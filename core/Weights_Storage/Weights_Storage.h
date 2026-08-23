@@ -105,6 +105,7 @@ class Weights_Storage {
     };
 
     bool distributed_ = false;
+    bool hierarchical_gdr_ = false;
     int local_node_rank_ = -1;
     int compact_fd_ = -1;
     int staging_fd_ = -1;

@@ -1,8 +1,20 @@
 import ast
+import json
 from pathlib import Path
 
+import pytest
 
-WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+INITIALIZER = (
+    ROOT
+    / "batchgen"
+    / "models"
+    / "moonshotai"
+    / "kimi_linear"
+    / "kimi_initializer.py"
+)
 
 
 def _class(tree, name):
@@ -59,3 +71,87 @@ def test_distributed_weight_config_reaches_kimi_initializer():
     assert config_entry.value.value.id == "self"
     assert config_entry.value.attr == "args"
     assert config_entry.attr == "distributed_weight_config"
+
+
+def _write_store_config(tmp_path, **overrides):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    store = tmp_path / "store.bin"
+    store.write_bytes(b"store")
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text("H\n")
+    config = {
+        "node_rank": 0,
+        "node_ips": ["n0", "n1", "n2", "n3"],
+        "workers": 8,
+        "store_path": str(store),
+        "metadata_path": str(metadata),
+        "daemon_socket": str(tmp_path / "daemon.sock"),
+        "summary_path": str(tmp_path / "summary.json"),
+        "store_bytes": store.stat().st_size,
+        "replicated_bytes": 0,
+        "module_bytes": 1,
+        "worker_sharded": True,
+    }
+    config.update(overrides)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    return path
+
+
+def test_weight_transport_defaults_to_host_rdma_and_accepts_hierarchical(
+    tmp_path,
+):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        load_distributed_weight_config,
+    )
+
+    # Backward compatibility: a config written before the transport key exists
+    # keeps the validated host-RDMA behaviour, and the key is normalized in so
+    # callers never have to re-apply the default.
+    legacy = load_distributed_weight_config(_write_store_config(tmp_path))
+    assert legacy["transport"] == "host_rdma"
+
+    selected = load_distributed_weight_config(
+        _write_store_config(tmp_path / "gdr", transport="hierarchical_gdr")
+    )
+    assert selected["transport"] == "hierarchical_gdr"
+
+
+def test_weight_transport_rejects_values_outside_the_two_allowed(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        WEIGHT_TRANSPORTS,
+        load_distributed_weight_config,
+    )
+
+    assert WEIGHT_TRANSPORTS == ("host_rdma", "hierarchical_gdr")
+    for value in ("gdr", "nvlink", "HOST_RDMA", "", None, 1):
+        path = _write_store_config(tmp_path / str(value), transport=value)
+        with pytest.raises(ValueError, match="transport must be one of"):
+            load_distributed_weight_config(path)
+
+
+def test_initializer_publishes_the_selected_transport_without_env_vars():
+    tree = ast.parse(INITIALIZER.read_text(), filename=str(INITIALIZER))
+    source = INITIALIZER.read_text()
+
+    # The value reaches Basic_Config from the store config, never getenv.
+    stamped = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "distributed_weight_transport"
+            and ast.unparse(target).endswith(
+                "Basic_Config.distributed_weight_transport"
+            )
+            for target in node.targets
+        )
+    ]
+    assert len(stamped) == 1
+    assert (
+        ast.unparse(stamped[0].value) == "self.distributed_weight_transport"
+    )
+    assert "load_distributed_weight_config" in source
+    assert "TRANSPORT" not in source
+    assert 'self.distributed_weight_transport = "host_rdma"' in source

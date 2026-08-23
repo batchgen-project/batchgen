@@ -8,6 +8,10 @@ Expert ingress is also sharded: local TP rank ``g`` copies only its contiguous
 112-expert shard from host, then six node-local all-gathers assemble one full
 896-expert layer on every GPU. The full-layer buffers are reused by all MoE
 layers; only one layer is resident at a time.
+
+Under the ``hierarchical_gdr`` transport the shard is fetched from host on one
+source rank per local TP slot and replicated GPU-to-GPU to the other three
+nodes over a dedicated cross-node group before the node-local all-gathers.
 """
 
 from __future__ import annotations
@@ -53,6 +57,9 @@ class StreamedSP8LayerBuffer:
         latent_size: int,
         acquire_batch_size: int,
         layer_indices=None,
+        cross_group=None,
+        cross_root=None,
+        cross_source: bool = False,
     ):
         if tp_size <= 1 or num_experts % tp_size:
             raise ValueError(
@@ -64,6 +71,18 @@ class StreamedSP8LayerBuffer:
         self.tp_group = tp_group
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
+        self.cross_group = cross_group
+        self.cross_root = cross_root
+        self.cross_source = bool(cross_source)
+        if cross_group is not None and cross_root is None:
+            raise ValueError(
+                "hierarchical cross-node weight transport needs the global "
+                "root rank of the cross-node group"
+            )
+        # host_rdma: every rank pulls its own shard from its node's host store.
+        # hierarchical_gdr: only the group's source rank does; the rest receive
+        # the same bytes from the broadcast below.
+        self._acquires_from_host = cross_group is None or self.cross_source
         self.num_experts = int(num_experts)
         self.experts_per_rank = self.num_experts // self.tp_size
         self.expert_start = self.tp_rank * self.experts_per_rank
@@ -82,6 +101,7 @@ class StreamedSP8LayerBuffer:
         )
         self.local = None
         self.full = None
+        self._cross_status = None
         self.scale_bf16 = {}
         self._expert_offsets = torch.arange(
             self.num_experts, dtype=torch.int64, device=self.device
@@ -120,41 +140,117 @@ class StreamedSP8LayerBuffer:
                 )
                 for name, shape in self.shapes.items()
             }
+            if self.cross_group is not None:
+                self._cross_status = torch.empty(
+                    (1,), dtype=torch.int32, device=self.device
+                )
 
     def _acquire_local_shard(self, layer_idx: int, stream=None):
         self._allocate()
-        names = [
-            f"routed_expert_{layer_idx}_{expert_idx}"
-            for expert_idx in range(
-                self.expert_start,
-                self.expert_start + self.experts_per_rank,
-            )
-        ]
-        # Hold every slot in this bounded batch until its D2D copy completes.
-        # The ordinary prefill phase may evict earlier expert mappings while a
-        # later module is still being acquired.
-        phase = "prefill_sp8"
         copy_stream = stream or torch.cuda.current_stream(self.device)
-        for begin in range(0, len(names), self.acquire_batch_size):
-            acquired = []
-            batch = names[begin:begin + self.acquire_batch_size]
-            with torch.cuda.stream(copy_stream):
-                for local_offset, module_name in enumerate(batch, start=begin):
-                    weights = self.core_engine.get_weights(module_name, phase)
-                    validate_routed_expert_slot(module_name, weights, self.shapes)
-                    for tensor_name in self.shapes:
-                        self.local[tensor_name][local_offset].copy_(
-                            weights[tensor_name]
-                        )
-                    acquired.append(module_name)
+        source_error = None
+        if self._acquires_from_host:
+            names = [
+                f"routed_expert_{layer_idx}_{expert_idx}"
+                for expert_idx in range(
+                    self.expert_start,
+                    self.expert_start + self.experts_per_rank,
+                )
+            ]
+            # Hold every slot in this bounded batch until its D2D copy
+            # completes.  The ordinary prefill phase may evict earlier expert
+            # mappings while a later module is still being acquired.
+            phase = "prefill_sp8"
+            try:
+                for begin in range(0, len(names), self.acquire_batch_size):
+                    acquired = []
+                    batch = names[begin:begin + self.acquire_batch_size]
+                    try:
+                        with torch.cuda.stream(copy_stream):
+                            for local_offset, module_name in enumerate(
+                                batch, start=begin
+                            ):
+                                weights = self.core_engine.get_weights(
+                                    module_name, phase
+                                )
+                                acquired.append(module_name)
+                                validate_routed_expert_slot(
+                                    module_name, weights, self.shapes
+                                )
+                                for tensor_name in self.shapes:
+                                    self.local[tensor_name][local_offset].copy_(
+                                        weights[tensor_name]
+                                    )
+                    finally:
+                        # The ring slot may be overwritten immediately after
+                        # release. Drain all D2D slot->local copies once per
+                        # bounded batch, and release every lease even when
+                        # validation or a later copy fails.
+                        copy_stream.synchronize()
+                        for module_name in acquired:
+                            self.core_engine.free_weights_buffer(module_name)
+            except BaseException as exc:
+                if self.cross_group is None:
+                    raise
+                source_error = exc
 
-            # The ring slot may be overwritten immediately after release.
-            # Drain all D2D slot->local copies once per bounded batch, not once
-            # per expert.  For a prefetch this blocks only the prefetch thread;
-            # the main thread is running attention/MoE in parallel.
-            copy_stream.synchronize()
-            for module_name in acquired:
-                self.core_engine.free_weights_buffer(module_name)
+        # A source-side Python/storage failure must be announced before peers
+        # enter the six large payload broadcasts. Otherwise the other three
+        # nodes can wait forever after the source thread has already unwound.
+        if not self._broadcast_source_status(
+            copy_stream, source_error is None
+        ):
+            if source_error is not None:
+                raise source_error
+            raise RuntimeError(
+                f"hierarchical_gdr source rank {self.cross_root} failed "
+                f"to acquire layer {layer_idx}"
+            )
+
+        # Cross-node replication is part of ingress, not of assembly: it writes
+        # ``self.local`` only, so it inherits the same WAR event and the same
+        # early-ingress overlap as the host copies above, and it necessarily
+        # precedes the node-local all-gather that reads ``self.local``.
+        self._broadcast_local_shard(copy_stream)
+
+    def _broadcast_source_status(self, stream, source_ok: bool) -> bool:
+        """Tell peers whether the source shard is ready for payload ingress."""
+        if self.cross_group is None:
+            return True
+        profile = StreamedSP8MXFP4MoELayer
+        with torch.cuda.stream(stream):
+            if self.cross_source:
+                self._cross_status.fill_(1 if source_ok else 0)
+            dist.broadcast(
+                self._cross_status, self.cross_root, group=self.cross_group
+            )
+        ok = bool(self._cross_status.item())
+        if profile._prefill_profile_enabled:
+            profile._prefill_profile_cross_status_calls += 1
+            if not ok:
+                profile._prefill_profile_cross_status_failures += 1
+        return ok
+
+    def _broadcast_local_shard(self, stream):
+        """Replicate the source rank's 112-expert shard to the other nodes.
+
+        No-op for ``host_rdma``, where every rank has already pulled its own
+        shard, so that path stays byte-identical.
+        """
+        if self.cross_group is None:
+            return
+        profile = StreamedSP8MXFP4MoELayer
+        with torch.cuda.stream(stream):
+            for tensor_name in self.shapes:
+                tensor = self.local[tensor_name]
+                dist.broadcast(tensor, self.cross_root, group=self.cross_group)
+                if profile._prefill_profile_enabled:
+                    profile._prefill_profile_cross_broadcast_calls += 1
+                    profile._prefill_profile_cross_broadcast_bytes += (
+                        tensor.numel() * tensor.element_size()
+                    )
+        if profile._prefill_profile_enabled:
+            profile._prefill_profile_cross_source = self.cross_source
 
     def _gather_full_layer(self, stream=None):
         gather_stream = stream or torch.cuda.current_stream(self.device)
@@ -366,6 +462,14 @@ class StreamedSP8MXFP4MoELayer:
     _prefill_profile_grouped_chunks = 0
     _prefill_profile_active_experts = 0
     _prefill_profile_wall_s = 0.0
+    # Cross-node weight transport evidence (hierarchical_gdr). Counted by
+    # StreamedSP8LayerBuffer, which owns the broadcasts; zero/False proves the
+    # host_rdma path ran no cross-node collective on this rank.
+    _prefill_profile_cross_broadcast_calls = 0
+    _prefill_profile_cross_broadcast_bytes = 0
+    _prefill_profile_cross_source = False
+    _prefill_profile_cross_status_calls = 0
+    _prefill_profile_cross_status_failures = 0
 
     @classmethod
     def reset_prefill_profile(cls, enabled: bool) -> None:
@@ -376,6 +480,11 @@ class StreamedSP8MXFP4MoELayer:
         cls._prefill_profile_grouped_chunks = 0
         cls._prefill_profile_active_experts = 0
         cls._prefill_profile_wall_s = 0.0
+        cls._prefill_profile_cross_broadcast_calls = 0
+        cls._prefill_profile_cross_broadcast_bytes = 0
+        cls._prefill_profile_cross_source = False
+        cls._prefill_profile_cross_status_calls = 0
+        cls._prefill_profile_cross_status_failures = 0
 
     @classmethod
     def prefill_profile_snapshot(cls) -> dict:
@@ -387,6 +496,17 @@ class StreamedSP8MXFP4MoELayer:
             "grouped_chunks": cls._prefill_profile_grouped_chunks,
             "active_experts": cls._prefill_profile_active_experts,
             "wall_s": cls._prefill_profile_wall_s,
+            "cross_broadcast_calls": (
+                cls._prefill_profile_cross_broadcast_calls
+            ),
+            "cross_broadcast_bytes": (
+                cls._prefill_profile_cross_broadcast_bytes
+            ),
+            "cross_source": cls._prefill_profile_cross_source,
+            "cross_status_calls": cls._prefill_profile_cross_status_calls,
+            "cross_status_failures": (
+                cls._prefill_profile_cross_status_failures
+            ),
         }
 
     def __init__(

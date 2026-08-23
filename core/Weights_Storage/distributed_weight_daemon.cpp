@@ -339,6 +339,12 @@ struct DistributedWeightDaemon::Impl {
         outstanding = config.value("outstanding", 8);
         workers = config.value("workers", kDefaultWorkers);
         worker_sharded = config.value("worker_sharded", false);
+        transport = config.value("transport", "host_rdma");
+        if (transport != "host_rdma" &&
+            transport != "hierarchical_gdr") {
+            fail("invalid distributed weight transport: " + transport);
+        }
+        hierarchical_gdr = transport == "hierarchical_gdr";
 
         if (node_rank < 0 || node_rank >= kNodes ||
             node_ips.size() != kNodes) {
@@ -380,6 +386,8 @@ struct DistributedWeightDaemon::Impl {
     int outstanding = 8;
     int workers = kDefaultWorkers;
     bool worker_sharded = false;
+    std::string transport = "host_rdma";
+    bool hierarchical_gdr = false;
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -615,15 +623,24 @@ struct DistributedWeightDaemon::Impl {
         try {
             AllocateMappings();
             SetupUnixListener();
-            bootstrap_thread = std::thread([this]() {
-                try {
-                    BootstrapNetwork();
-                } catch (const std::exception& error) {
-                    if (!stop.load()) {
-                        RecordFailure(error.what());
+            if (hierarchical_gdr) {
+                // The compact stores remain quarter-sharded, but remote
+                // shards move GPU-to-GPU through NCCL. Workers still use the
+                // daemon's local Unix handshake/staging ABI; no UCP endpoint,
+                // host-RDMA prefetch, or remote host registration is needed.
+                network_ready.store(true);
+                ready_cv.notify_all();
+            } else {
+                bootstrap_thread = std::thread([this]() {
+                    try {
+                        BootstrapNetwork();
+                    } catch (const std::exception& error) {
+                        if (!stop.load()) {
+                            RecordFailure(error.what());
+                        }
                     }
-                }
-            });
+                });
+            }
             unix_accept_thread = std::thread([this]() {
                 try {
                     AcceptWorkers();
@@ -940,6 +957,10 @@ struct DistributedWeightDaemon::Impl {
 
     void Acquire(const std::string& module_key, int worker_id,
                  Response* response) {
+        if (hierarchical_gdr) {
+            fail("hierarchical_gdr forbids remote host acquire: " +
+                 module_key);
+        }
         const auto [layer, expert] = parse_module_key(module_key);
         const int owner = expert / kExpertsPerOwner;
         if (owner == node_rank) {
@@ -1287,6 +1308,7 @@ struct DistributedWeightDaemon::Impl {
             summary["superchunk"] = superchunk;
             summary["outstanding"] = outstanding;
             summary["worker_sharded"] = worker_sharded;
+            summary["transport"] = transport;
             summary["store_bytes"] = store_bytes;
             summary["staging_bytes"] = staging_bytes;
             summary["fetched_modules"] = fetched_modules;

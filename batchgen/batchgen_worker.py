@@ -6729,6 +6729,9 @@ class BatchGenWorker:
 		prefill_debug = (
 			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
 		)
+		k3_prefill_profile = self._debug_flag_enabled(
+			prefill_debug.get("k3_prefill_profile")
+		)
 		AttnWrapperBase.batchgen_debug = prefill_debug or None
 		_default_k3_prefill_mode = "streamed"
 		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
@@ -6794,6 +6797,8 @@ class BatchGenWorker:
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		self._destroy_gpu_paged_kv_cache()
+		if k3_prefill_profile and torch.cuda.is_available():
+			torch.cuda.reset_peak_memory_stats(self.local_rank)
 
 		if (
 			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
@@ -6870,9 +6875,6 @@ class BatchGenWorker:
 		if not sp8_reentry:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_prefill_buffer()
-		k3_prefill_profile = self._debug_flag_enabled(
-			prefill_debug.get("k3_prefill_profile")
-		)
 		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
 		if k3_prefill_profile:
 			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
@@ -6895,9 +6897,12 @@ class BatchGenWorker:
 					"preserved daemon cursor no longer matches the rebuilt "
 					"task and would stream the wrong experts"
 				)
+			if any(self.weight_copy_task.values()):
+				self.core_engine.start_h2d_worker()
 		else:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-		self.core_engine.start_h2d_worker()
+			if any(self.weight_copy_task.values()):
+				self.core_engine.start_h2d_worker()
 		self._streamed_sp8_h2d_installed = streamed_sp8
 		self._streamed_sp8_weight_copy_fingerprint = (
 			fingerprint if streamed_sp8 else None
@@ -8163,8 +8168,25 @@ class BatchGenWorker:
 			from batchgen.moe.streamed_sp8_mxfp4 import (
 				StreamedSP8MXFP4MoELayer,
 			)
+			free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
 			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
 				"rank": self.rank,
+				"hbm": {
+					"current_allocated_bytes": torch.cuda.memory_allocated(
+						self.local_rank
+					),
+					"current_reserved_bytes": torch.cuda.memory_reserved(
+						self.local_rank
+					),
+					"peak_allocated_bytes": torch.cuda.max_memory_allocated(
+						self.local_rank
+					),
+					"peak_reserved_bytes": torch.cuda.max_memory_reserved(
+						self.local_rank
+					),
+					"free_bytes": free_hbm,
+					"total_bytes": total_hbm,
+				},
 				"weight_stream": self.core_engine.get_weight_stream_profile(),
 				"expert_consumer": (
 					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()

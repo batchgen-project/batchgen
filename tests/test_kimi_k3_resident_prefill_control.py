@@ -334,10 +334,28 @@ def test_streamed_sp8_builds_rank_local_112_expert_schedule():
         / "kimi_linear"
         / "Parallel_Strategy_Manager.py"
     )
+    manager = _sp8_schedule_manager(hierarchical_gdr=False)
+    build = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_build_weight_copy_task",
+    ).__get__(manager)
+
+    tasks = build()["routed_expert"]
+
+    assert len(tasks) == 112
+    assert tasks[0] == "routed_expert_0_336"
+    assert tasks[-1] == "routed_expert_0_447"
+
+
+def _sp8_schedule_manager(*, hierarchical_gdr, cross_source=False):
+    """A TP8 rank-3 manager stub for ``_build_weight_copy_task``."""
     manager = type("Manager", (), {})()
     manager._stream_all_modules = False
     manager._attn_tp_size = 8
     manager._attn_tp_rank = 3
+    manager._hierarchical_gdr = hierarchical_gdr
+    manager._cross_weight_source = cross_source
     manager.prefill_uses_streamed_sp8 = lambda: True
     moe = type("MoE", (), {
         "experts": [object()] * 896,
@@ -351,17 +369,110 @@ def test_streamed_sp8_builds_rank_local_112_expert_schedule():
         "num_hidden_layers": 1,
         "is_kda_layer": lambda self, _: False,
     })()
+    return manager
+
+
+def test_hierarchical_gdr_schedules_host_ingress_on_source_ranks_only():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+
+    def routed(manager):
+        return _isolated_method(
+            path,
+            "KimiLinearParallelStrategyManager",
+            "_build_weight_copy_task",
+        ).__get__(manager)()["routed_expert"]
+
+    # A source rank keeps exactly its contiguous 112-expert shard: the eight
+    # sources between them still cover all 896 experts of the layer.
+    source = routed(
+        _sp8_schedule_manager(hierarchical_gdr=True, cross_source=True)
+    )
+    assert len(source) == 112
+    assert source[0] == "routed_expert_0_336"
+    assert source[-1] == "routed_expert_0_447"
+
+    # The 24 non-source ranks receive the shard over the cross-node broadcast
+    # and must request nothing from the host store.
+    assert routed(
+        _sp8_schedule_manager(hierarchical_gdr=True, cross_source=False)
+    ) == []
+
+
+def test_hierarchical_gdr_builds_the_exact_cross_node_group_and_root_map():
+    dist = pytest.importorskip("torch.distributed")
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
     build = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
-        "_build_weight_copy_task",
-    ).__get__(manager)
+        "_build_cross_weight_group",
+    )
+    created = []
+    original = dist.new_group
 
-    tasks = build()["routed_expert"]
+    def fake_new_group(ranks=None, **kwargs):
+        created.append(tuple(ranks))
+        return ("group", tuple(ranks))
 
-    assert len(tasks) == 112
-    assert tasks[0] == "routed_expert_0_336"
-    assert tasks[-1] == "routed_expert_0_447"
+    def manager_for(global_rank, hierarchical_gdr=True):
+        manager = type("Manager", (), {})()
+        manager._hierarchical_gdr = hierarchical_gdr
+        manager._attn_tp_size = 8
+        manager._attn_tp_rank = global_rank % 8
+        manager.world_size = 32
+        manager.global_rank = global_rank
+        manager._cross_weight_group = None
+        manager._cross_weight_root = None
+        manager._cross_weight_source = False
+        return manager
+
+    dist.new_group = fake_new_group
+    try:
+        sources = []
+        for global_rank in range(32):
+            manager = manager_for(global_rank)
+            created.clear()
+            build.__get__(manager)()
+
+            # Every rank creates all eight groups, in one identical order.
+            assert created == [
+                (g, g + 8, g + 16, g + 24) for g in range(8)
+            ]
+            g = global_rank % 8
+            assert manager._cross_weight_group == (
+                "group", (g, g + 8, g + 16, g + 24)
+            )
+            assert manager._cross_weight_root == (g // 2) * 8 + g
+            if manager._cross_weight_source:
+                sources.append(global_rank)
+
+        # Two sources per node, so every node drives an egress stream.
+        assert sources == [0, 1, 10, 11, 20, 21, 30, 31]
+
+        # host_rdma builds nothing at all, so the attention and node-local
+        # weight groups keep their existing creation order and count.
+        manager = manager_for(5, hierarchical_gdr=False)
+        created.clear()
+        build.__get__(manager)()
+        assert created == []
+        assert manager._cross_weight_group is None
+        assert manager._cross_weight_root is None
+        assert manager._cross_weight_source is False
+    finally:
+        dist.new_group = original
 
 
 def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
@@ -793,6 +904,245 @@ def test_streamed_sp8_gather_marks_local_shard_free():
     assert "self._local_free = torch.cuda.Event()" in init
 
 
+SIX_TENSORS = (
+    "w1.weight_packed",
+    "w1.weight_scale",
+    "w3.weight_packed",
+    "w3.weight_scale",
+    "w2.weight_packed",
+    "w2.weight_scale",
+)
+
+
+class _FakeShardTensor:
+    def __init__(self, name):
+        self.name = name
+        self.value = 1
+
+    def __getitem__(self, index):
+        return SimpleNamespace(copy_=lambda source: None)
+
+    def numel(self):
+        return 1024
+
+    def element_size(self):
+        return 1
+
+    def fill_(self, value):
+        self.value = int(value)
+
+    def item(self):
+        return self.value
+
+
+class _FakeIngressStream:
+    def __init__(self, trace):
+        self.name = "prefetch"
+        self._trace = trace
+
+    def synchronize(self):
+        self._trace.append(("synchronize",))
+
+
+class _FakeStreamContext:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __enter__(self):
+        return self._stream
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
+    """Bind the real ingress/assembly methods onto fake streams and NCCL."""
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    profile = type("Profile", (), {
+        "_prefill_profile_enabled": True,
+        "_prefill_profile_cross_broadcast_calls": 0,
+        "_prefill_profile_cross_broadcast_bytes": 0,
+        "_prefill_profile_cross_source": False,
+        "_prefill_profile_cross_status_calls": 0,
+        "_prefill_profile_cross_status_failures": 0,
+    })
+    globals_ = {
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(
+                stream=_FakeStreamContext,
+                current_stream=lambda device: None,
+            )
+        ),
+        "dist": SimpleNamespace(
+            broadcast=lambda tensor, root, group=None: trace.append(
+                ("broadcast", tensor.name, root, group)
+            ),
+            all_gather_into_tensor=lambda out, src, group=None: trace.append(
+                ("all_gather", src.name, group)
+            ),
+        ),
+        "validate_routed_expert_slot": lambda *args: None,
+        "StreamedSP8MXFP4MoELayer": profile,
+    }
+    buffer = type("Buffer", (), {})()
+    buffer.device = "cuda:0"
+    buffer.shapes = {name: (2,) for name in SIX_TENSORS}
+    buffer.local = {name: _FakeShardTensor(name) for name in SIX_TENSORS}
+    buffer.full = {name: _FakeShardTensor(name) for name in SIX_TENSORS}
+    buffer._cross_status = _FakeShardTensor("source_status")
+    buffer.tp_group = "tp8"
+    buffer.expert_start = 336
+    buffer.experts_per_rank = 2
+    buffer.acquire_batch_size = 2
+    buffer.cross_group = cross_group
+    buffer.cross_root = cross_root
+    buffer.cross_source = cross_source
+    buffer._acquires_from_host = cross_group is None or cross_source
+    buffer._allocate = lambda: None
+    buffer._local_free = SimpleNamespace(
+        record=lambda stream: trace.append(("local_free",))
+    )
+    buffer.core_engine = SimpleNamespace(
+        get_weights=lambda name, phase: trace.append(
+            ("get_weights", name, phase)
+        ) or {tensor: tensor for tensor in SIX_TENSORS},
+        free_weights_buffer=lambda name: None,
+    )
+    for name in (
+        "_acquire_local_shard",
+        "_broadcast_source_status",
+        "_broadcast_local_shard",
+        "_gather_full_layer",
+    ):
+        setattr(
+            buffer,
+            name,
+            _isolated_method(
+                path, "StreamedSP8LayerBuffer", name, globals_
+            ).__get__(buffer),
+        )
+    return buffer, profile
+
+
+def _op_span(trace, op):
+    positions = [i for i, entry in enumerate(trace) if entry[0] == op]
+    return positions[0], positions[-1]
+
+
+def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_gather():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group="cross3", cross_root=11, cross_source=True
+    )
+
+    buffer._acquire_local_shard(7, stream=stream)
+    buffer._gather_full_layer(stream=stream)
+
+    ops = [entry[0] for entry in trace]
+    assert ops.count("get_weights") == 2
+    assert ops.count("broadcast") == 7
+    assert ops.count("all_gather") == 6
+    # Host ingress -> cross-node replication -> node-local assembly. The
+    # all-gather reads self.local, so it must follow every broadcast into it.
+    assert _op_span(trace, "get_weights")[1] < _op_span(trace, "broadcast")[0]
+    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "all_gather")[0]
+
+    broadcasts = [
+        entry for entry in trace
+        if entry[0] == "broadcast" and entry[1] != "source_status"
+    ]
+    assert [entry[1] for entry in broadcasts] == list(SIX_TENSORS)
+    assert {(entry[2], entry[3]) for entry in broadcasts} == {(11, "cross3")}
+    assert profile._prefill_profile_cross_broadcast_calls == 6
+    assert profile._prefill_profile_cross_broadcast_bytes == 6 * 1024
+    assert profile._prefill_profile_cross_source is True
+    assert profile._prefill_profile_cross_status_calls == 1
+    assert profile._prefill_profile_cross_status_failures == 0
+
+
+def test_hierarchical_gdr_non_source_rank_receives_without_host_ingress():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group="cross3", cross_root=11, cross_source=False
+    )
+
+    buffer._acquire_local_shard(7, stream=stream)
+    buffer._gather_full_layer(stream=stream)
+
+    ops = [entry[0] for entry in trace]
+    # 24 of the 32 ranks touch the host store for no expert at all, but they
+    # still enter every cross-node broadcast and every node-local all-gather.
+    assert "get_weights" not in ops
+    assert ops.count("broadcast") == 7
+    assert ops.count("all_gather") == 6
+    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "all_gather")[0]
+    assert profile._prefill_profile_cross_broadcast_calls == 6
+    assert profile._prefill_profile_cross_source is False
+    assert profile._prefill_profile_cross_status_calls == 1
+    assert profile._prefill_profile_cross_status_failures == 0
+
+
+def test_host_rdma_transport_runs_no_cross_node_collective():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group=None, cross_root=None, cross_source=False
+    )
+
+    buffer._acquire_local_shard(7, stream=stream)
+    buffer._gather_full_layer(stream=stream)
+
+    ops = [entry[0] for entry in trace]
+    assert ops.count("get_weights") == 2
+    assert "broadcast" not in ops
+    assert ops.count("all_gather") == 6
+    assert profile._prefill_profile_cross_broadcast_calls == 0
+    assert profile._prefill_profile_cross_broadcast_bytes == 0
+    assert profile._prefill_profile_cross_source is False
+    assert profile._prefill_profile_cross_status_calls == 0
+    assert profile._prefill_profile_cross_status_failures == 0
+
+
+def test_hierarchical_gdr_source_failure_announces_status_before_raising():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group="cross3", cross_root=11, cross_source=True
+    )
+
+    def fail_source(name, phase):
+        raise RuntimeError("source load failed")
+
+    buffer.core_engine.get_weights = fail_source
+    with pytest.raises(RuntimeError, match="source load failed"):
+        buffer._acquire_local_shard(7, stream=stream)
+
+    broadcasts = [entry for entry in trace if entry[0] == "broadcast"]
+    assert broadcasts == [("broadcast", "source_status", 11, "cross3")]
+    assert "all_gather" not in [entry[0] for entry in trace]
+    assert profile._prefill_profile_cross_broadcast_calls == 0
+    assert profile._prefill_profile_cross_status_calls == 1
+    assert profile._prefill_profile_cross_status_failures == 1
+
+
+def test_cross_node_broadcast_stays_inside_the_early_ingress_phase():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    acquire = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_acquire_local_shard")
+    )
+    # Phase one writes self.local only, so the broadcast inherits the existing
+    # WAR event and overlaps the current layer's compute.
+    assert "self._broadcast_local_shard(copy_stream)" in acquire
+    # Phase two is the parked all-gather; carrying the broadcast there would
+    # serialize the cross-node transfer behind the overwrite handshake.
+    gather = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_gather_full_layer")
+    )
+    assert "_broadcast_local_shard" not in gather
+
+
 def test_streamed_sp8_empty_rank_loads_before_returning():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(
@@ -824,6 +1174,33 @@ def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile()
     assert "StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)" in source
     assert '"streamed_sp8": (' in source
     assert '"expert_consumer": (' in source
+    assert "torch.cuda.reset_peak_memory_stats(self.local_rank)" in source
+    for field in (
+        "current_allocated_bytes",
+        "current_reserved_bytes",
+        "peak_allocated_bytes",
+        "peak_reserved_bytes",
+        "free_bytes",
+        "total_bytes",
+    ):
+        assert f'"{field}"' in source
+
+
+def test_h2d_worker_starts_are_guarded_for_empty_hierarchical_ranks():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    function = _function(path, "BatchGenWorker", "_config_prefill_for_batch")
+    guards = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "any(self.weight_copy_task.values())"
+    ]
+    assert len(guards) == 2
+    assert all(
+        [ast.unparse(node) for node in guard.body]
+        == ["self.core_engine.start_h2d_worker()"]
+        for guard in guards
+    )
 
 
 def test_distributed_daemon_joins_bootstrap_threads_on_failure():
@@ -834,6 +1211,30 @@ def test_distributed_daemon_joins_bootstrap_threads_on_failure():
     assert "close_tcp_listeners" in source
     assert source.count("join_accept_threads();") >= 3
     assert "if (listener >= 0)" in source
+
+
+def test_hierarchical_gdr_core_transport_fails_closed_without_host_network():
+    storage = (
+        ROOT / "core" / "Weights_Storage" / "Weights_Storage.cpp"
+    ).read_text()
+    daemon = (
+        ROOT
+        / "core"
+        / "Weights_Storage"
+        / "distributed_weight_daemon.cpp"
+    ).read_text()
+
+    assert 'config.value("transport", "host_rdma")' in storage
+    assert 'transport != "host_rdma"' in storage
+    assert 'transport != "hierarchical_gdr"' in storage
+    assert "hierarchical_gdr rank requested non-local host module" in storage
+
+    assert 'config.value("transport", "host_rdma")' in daemon
+    assert "if (hierarchical_gdr)" in daemon
+    assert "network_ready.store(true)" in daemon
+    assert "BootstrapNetwork();" in daemon
+    assert "hierarchical_gdr forbids remote host acquire" in daemon
+    assert 'summary["transport"] = transport' in daemon
 
 
 def test_streamed_sp8_reinterprets_offline_marlin_as_int32():

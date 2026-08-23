@@ -92,6 +92,16 @@ class KimiLinearInitializer:
                 "K3 distributed host weights require model_type='kimi_k3' "
                 "and world_size=32"
             )
+        # Weight transport is selected in the distributed store config, not by
+        # an env var. Re-reading the (small) JSON here keeps the allowed-value
+        # check in the one loader that already validates the store.
+        self.distributed_weight_transport = "host_rdma"
+        if self.distributed_weight_sharded:
+            from .distributed_weight_store import load_distributed_weight_config
+
+            self.distributed_weight_transport = load_distributed_weight_config(
+                self.distributed_weight_config
+            )["transport"]
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
@@ -126,7 +136,14 @@ class KimiLinearInitializer:
         self.engine_config.Basic_Config.distributed_weight_sharded = (
             self.distributed_weight_sharded
         )
+        self.engine_config.Basic_Config.distributed_weight_transport = (
+            self.distributed_weight_transport
+        )
         if self.global_rank == 0:
+            logging.info(
+                "K3 distributed weight transport = "
+                f"{self.distributed_weight_transport}"
+            )
             logging.info(f"Engine config after planning: {self.engine_config}")
 
         self.shm_name = input_arguments.shm_name

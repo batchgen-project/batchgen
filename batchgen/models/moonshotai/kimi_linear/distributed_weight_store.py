@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any
 
 
+#: How a worker obtains this layer's 112-expert ingress shard.
+#:
+#: ``host_rdma`` (default, backward compatible) — every one of the 32 workers
+#: pulls its own shard from its node's compact host store.
+#: ``hierarchical_gdr`` — only eight source ranks pull from the host store and
+#: replicate their shard to the other three nodes over dedicated cross-node
+#: NCCL groups.
+WEIGHT_TRANSPORTS = ("host_rdma", "hierarchical_gdr")
+
+
 def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     config = json.loads(config_path.read_text())
@@ -41,6 +51,16 @@ def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "K3 distributed host weights require workers=8 per node"
         )
+    # Optional; an existing config without the key keeps the validated
+    # host-RDMA transport. Normalized into the returned dict so every caller
+    # can read `config["transport"]` unconditionally.
+    transport = config.get("transport", "host_rdma")
+    if transport not in WEIGHT_TRANSPORTS:
+        raise ValueError(
+            f"distributed weight transport must be one of {WEIGHT_TRANSPORTS}; "
+            f"got {config.get('transport')!r}"
+        )
+    config["transport"] = transport
     store = Path(config["store_path"])
     if store.stat().st_size != int(config["store_bytes"]):
         raise ValueError("distributed compact-store byte size mismatch")

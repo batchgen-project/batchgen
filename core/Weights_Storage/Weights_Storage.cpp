@@ -214,6 +214,15 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
         config.at("store_bytes").get<int64_t>();
     this->distributed_module_bytes_ =
         config.at("module_bytes").get<int64_t>();
+    const std::string transport =
+        config.value("transport", "host_rdma");
+    if (transport != "host_rdma" &&
+        transport != "hierarchical_gdr") {
+        throw std::runtime_error(
+            "distributed weight transport must be host_rdma or "
+            "hierarchical_gdr");
+    }
+    this->hierarchical_gdr_ = transport == "hierarchical_gdr";
     if (!config.contains("worker_sharded") ||
         !config.at("worker_sharded").is_boolean() ||
         !config.at("worker_sharded").get<bool>()) {
@@ -367,11 +376,12 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
     this->byte_size_ = this->compact_bytes_;
     this->logger->info(
         "Distributed compact weights ready: node_rank={}, store={:.3f} "
-        "GiB, staging={:.3f} GiB, local_tensors={}, remote_tensors={}",
+        "GiB, staging={:.3f} GiB, local_tensors={}, remote_tensors={}, "
+        "transport={}",
         this->local_node_rank_,
         this->compact_bytes_ / (1024.0 * 1024.0 * 1024.0),
         this->staging_bytes_ / (1024.0 * 1024.0 * 1024.0),
-        local_tensors, remote_tensors);
+        local_tensors, remote_tensors, transport);
 }
 
 Weights_Storage::active_lease
@@ -541,6 +551,11 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
     }
     auto remote = this->remote_module_weights_.find(module_key);
     if (remote != this->remote_module_weights_.end()) {
+        if (this->hierarchical_gdr_) {
+            throw std::runtime_error(
+                "hierarchical_gdr rank requested non-local host module: " +
+                module_key);
+        }
         const active_lease lease =
             this->acquire_remote_module(module_key);
         std::unordered_map<std::string, tensor_buffer> result;
