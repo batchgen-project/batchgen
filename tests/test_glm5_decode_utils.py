@@ -2827,6 +2827,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker._current_decode_max_rank_batch_size = 2
     worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
     worker._cuda_graph_manager = None
+    worker._cuda_graph_adapter = None
     worker._whole_model_segment = None
     worker._whole_model_bucketing = None
     worker._whole_model_graph = False
