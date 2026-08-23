@@ -26,10 +26,21 @@ _BUF = 32
 _GPN = 8  # gpus per node
 
 
-def _cand(uuid, *, rank=0, evicted=False, gidx=0, decoded=0, prompt=100, budget=100000):
+def _cand(
+    uuid,
+    *,
+    rank=0,
+    node=None,
+    evicted=False,
+    gidx=0,
+    decoded=0,
+    prompt=100,
+    budget=100000,
+):
     return PrefillCandidate(
         uuid=uuid,
         assigned_rank=rank,
+        node_id=rank // _GPN if node is None else node,
         is_evicted=evicted,
         global_idx=gidx,
         total_decoded_before_eviction=decoded,
@@ -45,8 +56,8 @@ def _req(
     *,
     chunk=128,
     gpus_per_node=_GPN,
-    max_sequences_per_rank=None,
-    max_sequences_per_node=None,
+    per_rank_sequence_free=None,
+    per_node_sequence_free=None,
 ):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
@@ -55,8 +66,14 @@ def _req(
         num_nodes=len(per_node_free),
         gpus_per_node=gpus_per_node,
         initial_gpu_page_buffer=_BUF,
-        max_sequences_per_rank=max_sequences_per_rank,
-        max_sequences_per_node=max_sequences_per_node,
+        per_rank_sequence_free=(
+            tuple(per_rank_sequence_free)
+            if per_rank_sequence_free is not None else None
+        ),
+        per_node_sequence_free=(
+            tuple(per_node_sequence_free)
+            if per_node_sequence_free is not None else None
+        ),
     )
 
 
@@ -168,7 +185,7 @@ def test_persistent_kda_limit_is_per_rank_when_requested():
         _cand("r1-a", rank=1, gidx=3),
     ]
     plan = PrefillScheduler.select_prefill_batch(
-        _req(cands, [200], max_sequences_per_rank=2)
+        _req(cands, [200], per_rank_sequence_free=[2, 2])
     )
     assert plan == ["r0-a", "r0-b", "r1-a"]
 
@@ -181,9 +198,43 @@ def test_persistent_kda_limit_is_per_node_for_tp8_group():
         _cand("n1-a", rank=8, gidx=3),
     ]
     plan = PrefillScheduler.select_prefill_batch(
-        _req(cands, [200, 200], max_sequences_per_node=2)
+        _req(cands, [200, 200], per_node_sequence_free=[2, 2])
     )
     assert plan == ["n0-a", "n0-b", "n1-a"]
+
+
+def test_tp8_capacity_uses_group_node_not_legacy_assigned_rank():
+    # The legacy rank balancer can assign all requests to ranks 0..15 while
+    # TP8 decode groups place four requests on each physical node. Admission
+    # must follow the latter or a 16-request W2 batch is split unnecessarily.
+    cands = [
+        _cand(f"q{i}", rank=i, node=i % 4, gidx=i)
+        for i in range(16)
+    ]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(
+            cands,
+            [1000, 1000, 1000, 1000],
+            per_node_sequence_free=[4, 4, 4, 4],
+        )
+    )
+    assert plan == [f"q{i}" for i in range(16)]
+
+
+def test_asymmetric_node_slot_capacity_is_applied_from_gathered_vector():
+    cands = [
+        _cand("n0", rank=0, node=0, gidx=0),
+        _cand("n1-a", rank=0, node=1, gidx=1),
+        _cand("n1-b", rank=0, node=1, gidx=2),
+    ]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(
+            cands,
+            [200, 200],
+            per_node_sequence_free=[0, 2],
+        )
+    )
+    assert plan == ["n1-a", "n1-b"]
 
 
 def test_persistent_kda_limits_cannot_have_two_scopes():
@@ -192,8 +243,8 @@ def test_persistent_kda_limits_cannot_have_two_scopes():
             _req(
                 [_cand("a")],
                 [34],
-                max_sequences_per_rank=1,
-                max_sequences_per_node=1,
+                per_rank_sequence_free=[1],
+                per_node_sequence_free=[1],
             )
         )
 

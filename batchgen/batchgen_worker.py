@@ -3330,14 +3330,7 @@ class BatchGenWorker:
 			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 		)
 
-		# Kimi-Linear: release KDA state slots alongside GPU KV pages (no-op for
-		# other models — slot_manager is None).
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-			if KimiLinearKDAWrapper.slot_manager is not None:
-				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
-		except ImportError:
-			pass
+		self._release_kda_state_slots(global_sequence_ids)
 
 		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
 		for local_idx in local_sequence_ids:
@@ -3347,6 +3340,17 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
 					seq.gpu_pages_allocated = 0
+
+	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
+		"""Release Kimi-Linear KDA state independently of paged GPU KV."""
+		if not global_sequence_ids:
+			return
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+			if KimiLinearKDAWrapper.slot_manager is not None:
+				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
+		except ImportError:
+			pass
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Destroy the GPU paged KV cache manager if it is present."""
@@ -5033,20 +5037,38 @@ class BatchGenWorker:
 		gpus_per_node = NUM_GPUS_PER_NODE
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
+		sequence_limits = self._prefill_sequence_limits()
+		node_sequence_free = sequence_limits.get("max_sequences_per_node")
+		rank_sequence_free = sequence_limits.get("max_sequences_per_rank")
+		if node_sequence_free is not None and rank_sequence_free is not None:
+			raise ValueError(
+				"prefill sequence capacity must be scoped to rank or node, not both"
+			)
+		if node_sequence_free is not None:
+			limit_scope = 2
+			local_sequence_free = int(node_sequence_free)
+		elif rank_sequence_free is not None:
+			limit_scope = 1
+			local_sequence_free = int(rank_sequence_free)
+		else:
+			limit_scope = 0
+			local_sequence_free = -1
 
 		# Step 1: Get this node's host KV free pages
 		local_host_free = self._get_host_kv_free_pages()
 
-		# Step 2: Gather host KV free pages from first rank on each node
-		# Only rank 0, 8, 16, ... (first on each node) reports actual value
-		if self.local_rank == 0:
-			report_node = self.rank // gpus_per_node
-			report_free = local_host_free
-		else:
-			report_node = -1
-			report_free = 0  # Non-first ranks report 0
-
-		free_tensor = torch.tensor([report_node, report_free], dtype=torch.int64, device=self.torch_device)
+		# Step 2: Gather host KV plus persistent sequence capacity. Host KV is
+		# one shared region per node, so only the node leader reports it. KDA
+		# state is per GPU; every rank reports its free count and the scheduler
+		# uses the node minimum. This keeps every rank's selection identical
+		# even if a prior lifecycle bug left one TP group asymmetric.
+		report_node = self.rank // gpus_per_node
+		report_host_free = local_host_free if self.local_rank == 0 else -1
+		free_tensor = torch.tensor(
+			[report_node, report_host_free, limit_scope, local_sequence_free],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
 
@@ -5054,14 +5076,49 @@ class BatchGenWorker:
 		reports_by_node = {}
 		for item in gathered:
 			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = int(item[1].item())
+			host_free = int(item[1].item())
+			if node_id >= 0 and host_free >= 0:
+				reports_by_node[node_id] = host_free
 		per_node_host_free = []
 		for node in range(num_nodes):
 			per_node_host_free.append(reports_by_node.get(node, 0))
 
+		gathered_scopes = {int(item[2].item()) for item in gathered}
+		if len(gathered_scopes) != 1:
+			raise RuntimeError(
+				f"prefill sequence-capacity scope diverged across ranks: "
+				f"{sorted(gathered_scopes)}"
+			)
+		per_rank_sequence_free = None
+		per_node_sequence_free = None
+		gathered_scope = next(iter(gathered_scopes))
+		if gathered_scope == 1:
+			per_rank_sequence_free = [int(item[3].item()) for item in gathered]
+		elif gathered_scope == 2:
+			per_node_sequence_free = []
+			for node in range(num_nodes):
+				values = [
+					int(item[3].item())
+					for item in gathered
+					if int(item[0].item()) == node
+				]
+				if not values:
+					raise RuntimeError(
+						f"missing persistent sequence-capacity report for node {node}"
+					)
+				per_node_sequence_free.append(min(values))
+		elif gathered_scope != 0:
+			raise RuntimeError(
+				f"unknown prefill sequence-capacity scope {gathered_scope}"
+			)
+
 		if self.rank == 0:
 			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
+			if per_node_sequence_free is not None:
+				logging.info(
+					f"[PREFILL] Persistent sequence slots free by node: "
+					f"{per_node_sequence_free}"
+				)
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
@@ -5071,7 +5128,12 @@ class BatchGenWorker:
 		# sequence completes or is evicted.
 		prefill_batch = PrefillScheduler.select_prefill_batch(
 			self._make_prefill_selection_request(
-				all_candidates, per_node_host_free, num_nodes, chunk_size
+				all_candidates,
+				per_node_host_free,
+				num_nodes,
+				chunk_size,
+				per_rank_sequence_free=per_rank_sequence_free,
+				per_node_sequence_free=per_node_sequence_free,
 			)
 		)
 
@@ -5110,16 +5172,31 @@ class BatchGenWorker:
 
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
-		num_nodes: int, chunk_size: int,
+		num_nodes: int, chunk_size: int, *,
+		per_rank_sequence_free=None, per_node_sequence_free=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
+			seq_node = seq.assigned_rank // NUM_GPUS_PER_NODE
+			G = self._decode_attn_tp_size()
+			if G > 1:
+				if seq.decode_dp_group is None:
+					raise RuntimeError(
+						f"sequence {uuid[:8]} has no decode_dp_group before "
+						"TP prefill selection"
+					)
+				from batchgen.decode_dp_group import host_kv_owner_rank
+				seq_node = (
+					host_kv_owner_rank(seq.decode_dp_group, G)
+					// NUM_GPUS_PER_NODE
+				)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
 				assigned_rank=seq.assigned_rank,
+				node_id=seq_node,
 				is_evicted=(seq.status == SequenceStatus.EVICTED),
 				global_idx=seq.global_idx,
 				total_decoded_before_eviction=getattr(
@@ -5129,7 +5206,6 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
 			))
-		limits = self._prefill_sequence_limits()
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
 			per_node_host_free=tuple(per_node_host_free),
@@ -5137,8 +5213,14 @@ class BatchGenWorker:
 			num_nodes=num_nodes,
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
-			max_sequences_per_rank=limits.get("max_sequences_per_rank"),
-			max_sequences_per_node=limits.get("max_sequences_per_node"),
+			per_rank_sequence_free=(
+				tuple(per_rank_sequence_free)
+				if per_rank_sequence_free is not None else None
+			),
+			per_node_sequence_free=(
+				tuple(per_node_sequence_free)
+				if per_node_sequence_free is not None else None
+			),
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
@@ -5454,8 +5536,14 @@ class BatchGenWorker:
 			# prefill_prepacked writes KV straight to host, so most of these
 			# never registered with the GPU paged manager.
 			gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+			kda_only = [u for u in my_completed if u not in self._sequences_with_gpu_kv]
 			if gpu_allocated:
 				self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+			if kda_only:
+				self._release_kda_state_slots([
+					self.global_batch.get_sequence(uuid).global_idx
+					for uuid in kda_only
+				])
 			self._release_host_kv_pages_for_batch(my_completed)
 		for uuid in completed_uuids:
 			seq = self.global_batch.get_sequence(uuid)

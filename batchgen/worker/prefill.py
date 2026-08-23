@@ -40,6 +40,7 @@ class PrefillCandidate:
 
     uuid: str
     assigned_rank: int
+    node_id: int
     is_evicted: bool
     global_idx: int
     total_decoded_before_eviction: int
@@ -64,10 +65,11 @@ class PrefillSelectionRequest:
     gpus_per_node: int
     initial_gpu_page_buffer: int
     # Persistent model state is a separate constraint from the token cap.
-    # KDA keeps one state slot for a sequence until completion/eviction,
-    # even when prefill is split into smaller token micro-batches.
-    max_sequences_per_rank: Optional[int] = None
-    max_sequences_per_node: Optional[int] = None
+    # KDA keeps one state slot for a sequence until completion/eviction.
+    # Free capacity can differ after prior work, so carry the gathered
+    # rank/node vectors rather than one caller-local scalar.
+    per_rank_sequence_free: Optional[Tuple[int, ...]] = None
+    per_node_sequence_free: Optional[Tuple[int, ...]] = None
 
 
 class PrefillScheduler:
@@ -103,17 +105,25 @@ class PrefillScheduler:
             return []
 
         if (
-            req.max_sequences_per_rank is not None
-            and req.max_sequences_per_node is not None
+            req.per_rank_sequence_free is not None
+            and req.per_node_sequence_free is not None
         ):
             raise ValueError(
                 "prefill sequence capacity must be scoped to rank or node, "
                 "not both"
             )
-        if req.max_sequences_per_rank is not None and req.max_sequences_per_rank < 0:
-            raise ValueError("max_sequences_per_rank must be >= 0")
-        if req.max_sequences_per_node is not None and req.max_sequences_per_node < 0:
-            raise ValueError("max_sequences_per_node must be >= 0")
+        if req.per_rank_sequence_free is not None:
+            if len(req.per_rank_sequence_free) == 0:
+                raise ValueError("per_rank_sequence_free must not be empty")
+            if any(value < 0 for value in req.per_rank_sequence_free):
+                raise ValueError("per_rank_sequence_free values must be >= 0")
+        if req.per_node_sequence_free is not None:
+            if len(req.per_node_sequence_free) != req.num_nodes:
+                raise ValueError(
+                    "per_node_sequence_free must have one value per node"
+                )
+            if any(value < 0 for value in req.per_node_sequence_free):
+                raise ValueError("per_node_sequence_free values must be >= 0")
 
         per_node_effective_free = list(req.per_node_host_free)
         node_pages_used = [0] * req.num_nodes
@@ -122,16 +132,30 @@ class PrefillScheduler:
         prefill_batch: List[str] = []
 
         for c in all_candidates:
-            seq_node = c.assigned_rank // req.gpus_per_node
+            seq_node = c.node_id
+            if seq_node < 0 or seq_node >= req.num_nodes:
+                raise ValueError(
+                    f"candidate {c.uuid} has invalid node_id={seq_node} "
+                    f"for num_nodes={req.num_nodes}"
+                )
             if (
-                req.max_sequences_per_rank is not None
+                req.per_rank_sequence_free is not None
+                and c.assigned_rank >= len(req.per_rank_sequence_free)
+            ):
+                raise ValueError(
+                    f"candidate {c.uuid} has assigned_rank={c.assigned_rank} "
+                    "outside per_rank_sequence_free"
+                )
+            if (
+                req.per_rank_sequence_free is not None
                 and rank_sequences_used.get(c.assigned_rank, 0)
-                >= req.max_sequences_per_rank
+                >= req.per_rank_sequence_free[c.assigned_rank]
             ):
                 continue
             if (
-                req.max_sequences_per_node is not None
-                and node_sequences_used[seq_node] >= req.max_sequences_per_node
+                req.per_node_sequence_free is not None
+                and node_sequences_used[seq_node]
+                >= req.per_node_sequence_free[seq_node]
             ):
                 continue
             post_prefill_length = c.prompt_length + 1

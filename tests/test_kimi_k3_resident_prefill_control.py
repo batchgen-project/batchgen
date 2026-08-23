@@ -176,6 +176,102 @@ def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
     assert method() == {"max_sequences_per_rank": 4}
 
 
+def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    prefilled = object()
+    seq = SimpleNamespace(
+        uuid="u",
+        global_idx=17,
+        status=prefilled,
+        decoded_length=1,
+        max_decode_length=1,
+        gpu_pages_allocated=0,
+        host_pages_allocated=1,
+        host_token_capacity=64,
+    )
+    batch = SimpleNamespace(get_sequence=lambda uuid: seq if uuid == "u" else None)
+    calls = SimpleNamespace(kda=[], gpu=[], host=[], report=[])
+    worker = SimpleNamespace(
+        rank=1,
+        global_batch=batch,
+        _uuid_to_local_map={"u": 0},
+        _sequences_with_gpu_kv=set(),
+        _response_queue=object(),
+        _sync_sequence_metadata=lambda uuids: None,
+        _submit_completed_to_incremental_writer=lambda uuids: None,
+        _gather_completed_tokens=lambda uuids: {"u": "<|sep|>"},
+        _release_gpu_kv_pages=lambda local_ids: calls.gpu.append(local_ids),
+        _get_local_indices_for_uuids=lambda uuids: [0],
+        _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
+        _release_host_kv_pages_for_batch=lambda uuids: calls.host.append(uuids),
+        _update_batch_status=lambda uuids, status: None,
+        _report_completion=lambda uuid, gathered_text=None: calls.report.append(
+            (uuid, gathered_text)
+        ),
+    )
+    method = _isolated_method(
+        path,
+        "BatchGenWorker",
+        "_finish_prefill_completed_sequences",
+        {
+            "List": list,
+            "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+        },
+    ).__get__(worker)
+
+    assert method(["u"]) == ["u"]
+    assert calls.gpu == []
+    assert calls.kda == [[17]]
+    assert calls.host == [["u"]]
+    assert calls.report == [("u", "<|sep|>")]
+
+
+def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    prefilled = object()
+    seq = SimpleNamespace(
+        uuid="u",
+        global_idx=17,
+        status=prefilled,
+        decoded_length=1,
+        max_decode_length=1,
+        gpu_pages_allocated=1,
+        host_pages_allocated=1,
+        host_token_capacity=64,
+    )
+    batch = SimpleNamespace(get_sequence=lambda uuid: seq if uuid == "u" else None)
+    calls = SimpleNamespace(kda=[], gpu=[])
+    worker = SimpleNamespace(
+        rank=1,
+        global_batch=batch,
+        _uuid_to_local_map={"u": 0},
+        _sequences_with_gpu_kv={"u"},
+        _response_queue=object(),
+        _sync_sequence_metadata=lambda uuids: None,
+        _submit_completed_to_incremental_writer=lambda uuids: None,
+        _gather_completed_tokens=lambda uuids: {"u": "<|sep|>"},
+        _release_gpu_kv_pages=lambda local_ids: calls.gpu.append(local_ids),
+        _get_local_indices_for_uuids=lambda uuids: [0],
+        _release_kda_state_slots=lambda global_ids: calls.kda.append(global_ids),
+        _release_host_kv_pages_for_batch=lambda uuids: None,
+        _update_batch_status=lambda uuids, status: None,
+        _report_completion=lambda uuid, gathered_text=None: None,
+    )
+    method = _isolated_method(
+        path,
+        "BatchGenWorker",
+        "_finish_prefill_completed_sequences",
+        {
+            "List": list,
+            "SequenceStatus": SimpleNamespace(PREFILLED=prefilled, COMPLETED=object()),
+        },
+    ).__get__(worker)
+
+    assert method(["u"]) == ["u"]
+    assert calls.gpu == [[0]]
+    assert calls.kda == []
+
+
 def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
     from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
         load_distributed_weight_config,
