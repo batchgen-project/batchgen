@@ -7682,10 +7682,26 @@ class BatchGenWorker:
 		# on one micro-batch when a single very long sequence is present.
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		# The planner's token cap is a bound between sequence boundaries.  A
+		# single K3 prompt may itself be much larger than that cap, so the
+		# ordinary greedy planner cannot split it and would still co-reside two
+		# 262K-token sequences in one decoder pass.  That pass allocates the
+		# block-attention-residual scratch for *all* rows and exceeded H20 HBM
+		# before the first streamed-SP8 expert layer.  K3's KDA/MLA state is
+		# persistent per sequence, so keeping each long sequence in its own
+		# prepack pass preserves the state contract; it is not a token-axis
+		# split pretending to be a resumable model forward.
+		_use_single_sequence_mb = (
+			MAX_TOKENS_PER_MICRO_BATCH > 0
+			and max(seq_lengths_list) > MAX_TOKENS_PER_MICRO_BATCH
+			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
 		micro_batches, l2_cap = build_prefill_micro_batches(
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
+			single_sequence_only=_use_single_sequence_mb,
 		)
 		total_tokens_all = sum(seq_lengths_list)
 		if (
@@ -7718,6 +7734,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Prepacked prefill: {len(micro_batches)} micro batches, "
 				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
+				+ (", single-sequence long-prompt guard" if _use_single_sequence_mb else "")
 				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
 
