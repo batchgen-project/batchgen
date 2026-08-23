@@ -292,6 +292,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         "transform": 0,
         "select": 0,
         "flashmla": 0,
+        "metadata": 0,
         "fa3": 0,
         "q_absorb": 0,
     }
@@ -390,26 +391,15 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
             selected_lengths.masked_fill_(~valid, 0)
         return physical_token_ids, selected_lengths
 
-    def fake_metadata(selected_lengths, num_heads):
-        del selected_lengths, num_heads
-        return (
-            torch.arange(4, device=device, dtype=torch.int32).view(1, 4),
-            torch.ones(1, device=device, dtype=torch.int32),
-        )
-
-    def fake_prepare(query_states, selected_mla_kv, selected_lengths, num_heads, softmax_scale, *, head_dim_v, page_size):
-        del num_heads, softmax_scale, head_dim_v, page_size
-        return types.SimpleNamespace(
-            query_states=query_states,
-            selected_mla_kv=selected_mla_kv,
-            selected_lengths=selected_lengths,
-        )
-
     def fake_run_prepared(prepared, *, tile_scheduler_metadata, num_splits):
         del tile_scheduler_metadata, num_splits
         calls["flashmla"] += 1
         selected = prepared.selected_mla_kv[:, :1, :, :v_dim]
         return prepared.query_states[..., :v_dim] + selected
+
+    def fail_metadata(*_args, **_kwargs):
+        calls["metadata"] += 1
+        raise AssertionError("FA3 graph path must not initialize FlashMLA metadata")
 
     def fake_fa3(*, q, k_cache, v_cache, qv, page_table, cache_seqlens, **kwargs):
         del q, k_cache, v_cache, page_table, cache_seqlens, kwargs
@@ -446,8 +436,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
     monkeypatch.setattr(segments, "fused_paged_score_and_topk_with_slots_out", fake_score_topk)
     monkeypatch.setattr(segments, "select_mla_kv_for_flashmla_bf16_out", fake_select)
     monkeypatch.setattr(segments, "transform_selected_positions_out", fake_transform)
-    monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_tensor_metadata", fake_metadata)
-    monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_inputs", fake_prepare)
+    monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_tensor_metadata", fail_metadata)
     monkeypatch.setattr(segments, "run_prepared_sparse_flash_mla_decode", fake_run_prepared)
     monkeypatch.setattr(segments, "_fa3_with_kvcache", fake_fa3)
     monkeypatch.setattr(segments, "fp8_q_absorb_out", fake_q_absorb)
@@ -506,8 +495,6 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     cache_seqlens = torch.tensor([2, 3], dtype=torch.int32, device=device)
     primary_slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
     aux_slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    metadata = torch.arange(4, dtype=torch.int32, device=device).view(1, 4)
-    num_splits = torch.ones(1, dtype=torch.int32, device=device)
     num_valid_tokens = torch.tensor([actual_bsz], dtype=torch.int32, device=device)
 
     def run_eager():
@@ -520,8 +507,6 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
             primary_slot_indices=primary_slots,
             aux_slot_indices=aux_slots,
             num_valid_tokens=num_valid_tokens,
-            flashmla_tile_scheduler_metadata=metadata,
-            flashmla_num_splits=num_splits,
         )
         torch.cuda.synchronize()
         return (
@@ -534,6 +519,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert calls["transform"] == 1
     assert calls["select"] == 0
     assert calls["flashmla"] == 0
+    assert calls["metadata"] == 0
     assert calls["fa3"] == 1
 
     manager = CUDAGraphManager(BatchSizeBucketing([bucket_size]), device=device)
@@ -544,6 +530,9 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert bucket_size in shared_buffers
     assert bucket_size in segment._outputs
     captured = manager._graphs[name][bucket_size]
+    assert "flashmla_tile_scheduler_metadata" not in captured.static_inputs
+    assert "flashmla_num_splits" not in captured.static_inputs
+    selected_lengths_ptr = shared_buffers[bucket_size].selected_lengths.data_ptr()
     assert torch.equal(
         captured.static_inputs["num_valid_tokens"],
         torch.ones(1, dtype=torch.int32, device=device),
@@ -567,8 +556,6 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
         cache_seqlens=cache_seqlens,
         primary_slot_indices=primary_slots,
         aux_slot_indices=aux_slots,
-        flashmla_tile_scheduler_metadata=metadata,
-        flashmla_num_splits=num_splits,
     )
     torch.cuda.synchronize()
     graph_primary_cache = primary_cache.detach().clone()
@@ -591,10 +578,37 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.equal(buffers.kv_aux_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.safe_cache_seqlens, expected_safe_seqlens)
     assert torch.equal(captured.static_inputs["num_valid_tokens"], num_valid_tokens)
+    assert buffers.selected_lengths.data_ptr() == selected_lengths_ptr
+    assert torch.equal(
+        buffers.selected_lengths,
+        torch.tensor([2, 3, 0, 0], dtype=torch.int32, device=device),
+    )
     assert torch.all(buffers.selected_token_ids[actual_bsz:] == -1)
     assert torch.count_nonzero(buffers.selected_lengths[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
     assert torch.count_nonzero(static_outputs.attn_output[actual_bsz:]).item() == 0
+    assert calls["flashmla"] == 0
+
+    updated_cache_seqlens = torch.tensor(
+        [1, 3], dtype=torch.int32, device=device,
+    )
+    manager.replay(
+        name,
+        actual_bsz,
+        hidden_states=hidden,
+        position_ids=position_ids,
+        cache_seqlens=updated_cache_seqlens,
+        primary_slot_indices=primary_slots,
+        aux_slot_indices=aux_slots,
+    )
+    torch.cuda.synchronize()
+    assert buffers.selected_lengths.data_ptr() == selected_lengths_ptr
+    assert torch.equal(
+        buffers.selected_lengths,
+        torch.tensor([1, 3, 0, 0], dtype=torch.int32, device=device),
+    )
+    assert calls["flashmla"] == 0
+    assert calls["metadata"] == 0
 
     manager.drop_bucket(bucket_size)
     assert bucket_size not in shared_buffers
@@ -647,8 +661,6 @@ def test_glm5_full_dsa_all_short_skips_query_score_but_writes_indexer_k(monkeypa
         primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         num_valid_tokens=torch.tensor([bucket_size], dtype=torch.int32, device=device),
-        flashmla_tile_scheduler_metadata=torch.arange(4, dtype=torch.int32, device=device).view(1, 4),
-        flashmla_num_splits=torch.ones(1, dtype=torch.int32, device=device),
     )
     torch.cuda.synchronize()
 
@@ -757,10 +769,6 @@ def test_glm52_full_dsa_folded_q_b_skips_q_absorb(monkeypatch):
         num_valid_tokens=torch.tensor(
             [bucket_size], dtype=torch.int32, device=device,
         ),
-        flashmla_tile_scheduler_metadata=torch.arange(
-            4, dtype=torch.int32, device=device,
-        ).view(1, 4),
-        flashmla_num_splits=torch.ones(1, dtype=torch.int32, device=device),
     )
     torch.cuda.synchronize()
 

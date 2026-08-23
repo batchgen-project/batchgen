@@ -304,9 +304,6 @@ class _FakeDsaSegment:
         self.init_calls = []
         self.release_calls = []
 
-    def _flashmla_tensor_metadata_specs(self, bucket_size):
-        return (bucket_size, 2), torch.int32, (1,), torch.int32
-
     def setup_static_buffers(self, bucket_size):
         self.setup_calls.append(bucket_size)
 
@@ -335,7 +332,8 @@ def test_glm5_layer_graph_segment_static_contract_and_delegation():
     assert inputs["primary_slot_indices"].fill_value == -1
     assert inputs["aux_slot_indices"].fill_value == -1
     assert inputs["rank_token_counts"].resolve_shape(2) == (16,)
-    assert inputs["flashmla_tile_scheduler_metadata"].resolve_shape(2) == (2, 2)
+    assert "flashmla_tile_scheduler_metadata" not in inputs
+    assert "flashmla_num_splits" not in inputs
 
     outputs = segment.get_static_output_specs(bucket_size=2)
     assert outputs["hidden_states"].resolve_shape(2) == (2, 1, 4)

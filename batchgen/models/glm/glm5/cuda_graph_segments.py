@@ -746,7 +746,6 @@ class Glm5FullDsaAttnSegment:
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
-        self._flashmla_metadata_specs: Dict[int, tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]] = {}
 
         if self.primary_blocked_k.ndim != 4 or self.primary_blocked_k.shape[2] != 1:
             raise ValueError(
@@ -834,36 +833,7 @@ class Glm5FullDsaAttnSegment:
             return_softmax_lse=False,
         )
 
-    def _flashmla_tensor_metadata_specs(
-        self,
-        bucket_size: int,
-    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
-        cached = self._flashmla_metadata_specs.get(bucket_size)
-        if cached is not None:
-            return cached
-        lengths = torch.full(
-            (bucket_size,),
-            self._padding_selected_length(),
-            dtype=torch.int32,
-            device=self.primary_blocked_k.device,
-        )
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            lengths,
-            self.attn.num_heads,
-        )
-        spec = (
-            tuple(tile_scheduler_metadata.shape),
-            tile_scheduler_metadata.dtype,
-            tuple(num_splits.shape),
-            num_splits.dtype,
-        )
-        self._flashmla_metadata_specs[bucket_size] = spec
-        return spec
-
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
-            self._flashmla_tensor_metadata_specs(bucket_size)
-        )
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.attn.hidden_size),
@@ -882,8 +852,6 @@ class Glm5FullDsaAttnSegment:
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
-            "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
-            "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -1146,27 +1114,13 @@ class Glm5FullDsaAttnSegment:
         static_inputs["cache_seqlens"].zero_()
         static_inputs["primary_slot_indices"].fill_(-1)
         static_inputs["aux_slot_indices"].fill_(-1)
-        # FlashMLA can illegal-access during graph capture with an all-zero
+        # FA3 can illegal-access during graph capture with an all-zero
         # selected-length schedule. Capture one safe dummy row; replay overwrites
         # this scalar with the real local batch size before graph launch.
         static_inputs["num_valid_tokens"].fill_(1)
         static_inputs["cache_seqlens"][:1].fill_(1)
         static_inputs["primary_slot_indices"][:1].fill_(0)
         static_inputs["aux_slot_indices"][:1].fill_(0)
-        selected_lengths = torch.ones(
-            (bucket_size,),
-            dtype=torch.int32,
-            device=self.primary_blocked_k.device,
-        )
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths,
-            self.attn.num_heads,
-        )
-        static_inputs["flashmla_tile_scheduler_metadata"].copy_(
-            tile_scheduler_metadata,
-            non_blocking=True,
-        )
-        static_inputs["flashmla_num_splits"].copy_(num_splits, non_blocking=True)
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self._buffers.pop(bucket_size, None)
@@ -1180,8 +1134,6 @@ class Glm5FullDsaAttnSegment:
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn

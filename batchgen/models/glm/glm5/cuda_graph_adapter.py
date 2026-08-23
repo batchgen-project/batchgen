@@ -62,7 +62,6 @@ class _Glm5AdapterContext:
     whole_model_segment: Optional[CapturableSegment]
     bundle: SegmentBundle
     num_heads: int
-    index_topk: int
 
 
 class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
@@ -148,7 +147,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             whole_model_segment=whole_model_segment,
             bundle=bundle,
             num_heads=int(attn0.num_heads),
-            index_topk=int(indexer0.index_topk),
         )
 
     def build_segments(
@@ -183,7 +181,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         vocab_size = int(model.config.vocab_size)
         hidden_size = int(model.config.hidden_size)
         num_heads = int(attn0.num_heads)
-        index_topk = int(indexer0.index_topk)
 
         whole_segment = Glm5WholeModelSegment(
             model=model,
@@ -209,7 +206,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             whole_model_segment=whole_segment,
             bundle=bundle,
             num_heads=num_heads,
-            index_topk=index_topk,
         )
         return bundle
 
@@ -281,16 +277,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         except for `rank_token_counts` which is world-size-shaped.
         """
         self._require_ctx()
-        from batchgen.attention.dsa.sparse_decode_mla import (
-            prepare_sparse_flash_mla_decode_tensor_metadata,
-        )
-
         device = self._ctx.device
-        num_heads = self._ctx.num_heads
-        selected_lengths = torch.ones((int(bucket),), dtype=torch.int32, device=device)
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths, int(num_heads),
-        )
         return {
             "input_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
             "cache_seqlens": torch.empty((0,), dtype=torch.int32, device=device),
@@ -301,8 +288,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 (self.world_size,), dtype=torch.int64, device=device,
             ),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=device),
-            "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-            "flashmla_num_splits": num_splits,
         }
 
     # ---- Step-time ------------------------------------------------------
@@ -376,10 +361,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         this dict to `manager.replay`.
         """
         self._require_ctx()
-        from batchgen.attention.dsa.sparse_decode_mla import (
-            prepare_sparse_flash_mla_decode_tensor_metadata,
-        )
-
         device = self._ctx.device
         gpu_manager = batch_state.gpu_kv_manager or self._ctx.gpu_kv_manager
         primary_manager = getattr(gpu_manager, "primary", gpu_manager)
@@ -389,7 +370,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 "Glm5CudaGraphAdapter.prepare_replay_inputs requires auxiliary GPU KV manager"
             )
 
-        bucket = int(decision.bucket or 0)
         local_bsz = int(batch_state.local_bsz)
         active_sequence_ids = list(batch_state.cur_batch_sequence_ids or ())
 
@@ -417,25 +397,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             cache_seqlens_i32 = torch.empty((0,), dtype=torch.int32, device=device)
             position_ids_i64 = torch.empty((0, 1), dtype=torch.int64, device=device)
 
-        index_topk = int(self._ctx.index_topk)
-        num_heads = int(self._ctx.num_heads)
-        graph_max_seqlen = int(
-            self._ctx.max_seqlen_cap
-            or getattr(AttnWrapperBase, "max_seqlen", 0)
-            or index_topk
-        )
-        selected_lengths = torch.empty((bucket,), dtype=torch.int32, device=device)
-        if local_bsz > 0:
-            selected_lengths[:local_bsz].copy_(
-                torch.clamp(cache_seqlens_i32, max=index_topk),
-                non_blocking=True,
-            )
-        if local_bsz < bucket:
-            selected_lengths[local_bsz:].fill_(min(graph_max_seqlen, index_topk))
-
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths, num_heads,
-        )
         num_valid_tokens = torch.empty((1,), dtype=torch.int32, device=device)
         num_valid_tokens.fill_(local_bsz)
 
@@ -460,8 +421,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "aux_slot_indices": _graph_slots(aux_manager),
             "rank_token_counts": rank_token_counts,
             "num_valid_tokens": num_valid_tokens,
-            "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-            "flashmla_num_splits": num_splits,
         }
 
     def stage_post_graph_kv(
@@ -539,10 +498,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 aux_slot_indices=captured_inputs.get("aux_slot_indices"),
                 num_valid_tokens=captured_inputs.get("num_valid_tokens"),
                 rank_token_counts=captured_inputs.get("rank_token_counts"),
-                flashmla_tile_scheduler_metadata=captured_inputs.get(
-                    "flashmla_tile_scheduler_metadata"
-                ),
-                flashmla_num_splits=captured_inputs.get("flashmla_num_splits"),
                 use_layer_segments=False,
             )
         out: Dict[str, torch.Tensor] = dict(outputs)

@@ -73,16 +73,7 @@ class Glm5DecoderLayerGraphSegment:
             .clone()
         )
 
-    def _flashmla_tensor_metadata_specs(
-        self,
-        bucket_size: int,
-    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
-        return self.dsa_segment._flashmla_tensor_metadata_specs(bucket_size)
-
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
-            self._flashmla_tensor_metadata_specs(bucket_size)
-        )
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size),
@@ -102,8 +93,6 @@ class Glm5DecoderLayerGraphSegment:
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
-            "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
-            "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -166,8 +155,6 @@ class Glm5DecoderLayerGraphSegment:
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: torch.Tensor,
         rank_token_counts: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
@@ -180,8 +167,6 @@ class Glm5DecoderLayerGraphSegment:
             primary_slot_indices=primary_slot_indices,
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
-            flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            flashmla_num_splits=flashmla_num_splits,
         )
         hidden_states, residual = cuda_add_rmsnorm(
             residual,

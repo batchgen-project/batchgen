@@ -157,14 +157,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             shared_buffers if shared_buffers is not None else {}
         )
         self._outputs: Dict[int, object] = {}
-        self._flashmla_metadata_specs: Dict[int, object] = {}
 
     # -- capture-plumbing overrides ------------------------------------------
     # No super() here: the parent's specs/output methods deref aux_blocked_k /
     # attn.indexer, which skip layers do not have.
     def get_static_input_specs(self, bucket_size: int):
-        # Parent body is deref-safe for skip layers (literals + attn dims +
-        # _flashmla_tensor_metadata_specs); only the aux slot input is dropped.
+        # Parent body is deref-safe for skip layers; only the aux slot input is dropped.
         specs = dict(Glm5FullDsaAttnSegment.get_static_input_specs(self, bucket_size))
         specs.pop("aux_slot_indices", None)
         return specs
@@ -351,8 +349,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         position_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
     ) -> Dict[str, torch.Tensor]:

@@ -24,8 +24,8 @@ class PreparedSparseFlashMlaDecode:
     cache_seqlens: torch.Tensor
     num_heads: int
     head_dim_v: int
-    tile_scheduler_metadata: torch.Tensor
-    num_splits: torch.Tensor
+    tile_scheduler_metadata: object
+    num_splits: object
     softmax_scale: float
 
 
@@ -64,8 +64,12 @@ def prepare_sparse_flash_mla_decode_tensor_metadata(
         torch.Tensor,
     ):
         raise TypeError(
-            "GLM-5 DSA CUDA graph metadata requires the tensor FlashMLA metadata "
-            "API; the installed flash_mla returned non-tensor metadata"
+            "captured FlashMLA decode requires get_mla_metadata() to return "
+            "(torch.Tensor, torch.Tensor); the installed flash_mla returned "
+            f"({type(tile_scheduler_metadata).__name__}, "
+            f"{type(num_splits).__name__}). The object scheduler API initializes "
+            "and mutates metadata inside flash_mla_with_kvcache, so it cannot be "
+            "used by this captured FlashMLA path"
         )
     return tile_scheduler_metadata, num_splits
 
@@ -120,8 +124,8 @@ def prepare_sparse_flash_mla_decode_inputs(
 def run_prepared_sparse_flash_mla_decode(
     prepared: PreparedSparseFlashMlaDecode,
     *,
-    tile_scheduler_metadata: torch.Tensor | None = None,
-    num_splits: torch.Tensor | None = None,
+    tile_scheduler_metadata: object | None = None,
+    num_splits: object | None = None,
 ) -> torch.Tensor:
     """Invoke FlashMLA from already prepared selected-KV inputs."""
 
