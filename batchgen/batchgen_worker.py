@@ -851,6 +851,11 @@ class BatchGenWorker:
 		# Per-request sampling parameters (list of dicts, one per prompt in batch order)
 		self._per_sequence_sampling_params: Optional[list] = None
 		self._batchgen_debug: Optional[dict] = None
+		# Causal-profiling control (batchgen_debug.glm5_suppress_decode_host_kv_writeback):
+		# when set, decode host-KV append launches are skipped and the identical
+		# global active set is marked stale on every rank so host-KV consumers fail
+		# closed. Batch-scoped; cleared in _reset_for_new_batch().
+		self._reset_decode_host_kv_writeback_debug_state()
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -1160,6 +1165,57 @@ class BatchGenWorker:
 		self._batchgen_debug = debug if isinstance(debug, dict) and debug else None
 		if self.rank == 0 and self._batchgen_debug:
 			logging.warning(f"[BATCHGEN_DEBUG] enabled flags: {sorted(self._batchgen_debug.keys())}")
+		self._resolve_suppress_decode_host_kv_writeback()
+
+	def _resolve_suppress_decode_host_kv_writeback(self) -> None:
+		"""Resolve the decode host-KV writeback suppression control for this batch.
+
+		Causal-profiling only: it deliberately drops decode KV so a fixed-work run
+		can attribute the residual to the two post-forward UVA append kernels. It
+		is never a production optimization, so any configuration that would later
+		read the (now stale) host KV is rejected up front.
+		"""
+		debug = self._batchgen_debug or {}
+		suppress = self._debug_flag_enabled(
+			debug.get("glm5_suppress_decode_host_kv_writeback")
+		)
+		if suppress:
+			if BATCHGEN_SYNC_KV:
+				raise RuntimeError(
+					"glm5_suppress_decode_host_kv_writeback requires the deferred KV "
+					"offload path, but BATCHGEN_SYNC_KV=1 appends decode KV to host "
+					"inline; suppressed decode writeback would not be the only variable"
+				)
+			if self.rank == 0:
+				logging.warning(
+					"[BATCHGEN_DEBUG] glm5_suppress_decode_host_kv_writeback=1: decode "
+					"host-KV append launches are SUPPRESSED for this batch. Host KV "
+					"becomes stale — profiling runs must remain on resident GPU KV."
+				)
+		self._suppress_decode_host_kv_writeback = suppress
+
+	def _reset_decode_host_kv_writeback_debug_state(self) -> None:
+		"""Clear batch-scoped state for the decode writeback causal control."""
+		self._suppress_decode_host_kv_writeback = False
+		self._host_kv_stale_global_ids: Set[int] = set()
+
+	def _mark_suppressed_decode_host_kv_stale(self, decode_uuids) -> None:
+		"""Mark the same global active set stale on every rank after a skipped append."""
+		if (
+			not self._suppress_decode_host_kv_writeback
+			or self._host_kv_stale_global_ids
+		):
+			return
+		global_ids = []
+		for uuid in decode_uuids or []:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					"glm5_suppress_decode_host_kv_writeback: active decode sequence "
+					f"{uuid} is missing, cannot mark host KV stale symmetrically"
+				)
+			global_ids.append(int(seq.global_idx))
+		self._host_kv_stale_global_ids.update(global_ids)
 
 	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
 		if self._batchgen_debug:
@@ -2186,7 +2242,14 @@ class BatchGenWorker:
 		"""Put sequences ON_HOLD: release GPU KV pages, keep host KV."""
 		if not uuids:
 			return
-		
+
+		# ON_HOLD drops GPU KV and keeps only host KV — refuse while host KV is stale.
+		if self._host_kv_stale_global_ids:
+			self._assert_host_kv_not_stale(
+				[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
+				"_put_sequences_onhold (frees GPU KV pages)",
+			)
+
 		my_uuids = [u for u in uuids if u in self._uuid_to_local_map]
 		
 		if my_uuids:
@@ -2292,6 +2355,23 @@ class BatchGenWorker:
 		# call), so this one sync covers it too.
 		self._kv_offload_synced_this_step = True
 
+		# Causal-profiling control: skip ONLY the append launches. Everything
+		# above (metadata prep, capacity growth, the single event record +
+		# synchronize that also drains the caller's token D2H copy) is
+		# unchanged, so the two UVA append kernels are the only variable.
+		if self._suppress_decode_host_kv_writeback:
+			if sequence_ids is None or sequence_lengths is None:
+				raise RuntimeError(
+					"glm5_suppress_decode_host_kv_writeback: deferred KV batch metadata "
+					"is missing, cannot verify the suppressed append contract"
+				)
+			self._deferred_kv_entries = []
+			self._deferred_kv_entries_aux = []
+			self._deferred_kv_batch = None
+			self._deferred_kv_worker_view = None
+			self._deferred_kv_worker_view_aux = None
+			return
+
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
@@ -2389,6 +2469,52 @@ class BatchGenWorker:
 		self._deferred_kv_batch = None
 		self._deferred_kv_worker_view = None
 		self._deferred_kv_worker_view_aux = None
+
+	def _assert_host_kv_not_stale(self, global_ids, context: str) -> None:
+		"""Fail closed before stale host KV is read or fresh GPU KV is dropped.
+
+		Only ever trips when the causal-profiling suppression control has skipped
+		decode host-KV appends (``_host_kv_stale_global_ids`` is otherwise empty).
+		"""
+		if not self._host_kv_stale_global_ids:
+			return
+		stale = sorted(
+			int(gid) for gid in (global_ids or [])
+			if int(gid) in self._host_kv_stale_global_ids
+		)
+		if stale:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} refused — stale host KV for "
+				f"global_ids={stale[:16]} (n={len(stale)}) caused by suppressed decode "
+				f"host-KV writeback (batchgen_debug.glm5_suppress_decode_host_kv_writeback)"
+			)
+
+	def _assert_boundary_decisions_allowed_with_stale_host_kv(self, decisions) -> None:
+		"""Reject boundary transitions that would consume stale host KV.
+
+		ON_HOLD frees the only fresh copy (GPU), loads read host KV back, and host
+		eviction changes the fixed-work path to release/recompute — all invalid once
+		the causal-profiling suppression control has skipped decode host writeback.
+		"""
+		if not self._host_kv_stale_global_ids:
+			return
+		offending = {
+			name: len(uuids)
+			for name, uuids in (
+				("onhold_uuids", decisions.onhold_uuids or []),
+				("new_load_uuids", decisions.new_load_uuids or []),
+				("host_evicted_uuids", decisions.host_evicted_uuids or []),
+			)
+			if uuids
+		}
+		if offending:
+			raise RuntimeError(
+				f"Rank {self.rank}: page-boundary transition refused — host KV is stale "
+				f"for {len(self._host_kv_stale_global_ids)} global ids because decode "
+				f"host-KV writeback is suppressed "
+				f"(batchgen_debug.glm5_suppress_decode_host_kv_writeback); "
+				f"prohibited decisions: {offending}"
+			)
 
 	def _ensure_host_kv_append_capacity(
 		self,
@@ -3104,6 +3230,7 @@ class BatchGenWorker:
 			raise RuntimeError("DSA dual KV load requires DualKVCacheCoordinator")
 		if not new_global_ids:
 			raise ValueError("_prepare_dual_kv_load_pointers requires non-empty sequence ids")
+		self._assert_host_kv_not_stale(new_global_ids, "_prepare_dual_kv_load_pointers")
 
 		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
 		try:
@@ -3165,6 +3292,7 @@ class BatchGenWorker:
 		"""Copy prefetched host KV pages into the GPU cache."""
 		if not global_sequence_ids:
 			return
+		self._assert_host_kv_not_stale(global_sequence_ids, "_load_host_kv_to_gpu")
 		copy_start = time.perf_counter()
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
@@ -3901,6 +4029,13 @@ class BatchGenWorker:
 		"""
 		if not self.enable_decode_preemption:
 			return
+
+		# Migration copies host KV between nodes. Only reject once a suppressed
+		# decode step has actually made host KV stale — the initial prefill
+		# rebalance (no stale ids yet) is still a faithful copy.
+		self._assert_host_kv_not_stale(
+			self._host_kv_stale_global_ids, "_rebalance_host_kv (migrates host KV)"
+		)
 
 		rebalance_start = time.perf_counter()
 		if self.rank == 0:
@@ -5042,6 +5177,13 @@ class BatchGenWorker:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
 		if not uuids:
 			return
+
+		# ON_HOLD drops GPU KV and keeps only host KV — refuse while host KV is stale.
+		if self._host_kv_stale_global_ids:
+			self._assert_host_kv_not_stale(
+				[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
+				"_put_sequences_on_hold (frees GPU KV pages)",
+			)
 
 		if self.rank == 0:
 			logging.info(
@@ -8102,6 +8244,9 @@ class BatchGenWorker:
 		decisions = decisions_list[0]
 		if decisions.scheduler_error:
 			raise RuntimeError(f"Rank {self.rank}: {decisions.scheduler_error}")
+		# Fail closed BEFORE any Phase 4 mutation or load: every rank rejects the
+		# same broadcast decisions, so this cannot desync ranks.
+		self._assert_boundary_decisions_allowed_with_stale_host_kv(decisions)
 
 		timing.num_completed = len(decisions.completed_uuids)
 		timing.num_onhold = len(decisions.onhold_uuids)
@@ -8384,6 +8529,16 @@ class BatchGenWorker:
 		if my_remaining_ext:
 			success = self._extend_gpu_kv_allocation(my_remaining_ext)
 			if not success:
+				# Never destroy the only fresh KV copy after writeback suppression.
+				# This path is owner-local, so the Python error on the failing rank is
+				# the authoritative cause; peer collective errors are only fallout.
+				self._assert_host_kv_not_stale(
+					[
+						self.global_batch.get_sequence(uuid).global_idx
+						for uuid in my_remaining_ext
+					],
+					"GPU page extension failure fallback to ON_HOLD",
+				)
 				# Extension failed — put failed sequences ON_HOLD to prevent
 				# cache_seqlens from exceeding gpu_pages_allocated × PAGE_SIZE,
 				# which would cause FlashAttention to read -1 sentinel page
@@ -11236,6 +11391,10 @@ class BatchGenWorker:
 				self._flush_deferred_kv_to_host()
 				if not getattr(self, '_kv_offload_synced_this_step', False):
 					torch.cuda.current_stream(self.torch_device).synchronize()
+				# decode_uuids is the globally identical active set. Marking it only
+				# after the flush keeps every rank's stale-ID guard state symmetric,
+				# including ranks whose local decode batch is empty.
+				self._mark_suppressed_decode_host_kv_stale(decode_uuids)
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
@@ -12943,6 +13102,10 @@ class BatchGenWorker:
 		
 		# 7. Reset GPU KV tracking
 		self._sequences_with_gpu_kv = set()
+
+		# Causal-profiling suppression is batch-scoped; the next batch re-resolves
+		# it in set_batchgen_debug(), which runs after Init()/this reset.
+		self._reset_decode_host_kv_writeback_debug_state()
 		
 		# 8. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:
