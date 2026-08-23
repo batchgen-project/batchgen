@@ -1186,23 +1186,6 @@ def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile()
         assert f'"{field}"' in source
 
 
-def test_h2d_worker_starts_are_guarded_for_empty_hierarchical_ranks():
-    path = ROOT / "batchgen" / "batchgen_worker.py"
-    function = _function(path, "BatchGenWorker", "_config_prefill_for_batch")
-    guards = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "any(self.weight_copy_task.values())"
-    ]
-    assert len(guards) == 2
-    assert all(
-        [ast.unparse(node) for node in guard.body]
-        == ["self.core_engine.start_h2d_worker()"]
-        for guard in guards
-    )
-
-
 def test_distributed_daemon_joins_bootstrap_threads_on_failure():
     path = ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.cpp"
     source = path.read_text()
@@ -1534,20 +1517,29 @@ def test_worker_initializes_streamed_sp8_install_state():
     assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
 
 
-def test_streamed_sp8_prefill_installs_the_h2d_pipeline_exactly_once():
+def test_streamed_sp8_prefill_seeds_once_and_restarts_nonempty_workers():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(
         worker_path, "BatchGenWorker", "_config_prefill_for_batch"
     )
     guards = _call_guards(function)
 
-    # Every prefill still stops/starts the copy engine and resets the profile.
+    # Every admission stops the copy engine and resets the profile. Source
+    # ranks restart it from the preserved cursor; hierarchical non-sources
+    # have an empty schedule and must never create an H2D thread.
     for name in (
         "stop_h2d_worker",
-        "start_h2d_worker",
         "reset_weight_stream_profile",
     ):
         assert () in guards[name], name
+    start_guards = guards["start_h2d_worker"]
+    assert len(start_guards) == 2
+    assert all(
+        "any(self.weight_copy_task.values())" in stack
+        for stack in start_guards
+    )
+    assert any("sp8_reentry" in stack for stack in start_guards)
+    assert any("else: sp8_reentry" in stack for stack in start_guards)
 
     # Seeding the queue and dropping the prefill buffer would rewind the
     # daemon's free-running circular schedule, so they are first-install only.
