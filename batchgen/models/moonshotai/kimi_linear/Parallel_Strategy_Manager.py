@@ -490,8 +490,8 @@ class KimiLinearParallelStrategyManager:
             if self.rank == 0:
                 logging.info(
                     "[K3_PREFILL_MOE] streamed_sp8 enabled: transport=%s, "
-                    "112 experts/shard, TP8 layer weight all-gather, "
-                    "local row scatter/gather, "
+                    "112 experts/shard, no TP8 weight all-gather, "
+                    "node-local latent gather/FP32 reduce-scatter, "
                     "zero cross-node MoE activation collectives",
                     self._distributed_weight_transport,
                 )

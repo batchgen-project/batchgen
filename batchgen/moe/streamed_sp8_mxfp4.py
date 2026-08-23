@@ -239,7 +239,11 @@ class StreamedSP8LayerBuffer:
             dist.broadcast(
                 self._cross_status, self.cross_root, group=self.cross_group
             )
-        ok = bool(self._cross_status.item())
+            # ``stream`` is a non-default pool stream on the background
+            # prefetch thread. Keep the scalar read in this context so its D2H
+            # copy is ordered after the status broadcast rather than racing a
+            # stale or uninitialized value on the thread's default stream.
+            ok = bool(self._cross_status.item())
         if profile._prefill_profile_enabled:
             profile._prefill_profile_cross_status_calls += 1
             if not ok:
@@ -342,10 +346,11 @@ class StreamedSP8LayerBuffer:
     def begin_prefetch_next(self, layer_idx: int):
         """Start host->HBM ingress for the next MoE layer.
 
-        Phase one of the prefetch.  It is called right after the current layer
-        has been loaded and before its grouped MoE is enqueued, because the
-        remote ingress dominates the layer and only writes ``self.local``,
-        which no compute kernel reads.  The copy that overwrites
+        Phase one of the prefetch. Host-RDMA calls it right after the current
+        layer is loaded. Hierarchical GDR calls it after the current layer's
+        TP8 activation gathers, preserving one global communicator order. In
+        both cases it precedes grouped MoE and writes only ``self.local``,
+        which no compute kernel reads. The copy that overwrites
         ``self.compute`` is parked inside the worker thread until
         :meth:`allow_full_overwrite`.
 
@@ -368,10 +373,29 @@ class StreamedSP8LayerBuffer:
             error=None,
             ready=torch.cuda.Event(),
             compute_done=torch.cuda.Event(),
+            # hierarchical_gdr uses a cross-node process group on the
+            # prefetch stream while the model thread uses the orthogonal TP8
+            # group. Launching those collectives in opposite orders can form
+            # a grid-wide NCCL cycle. Fence the cross-group launch behind the
+            # TP8 gathers that precede this call, then expose a second event so
+            # the later TP8 reduce-scatter can be fenced behind ingress.
+            cross_launch_after=(
+                torch.cuda.Event() if self.cross_group is not None else None
+            ),
+            cross_ingress_done=(
+                torch.cuda.Event() if self.cross_group is not None else None
+            ),
+            cross_ingress_enqueued=(
+                threading.Event() if self.cross_group is not None else None
+            ),
             overwrite_allowed=threading.Event(),
             cancelled=False,
             thread=None,
         )
+        if pending.cross_launch_after is not None:
+            pending.cross_launch_after.record(
+                torch.cuda.current_stream(self.device)
+            )
 
         def run():
             try:
@@ -380,11 +404,18 @@ class StreamedSP8LayerBuffer:
                 # reads it, and on the first boundary that copy was enqueued on
                 # the compute stream.  Order this layer's ingress after it.
                 self._prefetch_stream.wait_event(self._local_free)
+                if pending.cross_launch_after is not None:
+                    self._prefetch_stream.wait_event(
+                        pending.cross_launch_after
+                    )
                 # Local-shard acquisition writes ``self.local`` only, which no
                 # compute kernel reads, so it overlaps the current layer.
                 self._acquire_local_shard(
                     next_layer, stream=self._prefetch_stream
                 )
+                if pending.cross_ingress_done is not None:
+                    pending.cross_ingress_done.record(self._prefetch_stream)
+                    pending.cross_ingress_enqueued.set()
                 # ``self.compute`` is overwritten below.  Park here until the
                 # model thread has enqueued every current-layer reader and
                 # recorded the compute-stream event that covers them.
@@ -396,6 +427,8 @@ class StreamedSP8LayerBuffer:
                 pending.ready.record(self._prefetch_stream)
             except BaseException as exc:  # re-raise on the model thread
                 pending.error = exc
+                if pending.cross_ingress_enqueued is not None:
+                    pending.cross_ingress_enqueued.set()
 
         pending.thread = threading.Thread(
             target=run,
@@ -404,6 +437,27 @@ class StreamedSP8LayerBuffer:
         )
         self._pending = pending
         pending.thread.start()
+
+    def order_tp_collective_after_cross_ingress(self):
+        """Order the next TP8 collective after hierarchical GDR ingress.
+
+        Grouped expert kernels remain concurrent with cross-node weight
+        ingress. Only the two orthogonal NCCL communicator families are
+        serialized, avoiding a launch-order cycle without a device-wide
+        synchronization. Host-RDMA has no cross-node GPU collective and is a
+        no-op here.
+        """
+        pending = self._pending
+        if self.cross_group is None or pending is None:
+            return
+        pending.cross_ingress_enqueued.wait()
+        if pending.error is not None:
+            raise RuntimeError(
+                f"streamed-SP8 prefetch of layer {pending.layer_idx} failed"
+            ) from pending.error
+        torch.cuda.current_stream(self.device).wait_event(
+            pending.cross_ingress_done
+        )
 
     def allow_full_overwrite(self):
         """Phase two: let the pending prefetch overwrite ``self.compute``.
@@ -586,14 +640,19 @@ class StreamedSP8MXFP4MoELayer:
         # the cross-node broadcast alone and deadlocks the group on short or
         # imbalanced microbatches.
         shard = buffer.load(self.layer_idx)
-        # Start the next layer's remote ingress before this layer's kernels are
-        # enqueued.  It writes ``buffer.local`` only; the copy that overwrites
-        # ``buffer.compute`` stays parked until the release below.
-        buffer.begin_prefetch_next(self.layer_idx)
+        ordered_cross_ingress = buffer.cross_group is not None
+        # Host-RDMA has no second GPU communicator and keeps its original
+        # earliest-start schedule. Hierarchical GDR starts after the TP8
+        # activation gathers below so every GPU orders TP8 -> cross-node.
+        if not ordered_cross_ingress:
+            buffer.begin_prefetch_next(self.layer_idx)
         # ``num_rows`` is the node-wide count, so this branch is taken by all
         # eight ranks together or by none.  Keying it on the per-rank ``T``
         # instead would desynchronize the node-local collectives below.
         if num_rows == 0:
+            if ordered_cross_ingress:
+                buffer.begin_prefetch_next(self.layer_idx)
+            buffer.order_tp_collective_after_cross_ingress()
             buffer.allow_full_overwrite()
             return x.new_zeros((0, H))
 
@@ -643,6 +702,11 @@ class StreamedSP8MXFP4MoELayer:
         dist.all_gather_into_tensor(all_latent, x_latent, group=tp_group)
         dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
         dist.all_gather_into_tensor(all_weight, topk_weight, group=tp_group)
+        if ordered_cross_ingress:
+            # The event recorded by begin_prefetch_next follows all three TP8
+            # gathers on this stream. Cross-node ingress can now overlap the
+            # grouped expert kernels, but cannot race those gathers.
+            buffer.begin_prefetch_next(self.layer_idx)
 
         if profile:
             cls._prefill_profile_grouped_chunks += (
@@ -689,6 +753,10 @@ class StreamedSP8MXFP4MoELayer:
         # --- node-local SUM of the eight disjoint FP32 partials, scattered ---
         # back to each rank's own padded row block. Summing in FP32 before the
         # single bf16 downcast matches the resident-EP reduction exactly.
+        # Hierarchical ingress has overlapped all grouped work above. Fence
+        # only its completion before entering the orthogonal TP8 communicator
+        # again, preventing a cross-group NCCL launch-order cycle.
+        buffer.order_tp_collective_after_cross_ingress()
         local_latent = combined.new_empty((ntp, latent_size))
         dist.reduce_scatter_tensor(
             local_latent, combined, op=dist.ReduceOp.SUM, group=tp_group

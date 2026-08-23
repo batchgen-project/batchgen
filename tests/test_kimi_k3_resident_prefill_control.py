@@ -595,7 +595,9 @@ class _FakeStream:
         self._log("synchronize")
 
 
-def _mock_sp8_buffer(trace, method_names, *, acquire=None):
+def _mock_sp8_buffer(
+    trace, method_names, *, acquire=None, cross_group=None
+):
     """Bind real ``StreamedSP8LayerBuffer`` methods onto fake CUDA streams."""
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     compute_stream = _FakeStream("compute", trace)
@@ -616,6 +618,7 @@ def _mock_sp8_buffer(trace, method_names, *, acquire=None):
 
     buffer = type("Buffer", (), {})()
     buffer.device = "cuda:0"
+    buffer.cross_group = cross_group
     buffer._pending = None
     buffer._next_layer = {3: 4}
     buffer._prefetch_stream = prefetch_stream
@@ -772,7 +775,9 @@ def test_streamed_sp8_load_propagates_prefetch_errors_to_the_model_thread():
 
     buffer.begin_prefetch_next(3)
     buffer.allow_full_overwrite()
-    with pytest.raises(RuntimeError, match="prefetch of layer 4 failed") as excinfo:
+    with pytest.raises(
+        RuntimeError, match="prefetch of layer 4 failed"
+    ) as excinfo:
         buffer.load(4)
 
     assert excinfo.value.__cause__ is failure
@@ -822,6 +827,7 @@ def _mock_sp8_moe_layer(
     num_local=4,
     row_experts=None,
     profile=False,
+    cross_group=None,
 ):
     """Bind the real ``forward`` onto mock projections, buffer and NCCL.
 
@@ -897,7 +903,11 @@ def _mock_sp8_moe_layer(
     layer.buffer = SimpleNamespace(
         load=lambda idx: log("load", SimpleNamespace(K_latent=latent)),
         begin_prefetch_next=lambda idx: log("begin", None),
+        order_tp_collective_after_cross_ingress=lambda: (
+            log("order_cross", None) if cross_group is not None else None
+        ),
         allow_full_overwrite=lambda: log("allow", None),
+        cross_group=cross_group,
         tp_group="tp8",
         tp_size=tp_size,
         expert_start=expert_start,
@@ -956,6 +966,111 @@ def test_streamed_sp8_forward_begins_ingress_before_grouped_expert_work():
     assert ops.index("reduce_scatter") < ops.index("allow")
     # norm/up-proj read no expert weight, so they may trail the release.
     assert ops.index("allow") < ops.index("norm") < ops.index("up")
+
+
+def test_hierarchical_gdr_orders_cross_ingress_between_tp_collectives():
+    trace = []
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace,
+        rows=3,
+        num_rows=5,
+        tp_size=2,
+        cross_group="cross4",
+    )
+
+    output = layer.forward(x, gate, num_rows)
+    ops = _ops(trace)
+
+    assert tuple(output.shape) == (3, SP8_HIDDEN)
+    gather_positions = [
+        index for index, op in enumerate(ops) if op == "all_gather"
+    ]
+    assert len(gather_positions) == 3
+    # Every rank enqueues the node-local gathers before the orthogonal
+    # cross-node communicator starts. Ingress still precedes and overlaps the
+    # grouped expert work.
+    assert max(gather_positions) < ops.index("begin")
+    assert ops.index("begin") < ops.index("expert_path")
+    # Before TP8 is entered again, it is ordered after cross-node ingress; the
+    # grouped compute remains between the two communicator families.
+    assert ops.index("combine") < ops.index("order_cross")
+    assert ops.index("order_cross") < ops.index("reduce_scatter")
+
+
+def test_hierarchical_gdr_prefetch_exposes_cross_ingress_event():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "order_tp_collective_after_cross_ingress",
+            "allow_full_overwrite",
+        ),
+        cross_group="cross4",
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+    buffer.order_tp_collective_after_cross_ingress()
+
+    launch_record = next(
+        entry
+        for entry in trace
+        if entry.op == "record" and entry.event is pending.cross_launch_after
+    )
+    launch_wait = next(
+        entry
+        for entry in trace
+        if entry.op == "wait" and entry.event is pending.cross_launch_after
+    )
+    ingress_record = next(
+        entry
+        for entry in trace
+        if entry.op == "record" and entry.event is pending.cross_ingress_done
+    )
+    ingress_wait = next(
+        entry
+        for entry in trace
+        if entry.op == "wait" and entry.event is pending.cross_ingress_done
+    )
+    assert launch_record.stream == "compute"
+    assert launch_wait.stream == "prefetch"
+    assert ingress_record.stream == "prefetch"
+    assert ingress_wait.stream == "compute"
+    assert trace.index(launch_record) < trace.index(launch_wait)
+    assert trace.index(ingress_record) < trace.index(ingress_wait)
+
+    buffer.allow_full_overwrite()
+    pending.thread.join(5)
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+
+
+def test_hierarchical_gdr_prefetch_error_unblocks_tp_ordering():
+    trace = []
+    failure = RuntimeError("source shard failed")
+
+    def acquire(layer_idx, stream=None):
+        raise failure
+
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "order_tp_collective_after_cross_ingress",
+        ),
+        acquire=acquire,
+        cross_group="cross4",
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+    with pytest.raises(RuntimeError, match="prefetch of layer 4 failed") as excinfo:
+        buffer.order_tp_collective_after_cross_ingress()
+
+    pending.thread.join(5)
+    assert not pending.thread.is_alive()
+    assert excinfo.value.__cause__ is failure
 
 
 def test_streamed_sp8_forward_gathers_only_inside_the_tp_group():
@@ -1027,6 +1142,23 @@ def test_streamed_sp8_forward_node_with_no_rows_skips_on_every_rank():
     # loads and releases, or the next layer's ingress handshake would hang.
     assert tuple(output.shape) == (0, SP8_HIDDEN)
     assert trace == ["load", "begin", "allow"]
+
+
+def test_hierarchical_gdr_node_with_no_rows_orders_ingress_before_return():
+    trace = []
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace,
+        rows=0,
+        num_rows=0,
+        cross_group="cross4",
+    )
+
+    output = layer.forward(x, gate, num_rows)
+
+    assert tuple(output.shape) == (0, SP8_HIDDEN)
+    # No activation collective or grouped work exists, but the cross ingress
+    # event must still fence the caller's subsequent TP8 row gather/attention.
+    assert trace == ["load", "begin", "order_cross", "allow"]
 
 
 def test_streamed_sp8_forward_pads_uneven_rows_out_of_expert_ownership():
@@ -1435,6 +1567,29 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 1
+
+
+def test_hierarchical_gdr_status_read_is_stream_ordered_after_broadcast():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    function = _function(
+        path, "StreamedSP8LayerBuffer", "_broadcast_source_status"
+    )
+    item_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "item"
+    ]
+    stream_contexts = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.With)
+        and "torch.cuda.stream(stream)" in ast.unparse(node)
+    ]
+    assert len(item_calls) == 1
+    assert len(stream_contexts) == 1
+    assert item_calls[0] in set(ast.walk(stream_contexts[0]))
 
 
 def test_cross_node_broadcast_stays_inside_the_early_ingress_phase():
