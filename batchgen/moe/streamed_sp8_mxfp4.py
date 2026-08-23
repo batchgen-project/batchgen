@@ -462,6 +462,12 @@ class StreamedSP8LayerBuffer:
             cross_launch_enqueued=(
                 threading.Event() if self.cross_group is not None else None
             ),
+            cross_ingress_done=(
+                torch.cuda.Event() if self.cross_group is not None else None
+            ),
+            cross_ingress_enqueued=(
+                threading.Event() if self.cross_group is not None else None
+            ),
             overwrite_allowed=threading.Event(),
             cancelled=False,
             thread=None,
@@ -504,6 +510,14 @@ class StreamedSP8LayerBuffer:
                         else None
                     ),
                 )
+                if pending.cross_ingress_done is not None:
+                    # Record after the six payload broadcasts on the same
+                    # stream. The model thread waits on this event before it
+                    # re-enters TP8, keeping the orthogonal communicator
+                    # families from executing concurrently while retaining
+                    # early host acquisition.
+                    pending.cross_ingress_done.record(self._prefetch_stream)
+                    pending.cross_ingress_enqueued.set()
                 # ``self.compute`` is overwritten below.  Park here until the
                 # model thread has enqueued every current-layer reader and
                 # recorded the compute-stream event that covers them.
@@ -522,6 +536,8 @@ class StreamedSP8LayerBuffer:
                 # thread can never be parked by a dead worker.
                 if pending.cross_launch_enqueued is not None:
                     pending.cross_launch_enqueued.set()
+                if pending.cross_ingress_enqueued is not None:
+                    pending.cross_ingress_enqueued.set()
 
         pending.thread = threading.Thread(
             target=run,
@@ -549,14 +565,12 @@ class StreamedSP8LayerBuffer:
         pending.cross_launch_allowed.set()
 
     def order_tp_collective_after_cross_launch(self):
-        """Issue the next TP8 collective after every cross-node launch.
+        """Issue the next TP8 collective after cross-node ingress.
 
-        ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` turns this deterministic host order
-        into CUDA launch-completion edges while still permitting the two
-        communicator families to execute concurrently on CUDA 12.3+. Waiting
-        for ingress *completion* here would serialize every next-layer weight
-        transfer before the current reduce-scatter and prevent it from
-        overlapping the up-projection and next layer's attention.
+        The host gate still proves every cross-node call was issued after the
+        preceding TP8 gathers. The CUDA event additionally keeps the payload
+        broadcasts from executing concurrently with the following TP8
+        reduce-scatter.
 
         Host-RDMA has no cross-node GPU collective and is a no-op here.
         """
@@ -574,6 +588,19 @@ class StreamedSP8LayerBuffer:
             # phase teardown would observe the same poisoned pending state and
             # raise a second time before releasing the layer buffers.
             self._wait_pending()
+        if not pending.cross_ingress_enqueued.wait(
+            PREFETCH_HANDOFF_TIMEOUT_S
+        ):
+            raise RuntimeError(
+                f"streamed-SP8 prefetch of layer {pending.layer_idx} did not "
+                "enqueue its cross-node completion event within "
+                f"{PREFETCH_HANDOFF_TIMEOUT_S:.0f}s"
+            )
+        if pending.error is not None:
+            self._wait_pending()
+        torch.cuda.current_stream(self.device).wait_event(
+            pending.cross_ingress_done
+        )
 
     def allow_full_overwrite(self):
         """Phase two: let the pending prefetch overwrite ``self.compute``.
@@ -899,10 +926,10 @@ class StreamedSP8MXFP4MoELayer:
         # --- node-local SUM of the eight disjoint FP32 partials, scattered ---
         # back to each rank's own padded row block. Summing in FP32 before the
         # single bf16 downcast matches the resident-EP reduction exactly.
-        # The cross-node calls must be issued before TP8 is entered again, but
-        # they deliberately remain in flight: NCCL implicit launch ordering
-        # prevents a cross-communicator cycle while preserving overlap into the
-        # up-projection and next layer's attention.
+        # Cross-node ingress completes before TP8 is entered again. Host/ring
+        # acquisition still started at the top of this layer and overlapped its
+        # router, gathers and grouped expert work; only the two orthogonal NCCL
+        # communicator families are kept from contending with one another.
         buffer.order_tp_collective_after_cross_launch()
         local_latent = combined.new_empty((ntp, latent_size))
         dist.reduce_scatter_tensor(

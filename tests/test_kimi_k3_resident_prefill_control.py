@@ -1178,14 +1178,18 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
     buffer.order_tp_collective_after_cross_launch()
 
     assert pending.cross_launch_enqueued.is_set()
-    # Only the local-buffer WAR edge remains. A compute-stream wait for cross
-    # ingress completion would serialize transfer before reduce-scatter and
-    # lose overlap into the next attention layer.
+    # Host acquisition starts early, but the following TP8 collective waits on
+    # the event recorded after the cross-node payloads. This keeps the two
+    # orthogonal NCCL communicator families from interfering on the device.
     assert [(entry.op, entry.stream) for entry in trace] == [
         ("wait", "prefetch"),
         ("acquire", "prefetch"),
         ("cross_broadcast", "prefetch"),
+        ("record", "prefetch"),
+        ("wait", "compute"),
     ]
+    assert trace[3].event is pending.cross_ingress_done
+    assert trace[4].event is pending.cross_ingress_done
     assert pending.thread.is_alive()
 
     buffer.allow_full_overwrite()
