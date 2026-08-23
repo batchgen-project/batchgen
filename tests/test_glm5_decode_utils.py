@@ -248,8 +248,8 @@ def test_glm5_dsa_selector_preserves_dense_short_circuit():
         (),
         {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
     )()
-    old_short_count = AttnWrapperBase._dsa_short_count
-    AttnWrapperBase._dsa_short_count = None
+    old_short_count = GLM5AttnWrapper._dsa_short_count
+    GLM5AttnWrapper._dsa_short_count = None
     try:
         top_k, branch, row_modes = _select_glm5_dsa_indices(
             wrapper,
@@ -262,7 +262,7 @@ def test_glm5_dsa_selector_preserves_dense_short_circuit():
             aux_slot_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
         )
     finally:
-        AttnWrapperBase._dsa_short_count = old_short_count
+        GLM5AttnWrapper._dsa_short_count = old_short_count
 
     assert branch == "dense-short-circuit"
     assert row_modes.tolist() == [0, 0, 0]
@@ -336,8 +336,8 @@ def test_glm5_dsa_selector_scores_only_long_rows_in_mixed_batch():
         (),
         {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
     )()
-    old_short_count = AttnWrapperBase._dsa_short_count
-    AttnWrapperBase._dsa_short_count = 2
+    old_short_count = GLM5AttnWrapper._dsa_short_count
+    GLM5AttnWrapper._dsa_short_count = 2
     try:
         top_k, branch, row_modes = _select_glm5_dsa_indices(
             wrapper,
@@ -350,7 +350,7 @@ def test_glm5_dsa_selector_scores_only_long_rows_in_mixed_batch():
             aux_slot_indices=torch.tensor([3, 1, 2, 0], dtype=torch.int32),
         )
     finally:
-        AttnWrapperBase._dsa_short_count = old_short_count
+        GLM5AttnWrapper._dsa_short_count = old_short_count
 
     assert branch == "mixed"
     assert row_modes.tolist() == [0, 1, 0, 1]
