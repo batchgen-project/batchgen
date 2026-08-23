@@ -2874,7 +2874,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
 
     worker._setup_cuda_graphs(gpu_manager)
 
-    expected_buckets = [1, 2, 4, 8]
+    expected_buckets = [8, 4, 2, 1]
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
     assert bucket_inputs == [True] * len(expected_buckets)
