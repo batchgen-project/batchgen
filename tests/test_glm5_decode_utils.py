@@ -441,7 +441,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     )()
     expected = torch.ones(2, 1, 16)
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_graph_forward_state",
         {
             "path": "graph",
@@ -453,7 +453,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_flashmla_graph_metadata",
         {
             "bucket_size": 2,
@@ -534,7 +534,7 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
         lambda self, primary, aux: True,
     )
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_graph_forward_state",
         {
             "path": "eager",
@@ -546,7 +546,7 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
         raising=False,
     )
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_flashmla_graph_metadata",
         None,
         raising=False,
@@ -615,14 +615,14 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
 
     old_debug = AttnWrapperBase.batchgen_debug
     AttnWrapperBase.batchgen_debug = {"glm5_dsa_graph_compare": True}
-    AttnWrapperBase.glm5_dsa_graph_forward_state = {
+    GLM5AttnWrapper.glm5_dsa_graph_forward_state = {
         "path": "graph",
         "bucket": 2,
         "reason": "captured",
         "local_bsz": 2,
         "metadata_prepared": True,
     }
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
         "bucket_size": 2,
         "tile_scheduler_metadata": torch.empty(1, dtype=torch.int32),
         "num_splits": torch.empty(1, dtype=torch.int32),
@@ -638,8 +638,8 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
         )
     finally:
         AttnWrapperBase.batchgen_debug = old_debug
-        AttnWrapperBase.glm5_dsa_graph_forward_state = None
-        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+        GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 
     assert actual is expected
     assert calls == {"return_debug": True, "compare": True}
@@ -1357,11 +1357,11 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         },
         raising=False,
     )
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", None, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", None, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", None, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
 
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
@@ -1371,8 +1371,8 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
     ]
 
     worker._configure_glm5_dispatch_trace(seqs)
-    assert AttnWrapperBase.glm5_dispatch_trace_enabled
-    assert AttnWrapperBase.glm5_dispatch_trace_context == {
+    assert GLM5AttnWrapper.glm5_dispatch_trace_enabled
+    assert GLM5AttnWrapper.glm5_dispatch_trace_context == {
         "rank": 0,
         "batch_ids": "batch-a",
         "global_ids": "3,7",
@@ -1404,24 +1404,24 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         reason="graph replay",
     )
 
-    assert AttnWrapperBase.glm5_dispatch_counts == {
+    assert GLM5AttnWrapper.glm5_dispatch_counts == {
         "dsa_eager": 2,
         "moe_graph": 1,
     }
 
     monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
     worker._configure_glm5_dispatch_trace(seqs)
-    assert not AttnWrapperBase.glm5_dispatch_trace_enabled
-    assert AttnWrapperBase.glm5_dispatch_counts == {}
+    assert not GLM5AttnWrapper.glm5_dispatch_trace_enabled
+    assert GLM5AttnWrapper.glm5_dispatch_counts == {}
 
 
 def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-dsa", raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", "unit-dsa", raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
 
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.layer_idx = 0
@@ -1471,9 +1471,9 @@ def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
         object(),
     )
     assert graph_out[0, 0, 0].item() == 11.0
-    assert AttnWrapperBase.glm5_dispatch_counts["dsa_graph"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["dsa_graph"] == 1
 
-    AttnWrapperBase.glm5_dispatch_counts = {}
+    GLM5AttnWrapper.glm5_dispatch_counts = {}
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1489,16 +1489,16 @@ def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
         object(),
     )
     assert eager_out[0, 0, 0].item() == 22.0
-    assert AttnWrapperBase.glm5_dispatch_counts["dsa_eager"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["dsa_eager"] == 1
 
 
 def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-moe", raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", "unit-moe", raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
     monkeypatch.setattr(glm5_model, "_GLM5_HAS_DISPATCH_3D", True)
     monkeypatch.setattr(Glm5MoE, "_3d_buf", object(), raising=False)
 
@@ -1529,9 +1529,9 @@ def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     )
     graph_out = moe._forward_decode(hidden)
     assert graph_out[0, 0].item() == 11.0
-    assert AttnWrapperBase.glm5_dispatch_counts["moe_graph"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["moe_graph"] == 1
 
-    AttnWrapperBase.glm5_dispatch_counts = {}
+    GLM5AttnWrapper.glm5_dispatch_counts = {}
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1540,7 +1540,7 @@ def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     )
     eager_out = moe._forward_decode(hidden)
     assert eager_out[0, 0].item() == 22.0
-    assert AttnWrapperBase.glm5_dispatch_counts["moe_eager"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["moe_eager"] == 1
 
 
 def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
@@ -1637,13 +1637,13 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
         "_project_dsa_attn_heads",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not project")),
     )
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
         "bucket_size": 4,
         "tile_scheduler_metadata": torch.ones(3, dtype=torch.int32),
         "num_splits": torch.ones(1, dtype=torch.int32),
     }
-    AttnWrapperBase.glm5_decode_primary_slot_indices = torch.tensor([3, 4], dtype=torch.int32)
-    AttnWrapperBase.glm5_decode_aux_slot_indices = torch.tensor([7, 8], dtype=torch.int32)
+    GLM5AttnWrapper.glm5_decode_primary_slot_indices = torch.tensor([3, 4], dtype=torch.int32)
+    GLM5AttnWrapper.glm5_decode_aux_slot_indices = torch.tensor([7, 8], dtype=torch.int32)
     primary_appends = []
     aux_appends = []
     AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
@@ -1663,9 +1663,9 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
             object(),
         )
     finally:
-        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
-        AttnWrapperBase.glm5_decode_primary_slot_indices = None
-        AttnWrapperBase.glm5_decode_aux_slot_indices = None
+        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
+        GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+        GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
         AttnWrapperBase.kv_append_callback = None
         AttnWrapperBase.kv_append_callback_aux = None
 
@@ -2080,23 +2080,23 @@ def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
 
     assert captured_lengths["values"].tolist() == [970, 2048, 2048, 2048]
     assert captured_lengths["num_heads"] == 64
-    assert AttnWrapperBase.glm5_dsa_graph_forward_state == {
+    assert GLM5AttnWrapper.glm5_dsa_graph_forward_state == {
         "path": "graph",
         "bucket": 4,
         "reason": "captured",
         "local_bsz": 2,
         "metadata_prepared": True,
     }
-    metadata = AttnWrapperBase.glm5_dsa_flashmla_graph_metadata
+    metadata = GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata
     assert metadata["bucket_size"] == 4
     assert metadata["tile_scheduler_metadata"].tolist() == [1, 1, 1]
     assert metadata["num_splits"].tolist() == [1]
-    assert AttnWrapperBase.glm5_decode_primary_slot_indices.tolist() == [3, 4]
-    assert AttnWrapperBase.glm5_decode_aux_slot_indices.tolist() == [7, 8]
-    AttnWrapperBase.glm5_dsa_graph_forward_state = None
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
-    AttnWrapperBase.glm5_decode_primary_slot_indices = None
-    AttnWrapperBase.glm5_decode_aux_slot_indices = None
+    assert GLM5AttnWrapper.glm5_decode_primary_slot_indices.tolist() == [3, 4]
+    assert GLM5AttnWrapper.glm5_decode_aux_slot_indices.tolist() == [7, 8]
+    GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
+    GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+    GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 
 
 def test_glm5_gpu_kv_config_uses_actual_prompt_for_graph_page_table():
