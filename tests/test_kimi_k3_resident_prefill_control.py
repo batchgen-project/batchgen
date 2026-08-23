@@ -536,6 +536,26 @@ def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
     assert "acquire_batch_size=16" not in source
 
 
+def test_distributed_k3_sizes_the_prefill_ring_to_one_tp8_expert_shard():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "kimi_initializer.py"
+    )
+    source = ast.unparse(
+        _function(path, "KimiLinearInitializer", "__init__")
+    )
+
+    assert "if self.distributed_weight_sharded" in source
+    assert (
+        "num_prefill_module_buffer['routed_expert'] = "
+        "require_num_routed_experts(self.loaded_model_config) // G"
+    ) in source
+
+
 def test_streamed_sp8_forward_uses_only_local_row_collective():
     path = (
         ROOT

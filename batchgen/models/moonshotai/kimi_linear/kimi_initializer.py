@@ -133,6 +133,14 @@ class KimiLinearInitializer:
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
         self.engine_config = self.planner.generate_config(self.engine_config)
+        if self.distributed_weight_sharded:
+            # Hierarchical GDR holds one complete TP8 expert shard until all
+            # cross-node payload launches have consumed the local H2D copy.
+            # The G=8 resident-attention plan otherwise inherits the base
+            # eight-slot ring because stream_all_modules is disabled.
+            self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer[
+                "routed_expert"
+            ] = require_num_routed_experts(self.loaded_model_config) // G
         self.engine_config.Basic_Config.distributed_weight_sharded = (
             self.distributed_weight_sharded
         )
