@@ -937,7 +937,10 @@ def moe_forward_serving(self, hidden_states):
 
         num_rows = x.shape[0]
         x_local = scatter_rows(x, G, self.attn_tp_rank)
-        routed_local = streamed_sp8.forward(x_local, self.gate)
+        # The layer is expert-parallel inside the node, so it needs the node's
+        # pre-split row count to pad this slice to the shared ntp stride its
+        # node-local latent gather and reduce-scatter are laid out on.
+        routed_local = streamed_sp8.forward(x_local, self.gate, num_rows)
         routed = all_gather_rows(
             routed_local,
             num_rows,

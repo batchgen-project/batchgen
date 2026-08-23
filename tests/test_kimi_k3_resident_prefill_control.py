@@ -621,7 +621,7 @@ def _mock_sp8_buffer(trace, method_names, *, acquire=None):
     buffer._prefetch_stream = prefetch_stream
     buffer._local_free = _FakeEvent(trace)
     buffer._acquire_local_shard = acquire or record_call("acquire")
-    buffer._gather_full_layer = record_call("gather")
+    buffer._assemble_compute_shard = record_call("assemble")
     buffer.shard = SimpleNamespace(name="shard")
     buffer._make_shard = lambda: buffer.shard
     globals_ = {
@@ -687,11 +687,12 @@ def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
     assert trace[1].thread != model_thread
     resume.set()
 
-    # Safety: the all-gather that overwrites the single ``self.full`` buffer is
-    # parked on the handshake until the model thread grants permission.
+    # Safety: the local->compute copy that overwrites the shard the current
+    # layer's kernels read is parked on the handshake until the model thread
+    # grants permission.
     pending.thread.join(0.1)
     assert pending.thread.is_alive()
-    assert not any(entry.op == "gather" for entry in trace)
+    assert not any(entry.op == "assemble" for entry in trace)
 
     buffer.allow_full_overwrite()
     pending.thread.join(5)
@@ -702,7 +703,7 @@ def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
         ("acquire", "prefetch"),
         ("record", "compute"),
         ("wait", "prefetch"),
-        ("gather", "prefetch"),
+        ("assemble", "prefetch"),
         ("record", "prefetch"),
     ]
     # The covering event is recorded on the model thread at release time — not
@@ -775,7 +776,7 @@ def test_streamed_sp8_load_propagates_prefetch_errors_to_the_model_thread():
         buffer.load(4)
 
     assert excinfo.value.__cause__ is failure
-    assert not any(entry.op == "gather" for entry in trace)
+    assert not any(entry.op == "assemble" for entry in trace)
 
 
 def test_streamed_sp8_close_cannot_strand_a_prefetch_awaiting_permission():
@@ -794,17 +795,45 @@ def test_streamed_sp8_close_cannot_strand_a_prefetch_awaiting_permission():
     assert not pending.thread.is_alive()
     assert pending.error is None
     assert buffer._pending is None
-    # Teardown cancels the unreleased all-gather rather than granting it: the
-    # other ranks may never reach a matching collective.
-    assert not any(entry.op == "gather" for entry in trace)
+    # Teardown cancels the unreleased assembly rather than granting it: the
+    # ingress it follows may never have completed on the other ranks.
+    assert not any(entry.op == "assemble" for entry in trace)
     assert (trace[-1].op, trace[-1].stream) == ("synchronize", "prefetch")
 
 
-def _mock_sp8_moe_layer(trace, rows):
-    """Bind the real ``forward`` onto mock projections and a mock buffer."""
+SP8_HIDDEN = 8
+SP8_LATENT = 4
+SP8_TOP_K = 2
+
+
+def _ops(trace):
+    """Operation names of a mixed string/tuple trace."""
+    return [entry if isinstance(entry, str) else entry[0] for entry in trace]
+
+
+def _mock_sp8_moe_layer(
+    trace,
+    rows,
+    *,
+    num_rows=None,
+    tp_size=2,
+    tp_rank=0,
+    expert_start=0,
+    num_local=4,
+    row_experts=None,
+    profile=False,
+):
+    """Bind the real ``forward`` onto mock projections, buffer and NCCL.
+
+    ``rows`` is this rank's slice of the node's ``num_rows`` replicated rows;
+    ``row_experts`` (per padded local row, ``SP8_TOP_K`` expert ids) drives the
+    router so ownership accounting can be checked.
+    """
     torch = pytest.importorskip("torch")
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    hidden, latent = 8, 4
+    hidden, latent = SP8_HIDDEN, SP8_LATENT
+    if num_rows is None:
+        num_rows = rows
 
     class FakeHelper:
         def __init__(
@@ -818,27 +847,61 @@ def _mock_sp8_moe_layer(trace, rows):
             expert_start=0,
         ):
             self.shard = shard
+            trace.append(("helper", world_size, expert_start))
 
         def _expert_path(self, x_latent, topk_idx, count):
-            trace.append("expert_path")
+            trace.append(("expert_path", count, tuple(topk_idx.shape)))
             return torch.zeros((count, 2, self.shard.K_latent)), None
 
         def _combine_fp32(
             self, expert_out, topk_pos, topk_weight, count, latent_size, top_k
         ):
-            trace.append("combine")
+            trace.append(("combine", count))
             return torch.zeros((count, latent_size))
 
     def log(op, value):
         trace.append(op)
         return value
 
-    layer = type("Layer", (), {"_prefill_profile_enabled": False})()
+    def all_gather_into_tensor(out, src, group=None):
+        trace.append(("all_gather", tuple(src.shape), str(src.dtype), group))
+        n = src.shape[0]
+        for g in range(tp_size):
+            out[g * n:(g + 1) * n].copy_(src)
+
+    def reduce_scatter_tensor(out, inp, op=None, group=None):
+        trace.append(
+            ("reduce_scatter", tuple(inp.shape), str(inp.dtype), op, group)
+        )
+        n = out.shape[0]
+        out.copy_(inp[tp_rank * n:(tp_rank + 1) * n])
+
+    fake_dist = SimpleNamespace(
+        all_gather_into_tensor=all_gather_into_tensor,
+        reduce_scatter_tensor=reduce_scatter_tensor,
+        ReduceOp=SimpleNamespace(SUM="SUM"),
+    )
+
+    layer = type("Layer", (), {
+        "_prefill_profile_enabled": profile,
+        "_prefill_profile_forward_calls": 0,
+        "_prefill_profile_input_rows": 0,
+        "_prefill_profile_routed_assignments": 0,
+        "_prefill_profile_node_routed_assignments": 0,
+        "_prefill_profile_expert_shard_size": 0,
+        "_prefill_profile_grouped_chunks": 0,
+        "_prefill_profile_active_experts": 0,
+        "_prefill_profile_wall_s": 0.0,
+    })()
     layer.layer_idx = 3
     layer.buffer = SimpleNamespace(
         load=lambda idx: log("load", SimpleNamespace(K_latent=latent)),
         begin_prefetch_next=lambda idx: log("begin", None),
         allow_full_overwrite=lambda: log("allow", None),
+        tp_group="tp8",
+        tp_size=tp_size,
+        expert_start=expert_start,
+        experts_per_rank=num_local,
     )
     layer.down_proj = lambda t: torch.zeros((t.shape[0], latent))
     layer.norm = lambda t: log("norm", t)
@@ -852,56 +915,288 @@ def _mock_sp8_moe_layer(trace, rows):
         {
             "torch": torch,
             "time": time,
+            "dist": fake_dist,
             "ResidentEPMXFP4MoELayer": FakeHelper,
         },
     ).__get__(layer)
 
-    x = torch.zeros((rows, hidden))
-    gate = lambda t: (torch.zeros((rows, 1, 2)), torch.ones((rows, 1, 2)))
-    return layer, x, gate, hidden
+    def gate(t):
+        n = t.shape[0]
+        if row_experts is None:
+            idx = torch.zeros((n, 1, SP8_TOP_K), dtype=torch.int64)
+        else:
+            idx = torch.tensor(
+                row_experts[:n], dtype=torch.int64
+            ).reshape(n, 1, SP8_TOP_K)
+        return idx, torch.ones((n, 1, SP8_TOP_K))
+
+    return layer, torch.zeros((rows, hidden)), gate, num_rows
 
 
 def test_streamed_sp8_forward_begins_ingress_before_grouped_expert_work():
     trace = []
-    layer, x, gate, hidden = _mock_sp8_moe_layer(trace, rows=5)
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace, rows=3, num_rows=5, tp_size=2
+    )
 
-    output = layer.forward(x, gate)
+    output = layer.forward(x, gate, num_rows)
+    ops = _ops(trace)
 
-    assert tuple(output.shape) == (5, hidden)
+    assert tuple(output.shape) == (3, SP8_HIDDEN)
     # Ingress starts immediately after the current layer is loaded, before any
     # grouped expert work is enqueued.
     assert trace[:2] == ["load", "begin"]
-    assert trace.index("begin") < trace.index("expert_path")
-    # Permission to overwrite the single full-layer buffer is signalled only
-    # after every grouped/combine/norm/up kernel has been enqueued.
-    assert trace.count("allow") == 1
-    assert trace[-1] == "allow"
-    assert {"expert_path", "combine", "norm", "up"}.issubset(set(trace))
+    assert ops.index("begin") < ops.index("expert_path")
+    # Permission to overwrite the compute shard is signalled exactly once, and
+    # only after every reader of it -- the grouped kernels, their FP32 combine
+    # and the node-local reduce-scatter that consumes them -- is enqueued.
+    assert ops.count("allow") == 1
+    assert ops.index("expert_path") < ops.index("combine")
+    assert ops.index("combine") < ops.index("reduce_scatter")
+    assert ops.index("reduce_scatter") < ops.index("allow")
+    # norm/up-proj read no expert weight, so they may trail the release.
+    assert ops.index("allow") < ops.index("norm") < ops.index("up")
 
 
-def test_streamed_sp8_forward_empty_rank_begins_and_releases_the_prefetch():
+def test_streamed_sp8_forward_gathers_only_inside_the_tp_group():
     trace = []
-    layer, x, gate, hidden = _mock_sp8_moe_layer(trace, rows=0)
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace, rows=3, num_rows=5, tp_size=2, expert_start=4, num_local=4
+    )
 
-    output = layer.forward(x, gate)
+    layer.forward(x, gate, num_rows)
 
-    # An empty rank runs no kernel that reads the full buffer, but it must
-    # still enter the collective ingress and release the overwrite, or the
-    # next layer's all-gather would hang on this rank.
-    assert tuple(output.shape) == (0, hidden)
+    # ntp = ceil(5/2) = 3, so the node lays out 2*3 = 6 rows.
+    gathers = [entry for entry in trace if entry[0] == "all_gather"]
+    assert [(entry[1], entry[2]) for entry in gathers] == [
+        ((3, SP8_LATENT), "torch.float32"),      # latent, not the 7168 hidden
+        ((3, SP8_TOP_K), "torch.int32"),         # topk indices
+        ((3, SP8_TOP_K), "torch.float32"),       # topk weights
+    ]
+    # Every collective is the node-local TP group; nothing crosses nodes.
+    assert {entry[-1] for entry in gathers} == {"tp8"}
+
+    scatters = [entry for entry in trace if entry[0] == "reduce_scatter"]
+    assert len(scatters) == 1
+    # The combine is summed in FP32 over all 6 node rows before the single
+    # bf16 downcast, and lands as this rank's own 3-row block.
+    assert scatters[0][1] == (6, SP8_LATENT)
+    assert scatters[0][2] == "torch.float32"
+    assert scatters[0][3] == "SUM"
+    assert scatters[0][4] == "tp8"
+
+    # The grouped work covers all 6 node rows, chunked at chunk_rows=2, and it
+    # runs against THIS rank's expert offset.
+    assert [
+        entry[1] for entry in trace if entry[0] == "expert_path"
+    ] == [2, 2, 2]
+    assert [entry for entry in trace if entry[0] == "helper"] == [
+        ("helper", 1, 4)
+    ]
+
+
+def test_streamed_sp8_forward_empty_rank_still_enters_every_node_collective():
+    trace = []
+    # num_rows=1 over tp_size=2: rank 1 owns zero rows after the balanced split.
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace, rows=0, num_rows=1, tp_size=2, tp_rank=1
+    )
+
+    output = layer.forward(x, gate, num_rows)
+    ops = _ops(trace)
+
+    # It contributes no rows but still owns experts for the OTHER rank's rows,
+    # so it must run the gathers, the grouped kernels and the reduce-scatter.
+    assert tuple(output.shape) == (0, SP8_HIDDEN)
+    assert ops.count("all_gather") == 3
+    assert ops.count("reduce_scatter") == 1
+    assert ops.count("expert_path") == 1
+    assert ops.count("allow") == 1
+    # No rows of its own means no post-combine work at all.
+    assert "norm" not in ops and "up" not in ops
+
+
+def test_streamed_sp8_forward_node_with_no_rows_skips_on_every_rank():
+    trace = []
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(trace, rows=0, num_rows=0)
+
+    output = layer.forward(x, gate, num_rows)
+
+    # The early return keys off the NODE row count, which is identical on all
+    # eight ranks, so they skip the node-local collectives together. It still
+    # loads and releases, or the next layer's ingress handshake would hang.
+    assert tuple(output.shape) == (0, SP8_HIDDEN)
     assert trace == ["load", "begin", "allow"]
 
 
-def test_streamed_sp8_gather_marks_local_shard_free():
+def test_streamed_sp8_forward_pads_uneven_rows_out_of_expert_ownership():
+    trace = []
+    # ntp = 3 but this rank owns 2 real rows; the router still returns experts
+    # for the zero pad row, and those must not be dispatched or counted.
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace,
+        rows=2,
+        num_rows=5,
+        tp_size=2,
+        tp_rank=1,
+        expert_start=0,
+        num_local=8,
+        row_experts=[[0, 1], [2, 3], [4, 5]],
+        profile=True,
+    )
+
+    layer.forward(x, gate, num_rows)
+    cls = type(layer)
+
+    # The mock replicates this rank's block on both gather slots, so the 6 node
+    # rows carry 2 real rows x 2 slots x top_k=2 = 8 owned assignments. Experts
+    # 4/5 belong to the pad row and are masked to -1 rather than counted.
+    assert cls._prefill_profile_routed_assignments == 8
+    assert cls._prefill_profile_active_experts == 4
+    # input_rows stays this rank's REAL local rows.
+    assert cls._prefill_profile_input_rows == 2
+    assert cls._prefill_profile_expert_shard_size == 8
+
+
+def test_streamed_sp8_profile_counts_only_this_rank_owned_assignments():
+    trace = []
+    # expert_start=4 with 4 local experts: of each row's 2 assignments only
+    # experts 4 and 5 belong here, and the mock repeats the block per slot.
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace,
+        rows=3,
+        num_rows=6,
+        tp_size=2,
+        expert_start=4,
+        num_local=4,
+        row_experts=[[0, 4], [1, 5], [2, 9]],
+        profile=True,
+    )
+
+    layer.forward(x, gate, num_rows)
+    cls = type(layer)
+
+    # Owned assignments are deduplicated by expert range, NOT input_rows*top_k:
+    # ownership is skewed, and here this rank computes 4 of the node's 12.
+    assert cls._prefill_profile_routed_assignments == 4
+    assert cls._prefill_profile_active_experts == 2
+    assert cls._prefill_profile_input_rows == 3
+    # Group-level evidence: summing routed_assignments over the node's ranks
+    # must reproduce node_routed_assignments exactly.
+    assert cls._prefill_profile_node_routed_assignments == 6 * SP8_TOP_K
+    assert cls._prefill_profile_expert_shard_size == 4
+    assert cls._prefill_profile_forward_calls == 1
+
+
+def test_streamed_sp8_grouped_chunk_is_wide_enough_for_large_token_runs():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    init = _function(path, "StreamedSP8MXFP4MoELayer", "__init__")
+    defaults = {
+        arg.arg: ast.literal_eval(default)
+        for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
+        if default is not None
+    }
+    # 256-row chunks over a 112-expert shard leave ~4 assignments per expert.
+    # The resident-EP 256 bound answers a different HBM budget (896 experts
+    # materialized on every rank), which this path no longer pays.
+    assert defaults["chunk_rows"] == 2048
+    assert defaults["post_chunk_rows"] == 8192
+
+
+def test_streamed_sp8_make_shard_exposes_only_the_rank_expert_range():
+    torch = pytest.importorskip("torch")
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
+        MXFP4_GROUP_SIZE,
+        ROUTED_EXPERT_PROJECTIONS,
+        routed_expert_module_shapes,
+    )
+
+    intermediate, latent, num_local = 32, 32, 3
+    shapes = routed_expert_module_shapes(intermediate, latent)
+    buffer = type("Buffer", (), {})()
+    buffer.experts_per_rank = num_local
+    buffer.intermediate_size = intermediate
+    buffer.latent_size = latent
+    buffer.scale_bf16 = {}
+    buffer.compute = {
+        name: torch.zeros((num_local, *shape), dtype=torch.uint8)
+        for name, shape in shapes.items()
+    }
+    buffer._expert_offsets = torch.arange(num_local, dtype=torch.int64)
+    buffer._ptrs = _isolated_method(
+        path, "StreamedSP8LayerBuffer", "_ptrs", {"torch": torch}
+    ).__get__(buffer)
+    # Both of these are ``@staticmethod`` on the real class, so binding them
+    # would shift their arguments.
+    for name in ("_expand_e8m0_into", "_offline_marlin_packed_view"):
+        setattr(
+            buffer,
+            name,
+            _isolated_method(
+                path, "StreamedSP8LayerBuffer", name, {"torch": torch}
+            ),
+        )
+    buffer._make_shard = _isolated_method(
+        path,
+        "StreamedSP8LayerBuffer",
+        "_make_shard",
+        {
+            "torch": torch,
+            "SimpleNamespace": SimpleNamespace,
+            "MXFP4_GROUP_SIZE": MXFP4_GROUP_SIZE,
+            "ROUTED_EXPERT_PROJECTIONS": ROUTED_EXPERT_PROJECTIONS,
+        },
+    ).__get__(buffer)
+
+    shard = buffer._make_shard()
+
+    # The grouped kernels see this rank's shard only, never all 896 experts.
+    assert shard.num_local == num_local
+    for field in (
+        "gate_B_ptrs",
+        "gate_scales_ptrs",
+        "up_B_ptrs",
+        "up_scales_ptrs",
+        "down_B_ptrs",
+        "down_scales_ptrs",
+    ):
+        assert getattr(shard, field).numel() == num_local, field
+    # Pointer array 0 is the compute buffer's base, i.e. LOCAL expert 0 -- the
+    # global offset lives in ``buffer.expert_start``, not in the pointers.
+    assert int(shard.gate_B_ptrs[0]) == (
+        buffer.compute["w1.weight_packed"].data_ptr()
+    )
+
+
+def test_streamed_sp8_assembly_is_a_same_rank_copy_and_frees_the_local_shard():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     source = ast.unparse(
-        _function(path, "StreamedSP8LayerBuffer", "_gather_full_layer")
+        _function(path, "StreamedSP8LayerBuffer", "_assemble_compute_shard")
     )
-    assert source.index("all_gather_into_tensor") < source.index(
-        "self._local_free.record(gather_stream)"
+    # Node-local weight all-gathers were the 12 GiB / 896-tiny-GEMM cost: the
+    # eight TP slots own disjoint experts, so nothing is exchanged at all.
+    assert "all_gather" not in source
+    assert source.index("self.compute[tensor_name].copy_(") < source.index(
+        "self._local_free.record(copy_stream)"
     )
     init = ast.unparse(_function(path, "StreamedSP8LayerBuffer", "__init__"))
     assert "self._local_free = torch.cuda.Event()" in init
+
+
+def test_streamed_sp8_buffers_hold_only_this_rank_expert_shard():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    allocate = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_allocate")
+    )
+    # BOTH roles are 112 experts. A ``self.num_experts`` allocation here is the
+    # regression this path exists to prevent.
+    assert allocate.count("(self.experts_per_rank, *shape)") == 2
+    assert "self.num_experts" not in allocate
+
+    init = ast.unparse(_function(path, "StreamedSP8LayerBuffer", "__init__"))
+    assert "self.expert_start = self.tp_rank * self.experts_per_rank" in init
+    assert "torch.arange(self.experts_per_rank" in init
 
 
 SIX_TENSORS = (
@@ -915,12 +1210,16 @@ SIX_TENSORS = (
 
 
 class _FakeShardTensor:
-    def __init__(self, name):
+    def __init__(self, name, trace=None):
         self.name = name
         self.value = 1
+        self._trace = trace
 
     def __getitem__(self, index):
         return SimpleNamespace(copy_=lambda source: None)
+
+    def copy_(self, source):
+        self._trace.append(("assemble", self.name, source.name))
 
     def numel(self):
         return 1024
@@ -987,9 +1286,13 @@ def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
     buffer = type("Buffer", (), {})()
     buffer.device = "cuda:0"
     buffer.shapes = {name: (2,) for name in SIX_TENSORS}
-    buffer.local = {name: _FakeShardTensor(name) for name in SIX_TENSORS}
-    buffer.full = {name: _FakeShardTensor(name) for name in SIX_TENSORS}
-    buffer._cross_status = _FakeShardTensor("source_status")
+    buffer.local = {
+        name: _FakeShardTensor(name, trace) for name in SIX_TENSORS
+    }
+    buffer.compute = {
+        name: _FakeShardTensor(name, trace) for name in SIX_TENSORS
+    }
+    buffer._cross_status = _FakeShardTensor("source_status", trace)
     buffer.tp_group = "tp8"
     buffer.expert_start = 336
     buffer.experts_per_rank = 2
@@ -1012,7 +1315,7 @@ def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
         "_acquire_local_shard",
         "_broadcast_source_status",
         "_broadcast_local_shard",
-        "_gather_full_layer",
+        "_assemble_compute_shard",
     ):
         setattr(
             buffer,
@@ -1029,7 +1332,7 @@ def _op_span(trace, op):
     return positions[0], positions[-1]
 
 
-def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_gather():
+def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     trace = []
     stream = _FakeIngressStream(trace)
     buffer, profile = _sp8_ingress_buffer(
@@ -1037,16 +1340,21 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_gather():
     )
 
     buffer._acquire_local_shard(7, stream=stream)
-    buffer._gather_full_layer(stream=stream)
+    buffer._assemble_compute_shard(stream=stream)
 
     ops = [entry[0] for entry in trace]
     assert ops.count("get_weights") == 2
     assert ops.count("broadcast") == 7
-    assert ops.count("all_gather") == 6
-    # Host ingress -> cross-node replication -> node-local assembly. The
-    # all-gather reads self.local, so it must follow every broadcast into it.
+    # Six same-rank local->compute copies, and no weight collective at all.
+    assert ops.count("assemble") == 6
+    assert "all_gather" not in ops
+    assert [(entry[1], entry[2]) for entry in trace if entry[0] == "assemble"] == [
+        (name, name) for name in SIX_TENSORS
+    ]
+    # Host ingress -> cross-node replication -> same-rank assembly. The copy
+    # reads self.local, so it must follow every broadcast into it.
     assert _op_span(trace, "get_weights")[1] < _op_span(trace, "broadcast")[0]
-    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "all_gather")[0]
+    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "assemble")[0]
 
     broadcasts = [
         entry for entry in trace
@@ -1069,15 +1377,16 @@ def test_hierarchical_gdr_non_source_rank_receives_without_host_ingress():
     )
 
     buffer._acquire_local_shard(7, stream=stream)
-    buffer._gather_full_layer(stream=stream)
+    buffer._assemble_compute_shard(stream=stream)
 
     ops = [entry[0] for entry in trace]
     # 24 of the 32 ranks touch the host store for no expert at all, but they
-    # still enter every cross-node broadcast and every node-local all-gather.
+    # still enter every cross-node broadcast and still assemble their shard.
     assert "get_weights" not in ops
     assert ops.count("broadcast") == 7
-    assert ops.count("all_gather") == 6
-    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "all_gather")[0]
+    assert ops.count("assemble") == 6
+    assert "all_gather" not in ops
+    assert _op_span(trace, "broadcast")[1] < _op_span(trace, "assemble")[0]
     assert profile._prefill_profile_cross_broadcast_calls == 6
     assert profile._prefill_profile_cross_source is False
     assert profile._prefill_profile_cross_status_calls == 1
@@ -1092,12 +1401,13 @@ def test_host_rdma_transport_runs_no_cross_node_collective():
     )
 
     buffer._acquire_local_shard(7, stream=stream)
-    buffer._gather_full_layer(stream=stream)
+    buffer._assemble_compute_shard(stream=stream)
 
     ops = [entry[0] for entry in trace]
     assert ops.count("get_weights") == 2
     assert "broadcast" not in ops
-    assert ops.count("all_gather") == 6
+    assert ops.count("assemble") == 6
+    assert "all_gather" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_broadcast_bytes == 0
     assert profile._prefill_profile_cross_source is False
@@ -1121,7 +1431,7 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
 
     broadcasts = [entry for entry in trace if entry[0] == "broadcast"]
     assert broadcasts == [("broadcast", "source_status", 11, "cross3")]
-    assert "all_gather" not in [entry[0] for entry in trace]
+    assert "assemble" not in [entry[0] for entry in trace]
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 1
@@ -1135,23 +1445,26 @@ def test_cross_node_broadcast_stays_inside_the_early_ingress_phase():
     # Phase one writes self.local only, so the broadcast inherits the existing
     # WAR event and overlaps the current layer's compute.
     assert "self._broadcast_local_shard(copy_stream)" in acquire
-    # Phase two is the parked all-gather; carrying the broadcast there would
+    # Phase two is the parked assembly copy; carrying the broadcast there would
     # serialize the cross-node transfer behind the overwrite handshake.
-    gather = ast.unparse(
-        _function(path, "StreamedSP8LayerBuffer", "_gather_full_layer")
+    assemble = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_assemble_compute_shard")
     )
-    assert "_broadcast_local_shard" not in gather
+    assert "_broadcast_local_shard" not in assemble
 
 
-def test_streamed_sp8_empty_rank_loads_before_returning():
+def test_streamed_sp8_node_empty_check_happens_after_the_load():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(
         path, "StreamedSP8MXFP4MoELayer", "forward"
     )
     source = ast.unparse(function)
-    assert source.index("shard = self.buffer.load") < source.index(
-        "if T == 0"
+    assert source.index("shard = buffer.load") < source.index(
+        "if num_rows == 0"
     )
+    # A per-rank ``T == 0`` early return would desynchronize the node-local
+    # gathers and the reduce-scatter below it.
+    assert "if T == 0" not in source
 
 
 def test_streamed_sp8_profile_counts_grouped_assignments():
@@ -1160,7 +1473,17 @@ def test_streamed_sp8_profile_counts_grouped_assignments():
     source = ast.unparse(forward)
 
     assert "_prefill_profile_input_rows += T" in source
-    assert "_prefill_profile_routed_assignments += int(topk_idx.numel())" in source
+    assert (
+        "_prefill_profile_routed_assignments += int(owned.sum().item())"
+        in source
+    )
+    # The old accounting counted every assignment of every row this rank held.
+    # Post-gather that is the whole node's routing on all eight ranks, so it
+    # would over-report the node 8x.
+    assert "int(topk_idx.numel())" not in source
+    assert (
+        "_prefill_profile_node_routed_assignments += num_rows * top_k" in source
+    )
     assert "_prefill_profile_grouped_chunks +=" in source
     assert source.count("helper._expert_path") == 1
 
