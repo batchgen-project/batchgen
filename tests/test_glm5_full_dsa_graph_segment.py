@@ -672,6 +672,7 @@ def test_glm5_full_dsa_all_short_skips_query_score_but_writes_indexer_k(monkeypa
         "transform": 0,
         "select": 0,
         "flashmla": 0,
+        "metadata": 0,
         "fa3": 1,
         "q_absorb": 1,
     }
