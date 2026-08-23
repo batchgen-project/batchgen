@@ -27,6 +27,11 @@ def test_eager_decode_passes_object_scheduler_metadata_without_batchgen_mutation
         "_flash_mla_ops",
         lambda: (fake_flash_mla, fake_get_metadata),
     )
+    monkeypatch.setattr(
+        sparse_decode_mla,
+        "make_flashmla_selected_block_table",
+        lambda *_args, **_kwargs: torch.tensor([[0]], dtype=torch.int32),
+    )
 
     prepared = sparse_decode_mla.prepare_sparse_flash_mla_decode_inputs(
         query_states=torch.zeros(1, 1, 4, 6),
