@@ -1,7 +1,9 @@
 import ast
 import copy
 import json
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -320,6 +322,102 @@ def test_streamed_sp8_reusable_buffers_are_not_inference_tensors():
     source = ast.unparse(function)
 
     assert "with torch.inference_mode(False)" in source
+
+
+def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    trace = []
+    model_thread = threading.get_ident()
+
+    class FakeEvent:
+        def record(self, stream):
+            trace.append(
+                SimpleNamespace(
+                    op="record",
+                    event=self,
+                    stream=stream.name,
+                    thread=threading.get_ident(),
+                )
+            )
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            trace.append(
+                SimpleNamespace(
+                    op="wait",
+                    event=event,
+                    stream=self.name,
+                    thread=threading.get_ident(),
+                )
+            )
+
+    compute_stream = FakeStream("compute")
+    prefetch_stream = FakeStream("prefetch")
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            Event=FakeEvent,
+            current_stream=lambda device: compute_stream,
+            set_device=lambda device: None,
+        )
+    )
+
+    def record_call(op):
+        def call(*_args, stream=None, **_kwargs):
+            trace.append(
+                SimpleNamespace(
+                    op=op,
+                    event=None,
+                    stream=stream.name,
+                    thread=threading.get_ident(),
+                )
+            )
+
+        return call
+
+    buffer = type("Buffer", (), {})()
+    buffer.device = "cuda:0"
+    buffer._pending = None
+    buffer._next_layer = {3: 4}
+    buffer._prefetch_stream = prefetch_stream
+    buffer._acquire_local_shard = record_call("acquire")
+    buffer._gather_full_layer = record_call("gather")
+    buffer.prefetch_next = _isolated_method(
+        path,
+        "StreamedSP8LayerBuffer",
+        "prefetch_next",
+        {
+            "torch": torch,
+            "threading": threading,
+            "SimpleNamespace": SimpleNamespace,
+        },
+    ).__get__(buffer)
+
+    buffer.prefetch_next(3)
+    pending = buffer._pending
+    pending.thread.join()
+
+    assert pending.error is None
+    assert [(entry.op, entry.stream) for entry in trace] == [
+        ("record", "compute"),
+        ("acquire", "prefetch"),
+        ("wait", "prefetch"),
+        ("gather", "prefetch"),
+        ("record", "prefetch"),
+    ]
+    # Safety: the all-gather that overwrites ``self.full`` is ordered after the
+    # compute-stream event, and that event is recorded on the model thread
+    # before the prefetch thread starts, so it covers the in-flight MoE work.
+    compute_done = trace[0].event
+    assert trace[2].event is compute_done
+    assert trace[0].thread == model_thread
+    assert trace[1].thread != model_thread
+    # Overlap: the local-shard acquisition is not held behind that wait, and
+    # ``pending.ready`` still orders the prefetch before the next compute.
+    assert trace[4].event is pending.ready
+    assert pending.ready is not compute_done
 
 
 def test_streamed_sp8_empty_rank_loads_before_returning():

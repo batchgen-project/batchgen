@@ -233,13 +233,24 @@ class StreamedSP8LayerBuffer:
             ready=torch.cuda.Event(),
             thread=None,
         )
+        # The grouped-MoE, combine and up-projection kernels of the current
+        # layer have only been enqueued when this method is called; they may
+        # still read ``self.full``.  Record on the caller's compute stream here,
+        # on the model thread, so the event covers exactly that in-flight work.
+        compute_done = torch.cuda.Event()
+        compute_done.record(torch.cuda.current_stream(self.device))
 
         def run():
             try:
                 torch.cuda.set_device(self.device)
+                # Local-shard acquisition writes ``self.local`` only, which no
+                # compute kernel reads, so it overlaps the current layer.
                 self._acquire_local_shard(
                     next_layer, stream=self._prefetch_stream
                 )
+                # ``self.full`` is overwritten below: order the all-gather
+                # after the current layer's readers.
+                self._prefetch_stream.wait_event(compute_done)
                 self._gather_full_layer(stream=self._prefetch_stream)
                 pending.ready.record(self._prefetch_stream)
             except BaseException as exc:  # re-raise on the model thread
