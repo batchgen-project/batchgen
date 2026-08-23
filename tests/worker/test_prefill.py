@@ -39,7 +39,15 @@ def _cand(uuid, *, rank=0, evicted=False, gidx=0, decoded=0, prompt=100, budget=
     )
 
 
-def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
+def _req(
+    candidates,
+    per_node_free,
+    *,
+    chunk=128,
+    gpus_per_node=_GPN,
+    max_sequences_per_rank=None,
+    max_sequences_per_node=None,
+):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
         per_node_host_free=tuple(per_node_free),
@@ -47,6 +55,8 @@ def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
         num_nodes=len(per_node_free),
         gpus_per_node=gpus_per_node,
         initial_gpu_page_buffer=_BUF,
+        max_sequences_per_rank=max_sequences_per_rank,
+        max_sequences_per_node=max_sequences_per_node,
     )
 
 
@@ -148,6 +158,44 @@ def test_no_eviction_candidates_pure_queueing_order():
     plan = PrefillScheduler.select_prefill_batch(_req(cands, [200]))
     # all fit (200 >= 3*34=102), order by global_idx ascending
     assert plan == ["q2", "q1", "q0"]  # uuids q2(gidx0), q1(gidx1), q0(gidx2)
+
+
+def test_persistent_kda_limit_is_per_rank_when_requested():
+    cands = [
+        _cand("r0-a", rank=0, gidx=0),
+        _cand("r0-b", rank=0, gidx=1),
+        _cand("r0-c", rank=0, gidx=2),
+        _cand("r1-a", rank=1, gidx=3),
+    ]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(cands, [200], max_sequences_per_rank=2)
+    )
+    assert plan == ["r0-a", "r0-b", "r1-a"]
+
+
+def test_persistent_kda_limit_is_per_node_for_tp8_group():
+    cands = [
+        _cand("n0-a", rank=0, gidx=0),
+        _cand("n0-b", rank=1, gidx=1),
+        _cand("n0-c", rank=7, gidx=2),
+        _cand("n1-a", rank=8, gidx=3),
+    ]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(cands, [200, 200], max_sequences_per_node=2)
+    )
+    assert plan == ["n0-a", "n0-b", "n1-a"]
+
+
+def test_persistent_kda_limits_cannot_have_two_scopes():
+    with pytest.raises(ValueError, match="scoped to rank or node"):
+        PrefillScheduler.select_prefill_batch(
+            _req(
+                [_cand("a")],
+                [34],
+                max_sequences_per_rank=1,
+                max_sequences_per_node=1,
+            )
+        )
 
 
 def test_request_and_candidate_are_frozen():

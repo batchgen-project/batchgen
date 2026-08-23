@@ -240,6 +240,27 @@ class KimiLinearParallelStrategyManager:
     def prefill_uses_streamed_sp8(self):
         return self._prefill_moe_mode == "streamed_sp8"
 
+    def prefill_sequence_limits(self):
+        """Return the persistent KDA-state capacity available to prefill.
+
+        The prefill token cap bounds temporary activation/scratch work. KDA
+        state is different: one slot is retained for each sequence until it
+        completes or is evicted, so the scheduler must not admit more local
+        sequences than the fixed GPU pool can retain. With TP8 KDA, each
+        sequence is replicated across the eight ranks in one node-local
+        attention group; expose the free-slot count as a node limit. The
+        manager is absent before the first model build, so the configured
+        capacity is the available capacity at initial admission.
+        """
+        available = self._kda_pool_slots
+        state_manager = getattr(KimiLinearKDAWrapper, "state_manager", None)
+        if state_manager is not None:
+            available = state_manager.get_stats().num_free_state_items
+        available = max(0, int(available))
+        if self._attn_tp_size > 1:
+            return {"max_sequences_per_node": available}
+        return {"max_sequences_per_rank": available}
+
     def _set_prefill_memory_tiling(self, enabled):
         """Bound K3 prefill temporaries for resident-EP and streamed-SP8."""
         if self.model is None:

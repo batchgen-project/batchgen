@@ -5058,7 +5058,10 @@ class BatchGenWorker:
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
-		# per-node admission is delegated to PrefillScheduler.
+		# per-node admission is delegated to PrefillScheduler. Kimi-Linear
+		# additionally supplies a persistent KDA-state limit: unlike the token
+		# cap used later by prepack, a KDA slot remains occupied until the
+		# sequence completes or is evicted.
 		prefill_batch = PrefillScheduler.select_prefill_batch(
 			self._make_prefill_selection_request(
 				all_candidates, per_node_host_free, num_nodes, chunk_size
@@ -5076,6 +5079,27 @@ class BatchGenWorker:
 			)
 
 		return prefill_batch
+
+	def _prefill_sequence_limits(self) -> dict:
+		"""Return persistent model-state limits for prefill admission.
+
+		Kimi-K3's TP8 attention group replicates each sequence's KDA state on
+		all eight ranks of one node. Its limit is therefore per node, not per
+		rank. Other models/PSMs return no limits and retain the host-KV-only
+		selection contract.
+		"""
+		manager = getattr(self, "parallel_manager", None)
+		method = getattr(manager, "prefill_sequence_limits", None)
+		if method is None:
+			return {}
+		limits = method()
+		if limits is None:
+			return {}
+		if not isinstance(limits, dict):
+			raise TypeError(
+				"parallel_manager.prefill_sequence_limits() must return a dict"
+			)
+		return limits
 
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
@@ -5098,6 +5122,7 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
 			))
+		limits = self._prefill_sequence_limits()
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
 			per_node_host_free=tuple(per_node_host_free),
@@ -5105,6 +5130,8 @@ class BatchGenWorker:
 			num_nodes=num_nodes,
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+			max_sequences_per_rank=limits.get("max_sequences_per_rank"),
+			max_sequences_per_node=limits.get("max_sequences_per_node"),
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:

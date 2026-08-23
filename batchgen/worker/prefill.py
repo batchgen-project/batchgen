@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,11 @@ class PrefillSelectionRequest:
     num_nodes: int
     gpus_per_node: int
     initial_gpu_page_buffer: int
+    # Persistent model state is a separate constraint from the token cap.
+    # KDA keeps one state slot for a sequence until completion/eviction,
+    # even when prefill is split into smaller token micro-batches.
+    max_sequences_per_rank: Optional[int] = None
+    max_sequences_per_node: Optional[int] = None
 
 
 class PrefillScheduler:
@@ -97,12 +102,38 @@ class PrefillScheduler:
         if not all_candidates:
             return []
 
+        if (
+            req.max_sequences_per_rank is not None
+            and req.max_sequences_per_node is not None
+        ):
+            raise ValueError(
+                "prefill sequence capacity must be scoped to rank or node, "
+                "not both"
+            )
+        if req.max_sequences_per_rank is not None and req.max_sequences_per_rank < 0:
+            raise ValueError("max_sequences_per_rank must be >= 0")
+        if req.max_sequences_per_node is not None and req.max_sequences_per_node < 0:
+            raise ValueError("max_sequences_per_node must be >= 0")
+
         per_node_effective_free = list(req.per_node_host_free)
         node_pages_used = [0] * req.num_nodes
+        rank_sequences_used: dict[int, int] = {}
+        node_sequences_used = [0] * req.num_nodes
         prefill_batch: List[str] = []
 
         for c in all_candidates:
             seq_node = c.assigned_rank // req.gpus_per_node
+            if (
+                req.max_sequences_per_rank is not None
+                and rank_sequences_used.get(c.assigned_rank, 0)
+                >= req.max_sequences_per_rank
+            ):
+                continue
+            if (
+                req.max_sequences_per_node is not None
+                and node_sequences_used[seq_node] >= req.max_sequences_per_node
+            ):
+                continue
             post_prefill_length = c.prompt_length + 1
             gpu_initial_pages = (
                 math.ceil(post_prefill_length / c.page_size)
@@ -116,5 +147,9 @@ class PrefillScheduler:
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
                 node_pages_used[seq_node] += req_pages
+                rank_sequences_used[c.assigned_rank] = (
+                    rank_sequences_used.get(c.assigned_rank, 0) + 1
+                )
+                node_sequences_used[seq_node] += 1
 
         return prefill_batch

@@ -82,13 +82,11 @@ class KimiLinearPlanner(BasePlanner):
         # Modern paged-KV decode path (decoding_continuous), same as K2.5.
         self.config.Basic_Config.attn_mode = 3
 
-        # Kimi-Linear context: model_max_length=1048576.  The TP8 K3 path
-        # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB), so
-        # a 4,096-token stress sequence batch must be split at four sequences
-        # per forward.  Without this bound, the worker allocates the host KV
-        # region for the whole request set and then asks KDA for more slots
-        # than the HBM budget can hold.  The 48B and single-shard K3 paths keep
-        # the larger cap used by their throughput runs.
+        # Kimi-Linear context: model_max_length=1048576. The TP8 K3 path
+        # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB).
+        # The admission scheduler enforces that persistent sequence limit;
+        # this token cap is a separate bound on temporary prefill scratch and
+        # must not be mistaken for a KDA-slot limit.
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = (
             16_384 if self.is_k3 and self.attention_group_size > 1 else 262_144
         )
@@ -194,9 +192,11 @@ class KimiLinearPlanner(BasePlanner):
         #                                       = 449,372,160 B (428.6 MiB)/slot
         # The 48B's 256 slots would be 107.14 GiB — larger than the whole GPU.
         # 4 slots = 1,797,488,640 B = 1.674 GiB. This is a hard cap on
-        # CONCURRENT SEQUENCES (one slot each, one reserved by the decode
-        # graph's padding/warmup slot); raise it deliberately, at 428.6 MiB
-        # apiece, when the workload needs more than a handful in flight.
+        # concurrent sequences; TP8 exposes it to admission as a per-node
+        # limit because each sequence is replicated on the node's eight ranks.
+        # Raise it deliberately, at 428.6 MiB apiece, only with a matching
+        # HBM budget (and reserve one additional slot if decode graphs are
+        # enabled for a batch).
         self.config.GPU_Buffer_Config.kda_state_slots = 4
 
     def _configure_streamed_rings(self):

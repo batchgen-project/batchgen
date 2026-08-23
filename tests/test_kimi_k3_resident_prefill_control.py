@@ -122,6 +122,32 @@ def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
         set_mode("resident_ep")
 
 
+def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
+    manager._kda_pool_slots = 4
+    manager._attn_tp_size = 8
+    fake_wrapper = type("KDAWrapper", (), {"state_manager": None})
+    method = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "prefill_sequence_limits",
+        {"KimiLinearKDAWrapper": fake_wrapper},
+    ).__get__(manager)
+
+    assert method() == {"max_sequences_per_node": 4}
+
+    manager._attn_tp_size = 1
+    assert method() == {"max_sequences_per_rank": 4}
+
+
 def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
     from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
         load_distributed_weight_config,
