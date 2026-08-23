@@ -17,6 +17,12 @@
 #include <utility>
 #include <stdexcept>
 
+// CUDA 13 retains the versioned driver-entry typedef but drops the legacy
+// unversioned alias used by CUDA 12.x headers.
+#if CUDA_VERSION >= 13000
+using PFN_cuTensorMapEncodeTiled = PFN_cuTensorMapEncodeTiled_v12000;
+#endif
+
 // ============================================================================
 // Configuration
 // ============================================================================
