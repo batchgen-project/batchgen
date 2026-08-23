@@ -1270,7 +1270,11 @@ def test_hierarchical_gdr_acquires_host_shard_before_the_cross_launch_gate():
         "wait",
         "acquire",
         "cross_broadcast",
+        "record",
+        "wait",
     ]
+    assert trace[-2].event is pending.cross_ingress_done
+    assert trace[-1].event is pending.cross_ingress_done
 
     buffer.allow_full_overwrite()
     pending.thread.join(5)
