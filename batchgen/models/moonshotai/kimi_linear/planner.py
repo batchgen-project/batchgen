@@ -82,10 +82,16 @@ class KimiLinearPlanner(BasePlanner):
         # Modern paged-KV decode path (decoding_continuous), same as K2.5.
         self.config.Basic_Config.attn_mode = 3
 
-        # Kimi-Linear context: model_max_length=1048576; keep the micro-batch
-        # token cap aligned with the KV/prefill budget instead of the raw
-        # context window.
-        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
+        # Kimi-Linear context: model_max_length=1048576.  The TP8 K3 path
+        # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB), so
+        # a 4,096-token stress sequence batch must be split at four sequences
+        # per forward.  Without this bound, the worker allocates the host KV
+        # region for the whole request set and then asks KDA for more slots
+        # than the HBM budget can hold.  The 48B and single-shard K3 paths keep
+        # the larger cap used by their throughput runs.
+        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = (
+            16_384 if self.is_k3 and self.attention_group_size > 1 else 262_144
+        )
 
         # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":
         # base_planner's kv_element_size check and the engine dtype map
