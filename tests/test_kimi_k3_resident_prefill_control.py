@@ -2,6 +2,7 @@ import ast
 import copy
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -446,45 +447,48 @@ def test_streamed_sp8_reusable_buffers_are_not_inference_tensors():
     assert "with torch.inference_mode(False)" in source
 
 
-def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
-    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
-    trace = []
-    model_thread = threading.get_ident()
+class _FakeEvent:
+    def __init__(self, trace):
+        self._trace = trace
 
-    class FakeEvent:
-        def record(self, stream):
-            trace.append(
-                SimpleNamespace(
-                    op="record",
-                    event=self,
-                    stream=stream.name,
-                    thread=threading.get_ident(),
-                )
+    def record(self, stream):
+        self._trace.append(
+            SimpleNamespace(
+                op="record",
+                event=self,
+                stream=stream.name,
+                thread=threading.get_ident(),
             )
-
-    class FakeStream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            trace.append(
-                SimpleNamespace(
-                    op="wait",
-                    event=event,
-                    stream=self.name,
-                    thread=threading.get_ident(),
-                )
-            )
-
-    compute_stream = FakeStream("compute")
-    prefetch_stream = FakeStream("prefetch")
-    torch = SimpleNamespace(
-        cuda=SimpleNamespace(
-            Event=FakeEvent,
-            current_stream=lambda device: compute_stream,
-            set_device=lambda device: None,
         )
-    )
+
+
+class _FakeStream:
+    def __init__(self, name, trace):
+        self.name = name
+        self._trace = trace
+
+    def _log(self, op, event=None):
+        self._trace.append(
+            SimpleNamespace(
+                op=op,
+                event=event,
+                stream=self.name,
+                thread=threading.get_ident(),
+            )
+        )
+
+    def wait_event(self, event):
+        self._log("wait", event)
+
+    def synchronize(self):
+        self._log("synchronize")
+
+
+def _mock_sp8_buffer(trace, method_names, *, acquire=None):
+    """Bind real ``StreamedSP8LayerBuffer`` methods onto fake CUDA streams."""
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    compute_stream = _FakeStream("compute", trace)
+    prefetch_stream = _FakeStream("prefetch", trace)
 
     def record_call(op):
         def call(*_args, stream=None, **_kwargs):
@@ -492,7 +496,7 @@ def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
                 SimpleNamespace(
                     op=op,
                     event=None,
-                    stream=stream.name,
+                    stream=(stream or compute_stream).name,
                     thread=threading.get_ident(),
                 )
             )
@@ -504,49 +508,277 @@ def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
     buffer._pending = None
     buffer._next_layer = {3: 4}
     buffer._prefetch_stream = prefetch_stream
-    buffer._local_free = FakeEvent()
-    buffer._acquire_local_shard = record_call("acquire")
+    buffer._local_free = _FakeEvent(trace)
+    buffer._acquire_local_shard = acquire or record_call("acquire")
     buffer._gather_full_layer = record_call("gather")
-    buffer.prefetch_next = _isolated_method(
-        path,
-        "StreamedSP8LayerBuffer",
-        "prefetch_next",
-        {
-            "torch": torch,
-            "threading": threading,
-            "SimpleNamespace": SimpleNamespace,
-        },
-    ).__get__(buffer)
+    buffer.shard = SimpleNamespace(name="shard")
+    buffer._make_shard = lambda: buffer.shard
+    globals_ = {
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(
+                Event=lambda: _FakeEvent(trace),
+                current_stream=lambda device: compute_stream,
+                set_device=lambda device: None,
+            )
+        ),
+        "threading": threading,
+        "SimpleNamespace": SimpleNamespace,
+    }
+    for name in method_names:
+        setattr(
+            buffer,
+            name,
+            _isolated_method(
+                path, "StreamedSP8LayerBuffer", name, globals_
+            ).__get__(buffer),
+        )
+    return buffer
 
-    buffer.prefetch_next(3)
+
+def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
+    trace = []
+    model_thread = threading.get_ident()
+    started = threading.Event()
+    resume = threading.Event()
+
+    def acquire(layer_idx, stream=None):
+        trace.append(
+            SimpleNamespace(
+                op="acquire",
+                event=None,
+                stream=stream.name,
+                thread=threading.get_ident(),
+            )
+        )
+        started.set()
+        assert resume.wait(5)
+
+    buffer = _mock_sp8_buffer(
+        trace,
+        ("begin_prefetch_next", "allow_full_overwrite"),
+        acquire=acquire,
+    )
+
+    buffer.begin_prefetch_next(3)
     pending = buffer._pending
-    pending.thread.join()
 
-    assert pending.error is None
+    # Overlap: remote ingress runs without waiting for any current-layer
+    # kernel, i.e. it is not held behind a compute-stream event.
+    assert started.wait(5)
     assert [(entry.op, entry.stream) for entry in trace] == [
-        ("record", "compute"),
         ("wait", "prefetch"),
         ("acquire", "prefetch"),
+    ]
+    # Safety: the ingress that overwrites ``self.local`` is still ordered after
+    # the PREVIOUS all-gather, which on the first boundary ran on the compute
+    # stream and is therefore not covered by prefetch-stream ordering.
+    assert trace[0].event is buffer._local_free
+    assert trace[1].thread != model_thread
+    resume.set()
+
+    # Safety: the all-gather that overwrites the single ``self.full`` buffer is
+    # parked on the handshake until the model thread grants permission.
+    pending.thread.join(0.1)
+    assert pending.thread.is_alive()
+    assert not any(entry.op == "gather" for entry in trace)
+
+    buffer.allow_full_overwrite()
+    pending.thread.join(5)
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+    assert [(entry.op, entry.stream) for entry in trace] == [
+        ("wait", "prefetch"),
+        ("acquire", "prefetch"),
+        ("record", "compute"),
         ("wait", "prefetch"),
         ("gather", "prefetch"),
         ("record", "prefetch"),
     ]
-    # Safety: the all-gather that overwrites ``self.full`` is ordered after the
-    # compute-stream event, and that event is recorded on the model thread
-    # before the prefetch thread starts, so it covers the in-flight MoE work.
-    compute_done = trace[0].event
-    assert trace[3].event is compute_done
-    assert trace[0].thread == model_thread
-    assert trace[1].thread != model_thread
-    # Safety: the ingress that overwrites ``self.local`` is ordered after the
-    # PREVIOUS all-gather, which on the first boundary ran on the compute
-    # stream and is therefore not covered by prefetch-stream ordering.
-    assert trace[1].event is buffer._local_free
-    assert buffer._local_free is not compute_done
-    # Overlap: the local-shard acquisition is not held behind the compute wait,
-    # and ``pending.ready`` still orders the prefetch before the next compute.
+    # The covering event is recorded on the model thread at release time — not
+    # when the prefetch started — so it spans the whole current-layer MoE, and
+    # the overwriting gather waits on exactly that event.
+    assert trace[2].event is pending.compute_done
+    assert trace[2].thread == model_thread
+    assert trace[3].event is pending.compute_done
+    # ``pending.ready`` still orders the next compute after the prefetch.
     assert trace[5].event is pending.ready
-    assert pending.ready is not compute_done
+    assert pending.ready is not pending.compute_done
+
+    # Releasing twice must not re-record the event behind the worker's wait.
+    buffer.allow_full_overwrite()
+    assert len(trace) == 6
+
+
+def test_streamed_sp8_load_joins_the_pending_layer():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "allow_full_overwrite",
+            "_wait_pending",
+            "load",
+        ),
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+    buffer.allow_full_overwrite()
+
+    assert buffer.load(4) is buffer.shard
+    assert buffer._pending is None
+    assert not pending.thread.is_alive()
+    # The compute stream is ordered after the prefetch's full-layer writes.
+    last = trace[-1]
+    assert (last.op, last.stream, last.event) == ("wait", "compute", pending.ready)
+
+    # Loading any layer other than the pending one is a scheduling bug.
+    buffer.begin_prefetch_next(3)
+    with pytest.raises(RuntimeError, match="expected prefetched layer 4, requested 9"):
+        buffer.load(9)
+    buffer.allow_full_overwrite()
+    buffer._wait_pending()
+
+
+def test_streamed_sp8_load_propagates_prefetch_errors_to_the_model_thread():
+    trace = []
+    failure = RuntimeError("weight lease timed out")
+
+    def acquire(layer_idx, stream=None):
+        raise failure
+
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "allow_full_overwrite",
+            "_wait_pending",
+            "load",
+        ),
+        acquire=acquire,
+    )
+
+    buffer.begin_prefetch_next(3)
+    buffer.allow_full_overwrite()
+    with pytest.raises(RuntimeError, match="prefetch of layer 4 failed") as excinfo:
+        buffer.load(4)
+
+    assert excinfo.value.__cause__ is failure
+    assert not any(entry.op == "gather" for entry in trace)
+
+
+def test_streamed_sp8_close_cannot_strand_a_prefetch_awaiting_permission():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace, ("begin_prefetch_next", "_wait_pending", "close")
+    )
+
+    # A forward that raised between the two phases never grants permission.
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+
+    buffer.close()
+
+    assert pending.cancelled
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+    assert buffer._pending is None
+    # Teardown cancels the unreleased all-gather rather than granting it: the
+    # other ranks may never reach a matching collective.
+    assert not any(entry.op == "gather" for entry in trace)
+    assert (trace[-1].op, trace[-1].stream) == ("synchronize", "prefetch")
+
+
+def _mock_sp8_moe_layer(trace, rows):
+    """Bind the real ``forward`` onto mock projections and a mock buffer."""
+    torch = pytest.importorskip("torch")
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    hidden, latent = 8, 4
+
+    class FakeHelper:
+        def __init__(
+            self,
+            layer_idx,
+            shard,
+            down_proj,
+            norm,
+            up_proj,
+            world_size=1,
+            expert_start=0,
+        ):
+            self.shard = shard
+
+        def _expert_path(self, x_latent, topk_idx, count):
+            trace.append("expert_path")
+            return torch.zeros((count, 2, self.shard.K_latent)), None
+
+        def _combine_fp32(
+            self, expert_out, topk_pos, topk_weight, count, latent_size, top_k
+        ):
+            trace.append("combine")
+            return torch.zeros((count, latent_size))
+
+    def log(op, value):
+        trace.append(op)
+        return value
+
+    layer = type("Layer", (), {"_prefill_profile_enabled": False})()
+    layer.layer_idx = 3
+    layer.buffer = SimpleNamespace(
+        load=lambda idx: log("load", SimpleNamespace(K_latent=latent)),
+        begin_prefetch_next=lambda idx: log("begin", None),
+        allow_full_overwrite=lambda: log("allow", None),
+    )
+    layer.down_proj = lambda t: torch.zeros((t.shape[0], latent))
+    layer.norm = lambda t: log("norm", t)
+    layer.up_proj = lambda t: log("up", torch.zeros((t.shape[0], hidden)))
+    layer.chunk_rows = 2
+    layer.post_chunk_rows = 3
+    layer.forward = _isolated_method(
+        path,
+        "StreamedSP8MXFP4MoELayer",
+        "forward",
+        {
+            "torch": torch,
+            "time": time,
+            "ResidentEPMXFP4MoELayer": FakeHelper,
+        },
+    ).__get__(layer)
+
+    x = torch.zeros((rows, hidden))
+    gate = lambda t: (torch.zeros((rows, 1, 2)), torch.ones((rows, 1, 2)))
+    return layer, x, gate, hidden
+
+
+def test_streamed_sp8_forward_begins_ingress_before_grouped_expert_work():
+    trace = []
+    layer, x, gate, hidden = _mock_sp8_moe_layer(trace, rows=5)
+
+    output = layer.forward(x, gate)
+
+    assert tuple(output.shape) == (5, hidden)
+    # Ingress starts immediately after the current layer is loaded, before any
+    # grouped expert work is enqueued.
+    assert trace[:2] == ["load", "begin"]
+    assert trace.index("begin") < trace.index("expert_path")
+    # Permission to overwrite the single full-layer buffer is signalled only
+    # after every grouped/combine/norm/up kernel has been enqueued.
+    assert trace.count("allow") == 1
+    assert trace[-1] == "allow"
+    assert {"expert_path", "combine", "norm", "up"}.issubset(set(trace))
+
+
+def test_streamed_sp8_forward_empty_rank_begins_and_releases_the_prefetch():
+    trace = []
+    layer, x, gate, hidden = _mock_sp8_moe_layer(trace, rows=0)
+
+    output = layer.forward(x, gate)
+
+    # An empty rank runs no kernel that reads the full buffer, but it must
+    # still enter the collective ingress and release the overwrite, or the
+    # next layer's all-gather would hang on this rank.
+    assert tuple(output.shape) == (0, hidden)
+    assert trace == ["load", "begin", "allow"]
 
 
 def test_streamed_sp8_gather_marks_local_shard_free():

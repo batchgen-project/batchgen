@@ -31,11 +31,13 @@ from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
 class StreamedSP8LayerBuffer:
     """One reusable full-layer MXFP4 buffer per GPU.
 
-    The buffer is deliberately single-buffered in HBM.  Once layer ``L``'s
-    grouped MoE has consumed ``full``, the local ingress storage and the same
-    full-layer storage can be filled with layer ``L+1`` while the model runs
-    layer ``L+1`` attention.  A second full 896-expert allocation would cost
-    another ~12 GiB/rank and defeat the memory objective.
+    The buffer is deliberately single-buffered in HBM.  A second full
+    896-expert allocation would cost another ~12 GiB/rank and defeat the
+    memory objective, so prefetching layer ``L+1`` is split in two phases:
+    ingress into ``local`` (which no compute kernel reads) starts as soon as
+    layer ``L`` has been loaded, while the all-gather that overwrites ``full``
+    is held back until the model thread confirms every layer-``L`` reader has
+    been enqueued.
     """
 
     def __init__(
@@ -215,12 +217,22 @@ class StreamedSP8LayerBuffer:
                 f"streamed-SP8 prefetch of layer {pending.layer_idx} failed"
             ) from pending.error
         # The prefetch stream owns the full-layer writes.  Make the caller's
-        # compute stream wait without a device-wide synchronize.
-        torch.cuda.current_stream(self.device).wait_event(pending.ready)
+        # compute stream wait without a device-wide synchronize.  A teardown
+        # cancellation deliberately skips the full-layer write, so it has no
+        # ready event to wait on.
+        if not pending.cancelled:
+            torch.cuda.current_stream(self.device).wait_event(pending.ready)
         self._pending = None
 
-    def prefetch_next(self, layer_idx: int):
-        """Start host->HBM + node-local assembly for the next MoE layer.
+    def begin_prefetch_next(self, layer_idx: int):
+        """Start host->HBM ingress for the next MoE layer.
+
+        Phase one of the prefetch.  It is called right after the current layer
+        has been loaded and before its grouped MoE is enqueued, because the
+        remote ingress dominates the layer and only writes ``self.local``,
+        which no compute kernel reads.  The all-gather that overwrites
+        ``self.full`` is parked inside the worker thread until
+        :meth:`allow_full_overwrite`.
 
         The call is intentionally non-blocking for the model thread.  The
         C++ ``get_weights`` binding releases the GIL while waiting for the
@@ -240,14 +252,11 @@ class StreamedSP8LayerBuffer:
             layer_idx=next_layer,
             error=None,
             ready=torch.cuda.Event(),
+            compute_done=torch.cuda.Event(),
+            overwrite_allowed=threading.Event(),
+            cancelled=False,
             thread=None,
         )
-        # The grouped-MoE, combine and up-projection kernels of the current
-        # layer have only been enqueued when this method is called; they may
-        # still read ``self.full``.  Record on the caller's compute stream here,
-        # on the model thread, so the event covers exactly that in-flight work.
-        compute_done = torch.cuda.Event()
-        compute_done.record(torch.cuda.current_stream(self.device))
 
         def run():
             try:
@@ -261,9 +270,13 @@ class StreamedSP8LayerBuffer:
                 self._acquire_local_shard(
                     next_layer, stream=self._prefetch_stream
                 )
-                # ``self.full`` is overwritten below: order the all-gather
-                # after the current layer's readers.
-                self._prefetch_stream.wait_event(compute_done)
+                # ``self.full`` is overwritten below.  Park here until the
+                # model thread has enqueued every current-layer reader and
+                # recorded the compute-stream event that covers them.
+                pending.overwrite_allowed.wait()
+                if pending.cancelled:
+                    return
+                self._prefetch_stream.wait_event(pending.compute_done)
                 self._gather_full_layer(stream=self._prefetch_stream)
                 pending.ready.record(self._prefetch_stream)
             except BaseException as exc:  # re-raise on the model thread
@@ -277,8 +290,30 @@ class StreamedSP8LayerBuffer:
         self._pending = pending
         pending.thread.start()
 
+    def allow_full_overwrite(self):
+        """Phase two: let the pending prefetch overwrite ``self.full``.
+
+        Must be called on the model thread once the current layer's grouped
+        MoE, combine and up-projection kernels have all been enqueued.  The
+        event is recorded here, at that late point, so it covers exactly the
+        in-flight work that still reads ``self.full``.
+        """
+        pending = self._pending
+        if pending is None or pending.overwrite_allowed.is_set():
+            return
+        pending.compute_done.record(torch.cuda.current_stream(self.device))
+        pending.overwrite_allowed.set()
+
     def close(self):
         """Drain a pending prefetch before phase teardown."""
+        pending = self._pending
+        if pending is not None and not pending.overwrite_allowed.is_set():
+            # A forward that raised between the two phases would otherwise
+            # leave the worker parked on the handshake forever.  Cancel the
+            # all-gather instead of granting it: the phase is ending and the
+            # other ranks may never reach a matching collective.
+            pending.cancelled = True
+            pending.overwrite_allowed.set()
         self._wait_pending()
         self._prefetch_stream.synchronize()
 
@@ -386,7 +421,15 @@ class StreamedSP8MXFP4MoELayer:
         # non-empty ranks enter the collective alone and deadlocks the group
         # on short or imbalanced microbatches.
         shard = self.buffer.load(self.layer_idx)
+        # Start the next layer's remote ingress before this layer's kernels are
+        # enqueued.  It writes ``buffer.local`` only; the all-gather that
+        # overwrites ``buffer.full`` stays parked until the release below.
+        self.buffer.begin_prefetch_next(self.layer_idx)
         if T == 0:
+            # No kernel on this rank reads ``buffer.full``, so the overwrite is
+            # already safe -- but the gather is collective and every rank must
+            # still enter it.
+            self.buffer.allow_full_overwrite()
             return x.new_zeros((0, H))
 
         profile_start = time.perf_counter() if profile else None
@@ -443,9 +486,9 @@ class StreamedSP8MXFP4MoELayer:
             if self.norm is not None:
                 y = self.norm(y)
             output[start:end].copy_(self.up_proj(y))
-        # At this point ``buffer.full`` is no longer read by this MoE.  Reuse
-        # it for the next layer while the decoder runs that layer's attention.
-        self.buffer.prefetch_next(self.layer_idx)
+        # Every kernel that reads ``buffer.full`` has now been enqueued, so the
+        # prefetch started above may assemble the next layer into it.
+        self.buffer.allow_full_overwrite()
         if profile:
             cls._prefill_profile_wall_s += (
                 time.perf_counter() - profile_start
