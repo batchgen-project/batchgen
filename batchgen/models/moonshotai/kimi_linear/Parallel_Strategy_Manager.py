@@ -33,6 +33,7 @@ Read that first when modifying this file or batchgen_worker.py.
 """
 
 import logging
+import os
 import time
 import types
 
@@ -211,6 +212,8 @@ class KimiLinearParallelStrategyManager:
                 f"world_size={world_size}, "
                 f"attention_group_size={self._attn_tp_size}"
             )
+        if self._hierarchical_gdr:
+            self._require_hierarchical_gdr_runtime()
         if self._stream_all_modules and self._attn_tp_size > 1:
             # Streamed KDA feeds full-96-head tensors from the copy-engine
             # ring, which _load_kda_modules never sees, so the head slice
@@ -234,6 +237,46 @@ class KimiLinearParallelStrategyManager:
     # ------------------------------------------------------------------ #
     #  Phase configuration                                                #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _require_hierarchical_gdr_runtime():
+        """Fail closed unless implicit NCCL launch ordering is supported."""
+        if os.environ.get("NCCL_LAUNCH_ORDER_IMPLICIT") != "1":
+            raise RuntimeError(
+                "hierarchical_gdr requires NCCL_LAUNCH_ORDER_IMPLICIT=1 "
+                "before process-group initialization so cross-node weight "
+                "broadcasts can overlap TP8 collectives without a "
+                "cross-communicator launch-order deadlock"
+            )
+
+        nccl_version = torch.cuda.nccl.version()
+        if not isinstance(nccl_version, tuple) or len(nccl_version) < 2:
+            raise RuntimeError(
+                "hierarchical_gdr could not verify the NCCL runtime version; "
+                f"torch.cuda.nccl.version() returned {nccl_version!r}"
+            )
+        nccl_major_minor = tuple(int(value) for value in nccl_version[:2])
+        if nccl_major_minor < (2, 26):
+            raise RuntimeError(
+                "hierarchical_gdr requires NCCL >=2.26 for implicit launch "
+                f"ordering, got {nccl_version!r}"
+            )
+
+        cuda_version = torch.version.cuda
+        try:
+            cuda_major_minor = tuple(
+                int(value) for value in cuda_version.split(".")[:2]
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "hierarchical_gdr could not verify torch.version.cuda; "
+                f"got {cuda_version!r}"
+            ) from exc
+        if len(cuda_major_minor) < 2 or cuda_major_minor < (12, 3):
+            raise RuntimeError(
+                "hierarchical_gdr requires CUDA >=12.3 for implicit launch "
+                f"ordering, got {cuda_version!r}"
+            )
 
     def set_comm(self, comm):
         """Receive the BatchGen NCCL communicator from the worker. Consumed by
@@ -510,6 +553,15 @@ class KimiLinearParallelStrategyManager:
         non-empty routed_expert list). "streamed": legacy pure-DP streaming,
         identical to prefill.
         """
+        if (
+            self._distributed_weight_sharded
+            and self._decode_moe_mode() != "resident_ep"
+        ):
+            raise RuntimeError(
+                "distributed K3 host weights require resident-EP decode; "
+                "streamed decode would replace the preserved streamed-SP8 "
+                "prefill schedule"
+            )
         if self._stream_all_modules:
             # Decode under stream_all_modules is NOT wired: the worker starts
             # the decode H2D streamer only when the routed_expert task is
