@@ -664,15 +664,30 @@ def _mock_sp8_buffer(
     prefetch_stream = _FakeStream("prefetch", trace)
 
     def record_call(op):
-        def call(*_args, stream=None, cross_launch_callback=None, **_kwargs):
-            trace.append(
-                SimpleNamespace(
-                    op=op,
-                    event=None,
-                    stream=(stream or compute_stream).name,
-                    thread=threading.get_ident(),
+        def call(
+            *_args,
+            stream=None,
+            cross_launch_gate=None,
+            cross_launch_callback=None,
+            **_kwargs,
+        ):
+            def log(name):
+                trace.append(
+                    SimpleNamespace(
+                        op=name,
+                        event=None,
+                        stream=(stream or compute_stream).name,
+                        thread=threading.get_ident(),
+                    )
                 )
-            )
+
+            # Host/ring ingress runs as soon as the thread starts; the
+            # cross-node collectives are held behind the model thread's gate.
+            log(op)
+            if cross_launch_gate is not None:
+                if not cross_launch_gate():
+                    return
+                log("cross_broadcast")
             if cross_launch_callback is not None:
                 cross_launch_callback()
 
@@ -718,7 +733,12 @@ def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
     started = threading.Event()
     resume = threading.Event()
 
-    def acquire(layer_idx, stream=None, cross_launch_callback=None):
+    def acquire(
+        layer_idx,
+        stream=None,
+        cross_launch_gate=None,
+        cross_launch_callback=None,
+    ):
         trace.append(
             SimpleNamespace(
                 op="acquire",
@@ -729,6 +749,8 @@ def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
         )
         started.set()
         assert resume.wait(5)
+        # host_rdma has no cross-node communicator to order.
+        assert cross_launch_gate is None
         if cross_launch_callback is not None:
             cross_launch_callback()
 
@@ -1035,6 +1057,9 @@ def _mock_sp8_moe_layer(
     layer.buffer = SimpleNamespace(
         load=lambda idx: log("load", SimpleNamespace(K_latent=latent)),
         begin_prefetch_next=lambda idx: log("begin", None),
+        allow_cross_launch=lambda: (
+            log("allow_cross", None) if cross_group is not None else None
+        ),
         order_tp_collective_after_cross_launch=lambda: (
             log("order_cross", None) if cross_group is not None else None
         ),
@@ -1118,11 +1143,15 @@ def test_hierarchical_gdr_orders_cross_launch_between_tp_collectives():
         index for index, op in enumerate(ops) if op == "all_gather"
     ]
     assert len(gather_positions) == 3
-    # Every rank enqueues the node-local gathers before the orthogonal
-    # cross-node communicator starts. Ingress still precedes and overlaps the
-    # grouped expert work.
-    assert max(gather_positions) < ops.index("begin")
-    assert ops.index("begin") < ops.index("expert_path")
+    # Host/ring ingress starts right after the load, exactly like host_rdma, so
+    # it overlaps the router, down-proj and the gathers themselves.
+    assert trace[:2] == ["load", "begin"]
+    assert ops.index("begin") < min(gather_positions)
+    # Every rank still enqueues all three node-local gathers before the
+    # orthogonal cross-node communicator is released, and the release precedes
+    # the grouped expert work.
+    assert max(gather_positions) < ops.index("allow_cross")
+    assert ops.index("allow_cross") < ops.index("expert_path")
     # Before TP8 is entered again, all cross-node calls have been issued; the
     # grouped compute remains between the two communicator families while the
     # GPU operations themselves are allowed to overlap.
@@ -1136,6 +1165,7 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
         trace,
         (
             "begin_prefetch_next",
+            "allow_cross_launch",
             "order_tp_collective_after_cross_launch",
             "allow_full_overwrite",
         ),
@@ -1144,6 +1174,7 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
 
     buffer.begin_prefetch_next(3)
     pending = buffer._pending
+    buffer.allow_cross_launch()
     buffer.order_tp_collective_after_cross_launch()
 
     assert pending.cross_launch_enqueued.is_set()
@@ -1153,6 +1184,7 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
     assert [(entry.op, entry.stream) for entry in trace] == [
         ("wait", "prefetch"),
         ("acquire", "prefetch"),
+        ("cross_broadcast", "prefetch"),
     ]
     assert pending.thread.is_alive()
 
@@ -1160,6 +1192,115 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
     pending.thread.join(5)
     assert not pending.thread.is_alive()
     assert pending.error is None
+
+
+def test_hierarchical_gdr_acquires_host_shard_before_the_cross_launch_gate():
+    trace = []
+    model_thread = threading.get_ident()
+    acquired = threading.Event()
+
+    def acquire(
+        layer_idx,
+        stream=None,
+        cross_launch_gate=None,
+        cross_launch_callback=None,
+    ):
+        trace.append(
+            SimpleNamespace(
+                op="acquire",
+                event=None,
+                stream=stream.name,
+                thread=threading.get_ident(),
+            )
+        )
+        acquired.set()
+        assert cross_launch_gate()
+        trace.append(
+            SimpleNamespace(
+                op="cross_broadcast",
+                event=None,
+                stream=stream.name,
+                thread=threading.get_ident(),
+            )
+        )
+        cross_launch_callback()
+
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "allow_cross_launch",
+            "order_tp_collective_after_cross_launch",
+            "allow_full_overwrite",
+            "_wait_pending",
+        ),
+        acquire=acquire,
+        cross_group="cross4",
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+
+    # Host/ring ingress starts immediately, on the prefetch thread, without
+    # waiting for the model thread's TP8 gathers: that is the whole point of
+    # starting the prefetch right after ``buffer.load``.
+    assert acquired.wait(5)
+    assert [(entry.op, entry.stream) for entry in trace] == [
+        ("wait", "prefetch"),
+        ("acquire", "prefetch"),
+    ]
+    assert trace[1].thread != model_thread
+
+    # The cross-node collectives are NOT issued yet. Until the gate opens the
+    # thread is parked, so the TP8 gathers keep their place ahead of every
+    # cross-node launch in the one global host order.
+    pending.thread.join(0.1)
+    assert pending.thread.is_alive()
+    assert not pending.cross_launch_allowed.is_set()
+    assert not pending.cross_launch_enqueued.is_set()
+    assert not any(entry.op == "cross_broadcast" for entry in trace)
+
+    buffer.allow_cross_launch()
+    buffer.order_tp_collective_after_cross_launch()
+    assert [entry.op for entry in trace] == [
+        "wait",
+        "acquire",
+        "cross_broadcast",
+    ]
+
+    buffer.allow_full_overwrite()
+    pending.thread.join(5)
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+
+
+def test_hierarchical_gdr_close_cannot_strand_the_cross_launch_gate():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace,
+        ("begin_prefetch_next", "_wait_pending", "close"),
+        cross_group="cross4",
+    )
+
+    # A forward that raised between the gathers and the gate never releases it.
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+
+    buffer.close()
+
+    assert pending.cancelled
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+    assert buffer._pending is None
+    # Teardown wakes the parked thread rather than granting the launch: the
+    # peers whose broadcasts it would join may never enter them.
+    ops = [entry.op for entry in trace]
+    assert "cross_broadcast" not in ops
+    assert "assemble" not in ops
+    # Both handshakes are released, so neither this thread nor a later
+    # ``order_tp_collective_after_cross_launch`` can be parked forever.
+    assert pending.cross_launch_allowed.is_set()
+    assert pending.cross_launch_enqueued.is_set()
 
 
 def test_hierarchical_gdr_prefetch_error_unblocks_tp_launch_ordering():
@@ -1276,9 +1417,11 @@ def test_hierarchical_gdr_node_with_no_rows_orders_ingress_before_return():
     output = layer.forward(x, gate, num_rows)
 
     assert tuple(output.shape) == (0, SP8_HIDDEN)
-    # No activation collective or grouped work exists, but the cross launch
-    # handoff must still precede the caller's subsequent TP8 gather/attention.
-    assert trace == ["load", "begin", "order_cross", "allow"]
+    # No activation collective or grouped work exists, but the gate must still
+    # open -- otherwise the parked worker would never issue the broadcasts its
+    # peers enter -- and the cross launch handoff must still precede the
+    # caller's subsequent TP8 gather/attention.
+    assert trace == ["load", "begin", "allow_cross", "order_cross", "allow"]
 
 
 def test_streamed_sp8_forward_pads_uneven_rows_out_of_expert_ownership():
@@ -1631,6 +1774,7 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     buffer._acquire_local_shard(
         7,
         stream=stream,
+        cross_launch_gate=lambda: trace.append(("cross_gate",)) or True,
         cross_launch_callback=lambda: trace.append(("cross_launch_handoff",)),
     )
     buffer._assemble_compute_shard(stream=stream)
@@ -1648,6 +1792,11 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     # reads self.local, so it must follow every broadcast into it.
     assert _op_span(trace, "get_weights")[1] < _op_span(trace, "broadcast")[0]
     assert _op_span(trace, "broadcast")[1] < _op_span(trace, "assemble")[0]
+    # The host shard is pulled BEFORE the gate is consulted, so ingress starts
+    # early; the status broadcast and all six payload broadcasts are issued
+    # only after the model thread released it.
+    assert _op_span(trace, "get_weights")[1] < _op_span(trace, "cross_gate")[0]
+    assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "broadcast")[0]
     # The model-thread handoff proves all NCCL calls were issued, not that the
     # source H2D or payload completed. Lease release waits for the earlier H2D
     # event only after the handoff, preserving overlap without ring reuse.
@@ -1729,14 +1878,51 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
 
     buffer.core_engine.get_weights = fail_source
     with pytest.raises(RuntimeError, match="source load failed"):
-        buffer._acquire_local_shard(7, stream=stream)
+        buffer._acquire_local_shard(
+            7,
+            stream=stream,
+            cross_launch_gate=lambda: trace.append(("cross_gate",)) or True,
+        )
 
     broadcasts = [entry for entry in trace if entry[0] == "broadcast"]
     assert broadcasts == [("broadcast", "source_status", 11, "cross3")]
     assert "assemble" not in [entry[0] for entry in trace]
+    # Even the failure announcement is a cross-node collective, so it stays
+    # behind the gate; announcing it early would reorder this rank's
+    # communicator launches against its peers'.
+    assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "broadcast")[0]
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 1
+
+
+def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group="cross3", cross_root=11, cross_source=True
+    )
+
+    # Teardown cancels the gate. The peers are unwinding too, so this rank must
+    # issue neither the status broadcast nor any payload broadcast -- but it
+    # must still release the ring leases its host ingress took.
+    buffer._acquire_local_shard(
+        7,
+        stream=stream,
+        cross_launch_gate=lambda: trace.append(("cross_gate",)) or False,
+        cross_launch_callback=lambda: trace.append(("cross_launch_handoff",)),
+    )
+
+    ops = [entry[0] for entry in trace]
+    assert ops.count("get_weights") == 2
+    assert "broadcast" not in ops
+    assert "cross_launch_handoff" not in ops
+    assert "assemble" not in ops
+    assert _op_span(trace, "cross_gate")[0] < _op_span(
+        trace, "h2d_synchronize"
+    )[0]
+    assert profile._prefill_profile_cross_broadcast_calls == 0
+    assert profile._prefill_profile_cross_status_calls == 0
 
 
 def test_hierarchical_gdr_status_read_is_stream_ordered_after_broadcast():

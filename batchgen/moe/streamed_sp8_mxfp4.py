@@ -182,7 +182,11 @@ class StreamedSP8LayerBuffer:
                 )
 
     def _acquire_local_shard(
-        self, layer_idx: int, stream=None, cross_launch_callback=None
+        self,
+        layer_idx: int,
+        stream=None,
+        cross_launch_gate=None,
+        cross_launch_callback=None,
     ):
         self._allocate()
         copy_stream = stream or torch.cuda.current_stream(self.device)
@@ -254,6 +258,15 @@ class StreamedSP8LayerBuffer:
         # enter the six large payload broadcasts. Otherwise the other three
         # nodes can wait forever after the source thread has already unwound.
         try:
+            # Host/ring acquisition above is free to run as early as this
+            # thread starts, but the cross-node communicator is not: the model
+            # thread issues the layer's three TP8 gathers first and only then
+            # opens this gate, so every GPU keeps one deterministic
+            # TP8 -> cross-node launch order.  A cancelled gate means the phase
+            # is tearing down; issuing the status broadcast then would park
+            # this thread against peers that will never join it.
+            if cross_launch_gate is not None and not cross_launch_gate():
+                return
             if not self._broadcast_source_status(
                 self._status_stream or copy_stream, source_error is None
             ):
@@ -408,12 +421,14 @@ class StreamedSP8LayerBuffer:
     def begin_prefetch_next(self, layer_idx: int):
         """Start host->HBM ingress for the next MoE layer.
 
-        Phase one of the prefetch. Host-RDMA calls it right after the current
-        layer is loaded. Hierarchical GDR calls it after the current layer's
-        TP8 activation gathers, preserving one global host launch order. In
-        both cases it precedes grouped MoE and writes only ``self.local``,
-        which no compute kernel reads. The copy that overwrites
-        ``self.compute`` is parked inside the worker thread until
+        Phase one of the prefetch. Both transports call it right after the
+        current layer is loaded, so host and ring-to-local acquisition starts
+        at the earliest possible point. It precedes grouped MoE and writes only
+        ``self.local``, which no compute kernel reads. Hierarchical GDR parks
+        the worker thread on :meth:`allow_cross_launch` before its cross-node
+        collectives so the model thread still issues the TP8 activation gathers
+        first, preserving one global host launch order. The copy that
+        overwrites ``self.compute`` is parked until
         :meth:`allow_full_overwrite`.
 
         The call is intentionally non-blocking for the model thread.  The
@@ -436,10 +451,14 @@ class StreamedSP8LayerBuffer:
             ready=torch.cuda.Event(),
             compute_done=torch.cuda.Event(),
             # NCCL_LAUNCH_ORDER_IMPLICIT preserves overlap only when every
-            # communicator launch has one deterministic host order. The TP8
-            # gathers are issued before this thread starts; this handoff proves
-            # all cross-node broadcasts have been issued before the model
-            # thread is allowed to issue the TP8 reduce-scatter.
+            # communicator launch has one deterministic host order. The gate
+            # below proves the TP8 gathers were issued before any cross-node
+            # collective; this handoff proves all cross-node broadcasts have
+            # been issued before the model thread is allowed to issue the TP8
+            # reduce-scatter.
+            cross_launch_allowed=(
+                threading.Event() if self.cross_group is not None else None
+            ),
             cross_launch_enqueued=(
                 threading.Event() if self.cross_group is not None else None
             ),
@@ -447,6 +466,19 @@ class StreamedSP8LayerBuffer:
             cancelled=False,
             thread=None,
         )
+
+        def open_cross_launch():
+            """Hold phase one's collectives until the model thread's gate."""
+            if not pending.cross_launch_allowed.wait(
+                PREFETCH_HANDOFF_TIMEOUT_S
+            ):
+                raise RuntimeError(
+                    f"streamed-SP8 prefetch of layer {next_layer} was not "
+                    "released for cross-node launch within "
+                    f"{PREFETCH_HANDOFF_TIMEOUT_S:.0f}s"
+                )
+            return not pending.cancelled
+
         def run():
             try:
                 torch.cuda.set_device(self.device)
@@ -455,10 +487,17 @@ class StreamedSP8LayerBuffer:
                 # the compute stream.  Order this layer's ingress after it.
                 self._prefetch_stream.wait_event(self._local_free)
                 # Local-shard acquisition writes ``self.local`` only, which no
-                # compute kernel reads, so it overlaps the current layer.
+                # compute kernel reads, so it overlaps the current layer.  Its
+                # host phase starts here; its cross-node phase waits on the
+                # gate.
                 self._acquire_local_shard(
                     next_layer,
                     stream=self._prefetch_stream,
+                    cross_launch_gate=(
+                        open_cross_launch
+                        if pending.cross_launch_allowed is not None
+                        else None
+                    ),
                     cross_launch_callback=(
                         pending.cross_launch_enqueued.set
                         if pending.cross_launch_enqueued is not None
@@ -476,6 +515,11 @@ class StreamedSP8LayerBuffer:
                 pending.ready.record(self._prefetch_stream)
             except BaseException as exc:  # re-raise on the model thread
                 pending.error = exc
+            finally:
+                # A thread that has terminated will never issue another cross
+                # collective, whether it failed, was cancelled or completed
+                # normally.  Release the handoff unconditionally so the model
+                # thread can never be parked by a dead worker.
                 if pending.cross_launch_enqueued is not None:
                     pending.cross_launch_enqueued.set()
 
@@ -486,6 +530,23 @@ class StreamedSP8LayerBuffer:
         )
         self._pending = pending
         pending.thread.start()
+
+    def allow_cross_launch(self):
+        """Let the pending prefetch issue its cross-node collectives.
+
+        Must be called on the model thread once this layer's three TP8
+        activation gathers have been issued.  Until then the worker thread has
+        already pulled its shard from the host store or the source ring, but
+        has issued neither the status broadcast nor the six payload
+        broadcasts, so ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` still sees one
+        deterministic TP8 -> cross-node order on every GPU.
+
+        Host-RDMA has no cross-node communicator and is a no-op here.
+        """
+        pending = self._pending
+        if pending is None or pending.cross_launch_allowed is None:
+            return
+        pending.cross_launch_allowed.set()
 
     def order_tp_collective_after_cross_launch(self):
         """Issue the next TP8 collective after every cross-node launch.
@@ -533,11 +594,16 @@ class StreamedSP8LayerBuffer:
         """Drain a pending prefetch before phase teardown."""
         pending = self._pending
         if pending is not None and not pending.overwrite_allowed.is_set():
-            # A forward that raised between the two phases would otherwise
-            # leave the worker parked on the handshake forever.  Cancel the
-            # assembly instead of granting it: the phase is ending and the
-            # ingress it follows may never have completed on the other ranks.
+            # A forward that raised between the phases would otherwise leave
+            # the worker parked on a handshake forever.  ``allow_cross_launch``
+            # always precedes ``allow_full_overwrite`` in a forward, so an
+            # ungranted overwrite covers an ungranted cross launch too.  Cancel
+            # both instead of granting them: the phase is ending, and neither
+            # the peers' broadcasts nor the ingress the assembly follows may
+            # ever complete on the other ranks.
             pending.cancelled = True
+            if pending.cross_launch_allowed is not None:
+                pending.cross_launch_allowed.set()
             pending.overwrite_allowed.set()
         self._wait_pending()
         self._prefetch_stream.synchronize()
@@ -708,18 +774,20 @@ class StreamedSP8MXFP4MoELayer:
         # the cross-node broadcast alone and deadlocks the group on short or
         # imbalanced microbatches.
         shard = buffer.load(self.layer_idx)
-        ordered_cross_launch = buffer.cross_group is not None
-        # Host-RDMA has no second GPU communicator and keeps its original
-        # earliest-start schedule. Hierarchical GDR starts after the TP8
-        # activation gathers below so every GPU orders TP8 -> cross-node.
-        if not ordered_cross_launch:
-            buffer.begin_prefetch_next(self.layer_idx)
+        # Both transports start ingress at the earliest point, so the host and
+        # ring-to-local acquisition of the next layer overlaps this one from
+        # here. Hierarchical GDR holds only its cross-node collectives, until
+        # the gate released after the TP8 activation gathers below, so every
+        # GPU still orders TP8 -> cross-node.
+        buffer.begin_prefetch_next(self.layer_idx)
         # ``num_rows`` is the node-wide count, so this branch is taken by all
         # eight ranks together or by none.  Keying it on the per-rank ``T``
         # instead would desynchronize the node-local collectives below.
         if num_rows == 0:
-            if ordered_cross_launch:
-                buffer.begin_prefetch_next(self.layer_idx)
+            # No activation collective exists to order against, but the gate
+            # must still open or the worker thread would never issue -- and
+            # never hand off -- the cross-node broadcasts its peers enter.
+            buffer.allow_cross_launch()
             buffer.order_tp_collective_after_cross_launch()
             buffer.allow_full_overwrite()
             return x.new_zeros((0, H))
@@ -770,12 +838,12 @@ class StreamedSP8MXFP4MoELayer:
         dist.all_gather_into_tensor(all_latent, x_latent, group=tp_group)
         dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
         dist.all_gather_into_tensor(all_weight, topk_weight, group=tp_group)
-        if ordered_cross_launch:
-            # All three TP8 gather calls have now been issued from the model
-            # thread. The cross-node thread may issue its communicator next;
-            # implicit launch ordering permits GPU overlap but preserves this
-            # deterministic host order.
-            buffer.begin_prefetch_next(self.layer_idx)
+        # All three TP8 gather calls have now been issued from the model
+        # thread. The prefetch thread, whose host ingress has been running
+        # since ``begin_prefetch_next`` above, may issue its cross-node
+        # communicator next; implicit launch ordering permits GPU overlap but
+        # preserves this deterministic host order.
+        buffer.allow_cross_launch()
 
         if profile:
             cls._prefill_profile_grouped_chunks += (
