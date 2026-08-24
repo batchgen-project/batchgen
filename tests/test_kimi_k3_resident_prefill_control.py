@@ -588,7 +588,7 @@ def _psm_path():
     )
 
 
-def test_streamed_sp8_init_attaches_the_order_wait_to_attention_modules():
+def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     source = ast.unparse(
         _function(
             _psm_path(),
@@ -605,6 +605,12 @@ def test_streamed_sp8_init_attaches_the_order_wait_to_attention_modules():
     )
     assert "for module in self._streamed_sp8_attention_modules():" in source
     assert "module._streamed_sp8_order_wait = order_wait" in source
+    assert (
+        "module._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
+    )
+    assert (
+        "shared._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
+    )
 
 
 def _psm_layer(module, *, wrapped):
@@ -612,6 +618,8 @@ def _psm_layer(module, *, wrapped):
     moe = type("MoE", (), {})()
     moe._streamed_sp8_prefill_enabled = True
     moe._streamed_sp8_moe = object()
+    moe.shared_experts = type("Shared", (), {})()
+    moe.shared_experts._streamed_sp8_profiler = object()
     return type("Layer", (), {
         "self_attn": SimpleNamespace(module=module) if wrapped else module,
         "block_sparse_moe": moe,
@@ -624,6 +632,7 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
     modules = [type("Attn", (), {})() for _ in range(2)]
     for module in modules:
         module._streamed_sp8_order_wait = lambda: None
+        module._streamed_sp8_profiler = object()
     # ``self_attn`` is the MLA/KDA streaming wrapper once prefill is
     # configured, but the serving methods live on the module it wraps; cover
     # the unwrapped shape too so the callback lands on the same object either
@@ -660,10 +669,15 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
     for layer in layers:
         assert layer.block_sparse_moe._streamed_sp8_moe is None
         assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
+        assert not hasattr(
+            layer.block_sparse_moe.shared_experts,
+            "_streamed_sp8_profiler",
+        )
     # Decode reaches the same attention all-reduce helper. A surviving callback
     # would close over the buffer this release just tore down.
     for module in modules:
         assert not hasattr(module, "_streamed_sp8_order_wait")
+        assert not hasattr(module, "_streamed_sp8_profiler")
 
     # configure_prefill -> configure_decoding releases twice; the second pass
     # has no buffer and no callback left and must still be a no-op.
@@ -676,6 +690,7 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
     manager = type("Manager", (), {})()
     module = type("Attn", (), {})()
     module._streamed_sp8_order_wait = lambda: None
+    module._streamed_sp8_profiler = object()
     layer = _psm_layer(module, wrapped=True)
     manager.model = type("Model", (), {
         "model": type("Inner", (), {"layers": [layer]})(),
@@ -705,7 +720,12 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
     assert manager._streamed_sp8_buffer is None
     assert layer.block_sparse_moe._streamed_sp8_moe is None
     assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
+    assert not hasattr(
+        layer.block_sparse_moe.shared_experts,
+        "_streamed_sp8_profiler",
+    )
     assert not hasattr(module, "_streamed_sp8_order_wait")
+    assert not hasattr(module, "_streamed_sp8_profiler")
 
 
 def test_streamed_sp8_attention_modules_unwraps_and_skips_missing_attention():
@@ -908,23 +928,43 @@ def test_mla_tp_reduce_calls_the_installed_order_wait_then_all_reduce(
         {
             "_wait_streamed_sp8_cross_launch": _isolated_function(
                 path, "_wait_streamed_sp8_cross_launch"
-            )
+            ),
+            "_begin_streamed_sp8_profile": _isolated_function(
+                path, "_begin_streamed_sp8_profile"
+            ),
+            "_end_streamed_sp8_profile": _isolated_function(
+                path, "_end_streamed_sp8_profile"
+            ),
         },
+    )
+    profiler = SimpleNamespace(
+        _prefill_profile_enabled=True,
+        begin_profile_span=lambda: trace.append(("profile_begin",)) or "span",
+        end_profile_span=lambda name, span: trace.append(
+            ("profile_end", name, span)
+        ),
     )
     module = SimpleNamespace(
         attn_tp_size=8,
         attn_tp_group="tp8",
         _streamed_sp8_order_wait=lambda: trace.append(("order_wait",)),
+        _streamed_sp8_profiler=profiler,
     )
     output = object()
 
     assert reduce_output(module, output) is output
-    assert trace == [("order_wait",), ("all_reduce", "tp8")]
+    assert trace == [
+        ("order_wait",),
+        ("profile_begin",),
+        ("all_reduce", "tp8"),
+        ("profile_end", "attention_reduce", "span"),
+    ]
 
     # Decode reaches the SAME helper after the PSM released prefill. With the
     # callback removed there is no wait and no reference to a torn-down buffer.
     trace.clear()
     del module._streamed_sp8_order_wait
+    del module._streamed_sp8_profiler
     reduce_output(module, output)
     assert trace == [("all_reduce", "tp8")]
 
@@ -1392,6 +1432,13 @@ def _mock_sp8_moe_layer(
         ReduceOp=SimpleNamespace(SUM="SUM"),
     )
 
+    def begin_profile_span(cls):
+        return object() if cls._prefill_profile_enabled else None
+
+    def end_profile_span(cls, name, start):
+        if start is not None:
+            cls._prefill_profile_named_spans[name].append((start, object()))
+
     layer = type("Layer", (), {
         "_prefill_profile_enabled": profile,
         "_prefill_profile_forward_calls": 0,
@@ -1404,6 +1451,12 @@ def _mock_sp8_moe_layer(
         "_prefill_profile_wall_s": 0.0,
         "_prefill_profile_layer_marks": [],
         "_prefill_profile_load_spans": [],
+        "_prefill_profile_named_spans": {
+            "grouped_expert_path": [],
+            "grouped_combine": [],
+        },
+        "begin_profile_span": classmethod(begin_profile_span),
+        "end_profile_span": classmethod(end_profile_span),
     })()
     layer.layer_idx = 3
     layer.buffer = SimpleNamespace(
@@ -1923,6 +1976,8 @@ def test_streamed_sp8_profile_counts_only_this_rank_owned_assignments():
     assert cls._prefill_profile_node_routed_assignments == 6 * SP8_TOP_K
     assert cls._prefill_profile_expert_shard_size == 4
     assert cls._prefill_profile_forward_calls == 1
+    assert len(cls._prefill_profile_named_spans["grouped_expert_path"]) == 3
+    assert len(cls._prefill_profile_named_spans["grouped_combine"]) == 3
 
 
 def test_streamed_sp8_profile_does_not_synchronize_each_layer():
@@ -2119,6 +2174,8 @@ def _isolated_profile_class(synchronizes):
     )
     wanted = (
         "reset_prefill_profile",
+        "begin_profile_span",
+        "end_profile_span",
         "_profile_span_stats",
         "prefill_profile_snapshot",
     )
@@ -2147,8 +2204,16 @@ def _isolated_profile_class(synchronizes):
         ],
         type_ignores=[],
     )
+    mark_stamps = []
+
+    def profile_mark(marks):
+        stamp = float(len(mark_stamps))
+        mark_stamps.append(stamp)
+        marks.append(_FakeTimingEvent(stamp))
+
     namespace = {
         "math": math,
+        "_profile_mark": profile_mark,
         "torch": SimpleNamespace(
             Tensor=_NotATensor,
             cuda=SimpleNamespace(
@@ -2161,6 +2226,22 @@ def _isolated_profile_class(synchronizes):
         namespace,
     )
     return namespace["Profile"]
+
+
+def test_streamed_sp8_external_profile_spans_publish_complete_pairs_only():
+    profile = _isolated_profile_class([])
+
+    profile.reset_prefill_profile(False)
+    assert profile.begin_profile_span() is None
+
+    profile.reset_prefill_profile(True)
+    start = profile.begin_profile_span()
+    assert profile._prefill_profile_named_spans["attention_reduce"] == []
+    profile.end_profile_span("attention_reduce", start)
+    assert len(profile._prefill_profile_named_spans["attention_reduce"]) == 1
+
+    with pytest.raises(ValueError, match="unknown streamed-SP8 profile span"):
+        profile.end_profile_span("not-a-span", profile.begin_profile_span())
 
 
 def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
@@ -2200,6 +2281,10 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
             broadcast_enqueue_s=4.1,
         ),
     ])
+    for offset, name in enumerate(profile._prefill_profile_span_names, start=1):
+        profile._prefill_profile_named_spans[name].append(
+            (_FakeTimingEvent(0.0), _FakeTimingEvent(float(offset)))
+        )
 
     snapshot = profile.prefill_profile_snapshot()
 
@@ -2209,6 +2294,15 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
     # Adjacent boundaries, nearest-rank percentiles, milliseconds throughout.
     assert snapshot["grouped_execution"] == {
         "count": 2, "sum_ms": 11.0, "p50_ms": 4.0, "p95_ms": 7.0
+    }
+    assert snapshot["moe_pre_gather"] == {
+        "count": 2, "sum_ms": 3.0, "p50_ms": 1.0, "p95_ms": 2.0
+    }
+    assert snapshot["moe_activation_gather"] == {
+        "count": 2, "sum_ms": 13.0, "p50_ms": 3.0, "p95_ms": 10.0
+    }
+    assert snapshot["moe_profile_accounting"] == {
+        "count": 2, "sum_ms": 2.0, "p50_ms": 1.0, "p95_ms": 1.0
     }
     assert snapshot["fence_stall"] == {
         "count": 2, "sum_ms": 5.0, "p50_ms": 2.0, "p95_ms": 3.0
@@ -2237,6 +2331,13 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
         "gate_open": 2,
         "broadcast_enqueue": 2,
     }
+    for offset, name in enumerate(profile._prefill_profile_span_names, start=1):
+        assert snapshot[name] == {
+            "count": 1,
+            "sum_ms": float(offset),
+            "p50_ms": float(offset),
+            "p95_ms": float(offset),
+        }
 
     stale = profile._prefill_profile_layer_marks
     stale_loads = profile._prefill_profile_load_spans
@@ -2251,12 +2352,16 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
     for key in (
         "broadcast_execution",
         "load_readiness_wait",
+        "moe_pre_gather",
+        "moe_activation_gather",
+        "moe_profile_accounting",
         "fence_stall",
         "grouped_execution",
         "reduce_scatter",
         "post_moe",
         "host_acquisition",
         "host_launch_handoff",
+        *profile._prefill_profile_span_names,
     ):
         assert profile.prefill_profile_snapshot()[key] == {
             "count": 0, "sum_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0
@@ -2867,7 +2972,15 @@ def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile()
     assert function is not None
     source = path.read_text()
 
-    assert "StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)" in source
+    assert (
+        "StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)"
+        in source
+    )
+    assert (
+        "KimiK3MXFP4ExpertWrapper.reset_prefill_profile(k3_prefill_profile)"
+        in source
+    )
+    assert "if streamed_sp8 or k3_prefill_profile:" in source
     assert '"streamed_sp8": (' in source
     assert '"expert_consumer": (' in source
     assert "torch.cuda.reset_peak_memory_stats(self.local_rank)" in source
@@ -2880,6 +2993,25 @@ def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile()
         "total_bytes",
     ):
         assert f'"{field}"' in source
+
+
+def test_streamed_sp8_detailed_profile_hooks_cover_the_non_load_gap():
+    wrapper_source = (ROOT / "batchgen" / "models" / "moonshotai" /
+                      "kimi_linear" / "wrappers.py").read_text()
+    serving_source = _serving_modules_path().read_text()
+    model_source = (ROOT / "batchgen" / "models" / "moonshotai" /
+                    "kimi_linear" / "model.py").read_text()
+
+    for name in ("kda_attention", "mla_attention", "mla_kv_offload"):
+        assert f'end_profile_span("{name}"' in wrapper_source
+    for name in (
+        "attention_reduce",
+        "routed_output_gather",
+        "shared_expert",
+        "moe_serving_total",
+    ):
+        assert f'"{name}"' in serving_source
+    assert 'end_profile_span("shared_expert_reduce"' in model_source
 
 
 def test_distributed_daemon_joins_bootstrap_threads_on_failure():

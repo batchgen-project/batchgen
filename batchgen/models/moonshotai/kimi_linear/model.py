@@ -186,7 +186,18 @@ class KimiMLP(nn.Module):
         if getattr(self, "_tp_size", 1) > 1:
             import torch.distributed as dist
 
+            profiler = getattr(self, "_streamed_sp8_profiler", None)
+            if (
+                profiler is not None
+                and not profiler._prefill_profile_enabled
+            ):
+                profiler = None
+            span = (
+                profiler.begin_profile_span() if profiler is not None else None
+            )
             dist.all_reduce(output, group=self._tp_group)
+            if profiler is not None:
+                profiler.end_profile_span("shared_expert_reduce", span)
         return output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

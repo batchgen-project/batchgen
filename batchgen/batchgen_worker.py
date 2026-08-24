@@ -6876,15 +6876,15 @@ class BatchGenWorker:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_prefill_buffer()
 		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
-		if k3_prefill_profile:
+		if streamed_sp8 or k3_prefill_profile:
 			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
 				KimiK3MXFP4ExpertWrapper,
 			)
-			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(True)
+			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(k3_prefill_profile)
 			from batchgen.moe.streamed_sp8_mxfp4 import (
 				StreamedSP8MXFP4MoELayer,
 			)
-			StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)
+			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
 		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
 		if sp8_reentry:
 			# configure_prefill rebuilt the task from scratch. The preserved
@@ -8169,6 +8169,9 @@ class BatchGenWorker:
 				StreamedSP8MXFP4MoELayer,
 			)
 			free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
+			# The top-k ``.cpu()`` transfers above have drained the compute stream.
+			# Pending ingress events precede the ready events that stream waited on,
+			# so every timing pair is complete before ``elapsed_time`` is queried.
 			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
 				"rank": self.rank,
 				"hbm": {

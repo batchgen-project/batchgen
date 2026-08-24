@@ -420,6 +420,12 @@ class KimiLinearParallelStrategyManager:
                     if moe is not None:
                         moe._streamed_sp8_prefill_enabled = False
                         moe._streamed_sp8_moe = None
+                        shared = getattr(moe, "shared_experts", None)
+                        if (
+                            shared is not None
+                            and hasattr(shared, "_streamed_sp8_profiler")
+                        ):
+                            del shared._streamed_sp8_profiler
             # Drop the callback with the buffer it closes over: decode reaches
             # the SAME ``_reduce_mla_tp_output`` helper, and a stale reference
             # there would park its all-reduce on a torn-down handshake. This
@@ -427,6 +433,8 @@ class KimiLinearParallelStrategyManager:
             for module in self._streamed_sp8_attention_modules():
                 if hasattr(module, "_streamed_sp8_order_wait"):
                     del module._streamed_sp8_order_wait
+                if hasattr(module, "_streamed_sp8_profiler"):
+                    del module._streamed_sp8_profiler
             self._streamed_sp8_buffer = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -809,6 +817,9 @@ class KimiLinearParallelStrategyManager:
                 ),
                 up_proj=moe.routed_expert_up_proj,
             )
+            shared = getattr(moe, "shared_experts", None)
+            if shared is not None:
+                shared._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
         # The cross-node broadcast gate opens at the end of each MoE serving
         # branch; the next TP8 launch is the following layer's attention
         # all-reduce, which must observe every cross-node call already
@@ -818,6 +829,7 @@ class KimiLinearParallelStrategyManager:
         )
         for module in self._streamed_sp8_attention_modules():
             module._streamed_sp8_order_wait = order_wait
+            module._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step

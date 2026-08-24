@@ -59,13 +59,31 @@ def _wait_streamed_sp8_cross_launch(module):
         order_wait()
 
 
+def _begin_streamed_sp8_profile(module):
+    profiler = getattr(module, "_streamed_sp8_profiler", None)
+    if (
+        profiler is not None
+        and not profiler._prefill_profile_enabled
+    ):
+        profiler = None
+    span = profiler.begin_profile_span() if profiler is not None else None
+    return profiler, span
+
+
+def _end_streamed_sp8_profile(profiler, name, start):
+    if profiler is not None:
+        profiler.end_profile_span(name, start)
+
+
 def _reduce_mla_tp_output(module, output):
     """Sum the row-parallel MLA output projection across the TP group."""
     if getattr(module, "attn_tp_size", 1) > 1:
         import torch.distributed as dist
 
         _wait_streamed_sp8_cross_launch(module)
+        profiler, span = _begin_streamed_sp8_profile(module)
         dist.all_reduce(output, group=module.attn_tp_group)
+        _end_streamed_sp8_profile(profiler, "attention_reduce", span)
     return output
 
 
@@ -619,7 +637,9 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         import torch.distributed as dist
 
         _wait_streamed_sp8_cross_launch(self)
+        profiler, span = _begin_streamed_sp8_profile(self)
         dist.all_reduce(o, group=self.attn_tp_group)
+        _end_streamed_sp8_profile(profiler, "attention_reduce", span)
     return o
 
 
@@ -943,6 +963,9 @@ def moe_forward_serving(self, hidden_states):
         and getattr(self, "_streamed_sp8_prefill_enabled", False)
         and KimiLinearExpertWrapper.phase == "prefill"
     ):
+        profiler = type(streamed_sp8)
+        profile = profiler._prefill_profile_enabled
+        moe_span = profiler.begin_profile_span() if profile else None
         identity = hidden_states
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, self.hidden_dim)
@@ -959,6 +982,9 @@ def moe_forward_serving(self, hidden_states):
         # pre-split row count to pad this slice to the shared ntp stride its
         # node-local latent gather and reduce-scatter are laid out on.
         routed_local = streamed_sp8.forward(x_local, self.gate, num_rows)
+        routed_gather_span = (
+            profiler.begin_profile_span() if profile else None
+        )
         routed = all_gather_rows(
             routed_local,
             num_rows,
@@ -966,9 +992,16 @@ def moe_forward_serving(self, hidden_states):
             self.attn_tp_rank,
             self.attn_tp_group,
         )
+        if profile:
+            profiler.end_profile_span(
+                "routed_output_gather", routed_gather_span
+            )
         out = routed.reshape(orig_shape)
         if getattr(self, "shared_experts", None) is not None:
+            shared_span = profiler.begin_profile_span() if profile else None
             out.add_(self.shared_experts(identity))
+            if profile:
+                profiler.end_profile_span("shared_expert", shared_span)
         # Every TP8 collective of this layer -- the node-local latent/routing
         # gathers, the FP32 reduce-scatter, the routed-output all-gather above
         # and the shared expert's row-parallel all-reduce -- has now been
@@ -976,6 +1009,8 @@ def moe_forward_serving(self, hidden_states):
         # layer's cross-node broadcasts, so under NCCL_LAUNCH_ORDER_IMPLICIT=1
         # their payloads overlap the next layer's attention compute instead of
         # pushing the peers' wait into one of the collectives above (E1).
+        if profile:
+            profiler.end_profile_span("moe_serving_total", moe_span)
         streamed_sp8.buffer.allow_cross_launch()
         return out
 

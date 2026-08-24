@@ -208,6 +208,15 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
                 "Kimi-Linear serving requires prepack prefill (default). "
                 "Standard padded prefill is not supported."
             )
+        profiler = getattr(self.module, "_streamed_sp8_profiler", None)
+        if (
+            profiler is not None
+            and not profiler._prefill_profile_enabled
+        ):
+            profiler = None
+        attention_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         state = KimiLinearKDAWrapper.layer_pools[self.layer_idx]
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         device = hidden_states.device
@@ -229,6 +238,8 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
                 state,
                 segment_tokens=segment_tokens,
             )
+        if profiler is not None:
+            profiler.end_profile_span("kda_attention", attention_span)
         return out.unsqueeze(0)
 
     def _forward_decode(self, hidden_states, **kwargs):
@@ -266,6 +277,15 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
         cu_seqlens = AttnWrapperBase.prepack_cu_seqlens.to(device)
 
+        profiler = getattr(self.module, "_streamed_sp8_profiler", None)
+        if (
+            profiler is not None
+            and not profiler._prefill_profile_enabled
+        ):
+            profiler = None
+        attention_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         attn_output, offload_kv = self.module.mla_prefill_nope_prepacked(
             hidden_2d,
             AttnWrapperBase.position_ids,
@@ -273,7 +293,14 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             AttnWrapperBase.prepack_max_seqlen,
             AttnWrapperBase.prepack_num_sequences,
         )
+        if profiler is not None:
+            profiler.end_profile_span("mla_attention", attention_span)
+        offload_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         self._offload_prepacked_kv(offload_kv, cu_seqlens)
+        if profiler is not None:
+            profiler.end_profile_span("mla_kv_offload", offload_span)
         return attn_output.unsqueeze(0)
 
     def _offload_prepacked_kv(self, offload_kv, cu_seqlens):

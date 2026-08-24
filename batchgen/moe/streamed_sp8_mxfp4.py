@@ -757,6 +757,25 @@ class StreamedSP8MXFP4MoELayer:
     # One (start, end) pair per completed six-tensor payload broadcast, on the
     # ingress stream.  Empty on host_rdma, which runs no cross-node collective.
     _prefill_profile_broadcast_spans = []
+    # Additional compute-stream spans used to localize the residual W1 gap.
+    # The events are recorded only while the explicit K3 prefill profiler is
+    # enabled and are queried only after prefill has completed, so they add no
+    # per-layer synchronize and preserve the overlap being measured.
+    _prefill_profile_span_names = (
+        "grouped_expert_path",
+        "grouped_combine",
+        "routed_output_gather",
+        "shared_expert",
+        "shared_expert_reduce",
+        "moe_serving_total",
+        "kda_attention",
+        "mla_attention",
+        "mla_kv_offload",
+        "attention_reduce",
+    )
+    _prefill_profile_named_spans = {
+        name: [] for name in _prefill_profile_span_names
+    }
     # Host ``perf_counter`` timestamps for one ingress. The async record is
     # published after assembly; its order-wait timestamps may be filled later
     # by the following attention layer. The first synchronous layer has no
@@ -785,6 +804,29 @@ class StreamedSP8MXFP4MoELayer:
         cls._prefill_profile_load_spans = []
         cls._prefill_profile_broadcast_spans = []
         cls._prefill_profile_host_records = []
+        cls._prefill_profile_named_spans = {
+            name: [] for name in cls._prefill_profile_span_names
+        }
+
+    @classmethod
+    def begin_profile_span(cls):
+        """Record one asynchronous start event for an external K3 span."""
+        if not cls._prefill_profile_enabled:
+            return None
+        marks = []
+        _profile_mark(marks)
+        return marks[0]
+
+    @classmethod
+    def end_profile_span(cls, name: str, start) -> None:
+        """Publish a complete external span without synchronizing the device."""
+        if start is None:
+            return
+        if name not in cls._prefill_profile_named_spans:
+            raise ValueError(f"unknown streamed-SP8 profile span {name!r}")
+        marks = [start]
+        _profile_mark(marks)
+        cls._prefill_profile_named_spans[name].append(tuple(marks))
 
     @staticmethod
     def _profile_span_stats(samples_ms) -> dict:
@@ -837,7 +879,7 @@ class StreamedSP8MXFP4MoELayer:
                 and getattr(record, end_name) is not None
             ]
 
-        return {
+        snapshot = {
             "enabled": cls._prefill_profile_enabled,
             "forward_calls": cls._prefill_profile_forward_calls,
             "input_rows": cls._prefill_profile_input_rows,
@@ -868,6 +910,13 @@ class StreamedSP8MXFP4MoELayer:
             "load_readiness_wait": cls._profile_span_stats(
                 [start.elapsed_time(end) for start, end in loads]
             ),
+            "moe_pre_gather": cls._profile_span_stats(boundary_ms(0, 1)),
+            "moe_activation_gather": cls._profile_span_stats(
+                boundary_ms(1, 2)
+            ),
+            "moe_profile_accounting": cls._profile_span_stats(
+                boundary_ms(2, 3)
+            ),
             "fence_stall": cls._profile_span_stats(boundary_ms(4, 5)),
             "grouped_execution": cls._profile_span_stats(boundary_ms(3, 4)),
             "reduce_scatter": cls._profile_span_stats(boundary_ms(6, 7)),
@@ -890,6 +939,14 @@ class StreamedSP8MXFP4MoELayer:
                 ),
             },
         }
+        snapshot.update({
+            name: cls._profile_span_stats([
+                start.elapsed_time(end)
+                for start, end in cls._prefill_profile_named_spans[name]
+            ])
+            for name in cls._prefill_profile_span_names
+        })
+        return snapshot
 
     def __init__(
         self,
@@ -1049,11 +1106,17 @@ class StreamedSP8MXFP4MoELayer:
         for start in range(0, num_node_rows, self.chunk_rows):
             end = min(start + self.chunk_rows, num_node_rows)
             count = end - start
+            expert_path_span = cls.begin_profile_span() if profile else None
             expert_out, topk_pos = helper._expert_path(
                 all_latent[start:end],
                 all_idx[start:end],
                 count,
             )
+            if profile:
+                cls.end_profile_span(
+                    "grouped_expert_path", expert_path_span
+                )
+            combine_span = cls.begin_profile_span() if profile else None
             combined[start:end].copy_(
                 helper._combine_fp32(
                     expert_out,
@@ -1064,6 +1127,8 @@ class StreamedSP8MXFP4MoELayer:
                     top_k,
                 )
             )
+            if profile:
+                cls.end_profile_span("grouped_combine", combine_span)
         if profile:
             _profile_mark(marks)
 
