@@ -536,7 +536,7 @@ def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
     assert "acquire_batch_size=16" not in source
 
 
-def test_distributed_k3_sizes_the_prefill_ring_to_one_tp8_expert_shard():
+def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
     path = (
         ROOT
         / "batchgen"
@@ -549,11 +549,11 @@ def test_distributed_k3_sizes_the_prefill_ring_to_one_tp8_expert_shard():
         _function(path, "KimiLinearInitializer", "__init__")
     )
 
-    assert "if self.distributed_weight_sharded" in source
-    assert (
-        "num_prefill_module_buffer['routed_expert'] = "
-        "require_num_routed_experts(self.loaded_model_config) // G"
-    ) in source
+    # The routed-expert ring is bounded by the base planner's depth-8 slot
+    # budget. Sizing it to a whole 112-expert TP8 shard here would reserve ~12
+    # GiB of ring per rank for an ingress that now releases each bounded batch
+    # as soon as its copies land.
+    assert "num_prefill_module_buffer" not in source
 
 
 def test_streamed_sp8_forward_uses_only_local_row_collective():
@@ -1692,7 +1692,15 @@ class _FakeStreamContext:
         return False
 
 
-def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
+def _sp8_ingress_buffer(
+    trace,
+    *,
+    cross_group,
+    cross_root,
+    cross_source,
+    experts_per_rank=2,
+    acquire_batch_size=2,
+):
     """Bind the real ingress/assembly methods onto fake streams and NCCL."""
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     profile = type("Profile", (), {
@@ -1734,8 +1742,8 @@ def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
     buffer._cross_status = _FakeShardTensor("source_status", trace)
     buffer.tp_group = "tp8"
     buffer.expert_start = 336
-    buffer.experts_per_rank = 2
-    buffer.acquire_batch_size = 2
+    buffer.experts_per_rank = experts_per_rank
+    buffer.acquire_batch_size = acquire_batch_size
     buffer.cross_group = cross_group
     buffer.cross_root = cross_root
     buffer.cross_source = cross_source
@@ -1749,7 +1757,7 @@ def _sp8_ingress_buffer(trace, *, cross_group, cross_root, cross_source):
         get_weights=lambda name, phase: trace.append(
             ("get_weights", name, phase)
         ) or {tensor: tensor for tensor in SIX_TENSORS},
-        free_weights_buffer=lambda name: None,
+        free_weights_buffer=lambda name: trace.append(("free_weights", name)),
     )
     for name in (
         "_acquire_local_shard",
@@ -1775,8 +1783,15 @@ def _op_span(trace, op):
 def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     trace = []
     stream = _FakeIngressStream(trace)
+    # Four experts over a depth-2 ring: the source must complete the shard in
+    # two bounded batches, so the ring is NOT required to hold it whole.
     buffer, profile = _sp8_ingress_buffer(
-        trace, cross_group="cross3", cross_root=11, cross_source=True
+        trace,
+        cross_group="cross3",
+        cross_root=11,
+        cross_source=True,
+        experts_per_rank=4,
+        acquire_batch_size=2,
     )
 
     buffer._acquire_local_shard(
@@ -1788,7 +1803,7 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     buffer._assemble_compute_shard(stream=stream)
 
     ops = [entry[0] for entry in trace]
-    assert ops.count("get_weights") == 2
+    assert ops.count("get_weights") == 4
     assert ops.count("broadcast") == 7
     # Six same-rank local->compute copies, and no weight collective at all.
     assert ops.count("assemble") == 6
@@ -1805,15 +1820,34 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     # only after the model thread released it.
     assert _op_span(trace, "get_weights")[1] < _op_span(trace, "cross_gate")[0]
     assert _op_span(trace, "cross_gate")[1] < _op_span(trace, "broadcast")[0]
-    # The model-thread handoff proves all NCCL calls were issued, not that the
-    # source H2D or payload completed. Lease release waits for the earlier H2D
-    # event only after the handoff, preserving overlap without ring reuse.
     assert _op_span(trace, "broadcast")[1] < _op_span(
         trace, "cross_launch_handoff"
     )[0]
-    assert _op_span(trace, "cross_launch_handoff")[0] < _op_span(
-        trace, "h2d_synchronize"
-    )[0]
+
+    # Each bounded batch is synchronized and released on its own, and the first
+    # batch's slots are freed BEFORE the second batch acquires -- that is what
+    # lets a depth-2 ring carry a four-expert shard.
+    assert ops.count("synchronize") == 2
+    assert ops.count("free_weights") == 4
+    assert trace[:10] == [
+        ("get_weights", "routed_expert_7_336", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_337", "prefill_sp8"),
+        ("synchronize",),
+        ("free_weights", "routed_expert_7_336"),
+        ("free_weights", "routed_expert_7_337"),
+        ("get_weights", "routed_expert_7_338", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_339", "prefill_sp8"),
+        ("synchronize",),
+        ("free_weights", "routed_expert_7_338"),
+        ("free_weights", "routed_expert_7_339"),
+    ]
+    # Every lease is released before the cross-node phase begins, so no slot is
+    # held across the gate, the status broadcast or the payload broadcasts.
+    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
+    # Releases are not deferred behind an H2D completion event any more: the
+    # per-batch stream synchronize is the whole ordering.
+    assert "h2d_record" not in ops
+    assert "h2d_synchronize" not in ops
 
     broadcasts = [
         entry for entry in trace
@@ -1926,9 +1960,12 @@ def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     assert "broadcast" not in ops
     assert "cross_launch_handoff" not in ops
     assert "assemble" not in ops
-    assert _op_span(trace, "cross_gate")[0] < _op_span(
-        trace, "h2d_synchronize"
-    )[0]
+    # The leases were already released by their own bounded batch, so a
+    # cancelled gate returns early without stranding a single ring slot.
+    assert ops.count("free_weights") == 2
+    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
+    assert "h2d_record" not in ops
+    assert "h2d_synchronize" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 0
 

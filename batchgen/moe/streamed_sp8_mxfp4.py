@@ -110,16 +110,6 @@ class StreamedSP8LayerBuffer:
         self.intermediate_size = int(intermediate_size)
         self.latent_size = int(latent_size)
         self.acquire_batch_size = max(1, int(acquire_batch_size))
-        if (
-            self.cross_group is not None
-            and self.cross_source
-            and self.acquire_batch_size < self.experts_per_rank
-        ):
-            raise ValueError(
-                "hierarchical_gdr source ranks require the routed-expert "
-                f"ring depth ({self.acquire_batch_size}) to hold one complete "
-                f"{self.experts_per_rank}-expert shard"
-            )
         self.layer_indices = tuple(int(i) for i in (layer_indices or ()))
         self._next_layer = {
             current: following
@@ -191,8 +181,6 @@ class StreamedSP8LayerBuffer:
         self._allocate()
         copy_stream = stream or torch.cuda.current_stream(self.device)
         source_error = None
-        deferred_acquired = []
-        h2d_done = None
         if self._acquires_from_host:
             names = [
                 f"routed_expert_{layer_idx}_{expert_idx}"
@@ -208,7 +196,6 @@ class StreamedSP8LayerBuffer:
             try:
                 for begin in range(0, len(names), self.acquire_batch_size):
                     acquired = []
-                    batch_complete = False
                     batch = names[begin:begin + self.acquire_batch_size]
                     try:
                         with torch.cuda.stream(copy_stream):
@@ -226,29 +213,14 @@ class StreamedSP8LayerBuffer:
                                     self.local[tensor_name][local_offset].copy_(
                                         weights[tensor_name]
                                     )
-                        batch_complete = True
                     finally:
-                        if (
-                            self.cross_group is not None
-                            and batch_complete
-                        ):
-                            # The hierarchical source ring is required to hold
-                            # the complete shard. Record lease safety here, but
-                            # defer the CPU wait until after all payload
-                            # broadcasts have been issued so TP8 can proceed on
-                            # host launch order rather than H2D completion.
-                            deferred_acquired.extend(acquired)
-                            acquired.clear()
-                            h2d_done = torch.cuda.Event()
-                            h2d_done.record(copy_stream)
-                        else:
-                            # Host-RDMA batches, and every partial/error batch,
-                            # retain the original fail-safe release behavior.
-                            copy_stream.synchronize()
-                            for module_name in acquired:
-                                self.core_engine.free_weights_buffer(
-                                    module_name
-                                )
+                        # Both transports release each bounded batch as soon as
+                        # its copies have landed in ``self.local``, so the ring
+                        # only ever has to hold ``acquire_batch_size`` slots and
+                        # the next batch can reuse the ones just freed.
+                        copy_stream.synchronize()
+                        for module_name in acquired:
+                            self.core_engine.free_weights_buffer(module_name)
             except BaseException as exc:
                 if self.cross_group is None:
                     raise
@@ -257,43 +229,34 @@ class StreamedSP8LayerBuffer:
         # A source-side Python/storage failure must be announced before peers
         # enter the six large payload broadcasts. Otherwise the other three
         # nodes can wait forever after the source thread has already unwound.
-        try:
-            # Host/ring acquisition above is free to run as early as this
-            # thread starts, but the cross-node communicator is not: the model
-            # thread issues the layer's three TP8 gathers first and only then
-            # opens this gate, so every GPU keeps one deterministic
-            # TP8 -> cross-node launch order.  A cancelled gate means the phase
-            # is tearing down; issuing the status broadcast then would park
-            # this thread against peers that will never join it.
-            if cross_launch_gate is not None and not cross_launch_gate():
-                return
-            if not self._broadcast_source_status(
-                self._status_stream or copy_stream, source_error is None
-            ):
-                if source_error is not None:
-                    raise source_error
-                raise RuntimeError(
-                    f"hierarchical_gdr source rank {self.cross_root} failed "
-                    f"to acquire layer {layer_idx}"
-                )
+        #
+        # Host/ring acquisition above is free to run as early as this thread
+        # starts, but the cross-node communicator is not: the model thread
+        # issues the layer's three TP8 gathers first and only then opens this
+        # gate, so every GPU keeps one deterministic TP8 -> cross-node launch
+        # order.  A cancelled gate means the phase is tearing down; issuing the
+        # status broadcast then would park this thread against peers that will
+        # never join it.
+        if cross_launch_gate is not None and not cross_launch_gate():
+            return
+        if not self._broadcast_source_status(
+            self._status_stream or copy_stream, source_error is None
+        ):
+            if source_error is not None:
+                raise source_error
+            raise RuntimeError(
+                f"hierarchical_gdr source rank {self.cross_root} failed "
+                f"to acquire layer {layer_idx}"
+            )
 
-            # Cross-node replication is part of ingress, not of assembly: it
-            # writes ``self.local`` only, so it inherits the same WAR event and
-            # the same early-ingress overlap as the host copies above, and it
-            # necessarily precedes the local-to-compute copy that reads
-            # ``self.local``.
-            self._broadcast_local_shard(copy_stream)
-            if cross_launch_callback is not None:
-                cross_launch_callback()
-        finally:
-            # Payload reads ``self.local``, not the leased ring slots. Once all
-            # H2D copies have reached ``self.local`` the producer may safely
-            # reuse those slots while the cross-node broadcast remains in
-            # flight. The finally path preserves every lease on failures.
-            if h2d_done is not None:
-                h2d_done.synchronize()
-                for module_name in deferred_acquired:
-                    self.core_engine.free_weights_buffer(module_name)
+        # Cross-node replication is part of ingress, not of assembly: it
+        # writes ``self.local`` only, so it inherits the same WAR event and
+        # the same early-ingress overlap as the host copies above, and it
+        # necessarily precedes the local-to-compute copy that reads
+        # ``self.local``.
+        self._broadcast_local_shard(copy_stream)
+        if cross_launch_callback is not None:
+            cross_launch_callback()
 
     def _broadcast_source_status(self, stream, source_ok: bool) -> bool:
         """Tell peers whether the source shard is ready for payload ingress."""
