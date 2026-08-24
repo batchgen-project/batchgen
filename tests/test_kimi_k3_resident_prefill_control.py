@@ -2069,6 +2069,7 @@ def _sp8_ingress_buffer(
         "_prefill_profile_host_records": [],
     })
     globals_ = {
+        "SimpleNamespace": SimpleNamespace,
         "torch": SimpleNamespace(
             cuda=SimpleNamespace(
                 Event=lambda: _FakeIngressEvent(trace),
