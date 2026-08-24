@@ -3130,6 +3130,23 @@ def test_distributed_store_core_derives_and_checks_the_runtime_topology():
     assert "distributed routed-expert owner mismatch" in storage
 
 
+def test_distributed_daemon_selects_validated_configured_rail_devices():
+    daemon = (
+        ROOT
+        / "core"
+        / "Weights_Storage"
+        / "distributed_weight_daemon.cpp"
+    ).read_text()
+
+    assert 'config.contains("rail_devices")' in daemon
+    assert "devices.size() != kRails" in daemon
+    assert "rail_devices.at(rail_index)" in daemon
+    assert (
+        '"mlx5_bond_" + std::to_string(rail_index + 1) + ":1"'
+        not in daemon
+    )
+
+
 def test_kimi_initializer_cross_checks_store_nodes_against_world_size():
     source = (
         ROOT

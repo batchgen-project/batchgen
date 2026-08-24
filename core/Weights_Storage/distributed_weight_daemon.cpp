@@ -347,6 +347,26 @@ struct DistributedWeightDaemon::Impl {
             fail("invalid distributed weight transport: " + transport);
         }
         hierarchical_gdr = transport == "hierarchical_gdr";
+        if (config.contains("rail_devices")) {
+            const nlohmann::json& devices = config.at("rail_devices");
+            if (!devices.is_array() || devices.size() != kRails) {
+                fail("distributed weight rail_devices must contain exactly "
+                     "eight non-empty strings");
+            }
+            rail_devices.clear();
+            for (const nlohmann::json& device : devices) {
+                if (!device.is_string()) {
+                    fail("distributed weight rail_devices must contain "
+                         "exactly eight non-empty strings");
+                }
+                std::string value = device.get<std::string>();
+                if (value.empty()) {
+                    fail("distributed weight rail_devices must contain "
+                         "exactly eight non-empty strings");
+                }
+                rail_devices.push_back(std::move(value));
+            }
+        }
 
         // Eight TP8 workers per node: two nodes are world16, four are world32.
         if ((num_nodes != 2 && num_nodes != 4) || node_rank < 0 ||
@@ -399,6 +419,10 @@ struct DistributedWeightDaemon::Impl {
     bool worker_sharded = false;
     std::string transport = "host_rdma";
     bool hierarchical_gdr = false;
+    std::vector<std::string> rail_devices = {
+        "mlx5_bond_1:1", "mlx5_bond_2:1", "mlx5_bond_3:1",
+        "mlx5_bond_4:1", "mlx5_bond_5:1", "mlx5_bond_6:1",
+        "mlx5_bond_7:1", "mlx5_bond_8:1"};
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -530,8 +554,7 @@ struct DistributedWeightDaemon::Impl {
         ucp_config_t* config = nullptr;
         check_ucs(ucp_config_read(nullptr, nullptr, &config),
                   "ucp_config_read");
-        const std::string device =
-            "mlx5_bond_" + std::to_string(rail_index + 1) + ":1";
+        const std::string& device = rail_devices.at(rail_index);
         check_ucs(ucp_config_modify(config, "TLS", "rc_x,self"),
                   "ucp_config_modify TLS");
         check_ucs(

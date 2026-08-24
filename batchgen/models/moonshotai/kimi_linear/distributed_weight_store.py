@@ -20,6 +20,10 @@ WEIGHT_TRANSPORTS = ("host_rdma", "hierarchical_gdr")
 #: world16 (2 nodes) and world32 (4 nodes) topologies.
 DISTRIBUTED_NODE_COUNTS = (2, 4)
 
+#: Eight UCX rails used by the original H20 deployment. Configs may override
+#: these for fleets whose HCA numbering differs (for example H200 uses 0..7).
+DEFAULT_RAIL_DEVICES = tuple(f"mlx5_bond_{index}:1" for index in range(1, 9))
+
 
 def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
@@ -80,6 +84,20 @@ def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
             f"got {config.get('transport')!r}"
         )
     config["transport"] = transport
+    rail_devices = config.get("rail_devices", list(DEFAULT_RAIL_DEVICES))
+    if (
+        not isinstance(rail_devices, list)
+        or len(rail_devices) != len(DEFAULT_RAIL_DEVICES)
+        or any(
+            not isinstance(device, str) or not device
+            for device in rail_devices
+        )
+    ):
+        raise ValueError(
+            "distributed weight rail_devices must contain exactly eight "
+            "non-empty strings"
+        )
+    config["rail_devices"] = rail_devices
     store = Path(config["store_path"])
     if store.stat().st_size != int(config["store_bytes"]):
         raise ValueError("distributed compact-store byte size mismatch")

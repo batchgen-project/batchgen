@@ -194,6 +194,45 @@ def test_weight_transport_rejects_values_outside_the_two_allowed(tmp_path):
             load_distributed_weight_config(path)
 
 
+def test_rail_devices_default_and_override_are_normalized(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        DEFAULT_RAIL_DEVICES,
+        load_distributed_weight_config,
+    )
+
+    legacy = load_distributed_weight_config(_write_store_config(tmp_path))
+    assert legacy["rail_devices"] == list(DEFAULT_RAIL_DEVICES)
+
+    h200_devices = [f"mlx5_bond_{index}:1" for index in range(8)]
+    selected = load_distributed_weight_config(
+        _write_store_config(tmp_path / "h200", rail_devices=h200_devices)
+    )
+    assert selected["rail_devices"] == h200_devices
+
+
+@pytest.mark.parametrize(
+    "rail_devices",
+    (
+        "mlx5_bond_0:1",
+        [],
+        [f"mlx5_bond_{index}:1" for index in range(7)],
+        [f"mlx5_bond_{index}:1" for index in range(8)] + ["extra:1"],
+        [f"mlx5_bond_{index}:1" for index in range(7)] + [""],
+        [f"mlx5_bond_{index}:1" for index in range(7)] + [1],
+    ),
+)
+def test_rail_devices_require_eight_non_empty_strings(
+    tmp_path, rail_devices
+):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        load_distributed_weight_config,
+    )
+
+    path = _write_store_config(tmp_path, rail_devices=rail_devices)
+    with pytest.raises(ValueError, match="exactly eight non-empty strings"):
+        load_distributed_weight_config(path)
+
+
 def test_initializer_publishes_the_selected_transport_without_env_vars():
     tree = ast.parse(INITIALIZER.read_text(), filename=str(INITIALIZER))
     source = INITIALIZER.read_text()
