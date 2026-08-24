@@ -75,6 +75,25 @@ def _fp32_rmsnorm(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return value_fp32 * inv_rms * weight.float()
 
 
+def _add_rmsnorm_reference(
+    residual: torch.Tensor,
+    hidden_input: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mixed-precision reference for the fused add + RMSNorm kernels.
+
+    ``inv_rms`` is derived from the unrounded float ``residual + hidden`` sum,
+    while the normalized numerator is that sum after rounding to the residual
+    dtype -- the value the kernels store back into ``residual``.
+
+    Returns ``(residual_reference, output_reference)``.
+    """
+    unrounded_sum = residual.float() + hidden_input.float()
+    rounded_sum = unrounded_sum.to(residual.dtype)
+    inv_rms = torch.rsqrt(unrounded_sum.square().mean(dim=-1, keepdim=True) + EPS)
+    return rounded_sum, rounded_sum.float() * inv_rms * weight.float()
+
+
 def _assert_numeric(actual: torch.Tensor, reference: torch.Tensor) -> None:
     actual_fp32 = actual.float()
     error = (actual_fp32 - reference).abs()
@@ -120,9 +139,9 @@ def test_bf16_6144_matches_fp32_oracle(batch: int, ops: tuple[Callable, Callable
     _assert_numeric(output, _fp32_rmsnorm(x, weight))
 
     residual_input = residual.clone()
-    unrounded_sum = residual.float() + hidden_input.float()
-    output_reference = _fp32_rmsnorm(unrounded_sum, weight)
-    residual_reference = unrounded_sum.to(torch.bfloat16)
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual, hidden_input, weight
+    )
     add_output, returned_residual = add_rmsnorm(
         residual_input, hidden_input, weight, EPS
     )
@@ -148,9 +167,9 @@ def test_num_valid_tokens_preserves_residual_padding(
 
     residual_input = residual.clone()
     residual_padding = residual_input[valid_rows:].clone()
-    unrounded_sum = residual[:valid_rows].float() + hidden_input[:valid_rows].float()
-    output_reference = _fp32_rmsnorm(unrounded_sum, weight)
-    residual_reference = unrounded_sum.to(torch.bfloat16)
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual[:valid_rows], hidden_input[:valid_rows], weight
+    )
     add_output, returned_residual = add_rmsnorm(
         residual_input, hidden_input, weight, EPS, num_valid
     )
@@ -199,13 +218,15 @@ def test_cuda_graph_capture_and_replay(ops: tuple[Callable, Callable]) -> None:
     add_graph.replay()
     torch.cuda.synchronize()
 
-    unrounded_sum = residual.float() + hidden_input.float()
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual, hidden_input, weight
+    )
     _assert_add_result(
         add_output,
         returned_residual,
         residual_input,
-        unrounded_sum.to(torch.bfloat16),
-        _fp32_rmsnorm(unrounded_sum, weight),
+        residual_reference,
+        output_reference,
     )
 
 
@@ -254,18 +275,12 @@ def test_cuda_graph_replay_honors_dynamic_num_valid_tokens(
     add_graph.replay()
     torch.cuda.synchronize()
 
-    unrounded_sum = (
-        residual[:valid_rows].float() + hidden_input[:valid_rows].float()
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual[:valid_rows], hidden_input[:valid_rows], weight
     )
-    _assert_numeric(
-        add_output[:valid_rows],
-        _fp32_rmsnorm(unrounded_sum, weight),
-    )
+    _assert_numeric(add_output[:valid_rows], output_reference)
     assert returned_residual.data_ptr() == residual_input.data_ptr()
-    assert torch.equal(
-        residual_input[:valid_rows],
-        unrounded_sum.to(torch.bfloat16),
-    )
+    assert torch.equal(residual_input[:valid_rows], residual_reference)
     assert torch.equal(residual_input[valid_rows:], residual_padding)
     assert torch.isnan(add_output[valid_rows:].float()).all()
 
@@ -286,7 +301,9 @@ def test_scalar_fallbacks_match_fp32_oracle(
     _assert_numeric(output, _fp32_rmsnorm(x, weight))
 
     residual_input = residual.clone()
-    unrounded_sum = residual.float() + hidden_input.float()
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual, hidden_input, weight
+    )
     add_output, returned_residual = add_rmsnorm(
         residual_input, hidden_input, weight, EPS
     )
@@ -294,8 +311,8 @@ def test_scalar_fallbacks_match_fp32_oracle(
         add_output,
         returned_residual,
         residual_input,
-        unrounded_sum.to(dtype),
-        _fp32_rmsnorm(unrounded_sum, weight),
+        residual_reference,
+        output_reference,
     )
 
 
@@ -327,7 +344,9 @@ def test_unaligned_bf16_6144_falls_back_safely(
     output = rmsnorm(x, weight, EPS)
     _assert_numeric(output, _fp32_rmsnorm(x, weight))
 
-    unrounded_sum = residual.float() + hidden_input.float()
+    residual_reference, output_reference = _add_rmsnorm_reference(
+        residual, hidden_input, weight
+    )
     add_output, returned_residual = add_rmsnorm(
         residual, hidden_input, weight, EPS
     )
@@ -335,6 +354,73 @@ def test_unaligned_bf16_6144_falls_back_safely(
         add_output,
         returned_residual,
         residual,
-        unrounded_sum.to(torch.bfloat16),
-        _fp32_rmsnorm(unrounded_sum, weight),
+        residual_reference,
+        output_reference,
     )
+
+
+def test_aligned_specialization_matches_unaligned_fallback(
+    ops: tuple[Callable, Callable],
+) -> None:
+    """Both BF16-6144 paths must agree on value-identical inputs."""
+    rmsnorm, add_rmsnorm = ops
+    batch = 3
+    unaligned_x = _unaligned_random((batch, HIDDEN), 11)
+    unaligned_residual = _unaligned_random((batch, HIDDEN), 12)
+    unaligned_hidden = _unaligned_random((batch, HIDDEN), 13)
+    unaligned_weight = _unaligned_random((HIDDEN,), 14)
+    unaligned_weight.add_(1.0)
+
+    # Cloning into fresh allocator storage yields the 16B-aligned pointers that
+    # select the vector specialization, with bitwise-identical BF16 values.
+    aligned_x = unaligned_x.clone()
+    aligned_residual = unaligned_residual.clone()
+    aligned_hidden = unaligned_hidden.clone()
+    aligned_weight = unaligned_weight.clone()
+    for tensor in (aligned_x, aligned_residual, aligned_hidden, aligned_weight):
+        assert tensor.data_ptr() % 16 == 0
+
+    aligned_norm = rmsnorm(aligned_x, aligned_weight, EPS)
+    unaligned_norm = rmsnorm(unaligned_x, unaligned_weight, EPS)
+    _assert_numeric(aligned_norm, unaligned_norm.float())
+
+    aligned_out, aligned_returned = add_rmsnorm(
+        aligned_residual, aligned_hidden, aligned_weight, EPS
+    )
+    unaligned_out, unaligned_returned = add_rmsnorm(
+        unaligned_residual, unaligned_hidden, unaligned_weight, EPS
+    )
+    # The residual writeback is a plain BF16-rounded sum on both paths.
+    assert torch.equal(aligned_returned, unaligned_returned)
+    _assert_numeric(aligned_out, unaligned_out.float())
+
+
+def test_fused_add_uses_bf16_rounded_numerator(
+    ops: tuple[Callable, Callable],
+) -> None:
+    """Pin the fused numerator rounding independently of broad numeric gates."""
+    _, add_rmsnorm = ops
+
+    # Both inputs are exactly representable in BF16, but their FP32 sum is the
+    # midpoint between adjacent BF16 values around 1.0. Round-to-nearest-even
+    # therefore stores 1.0 in the residual. Normalizing that rounded numerator
+    # yields 0.99609375 in BF16; normalizing the unrounded 1.00390625 yields 1.0.
+    residual = torch.full((1, HIDDEN), 1.0, device="cuda", dtype=torch.bfloat16)
+    hidden_input = torch.full(
+        (1, HIDDEN), 2.0**-8, device="cuda", dtype=torch.bfloat16
+    )
+    weight = torch.ones((HIDDEN,), device="cuda", dtype=torch.bfloat16)
+    for tensor in (residual, hidden_input, weight):
+        assert tensor.data_ptr() % 16 == 0
+
+    unrounded_sum = torch.tensor(1.0 + 2.0**-8, device="cuda")
+    inv_rms = torch.rsqrt(unrounded_sum.square() + EPS)
+    rounded_reference = inv_rms.to(torch.bfloat16)
+    unrounded_reference = (unrounded_sum * inv_rms).to(torch.bfloat16)
+    assert rounded_reference.item() != unrounded_reference.item()
+
+    output, returned_residual = add_rmsnorm(
+        residual, hidden_input, weight, EPS
+    )
+    assert torch.equal(returned_residual, torch.ones_like(returned_residual))
+    assert torch.equal(output, rounded_reference.expand_as(output))

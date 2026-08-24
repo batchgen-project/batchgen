@@ -141,24 +141,23 @@ __global__ void add_rmsnorm_bf16_6144_kernel(
 
     __shared__ float warp_sums[kVectorWarps];
     __shared__ float s_inv_rms;
-    extern __shared__ float fp32_sums[];
 
     auto* residual_vectors = reinterpret_cast<BFloat16x8*>(residual);
     const auto* hidden_vectors = reinterpret_cast<const BFloat16x8*>(hidden);
     const auto* weight_vectors = reinterpret_cast<const BFloat16x8*>(weight);
     auto* output_vectors = reinterpret_cast<BFloat16x8*>(normed_out);
     int vector_index = row * kVectorThreads + threadIdx.x;
-    int shared_index = threadIdx.x * kVectorWidth;
 
     BFloat16x8 residual_vector = residual_vectors[vector_index];
     BFloat16x8 hidden_vector = hidden_vectors[vector_index];
+    // Matches the scalar fallback: the reduction uses the unrounded float sum
+    // while the normalized numerator re-reads the BF16-rounded residual.
     BFloat16x8 rounded_sum;
     float sum_sq = 0.0f;
     #pragma unroll
     for (int i = 0; i < kVectorWidth; ++i) {
         float sum = __bfloat162float(residual_vector.values[i])
                   + __bfloat162float(hidden_vector.values[i]);
-        fp32_sums[shared_index + i] = sum;
         rounded_sum.values[i] = __float2bfloat16_rn(sum);
         sum_sq = fmaf(sum, sum, sum_sq);
     }
@@ -174,9 +173,9 @@ __global__ void add_rmsnorm_bf16_6144_kernel(
     BFloat16x8 output_vector;
     #pragma unroll
     for (int i = 0; i < kVectorWidth; ++i) {
+        float val = __bfloat162float(rounded_sum.values[i]);
         float scale = __bfloat162float(weight_vector.values[i]);
-        output_vector.values[i] = __float2bfloat16_rn(
-            fp32_sums[shared_index + i] * s_inv_rms * scale);
+        output_vector.values[i] = __float2bfloat16_rn(val * s_inv_rms * scale);
     }
     output_vectors[vector_index] = output_vector;
 }
@@ -402,10 +401,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
                                    && is_aligned_16(weight.data_ptr<at::BFloat16>())
                                    && is_aligned_16(normed_out.data_ptr<at::BFloat16>());
                 if (hidden_size == kVectorHiddenSize && vector_aligned) {
-                    constexpr int shared_bytes =
-                        kVectorHiddenSize * sizeof(float);
                     add_rmsnorm_bf16_6144_kernel<<<
-                        blocks, kVectorThreads, shared_bytes, stream>>>(
+                        blocks, kVectorThreads, 0, stream>>>(
                         reinterpret_cast<__nv_bfloat16*>(
                             residual.data_ptr<at::BFloat16>()),
                         reinterpret_cast<const __nv_bfloat16*>(
