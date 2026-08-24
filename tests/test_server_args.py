@@ -1,9 +1,35 @@
 """Server-argument validation for the K3 distributed host-weight topologies."""
 
+import importlib
+import sys
+import types
+from pathlib import Path
+
 import pytest
 
-from batchgen.server import server_args as server_args_module
-from batchgen.server.server_args import ServerArgs, validate_server_args
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_server_args_module():
+    """Import the leaf module without running the HTTP server package init."""
+    package_name = "batchgen.server"
+    previous = sys.modules.get(package_name)
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(ROOT / "batchgen" / "server")]
+    sys.modules[package_name] = package
+    try:
+        return importlib.import_module("batchgen.server.server_args")
+    finally:
+        if previous is None:
+            sys.modules.pop(package_name, None)
+        else:
+            sys.modules[package_name] = previous
+
+
+server_args_module = _load_server_args_module()
+ServerArgs = server_args_module.ServerArgs
+validate_server_args = server_args_module.validate_server_args
 
 
 @pytest.fixture(autouse=True)
