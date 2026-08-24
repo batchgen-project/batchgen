@@ -5,6 +5,12 @@ host-KV append launches so a fixed-work remote run can attribute the residual to
 them. Everything that shapes the step's synchronization structure (capacity
 growth, the single event record + synchronize) must survive, and every consumer
 of host KV must fail closed once the writeback has been skipped.
+
+The second half of this module covers the GLM-5 whole-model-graph boundary
+host-KV writeback, which shares the deferred-KV plumbing but is a *production*
+path: it defers the per-token append into one exact-range copy per host view at
+the page boundary and at decode cleanup. The two must stay separate — the
+suppression knob keeps its own causal path and never turns into a writeback.
 """
 
 import pytest
@@ -528,3 +534,552 @@ def test_worker_state_drift_from_active_group_is_rejected(monkeypatch):
 
     with pytest.raises(RuntimeError, match="worker has"):
         worker._resolve_admission_batchgen_debug(_entries({FLAG: True}))
+
+
+# ==========================================================================
+# GLM-5 whole-model graph boundary host-KV writeback.
+# ==========================================================================
+
+
+class _FakeDirectHostKVView:
+    """Host worker view exposing the exact-range boundary copy."""
+
+    def __init__(self, name, trace, *, error=None):
+        self._name = name
+        self._trace = trace
+        self._error = error
+        self.task = object()
+
+    def async_copy_dirty_kv_token_ranges_to_host(
+        self,
+        *,
+        sequence_ids,
+        active_page_counts,
+        dirty_token_ranges,
+        k_device_page_ptrs,
+        v_device_page_ptrs,
+    ):
+        self._trace.append(
+            (
+                f"{self._name}_copy",
+                sequence_ids.tolist(),
+                active_page_counts.tolist(),
+                dirty_token_ranges.tolist(),
+                k_device_page_ptrs.tolist(),
+                None if v_device_page_ptrs is None else v_device_page_ptrs.tolist(),
+            )
+        )
+        if self._error is not None:
+            raise self._error
+        return self.task
+
+
+class _MappedHostKVView:
+    """Legacy mapped view: append-only, no exact-range capability."""
+
+    def async_append_decode_kv_to_host_batched_kernel(self, **kwargs):
+        raise AssertionError("append must not run on the boundary path")
+
+
+class _FakeGPUManager:
+    """Minimal stand-in for one side of the dual GPU paged-KV manager."""
+
+    def __init__(self, slot_order, base_ptr, *, num_layers=2, max_pages=2,
+                 page_counts=None, has_v=False):
+        self._gpu_page_table_manager = types.SimpleNamespace(
+            slot_to_seq_id=list(slot_order)
+        )
+        n = len(slot_order)
+        self._k = (
+            base_ptr + torch.arange(num_layers * n * max_pages, dtype=torch.int64)
+        ).reshape(num_layers, n, max_pages)
+        self._v = self._k + 10_000 if has_v else None
+        self._counts = torch.tensor(
+            list(page_counts) if page_counts is not None else [max_pages] * n,
+            dtype=torch.int32,
+        )
+
+    def get_padded_3d_page_pointers(self):
+        return self._k, self._v
+
+    def export_active_sequence_page_counts(self):
+        return self._counts
+
+
+def _dual(primary, auxiliary):
+    return types.SimpleNamespace(primary=primary, auxiliary=auxiliary)
+
+
+def _boundary_worker(monkeypatch, **overrides):
+    import batchgen.batchgen_worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "BATCHGEN_SYNC_KV", False)
+
+    worker = object.__new__(worker_mod.BatchGenWorker)
+    worker.rank = 0
+    worker._suppress_decode_host_kv_writeback = False
+    worker._glm5_whole_model_graph = True
+    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=None)
+    worker.global_batch = None
+    worker._pending_kv_append_tasks = []
+    worker._pending_kv_append_tensors = []
+    worker._boundary_kv_dirty_ranges = {}
+    worker._reset_boundary_kv_dirty_state()
+    for key, value in overrides.items():
+        setattr(worker, key, value)
+    return worker
+
+
+def _arm_deferred(worker, trace, *, ids=(11, 12), write_positions=(63, 64),
+                  primary_view=None, aux_view=None):
+    worker._deferred_kv_batch = (list(ids), list(write_positions))
+    worker._deferred_kv_entries = [(0, torch.zeros(2, 1, 8), None)]
+    worker._deferred_kv_entries_aux = [(0, torch.zeros(2, 1, 4), None)]
+    worker._deferred_kv_worker_view = (
+        primary_view if primary_view is not None
+        else _FakeDirectHostKVView("primary", trace)
+    )
+    worker._deferred_kv_worker_view_aux = (
+        aux_view if aux_view is not None
+        else _FakeDirectHostKVView("aux", trace)
+    )
+
+
+def _install_wait_stub(worker, trace, *, error=None):
+    def _wait(*, sync_distributed_errors=False, defer_errors=False):
+        deferred = list(
+            getattr(worker, "_deferred_kv_append_wait_errors", [])
+        )
+        if hasattr(worker, "_deferred_kv_append_wait_errors"):
+            worker._deferred_kv_append_wait_errors.clear()
+        trace.append(
+            ("wait", sync_distributed_errors, list(worker._pending_kv_append_tasks))
+        )
+        if error is not None:
+            raise error
+        num = len(worker._pending_kv_append_tasks)
+        worker._pending_kv_append_tasks.clear()
+        worker._pending_kv_append_tensors.clear()
+        if deferred:
+            raise RuntimeError(
+                f"KV append/offload failed on at least one rank: {deferred}"
+            )
+        return num
+
+    worker._wait_pending_kv_append_tasks = _wait
+
+
+def _assert_deferred_consumed(worker):
+    assert worker._deferred_kv_entries == []
+    assert worker._deferred_kv_entries_aux == []
+    assert worker._deferred_kv_batch is None
+    assert worker._deferred_kv_worker_view is None
+    assert worker._deferred_kv_worker_view_aux is None
+
+
+def test_recording_merges_exact_write_positions_across_tokens(monkeypatch):
+    trace = []
+    worker = _boundary_worker(monkeypatch)
+    gpu = _dual(_FakeGPUManager([11, 12], 0x1000), _FakeGPUManager([11, 12], 0x9000))
+
+    _arm_deferred(worker, trace, write_positions=(63, 64))
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is True
+    # write_pos = current_context_length - 1, recorded as [write_pos, write_pos+1).
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 64], 12: [64, 65]}
+    # Nothing is staged or appended for this token.
+    _assert_deferred_consumed(worker)
+    assert trace == []
+    assert worker._pending_kv_append_tasks == []
+
+    _arm_deferred(worker, trace, write_positions=(64, 65))
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is True
+    _arm_deferred(worker, trace, write_positions=(65, 66))
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is True
+
+    # Merged hull is exactly the tokens produced since the last flush.
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 66], 12: [64, 67]}
+
+
+def test_recording_tracks_a_sequence_that_joins_mid_interval(monkeypatch):
+    trace = []
+    worker = _boundary_worker(monkeypatch)
+    gpu = _dual(_FakeGPUManager([11, 12], 0x1000), _FakeGPUManager([11, 12], 0x9000))
+
+    _arm_deferred(worker, trace, ids=(11,), write_positions=(63,))
+    worker._record_glm5_boundary_dirty_kv(gpu)
+    _arm_deferred(worker, trace, ids=(11, 12), write_positions=(64, 20))
+    worker._record_glm5_boundary_dirty_kv(gpu)
+
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 65], 12: [20, 21]}
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "sync_kv",
+        "non_glm5_or_eager_fallback",
+        "no_deferred_batch",
+        "primary_view_without_capability",
+        "aux_view_without_capability",
+        "missing_aux_view",
+    ],
+)
+def test_missing_capability_keeps_per_token_stage_and_append(monkeypatch, missing):
+    import batchgen.batchgen_worker as worker_mod
+
+    trace = []
+    worker = _boundary_worker(monkeypatch)
+    gpu = _dual(_FakeGPUManager([11, 12], 0x1000), _FakeGPUManager([11, 12], 0x9000))
+    _arm_deferred(worker, trace)
+
+    if missing == "sync_kv":
+        monkeypatch.setattr(worker_mod, "BATCHGEN_SYNC_KV", True)
+    elif missing == "non_glm5_or_eager_fallback":
+        worker._glm5_whole_model_graph = False
+    elif missing == "no_deferred_batch":
+        worker._deferred_kv_batch = None
+    elif missing == "primary_view_without_capability":
+        worker._deferred_kv_worker_view = _MappedHostKVView()
+    elif missing == "aux_view_without_capability":
+        worker._deferred_kv_worker_view_aux = _MappedHostKVView()
+    else:
+        worker._deferred_kv_worker_view_aux = None
+
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is False
+
+    # Deferred metadata is left completely intact for the existing path.
+    assert worker._deferred_kv_entries != []
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert trace == []
+
+
+@pytest.mark.parametrize(
+    "gpu",
+    [
+        pytest.param(
+            _dual(_FakeGPUManager([11], 0x1000), None), id="missing_aux_manager"
+        ),
+        pytest.param(
+            _dual(_FakeGPUManager([11], 0x1000), types.SimpleNamespace()),
+            id="aux_manager_without_pointer_api",
+        ),
+        pytest.param(
+            _dual(types.SimpleNamespace(), _FakeGPUManager([11], 0x9000)),
+            id="primary_manager_without_pointer_api",
+        ),
+    ],
+)
+def test_missing_dual_manager_capability_keeps_per_token_path(monkeypatch, gpu):
+    trace = []
+    worker = _boundary_worker(monkeypatch)
+    _arm_deferred(worker, trace, ids=(11,), write_positions=(63,))
+
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is False
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert worker._deferred_kv_batch == ([11], [63])
+
+
+def test_suppression_control_never_becomes_boundary_writeback(monkeypatch):
+    trace = []
+    worker = _boundary_worker(monkeypatch, _suppress_decode_host_kv_writeback=True)
+    gpu = _dual(_FakeGPUManager([11, 12], 0x1000), _FakeGPUManager([11, 12], 0x9000))
+    _arm_deferred(worker, trace)
+
+    # Full capability present, but the diagnostic keeps its own causal path:
+    # the deferred metadata stays for _flush_deferred_kv_to_host to drop.
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is False
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert worker._deferred_kv_batch == ([11, 12], [63, 64])
+    assert trace == []
+
+
+def _armed_flush_worker(monkeypatch, trace, *, primary=None, aux=None,
+                        primary_view=None, aux_view=None,
+                        write_positions=(63, 64), ids=(11, 12)):
+    worker = _boundary_worker(monkeypatch)
+    gpu = _dual(
+        primary if primary is not None else _FakeGPUManager([11, 12], 0x1000),
+        aux if aux is not None else _FakeGPUManager([11, 12], 0x9000, max_pages=3),
+    )
+    _arm_deferred(
+        worker, trace, ids=ids, write_positions=write_positions,
+        primary_view=primary_view, aux_view=aux_view,
+    )
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is True
+    return worker, gpu
+
+
+def test_flush_launches_exact_ranges_on_both_views_then_waits(monkeypatch):
+    trace = []
+    primary = _FakeGPUManager([11, 12], 0x1000)
+    aux = _FakeGPUManager([11, 12], 0x9000, max_pages=3)
+    primary_view = _FakeDirectHostKVView("primary", trace)
+    aux_view = _FakeDirectHostKVView("aux", trace)
+    worker, _ = _armed_flush_worker(
+        monkeypatch, trace, primary=primary, aux=aux,
+        primary_view=primary_view, aux_view=aux_view,
+    )
+    _install_wait_stub(worker, trace)
+
+    assert worker._flush_boundary_dirty_kv_ranges() == 2
+
+    primary_call, aux_call, wait_call = trace
+    # Slot order, ranges, counts and pointers are all materialized in the SAME
+    # page-table slot order, per side.
+    assert primary_call == (
+        "primary_copy",
+        [11, 12],
+        [2, 2],
+        [[63, 64], [64, 65]],
+        primary._k.tolist(),
+        None,
+    )
+    assert aux_call == (
+        "aux_copy",
+        [11, 12],
+        [3, 3],
+        [[63, 64], [64, 65]],
+        aux._k.tolist(),
+        None,
+    )
+    # Both tasks are surfaced through the existing collective waiter.
+    assert wait_call == (
+        "wait", True, [primary_view.task, aux_view.task],
+    )
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert worker._boundary_kv_primary_manager is None
+    assert worker._boundary_kv_aux_manager is None
+    assert worker._boundary_kv_primary_view is None
+    assert worker._boundary_kv_aux_view is None
+
+
+def test_flush_ensures_host_capacity_before_materializing_page_tables(monkeypatch):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    _install_wait_stub(worker, trace)
+
+    def _ensure(sequence_ids, write_positions):
+        trace.append(("ensure_capacity", sequence_ids, write_positions))
+
+    worker._ensure_host_kv_append_capacity = _ensure
+    worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace[0] == ("ensure_capacity", [11, 12], [63, 64])
+    assert trace[1][0] == "primary_copy"
+
+
+def test_flush_emits_empty_ranges_for_active_but_undirtied_slots(monkeypatch):
+    trace = []
+    primary = _FakeGPUManager([11, 12, 13], 0x1000)
+    aux = _FakeGPUManager([11, 12, 13], 0x9000)
+    worker, _ = _armed_flush_worker(
+        monkeypatch, trace, primary=primary, aux=aux, ids=(12,),
+        write_positions=(7,),
+    )
+    _install_wait_stub(worker, trace)
+
+    worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace[0][1] == [11, 12, 13]
+    assert trace[0][3] == [[0, 0], [7, 8], [0, 0]]
+
+
+def test_flush_forwards_v_pointers_when_the_cache_has_them(monkeypatch):
+    trace = []
+    primary = _FakeGPUManager([11], 0x1000, has_v=True)
+    aux = _FakeGPUManager([11], 0x9000)
+    worker, _ = _armed_flush_worker(
+        monkeypatch, trace, primary=primary, aux=aux, ids=(11,),
+        write_positions=(5,),
+    )
+    _install_wait_stub(worker, trace)
+
+    worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace[0][5] == primary._v.tolist()
+    assert trace[1][5] is None
+
+
+def test_flush_without_dirty_state_still_waits_pending_appends(monkeypatch):
+    trace = []
+    worker = _boundary_worker(monkeypatch)
+    sentinel = object()
+    worker._pending_kv_append_tasks = [sentinel]
+    _install_wait_stub(worker, trace)
+
+    assert worker._flush_boundary_dirty_kv_ranges() == 1
+    assert trace == [("wait", True, [sentinel])]
+
+
+def test_flush_waits_per_token_appends_together_with_boundary_copies(monkeypatch):
+    trace = []
+    primary_view = _FakeDirectHostKVView("primary", trace)
+    aux_view = _FakeDirectHostKVView("aux", trace)
+    worker, _ = _armed_flush_worker(
+        monkeypatch, trace, primary_view=primary_view, aux_view=aux_view
+    )
+    leftover = object()
+    worker._pending_kv_append_tasks.append(leftover)
+    _install_wait_stub(worker, trace)
+
+    assert worker._flush_boundary_dirty_kv_ranges() == 3
+    assert trace[-1] == (
+        "wait", True, [leftover, primary_view.task, aux_view.task],
+    )
+
+
+def test_slot_order_mismatch_fails_closed_before_any_launch(monkeypatch):
+    trace = []
+    worker, _ = _armed_flush_worker(
+        monkeypatch,
+        trace,
+        primary=_FakeGPUManager([11, 12], 0x1000),
+        aux=_FakeGPUManager([12, 11], 0x9000),
+    )
+    _install_wait_stub(worker, trace)
+
+    with pytest.raises(RuntimeError, match="slot-order mismatch"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    # No copy launched, but every rank still enters the collective waiter so
+    # the local validation error cannot deadlock peers.
+    assert trace == [("wait", True, [])]
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 64], 12: [64, 65]}
+
+
+def test_dirty_id_missing_from_slot_order_fails_closed(monkeypatch):
+    trace = []
+    worker, _ = _armed_flush_worker(
+        monkeypatch,
+        trace,
+        primary=_FakeGPUManager([11], 0x1000),
+        aux=_FakeGPUManager([11], 0x9000),
+    )
+    _install_wait_stub(worker, trace)
+
+    with pytest.raises(RuntimeError, match="no GPU page-table slot"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace == [("wait", True, [])]
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 64], 12: [64, 65]}
+
+
+@pytest.mark.parametrize(
+    "attr",
+    [
+        "_boundary_kv_primary_manager",
+        "_boundary_kv_aux_manager",
+        "_boundary_kv_primary_view",
+        "_boundary_kv_aux_view",
+    ],
+)
+def test_lost_manager_or_view_fails_closed_with_dirty_ranges(monkeypatch, attr):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    _install_wait_stub(worker, trace)
+    setattr(worker, attr, None)
+
+    with pytest.raises(RuntimeError, match="dual GPU manager / host view"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace == [("wait", True, [])]
+    assert worker._boundary_kv_dirty_ranges != {}
+
+
+def test_page_count_width_mismatch_fails_closed(monkeypatch):
+    trace = []
+    aux = _FakeGPUManager([11, 12], 0x9000)
+    aux._counts = torch.tensor([2], dtype=torch.int32)
+    worker, _ = _armed_flush_worker(monkeypatch, trace, aux=aux)
+    _install_wait_stub(worker, trace)
+
+    with pytest.raises(RuntimeError, match="active page counts"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    # Both sides are validated before either launches, so an aux-side defect
+    # leaves no unwaited primary copy in flight and the ranges are still owed.
+    assert trace == [("wait", True, [])]
+    assert worker._boundary_kv_dirty_ranges != {}
+
+
+def test_pointer_rank_mismatch_fails_closed(monkeypatch):
+    trace = []
+    primary = _FakeGPUManager([11, 12], 0x1000)
+    primary._k = primary._k[0]
+    worker, _ = _armed_flush_worker(monkeypatch, trace, primary=primary)
+    _install_wait_stub(worker, trace)
+
+    with pytest.raises(RuntimeError, match="unusable primary page pointers"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace == [("wait", True, [])]
+    assert worker._boundary_kv_dirty_ranges != {}
+
+
+def test_launch_failure_keeps_dirty_ranges(monkeypatch):
+    trace = []
+    worker, _ = _armed_flush_worker(
+        monkeypatch,
+        trace,
+        aux_view=_FakeDirectHostKVView(
+            "aux", trace, error=RuntimeError("contains null pointer")
+        ),
+    )
+    _install_wait_stub(worker, trace)
+
+    with pytest.raises(RuntimeError, match="contains null pointer"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    # The primary task launched before aux failed, and was drained by the
+    # collective error path before the exception escaped.
+    assert trace[-1][0] == "wait"
+    assert len(trace[-1][2]) == 1
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 64], 12: [64, 65]}
+
+
+def test_collective_wait_failure_keeps_dirty_ranges(monkeypatch):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    _install_wait_stub(
+        worker, trace, error=RuntimeError("KV append/offload failed on at least one rank")
+    )
+
+    with pytest.raises(RuntimeError, match="at least one rank"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    assert worker._boundary_kv_dirty_ranges == {11: [63, 64], 12: [64, 65]}
+
+
+def test_successful_flush_clears_and_next_interval_starts_fresh(monkeypatch):
+    trace = []
+    worker, gpu = _armed_flush_worker(monkeypatch, trace)
+    _install_wait_stub(worker, trace)
+
+    worker._flush_boundary_dirty_kv_ranges()
+    assert worker._boundary_kv_dirty_ranges == {}
+
+    _arm_deferred(worker, trace, write_positions=(70, 71))
+    worker._record_glm5_boundary_dirty_kv(gpu)
+
+    assert worker._boundary_kv_dirty_ranges == {11: [70, 71], 12: [71, 72]}
+
+
+def test_reset_refuses_to_discard_unwritten_ranges_and_clears_after_cleanup(
+    monkeypatch,
+):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    _install_wait_stub(worker, trace)
+
+    # A new batch must not be able to drop ranges the cleanup flush never wrote.
+    with pytest.raises(RuntimeError, match="never written back"):
+        worker._reset_boundary_kv_dirty_state()
+
+    worker._flush_boundary_dirty_kv_ranges()
+    worker._reset_boundary_kv_dirty_state()
+
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert worker._boundary_kv_primary_manager is None
+    assert worker._boundary_kv_aux_manager is None
+    assert worker._boundary_kv_primary_view is None
+    assert worker._boundary_kv_aux_view is None

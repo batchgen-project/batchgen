@@ -856,6 +856,8 @@ class BatchGenWorker:
 		# global active set is marked stale on every rank so host-KV consumers fail
 		# closed. Batch-scoped; cleared in _reset_for_new_batch().
 		self._reset_decode_host_kv_writeback_debug_state()
+		# GLM-5 whole-model graph boundary host-KV writeback (batch-scoped).
+		self._reset_boundary_kv_dirty_state()
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -2534,6 +2536,247 @@ class BatchGenWorker:
 		self._deferred_kv_batch = None
 		self._deferred_kv_worker_view = None
 		self._deferred_kv_worker_view_aux = None
+
+	# ------------------------------------------------------------------
+	# GLM-5 whole-model graph: boundary host-KV writeback.
+	#
+	# The whole-model graph already writes decode KV into the GPU paged
+	# pages, so the per-token stage clone + host append only has to be
+	# materialized again where host KV can actually be read or where GPU
+	# pages can move/free: the page boundary and decode cleanup. Instead of
+	# appending every token, record which token each active sequence dirtied
+	# and issue ONE exact-range copy per host view at those points.
+	# ------------------------------------------------------------------
+
+	def _reset_boundary_kv_dirty_state(self) -> None:
+		"""Clear boundary host-KV dirty tracking, refusing to drop live ranges."""
+		pending = getattr(self, "_boundary_kv_dirty_ranges", None)
+		if pending:
+			raise RuntimeError(
+				f"Rank {self.rank}: refusing to reset boundary host-KV state with "
+				f"{len(pending)} dirty ranges that were never written back"
+			)
+		self._boundary_kv_dirty_ranges: Dict[int, List[int]] = {}
+		self._boundary_kv_primary_manager = None
+		self._boundary_kv_aux_manager = None
+		self._boundary_kv_primary_view = None
+		self._boundary_kv_aux_view = None
+
+	def _glm5_boundary_kv_writeback_targets(self, gpu_manager):
+		"""Return ``(primary_mgr, aux_mgr, primary_view, aux_view)`` or ``None``.
+
+		Capability-gated only — there is no environment switch. BATCHGEN_SYNC_KV,
+		the suppression control, non-GLM-5 paths, and any missing dual
+		manager/view capability all return ``None`` so the caller keeps the
+		existing per-token stage and append path.
+		"""
+		if BATCHGEN_SYNC_KV or self._suppress_decode_host_kv_writeback:
+			return None
+		if not getattr(self, "_glm5_whole_model_graph", False):
+			return None
+		if getattr(self, "_deferred_kv_batch", None) is None:
+			return None
+		primary_view = getattr(self, "_deferred_kv_worker_view", None)
+		aux_view = getattr(self, "_deferred_kv_worker_view_aux", None)
+		for view in (primary_view, aux_view):
+			if view is None or not callable(getattr(
+				view, "async_copy_dirty_kv_token_ranges_to_host", None
+			)):
+				return None
+		primary_mgr = getattr(gpu_manager, "primary", gpu_manager)
+		aux_mgr = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		for mgr in (primary_mgr, aux_mgr):
+			if mgr is None:
+				return None
+			if not callable(getattr(mgr, "get_padded_3d_page_pointers", None)):
+				return None
+			if not callable(getattr(mgr, "export_active_sequence_page_counts", None)):
+				return None
+		return primary_mgr, aux_mgr, primary_view, aux_view
+
+	def _record_glm5_boundary_dirty_kv(self, gpu_manager) -> bool:
+		"""Record this step's dirty token range per sequence after a graph replay.
+
+		Returns True when the boundary writeback took ownership of this step's KV
+		(the caller must then skip ``stage_post_graph_kv``), False when the
+		capability is unavailable and the per-token path must run unchanged.
+		"""
+		targets = self._glm5_boundary_kv_writeback_targets(gpu_manager)
+		if targets is None:
+			return False
+		primary_mgr, aux_mgr, primary_view, aux_view = targets
+		sequence_ids, write_positions = self._deferred_kv_batch
+		if len(sequence_ids) != len(write_positions):
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV metadata mismatch: "
+				f"sequence_ids={len(sequence_ids)} write_positions={len(write_positions)}"
+			)
+		for global_idx, write_pos in zip(sequence_ids, write_positions):
+			global_idx = int(global_idx)
+			write_pos = int(write_pos)
+			if write_pos < 0:
+				raise RuntimeError(
+					f"Rank {self.rank}: boundary host-KV writeback got negative write "
+					f"position {write_pos} for gid={global_idx}"
+				)
+			existing = self._boundary_kv_dirty_ranges.get(global_idx)
+			if existing is None:
+				self._boundary_kv_dirty_ranges[global_idx] = [write_pos, write_pos + 1]
+			else:
+				existing[0] = min(existing[0], write_pos)
+				existing[1] = max(existing[1], write_pos + 1)
+		self._boundary_kv_primary_manager = primary_mgr
+		self._boundary_kv_aux_manager = aux_mgr
+		self._boundary_kv_primary_view = primary_view
+		self._boundary_kv_aux_view = aux_view
+		# The graph wrote the GPU pages directly: drop the per-step callback
+		# metadata so no clone is staged and no host append is launched.
+		self._deferred_kv_entries = []
+		self._deferred_kv_entries_aux = []
+		self._deferred_kv_batch = None
+		self._deferred_kv_worker_view = None
+		self._deferred_kv_worker_view_aux = None
+		return True
+
+	def _boundary_kv_slot_order(self, primary_mgr, aux_mgr, dirty) -> List[int]:
+		"""Slot order shared by both GPU page tables, covering every dirty id."""
+		orders = []
+		for mgr, name in ((primary_mgr, "primary"), (aux_mgr, "aux")):
+			table_mgr = getattr(mgr, "_gpu_page_table_manager", None)
+			slot_order = getattr(table_mgr, "slot_to_seq_id", None)
+			if not slot_order:
+				raise RuntimeError(
+					f"Rank {self.rank}: boundary host-KV writeback found no {name} GPU "
+					"page-table slot order"
+				)
+			orders.append([int(seq_id) for seq_id in slot_order])
+		if orders[0] != orders[1]:
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV writeback slot-order mismatch — "
+				f"primary={orders[0][:8]} aux={orders[1][:8]}"
+			)
+		missing = sorted(set(dirty) - set(orders[0]))
+		if missing:
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV writeback has no GPU page-table "
+				f"slot for dirty global ids {missing[:8]} (n={len(missing)})"
+			)
+		return orders[0]
+
+	def _validate_boundary_kv_pointers(
+		self, name: str, k_ptrs, v_ptrs, page_counts, num_slots: int
+	) -> None:
+		if k_ptrs is None or k_ptrs.dim() != 3 or k_ptrs.shape[1] != num_slots:
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV writeback got unusable {name} page "
+				f"pointers shape={None if k_ptrs is None else tuple(k_ptrs.shape)} for "
+				f"{num_slots} slots"
+			)
+		if v_ptrs is not None and tuple(v_ptrs.shape) != tuple(k_ptrs.shape):
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV writeback {name} V pointer shape "
+				f"{tuple(v_ptrs.shape)} does not match K {tuple(k_ptrs.shape)}"
+			)
+		if page_counts is None or page_counts.numel() != num_slots:
+			raise RuntimeError(
+				f"Rank {self.rank}: boundary host-KV writeback {name} active page counts "
+				f"n={None if page_counts is None else page_counts.numel()} do not match "
+				f"{num_slots} slots"
+			)
+
+	def _flush_boundary_dirty_kv_ranges(self) -> int:
+		"""Copy every recorded dirty token range to host, then wait collectively.
+
+		Must run before any page-boundary decision or page/view mutation, and
+		again at decode cleanup before pages or views can be released. Also waits
+		the per-token append tasks, so it fully replaces the plain waiter at those
+		call sites. Returns the number of KV tasks waited for.
+		"""
+		dirty = getattr(self, "_boundary_kv_dirty_ranges", None)
+		if not hasattr(self, "_pending_kv_append_tasks"):
+			self._pending_kv_append_tasks = []
+		if not hasattr(self, "_pending_kv_append_tensors"):
+			self._pending_kv_append_tensors = []
+		if dirty:
+			try:
+				primary_mgr = self._boundary_kv_primary_manager
+				aux_mgr = self._boundary_kv_aux_manager
+				primary_view = self._boundary_kv_primary_view
+				aux_view = self._boundary_kv_aux_view
+				if (
+					primary_mgr is None or aux_mgr is None
+					or primary_view is None or aux_view is None
+				):
+						raise RuntimeError(
+							f"Rank {self.rank}: boundary host-KV writeback has {len(dirty)} dirty "
+							"ranges but the dual GPU manager / host view pair is missing"
+						)
+				# Preserve the per-token path's dynamic host-capacity guarantee.
+				# This may grow the mirrored primary/aux host allocation, so it
+				# must happen before either page table is materialized below.
+				dirty_items = sorted(dirty.items())
+				self._ensure_host_kv_append_capacity(
+					[global_idx for global_idx, _ in dirty_items],
+					[token_range[1] - 1 for _, token_range in dirty_items],
+				)
+				slot_order = self._boundary_kv_slot_order(primary_mgr, aux_mgr, dirty)
+				sequence_ids = torch.tensor(slot_order, dtype=torch.int64)
+				ranges = torch.tensor(
+					[list(dirty.get(seq_id, (0, 0))) for seq_id in slot_order],
+					dtype=torch.int64,
+				).reshape(len(slot_order), 2)
+				# Materialize and validate BOTH sides before launching either.
+				launches = []
+				for mgr, view, name in (
+					(primary_mgr, primary_view, "primary"),
+					(aux_mgr, aux_view, "aux"),
+				):
+					k_ptrs, v_ptrs = mgr.get_padded_3d_page_pointers()
+					page_counts = mgr.export_active_sequence_page_counts()
+					self._validate_boundary_kv_pointers(
+						name, k_ptrs, v_ptrs, page_counts, len(slot_order)
+					)
+					launches.append((view, k_ptrs, v_ptrs, page_counts))
+				for view, k_ptrs, v_ptrs, page_counts in launches:
+					self._pending_kv_append_tensors.extend(
+						t for t in (sequence_ids, page_counts, ranges, k_ptrs, v_ptrs)
+						if t is not None
+					)
+					task = view.async_copy_dirty_kv_token_ranges_to_host(
+						sequence_ids=sequence_ids,
+						active_page_counts=page_counts,
+						dirty_token_ranges=ranges,
+						k_device_page_ptrs=k_ptrs,
+						v_device_page_ptrs=v_ptrs,
+					)
+					if task is None:
+						raise RuntimeError(
+							"boundary host-KV exact-range copy returned no task"
+						)
+					self._pending_kv_append_tasks.append(task)
+			except Exception as exc:
+				# Every rank must still enter the collective waiter. It drains any
+				# task launched before this local failure and broadcasts the error,
+				# preventing one rank from hanging peers in the all-gather below.
+				if not hasattr(self, "_deferred_kv_append_wait_errors"):
+					self._deferred_kv_append_wait_errors = []
+				self._deferred_kv_append_wait_errors.append(
+					f"boundary dirty-range {type(exc).__name__}: {exc}"
+				)
+		num_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+		if dirty:
+			# Host pages are current only now; a failed launch or wait raises
+			# above and keeps the ranges for the next attempt.
+			dirty.clear()
+			self._boundary_kv_primary_manager = None
+			self._boundary_kv_aux_manager = None
+			self._boundary_kv_primary_view = None
+			self._boundary_kv_aux_view = None
+		return num_tasks
 
 	def _assert_host_kv_not_stale(self, global_ids, context: str) -> None:
 		"""Fail closed before stale host KV is read or fresh GPU KV is dropped.
@@ -8041,8 +8284,12 @@ class BatchGenWorker:
 		boundary_start = time.perf_counter()
 		
 		# ========== PHASE 0: Wait for pending async operations ==========
+		# Boundary host-KV writeback runs FIRST: before any decision is taken and
+		# before any host or GPU page is mutated, so the exact dirty ranges are
+		# copied off pages that are still in place. It also waits the per-token
+		# append tasks, so it replaces the plain waiter here.
 		t0 = time.perf_counter()
-		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+		timing.num_kv_append_tasks = self._flush_boundary_dirty_kv_ranges()
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
 		# decode_uuids sync: only run in debug mode for desync detection.
@@ -11346,6 +11593,13 @@ class BatchGenWorker:
 					else:
 						new_tokens_out = self._select_tokens(logits, batch_sequences)
 
+					if not _glm5_skip_graph_kv_offload and self._record_glm5_boundary_dirty_kv(gpu_manager):
+						# Whole-model replay succeeded and both host views expose the
+						# exact-range copy: the graph's own GPU pages are the record
+						# until the next page boundary / decode cleanup, so skip the
+						# per-token stage + append entirely for this token.
+						_glm5_skip_graph_kv_offload = True
+
 					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
 						# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
 						# contiguous-only clone path; no per-layer fallback branch).
@@ -11544,8 +11798,9 @@ class BatchGenWorker:
 				_dt.log_summary()
 				_dt.reset()
 
-		# Cleanup
-		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+		# Cleanup. Flush the boundary dirty ranges (and wait the per-token append
+		# tasks) BEFORE any GPU page or host worker view below can be released.
+		self._flush_boundary_dirty_kv_ranges()
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
@@ -13101,6 +13356,10 @@ class BatchGenWorker:
 
 		# Synchronize all ranks before cleanup
 		dist.barrier()
+		# Refuse before releasing host pages or destroying GPU pages. Decode
+		# cleanup normally flushed these ranges; reaching reset with live dirt
+		# means the data it protects must remain intact for diagnosis/retry.
+		self._reset_boundary_kv_dirty_state()
 		self._ignore_eos = False
 		# Reset logging flags for new batch (to log sampling mode once per batch)
 		self._logged_greedy = False
@@ -13171,7 +13430,6 @@ class BatchGenWorker:
 		# Causal-profiling suppression is batch-scoped; the next batch re-resolves
 		# it in set_batchgen_debug(), which runs after Init()/this reset.
 		self._reset_decode_host_kv_writeback_debug_state()
-		
 		# 8. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:
 			try:
