@@ -47,11 +47,9 @@ using batchgen::distributed_weights::Request;
 using batchgen::distributed_weights::Response;
 
 constexpr std::uint64_t kBootstrapMagic = 0x4b33523452444d41ULL;
-constexpr int kNodes = 4;
 constexpr int kRails = 8;
 constexpr int kLayers = 92;
 constexpr int kExperts = 896;
-constexpr int kExpertsPerOwner = 224;
 constexpr int kDefaultWorkers = 8;
 
 [[noreturn]] void fail(const std::string& message) {
@@ -226,8 +224,11 @@ void close_endpoint(ucp_worker_h worker, ucp_ep_h endpoint) {
     wait_request(worker, ucp_ep_close_nbx(endpoint, &params));
 }
 
-int destination_for_owner_rail(int owner, int rail) {
-    return (owner + 1 + (rail - 1) % 3) % kNodes;
+// Spread each owner's eight egress rails over the (num_nodes - 1) nodes that
+// pull from it. With four nodes this is the validated (rail - 1) % 3 walk;
+// with two nodes the single peer takes every rail.
+int destination_for_owner_rail(int owner, int rail, int num_nodes) {
+    return (owner + 1 + (rail - 1) % (num_nodes - 1)) % num_nodes;
 }
 
 double elapsed_seconds(Clock::time_point begin,
@@ -322,7 +323,8 @@ struct DistributedWeightDaemon::Impl {
         handle >> config;
         node_rank = config.at("node_rank").get<int>();
         node_ips = config.at("node_ips")
-                       .get<std::array<std::string, kNodes>>();
+                       .get<std::vector<std::string>>();
+        num_nodes = static_cast<int>(node_ips.size());
         store_path = config.at("store_path").get<std::string>();
         socket_path =
             config.at("daemon_socket").get<std::string>();
@@ -346,13 +348,15 @@ struct DistributedWeightDaemon::Impl {
         }
         hierarchical_gdr = transport == "hierarchical_gdr";
 
-        if (node_rank < 0 || node_rank >= kNodes ||
-            node_ips.size() != kNodes) {
+        // Eight TP8 workers per node: two nodes are world16, four are world32.
+        if ((num_nodes != 2 && num_nodes != 4) || node_rank < 0 ||
+            node_rank >= num_nodes) {
             fail("invalid distributed weight node topology");
         }
+        experts_per_owner = kExperts / num_nodes;
         if (depth <= 0 || depth % superchunk != 0 ||
             superchunk <= 0 || outstanding <= 0 ||
-            workers <= 0 || workers > 31 ||
+            workers != kDefaultWorkers ||
             !config.contains("worker_sharded") ||
             !config.at("worker_sharded").is_boolean() ||
             !worker_sharded ||
@@ -366,13 +370,20 @@ struct DistributedWeightDaemon::Impl {
         all_workers_mask =
             (static_cast<std::uint32_t>(1) << workers) - 1;
         slots.resize(depth);
+        owner_rails.resize(num_nodes);
+        owner_rail_cursor.assign(num_nodes, 0);
+        for (std::vector<RemoteEndpoint>& rail_remotes : remotes) {
+            rail_remotes.resize(num_nodes);
+        }
     }
 
     ~Impl() { Stop(); }
 
     std::string config_path;
     int node_rank = -1;
-    std::array<std::string, kNodes> node_ips;
+    int num_nodes = 0;
+    int experts_per_owner = 0;
+    std::vector<std::string> node_ips;
     std::string store_path;
     std::string socket_path;
     std::string summary_path;
@@ -401,11 +412,11 @@ struct DistributedWeightDaemon::Impl {
         return listeners;
     }();
     std::array<UcpRail, kRails> rails;
-    std::array<std::array<RemoteEndpoint, kNodes>, kRails> remotes;
+    std::array<std::vector<RemoteEndpoint>, kRails> remotes;
     std::array<std::vector<ucp_ep_h>, kRails> incoming_endpoints;
     std::array<std::vector<int>, kRails> incoming_controls;
-    std::array<std::vector<int>, kNodes> owner_rails;
-    std::array<int, kNodes> owner_rail_cursor{};
+    std::vector<std::vector<int>> owner_rails;
+    std::vector<int> owner_rail_cursor;
 
     std::atomic<bool> started{false};
     std::atomic<bool> stop{false};
@@ -750,10 +761,10 @@ struct DistributedWeightDaemon::Impl {
             }
 
             for (int rail = 0; rail < kRails; ++rail) {
-                for (int owner = 0; owner < kNodes; ++owner) {
+                for (int owner = 0; owner < num_nodes; ++owner) {
                     if (owner == node_rank ||
-                        destination_for_owner_rail(owner, rail + 1) !=
-                            node_rank) {
+                        destination_for_owner_rail(owner, rail + 1,
+                                                   num_nodes) != node_rank) {
                         continue;
                     }
                     const int fd = connect_retry(
@@ -820,13 +831,21 @@ struct DistributedWeightDaemon::Impl {
         if (stop.load()) {
             return;
         }
-        for (int owner = 0; owner < kNodes; ++owner) {
+        // kRails rails spread over the (num_nodes - 1) peers of each owner:
+        // 2/3 endpoints on four nodes, all 8 on two nodes.
+        const size_t min_rails =
+            static_cast<size_t>(kRails / (num_nodes - 1));
+        const size_t max_rails = static_cast<size_t>(
+            (kRails + num_nodes - 2) / (num_nodes - 1));
+        for (int owner = 0; owner < num_nodes; ++owner) {
             if (owner == node_rank) {
                 continue;
             }
-            if (owner_rails[owner].size() < 2 ||
-                owner_rails[owner].size() > 3) {
-                fail("owner rail mapping is not 2/3 endpoints");
+            if (owner_rails[owner].size() < min_rails ||
+                owner_rails[owner].size() > max_rails) {
+                fail("owner rail mapping is not " +
+                     std::to_string(min_rails) + "/" +
+                     std::to_string(max_rails) + " endpoints");
             }
         }
         for (int rail = 0; rail < kRails; ++rail) {
@@ -962,7 +981,7 @@ struct DistributedWeightDaemon::Impl {
                  module_key);
         }
         const auto [layer, expert] = parse_module_key(module_key);
-        const int owner = expert / kExpertsPerOwner;
+        const int owner = expert / experts_per_owner;
         if (owner == node_rank) {
             fail("daemon received a local module acquire: " +
                  module_key);
@@ -1071,7 +1090,7 @@ struct DistributedWeightDaemon::Impl {
     std::vector<std::string> BuildSchedule() const {
         std::vector<std::string> schedule;
         schedule.reserve(
-            kLayers * (kExperts - kExpertsPerOwner));
+            kLayers * (kExperts - experts_per_owner));
         if (worker_sharded) {
             const int experts_per_worker = kExperts / workers;
             // Round-robin complete superchunks across worker shards. Every
@@ -1085,7 +1104,7 @@ struct DistributedWeightDaemon::Impl {
                     for (int worker = 0; worker < workers; ++worker) {
                         const int first_expert =
                             worker * experts_per_worker + chunk_offset;
-                        if (first_expert / kExpertsPerOwner == node_rank) {
+                        if (first_expert / experts_per_owner == node_rank) {
                             continue;
                         }
                         for (int index = 0; index < superchunk; ++index) {
@@ -1100,7 +1119,7 @@ struct DistributedWeightDaemon::Impl {
         }
         for (int layer = 1; layer <= kLayers; ++layer) {
             for (int expert = 0; expert < kExperts; ++expert) {
-                if (expert / kExpertsPerOwner == node_rank) {
+                if (expert / experts_per_owner == node_rank) {
                     continue;
                 }
                 schedule.push_back(
@@ -1115,9 +1134,9 @@ struct DistributedWeightDaemon::Impl {
         const auto [layer, expert] = parse_module_key(module_key);
         return replicated_bytes +
                (static_cast<std::uint64_t>(layer - 1) *
-                    kExpertsPerOwner +
+                    experts_per_owner +
                 static_cast<std::uint64_t>(
-                    expert % kExpertsPerOwner)) *
+                    expert % experts_per_owner)) *
                    module_bytes;
     }
 
@@ -1213,7 +1232,7 @@ struct DistributedWeightDaemon::Impl {
                 const auto [layer, first_expert] =
                     parse_module_key(schedule[next]);
                 const int owner =
-                    first_expert / kExpertsPerOwner;
+                    first_expert / experts_per_owner;
                 if (next + superchunk > schedule.size()) {
                     fail("truncated final superchunk");
                 }
@@ -1222,7 +1241,7 @@ struct DistributedWeightDaemon::Impl {
                         parse_module_key(schedule[next + index]);
                     if (next_layer != layer ||
                         next_expert != first_expert + index ||
-                        next_expert / kExpertsPerOwner != owner) {
+                        next_expert / experts_per_owner != owner) {
                         fail("remote schedule is not superchunk-contiguous");
                     }
                 }
@@ -1392,7 +1411,7 @@ struct DistributedWeightDaemon::Impl {
         }
 
         for (int rail = 0; rail < kRails; ++rail) {
-            for (int owner = 0; owner < kNodes; ++owner) {
+            for (int owner = 0; owner < num_nodes; ++owner) {
                 RemoteEndpoint& remote = remotes[rail][owner];
                 if (remote.rkey != nullptr) {
                     ucp_rkey_destroy(remote.rkey);

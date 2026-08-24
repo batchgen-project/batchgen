@@ -42,6 +42,8 @@ using batchgen::distributed_weights::Operation;
 using batchgen::distributed_weights::Request;
 using batchgen::distributed_weights::Response;
 
+constexpr int kKimiK3Experts = 896;
+
 void send_exact(int fd, const void* data, size_t bytes) {
     const char* cursor = static_cast<const char*>(data);
     while (bytes > 0) {
@@ -204,6 +206,22 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
     config_handle >> config;
 
     this->local_node_rank_ = config.at("node_rank").get<int>();
+    // Runtime topology: eight TP8 workers per node, so two nodes are world16
+    // and four nodes are world32. Owners in the metadata are validated against
+    // this count below, before any of them can reach prefill.
+    const int num_nodes =
+        static_cast<int>(config.at("node_ips").size());
+    if (num_nodes != 2 && num_nodes != 4) {
+        throw std::runtime_error(
+            "distributed weights require exactly 2 or 4 node_ips, got " +
+            std::to_string(num_nodes));
+    }
+    if (this->local_node_rank_ < 0 ||
+        this->local_node_rank_ >= num_nodes) {
+        throw std::runtime_error(
+            "distributed weight node_rank is outside [0, " +
+            std::to_string(num_nodes) + ")");
+    }
     const std::string store_path =
         config.at("store_path").get<std::string>();
     const std::string metadata_path =
@@ -286,6 +304,38 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
             throw std::runtime_error(
                 "distributed tensor exceeds compact store: " +
                 module_key + "/" + tensor_key);
+        }
+        // -1 is the replicated marker; anything else must name a real node of
+        // this topology, otherwise a stale world32 store would silently be
+        // read as local on a two-node run.
+        if (owner < -1 || owner >= num_nodes) {
+            throw std::runtime_error(
+                "distributed weight owner " + std::to_string(owner) +
+                " is outside [-1, " + std::to_string(num_nodes) + "): " +
+                module_key + "/" + tensor_key);
+        }
+        if (owner >= 0) {
+            constexpr const char* prefix = "routed_expert_";
+            const size_t separator = module_key.rfind('_');
+            if (module_key.rfind(prefix, 0) != 0 ||
+                separator == std::string::npos ||
+                separator + 1 == module_key.size()) {
+                throw std::runtime_error(
+                    "distributed owned module is not a routed expert: " +
+                    module_key);
+            }
+            size_t parsed = 0;
+            const int expert =
+                std::stoi(module_key.substr(separator + 1), &parsed);
+            const size_t expert_digits = module_key.size() - separator - 1;
+            const int experts_per_owner = kKimiK3Experts / num_nodes;
+            if (parsed != expert_digits || expert < 0 ||
+                expert >= kKimiK3Experts ||
+                owner != expert / experts_per_owner) {
+                throw std::runtime_error(
+                    "distributed routed-expert owner mismatch: " +
+                    module_key + " owner=" + std::to_string(owner));
+            }
         }
         if (owner < 0 || owner == this->local_node_rank_) {
             this->module_weights_storage_[module_key][tensor_key] =

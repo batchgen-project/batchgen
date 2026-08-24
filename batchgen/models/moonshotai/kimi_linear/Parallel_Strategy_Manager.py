@@ -117,10 +117,11 @@ class KimiLinearParallelStrategyManager:
             )
         )
         if self._distributed_weight_sharded and (
-            not self._is_k3 or world_size != 32
+            not self._is_k3 or world_size not in (16, 32)
         ):
             raise ValueError(
-                "distributed host weights require K3 with world_size=32"
+                "distributed host weights require K3 with world_size=16 "
+                "(2 nodes) or world_size=32 (4 nodes)"
             )
         # Weight transport (initializer-set from the distributed store config,
         # no env var). "host_rdma" is the validated default in which every rank
@@ -196,18 +197,18 @@ class KimiLinearParallelStrategyManager:
         self._weight_tp_group = None
         # Hierarchical GDR adds a third communicator family: eight cross-node
         # groups, one per local TP slot, each carrying that slot's 112-expert
-        # shard from its single source rank to the other three nodes.
+        # shard from its single source rank to the remaining nodes.
         self._cross_weight_group = None
         self._cross_weight_root = None
         self._cross_weight_source = False
         if self._hierarchical_gdr and not (
             self._distributed_weight_sharded
-            and world_size == 32
+            and world_size in (16, 32)
             and self._attn_tp_size == 8
         ):
             raise ValueError(
                 "hierarchical_gdr weight transport is defined only for the "
-                "distributed K3 TP8/world32 topology; got "
+                "distributed K3 TP8/world16 or TP8/world32 topology; got "
                 f"distributed_weight_sharded={self._distributed_weight_sharded}, "
                 f"world_size={world_size}, "
                 f"attention_group_size={self._attn_tp_size}"
@@ -507,9 +508,10 @@ class KimiLinearParallelStrategyManager:
                 and self.prefill_uses_streamed_sp8()
                 and not self._cross_weight_source
             ):
-                # Hierarchical GDR: 24 of the 32 ranks receive this layer's
-                # shard over the cross-node broadcast, so they must request
-                # nothing at all from the host store.
+                # Hierarchical GDR: every rank that is not one of the eight
+                # sources receives this layer's shard over the cross-node
+                # broadcast, so it must request nothing at all from the host
+                # store.
                 continue
             for e_idx in range(len(moe.experts)):
                 if self.prefill_uses_streamed_sp8():
@@ -1125,11 +1127,13 @@ class KimiLinearParallelStrategyManager:
         They are created LAST so that the creation order of the attention and
         node-local weight groups is unchanged for host_rdma.
 
-        Group ``g`` is ``[g, g+8, g+16, g+24]`` — local TP slot ``g`` on each of
-        the four nodes, i.e. exactly the four ranks that need experts
-        ``[112g, 112(g+1))``. Its source is local slot ``g`` on node ``g // 2``,
-        so the eight sources spread two per node and every node drives an
-        egress stream instead of one node fanning out all 896 experts.
+        Group ``g`` is ``[g + n*8 for n in range(num_nodes)]`` — local TP slot
+        ``g`` on each node, i.e. exactly the ranks that need experts
+        ``[112g, 112(g+1))``. Its source is local slot ``g`` on node
+        ``(g * num_nodes) // 8``, so the eight sources spread evenly over the
+        nodes (two per node on four nodes, four per node on two nodes) and
+        every node drives an egress stream instead of one node fanning out all
+        896 experts.
         """
         if not self._hierarchical_gdr:
             return
@@ -1143,7 +1147,7 @@ class KimiLinearParallelStrategyManager:
             )
             if g == self._attn_tp_rank:
                 self._cross_weight_group = grp
-                self._cross_weight_root = (g // 2) * G + g
+                self._cross_weight_root = ((g * num_nodes) // G) * G + g
         self._cross_weight_source = (
             self.global_rank == self._cross_weight_root
         )

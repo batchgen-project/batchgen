@@ -503,10 +503,10 @@ def validate_server_args(args: ServerArgs) -> None:
             raise ValueError(
                 "--distributed-weight-config currently supports Kimi-K3 only"
             )
-        if args.nnodes != 4 or args.world_size != 32:
+        if args.nnodes not in (2, 4) or args.world_size != args.nnodes * 8:
             raise ValueError(
                 "Kimi-K3 distributed host weights require "
-                "--nnodes 4 --world-size 32"
+                "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
             )
     if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
         raise ValueError("watchdog_timeout must be non-negative (0 to disable)")

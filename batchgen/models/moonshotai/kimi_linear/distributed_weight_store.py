@@ -9,12 +9,16 @@ from typing import Any
 
 #: How a worker obtains this layer's 112-expert ingress shard.
 #:
-#: ``host_rdma`` (default, backward compatible) — every one of the 32 workers
-#: pulls its own shard from its node's compact host store.
+#: ``host_rdma`` (default, backward compatible) — every worker pulls its own
+#: shard from its node's compact host store.
 #: ``hierarchical_gdr`` — only eight source ranks pull from the host store and
-#: replicate their shard to the other three nodes over dedicated cross-node
+#: replicate their shard to the remaining nodes over dedicated cross-node
 #: NCCL groups.
 WEIGHT_TRANSPORTS = ("host_rdma", "hierarchical_gdr")
+
+#: Supported node counts. Each node runs eight TP8 workers, so these are the
+#: world16 (2 nodes) and world32 (4 nodes) topologies.
+DISTRIBUTED_NODE_COUNTS = (2, 4)
 
 
 def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
@@ -38,10 +42,25 @@ def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             f"distributed weight config {config_path} misses {missing}"
         )
-    if len(config["node_ips"]) != 4:
-        raise ValueError("distributed weight config requires four node IPs")
-    if int(config["node_rank"]) not in range(4):
-        raise ValueError("distributed weight node_rank must be in [0, 4)")
+    num_nodes = len(config["node_ips"])
+    if num_nodes not in DISTRIBUTED_NODE_COUNTS:
+        raise ValueError(
+            "distributed weight config requires exactly "
+            f"{' or '.join(str(n) for n in DISTRIBUTED_NODE_COUNTS)} node "
+            f"IPs; got {num_nodes}"
+        )
+    if "num_nodes" in config and int(config["num_nodes"]) != num_nodes:
+        raise ValueError(
+            f"distributed weight num_nodes {config['num_nodes']} disagrees "
+            f"with {num_nodes} node IPs"
+        )
+    # Normalized so every caller can read `config["num_nodes"]` instead of
+    # re-deriving the topology from the IP list.
+    config["num_nodes"] = num_nodes
+    if int(config["node_rank"]) not in range(num_nodes):
+        raise ValueError(
+            f"distributed weight node_rank must be in [0, {num_nodes})"
+        )
     if config["worker_sharded"] is not True:
         raise ValueError(
             "K3 distributed host weights require worker_sharded=true; "

@@ -516,6 +516,69 @@ def test_hierarchical_gdr_builds_the_exact_cross_node_group_and_root_map():
         dist.new_group = original
 
 
+def test_hierarchical_gdr_cross_node_map_follows_the_node_count():
+    """world16 (2 nodes) and world32 (4 nodes) both derive from world_size."""
+    dist = pytest.importorskip("torch.distributed")
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    build = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_build_cross_weight_group",
+    )
+    created = []
+    original = dist.new_group
+
+    def fake_new_group(ranks=None, **kwargs):
+        created.append(tuple(ranks))
+        return ("group", tuple(ranks))
+
+    dist.new_group = fake_new_group
+    try:
+        for world_size, expected_sources in (
+            (16, [0, 1, 2, 3, 12, 13, 14, 15]),
+            (32, [0, 1, 10, 11, 20, 21, 30, 31]),
+        ):
+            num_nodes = world_size // 8
+            sources = []
+            for global_rank in range(world_size):
+                manager = type("Manager", (), {})()
+                manager._hierarchical_gdr = True
+                manager._attn_tp_size = 8
+                manager._attn_tp_rank = global_rank % 8
+                manager.world_size = world_size
+                manager.global_rank = global_rank
+                manager._cross_weight_group = None
+                manager._cross_weight_root = None
+                manager._cross_weight_source = False
+                created.clear()
+                build.__get__(manager)()
+
+                # Cross group g stays [g + n*8], one rank per node.
+                assert created == [
+                    tuple(g + node * 8 for node in range(num_nodes))
+                    for g in range(8)
+                ]
+                g = global_rank % 8
+                assert manager._cross_weight_root == (
+                    ((g * num_nodes) // 8) * 8 + g
+                )
+                assert 0 <= manager._cross_weight_root < world_size
+                if manager._cross_weight_source:
+                    sources.append(global_rank)
+
+            # Eight sources, spread evenly so every node drives egress.
+            assert sources == expected_sources
+    finally:
+        dist.new_group = original
+
+
 def test_hierarchical_gdr_requires_supported_implicit_launch_order(monkeypatch):
     path = (
         ROOT
@@ -3046,6 +3109,40 @@ def test_hierarchical_gdr_core_transport_fails_closed_without_host_network():
     assert "BootstrapNetwork();" in daemon
     assert "hierarchical_gdr forbids remote host acquire" in daemon
     assert 'summary["transport"] = transport' in daemon
+
+
+def test_distributed_store_core_derives_and_checks_the_runtime_topology():
+    storage = (
+        ROOT / "core" / "Weights_Storage" / "Weights_Storage.cpp"
+    ).read_text()
+    daemon = (
+        ROOT
+        / "core"
+        / "Weights_Storage"
+        / "distributed_weight_daemon.cpp"
+    ).read_text()
+
+    assert "num_nodes != 2 && num_nodes != 4" in daemon
+    assert "experts_per_owner = kExperts / num_nodes" in daemon
+    assert "(rail - 1) % (num_nodes - 1)" in daemon
+    assert "workers != kDefaultWorkers" in daemon
+    assert "owner != expert / experts_per_owner" in storage
+    assert "distributed routed-expert owner mismatch" in storage
+
+
+def test_kimi_initializer_cross_checks_store_nodes_against_world_size():
+    source = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "kimi_initializer.py"
+    ).read_text()
+
+    assert 'self.world_size not in (16, 32)' in source
+    assert 'distributed_config["num_nodes"] * 8 != self.world_size' in source
+    assert "distributed weight config topology does not match" in source
 
 
 def test_streamed_sp8_reinterprets_offline_marlin_as_int32():

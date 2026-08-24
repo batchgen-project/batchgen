@@ -775,6 +775,12 @@ class WorkerManager:
 
         config_path = Path(self.args.distributed_weight_config)
         config = load_distributed_weight_config(config_path)
+        if int(config["num_nodes"]) != int(self.args.nnodes):
+            raise ValueError(
+                "distributed weight config lists "
+                f"{config['num_nodes']} node IPs, which does not match "
+                f"--nnodes {self.args.nnodes}"
+            )
         if int(config["node_rank"]) != int(self.args.node_rank):
             raise ValueError(
                 "distributed weight config node_rank does not match "

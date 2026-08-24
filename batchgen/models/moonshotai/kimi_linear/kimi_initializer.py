@@ -86,11 +86,11 @@ class KimiLinearInitializer:
         )
         self.distributed_weight_sharded = bool(self.distributed_weight_config)
         if self.distributed_weight_sharded and (
-            not self.is_k3 or self.world_size != 32
+            not self.is_k3 or self.world_size not in (16, 32)
         ):
             raise ValueError(
                 "K3 distributed host weights require model_type='kimi_k3' "
-                "and world_size=32"
+                "and world_size=16 (2 nodes) or world_size=32 (4 nodes)"
             )
         # Weight transport is selected in the distributed store config, not by
         # an env var. Re-reading the (small) JSON here keeps the allowed-value
@@ -99,9 +99,16 @@ class KimiLinearInitializer:
         if self.distributed_weight_sharded:
             from .distributed_weight_store import load_distributed_weight_config
 
-            self.distributed_weight_transport = load_distributed_weight_config(
+            distributed_config = load_distributed_weight_config(
                 self.distributed_weight_config
-            )["transport"]
+            )
+            if distributed_config["num_nodes"] * 8 != self.world_size:
+                raise ValueError(
+                    "distributed weight config topology does not match "
+                    f"world_size={self.world_size}: "
+                    f"num_nodes={distributed_config['num_nodes']}"
+                )
+            self.distributed_weight_transport = distributed_config["transport"]
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
