@@ -26,8 +26,9 @@ namespace kernels {
 // Warpgroup barriers use IDs 2/3 to avoid conflict with __syncthreads (barrier 0).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC,
-          typename TmaAS, typename TmaBS, bool IsLoopH, int kBlockThreads>
-__global__ void __launch_bounds__(kBlockThreads, 1)
+          typename TmaAS, typename TmaBS, bool IsLoopH, int kBlockThreads,
+          int kMinBlocksPerSM = 1>
+__global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
     fp8_blockwise_fused_s1_kernel(
         const __grid_constant__ TmaB tma_b_gate,
         const __grid_constant__ TmaB tma_b_up,
@@ -155,6 +156,8 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
   constexpr int kNumThreads = size(TiledMma{});
   static_assert(kBlockThreads == kNumThreads + 128,
                 "block must contain the math threads plus one loader warpgroup");
+  static_assert(kMinBlocksPerSM == 1 || (kMinBlocksPerSM == 2 && kBlockThreads <= 256),
+                "minBlocksPerSM=2 is only valid for blocks of at most 256 threads");
 
   // ========================================================================
   // LOADER WARPGROUP (after the Config-selected math threads)

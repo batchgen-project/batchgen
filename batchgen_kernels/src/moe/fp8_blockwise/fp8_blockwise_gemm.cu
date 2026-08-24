@@ -26,7 +26,7 @@ namespace moe {
 // ============================================================================
 template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage, int kWarpgroupM,
           int kWarpgroupN, int kSwizzleX, int kSwizzleW, int kSwizzleY,
-          int kBlockThreads = 384, int kGridMultiplier = 1>
+          int kBlockThreads = 384, int kGridMultiplier = 1, int kMinBlocksPerSM = 1>
 void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                 const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                 const void *xscale_ptr, const void *wscale_ptr, void *tmas_ptr,
@@ -95,7 +95,7 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
           kernels::fp8_blockwise_grouped_gemm_kernel<decltype(config), decltype(tma_x),
                                                       decltype(tma_w), decltype(tma_y),
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH,
-                                                      kBlockThreads>;
+                                                      kBlockThreads, kMinBlocksPerSM>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr,
@@ -107,7 +107,7 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
           kernels::fp8_blockwise_grouped_gemm_kernel<decltype(config), decltype(tma_x),
                                                       decltype(tma_w), decltype(tma_y),
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH,
-                                                      kBlockThreads>;
+                                                      kBlockThreads, kMinBlocksPerSM>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr,
@@ -181,23 +181,24 @@ void fp8_blockwise_grouped_gemm_high_occ_async(
   constexpr int kSwizzleY = 64;
   constexpr int kBlockThreads = 256;
   constexpr int kGridMultiplier = 2;
+  constexpr int kMinBlocksPerSM = 2;
 
   if (num_seq_per_group_avg <= 16) {
     launch_fp8_blockwise_gemm<16, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY,
-                               kBlockThreads, kGridMultiplier>(
+                               kBlockThreads, kGridMultiplier, kMinBlocksPerSM>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
         tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   } else if (num_seq_per_group_avg <= 32) {
     launch_fp8_blockwise_gemm<32, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY,
-                               kBlockThreads, kGridMultiplier>(
+                               kBlockThreads, kGridMultiplier, kMinBlocksPerSM>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
         tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   } else {
     launch_fp8_blockwise_gemm<64, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY,
-                               kBlockThreads, kGridMultiplier>(
+                               kBlockThreads, kGridMultiplier, kMinBlocksPerSM>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
         tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   }
@@ -308,7 +309,7 @@ torch::Tensor fp8_blockwise_grouped_gemm_high_occ(
 template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage,
           int kWarpgroupM, int kWarpgroupN,
           int kSwizzleX, int kSwizzleW, int kSwizzleY,
-          int kBlockThreads = 384, int kGridMultiplier = 1>
+          int kBlockThreads = 384, int kGridMultiplier = 1, int kMinBlocksPerSM = 1>
 void launch_fp8_blockwise_fused_s1(
     void *y_ptr, const void *x_ptr,
     const void *gate_w_ptr, const void *up_w_ptr,
@@ -380,7 +381,8 @@ void launch_fp8_blockwise_fused_s1(
       constexpr bool IsLoopH = true;
       auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
           decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
-          decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads>;
+          decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads,
+          kMinBlocksPerSM>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
@@ -392,7 +394,8 @@ void launch_fp8_blockwise_fused_s1(
       constexpr bool IsLoopH = false;
       auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
           decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
-          decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads>;
+          decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads,
+          kMinBlocksPerSM>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
@@ -453,12 +456,13 @@ void fp8_blockwise_fused_s1_high_occ_async(
   constexpr int kTileN = 64, kTileK = 128, kTileS = 64, kStage = 4;
   constexpr int kWarpgroupM = 1, kWarpgroupN = 1;
   constexpr int kSwizzleX = 128, kSwizzleW = 128, kSwizzleY = 64;
-  constexpr int kBlockThreads = 256, kGridMultiplier = 2;
+  constexpr int kBlockThreads = 256, kGridMultiplier = 2, kMinBlocksPerSM = 2;
 
   if (num_seq_per_group_avg <= 16) {
     launch_fp8_blockwise_fused_s1<
         16, kTileN, kTileK, kTileS, kStage, kWarpgroupM, kWarpgroupN,
-        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier>(
+        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier,
+        kMinBlocksPerSM>(
         y_ptr, x_ptr, gate_w_ptr, up_w_ptr, seqlens_ptr, cu_seqlens_ptr,
         xscale_ptr, gate_wscale_ptr, up_wscale_ptr, tmas_ptr, tiles_ptr,
         cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4,
@@ -466,7 +470,8 @@ void fp8_blockwise_fused_s1_high_occ_async(
   } else if (num_seq_per_group_avg <= 32) {
     launch_fp8_blockwise_fused_s1<
         32, kTileN, kTileK, kTileS, kStage, kWarpgroupM, kWarpgroupN,
-        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier>(
+        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier,
+        kMinBlocksPerSM>(
         y_ptr, x_ptr, gate_w_ptr, up_w_ptr, seqlens_ptr, cu_seqlens_ptr,
         xscale_ptr, gate_wscale_ptr, up_wscale_ptr, tmas_ptr, tiles_ptr,
         cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4,
@@ -474,7 +479,8 @@ void fp8_blockwise_fused_s1_high_occ_async(
   } else {
     launch_fp8_blockwise_fused_s1<
         64, kTileN, kTileK, kTileS, kStage, kWarpgroupM, kWarpgroupN,
-        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier>(
+        kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier,
+        kMinBlocksPerSM>(
         y_ptr, x_ptr, gate_w_ptr, up_w_ptr, seqlens_ptr, cu_seqlens_ptr,
         xscale_ptr, gate_wscale_ptr, up_wscale_ptr, tmas_ptr, tiles_ptr,
         cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4,

@@ -169,8 +169,8 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 // x_scale is indexed in x's row space via cu_seqlens (see file header).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC, typename TmaAS,
-          typename TmaBS, bool IsLoopH, int kBlockThreads>
-__global__ void __launch_bounds__(kBlockThreads, 1)
+          typename TmaBS, bool IsLoopH, int kBlockThreads, int kMinBlocksPerSM = 1>
+__global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
     fp8_blockwise_grouped_gemm_kernel(const __grid_constant__ TmaB tma_b,
                                       const __grid_constant__ TmaAS tma_as,
                                       const __grid_constant__ TmaBS tma_bs,
@@ -286,6 +286,8 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
   constexpr int kNumThreads = size(TiledMma{});
   static_assert(kBlockThreads == kNumThreads + 128,
                 "block must contain the math threads plus one loader warpgroup");
+  static_assert(kMinBlocksPerSM == 1 || (kMinBlocksPerSM == 2 && kBlockThreads <= 256),
+                "minBlocksPerSM=2 is only valid for blocks of at most 256 threads");
   // Loader warpgroup
   if (idx >= kNumThreads) {
     cutlass::arch::warpgroup_reg_dealloc<32>();
