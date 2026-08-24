@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
 #include "attention_ops.h"
 
 // ============================================================================
@@ -41,6 +42,147 @@ __device__ __forceinline__ float block_reduce_sum(float val) {
         val = warp_reduce_sum(val);
     }
     return val; // Only thread 0 has the final result
+}
+
+// ============================================================================
+// BF16 hidden-size-6144 vector specialization
+// ============================================================================
+
+constexpr int kVectorHiddenSize = 6144;
+constexpr int kVectorWidth = 8;
+constexpr int kVectorThreads = kVectorHiddenSize / kVectorWidth;
+constexpr int kVectorWarps = kVectorThreads / 32;
+
+struct alignas(16) BFloat16x8 {
+    __nv_bfloat16 values[kVectorWidth];
+};
+
+static_assert(sizeof(BFloat16x8) == 16, "BFloat16x8 must be 16 bytes");
+static_assert(sizeof(at::BFloat16) == sizeof(__nv_bfloat16),
+              "at::BFloat16 and __nv_bfloat16 must have the same size");
+
+__device__ __forceinline__ float block_reduce_sum_24(
+    float val,
+    float* warp_sums)
+{
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+
+    val = warp_reduce_sum(val);
+    if (lane == 0) {
+        warp_sums[warp_id] = val;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        val = (lane < kVectorWarps) ? warp_sums[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) {
+            warp_sums[0] = val;
+        }
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+__global__ void rmsnorm_bf16_6144_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    float eps,
+    const int* __restrict__ num_valid_ptr)
+{
+    int row = blockIdx.x;
+    if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
+    __shared__ float warp_sums[kVectorWarps];
+    __shared__ float s_inv_rms;
+
+    const auto* input_vectors = reinterpret_cast<const BFloat16x8*>(input);
+    const auto* weight_vectors = reinterpret_cast<const BFloat16x8*>(weight);
+    auto* output_vectors = reinterpret_cast<BFloat16x8*>(output);
+    int vector_index = row * kVectorThreads + threadIdx.x;
+
+    BFloat16x8 input_vector = input_vectors[vector_index];
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kVectorWidth; ++i) {
+        float val = __bfloat162float(input_vector.values[i]);
+        sum_sq = fmaf(val, val, sum_sq);
+    }
+
+    float total = block_reduce_sum_24(sum_sq, warp_sums);
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(total / kVectorHiddenSize + eps);
+    }
+    __syncthreads();
+
+    BFloat16x8 weight_vector = weight_vectors[threadIdx.x];
+    BFloat16x8 output_vector;
+    #pragma unroll
+    for (int i = 0; i < kVectorWidth; ++i) {
+        float val = __bfloat162float(input_vector.values[i]);
+        float scale = __bfloat162float(weight_vector.values[i]);
+        output_vector.values[i] = __float2bfloat16_rn(val * s_inv_rms * scale);
+    }
+    output_vectors[vector_index] = output_vector;
+}
+
+__global__ void add_rmsnorm_bf16_6144_kernel(
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ normed_out,
+    float eps,
+    const int* __restrict__ num_valid_ptr)
+{
+    int row = blockIdx.x;
+    if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
+    __shared__ float warp_sums[kVectorWarps];
+    __shared__ float s_inv_rms;
+    extern __shared__ float fp32_sums[];
+
+    auto* residual_vectors = reinterpret_cast<BFloat16x8*>(residual);
+    const auto* hidden_vectors = reinterpret_cast<const BFloat16x8*>(hidden);
+    const auto* weight_vectors = reinterpret_cast<const BFloat16x8*>(weight);
+    auto* output_vectors = reinterpret_cast<BFloat16x8*>(normed_out);
+    int vector_index = row * kVectorThreads + threadIdx.x;
+    int shared_index = threadIdx.x * kVectorWidth;
+
+    BFloat16x8 residual_vector = residual_vectors[vector_index];
+    BFloat16x8 hidden_vector = hidden_vectors[vector_index];
+    BFloat16x8 rounded_sum;
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kVectorWidth; ++i) {
+        float sum = __bfloat162float(residual_vector.values[i])
+                  + __bfloat162float(hidden_vector.values[i]);
+        fp32_sums[shared_index + i] = sum;
+        rounded_sum.values[i] = __float2bfloat16_rn(sum);
+        sum_sq = fmaf(sum, sum, sum_sq);
+    }
+    residual_vectors[vector_index] = rounded_sum;
+
+    float total = block_reduce_sum_24(sum_sq, warp_sums);
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(total / kVectorHiddenSize + eps);
+    }
+    __syncthreads();
+
+    BFloat16x8 weight_vector = weight_vectors[threadIdx.x];
+    BFloat16x8 output_vector;
+    #pragma unroll
+    for (int i = 0; i < kVectorWidth; ++i) {
+        float scale = __bfloat162float(weight_vector.values[i]);
+        output_vector.values[i] = __float2bfloat16_rn(
+            fp32_sums[shared_index + i] * s_inv_rms * scale);
+    }
+    output_vectors[vector_index] = output_vector;
+}
+
+inline bool is_aligned_16(const void* ptr) {
+    return reinterpret_cast<std::uintptr_t>(ptr) % 16 == 0;
 }
 
 // ============================================================================
@@ -176,11 +318,32 @@ torch::Tensor rmsnorm_forward(
     AT_DISPATCH_SWITCH(input.scalar_type(),
         "rmsnorm_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
-                input.data_ptr<at::BFloat16>(),
-                weight.data_ptr<at::BFloat16>(),
-                output.data_ptr<at::BFloat16>(),
-                hidden_size, eps, num_valid_ptr); })
+            [&] {
+                bool vector_aligned = is_aligned_16(input.data_ptr<at::BFloat16>())
+                                   && is_aligned_16(weight.data_ptr<at::BFloat16>())
+                                   && is_aligned_16(output.data_ptr<at::BFloat16>());
+                if (hidden_size == kVectorHiddenSize && vector_aligned) {
+                    rmsnorm_bf16_6144_kernel<<<blocks, kVectorThreads, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            input.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            weight.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<__nv_bfloat16*>(
+                            output.data_ptr<at::BFloat16>()),
+                        eps, num_valid_ptr);
+                } else {
+                    if (hidden_size == kVectorHiddenSize && !vector_aligned) {
+                        TORCH_WARN_ONCE(
+                            "BF16 RMSNorm hidden-size-6144 vector alignment check failed; "
+                            "falling back to the scalar kernel");
+                    }
+                    rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
+                        input.data_ptr<at::BFloat16>(),
+                        weight.data_ptr<at::BFloat16>(),
+                        output.data_ptr<at::BFloat16>(),
+                        hidden_size, eps, num_valid_ptr);
+                }
+            })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<at::Half>(),
@@ -233,12 +396,39 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
     AT_DISPATCH_SWITCH(residual.scalar_type(),
         "add_rmsnorm_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { add_rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
-                residual.data_ptr<at::BFloat16>(),
-                hidden.data_ptr<at::BFloat16>(),
-                weight.data_ptr<at::BFloat16>(),
-                normed_out.data_ptr<at::BFloat16>(),
-                hidden_size, eps, num_valid_ptr); })
+            [&] {
+                bool vector_aligned = is_aligned_16(residual.data_ptr<at::BFloat16>())
+                                   && is_aligned_16(hidden.data_ptr<at::BFloat16>())
+                                   && is_aligned_16(weight.data_ptr<at::BFloat16>())
+                                   && is_aligned_16(normed_out.data_ptr<at::BFloat16>());
+                if (hidden_size == kVectorHiddenSize && vector_aligned) {
+                    constexpr int shared_bytes =
+                        kVectorHiddenSize * sizeof(float);
+                    add_rmsnorm_bf16_6144_kernel<<<
+                        blocks, kVectorThreads, shared_bytes, stream>>>(
+                        reinterpret_cast<__nv_bfloat16*>(
+                            residual.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            hidden.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<const __nv_bfloat16*>(
+                            weight.data_ptr<at::BFloat16>()),
+                        reinterpret_cast<__nv_bfloat16*>(
+                            normed_out.data_ptr<at::BFloat16>()),
+                        eps, num_valid_ptr);
+                } else {
+                    if (hidden_size == kVectorHiddenSize && !vector_aligned) {
+                        TORCH_WARN_ONCE(
+                            "BF16 Add+RMSNorm hidden-size-6144 vector alignment check failed; "
+                            "falling back to the scalar kernel");
+                    }
+                    add_rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
+                        residual.data_ptr<at::BFloat16>(),
+                        hidden.data_ptr<at::BFloat16>(),
+                        weight.data_ptr<at::BFloat16>(),
+                        normed_out.data_ptr<at::BFloat16>(),
+                        hidden_size, eps, num_valid_ptr);
+                }
+            })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { add_rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<at::Half>(),
