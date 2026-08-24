@@ -319,6 +319,207 @@ def test_mapped_mla_view_routes_prefill_and_batched_decode_writes(bg):
         _shm_unlink(shm_name)
 
 
+@pytest.mark.parametrize("use_custom_stream", [False, True])
+def test_mapped_mla_view_copies_exact_dirty_gpu_page_ranges(
+    bg, use_custom_stream
+):
+    shm_name = _random_shm_name()
+    cfg = _make_mapped_mla_config(bg, shm_name)
+    view = None
+    sequence_ids = [110, 220, 330, 440]
+    active_pages = 3
+    allocated_pages = 4
+    dirty_ranges = [
+        (0, 0),
+        (1, PAGE_TOKENS + 3),
+        (PAGE_TOKENS - 1, PAGE_TOKENS * 2 + 1),
+        (PAGE_TOKENS * 2 - 2, PAGE_TOKENS * 3),
+    ]
+    host_sentinel = -37.0
+
+    try:
+        torch.cuda.set_device(0)
+        view = bg.MappedMLAHostPagedKVWorkerView(cfg)
+        view.initialize(0, True)
+        view.register_sequences(sequence_ids)
+        allocations = view.allocate_pages_for_sequences(
+            [
+                (sequence_id, PAGE_TOKENS * allocated_pages)
+                for sequence_id in sequence_ids
+            ]
+        )
+        assert all(len(pages) == allocated_pages for pages in allocations)
+
+        host_initial = torch.full(
+            (
+                NUM_PHYSICAL_LAYERS,
+                allocated_pages,
+                PAGE_TOKENS,
+                NUM_K_HEADS,
+                K_HEAD_DIM,
+            ),
+            host_sentinel,
+            dtype=torch.bfloat16,
+        )
+        for sequence_id in sequence_ids:
+            view.write_sequence_kv_from_cpu(sequence_id, host_initial, None)
+
+        source_shape = (
+            NUM_PHYSICAL_LAYERS,
+            len(sequence_ids),
+            active_pages,
+            PAGE_TOKENS,
+            NUM_K_HEADS,
+            K_HEAD_DIM,
+        )
+        source_cpu = torch.empty(
+            source_shape,
+            dtype=torch.bfloat16,
+            pin_memory=True,
+        )
+        layer_values = torch.arange(NUM_PHYSICAL_LAYERS).view(-1, 1, 1, 1)
+        sequence_values = torch.arange(len(sequence_ids)).view(1, -1, 1, 1)
+        token_values = torch.arange(active_pages * PAGE_TOKENS).view(
+            1, 1, active_pages, PAGE_TOKENS
+        )
+        source_bits = (
+            1
+            + layer_values
+            * len(sequence_ids)
+            * active_pages
+            * PAGE_TOKENS
+            + sequence_values * active_pages * PAGE_TOKENS
+            + token_values
+        ).to(torch.uint16)
+        source_values = source_bits.view(torch.bfloat16)
+        source_cpu.copy_(
+            source_values[..., None, None].expand(source_shape)
+        )
+
+        device_pages = torch.empty(
+            source_shape,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        device_ptrs = torch.zeros(
+            (
+                NUM_PHYSICAL_LAYERS,
+                len(sequence_ids),
+                allocated_pages,
+            ),
+            dtype=torch.int64,
+        )
+        for physical_layer in range(NUM_PHYSICAL_LAYERS):
+            for sequence_idx in range(len(sequence_ids)):
+                for page_idx in range(active_pages):
+                    device_ptrs[
+                        physical_layer, sequence_idx, page_idx
+                    ] = device_pages[
+                        physical_layer, sequence_idx, page_idx
+                    ].data_ptr()
+
+        sequence_tensor = torch.tensor(sequence_ids, dtype=torch.int64)
+        page_count_tensor = torch.full(
+            (len(sequence_ids),), active_pages, dtype=torch.int32
+        )
+        range_tensor = torch.tensor(dirty_ranges, dtype=torch.int64)
+
+        if use_custom_stream:
+            producer_stream = torch.cuda.Stream(device=0)
+            with torch.cuda.stream(producer_stream):
+                device_pages.copy_(source_cpu, non_blocking=True)
+                task = view.async_copy_dirty_kv_token_ranges_to_host(
+                    sequence_tensor,
+                    page_count_tensor,
+                    range_tensor,
+                    device_ptrs,
+                    None,
+                )
+        else:
+            device_pages.copy_(source_cpu, non_blocking=True)
+            task = view.async_copy_dirty_kv_token_ranges_to_host(
+                sequence_tensor,
+                page_count_tensor,
+                range_tensor,
+                device_ptrs,
+                None,
+            )
+        task.wait()
+
+        for sequence_idx, sequence_id in enumerate(sequence_ids):
+            actual, v_cpu = view.read_sequence_kv_to_cpu(sequence_id)
+            assert v_cpu.numel() == 0
+            expected = host_initial.clone()
+            start_token, end_token = dirty_ranges[sequence_idx]
+            expected_tokens = expected.view(
+                NUM_PHYSICAL_LAYERS,
+                allocated_pages * PAGE_TOKENS,
+                NUM_K_HEADS,
+                K_HEAD_DIM,
+            )
+            source_active = source_cpu[:, sequence_idx].reshape(
+                NUM_PHYSICAL_LAYERS,
+                active_pages * PAGE_TOKENS,
+                NUM_K_HEADS,
+                K_HEAD_DIM,
+            )
+            expected_tokens[:, start_token:end_token].copy_(
+                source_active[:, start_token:end_token]
+            )
+            assert torch.equal(actual, expected)
+
+        null_active_pointer = device_ptrs.clone()
+        null_active_pointer[0, 1, 0] = 0
+        with pytest.raises(RuntimeError, match="contains null pointer"):
+            view.async_copy_dirty_kv_token_ranges_to_host(
+                sequence_tensor,
+                page_count_tensor,
+                range_tensor,
+                null_active_pointer,
+                None,
+            )
+
+        beyond_capacity = range_tensor.clone()
+        beyond_capacity[1] = torch.tensor(
+            [0, active_pages * PAGE_TOKENS + 1], dtype=torch.int64
+        )
+        with pytest.raises(IndexError, match="exceeds active token capacity"):
+            view.async_copy_dirty_kv_token_ranges_to_host(
+                sequence_tensor,
+                page_count_tensor,
+                beyond_capacity,
+                device_ptrs,
+                None,
+            )
+
+        reversed_range = range_tensor.clone()
+        reversed_range[1] = torch.tensor([2, 1], dtype=torch.int64)
+        with pytest.raises(IndexError, match="invalid token range"):
+            view.async_copy_dirty_kv_token_ranges_to_host(
+                sequence_tensor,
+                page_count_tensor,
+                reversed_range,
+                device_ptrs,
+                None,
+            )
+
+        with pytest.raises(ValueError, match="V cache is disabled"):
+            view.async_copy_dirty_kv_token_ranges_to_host(
+                sequence_tensor,
+                page_count_tensor,
+                range_tensor,
+                device_ptrs,
+                device_ptrs,
+            )
+
+        view.release_sequence_pages(sequence_ids)
+        view.shutdown()
+        view = None
+    finally:
+        _close_view(view, sequence_ids)
+        _shm_unlink(shm_name)
+
+
 def test_mapped_mla_view_rejects_all_absent_mapping(bg):
     cfg = _make_mapped_mla_config(bg, _random_shm_name())
     cfg.logical_to_physical_layer = [-1, -1, -1]

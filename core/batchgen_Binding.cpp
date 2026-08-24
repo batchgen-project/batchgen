@@ -71,6 +71,13 @@ struct HasGrowPagesForSequences<
            std::declval<const std::vector<std::size_t>&>()))>>
     : std::true_type {};
 
+template <typename T>
+struct IsDirectHostPagedKVWorkerView : std::false_type {};
+
+template <kv::HostKVMode Mode, typename Layout, typename LayerMapper>
+struct IsDirectHostPagedKVWorkerView<
+    kv::HostPagedKVWorkerView<Mode, Layout, LayerMapper>> : std::true_type {};
+
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
     py::class_<Manager>(m, name)
@@ -386,6 +393,36 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
     if constexpr (HasCompressionRatio<WorkerView>::value) {
         cls.def_property_readonly("compression_ratio",
                                   &WorkerView::compression_ratio);
+    }
+    if constexpr (IsDirectHostPagedKVWorkerView<WorkerView>::value) {
+        cls.def(
+            "async_copy_dirty_kv_token_ranges_to_host",
+            [](WorkerView& self, torch::Tensor sequence_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor dirty_token_ranges,
+               torch::Tensor k_device_page_ptrs,
+               std::optional<torch::Tensor> v_device_page_ptrs) {
+                return self.AsyncCopyDirtyKVTokenRangesToHost(
+                    std::move(sequence_ids), std::move(active_page_counts),
+                    std::move(dirty_token_ranges),
+                    std::move(k_device_page_ptrs),
+                    std::move(v_device_page_ptrs));
+            },
+            py::arg("sequence_ids"), py::arg("active_page_counts"),
+            py::arg("dirty_token_ranges"),
+            py::arg("k_device_page_ptrs"),
+            py::arg("v_device_page_ptrs") = py::none(),
+            "Asynchronously copy exact per-sequence [start, end) token ranges "
+            "from GPU paged-KV pages to the corresponding host pages. "
+            "Pointer tensors must be CPU int64 tensors shaped "
+            "[physical_layers, batch, max_pages] and aligned with "
+            "sequence_ids and active_page_counts. The layer dimension is "
+            "physical even for mapped worker views and is not logically "
+            "remapped. Empty ranges are no-ops; ranges may differ by "
+            "sequence and cross page boundaries. V pointers are optional "
+            "and invalid for MLA worker views. The caller must keep the "
+            "worker view, host sequence pages, and GPU pages alive and "
+            "unchanged until task.wait() completes.");
     }
 }
 
