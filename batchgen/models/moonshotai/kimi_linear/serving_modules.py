@@ -43,11 +43,28 @@ from .wrappers import KimiLinearExpertWrapper
 # ============================================================================
 
 
+def _wait_streamed_sp8_cross_launch(module):
+    """Host-enqueue the pending cross-node weight calls before a TP collective.
+
+    Installed on the underlying attention module by the PSM for streamed-SP8
+    prefill only, and removed again on release, so decode and every other
+    prefill mode see no attribute and pay nothing. The next layer's
+    cross-node broadcast gate opened at the end of the previous layer's MoE;
+    under ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` this all-reduce is the next TP8
+    launch, so every rank must observe the same cross-then-TP8 host order
+    here or the implicit ordering serializes them against each other.
+    """
+    order_wait = getattr(module, "_streamed_sp8_order_wait", None)
+    if order_wait is not None:
+        order_wait()
+
+
 def _reduce_mla_tp_output(module, output):
     """Sum the row-parallel MLA output projection across the TP group."""
     if getattr(module, "attn_tp_size", 1) > 1:
         import torch.distributed as dist
 
+        _wait_streamed_sp8_cross_launch(module)
         dist.all_reduce(output, group=module.attn_tp_group)
     return output
 
@@ -601,6 +618,7 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     if getattr(self, "attn_tp_size", 1) > 1:
         import torch.distributed as dist
 
+        _wait_streamed_sp8_cross_launch(self)
         dist.all_reduce(o, group=self.attn_tp_group)
     return o
 
@@ -951,6 +969,14 @@ def moe_forward_serving(self, hidden_states):
         out = routed.reshape(orig_shape)
         if getattr(self, "shared_experts", None) is not None:
             out.add_(self.shared_experts(identity))
+        # Every TP8 collective of this layer -- the node-local latent/routing
+        # gathers, the FP32 reduce-scatter, the routed-output all-gather above
+        # and the shared expert's row-parallel all-reduce -- has now been
+        # issued. Only here may the parked prefetch thread launch the next
+        # layer's cross-node broadcasts, so under NCCL_LAUNCH_ORDER_IMPLICIT=1
+        # their payloads overlap the next layer's attention compute instead of
+        # pushing the peers' wait into one of the collectives above (E1).
+        streamed_sp8.buffer.allow_cross_launch()
         return out
 
     identity = hidden_states

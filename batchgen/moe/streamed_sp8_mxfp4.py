@@ -264,11 +264,11 @@ class StreamedSP8LayerBuffer:
         #
         # Host/ring acquisition above is free to run as early as this thread
         # starts, but the cross-node communicator is not: the model thread
-        # issues the layer's three TP8 gathers first and only then opens this
-        # gate, so every GPU keeps one deterministic TP8 -> cross-node launch
-        # order.  A cancelled gate means the phase is tearing down; issuing the
-        # status broadcast then would park this thread against peers that will
-        # never join it.
+        # issues every TP8 collective of the current layer first and only then
+        # opens this gate, so every GPU keeps one deterministic TP8 ->
+        # cross-node launch order.  A cancelled gate means the phase is tearing
+        # down; issuing the status broadcast then would park this thread
+        # against peers that will never join it.
         if cross_launch_gate is not None and not cross_launch_gate():
             return
         if not self._broadcast_source_status(
@@ -434,10 +434,11 @@ class StreamedSP8LayerBuffer:
         at the earliest possible point. It precedes grouped MoE and writes only
         ``self.local``, which no compute kernel reads. Hierarchical GDR parks
         the worker thread on :meth:`allow_cross_launch` before its cross-node
-        collectives so the model thread still issues the TP8 activation gathers
-        first, preserving one global host launch order. The copy that
-        overwrites ``self.compute`` is parked until
-        :meth:`allow_full_overwrite`.
+        collectives so the model thread still issues every TP8 collective of
+        the current layer first, preserving one global host launch order. The
+        copy that overwrites ``self.compute`` is parked until
+        :meth:`allow_full_overwrite`, which the MoE forward now grants BEFORE
+        that gate opens.
 
         The call is intentionally non-blocking for the model thread.  The
         C++ ``get_weights`` binding releases the GIL while waiting for the
@@ -460,10 +461,10 @@ class StreamedSP8LayerBuffer:
             compute_done=torch.cuda.Event(),
             # NCCL_LAUNCH_ORDER_IMPLICIT preserves overlap only when every
             # communicator launch has one deterministic host order. The gate
-            # below proves the TP8 gathers were issued before any cross-node
-            # collective; this handoff proves all cross-node broadcasts have
-            # been issued before the model thread is allowed to issue the TP8
-            # reduce-scatter.
+            # below proves every TP8 collective of the current layer was issued
+            # before any cross-node collective; this handoff proves all
+            # cross-node broadcasts have been issued before the model thread is
+            # allowed to issue the next layer's attention all-reduce.
             cross_launch_allowed=(
                 threading.Event() if self.cross_group is not None else None
             ),
@@ -560,12 +561,16 @@ class StreamedSP8LayerBuffer:
     def allow_cross_launch(self):
         """Let the pending prefetch issue its cross-node collectives.
 
-        Must be called on the model thread once this layer's three TP8
-        activation gathers have been issued.  Until then the worker thread has
-        already pulled its shard from the host store or the source ring, but
-        has issued neither the status broadcast nor the six payload
-        broadcasts, so ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` still sees one
-        deterministic TP8 -> cross-node order on every GPU.
+        Must be called on the model thread at the very END of the layer's MoE
+        serving branch, i.e. once EVERY TP8 collective of the current layer --
+        the latent/routing gathers, the reduce-scatter, the routed-output
+        all-gather and the shared-expert all-reduce -- has been issued.  E1
+        showed that opening the gate mid-layer only relocates the peers' wait
+        into the next TP8 collective, because implicit launch ordering turns
+        the host order into launch-completion edges.  Opening it last leaves
+        the cross-node payloads overlapping the next layer's attention compute
+        instead, and the worker thread has still issued neither the status
+        broadcast nor the six payload broadcasts before this point.
 
         Host-RDMA has no cross-node communicator and is a no-op here.
         """
@@ -582,19 +587,29 @@ class StreamedSP8LayerBuffer:
     def order_tp_collective_after_cross_launch(self):
         """Issue the next TP8 collective after every cross-node launch.
 
-        ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` turns this deterministic host order
-        into CUDA launch-completion edges while still permitting the two
-        communicator families to execute concurrently on CUDA 12.3+. Waiting
-        for ingress completion here would serialize every next-layer weight
-        transfer before the current reduce-scatter and prevent overlap into
-        the up-projection and next layer's attention.
+        Installed by the PSM on every attention module and called immediately
+        before the prefill attention TP all-reduce, which is the first TP8
+        collective after the gate opened at the end of the previous layer's
+        MoE.  ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` turns this deterministic host
+        order into CUDA launch-completion edges while still permitting the two
+        communicator families to execute concurrently on CUDA 12.3+, so the
+        payloads stay in flight across the whole attention compute.  Waiting
+        for ingress COMPLETION here would serialize every next-layer weight
+        transfer before that all-reduce and destroy the overlap.
 
         Host-RDMA has no cross-node GPU collective and is a no-op here.
         """
         pending = self._pending
         if self.cross_group is None or pending is None:
             return
-        if pending.profile_host is not None:
+        # Every layer's attention calls this, so a dense layer between two MoE
+        # layers would re-enter an already satisfied handoff. Keep the FIRST
+        # sample -- the one that actually waited -- instead of overwriting it
+        # with the zero-cost re-entry.
+        if (
+            pending.profile_host is not None
+            and pending.profile_host.order_wait_begin_s is None
+        ):
             pending.profile_host.order_wait_begin_s = time.perf_counter()
         if not pending.cross_launch_enqueued.wait(PREFETCH_HANDOFF_TIMEOUT_S):
             raise RuntimeError(
@@ -607,7 +622,10 @@ class StreamedSP8LayerBuffer:
             # phase teardown would observe the same poisoned pending state and
             # raise a second time before releasing the layer buffers.
             self._wait_pending()
-        if pending.profile_host is not None:
+        if (
+            pending.profile_host is not None
+            and pending.profile_host.order_wait_end_s is None
+        ):
             pending.profile_host.order_wait_end_s = time.perf_counter()
 
     def allow_full_overwrite(self):
@@ -618,6 +636,10 @@ class StreamedSP8LayerBuffer:
         them have all been enqueued.  The event is recorded here, at that late
         point, so it covers exactly the in-flight work that still reads
         ``self.compute``.
+
+        This grant now PRECEDES :meth:`allow_cross_launch`; the worker still
+        reaches the assembly only after its cross-node broadcasts, which are
+        enqueued ahead of it on the same prefetch stream.
         """
         pending = self._pending
         if pending is None or pending.overwrite_allowed.is_set():
@@ -628,18 +650,24 @@ class StreamedSP8LayerBuffer:
     def close(self):
         """Drain a pending prefetch before phase teardown."""
         pending = self._pending
-        if pending is not None and not pending.overwrite_allowed.is_set():
+        if pending is not None:
             # A forward that raised between the phases would otherwise leave
-            # the worker parked on a handshake forever.  ``allow_cross_launch``
-            # always precedes ``allow_full_overwrite`` in a forward, so an
-            # ungranted overwrite covers an ungranted cross launch too.  Cancel
-            # both instead of granting them: the phase is ending, and neither
-            # the peers' broadcasts nor the ingress the assembly follows may
-            # ever complete on the other ranks.
-            pending.cancelled = True
-            if pending.cross_launch_allowed is not None:
-                pending.cross_launch_allowed.set()
-            pending.overwrite_allowed.set()
+            # the worker parked on a handshake forever.  The grant order is now
+            # REVERSED -- ``allow_full_overwrite`` runs inside the MoE forward
+            # and ``allow_cross_launch`` at the end of the serving branch -- so
+            # a granted overwrite no longer implies a granted cross launch.
+            # Check both, and cancel rather than grant: the phase is ending,
+            # and neither the peers' broadcasts nor the ingress the assembly
+            # follows may ever complete on the other ranks.
+            cross_ungranted = (
+                pending.cross_launch_allowed is not None
+                and not pending.cross_launch_allowed.is_set()
+            )
+            if cross_ungranted or not pending.overwrite_allowed.is_set():
+                pending.cancelled = True
+                if pending.cross_launch_allowed is not None:
+                    pending.cross_launch_allowed.set()
+                pending.overwrite_allowed.set()
         self._wait_pending()
         self._prefetch_stream.synchronize()
 
@@ -681,6 +709,7 @@ class StreamedSP8LayerBuffer:
             self._acquire_local_shard(layer_idx)
             self._assemble_compute_shard()
         return self._make_shard()
+
 
 class StreamedSP8MXFP4MoELayer:
     """SP8 routed path for one K3 MoE layer."""
@@ -725,8 +754,8 @@ class StreamedSP8MXFP4MoELayer:
     # ingress stream.  Empty on host_rdma, which runs no cross-node collective.
     _prefill_profile_broadcast_spans = []
     # Host ``perf_counter`` timestamps for one ingress. The async record is
-    # published only after assembly, by which point the model thread has also
-    # completed the launch-order handoff. The first synchronous layer has no
+    # published after assembly; its order-wait timestamps may be filled later
+    # by the following attention layer. The first synchronous layer has no
     # gate/order-wait timestamps but still records acquisition and enqueue.
     _prefill_profile_host_records = []
 
@@ -897,18 +926,17 @@ class StreamedSP8MXFP4MoELayer:
         # Both transports start ingress at the earliest point, so the host and
         # ring-to-local acquisition of the next layer overlaps this one from
         # here. Hierarchical GDR holds only its cross-node collectives, until
-        # the gate released after the TP8 activation gathers below, so every
-        # GPU still orders TP8 -> cross-node.
+        # the gate the serving branch opens once EVERY TP8 collective of this
+        # layer has been issued, so every GPU still orders TP8 -> cross-node.
         buffer.begin_prefetch_next(self.layer_idx)
         # ``num_rows`` is the node-wide count, so this branch is taken by all
         # eight ranks together or by none.  Keying it on the per-rank ``T``
         # instead would desynchronize the node-local collectives below.
         if num_rows == 0:
-            # No activation collective exists to order against, but the gate
-            # must still open or the worker thread would never issue -- and
-            # never hand off -- the cross-node broadcasts its peers enter.
-            buffer.allow_cross_launch()
-            buffer.order_tp_collective_after_cross_launch()
+            # No reader of ``buffer.compute`` is enqueued at all, so the
+            # assembly may proceed.  The cross-node gate is NOT opened here:
+            # the serving branch opens it after the routed all-gather and the
+            # shared-expert all-reduce, which this node still enters.
             buffer.allow_full_overwrite()
             return x.new_zeros((0, H))
 
@@ -969,14 +997,6 @@ class StreamedSP8MXFP4MoELayer:
         dist.all_gather_into_tensor(all_weight, topk_weight, group=tp_group)
         if profile:
             _profile_mark(marks)
-        # All three TP8 gather calls have now been issued from the model
-        # thread. The prefetch thread, whose host ingress has been running
-        # since ``begin_prefetch_next`` above, may issue its cross-node
-        # communicator next; implicit launch ordering permits GPU overlap but
-        # preserves this deterministic host order.
-        buffer.allow_cross_launch()
-
-        if profile:
             cls._prefill_profile_grouped_chunks += (
                 num_node_rows + self.chunk_rows - 1
             ) // self.chunk_rows
@@ -1035,15 +1055,15 @@ class StreamedSP8MXFP4MoELayer:
         # --- node-local SUM of the eight disjoint FP32 partials, scattered ---
         # back to each rank's own padded row block. Summing in FP32 before the
         # single bf16 downcast matches the resident-EP reduction exactly.
-        # Every cross-node call is issued before TP8 is entered again, but the
-        # payloads remain in flight: NCCL implicit launch ordering prevents a
-        # cross-communicator cycle while overlap continues through the TP8
-        # reduce-scatter, up-projection and next layer's attention.
-        buffer.order_tp_collective_after_cross_launch()
+        # No cross-node call has been issued yet: E1 showed that opening the
+        # gate here only moved the peers' payload wait into THIS reduce-scatter
+        # under ``NCCL_LAUNCH_ORDER_IMPLICIT=1``. Every TP8 collective of the
+        # layer now runs first and the gate opens after the serving branch's
+        # routed all-gather and shared-expert all-reduce.
         if profile:
-            # Bounds grouped completion -> permission to re-enter TP8. Under
-            # the E0 control this included the completion fence; launch-only
-            # leaves just the deterministic host launch handoff.
+            # Kept as boundary 5 so the nine-mark layout and the snapshot keys
+            # are unchanged. It no longer straddles a launch handoff, so the
+            # legacy ``fence_stall`` span is intentionally near zero.
             _profile_mark(marks)
         local_latent = combined.new_empty((ntp, latent_size))
         if profile:

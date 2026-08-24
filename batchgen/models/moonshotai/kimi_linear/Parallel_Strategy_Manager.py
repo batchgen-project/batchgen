@@ -393,18 +393,43 @@ class KimiLinearParallelStrategyManager:
             if moe is not None:
                 moe._streamed_sp8_prefill_enabled = bool(enabled)
 
+    def _streamed_sp8_attention_modules(self):
+        """The UNDERLYING attention module of every layer.
+
+        ``self_attn`` is the streaming wrapper by the time prefill is
+        configured, but the serving methods that run the TP all-reduce are
+        installed on the module it wraps, so the launch-order callback the
+        streamed-SP8 schedule needs has to live there too.
+        """
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            yield getattr(attn, "module", attn)
+
     def _release_streamed_sp8_prefill(self):
-        if self._streamed_sp8_buffer is not None:
-            self._streamed_sp8_buffer.close()
-        if self.model is not None:
-            for layer in self.model.model.layers:
-                moe = getattr(layer, "block_sparse_moe", None)
-                if moe is not None:
-                    moe._streamed_sp8_prefill_enabled = False
-                    moe._streamed_sp8_moe = None
-        self._streamed_sp8_buffer = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            if self._streamed_sp8_buffer is not None:
+                self._streamed_sp8_buffer.close()
+        finally:
+            if self.model is not None:
+                for layer in self.model.model.layers:
+                    moe = getattr(layer, "block_sparse_moe", None)
+                    if moe is not None:
+                        moe._streamed_sp8_prefill_enabled = False
+                        moe._streamed_sp8_moe = None
+            # Drop the callback with the buffer it closes over: decode reaches
+            # the SAME ``_reduce_mla_tp_output`` helper, and a stale reference
+            # there would park its all-reduce on a torn-down handshake. This
+            # cleanup is required even when close() surfaces an ingress error.
+            for module in self._streamed_sp8_attention_modules():
+                if hasattr(module, "_streamed_sp8_order_wait"):
+                    del module._streamed_sp8_order_wait
+            self._streamed_sp8_buffer = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def prepare_resident_ep_prefill_output(self, num_global):
         """Reserve the reusable global FP32 combine output before expert HBM."""
@@ -784,6 +809,15 @@ class KimiLinearParallelStrategyManager:
                 ),
                 up_proj=moe.routed_expert_up_proj,
             )
+        # The cross-node broadcast gate opens at the end of each MoE serving
+        # branch; the next TP8 launch is the following layer's attention
+        # all-reduce, which must observe every cross-node call already
+        # host-enqueued. Attach the wait there rather than inside the MoE.
+        order_wait = (
+            self._streamed_sp8_buffer.order_tp_collective_after_cross_launch
+        )
+        for module in self._streamed_sp8_attention_modules():
+            module._streamed_sp8_order_wait = order_wait
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step

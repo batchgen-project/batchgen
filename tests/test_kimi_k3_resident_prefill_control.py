@@ -112,7 +112,7 @@ def _tracing_profile_mark(trace):
     return mark
 
 
-def _isolated_function(path, function_name):
+def _isolated_function(path, function_name, globals_=None):
     tree = ast.parse(path.read_text())
     function = copy.deepcopy(
         next(
@@ -122,7 +122,7 @@ def _isolated_function(path, function_name):
         )
     )
     module = ast.Module(body=[function], type_ignores=[])
-    namespace = {}
+    namespace = dict(globals_ or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[function_name]
 
@@ -577,6 +577,159 @@ def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
     assert "acquire_batch_size=16" not in source
 
 
+def _psm_path():
+    return (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+
+
+def test_streamed_sp8_init_attaches_the_order_wait_to_attention_modules():
+    source = ast.unparse(
+        _function(
+            _psm_path(),
+            "KimiLinearParallelStrategyManager",
+            "_init_streamed_sp8_prefill",
+        )
+    )
+
+    # The wait lives on attention, because the next TP8 launch after the gate
+    # opens is the following layer's attention all-reduce, not an MoE call.
+    assert (
+        "order_wait = self._streamed_sp8_buffer"
+        ".order_tp_collective_after_cross_launch" in source
+    )
+    assert "for module in self._streamed_sp8_attention_modules():" in source
+    assert "module._streamed_sp8_order_wait = order_wait" in source
+
+
+def _psm_layer(module, *, wrapped):
+    """One decoder layer whose ``self_attn`` may or may not be wrapped."""
+    moe = type("MoE", (), {})()
+    moe._streamed_sp8_prefill_enabled = True
+    moe._streamed_sp8_moe = object()
+    return type("Layer", (), {
+        "self_attn": SimpleNamespace(module=module) if wrapped else module,
+        "block_sparse_moe": moe,
+    })()
+
+
+def test_streamed_sp8_release_removes_the_attention_order_wait():
+    path = _psm_path()
+    manager = type("Manager", (), {})()
+    modules = [type("Attn", (), {})() for _ in range(2)]
+    for module in modules:
+        module._streamed_sp8_order_wait = lambda: None
+    # ``self_attn`` is the MLA/KDA streaming wrapper once prefill is
+    # configured, but the serving methods live on the module it wraps; cover
+    # the unwrapped shape too so the callback lands on the same object either
+    # way.
+    layers = [
+        _psm_layer(modules[0], wrapped=True),
+        _psm_layer(modules[1], wrapped=False),
+    ]
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": layers})(),
+    })()
+    closed = []
+    manager._streamed_sp8_buffer = SimpleNamespace(
+        close=lambda: closed.append("close")
+    )
+    manager._streamed_sp8_attention_modules = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_streamed_sp8_attention_modules",
+    ).__get__(manager)
+    release = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_release_streamed_sp8_prefill",
+        {"torch": SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False)
+        )},
+    ).__get__(manager)
+
+    release()
+
+    assert closed == ["close"]
+    assert manager._streamed_sp8_buffer is None
+    for layer in layers:
+        assert layer.block_sparse_moe._streamed_sp8_moe is None
+        assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
+    # Decode reaches the same attention all-reduce helper. A surviving callback
+    # would close over the buffer this release just tore down.
+    for module in modules:
+        assert not hasattr(module, "_streamed_sp8_order_wait")
+
+    # configure_prefill -> configure_decoding releases twice; the second pass
+    # has no buffer and no callback left and must still be a no-op.
+    release()
+    assert closed == ["close"]
+
+
+def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
+    path = _psm_path()
+    manager = type("Manager", (), {})()
+    module = type("Attn", (), {})()
+    module._streamed_sp8_order_wait = lambda: None
+    layer = _psm_layer(module, wrapped=True)
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": [layer]})(),
+    })()
+
+    def close():
+        raise RuntimeError("ingress failed")
+
+    manager._streamed_sp8_buffer = SimpleNamespace(close=close)
+    manager._streamed_sp8_attention_modules = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_streamed_sp8_attention_modules",
+    ).__get__(manager)
+    release = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_release_streamed_sp8_prefill",
+        {"torch": SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False)
+        )},
+    ).__get__(manager)
+
+    with pytest.raises(RuntimeError, match="ingress failed"):
+        release()
+
+    assert manager._streamed_sp8_buffer is None
+    assert layer.block_sparse_moe._streamed_sp8_moe is None
+    assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
+    assert not hasattr(module, "_streamed_sp8_order_wait")
+
+
+def test_streamed_sp8_attention_modules_unwraps_and_skips_missing_attention():
+    manager = type("Manager", (), {})()
+    method = _isolated_method(
+        _psm_path(),
+        "KimiLinearParallelStrategyManager",
+        "_streamed_sp8_attention_modules",
+    ).__get__(manager)
+
+    manager.model = None
+    assert list(method()) == []
+
+    inner = object()
+    layers = [
+        type("Wrapped", (), {"self_attn": SimpleNamespace(module=inner)})(),
+        type("Bare", (), {})(),
+    ]
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": layers})(),
+    })()
+    assert list(method()) == [inner]
+
+
 def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
     path = (
         ROOT
@@ -633,6 +786,152 @@ def test_streamed_sp8_forward_uses_only_local_row_collective():
     assert "all_gather_rows" in calls
     assert "all_reduce" not in calls
     assert "all_gather" not in calls
+
+
+def _serving_modules_path():
+    return (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "serving_modules.py"
+    )
+
+
+def _sp8_serving_branch():
+    tree = ast.parse(_serving_modules_path().read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "moe_forward_serving"
+    )
+    return next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(name, ast.Name) and name.id == "streamed_sp8"
+            for name in ast.walk(node.test)
+        )
+    )
+
+
+def test_streamed_sp8_serving_opens_the_cross_gate_last_in_the_branch():
+    branch = _sp8_serving_branch()
+    calls = [
+        (
+            node.lineno,
+            node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else node.func.id,
+        )
+        for node in ast.walk(branch)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, (ast.Attribute, ast.Name))
+    ]
+
+    def last(name):
+        return max(line for line, called in calls if called == name)
+
+    # The gate must trail EVERY TP8 collective of the layer: the routed-output
+    # all-gather and the shared expert's row-parallel all-reduce both live out
+    # here, past the streamed-SP8 layer forward.
+    assert last("forward") < last("all_gather_rows") < last("allow_cross_launch")
+    assert last("shared_experts") < last("allow_cross_launch")
+    # ...and it must be the LAST thing the branch does, so nothing new can be
+    # slipped in between the gate and the next layer's attention.
+    assert last("allow_cross_launch") == max(line for line, _ in calls)
+    # The launch-order wait belongs to attention now, not to the MoE.
+    assert "order_tp_collective_after_cross_launch" not in {
+        called for _, called in calls
+    }
+
+
+def test_streamed_sp8_layer_forward_touches_neither_side_of_the_handshake():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    forward = _function(path, "StreamedSP8MXFP4MoELayer", "forward")
+    guards = _call_guards(forward)
+
+    # Both halves moved out of the layer: the gate to the end of the serving
+    # branch, the wait to the next attention's TP all-reduce. Only the
+    # compute-buffer release is still issued from here.
+    assert "allow_cross_launch" not in guards
+    assert "order_tp_collective_after_cross_launch" not in guards
+    assert guards["allow_full_overwrite"]
+
+
+def test_prefill_attention_waits_for_cross_launch_before_its_tp_all_reduce():
+    tree = ast.parse(_serving_modules_path().read_text())
+    for name in ("_reduce_mla_tp_output", "kda_prefill_serving"):
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        waits = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_wait_streamed_sp8_cross_launch"
+        ]
+        reduces = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "all_reduce"
+        ]
+        # One wait per all-reduce, and it is issued first: this all-reduce is
+        # the next TP8 launch after the previous layer's MoE opened the gate.
+        assert len(waits) == 1, name
+        assert len(reduces) == 1, name
+        assert waits[0] < reduces[0], name
+
+
+def test_mla_tp_reduce_calls_the_installed_order_wait_then_all_reduce(
+    monkeypatch,
+):
+    dist = pytest.importorskip("torch.distributed")
+    path = _serving_modules_path()
+    trace = []
+    monkeypatch.setattr(
+        dist,
+        "all_reduce",
+        lambda output, group=None: trace.append(("all_reduce", group)),
+    )
+    reduce_output = _isolated_function(
+        path,
+        "_reduce_mla_tp_output",
+        {
+            "_wait_streamed_sp8_cross_launch": _isolated_function(
+                path, "_wait_streamed_sp8_cross_launch"
+            )
+        },
+    )
+    module = SimpleNamespace(
+        attn_tp_size=8,
+        attn_tp_group="tp8",
+        _streamed_sp8_order_wait=lambda: trace.append(("order_wait",)),
+    )
+    output = object()
+
+    assert reduce_output(module, output) is output
+    assert trace == [("order_wait",), ("all_reduce", "tp8")]
+
+    # Decode reaches the SAME helper after the PSM released prefill. With the
+    # callback removed there is no wait and no reference to a torn-down buffer.
+    trace.clear()
+    del module._streamed_sp8_order_wait
+    reduce_output(module, output)
+    assert trace == [("all_reduce", "tp8")]
+
+    # attn_tp_size==1 has no TP all-reduce to order against at all.
+    trace.clear()
+    reduce_output(SimpleNamespace(attn_tp_size=1), output)
+    assert trace == []
 
 
 def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
@@ -1180,7 +1479,7 @@ def test_streamed_sp8_forward_begins_ingress_before_grouped_expert_work():
     assert ops.index("allow") < ops.index("norm") < ops.index("up")
 
 
-def test_hierarchical_gdr_orders_cross_launch_between_tp_collectives():
+def test_hierarchical_gdr_defers_cross_launch_past_every_tp_collective():
     trace = []
     layer, x, gate, num_rows = _mock_sp8_moe_layer(
         trace,
@@ -1202,16 +1501,19 @@ def test_hierarchical_gdr_orders_cross_launch_between_tp_collectives():
     # it overlaps the router, down-proj and the gathers themselves.
     assert trace[:2] == ["load", "begin"]
     assert ops.index("begin") < min(gather_positions)
-    # Every rank still enqueues all three node-local gathers before the
-    # orthogonal cross-node communicator is released, and the release precedes
-    # the grouped expert work.
-    assert max(gather_positions) < ops.index("allow_cross")
-    assert ops.index("allow_cross") < ops.index("expert_path")
-    # Before TP8 is entered again, all cross-node calls have been issued; the
-    # grouped compute remains between the two communicator families while the
-    # GPU operations themselves are allowed to overlap.
-    assert ops.index("combine") < ops.index("order_cross")
-    assert ops.index("order_cross") < ops.index("reduce_scatter")
+    # E1: releasing the cross-node communicator mid-layer only relocated the
+    # peers' payload wait into the TP8 reduce-scatter, because implicit launch
+    # ordering turns the host order into launch-completion edges. The layer
+    # forward therefore touches NEITHER side of the handshake -- the serving
+    # branch opens the gate after its routed all-gather and shared expert, and
+    # the next layer's attention all-reduce performs the launch-order wait.
+    assert "allow_cross" not in ops
+    assert "order_cross" not in ops
+    # Every TP8 collective of the layer still runs in the same order, and the
+    # compute-buffer release still trails the reduce-scatter that reads it.
+    assert max(gather_positions) < ops.index("expert_path")
+    assert ops.index("combine") < ops.index("reduce_scatter")
+    assert ops.index("reduce_scatter") < ops.index("allow")
 
 
 def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
@@ -1251,6 +1553,13 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
     assert host.gate_open_s is not None
     assert host.broadcast_enqueue_s >= host.gate_open_s
     assert host.order_wait_end_s >= host.order_wait_begin_s
+
+    # Every layer's attention performs the wait, so a dense layer between two
+    # MoE layers re-enters an already satisfied handoff. The measured span must
+    # keep the first sample rather than collapse to the zero-cost re-entry.
+    stamps = (host.order_wait_begin_s, host.order_wait_end_s)
+    buffer.order_tp_collective_after_cross_launch()
+    assert (host.order_wait_begin_s, host.order_wait_end_s) == stamps
 
 
 def test_hierarchical_gdr_acquires_host_shard_before_the_cross_launch_gate():
@@ -1363,6 +1672,78 @@ def test_hierarchical_gdr_close_cannot_strand_the_cross_launch_gate():
     assert pending.cross_launch_enqueued.is_set()
 
 
+def test_hierarchical_gdr_close_cancels_an_overwrite_granted_before_the_gate():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "allow_full_overwrite",
+            "_wait_pending",
+            "close",
+        ),
+        cross_group="cross4",
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+    # The grant order is REVERSED under the new schedule: the MoE forward
+    # releases the compute buffer after its reduce-scatter, and only the end of
+    # the serving branch opens the cross gate. A forward that raised in between
+    # leaves the worker parked on the gate with the overwrite already granted,
+    # which the old "ungranted overwrite covers an ungranted gate" shortcut
+    # read as nothing to cancel -- and close() then hung on the parked thread.
+    buffer.allow_full_overwrite()
+    assert pending.overwrite_allowed.is_set()
+    pending.thread.join(0.1)
+    assert pending.thread.is_alive()
+
+    buffer.close()
+
+    assert pending.cancelled
+    assert not pending.thread.is_alive()
+    assert pending.error is None
+    assert buffer._pending is None
+    ops = [entry.op for entry in trace]
+    # Cancelled, not granted: the peers are unwinding too, so no cross-node
+    # collective is issued and the assembly that follows it is skipped.
+    assert "cross_broadcast" not in ops
+    assert "assemble" not in ops
+    assert pending.cross_launch_allowed.is_set()
+    assert pending.cross_launch_enqueued.is_set()
+    assert (trace[-1].op, trace[-1].stream) == ("synchronize", "prefetch")
+
+
+def test_streamed_sp8_close_keeps_a_fully_granted_prefetch():
+    trace = []
+    buffer = _mock_sp8_buffer(
+        trace,
+        (
+            "begin_prefetch_next",
+            "allow_cross_launch",
+            "allow_full_overwrite",
+            "_wait_pending",
+            "close",
+        ),
+        cross_group="cross4",
+    )
+
+    buffer.begin_prefetch_next(3)
+    pending = buffer._pending
+    buffer.allow_full_overwrite()
+    buffer.allow_cross_launch()
+
+    buffer.close()
+
+    # Both handshakes were granted in the new order, so teardown must drain the
+    # completed prefetch rather than cancel work the peers already joined.
+    assert not pending.cancelled
+    assert pending.error is None
+    ops = [entry.op for entry in trace]
+    assert "cross_broadcast" in ops
+    assert "assemble" in ops
+
+
 def test_hierarchical_gdr_prefetch_error_unblocks_tp_launch_ordering():
     trace = []
     failure = RuntimeError("source shard failed")
@@ -1465,7 +1846,7 @@ def test_streamed_sp8_forward_node_with_no_rows_skips_on_every_rank():
     assert trace == ["load", "begin", "allow"]
 
 
-def test_hierarchical_gdr_node_with_no_rows_orders_ingress_before_return():
+def test_hierarchical_gdr_node_with_no_rows_leaves_the_gate_to_the_caller():
     trace = []
     layer, x, gate, num_rows = _mock_sp8_moe_layer(
         trace,
@@ -1477,11 +1858,11 @@ def test_hierarchical_gdr_node_with_no_rows_orders_ingress_before_return():
     output = layer.forward(x, gate, num_rows)
 
     assert tuple(output.shape) == (0, SP8_HIDDEN)
-    # No activation collective or grouped work exists, but the gate must still
-    # open -- otherwise the parked worker would never issue the broadcasts its
-    # peers enter -- and the cross launch handoff must still precede the
-    # caller's subsequent TP8 gather/attention.
-    assert trace == ["load", "begin", "allow_cross", "order_cross", "allow"]
+    # No reader of the compute shard is enqueued, so the overwrite is released
+    # immediately. The gate is NOT opened here: the serving branch still enters
+    # the routed all-gather and the shared expert on this node, and it opens
+    # the gate after them exactly like a non-empty layer.
+    assert trace == ["load", "begin", "allow"]
 
 
 def test_streamed_sp8_forward_pads_uneven_rows_out_of_expert_ownership():
@@ -1626,13 +2007,14 @@ def test_streamed_sp8_layer_boundaries_follow_the_r10_order():
         return max(index for index, name in enumerate(ops) if name == op)
 
     # b0 layer; b1/b2 gathers; b3/b4 grouped+combine; b5 post-fence;
-    # b6/b7 reduce-scatter; b8 post-MoE. The fence boundary must straddle
-    # ``order_cross`` or fence_stall would not measure the stall at all.
+    # b6/b7 reduce-scatter; b8 post-MoE. The nine-boundary layout and every
+    # snapshot key are unchanged; b4->b5 no longer straddles a launch handoff
+    # because the handshake moved out of the layer entirely.
     assert marks[0] < marks[1] < ops.index("all_gather")
     assert last("all_gather") < marks[2] < marks[3]
     assert marks[3] < ops.index("expert_path")
-    assert last("combine") < marks[4] < ops.index("order_cross")
-    assert ops.index("order_cross") < marks[5] < marks[6]
+    assert last("combine") < marks[4] < marks[5]
+    assert marks[5] < marks[6]
     assert marks[6] < ops.index("reduce_scatter") < marks[7]
     assert marks[7] < ops.index("allow")
     assert last("up") < marks[8]
