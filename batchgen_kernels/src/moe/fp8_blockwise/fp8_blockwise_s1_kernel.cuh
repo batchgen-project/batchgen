@@ -1,5 +1,5 @@
 // BatchGen — FP8 Blockwise Fused S1 Kernel: gate GEMM + up GEMM + SiLU
-// Two-phase persistent 3-WG CuTe kernel, forked from fp8_blockwise_gemm_kernel.cuh.
+// Two-phase persistent CuTe kernel, forked from fp8_blockwise_gemm_kernel.cuh.
 // Phase 1: gate K-loop → gate result to SMEM (aliases shm_c).
 // Phase 2: up K-loop → SiLU(gate)*up epilogue → TMA store.
 
@@ -20,14 +20,14 @@ namespace kernels {
 
 // ============================================================================
 // Fused S1 kernel: gate GEMM + up GEMM + SiLU in single persistent launch.
-// 384 threads: 2 math WGs (256) + 1 TMA loader WG (128).
+// Config supplies the math-WG topology; one additional TMA loader WG is required.
 // Dual weight TMA descriptors: tma_b_gate/tma_b_up, tma_bs_gate/tma_bs_up.
 // Phase transition via __syncthreads + barrier reinitialization.
 // Warpgroup barriers use IDs 2/3 to avoid conflict with __syncthreads (barrier 0).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC,
-          typename TmaAS, typename TmaBS, bool IsLoopH>
-__global__ void __launch_bounds__(384, 1)
+          typename TmaAS, typename TmaBS, bool IsLoopH, int kBlockThreads>
+__global__ void __launch_bounds__(kBlockThreads, 1)
     fp8_blockwise_fused_s1_kernel(
         const __grid_constant__ TmaB tma_b_gate,
         const __grid_constant__ TmaB tma_b_up,
@@ -58,6 +58,9 @@ __global__ void __launch_bounds__(384, 1)
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
   constexpr int kStage = Config::kStage;
+  static_assert(Config::kWeightScaleBlockN % kTileN == 0,
+                "TileN must divide the 128-row weight-scale block");
+  constexpr int kWeightScaleTilesPerBlock = Config::kWeightScaleBlockN / kTileN;
 
   int idx = threadIdx.x;
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
@@ -150,9 +153,11 @@ __global__ void __launch_bounds__(384, 1)
   __syncthreads();
 
   constexpr int kNumThreads = size(TiledMma{});
+  static_assert(kBlockThreads == kNumThreads + 128,
+                "block must contain the math threads plus one loader warpgroup");
 
   // ========================================================================
-  // LOADER WARPGROUP (idx >= 256)
+  // LOADER WARPGROUP (after the Config-selected math threads)
   // ========================================================================
   if (idx >= kNumThreads) {
     cutlass::arch::warpgroup_reg_dealloc<32>();
@@ -187,6 +192,7 @@ __global__ void __launch_bounds__(384, 1)
       // x_scale shares x's row space (see fp8_blockwise_gemm_kernel.cuh header):
       // expert igroup's first scale tile is cu_seqlens[igroup] / kTileM.
       int scale_tile_base = cu_seqlens_ptr[igroup] / kTileM;
+      int weight_scale_tile_n = itile_n / kWeightScaleTilesPerBlock;
 
       // ──── PHASE 1: Gate weight K-loop (leader only) ────
       if (is_leader_in_load) {
@@ -203,7 +209,7 @@ __global__ void __launch_bounds__(384, 1)
                      tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
           cute::copy(tma_bs_gate.with(readable[ismem_write]),
-                     tBSg_gate(_, itile_n, itile_k / 4, igroup),
+                     tBSg_gate(_, weight_scale_tile_n, itile_k / 4, igroup),
                      tBSs_gate(_, ismem_write, 0));
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
           ++ismem_write;
@@ -211,7 +217,7 @@ __global__ void __launch_bounds__(384, 1)
         }
       }
 
-      // Phase transition: ALL 384 threads sync
+      // Phase transition: all math and loader threads sync.
       __syncthreads();
       __syncthreads();  // Wait for barrier reinit by block leader (math branch)
 
@@ -234,7 +240,7 @@ __global__ void __launch_bounds__(384, 1)
                      tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
           cute::copy(tma_bs_up.with(readable[ismem_write]),
-                     tBSg_up(_, itile_n, itile_k / 4, igroup),
+                     tBSg_up(_, weight_scale_tile_n, itile_k / 4, igroup),
                      tBSs_up(_, ismem_write, 0));
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
           ++ismem_write;
@@ -244,7 +250,7 @@ __global__ void __launch_bounds__(384, 1)
     }
 
   // ========================================================================
-  // MATH WARPGROUPS (idx < 256)
+  // MATH WARPGROUPS
   // ========================================================================
   } else {
     cutlass::arch::warpgroup_reg_alloc<168>();
@@ -357,7 +363,7 @@ __global__ void __launch_bounds__(384, 1)
         syncwarpgroup(iwarpgroup + 2);
       }
 
-      // Phase transition: ALL 384 threads sync
+      // Phase transition: all math and loader threads sync.
       __syncthreads();
 
       // Reinitialize barriers for phase 2
@@ -467,7 +473,7 @@ __global__ void __launch_bounds__(384, 1)
             auto tDg = btma_c.partition_D(gD);
             auto *td_y = td_xy + igroup * 2 + 1;
             cute::copy(tma_c.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
-                       tDg(_, itile_n * 2 + iwarpgroup, itile_m));
+                       tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
             tma_store_arrive();
           }
         }

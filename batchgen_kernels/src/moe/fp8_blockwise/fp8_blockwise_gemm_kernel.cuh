@@ -1,6 +1,7 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Kernel
-// Persistent 3-WG CuTe kernel: 2 math WGs (TiledMma N-split) + 1 TMA loader WG.
-// Adaptive TileM (16/32/64), TileN=128, TileK=128, 8-stage TMA pipeline.
+// Persistent CuTe kernel with templated math-WG topology and one TMA loader WG.
+// Production uses 2 math WGs, TileN=128, and 8 stages; an opt-in probe uses
+// 1 math WG, TileN=64, and 4 stages. Both retain adaptive TileM (16/32/64).
 // x/y/x_scale all live in one row space described by cu_seqlens; the layout may
 // be uniform-stride padded ([E, mtp, dim]) or compact ragged, the only contract
 // being that every cu_seqlens[e] is a multiple of TileM.
@@ -164,12 +165,12 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 
 // ============================================================================
 // Main persistent kernel: FP8 blockwise grouped GEMM
-// 384 threads: 2 math WGs (256 threads) + 1 loader WG (128 threads)
+// Config supplies the math-WG topology; one additional loader WG is required.
 // x_scale is indexed in x's row space via cu_seqlens (see file header).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC, typename TmaAS,
-          typename TmaBS, bool IsLoopH>
-__global__ void __launch_bounds__(384, 1)
+          typename TmaBS, bool IsLoopH, int kBlockThreads>
+__global__ void __launch_bounds__(kBlockThreads, 1)
     fp8_blockwise_grouped_gemm_kernel(const __grid_constant__ TmaB tma_b,
                                       const __grid_constant__ TmaAS tma_as,
                                       const __grid_constant__ TmaBS tma_bs,
@@ -198,6 +199,9 @@ __global__ void __launch_bounds__(384, 1)
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
   constexpr int kStage = Config::kStage;
+  static_assert(Config::kWeightScaleBlockN % kTileN == 0,
+                "TileN must divide the 128-row weight-scale block");
+  constexpr int kWeightScaleTilesPerBlock = Config::kWeightScaleBlockN / kTileN;
 
   int idx = threadIdx.x;
 
@@ -280,6 +284,8 @@ __global__ void __launch_bounds__(384, 1)
   __syncthreads();
 
   constexpr int kNumThreads = size(TiledMma{});
+  static_assert(kBlockThreads == kNumThreads + 128,
+                "block must contain the math threads plus one loader warpgroup");
   // Loader warpgroup
   if (idx >= kNumThreads) {
     cutlass::arch::warpgroup_reg_dealloc<32>();
@@ -316,6 +322,7 @@ __global__ void __launch_bounds__(384, 1)
         // Works for both the padded (cu_seqlens[e] = e*mtp) and the compact
         // ragged (64-aligned segment starts) layouts.
         int scale_tile_base = cu_seqlens_ptr[igroup] / kTileM;
+        int weight_scale_tile_n = itile_n / kWeightScaleTilesPerBlock;
 
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
@@ -328,7 +335,8 @@ __global__ void __launch_bounds__(384, 1)
 
           cute::copy(tma_as.with(readable[ismem_write]),
                      tASg(_, itile_k, scale_tile_base + itile_m), tASs(_, ismem_write, 0));
-          cute::copy(tma_bs.with(readable[ismem_write]), tBSg(_, itile_n, itile_k / 4, igroup),
+          cute::copy(tma_bs.with(readable[ismem_write]),
+                     tBSg(_, weight_scale_tile_n, itile_k / 4, igroup),
                      tBSs(_, ismem_write, 0));
 
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
@@ -458,7 +466,7 @@ __global__ void __launch_bounds__(384, 1)
         auto tDg = btma_c.partition_D(gD);
         auto *td_y = td_xy + igroup * 2 + 1;
         cute::copy(tma_c.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
-                   tDg(_, itile_n * 2 + iwarpgroup, itile_m));
+                   tDg(_, itile_n * Config::kWarpgroupM + iwarpgroup, itile_m));
         tma_store_arrive();
       }
     }

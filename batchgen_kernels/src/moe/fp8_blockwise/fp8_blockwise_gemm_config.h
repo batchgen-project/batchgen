@@ -1,6 +1,6 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Configuration
 // CuTe/CUTLASS-based tile configs, SMEM layouts, TiledMma dispatch.
-// SM90a (H20/H100/GH200) persistent 3-WG architecture.
+// SM90a (H20/H100/GH200) persistent warpgroup architecture.
 
 #ifndef BATCHGEN_FP8_BLOCKWISE_GEMM_CONFIG_H_
 #define BATCHGEN_FP8_BLOCKWISE_GEMM_CONFIG_H_
@@ -62,8 +62,8 @@ static constexpr auto mma_selector() {
   }
 }
 
-// Blockwise FP8 grouped GEMM configuration.
-// kTileM adaptive (16/32/64 based on avg tokens), kTileN=128, kTileK=128.
+// Blockwise FP8 grouped GEMM configuration. TileM is adaptive (16/32/64);
+// the dispatch selects TileN, stage count, and math-warpgroup topology.
 template <typename Tin_, typename Tout_, typename TS_, int kTileM_, int kTileN_, int kTileK_,
           int kTileS_, int kStage_, int kWarpgroupM_ = 2, int kWarpgroupN_ = 1, int kSwizzleX = 128,
           int kSwizzleW = 128, int kSwizzleY = 128>
@@ -79,6 +79,8 @@ struct Fp8BlockwiseGemmConfig {
   static constexpr int kStage = kStage_;
   static constexpr int kWarpgroupM = kWarpgroupM_;
   static constexpr int kWarpgroupN = kWarpgroupN_;
+  // Weight scales retain one scale per 128 N rows independently of TileN.
+  static constexpr int kWeightScaleBlockN = 128;
 
   using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
   using SLayoutWAtom = decltype(slayout_selector<kSwizzleW, Tin>());

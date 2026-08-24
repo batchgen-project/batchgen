@@ -4,7 +4,7 @@ Provides S1 (gate+up+SiLU) and S3 (down) grouped GEMM functions for
 FP8 blockwise-scaled MoE layers. Uses pre-allocated reserved buffers
 with uniform mtp-stride layout [E * mtp, dim].
 
-Architecture: persistent 3-WG CuTe kernel, adaptive TileM (16/32/64),
+Default architecture: persistent 3-WG CuTe kernel, adaptive TileM (16/32/64),
 TileN=128, TileK=128, 8-stage TMA pipeline, FastDivmod tile scheduling.
 
 Usage:
@@ -25,6 +25,9 @@ _KERNEL_MODULE_NAME = "batchgen_kernels.moe._C_fp8_blockwise_gemm"
 _kernel_module = None
 _warned_import = False
 _warned_fused_s1 = False
+_warned_high_occ_gemm = False
+_warned_high_occ_fused_s1 = False
+_warned_high_occ_s3 = False
 
 
 def _get_kernel_module():
@@ -73,6 +76,48 @@ def _get_fused_s1_kernel():
     return kernel
 
 
+def _get_high_occ_gemm_kernel():
+    """Load the opt-in high-occupancy generic GEMM probe."""
+    global _warned_high_occ_gemm
+    try:
+        module = _get_kernel_module()
+    except ImportError:
+        module = None
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm_high_occ", None)
+    if kernel is None and not _warned_high_occ_gemm:
+        _warned_high_occ_gemm = True
+        logger.warning("FP8 high-occupancy grouped GEMM probe is not available")
+    return kernel
+
+
+def _get_high_occ_fused_s1_kernel():
+    """Load the opt-in high-occupancy fused S1 probe."""
+    global _warned_high_occ_fused_s1
+    try:
+        module = _get_kernel_module()
+    except ImportError:
+        module = None
+    kernel = getattr(module, "fp8_blockwise_fused_s1_high_occ", None)
+    if kernel is None and not _warned_high_occ_fused_s1:
+        _warned_high_occ_fused_s1 = True
+        logger.warning("FP8 high-occupancy fused S1 probe is not available")
+    return kernel
+
+
+def _get_high_occ_s3_kernel():
+    """Load the opt-in high-occupancy S3 probe."""
+    global _warned_high_occ_s3
+    try:
+        module = _get_kernel_module()
+    except ImportError:
+        module = None
+    kernel = getattr(module, "fp8_blockwise_s3_high_occ", None)
+    if kernel is None and not _warned_high_occ_s3:
+        _warned_high_occ_s3 = True
+        logger.warning("FP8 high-occupancy S3 probe is not available")
+    return kernel
+
+
 def grouped_fp8_blockwise_gemm(
     x_fp8: Tensor,
     weight_3d: Tensor,
@@ -117,6 +162,35 @@ def grouped_fp8_blockwise_gemm(
         x_scale, w_scale_3d,
         num_seq_per_group_avg,
         output, tma_desc,
+    )
+
+
+def grouped_fp8_blockwise_gemm_high_occ(
+    x_fp8: Tensor,
+    weight_3d: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    x_scale: Tensor,
+    w_scale_3d: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Run the opt-in 1-math-WG + 1-loader-WG grouped GEMM probe."""
+    kernel = _get_high_occ_gemm_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 high-occupancy grouped GEMM probe not compiled. "
+            "Rebuild batchgen_kernels from this source checkout."
+        )
+
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+
+    return kernel(
+        x_fp8, weight_3d, seqlens, cu_seqlens,
+        x_scale, w_scale_3d,
+        num_seq_per_group_avg,
+        output,
     )
 
 
@@ -228,6 +302,34 @@ def grouped_fp8_blockwise_fused_s1(
     )
 
 
+def grouped_fp8_blockwise_fused_s1_high_occ(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    gate_w3d: Tensor,
+    up_w3d: Tensor,
+    gate_ws3d: Tensor,
+    up_ws3d: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Run the opt-in 1-math-WG + 1-loader-WG fused S1 probe."""
+    kernel = _get_high_occ_fused_s1_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 high-occupancy fused S1 probe not compiled. "
+            "Rebuild batchgen_kernels from this source checkout."
+        )
+    return kernel(
+        x_fp8, gate_w3d, up_w3d,
+        seqlens, cu_seqlens, x_scale,
+        gate_ws3d, up_ws3d,
+        num_seq_per_group_avg,
+        output,
+    )
+
+
 def grouped_fp8_blockwise_s3(
     x_fp8: Tensor,
     x_scale: Tensor,
@@ -259,4 +361,33 @@ def grouped_fp8_blockwise_s3(
         x_fp8, down_w3d, seqlens, cu_seqlens,
         x_scale, down_ws3d, num_seq_per_group_avg,
         output=output,
+    )
+
+
+def grouped_fp8_blockwise_s3_high_occ(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    down_w3d: Tensor,
+    down_ws3d: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Run the opt-in 1-math-WG + 1-loader-WG S3 probe."""
+    kernel = _get_high_occ_s3_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 high-occupancy S3 probe not compiled. "
+            "Rebuild batchgen_kernels from this source checkout."
+        )
+
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+
+    return kernel(
+        x_fp8, down_w3d, seqlens, cu_seqlens,
+        x_scale, down_ws3d,
+        num_seq_per_group_avg,
+        output,
     )
