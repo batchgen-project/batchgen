@@ -28,6 +28,7 @@ nodes over a dedicated cross-node group before that local-to-compute copy.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from types import SimpleNamespace
@@ -48,6 +49,19 @@ from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
 # handoff earlier would strand peers in a payload broadcast while a cold source
 # was still legitimately waiting for its host shard.
 PREFETCH_HANDOFF_TIMEOUT_S = 300.0
+
+
+def _profile_mark(marks):
+    """Append one E0 boundary event, recorded on the current stream.
+
+    Timing events are only ever RECORDED, never queried, in the layer and
+    ingress paths: an ``elapsed_time`` or ``synchronize`` per layer would park
+    the host on the very overlap this path exists to create.  The pairs are
+    read exactly once, in :meth:`StreamedSP8MXFP4MoELayer.prefill_profile_snapshot`.
+    """
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    marks.append(event)
 
 
 class StreamedSP8LayerBuffer:
@@ -177,11 +191,27 @@ class StreamedSP8LayerBuffer:
         stream=None,
         cross_launch_gate=None,
         cross_launch_callback=None,
+        profile_host=None,
     ):
         self._allocate()
         copy_stream = stream or torch.cuda.current_stream(self.device)
+        profile = StreamedSP8MXFP4MoELayer
+        enabled = profile._prefill_profile_enabled
+        publish_profile_host = enabled and profile_host is None
+        if enabled and profile_host is None:
+            profile_host = SimpleNamespace(
+                layer_idx=int(layer_idx),
+                acquisition_start_s=None,
+                acquisition_end_s=None,
+                gate_open_s=None,
+                order_wait_begin_s=None,
+                order_wait_end_s=None,
+                broadcast_enqueue_s=None,
+            )
         source_error = None
         if self._acquires_from_host:
+            if enabled:
+                profile_host.acquisition_start_s = time.perf_counter()
             names = [
                 f"routed_expert_{layer_idx}_{expert_idx}"
                 for expert_idx in range(
@@ -225,6 +255,8 @@ class StreamedSP8LayerBuffer:
                 if self.cross_group is None:
                     raise
                 source_error = exc
+            if enabled and source_error is None:
+                profile_host.acquisition_end_s = time.perf_counter()
 
         # A source-side Python/storage failure must be announced before peers
         # enter the six large payload broadcasts. Otherwise the other three
@@ -255,8 +287,12 @@ class StreamedSP8LayerBuffer:
         # necessarily precedes the local-to-compute copy that reads
         # ``self.local``.
         self._broadcast_local_shard(copy_stream)
+        if enabled and self.cross_group is not None:
+            profile_host.broadcast_enqueue_s = time.perf_counter()
         if cross_launch_callback is not None:
             cross_launch_callback()
+        if publish_profile_host:
+            profile._prefill_profile_host_records.append(profile_host)
 
     def _broadcast_source_status(self, stream, source_ok: bool) -> bool:
         """Tell peers whether the source shard is ready for payload ingress."""
@@ -289,16 +325,25 @@ class StreamedSP8LayerBuffer:
         if self.cross_group is None:
             return
         profile = StreamedSP8MXFP4MoELayer
+        enabled = profile._prefill_profile_enabled
+        span = []
         with torch.cuda.stream(stream):
+            if enabled:
+                _profile_mark(span)
             for tensor_name in self.shapes:
                 tensor = self.local[tensor_name]
                 dist.broadcast(tensor, self.cross_root, group=self.cross_group)
-                if profile._prefill_profile_enabled:
+                if enabled:
                     profile._prefill_profile_cross_broadcast_calls += 1
                     profile._prefill_profile_cross_broadcast_bytes += (
                         tensor.numel() * tensor.element_size()
                     )
-        if profile._prefill_profile_enabled:
+            if enabled:
+                _profile_mark(span)
+        if enabled:
+            # Published only once BOTH ends are recorded, so a broadcast that
+            # raised leaves no half pair behind for the snapshot to read.
+            profile._prefill_profile_broadcast_spans.append(tuple(span))
             profile._prefill_profile_cross_source = self.cross_source
 
     def _assemble_compute_shard(self, stream=None):
@@ -434,6 +479,19 @@ class StreamedSP8LayerBuffer:
             overwrite_allowed=threading.Event(),
             cancelled=False,
             thread=None,
+            profile_host=(
+                SimpleNamespace(
+                    layer_idx=int(next_layer),
+                    acquisition_start_s=None,
+                    acquisition_end_s=None,
+                    gate_open_s=None,
+                    order_wait_begin_s=None,
+                    order_wait_end_s=None,
+                    broadcast_enqueue_s=None,
+                )
+                if StreamedSP8MXFP4MoELayer._prefill_profile_enabled
+                else None
+            ),
         )
 
         def open_cross_launch():
@@ -472,6 +530,7 @@ class StreamedSP8LayerBuffer:
                         if pending.cross_launch_enqueued is not None
                         else None
                     ),
+                    profile_host=pending.profile_host,
                 )
                 if pending.cross_ingress_done is not None:
                     # Record after the six payload broadcasts on the same
@@ -489,6 +548,10 @@ class StreamedSP8LayerBuffer:
                     return
                 self._prefetch_stream.wait_event(pending.compute_done)
                 self._assemble_compute_shard(stream=self._prefetch_stream)
+                if pending.profile_host is not None:
+                    StreamedSP8MXFP4MoELayer._prefill_profile_host_records.append(
+                        pending.profile_host
+                    )
                 pending.ready.record(self._prefetch_stream)
             except BaseException as exc:  # re-raise on the model thread
                 pending.error = exc
@@ -525,6 +588,11 @@ class StreamedSP8LayerBuffer:
         pending = self._pending
         if pending is None or pending.cross_launch_allowed is None:
             return
+        if (
+            pending.profile_host is not None
+            and pending.profile_host.gate_open_s is None
+        ):
+            pending.profile_host.gate_open_s = time.perf_counter()
         pending.cross_launch_allowed.set()
 
     def order_tp_collective_after_cross_launch(self):
@@ -540,6 +608,8 @@ class StreamedSP8LayerBuffer:
         pending = self._pending
         if self.cross_group is None or pending is None:
             return
+        if pending.profile_host is not None:
+            pending.profile_host.order_wait_begin_s = time.perf_counter()
         if not pending.cross_launch_enqueued.wait(PREFETCH_HANDOFF_TIMEOUT_S):
             raise RuntimeError(
                 f"streamed-SP8 prefetch of layer {pending.layer_idx} did not "
@@ -564,6 +634,8 @@ class StreamedSP8LayerBuffer:
         torch.cuda.current_stream(self.device).wait_event(
             pending.cross_ingress_done
         )
+        if pending.profile_host is not None:
+            pending.profile_host.order_wait_end_s = time.perf_counter()
 
     def allow_full_overwrite(self):
         """Phase two: let the pending prefetch overwrite ``self.compute``.
@@ -665,6 +737,25 @@ class StreamedSP8MXFP4MoELayer:
     _prefill_profile_cross_source = False
     _prefill_profile_cross_status_calls = 0
     _prefill_profile_cross_status_failures = 0
+    # E0 span evidence.  Every entry is a COMPLETE record: a layer or a
+    # broadcast that returned early, was cancelled or raised publishes nothing,
+    # so the snapshot never has to interpret a half pair.
+    #
+    # ``_prefill_profile_layer_marks`` holds one nine-event boundary sequence
+    # per non-empty layer, recorded on the compute stream:
+    #   0 layer start       1/2 activation gathers start/end
+    #   3/4 grouped + FP32 combine start/end
+    #   5 post-ingress-wait 6/7 reduce-scatter start/end
+    #   8 post-MoE layer end
+    _prefill_profile_layer_marks = []
+    # One (start, end) pair per completed six-tensor payload broadcast, on the
+    # ingress stream.  Empty on host_rdma, which runs no cross-node collective.
+    _prefill_profile_broadcast_spans = []
+    # Host ``perf_counter`` timestamps for one ingress. The async record is
+    # published only after assembly, by which point the model thread has also
+    # completed the launch-order handoff. The first synchronous layer has no
+    # gate/order-wait timestamps but still records acquisition and enqueue.
+    _prefill_profile_host_records = []
 
     @classmethod
     def reset_prefill_profile(cls, enabled: bool) -> None:
@@ -682,6 +773,31 @@ class StreamedSP8MXFP4MoELayer:
         cls._prefill_profile_cross_source = False
         cls._prefill_profile_cross_status_calls = 0
         cls._prefill_profile_cross_status_failures = 0
+        # Replaced, not cleared in place: a snapshot already handed to the
+        # caller keeps the records it aggregated from.
+        cls._prefill_profile_layer_marks = []
+        cls._prefill_profile_broadcast_spans = []
+        cls._prefill_profile_host_records = []
+
+    @staticmethod
+    def _profile_span_stats(samples_ms) -> dict:
+        """count / sum / p50 / p95 of one span family, in milliseconds."""
+        samples = sorted(samples_ms)
+        count = len(samples)
+        if count == 0:
+            return {"count": 0, "sum_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0}
+
+        def percentile(fraction):
+            # Nearest-rank: the reported value is always an observed sample and
+            # is reproducible across ranks without an interpolation rule.
+            return samples[min(count - 1, math.ceil(fraction * count) - 1)]
+
+        return {
+            "count": count,
+            "sum_ms": float(sum(samples)),
+            "p50_ms": float(percentile(0.50)),
+            "p95_ms": float(percentile(0.95)),
+        }
 
     @classmethod
     def prefill_profile_snapshot(cls) -> dict:
@@ -695,6 +811,23 @@ class StreamedSP8MXFP4MoELayer:
                 if isinstance(value, torch.Tensor)
                 else value
             )
+
+        marks = cls._prefill_profile_layer_marks
+        broadcasts = cls._prefill_profile_broadcast_spans
+        def boundary_ms(first, second):
+            return [
+                record[first].elapsed_time(record[second])
+                for record in marks
+            ]
+
+        def host_span_ms(start_name, end_name):
+            return [
+                (getattr(record, end_name) - getattr(record, start_name))
+                * 1000.0
+                for record in cls._prefill_profile_host_records
+                if getattr(record, start_name) is not None
+                and getattr(record, end_name) is not None
+            ]
 
         return {
             "enabled": cls._prefill_profile_enabled,
@@ -721,6 +854,30 @@ class StreamedSP8MXFP4MoELayer:
             "cross_status_failures": (
                 cls._prefill_profile_cross_status_failures
             ),
+            "broadcast_execution": cls._profile_span_stats(
+                [start.elapsed_time(end) for start, end in broadcasts]
+            ),
+            "fence_stall": cls._profile_span_stats(boundary_ms(4, 5)),
+            "grouped_execution": cls._profile_span_stats(boundary_ms(3, 4)),
+            "reduce_scatter": cls._profile_span_stats(boundary_ms(6, 7)),
+            "post_moe": cls._profile_span_stats(boundary_ms(7, 8)),
+            "host_acquisition": cls._profile_span_stats(
+                host_span_ms("acquisition_start_s", "acquisition_end_s")
+            ),
+            "host_launch_handoff": cls._profile_span_stats(
+                host_span_ms("order_wait_begin_s", "order_wait_end_s")
+            ),
+            "host_timestamp_counts": {
+                "ingress_records": len(cls._prefill_profile_host_records),
+                "gate_open": sum(
+                    record.gate_open_s is not None
+                    for record in cls._prefill_profile_host_records
+                ),
+                "broadcast_enqueue": sum(
+                    record.broadcast_enqueue_s is not None
+                    for record in cls._prefill_profile_host_records
+                ),
+            },
         }
 
     def __init__(
@@ -783,6 +940,13 @@ class StreamedSP8MXFP4MoELayer:
             return x.new_zeros((0, H))
 
         profile_start = time.perf_counter() if profile else None
+        # E0 boundaries for THIS layer, recorded on the compute stream and
+        # never waited on here.  Published as one record at the end, so a layer
+        # that raises leaves no partial sequence behind.  A zero-row node
+        # returned above and contributes no record at all.
+        marks = [] if profile else None
+        if profile:
+            _profile_mark(marks)
         tp_size = buffer.tp_size
         tp_group = buffer.tp_group
         expert_start = buffer.expert_start
@@ -825,9 +989,13 @@ class StreamedSP8MXFP4MoELayer:
         all_latent = x_latent.new_empty((num_node_rows, latent_size))
         all_idx = topk_idx.new_empty((num_node_rows, top_k))
         all_weight = topk_weight.new_empty((num_node_rows, top_k))
+        if profile:
+            _profile_mark(marks)
         dist.all_gather_into_tensor(all_latent, x_latent, group=tp_group)
         dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
         dist.all_gather_into_tensor(all_weight, topk_weight, group=tp_group)
+        if profile:
+            _profile_mark(marks)
         # All three TP8 gather calls have now been issued from the model
         # thread. The prefetch thread, whose host ingress has been running
         # since ``begin_prefetch_next`` above, may issue its cross-node
@@ -857,6 +1025,9 @@ class StreamedSP8MXFP4MoELayer:
             cls._prefill_profile_active_experts += active[:num_local].sum()
             cls._prefill_profile_node_routed_assignments += num_rows * top_k
             cls._prefill_profile_expert_shard_size = num_local
+            # Start grouped timing after the asynchronous accounting kernels;
+            # they are observability overhead, not grouped-MoE execution.
+            _profile_mark(marks)
 
         # --- this rank's 112 experts over ALL node rows (non-owned -> -1) ---
         # Chunked on the independent token dimension only. 2048 rows keeps the
@@ -885,6 +1056,8 @@ class StreamedSP8MXFP4MoELayer:
                     top_k,
                 )
             )
+        if profile:
+            _profile_mark(marks)
 
         # --- node-local SUM of the eight disjoint FP32 partials, scattered ---
         # back to each rank's own padded row block. Summing in FP32 before the
@@ -894,10 +1067,18 @@ class StreamedSP8MXFP4MoELayer:
         # router, gathers and grouped expert work; only the two orthogonal NCCL
         # communicator families are kept from contending with one another.
         buffer.order_tp_collective_after_cross_launch()
+        if profile:
+            # Bounds the compute stream's stall on the cross-node ingress
+            # fence. host_rdma has no such fence, so this span is ~0 there.
+            _profile_mark(marks)
         local_latent = combined.new_empty((ntp, latent_size))
+        if profile:
+            _profile_mark(marks)
         dist.reduce_scatter_tensor(
             local_latent, combined, op=dist.ReduceOp.SUM, group=tp_group
         )
+        if profile:
+            _profile_mark(marks)
         # Every kernel and node-local collective that reads ``buffer.compute``
         # has now been enqueued, so the prefetch started above may assemble the
         # next layer into it.  Nothing below touches expert weights.
@@ -911,6 +1092,8 @@ class StreamedSP8MXFP4MoELayer:
                 y = self.norm(y)
             output[start:end].copy_(self.up_proj(y))
         if profile:
+            _profile_mark(marks)
+            cls._prefill_profile_layer_marks.append(tuple(marks))
             cls._prefill_profile_wall_s += (
                 time.perf_counter() - profile_start
             )

@@ -1,6 +1,7 @@
 import ast
 import copy
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -69,6 +70,46 @@ def _call_guards(function):
     for statement in function.body:
         visit(statement, ())
     return found
+
+
+def _name_call_guards(function, name):
+    """Enclosing ``if`` tests for each bare ``name(...)`` call.
+
+    ``_call_guards`` only sees ``obj.method()`` calls; the E0 boundary helper is
+    a module-level function, so it needs its own walk.
+    """
+    found = []
+
+    def visit(node, stack):
+        if isinstance(node, ast.If):
+            visit(node.test, stack)
+            for child in node.body:
+                visit(child, stack + (ast.unparse(node.test),))
+            for child in node.orelse:
+                visit(child, stack + ("else: " + ast.unparse(node.test),))
+            return
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+        ):
+            found.append(stack)
+        for child in ast.iter_child_nodes(node):
+            visit(child, stack)
+
+    for statement in function.body:
+        visit(statement, ())
+    return found
+
+
+def _tracing_profile_mark(trace):
+    """Stand-in for the module's ``_profile_mark``: records, never waits."""
+
+    def mark(marks):
+        marks.append(SimpleNamespace(order=len(trace)))
+        trace.append(("profile_mark",))
+
+    return mark
 
 
 def _isolated_function(path, function_name):
@@ -656,7 +697,7 @@ class _FakeStream:
 
 
 def _mock_sp8_buffer(
-    trace, method_names, *, acquire=None, cross_group=None
+    trace, method_names, *, acquire=None, cross_group=None, profile=False
 ):
     """Bind real ``StreamedSP8LayerBuffer`` methods onto fake CUDA streams."""
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
@@ -669,6 +710,7 @@ def _mock_sp8_buffer(
             stream=None,
             cross_launch_gate=None,
             cross_launch_callback=None,
+            profile_host=None,
             **_kwargs,
         ):
             def log(name):
@@ -688,6 +730,8 @@ def _mock_sp8_buffer(
                 if not cross_launch_gate():
                     return
                 log("cross_broadcast")
+                if profile_host is not None:
+                    profile_host.broadcast_enqueue_s = time.perf_counter()
             if cross_launch_callback is not None:
                 cross_launch_callback()
 
@@ -704,6 +748,10 @@ def _mock_sp8_buffer(
     buffer._assemble_compute_shard = record_call("assemble")
     buffer.shard = SimpleNamespace(name="shard")
     buffer._make_shard = lambda: buffer.shard
+    profile_cls = type("Profile", (), {
+        "_prefill_profile_enabled": profile,
+        "_prefill_profile_host_records": [],
+    })
     globals_ = {
         "torch": SimpleNamespace(
             cuda=SimpleNamespace(
@@ -713,8 +761,10 @@ def _mock_sp8_buffer(
             )
         ),
         "threading": threading,
+        "time": time,
         "SimpleNamespace": SimpleNamespace,
         "PREFETCH_HANDOFF_TIMEOUT_S": 300.0,
+        "StreamedSP8MXFP4MoELayer": profile_cls,
     }
     for name in method_names:
         setattr(
@@ -738,6 +788,7 @@ def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
         stream=None,
         cross_launch_gate=None,
         cross_launch_callback=None,
+        **_kwargs,
     ):
         trace.append(
             SimpleNamespace(
@@ -1052,6 +1103,7 @@ def _mock_sp8_moe_layer(
         "_prefill_profile_grouped_chunks": 0,
         "_prefill_profile_active_experts": 0,
         "_prefill_profile_wall_s": 0.0,
+        "_prefill_profile_layer_marks": [],
     })()
     layer.layer_idx = 3
     layer.buffer = SimpleNamespace(
@@ -1084,6 +1136,9 @@ def _mock_sp8_moe_layer(
             "time": time,
             "dist": fake_dist,
             "ResidentEPMXFP4MoELayer": FakeHelper,
+            # The real helper records a CUDA timing event; the mocks run on CPU
+            # tensors, so stand in for it and log the boundary instead.
+            "_profile_mark": _tracing_profile_mark(trace),
         },
     ).__get__(layer)
 
@@ -1170,6 +1225,7 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
             "allow_full_overwrite",
         ),
         cross_group="cross4",
+        profile=True,
     )
 
     buffer.begin_prefetch_next(3)
@@ -1196,6 +1252,10 @@ def test_hierarchical_gdr_prefetch_hands_off_after_cross_launch():
     pending.thread.join(5)
     assert not pending.thread.is_alive()
     assert pending.error is None
+    host = pending.profile_host
+    assert host.gate_open_s is not None
+    assert host.broadcast_enqueue_s >= host.gate_open_s
+    assert host.order_wait_end_s >= host.order_wait_begin_s
 
 
 def test_hierarchical_gdr_acquires_host_shard_before_the_cross_launch_gate():
@@ -1208,6 +1268,7 @@ def test_hierarchical_gdr_acquires_host_shard_before_the_cross_launch_gate():
         stream=None,
         cross_launch_gate=None,
         cross_launch_callback=None,
+        **_kwargs,
     ):
         trace.append(
             SimpleNamespace(
@@ -1514,6 +1575,300 @@ def test_streamed_sp8_profile_does_not_synchronize_each_layer():
     assert "unique" not in forward_calls
     assert "item" in snapshot_calls
 
+    # E0 timing events are RECORDED in the measured path and consumed exactly
+    # once, in the snapshot. A per-layer ``elapsed_time``/``synchronize`` would
+    # park the host on the overlap this path exists to create.
+    path_functions = {
+        "forward": forward,
+        "_acquire_local_shard": _function(
+            path, "StreamedSP8LayerBuffer", "_acquire_local_shard"
+        ),
+        "_broadcast_local_shard": _function(
+            path, "StreamedSP8LayerBuffer", "_broadcast_local_shard"
+        ),
+        "_profile_mark": next(
+            node
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_profile_mark"
+        ),
+    }
+    for name, function in path_functions.items():
+        attrs = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        assert "elapsed_time" not in attrs, name
+        # ``_acquire_local_shard`` keeps its per-batch ring-lease synchronize,
+        # which predates E0 and is not a timing-event read.
+        if name != "_acquire_local_shard":
+            assert "synchronize" not in attrs, name
+    assert "elapsed_time" in snapshot_calls
+    assert "synchronize" not in snapshot_calls
+
+
+def test_streamed_sp8_layer_boundaries_follow_the_r10_order():
+    trace = []
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace,
+        rows=3,
+        num_rows=5,
+        tp_size=2,
+        profile=True,
+        cross_group="cross4",
+    )
+
+    layer.forward(x, gate, num_rows)
+    ops = _ops(trace)
+    marks = [index for index, op in enumerate(ops) if op == "profile_mark"]
+
+    # Nine exact boundaries, one complete record, published as a unit.
+    assert len(marks) == 9
+    assert len(type(layer)._prefill_profile_layer_marks) == 1
+    record = type(layer)._prefill_profile_layer_marks[0]
+    assert len(record) == 9
+    assert [event.order for event in record] == marks
+
+    def last(op):
+        return max(index for index, name in enumerate(ops) if name == op)
+
+    # b0 layer; b1/b2 gathers; b3/b4 grouped+combine; b5 post-fence;
+    # b6/b7 reduce-scatter; b8 post-MoE. The fence boundary must straddle
+    # ``order_cross`` or fence_stall would not measure the stall at all.
+    assert marks[0] < marks[1] < ops.index("all_gather")
+    assert last("all_gather") < marks[2] < marks[3]
+    assert marks[3] < ops.index("expert_path")
+    assert last("combine") < marks[4] < ops.index("order_cross")
+    assert ops.index("order_cross") < marks[5] < marks[6]
+    assert marks[6] < ops.index("reduce_scatter") < marks[7]
+    assert marks[7] < ops.index("allow")
+    assert last("up") < marks[8]
+
+
+def test_streamed_sp8_empty_node_publishes_no_layer_boundaries():
+    trace = []
+    layer, x, gate, num_rows = _mock_sp8_moe_layer(
+        trace, rows=0, num_rows=0, profile=True, cross_group="cross4"
+    )
+
+    layer.forward(x, gate, num_rows)
+
+    # The zero-row node returns before the first boundary, so it contributes no
+    # record rather than a partial one the snapshot would have to interpret.
+    assert "profile_mark" not in _ops(trace)
+    assert type(layer)._prefill_profile_layer_marks == []
+
+
+def test_streamed_sp8_e0_records_are_gated_on_the_profile_flag():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    forward = _function(path, "StreamedSP8MXFP4MoELayer", "forward")
+
+    # Every boundary in the layer path, and the record that publishes them,
+    # sits behind ``profile``; a disabled prefill records nothing at all.
+    guards = _name_call_guards(forward, "_profile_mark")
+    assert len(guards) == 9
+    assert all(
+        any("profile" in test for test in stack) for stack in guards
+    ), guards
+    publish = _call_guards(forward)["append"]
+    assert publish and all(
+        any("profile" in test for test in stack) for stack in publish
+    ), publish
+
+    broadcast = _function(
+        path, "StreamedSP8LayerBuffer", "_broadcast_local_shard"
+    )
+    broadcast_guards = _name_call_guards(broadcast, "_profile_mark")
+    assert len(broadcast_guards) == 2
+    assert all(
+        any("enabled" in test for test in stack)
+        for stack in broadcast_guards
+    ), broadcast_guards
+
+    acquire = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_acquire_local_shard")
+    )
+    assert "enabled = profile._prefill_profile_enabled" in acquire
+    assert "profile_host.acquisition_start_s = time.perf_counter()" in acquire
+    assert "profile_host.acquisition_end_s = time.perf_counter()" in acquire
+    assert "if enabled and source_error is None:" in acquire
+    assert "profile_host.broadcast_enqueue_s = time.perf_counter()" in acquire
+
+    allow = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "allow_cross_launch")
+    )
+    assert "pending.profile_host.gate_open_s = time.perf_counter()" in allow
+    order = ast.unparse(
+        _function(
+            path,
+            "StreamedSP8LayerBuffer",
+            "order_tp_collective_after_cross_launch",
+        )
+    )
+    assert "pending.profile_host.order_wait_begin_s = time.perf_counter()" in order
+    assert "pending.profile_host.order_wait_end_s = time.perf_counter()" in order
+
+
+class _FakeTimingEvent:
+    """A recorded E0 event; ``elapsed_time`` is ms to a later boundary."""
+
+    def __init__(self, stamp_ms):
+        self.stamp_ms = stamp_ms
+
+    def elapsed_time(self, other):
+        return other.stamp_ms - self.stamp_ms
+
+
+class _NotATensor:
+    pass
+
+
+def _isolated_profile_class(synchronizes):
+    """The real class profile state plus reset / stats / snapshot."""
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    klass = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "StreamedSP8MXFP4MoELayer"
+    )
+    wanted = (
+        "reset_prefill_profile",
+        "_profile_span_stats",
+        "prefill_profile_snapshot",
+    )
+    body = [
+        copy.deepcopy(node)
+        for node in klass.body
+        if (
+            isinstance(node, ast.Assign)
+            and all(
+                isinstance(target, ast.Name)
+                and target.id.startswith("_prefill_profile_")
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name in wanted)
+    ]
+    module = ast.Module(
+        body=[
+            ast.ClassDef(
+                name="Profile",
+                bases=[],
+                keywords=[],
+                body=body,
+                decorator_list=[],
+            )
+        ],
+        type_ignores=[],
+    )
+    namespace = {
+        "math": math,
+        "torch": SimpleNamespace(
+            Tensor=_NotATensor,
+            cuda=SimpleNamespace(
+                synchronize=lambda: synchronizes.append("sync")
+            ),
+        ),
+    }
+    exec(
+        compile(ast.fix_missing_locations(module), str(path), "exec"),
+        namespace,
+    )
+    return namespace["Profile"]
+
+
+def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
+    synchronizes = []
+    profile = _isolated_profile_class(synchronizes)
+
+    profile.reset_prefill_profile(True)
+    for stamps in (
+        (0.0, 1.0, 4.0, 5.0, 9.0, 12.0, 13.0, 17.0, 20.0),
+        (20.0, 22.0, 32.0, 33.0, 40.0, 42.0, 43.0, 50.0, 52.0),
+    ):
+        profile._prefill_profile_layer_marks.append(
+            tuple(_FakeTimingEvent(stamp) for stamp in stamps)
+        )
+    profile._prefill_profile_broadcast_spans.append(
+        (_FakeTimingEvent(0.0), _FakeTimingEvent(7.0))
+    )
+    profile._prefill_profile_host_records.extend([
+        SimpleNamespace(
+            acquisition_start_s=1.0,
+            acquisition_end_s=1.125,
+            gate_open_s=2.0,
+            order_wait_begin_s=3.0,
+            order_wait_end_s=3.750,
+            broadcast_enqueue_s=2.1,
+        ),
+        SimpleNamespace(
+            acquisition_start_s=None,
+            acquisition_end_s=None,
+            gate_open_s=4.0,
+            order_wait_begin_s=5.0,
+            order_wait_end_s=5.250,
+            broadcast_enqueue_s=4.1,
+        ),
+    ])
+
+    snapshot = profile.prefill_profile_snapshot()
+
+    # The existing end-of-prefill dependency chain has completed every event;
+    # the snapshot consumes them without adding another device-wide fence.
+    assert synchronizes == []
+    # Adjacent boundaries, nearest-rank percentiles, milliseconds throughout.
+    assert snapshot["grouped_execution"] == {
+        "count": 2, "sum_ms": 11.0, "p50_ms": 4.0, "p95_ms": 7.0
+    }
+    assert snapshot["fence_stall"] == {
+        "count": 2, "sum_ms": 5.0, "p50_ms": 2.0, "p95_ms": 3.0
+    }
+    assert snapshot["reduce_scatter"] == {
+        "count": 2, "sum_ms": 11.0, "p50_ms": 4.0, "p95_ms": 7.0
+    }
+    assert snapshot["post_moe"] == {
+        "count": 2, "sum_ms": 5.0, "p50_ms": 2.0, "p95_ms": 3.0
+    }
+    assert snapshot["broadcast_execution"] == {
+        "count": 1, "sum_ms": 7.0, "p50_ms": 7.0, "p95_ms": 7.0
+    }
+    # Host stamps are seconds on the wire and milliseconds in the snapshot.
+    assert snapshot["host_acquisition"] == {
+        "count": 1, "sum_ms": 125.0, "p50_ms": 125.0, "p95_ms": 125.0
+    }
+    assert snapshot["host_launch_handoff"] == {
+        "count": 2, "sum_ms": 1000.0, "p50_ms": 250.0, "p95_ms": 750.0
+    }
+    assert snapshot["host_timestamp_counts"] == {
+        "ingress_records": 2,
+        "gate_open": 2,
+        "broadcast_enqueue": 2,
+    }
+
+    stale = profile._prefill_profile_layer_marks
+    profile.reset_prefill_profile(False)
+
+    # Reset REPLACES the record lists, so a snapshot already handed to the
+    # caller keeps the records it aggregated from.
+    assert profile._prefill_profile_layer_marks is not stale
+    assert len(stale) == 2
+    for key in (
+        "broadcast_execution",
+        "fence_stall",
+        "grouped_execution",
+        "reduce_scatter",
+        "post_moe",
+        "host_acquisition",
+        "host_launch_handoff",
+    ):
+        assert profile.prefill_profile_snapshot()[key] == {
+            "count": 0, "sum_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0
+        }, key
+    assert synchronizes == []
+
 
 def test_streamed_sp8_grouped_chunk_is_wide_enough_for_large_token_runs():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
@@ -1710,6 +2065,8 @@ def _sp8_ingress_buffer(
         "_prefill_profile_cross_source": False,
         "_prefill_profile_cross_status_calls": 0,
         "_prefill_profile_cross_status_failures": 0,
+        "_prefill_profile_broadcast_spans": [],
+        "_prefill_profile_host_records": [],
     })
     globals_ = {
         "torch": SimpleNamespace(
@@ -1719,6 +2076,8 @@ def _sp8_ingress_buffer(
                 current_stream=lambda device: None,
             )
         ),
+        "time": time,
+        "_profile_mark": _tracing_profile_mark(trace),
         "dist": SimpleNamespace(
             broadcast=lambda tensor, root, group=None: trace.append(
                 ("broadcast", tensor.name, root, group)
@@ -1861,6 +2220,28 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 0
 
+    # E0: exactly one complete broadcast pair, and it BRACKETS the six payload
+    # broadcasts -- the status broadcast and the assembly stay outside it.
+    assert len(profile._prefill_profile_broadcast_spans) == 1
+    opened, closed = profile._prefill_profile_broadcast_spans[0]
+    payload = [
+        index
+        for index, entry in enumerate(trace)
+        if entry[0] == "broadcast" and entry[1] != "source_status"
+    ]
+    assert opened.order < payload[0]
+    assert payload[-1] < closed.order
+    assert closed.order < _op_span(trace, "assemble")[0]
+    # The synchronous ingress records acquisition and enqueue timestamps; it
+    # has no async gate or model-thread ordering wait.
+    assert len(profile._prefill_profile_host_records) == 1
+    host = profile._prefill_profile_host_records[0]
+    assert host.acquisition_end_s >= host.acquisition_start_s
+    assert host.broadcast_enqueue_s is not None
+    assert host.gate_open_s is None
+    assert host.order_wait_begin_s is None
+    assert host.order_wait_end_s is None
+
 
 def test_hierarchical_gdr_non_source_rank_receives_without_host_ingress():
     trace = []
@@ -1884,6 +2265,14 @@ def test_hierarchical_gdr_non_source_rank_receives_without_host_ingress():
     assert profile._prefill_profile_cross_source is False
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 0
+    # A synchronous non-source rank pulls nothing from host but still records
+    # that its cross-node payloads were enqueued.
+    assert len(profile._prefill_profile_broadcast_spans) == 1
+    assert len(profile._prefill_profile_host_records) == 1
+    host = profile._prefill_profile_host_records[0]
+    assert host.acquisition_start_s is None
+    assert host.acquisition_end_s is None
+    assert host.broadcast_enqueue_s is not None
 
 
 def test_host_rdma_transport_runs_no_cross_node_collective():
@@ -1906,6 +2295,34 @@ def test_host_rdma_transport_runs_no_cross_node_collective():
     assert profile._prefill_profile_cross_source is False
     assert profile._prefill_profile_cross_status_calls == 0
     assert profile._prefill_profile_cross_status_failures == 0
+    # No cross-node communicator exists, so neither the broadcast pair nor the
+    # ordering handoff has anything to time -- but the host pull still does.
+    assert "profile_mark" not in ops
+    assert profile._prefill_profile_broadcast_spans == []
+    assert len(profile._prefill_profile_host_records) == 1
+    host = profile._prefill_profile_host_records[0]
+    assert host.acquisition_end_s >= host.acquisition_start_s
+    assert host.broadcast_enqueue_s is None
+
+
+def test_streamed_sp8_synchronous_first_layer_still_times_the_handoff():
+    trace = []
+    stream = _FakeIngressStream(trace)
+    # ``load`` acquires the first layer inline, with no gate to wait on.
+    buffer, profile = _sp8_ingress_buffer(
+        trace, cross_group="cross3", cross_root=11, cross_source=True
+    )
+
+    buffer._acquire_local_shard(7, stream=stream)
+
+    assert len(profile._prefill_profile_host_records) == 1
+    host = profile._prefill_profile_host_records[0]
+    assert host.acquisition_end_s >= host.acquisition_start_s
+    assert host.broadcast_enqueue_s is not None
+    assert host.gate_open_s is None
+    assert len(profile._prefill_profile_broadcast_spans) == 1
+    opened, closed = profile._prefill_profile_broadcast_spans[0]
+    assert opened.order < closed.order
 
 
 def test_hierarchical_gdr_source_failure_announces_status_before_raising():
@@ -1936,6 +2353,10 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 1
     assert profile._prefill_profile_cross_status_failures == 1
+    # A failed ingress publishes nothing: no half broadcast pair, no
+    # acquisition sample timing the failure, no ordering handoff.
+    assert profile._prefill_profile_broadcast_spans == []
+    assert profile._prefill_profile_host_records == []
 
 
 def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
@@ -1968,6 +2389,10 @@ def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     assert "h2d_synchronize" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0
     assert profile._prefill_profile_cross_status_calls == 0
+    # A cancelled gate publishes no partial host or event record.
+    assert "profile_mark" not in ops
+    assert profile._prefill_profile_broadcast_spans == []
+    assert profile._prefill_profile_host_records == []
 
 
 def test_hierarchical_gdr_status_read_is_stream_ordered_after_broadcast():
