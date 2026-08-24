@@ -302,6 +302,44 @@ def grouped_fp8_blockwise_fused_s1(
     )
 
 
+def grouped_fp8_blockwise_fused_s1_keep_gate_in_regs(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    gate_w3d: Tensor,
+    up_w3d: Tensor,
+    gate_ws3d: Tensor,
+    up_ws3d: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Experimental production-topology M64 fused S1 KeepGateInRegs probe."""
+    if num_seq_per_group_avg != 64:
+        raise ValueError(
+            "experimental KeepGateInRegs fused S1 requires num_seq_per_group_avg=64"
+        )
+
+    import batchgen_kernels
+
+    module = batchgen_kernels.load_extension(
+        "batchgen_kernels.moe._C_fp8_blockwise_gemm"
+    )
+    kernel = getattr(module, "fp8_blockwise_fused_s1_keep_gate_in_regs", None)
+    if kernel is None:
+        raise RuntimeError(
+            "Experimental FP8 KeepGateInRegs fused S1 probe not compiled. "
+            "Rebuild batchgen_kernels from this source checkout."
+        )
+    return kernel(
+        x_fp8, gate_w3d, up_w3d,
+        seqlens, cu_seqlens, x_scale,
+        gate_ws3d, up_ws3d,
+        num_seq_per_group_avg,
+        output,
+    )
+
+
 def grouped_fp8_blockwise_fused_s1_high_occ(
     x_fp8: Tensor,
     x_scale: Tensor,

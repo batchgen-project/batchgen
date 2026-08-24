@@ -27,7 +27,7 @@ namespace kernels {
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC,
           typename TmaAS, typename TmaBS, bool IsLoopH, int kBlockThreads,
-          int kMinBlocksPerSM = 1>
+          int kMinBlocksPerSM = 1, bool KeepGateInRegs = false>
 __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
     fp8_blockwise_fused_s1_kernel(
         const __grid_constant__ TmaB tma_b_gate,
@@ -59,6 +59,14 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
   constexpr int kStage = Config::kStage;
+  if constexpr (KeepGateInRegs) {
+    static_assert(kTileM == 64 && kTileN == 128 && kTileK == 128 && kStage == 8,
+                  "KeepGateInRegs probe requires M64/N128/K128/stage8");
+    static_assert(Config::kWarpgroupM == 2 && Config::kWarpgroupN == 1,
+                  "KeepGateInRegs probe requires two math warpgroups");
+    static_assert(kBlockThreads == 384 && kMinBlocksPerSM == 1,
+                  "KeepGateInRegs probe requires 1-loader+2-math WG, min-blocks=1");
+  }
   static_assert(Config::kWeightScaleBlockN % kTileN == 0,
                 "TileN must divide the 128-row weight-scale block");
   constexpr int kWeightScaleTilesPerBlock = Config::kWeightScaleBlockN / kTileN;
@@ -256,7 +264,11 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
   // MATH WARPGROUPS
   // ========================================================================
   } else {
-    cutlass::arch::warpgroup_reg_alloc<168>();
+    if constexpr (KeepGateInRegs) {
+      cutlass::arch::warpgroup_reg_alloc<232>();
+    } else {
+      cutlass::arch::warpgroup_reg_alloc<168>();
+    }
 
     int idx_in_warpgroup = idx % 128;
     int iwarpgroup = idx / 128;
@@ -298,6 +310,14 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
 
       int ntile_k = size<2>(tAg);
 
+      // Opt-in probe only: retain the completed FP32 gate aggregate across the
+      // existing phase transition. The default specialization never references
+      // this fragment and keeps its existing SMEM gate handoff unchanged.
+      auto tDr_gate_regs = make_tensor_like(tCr);
+      if constexpr (KeepGateInRegs) {
+        clear(tDr_gate_regs);
+      }
+
       // ──── PHASE 1: Gate K-loop ────
       {
         auto tDr = make_tensor_like(tCr);
@@ -328,12 +348,18 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
           warpgroup_fence_operand(tCr);
 
           auto tDr_mn = retile_fragment(tDr);
+          auto tDr_gate_mn = retile_fragment(tDr_gate_regs);
 #pragma unroll
           for (int in = 0; in < kN; in++) {
             float yscale = tCS[in];
 #pragma unroll
             for (int im = 0; im < kM; im++) {
-              tDr_mn(im, in) = tCr_mn(im, in) * yscale + tDr_mn(im, in);
+              if constexpr (KeepGateInRegs) {
+                tDr_gate_mn(im, in) =
+                    tCr_mn(im, in) * yscale + tDr_gate_mn(im, in);
+              } else {
+                tDr_mn(im, in) = tCr_mn(im, in) * yscale + tDr_mn(im, in);
+              }
             }
           }
 
@@ -344,26 +370,34 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
           if (ismem_read == kStage) { phase ^= 1; ismem_read = 0; }
         }
 
-        // Gate to SMEM: FP32 → BF16 → R2S
-        auto tCrh_gate = make_tensor_like<cute::bfloat16_t>(tCr);
+        if constexpr (!KeepGateInRegs) {
+          // Gate to SMEM: FP32 → BF16 → R2S
+          auto tCrh_gate = make_tensor_like<cute::bfloat16_t>(tCr);
 #pragma unroll
-        for (int i = 0; i < size(tCr); ++i) {
-          tCrh_gate(i) = (Tout)(tDr(i));
+          for (int i = 0; i < size(tCr); ++i) {
+            tCrh_gate(i) = (Tout)(tDr(i));
+          }
+
+          auto sGate = make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_gate)),
+                                   SLayoutCT{});
+          using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>;
+          auto tiled_copy_gate = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+          auto thr_copy_gate = tiled_copy_gate.get_slice(idx);
+          auto tGr4s = thr_copy_gate.retile_S(tCrh_gate);
+          auto tGs4r = thr_copy_gate.partition_D(sGate);
+
+          // Wait for previous tile's TMA store (shm_gate aliases shm_c)
+          tma_store_wait<0>();
+          syncwarpgroup(iwarpgroup + 2);
+          cute::copy(tiled_copy_gate, tGr4s, tGs4r);
+          syncwarpgroup(iwarpgroup + 2);
+        } else {
+          // Preserve the existing store-reuse wait and warpgroup barriers even
+          // though this specialization does not overwrite shm_gate.
+          tma_store_wait<0>();
+          syncwarpgroup(iwarpgroup + 2);
+          syncwarpgroup(iwarpgroup + 2);
         }
-
-        auto sGate = make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_gate)),
-                                 SLayoutCT{});
-        using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>;
-        auto tiled_copy_gate = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
-        auto thr_copy_gate = tiled_copy_gate.get_slice(idx);
-        auto tGr4s = thr_copy_gate.retile_S(tCrh_gate);
-        auto tGs4r = thr_copy_gate.partition_D(sGate);
-
-        // Wait for previous tile's TMA store (shm_gate aliases shm_c)
-        tma_store_wait<0>();
-        syncwarpgroup(iwarpgroup + 2);
-        cute::copy(tiled_copy_gate, tGr4s, tGs4r);
-        syncwarpgroup(iwarpgroup + 2);
       }
 
       // Phase transition: all math and loader threads sync.
@@ -434,6 +468,7 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
           auto sGate = make_tensor(
               make_smem_ptr(reinterpret_cast<Tout *>(shm_gate)), SLayoutCT{});
           auto tDr_mn = retile_fragment(tDr);
+          auto tDr_gate_mn = retile_fragment(tDr_gate_regs);
 
           // tI_mn: get<0>=N coord, get<1>=M coord. SLayoutCT=(kTileN, kTileM).
 #pragma unroll
@@ -441,7 +476,14 @@ __global__ void __launch_bounds__(kBlockThreads, kMinBlocksPerSM)
 #pragma unroll
             for (int im = 0; im < kM; im++) {
               auto coord = tI_mn(im, in);
-              auto gate_bf16 = sGate(get<0>(coord), get<1>(coord));
+              Tout gate_bf16;
+              if constexpr (KeepGateInRegs) {
+                // Preserve the production semantic boundary explicitly:
+                // completed gate FP32 -> BF16 -> FP32. Up remains FP32.
+                gate_bf16 = (Tout)tDr_gate_mn(im, in);
+              } else {
+                gate_bf16 = sGate(get<0>(coord), get<1>(coord));
+              }
               float gate_val =
                   __bfloat162float(reinterpret_cast<const __nv_bfloat16 &>(gate_bf16));
               float sigmoid = 1.0f / (1.0f + __expf(-gate_val));

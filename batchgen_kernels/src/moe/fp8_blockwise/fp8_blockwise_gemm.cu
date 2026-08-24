@@ -309,7 +309,8 @@ torch::Tensor fp8_blockwise_grouped_gemm_high_occ(
 template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage,
           int kWarpgroupM, int kWarpgroupN,
           int kSwizzleX, int kSwizzleW, int kSwizzleY,
-          int kBlockThreads = 384, int kGridMultiplier = 1, int kMinBlocksPerSM = 1>
+          int kBlockThreads = 384, int kGridMultiplier = 1,
+          int kMinBlocksPerSM = 1, bool KeepGateInRegs = false>
 void launch_fp8_blockwise_fused_s1(
     void *y_ptr, const void *x_ptr,
     const void *gate_w_ptr, const void *up_w_ptr,
@@ -377,6 +378,37 @@ void launch_fp8_blockwise_fused_s1(
     int shm_seq = sizeof(int) * (num_group + 1);
     int shm_size = config.get_shm_size() + shm_seq;
 
+    if constexpr (KeepGateInRegs) {
+      if (k <= 1024 || n <= 1024) {
+        constexpr bool IsLoopH = true;
+        auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
+            decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads,
+            kMinBlocksPerSM, true>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+        kernel<<<grid, block, shm_size, stream>>>(
+            tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
+            tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr, (float *)xscale_ptr,
+            (int *)tiles_ptr, (int *)cu_tiles_ptr,
+            num_group, m, n, k, m_pad,
+            num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      } else {
+        constexpr bool IsLoopH = false;
+        auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
+            decltype(tma_xs), decltype(tma_ws_gate), IsLoopH, kBlockThreads,
+            kMinBlocksPerSM, true>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+        kernel<<<grid, block, shm_size, stream>>>(
+            tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
+            tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr, (float *)xscale_ptr,
+            (int *)tiles_ptr, (int *)cu_tiles_ptr,
+            num_group, m, n, k, m_pad,
+            num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      }
+      return;
+    }
+
     if (k <= 1024 || n <= 1024) {
       constexpr bool IsLoopH = true;
       auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
@@ -442,6 +474,36 @@ void fp8_blockwise_fused_s1_async(
   }
 }
 
+// Experimental production-topology probe: retain the completed gate aggregate
+// in registers across the otherwise unchanged gate->up phase transition.
+void fp8_blockwise_fused_s1_keep_gate_in_regs_async(
+    void *y_ptr, const void *x_ptr,
+    const void *gate_w_ptr, const void *up_w_ptr,
+    const void *seqlens_ptr, const void *cu_seqlens_ptr,
+    const void *xscale_ptr,
+    const void *gate_wscale_ptr, const void *up_wscale_ptr,
+    void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr,
+    int num_group, int m, int n, int k, int m_pad,
+    int num_block_k_pad4, int num_seq_per_group_avg,
+    bool update_tma, cudaStream_t stream) {
+  TORCH_CHECK(num_seq_per_group_avg == 64,
+              "experimental KeepGateInRegs fused S1 requires TileM=64");
+
+  constexpr int kTileN = 128, kTileK = 128, kTileS = 64, kStage = 8;
+  constexpr int kWarpgroupM = 2, kWarpgroupN = 1;
+  constexpr int kSwizzleX = 128, kSwizzleW = 128, kSwizzleY = 64;
+  constexpr int kBlockThreads = 384, kGridMultiplier = 1, kMinBlocksPerSM = 1;
+
+  launch_fp8_blockwise_fused_s1<
+      64, kTileN, kTileK, kTileS, kStage, kWarpgroupM, kWarpgroupN,
+      kSwizzleX, kSwizzleW, kSwizzleY, kBlockThreads, kGridMultiplier,
+      kMinBlocksPerSM, true>(
+      y_ptr, x_ptr, gate_w_ptr, up_w_ptr, seqlens_ptr, cu_seqlens_ptr,
+      xscale_ptr, gate_wscale_ptr, up_wscale_ptr, tmas_ptr, tiles_ptr,
+      cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4,
+      update_tma, stream);
+}
+
 // Opt-in occupancy probe. Production fused S1 dispatch above is unchanged.
 void fp8_blockwise_fused_s1_high_occ_async(
     void *y_ptr, const void *x_ptr,
@@ -491,7 +553,8 @@ void fp8_blockwise_fused_s1_high_occ_async(
 // ============================================================================
 // Fused S1 PyTorch entry point
 // ============================================================================
-torch::Tensor fp8_blockwise_fused_s1(
+torch::Tensor fp8_blockwise_fused_s1_impl(
+    bool keep_gate_in_regs,
     const torch::Tensor &x,
     const torch::Tensor &gate_weight, const torch::Tensor &up_weight,
     const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
@@ -525,7 +588,10 @@ torch::Tensor fp8_blockwise_fused_s1(
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
-  fp8_blockwise_fused_s1_async(
+  auto fused_s1_launcher = keep_gate_in_regs
+      ? fp8_blockwise_fused_s1_keep_gate_in_regs_async
+      : fp8_blockwise_fused_s1_async;
+  fused_s1_launcher(
       y.mutable_data_ptr(), x.const_data_ptr(),
       gate_weight.const_data_ptr(), up_weight.const_data_ptr(),
       seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
@@ -536,6 +602,34 @@ torch::Tensor fp8_blockwise_fused_s1(
       num_seq_per_group_avg, true, stream);
 
   return y;
+}
+
+torch::Tensor fp8_blockwise_fused_s1(
+    const torch::Tensor &x,
+    const torch::Tensor &gate_w, const torch::Tensor &up_w,
+    const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
+    const torch::Tensor &x_scale,
+    const torch::Tensor &gate_w_scale, const torch::Tensor &up_w_scale,
+    int64_t num_seq_per_group_avg,
+    std::optional<torch::Tensor> output = std::nullopt) {
+  return fp8_blockwise_fused_s1_impl(
+      false, x, gate_w, up_w, seqlens, cu_seqlens, x_scale,
+      gate_w_scale, up_w_scale, num_seq_per_group_avg, output);
+}
+
+torch::Tensor fp8_blockwise_fused_s1_keep_gate_in_regs(
+    const torch::Tensor &x,
+    const torch::Tensor &gate_w, const torch::Tensor &up_w,
+    const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
+    const torch::Tensor &x_scale,
+    const torch::Tensor &gate_w_scale, const torch::Tensor &up_w_scale,
+    int64_t num_seq_per_group_avg,
+    std::optional<torch::Tensor> output = std::nullopt) {
+  TORCH_CHECK(num_seq_per_group_avg == 64,
+              "experimental KeepGateInRegs fused S1 requires TileM=64");
+  return fp8_blockwise_fused_s1_impl(
+      true, x, gate_w, up_w, seqlens, cu_seqlens, x_scale,
+      gate_w_scale, up_w_scale, num_seq_per_group_avg, output);
 }
 
 torch::Tensor fp8_blockwise_fused_s1_high_occ(
@@ -590,6 +684,13 @@ torch::Tensor fp8_blockwise_fused_s1_high_occ(
 }  // close namespace batchgen
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("fp8_blockwise_fused_s1_keep_gate_in_regs",
+        &batchgen::moe::fp8_blockwise_fused_s1_keep_gate_in_regs,
+        "Experimental M64/N128/stage8 fused S1 with the FP32 gate aggregate kept in registers",
+        py::arg("x"), py::arg("gate_weight"), py::arg("up_weight"),
+        py::arg("seqlens"), py::arg("cu_seqlens"),
+        py::arg("x_scale"), py::arg("gate_w_scale"), py::arg("up_w_scale"),
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none());
   m.def("fp8_blockwise_grouped_gemm",
         &batchgen::moe::fp8_blockwise_grouped_gemm,
         "FP8 blockwise grouped GEMM (CuTe persistent 3-WG, adaptive TileM)",
