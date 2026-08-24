@@ -750,6 +750,10 @@ class StreamedSP8MXFP4MoELayer:
     #   5 post-ingress-wait 6/7 reduce-scatter start/end
     #   8 post-MoE layer end
     _prefill_profile_layer_marks = []
+    # One compute-stream event pair around ``buffer.load`` per MoE layer.  The
+    # end event is ordered after the pending-ready wait installed by ``load``,
+    # so this captures the GPU readiness bubble that host wall timing misses.
+    _prefill_profile_load_spans = []
     # One (start, end) pair per completed six-tensor payload broadcast, on the
     # ingress stream.  Empty on host_rdma, which runs no cross-node collective.
     _prefill_profile_broadcast_spans = []
@@ -778,6 +782,7 @@ class StreamedSP8MXFP4MoELayer:
         # Replaced, not cleared in place: a snapshot already handed to the
         # caller keeps the records it aggregated from.
         cls._prefill_profile_layer_marks = []
+        cls._prefill_profile_load_spans = []
         cls._prefill_profile_broadcast_spans = []
         cls._prefill_profile_host_records = []
 
@@ -815,6 +820,7 @@ class StreamedSP8MXFP4MoELayer:
             )
 
         marks = cls._prefill_profile_layer_marks
+        loads = cls._prefill_profile_load_spans
         broadcasts = cls._prefill_profile_broadcast_spans
         def boundary_ms(first, second):
             return [
@@ -858,6 +864,9 @@ class StreamedSP8MXFP4MoELayer:
             ),
             "broadcast_execution": cls._profile_span_stats(
                 [start.elapsed_time(end) for start, end in broadcasts]
+            ),
+            "load_readiness_wait": cls._profile_span_stats(
+                [start.elapsed_time(end) for start, end in loads]
             ),
             "fence_stall": cls._profile_span_stats(boundary_ms(4, 5)),
             "grouped_execution": cls._profile_span_stats(boundary_ms(3, 4)),
@@ -922,7 +931,13 @@ class StreamedSP8MXFP4MoELayer:
         # split. Returning before ``buffer.load`` lets the non-empty ranks enter
         # the cross-node broadcast alone and deadlocks the group on short or
         # imbalanced microbatches.
+        load_marks = [] if profile else None
+        if profile:
+            _profile_mark(load_marks)
         shard = buffer.load(self.layer_idx)
+        if profile:
+            _profile_mark(load_marks)
+            cls._prefill_profile_load_spans.append(tuple(load_marks))
         # Both transports start ingress at the earliest point, so the host and
         # ring-to-local acquisition of the next layer overlaps this one from
         # here. Hierarchical GDR holds only its cross-node collectives, until

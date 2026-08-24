@@ -1403,6 +1403,7 @@ def _mock_sp8_moe_layer(
         "_prefill_profile_active_experts": 0,
         "_prefill_profile_wall_s": 0.0,
         "_prefill_profile_layer_marks": [],
+        "_prefill_profile_load_spans": [],
     })()
     layer.layer_idx = 3
     layer.buffer = SimpleNamespace(
@@ -1996,12 +1997,20 @@ def test_streamed_sp8_layer_boundaries_follow_the_r10_order():
     ops = _ops(trace)
     marks = [index for index, op in enumerate(ops) if op == "profile_mark"]
 
-    # Nine exact boundaries, one complete record, published as a unit.
-    assert len(marks) == 9
+    # Two load-readiness boundaries followed by the nine layer boundaries.
+    assert len(marks) == 11
+    assert len(type(layer)._prefill_profile_load_spans) == 1
+    load_record = type(layer)._prefill_profile_load_spans[0]
+    assert len(load_record) == 2
+    assert [event.order for event in load_record] == marks[:2]
+    assert marks[0] < ops.index("load") < marks[1] < ops.index("begin")
+
+    # Nine exact layer boundaries, one complete record, published as a unit.
     assert len(type(layer)._prefill_profile_layer_marks) == 1
     record = type(layer)._prefill_profile_layer_marks[0]
     assert len(record) == 9
-    assert [event.order for event in record] == marks
+    assert [event.order for event in record] == marks[2:]
+    marks = marks[2:]
 
     def last(op):
         return max(index for index, name in enumerate(ops) if name == op)
@@ -2028,9 +2037,10 @@ def test_streamed_sp8_empty_node_publishes_no_layer_boundaries():
 
     layer.forward(x, gate, num_rows)
 
-    # The zero-row node returns before the first boundary, so it contributes no
-    # record rather than a partial one the snapshot would have to interpret.
-    assert "profile_mark" not in _ops(trace)
+    # The zero-row node still enters ``load`` in collective lockstep and records
+    # that readiness span, but returns before the first compute-layer boundary.
+    assert _ops(trace).count("profile_mark") == 2
+    assert len(type(layer)._prefill_profile_load_spans) == 1
     assert type(layer)._prefill_profile_layer_marks == []
 
 
@@ -2041,7 +2051,7 @@ def test_streamed_sp8_e0_records_are_gated_on_the_profile_flag():
     # Every boundary in the layer path, and the record that publishes them,
     # sits behind ``profile``; a disabled prefill records nothing at all.
     guards = _name_call_guards(forward, "_profile_mark")
-    assert len(guards) == 9
+    assert len(guards) == 11
     assert all(
         any("profile" in test for test in stack) for stack in guards
     ), guards
@@ -2168,6 +2178,10 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
     profile._prefill_profile_broadcast_spans.append(
         (_FakeTimingEvent(0.0), _FakeTimingEvent(7.0))
     )
+    profile._prefill_profile_load_spans.extend([
+        (_FakeTimingEvent(0.0), _FakeTimingEvent(60.0)),
+        (_FakeTimingEvent(10.0), _FakeTimingEvent(30.0)),
+    ])
     profile._prefill_profile_host_records.extend([
         SimpleNamespace(
             acquisition_start_s=1.0,
@@ -2208,6 +2222,9 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
     assert snapshot["broadcast_execution"] == {
         "count": 1, "sum_ms": 7.0, "p50_ms": 7.0, "p95_ms": 7.0
     }
+    assert snapshot["load_readiness_wait"] == {
+        "count": 2, "sum_ms": 80.0, "p50_ms": 20.0, "p95_ms": 60.0
+    }
     # Host stamps are seconds on the wire and milliseconds in the snapshot.
     assert snapshot["host_acquisition"] == {
         "count": 1, "sum_ms": 125.0, "p50_ms": 125.0, "p95_ms": 125.0
@@ -2222,14 +2239,18 @@ def test_streamed_sp8_snapshot_aggregates_spans_and_reset_replaces_them():
     }
 
     stale = profile._prefill_profile_layer_marks
+    stale_loads = profile._prefill_profile_load_spans
     profile.reset_prefill_profile(False)
 
     # Reset REPLACES the record lists, so a snapshot already handed to the
     # caller keeps the records it aggregated from.
     assert profile._prefill_profile_layer_marks is not stale
+    assert profile._prefill_profile_load_spans is not stale_loads
     assert len(stale) == 2
+    assert len(stale_loads) == 2
     for key in (
         "broadcast_execution",
+        "load_readiness_wait",
         "fence_stall",
         "grouped_execution",
         "reduce_scatter",
