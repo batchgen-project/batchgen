@@ -1186,11 +1186,14 @@ class BatchGenWorker:
 					"offload path, but BATCHGEN_SYNC_KV=1 appends decode KV to host "
 					"inline; suppressed decode writeback would not be the only variable"
 				)
-			if self.rank == 0:
+			# Every rank suppresses, so every rank says so — but only on the
+			# transition, so an already-active group is not re-announced.
+			if not self._suppress_decode_host_kv_writeback:
 				logging.warning(
-					"[BATCHGEN_DEBUG] glm5_suppress_decode_host_kv_writeback=1: decode "
-					"host-KV append launches are SUPPRESSED for this batch. Host KV "
-					"becomes stale — profiling runs must remain on resident GPU KV."
+					f"[BATCHGEN_DEBUG] rank={self.rank} "
+					"glm5_suppress_decode_host_kv_writeback=1: decode host-KV append "
+					"launches are SUPPRESSED for this batch group. Host KV becomes "
+					"stale — profiling runs must remain on resident GPU KV."
 				)
 		self._suppress_decode_host_kv_writeback = suppress
 
@@ -1216,6 +1219,65 @@ class BatchGenWorker:
 				)
 			global_ids.append(int(seq.global_idx))
 		self._host_kv_stale_global_ids.update(global_ids)
+
+	def _resolve_admission_batchgen_debug(self, entries: list) -> None:
+		"""Resolve one pool group's debug state before admission mutates it."""
+		def normalize(value, source):
+			if value is None:
+				return None
+			if not isinstance(value, dict):
+				raise RuntimeError(
+					f"batchgen_debug from {source} must be a dict or None, got "
+					f"{type(value).__name__}: {value!r}"
+				)
+			return value or None
+
+		incoming = normalize(entries[0].get("batchgen_debug"), "admission entry 0")
+		for i, entry in enumerate(entries[1:], start=1):
+			debug = normalize(
+				entry.get("batchgen_debug"), f"admission entry {i}"
+			)
+			if debug != incoming:
+				raise RuntimeError(
+					"batchgen_debug is batch-level: admission message mixes "
+					f"{incoming!r} (entry 0) with {debug!r} (entry {i})"
+				)
+
+		active = None
+		active_uuid = None
+		for seq in self.global_batch:
+			if seq.status == SequenceStatus.COMPLETED:
+				continue
+			debug = normalize(
+				seq.batchgen_debug, f"active sequence {seq.uuid}"
+			)
+			if active_uuid is None:
+				active, active_uuid = debug, seq.uuid
+			elif debug != active:
+				raise RuntimeError(
+					"batchgen_debug is batch-level: active pool sequences disagree "
+					f"— {active_uuid} has {active!r}, {seq.uuid} has {debug!r}"
+				)
+
+		if active_uuid is None:
+			# Drained pool: this admission starts a new group.
+			self._reset_decode_host_kv_writeback_debug_state()
+			self.set_batchgen_debug(incoming)
+			return
+
+		if active != incoming:
+			raise RuntimeError(
+				"batchgen_debug is batch-level: cannot admit into a running group "
+				f"— active group ({active_uuid}) has {active!r}, admission has "
+				f"{incoming!r}; differently configured admissions cannot overlap"
+			)
+		worker_debug = normalize(self._batchgen_debug, "worker state")
+		if worker_debug != active:
+			raise RuntimeError(
+				"batchgen_debug is batch-level: worker state has drifted from the "
+				f"active group — worker has {worker_debug!r}, active group "
+				f"({active_uuid}) has {active!r}"
+			)
 
 	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
 		if self._batchgen_debug:
@@ -1406,6 +1468,9 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+
+		# Step 0: settle batch-level debug flags before ANY admission mutation.
+		self._resolve_admission_batchgen_debug(entries)
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(

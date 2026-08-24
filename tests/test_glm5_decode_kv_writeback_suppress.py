@@ -11,8 +11,12 @@ import pytest
 import torch
 import types
 
+from batchgen.sequence import SequenceStatus
+
 
 FLAG = "glm5_suppress_decode_host_kv_writeback"
+_COMPLETED = SequenceStatus.COMPLETED
+_IN_DECODE = SequenceStatus.IN_DECODE
 
 
 class _FakeEvent:
@@ -335,3 +339,192 @@ def test_reset_helper_clears_suppression_state():
 
     assert worker._suppress_decode_host_kv_writeback is False
     assert worker._host_kv_stale_global_ids == set()
+
+
+# --------------------------------------------------------------------------
+# Pool admission: batchgen_debug must be settled before anything mutates.
+# The causal control is batch-scoped, so a mid-group flag change would mix two
+# host-KV validity regimes inside one decode microbatch.
+# --------------------------------------------------------------------------
+
+
+def _pool_worker(monkeypatch, debug=None, suppress=False, stale=(), sequences=()):
+    import batchgen.batchgen_worker as worker_mod
+    from batchgen.sequence import SequenceBatch, SequenceEntry
+
+    monkeypatch.setattr(worker_mod, "BATCHGEN_SYNC_KV", False)
+
+    worker = object.__new__(worker_mod.BatchGenWorker)
+    worker.rank = 0
+    worker._batchgen_debug = debug
+    worker._suppress_decode_host_kv_writeback = suppress
+    worker._host_kv_stale_global_ids = set(stale)
+    worker.global_batch = SequenceBatch()
+    for idx, (uuid, seq_debug, status) in enumerate(sequences):
+        seq = SequenceEntry(
+            uuid=uuid, global_idx=idx, prompt_length=4, max_decode_length=8
+        )
+        seq.batchgen_debug = seq_debug
+        # Set before add_sequence so the batch's status index stays coherent.
+        seq.status = status
+        worker.global_batch.add_sequence(seq)
+    return worker
+
+
+def _entries(*debugs):
+    return [
+        {"request_id": f"r{i}", "text": "hi", "batchgen_debug": debug}
+        for i, debug in enumerate(debugs)
+    ]
+
+
+def test_first_pool_activation_arms_causal_control_from_a_drained_pool(
+    monkeypatch, caplog
+):
+    # Leftovers from a previous (fully completed) group must not survive.
+    worker = _pool_worker(
+        monkeypatch,
+        debug={"glm5_moe_mode": "graph"},
+        suppress=True,
+        stale={11, 12},
+        sequences=[("old", {"glm5_moe_mode": "graph"}, _COMPLETED)],
+    )
+    worker.rank = 3
+
+    worker._resolve_admission_batchgen_debug(_entries({FLAG: True}, {FLAG: True}))
+    worker.set_batchgen_debug({FLAG: True})
+
+    assert worker._batchgen_debug == {FLAG: True}
+    assert worker._suppress_decode_host_kv_writeback is True
+    assert worker._host_kv_stale_global_ids == set()
+    markers = [
+        record.getMessage()
+        for record in caplog.records
+        if FLAG in record.getMessage() and "SUPPRESSED" in record.getMessage()
+    ]
+    assert len(markers) == 1
+    assert "rank=3" in markers[0]
+
+
+@pytest.mark.parametrize("incoming", [(None, {}), ({}, None)])
+def test_first_pool_activation_treats_none_and_empty_debug_alike(monkeypatch, incoming):
+    worker = _pool_worker(monkeypatch, debug={FLAG: True}, suppress=True, stale={11})
+
+    worker._resolve_admission_batchgen_debug(_entries(*incoming))
+
+    assert worker._batchgen_debug is None
+    assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._host_kv_stale_global_ids == set()
+
+
+def test_sequential_completed_group_switch_resets_causal_state(monkeypatch):
+    # A suppressed group that has fully completed releases the control, so the
+    # next group starts from a clean (non-stale) host KV view.
+    worker = _pool_worker(
+        monkeypatch,
+        debug={FLAG: True},
+        suppress=True,
+        stale={11, 12},
+        sequences=[
+            ("done-a", {FLAG: True}, _COMPLETED),
+            ("done-b", {FLAG: True}, _COMPLETED),
+        ],
+    )
+
+    worker._resolve_admission_batchgen_debug(_entries({"glm5_moe_mode": "eager"}))
+
+    assert worker._batchgen_debug == {"glm5_moe_mode": "eager"}
+    assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._host_kv_stale_global_ids == set()
+
+
+def test_same_debug_admission_into_active_group_preserves_stale_ids(monkeypatch):
+    worker = _pool_worker(
+        monkeypatch,
+        debug={FLAG: True},
+        suppress=True,
+        stale={11, 12},
+        sequences=[
+            ("live", {FLAG: True}, _IN_DECODE),
+            ("done", {FLAG: True}, _COMPLETED),
+        ],
+    )
+    reconfigured = []
+    worker.set_batchgen_debug = reconfigured.append
+
+    # Equal-but-distinct dict: the group is matched by value, not identity.
+    worker._resolve_admission_batchgen_debug(_entries({FLAG: True}))
+
+    # No reset and no re-arm: the running group keeps its stale-ID bookkeeping,
+    # which the host-KV consumer guards depend on.
+    assert reconfigured == []
+    assert worker._host_kv_stale_global_ids == {11, 12}
+    assert worker._suppress_decode_host_kv_writeback is True
+
+
+def test_mixed_incoming_debug_rejected_before_sequences_or_tokenization(monkeypatch):
+    worker = _pool_worker(monkeypatch)
+    tokenized = []
+    worker._tokenize_admitted_sequences = tokenized.append
+
+    with pytest.raises(RuntimeError, match="batch-level"):
+        worker._admit_sequences_from_message(
+            {"entries": _entries({FLAG: True}, None)}
+        )
+
+    assert len(worker.global_batch) == 0
+    assert tokenized == []
+    assert worker._batchgen_debug is None
+
+
+@pytest.mark.parametrize("invalid", [FLAG, [], 0])
+def test_non_dict_incoming_debug_rejected(monkeypatch, invalid):
+    worker = _pool_worker(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="must be a dict"):
+        worker._resolve_admission_batchgen_debug(_entries(invalid))
+
+
+def test_active_group_rejects_admission_with_different_debug(monkeypatch):
+    worker = _pool_worker(
+        monkeypatch,
+        debug={FLAG: True},
+        suppress=True,
+        stale={11},
+        sequences=[("live", {FLAG: True}, _IN_DECODE)],
+    )
+
+    with pytest.raises(RuntimeError, match="running group"):
+        worker._resolve_admission_batchgen_debug(_entries(None))
+
+    assert worker._suppress_decode_host_kv_writeback is True
+    assert worker._host_kv_stale_global_ids == {11}
+
+
+def test_active_sequences_disagreeing_with_each_other_are_rejected(monkeypatch):
+    worker = _pool_worker(
+        monkeypatch,
+        debug={FLAG: True},
+        suppress=True,
+        sequences=[
+            ("live-a", {FLAG: True}, _IN_DECODE),
+            ("live-b", None, _IN_DECODE),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="disagree"):
+        worker._resolve_admission_batchgen_debug(_entries({FLAG: True}))
+
+
+def test_worker_state_drift_from_active_group_is_rejected(monkeypatch):
+    # Worker-level debug lost the flag while a suppressed group is still live.
+    worker = _pool_worker(
+        monkeypatch,
+        debug=None,
+        suppress=True,
+        stale={11},
+        sequences=[("live", {FLAG: True}, _IN_DECODE)],
+    )
+
+    with pytest.raises(RuntimeError, match="worker has"):
+        worker._resolve_admission_batchgen_debug(_entries({FLAG: True}))
