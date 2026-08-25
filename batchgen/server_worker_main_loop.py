@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
 from batchgen.server.process_utils import install_worker_signal_handlers
+from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
 
 
@@ -191,22 +192,6 @@ def _setup_worker_logging(rank_idx: int, global_rank: int = -1):
 		format=f'%(asctime)s - [BatchGenWorker-{rank_label}] - %(levelname)s - %(message)s',
 		force=True,  # Override any existing configuration
 	)
-
-
-def _signal_local_worker_manager_ready(
-	ready_event: Optional[mp.Event],
-	*,
-	local_rank: int,
-	global_rank: int,
-) -> bool:
-	"""Signal the node-local launcher after its workers pass the global barrier."""
-	if ready_event is None or local_rank != 0:
-		return False
-	ready_event.set()
-	logging.info(
-		f"Rank {global_rank}: Signaled node-local ready event to WorkerManager"
-	)
-	return True
 
 
 def _server_worker_main_impl(

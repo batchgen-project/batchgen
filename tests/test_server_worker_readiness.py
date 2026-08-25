@@ -1,4 +1,4 @@
-from batchgen.server_worker_main_loop import _signal_local_worker_manager_ready
+from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 
 
 class _ReadyEvent:
