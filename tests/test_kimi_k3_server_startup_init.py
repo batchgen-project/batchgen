@@ -207,6 +207,9 @@ def _startup_worker(trace, *, default_mode="streamed_sp8"):
         _k3_startup_prefill_ready=False,
     )
     worker.Init = lambda *args, **kwargs: trace.append(("Init", args, kwargs))
+    worker._preload_kimi_k3_runtime_extensions = lambda: trace.append(
+        ("preload_runtime_extensions",)
+    )
     worker._ensure_pynccl_communicator = lambda: trace.append(("ensure_pynccl",))
     worker._load_decode_model = lambda bsz, comm=None: trace.append(
         ("load_decode_model", bsz, comm)
@@ -242,6 +245,9 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
     assert trace == [
         # Core components first — everything below needs the parallel manager.
         ("Init", (None, 4096, 0), {}),
+        # Compile/import the exact kernels otherwise first reached by KDA and
+        # resident grouped MoE on the first admitted prefill.
+        ("preload_runtime_extensions",),
         ("ensure_pynccl",),
         # The resident-EP decode MoE collectives run on this communicator, so
         # the manager holds it before configure_decoding, not at first decode.
@@ -261,6 +267,54 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
     assert worker._k3_startup_completed
     assert worker._k3_startup_prefill_ready
     assert worker._k3_startup_prefill_mode == "streamed_sp8"
+
+
+def test_kimi_k3_startup_preloads_the_two_first_forward_extensions(monkeypatch):
+    trace = []
+    conv1d = ModuleType("batchgen_kernels.conv1d")
+    conv1d._get_ext = lambda: trace.append("causal_conv1d") or object()
+    dispatch = ModuleType("batchgen.moe.dispatch_scatter_3d")
+    dispatch._load_dispatch_reduce_module = (
+        lambda: trace.append("dispatch_scatter_3d") or object()
+    )
+    monkeypatch.setitem(sys.modules, conv1d.__name__, conv1d)
+    monkeypatch.setitem(sys.modules, dispatch.__name__, dispatch)
+
+    worker = SimpleNamespace(rank=7)
+    preload = _isolated_method(
+        WORKER,
+        "BatchGenWorker",
+        "_preload_kimi_k3_runtime_extensions",
+        {"logging": SimpleNamespace(info=lambda *a, **k: None)},
+    ).__get__(worker)
+    preload()
+
+    assert trace == ["causal_conv1d", "dispatch_scatter_3d"]
+
+
+def test_kimi_k3_startup_fails_closed_when_a_runtime_extension_is_missing(
+    monkeypatch,
+):
+    conv1d = ModuleType("batchgen_kernels.conv1d")
+    conv1d._get_ext = lambda: object()
+    dispatch = ModuleType("batchgen.moe.dispatch_scatter_3d")
+    dispatch._load_dispatch_reduce_module = lambda: None
+    monkeypatch.setitem(sys.modules, conv1d.__name__, conv1d)
+    monkeypatch.setitem(sys.modules, dispatch.__name__, dispatch)
+
+    worker = SimpleNamespace(rank=14)
+    preload = _isolated_method(
+        WORKER,
+        "BatchGenWorker",
+        "_preload_kimi_k3_runtime_extensions",
+        {"logging": SimpleNamespace(info=lambda *a, **k: None)},
+    ).__get__(worker)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Rank 14: required Kimi-K3 extension dispatch_scatter_3d failed to load",
+    ):
+        preload()
 
 
 def test_kimi_k3_startup_uses_the_runtime_decode_batch_cap():

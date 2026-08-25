@@ -6045,11 +6045,11 @@ class BatchGenWorker:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
 
 		Everything here is fixed by the checkpoint and the topology, not by the
-		request: core components, the PyNccl communicator, the model build, the
-		resident-EP decode shards, and — on the distributed weight store — the
-		streamed-SP8 buffers plus the single H2D weight schedule. Doing it on
-		the first admission instead made a healthy server take minutes to answer
-		its first request.
+		request: core components, required CUDA-extension loading, the PyNccl
+		communicator, the model build, the resident-EP decode shards, and — on
+		the distributed weight store — the streamed-SP8 buffers plus the single
+		H2D weight schedule. Doing it on the first admission instead made a
+		healthy server take minutes to answer its first request.
 
 		What stays at admission time cannot be sized here: the QueryBook buffer
 		pool needs the tokenized prompt/decode widths, and the resident prefill
@@ -6066,6 +6066,7 @@ class BatchGenWorker:
 			f"before readiness"
 		)
 		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
+		self._preload_kimi_k3_runtime_extensions()
 		self._ensure_pynccl_communicator()
 		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
 		# manager needs the communicator before configure_decoding, not at the
@@ -6091,6 +6092,24 @@ class BatchGenWorker:
 		self._k3_startup_prefill_ready = True
 		self._k3_startup_prefill_mode = startup_prefill_mode
 		logging.info(f"Rank {self.rank}: [K3_STARTUP] Prefill phase ready")
+
+	def _preload_kimi_k3_runtime_extensions(self) -> None:
+		"""Load K3's first-forward CUDA extensions before HTTP readiness."""
+		from batchgen.moe.dispatch_scatter_3d import _load_dispatch_reduce_module
+		from batchgen_kernels.conv1d import _get_ext as _get_causal_conv1d_ext
+
+		required_extensions = (
+			("causal_conv1d", _get_causal_conv1d_ext),
+			("dispatch_scatter_3d", _load_dispatch_reduce_module),
+		)
+		for name, loader in required_extensions:
+			if loader() is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: required Kimi-K3 extension {name} failed to load"
+				)
+			logging.info(
+				f"Rank {self.rank}: [K3_STARTUP] Loaded runtime extension {name}"
+			)
 
 	def generate(self):
 		"""
