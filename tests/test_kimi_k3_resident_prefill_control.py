@@ -3815,3 +3815,140 @@ def test_distributed_readiness_log_reports_the_pin_role_and_pinned_bytes():
     assert (
         "pinned_compact_bytes / (1024.0 * 1024.0 * 1024.0)" in init
     )
+
+
+class _FakeStoreTensor:
+    """A CPU int32 view into the compact store: exact address and pin state."""
+
+    def __init__(self, ptr, nbytes, pinned, *, device="cpu", contiguous=True):
+        self._ptr = ptr
+        self._nbytes = nbytes
+        self._pinned = pinned
+        self._contiguous = contiguous
+        self.device = SimpleNamespace(type=device)
+        self.clones = 0
+
+    def data_ptr(self):
+        return self._ptr
+
+    def numel(self):
+        return self._nbytes // 4
+
+    def element_size(self):
+        return 4
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def is_pinned(self):
+        return self._pinned
+
+    def clone(self):
+        self.clones += 1
+        # A fresh CPU allocation: different address, never registered.
+        return _FakeStoreTensor(self._ptr + (1 << 40), self._nbytes, False)
+
+
+PACKED_BYTES = 1 << 20
+SCALE_BYTES = 1 << 15
+REGISTER_EDGE = 1 << 31
+
+
+def _store_pair(
+    *,
+    packed_pinned,
+    scale_pinned,
+    gap=0,
+    packed_device="cpu",
+    packed_contiguous=True,
+    scale_contiguous=True,
+):
+    """``w1.weight_packed`` followed in the store by ``w1.weight_scale``."""
+    packed = _FakeStoreTensor(
+        REGISTER_EDGE,
+        PACKED_BYTES,
+        packed_pinned,
+        device=packed_device,
+        contiguous=packed_contiguous,
+    )
+    scale = _FakeStoreTensor(
+        REGISTER_EDGE + PACKED_BYTES + gap,
+        SCALE_BYTES,
+        scale_pinned,
+        contiguous=scale_contiguous,
+    )
+    return packed, scale
+
+
+def _boundary_guard():
+    return _isolated_function(
+        ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py",
+        "_stage_registration_boundary_packed",
+    )
+
+
+def test_resident_offline_marlin_stages_the_registration_boundary_packed_once():
+    stage = _boundary_guard()
+    # The measured rank-14 signature: a packed whose START is inside the
+    # registered range but whose tail is not, so its immediately adjacent scale
+    # already reports pageable.
+    packed, scale = _store_pair(packed_pinned=True, scale_pinned=False)
+
+    staged = stage(packed, scale)
+
+    assert staged is not packed
+    assert packed.clones == 1
+    assert not staged.is_pinned()
+    assert staged.numel() * staged.element_size() == PACKED_BYTES
+    # Exactly once: the staged copy no longer carries the boundary signature,
+    # so re-running the guard on it cannot stage a second copy.
+    assert stage(staged, scale) is staged
+    assert packed.clones == 1
+    assert staged.clones == 0
+
+
+def test_resident_offline_marlin_leaves_every_other_packed_on_the_direct_path():
+    stage = _boundary_guard()
+    cases = {
+        # Fully inside the registered range (measured: expert 783).
+        "fully pinned": _store_pair(packed_pinned=True, scale_pinned=True),
+        # Fully outside it (measured: expert 785).
+        "pageable": _store_pair(packed_pinned=False, scale_pinned=False),
+        # Mixed pin state, but the scale is not this packed's neighbour, so it
+        # says nothing about where this packed ends.
+        "non-adjacent mixed": _store_pair(
+            packed_pinned=True, scale_pinned=False, gap=4096
+        ),
+        "pageable packed, pinned scale": _store_pair(
+            packed_pinned=False, scale_pinned=True
+        ),
+        "not a host tensor": _store_pair(
+            packed_pinned=True, scale_pinned=False, packed_device="cuda"
+        ),
+        "non-contiguous packed": _store_pair(
+            packed_pinned=True, scale_pinned=False, packed_contiguous=False
+        ),
+        "non-contiguous scale": _store_pair(
+            packed_pinned=True, scale_pinned=False, scale_contiguous=False
+        ),
+    }
+    for name, (packed, scale) in cases.items():
+        assert stage(packed, scale) is packed, name
+        assert packed.clones == 0, name
+
+
+def test_resident_boundary_guard_is_scoped_to_the_offline_marlin_branch():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    tree = ast.parse(path.read_text())
+    repack = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_repack_projection"
+    )
+
+    # Only the stored-marlin int32 branch direct-copies the packed weight; the
+    # uint8 path repacks on device and must keep its untouched call.
+    assert _name_call_guards(repack, "_stage_registration_boundary_packed") == [
+        ("packed.dtype == torch.int32",)
+    ]

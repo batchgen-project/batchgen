@@ -123,6 +123,39 @@ class MXFP4LayerShard:
         return total
 
 
+def _stage_registration_boundary_packed(packed, scale):
+    """Return ``packed``, or a pageable copy of it when it straddles the compact
+    store's ``cudaHostRegister`` right edge.
+
+    MEASURED (world16 hierarchical GDR; global rank 14 registers routed experts
+    [672, 784)): the first resident decode tensor of expert 784,
+    ``w1.weight_packed``, begins exactly at that right edge.
+    ``tensor.is_pinned()`` is true because it reports on the START address, so
+    Torch takes the pinned H2D path, but the rest of the tensor lies outside the
+    registered range and the direct ``packed.to(cuda)`` raises
+    ``cudaErrorInvalidValue``. The immediately following scale — the next bytes
+    of the store — reports ``is_pinned()`` false, which is exactly what the
+    boundary looks like: a pinned packed whose adjacent neighbour is already
+    unregistered. A pageable ``clone()`` copies successfully and byte-identically
+    (the fully pinned expert 783 before it, the fully pageable expert 785 after
+    it, and expert 840 all direct-copy correctly).
+
+    This runs once per projection during the startup repack, and the CPU /
+    contiguous / exact-adjacency tests keep every other tensor on the direct
+    path.
+    """
+    if packed.device.type != "cpu" or scale.device.type != "cpu":
+        return packed
+    if not packed.is_contiguous() or not scale.is_contiguous():
+        return packed
+    if not packed.is_pinned() or scale.is_pinned():
+        return packed
+    packed_end = packed.data_ptr() + packed.numel() * packed.element_size()
+    if packed_end != scale.data_ptr():
+        return packed
+    return packed.clone()
+
+
 def _repack_projection(packed, scale, device):
     """Repack one MXFP4 projection ([n_out, k_in//pack] uint8 + [n_out, k_in//gs]
     uint8 E8M0) into (marlin_qw int32, marlin_s bf16). Shapes are inferred from
@@ -139,6 +172,7 @@ def _repack_projection(packed, scale, device):
         # Stored marlin (task #53 offline): packed IS marlin_qw int32; scale
         # IS the marlin-order uint8 E8M0. Direct-copy qw, dequant scale once.
         from batchgen.moe.marlin_weight_prep import mxfp4_scale_e8m0_to_bf16
+        packed = _stage_registration_boundary_packed(packed, scale)
         return packed.to(device), mxfp4_scale_e8m0_to_bf16(scale.to(device))
     n_out = int(packed.shape[0])
     k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
