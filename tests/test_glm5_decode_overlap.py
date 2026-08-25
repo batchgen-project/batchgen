@@ -43,7 +43,11 @@ def _worker_method_node(name):
 
 def _source_for_node(source, node):
     lines = source.splitlines(keepends=True)
-    return textwrap.dedent("".join(lines[node.lineno - 1 : node.end_lineno]))
+    first_line = min(
+        [node.lineno]
+        + [decorator.lineno for decorator in getattr(node, "decorator_list", [])]
+    )
+    return textwrap.dedent("".join(lines[first_line - 1 : node.end_lineno]))
 
 
 def _build_token_state_machine():
