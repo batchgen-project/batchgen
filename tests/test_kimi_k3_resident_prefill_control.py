@@ -3483,16 +3483,18 @@ def test_worker_initializes_streamed_sp8_install_state():
     assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
 
 
-def test_streamed_sp8_prefill_seeds_once_and_restarts_nonempty_workers():
+def test_streamed_sp8_installer_seeds_once_and_restarts_nonempty_workers():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(
-        worker_path, "BatchGenWorker", "_config_prefill_for_batch"
+        worker_path,
+        "BatchGenWorker",
+        "_install_prefill_weight_copy_pipeline",
     )
     guards = _call_guards(function)
 
-    # Every admission stops the copy engine and resets the profile. Source
-    # ranks restart it from the preserved cursor; hierarchical non-sources
-    # have an empty schedule and must never create an H2D thread.
+    # Every installer invocation stops the copy engine and resets the profile.
+    # Source ranks restart it from the preserved cursor; hierarchical
+    # non-sources have an empty schedule and must never create an H2D thread.
     for name in (
         "stop_h2d_worker",
         "reset_weight_stream_profile",
