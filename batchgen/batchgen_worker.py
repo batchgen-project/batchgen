@@ -6130,6 +6130,52 @@ class BatchGenWorker:
 				f"Rank {self.rank}: [K3_STARTUP] Loaded runtime extension {name}"
 			)
 
+		# flashmla_backend imports these two symbols at module import time, so a
+		# broken FlashMLA install only surfaced on the first decode — after the
+		# server had already reported ready, and on every rank at once.
+		try:
+			import flash_mla
+		except ImportError as e:
+			raise RuntimeError(
+				f"Rank {self.rank}: required Kimi-K3 extension flash_mla failed to load - {e}"
+			)
+		for symbol in ("flash_mla_with_kvcache", "get_mla_metadata"):
+			if not callable(getattr(flash_mla, symbol, None)):
+				raise RuntimeError(
+					f"Rank {self.rank}: required Kimi-K3 extension flash_mla is "
+					f"missing callable {symbol}"
+				)
+		self._warmup_kimi_k3_flash_mla(flash_mla)
+		logging.info(
+			f"Rank {self.rank}: [K3_STARTUP] Loaded and warmed runtime extension flash_mla"
+		)
+
+	def _warmup_kimi_k3_flash_mla(self, flash_mla) -> None:
+		"""Launch the exact K3 decode kernel once before HTTP readiness."""
+		device = torch.device("cuda", torch.cuda.current_device())
+		cache_seqlens = torch.ones((1,), dtype=torch.int32, device=device)
+		query = torch.zeros(
+			(1, 1, 12, 576), dtype=torch.bfloat16, device=device
+		)
+		blocked_k = torch.zeros(
+			(1, 64, 1, 576), dtype=torch.bfloat16, device=device
+		)
+		block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+		tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+			cache_seqlens, 12, 1
+		)
+		flash_mla.flash_mla_with_kvcache(
+			query,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			causal=True,
+		)
+		torch.cuda.synchronize(device)
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).

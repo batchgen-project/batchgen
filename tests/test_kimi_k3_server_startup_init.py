@@ -269,8 +269,23 @@ def test_kimi_k3_startup_builds_decode_shards_then_the_prefill_phase():
     assert worker._k3_startup_prefill_mode == "streamed_sp8"
 
 
-def test_kimi_k3_startup_preloads_the_two_first_forward_extensions(monkeypatch):
-    trace = []
+class _FlashMLAStub(ModuleType):
+    """``flash_mla`` that records which symbols the preload actually reads."""
+
+    def __init__(self, trace, symbols):
+        super().__init__("flash_mla")
+        self._trace = trace
+        self._symbols = symbols
+
+    def __getattr__(self, name):
+        if name not in self._symbols:
+            raise AttributeError(name)
+        self._trace.append(f"flash_mla.{name}")
+        return self._symbols[name]
+
+
+def _bind_preload(monkeypatch, trace, rank, flash_mla):
+    """Bind the preload alone. ``flash_mla=None`` makes its import fail."""
     conv1d = ModuleType("batchgen_kernels.conv1d")
     conv1d._get_ext = lambda: trace.append("causal_conv1d") or object()
     dispatch = ModuleType("batchgen.moe.dispatch_scatter_3d")
@@ -279,17 +294,157 @@ def test_kimi_k3_startup_preloads_the_two_first_forward_extensions(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, conv1d.__name__, conv1d)
     monkeypatch.setitem(sys.modules, dispatch.__name__, dispatch)
+    # A None entry makes ``import flash_mla`` raise regardless of what is
+    # installed on the host running the test.
+    monkeypatch.setitem(sys.modules, "flash_mla", flash_mla)
 
-    worker = SimpleNamespace(rank=7)
-    preload = _isolated_method(
+    worker = SimpleNamespace(
+        rank=rank,
+        _warmup_kimi_k3_flash_mla=lambda module: trace.append("flash_mla.warmup"),
+    )
+    return _isolated_method(
         WORKER,
         "BatchGenWorker",
         "_preload_kimi_k3_runtime_extensions",
         {"logging": SimpleNamespace(info=lambda *a, **k: None)},
     ).__get__(worker)
-    preload()
 
-    assert trace == ["causal_conv1d", "dispatch_scatter_3d"]
+
+def test_kimi_k3_startup_preloads_the_first_forward_extensions_and_flashmla(
+    monkeypatch,
+):
+    trace = []
+    flash_mla = _FlashMLAStub(
+        trace,
+        {"flash_mla_with_kvcache": lambda: None, "get_mla_metadata": lambda: None},
+    )
+    _bind_preload(monkeypatch, trace, 7, flash_mla)()
+
+    # FlashMLA is validated last, but still inside the one pre-readiness pass:
+    # both symbols flashmla_backend imports are resolved before the barrier.
+    assert trace == [
+        "causal_conv1d",
+        "dispatch_scatter_3d",
+        "flash_mla.flash_mla_with_kvcache",
+        "flash_mla.get_mla_metadata",
+        "flash_mla.warmup",
+    ]
+
+
+def test_kimi_k3_startup_fails_closed_when_flash_mla_is_not_importable(monkeypatch):
+    preload = _bind_preload(monkeypatch, [], 3, None)
+
+    # This is the exact first-decode ModuleNotFoundError, moved ahead of
+    # readiness: an unimportable flash_mla must never reach an HTTP-ready rank.
+    with pytest.raises(
+        RuntimeError,
+        match="Rank 3: required Kimi-K3 extension flash_mla failed to load",
+    ):
+        preload()
+
+
+@pytest.mark.parametrize(
+    "symbols",
+    [
+        # Symbol absent from the module entirely...
+        {"flash_mla_with_kvcache": lambda: None},
+        {"get_mla_metadata": lambda: None},
+        # ...and present but not callable, i.e. a half-built extension whose
+        # binding never resolved.
+        {"flash_mla_with_kvcache": lambda: None, "get_mla_metadata": None},
+    ],
+)
+def test_kimi_k3_startup_fails_closed_on_an_invalid_flash_mla(monkeypatch, symbols):
+    trace = []
+    preload = _bind_preload(monkeypatch, trace, 9, _FlashMLAStub(trace, symbols))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Rank 9: required Kimi-K3 extension flash_mla is missing callable "
+        r"(flash_mla_with_kvcache|get_mla_metadata)",
+    ):
+        preload()
+
+
+def test_flashmla_backend_symbols_are_all_validated_at_startup():
+    backend = ROOT / "batchgen" / "attention" / "mla" / "flashmla_backend.py"
+    imported = {
+        alias.name
+        for node in ast.parse(backend.read_text()).body
+        if isinstance(node, ast.ImportFrom) and node.module == "flash_mla"
+        for alias in node.names
+    }
+    assert imported == {"flash_mla_with_kvcache", "get_mla_metadata"}
+
+    # Whatever the backend imports at module scope is what startup must prove
+    # exists — otherwise the check drifts away from the failing import.
+    source = _body_source(
+        _function(WORKER, "_preload_kimi_k3_runtime_extensions", "BatchGenWorker")
+    )
+    for symbol in imported:
+        assert symbol in source
+
+
+def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
+    trace = []
+
+    class FakeTorch:
+        int32 = "int32"
+        bfloat16 = "bfloat16"
+
+        class cuda:
+            @staticmethod
+            def current_device():
+                trace.append("current_device")
+                return 3
+
+            @staticmethod
+            def synchronize(device):
+                trace.append(("synchronize", device))
+
+        @staticmethod
+        def device(kind, index):
+            return f"{kind}:{index}"
+
+        @staticmethod
+        def ones(shape, *, dtype, device):
+            value = ("ones", shape, dtype, device)
+            trace.append(value)
+            return value
+
+        @staticmethod
+        def zeros(shape, *, dtype, device):
+            value = ("zeros", shape, dtype, device)
+            trace.append(value)
+            return value
+
+    class FakeFlashMLA:
+        @staticmethod
+        def get_mla_metadata(cache_seqlens, num_q_tokens, num_kv_heads):
+            trace.append(("metadata", cache_seqlens, num_q_tokens, num_kv_heads))
+            return "metadata", "splits"
+
+        @staticmethod
+        def flash_mla_with_kvcache(*args, **kwargs):
+            trace.append(("decode", args, kwargs))
+
+    warmup = _isolated_method(
+        WORKER,
+        "BatchGenWorker",
+        "_warmup_kimi_k3_flash_mla",
+        {"torch": FakeTorch},
+    ).__get__(SimpleNamespace(rank=11))
+    warmup(FakeFlashMLA)
+
+    assert trace[0] == "current_device"
+    assert ("zeros", (1, 1, 12, 576), "bfloat16", "cuda:3") in trace
+    assert ("zeros", (1, 64, 1, 576), "bfloat16", "cuda:3") in trace
+    metadata = next(item for item in trace if item[0] == "metadata")
+    assert metadata[2:] == (12, 1)
+    decode = next(item for item in trace if item[0] == "decode")
+    assert decode[1][4] == 512
+    assert decode[2] == {"causal": True}
+    assert trace[-1] == ("synchronize", "cuda:3")
 
 
 def test_kimi_k3_startup_fails_closed_when_a_runtime_extension_is_missing(
