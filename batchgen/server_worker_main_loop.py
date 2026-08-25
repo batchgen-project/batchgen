@@ -12,7 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+from batchgen.batchgen_worker import (
+	KIMI_K3_MODEL_ID,
+	BatchGenWorker,
+	BatchGenWorkerArgs,
+)
 from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
@@ -315,6 +319,15 @@ def _server_worker_main_impl(
 
 	# Pass watchdog to worker for fine-grained feeding during inference
 	worker.set_watchdog(watchdog)
+
+	# Kimi-K3 finishes its workload-independent one-time work — model build,
+	# resident-EP decode shards, streamed-SP8 buffers and the H2D weight
+	# schedule — BEFORE the readiness signal below, so a server that reports
+	# ready can serve its first request immediately. Exact model id only: the
+	# sibling Kimi-Linear checkpoints share the architecture but not this
+	# lifecycle. Any failure propagates and the worker never signals ready.
+	if args.model_name == KIMI_K3_MODEL_ID:
+		worker.prepare_kimi_k3_startup()
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.

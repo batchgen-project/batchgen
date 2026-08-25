@@ -211,6 +211,16 @@ BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS'
 # the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
 _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
 
+# The one served model whose workload-independent startup work runs before the
+# server reports ready (prepare_kimi_k3_startup). Matched EXACTLY: the sibling
+# Kimi-Linear/K2.5 checkpoints share this architecture but not this lifecycle.
+KIMI_K3_MODEL_ID = "moonshotai/Kimi-K3"
+
+# Decode budget the startup pass uses. max_decoding_length only sizes scheduler
+# hints at this point; the real per-batch value arrives with the pool "init"
+# message, which re-enters Init() before any sequence is admitted.
+_K3_STARTUP_MAX_DECODING_LENGTH = 4096
+
 # Optional Nsight Systems capture window for decode-forward profiling.
 # Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
 BATCHGEN_NSYS_DECODE_PROFILE = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE", "0") == "1"
@@ -719,6 +729,12 @@ class BatchGenWorker:
 		# queue cursor or drop the routed-expert GPU slots it has prefetched.
 		self._streamed_sp8_h2d_installed = False
 		self._streamed_sp8_weight_copy_fingerprint = None
+		# Kimi-K3 pre-readiness startup (prepare_kimi_k3_startup). The first
+		# flag makes that pass idempotent; the second hands the prepared prefill
+		# phase to the first real admission so it is not torn down and rebuilt.
+		self._k3_startup_completed = False
+		self._k3_startup_prefill_ready = False
+		self._k3_startup_prefill_mode = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -5927,6 +5943,155 @@ class BatchGenWorker:
 			sys.stderr.flush()
 			os._exit(0)
 
+	def _ensure_pynccl_communicator(self) -> None:
+		"""Create the PyNccl communicator unless every rank already holds one.
+
+		Collective and idempotent: the need-init vote, the port broadcast and
+		the pre-TCPStore barrier are all torch.distributed collectives, so every
+		rank must call this together. Once all ranks have a communicator the
+		vote fails and nothing is created.
+		"""
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") != "0":
+			return
+
+		# Verify rank consistency
+		if dist.is_initialized():
+			assert self.rank == dist.get_rank(), \
+				f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
+
+		# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
+		if self.world_size == 1:
+			logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
+			return
+
+		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+
+		# Coordinate PyNccl initialization across all ranks
+		# Use all_reduce to check if ANY rank needs to (re)init the communicator
+		need_init = 1 if self.comm is None else 0
+		need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+		dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
+		any_rank_needs_init = need_init_tensor.item() > 0
+
+		if not any_rank_needs_init:
+			return
+
+		# All ranks must participate in init - destroy any existing comm first
+		if self.comm is not None:
+			logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
+			try:
+				self.comm.destroy()
+			except Exception:
+				pass
+			self.comm = None
+			if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+				del self._nccl_group
+				self._nccl_group = None
+
+		device = torch.device("cuda", self.local_rank)
+
+		if comm_master_addr is None:
+			logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+		elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+			# Track port - incremented in _check_and_reinit_pynccl on failures
+			if not hasattr(self, '_nccl_port'):
+				self._nccl_port = 20003
+
+			# Rank 0 finds an available port, then broadcasts to all ranks
+			if self.rank == 0:
+				try:
+					self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
+					logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+				except RuntimeError as e:
+					logging.error(f"Rank 0: Failed to find available port: {e}")
+					raise
+
+			# Broadcast the chosen port from rank 0 to all ranks
+			port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+			dist.broadcast(port_tensor, src=0)
+			self._nccl_port = port_tensor.item()
+
+			# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
+			# is ready before other ranks try to connect. Different ranks may reach
+			# this point at very different times due to tokenization workload.
+			logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+			dist.barrier()
+
+			try:
+				logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+
+				# Store group separately so we can properly destroy it on reinit
+				self._nccl_group = StatelessProcessGroup.create(
+					host=comm_master_addr,
+					port=self._nccl_port,
+					rank=self.rank,
+					world_size=self.world_size,
+					data_expiration_seconds=36000,  # 10 hours
+				)
+				self.comm = PyNcclCommunicator(
+					group=self._nccl_group,
+					device=device
+				)
+				# Only rank 0 logs at INFO level to reduce verbosity
+				if self.rank == 0:
+					logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
+				else:
+					logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+			except Exception as e:
+				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+	def prepare_kimi_k3_startup(self) -> None:
+		"""Run Kimi-K3's workload-independent one-time work before readiness.
+
+		Everything here is fixed by the checkpoint and the topology, not by the
+		request: core components, the PyNccl communicator, the model build, the
+		resident-EP decode shards, and — on the distributed weight store — the
+		streamed-SP8 buffers plus the single H2D weight schedule. Doing it on
+		the first admission instead made a healthy server take minutes to answer
+		its first request.
+
+		What stays at admission time cannot be sized here: the QueryBook buffer
+		pool needs the tokenized prompt/decode widths, and the resident prefill
+		output needs the micro-batch token count of the admitted sequences.
+
+		Collective (Init, _ensure_pynccl_communicator and configure_decoding all
+		run torch.distributed collectives) and idempotent.
+		"""
+		if self._k3_startup_completed:
+			return
+
+		logging.info(
+			f"Rank {self.rank}: [K3_STARTUP] Building model and weight pipeline "
+			f"before readiness"
+		)
+		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
+		self._ensure_pynccl_communicator()
+		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
+		# manager needs the communicator before configure_decoding, not at the
+		# first decode phase.
+		self.parallel_manager.set_comm(self.comm)
+
+		# Decode first: configure_decoding materializes the stacked MXFP4 EP
+		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
+		# the runtime decode path applies to its own estimate, so the padded MoE
+		# buffers are already sized for the largest batch that can be admitted.
+		self._load_decode_model(_MAX_DECODE_RANK_BSZ, comm=self.comm)
+
+		# Then hand the built model to the prefill mode this weight topology
+		# will actually use, so the first admission inherits this phase directly
+		# instead of rebuilding the streamed-SP8 buffers itself.
+		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
+		self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
+		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		self.set_phase("prefill")
+		self._install_prefill_weight_copy_pipeline(k3_prefill_profile=False)
+
+		self._k3_startup_completed = True
+		self._k3_startup_prefill_ready = True
+		self._k3_startup_prefill_mode = startup_prefill_mode
+		logging.info(f"Rank {self.rank}: [K3_STARTUP] Prefill phase ready")
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -5956,90 +6121,7 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: Distributed connections verified")
 		
 		# Ensure communicator is ready
-		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
-			# Verify rank consistency
-			if dist.is_initialized():
-				assert self.rank == dist.get_rank(), \
-					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
-
-			# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
-			if self.world_size == 1:
-				logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
-			else:
-				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-
-				# Coordinate PyNccl initialization across all ranks
-				# Use all_reduce to check if ANY rank needs to (re)init the communicator
-				need_init = 1 if self.comm is None else 0
-				need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
-				dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
-				any_rank_needs_init = need_init_tensor.item() > 0
-
-				if any_rank_needs_init:
-					# All ranks must participate in init - destroy any existing comm first
-					if self.comm is not None:
-						logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
-						try:
-							self.comm.destroy()
-						except Exception:
-							pass
-						self.comm = None
-						if hasattr(self, '_nccl_group') and self._nccl_group is not None:
-							del self._nccl_group
-							self._nccl_group = None
-
-					device = torch.device("cuda", self.local_rank)
-
-					if comm_master_addr is None:
-						logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-					elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-						# Track port - incremented in _check_and_reinit_pynccl on failures
-						if not hasattr(self, '_nccl_port'):
-							self._nccl_port = 20003
-
-						# Rank 0 finds an available port, then broadcasts to all ranks
-						if self.rank == 0:
-							try:
-								self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
-								logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
-							except RuntimeError as e:
-								logging.error(f"Rank 0: Failed to find available port: {e}")
-								raise
-
-						# Broadcast the chosen port from rank 0 to all ranks
-						port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
-						dist.broadcast(port_tensor, src=0)
-						self._nccl_port = port_tensor.item()
-
-						# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-						# is ready before other ranks try to connect. Different ranks may reach
-						# this point at very different times due to tokenization workload.
-						logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
-						dist.barrier()
-
-						try:
-							logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
-
-							# Store group separately so we can properly destroy it on reinit
-							self._nccl_group = StatelessProcessGroup.create(
-								host=comm_master_addr,
-								port=self._nccl_port,
-								rank=self.rank,
-								world_size=self.world_size,
-								data_expiration_seconds=36000,  # 10 hours
-							)
-							self.comm = PyNcclCommunicator(
-								group=self._nccl_group,
-								device=device
-							)
-							# Only rank 0 logs at INFO level to reduce verbosity
-							if self.rank == 0:
-								logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
-							else:
-								logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
-						except Exception as e:
-							logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-							raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		self._ensure_pynccl_communicator()
 
 		iteration = 0
 
@@ -6718,6 +6800,62 @@ class BatchGenWorker:
 			for module_type, names in sorted((weight_copy_task or {}).items())
 		)
 
+	def _install_prefill_weight_copy_pipeline(self, k3_prefill_profile: bool) -> None:
+		"""Point the H2D copy engine at the prefill weight-copy schedule.
+
+		Requires ``self.weight_copy_task`` from the configure_prefill that just
+		ran. Shared by the pre-readiness Kimi-K3 startup and by every per-batch
+		prefill config, so the streamed-SP8 install happens exactly once no
+		matter which of them runs first.
+		"""
+		# The distributed weight daemon drives ONE free-running circular schedule
+		# and erases each key as it releases it. Re-seeding the weight queue
+		# rewinds our cursor onto keys the daemon has already erased, and
+		# resetting the prefill buffer throws away routed-expert GPU slots the
+		# daemon has already delivered. So the streamed-SP8 H2D pipeline is
+		# installed exactly once; every later prefill resumes it in place.
+		streamed_sp8 = (
+			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
+		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
+		self.core_engine.stop_h2d_worker()
+		if not sp8_reentry:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_prefill_buffer()
+		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
+		if streamed_sp8 or k3_prefill_profile:
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(k3_prefill_profile)
+			from batchgen.moe.streamed_sp8_mxfp4 import (
+				StreamedSP8MXFP4MoELayer,
+			)
+			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
+		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
+		if sp8_reentry:
+			# configure_prefill rebuilt the task from scratch. The preserved
+			# cursor only means anything if that rebuild is byte-identical to
+			# the schedule the daemon is still walking.
+			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
+				raise RuntimeError(
+					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
+					"changed after the H2D pipeline was installed; the "
+					"preserved daemon cursor no longer matches the rebuilt "
+					"task and would stream the wrong experts"
+				)
+			if any(self.weight_copy_task.values()):
+				self.core_engine.start_h2d_worker()
+		else:
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			if any(self.weight_copy_task.values()):
+				self.core_engine.start_h2d_worker()
+		self._streamed_sp8_h2d_installed = streamed_sp8
+		self._streamed_sp8_weight_copy_fingerprint = (
+			fingerprint if streamed_sp8 else None
+		)
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
@@ -6740,6 +6878,11 @@ class BatchGenWorker:
 			)
 		k3_prefill_moe_mode = prefill_debug.get(
 			"k3_prefill_moe_mode", _default_k3_prefill_mode
+		)
+		reuse_startup_prefill = (
+			self._k3_startup_prefill_ready
+			and k3_prefill_moe_mode == self._k3_startup_prefill_mode
+			and not k3_prefill_profile
 		)
 		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
 			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)
@@ -6790,8 +6933,21 @@ class BatchGenWorker:
 		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
-		logging.info("Deep freeing model memory before prefill config...")
-		self.deep_free_model_memory()
+		if reuse_startup_prefill:
+			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
+			# decode model has run yet, and this prefill phase — model,
+			# streamed-SP8 buffers, installed H2D schedule — is the one startup
+			# built. deep_free_model_memory() would release those buffers and
+			# strand the weight daemon's preserved cursor. Consumed here, so every
+			# later prefill (which does follow a decode phase) frees normally.
+			self._k3_startup_prefill_ready = False
+			logging.info("Reusing Kimi-K3 startup-prepared prefill model...")
+		else:
+			# Consume a startup handoff that the request cannot reuse (for example,
+			# a diagnostic mode/profile override) before rebuilding that phase.
+			self._k3_startup_prefill_ready = False
+			logging.info("Deep freeing model memory before prefill config...")
+			self.deep_free_model_memory()
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
@@ -6843,13 +6999,16 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
 			)
 
-		# STEP 1: Configure model for prefill
-		# Hand the NCCL communicator to managers that need it during prefill
-		# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
-		if hasattr(self.parallel_manager, "set_comm"):
-			self.parallel_manager.set_comm(self.comm)
-		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
-		self.set_phase("prefill")
+		# STEP 1: Configure model for prefill. The normal first K3 admission
+		# inherits the exact phase installed before readiness; do not re-enter
+		# configure_prefill or stop/restart its H2D pipeline lazily here.
+		if not reuse_startup_prefill:
+			# Hand the NCCL communicator to managers that need it during prefill
+			# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
+			if hasattr(self.parallel_manager, "set_comm"):
+				self.parallel_manager.set_comm(self.comm)
+			self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+			self.set_phase("prefill")
 
 		if torch.cuda.is_available():
 			torch.cuda.synchronize(self.torch_device)
@@ -6860,53 +7019,8 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 			)
 
-		# The distributed weight daemon drives ONE free-running circular schedule
-		# and erases each key as it releases it. Re-seeding the weight queue
-		# rewinds our cursor onto keys the daemon has already erased, and
-		# resetting the prefill buffer throws away routed-expert GPU slots the
-		# daemon has already delivered. So the streamed-SP8 H2D pipeline is
-		# installed exactly once; every later prefill resumes it in place.
-		streamed_sp8 = (
-			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
-			and self.parallel_manager.prefill_uses_streamed_sp8()
-		)
-		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
-		self.core_engine.stop_h2d_worker()
-		if not sp8_reentry:
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_prefill_buffer()
-		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
-		if streamed_sp8 or k3_prefill_profile:
-			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
-				KimiK3MXFP4ExpertWrapper,
-			)
-			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(k3_prefill_profile)
-			from batchgen.moe.streamed_sp8_mxfp4 import (
-				StreamedSP8MXFP4MoELayer,
-			)
-			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
-		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
-		if sp8_reentry:
-			# configure_prefill rebuilt the task from scratch. The preserved
-			# cursor only means anything if that rebuild is byte-identical to
-			# the schedule the daemon is still walking.
-			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
-				raise RuntimeError(
-					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
-					"changed after the H2D pipeline was installed; the "
-					"preserved daemon cursor no longer matches the rebuilt "
-					"task and would stream the wrong experts"
-				)
-			if any(self.weight_copy_task.values()):
-				self.core_engine.start_h2d_worker()
-		else:
-			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-			if any(self.weight_copy_task.values()):
-				self.core_engine.start_h2d_worker()
-		self._streamed_sp8_h2d_installed = streamed_sp8
-		self._streamed_sp8_weight_copy_fingerprint = (
-			fingerprint if streamed_sp8 else None
-		)
+		if not reuse_startup_prefill:
+			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
 
 		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
