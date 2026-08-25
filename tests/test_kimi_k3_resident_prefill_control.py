@@ -3569,3 +3569,223 @@ def test_weight_copy_task_fingerprint_pins_type_and_order():
     assert fingerprint(base) != fingerprint(
         {**base, "routed_expert": base["routed_expert"][:1]}
     )
+
+
+def _weights_storage_source():
+    return (
+        ROOT / "core" / "Weights_Storage" / "Weights_Storage.cpp"
+    ).read_text()
+
+
+def _cpp_section(source, begin, end):
+    """The text of one C++ definition, delimited by two unique markers."""
+    start = source.index(begin)
+    return source[start:source.index(end, start)]
+
+
+def _init_distributed_section(source):
+    return _cpp_section(
+        source,
+        "void Weights_Storage::InitDistributed",
+        "Weights_Storage::active_lease",
+    )
+
+
+def test_hierarchical_gdr_pin_source_owns_the_slot_it_registers():
+    """``(g * num_nodes) / 8`` names the node that owns slot ``g``.
+
+    The compact store's owner column is ``expert / (896 / num_nodes)``. A
+    worker may only pin experts its own node owns, otherwise the bytes it
+    registers are not even resident in its copy of the store.
+    """
+    for num_nodes in (2, 4):
+        experts_per_owner = 896 // num_nodes
+        sources = []
+        for g in range(8):
+            source_node = (g * num_nodes) // 8
+            assert 0 <= source_node < num_nodes
+            owners = {
+                expert // experts_per_owner
+                for expert in range(112 * g, 112 * (g + 1))
+            }
+            assert owners == {source_node}
+            sources.append(source_node)
+        # Every node sources an equal share of the eight slots, and the eight
+        # slots together still cover all 896 experts exactly once.
+        assert sorted(sources) == sources
+        assert all(
+            sources.count(node) == 8 // num_nodes for node in range(num_nodes)
+        )
+
+    init = _init_distributed_section(_weights_storage_source())
+    assert (
+        "(this->device_id_ * num_nodes) / kKimiK3Workers" in init
+    )
+    assert (
+        "this->pin_expert_begin_ = this->device_id_ * kKimiK3ExpertsPerWorker"
+        in init
+    )
+    assert "this->local_node_rank_ == pin_source_node" in init
+
+
+def test_hierarchical_gdr_registers_only_the_slot_experts_of_the_source():
+    source = _weights_storage_source()
+    init = _init_distributed_section(source)
+
+    # 112 experts per TP slot, 896 across the node.
+    assert "constexpr int kKimiK3ExpertsPerWorker = kKimiK3Experts / kKimiK3Workers;" in source
+    assert "constexpr int kKimiK3Workers = 8;" in source
+
+    # Only a source collects intervals, and only for its own slot.
+    assert (
+        "if (this->pin_source_ && expert >= this->pin_expert_begin_ &&\n"
+        "                expert < this->pin_expert_end_) {" in init
+    )
+    assert "pin_intervals.emplace_back(" in init
+
+    # host_rdma keeps the whole compact store pinned; a non-source
+    # hierarchical worker collects nothing and therefore pins nothing.
+    assert "if (this->hierarchical_gdr_) {" in init
+    assert "pin_intervals = {{0, this->compact_bytes_}};" in init
+
+    # The full mapping and every local module survive the narrowing, because
+    # get_tensor still hands out pageable views of them.
+    assert "mmap(nullptr, this->compact_bytes_" in init
+    local_insert = _cpp_section(
+        init,
+        "if (owner < 0 || owner == this->local_node_rank_)",
+        "++local_tensors;",
+    )
+    assert "module_weights_storage_[module_key][tensor_key]" in local_insert
+    assert "pin_" not in local_insert
+
+    # The replicated prefix (owner == -1) is never a pin candidate: interval
+    # collection lives inside the owned-expert branch only.
+    owned_branch = _cpp_section(
+        init, "if (owner >= 0) {", "if (owner < 0 || owner =="
+    )
+    assert "pin_intervals.emplace_back(" in owned_branch
+    assert init.count("pin_intervals.emplace_back(") == 1
+
+
+def test_distributed_pin_intervals_are_aligned_coalesced_and_clamped():
+    source = _weights_storage_source()
+    merge = _cpp_section(
+        source,
+        "std::vector<std::pair<int64_t, int64_t>> merge_pin_intervals(",
+        "}  // namespace",
+    )
+
+    assert "constexpr int64_t kPinAlignment = 2 * 1024 * 1024;" in source
+    # Start rounds down, end rounds up.
+    assert "(interval.first / kPinAlignment) * kPinAlignment" in merge
+    assert (
+        "((interval.second + kPinAlignment - 1) / kPinAlignment) *"
+        in merge
+    )
+    # Clamped to the store, so the unaligned tail cannot run past the mapping.
+    assert "std::max<int64_t>(begin, 0)" in merge
+    assert "std::min<int64_t>(end, limit)" in merge
+    # Sorted, then touching or overlapping ranges are merged (``<=``, not
+    # ``<``): 2 MiB rounding makes adjacent experts share a boundary page.
+    assert "std::sort(aligned.begin(), aligned.end());" in merge
+    assert "range.first <= merged.back().second" in merge
+    assert "std::max(merged.back().second, range.second)" in merge
+
+    init = _init_distributed_section(source)
+    assert "merge_pin_intervals(std::move(pin_intervals)" in init
+
+
+def test_distributed_unregisters_exactly_the_ranges_it_registered():
+    source = _weights_storage_source()
+    init = _init_distributed_section(source)
+    lines = init.splitlines()
+
+    # Every successful registration is recorded, immediately: a throw from a
+    # later one must not strand the earlier pins.
+    registrations = [
+        index for index, line in enumerate(lines)
+        if "cudaHostRegister(" in line
+    ]
+    assert len(registrations) == 2  # compact ranges, then the staging memfd
+    reserve_index = next(
+        index for index, line in enumerate(lines)
+        if "this->registered_ranges_.reserve(" in line
+    )
+    assert reserve_index < registrations[0]
+    for index in registrations:
+        assert any(
+            "registered_ranges_.emplace_back" in line
+            for line in lines[index:index + 4]
+        )
+    assert init.count("registered_ranges_.emplace_back") == 2
+
+    destructor = _cpp_section(
+        source,
+        "Weights_Storage::~Weights_Storage()",
+        "void Weights_Storage::InitDistributed",
+    )
+    # Teardown walks the recorded ranges instead of assuming the whole
+    # compact/staging mapping was pinned, and unregisters before munmap.
+    assert "this->registered_ranges_.rbegin()" in destructor
+    assert "cudaHostUnregister(range->first);" in destructor
+    assert "cudaHostUnregister(this->compact_ptr_)" not in destructor
+    assert "cudaHostUnregister(this->staging_ptr_)" not in destructor
+    assert destructor.index("cudaHostUnregister") < destructor.index("munmap")
+
+    # Partial init: the mappings are unmapped only when they exist, and the
+    # recorded range list is whatever InitDistributed got through.
+    assert "if (this->compact_ptr_ != nullptr) {" in destructor
+    assert "if (this->staging_ptr_ != nullptr) {" in destructor
+
+
+def test_hierarchical_gdr_get_module_is_fail_closed_outside_the_pinned_slot():
+    source = _weights_storage_source()
+    get_module = _cpp_section(
+        source,
+        "Weights_Storage::get_module_weights_storage(std::string module_key)",
+        "py::dict Weights_Storage::get_tensor",
+    )
+    get_tensor = source[source.index("py::dict Weights_Storage::get_tensor"):]
+
+    # A routed-expert copy from a worker that did not pin it would DMA out of
+    # unregistered host memory, so refuse before reaching the copy engine.
+    assert "if (this->hierarchical_gdr_) {" in get_module
+    assert "const int expert = parse_routed_expert(module_key);" in get_module
+    assert (
+        "if (expert >= 0 &&\n"
+        "            !(this->pin_source_ && expert >= this->pin_expert_begin_ &&\n"
+        "              expert < this->pin_expert_end_)) {" in get_module
+    )
+    assert (
+        "hierarchical_gdr worker is not the pinned source of" in get_module
+    )
+    # The host-transport path is untouched.
+    assert "hierarchical_gdr rank requested non-local host module" in get_module
+
+    # get_tensor keeps every local module, including the 7/8 of the routed
+    # experts this worker never pins: its consumers are one-time pageable
+    # Torch copies and decode reads them all.
+    assert "module_weights_storage_" in get_tensor
+    for guard in (
+        "pin_source_",
+        "pin_expert_begin_",
+        "pin_expert_end_",
+        "parse_routed_expert",
+        "hierarchical_gdr_",
+    ):
+        assert guard not in get_tensor, guard
+
+
+def test_distributed_readiness_log_reports_the_pin_role_and_pinned_bytes():
+    init = _init_distributed_section(_weights_storage_source())
+
+    assert '"host_rdma_full"' in init
+    assert '(this->pin_source_ ? "gdr_source" : "gdr_replica")' in init
+    assert "pin_role={}" in init
+    assert "pinned_ranges={}" in init
+    assert "pinned_compact={:.3f} GiB" in init
+    assert "pin_intervals.size()," in init
+    assert (
+        "pinned_compact_bytes / (1024.0 * 1024.0 * 1024.0)" in init
+    )

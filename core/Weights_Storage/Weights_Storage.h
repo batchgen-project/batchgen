@@ -27,6 +27,7 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "../Parameter_Server/Parameter_Server.h"
@@ -107,6 +108,16 @@ class Weights_Storage {
     bool distributed_ = false;
     bool hierarchical_gdr_ = false;
     int local_node_rank_ = -1;
+    // hierarchical_gdr pins only the routed experts this worker streams:
+    // TP slot device_id_ owns experts [pin_expert_begin_, pin_expert_end_),
+    // and only the node that sources that slot registers them.
+    bool pin_source_ = false;
+    int pin_expert_begin_ = -1;
+    int pin_expert_end_ = -1;
+    // Every cudaHostRegister that actually succeeded, so the destructor can
+    // unregister exactly those ranges before munmap, including after a
+    // partially completed InitDistributed.
+    std::vector<std::pair<void*, size_t>> registered_ranges_;
     int compact_fd_ = -1;
     int staging_fd_ = -1;
     int daemon_socket_ = -1;

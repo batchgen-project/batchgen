@@ -43,6 +43,61 @@ using batchgen::distributed_weights::Request;
 using batchgen::distributed_weights::Response;
 
 constexpr int kKimiK3Experts = 896;
+constexpr int kKimiK3Workers = 8;
+constexpr int kKimiK3ExpertsPerWorker = kKimiK3Experts / kKimiK3Workers;
+constexpr int64_t kPinAlignment = 2 * 1024 * 1024;
+
+// Trailing expert index of "routed_expert_<layer>_<expert>", or -1 when the
+// key is not a routed expert at all. Never throws: the fail-closed pin guard
+// runs on every module key, including the replicated ones.
+int parse_routed_expert(const std::string& module_key) {
+    constexpr const char* prefix = "routed_expert_";
+    if (module_key.rfind(prefix, 0) != 0) {
+        return -1;
+    }
+    const size_t separator = module_key.rfind('_');
+    if (separator == std::string::npos ||
+        separator + 1 == module_key.size()) {
+        return -1;
+    }
+    const std::string suffix = module_key.substr(separator + 1);
+    if (suffix.find_first_not_of("0123456789") != std::string::npos ||
+        suffix.size() > 9) {
+        return -1;
+    }
+    return std::stoi(suffix);
+}
+
+// Page-align the selected tensor extents outward and coalesce them, so a
+// 112-expert slot is registered as a handful of large ranges instead of one
+// cudaHostRegister per tensor.
+std::vector<std::pair<int64_t, int64_t>> merge_pin_intervals(
+    std::vector<std::pair<int64_t, int64_t>> intervals, int64_t limit) {
+    std::vector<std::pair<int64_t, int64_t>> aligned;
+    aligned.reserve(intervals.size());
+    for (const auto& interval : intervals) {
+        int64_t begin = (interval.first / kPinAlignment) * kPinAlignment;
+        int64_t end =
+            ((interval.second + kPinAlignment - 1) / kPinAlignment) *
+            kPinAlignment;
+        begin = std::max<int64_t>(begin, 0);
+        end = std::min<int64_t>(end, limit);
+        if (end > begin) {
+            aligned.emplace_back(begin, end);
+        }
+    }
+    std::sort(aligned.begin(), aligned.end());
+    std::vector<std::pair<int64_t, int64_t>> merged;
+    for (const auto& range : aligned) {
+        if (!merged.empty() && range.first <= merged.back().second) {
+            merged.back().second =
+                std::max(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
+}
 
 void send_exact(int fd, const void* data, size_t bytes) {
     const char* cursor = static_cast<const char*>(data);
@@ -173,12 +228,18 @@ Weights_Storage::Weights_Storage(int device_id)
 Weights_Storage::~Weights_Storage() {
     // free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
     //                           this->byte_size_, true);
+    // Unregister exactly what was registered. A hierarchical_gdr worker pins a
+    // few slot-local ranges instead of the whole mapping, and a failed
+    // InitDistributed can leave any prefix of them behind.
+    for (auto range = this->registered_ranges_.rbegin();
+         range != this->registered_ranges_.rend(); ++range) {
+        cudaHostUnregister(range->first);
+    }
+    this->registered_ranges_.clear();
     if (this->compact_ptr_ != nullptr) {
-        cudaHostUnregister(this->compact_ptr_);
         munmap(this->compact_ptr_, this->compact_bytes_);
     }
     if (this->staging_ptr_ != nullptr) {
-        cudaHostUnregister(this->staging_ptr_);
         munmap(this->staging_ptr_, this->staging_bytes_);
     }
     if (this->compact_fd_ >= 0) {
@@ -269,8 +330,22 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
             "mmap compact weight store failed: " +
             std::string(strerror(errno)));
     }
-    CUDA_CHECK(cudaHostRegister(this->compact_ptr_, this->compact_bytes_,
-                                cudaHostRegisterDefault));
+    // The full mapping stays in every worker because get_tensor hands pageable
+    // views of the local modules to Torch. Only the DMA pinning below is
+    // narrowed, and only for hierarchical_gdr.
+    if (this->device_id_ < 0 || this->device_id_ >= kKimiK3Workers) {
+        throw std::runtime_error(
+            "distributed weights require a TP slot in [0, " +
+            std::to_string(kKimiK3Workers) + "), got " +
+            std::to_string(this->device_id_));
+    }
+    const int pin_source_node =
+        (this->device_id_ * num_nodes) / kKimiK3Workers;
+    this->pin_expert_begin_ = this->device_id_ * kKimiK3ExpertsPerWorker;
+    this->pin_expert_end_ =
+        this->pin_expert_begin_ + kKimiK3ExpertsPerWorker;
+    this->pin_source_ = this->hierarchical_gdr_ &&
+                        this->local_node_rank_ == pin_source_node;
 
     std::ifstream metadata_handle(metadata_path);
     if (!metadata_handle) {
@@ -279,6 +354,7 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
     }
     std::string line;
     std::unordered_map<std::string, uint64_t> remote_module_bases;
+    std::vector<std::pair<int64_t, int64_t>> pin_intervals;
     size_t local_tensors = 0;
     size_t remote_tensors = 0;
     while (std::getline(metadata_handle, line)) {
@@ -315,26 +391,26 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
                 module_key + "/" + tensor_key);
         }
         if (owner >= 0) {
-            constexpr const char* prefix = "routed_expert_";
-            const size_t separator = module_key.rfind('_');
-            if (module_key.rfind(prefix, 0) != 0 ||
-                separator == std::string::npos ||
-                separator + 1 == module_key.size()) {
+            const int expert = parse_routed_expert(module_key);
+            if (expert < 0) {
                 throw std::runtime_error(
                     "distributed owned module is not a routed expert: " +
                     module_key);
             }
-            size_t parsed = 0;
-            const int expert =
-                std::stoi(module_key.substr(separator + 1), &parsed);
-            const size_t expert_digits = module_key.size() - separator - 1;
             const int experts_per_owner = kKimiK3Experts / num_nodes;
-            if (parsed != expert_digits || expert < 0 ||
-                expert >= kKimiK3Experts ||
+            if (expert >= kKimiK3Experts ||
                 owner != expert / experts_per_owner) {
                 throw std::runtime_error(
                     "distributed routed-expert owner mismatch: " +
                     module_key + " owner=" + std::to_string(owner));
+            }
+            // Only a source worker pins, and only the 112-expert slot it
+            // actually streams out of the compact store.
+            if (this->pin_source_ && expert >= this->pin_expert_begin_ &&
+                expert < this->pin_expert_end_) {
+                pin_intervals.emplace_back(
+                    static_cast<int64_t>(compact_offset),
+                    static_cast<int64_t>(compact_offset) + tensor_bytes);
             }
         }
         if (owner < 0 || owner == this->local_node_rank_) {
@@ -357,6 +433,32 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
             ++remote_tensors;
         }
     }
+    // host_rdma serves arbitrary modules to arbitrary peers, so it keeps the
+    // whole compact store pinned. hierarchical_gdr registers the coalesced
+    // slot ranges only, which is what turns a >20 min startup into seconds.
+    if (this->hierarchical_gdr_) {
+        pin_intervals =
+            merge_pin_intervals(std::move(pin_intervals),
+                                this->compact_bytes_);
+    } else {
+        pin_intervals = {{0, this->compact_bytes_}};
+    }
+    // Reserve before the first registration so recording a successful pin
+    // cannot allocate and throw between cudaHostRegister and emplace_back.
+    this->registered_ranges_.reserve(
+        this->registered_ranges_.size() + pin_intervals.size() + 1);
+    int64_t pinned_compact_bytes = 0;
+    for (const auto& range : pin_intervals) {
+        void* address =
+            static_cast<char*>(this->compact_ptr_) + range.first;
+        const size_t bytes =
+            static_cast<size_t>(range.second - range.first);
+        CUDA_CHECK(cudaHostRegister(address, bytes,
+                                    cudaHostRegisterDefault));
+        this->registered_ranges_.emplace_back(address, bytes);
+        pinned_compact_bytes += static_cast<int64_t>(bytes);
+    }
+
     for (auto& [module_key, tensors] :
          this->remote_module_weights_) {
         const uint64_t base = remote_module_bases.at(module_key);
@@ -422,16 +524,26 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
     CUDA_CHECK(cudaHostRegister(this->staging_ptr_,
                                 this->staging_bytes_,
                                 cudaHostRegisterDefault));
+    this->registered_ranges_.emplace_back(
+        this->staging_ptr_, static_cast<size_t>(this->staging_bytes_));
     this->distributed_ = true;
     this->byte_size_ = this->compact_bytes_;
+    const std::string pin_role =
+        !this->hierarchical_gdr_
+            ? "host_rdma_full"
+            : (this->pin_source_ ? "gdr_source" : "gdr_replica");
     this->logger->info(
         "Distributed compact weights ready: node_rank={}, store={:.3f} "
         "GiB, staging={:.3f} GiB, local_tensors={}, remote_tensors={}, "
-        "transport={}",
+        "transport={}, pin_role={}, pin_experts=[{}, {}), "
+        "pinned_ranges={}, pinned_compact={:.3f} GiB",
         this->local_node_rank_,
         this->compact_bytes_ / (1024.0 * 1024.0 * 1024.0),
         this->staging_bytes_ / (1024.0 * 1024.0 * 1024.0),
-        local_tensors, remote_tensors, transport);
+        local_tensors, remote_tensors, transport, pin_role,
+        this->pin_expert_begin_, this->pin_expert_end_,
+        pin_intervals.size(),
+        pinned_compact_bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
 Weights_Storage::active_lease
@@ -595,6 +707,23 @@ void Weights_Storage::Init(
 std::unordered_map<std::string, tensor_buffer>
 Weights_Storage::get_module_weights_storage(std::string module_key) {
     /* To Facilitate Module Copy */
+    // A hierarchical_gdr worker only pinned its own 112-expert slot, so any
+    // other routed-expert copy would DMA from unregistered host memory. Fail
+    // here rather than let the copy engine read the wrong pages. get_tensor
+    // does not come through this path and keeps every local module.
+    if (this->hierarchical_gdr_) {
+        const int expert = parse_routed_expert(module_key);
+        if (expert >= 0 &&
+            !(this->pin_source_ && expert >= this->pin_expert_begin_ &&
+              expert < this->pin_expert_end_)) {
+            throw std::runtime_error(
+                "hierarchical_gdr worker is not the pinned source of " +
+                module_key + ": slot experts [" +
+                std::to_string(this->pin_expert_begin_) + ", " +
+                std::to_string(this->pin_expert_end_) + "), source=" +
+                (this->pin_source_ ? "true" : "false"));
+        }
+    }
     auto local = this->module_weights_storage_.find(module_key);
     if (local != this->module_weights_storage_.end()) {
         return local->second;
