@@ -20,7 +20,9 @@ Run: python -m pytest tests/test_kimi_linear_m2b_decode_dp_group.py -x -q -rA
 
 from __future__ import annotations
 
+import logging
 import math
+import types
 
 import pytest
 
@@ -224,3 +226,75 @@ def test_moe_ntp_g1_identity_and_nonvacuity():
     assert moe_ntp_from_group_max(64, 8) < 64
     with pytest.raises(ValueError):
         moe_ntp_from_group_max(64, 0)
+
+
+# --------------------------------------------------------------------------- #
+#  Piece 1c: legacy host-KV migration is disabled under G>1                    #
+# --------------------------------------------------------------------------- #
+
+def _bare_worker(G, *, rank=0, world_size=16):
+    """A BatchGenWorker with ONLY the fields _plan_kv_migration reads."""
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = rank
+    worker.local_rank = rank % 8
+    worker.world_size = world_size
+    worker.parallel_manager = types.SimpleNamespace(attn_tp_size=G)
+    return worker
+
+
+def test_plan_kv_migration_disabled_for_decode_tp_group(monkeypatch, caplog):
+    """G>1: the legacy planner keys from_rank/to_rank on the SINGLE assigned_rank,
+    which under unified resident TP may hold no HostKVPageTable registration at
+    all (the world16/G=8 IndexError). _plan_kv_migration must fail safe to [] and
+    must not touch host-utilization / NCCL / the planner on the way there."""
+    from batchgen import batchgen_worker as bw
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("legacy single-rank migration path ran under G>1")
+
+    worker = _bare_worker(8, rank=0)
+    worker._get_host_kv_utilization = _must_not_run
+    worker._make_migration_plan_request = _must_not_run
+    worker._get_or_create_gloo_group = _must_not_run
+    monkeypatch.setattr(bw.dist, "all_gather_object", _must_not_run)
+    monkeypatch.setattr(
+        bw, "KVCacheManager",
+        types.SimpleNamespace(plan_kv_migration=_must_not_run),
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert worker._plan_kv_migration() == []
+        assert worker._plan_kv_migration() == []   # still safe on re-entry
+
+    # One-shot: informative, and logged exactly once for the whole run.
+    skips = [r for r in caplog.records
+             if "skipping legacy single-rank" in r.getMessage()]
+    assert len(skips) == 1, [r.getMessage() for r in caplog.records]
+    assert "attn_tp_size=8" in skips[0].getMessage()
+
+
+def test_plan_kv_migration_g1_still_plans(monkeypatch):
+    """NON-VACUITY control: with G==1 (validated pure-DP path) the guard is
+    inert -- stats are gathered and the planner's decision is returned verbatim."""
+    from batchgen import batchgen_worker as bw
+
+    worker = _bare_worker(1, rank=0, world_size=2)
+    worker._get_host_kv_utilization = lambda: {"node_id": 0}
+    worker._make_migration_plan_request = lambda node_stats: node_stats
+
+    def _fake_all_gather_object(object_list, obj, group=None):
+        object_list[0] = {"node_id": 0}
+        object_list[1] = {"node_id": 1}
+
+    monkeypatch.setattr(bw.dist, "all_gather_object", _fake_all_gather_object)
+
+    planned = [types.SimpleNamespace(
+        uuid="deadbeefcafe", from_rank=0, to_rank=1, pages=3)]
+    monkeypatch.setattr(
+        bw, "KVCacheManager",
+        types.SimpleNamespace(plan_kv_migration=lambda req: planned),
+    )
+
+    assert worker._plan_kv_migration() is planned

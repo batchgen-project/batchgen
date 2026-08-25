@@ -3741,6 +3741,25 @@ class BatchGenWorker:
 		Returns:
 			List of MigrationOp objects describing planned migrations.
 		"""
+		# Unified resident TP (G>1): a sequence is physically owned by ALL G
+		# ranks of its decode_dp_group, so the legacy planner/executor -- which
+		# keys from_rank/to_rank and the local-map update on the SINGLE
+		# ``assigned_rank`` -- targets a rank that may hold no HostKVPageTable
+		# registration at all (IndexError), and a correct move would have to
+		# carry the replicated query-book / KDA / local-map state across all G
+		# ranks, which this executor does not implement. Decode-group admission
+		# already balances host KV across groups, so fail safe: no migrations,
+		# BEFORE any Gloo group creation or NCCL execution. G==1 is unchanged.
+		G = self._decode_attn_tp_size()
+		if G > 1:
+			if not getattr(self, '_logged_migration_skip_tp', False) and self.rank == 0:
+				logging.info(
+					f"MIGRATION: attn_tp_size={G} (>1): decode-group admission owns "
+					f"host-KV balancing; skipping legacy single-rank migration"
+				)
+				self._logged_migration_skip_tp = True
+			return []
+
 		# Gather host KV stats from all local_rank 0 (NCCL side effect)
 		if self.local_rank == 0:
 			local_stats = self._get_host_kv_utilization()
