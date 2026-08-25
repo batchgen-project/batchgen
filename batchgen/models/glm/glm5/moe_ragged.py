@@ -45,11 +45,17 @@ ROW_ALIGN = 64
 QUANT_BLOCK = 128
 
 # TileM selector handed to the grouped FP8 GEMM (`num_seq_per_group_avg`, which
-# the kernel maps to TileM 16/32/64). The 3D path computed `mtp // E_local`,
-# >= 64 for every shipped GLM-5 config, so the kernel always ran the TileM=64
-# variant. The compact layout has no mtp; pin the same value so M1a-2 stays a
-# memory-only change. Re-tuning TileM is a separate experiment.
-GEMM_TILEM_AVG = 64
+# the compiled dispatch maps to TileM 16/32/64: <=16 -> 16, <=32 -> 32, else 64).
+# The fixed336 decode workload routes 336 global rows at top-k 8 over 256
+# experts — 10.5 rows per expert segment on average — so a 64-row M-tile leaves
+# most of each tile empty.  An exact real-routing H200 sweep over layers
+# 3/40/77 (three repetitions each) selected TileM=32 as the best static choice:
+# 317.62 us rank-max full-window versus 318.87 us for TileM=16 and 324.17 us
+# for TileM=64. This is a static, capture-time host constant, NOT a device->host
+# readback of the real counts, so it stays CUDA-graph safe. ROW_ALIGN = 64
+# divides 32, so segment starts remain tile-aligned and the padded callers
+# (whose `cu_seqlens[e] = e * mtp`, mtp a multiple of 64) are unaffected.
+GEMM_TILEM_AVG = 32
 
 # Row capacity is rounded to this so the x_scale row stride (capacity * 4 B) is
 # always 16 B aligned for the scale TMA descriptor.

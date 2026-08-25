@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from batchgen.models.glm.glm5.moe_ragged import (
+    GEMM_TILEM_AVG,
     QUANT_BLOCK,
     ROW_ALIGN,
     ragged_row_capacity,
@@ -54,6 +55,15 @@ def _row_to_expert(cu, num_experts, row):
         else:
             hi = mid - 1
     return lo
+
+
+def _tile_m_for_avg(avg):
+    """Mirror of fp8_blockwise_grouped_gemm_async's compiled TileM dispatch."""
+    if avg <= 16:
+        return 16
+    if avg <= 32:
+        return 32
+    return 64
 
 
 def _random_counts(num_experts, nk, rng):
@@ -167,6 +177,34 @@ def test_scale_tile_reads_stay_in_capacity():
                 for e in range(num_experts)
             )
             assert top_tile * tile_m <= capacity
+
+
+def test_selected_tile_m_is_supported_and_divides_every_segment_start():
+    """The TileM the static selector resolves to must divide ROW_ALIGN.
+
+    `GEMM_TILEM_AVG` is pinned on the host (graph-safe: no device->host readback
+    of the real counts), so one TileM is baked in for every step. If it were not
+    a divisor of ROW_ALIGN, the x_scale tile index `cu_seqlens[e] / TileM` would
+    land mid-tile for some expert and silently read the wrong scales.
+    """
+    tile_m = _tile_m_for_avg(GEMM_TILEM_AVG)
+    assert tile_m in TILE_MS
+    assert ROW_ALIGN % tile_m == 0
+
+    # fixed336 EP8 shape: 336 global rows, top-k 8, 32 local experts/rank
+    # (256 global experts).  A rank may receive any subset of the 2,688 routed
+    # pairs, so retain the global row bound while modeling the local layout.
+    num_experts, max_global, topk = 32, 336, 8
+    capacity = ragged_row_capacity(max_global, topk, num_experts)
+    rng = random.Random(336)
+    for _ in range(20):
+        counts = _random_counts(num_experts, max_global * topk, rng)
+        cu = _cu_seqlens(counts)
+        assert cu[-1] <= capacity
+        for e, count in enumerate(counts):
+            assert cu[e] % tile_m == 0
+            n_tiles = (count + tile_m - 1) // tile_m
+            assert cu[e] + n_tiles * tile_m <= cu[e + 1]
 
 
 # ---------------------------------------------------------------------------
