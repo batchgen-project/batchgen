@@ -193,6 +193,22 @@ def _setup_worker_logging(rank_idx: int, global_rank: int = -1):
 	)
 
 
+def _signal_local_worker_manager_ready(
+	ready_event: Optional[mp.Event],
+	*,
+	local_rank: int,
+	global_rank: int,
+) -> bool:
+	"""Signal the node-local launcher after its workers pass the global barrier."""
+	if ready_event is None or local_rank != 0:
+		return False
+	ready_event.set()
+	logging.info(
+		f"Rank {global_rank}: Signaled node-local ready event to WorkerManager"
+	)
+	return True
+
+
 def _server_worker_main_impl(
 	rank_idx: int,
 	request_queue: mp.Queue,
@@ -323,10 +339,13 @@ def _server_worker_main_impl(
 	dist.barrier()
 	logging.info(f"Rank {args.global_rank}: All ranks ready, entering main loop.")
 
-	# Signal that workers are ready (only rank 0 sets the event to avoid race conditions)
-	if ready_event is not None and args.global_rank == 0:
-		ready_event.set()
-		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
+	# Each launcher owns a node-local event, so local rank 0 must signal its own
+	# WorkerManager. The global barrier above proves all workers are ready first.
+	_signal_local_worker_manager_ready(
+		ready_event,
+		local_rank=args.local_rank,
+		global_rank=args.global_rank,
+	)
 
 	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
 	# not worker init, CUDA graph capture, or NCCL warmup.
