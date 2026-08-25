@@ -281,6 +281,14 @@ class _DualKVLoadPointers:
 	aux_page_counts: torch.Tensor
 
 
+@dataclass
+class _PendingDecodeTokenResult:
+	ready_event: object
+	tokens_cpu: torch.Tensor
+	rows: list
+	local_iteration: int
+
+
 class QueryBookPoolCapacityError(RuntimeError):
 	"""A QueryBook pool request exceeded the rows/width actually allocated."""
 
@@ -1987,6 +1995,109 @@ class BatchGenWorker:
 			logging.info(f"Using SAMPLING: temperature={self._temperature}, top_p={self._top_p}")
 			self._logged_sampling = True
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
+
+	def _advance_decode_sequences_for_pending_token(
+		self,
+		batch: List[int],
+		batch_sequences: List[SequenceEntry],
+	) -> list:
+		"""Advance token-count metadata before the token value reaches the CPU.
+
+		Decode membership changes only at a page boundary.  Advancing the known
+		one-token counters here lets the next whole-model graph be enqueued while
+		the previous token result is still in flight.  Token-dependent state is
+		applied later by ``_finalize_pending_decode_token``.
+		"""
+		rows = []
+		for token_row, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
+			if self._is_sequence_completed(seq):
+				continue
+			decode_pos = seq.decoded_length
+			seq.decoded_length += 1
+			seq.current_context_length += 1
+			rows.append((token_row, local_idx, seq, decode_pos))
+		return rows
+
+	def _finalize_pending_decode_token(
+		self,
+		pending: _PendingDecodeTokenResult,
+	) -> None:
+		"""Wait only for ``pending`` and apply its token-dependent CPU state."""
+		pending.ready_event.synchronize()
+		self._apply_pending_decode_token(pending)
+
+	def _apply_pending_decode_token(
+		self,
+		pending: _PendingDecodeTokenResult,
+	) -> None:
+		"""Apply a token result whose readiness has already been established."""
+		new_tokens_cpu = pending.tokens_cpu
+		for token_row, local_idx, seq, decode_pos in pending.rows:
+			if BATCHGEN_CB_DEBUG:
+				qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
+				seq_ptr = seq.decoded_tokens.data_ptr()
+				if qb_ptr != seq_ptr:
+					logging.error(
+						f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
+						f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
+						f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+					)
+			self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[token_row]
+
+			token_id = new_tokens_cpu[token_row].item()
+			if (
+				BATCHGEN_MULTI_BATCH_DIAG
+				and self.rank == 0
+				and pending.local_iteration <= 3
+				and token_row < 10
+			):
+				logging.info(
+					f"[MULTI_DIAG] iter={pending.local_iteration} seq={seq.uuid[:8]} "
+					f"decoded_len={seq.decoded_length} token={token_id}"
+				)
+			if self._should_stop_at_eos(token_id):
+				seq.eos_reached = True
+
+			if seq.decoded_length >= seq.max_decode_length:
+				seq.eos_reached = True
+
+			if REP_DETECTION and not seq._rep_detected:
+				if token_id == seq._rep_last_token:
+					seq._rep_count += 1
+					if seq._rep_count >= 32:
+						seq._rep_detected = True
+						seq.eos_reached = True
+						seq.log_event(
+							SeqEvent.REPETITION,
+							self.rank,
+							f"token={token_id}, count={seq._rep_count}",
+						)
+						lifespan.dump_lifespan(
+							seq.uuid,
+							seq.global_idx,
+							seq._lifespan_log,
+							"REPETITION",
+						)
+						logging.warning(
+							f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
+							f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+						)
+				else:
+					seq._rep_last_token = token_id
+					seq._rep_count = 1
+				if (
+					not seq._rep_detected
+					and seq.decoded_length >= 6
+					and seq.decoded_length % 64 == 0
+				):
+					_tokens = self.query_book[local_idx].decoded_tokens[0]
+					if _check_repeating_pattern(_tokens, seq.decoded_length):
+						seq._rep_detected = True
+						seq.eos_reached = True
+						logging.warning(
+							f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
+							f"gid={seq.global_idx} at decoded_len={seq.decoded_length}"
+						)
 
 	def _log_prefill_timing(self):
 		"""Log prefill timing stats if available (GPT-OSS specific)."""
@@ -9275,8 +9386,10 @@ class BatchGenWorker:
 		AttnWrapperBase.max_seqlen = max_ctx
 		AttnWrapperBase.cur_batch = cur_batch
 		index_topk = getattr(self.model_config, "index_topk", None)
-		if index_topk is not None and cache_view.numel() > 0:
-			GLM5AttnWrapper._dsa_short_count = int((cache_view <= int(index_topk)).sum().item())
+		if index_topk is not None and cache_seqlens:
+			GLM5AttnWrapper._dsa_short_count = sum(
+				int(length) <= int(index_topk) for length in cache_seqlens
+			)
 		else:
 			GLM5AttnWrapper._dsa_short_count = 0 if cache_view.numel() == 0 else None
 
@@ -10753,8 +10866,13 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
-		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
+		# Two token-readback slots permit one GLM-5 whole-graph result to be
+		# consumed on CPU while the next graph is already running.
+		_new_tokens_pinned = torch.empty(
+			2, max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True
+		)
+		_token_ready_events = [torch.cuda.Event(), torch.cuda.Event()]
+		_pending_decode_token = None
 
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
@@ -10793,6 +10911,12 @@ class BatchGenWorker:
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				# Scheduling may change membership or move/free KV pages.  Resolve
+				# the one in-flight token before any boundary decision observes
+				# sequence completion state.
+				if _pending_decode_token is not None:
+					self._finalize_pending_decode_token(_pending_decode_token)
+					_pending_decode_token = None
 				with (_dtimer.host_timed("boundary_block") if _dtimer and _dtimer.enabled else nullcontext()):
 					last_boundary = local_iteration
 
@@ -11051,14 +11175,16 @@ class BatchGenWorker:
 
 					# Per-step DSA dispatch hint: count sequences whose cache is
 					# short enough to take the dense short-circuit instead of
-					# indexer scoring. Computing once here instead of inside
-					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
-					# per decode step on DSA models (GLM-5).
+					# indexer scoring.  Use the canonical CPU lengths rather than
+					# reducing the mirrored CUDA tensor: after decode overlap is
+					# enabled, a .item() here would wait for the previous whole-
+					# model graph and recreate the inter-graph host bubble.
 					with (_dtimer.host_timed("host_dsa_shortcount_sync") if _dtimer and _dtimer.enabled else nullcontext()):
 						_dsa_index_topk = getattr(self.model_config, "index_topk", None)
 						if _dsa_index_topk is not None:
-							GLM5AttnWrapper._dsa_short_count = int(
-								(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
+							GLM5AttnWrapper._dsa_short_count = sum(
+								int(length) <= int(_dsa_index_topk)
+								for length in cache_seqlens
 							)
 						else:
 							GLM5AttnWrapper._dsa_short_count = None
@@ -11335,6 +11461,7 @@ class BatchGenWorker:
 					)
 					_glm5_whole_timing_items = {}
 					_glm5_skip_graph_kv_offload = False
+					_glm5_boundary_kv_owned = False
 					# Whole-model CUDA graph replay.
 					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
 					# computation, NOT local len(batch). The graph has NCCL all_reduce
@@ -11598,6 +11725,7 @@ class BatchGenWorker:
 						# exact-range copy: the graph's own GPU pages are the record
 						# until the next page boundary / decode cleanup, so skip the
 						# per-token stage + append entirely for this token.
+						_glm5_boundary_kv_owned = True
 						_glm5_skip_graph_kv_offload = True
 
 					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
@@ -11681,6 +11809,7 @@ class BatchGenWorker:
 							_glm5_whole_compare,
 						)
 				else:
+					_glm5_boundary_kv_owned = False
 					# Per-layer graph or eager forward
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
@@ -11693,94 +11822,71 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Enqueue
-			# the copy BEFORE flushing KV so _flush_deferred_kv_to_host's single
-			# event.synchronize() (recorded after this copy on the same stream)
-			# covers it too — collapses the two per-step host syncs into one.
+			# One-step GLM-5 overlap: enqueue this token readback before waiting
+			# for the prior token.  On the next iteration the graph launch is
+			# therefore already in the stream when the prior event is resolved.
 			bs = new_tokens.shape[0]
-			if bs > _new_tokens_pinned.shape[0]:
-				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
+			if bs > _new_tokens_pinned.shape[1]:
+				if _pending_decode_token is not None:
+					self._finalize_pending_decode_token(_pending_decode_token)
+					_pending_decode_token = None
+				_new_tokens_pinned = torch.empty(
+					2, bs, 1, dtype=torch.long, pin_memory=True
+				)
+			_token_slot = local_iteration & 1
+			_tokens_cpu = _new_tokens_pinned[_token_slot, :bs]
 			with (_dtimer.timed("token_d2h", 0) if _dtimer and _dtimer.enabled else nullcontext()):
-				_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
+				_tokens_cpu.copy_(new_tokens[:bs], non_blocking=True)
+			_token_ready_events[_token_slot].record(
+				torch.cuda.current_stream(self.torch_device)
+			)
 
-			# Flush deferred KV entries — its single sync covers all layers plus
-			# the token copy above. Only sync again if it had nothing to flush
-			# (early return without syncing) so the token copy isn't read stale.
-			with (_dtimer.host_timed("kv_flush_wait") if _dtimer and _dtimer.enabled else nullcontext()):
-				self._flush_deferred_kv_to_host()
-				if not getattr(self, '_kv_offload_synced_this_step', False):
-					torch.cuda.current_stream(self.torch_device).synchronize()
-				# decode_uuids is the globally identical active set. Marking it only
-				# after the flush keeps every rank's stale-ID guard state symmetric,
-				# including ranks whose local decode batch is empty.
-				self._mark_suppressed_decode_host_kv_stale(decode_uuids)
-			new_tokens_cpu = _new_tokens_pinned[:bs]
-
-			# Update sequences (reuse batch_sequences from forward pass setup)
-			with (_dtimer.host_timed("host_update_loop") if _dtimer and _dtimer.enabled else nullcontext()):
-				for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-					if self._is_sequence_completed(seq):
-						continue
-
-					decode_pos = seq.decoded_length
-					if BATCHGEN_CB_DEBUG:
-						qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
-						seq_ptr = seq.decoded_tokens.data_ptr()
-						if qb_ptr != seq_ptr:
-							logging.error(
-								f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
-								f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
-								f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
-							)
-					self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
-
-					seq.decoded_length += 1
-					seq.current_context_length += 1
-
-					# Use CPU tensor to avoid GPU sync
-					token_id = new_tokens_cpu[i].item()
-
-					# DIAG: Log first 3 tokens for first 10 seqs in each decode group
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
-						logging.info(
-							f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
-							f"decoded_len={seq.decoded_length} token={token_id}"
+			_overlap_this_step = bool(
+				_use_graph
+				and getattr(self, "_glm5_whole_model_graph", False)
+				and _glm5_boundary_kv_owned
+				and not _glm5_whole_compare
+				and not _glm5_whole_timing
+				and not (_dtimer and _dtimer.enabled)
+			)
+			if _overlap_this_step:
+				# Current graph + D2H are already queued.  Resolving the prior
+				# event now lets its CPU bookkeeping overlap current GPU work.
+				if _pending_decode_token is not None:
+					self._finalize_pending_decode_token(_pending_decode_token)
+				with (_dtimer.host_timed("host_update_loop") if _dtimer and _dtimer.enabled else nullcontext()):
+					_pending_rows = self._advance_decode_sequences_for_pending_token(
+						batch, batch_sequences
+					)
+				_pending_decode_token = _PendingDecodeTokenResult(
+					ready_event=_token_ready_events[_token_slot],
+					tokens_cpu=_tokens_cpu,
+					rows=_pending_rows,
+					local_iteration=local_iteration,
+				)
+			else:
+				if _pending_decode_token is not None:
+					self._finalize_pending_decode_token(_pending_decode_token)
+					_pending_decode_token = None
+				# Existing synchronous fallback, unchanged for every path that
+				# cannot prove whole-graph + boundary-KV ownership.
+				with (_dtimer.host_timed("kv_flush_wait") if _dtimer and _dtimer.enabled else nullcontext()):
+					self._flush_deferred_kv_to_host()
+					if not getattr(self, '_kv_offload_synced_this_step', False):
+						torch.cuda.current_stream(self.torch_device).synchronize()
+					self._mark_suppressed_decode_host_kv_stale(decode_uuids)
+				with (_dtimer.host_timed("host_update_loop") if _dtimer and _dtimer.enabled else nullcontext()):
+					_pending_rows = self._advance_decode_sequences_for_pending_token(
+						batch, batch_sequences
+					)
+					self._apply_pending_decode_token(
+						_PendingDecodeTokenResult(
+							ready_event=_token_ready_events[_token_slot],
+							tokens_cpu=_tokens_cpu,
+							rows=_pending_rows,
+							local_iteration=local_iteration,
 						)
-					if self._should_stop_at_eos(token_id):
-						seq.eos_reached = True
-
-					if seq.decoded_length >= seq.max_decode_length:
-						seq.eos_reached = True
-
-					# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-					if REP_DETECTION and not seq._rep_detected:
-						if token_id == seq._rep_last_token:
-							seq._rep_count += 1
-							if seq._rep_count >= 32:
-								seq._rep_detected = True
-								seq.eos_reached = True
-								seq.log_event(SeqEvent.REPETITION, self.rank,
-									f"token={token_id}, count={seq._rep_count}")
-								lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-									seq._lifespan_log, "REPETITION")
-								logging.warning(
-									f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
-									f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
-								)
-						else:
-							seq._rep_last_token = token_id
-							seq._rep_count = 1
-						# Variable-length N-gram pattern check (every 64 tokens)
-						if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
-							_dl = seq.decoded_length
-							_tokens = self.query_book[local_idx].decoded_tokens[0]
-							if _check_repeating_pattern(_tokens, _dl):
-								seq._rep_detected = True
-								seq.eos_reached = True
-								logging.warning(
-									f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
-									f"gid={seq.global_idx} at decoded_len={_dl}"
-								)
+					)
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
@@ -11800,6 +11906,9 @@ class BatchGenWorker:
 
 		# Cleanup. Flush the boundary dirty ranges (and wait the per-token append
 		# tasks) BEFORE any GPU page or host worker view below can be released.
+		if _pending_decode_token is not None:
+			self._finalize_pending_decode_token(_pending_decode_token)
+			_pending_decode_token = None
 		self._flush_boundary_dirty_kv_ranges()
 		if pending_async_task is not None:
 			pending_async_task.wait()
