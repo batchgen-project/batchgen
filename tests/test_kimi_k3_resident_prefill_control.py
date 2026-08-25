@@ -3087,6 +3087,30 @@ def test_distributed_daemon_joins_bootstrap_threads_on_failure():
     assert "if (listener >= 0)" in source
 
 
+def test_distributed_daemon_prepares_for_expected_worker_disconnects():
+    daemon = (
+        ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.cpp"
+    ).read_text()
+    header = (
+        ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.h"
+    ).read_text()
+    binding = (ROOT / "core" / "batchgen_Binding.cpp").read_text()
+    manager = (ROOT / "batchgen" / "server" / "worker_manager.py").read_text()
+    stop = manager[manager.index("    def stop(self) -> None:") :]
+    stop = stop[: stop.index("    def _get_worker_pids")]
+
+    assert "void PrepareStop();" in header
+    assert "void PrepareStop()" in daemon
+    assert "PrepareStop();" in daemon
+    assert 'def("prepare_stop", &DistributedWeightDaemon::PrepareStop)' in binding
+    assert stop.index("distributed_weight_daemon.prepare_stop()") < stop.index(
+        "os.kill(pid, signal.SIGTERM)"
+    )
+    assert stop.index("os.kill(pid, signal.SIGTERM)") < stop.index(
+        "distributed_weight_daemon.stop()"
+    )
+
+
 def test_hierarchical_gdr_core_transport_fails_closed_without_host_network():
     storage = (
         ROOT / "core" / "Weights_Storage" / "Weights_Storage.cpp"

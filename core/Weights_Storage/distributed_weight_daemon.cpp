@@ -1378,13 +1378,20 @@ struct DistributedWeightDaemon::Impl {
         rename(temporary.c_str(), summary_path.c_str());
     }
 
-    void Stop() {
+    void PrepareStop() {
         if (!started.load()) {
             return;
         }
         stop.store(true);
         ready_cv.notify_all();
         ring_cv.notify_all();
+    }
+
+    void Stop() {
+        if (!started.load()) {
+            return;
+        }
+        PrepareStop();
         if (unix_listener >= 0) {
             shutdown(unix_listener, SHUT_RDWR);
             close(unix_listener);
@@ -1491,5 +1498,7 @@ void DistributedWeightDaemon::Start() { impl_->Start(); }
 void DistributedWeightDaemon::WaitReady(double timeout_seconds) {
     impl_->WaitReady(timeout_seconds);
 }
+
+void DistributedWeightDaemon::PrepareStop() { impl_->PrepareStop(); }
 
 void DistributedWeightDaemon::Stop() { impl_->Stop(); }

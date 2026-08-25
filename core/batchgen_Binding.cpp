@@ -577,6 +577,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("start", &DistributedWeightDaemon::Start)
         .def("wait_ready", &DistributedWeightDaemon::WaitReady,
              py::arg("timeout_seconds"))
+        .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
         .def("stop", &DistributedWeightDaemon::Stop);
     
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")

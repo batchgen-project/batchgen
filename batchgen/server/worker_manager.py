@@ -235,6 +235,12 @@ class WorkerManager:
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=5)
 
+        # Worker teardown closes the daemon control sockets. Mark the daemon as
+        # stopping first so those expected disconnects are not recorded as a
+        # transport failure; full daemon teardown still follows worker exit.
+        if self.distributed_weight_daemon is not None:
+            self.distributed_weight_daemon.prepare_stop()
+
         # Collect worker PIDs before sending shutdown signal
         worker_pids = self._get_worker_pids()
 

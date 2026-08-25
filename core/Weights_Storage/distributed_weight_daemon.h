@@ -14,6 +14,7 @@ class DistributedWeightDaemon {
 
     void Start();
     void WaitReady(double timeout_seconds);
+    void PrepareStop();
     void Stop();
 
    private:
