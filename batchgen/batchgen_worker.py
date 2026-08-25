@@ -6130,9 +6130,9 @@ class BatchGenWorker:
 				f"Rank {self.rank}: [K3_STARTUP] Loaded runtime extension {name}"
 			)
 
-		# flashmla_backend imports these two symbols at module import time, so a
-		# broken FlashMLA install only surfaced on the first decode — after the
-		# server had already reported ready, and on every rank at once.
+		# K3's pure-BF16 NoPE decode consumes these two symbols directly.  Import,
+		# validate, and kernel-warm them here so its function-local cached import
+		# cannot trigger extension setup after the server has reported ready.
 		try:
 			import flash_mla
 		except ImportError as e:

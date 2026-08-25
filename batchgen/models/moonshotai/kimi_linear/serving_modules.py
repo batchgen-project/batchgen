@@ -250,7 +250,12 @@ def mla_decoding_nope_with_pagekv(
         attn_output: (bsz, 1, hidden)
         k_tensor: (bsz, 1, 1, 576) new KV (already written into pages)
     """
-    from batchgen.attention.mla.flashmla_backend import (
+    # K3's pure-BF16 NoPE path only consumes the two FlashMLA entry points.
+    # Importing the legacy BatchGen backend here also imports fa3_backend and
+    # DeepGEMM, neither of which participates in this forward.  The K3 server
+    # has already imported, validated, and kernel-warmed flash_mla before HTTP
+    # readiness, so this cached import performs no first-admission setup.
+    from flash_mla import (
         flash_mla_with_kvcache,
         get_mla_metadata,
     )

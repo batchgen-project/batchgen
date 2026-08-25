@@ -20,6 +20,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 MAIN_LOOP = ROOT / "batchgen" / "server_worker_main_loop.py"
+KIMI_LINEAR_SERVING = (
+    ROOT
+    / "batchgen"
+    / "models"
+    / "moonshotai"
+    / "kimi_linear"
+    / "serving_modules.py"
+)
 
 
 def _function(path, function_name, class_name=None):
@@ -321,7 +329,7 @@ def test_kimi_k3_startup_preloads_the_first_forward_extensions_and_flashmla(
     _bind_preload(monkeypatch, trace, 7, flash_mla)()
 
     # FlashMLA is validated last, but still inside the one pre-readiness pass:
-    # both symbols flashmla_backend imports are resolved before the barrier.
+    # both symbols the K3 NoPE decode consumes are resolved before the barrier.
     assert trace == [
         "causal_conv1d",
         "dispatch_scatter_3d",
@@ -366,18 +374,26 @@ def test_kimi_k3_startup_fails_closed_on_an_invalid_flash_mla(monkeypatch, symbo
         preload()
 
 
-def test_flashmla_backend_symbols_are_all_validated_at_startup():
-    backend = ROOT / "batchgen" / "attention" / "mla" / "flashmla_backend.py"
+def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols():
+    decode = _function(KIMI_LINEAR_SERVING, "mla_decoding_nope_with_pagekv")
     imported = {
         alias.name
-        for node in ast.parse(backend.read_text()).body
+        for node in ast.walk(decode)
         if isinstance(node, ast.ImportFrom) and node.module == "flash_mla"
         for alias in node.names
     }
     assert imported == {"flash_mla_with_kvcache", "get_mla_metadata"}
 
-    # Whatever the backend imports at module scope is what startup must prove
-    # exists — otherwise the check drifts away from the failing import.
+    # The pure-BF16 consumer must not pull in the legacy FP8/FA3 backend: that
+    # module eagerly imports DeepGEMM although this K3 forward never calls it.
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "batchgen.attention.mla.flashmla_backend"
+        for node in ast.walk(decode)
+    )
+
+    # Whatever the real K3 consumer imports is what startup must prove exists;
+    # otherwise the readiness check can drift away from the failing path.
     source = _body_source(
         _function(WORKER, "_preload_kimi_k3_runtime_extensions", "BatchGenWorker")
     )
