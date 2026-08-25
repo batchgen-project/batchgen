@@ -1,4 +1,13 @@
-from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
+import runpy
+from pathlib import Path
+
+
+_MODULE_PATH = (
+    Path(__file__).parents[1] / "batchgen" / "server" / "worker_readiness.py"
+)
+_signal_local_worker_manager_ready = runpy.run_path(str(_MODULE_PATH))[
+    "_signal_local_worker_manager_ready"
+]
 
 
 class _ReadyEvent:
