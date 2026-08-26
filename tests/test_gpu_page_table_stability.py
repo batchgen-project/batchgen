@@ -174,6 +174,29 @@ def test_clear_page_table_preserves_graph_storage_and_active_empty_api():
     assert cleared_graph_state.slot_to_seq_id.numel() == 0
 
 
+def test_rebuild_and_clear_accept_inference_created_page_tables():
+    manager = _make_manager()
+    manager.allocate_pages_for_sequences([1, 2], [4, 8])
+
+    with torch.inference_mode():
+        manager.rebuild_page_table([1, 2])
+
+    active = manager._gpu_page_table_manager.gpu_table
+    graph = manager.get_cuda_graph_page_table_storage()
+    assert torch.is_inference(active)
+    assert torch.is_inference(graph)
+
+    # Same-order rebuild reuses and mutates the inference-created active table.
+    manager.rebuild_page_table([1, 2])
+    # Reordering allocates a new active table but refreshes the existing
+    # inference-created graph-stable backing table.
+    manager.rebuild_page_table([2, 1])
+    manager.clear_page_table()
+
+    assert manager._gpu_page_table_manager.gpu_table.shape[0] == 0
+    assert torch.all(manager.get_cuda_graph_page_table() == -1)
+
+
 def test_cuda_graph_capacity_errors_do_not_break_active_dynamic_table(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS", "2")
     manager = _make_manager(num_pages=8)
