@@ -5347,10 +5347,8 @@ class BatchGenWorker:
 			global_seq_ids = []
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				if seq.assigned_rank == self.rank:
-					# Verify sequence is in local map (should be for IN_DECODE sequences)
-					if uuid in self._uuid_to_local_map:
-						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
+				if uuid in self._uuid_to_local_map:
+					global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
 			if global_seq_ids:
 				# Filter to only sequences the GPU manager actually tracks
@@ -5365,8 +5363,7 @@ class BatchGenWorker:
 					)
 				# Also remove from tracking set
 				for uuid in uuids:
-					seq = self.global_batch.get_sequence(uuid)
-					if seq.assigned_rank == self.rank:
+					if uuid in self._uuid_to_local_map:
 						self._sequences_with_gpu_kv.discard(uuid)
 
 		# Update sequence status and reset GPU allocation
@@ -5432,12 +5429,14 @@ class BatchGenWorker:
 				assigned_rank=seq.assigned_rank,
 				global_idx=seq.global_idx,
 				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
+				decode_dp_group=seq.decode_dp_group,
 			))
 		return DecodeBatchRequest(
 			candidates=tuple(candidates),
 			total_pages=total_pages,
 			world_size=self.world_size,
 			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
+			attn_tp_size=self._decode_attn_tp_size(),
 		)
 
 	def _check_and_handle_completions(
@@ -7681,17 +7680,11 @@ class BatchGenWorker:
 					seq.mark_initial_gpu_reservation_done()
 					self._sequences_with_gpu_kv.add(uuid)
 			else:
-				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
-				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
-				# do NOT add these sequences to tracking. Otherwise subsequent
-				# rebuild_page_table() calls will crash with KeyError because the
-				# sequences exist in _sequences_with_gpu_kv / batch but were never
-				# registered in gpu_manager._sequences.
-				logging.error(
-					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
-					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
+				raise RuntimeError(
+					f"Rank {self.rank}: GPU KV allocation failed for "
+					f"{len(local_decode_indices)} locally owned sequences; "
+					"decode admission exceeded the available replica capacity"
 				)
-				local_decode_indices.clear()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")

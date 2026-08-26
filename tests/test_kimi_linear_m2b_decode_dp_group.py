@@ -342,3 +342,69 @@ def test_plan_kv_migration_g1_still_plans():
     ).__get__(worker)
 
     assert plan() is planned
+
+
+# --------------------------------------------------------------------------- #
+#  Piece 1d: ON_HOLD releases every locally replicated GPU-KV entry            #
+# --------------------------------------------------------------------------- #
+
+def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
+    """A TP-group member owns local GPU KV even when assigned_rank points at a
+    different rank. The local binding, not the legacy rank, controls release."""
+    on_hold = object()
+    calls = types.SimpleNamespace(freed=[], barriers=0)
+
+    class _Seq:
+        uuid = "u"
+        global_idx = 17
+        assigned_rank = 0
+        decode_dp_group = 0
+        gpu_pages_allocated = 12
+
+        def log_event(self, *args, **kwargs):
+            pass
+
+    seq = _Seq()
+
+    class _Batch:
+        def get_sequence(self, uuid):
+            assert uuid == "u"
+            return seq
+
+        def update_status(self, uuid, status):
+            assert uuid == "u"
+            assert status is on_hold
+
+    class _Manager:
+        _sequences = {17: object()}
+
+        def free_pages_for_sequences(self, global_ids):
+            calls.freed.append(list(global_ids))
+
+    worker = types.SimpleNamespace(
+        rank=1,
+        global_batch=_Batch(),
+        gpu_paged_kv_cache_manager=_Manager(),
+        _uuid_to_local_map={"u": 3},
+        _sequences_with_gpu_kv={"u"},
+        _sync_sequence_metadata=lambda uuids: None,
+    )
+    method = _isolated_worker_method(
+        "_put_sequences_on_hold",
+        {
+            "List": List,
+            "logging": logging,
+            "SequenceStatus": types.SimpleNamespace(ON_HOLD=on_hold),
+            "SeqEvent": types.SimpleNamespace(ON_HOLD=object()),
+            "dist": types.SimpleNamespace(
+                barrier=lambda: setattr(calls, "barriers", calls.barriers + 1)
+            ),
+        },
+    ).__get__(worker)
+
+    method(["u"])
+
+    assert calls.freed == [[17]]
+    assert worker._sequences_with_gpu_kv == set()
+    assert seq.gpu_pages_allocated == 0
+    assert calls.barriers == 1
