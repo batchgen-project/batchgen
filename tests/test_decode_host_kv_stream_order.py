@@ -58,7 +58,7 @@ def test_deferred_host_kv_launch_does_not_touch_cuda_from_python(monkeypatch):
 
     namespace = {
         "os": os,
-        "torch": SimpleNamespace(cuda=_ForbiddenCuda()),
+        "torch": SimpleNamespace(cuda=_ForbiddenCuda(), Tensor=object),
         "RuntimeError": RuntimeError,
     }
     exec(compile(source, str(WORKER), "exec"), namespace)
