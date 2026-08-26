@@ -195,6 +195,61 @@ def test_current_graph_and_d2h_are_enqueued_before_prior_token_wait():
     assert event_record.lineno < prior_finalize[0].lineno
 
 
+def test_graph_window_timing_samples_replay_without_disabling_overlap():
+    method = _worker_method_node("decoding_continuous")
+    timing = _assignments_named(method, "_glm5_graph_window_timing")
+    sample = _assignments_named(method, "_glm5_graph_window_sample")
+
+    assert len(timing) == len(sample) == 1
+    assert "'glm5_graph_window_timing'" in ast.unparse(timing[0].value)
+    sample_condition = ast.unparse(sample[0].value)
+    for term in (
+        "_glm5_graph_window_timing",
+        "self, '_glm5_whole_model_graph'",
+        "len(_glm5_graph_window_samples) < 8",
+        "local_iteration - last_boundary + 1",
+        "self.DECISION_INTERVAL // 8",
+    ):
+        assert term in sample_condition
+
+    starts = _calls_named(method, "_start_glm5_graph_window_sample")
+    finishes = _calls_named(method, "_finish_glm5_graph_window_sample")
+    adapter_replay = next(
+        call
+        for call in _calls_named(method, "replay")
+        if call.args and ast.unparse(call.args[0]) == "_wm_seg_name"
+    )
+    direct_replay = next(
+        call
+        for call in _calls_named(method, "replay")
+        if call.args and ast.unparse(call.args[0]) == "'glm5_whole_model'"
+    )
+
+    assert len(starts) == len(finishes) == 2
+    assert starts[0].lineno < adapter_replay.lineno < finishes[0].lineno
+    assert starts[1].lineno < direct_replay.lineno < finishes[1].lineno
+    assert "_glm5_graph_window_timing" not in ast.unparse(_overlap_if(method).test)
+
+    # Boundaries run before the replay at iterations 128, 256, ... .  For the
+    # fixed 1,023-replay trace, the shipping predicate therefore yields eight
+    # samples in each of eight windows, including the cleanup-resolved tail.
+    last_boundary = 0
+    windows = []
+    samples = []
+    for local_iteration in range(1, 1024):
+        if local_iteration - last_boundary >= 128:
+            windows.append(samples)
+            samples = []
+            last_boundary = local_iteration
+        if len(samples) < 8 and (local_iteration - last_boundary + 1) % 16 == 0:
+            samples.append(local_iteration)
+    windows.append(samples)
+    assert len(windows) == 8
+    assert all(len(window) == 8 for window in windows)
+    assert windows[0] == [15, 31, 47, 63, 79, 95, 111, 127]
+    assert windows[-1] == [911, 927, 943, 959, 975, 991, 1007, 1023]
+
+
 def test_finalize_waits_for_readback_before_applying_cpu_state():
     worker, Pending = _token_worker()
     trace = []
@@ -325,23 +380,53 @@ def test_pending_result_is_drained_before_boundary_and_cleanup_consumers():
     boundary_finalize = _calls_named(boundary.body[0], "_finalize_pending_decode_token")
     boundary_call = _calls_named(boundary.body, "_page_boundary_fast")
     boundary_clear = _assignments_named(boundary.body[0], "_pending_decode_token")
+    boundary_resolution = _calls_named(
+        boundary.body, "_log_glm5_graph_window_timing"
+    )
 
-    assert len(boundary_finalize) == len(boundary_clear) == len(boundary_call) == 1
+    assert all(
+        len(group) == 1
+        for group in (
+            boundary_finalize,
+            boundary_clear,
+            boundary_resolution,
+            boundary_call,
+        )
+    )
     assert isinstance(boundary_clear[0].value, ast.Constant)
     assert boundary_clear[0].value.value is None
-    assert boundary_finalize[0].lineno < boundary_clear[0].lineno < boundary_call[0].lineno
+    assert (
+        boundary_finalize[0].lineno
+        < boundary_clear[0].lineno
+        < boundary_resolution[0].lineno
+        < boundary_call[0].lineno
+    )
+    assert ast.unparse(boundary_resolution[0].args[0]) == "'boundary'"
 
     decode_loop = next(node for node in method.body if isinstance(node, ast.While))
     loop_index = method.body.index(decode_loop)
     cleanup_drain = method.body[loop_index + 1]
-    cleanup_flush = method.body[loop_index + 2]
+    cleanup_resolution = method.body[loop_index + 2]
+    cleanup_flush = method.body[loop_index + 3]
 
     assert isinstance(cleanup_drain, ast.If)
     assert ast.unparse(cleanup_drain.test) == "_pending_decode_token is not None"
     assert len(_calls_named(cleanup_drain, "_finalize_pending_decode_token")) == 1
     assert len(_assignments_named(cleanup_drain, "_pending_decode_token")) == 1
+    assert ast.unparse(cleanup_resolution) == (
+        "_log_glm5_graph_window_timing('cleanup')"
+    )
     assert len(_calls_named(cleanup_flush, "_flush_boundary_dirty_kv_ranges")) == 1
-    assert cleanup_drain.end_lineno < cleanup_flush.lineno
+    assert cleanup_drain.end_lineno < cleanup_resolution.lineno < cleanup_flush.lineno
+
+    resolver = next(
+        node
+        for node in method.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_log_glm5_graph_window_timing"
+    )
+    assert len(_calls_named(resolver, "elapsed_time")) == 1
+    assert not _calls_named(resolver, "synchronize")
 
 
 def test_non_overlap_fallback_preserves_synchronous_update_order():

@@ -10984,6 +10984,54 @@ class BatchGenWorker:
 		)
 		_token_ready_events = [torch.cuda.Event(), torch.cuda.Event()]
 		_pending_decode_token = None
+		_glm5_graph_window_timing = self._debug_flag_enabled(
+			(self._batchgen_debug or {}).get("glm5_graph_window_timing")
+		)
+		_glm5_graph_window_samples = []
+
+		def _start_glm5_graph_window_sample():
+			start = torch.cuda.Event(enable_timing=True)
+			end = torch.cuda.Event(enable_timing=True)
+			start.record(torch.cuda.current_stream(self.torch_device))
+			return start, end
+
+		def _finish_glm5_graph_window_sample(events, iteration, context, graph_bucket):
+			start, end = events
+			end.record(torch.cuda.current_stream(self.torch_device))
+			_glm5_graph_window_samples.append(
+				(start, end, iteration, context, graph_bucket)
+			)
+
+		def _log_glm5_graph_window_timing(resolution):
+			if not _glm5_graph_window_samples:
+				return
+			window_ms = [
+				start.elapsed_time(end)
+				for start, end, _, _, _ in _glm5_graph_window_samples
+			]
+			iterations = [
+				iteration for _, _, iteration, _, _ in _glm5_graph_window_samples
+			]
+			contexts = [
+				context for _, _, _, context, _ in _glm5_graph_window_samples
+			]
+			logging.info(
+				"[GLM5_GRAPH_WINDOW_TIMING] rank=%s n=%s mean_ms=%.3f "
+				"min_ms=%.3f max_ms=%.3f iteration_min=%s iteration_max=%s "
+				"context_min=%s context_max=%s graph_bucket=%s resolution=%s",
+				self.rank,
+				len(window_ms),
+				sum(window_ms) / len(window_ms),
+				min(window_ms),
+				max(window_ms),
+				min(iterations),
+				max(iterations),
+				min(contexts),
+				max(contexts),
+				_glm5_graph_window_samples[0][4],
+				resolution,
+			)
+			_glm5_graph_window_samples.clear()
 
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
@@ -11028,6 +11076,7 @@ class BatchGenWorker:
 				if _pending_decode_token is not None:
 					self._finalize_pending_decode_token(_pending_decode_token)
 					_pending_decode_token = None
+				_log_glm5_graph_window_timing("boundary")
 				with (_dtimer.host_timed("boundary_block") if _dtimer and _dtimer.enabled else nullcontext()):
 					last_boundary = local_iteration
 
@@ -11641,6 +11690,13 @@ class BatchGenWorker:
 								_adapter_decision.mode.value, _adapter_decision.reason,
 							)
 							_adapter_dual_active = False
+					_glm5_graph_window_sample = bool(
+						_glm5_graph_window_timing
+						and getattr(self, "_glm5_whole_model_graph", False)
+						and len(_glm5_graph_window_samples) < 8
+						and (local_iteration - last_boundary + 1)
+						% max(self.DECISION_INTERVAL // 8, 1) == 0
+					)
 					if _adapter_dual_active:
 						# ADAPTER PATH (Phase B dual gate)
 						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
@@ -11651,9 +11707,18 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
+						if _glm5_graph_window_sample:
+							_glm5_graph_window_events = _start_glm5_graph_window_sample()
 						graph_out = self._cuda_graph_manager.replay(
 							_wm_seg_name, _max_bs, **replay_inputs,
 						)
+						if _glm5_graph_window_sample:
+							_finish_glm5_graph_window_sample(
+								_glm5_graph_window_events,
+								local_iteration,
+								int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+								int(bucket),
+							)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
@@ -11718,6 +11783,8 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
+						if _glm5_graph_window_sample:
+							_glm5_graph_window_events = _start_glm5_graph_window_sample()
 						graph_out = self._cuda_graph_manager.replay(
 							"glm5_whole_model", _max_bs,
 							input_ids=new_tokens[:batch_size],
@@ -11728,6 +11795,13 @@ class BatchGenWorker:
 							rank_token_counts=_all_rank_counts,
 							num_valid_tokens=graph_inputs["num_valid_tokens"],
 						)
+						if _glm5_graph_window_sample:
+							_finish_glm5_graph_window_sample(
+								_glm5_graph_window_events,
+								local_iteration,
+								int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+								int(bucket),
+							)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
@@ -12038,6 +12112,7 @@ class BatchGenWorker:
 		if _pending_decode_token is not None:
 			self._finalize_pending_decode_token(_pending_decode_token)
 			_pending_decode_token = None
+		_log_glm5_graph_window_timing("cleanup")
 		self._flush_boundary_dirty_kv_ranges()
 		if pending_async_task is not None:
 			pending_async_task.wait()
