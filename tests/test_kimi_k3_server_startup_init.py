@@ -28,6 +28,7 @@ KIMI_LINEAR_SERVING = (
     / "kimi_linear"
     / "serving_modules.py"
 )
+KIMI_LINEAR_GRAPH = KIMI_LINEAR_SERVING.with_name("cuda_graph_segments.py")
 
 
 def _function(path, function_name, class_name=None):
@@ -374,8 +375,17 @@ def test_kimi_k3_startup_fails_closed_on_an_invalid_flash_mla(monkeypatch, symbo
         preload()
 
 
-def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols():
-    decode = _function(KIMI_LINEAR_SERVING, "mla_decoding_nope_with_pagekv")
+@pytest.mark.parametrize(
+    ("path", "function_name"),
+    [
+        (KIMI_LINEAR_SERVING, "mla_decoding_nope_with_pagekv"),
+        (KIMI_LINEAR_GRAPH, "_mla_decode_graph_safe"),
+    ],
+)
+def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
+    path, function_name
+):
+    decode = _function(path, function_name)
     imported = {
         alias.name
         for node in ast.walk(decode)
@@ -384,15 +394,16 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols():
     }
     assert imported == {"flash_mla_with_kvcache", "get_mla_metadata"}
 
-    # The pure-BF16 consumer must not pull in the legacy FP8/FA3 backend: that
-    # module eagerly imports DeepGEMM although this K3 forward never calls it.
+    # The pure-BF16 consumers must not pull in the legacy FP8/FA3 backend:
+    # that module eagerly imports DeepGEMM although these K3 forwards do not
+    # call it.
     assert not any(
         isinstance(node, ast.ImportFrom)
         and node.module == "batchgen.attention.mla.flashmla_backend"
         for node in ast.walk(decode)
     )
 
-    # Whatever the real K3 consumer imports is what startup must prove exists;
+    # Whatever the real K3 consumers import is what startup must prove exists;
     # otherwise the readiness check can drift away from the failing path.
     source = _body_source(
         _function(WORKER, "_preload_kimi_k3_runtime_extensions", "BatchGenWorker")

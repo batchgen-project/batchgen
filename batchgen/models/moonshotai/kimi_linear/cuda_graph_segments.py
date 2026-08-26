@@ -174,7 +174,10 @@ def _mla_decode_graph_safe(
     Returns:
         (attn_output (bucket, 1, hidden), k_tensor (bucket, 1, 1, kv_dim)).
     """
-    from batchgen.attention.mla.flashmla_backend import (
+    # K3's graph path uses the same pure-BF16 FlashMLA entry points as the
+    # eager path.  Import them directly so graph capture does not pull in the
+    # unused legacy FP8/FA3 backend and its DeepGEMM dependency.
+    from flash_mla import (
         flash_mla_with_kvcache,
         get_mla_metadata,
     )
