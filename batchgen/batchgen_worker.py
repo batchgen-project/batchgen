@@ -1174,7 +1174,26 @@ class BatchGenWorker:
 			)
 
 	def set_batchgen_debug(self, debug: Optional[dict]) -> None:
-		self._batchgen_debug = debug if isinstance(debug, dict) and debug else None
+		resolved_debug = debug if isinstance(debug, dict) and debug else None
+		debug_flags = resolved_debug or {}
+		suppress_decode = self._debug_flag_enabled(
+			debug_flags.get("glm5_suppress_decode_host_kv_writeback")
+		)
+		suppress_boundary = self._debug_flag_enabled(
+			debug_flags.get("glm5_suppress_boundary_kv_writeback")
+		)
+		if suppress_decode and suppress_boundary:
+			raise RuntimeError(
+				"glm5_suppress_decode_host_kv_writeback and "
+				"glm5_suppress_boundary_kv_writeback are mutually exclusive: the "
+				"boundary control must preserve whole-model graph dirty recording"
+			)
+		if suppress_boundary and BATCHGEN_SYNC_KV:
+			raise RuntimeError(
+				"glm5_suppress_boundary_kv_writeback requires deferred whole-model "
+				"graph boundary writeback, but BATCHGEN_SYNC_KV=1 writes KV inline"
+			)
+		self._batchgen_debug = resolved_debug
 		if self.rank == 0 and self._batchgen_debug:
 			logging.warning(f"[BATCHGEN_DEBUG] enabled flags: {sorted(self._batchgen_debug.keys())}")
 		self._resolve_suppress_decode_host_kv_writeback()
@@ -1234,6 +1253,11 @@ class BatchGenWorker:
 		"""Clear batch-scoped state for both writeback causal controls."""
 		self._suppress_decode_host_kv_writeback = False
 		self._suppress_boundary_kv_writeback = False
+		self._boundary_kv_suppression_observed = False
+		# Rank-symmetric latch: unlike the diagnostic ID set below, this is set
+		# after every rank completes the same suppressed boundary waiter, including
+		# ranks with no local decode rows.
+		self._boundary_kv_host_state_stale = False
 		self._host_kv_stale_global_ids: Set[int] = set()
 
 	def _mark_suppressed_decode_host_kv_stale(self, decode_uuids) -> None:
@@ -2445,12 +2469,13 @@ class BatchGenWorker:
 		if not uuids:
 			return
 
-		# ON_HOLD drops GPU KV and keeps only host KV — refuse while host KV is stale.
-		if self._host_kv_stale_global_ids:
-			self._assert_host_kv_not_stale(
-				[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
-				"_put_sequences_onhold (frees GPU KV pages)",
-			)
+		# ON_HOLD drops GPU KV and keeps only host KV. Call unconditionally because
+		# boundary suppression also carries a rank-symmetric stale latch on ranks
+		# whose local stale-ID set is empty.
+		self._assert_host_kv_not_stale(
+			[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
+			"_put_sequences_onhold (frees GPU KV pages)",
+		)
 
 		my_uuids = [u for u in uuids if u in self._uuid_to_local_map]
 		
@@ -2704,34 +2729,56 @@ class BatchGenWorker:
 		the per-token suppression control, non-GLM-5 paths, and any missing dual
 		manager/view capability all return ``None`` so the caller keeps the
 		existing per-token stage and append path. The boundary-only causal control
-		must remain eligible here so it suppresses only the final exact-range copies.
+		must remain eligible here so it suppresses only the final exact-range copies;
+		when that control is active, any capability miss is an error rather than a
+		silent fallback to a different writeback path.
 		"""
-		if BATCHGEN_SYNC_KV or self._suppress_decode_host_kv_writeback:
+		suppress_boundary = getattr(self, "_suppress_boundary_kv_writeback", False)
+
+		def unavailable(reason: str):
+			if suppress_boundary:
+				raise RuntimeError(
+					"glm5_suppress_boundary_kv_writeback requires the GLM-5 "
+					"whole-model graph dual exact-range writeback path; " + reason
+				)
 			return None
+
+		if BATCHGEN_SYNC_KV:
+			return unavailable("BATCHGEN_SYNC_KV=1 writes KV inline")
+		if self._suppress_decode_host_kv_writeback:
+			return unavailable(
+				"glm5_suppress_decode_host_kv_writeback is simultaneously active"
+			)
 		if not getattr(self, "_glm5_whole_model_graph", False):
-			return None
+			return unavailable("the whole-model graph is not active")
 		if getattr(self, "_deferred_kv_batch", None) is None:
-			return None
+			return unavailable("the deferred decode batch metadata is missing")
 		primary_view = getattr(self, "_deferred_kv_worker_view", None)
 		aux_view = getattr(self, "_deferred_kv_worker_view_aux", None)
-		for view in (primary_view, aux_view):
+		for name, view in (("primary", primary_view), ("auxiliary", aux_view)):
 			if view is None or not callable(getattr(
 				view, "async_copy_dirty_kv_token_ranges_to_host", None
 			)):
-				return None
+				return unavailable(
+					f"the {name} host view lacks exact-range copy capability"
+				)
 		primary_mgr = getattr(gpu_manager, "primary", gpu_manager)
 		aux_mgr = getattr(
 			gpu_manager,
 			"auxiliary",
 			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
 		)
-		for mgr in (primary_mgr, aux_mgr):
+		for name, mgr in (("primary", primary_mgr), ("auxiliary", aux_mgr)):
 			if mgr is None:
-				return None
+				return unavailable(f"the {name} GPU KV manager is missing")
 			if not callable(getattr(mgr, "get_padded_3d_page_pointers", None)):
-				return None
+				return unavailable(
+					f"the {name} GPU KV manager cannot export page pointers"
+				)
 			if not callable(getattr(mgr, "export_active_sequence_page_counts", None)):
-				return None
+				return unavailable(
+					f"the {name} GPU KV manager cannot export active page counts"
+				)
 		return primary_mgr, aux_mgr, primary_view, aux_view
 
 	def _record_glm5_boundary_dirty_kv(self, gpu_manager) -> bool:
@@ -2909,6 +2956,20 @@ class BatchGenWorker:
 					f"boundary dirty-range {type(exc).__name__}: {exc}"
 				)
 		num_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+		if suppress_boundary_writeback:
+			# This assignment is deliberately outside ``if dirty``. Every rank enters
+			# the same collective waiter, but a valid decode rank may have zero local
+			# rows. The rank-symmetric latch makes all later transition guards agree;
+			# the ID set below remains local diagnostic detail.
+			self._boundary_kv_host_state_stale = True
+			if dirty and not getattr(self, "_boundary_kv_suppression_observed", False):
+				logging.warning(
+					f"[BATCHGEN_DEBUG] rank={self.rank} "
+					"glm5_suppress_boundary_kv_writeback ACTUAL: "
+					f"dirty_id_count={len(dirty)}; primary+aux exact-range "
+					"GPU->host copies were skipped"
+				)
+				self._boundary_kv_suppression_observed = True
 		if dirty:
 			# A failed launch or wait raises above and keeps both the dirty ranges
 			# and stale-ID state unchanged. In the causal arm, only the GPU copy is
@@ -2930,16 +2991,20 @@ class BatchGenWorker:
 		Only ever trips when the causal-profiling suppression control has skipped
 		decode host-KV appends (``_host_kv_stale_global_ids`` is otherwise empty).
 		"""
-		if not self._host_kv_stale_global_ids:
+		boundary_stale = getattr(self, "_boundary_kv_host_state_stale", False)
+		if not boundary_stale and not self._host_kv_stale_global_ids:
 			return
+		requested = [int(gid) for gid in (global_ids or [])]
 		stale = sorted(
-			int(gid) for gid in (global_ids or [])
+			gid for gid in requested
 			if int(gid) in self._host_kv_stale_global_ids
 		)
-		if stale:
+		if boundary_stale or stale:
 			raise RuntimeError(
 				f"Rank {self.rank}: {context} refused — stale host KV for "
-				f"global_ids={stale[:16]} (n={len(stale)}) caused by suppressed decode "
+				f"global_ids={stale[:16]} (n={len(stale)}), "
+				f"requested_global_ids={requested[:16]}, "
+				f"boundary_rank_symmetric_stale={boundary_stale}; caused by suppressed decode "
 				"or boundary host-KV writeback "
 				"(batchgen_debug.glm5_suppress_decode_host_kv_writeback or "
 				"batchgen_debug.glm5_suppress_boundary_kv_writeback)"
@@ -2952,7 +3017,8 @@ class BatchGenWorker:
 		eviction changes the fixed-work path to release/recompute — all invalid once
 		the causal-profiling suppression control has skipped decode host writeback.
 		"""
-		if not self._host_kv_stale_global_ids:
+		boundary_stale = getattr(self, "_boundary_kv_host_state_stale", False)
+		if not boundary_stale and not self._host_kv_stale_global_ids:
 			return
 		offending = {
 			name: len(uuids)
@@ -2966,7 +3032,8 @@ class BatchGenWorker:
 		if offending:
 			raise RuntimeError(
 				f"Rank {self.rank}: page-boundary transition refused — host KV is stale "
-				f"for {len(self._host_kv_stale_global_ids)} global ids because decode "
+				f"for {len(self._host_kv_stale_global_ids)} local global ids "
+				f"(boundary_rank_symmetric_stale={boundary_stale}) because decode "
 				"or boundary host-KV writeback is suppressed "
 				"(batchgen_debug.glm5_suppress_decode_host_kv_writeback or "
 				"batchgen_debug.glm5_suppress_boundary_kv_writeback); "
@@ -5635,12 +5702,13 @@ class BatchGenWorker:
 		if not uuids:
 			return
 
-		# ON_HOLD drops GPU KV and keeps only host KV — refuse while host KV is stale.
-		if self._host_kv_stale_global_ids:
-			self._assert_host_kv_not_stale(
-				[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
-				"_put_sequences_on_hold (frees GPU KV pages)",
-			)
+		# ON_HOLD drops GPU KV and keeps only host KV. Call unconditionally because
+		# boundary suppression also carries a rank-symmetric stale latch on ranks
+		# whose local stale-ID set is empty.
+		self._assert_host_kv_not_stale(
+			[s.global_idx for s in map(self.global_batch.get_sequence, uuids) if s is not None],
+			"_put_sequences_on_hold (frees GPU KV pages)",
+		)
 
 		if self.rank == 0:
 			logging.info(
@@ -11488,11 +11556,29 @@ class BatchGenWorker:
 						or _glm5_whole_graph_active
 					)
 				)
+				if (
+					getattr(self, "_suppress_boundary_kv_writeback", False)
+					and not (_use_graph and _glm5_whole_graph_active)
+				):
+					raise RuntimeError(
+						"glm5_suppress_boundary_kv_writeback requires an active "
+						"GLM-5 whole-model graph at the decode consumer path; "
+						"refusing eager or non-GLM-5 fallback"
+					)
 				if _use_graph:
 					_glm5_whole_compare = bool(
 						getattr(self, "_glm5_whole_model_graph", False)
 						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
 					)
+					if (
+						getattr(self, "_suppress_boundary_kv_writeback", False)
+						and _glm5_whole_compare
+					):
+						raise RuntimeError(
+							"glm5_suppress_boundary_kv_writeback is incompatible with "
+							"whole-model graph compare because compare bypasses boundary "
+							"dirty recording"
+						)
 					_glm5_whole_timing = bool(
 						getattr(self, "_glm5_whole_model_graph", False)
 						and self._glm5_whole_model_graph_timing_requested_for_current_batch()
