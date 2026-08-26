@@ -308,27 +308,58 @@ def test_output_hook_rejects_a_truncated_stack():
 
 
 # --------------------------------------------------------------------------- #
-#  T5 — the decode CUDA-graph adapter cannot represent block_residual          #
+#  T5 — the decode CUDA-graph adapter is installed for block_residual          #
 # --------------------------------------------------------------------------- #
-def test_decode_graph_mode_refused_for_attn_res():
-    """``cuda_graph_segments._make_layer_forward`` returns a 1-tuple and its
-    captured span runs the classic residual body, so a replayed K3 layer would
-    drop the depth residuals. The PSM must refuse the mode outright rather than
-    install an adapter one debug flag away from silently wrong decode."""
+def test_decode_graph_mode_installed_for_attn_res(monkeypatch):
+    """K3 must install the graph adapter rather than retain the old refusal.
+
+    The fake keeps this wiring test CPU-only; the dedicated GPU segment-capture
+    test proves boundary writes and depth-mix parity under replay.
+    """
     _, kl, cfg = _build_pair(torch.float32)
+    installed = []
+
+    class FakeDecodeGraph:
+        def __init__(self, model, model_config, **kwargs):
+            self.model = model
+            self.model_config = model_config
+            self.kwargs = kwargs
+            self.modes = [kwargs["mode"]]
+
+        def install(self):
+            installed.append(self)
+
+        def set_mode(self, mode):
+            self.modes.append(mode)
+
+    from batchgen.models.moonshotai.kimi_linear import cuda_graph_segments
+    monkeypatch.setattr(
+        cuda_graph_segments, "KimiLinearDecodeGraph", FakeDecodeGraph
+    )
+
     stub = types.SimpleNamespace(
         loaded_model_config=cfg,
         model=types.SimpleNamespace(model=kl),
         rank=1,
         _decode_graph=None,
         _decode_graph_mode=lambda: "graph",
+        engine_config=types.SimpleNamespace(
+            Basic_Config=types.SimpleNamespace(
+                device_torch=DEVICE,
+                decode_graph_buckets=[1, 2, 4],
+                decode_graph_compare_every=7,
+            )
+        ),
     )
-    with pytest.raises(NotImplementedError, match="block_residual"):
-        PSM._init_decode_graph(stub)
+    PSM._init_decode_graph(stub)
+    assert installed == [stub._decode_graph]
+    assert stub._decode_graph.model is stub.model
+    assert stub._decode_graph.model_config is cfg
+    assert stub._decode_graph.kwargs["mode"] == "graph"
 
     stub._decode_graph_mode = lambda: "eager"
-    PSM._init_decode_graph(stub)          # inert, and installs nothing
-    assert stub._decode_graph is None
+    PSM._init_decode_graph(stub)
+    assert stub._decode_graph.modes == ["graph", "eager"]
 
 
 # --------------------------------------------------------------------------- #

@@ -95,6 +95,7 @@ from batchgen.cuda_graph.graph_manager import (
 )
 from batchgen.models.wrappers import AttnWrapperBase
 
+from .block_residual import apply_attn_res, num_block_residual_columns
 from .serving_modules import kda_decode_serving, mla_decoding_nope_with_pagekv
 from .wrappers import KDALayerState, KimiLinearKDAWrapper
 
@@ -276,7 +277,9 @@ class _BucketStatics:
     addresses in) and refreshed in place, eagerly, before the step's replays.
     """
 
-    def __init__(self, bucket: int, max_pages: int, device, kda_slots):
+    def __init__(self, bucket: int, max_pages: int, device, kda_slots, *,
+                 block_residual_columns: int = 0, hidden_size: int = 0,
+                 dtype=None):
         self.bucket = bucket
         self.cache_seqlens = torch.ones(
             bucket, dtype=torch.int32, device=device
@@ -297,6 +300,12 @@ class _BucketStatics:
         # View of KDAStateGPUManager's persistent slot buffer (M5.1) — bound,
         # not allocated.
         self.kda_slots = kda_slots
+        self.block_residual = None
+        if block_residual_columns:
+            self.block_residual = torch.empty(
+                bucket, block_residual_columns, hidden_size,
+                dtype=dtype, device=device,
+            )
 
     def arm_for_capture(self) -> None:
         """Neutral contents for warmup + capture: no KV writes (num_valid=0),
@@ -306,6 +315,8 @@ class _BucketStatics:
         self.cache_seqlens.fill_(1)
         self.token_indices.zero_()
         self.page_table.zero_()
+        if self.block_residual is not None:
+            self.block_residual.zero_()
 
     def refresh(self, bsz: int, cache_seqlens, token_indices, page_rows) -> None:
         """Bind this step's batch into the static buffers (rows >= bsz are
@@ -323,10 +334,17 @@ class _BucketStatics:
 class KimiLinearSpanSegment:
     """One decoder layer's capturable decode span (`CapturableSegment`).
 
-    KDA layer: input_layernorm -> kda_decode_serving -> +residual -> post_ln.
-    MLA layer: input_layernorm -> graph-safe NoPE-MLA -> +residual -> post_ln.
+    KDA layer: input_layernorm -> kda_decode_serving -> residual body -> post_ln.
+    MLA layer: input_layernorm -> graph-safe NoPE-MLA -> residual body -> post_ln.
     Dense layer (no `block_sparse_moe`, i.e. no collectives): the span also
     folds the dense MLP + second residual, so the whole layer is one graph.
+
+    For K3 the residual body is Block Attention Residual, not the classic
+    ``hidden + attention`` path. Every bucket owns one fixed-address full
+    ``(bucket, num_boundaries, hidden)`` buffer shared by all 93 spans. A layer
+    captures its statically-known active-column view; boundary spans write the
+    pre-mix prefix into their column before the MLP-depth mix. Thus the graph
+    carries the complete K3 state without copying that buffer between spans.
     """
 
     def __init__(self, layer, layer_idx: int, statics: Dict[int, _BucketStatics],
@@ -341,6 +359,21 @@ class KimiLinearSpanSegment:
         self.dtype = dtype
         self._statics = statics
         self._buf: Optional[_BucketStatics] = None
+        self.use_block_residual = bool(
+            getattr(layer, "use_attn_residuals", False)
+        )
+        self.block_size = (
+            int(layer.attn_res_block_size) if self.use_block_residual else 0
+        )
+        self.is_block_boundary = bool(
+            self.use_block_residual and layer_idx % self.block_size == 0
+        )
+        self.num_blocks_after = (
+            layer_idx // self.block_size + 1 if self.use_block_residual else 0
+        )
+        self.num_blocks_before = (
+            self.num_blocks_after - int(self.is_block_boundary)
+        )
         self.kda_state: Optional[KDALayerState] = (
             KimiLinearKDAWrapper.layer_pools[layer_idx] if self.is_kda else None
         )
@@ -377,9 +410,29 @@ class KimiLinearSpanSegment:
             self.kda_state.cur_decode_slots = self._buf.kda_slots
 
     def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if self.use_block_residual:
+            return self._forward_block_residual(
+                hidden_states,
+                self._graph_attention,
+                self._buf.block_residual,
+                write_boundary=True,
+            )
+
         layer = self.layer
-        buf = self._buf
         normed = layer.input_layernorm(hidden_states)
+        attn_out, k_tensor = self._graph_attention(normed)
+        residual = hidden_states + attn_out
+        normed_out = layer.post_attention_layernorm(residual)
+        if self.fold_ffn:
+            out = {"hidden": residual + layer.mlp(normed_out)}
+        else:
+            out = {"normed": normed_out, "residual": residual}
+        if k_tensor is not None:
+            out["k_tensor"] = k_tensor
+        return out
+
+    def _graph_attention(self, normed):
+        buf = self._buf
         if self.is_kda:
             attn_out = kda_decode_serving(self.attn, normed, self.kda_state)
             k_tensor = None
@@ -395,12 +448,63 @@ class KimiLinearSpanSegment:
                 num_valid_tokens=buf.num_valid_tokens,
                 page_size_tokens=self.page_size_tokens,
             )
-        residual = hidden_states + attn_out
-        normed_out = layer.post_attention_layernorm(residual)
+        return attn_out, k_tensor
+
+    def _forward_block_residual(
+        self,
+        hidden_states: torch.Tensor,
+        attention,
+        block_residual: torch.Tensor,
+        *,
+        write_boundary: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """K3's exact per-layer transition with graph-stable residual state.
+
+        ``write_boundary=True`` is the captured path and writes the current
+        layer's pre-mix prefix into the bucket-owned static buffer. Compare mode
+        passes ``False`` and materializes the one new column privately, so the
+        eager reference cannot advance state before the graph replay.
+        """
+        layer = self.layer
+        hidden_size = self.hidden_size
+        flat_prefix = hidden_states.reshape(-1, hidden_size)
+        active = block_residual[:, : self.num_blocks_before]
+
+        attn_input = hidden_states
+        if self.num_blocks_before:
+            attn_input = apply_attn_res(
+                flat_prefix,
+                active,
+                layer.self_attention_res_proj,
+                layer.self_attention_res_norm,
+            ).view_as(hidden_states)
+
+        prefix_sum = hidden_states
+        if self.is_block_boundary:
+            if write_boundary:
+                block_residual[:, self.num_blocks_before].copy_(flat_prefix)
+                active = block_residual[:, : self.num_blocks_after]
+            else:
+                active = torch.cat(
+                    (active, flat_prefix.unsqueeze(1)), dim=1
+                )
+            prefix_sum = None
+
+        normed = layer.input_layernorm(attn_input)
+        attn_out, k_tensor = attention(normed)
+        prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
+
+        ffn_input = apply_attn_res(
+            prefix_sum.reshape(-1, hidden_size),
+            active,
+            layer.mlp_res_proj,
+            layer.mlp_res_norm,
+        ).view_as(hidden_states)
+        normed_out = layer.post_attention_layernorm(ffn_input)
         if self.fold_ffn:
-            out = {"hidden": residual + layer.mlp(normed_out)}
+            out = {"hidden": prefix_sum + layer.mlp(normed_out)}
         else:
-            out = {"normed": normed_out, "residual": residual}
+            out = {"normed": normed_out, "residual": prefix_sum}
         if k_tensor is not None:
             out["k_tensor"] = k_tensor
         return out
@@ -460,8 +564,19 @@ class KimiLinearDecodeGraph:
         self._max_pages = 0
         self._page_size_tokens = 0
         self._orig_model_forward = None
+        self._orig_new_block_residual = None
         self._orig_layer_forwards: Dict[int, object] = {}
         self._fallbacks_logged: dict = {}
+        self._uses_block_residual = bool(
+            getattr(model_config, "attn_res_block_size", None) is not None
+        )
+        self._block_residual_columns = (
+            num_block_residual_columns(
+                model_config.num_hidden_layers,
+                model_config.attn_res_block_size,
+            )
+            if self._uses_block_residual else 0
+        )
 
         # per-step state
         self._step_active = False
@@ -485,6 +600,11 @@ class KimiLinearDecodeGraph:
         inner = self.model.model
         self._orig_model_forward = inner.forward
         inner.forward = self._make_model_forward(self._orig_model_forward)
+        if self._uses_block_residual:
+            self._orig_new_block_residual = inner._new_block_residual
+            inner._new_block_residual = self._make_new_block_residual(
+                self._orig_new_block_residual
+            )
         for layer_idx, layer in enumerate(inner.layers):
             orig = layer.forward
             self._orig_layer_forwards[layer_idx] = orig
@@ -503,6 +623,9 @@ class KimiLinearDecodeGraph:
         if self._installed:
             inner = self.model.model
             inner.forward = self._orig_model_forward
+            if self._orig_new_block_residual is not None:
+                inner._new_block_residual = self._orig_new_block_residual
+                self._orig_new_block_residual = None
             for layer_idx, orig in self._orig_layer_forwards.items():
                 inner.layers[layer_idx].forward = orig
             self._orig_layer_forwards = {}
@@ -531,9 +654,26 @@ class KimiLinearDecodeGraph:
                 self._step_active = False
         return forward
 
+    def _make_new_block_residual(self, orig_new):
+        def new_block_residual(hidden_states):
+            if not self._step_active:
+                return orig_new(hidden_states)
+            expected = (self._bsz, 1, self.model_config.hidden_size)
+            if tuple(hidden_states.shape) != expected:
+                self._fallback(
+                    "block-residual seed shape {} != {}".format(
+                        tuple(hidden_states.shape), expected
+                    )
+                )
+                self._step_active = False
+                return orig_new(hidden_states)
+            return self._block_residual_view(-1)
+        return new_block_residual
+
     def _make_layer_forward(self, layer_idx: int, orig_forward):
         def forward(hidden_states, attention_mask=None, position_ids=None,
-                    past_key_values=None, cu_seqlens=None, **kwargs):
+                    past_key_values=None, cu_seqlens=None,
+                    block_residual=None, **kwargs):
             if self._step_active and hidden_states.shape[0] != self._bsz:
                 # The step's metadata (slots, page rows, cache_seqlens) is bound
                 # for cur_batch; anything else (e.g. a micro-batched decode
@@ -547,10 +687,51 @@ class KimiLinearDecodeGraph:
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     cu_seqlens=cu_seqlens,
+                    block_residual=block_residual,
                     **kwargs,
+                )
+            if self._uses_block_residual:
+                expected = self._block_residual_view(layer_idx - 1)
+                if not self._same_block_residual(block_residual, expected):
+                    self._fallback(
+                        "layer {} received moved/misshaped block_residual".format(
+                            layer_idx
+                        )
+                    )
+                    self._step_active = False
+                    return orig_forward(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        cu_seqlens=cu_seqlens,
+                        block_residual=block_residual,
+                        **kwargs,
+                    )
+                return (
+                    self._run_layer(layer_idx, hidden_states),
+                    self._block_residual_view(layer_idx),
                 )
             return (self._run_layer(layer_idx, hidden_states),)
         return forward
+
+    @staticmethod
+    def _same_block_residual(actual, expected) -> bool:
+        if actual is None:
+            return False
+        return (
+            tuple(actual.shape) == tuple(expected.shape)
+            and tuple(actual.stride()) == tuple(expected.stride())
+            and actual.dtype == expected.dtype
+            and actual.device == expected.device
+            and actual.untyped_storage().data_ptr()
+            == expected.untyped_storage().data_ptr()
+        )
+
+    def _block_residual_view(self, layer_idx: int) -> torch.Tensor:
+        statics = self._statics[self._bucket]
+        columns = 0 if layer_idx < 0 else self.segments[layer_idx].num_blocks_after
+        return statics.block_residual[: self._bsz, :columns]
 
     # ------------------------------------------------------------------ #
     #  Step driver                                                        #
@@ -721,7 +902,16 @@ class KimiLinearDecodeGraph:
             slots = KimiLinearKDAWrapper.state_manager.prepare_decode_step(
                 [GRAPH_SCRATCH_SEQ_ID] * bucket
             )
-            statics = _BucketStatics(bucket, self._max_pages, self.device, slots)
+            statics = _BucketStatics(
+                bucket,
+                self._max_pages,
+                self.device,
+                slots,
+                block_residual_columns=self._block_residual_columns,
+                hidden_size=self.model_config.hidden_size,
+                dtype=(self.segments[0].dtype
+                       if self._uses_block_residual else None),
+            )
             self._statics[bucket] = statics
         return statics
 
@@ -768,9 +958,19 @@ class KimiLinearDecodeGraph:
         self.manager.WARMUP_ITERATIONS = WARMUP_ITERATIONS
         self.manager.WARMUP_ITERATIONS_SUBSEQUENT = WARMUP_ITERATIONS
 
+    @staticmethod
+    def _tensor_signature(tensor) -> tuple:
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
     def _signature(self, kv_manager) -> tuple:
-        """Everything material to the addresses baked into the graphs: the
-        graph-stable page table and the K cache the spans write/read.
+        """Everything external whose storage is baked into the graphs: page
+        table, K cache, KDA recurrent/conv pools, and KDA slot-index buffer.
 
         The MLA spans bake `_k_cache[physical_layer]` — a per-layer SLICE whose
         base address is `data_ptr + p * num_pages * page_stride`, a function of
@@ -780,17 +980,27 @@ class KimiLinearDecodeGraph:
         same base address with a different page count leaves data_ptr unchanged
         while every slice above physical layer 0 moves — by an amount
         proportional to p, which is why the corruption grew with layer depth.
-        Shape/stride MUST be in the signature or the graphs are never dropped
-        and replay against relocated K-cache slices (task #12).
+        Shape/stride MUST be in every tensor signature. Otherwise an allocator
+        may reuse the same base pointer for changed geometry while per-layer
+        views move, and graphs replay against valid but wrong storage (task
+        #12's K-cache failure mode applies equally to KDA views).
         """
         storage = kv_manager.get_cuda_graph_page_table_storage()
         k_cache, _ = kv_manager.get_kv_tensors()
+        state_manager = KimiLinearKDAWrapper.state_manager
+        kda_state = ()
+        if state_manager is not None:
+            recurrent = state_manager.get_recurrent_tensors()
+            conv = state_manager.get_conv_tensors()
+            prepared = state_manager._prepared_state_slots
+            kda_state = tuple(
+                self._tensor_signature(t)
+                for t in (recurrent, *conv, prepared)
+            )
         return (
-            storage.data_ptr(),
-            tuple(storage.shape),
-            k_cache.data_ptr(),
-            tuple(k_cache.shape),
-            tuple(k_cache.stride()),
+            self._tensor_signature(storage),
+            self._tensor_signature(k_cache),
+            kda_state,
             int(kv_manager.config.page_size_tokens),
         )
 
@@ -854,13 +1064,18 @@ class KimiLinearDecodeGraph:
         is deliberately NOT fired here.
         """
         layer = segment.layer
-        normed = layer.input_layernorm(hidden_states)
-        if segment.is_kda:
-            attn_out = kda_decode_serving(
-                segment.attn, normed, self._clone_kda_state(segment.kda_state)
-            )
-        else:
-            attn_out, _ = mla_decoding_nope_with_pagekv(
+
+        def eager_attention(normed):
+            if segment.is_kda:
+                return (
+                    kda_decode_serving(
+                        segment.attn,
+                        normed,
+                        self._clone_kda_state(segment.kda_state),
+                    ),
+                    None,
+                )
+            attn_out, k_tensor = mla_decoding_nope_with_pagekv(
                 segment.attn,
                 normed,
                 AttnWrapperBase.position_ids,
@@ -871,6 +1086,18 @@ class KimiLinearDecodeGraph:
                 segment.layer_idx,
                 None,
             )
+            return attn_out, k_tensor
+
+        if segment.use_block_residual:
+            return segment._forward_block_residual(
+                hidden_states,
+                eager_attention,
+                segment._buf.block_residual[: self._bsz],
+                write_boundary=False,
+            )
+
+        normed = layer.input_layernorm(hidden_states)
+        attn_out, _ = eager_attention(normed)
         residual = hidden_states + attn_out
         normed_out = layer.post_attention_layernorm(residual)
         if segment.fold_ffn:

@@ -690,37 +690,6 @@ class KimiLinearParallelStrategyManager:
         mode = self._decode_graph_mode()
         if mode == "off":
             return
-        if getattr(self.loaded_model_config, "attn_res_block_size", None) is not None:
-            # Block Attention Residuals and the Phase-A adapter cannot coexist:
-            # the adapter's patched layer forward returns a 1-tuple
-            # (cuda_graph_segments.py::_make_layer_forward) and its captured
-            # span runs the classic residual body, so a replayed layer neither
-            # produces nor consumes block_residual.
-            #
-            # The failure is LOUD, not silent — MEASURED: model.py:880 unpacks
-            # two values from every layer under use_attn_residuals, so a
-            # replayed 1-tuple dies on the first decode step with
-            # `ValueError: not enough values to unpack (expected 2, got 1)`.
-            # The guard is still worth it: that error names neither CUDA graphs
-            # nor block residuals, and it lands 93 layers into a live server
-            # instead of at configure time. Refuse here, by name.
-            if mode != "eager":
-                raise NotImplementedError(
-                    f"decode_graph_mode={mode!r} is not implemented for a "
-                    "Block-Attention-Residual model (attn_res_block_size="
-                    f"{self.loaded_model_config.attn_res_block_size}): the "
-                    "captured per-layer span carries no block_residual, so a "
-                    "replayed layer returns a 1-tuple and model.py:880 dies on "
-                    "`not enough values to unpack (expected 2, got 1)` at the "
-                    "first decode step. Run decode_graph_mode='eager'."
-                )
-            if self.rank == 0:
-                logging.info(
-                    "Decode CUDA-graph adapter NOT installed: Block Attention "
-                    "Residuals have no captured-span representation. "
-                    "batchgen_debug.kimi_decode_graph_mode is inert for K3."
-                )
-            return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
         # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager

@@ -555,7 +555,7 @@ def main():
            f"layer-1 offset {old_off1} -> {new_off1}; "
            f"base ptr {'REUSED (true failure mode)' if reused else 'moved'}")
     report("adapter sees the new geometry in its signature",
-           tuple(shrunk.shape) in adapter._signature(kv))
+           adapter._signature(kv)[1] == adapter._tensor_signature(shrunk))
 
     geo_snap = kv.snapshot()
     geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts)
@@ -588,11 +588,19 @@ def main():
     # bitwise clean) and halved MMLU accuracy before it was caught. Task #12.
     sig = adapter._signature(kv)
     report("capture signature carries the K-cache shape",
-           tuple(kv._k.shape) in sig,
+           sig[1][1] == tuple(kv._k.shape),
            f"shape={tuple(kv._k.shape)} sig={sig}")
     report("capture signature carries the K-cache stride",
-           tuple(kv._k.stride()) in sig,
+           sig[1][2] == tuple(kv._k.stride()),
            f"stride={tuple(kv._k.stride())} sig={sig}")
+    kda_tensors = (
+        mgr.get_recurrent_tensors(),
+        *mgr.get_conv_tensors(),
+        mgr._prepared_state_slots,
+    )
+    report("capture signature carries every persistent KDA tensor",
+           sig[2] == tuple(adapter._tensor_signature(t) for t in kda_tensors),
+           f"num_kda_tensors={len(sig[2])}")
 
     # Proves the above is not a vacuous check: the per-layer slice really does
     # move when only num_pages changes, so a pointer-only signature is blind.
