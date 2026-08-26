@@ -722,11 +722,9 @@ class BatchGenWorker:
 		self._decode_cache_seqlens_cpu_staging = None
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
-		# Kimi-K3 streamed-SP8 prefill: the distributed weight daemon serves one
-		# free-running circular schedule and erases every key it releases, so the
-		# H2D weight pipeline is installed exactly ONCE. These two fields record
-		# that installation; while set, the worker must not rewind the weight
-		# queue cursor or drop the routed-expert GPU slots it has prefetched.
+		# Kimi-K3 streamed-SP8 prefill pipeline identity. Host-RDMA preserves its
+		# remote-daemon cursor after the first install; hierarchical GDR uses the
+		# same fingerprint but reseeds its local queue/ring on each admission.
 		self._streamed_sp8_h2d_installed = False
 		self._streamed_sp8_weight_copy_fingerprint = None
 		# Kimi-K3 pre-readiness startup (prepare_kimi_k3_startup). The first
@@ -6889,22 +6887,42 @@ class BatchGenWorker:
 
 		Requires ``self.weight_copy_task`` from the configure_prefill that just
 		ran. Shared by the pre-readiness Kimi-K3 startup and by every per-batch
-		prefill config, so the streamed-SP8 install happens exactly once no
-		matter which of them runs first.
+		prefill config, so first-install and transport-specific reentry rules live
+		in one place no matter which caller runs first.
 		"""
-		# The distributed weight daemon drives ONE free-running circular schedule
-		# and erases each key as it releases it. Re-seeding the weight queue
-		# rewinds our cursor onto keys the daemon has already erased, and
-		# resetting the prefill buffer throws away routed-expert GPU slots the
-		# daemon has already delivered. So the streamed-SP8 H2D pipeline is
-		# installed exactly once; every later prefill resumes it in place.
+		# Host-RDMA drives one free-running remote-daemon schedule and erases each
+		# generation it releases, so that transport must preserve its queue cursor
+		# and prefetched GPU leases. Hierarchical GDR is different: source ranks
+		# read their local compact store directly and non-sources have an empty H2D
+		# task. Start that transport at the schedule boundary on every admission;
+		# preserving an arbitrary partially filled ring across resident decode can
+		# leave a full-batch consumer holding the published leases while it waits
+		# for a slot that can no longer be produced.
 		streamed_sp8 = (
 			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
 			and self.parallel_manager.prefill_uses_streamed_sp8()
 		)
 		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
+		reseed_reentry = (
+			sp8_reentry
+			and hasattr(
+				self.parallel_manager,
+				"streamed_sp8_reseeds_h2d_on_reentry",
+			)
+			and self.parallel_manager.streamed_sp8_reseeds_h2d_on_reentry()
+		)
 		self.core_engine.stop_h2d_worker()
-		if not sp8_reentry:
+		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
+		if sp8_reentry:
+			# configure_prefill rebuilt the task from scratch. Both a preserved
+			# cursor and a fresh schedule boundary require the same immutable task.
+			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
+					raise RuntimeError(
+					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
+					"changed after the H2D pipeline was installed; the "
+					"installed pipeline no longer matches the rebuilt task"
+				)
+		if not sp8_reentry or reseed_reentry:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_prefill_buffer()
 		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
@@ -6917,24 +6935,12 @@ class BatchGenWorker:
 				StreamedSP8MXFP4MoELayer,
 			)
 			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
-		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
-		if sp8_reentry:
-			# configure_prefill rebuilt the task from scratch. The preserved
-			# cursor only means anything if that rebuild is byte-identical to
-			# the schedule the daemon is still walking.
-			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
-				raise RuntimeError(
-					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
-					"changed after the H2D pipeline was installed; the "
-					"preserved daemon cursor no longer matches the rebuilt "
-					"task and would stream the wrong experts"
-				)
-			if any(self.weight_copy_task.values()):
-				self.core_engine.start_h2d_worker()
-		else:
+		if not sp8_reentry or reseed_reentry:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			if any(self.weight_copy_task.values()):
 				self.core_engine.start_h2d_worker()
+		elif any(self.weight_copy_task.values()):
+			self.core_engine.start_h2d_worker()
 		self._streamed_sp8_h2d_installed = streamed_sp8
 		self._streamed_sp8_weight_copy_fingerprint = (
 			fingerprint if streamed_sp8 else None
@@ -7365,12 +7371,11 @@ class BatchGenWorker:
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
-		# Resident decode does not stream routed experts, but the streamed-SP8
-		# prefill pipeline shares the daemon's single free-running circular
-		# schedule across the phase boundary. clear_weight_copy_queue() rewinds
-		# our cursor onto keys the daemon has already erased and
-		# reset_decoding_buffer() destroys the routed-expert GPU slots it has
-		# already prefetched — either one breaks the next prefill.
+		# Resident decode does not stream routed experts. Keep the installed
+		# streamed-SP8 state through this transition: host-RDMA needs its daemon
+		# cursor, while hierarchical GDR resets its local queue/ring at the next
+		# prefill boundary. reset_decoding_buffer() must not resize those slots to
+		# the decode layout in either case.
 		if not self._streamed_sp8_h2d_installed:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()

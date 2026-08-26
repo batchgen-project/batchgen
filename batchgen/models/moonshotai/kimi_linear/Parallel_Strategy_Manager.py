@@ -325,6 +325,18 @@ class KimiLinearParallelStrategyManager:
     def prefill_uses_streamed_sp8(self):
         return self._prefill_moe_mode == "streamed_sp8"
 
+    def streamed_sp8_reseeds_h2d_on_reentry(self):
+        """Whether each streamed-SP8 prefill starts a fresh local H2D cycle.
+
+        Hierarchical GDR sources read their owned shard directly from the local
+        compact store; the other ranks have an empty host-copy task.  No rank
+        acquires a remote daemon generation, so carrying a partially filled GPU
+        ring across resident decode is unnecessary and can strand a full-batch
+        consumer behind stale leases.  Host-RDMA still depends on the daemon's
+        acquire/release generations and must preserve its cursor.
+        """
+        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
+
     def prefill_sequence_limits(self):
         """Return the persistent KDA-state capacity available to prefill.
 

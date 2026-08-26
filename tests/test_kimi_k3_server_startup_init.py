@@ -590,12 +590,15 @@ def _bind_install(worker, trace, monkeypatch):
     ).__get__(worker)
 
 
-def _install_worker(trace, *, streamed_sp8=True, task=None):
+def _install_worker(
+    trace, *, streamed_sp8=True, reseed_reentry=False, task=None
+):
     return SimpleNamespace(
         rank=0,
         core_engine=_RecordingCoreEngine(trace),
         parallel_manager=SimpleNamespace(
-            prefill_uses_streamed_sp8=lambda: streamed_sp8
+            prefill_uses_streamed_sp8=lambda: streamed_sp8,
+            streamed_sp8_reseeds_h2d_on_reentry=lambda: reseed_reentry,
         ),
         weight_copy_task=task if task is not None else {"routed_expert": ["a", "b"]},
         _streamed_sp8_h2d_installed=False,
@@ -603,7 +606,7 @@ def _install_worker(trace, *, streamed_sp8=True, task=None):
     )
 
 
-def test_streamed_sp8_h2d_queue_is_seeded_once_and_resumed_afterwards(monkeypatch):
+def test_host_rdma_streamed_sp8_queue_is_seeded_once_and_resumed(monkeypatch):
     trace = []
     worker = _install_worker(trace)
     install = _bind_install(worker, trace, monkeypatch)
@@ -638,6 +641,22 @@ def test_streamed_sp8_h2d_queue_is_seeded_once_and_resumed_afterwards(monkeypatc
         ("start_h2d_worker",),
     ]
     assert worker._streamed_sp8_weight_copy_fingerprint == fingerprint
+
+
+def test_hierarchical_gdr_reentry_reseeds_queue_and_ring(monkeypatch):
+    trace = []
+    worker = _install_worker(trace, reseed_reentry=True)
+    install = _bind_install(worker, trace, monkeypatch)
+
+    install(k3_prefill_profile=False)
+    first = list(trace)
+    trace.clear()
+    install(k3_prefill_profile=False)
+
+    # Hierarchical GDR has no remote-host acquire/release generations. A new
+    # admission therefore returns both the task queue and GPU leases to the
+    # layer-zero boundary instead of inheriting a partial ring from decode.
+    assert trace == first
 
 
 def test_streamed_sp8_reentry_rejects_a_changed_weight_schedule(monkeypatch):

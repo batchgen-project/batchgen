@@ -1189,6 +1189,19 @@ class BatchScheduler:
 
         # Build response body based on endpoint type
         if url == "/v1/chat/completions":
+            content, reasoning_content, tool_calls = self._parse_output(
+                model, decoded_text
+            )
+            message = {
+                "role": "assistant",
+                "content": content,
+            }
+            if reasoning_content is not None:
+                message["reasoning_content"] = reasoning_content
+            if tool_calls:
+                message["tool_calls"] = [
+                    call.dict(exclude_none=True) for call in tool_calls
+                ]
             body = {
                 "id": f"chatcmpl-{uuid.uuid4().hex}",
                 "object": "chat.completion",
@@ -1196,10 +1209,7 @@ class BatchScheduler:
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": decoded_text,
-                    },
+                    "message": message,
                     "logprobs": None,
                     "finish_reason": finish_reason,
                 }],

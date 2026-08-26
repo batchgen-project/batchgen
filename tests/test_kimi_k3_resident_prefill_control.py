@@ -3483,7 +3483,34 @@ def test_worker_initializes_streamed_sp8_install_state():
     assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
 
 
-def test_streamed_sp8_installer_seeds_once_and_restarts_nonempty_workers():
+def test_only_hierarchical_gdr_reseeds_streamed_sp8_reentry():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    method = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "streamed_sp8_reseeds_h2d_on_reentry",
+    )
+    manager = SimpleNamespace(
+        _hierarchical_gdr=True,
+        prefill_uses_streamed_sp8=lambda: True,
+    )
+
+    assert method(manager) is True
+    manager._hierarchical_gdr = False
+    assert method(manager) is False
+    manager._hierarchical_gdr = True
+    manager.prefill_uses_streamed_sp8 = lambda: False
+    assert method(manager) is False
+
+
+def test_streamed_sp8_installer_selects_transport_specific_reentry():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(
         worker_path,
@@ -3493,8 +3520,8 @@ def test_streamed_sp8_installer_seeds_once_and_restarts_nonempty_workers():
     guards = _call_guards(function)
 
     # Every installer invocation stops the copy engine and resets the profile.
-    # Source ranks restart it from the preserved cursor; hierarchical
-    # non-sources have an empty schedule and must never create an H2D thread.
+    # Host-RDMA sources resume the cursor; hierarchical GDR sources reseed it.
+    # Hierarchical non-sources stay empty and never create an H2D thread.
     for name in (
         "stop_h2d_worker",
         "reset_weight_stream_profile",
@@ -3506,11 +3533,17 @@ def test_streamed_sp8_installer_seeds_once_and_restarts_nonempty_workers():
         "any(self.weight_copy_task.values())" in stack
         for stack in start_guards
     )
-    assert any("sp8_reentry" in stack for stack in start_guards)
-    assert any("else: sp8_reentry" in stack for stack in start_guards)
+    assert any(
+        any("reseed_reentry" in test for test in stack)
+        for stack in start_guards
+    )
+    assert any(
+        any(test.startswith("else:") for test in stack)
+        for stack in start_guards
+    )
 
-    # Seeding the queue and dropping the prefill buffer would rewind the
-    # daemon's free-running circular schedule, so they are first-install only.
+    # Host-RDMA preserves its daemon cursor. Hierarchical GDR has no remote
+    # generations, so it is allowed to reseed the queue and GPU ring.
     for name in (
         "clear_weight_copy_queue",
         "reset_prefill_buffer",
@@ -3521,9 +3554,13 @@ def test_streamed_sp8_installer_seeds_once_and_restarts_nonempty_workers():
             any("sp8_reentry" in test for test in stack)
             for stack in guards[name]
         ), name
+        assert any(
+            any("reseed_reentry" in test for test in stack)
+            for stack in guards[name]
+        ), name
 
     # A re-entry that finds a different schedule must fail loudly rather than
-    # stream the wrong experts against the preserved cursor.
+    # stream a task that no longer matches the installed pipeline.
     mismatch = next(
         node
         for node in ast.walk(function)
@@ -3540,8 +3577,7 @@ def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
 
     assert () in guards["stop_h2d_worker"]
     assert () in guards["clear_kv_copy_queue"]
-    # Both of these destroy streamed-SP8 state: one rewinds the queue cursor,
-    # the other frees the already-prefetched routed-expert GPU slots.
+    # Decode cannot replace the prefill queue or resize its routed-expert ring.
     for name in ("clear_weight_copy_queue", "reset_decoding_buffer"):
         assert guards[name], name
         assert all(
