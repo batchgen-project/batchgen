@@ -1,4 +1,4 @@
-"""CPU-only coverage for ``batchgen_debug.glm5_suppress_decode_host_kv_writeback``.
+"""CPU-only coverage for GLM-5 decode host-KV causal controls.
 
 The control is a causal-profiling knob: it removes ONLY the two post-forward
 host-KV append launches so a fixed-work remote run can attribute the residual to
@@ -9,8 +9,8 @@ of host KV must fail closed once the writeback has been skipped.
 The second half of this module covers the GLM-5 whole-model-graph boundary
 host-KV writeback, which shares the deferred-KV plumbing but is a *production*
 path: it defers the per-token append into one exact-range copy per host view at
-the page boundary and at decode cleanup. The two must stay separate — the
-suppression knob keeps its own causal path and never turns into a writeback.
+the page boundary and at decode cleanup. Its bounded causal control preserves
+dirty-range recording but suppresses only those final exact-range copies.
 """
 
 import pytest
@@ -21,6 +21,7 @@ from batchgen.sequence import SequenceStatus
 
 
 FLAG = "glm5_suppress_decode_host_kv_writeback"
+BOUNDARY_FLAG = "glm5_suppress_boundary_kv_writeback"
 _COMPLETED = SequenceStatus.COMPLETED
 _IN_DECODE = SequenceStatus.IN_DECODE
 
@@ -283,6 +284,7 @@ def _debug_worker(enable_host_kv_eviction=True):
     worker.rank = 0
     worker.enable_host_kv_eviction = enable_host_kv_eviction
     worker._suppress_decode_host_kv_writeback = False
+    worker._suppress_boundary_kv_writeback = False
     worker._host_kv_stale_global_ids = set()
     return worker
 
@@ -340,10 +342,40 @@ def test_global_decode_set_is_marked_stale_symmetrically():
 
 def test_reset_helper_clears_suppression_state():
     worker = _stale_worker()
+    worker._suppress_boundary_kv_writeback = True
 
     worker._reset_decode_host_kv_writeback_debug_state()
 
     assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._suppress_boundary_kv_writeback is False
+    assert worker._host_kv_stale_global_ids == set()
+
+
+def test_boundary_flag_activation_marker_is_transition_gated_and_reset_clears_state(
+    caplog,
+):
+    worker = _debug_worker()
+    worker.rank = 3
+    # Hot reload rebinds methods without rerunning BatchGenWorker.__init__.
+    del worker._suppress_boundary_kv_writeback
+
+    worker.set_batchgen_debug({BOUNDARY_FLAG: True})
+    worker.set_batchgen_debug({BOUNDARY_FLAG: True})
+
+    assert worker._suppress_boundary_kv_writeback is True
+    markers = [
+        record.getMessage()
+        for record in caplog.records
+        if BOUNDARY_FLAG in record.getMessage() and "SUPPRESSED" in record.getMessage()
+    ]
+    assert len(markers) == 1
+    assert "rank=3" in markers[0]
+
+    worker._host_kv_stale_global_ids = {11, 12}
+    worker._reset_decode_host_kv_writeback_debug_state()
+
+    assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._suppress_boundary_kv_writeback is False
     assert worker._host_kv_stale_global_ids == set()
 
 
@@ -354,7 +386,14 @@ def test_reset_helper_clears_suppression_state():
 # --------------------------------------------------------------------------
 
 
-def _pool_worker(monkeypatch, debug=None, suppress=False, stale=(), sequences=()):
+def _pool_worker(
+    monkeypatch,
+    debug=None,
+    suppress=False,
+    boundary_suppress=False,
+    stale=(),
+    sequences=(),
+):
     import batchgen.batchgen_worker as worker_mod
     from batchgen.sequence import SequenceBatch, SequenceEntry
 
@@ -364,6 +403,7 @@ def _pool_worker(monkeypatch, debug=None, suppress=False, stale=(), sequences=()
     worker.rank = 0
     worker._batchgen_debug = debug
     worker._suppress_decode_host_kv_writeback = suppress
+    worker._suppress_boundary_kv_writeback = boundary_suppress
     worker._host_kv_stale_global_ids = set(stale)
     worker.global_batch = SequenceBatch()
     for idx, (uuid, seq_debug, status) in enumerate(sequences):
@@ -414,12 +454,19 @@ def test_first_pool_activation_arms_causal_control_from_a_drained_pool(
 
 @pytest.mark.parametrize("incoming", [(None, {}), ({}, None)])
 def test_first_pool_activation_treats_none_and_empty_debug_alike(monkeypatch, incoming):
-    worker = _pool_worker(monkeypatch, debug={FLAG: True}, suppress=True, stale={11})
+    worker = _pool_worker(
+        monkeypatch,
+        debug={FLAG: True},
+        suppress=True,
+        boundary_suppress=True,
+        stale={11},
+    )
 
     worker._resolve_admission_batchgen_debug(_entries(*incoming))
 
     assert worker._batchgen_debug is None
     assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._suppress_boundary_kv_writeback is False
     assert worker._host_kv_stale_global_ids == set()
 
 
@@ -430,6 +477,7 @@ def test_sequential_completed_group_switch_resets_causal_state(monkeypatch):
         monkeypatch,
         debug={FLAG: True},
         suppress=True,
+        boundary_suppress=True,
         stale={11, 12},
         sequences=[
             ("done-a", {FLAG: True}, _COMPLETED),
@@ -441,6 +489,7 @@ def test_sequential_completed_group_switch_resets_causal_state(monkeypatch):
 
     assert worker._batchgen_debug == {"glm5_moe_mode": "eager"}
     assert worker._suppress_decode_host_kv_writeback is False
+    assert worker._suppress_boundary_kv_writeback is False
     assert worker._host_kv_stale_global_ids == set()
 
 
@@ -618,6 +667,8 @@ def _boundary_worker(monkeypatch, **overrides):
     worker = object.__new__(worker_mod.BatchGenWorker)
     worker.rank = 0
     worker._suppress_decode_host_kv_writeback = False
+    worker._suppress_boundary_kv_writeback = False
+    worker._host_kv_stale_global_ids = set()
     worker._glm5_whole_model_graph = True
     worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=None)
     worker.global_batch = None
@@ -793,6 +844,27 @@ def test_suppression_control_never_becomes_boundary_writeback(monkeypatch):
     assert trace == []
 
 
+def test_boundary_suppression_preserves_target_and_record_fast_path(monkeypatch):
+    trace = []
+    worker = _boundary_worker(
+        monkeypatch, _suppress_boundary_kv_writeback=True
+    )
+    gpu = _dual(
+        _FakeGPUManager([11, 12], 0x1000),
+        _FakeGPUManager([11, 12], 0x9000),
+    )
+    _arm_deferred(worker, trace)
+
+    assert worker._glm5_boundary_kv_writeback_targets(gpu) is not None
+    assert worker._record_glm5_boundary_dirty_kv(gpu) is True
+    assert worker._boundary_kv_dirty_ranges == {
+        11: [63, 64],
+        12: [64, 65],
+    }
+    _assert_deferred_consumed(worker)
+    assert trace == []
+
+
 def _armed_flush_worker(monkeypatch, trace, *, primary=None, aux=None,
                         primary_view=None, aux_view=None,
                         write_positions=(63, 64), ids=(11, 12)):
@@ -851,6 +923,68 @@ def test_flush_launches_exact_ranges_on_both_views_then_waits(monkeypatch):
     assert worker._boundary_kv_aux_manager is None
     assert worker._boundary_kv_primary_view is None
     assert worker._boundary_kv_aux_view is None
+
+
+def test_suppressed_boundary_flush_skips_copies_but_waits_and_marks_stale(
+    monkeypatch,
+):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    worker._suppress_boundary_kv_writeback = True
+    _install_wait_stub(worker, trace)
+
+    assert worker._flush_boundary_dirty_kv_ranges() == 0
+
+    assert trace == [("wait", True, [])]
+    assert worker._host_kv_stale_global_ids == {11, 12}
+    assert worker._boundary_kv_dirty_ranges == {}
+    assert worker._boundary_kv_primary_manager is None
+    assert worker._boundary_kv_aux_manager is None
+    assert worker._boundary_kv_primary_view is None
+    assert worker._boundary_kv_aux_view is None
+
+
+def test_suppressed_boundary_wait_failure_retains_dirty_and_does_not_mark_stale(
+    monkeypatch,
+):
+    trace = []
+    worker, _ = _armed_flush_worker(monkeypatch, trace)
+    worker._suppress_boundary_kv_writeback = True
+    _install_wait_stub(worker, trace, error=RuntimeError("collective wait failed"))
+
+    with pytest.raises(RuntimeError, match="collective wait failed"):
+        worker._flush_boundary_dirty_kv_ranges()
+
+    assert trace == [("wait", True, [])]
+    assert worker._host_kv_stale_global_ids == set()
+    assert worker._boundary_kv_dirty_ranges == {
+        11: [63, 64],
+        12: [64, 65],
+    }
+    assert worker._boundary_kv_primary_manager is not None
+    assert worker._boundary_kv_aux_manager is not None
+    assert worker._boundary_kv_primary_view is not None
+    assert worker._boundary_kv_aux_view is not None
+
+
+def test_boundary_suppression_stale_guard_allows_completion_only_and_rejects_transitions():
+    worker = _stale_worker()
+    worker._suppress_decode_host_kv_writeback = False
+    worker._suppress_boundary_kv_writeback = True
+    decisions = types.SimpleNamespace(
+        completed_uuids=["done"],
+        onhold_uuids=[],
+        new_load_uuids=[],
+        host_evicted_uuids=[],
+    )
+
+    worker._assert_boundary_decisions_allowed_with_stale_host_kv(decisions)
+
+    for field in ("onhold_uuids", "new_load_uuids", "host_evicted_uuids"):
+        setattr(decisions, field, ["blocked"])
+        with pytest.raises(RuntimeError, match=BOUNDARY_FLAG):
+            worker._assert_boundary_decisions_allowed_with_stale_host_kv(decisions)
+        setattr(decisions, field, [])
 
 
 def test_flush_ensures_host_capacity_before_materializing_page_tables(monkeypatch):

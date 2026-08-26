@@ -862,7 +862,9 @@ class BatchGenWorker:
 		# Causal-profiling control (batchgen_debug.glm5_suppress_decode_host_kv_writeback):
 		# when set, decode host-KV append launches are skipped and the identical
 		# global active set is marked stale on every rank so host-KV consumers fail
-		# closed. Batch-scoped; cleared in _reset_for_new_batch().
+		# closed. The boundary-only control shares the stale-ID guard state but
+		# preserves the whole-model graph dirty-range path. Batch-scoped; cleared
+		# in _reset_for_new_batch().
 		self._reset_decode_host_kv_writeback_debug_state()
 		# GLM-5 whole-model graph boundary host-KV writeback (batch-scoped).
 		self._reset_boundary_kv_dirty_state()
@@ -1176,6 +1178,7 @@ class BatchGenWorker:
 		if self.rank == 0 and self._batchgen_debug:
 			logging.warning(f"[BATCHGEN_DEBUG] enabled flags: {sorted(self._batchgen_debug.keys())}")
 		self._resolve_suppress_decode_host_kv_writeback()
+		self._resolve_suppress_boundary_kv_writeback()
 
 	def _resolve_suppress_decode_host_kv_writeback(self) -> None:
 		"""Resolve the decode host-KV writeback suppression control for this batch.
@@ -1207,9 +1210,30 @@ class BatchGenWorker:
 				)
 		self._suppress_decode_host_kv_writeback = suppress
 
+	def _resolve_suppress_boundary_kv_writeback(self) -> None:
+		"""Resolve the boundary exact-range writeback causal control."""
+		debug = self._batchgen_debug or {}
+		suppress = self._debug_flag_enabled(
+			debug.get("glm5_suppress_boundary_kv_writeback")
+		)
+		# Every rank suppresses, so every rank says so — but only on the
+		# transition, so an already-active group is not re-announced.
+		# ``__init__`` is not rerun when an already-live worker hot-reloads this
+		# diagnostic, so the pre-patch object may not own the new attribute yet.
+		if suppress and not getattr(self, "_suppress_boundary_kv_writeback", False):
+			logging.warning(
+				f"[BATCHGEN_DEBUG] rank={self.rank} "
+				"glm5_suppress_boundary_kv_writeback=1: primary+auxiliary "
+				"exact-range GPU->host boundary copies are SUPPRESSED for this "
+				"batch group. Host KV becomes stale — profiling runs must remain "
+				"on resident GPU KV."
+			)
+		self._suppress_boundary_kv_writeback = suppress
+
 	def _reset_decode_host_kv_writeback_debug_state(self) -> None:
-		"""Clear batch-scoped state for the decode writeback causal control."""
+		"""Clear batch-scoped state for both writeback causal controls."""
 		self._suppress_decode_host_kv_writeback = False
+		self._suppress_boundary_kv_writeback = False
 		self._host_kv_stale_global_ids: Set[int] = set()
 
 	def _mark_suppressed_decode_host_kv_stale(self, decode_uuids) -> None:
@@ -2677,9 +2701,10 @@ class BatchGenWorker:
 		"""Return ``(primary_mgr, aux_mgr, primary_view, aux_view)`` or ``None``.
 
 		Capability-gated only — there is no environment switch. BATCHGEN_SYNC_KV,
-		the suppression control, non-GLM-5 paths, and any missing dual
+		the per-token suppression control, non-GLM-5 paths, and any missing dual
 		manager/view capability all return ``None`` so the caller keeps the
-		existing per-token stage and append path.
+		existing per-token stage and append path. The boundary-only causal control
+		must remain eligible here so it suppresses only the final exact-range copies.
 		"""
 		if BATCHGEN_SYNC_KV or self._suppress_decode_host_kv_writeback:
 			return None
@@ -2808,6 +2833,9 @@ class BatchGenWorker:
 		call sites. Returns the number of KV tasks waited for.
 		"""
 		dirty = getattr(self, "_boundary_kv_dirty_ranges", None)
+		suppress_boundary_writeback = getattr(
+			self, "_suppress_boundary_kv_writeback", False
+		)
 		if not hasattr(self, "_pending_kv_append_tasks"):
 			self._pending_kv_append_tasks = []
 		if not hasattr(self, "_pending_kv_append_tensors"):
@@ -2857,6 +2885,8 @@ class BatchGenWorker:
 						t for t in (sequence_ids, page_counts, ranges, k_ptrs, v_ptrs)
 						if t is not None
 					)
+					if suppress_boundary_writeback:
+						continue
 					task = view.async_copy_dirty_kv_token_ranges_to_host(
 						sequence_ids=sequence_ids,
 						active_page_counts=page_counts,
@@ -2880,8 +2910,13 @@ class BatchGenWorker:
 				)
 		num_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		if dirty:
-			# Host pages are current only now; a failed launch or wait raises
-			# above and keeps the ranges for the next attempt.
+			# A failed launch or wait raises above and keeps both the dirty ranges
+			# and stale-ID state unchanged. In the causal arm, only the GPU copy is
+			# suppressed; the collective waiter still establishes the transition.
+			if suppress_boundary_writeback:
+				self._host_kv_stale_global_ids.update(
+					int(global_idx) for global_idx in dirty
+				)
 			dirty.clear()
 			self._boundary_kv_primary_manager = None
 			self._boundary_kv_aux_manager = None
@@ -2905,7 +2940,9 @@ class BatchGenWorker:
 			raise RuntimeError(
 				f"Rank {self.rank}: {context} refused — stale host KV for "
 				f"global_ids={stale[:16]} (n={len(stale)}) caused by suppressed decode "
-				f"host-KV writeback (batchgen_debug.glm5_suppress_decode_host_kv_writeback)"
+				"or boundary host-KV writeback "
+				"(batchgen_debug.glm5_suppress_decode_host_kv_writeback or "
+				"batchgen_debug.glm5_suppress_boundary_kv_writeback)"
 			)
 
 	def _assert_boundary_decisions_allowed_with_stale_host_kv(self, decisions) -> None:
@@ -2930,8 +2967,9 @@ class BatchGenWorker:
 			raise RuntimeError(
 				f"Rank {self.rank}: page-boundary transition refused — host KV is stale "
 				f"for {len(self._host_kv_stale_global_ids)} global ids because decode "
-				f"host-KV writeback is suppressed "
-				f"(batchgen_debug.glm5_suppress_decode_host_kv_writeback); "
+				"or boundary host-KV writeback is suppressed "
+				"(batchgen_debug.glm5_suppress_decode_host_kv_writeback or "
+				"batchgen_debug.glm5_suppress_boundary_kv_writeback); "
 				f"prohibited decisions: {offending}"
 			)
 
