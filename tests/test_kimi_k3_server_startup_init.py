@@ -412,6 +412,23 @@ def test_kimi_k3_decode_imports_only_the_validated_flashmla_symbols(
         assert symbol in source
 
 
+def test_kimi_k3_graph_mla_preserves_the_tp_output_reduce():
+    graph_decode = _function(KIMI_LINEAR_GRAPH, "_mla_decode_graph_safe")
+    calls = [
+        node
+        for node in ast.walk(graph_decode)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_reduce_mla_tp_output"
+    ]
+    assert len(calls) == 1
+
+    source = _body_source(graph_decode)
+    assert source.index("F.linear(attn_output, attn.o_proj.weight)") < source.index(
+        "_reduce_mla_tp_output(attn, attn_output)"
+    )
+
+
 def test_kimi_k3_flashmla_warmup_launches_the_real_decode_kernel_and_syncs():
     trace = []
 

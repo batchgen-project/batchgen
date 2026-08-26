@@ -37,7 +37,7 @@ WHAT IS AND IS NOT IN THE GRAPH
 -------------------------------
 In:   layer norms, all projections, 3x causal_conv1d_update + fla
       fused_recurrent_kda_fwd (KDA), paged-KV token write + FlashMLA (MLA),
-      o_proj, residual adds, dense MLP of layer 0.
+      the attention TP all-reduce, o_proj, residual adds, dense MLP of layer 0.
 Out:  MoE (collectives), embedding, final norm, lm_head, KV offload callback
       (fired post-replay with a cloned k_tensor), KDA slot alloc/free/zeroing,
       and the per-step static-buffer refresh — all eager, same stream, ordered
@@ -96,7 +96,11 @@ from batchgen.cuda_graph.graph_manager import (
 from batchgen.models.wrappers import AttnWrapperBase
 
 from .block_residual import apply_attn_res, num_block_residual_columns
-from .serving_modules import kda_decode_serving, mla_decoding_nope_with_pagekv
+from .serving_modules import (
+    _reduce_mla_tp_output,
+    kda_decode_serving,
+    mla_decoding_nope_with_pagekv,
+)
 from .wrappers import KDALayerState, KimiLinearKDAWrapper
 
 logger = logging.getLogger(__name__)
@@ -270,6 +274,7 @@ def _mla_decode_graph_safe(
         gate = F.linear(hidden_2d, attn.g_proj.weight).sigmoid()
         attn_output = attn_output * gate
     attn_output = F.linear(attn_output, attn.o_proj.weight)
+    attn_output = _reduce_mla_tp_output(attn, attn_output)
     return attn_output.view(bsz, 1, -1), k_tensor
 
 
