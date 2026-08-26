@@ -14,6 +14,37 @@
 from batchgen.planner.base_planner import BasePlanner
 
 
+_GIB = 1024 ** 3
+_K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
+
+
+def k3_kda_state_slots(
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+) -> int:
+    """Return K3's persistent KDA sequence capacity for this GPU class.
+
+    The distributed K3 topology uses TP8 KDA, so each rank stores only 1/8
+    of every sequence's recurrent/conv state (53.57 MiB per slot). H20 keeps
+    the validated four-slot plan. GPUs with at least 120 GiB of HBM use 32
+    slots, which costs 1.674 GiB/rank and removes the H20-only four-sequence
+    admission ceiling without consuming the H200 KV-cache headroom.
+
+    Unknown memory and non-TP8 configurations fail safe to the validated
+    four-slot plan.
+    """
+    group_size = int(attention_group_size)
+    if group_size <= 0:
+        raise ValueError("attention_group_size must be positive")
+    if gpu_total_memory_bytes is None:
+        return 4
+    memory_bytes = int(gpu_total_memory_bytes)
+    if memory_bytes <= 0:
+        raise ValueError("gpu_total_memory_bytes must be positive")
+    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
+        return 32
+    return 4
+
+
 class KimiLinearPlanner(BasePlanner):
     """Planner specialized for Kimi-Linear (48B-A3B, KDA + NoPE-MLA hybrid).
 
@@ -31,7 +62,8 @@ class KimiLinearPlanner(BasePlanner):
     NUM_EXPERTS = 256
 
     def __init__(self, is_k3: bool = False, stream_all_modules: bool = None,
-                 attention_group_size: int = 1):
+                 attention_group_size: int = 1,
+                 gpu_total_memory_bytes: int | None = None):
         """``is_k3`` selects the K3 (2.8T, 93L/896E) branch of the plan.
 
         Passed by ``KimiLinearInitializer`` from its own ``is_k3`` (which is
@@ -54,6 +86,11 @@ class KimiLinearPlanner(BasePlanner):
         super().__init__()
         self.is_k3 = is_k3
         self.attention_group_size = int(attention_group_size)
+        self.gpu_total_memory_bytes = (
+            None
+            if gpu_total_memory_bytes is None
+            else int(gpu_total_memory_bytes)
+        )
         # M2b: G>1 runs head-parallel KDA, whose RESIDENT load path (M2a)
         # requires stream_all_modules OFF -- the streamed-KDA head-shard seam
         # is unwired (PSM raises NotImplementedError). K3 streams only at G=1
@@ -186,18 +223,15 @@ class KimiLinearPlanner(BasePlanner):
         expert ring, activations or the CUDA context. Streaming all four module
         types is what makes 8xH20 possible at all.
         """
-        # KDA conv/recurrent state pools. Per slot at K3 dims:
-        #   recurrent 69 x 96 x 128 x 128 x 4 B = 434,110,464 B (414.0 MiB)
-        #   conv      3 x 69 x 12288 x 3 x 2 B  =  15,261,696 B ( 14.6 MiB)
-        #                                       = 449,372,160 B (428.6 MiB)/slot
-        # The 48B's 256 slots would be 107.14 GiB — larger than the whole GPU.
-        # 4 slots = 1,797,488,640 B = 1.674 GiB. This is a hard cap on
-        # concurrent sequences; TP8 exposes it to admission as a per-node
-        # limit because each sequence is replicated on the node's eight ranks.
-        # Raise it deliberately, at 428.6 MiB apiece, only with a matching
-        # HBM budget (and reserve one additional slot if decode graphs are
-        # enabled for a batch).
-        self.config.GPU_Buffer_Config.kda_state_slots = 4
+        # KDA conv/recurrent state pools. At K3 dimensions, an unsharded slot
+        # is 428.6 MiB. Distributed K3 uses TP8 KDA, making it 53.57 MiB/rank:
+        # H20 retains the validated four slots (214.3 MiB/rank), while H200
+        # receives 32 slots (1.674 GiB/rank). Admission exposes this replicated
+        # pool as a per-node limit because all eight TP ranks own each sequence.
+        self.config.GPU_Buffer_Config.kda_state_slots = k3_kda_state_slots(
+            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+            attention_group_size=self.attention_group_size,
+        )
 
     def _configure_streamed_rings(self):
         """Ring depths for the four streamed module types.

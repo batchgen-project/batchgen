@@ -135,7 +135,9 @@ class KimiLinearInitializer:
         else:
             G = requested_G
         self.planner = KimiLinearPlanner(
-            is_k3=self.is_k3, attention_group_size=G
+            is_k3=self.is_k3,
+            attention_group_size=G,
+            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
@@ -199,8 +201,9 @@ class KimiLinearInitializer:
         props = torch.cuda.get_device_properties(
             self.engine_config.Basic_Config.device
         )
+        self.gpu_total_memory_bytes = int(props.total_memory)
         logging.info(
-            f"Current device total memory: {props.total_memory / (1024**3):.2f} GB"
+            f"Current device total memory: {self.gpu_total_memory_bytes / (1024**3):.2f} GB"
         )
 
         cfg = self.batchgen_config
