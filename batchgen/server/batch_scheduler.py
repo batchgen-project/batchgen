@@ -1093,6 +1093,9 @@ class BatchScheduler:
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
+                self.storage.update_batch(batch_id, status="failed", error={
+                    "code": "worker_fatal", "message": error_msg,
+                })
                 logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
 
     async def _pool_completion_listener(self) -> None:
@@ -1150,7 +1153,13 @@ class BatchScheduler:
                         if batch_done:
                             logger.info(f"[POOL] Batch {batch_id} completed")
                 elif msg_type == "pool_shutdown":
-                    logger.info("[POOL] Worker shutdown signal received")
+                    error = result.get("error")
+                    if error:
+                        logger.error("[POOL] Worker fatal received: %s", error)
+                        self._fail_all_active_batches(error)
+                        self.worker.report_worker_fatal(error)
+                    else:
+                        logger.info("[POOL] Worker shutdown signal received")
                     break
                 elif "error" in result:
                     logger.error(f"[POOL] Worker error: {result}")

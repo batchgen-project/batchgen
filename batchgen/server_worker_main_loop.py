@@ -1,8 +1,10 @@
 import importlib
+import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from datetime import timedelta
@@ -20,6 +22,100 @@ from batchgen.batchgen_worker import (
 from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
+
+
+_WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
+_WORKER_FATAL_ACK_TIMEOUT_S = 5.0
+
+
+def _format_worker_fatal(
+	rank_idx: int,
+	global_rank: Optional[int],
+	error: BaseException,
+	traceback_text: str,
+) -> str:
+	return json.dumps({
+		"rank_idx": rank_idx,
+		"global_rank": global_rank,
+		"error_type": type(error).__name__,
+		"error": str(error),
+		"traceback": traceback_text,
+	}, ensure_ascii=False)
+
+
+def _publish_worker_fatal_to_store(message: str) -> None:
+	"""Publish the first Python fatal without using an NCCL collective."""
+	try:
+		from torch.distributed.distributed_c10d import _get_default_store
+		store = _get_default_store()
+		store.compare_set(_WORKER_FATAL_STORE_KEY, "", message)
+	except Exception:
+		logging.exception("Failed to publish worker fatal through TCPStore")
+
+
+def _send_worker_fatal_to_local_server(
+	response_queue: mp.Queue,
+	message: str,
+	ready_event: Optional[mp.Event],
+	fatal_ack_event: Optional[mp.Event],
+) -> None:
+	"""Send the exact fatal to this node's scheduler before worker exit."""
+	try:
+		response_queue.put({"type": "pool_shutdown", "error": message})
+	except Exception:
+		logging.exception("Failed to enqueue worker fatal for the local server")
+		return
+
+	# During startup the scheduler does not exist yet, so WorkerManager must
+	# observe the process exit. Once ready, wait briefly for the scheduler to
+	# persist active batches as failed before the worker disappears.
+	if (
+		ready_event is not None
+		and ready_event.is_set()
+		and fatal_ack_event is not None
+	):
+		if not fatal_ack_event.wait(timeout=_WORKER_FATAL_ACK_TIMEOUT_S):
+			logging.error(
+				"Timed out waiting for local server to acknowledge worker fatal"
+			)
+
+
+def _start_worker_fatal_monitor(
+	global_rank: int,
+	response_queue: mp.Queue,
+	ready_event: Optional[mp.Event],
+	fatal_ack_event: Optional[mp.Event],
+) -> None:
+	"""Relay a remote-rank TCPStore fatal to the rank-0 HTTP launcher."""
+	if global_rank != 0:
+		return
+
+	from torch.distributed.distributed_c10d import _get_default_store
+	store = _get_default_store()
+
+	def _monitor() -> None:
+		try:
+			while True:
+				if store.check([_WORKER_FATAL_STORE_KEY]):
+					message = store.get(_WORKER_FATAL_STORE_KEY).decode("utf-8")
+					logging.error("Remote worker Python fatal: %s", message)
+					_send_worker_fatal_to_local_server(
+						response_queue,
+						message,
+						ready_event,
+						fatal_ack_event,
+					)
+					os._exit(1)
+				time.sleep(0.1)
+		except Exception:
+			logging.exception("Worker fatal TCPStore monitor failed")
+			os._exit(1)
+
+	threading.Thread(
+		target=_monitor,
+		name="worker-fatal-monitor",
+		daemon=True,
+	).start()
 
 
 def _reload_worker_module(reload_deps=False):
@@ -168,19 +264,39 @@ def server_worker_main(
 	response_queue: mp.Queue,
 	args: BatchGenWorkerArgs,
 	ready_event: Optional[mp.Event] = None,
+	fatal_ack_event: Optional[mp.Event] = None,
 ):
 	try:
-		_server_worker_main_impl(rank_idx, request_queue, response_queue, args, ready_event)
+		_server_worker_main_impl(
+			rank_idx,
+			request_queue,
+			response_queue,
+			args,
+			ready_event,
+			fatal_ack_event,
+		)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
 		logging.error(f"[FATAL] Unhandled exception in worker "
 					  f"rank_idx={rank_idx}, global_rank={global_rank}: {e}")
-		traceback.print_exc()
-		try:
-			if dist.is_available() and dist.is_initialized():
-				dist.destroy_process_group()
-		except Exception:
-			pass
+		traceback_text = traceback.format_exc()
+		print(traceback_text, file=sys.stderr, flush=True)
+		message = _format_worker_fatal(
+			rank_idx,
+			global_rank,
+			e,
+			traceback_text,
+		)
+		if dist.is_available() and dist.is_initialized():
+			_publish_worker_fatal_to_store(message)
+		_send_worker_fatal_to_local_server(
+			response_queue,
+			message,
+			ready_event,
+			fatal_ack_event,
+		)
+		# Do not enter distributed teardown after a rank fatal: peers may already
+		# be stuck in a collective. The two launchers own process-tree cleanup.
 		os._exit(1)
 
 
@@ -204,6 +320,7 @@ def _server_worker_main_impl(
 	response_queue: mp.Queue,
 	args: BatchGenWorkerArgs,
 	ready_event: Optional[mp.Event] = None,
+	fatal_ack_event: Optional[mp.Event] = None,
 ):
 	"""
 	The main loop for the GPU workers.
@@ -261,6 +378,12 @@ def _server_worker_main_impl(
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
+	_start_worker_fatal_monitor(
+		args.global_rank,
+		response_queue,
+		ready_event,
+		fatal_ack_event,
+	)
 
 	# CRITICAL: Warmup NCCL connections before entering server loop
 	# This ensures all inter-node NCCL connections are fully established
@@ -463,8 +586,9 @@ def _server_worker_main_impl(
 
 			except Exception as e:
 				logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
-				if global_rank == 0:
-					response_queue.put({"type": "pool_shutdown", "error": str(e)})
+				# Let the outer worker boundary publish this rank's exact traceback
+				# through the TCPStore sideband and its node-local response queue.
+				raise
 
 			# Pool mode exits here — send shutdown sentinel and break
 			if global_rank == 0:

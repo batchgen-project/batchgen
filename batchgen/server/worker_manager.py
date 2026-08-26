@@ -123,6 +123,7 @@ class WorkerManager:
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
+        self._fatal_ack_event = self._mp_ctx.Event()
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
@@ -150,6 +151,7 @@ class WorkerManager:
         self._stopping = False
         self._monitor_stop_event.clear()
         self._ready_event.clear()
+        self._fatal_ack_event.clear()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -317,6 +319,11 @@ class WorkerManager:
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
+
+    def report_worker_fatal(self, reason: str) -> None:
+        """Acknowledge a persisted worker fatal, then stop the server."""
+        self._fatal_ack_event.set()
+        self._handle_worker_failure(reason, None)
 
     def infer(
         self,
@@ -654,6 +661,7 @@ class WorkerManager:
                 self.response_queue,
                 args,
                 self._ready_event,
+                self._fatal_ack_event,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
