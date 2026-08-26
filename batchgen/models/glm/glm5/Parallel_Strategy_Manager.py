@@ -18,6 +18,8 @@ Key differences from DeepSeek V3 PSM:
 """
 
 import gc
+import hashlib
+import json
 import logging
 import os
 import time
@@ -31,10 +33,16 @@ from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
 class GLM5ParallelStrategyManager:
+    ACCEPTS_BATCHGEN_DEBUG = True
     NUM_TOTAL_EXPERTS = 256
     NUM_LAYERS = 78
     FIRST_K_DENSE = 3
     HIDDEN_SIZE = 6144
+    EXPERT_PLACEMENT_SCHEMA = "batchgen.glm5_expert_placement"
+    EXPERT_PLACEMENT_VERSION = 1
+    EXPERT_PLACEMENT_WORLD_SIZE = 8
+    EXPERT_PLACEMENT_EXPERTS_PER_RANK = 32
+    EXPERT_PLACEMENT_DEBUG_KEY = "glm5_expert_placement_path"
 
     def __init__(
         self,
@@ -159,13 +167,14 @@ class GLM5ParallelStrategyManager:
             )
         return self.model, self.weight_copy_task
 
-    def configure_decoding(self, padding_bsz=None, comm=None):
+    def configure_decoding(self, padding_bsz=None, comm=None, batchgen_debug=None):
         """Configure model for decode: DP + EP."""
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
         self.model = None
         torch.cuda.empty_cache()
 
+        expert_placement = self._resolve_expert_placement(batchgen_debug)
         self.model = Glm5ForCausalLM(self.loaded_model_config)
 
         self.weight_copy_task = {
@@ -245,11 +254,18 @@ class GLM5ParallelStrategyManager:
         torch.cuda.empty_cache()
         self._extract_dequantize_scale()
         self._load_model_skeleton()
-        self._load_local_routed_experts()
+        if expert_placement is not None:
+            self._apply_expert_placement_to_gates(expert_placement)
+            self._load_local_routed_experts(expert_placement)
+        else:
+            self._load_local_routed_experts()
         self._load_attn_module()
         self._load_shared_expert_module()
         self._config_attn_module()
-        self._config_expert_module()
+        if expert_placement is not None:
+            self._config_expert_module(expert_placement)
+        else:
+            self._config_expert_module()
         self._configure_decode_moe(comm)
         self._config_lm_head_hook()
 
@@ -270,6 +286,211 @@ class GLM5ParallelStrategyManager:
             self._init_ata_comms(effective_bsz)
 
         return self.model, self.weight_copy_task
+
+    def _resolve_expert_placement(self, batchgen_debug):
+        if not isinstance(batchgen_debug, dict):
+            return None
+        if self.EXPERT_PLACEMENT_DEBUG_KEY not in batchgen_debug:
+            return None
+
+        requested_path = batchgen_debug[self.EXPERT_PLACEMENT_DEBUG_KEY]
+        placement = None
+        checksum = None
+        local_error = None
+        resolved_path = requested_path
+        try:
+            if not isinstance(requested_path, str) or not requested_path.strip():
+                raise ValueError(
+                    f"{self.EXPERT_PLACEMENT_DEBUG_KEY} must be a non-empty string"
+                )
+            resolved_path = os.path.abspath(os.path.expanduser(requested_path))
+            with open(resolved_path, "rb") as f:
+                raw = f.read()
+            checksum = hashlib.sha256(raw).hexdigest()
+            document = json.loads(raw.decode("utf-8"))
+            placement = self._validate_expert_placement_document(document)
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "GLM-5.2 diagnostic expert placement requires an initialized "
+                "distributed process group"
+            )
+        dist_world_size = dist.get_world_size()
+        if dist_world_size != self.world_size:
+            raise RuntimeError(
+                "GLM-5.2 diagnostic expert placement process-group mismatch: "
+                f"manager world_size={self.world_size}, distributed world_size={dist_world_size}"
+            )
+
+        local_report = {
+            "rank": dist.get_rank(),
+            "manager_rank": self.global_rank,
+            "path": resolved_path,
+            "checksum": checksum,
+            "error": local_error,
+        }
+        reports = [None] * dist_world_size
+        dist.all_gather_object(reports, local_report)
+
+        errors = []
+        for rank, report in enumerate(reports):
+            if report["rank"] != rank or report["manager_rank"] != rank:
+                errors.append(
+                    f"rank {rank}: rank identity mismatch "
+                    f"(distributed={report['rank']}, manager={report['manager_rank']})"
+                )
+            if report["error"] is not None:
+                errors.append(f"rank {rank}: {report['error']}")
+        if not errors:
+            signatures = {
+                (report["path"], report["checksum"]) for report in reports
+            }
+            if len(signatures) != 1:
+                errors.append(
+                    "ranks resolved different placement paths or file contents: "
+                    + repr(sorted(signatures))
+                )
+        if errors:
+            raise RuntimeError(
+                "GLM-5.2 diagnostic expert placement validation failed: "
+                + "; ".join(errors)
+            )
+
+        if self.rank == 0:
+            logging.warning(
+                "[BATCHGEN_DEBUG] GLM-5.2 diagnostic-only expert placement "
+                "override enabled: path=%s sha256=%s. This placement is not "
+                "approved for production.",
+                resolved_path,
+                checksum,
+            )
+        return placement
+
+    def _validate_expert_placement_document(self, document):
+        required_keys = {
+            "schema",
+            "version",
+            "model",
+            "first_layer",
+            "last_layer",
+            "world_size",
+            "experts_per_rank",
+            "num_experts",
+            "physical_to_original",
+        }
+        if not isinstance(document, dict):
+            raise ValueError("placement document must be a JSON object")
+        if set(document) != required_keys:
+            missing = sorted(required_keys - set(document))
+            extra = sorted(set(document) - required_keys)
+            raise ValueError(
+                f"placement schema keys mismatch: missing={missing}, extra={extra}"
+            )
+
+        expected_metadata = {
+            "schema": self.EXPERT_PLACEMENT_SCHEMA,
+            "version": self.EXPERT_PLACEMENT_VERSION,
+            "model": "glm-5.2",
+            "first_layer": self.FIRST_K_DENSE,
+            "last_layer": self.NUM_LAYERS - 1,
+            "world_size": self.EXPERT_PLACEMENT_WORLD_SIZE,
+            "experts_per_rank": self.EXPERT_PLACEMENT_EXPERTS_PER_RANK,
+            "num_experts": self.NUM_TOTAL_EXPERTS,
+        }
+        for key, expected in expected_metadata.items():
+            if document[key] != expected or type(document[key]) is not type(expected):
+                raise ValueError(
+                    f"placement {key} must be {expected!r}, got {document[key]!r}"
+                )
+
+        if self.world_size != self.EXPERT_PLACEMENT_WORLD_SIZE:
+            raise ValueError(
+                f"runtime world_size must be {self.EXPERT_PLACEMENT_WORLD_SIZE}, "
+                f"got {self.world_size}"
+            )
+        if not 0 <= self.global_rank < self.world_size:
+            raise ValueError(
+                f"runtime rank {self.global_rank} is outside world_size {self.world_size}"
+            )
+        if self.model_config.num_hidden_layers != self.NUM_LAYERS:
+            raise ValueError(
+                f"runtime num_hidden_layers must be {self.NUM_LAYERS}, "
+                f"got {self.model_config.num_hidden_layers}"
+            )
+        if self.model_config.num_local_experts != self.NUM_TOTAL_EXPERTS:
+            raise ValueError(
+                f"runtime num_local_experts must be {self.NUM_TOTAL_EXPERTS}, "
+                f"got {self.model_config.num_local_experts}"
+            )
+        model_type = getattr(self.loaded_model_config, "model_type", None)
+        if model_type != "glm_moe_dsa_5_2":
+            raise ValueError(
+                "runtime model_type must be 'glm_moe_dsa_5_2', "
+                f"got {model_type!r}"
+            )
+        configured_local = self.engine_config.EP_Config.num_local_expert_per_layer
+        if (
+            self.engine_config.EP_Config.enable_offloading
+            or configured_local not in (
+                None,
+                0,
+                self.EXPERT_PLACEMENT_EXPERTS_PER_RANK,
+            )
+        ):
+            raise ValueError(
+                "diagnostic expert placement requires all 32 physical experts per "
+                "rank to remain resident with EP offloading disabled; got "
+                f"num_local_expert_per_layer={configured_local!r}, "
+                f"enable_offloading={self.engine_config.EP_Config.enable_offloading}"
+            )
+
+        mapping = document["physical_to_original"]
+        num_moe_layers = self.NUM_LAYERS - self.FIRST_K_DENSE
+        if not isinstance(mapping, list) or len(mapping) != num_moe_layers:
+            raise ValueError(
+                f"physical_to_original must have shape "
+                f"[{num_moe_layers}, {self.NUM_TOTAL_EXPERTS}]"
+            )
+        expected_experts = set(range(self.NUM_TOTAL_EXPERTS))
+        validated = []
+        for row_idx, row in enumerate(mapping):
+            layer_idx = self.FIRST_K_DENSE + row_idx
+            if not isinstance(row, list) or len(row) != self.NUM_TOTAL_EXPERTS:
+                raise ValueError(
+                    f"physical_to_original layer {layer_idx} must contain exactly "
+                    f"{self.NUM_TOTAL_EXPERTS} entries"
+                )
+            if any(type(value) is not int for value in row):
+                raise ValueError(
+                    f"physical_to_original layer {layer_idx} contains a non-integer entry"
+                )
+            if set(row) != expected_experts:
+                raise ValueError(
+                    f"physical_to_original layer {layer_idx} is not a permutation of "
+                    f"0..{self.NUM_TOTAL_EXPERTS - 1}"
+                )
+            validated.append(tuple(row))
+        return tuple(validated)
+
+    def _expert_source_index(self, expert_placement, layer_idx, physical_expert_idx):
+        if expert_placement is None:
+            return physical_expert_idx
+        return expert_placement[layer_idx - self.FIRST_K_DENSE][physical_expert_idx]
+
+    def _apply_expert_placement_to_gates(self, expert_placement):
+        for layer_idx in range(self.FIRST_K_DENSE, self.NUM_LAYERS):
+            gate = self.model.model.layers[layer_idx].mlp.gate
+            permutation = torch.tensor(
+                expert_placement[layer_idx - self.FIRST_K_DENSE],
+                dtype=torch.long,
+                device=gate.weight.device,
+            )
+            gate.weight.data = gate.weight.data.index_select(0, permutation)
+            gate.e_score_correction_bias.data = (
+                gate.e_score_correction_bias.data.index_select(0, permutation)
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
@@ -414,7 +635,7 @@ class GLM5ParallelStrategyManager:
             shared.up_proj.weight.data = tensors["up_proj.weight"].to(device)
             shared.down_proj.weight.data = tensors["down_proj.weight"].to(device)
 
-    def _load_local_routed_experts(self):
+    def _load_local_routed_experts(self, expert_placement=None):
         """Load persistent routed expert FP8 weights for decode.
 
         Stores weights as flat attributes on placeholder (following GPT-OSS pattern).
@@ -422,11 +643,19 @@ class GLM5ParallelStrategyManager:
         """
         device = self.engine_config.Basic_Config.device_torch
         for routed_expert_idx in self.local_routed_experts:
-            tensors = self.core_engine.get_tensor(routed_expert_idx)
             parts = routed_expert_idx.split("_")
             layer_idx = int(parts[2])
-            expert_idx = int(parts[3])
-            expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+            physical_expert_idx = int(parts[3])
+            if expert_placement is None:
+                tensors = self.core_engine.get_tensor(routed_expert_idx)
+            else:
+                source_expert_idx = self._expert_source_index(
+                    expert_placement, layer_idx, physical_expert_idx
+                )
+                tensors = self.core_engine.get_tensor(
+                    f"routed_expert_{layer_idx}_{source_expert_idx}"
+                )
+            expert = self.model.model.layers[layer_idx].mlp.experts[physical_expert_idx]
             # Store as flat attrs on placeholder (no nn.Module needed)
             expert.fp8_gate = tensors["gate_proj.weight"].to(device)
             expert.fp8_up = tensors["up_proj.weight"].to(device)
@@ -507,7 +736,7 @@ class GLM5ParallelStrategyManager:
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Attn module config time: {elapsed:.2f}s")
 
-    def _config_expert_module(self):
+    def _config_expert_module(self, expert_placement=None):
         """Replace expert modules with GLM5ExpertWrapper."""
         start_time = time.perf_counter()
         mlp_names = ["gate_proj", "up_proj", "down_proj"]
@@ -540,7 +769,15 @@ class GLM5ParallelStrategyManager:
                 routed_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 persistent = routed_key not in self.weight_copy_task.get("routed_expert", [])
 
-                prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
+                if expert_placement is None:
+                    prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
+                else:
+                    source_expert_idx = self._expert_source_index(
+                        expert_placement, layer_idx, expert_idx
+                    )
+                    prefix = (
+                        f"model.layers.{layer_idx}.mlp.experts.{source_expert_idx}."
+                    )
                 expert_scales = {}
                 for name in mlp_names:
                     key = prefix + name + postfix

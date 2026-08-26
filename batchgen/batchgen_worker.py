@@ -7359,10 +7359,18 @@ class BatchGenWorker:
 		self.deep_free_model_memory()
 		self.init_nvshmem()
 
-		# Unified method handles all deployment scenarios
-		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
-			padding_bsz=max_num_seq, comm=comm
-		)
+		# GLM-5 accepts batch-scoped diagnostic configuration at decode-model load
+		# time. Keep every unrelated strategy-manager call unchanged.
+		if getattr(self.parallel_manager, "ACCEPTS_BATCHGEN_DEBUG", False):
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+				padding_bsz=max_num_seq,
+				comm=comm,
+				batchgen_debug=self._batchgen_debug,
+			)
+		else:
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+				padding_bsz=max_num_seq, comm=comm
+			)
 		self._initialize_glm52_folded_q_b_for_decode()
 		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
