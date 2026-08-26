@@ -555,6 +555,7 @@ class BatchGenWorkerArgs:
 	watchdog_test_stuck_time: float = 0.0  # Deliberate delay for testing
 	watchdog_heartbeat_interval: Optional[float] = None  # Heartbeat interval
 	decode_step_timeout: Optional[float] = None  # Max seconds per decode step
+	storage_path: Optional[str] = None
 
 	# Prepack optimization (default: enabled, recommended always on)
 	enable_prepack: bool = True
@@ -713,6 +714,13 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		self._glm5_moe_route_counts = None
+		self._glm5_moe_route_count_history = None
+		self._glm5_moe_route_count_layer_indices = ()
+		self._glm5_moe_route_count_batch_id = None
+		self._glm5_moe_route_count_decode_iterations = 0
+		self._glm5_moe_route_count_successful_forwards = 0
+		self._glm5_moe_route_count_emitted = False
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
@@ -9626,6 +9634,220 @@ class BatchGenWorker:
 			return True
 		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
 
+	def _glm5_moe_route_counts_requested_for_current_batch(self) -> bool:
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_moe_route_counts"))
+
+	def _clear_glm5_moe_route_count_state(self) -> None:
+		self._glm5_moe_route_counts = None
+		self._glm5_moe_route_count_history = None
+		self._glm5_moe_route_count_layer_indices = ()
+		self._glm5_moe_route_count_batch_id = None
+		self._glm5_moe_route_count_decode_iterations = 0
+		self._glm5_moe_route_count_successful_forwards = 0
+		self._glm5_moe_route_count_emitted = False
+
+	def _emit_glm5_moe_route_counts(self, *, round_complete: bool) -> None:
+		local_control = {
+			"requested": self._glm5_moe_route_counts_requested_for_current_batch(),
+			"round_complete": bool(round_complete),
+			"emitted": bool(getattr(self, "_glm5_moe_route_count_emitted", False)),
+		}
+		all_control = [None] * self.world_size
+		dist.all_gather_object(all_control, local_control)
+		if any(control != all_control[0] for control in all_control[1:]):
+			raise RuntimeError(
+				"GLM-5 MoE route-count diagnostic control state disagrees across ranks: "
+				f"{all_control}"
+			)
+		control = all_control[0]
+		if not control["requested"]:
+			return
+		if control["emitted"]:
+			raise RuntimeError(
+				"GLM-5 MoE route-count diagnostic attempted a second terminal emission"
+			)
+		if not control["round_complete"]:
+			raise RuntimeError(
+				"GLM-5 MoE route-count diagnostic requires one uninterrupted decode "
+				"round; the round ended before all sequences completed"
+			)
+
+		counts = getattr(self, "_glm5_moe_route_counts", None)
+		history = getattr(self, "_glm5_moe_route_count_history", None)
+		torch.cuda.synchronize(self.torch_device)
+		local_metadata = None
+		if counts is not None and history is not None:
+			local_metadata = {
+				"shape": tuple(int(dim) for dim in counts.shape),
+				"history_shape": tuple(int(dim) for dim in history.shape),
+				"dtype": str(counts.dtype),
+				"layer_indices": tuple(
+					int(layer_idx)
+					for layer_idx in self._glm5_moe_route_count_layer_indices
+				),
+				"decode_iterations": int(self._glm5_moe_route_count_decode_iterations),
+				"successful_forwards": int(
+					self._glm5_moe_route_count_successful_forwards
+				),
+				"batch_id": self._glm5_moe_route_count_batch_id,
+				"round_complete": bool(round_complete),
+			}
+		all_metadata = [None] * self.world_size
+		dist.all_gather_object(all_metadata, local_metadata)
+		if all(metadata is None for metadata in all_metadata):
+			raise RuntimeError(
+				"GLM-5 MoE route counts were requested, but no rank retained an "
+				"accumulator; the diagnostic requires a captured whole-model graph"
+			)
+		if any(metadata is None for metadata in all_metadata):
+			if counts is not None:
+				counts.zero_()
+				torch.cuda.synchronize(self.torch_device)
+			self._clear_glm5_moe_route_count_state()
+			raise RuntimeError(
+				"GLM-5 MoE route-count accumulator exists on only a subset of ranks: "
+				f"{all_metadata}"
+			)
+		expected_metadata = all_metadata[0]
+		if any(metadata != expected_metadata for metadata in all_metadata[1:]):
+			counts.zero_()
+			torch.cuda.synchronize(self.torch_device)
+			self._clear_glm5_moe_route_count_state()
+			raise RuntimeError(
+				"GLM-5 MoE route-count accumulator metadata disagree across ranks: "
+				f"{all_metadata}"
+			)
+		if expected_metadata["decode_iterations"] != expected_metadata["successful_forwards"]:
+			counts.zero_()
+			torch.cuda.synchronize(self.torch_device)
+			self._clear_glm5_moe_route_count_state()
+			raise RuntimeError(
+				"GLM-5 MoE route-count diagnostic missed one or more successful "
+				"decode forwards: "
+				f"graph_replays={expected_metadata['decode_iterations']} "
+				f"successful_forwards={expected_metadata['successful_forwards']}"
+			)
+
+		graph_replays = int(expected_metadata["decode_iterations"])
+		if graph_replays <= 0:
+			counts.zero_()
+			history.zero_()
+			torch.cuda.synchronize(self.torch_device)
+			self._clear_glm5_moe_route_count_state()
+			raise RuntimeError(
+				"GLM-5 MoE route counts were requested, but no whole-model graph "
+				"replay completed"
+			)
+		local_history = history[:graph_replays]
+		gathered = [torch.empty_like(local_history) for _ in range(self.world_size)]
+		dist.all_gather(gathered, local_history)
+		torch.cuda.synchronize(self.torch_device)
+		layer_indices = expected_metadata["layer_indices"]
+		payload = None
+		artifact_error = None
+		if self.rank == 0:
+			try:
+				global_history = torch.cat(gathered, dim=2)
+				selected_history = global_history[:, list(layer_indices), :]
+				expected_shape = (
+					graph_replays,
+					len(layer_indices),
+					self.world_size * int(counts.shape[1]),
+				)
+				if tuple(selected_history.shape) != expected_shape:
+					raise RuntimeError(
+						"GLM-5 MoE route-count global shape mismatch: "
+						f"got={tuple(selected_history.shape)} expected={expected_shape}"
+					)
+				aggregate_counts = selected_history.sum(dim=0, dtype=torch.int64)
+				storage_root = getattr(self.args, "storage_path", None)
+				if not storage_root:
+					raise RuntimeError(
+						"GLM-5 MoE route-count diagnostic requires --storage-path"
+					)
+				batch_label = str(expected_metadata["batch_id"] or "")
+				if not batch_label:
+					raise RuntimeError(
+						"GLM-5 MoE route-count diagnostic requires exactly one batch ID"
+					)
+				batch_label = "".join(
+					char if char.isalnum() or char in "._-" else "_"
+					for char in batch_label
+				)
+				diagnostic_dir = os.path.join(storage_root, "diagnostics")
+				os.makedirs(diagnostic_dir, exist_ok=True)
+				history_path = os.path.join(
+					diagnostic_dir,
+					f"{batch_label}_glm5_moe_route_counts.pt",
+				)
+				tmp_path = history_path + ".tmp"
+				if os.path.exists(history_path) or os.path.exists(tmp_path):
+					raise FileExistsError(
+						"GLM-5 MoE route-count diagnostic refuses to overwrite an "
+						f"existing artifact: {history_path}"
+					)
+				torch.save(
+					{
+						"schema": "batchgen.glm5_moe_route_counts",
+						"version": 2,
+						"batch_id": expected_metadata["batch_id"],
+						"layer_indices": list(layer_indices),
+						"history": selected_history.cpu(),
+						"aggregate_counts": aggregate_counts.cpu(),
+						"world_size": self.world_size,
+						"experts_per_rank": int(counts.shape[1]),
+						"graph_replays": graph_replays,
+						"successful_forwards": expected_metadata["successful_forwards"],
+						"round_complete": expected_metadata["round_complete"],
+					},
+					tmp_path,
+				)
+				os.replace(tmp_path, history_path)
+				payload = {
+					"schema": "batchgen.glm5_moe_route_counts",
+					"version": 2,
+					"batch_id": expected_metadata["batch_id"],
+					"layer_indices": list(layer_indices),
+					"shape": [int(dim) for dim in aggregate_counts.shape],
+					"history_shape": [int(dim) for dim in selected_history.shape],
+					"history_path": history_path,
+					"world_size": self.world_size,
+					"experts_per_rank": int(counts.shape[1]),
+					"decode_iterations": expected_metadata["decode_iterations"],
+					"graph_replays": expected_metadata["decode_iterations"],
+					"successful_forwards": expected_metadata["successful_forwards"],
+					"round_complete": expected_metadata["round_complete"],
+					"counts": aggregate_counts.cpu().tolist(),
+				}
+			except Exception as exc:
+				artifact_error = f"{type(exc).__name__}: {exc}"
+		artifact_status = [artifact_error]
+		dist.broadcast_object_list(artifact_status, src=0)
+		if artifact_status[0] is not None:
+			counts.zero_()
+			history.zero_()
+			torch.cuda.synchronize(self.torch_device)
+			self._clear_glm5_moe_route_count_state()
+			raise RuntimeError(
+				"GLM-5 MoE route-count artifact emission failed on rank 0: "
+				f"{artifact_status[0]}"
+			)
+		if self.rank == 0:
+			logging.warning(
+				"[GLM5_MOE_ROUTE_COUNTS] %s",
+				json.dumps(payload, sort_keys=True, separators=(",", ":")),
+			)
+
+		self._glm5_moe_route_count_emitted = True
+		counts.zero_()
+		history.zero_()
+		self._glm5_moe_route_count_decode_iterations = 0
+		self._glm5_moe_route_count_successful_forwards = 0
+		torch.cuda.synchronize(self.torch_device)
+
 	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
 			return True
@@ -9699,9 +9921,26 @@ class BatchGenWorker:
 				str(table.device),
 			)
 
+		route_counts_requested = self._glm5_moe_route_counts_requested_for_current_batch()
+		route_counts = getattr(self, "_glm5_moe_route_counts", None)
+		route_count_history = getattr(self, "_glm5_moe_route_count_history", None)
+		route_counts_signature = None
+		if (
+			route_counts_requested
+			and route_counts is not None
+			and route_count_history is not None
+		):
+			route_counts_signature = (
+				int(route_counts.data_ptr()),
+				tuple(int(dim) for dim in route_counts.shape),
+				int(route_count_history.data_ptr()),
+				tuple(int(dim) for dim in route_count_history.shape),
+			)
+
 		return (
 			_table_sig(primary_manager),
 			_table_sig(aux_manager),
+			(route_counts_requested, route_counts_signature),
 		)
 
 	def _glm5_whole_model_graph_current_bucket_missing(self) -> bool:
@@ -9786,6 +10025,7 @@ class BatchGenWorker:
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
+		self._clear_glm5_moe_route_count_state()
 		# Phase B: also drop the adapter's reference to the captured segment so
 		# the next /v1/reload + recapture starts from a clean adapter context.
 		if self._cuda_graph_adapter is not None:
@@ -10234,13 +10474,21 @@ class BatchGenWorker:
 				self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
 
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
-			moe_layers = [
-				layer.mlp for layer in self.model.model.layers
+			self._clear_glm5_moe_route_count_state()
+			moe_layer_entries = [
+				(layer_idx, layer.mlp)
+				for layer_idx, layer in enumerate(self.model.model.layers)
 				if isinstance(getattr(layer, "mlp", None), Glm5MoE)
 			]
 			moe_pool = None
-			if moe_layers:
-				first_moe = moe_layers[0]
+			route_counts = None
+			route_count_history = None
+			route_count_batch_id = None
+			route_count_layer_indices = tuple(
+				layer_idx for layer_idx, _ in moe_layer_entries
+			)
+			if moe_layer_entries:
+				first_moe = moe_layer_entries[0][1]
 				moe_pool = Glm5MoEGraphBufferPool(
 					world_size=self.world_size,
 					hidden_size=first_moe.hidden_size,
@@ -10251,6 +10499,74 @@ class BatchGenWorker:
 					bucket_sizes=bucket_sizes,
 					base_mtp=_GLM5_3D_MTP,
 				)
+				if self._glm5_moe_route_counts_requested_for_current_batch():
+					active_batch_ids = sorted({
+						str(seq.batch_id)
+						for seq in (self.global_batch or [])
+						if seq.status != SequenceStatus.COMPLETED and seq.batch_id
+					})
+					if len(active_batch_ids) != 1:
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic requires exactly one "
+							f"active batch ID, got {active_batch_ids}"
+						)
+					route_count_batch_id = active_batch_ids[0]
+					experts_per_rank = int(first_moe.experts_per_rank)
+					if self.rank != dist.get_rank() or self.world_size != dist.get_world_size():
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic rank metadata disagree "
+							f"with torch.distributed: worker={self.rank}/{self.world_size}, "
+							f"dist={dist.get_rank()}/{dist.get_world_size()}"
+						)
+					num_global_experts = int(first_moe.config.n_routed_experts)
+					if self.world_size * experts_per_rank != num_global_experts:
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic requires an exact expert "
+							"partition: "
+							f"world_size={self.world_size}, "
+							f"experts_per_rank={experts_per_rank}, "
+							f"num_global_experts={num_global_experts}"
+						)
+					if any(
+						int(moe.experts_per_rank) != experts_per_rank
+						or int(moe.config.n_routed_experts) != num_global_experts
+						for _, moe in moe_layer_entries
+					):
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic requires the same "
+							"experts_per_rank on every MoE layer"
+						)
+					expert_starts = tuple(
+						int(moe.routed_expert_start_idx)
+						for _, moe in moe_layer_entries
+					)
+					expected_expert_start = self.rank * experts_per_rank
+					if any(start != expected_expert_start for start in expert_starts):
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic requires contiguous "
+							f"rank-major expert placement; rank={self.rank}, "
+							f"expected_start={expected_expert_start}, starts={expert_starts}"
+						)
+					route_counts = torch.zeros(
+						(len(self.model.model.layers), experts_per_rank),
+						dtype=torch.int32,
+						device=self.torch_device,
+					)
+					max_route_count_steps = int(self.max_decoding_length)
+					if max_route_count_steps <= 0:
+						raise RuntimeError(
+							"GLM-5 MoE route-count diagnostic requires a positive "
+							"max_decoding_length"
+						)
+					route_count_history = torch.zeros(
+						(
+							max_route_count_steps,
+							len(self.model.model.layers),
+							experts_per_rank,
+						),
+						dtype=torch.int32,
+						device=self.torch_device,
+					)
 			shared_dsa_buffers = {}
 			shared_reuse_buffers = {}
 			last_full_segment = None
@@ -10333,6 +10649,11 @@ class BatchGenWorker:
 						world_size=self.world_size,
 						rank=self.rank,
 						device=self.torch_device,
+						route_counts=(
+							route_counts[layer_idx]
+							if route_counts is not None
+							else None
+						),
 					)
 				layer_segments.append(
 					Glm5DecoderLayerGraphSegment(
@@ -10375,6 +10696,13 @@ class BatchGenWorker:
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
 			manager.register_segment(segment_name, whole_seg)
+			self._glm5_moe_route_counts = route_counts
+			self._glm5_moe_route_count_history = route_count_history
+			self._glm5_moe_route_count_layer_indices = route_count_layer_indices
+			self._glm5_moe_route_count_batch_id = route_count_batch_id
+			self._glm5_moe_route_count_decode_iterations = 0
+			self._glm5_moe_route_count_successful_forwards = 0
+			self._glm5_moe_route_count_emitted = False
 			logging.info(
 				f"Rank {self.rank}: capturing GLM-5 whole-model CUDA graph "
 				f"segment={segment_name} buckets={capture_buckets}, "
@@ -10409,6 +10737,7 @@ class BatchGenWorker:
 				self._glm5_whole_model_capture_input_ids = None
 				self._whole_model_graph = False
 				self._glm5_whole_model_graph = False
+				self._clear_glm5_moe_route_count_state()
 				torch.cuda.empty_cache()
 				if whole_graph_required:
 					raise
@@ -10417,6 +10746,16 @@ class BatchGenWorker:
 					f"capture for bucket BS={capture_bucket} ran out of memory; using eager decode: {exc}"
 				)
 				return
+			except Exception:
+				self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
+				raise
+			if self._glm5_moe_route_counts is not None:
+				# Warmup/capture executes dummy routing work. Reset once, after
+				# every configured bucket is captured and before the first replay.
+				self._glm5_moe_route_counts.zero_()
+				self._glm5_moe_route_count_history.zero_()
+				torch.cuda.synchronize(self.torch_device)
+				dist.barrier()
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
 			# Phase B: hand the just-captured segment to the adapter so its
 			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
@@ -10773,6 +11112,10 @@ class BatchGenWorker:
 			self.engine_config.Basic_Config.attn_mode,
 		)
 		if RUNTIME_ATTN_MODE != 3:
+			if self._glm5_moe_route_counts_requested_for_current_batch():
+				raise RuntimeError(
+					"GLM-5 MoE route-count diagnostic requires runtime attention mode 3"
+				)
 			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
 			return decode_uuids, batch
 		
@@ -11631,6 +11974,21 @@ class BatchGenWorker:
 							page_table=pt_slice,
 							slot_indices=slot_indices_tensor[:batch_size],
 						)
+					if (
+						getattr(self, "_glm5_moe_route_counts", None) is not None
+						and getattr(self, "_glm5_whole_model_graph", False)
+					):
+						step_idx = self._glm5_moe_route_count_decode_iterations
+						if step_idx >= self._glm5_moe_route_count_history.shape[0]:
+							raise RuntimeError(
+								"GLM-5 MoE route-count history capacity exceeded: "
+								f"step={step_idx}, capacity="
+								f"{self._glm5_moe_route_count_history.shape[0]}"
+							)
+						self._glm5_moe_route_count_history[step_idx].copy_(
+							self._glm5_moe_route_counts
+						)
+						self._glm5_moe_route_count_decode_iterations += 1
 
 					logits = graph_out["logits"][:batch_size]
 					graph_hidden_states = graph_out.get("hidden_states")
@@ -11818,6 +12176,8 @@ class BatchGenWorker:
 						outputs = self._glm5_decode_model_forward(new_tokens)
 					with (_dtimer.timed("sample_argmax", 0) if _dtimer and _dtimer.enabled else nullcontext()):
 						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+				if self._glm5_moe_route_counts_requested_for_current_batch():
+					self._glm5_moe_route_count_successful_forwards += 1
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
@@ -11913,6 +12273,7 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
+		self._emit_glm5_moe_route_counts(round_complete=not bool(decode_uuids))
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
@@ -13426,6 +13787,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		self._clear_glm5_moe_route_count_state()
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)
@@ -13566,6 +13928,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_layer_graph_signature = None
 		self._glm5_layer_graph_max_seqlen = None
+		self._clear_glm5_moe_route_count_state()
 
 		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()

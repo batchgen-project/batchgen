@@ -587,6 +587,7 @@ class WorkerManager:
             watchdog_test_stuck_time=self.args.watchdog_test_stuck_time,
             watchdog_heartbeat_interval=self.args.watchdog_heartbeat_interval,
             decode_step_timeout=self.args.decode_step_timeout,
+            storage_path=str(self.args.storage_path),
             enable_prepack=self.args.enable_prepack,
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, fields as dataclass_fields
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -326,6 +326,7 @@ class Glm5MoEGraphSegment:
         world_size: int,
         rank: int,
         device: torch.device,
+        route_counts: Optional[torch.Tensor] = None,
     ) -> None:
         self.moe = moe
         self.pool = pool
@@ -339,6 +340,23 @@ class Glm5MoEGraphSegment:
         self.expert_start = int(moe.routed_expert_start_idx)
         self.intermediate_size = int(moe.config.moe_intermediate_size)
         self.routed_scaling_factor = float(moe.gate.routed_scaling_factor)
+        if route_counts is not None:
+            if route_counts.shape != (self.num_local_experts,):
+                raise RuntimeError(
+                    f"Layer {moe.layer_idx}: GLM-5 MoE route-count row must have "
+                    f"shape ({self.num_local_experts},), got {tuple(route_counts.shape)}"
+                )
+            if route_counts.dtype != torch.int32:
+                raise RuntimeError(
+                    f"Layer {moe.layer_idx}: GLM-5 MoE route-count row must be int32, "
+                    f"got {route_counts.dtype}"
+                )
+            if route_counts.device != device:
+                raise RuntimeError(
+                    f"Layer {moe.layer_idx}: GLM-5 MoE route-count row must be on "
+                    f"{device}, got {route_counts.device}"
+                )
+        self.route_counts = route_counts
 
         if not getattr(moe, "_fp8_blockwise_ready", False):
             raise RuntimeError(
@@ -483,6 +501,10 @@ class Glm5MoEGraphSegment:
                 bufs.cu_seqlens,
                 bufs.topk_pos,
             )
+            if self.route_counts is not None:
+                # The worker binds this row only for a diagnostic capture, so
+                # production graphs contain neither this tensor nor this op.
+                self.route_counts.copy_(expert_counts)
 
             self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
 
