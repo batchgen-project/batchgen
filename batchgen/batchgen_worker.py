@@ -2339,17 +2339,11 @@ class BatchGenWorker:
 	def _flush_deferred_kv_to_host(self) -> None:
 		"""Flush all deferred KV host offload entries accumulated during forward.
 
-		ONE event.synchronize() covers all layers (primary MLA KV + the
-		DSA auxiliary indexer KV if present), then batch-launch D2H
-		copies. Replaces N per-layer syncs with a single post-forward
-		sync for both caches.
+		Batch-launch D2H copies for all layers (primary MLA KV + the DSA
+		auxiliary indexer KV if present). The C++ async append APIs order their
+		dedicated D2H stream after the producer stream with a CUDA event, so this
+		function must not synchronize the CPU with the producer stream first.
 		"""
-		# Whether this call reached the event.synchronize() below. The caller
-		# enqueues the token-readback copy before calling us and relies on this
-		# flag to know if our single sync already drained that copy (so it can
-		# skip a second sync). Set False up-front so every early-return path
-		# leaves it False.
-		self._kv_offload_synced_this_step = False
 		entries = getattr(self, '_deferred_kv_entries', [])
 		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
 		if not entries and not entries_aux:
@@ -2381,15 +2375,6 @@ class BatchGenWorker:
 					f"gids={sequence_ids[:8] if sequence_ids is not None else []}, "
 					f"write_pos={sequence_lengths[:8] if sequence_lengths is not None else []}"
 				)
-
-		# ONE sync for ALL layers across BOTH caches — the key optimization
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-		# Recorded after the caller's token-readback copy (enqueued before this
-		# call), so this one sync covers it too.
-		self._kv_offload_synced_this_step = True
 
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -11072,8 +11057,10 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
+		# P0: Pre-allocate pinned memory and one reusable completion event for the
+		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
+		_new_tokens_ready = torch.cuda.Event()
 
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
@@ -11951,21 +11938,20 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Enqueue
-			# the copy BEFORE flushing KV so _flush_deferred_kv_to_host's single
-			# event.synchronize() (recorded after this copy on the same stream)
-			# covers it too — collapses the two per-step host syncs into one.
+			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
+			# exact token-readback boundary before launching host-KV copies on their
+			# independent D2H stream.
 			bs = new_tokens.shape[0]
 			if bs > _new_tokens_pinned.shape[0]:
 				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
 			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
+			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
 
-			# Flush deferred KV entries — its single sync covers all layers plus
-			# the token copy above. Only sync again if it had nothing to flush
-			# (early return without syncing) so the token copy isn't read stale.
+			# Host-KV offload orders its own stream with a device-side event. Wait
+			# only for the sampled-token readback required by exact EOS and output
+			# bookkeeping; do not drain host-KV copies or the whole CUDA device.
 			self._flush_deferred_kv_to_host()
-			if not getattr(self, '_kv_offload_synced_this_step', False):
-				torch.cuda.current_stream(self.torch_device).synchronize()
+			_new_tokens_ready.synchronize()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
