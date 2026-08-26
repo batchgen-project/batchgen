@@ -447,6 +447,26 @@ def test_boundary_flag_activation_marker_is_transition_gated_and_reset_clears_st
     assert worker._host_kv_stale_global_ids == set()
 
 
+@pytest.mark.parametrize(
+    "debug, expected",
+    [
+        (None, False),
+        ({}, False),
+        ({"glm5_boundary_timing": False}, False),
+        ({"glm5_boundary_timing": True}, True),
+        ({"glm5_boundary_timing": "1"}, True),
+    ],
+)
+def test_boundary_timing_is_batch_scoped_and_hot_reload_safe(debug, expected):
+    worker = _debug_worker()
+    worker._batchgen_debug = debug
+
+    assert worker._glm5_boundary_timing_enabled() is expected
+
+    del worker._batchgen_debug
+    assert worker._glm5_boundary_timing_enabled() is False
+
+
 # --------------------------------------------------------------------------
 # Pool admission: batchgen_debug must be settled before anything mutates.
 # The causal control is batch-scoped, so a mid-group flag change would mix two

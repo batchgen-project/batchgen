@@ -1249,6 +1249,11 @@ class BatchGenWorker:
 			)
 		self._suppress_boundary_kv_writeback = suppress
 
+	def _glm5_boundary_timing_enabled(self) -> bool:
+		"""Return whether this batch requests boundary phase timing logs."""
+		debug = getattr(self, "_batchgen_debug", None) or {}
+		return self._debug_flag_enabled(debug.get("glm5_boundary_timing"))
+
 	def _reset_decode_host_kv_writeback_debug_state(self) -> None:
 		"""Clear batch-scoped state for both writeback causal controls."""
 		self._suppress_decode_host_kv_writeback = False
@@ -11120,7 +11125,7 @@ class BatchGenWorker:
 							ps = self._host_kv_page_stats
 							page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
 
-						if BATCHGEN_CB_DEBUG:
+						if BATCHGEN_CB_DEBUG or self._glm5_boundary_timing_enabled():
 							# Detailed timing log when debug is enabled
 							logging.info(
 								f"[Decode Interval {self._cumulative_decode_boundaries}] "
@@ -12071,11 +12076,15 @@ class BatchGenWorker:
 		GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
-		# Only show when BATCHGEN_CB_LOG=DEBUG
-		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
+		# Show for either the server-wide debug env or this batch's timing request.
+		if (
+			self.rank == 0
+			and self._cumulative_decode_boundaries > 0
+			and (BATCHGEN_CB_DEBUG or self._glm5_boundary_timing_enabled())
+		):
 			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
 			avg_round = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
-			logging.debug(
+			(logging.debug if BATCHGEN_CB_DEBUG else logging.info)(
 				f"\n{'='*50}\n"
 				f"DECODE SUMMARY (Rank 0)\n"
 				f"{'='*50}\n"
