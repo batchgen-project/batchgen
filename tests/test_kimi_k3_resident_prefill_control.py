@@ -1168,6 +1168,9 @@ def _mock_sp8_buffer(
         "PREFETCH_HANDOFF_TIMEOUT_S": 300.0,
         "StreamedSP8MXFP4MoELayer": profile_cls,
     }
+    method_names = list(method_names)
+    if "load" in method_names and "_load_layer_bytes" not in method_names:
+        method_names.insert(method_names.index("load"), "_load_layer_bytes")
     for name in method_names:
         setattr(
             buffer,
@@ -1177,6 +1180,47 @@ def _mock_sp8_buffer(
             ).__get__(buffer),
         )
     return buffer
+
+
+def test_streamed_sp8_transport_only_pass_drives_bytes_without_model_math():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    trace = []
+    buffer = SimpleNamespace(
+        cross_group="cross4",
+        _pending=None,
+        layer_indices=(1, 3, 7),
+        _load_layer_bytes=lambda layer: trace.append(("bytes", layer)),
+        begin_prefetch_next=lambda layer: trace.append(("begin", layer)),
+        allow_full_overwrite=lambda: trace.append(("overwrite",)),
+        allow_cross_launch=lambda: trace.append(("cross",)),
+        _make_shard=lambda: pytest.fail("transport-only path expanded a shard"),
+    )
+    participate = _isolated_method(
+        path,
+        "StreamedSP8LayerBuffer",
+        "participate_empty_prefill_pass",
+    ).__get__(buffer)
+
+    participate()
+
+    assert trace == [
+        ("bytes", 1), ("begin", 1), ("overwrite",), ("cross",),
+        ("bytes", 3), ("begin", 3), ("overwrite",), ("cross",),
+        ("bytes", 7), ("begin", 7), ("overwrite",), ("cross",),
+    ]
+
+
+def test_streamed_sp8_transport_only_pass_rejects_host_rdma():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    buffer = SimpleNamespace(cross_group=None, _pending=None, layer_indices=())
+    participate = _isolated_method(
+        path,
+        "StreamedSP8LayerBuffer",
+        "participate_empty_prefill_pass",
+    ).__get__(buffer)
+
+    with pytest.raises(RuntimeError, match="requires hierarchical GDR"):
+        participate()
 
 
 def test_streamed_sp8_ingress_starts_before_full_overwrite_is_permitted():
@@ -3508,6 +3552,175 @@ def test_only_hierarchical_gdr_reseeds_streamed_sp8_reentry():
     manager._hierarchical_gdr = True
     manager.prefill_uses_streamed_sp8 = lambda: False
     assert method(manager) is False
+
+
+def test_only_hierarchical_gdr_aligns_and_drives_empty_prefill_passes():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    predicate = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "streamed_sp8_requires_global_pass_alignment",
+    )
+    drive = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "run_streamed_sp8_transport_only_prefill",
+    )
+    trace = []
+    manager = SimpleNamespace(
+        _hierarchical_gdr=True,
+        _streamed_sp8_buffer=SimpleNamespace(
+            participate_empty_prefill_pass=lambda: trace.append("pass")
+        ),
+        prefill_uses_streamed_sp8=lambda: True,
+    )
+    manager.streamed_sp8_requires_global_pass_alignment = (
+        predicate.__get__(manager)
+    )
+
+    assert manager.streamed_sp8_requires_global_pass_alignment() is True
+    drive(manager, 2)
+    assert trace == ["pass", "pass"]
+
+    manager._hierarchical_gdr = False
+    assert manager.streamed_sp8_requires_global_pass_alignment() is False
+    with pytest.raises(RuntimeError, match="only valid for hierarchical GDR"):
+        drive(manager, 1)
+    assert trace == ["pass", "pass"]
+
+
+@pytest.mark.parametrize(
+    "pass_counts",
+    (
+        (1, 0),       # singleton on a two-node deployment
+        (1, 1),       # balanced two-node admission
+        (2, 0, 1, 0), # partially populated four-node deployment
+    ),
+)
+def test_worker_aligns_hierarchical_prefill_pass_counts(pass_counts):
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    method = _isolated_method(
+        path,
+        "BatchGenWorker",
+        "_streamed_sp8_prefill_pass_alignment",
+        {"List": list, "Tuple": tuple},
+    )
+    global_count = max(pass_counts)
+
+    class FakeCount:
+        def __init__(self, value):
+            self.value = value
+
+        def item(self):
+            return self.value
+
+    for rank_count in pass_counts:
+        calls = []
+        fake_dist = SimpleNamespace(
+            ReduceOp=SimpleNamespace(MAX="MAX"),
+            all_reduce=lambda tensor, op: (
+                calls.append((tensor.value, op)),
+                setattr(tensor, "value", global_count),
+            )[-1],
+        )
+        method.__globals__["torch"] = SimpleNamespace(
+            int64="int64",
+            tensor=lambda values, dtype, device: FakeCount(values[0]),
+        )
+        method.__globals__["dist"] = fake_dist
+        worker = SimpleNamespace(
+            rank=rank_count,
+            torch_device="cuda:0",
+            parallel_manager=SimpleNamespace(
+                streamed_sp8_requires_global_pass_alignment=lambda: True
+            ),
+            _prefill_model_pass_count=lambda batch: len(batch),
+        )
+
+        assert method(worker, list(range(rank_count))) == (
+            rank_count,
+            global_count,
+        )
+        assert calls == [(rank_count, "MAX")]
+
+
+def test_worker_skips_pass_collective_outside_hierarchical_streamed_sp8():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    method = _isolated_method(
+        path,
+        "BatchGenWorker",
+        "_streamed_sp8_prefill_pass_alignment",
+        {"List": list, "Tuple": tuple},
+    )
+    worker = SimpleNamespace(
+        parallel_manager=SimpleNamespace(
+            streamed_sp8_requires_global_pass_alignment=lambda: False
+        ),
+        _prefill_model_pass_count=lambda batch: pytest.fail(
+            "non-hierarchical path calculated a pass count"
+        ),
+    )
+
+    assert method(worker, [1]) == (0, 0)
+
+
+def test_worker_runs_missing_weight_passes_outside_the_local_row_guard():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    generate = _function(path, "BatchGenWorker", "generate")
+    guards = _call_guards(generate)
+
+    driver_guards = guards["run_streamed_sp8_transport_only_prefill"]
+    assert len(driver_guards) == 1
+    assert any(
+        "transport_only_passes" in test for test in driver_guards[0]
+    )
+    assert not any(
+        "local_prefill_indices" in test for test in driver_guards[0]
+    )
+
+    call_lines = {
+        node.func.attr: node.lineno
+        for node in ast.walk(generate)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {
+            "_config_prefill_for_batch",
+            "_streamed_sp8_prefill_pass_alignment",
+            "run_streamed_sp8_transport_only_prefill",
+            "_unregister_fp8_weights",
+        }
+    }
+    assert (
+        call_lines["_config_prefill_for_batch"]
+        < call_lines["_streamed_sp8_prefill_pass_alignment"]
+        < call_lines["run_streamed_sp8_transport_only_prefill"]
+        < call_lines["_unregister_fp8_weights"]
+    )
+
+
+def test_worker_counts_the_same_prefill_plan_that_execution_uses():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    count = _function(path, "BatchGenWorker", "_prefill_model_pass_count")
+    execute = _function(path, "BatchGenWorker", "prefill_prepacked")
+
+    def calls_plan(function):
+        return sum(
+            1
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_plan_prefill_micro_batches"
+        )
+
+    assert calls_plan(count) == 1
+    assert calls_plan(execute) == 1
 
 
 def test_streamed_sp8_installer_selects_transport_specific_reentry():

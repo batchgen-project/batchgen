@@ -5203,6 +5203,76 @@ class BatchGenWorker:
 			)
 		return limits
 
+	def _plan_prefill_micro_batches(
+		self, seq_lengths: List[int]
+	) -> Tuple[List[Tuple[int, int]], int, bool]:
+		"""Build the one authoritative prepacked-forward plan for local rows."""
+		token_cap = (
+			self.engine_config.Module_Batching_Config
+			.prefill_micro_batch_token_cap
+		)
+		use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		single_sequence_only = (
+			token_cap > 0
+			and max(seq_lengths) > token_cap
+			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
+		micro_batches, l2_cap = build_prefill_micro_batches(
+			seq_lengths,
+			token_cap,
+			l2_balance=use_l2,
+			single_sequence_only=single_sequence_only,
+		)
+		return micro_batches, l2_cap, single_sequence_only
+
+	def _prefill_model_pass_count(self, batch: List[int]) -> int:
+		"""Return the number of complete model forwards local prefill will run."""
+		if not batch:
+			return 0
+		if not self.enable_prepack:
+			micro_batch_size = (
+				self.engine_config.Module_Batching_Config
+				.MoE_prefill_micro_batch_size
+			)
+			return math.ceil(len(batch) / micro_batch_size)
+
+		seq_lengths = [
+			self.global_batch.get_sequence(
+				self._local_to_uuid_map[local_idx]
+			).prompt_length
+			for local_idx in batch
+		]
+		micro_batches, _, _ = self._plan_prefill_micro_batches(seq_lengths)
+		return len(micro_batches)
+
+	def _streamed_sp8_prefill_pass_alignment(
+		self, local_prefill_indices: List[int]
+	) -> Tuple[int, int]:
+		"""Return local/global pass counts for hierarchical streamed-SP8."""
+		method = getattr(
+			self.parallel_manager,
+			"streamed_sp8_requires_global_pass_alignment",
+			None,
+		)
+		if method is None or not method():
+			return 0, 0
+
+		local_passes = self._prefill_model_pass_count(local_prefill_indices)
+		global_passes = torch.tensor(
+			[local_passes],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		dist.all_reduce(global_passes, op=dist.ReduceOp.MAX)
+		global_passes = int(global_passes.item())
+		if global_passes < local_passes:
+			raise RuntimeError(
+				f"Rank {self.rank}: global streamed-SP8 prefill pass count "
+				f"{global_passes} is below local count {local_passes}"
+			)
+		return local_passes, global_passes
+
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
 		num_nodes: int, chunk_size: int, *,
@@ -6398,6 +6468,11 @@ class BatchGenWorker:
 
 					# Get local indices AFTER config (new sequences now in map)
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
+					local_prefill_passes, global_prefill_passes = (
+						self._streamed_sp8_prefill_pass_alignment(
+							local_prefill_indices
+						)
+					)
 
 					# B. Execute Prefill
 					if local_prefill_indices:
@@ -6475,6 +6550,23 @@ class BatchGenWorker:
 							logging.info(
 								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
 							)
+
+					transport_only_passes = (
+						global_prefill_passes - local_prefill_passes
+					)
+					if transport_only_passes:
+						logging.info(
+							f"Rank {self.rank}: joining {transport_only_passes} "
+							"streamed-SP8 prefill weight schedules with no local rows"
+						)
+						transport_start = time.perf_counter()
+						for _ in range(transport_only_passes):
+							self.feed_watchdog()
+							with torch.inference_mode():
+								self.parallel_manager.run_streamed_sp8_transport_only_prefill(
+									1
+								)
+						prefill_time += time.perf_counter() - transport_start
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -8038,8 +8130,6 @@ class BatchGenWorker:
 		# Create micro-batches bounded by token count, optionally also by sum(L^2)
 		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
 		# on one micro-batch when a single very long sequence is present.
-		import os as _os_mb
-		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 		# The planner's token cap is a bound between sequence boundaries.  A
 		# single K3 prompt may itself be much larger than that cap, so the
 		# ordinary greedy planner cannot split it and would still co-reside two
@@ -8049,17 +8139,8 @@ class BatchGenWorker:
 		# persistent per sequence, so keeping each long sequence in its own
 		# prepack pass preserves the state contract; it is not a token-axis
 		# split pretending to be a resumable model forward.
-		_use_single_sequence_mb = (
-			MAX_TOKENS_PER_MICRO_BATCH > 0
-			and max(seq_lengths_list) > MAX_TOKENS_PER_MICRO_BATCH
-			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
-			and self.parallel_manager.prefill_uses_streamed_sp8()
-		)
-		micro_batches, l2_cap = build_prefill_micro_batches(
-			seq_lengths_list,
-			MAX_TOKENS_PER_MICRO_BATCH,
-			l2_balance=_USE_L2_MB,
-			single_sequence_only=_use_single_sequence_mb,
+		micro_batches, l2_cap, _use_single_sequence_mb = (
+			self._plan_prefill_micro_batches(seq_lengths_list)
 		)
 		total_tokens_all = sum(seq_lengths_list)
 		if (

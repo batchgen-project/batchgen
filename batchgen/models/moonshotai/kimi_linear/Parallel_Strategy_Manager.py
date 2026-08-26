@@ -337,6 +337,30 @@ class KimiLinearParallelStrategyManager:
         """
         return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
 
+    def streamed_sp8_requires_global_pass_alignment(self):
+        """Whether every node must join each streamed prefill model pass."""
+        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
+
+    def run_streamed_sp8_transport_only_prefill(self, num_passes):
+        """Join hierarchical weight broadcasts for passes with no local rows."""
+        num_passes = int(num_passes)
+        if num_passes < 0:
+            raise ValueError("streamed-SP8 transport-only pass count must be >= 0")
+        if num_passes == 0:
+            return
+        if not self.streamed_sp8_requires_global_pass_alignment():
+            raise RuntimeError(
+                "streamed-SP8 transport-only prefill is only valid for "
+                "hierarchical GDR"
+            )
+        if self._streamed_sp8_buffer is None:
+            raise RuntimeError(
+                "streamed-SP8 transport-only prefill requires an initialized "
+                "layer buffer"
+            )
+        for _ in range(num_passes):
+            self._streamed_sp8_buffer.participate_empty_prefill_pass()
+
     def prefill_sequence_limits(self):
         """Return the persistent KDA-state capacity available to prefill.
 

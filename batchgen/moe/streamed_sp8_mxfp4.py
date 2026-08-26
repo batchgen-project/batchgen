@@ -697,7 +697,8 @@ class StreamedSP8LayerBuffer:
             packed_u8.shape[0], k_in // 16, n_out * 2
         )
 
-    def load(self, layer_idx: int):
+    def _load_layer_bytes(self, layer_idx: int):
+        """Make one layer's shard bytes ready in ``self.compute``."""
         if self._pending is not None:
             if self._pending.layer_idx != int(layer_idx):
                 raise RuntimeError(
@@ -708,7 +709,43 @@ class StreamedSP8LayerBuffer:
         else:
             self._acquire_local_shard(layer_idx)
             self._assemble_compute_shard()
+
+    def load(self, layer_idx: int):
+        self._load_layer_bytes(layer_idx)
         return self._make_shard()
+
+    def participate_empty_prefill_pass(self):
+        """Join one hierarchical weight schedule without running model math.
+
+        A physical TP8 node can own no rows for an otherwise valid admission.
+        Its ranks still belong to the cross-node weight-broadcast groups, so
+        they must join every layer's ingress in the same order as populated
+        nodes.  This transport-only drive deliberately skips attention, routed
+        and shared expert compute, scale expansion, and logits.
+        """
+        if self.cross_group is None:
+            raise RuntimeError(
+                "transport-only streamed-SP8 participation requires "
+                "hierarchical GDR"
+            )
+        if self._pending is not None:
+            raise RuntimeError(
+                "transport-only streamed-SP8 pass started with a pending layer"
+            )
+
+        for layer_idx in self.layer_indices:
+            self._load_layer_bytes(layer_idx)
+            self.begin_prefetch_next(layer_idx)
+            # No kernel reads ``self.compute`` on this node. Release assembly
+            # first, then the cross launch, matching the populated MoE branch's
+            # handshake order without issuing any node-local collectives.
+            self.allow_full_overwrite()
+            self.allow_cross_launch()
+
+        if self._pending is not None:
+            raise RuntimeError(
+                "transport-only streamed-SP8 pass left a pending layer"
+            )
 
 
 class StreamedSP8MXFP4MoELayer:
