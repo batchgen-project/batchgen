@@ -527,10 +527,12 @@ class KimiLinearDecodeGraph:
     (`batchgen_worker.py`); the model-side contract is otherwise the same.
 
     Lifecycle: constructed + installed by the PSM at `configure_decoding` when
-    the planner asks for it. Graphs are captured lazily, on the first decode
-    step that uses a bucket. Every step that cannot be replayed (prefill phase,
-    empty rank, bsz above the top bucket, invalid/moved page table, eager mode)
-    falls through to the unmodified eager layer forward.
+    the planner asks for it. The dedicated KDA scratch slot is reserved during
+    installation, before server readiness and sequence admission. Graphs are
+    captured lazily, on the first decode step that uses a bucket. Every step
+    that cannot be replayed (prefill phase, empty rank, bsz above the top
+    bucket, invalid/moved page table, eager mode) falls through to the
+    unmodified eager layer forward.
     """
 
     def __init__(
@@ -605,6 +607,18 @@ class KimiLinearDecodeGraph:
         """Patch the decode forwards (idempotent)."""
         if self._installed:
             return
+        slot_manager = KimiLinearKDAWrapper.slot_manager
+        if slot_manager is None:
+            raise RuntimeError(
+                "Kimi decode graph installation requires initialized KDA "
+                "state pools"
+            )
+        # This adapter is installed by configure_decoding during K3's
+        # pre-readiness startup pass. Reserve padding/warmup state now so
+        # prefill admission observes the reduced free-slot count; allocating
+        # it lazily on first decode can otherwise exhaust a completely full
+        # KDA pool.
+        self._scratch_slot = slot_manager.alloc(GRAPH_SCRATCH_SEQ_ID)
         inner = self.model.model
         self._orig_model_forward = inner.forward
         inner.forward = self._make_model_forward(self._orig_model_forward)
@@ -877,11 +891,11 @@ class KimiLinearDecodeGraph:
         table = kv_manager.get_cuda_graph_page_table_storage()
         self._max_pages = int(table.shape[1])
         self._page_size_tokens = int(kv_manager.config.page_size_tokens)
-        # One reserved slot for padding + warmup rows (plan M5.3): never -1,
-        # which the fla kernel would turn into an OOB write before the pool.
-        self._scratch_slot = KimiLinearKDAWrapper.slot_manager.alloc(
-            GRAPH_SCRATCH_SEQ_ID
-        )
+        if self._scratch_slot is None:
+            raise RuntimeError(
+                "Kimi decode graph KDA scratch slot was not reserved during "
+                "installation"
+            )
         layers = self.model.model.layers
         dtype = layers[0].input_layernorm.weight.dtype
         for layer_idx, layer in enumerate(layers):

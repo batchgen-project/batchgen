@@ -148,6 +148,80 @@ def test_kimi_k3_startup_failure_is_not_caught_and_so_blocks_readiness():
     assert not any(isinstance(node, ast.Try) for node in ast.walk(guard))
 
 
+def test_decode_graph_reserves_kda_scratch_before_sequence_admission():
+    """The graph scratch consumes one pool item during startup, not decode."""
+
+    class SlotManager:
+        def __init__(self, capacity):
+            self.free = list(range(capacity))
+            self.owners = {}
+
+        def alloc(self, seq_id):
+            if seq_id in self.owners:
+                return self.owners[seq_id]
+            if not self.free:
+                raise RuntimeError("Insufficient free KDA state items")
+            slot = self.free.pop()
+            self.owners[seq_id] = slot
+            return slot
+
+    slots = SlotManager(capacity=4)
+    wrapper = SimpleNamespace(slot_manager=slots)
+    original_model_forward = object()
+    original_layer_forward = object()
+    inner = SimpleNamespace(
+        forward=original_model_forward,
+        layers=[SimpleNamespace(forward=original_layer_forward)],
+    )
+    graph = SimpleNamespace(
+        _installed=False,
+        _scratch_slot=None,
+        _uses_block_residual=False,
+        model=SimpleNamespace(model=inner),
+        _orig_model_forward=None,
+        _orig_new_block_residual=None,
+        _orig_layer_forwards={},
+        _make_model_forward=lambda orig: ("model", orig),
+        _make_layer_forward=lambda layer_idx, orig: ("layer", layer_idx, orig),
+        rank=1,
+        mode="eager",
+        bucketing=SimpleNamespace(bucket_sizes=[1, 2, 4]),
+        compare_every=64,
+    )
+    install = _isolated_method(
+        KIMI_LINEAR_GRAPH,
+        "KimiLinearDecodeGraph",
+        "install",
+        {
+            "KimiLinearKDAWrapper": wrapper,
+            "GRAPH_SCRATCH_SEQ_ID": -1_000_001,
+            "logger": SimpleNamespace(info=lambda *args, **kwargs: None),
+        },
+    ).__get__(graph)
+
+    install()
+
+    assert graph._scratch_slot == slots.owners[-1_000_001]
+    assert len(slots.free) == 3
+    for sequence_id in range(3):
+        slots.alloc(sequence_id)
+    with pytest.raises(RuntimeError, match="Insufficient free KDA state items"):
+        slots.alloc(3)
+
+    # Idempotent re-installation must not consume another state item.
+    install()
+    assert len(slots.owners) == 4
+
+    ensure_built = _function(
+        KIMI_LINEAR_GRAPH,
+        "_ensure_built",
+        class_name="KimiLinearDecodeGraph",
+    )
+    assert "alloc" not in _calls(ensure_built), (
+        "KDA scratch allocation must not return to first-decode lazy init"
+    )
+
+
 # --------------------------------------------------------------------------- #
 #  (4) gating: the exact served model id, never a family match
 # --------------------------------------------------------------------------- #

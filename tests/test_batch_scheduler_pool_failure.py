@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 from batchgen.server.batch_scheduler import BatchScheduler
-from batchgen.server.io_struct import BatchStatus
+from batchgen.server.io_struct import (
+    BatchEndpoint,
+    BatchObject,
+    BatchStatus,
+    CompletionWindow,
+)
+from batchgen.server.storage import StorageManager
 
 
-def test_pool_worker_failure_writes_terminal_batch_status():
+def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     tracker = SimpleNamespace(is_complete=False, error={"message": "worker failed"})
-    storage = SimpleNamespace(update_batch_status=Mock())
+    storage = StorageManager(tmp_path)
+    storage.save_batch(BatchObject(
+        id="batch-test",
+        endpoint=BatchEndpoint.CHAT_COMPLETIONS,
+        input_file_id="file-test",
+        completion_window=CompletionWindow.ONE_DAY,
+        status=BatchStatus.IN_PROGRESS,
+        created_at=1,
+        expires_at=2,
+    ))
     scheduler = object.__new__(BatchScheduler)
     scheduler._scheduling_pool = SimpleNamespace(
         get_batch_tracker=lambda batch_id: tracker,
@@ -28,11 +42,7 @@ def test_pool_worker_failure_writes_terminal_batch_status():
         )
     )
 
-    storage.update_batch_status.assert_called_once_with(
-        "batch-test",
-        BatchStatus.FAILED,
-        error={
-            "code": "batch_failed",
-            "message": str(tracker.error),
-        },
-    )
+    persisted = storage.load_batch("batch-test")
+    assert persisted is not None
+    assert persisted.status == BatchStatus.FAILED
+    assert persisted.error == str(tracker.error)

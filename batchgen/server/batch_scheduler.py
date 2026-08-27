@@ -1003,9 +1003,11 @@ class BatchScheduler:
 
         if batch_failed:
             error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
-            self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
-                "code": "batch_failed", "message": str(error_msg)
-            })
+            self.storage.update_batch_status(
+                batch_id,
+                BatchStatus.FAILED,
+                error=str(error_msg),
+            )
             return
 
         self._finalize_batch_output(batch_id, requests, prompts)
