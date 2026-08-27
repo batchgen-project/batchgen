@@ -1,6 +1,21 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
 import pytest
 
-from batchgen.config.config import EngineConfig
+_config_path = Path(__file__).resolve().parents[1] / "batchgen" / "config" / "config.py"
+_config_pkg = types.ModuleType("batchgen.config")
+_config_pkg.__path__ = [str(_config_path.parent)]
+sys.modules.setdefault("batchgen.config", _config_pkg)
+_config_spec = importlib.util.spec_from_file_location("batchgen.config.config", _config_path)
+_config_module = importlib.util.module_from_spec(_config_spec)
+sys.modules.setdefault("batchgen.config.config", _config_module)
+assert _config_spec.loader is not None
+_config_spec.loader.exec_module(_config_module)
+EngineConfig = _config_module.EngineConfig
+
 from batchgen.models.moonshotai.kimi_linear.planner import (
     KimiLinearPlanner,
     k3_kda_state_slots,
