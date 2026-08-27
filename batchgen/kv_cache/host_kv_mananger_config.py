@@ -13,6 +13,7 @@ HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
 
 __all__ = [
 	"build_host_kv_config",
+	"build_host_kv_worker_view",
 	"build_gpu_kv_config",
 	"HOST_KV_SHM_NAME",
 ]
@@ -56,6 +57,7 @@ class _HostKVModelProfile:
 	kv_dtype: str = "bfloat16"
 	sequence_table_capacity: int | None = None
 	alignment_bytes: int = 64
+	logical_to_physical_layer: tuple[int, ...] | None = None
 
 	def bytes_per_page(self) -> int:
 		element_bytes = _dtype_size_bytes(self.kv_dtype)
@@ -145,20 +147,27 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# Kimi-K3: MLA latent KV, SAME geometry as kimi-linear (compressed_kv_dim=576)
-# but 93 ENGINE layers, not 27. K3 has 24 MLA layers sitting at engine indices
-# 3,7,...,87,91,92 — and `wrappers.py::_offload_prepacked_kv` indexes the pool
-# by ENGINE layer index, not by a dense MLA counter. Sized at 27 (the
-# kimi-linear value it used to alias onto), every MLA layer at index >= 27
-# writes past the end of the pool: silent memory corruption from the very
-# first prefill, at layer 28.
+# Kimi-K3 has 93 logical engine layers but only these 24 MLA layers own paged
+# KV.  The logical map preserves engine-layer indexing at every caller while
+# both host and GPU pools store the MLA layers densely.  Host->GPU bulk loads
+# therefore also see the same 24 physical rows on both sides.
+_KIMI_K3_MLA_LOGICAL_LAYERS = tuple(range(3, 92, 4)) + (92,)
+_KIMI_K3_MLA_PHYSICAL_BY_LOGICAL = {
+	logical_layer: physical_layer
+	for physical_layer, logical_layer in enumerate(_KIMI_K3_MLA_LOGICAL_LAYERS)
+}
+_KIMI_K3_MLA_LAYER_MAP = tuple(
+	_KIMI_K3_MLA_PHYSICAL_BY_LOGICAL.get(layer_idx, -1)
+	for layer_idx in range(93)
+)
 _KIMI_K3_MLA_PROFILE = _HostKVModelProfile(
-	num_layers=93,
+	num_layers=len(_KIMI_K3_MLA_LOGICAL_LAYERS),
 	num_k_heads=1,
 	k_head_dim=576,
 	num_v_heads=0,
 	v_head_dim=0,
 	kv_dtype="bfloat16",
+	logical_to_physical_layer=_KIMI_K3_MLA_LAYER_MAP,
 )
 
 # Kimi-Linear: MLA latent KV (compressed_kv_dim=576, 27 engine layers; only
@@ -232,8 +241,8 @@ for canonical, aliases in {
 		"kimi-linear",
 		"kimi_linear",
 	),
-	# K3 is NOT an alias of kimi-linear here: same KV geometry, 93 engine
-	# layers instead of 27. See _KIMI_K3_MLA_PROFILE.
+	# K3 is NOT an alias of kimi-linear here: same KV geometry, but a distinct
+	# 93-logical-layer -> 24-physical-MLA map. See _KIMI_K3_MLA_PROFILE.
 	"kimi_k3_mla": (
 		"moonshotai/kimi-k3",
 		"kimi-k3",
@@ -343,7 +352,29 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.logical_to_physical_layer = list(
+		profile.logical_to_physical_layer or ()
+	)
 	return config
+
+
+def build_host_kv_worker_view(core_engine_module: Any, config: Any) -> Any:
+	"""Construct the host worker view matching the physical layout and map."""
+
+	mapped_layers = bool(config.logical_to_physical_layer)
+	if config.num_v_heads == 0:
+		view_cls = (
+			core_engine_module.MappedMLAHostPagedKVWorkerView
+			if mapped_layers
+			else core_engine_module.MLAHostPagedKVWorkerView
+		)
+	else:
+		view_cls = (
+			core_engine_module.MappedDefaultHostPagedKVWorkerView
+			if mapped_layers
+			else core_engine_module.DefaultHostPagedKVWorkerView
+		)
+	return view_cls(config)
 
 
 def _normalize_sequence_tokens(sequence_tokens: Sequence[int]) -> list[int]:
@@ -396,6 +427,7 @@ def build_gpu_kv_config(
 		num_v_heads=profile.num_v_heads,
 		v_head_dim=profile.v_head_dim,
 		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
+		logical_to_physical_layer=profile.logical_to_physical_layer,
 	)
 
 
@@ -425,6 +457,7 @@ def build_gpu_kv_config_aux(
 		num_v_heads=profile.num_v_heads,
 		v_head_dim=profile.v_head_dim,
 		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
+		logical_to_physical_layer=profile.logical_to_physical_layer,
 	)
 
 
@@ -496,4 +529,5 @@ def build_gpu_kv_config_fixed_size(
 		num_v_heads=profile.num_v_heads,
 		v_head_dim=profile.v_head_dim,
 		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
+		logical_to_physical_layer=profile.logical_to_physical_layer,
 	)

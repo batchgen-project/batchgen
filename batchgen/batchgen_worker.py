@@ -144,6 +144,7 @@ import dataclasses as _dataclasses
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_host_kv_config,
+	build_host_kv_worker_view,
 	is_dsa_model,
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
@@ -830,12 +831,11 @@ class BatchGenWorker:
 				worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
 				worker_kv_config.memfd_fd = args.kv_memfd_fd
 
-			# Select worker view based on model's KV cache configuration
-			# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
-			if worker_kv_config.num_v_heads == 0:
-				self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-			else:
-				self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
+			# K3 keeps 93 logical engine-layer ids over 24 dense physical MLA
+			# rows, so the worker view must honor the profile's layer map.
+			self.host_paged_kv_worker_view = build_host_kv_worker_view(
+				core_engine, worker_kv_config
+			)
 
 			# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
 			_t0 = _time.monotonic()
