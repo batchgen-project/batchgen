@@ -918,58 +918,8 @@ def test_glm5_dsa_cuda_graph_replay_gate_allows_short_rows_with_fixed_selected_k
     )
 
 
-def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
-    env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
-
-    assert glm5_dsa_cuda_graph_requested_for_model("zai-org/GLM-5-FP8", environ=env)
-    assert should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
-    )
-    assert not should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=True,
-        global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
-    )
-    assert not should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=True,
-        model_name="gpt-oss-120b",
-        environ=env,
-    )
-    assert should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=False,
-        model_name="gpt-oss-120b",
-        environ={},
-    )
 
 
-def test_glm5_whole_model_graph_policy_is_env_or_cli_default_and_glm_only():
-    env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
-
-    assert glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8", environ=env
-    )
-    assert glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ={},
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
-        "gpt-oss-120b", environ=env
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8", environ={}
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5",
-        enable_cuda_graph=True,
-        environ={},
-    )
 
 
 def test_glm5_whole_model_compare_policy_requests_warmup():
@@ -998,25 +948,6 @@ def test_glm5_effective_decode_attn_mode_uses_continuous_path():
     assert glm5_effective_decode_attn_mode("deepseek_v3", 1) == 1
 
 
-def test_glm5_graph_policy_tracks_segmented_and_any_requests():
-    dsa_env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
-    moe_env = {"BATCHGEN_GLM5_MOE_CUDA_GRAPH": "1"}
-    whole_env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
-    compare_env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
-    model_name = "zai-org/GLM-5-FP8"
-
-    assert glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_moe_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert not glm5_segmented_cuda_graph_requested_for_model(
-        model_name, environ=whole_env
-    )
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
-    assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 
 def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
@@ -1069,29 +1000,6 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
 
 
-def test_glm5_segmented_env_overrides_cli_whole_model_default():
-    env = {"BATCHGEN_SEGMENTED_GRAPH": "1"}
-
-    assert glm5_segmented_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert glm5_dsa_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert glm5_moe_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
 
 
 def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
@@ -1121,60 +1029,8 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
     assert "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH" not in os.environ
 
 
-def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
-    import batchgen.server.server_args as server_args_module
-
-    monkeypatch.setenv("BATCHGEN_SEGMENTED_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
-
-    args = server_args_module.prepare_server_args([
-        "--model",
-        "zai-org/GLM-5-FP8",
-        "--listen-port",
-        "12000",
-        "--disable-cuda-graphs",
-        "--storage-path",
-        str(tmp_path / "storage"),
-    ])
-
-    assert not args.enable_cuda_graph
-    assert args.disable_cuda_graphs
-    assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"] == "0"
 
 
-def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    monkeypatch.delenv("BATCHGEN_SEGMENTED_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
-    worker._batchgen_debug = {}
-
-    assert worker._glm5_whole_model_graph_requested_for_current_batch()
-    assert worker._glm5_whole_model_graph_required_for_current_batch()
-    assert not worker._glm5_dsa_graph_requested_for_current_batch()
-    assert not worker._glm5_dsa_graph_output_required_for_current_batch()
-    assert not worker._glm5_moe_graph_requested_for_current_batch()
-    assert not worker._glm5_moe_graph_output_required_for_current_batch()
 
 
 def test_glm5_whole_graph_decode_cap_matches_largest_bucket(monkeypatch):
@@ -1310,37 +1166,6 @@ def test_decode_cap_rejects_conflicting_overrides(monkeypatch):
         worker._decode_rank_batch_cap()
 
 
-def test_worker_glm5_debug_modes_override_segmented_graph(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
-    worker._batchgen_debug = {
-        "glm5_dsa_mode": "eager",
-        "glm5_moe_mode": "eager",
-    }
-
-    assert not worker._glm5_dsa_full_graph_requested_for_current_batch()
-    assert not worker._glm5_dsa_graph_requested_for_current_batch()
-    assert not worker._glm5_dsa_graph_output_required_for_current_batch()
-    assert not worker._glm5_moe_graph_requested_for_current_batch()
-    assert not worker._glm5_moe_graph_output_required_for_current_batch()
-
-    worker.args = types.SimpleNamespace(enable_cuda_graph=False)
-    worker._batchgen_debug = {
-        "glm5_dsa_mode": "graph",
-        "glm5_moe_mode": "graph",
-    }
-
-    assert worker._glm5_dsa_graph_requested_for_current_batch()
-    assert worker._glm5_dsa_graph_output_required_for_current_batch()
-    assert worker._glm5_moe_graph_requested_for_current_batch()
-    assert worker._glm5_moe_graph_output_required_for_current_batch()
 
 
 def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
@@ -1569,21 +1394,6 @@ def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
     assert glm5_model._glm5_moe_cuda_graph_required()
 
 
-def test_worker_full_dsa_graph_flag_requests_dsa_path(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
-    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(enable_cuda_graph=False)
-    worker._batchgen_debug = {}
-
-    assert worker._glm5_dsa_full_graph_requested_for_current_batch()
-    assert worker._glm5_dsa_graph_requested_for_current_batch()
 
 
 def test_glm5_dsa_graph_enable_records_cli_required_state():
@@ -1599,85 +1409,6 @@ def test_glm5_dsa_graph_enable_records_cli_required_state():
     assert wrapper._dsa_cuda_graph_required is True
 
 
-def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection(monkeypatch):
-    class FakeBucketing:
-        def get_padded_size(self, batch_size):
-            assert batch_size == 2
-            return 4
-
-    class FakeManager:
-        bucketing = FakeBucketing()
-
-        def __init__(self):
-            self.inputs = None
-
-        def replay(self, segment_name, batch_size, **inputs):
-            self.inputs = (segment_name, batch_size, inputs)
-            return {
-                "attn_output": torch.full((batch_size, 1, 8), 3.0, dtype=torch.bfloat16),
-                "primary_k_tensor": torch.ones(batch_size, 1, 1, 4, dtype=torch.bfloat16),
-                "indexer_k_tensor": torch.ones(batch_size, 1, 1, 4, dtype=torch.bfloat16) * 2,
-            }
-
-    manager = FakeManager()
-    wrapper = object.__new__(GLM5AttnWrapper)
-    wrapper.layer_idx = 0
-    wrapper.module = types.SimpleNamespace(indexer=types.SimpleNamespace(index_topk=2048))
-    wrapper._dsa_cuda_graph_max_seqlen = 4096
-    wrapper._dsa_cuda_graph_manager = manager
-    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_0_full_dsa_attn"
-    wrapper._dsa_cuda_graph_full = True
-    monkeypatch.setattr(
-        wrapper,
-        "_dsa_cuda_graph_page_tables_match",
-        lambda primary_manager, aux_manager: True,
-    )
-    monkeypatch.setattr(
-        wrapper,
-        "_project_dsa_attn_heads",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not project")),
-    )
-    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
-        "bucket_size": 4,
-        "tile_scheduler_metadata": torch.ones(3, dtype=torch.int32),
-        "num_splits": torch.ones(1, dtype=torch.int32),
-    }
-    GLM5AttnWrapper.glm5_decode_primary_slot_indices = torch.tensor([3, 4], dtype=torch.int32)
-    GLM5AttnWrapper.glm5_decode_aux_slot_indices = torch.tensor([7, 8], dtype=torch.int32)
-    primary_appends = []
-    aux_appends = []
-    AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
-        (layer, tensor.clone())
-    )
-    AttnWrapperBase.kv_append_callback_aux = lambda layer, tensor, _: aux_appends.append(
-        (layer, tensor.clone())
-    )
-
-    try:
-        out = wrapper._forward_decode_dsa_graph(
-            torch.zeros(2, 1, 8, dtype=torch.bfloat16),
-            torch.tensor([[2048], [2049]], dtype=torch.int64),
-            torch.tensor([2049, 2050], dtype=torch.int32),
-            4096,
-            object(),
-            object(),
-        )
-    finally:
-        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
-        GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
-        GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
-        AttnWrapperBase.kv_append_callback = None
-        AttnWrapperBase.kv_append_callback_aux = None
-
-    assert out.shape == (2, 1, 8)
-    assert torch.equal(out, torch.full_like(out, 3.0))
-    segment_name, batch_size, inputs = manager.inputs
-    assert segment_name == "glm5_layer_0_full_dsa_attn"
-    assert batch_size == 2
-    assert inputs["primary_slot_indices"].tolist() == [3, 4]
-    assert inputs["aux_slot_indices"].tolist() == [7, 8]
-    assert primary_appends[0][0] == 0
-    assert aux_appends[0][0] == 0
 
 
 def test_glm5_moe_graph_enable_records_cli_required_state():
@@ -1780,37 +1511,37 @@ def test_glm5_moe_graph_output_is_full_module_boundary(monkeypatch):
     assert manager.replay_inputs["rank_token_counts"].tolist() == [4, 4]
 
 
-def test_glm5_power2_graph_buckets_cover_local_batches_to_32():
+def test_glm5_graph_buckets_cover_production_local_batches():
     buckets = GLM5_POWER_OF_TWO_BUCKETS_32
 
-    assert buckets == [1, 2, 4, 8, 16, 32]
+    assert buckets == [64, 192, 256]
     assert [
         glm5_cuda_graph_bucket_for_batch_size(batch_size, buckets)
-        for batch_size in [0, 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33]
-    ] == [None, 1, 2, 4, 4, 8, 8, 16, 16, 32, 32, None]
+        for batch_size in [0, 1, 64, 65, 192, 193, 256, 257]
+    ] == [None, 64, 64, 192, 192, 256, 256, None]
 
 
-def test_glm5_moe_power2_bucket_32_represents_global_512_rows():
+def test_glm5_moe_bucket_capacity_uses_h200_world_size():
     buckets = GLM5_POWER_OF_TWO_BUCKETS_32
 
     assert glm5_moe_graph_bucket_capacity(
-        max_rank_batch_size=16,
-        world_size=16,
+        max_rank_batch_size=42,
+        world_size=8,
         bucket_sizes=buckets,
-    ) == (16, 256)
+    ) == (64, 512)
     assert glm5_moe_graph_bucket_capacity(
-        max_rank_batch_size=17,
-        world_size=16,
+        max_rank_batch_size=65,
+        world_size=8,
         bucket_sizes=buckets,
-    ) == (32, 512)
+    ) == (192, 1536)
     assert glm5_moe_graph_bucket_capacity(
-        max_rank_batch_size=32,
-        world_size=16,
+        max_rank_batch_size=193,
+        world_size=8,
         bucket_sizes=buckets,
-    ) == (32, 512)
+    ) == (256, 2048)
     assert glm5_moe_graph_bucket_capacity(
-        max_rank_batch_size=33,
-        world_size=16,
+        max_rank_batch_size=257,
+        world_size=8,
         bucket_sizes=buckets,
     ) is None
 
@@ -1853,55 +1584,6 @@ def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
     assert torch.equal(out, hidden + 1)
 
 
-def test_glm5_dsa_graph_path_allows_short_rows_with_fixed_selected_kv(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeBucketing:
-        def get_padded_size(self, batch_size):
-            assert batch_size == 2
-            return 40
-
-    class FakeManager:
-        bucketing = FakeBucketing()
-
-        def has_graph(self, segment_name, batch_size):
-            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
-
-    class FakeWrapper:
-        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
-        _dsa_cuda_graph_max_seqlen = 8192
-        module = types.SimpleNamespace(
-            indexer=types.SimpleNamespace(index_topk=2048),
-        )
-
-        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
-            return True
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = FakeManager()
-    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=object())
-    worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(
-            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
-        ),
-    )
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        AttnWrapperBase,
-        "cache_seqlens",
-        torch.tensor([970, 982], dtype=torch.int32),
-        raising=False,
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
-
-    assert worker._glm5_dsa_graph_path_state(2, object()) == (
-        "graph",
-        40,
-        "captured",
-    )
 
 
 def test_glm5_dsa_page_table_signature_prefers_stable_graph_storage():
@@ -1917,186 +1599,8 @@ def test_glm5_dsa_page_table_signature_prefers_stable_graph_storage():
     assert _glm5_dsa_gpu_page_table_tensor(FakeManager()) is storage
 
 
-def test_glm5_dsa_graph_path_refreshes_page_table_state_before_storage_check(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeBucketing:
-        def get_padded_size(self, batch_size):
-            assert batch_size == 2
-            return 40
-
-    class FakeGraphManager:
-        bucketing = FakeBucketing()
-
-        def has_graph(self, segment_name, batch_size):
-            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
-
-    class FakePageManager:
-        def __init__(self, storage):
-            self.storage = storage
-            self.ensure_calls = []
-
-        def ensure_cuda_graph_page_table(self, sequence_ids):
-            self.ensure_calls.append(list(sequence_ids))
-            return self.storage
-
-        def get_cuda_graph_page_table_storage(self):
-            return self.storage
-
-        def get_cuda_graph_page_table(self):
-            raise RuntimeError("active graph table is invalid")
-
-    primary = FakePageManager(torch.empty(4, 8, dtype=torch.int32))
-    aux = FakePageManager(torch.empty(4, 8, dtype=torch.int32))
-    primary_expected = _glm5_dsa_page_table_signature(primary.storage)
-    aux_expected = _glm5_dsa_page_table_signature(aux.storage)
-
-    class FakeWrapper:
-        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
-        _dsa_cuda_graph_max_seqlen = 8192
-        module = types.SimpleNamespace(
-            indexer=types.SimpleNamespace(index_topk=2048),
-        )
-
-        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
-            return (
-                _glm5_dsa_page_table_signature(
-                    _glm5_dsa_gpu_page_table_tensor(primary_manager)
-                ) == primary_expected
-                and _glm5_dsa_page_table_signature(
-                    _glm5_dsa_gpu_page_table_tensor(aux_manager)
-                ) == aux_expected
-            )
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = FakeGraphManager()
-    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=aux)
-    worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(
-            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
-        ),
-    )
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        AttnWrapperBase,
-        "cache_seqlens",
-        torch.tensor([970, 982], dtype=torch.int32),
-        raising=False,
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
-
-    assert worker._glm5_dsa_graph_path_state(
-        2,
-        types.SimpleNamespace(primary=primary, auxiliary=aux),
-    ) == (
-        "graph",
-        40,
-        "captured",
-    )
-    assert primary.ensure_calls == [[11, 22]]
-    assert aux.ensure_calls == [[11, 22]]
 
 
-def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-    from batchgen.attention.dsa import sparse_decode_mla
-
-    class FakeBucketing:
-        def get_padded_size(self, batch_size):
-            assert batch_size == 2
-            return 4
-
-    class FakeGraphManager:
-        bucketing = FakeBucketing()
-
-        def has_graph(self, segment_name, batch_size):
-            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
-
-    class FakeKVManager:
-        def __init__(self, slot_indices):
-            self._state = types.SimpleNamespace(
-                slot_indices=torch.tensor(slot_indices, dtype=torch.int32)
-            )
-
-        def get_cuda_graph_page_table_state(self):
-            return self._state
-
-    class FakeWrapper:
-        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
-        _dsa_cuda_graph_max_seqlen = 8192
-        module = types.SimpleNamespace(
-            indexer=types.SimpleNamespace(index_topk=2048),
-            num_heads=64,
-        )
-
-        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
-            return True
-
-    captured_lengths = {}
-
-    def fake_prepare(selected_lengths, num_heads):
-        captured_lengths["values"] = selected_lengths.clone()
-        captured_lengths["num_heads"] = num_heads
-        return (
-            torch.ones(3, dtype=torch.int32),
-            torch.ones(1, dtype=torch.int32),
-        )
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = FakeGraphManager()
-    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=object())
-    worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(
-            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
-        ),
-    )
-    worker.torch_device = torch.device("cpu")
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        AttnWrapperBase,
-        "cache_seqlens",
-        torch.tensor([970, 2049], dtype=torch.int32),
-        raising=False,
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 4096, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
-    monkeypatch.setattr(
-        sparse_decode_mla,
-        "prepare_sparse_flash_mla_decode_tensor_metadata",
-        fake_prepare,
-    )
-
-    primary_manager = FakeKVManager([3, 4])
-    aux_manager = FakeKVManager([7, 8])
-    worker._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
-        2,
-        types.SimpleNamespace(primary=primary_manager, auxiliary=aux_manager),
-    )
-
-    assert captured_lengths["values"].tolist() == [970, 2048, 2048, 2048]
-    assert captured_lengths["num_heads"] == 64
-    assert GLM5AttnWrapper.glm5_dsa_graph_forward_state == {
-        "path": "graph",
-        "bucket": 4,
-        "reason": "captured",
-        "local_bsz": 2,
-        "metadata_prepared": True,
-    }
-    metadata = GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata
-    assert metadata["bucket_size"] == 4
-    assert metadata["tile_scheduler_metadata"].tolist() == [1, 1, 1]
-    assert metadata["num_splits"].tolist() == [1]
-    assert GLM5AttnWrapper.glm5_decode_primary_slot_indices.tolist() == [3, 4]
-    assert GLM5AttnWrapper.glm5_decode_aux_slot_indices.tolist() == [7, 8]
-    GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
-    GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
-    GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 
 
 def test_glm5_gpu_kv_config_uses_actual_prompt_for_graph_page_table():
@@ -2216,279 +1720,24 @@ def test_glm5_dsa_graph_required_tokens_falls_back_to_worker_budget():
     assert worker._glm5_dsa_graph_required_tokens([], page_size=64) == 576
 
 
-def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        def __init__(self, buckets):
-            self.bucketing = BatchSizeBucketing([1, 2, 4, 8, 16, 32, 64, 128])
-            self._buckets = set(buckets)
-
-        def has_bucket_for_all_segments(self, batch_size):
-            bucket = self.bucketing.get_padded_size(batch_size)
-            return bucket in self._buckets
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=128,
-        cuda_graph_num_buckets=8,
-    )
-    worker._batchgen_debug = {}
-    worker._glm5_dsa_graph_failed_buckets = set()
-    worker._glm5_moe_graph_failed_buckets = set()
-    worker._current_decode_local_batch_size = 17
-    worker._current_decode_max_rank_batch_size = 17
-    worker._cuda_graph_manager = FakeManager(
-        BatchGenWorker._generate_bucket_sizes(
-            worker.args.cuda_graph_max_bucket_size,
-            worker.args.cuda_graph_num_buckets,
-        )
-    )
-    worker._glm5_moe_cuda_graph_manager = FakeManager([32, 64])
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: False,
-    )
-
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert not worker._glm5_moe_graph_current_bucket_missing()
-
-    worker._current_decode_local_batch_size = 33
-    worker._current_decode_max_rank_batch_size = 33
-
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert not worker._glm5_moe_graph_current_bucket_missing()
 
 
-def test_glm5_moe_graph_accepts_larger_configured_bucket(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        def __init__(self, captured_buckets):
-            self.bucketing = BatchSizeBucketing([1, 2, 4, 8])
-            self._captured_buckets = set(captured_buckets)
-
-        def has_bucket_for_all_segments(self, batch_size):
-            bucket = self.bucketing.get_padded_size(batch_size)
-            return bucket in self._captured_buckets
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._glm5_moe_graph_failed_buckets = set()
-    worker._current_decode_max_rank_batch_size = 3
-    worker._glm5_moe_cuda_graph_manager = FakeManager([4])
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    assert not worker._glm5_moe_graph_current_bucket_missing()
-
-    worker._current_decode_max_rank_batch_size = 5
-    assert worker._glm5_moe_graph_current_bucket_missing()
 
 
-def test_glm5_moe_capture_uses_only_current_padded_bucket():
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker._current_decode_max_rank_batch_size = 17
-    worker._glm5_moe_graph_failed_buckets = set()
-
-    buckets = worker._glm5_moe_capture_buckets_for_current_decode(
-        BatchSizeBucketing([1, 2, 4, 8, 16, 32, 64])
-    )
-
-    assert buckets == [32]
 
 
-def test_glm5_moe_capture_skips_failed_or_over_bucket():
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker._current_decode_max_rank_batch_size = 17
-    worker._glm5_moe_graph_failed_buckets = {32}
-    bucketing = BatchSizeBucketing([1, 2, 4, 8, 16, 32, 64])
-
-    assert worker._glm5_moe_capture_buckets_for_current_decode(bucketing) == []
-
-    worker._current_decode_max_rank_batch_size = 65
-    worker._glm5_moe_graph_failed_buckets = set()
-    assert worker._glm5_moe_capture_buckets_for_current_decode(bucketing) == []
 
 
-def test_glm5_segmented_graph_existing_manager_missing_configured_bucket_requests_setup(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        def __init__(self, buckets):
-            self._buckets = set(buckets)
-
-        def has_bucket_for_all_segments(self, batch_size):
-            return batch_size in self._buckets
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=80,
-        cuda_graph_num_buckets=8,
-    )
-    worker._batchgen_debug = {}
-    worker._glm5_dsa_graph_failed_buckets = set()
-    worker._glm5_moe_graph_failed_buckets = set()
-    worker._current_decode_local_batch_size = 17
-    worker._current_decode_max_rank_batch_size = 17
-    worker._cuda_graph_manager = FakeManager([1, 2, 3, 7, 12, 24, 80])
-    worker._glm5_moe_cuda_graph_manager = FakeManager([1, 2, 3, 7, 12, 24, 80])
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: False,
-    )
-
-    assert worker._glm5_dsa_graph_current_bucket_missing()
-    assert worker._glm5_moe_graph_current_bucket_missing()
 
 
-def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_changes(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_local_batch_size = 8
-    worker._current_decode_max_rank_batch_size = 8
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    assert worker._glm5_dsa_graph_current_bucket_missing()
-    assert worker._glm5_moe_graph_current_bucket_missing()
-
-    worker._cuda_graph_manager = object()
-    worker._glm5_moe_cuda_graph_manager = object()
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: True,
-    )
-
-    assert worker._glm5_dsa_graph_current_bucket_missing()
-    assert worker._cuda_graph_manager is None
 
 
-def test_glm5_dsa_graph_zero_local_rank_defers_capture(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_local_batch_size = 0
-    worker._cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = False
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: False,
-    )
-
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert not worker._glm5_segmented_graph_initial_capture_missing()
-
-    worker._current_decode_local_batch_size = 3
-
-    assert worker._glm5_dsa_graph_current_bucket_missing()
-    assert worker._glm5_segmented_graph_initial_capture_missing()
 
 
-def test_glm5_segmented_graph_single_capture_per_batch_after_manager_clear(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_local_batch_size = 8
-    worker._current_decode_max_rank_batch_size = 8
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: False,
-    )
-
-    assert not worker._glm5_segmented_graph_initial_capture_missing()
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert not worker._glm5_moe_graph_current_bucket_missing()
 
 
-def test_glm5_segmented_graph_blocks_generic_warmup_after_capture_attempts(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-
-    assert worker._glm5_segmented_graph_capture_already_attempted_for_requested_paths()
-
-    worker._glm5_moe_graph_capture_attempted_for_batch = False
-
-    assert not worker._glm5_segmented_graph_capture_already_attempted_for_requested_paths()
 
 
-def test_glm5_layer_graph_suppresses_segmented_graph_warmup(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
-    worker._batchgen_debug = {}
-    worker._current_decode_local_batch_size = 1
-    worker._current_decode_max_rank_batch_size = 1
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = False
-    worker._glm5_moe_graph_capture_attempted_for_batch = False
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: False,
-    )
-
-    assert worker._glm5_segmented_graph_suppressed_by_composite_graph()
-    assert not worker._glm5_segmented_graph_initial_capture_missing()
-    assert worker._glm5_segmented_graph_capture_already_attempted_for_requested_paths()
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert not worker._glm5_moe_graph_current_bucket_missing()
 
 
 def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
@@ -2523,402 +1772,16 @@ def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
     assert AttnWrapperBase.batchgen_debug is original_debug
 
 
-def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    original_debug = {
-        "glm5_dsa_mode": "graph",
-        "glm5_moe_mode": "graph",
-        "glm5_moe_router_mode": "custom",
-    }
-    seen_debug = {}
-
-    class FakeModel:
-        def __call__(self, input_ids, **kwargs):
-            seen_debug.update(AttnWrapperBase.batchgen_debug)
-            assert kwargs["position_ids"] is AttnWrapperBase.position_ids
-            assert kwargs["attention_mask"] is AttnWrapperBase.attention_mask
-            assert kwargs["use_cache"] is False
-            return types.SimpleNamespace(
-                logits=torch.zeros(input_ids.shape[0], 1, 4)
-            )
-
-    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(
-        AttnWrapperBase,
-        "batchgen_debug",
-        original_debug,
-        raising=False,
-    )
-    monkeypatch.setattr(AttnWrapperBase, "position_ids", object(), raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "attention_mask", object(), raising=False)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker.model = FakeModel()
-
-    out = worker._glm5_decode_model_forward(torch.zeros(2, 1, dtype=torch.long))
-
-    assert out.logits.shape == (2, 1, 4)
-    assert seen_debug["glm5_dsa_mode"] == "eager"
-    assert seen_debug["glm5_moe_mode"] == "eager"
-    assert seen_debug["glm5_moe_router_mode"] == "custom"
-    assert AttnWrapperBase.batchgen_debug is original_debug
 
 
-def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        bucketing = BatchSizeBucketing([1, 2, 4])
-
-        def has_bucket_for_all_segments(self, batch_size):
-            return True
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=4,
-        cuda_graph_num_buckets=3,
-    )
-    worker._batchgen_debug = {}
-    worker._current_decode_max_rank_batch_size = 1
-    worker._glm5_layer_graph_failed_buckets = set()
-    worker._glm5_layer_cuda_graph_manager = FakeManager()
-    worker._glm5_layer_graph_signature = ("same",)
-    worker._glm5_layer_graph_max_seqlen = 16384
-    worker._glm5_layer_graph_capture_attempted_for_batch = True
-    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_whole_model_graph_capture_signature",
-        lambda bucket: ("same",),
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 20000, raising=False)
-
-    assert worker._glm5_layer_graph_current_bucket_missing()
-    assert worker._glm5_layer_cuda_graph_manager is None
-    assert worker._glm5_layer_graph_signature is None
-    assert not worker._glm5_layer_graph_capture_attempted_for_batch
 
 
-def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        bucketing = BatchSizeBucketing([1, 2, 4])
-
-        def __init__(self):
-            self.dropped = []
-
-        def has_bucket_for_all_segments(self, batch_size):
-            return True
-
-        def drop_bucket(self, bucket_size):
-            self.dropped.append(bucket_size)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_max_rank_batch_size = 1
-    manager = FakeManager()
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
-    worker._whole_model_bucketing = FakeManager.bucketing
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = ("same",)
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_whole_model_graph_capture_signature",
-        lambda *args: ("same",),
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 9000, raising=False)
-
-    assert not worker._glm5_whole_model_graph_current_bucket_missing()
-    assert worker._cuda_graph_manager is manager
-    assert worker._whole_model_segment is not None
-    assert worker._whole_model_bucketing is FakeManager.bucketing
-    assert worker._whole_model_graph
-    assert worker._glm5_whole_model_graph
-    assert worker._glm5_whole_model_graph_signature == ("same",)
-    assert manager.dropped == []
-    assert worker._glm5_whole_graph_path_state(1) == (
-        "eager",
-        1,
-        "max_seqlen_exceeds_capture",
-    )
 
 
-def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeManager:
-        bucketing = BatchSizeBucketing([1, 2, 4])
-
-        def has_bucket_for_all_segments(self, batch_size):
-            bucket = self.bucketing.get_padded_size(batch_size)
-            return bucket == 1
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_max_rank_batch_size = 3
-    manager = FakeManager()
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = ("same",)
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_whole_model_graph_capture_signature",
-        lambda *args: ("same",),
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 100, raising=False)
-
-    assert not worker._glm5_whole_model_graph_current_bucket_missing()
-    assert worker._glm5_whole_graph_path_state(3) == (
-        "eager",
-        4,
-        "bucket_not_captured",
-    )
 
 
-def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-    import batchgen.cuda_graph as cuda_graph_module
-    import batchgen.models.glm.glm5.cuda_graph_segments as dsa_segments
-    import batchgen.models.glm.glm5.layer_cuda_graph_segments as layer_segments_module
-    import batchgen.models.glm.glm5.whole_model_cuda_graph_segments as whole_segments
-
-    class FakeManager:
-        instances = []
-
-        def __init__(self, bucketing, device):
-            self.bucketing = bucketing
-            self.device = device
-            self.captured = []
-            self._segments = {}
-            FakeManager.instances.append(self)
-
-        def register_segment(self, name, segment):
-            self._segments[name] = segment
-            self.segment = segment
-
-        def warmup_and_capture_buckets(self, bucket_sizes):
-            self.captured.extend(int(bucket) for bucket in bucket_sizes)
-
-        def has_bucket_for_all_segments(self, batch_size):
-            bucket = self.bucketing.get_padded_size(batch_size)
-            return bucket in self.captured
-
-        def get_capture_stats(self):
-            return {"total_capture_time_ms": 0.0}
-
-    class FakeWholeSegment:
-        def __init__(self, **kwargs):
-            self.capture_inputs = []
-            self.max_seqlen = kwargs["max_seqlen"]
-
-        def set_capture_inputs(self, **inputs):
-            self.capture_inputs.append(inputs)
-
-    class FakeKVManager:
-        def __init__(self):
-            self.config = types.SimpleNamespace(page_size_tokens=64)
-            self.storage = torch.empty(4, 8, dtype=torch.int32)
-            self.k_cache = torch.empty(1, 1, 64, 1, 4, dtype=torch.bfloat16)
-
-        def ensure_cuda_graph_page_table(self, _sequence_ids):
-            return None
-
-        def get_cuda_graph_page_table_storage(self):
-            return self.storage
-
-        def get_kv_tensors(self):
-            return self.k_cache, None
-
-        def resolve_physical_layer(self, layer_idx):
-            return layer_idx
-
-    class FakeIndexer:
-        rope_head_dim = 4
-        index_topk = 8
-
-        def rotary_emb(self, _dummy, seq_len):
-            return torch.empty(seq_len, 1), torch.empty(seq_len, 1)
-
-    class FakeWrapper:
-        def __init__(self):
-            self.module = types.SimpleNamespace(
-                indexer=FakeIndexer(),
-                num_heads=64,
-            )
-            self._fp8_absorb_weights = object()
-            self._fp8_qkv_a_proj = object()
-            self._fp8_qkv_a_scale = object()
-            self._fused_wqb_weights = object()
-            self._indexer_cuda_module = object()
-
-    class FakeLayer:
-        def __init__(self):
-            self.self_attn = FakeWrapper()
-            self.mlp = None
-
-    bucket_inputs = []
-    monkeypatch.setattr(cuda_graph_module, "CUDAGraphManager", FakeManager)
-    monkeypatch.setattr(
-        dsa_segments,
-        "Glm5FullDsaAttnSegment",
-        lambda **_kwargs: object(),
-    )
-    monkeypatch.setattr(
-        layer_segments_module,
-        "Glm5DecoderLayerGraphSegment",
-        lambda **_kwargs: object(),
-    )
-    monkeypatch.setattr(whole_segments, "Glm5WholeModelSegment", FakeWholeSegment)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *args, **kwargs: None)
-    import torch.distributed as dist
-
-    monkeypatch.setattr(dist, "barrier", lambda *args, **kwargs: None)
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.world_size = 2
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=8,
-        cuda_graph_num_buckets=4,
-    )
-    worker.model_config = types.SimpleNamespace(max_position_embeddings=512)
-    worker.torch_device = torch.device("cpu")
-    worker._batchgen_debug = {}
-    worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(layers=[FakeLayer()]),
-        config=types.SimpleNamespace(vocab_size=16, hidden_size=4),
-        vocab_size=16,
-    )
-    worker.core_engine = types.SimpleNamespace()
-    worker.global_batch = None
-    worker._current_decode_local_batch_size = 2
-    worker._current_decode_max_rank_batch_size = 2
-    worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
-    worker._cuda_graph_manager = None
-    worker._cuda_graph_adapter = None
-    worker._whole_model_segment = None
-    worker._whole_model_bucketing = None
-    worker._whole_model_graph = False
-    worker._glm5_whole_model_graph = False
-    worker._glm5_whole_model_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_capture_attempted_for_batch = False
-    worker._glm5_whole_model_graph_state_change_after_capture_logged = False
-    worker._glm5_whole_model_graph_signature = None
-    worker._glm5_whole_model_graph_unavailable_reason = None
-    worker._glm5_whole_model_capture_input_ids = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    worker._glm5_layer_graph_failed_buckets = set()
-    worker._glm5_moe_graph_failed_buckets = set()
-    worker._glm5_whole_model_graph_requested_for_current_batch = lambda: True
-    worker._glm5_whole_model_graph_required_for_current_batch = lambda: True
-    worker._glm5_layer_graph_requested_for_current_batch = lambda: False
-    worker._glm5_dsa_graph_requested_for_current_batch = lambda: False
-    worker._glm5_dsa_full_graph_requested_for_current_batch = lambda: False
-    worker._glm5_moe_graph_requested_for_current_batch = lambda: False
-    worker._glm5_whole_model_graph_compare_requested_for_current_batch = lambda: False
-    worker._glm5_whole_model_graph_timing_requested_for_current_batch = lambda: False
-    worker._glm5_whole_model_graph_capture_signature = lambda: ("sig",)
-    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [10, 11], raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 128, raising=False)
-
-    def fake_capture_inputs():
-        bucket_inputs.append(True)
-        return {
-            "input_ids": torch.empty((0, 1), dtype=torch.int64),
-            "cache_seqlens": torch.empty((0,), dtype=torch.int32),
-            "position_ids": torch.empty((0, 1), dtype=torch.int64),
-            "primary_slot_indices": torch.empty((0,), dtype=torch.int32),
-            "aux_slot_indices": torch.empty((0,), dtype=torch.int32),
-            "rank_token_counts": torch.zeros((2,), dtype=torch.int64),
-            "num_valid_tokens": torch.zeros((1,), dtype=torch.int32),
-        }
-
-    worker._make_glm5_whole_model_capture_inputs = fake_capture_inputs
-    gpu_manager = types.SimpleNamespace(
-        primary=FakeKVManager(),
-        auxiliary=FakeKVManager(),
-    )
-
-    worker._setup_cuda_graphs(gpu_manager)
-
-    expected_buckets = [8, 4, 2, 1]
-    capture_manager = FakeManager.instances[-1]
-    assert capture_manager.captured == expected_buckets
-    assert bucket_inputs == [True] * len(expected_buckets)
-    assert worker._glm5_whole_model_graph_capture_attempted_for_batch
-    assert worker._glm5_whole_model_graph_signature == ("sig",)
 
 
-def test_glm5_release_whole_model_graph_state_preserves_capture_inputs():
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeBucketing:
-        bucket_sizes = [4, 8]
-
-    class FakeManager:
-        bucketing = FakeBucketing()
-
-        def __init__(self):
-            self.dropped = []
-
-        def drop_bucket(self, bucket_size):
-            self.dropped.append(bucket_size)
-
-    worker = object.__new__(BatchGenWorker)
-    manager = FakeManager()
-    capture_ids = object()
-    worker.torch_device = torch.device("cpu")
-    worker._cuda_graph_manager = manager
-    worker._whole_model_segment = object()
-    worker._whole_model_bucketing = FakeBucketing()
-    worker._whole_model_graph = True
-    worker._glm5_whole_model_graph = True
-    worker._glm5_whole_model_graph_signature = ("old",)
-    worker._glm5_whole_model_capture_input_ids = capture_ids
-
-    worker._release_glm5_whole_model_graph_state(empty_cuda_cache=False)
-
-    assert manager.dropped == [4, 8]
-    assert worker._cuda_graph_manager is None
-    assert worker._whole_model_segment is None
-    assert worker._whole_model_bucketing is None
-    assert not worker._whole_model_graph
-    assert not worker._glm5_whole_model_graph
-    assert worker._glm5_whole_model_graph_signature is None
-    assert worker._glm5_whole_model_capture_input_ids is capture_ids
 
 
 def test_glm5_layer_signature_uses_stable_page_table_storage():
@@ -2951,123 +1814,12 @@ def test_glm5_layer_signature_uses_stable_page_table_storage():
     assert signature[1][1] == (4, 9)
 
 
-def test_glm5_setup_cuda_graphs_does_not_recapture_after_manager_clear(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=80,
-        cuda_graph_num_buckets=8,
-    )
-    worker.model_config = types.SimpleNamespace(max_position_embeddings=131072)
-    worker.torch_device = torch.device("cpu")
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    worker._current_decode_local_batch_size = 8
-    worker._current_decode_max_rank_batch_size = 8
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    moe_setup_calls = []
-    monkeypatch.setattr(
-        worker,
-        "_setup_glm5_moe_cuda_graphs",
-        lambda bucket_sizes: moe_setup_calls.append(tuple(bucket_sizes)),
-    )
-
-    worker._setup_cuda_graphs(types.SimpleNamespace())
-
-    assert worker._cuda_graph_manager is None
-    assert moe_setup_calls
 
 
-def test_glm5_setup_cuda_graphs_defers_dsa_capture_for_zero_local_rank(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 9
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(
-        cuda_graph_max_bucket_size=64,
-        cuda_graph_num_buckets=7,
-    )
-    worker.model_config = types.SimpleNamespace(max_position_embeddings=131072)
-    worker.torch_device = torch.device("cpu")
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = False
-    worker._glm5_moe_graph_capture_attempted_for_batch = False
-    worker._current_decode_local_batch_size = 0
-    worker._current_decode_max_rank_batch_size = 3
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    moe_setup_calls = []
-    monkeypatch.setattr(
-        worker,
-        "_setup_glm5_moe_cuda_graphs",
-        lambda bucket_sizes: moe_setup_calls.append(tuple(bucket_sizes)),
-    )
-
-    worker._setup_cuda_graphs(types.SimpleNamespace())
-
-    assert worker._cuda_graph_manager is None
-    assert not worker._glm5_dsa_graph_capture_attempted_for_batch
-    assert moe_setup_calls == [(1, 2, 4, 8, 16, 32, 64)]
 
 
-def test_glm5_moe_setup_does_not_recapture_after_manager_clear(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    worker._current_decode_max_rank_batch_size = 8
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    worker._setup_glm5_moe_cuda_graphs([1, 2, 4, 8])
-
-    assert worker._glm5_moe_cuda_graph_manager is None
 
 
-def test_glm5_graph_path_reason_marks_manager_cleared_after_capture(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = None
-    worker._glm5_moe_cuda_graph_manager = None
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_moe_graph_capture_attempted_for_batch = True
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    assert worker._glm5_dsa_graph_path_state(8, None) == (
-        "eager",
-        None,
-        "no_manager_after_initial_capture",
-    )
-    assert worker._glm5_moe_graph_path_state(8) == (
-        "eager",
-        None,
-        "no_manager_after_initial_capture",
-    )
 
 
 def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
@@ -3116,29 +1868,6 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
     assert worker._glm5_layer_graph_max_seqlen is None
 
 
-def test_glm5_dsa_graph_page_table_change_after_capture_falls_back_eager(
-    monkeypatch,
-):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._current_decode_local_batch_size = 8
-    worker._cuda_graph_manager = object()
-    worker._glm5_dsa_graph_capture_attempted_for_batch = True
-    worker._glm5_dsa_graph_page_table_change_after_capture_logged = False
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_page_table_storage_changed",
-        lambda: True,
-    )
-
-    assert not worker._glm5_dsa_graph_current_bucket_missing()
-    assert worker._cuda_graph_manager is None
-    assert worker._glm5_dsa_graph_page_table_change_after_capture_logged
 
 
 def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
@@ -3157,94 +1886,24 @@ def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
     assert worker._glm5_graph_path_log_requested_for_current_batch()
 
 
-def test_glm5_graph_path_log_default_skips_hot_path_state(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class RankCountsSentinel:
-        @property
-        def shape(self):
-            raise AssertionError("rank_counts must not be touched when path log is off")
-
-        def detach(self):
-            raise AssertionError("rank_counts must not be copied to CPU")
-
-    worker = object.__new__(BatchGenWorker)
-    worker.rank = 0
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    monkeypatch.delenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", raising=False)
-    monkeypatch.setattr(
-        worker,
-        "_glm5_dsa_graph_path_state",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
-    )
-    monkeypatch.setattr(
-        worker,
-        "_glm5_moe_graph_path_state",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
-    )
-    monkeypatch.setattr(
-        worker,
-        "_glm5_layer_graph_path_state",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
-    )
-    monkeypatch.setattr(
-        worker,
-        "_glm5_whole_graph_path_state",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
-    )
-
-    worker._log_glm5_graph_path_for_forward(
-        local_bsz=1,
-        max_rank_bsz=1,
-        rank_counts=RankCountsSentinel(),
-        gpu_manager=object(),
-        decode_iter=7,
-    )
 
 
-def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = types.SimpleNamespace(
-        bucketing=BatchSizeBucketing([1, 2]),
-    )
-    worker._glm5_moe_cuda_graph_manager = types.SimpleNamespace(
-        bucketing=BatchSizeBucketing([1, 2]),
-    )
-    worker._glm5_moe_graph_failed_buckets = set()
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-
-    assert worker._glm5_dsa_graph_path_state(3, object()) == (
-        "eager",
-        None,
-        "over_bucket",
-    )
-    assert worker._glm5_moe_graph_path_state(3) == (
-        "eager",
-        None,
-        "over_bucket",
-    )
 
 
 def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
-    env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
-
     assert should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=False,
         global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        model_name="zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ={},
     )
     assert not should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=True,
         global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        model_name="zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ={},
     )
 
 
