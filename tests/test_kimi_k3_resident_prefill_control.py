@@ -3422,6 +3422,56 @@ def test_compact_resident_prefill_chunk_policy():
         choose(65536, 0)
 
 
+def test_resident_decode_combine_masks_unwritten_nonlocal_rows_before_math():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    torch = pytest.importorskip("torch")
+    combine = _isolated_method(
+        path,
+        "ResidentEPMXFP4MoELayer",
+        "_combine_fp32",
+        {"torch": torch},
+    )
+    layer = SimpleNamespace(compact_dispatch=False)
+
+    # Row 0 stands in for an empty local expert's unwritten output.  Non-local
+    # routes carry -1 and are clamped to row 0 for the gather; NaN * 0 is NaN,
+    # so masking only after multiplication silently corrupts every token.
+    tokens, top_k, hidden = 4, 3, 5
+    expert_out = torch.full((tokens + 1, hidden), float("nan"))
+    expert_out[1:] = torch.arange(tokens * hidden).view(tokens, hidden)
+    topk_pos = torch.full((tokens, top_k), -1, dtype=torch.int32)
+    topk_pos[:, 0] = torch.arange(1, tokens + 1, dtype=torch.int32)
+    topk_weight = torch.tensor(
+        [[0.5, 0.3, 0.2]] * tokens, dtype=torch.float32
+    )
+
+    output = combine(
+        layer,
+        expert_out,
+        topk_pos,
+        topk_weight,
+        tokens,
+        hidden,
+        top_k,
+    )
+    expected = expert_out[1:].float() * 0.5
+    assert torch.equal(output, expected)
+    assert torch.isfinite(output).all()
+
+    # A shard with no owned routes must contribute exact zeros to the EP sum,
+    # even when its entire expert output buffer is unwritten.
+    no_local = combine(
+        layer,
+        expert_out,
+        torch.full_like(topk_pos, -1),
+        topk_weight,
+        tokens,
+        hidden,
+        top_k,
+    )
+    assert torch.equal(no_local, torch.zeros_like(no_local))
+
+
 def test_resident_prefill_shared_merge_is_exact_and_in_place():
     path = (
         ROOT

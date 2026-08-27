@@ -340,8 +340,13 @@ class ResidentEPMXFP4MoELayer:
         valid = (pos >= 0)
         rows = pos.clamp(min=0).reshape(-1)
         gathered = expert_out.index_select(0, rows).float().view(T, K, H)
+        # ``-1`` marks a route owned by another EP rank.  Its clamped row 0
+        # can be unwritten (and therefore NaN/Inf); multiplying that value by
+        # a zero validity mask would still propagate NaN.  Zero invalid lanes
+        # before arithmetic, matching the compact-prefill branch above.
+        gathered.masked_fill_(~valid.unsqueeze(-1), 0.0)
         w = weight.unsqueeze(-1)
-        contrib = gathered * w * valid.unsqueeze(-1).to(torch.float32)
+        contrib = gathered * w
         return contrib.sum(dim=1)
 
     def _expert_path(
