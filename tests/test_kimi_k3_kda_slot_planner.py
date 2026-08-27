@@ -1,6 +1,8 @@
 import pytest
 
+from batchgen.config.config import EngineConfig
 from batchgen.models.moonshotai.kimi_linear.planner import (
+    KimiLinearPlanner,
     k3_kda_state_slots,
 )
 
@@ -8,14 +10,14 @@ from batchgen.models.moonshotai.kimi_linear.planner import (
 GIB = 1024 ** 3
 
 
-def test_h20_tp8_keeps_validated_four_slots():
+def test_h20_tp8_keeps_four_user_slots():
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=96 * GIB,
         attention_group_size=8,
     ) == 4
 
 
-def test_h200_tp8_uses_32_slots():
+def test_h200_tp8_uses_32_user_slots():
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=8,
@@ -46,3 +48,36 @@ def test_invalid_capacity_inputs_fail_closed(memory_bytes, group_size):
             gpu_total_memory_bytes=memory_bytes,
             attention_group_size=group_size,
         )
+
+
+def _plan_k3(gpu_memory_bytes):
+    config = EngineConfig()
+    config.Basic_Config.kv_dtype = "bfloat16"
+    config.Basic_Config.set_max_prompt_length(8192)
+    config.Basic_Config.max_decoding_length = 128
+    config.Basic_Config.world_size = 16
+    planner = KimiLinearPlanner(
+        is_k3=True,
+        stream_all_modules=False,
+        attention_group_size=8,
+        gpu_total_memory_bytes=gpu_memory_bytes,
+    )
+    return planner.generate_config(config)
+
+
+def test_h20_plan_adds_graph_scratch_without_reducing_user_capacity():
+    config = _plan_k3(96 * GIB)
+
+    assert config.GPU_Buffer_Config.kda_state_slots == 5
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 4
+    assert config.Basic_Config.decode_graph_buckets == [1, 2, 4]
+
+
+def test_h200_plan_exposes_32_users_plus_separate_graph_scratch():
+    config = _plan_k3(140 * GIB)
+
+    assert config.GPU_Buffer_Config.kda_state_slots == 33
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 32
+    assert config.Basic_Config.decode_graph_buckets == [
+        1, 2, 4, 8, 16, 24, 32,
+    ]

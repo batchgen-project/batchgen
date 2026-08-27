@@ -21,13 +21,14 @@ _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
 def k3_kda_state_slots(
     *, gpu_total_memory_bytes: int | None, attention_group_size: int
 ) -> int:
-    """Return K3's persistent KDA sequence capacity for this GPU class.
+    """Return K3's user-visible KDA sequence capacity for this GPU class.
 
     The distributed K3 topology uses TP8 KDA, so each rank stores only 1/8
     of every sequence's recurrent/conv state (53.57 MiB per slot). H20 keeps
     the validated four-slot plan. GPUs with at least 120 GiB of HBM use 32
-    slots, which costs 1.674 GiB/rank and removes the H20-only four-sequence
-    admission ceiling without consuming the H200 KV-cache headroom.
+    user slots, which cost 1.674 GiB/rank and remove the H20-only four-sequence
+    admission ceiling without consuming the H200 KV-cache headroom. The
+    planner allocates one additional physical item for CUDA-graph scratch.
 
     Unknown memory and non-TP8 configurations fail safe to the validated
     four-slot plan.
@@ -224,14 +225,30 @@ class KimiLinearPlanner(BasePlanner):
         types is what makes 8xH20 possible at all.
         """
         # KDA conv/recurrent state pools. At K3 dimensions, an unsharded slot
-        # is 428.6 MiB. Distributed K3 uses TP8 KDA, making it 53.57 MiB/rank:
-        # H20 retains the validated four slots (214.3 MiB/rank), while H200
-        # receives 32 slots (1.674 GiB/rank). Admission exposes this replicated
-        # pool as a per-node limit because all eight TP ranks own each sequence.
-        self.config.GPU_Buffer_Config.kda_state_slots = k3_kda_state_slots(
+        # is 428.6 MiB. Distributed K3 uses TP8 KDA, making it 53.57 MiB/rank.
+        # Preserve 4 user sequences on H20 and 32 on H200, then allocate one
+        # separate physical item for CUDA-graph padding/warmup. The graph
+        # reserves that item before readiness, so admission still sees exactly
+        # the user capacity instead of silently losing one sequence.
+        sequence_slots = k3_kda_state_slots(
             gpu_total_memory_bytes=self.gpu_total_memory_bytes,
             attention_group_size=self.attention_group_size,
         )
+        self.config.GPU_Buffer_Config.kda_state_slots = sequence_slots + 1
+
+        # This is a per-node sequence cap under TP8: every rank in the node
+        # holds the same sequence set. Keep the graph top bucket equal to that
+        # cap. The 24 bucket avoids padding a 17--24 row TP8 group to 32; that
+        # distinction becomes load-bearing when the grouped MoE joins capture
+        # because ceil(24/8)=3 while ceil(32/8)=4 rows/rank.
+        self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
+            sequence_slots
+        )
+        self.config.Basic_Config.decode_graph_buckets = [
+            bucket
+            for bucket in (1, 2, 4, 8, 16, 24, 32)
+            if bucket <= sequence_slots
+        ]
 
     def _configure_streamed_rings(self):
         """Ring depths for the four streamed module types.

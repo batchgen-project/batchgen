@@ -165,7 +165,8 @@ def test_decode_graph_reserves_kda_scratch_before_sequence_admission():
             self.owners[seq_id] = slot
             return slot
 
-    slots = SlotManager(capacity=4)
+    # Four user sequences plus one dedicated graph-scratch item.
+    slots = SlotManager(capacity=5)
     wrapper = SimpleNamespace(slot_manager=slots)
     original_model_forward = object()
     original_layer_forward = object()
@@ -202,15 +203,15 @@ def test_decode_graph_reserves_kda_scratch_before_sequence_admission():
     install()
 
     assert graph._scratch_slot == slots.owners[-1_000_001]
-    assert len(slots.free) == 3
-    for sequence_id in range(3):
+    assert len(slots.free) == 4
+    for sequence_id in range(4):
         slots.alloc(sequence_id)
     with pytest.raises(RuntimeError, match="Insufficient free KDA state items"):
-        slots.alloc(3)
+        slots.alloc(4)
 
     # Idempotent re-installation must not consume another state item.
     install()
-    assert len(slots.owners) == 4
+    assert len(slots.owners) == 5
 
     ensure_built = _function(
         KIMI_LINEAR_GRAPH,

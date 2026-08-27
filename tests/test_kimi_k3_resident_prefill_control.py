@@ -215,16 +215,16 @@ def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
     assert method() == {"max_sequences_per_node": 4}
 
     # The decode graph reserves its padding/warmup scratch slot during server
-    # startup. Admission must consume the manager's remaining free count, not
-    # the configured pool size, so a 32-item H200 pool exposes 31 sequences.
+    # startup. Admission consumes the manager's remaining free count, so the
+    # H200 plan needs 33 physical items to expose all 32 user sequences.
     fake_wrapper.state_manager = SimpleNamespace(
-        get_stats=lambda: SimpleNamespace(num_free_state_items=31)
+        get_stats=lambda: SimpleNamespace(num_free_state_items=32)
     )
-    manager._kda_pool_slots = 32
-    assert method() == {"max_sequences_per_node": 31}
+    manager._kda_pool_slots = 33
+    assert method() == {"max_sequences_per_node": 32}
 
     manager._attn_tp_size = 1
-    assert method() == {"max_sequences_per_rank": 31}
+    assert method() == {"max_sequences_per_rank": 32}
 
 
 def test_prefill_only_completion_releases_kda_without_paged_gpu_kv():
