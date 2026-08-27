@@ -5293,6 +5293,7 @@ class BatchGenWorker:
 				prompt_length=seq.prompt_length,
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
+				host_kv_replication_factor=G,
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),

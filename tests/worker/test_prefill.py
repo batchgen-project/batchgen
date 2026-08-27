@@ -36,6 +36,7 @@ def _cand(
     decoded=0,
     prompt=100,
     budget=100000,
+    host_kv_replication_factor=1,
 ):
     return PrefillCandidate(
         uuid=uuid,
@@ -47,6 +48,7 @@ def _cand(
         prompt_length=prompt,
         kv_token_budget=budget,
         page_size=_PAGE,
+        host_kv_replication_factor=host_kv_replication_factor,
     )
 
 
@@ -168,6 +170,36 @@ def test_greedy_fill_until_node_exhausted():
     cands = [_cand(f"q{i}", gidx=i, prompt=100) for i in range(3)]
     plan = PrefillScheduler.select_prefill_batch(_req(cands, [68]))
     assert plan == ["q0", "q1"]
+
+
+def test_tp8_host_kv_replication_is_charged_to_node_capacity():
+    # Each candidate needs 34 pages per rank.  A TP8 serve group consumes
+    # 8 * 34 = 272 pages from the node-level host KV allocator.
+    cands = [
+        _cand(
+            f"q{i}",
+            gidx=i,
+            prompt=100,
+            host_kv_replication_factor=8,
+        )
+        for i in range(2)
+    ]
+    assert PrefillScheduler.select_prefill_batch(_req(cands, [271])) == []
+    assert PrefillScheduler.select_prefill_batch(_req(cands, [272])) == ["q0"]
+    assert PrefillScheduler.select_prefill_batch(_req(cands, [544])) == [
+        "q0",
+        "q1",
+    ]
+
+
+def test_host_kv_replication_factor_must_be_positive():
+    with pytest.raises(ValueError, match="host_kv_replication_factor=0"):
+        PrefillScheduler.select_prefill_batch(
+            _req(
+                [_cand("q0", host_kv_replication_factor=0)],
+                [1000],
+            )
+        )
 
 
 def test_no_eviction_candidates_pure_queueing_order():

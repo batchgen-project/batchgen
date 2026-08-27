@@ -47,6 +47,10 @@ class PrefillCandidate:
     prompt_length: int
     kv_token_budget: int
     page_size: int
+    # TP attention can replicate one sequence's host KV allocation on every
+    # rank in its serve group.  The node-level allocator therefore consumes
+    # this many copies of ``req_pages`` for one admitted sequence.
+    host_kv_replication_factor: int = 1
 
 
 @dataclass(frozen=True)
@@ -158,6 +162,11 @@ class PrefillScheduler:
                 >= req.per_node_sequence_free[seq_node]
             ):
                 continue
+            if c.host_kv_replication_factor <= 0:
+                raise ValueError(
+                    f"candidate {c.uuid} has invalid host_kv_replication_factor="
+                    f"{c.host_kv_replication_factor}"
+                )
             post_prefill_length = c.prompt_length + 1
             gpu_initial_pages = (
                 math.ceil(post_prefill_length / c.page_size)
@@ -166,7 +175,10 @@ class PrefillScheduler:
             gpu_initial_tokens = gpu_initial_pages * c.page_size
             initial_capacity = max(c.prompt_length + req.chunk_size, gpu_initial_tokens)
             initial_capacity = min(initial_capacity, c.kv_token_budget)
-            req_pages = math.ceil(initial_capacity / c.page_size)
+            req_pages = (
+                math.ceil(initial_capacity / c.page_size)
+                * c.host_kv_replication_factor
+            )
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)

@@ -936,7 +936,7 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch(batch_id, status="failed", error={
+            self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
                 "code": "capacity_exceeded", "message": error_msg,
             })
             return
@@ -1003,7 +1003,7 @@ class BatchScheduler:
 
         if batch_failed:
             error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
-            self.storage.update_batch(batch_id, status="failed", error={
+            self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
                 "code": "batch_failed", "message": str(error_msg)
             })
             return
@@ -1093,7 +1093,7 @@ class BatchScheduler:
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
-                self.storage.update_batch(batch_id, status="failed", error={
+                self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
                     "code": "worker_fatal", "message": error_msg,
                 })
                 logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
