@@ -1682,9 +1682,10 @@ class BatchGenWorker:
 		# Use gathered text if provided, otherwise read from local buffer
 		text = gathered_text if gathered_text is not None else ""
 		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
-			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
 			try:
-				text = self.tokenizer.decode(token_ids)
+				text = self._decode_tokens_to_string(
+					seq.decoded_tokens[:, :seq.decoded_length]
+				)
 			except Exception:
 				text = ""
 		self._response_queue.put({
@@ -1693,7 +1694,10 @@ class BatchGenWorker:
 			"batch_id": getattr(seq, "batch_id", None),
 			"global_idx": seq.global_idx,
 			"text": text,
-			"prompt_length": seq.prompt_length,
+			# Re-entry turns prior completion tokens into the internal prompt so
+			# the KV state can be recomputed.  OpenAI usage must still report the
+			# caller's original prompt, not that internal reconstructed length.
+			"prompt_length": seq.original_prompt_length,
 			"decoded_length": seq.decoded_length,
 			"finish_reason": self._get_finish_reason(seq),
 		})
@@ -1718,9 +1722,11 @@ class BatchGenWorker:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					token_ids = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
+					decoded_tokens = self.query_book[local_idx].decoded_tokens[
+						:, :seq.decoded_length
+					]
 					try:
-						text = self.tokenizer.decode(token_ids)
+						text = self._decode_tokens_to_string(decoded_tokens)
 					except Exception:
 						text = ""
 					my_tokens[uuid] = text
