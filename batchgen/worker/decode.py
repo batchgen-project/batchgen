@@ -35,6 +35,18 @@ from typing import List, Optional, Tuple
 _DECODE_CAPACITY_FRACTION = 0.9
 
 
+def estimate_max_decode_replica_batch(
+    total_candidates: int, world_size: int, attn_tp_size: int
+) -> int:
+    """Upper-bound rows held by one DP replica (one TP attention group)."""
+    if attn_tp_size <= 0 or world_size % attn_tp_size != 0:
+        raise ValueError(
+            f"attn_tp_size={attn_tp_size} must divide world_size={world_size}"
+        )
+    num_replicas = world_size // attn_tp_size
+    return (total_candidates + num_replicas - 1) // num_replicas
+
+
 @dataclass(frozen=True)
 class DecodeCandidate:
     """A PREFILLED / ON_HOLD sequence eligible for the decode batch."""

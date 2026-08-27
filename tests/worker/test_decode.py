@@ -12,6 +12,7 @@ from batchgen.worker.decode import (
     DecodeBatchRequest,
     DecodeCandidate,
     DecodeScheduler,
+    estimate_max_decode_replica_batch,
 )
 
 
@@ -36,6 +37,13 @@ def _req(candidates, total_pages, world_size=8, attn_tp_size=1):
 
 def test_empty_candidates_returns_empty():
     assert DecodeScheduler.select_decode_batch(_req([], 1000)) == []
+
+
+def test_decode_replica_batch_estimate_accounts_for_tp_replication():
+    assert estimate_max_decode_replica_batch(64, 16, 8) == 32
+    assert estimate_max_decode_replica_batch(65, 16, 8) == 33
+    # Pure DP preserves the legacy total/world_size estimate.
+    assert estimate_max_decode_replica_batch(64, 16, 1) == 4
 
 
 def test_single_candidate_fits():

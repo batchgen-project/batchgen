@@ -127,6 +127,7 @@ from batchgen.worker.decode import (
 	DecodeBatchRequest,
 	DecodeCandidate,
 	DecodeScheduler,
+	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
 	GpuKvManagerPlan,
@@ -6599,8 +6600,13 @@ class BatchGenWorker:
 				onhold_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
 				in_decode_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE))
 				total_candidates = prefilled_count + onhold_count + in_decode_count
-				# Estimate max per rank (ceiling division)
-				max_num_seq_estimate = (total_candidates + self.world_size - 1) // self.world_size
+				# TP attention replicates one group's sequences across all G ranks,
+				# so each rank needs the per-group batch, not total/world_size.
+				max_num_seq_estimate = estimate_max_decode_replica_batch(
+					total_candidates,
+					self.world_size,
+					self._decode_attn_tp_size(),
+				)
 				# Ensure at least some minimum
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
 				# Cap per-rank decode batch so the MoE buffer's mtp (= round_up(world_size *
