@@ -616,6 +616,18 @@ class KimiLinearDecodeGraph:
         self._moe_bucket = 0
         self._moe_group_bucket = 0
         self._moe_ntp = 0
+        # K3 whole-model graph state.  The existing per-layer managers remain
+        # available as the correctness/fallback path; the outer manager owns a
+        # separate graph pool so it can capture direct child forwards rather
+        # than recursively replaying the per-layer graphs.
+        self.whole_manager = None
+        self.whole_segment = None
+        self._whole_built = False
+        self._whole_captured = set()
+        self._whole_capture_stats = {}
+        self._whole_step_active = False
+        self._whole_bucket = 0
+        self._whole_name = "kimi_linear/whole_model"
         # One per-rank scalar input for the K3 MoE graph.  Its value is
         # refreshed once per decode step; unlike a Python argument it is safe
         # to read inside a captured graph and avoids rebuilding a validity mask
@@ -680,6 +692,7 @@ class KimiLinearDecodeGraph:
                 inner.layers[layer_idx].forward = orig
             self._orig_layer_forwards = {}
             self._installed = False
+        self._drop_whole_graphs()
         self._drop_graphs()
         self._drop_moe_graphs()
         if self._scratch_slot is not None:
@@ -690,6 +703,9 @@ class KimiLinearDecodeGraph:
     def get_capture_stats(self) -> dict:
         stats = dict(self.manager.get_capture_stats())
         stats["kimi_capture"] = dict(self._capture_stats)
+        if self.whole_manager is not None:
+            stats["kimi_whole_capture"] = dict(self._whole_capture_stats)
+            stats["kimi_whole_manager"] = self.whole_manager.get_capture_stats()
         if self.moe_manager is not None:
             stats["kimi_moe_capture"] = dict(self._moe_capture_stats)
             stats["kimi_moe_manager"] = self.moe_manager.get_capture_stats()
@@ -703,10 +719,28 @@ class KimiLinearDecodeGraph:
         def forward(*args, **kwargs):
             self._begin_step()
             try:
+                if self._whole_step_active:
+                    input_ids = kwargs.get("input_ids")
+                    if input_ids is None and args:
+                        input_ids = args[0]
+                    if (
+                        not isinstance(input_ids, torch.Tensor)
+                        or input_ids.dim() != 2
+                        or input_ids.shape[1] != 1
+                        or input_ids.shape[0] != self._bsz
+                    ):
+                        self._fallback(
+                            "whole-model graph requires decode input_ids [local_bsz, 1]"
+                        )
+                        self._whole_step_active = False
+                        self._step_active = False
+                    else:
+                        return self._run_whole_model(input_ids)
                 return orig_forward(*args, **kwargs)
             finally:
                 self._step_active = False
                 self._moe_step_active = False
+                self._whole_step_active = False
         return forward
 
     def _make_new_block_residual(self, orig_new):
@@ -946,6 +980,81 @@ class KimiLinearDecodeGraph:
             )
             return None
 
+    def _whole_model_bucket_for_step(self) -> Optional[int]:
+        """Return the globally safe model bucket for inline K3 MoE.
+
+        The resident EP collectives are sized from the worker's synchronized
+        post-TP ``num_tokens_per_rank``.  Consequently the outer graph must
+        use the corresponding TP-group bucket even when this rank's local
+        attention batch is smaller.  Using a local bucket here would capture
+        different graph shapes in different DP groups and deadlock at the
+        first collective.
+        """
+        if not self._uses_block_residual or not self.moe_segments:
+            return None
+        moe_bucket = self._moe_group_bucket_for_step()
+        if moe_bucket is None:
+            return None
+        if moe_bucket not in self.bucketing.bucket_sizes:
+            self._fallback(
+                f"whole-model K3 bucket {moe_bucket} is not configured "
+                f"(buckets={self.bucketing.bucket_sizes})"
+            )
+            return None
+        return int(moe_bucket)
+
+    def _ensure_whole_built(self) -> bool:
+        """Build the direct-call transformer-body segment once."""
+        if self._whole_built:
+            return True
+        if not self._ensure_moe_built() or not self.moe_segments:
+            return False
+        from .whole_model_cuda_graph_segments import KimiLinearWholeModelSegment
+
+        first_moe = next(iter(self.moe_segments.values()))
+        tp_size = int(first_moe.tp_size)
+        tp_rank = int(first_moe.tp_rank)
+        dtype = self.segments[0].dtype
+        self.whole_manager = CUDAGraphManager(
+            self.bucketing, device=self.device
+        )
+        self.whole_manager.WARMUP_ITERATIONS = WARMUP_ITERATIONS
+        self.whole_manager.WARMUP_ITERATIONS_SUBSEQUENT = WARMUP_ITERATIONS
+        self.whole_segment = KimiLinearWholeModelSegment(
+            model=self.model,
+            layer_segments=list(self.segments.values()),
+            moe_segments=self.moe_segments,
+            statics=self._statics,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            device=self.device,
+            hidden_size=self.model_config.hidden_size,
+            dtype=dtype,
+            max_bucket_size=self.bucketing.bucket_sizes[-1],
+        )
+        self.whole_manager.register_segment(
+            self._whole_name, self.whole_segment
+        )
+        self._whole_built = True
+        if self.rank == 0:
+            logger.info(
+                "[KIMI_DECODE_GRAPH] built K3 whole-model segment: "
+                "layers=%d TP%d/TP-rank%d buckets=%s",
+                len(self.segments), tp_size, tp_rank,
+                self.bucketing.bucket_sizes,
+            )
+        return True
+
+    @staticmethod
+    def _collective_capture_barrier(device) -> None:
+        """Synchronize graph capture boundaries when NCCL is present."""
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        torch.cuda.synchronize(device)
+        dist.barrier()
+
     def prewarm_decode_graphs(self) -> bool:
         """Capture the first decode bucket before the decode loop starts.
 
@@ -998,6 +1107,33 @@ class KimiLinearDecodeGraph:
             self._kv_signature = signature
         if not self._ensure_built(kv_manager):
             return False
+
+        # K3 whole-model capture is only meaningful in graph mode.  Compare
+        # mode deliberately retains the proven per-layer compare path until a
+        # whole-stack eager reference is wired; it must not silently compare
+        # only a subset of the transformer.
+        whole_bucket = None
+        if mode == "graph":
+            self._ensure_moe_built()
+            if self._moe_all_ranks_nonempty():
+                whole_bucket = self._whole_model_bucket_for_step()
+        if whole_bucket is not None and self._ensure_whole_built():
+            self._bucket_statics(whole_bucket)
+            statics = self._statics[whole_bucket]
+            KimiLinearKDAWrapper.state_manager.prepare_decode_step(
+                [GRAPH_SCRATCH_SEQ_ID] * whole_bucket
+            )
+            statics.arm_for_capture()
+            if whole_bucket not in self._whole_captured:
+                self._capture_whole_bucket(whole_bucket)
+            self._refresh_statics(whole_bucket, bsz, seq_ids, page_table)
+            logger.info(
+                "[KIMI_DECODE_GRAPH] rank=%s whole-model prewarm complete: "
+                "bucket=%d captured=%s",
+                self.rank, whole_bucket, whole_bucket in self._whole_captured,
+            )
+            return True
+
         if bucket not in self._captured:
             self._capture_bucket(bucket)
 
@@ -1029,6 +1165,7 @@ class KimiLinearDecodeGraph:
         """
         self._step_active = False
         self._moe_step_active = False
+        self._whole_step_active = False
         if AttnWrapperBase.phase != "decode":
             return
         mode = _debug_mode() or self.mode
@@ -1082,6 +1219,36 @@ class KimiLinearDecodeGraph:
 
         if not self._ensure_built(kv_manager):
             return
+
+        # The outer graph includes the global resident-EP collectives, so its
+        # bucket is derived from the synchronized post-TP count rather than
+        # this rank's local attention batch.  This branch must happen before
+        # the legacy per-layer captures: registering a whole graph should not
+        # pay for 93 inner graph replays that it will never use.
+        if mode == "graph":
+            self._ensure_moe_built()
+            if self._moe_all_ranks_nonempty():
+                whole_bucket = self._whole_model_bucket_for_step()
+                if whole_bucket is not None and self._ensure_whole_built():
+                    self._bucket_statics(whole_bucket)
+                    if whole_bucket not in self._whole_captured:
+                        self._capture_whole_bucket(whole_bucket)
+                    self._refresh_statics(
+                        whole_bucket, bsz, seq_ids, page_table
+                    )
+                    # ``_run_whole_model`` is entered from the patched model
+                    # forward, while ``_bucket`` is also used by the legacy
+                    # layer hook.  Keep a dedicated whole-bucket field: the
+                    # outer graph bucket can be larger than this rank's local
+                    # attention batch when another DP group has more rows.
+                    self._whole_bucket = whole_bucket
+                    self._bucket = whole_bucket
+                    self._bsz = bsz
+                    self.step += 1
+                    self._step_active = True
+                    self._whole_step_active = True
+                    return
+
         if bucket not in self._captured:
             self._capture_bucket(bucket)
 
@@ -1114,6 +1281,33 @@ class KimiLinearDecodeGraph:
         self._bsz = bsz
         self.step += 1
         self._step_active = True
+
+    def _run_whole_model(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Replay the captured transformer body and stage MLA KV once."""
+        if self.whole_manager is None or self.whole_segment is None:
+            raise RuntimeError("K3 whole-model graph is active but not built")
+        statics = self._statics[self._whole_bucket]
+        graph_out = self.whole_manager.replay(
+            self._whole_name,
+            self._whole_bucket,
+            input_ids=input_ids,
+            num_valid_tokens=statics.num_valid_tokens,
+        )
+
+        # The outer CausalLM applies lm_head after this method returns. Keep
+        # only real local rows; the graph is globally bucketed so all ranks
+        # execute identical collective shapes.
+        hidden_states = graph_out["hidden_states"][: self._bsz]
+        callback = AttnWrapperBase.kv_append_callback
+        kv_buffer = self.whole_segment._kv_key_buffer
+        if callback is not None and kv_buffer is not None and self._bsz > 0:
+            # One device clone for the complete MLA stack, then one lightweight
+            # callback per MLA layer. This replaces the per-layer clone path.
+            staged = kv_buffer[:, : self._bsz].clone()
+            for layer_idx, segment in self.segments.items():
+                if not segment.is_kda:
+                    callback(layer_idx, staged[layer_idx], None)
+        return hidden_states
 
     def _run_layer(self, layer_idx: int, hidden_states: torch.Tensor):
         segment = self.segments[layer_idx]
@@ -1302,10 +1496,41 @@ class KimiLinearDecodeGraph:
             self.rank, bucket, len(self.moe_segments), elapsed,
         )
 
+    def _capture_whole_bucket(self, bucket: int) -> None:
+        """Capture one globally-shaped K3 transformer-body graph."""
+        if self.whole_manager is None or self.whole_segment is None:
+            raise RuntimeError("K3 whole-model graph manager is not initialized")
+        statics = self._bucket_statics(bucket)
+        KimiLinearKDAWrapper.state_manager.prepare_decode_step(
+            [GRAPH_SCRATCH_SEQ_ID] * bucket
+        )
+        statics.arm_for_capture()
+        self._collective_capture_barrier(self.device)
+        start = time.perf_counter()
+        free_before, _ = torch.cuda.mem_get_info(self.device)
+        self.whole_manager.warmup_and_capture_buckets([bucket])
+        torch.cuda.synchronize(self.device)
+        free_after, _ = torch.cuda.mem_get_info(self.device)
+        self._collective_capture_barrier(self.device)
+        elapsed = time.perf_counter() - start
+        used_mib = (free_before - free_after) / (1024 ** 2)
+        self._whole_captured.add(bucket)
+        self._whole_capture_stats[bucket] = {
+            "seconds": elapsed,
+            "mib": used_mib,
+            "layers": len(self.segments),
+        }
+        logger.warning(
+            "[KIMI_DECODE_GRAPH] rank=%s captured K3 whole-model bucket=%d: "
+            "%d layers in %.2fs, +%.1f MiB",
+            self.rank, bucket, len(self.segments), elapsed, used_mib,
+        )
+
     def _drop_graphs(self) -> None:
         """Release every captured bucket and the geometry derived from the KV
         manager. Segments are rebuilt (and re-registered on a fresh
         CUDAGraphManager) on the next eligible step."""
+        self._drop_whole_graphs()
         for bucket in list(self._captured):
             self.manager.drop_bucket(bucket)
         self._captured = set()
@@ -1316,6 +1541,18 @@ class KimiLinearDecodeGraph:
         self.manager = CUDAGraphManager(self.bucketing, device=self.device)
         self.manager.WARMUP_ITERATIONS = WARMUP_ITERATIONS
         self.manager.WARMUP_ITERATIONS_SUBSEQUENT = WARMUP_ITERATIONS
+
+    def _drop_whole_graphs(self) -> None:
+        """Release whole-model graphs before child span state is rebuilt."""
+        if self.whole_manager is not None:
+            for bucket in list(self._whole_captured):
+                self.whole_manager.drop_bucket(bucket)
+        self.whole_manager = None
+        self.whole_segment = None
+        self._whole_built = False
+        self._whole_captured = set()
+        self._whole_capture_stats = {}
+        self._whole_step_active = False
 
     def _drop_moe_graphs(self) -> None:
         """Release K3 MoE graphs and their shared static pool."""

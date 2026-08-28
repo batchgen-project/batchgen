@@ -21,6 +21,9 @@ from batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments import (
 from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
     balanced_row_split,
 )
+from batchgen.models.moonshotai.kimi_linear.whole_model_cuda_graph_segments import (
+    KimiLinearWholeModelSegment,
+)
 
 
 def test_k3_moe_graph_buckets_use_full_tp_group_geometry():
@@ -120,3 +123,45 @@ def test_nondivisible_tp_scatter_uses_balanced_rows():
         for rank in range(8)
     ]
     assert got == expected
+
+
+def test_whole_model_row_maps_round_trip_nondivisible_batch_on_cpu():
+    segment = KimiLinearWholeModelSegment.__new__(KimiLinearWholeModelSegment)
+    segment.tp_size = 8
+    segment.tp_rank = 3
+    segment.device = torch.device("cpu")
+
+    maps = segment._make_bucket_maps(17)
+    splits = balanced_row_split(17, 8)
+    assert maps.group_bucket == 24
+    assert maps.local_bucket == 3
+    assert maps.local_counts[17].item() == splits[3][1] - splits[3][0]
+
+    rank_major_rows = maps.padded_indices[17][maps.padded_valid[17]].tolist()
+    expected_rank_major = [
+        row for start, end in splits for row in range(start, end)
+    ]
+    assert rank_major_rows == expected_rank_major
+
+    original_to_rank_major = maps.original_indices[17]
+    restored = [rank_major_rows[int(original_to_rank_major[row])] for row in range(17)]
+    assert restored == list(range(17))
+
+
+def test_whole_model_row_maps_have_fixed_device_tables():
+    segment = KimiLinearWholeModelSegment.__new__(KimiLinearWholeModelSegment)
+    segment.tp_size = 8
+    segment.tp_rank = 0
+    segment.device = torch.device("cpu")
+
+    maps = segment._make_bucket_maps(8)
+    for table in (
+        maps.padded_indices,
+        maps.padded_valid,
+        maps.local_indices,
+        maps.local_valid,
+        maps.local_counts,
+        maps.original_indices,
+        maps.original_valid,
+    ):
+        assert table.device.type == "cpu"
