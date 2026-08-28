@@ -614,11 +614,17 @@ class K3MoEGraphSegment:
             ).contiguous()
 
         # EP collectives are graph-captured on the current decode stream.  The
-        # order is identical to ResidentEPMXFP4MoELayer._forward_ep.
+        # order is identical to ResidentEPMXFP4MoELayer._forward_ep.  The three
+        # gathers are submitted inside one NCCL group so they are launched as a
+        # single collective batch instead of three: it removes two per-collective
+        # launch/handshake costs while each tensor keeps its own native buffer
+        # and layout, so no packing or extra copy is introduced.
         with self.resident.comm.change_state(enable=True):
+            self.resident.comm.group_start()
             self.resident.comm.all_gather(bufs.all_latent, x_latent)
             self.resident.comm.all_gather(bufs.all_indices, topk_idx)
             self.resident.comm.all_gather(bufs.all_weights, topk_weight)
+            self.resident.comm.group_end()
 
         expert_counts, topk_pos = dispatch_scatter_3d(
             bufs.all_latent,
