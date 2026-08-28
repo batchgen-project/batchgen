@@ -254,6 +254,11 @@ class ResidentEPMXFP4MoELayer:
     # Per-step padded rows per rank; set by the worker for the M3.1b EP layout.
     # Unused at world=1 (all_gather / all_reduce are identity).
     num_tokens_per_rank = None
+    # Set alongside ``num_tokens_per_rank`` at the worker's rank-count
+    # synchronization boundary.  A K3 CUDA-graph MoE replay is collective
+    # global, so it is enabled only when every EP rank has a live row; an empty
+    # rank remains on the eager path and all ranks must make the same choice.
+    decode_all_ranks_nonempty = False
     # Reused by every layer during resident prefill. W2 needs 896 MiB for this
     # exact FP32 global output; reserving it before the resident expert shards
     # prevents the late first-layer allocation from failing in a fragmented
@@ -280,6 +285,19 @@ class ResidentEPMXFP4MoELayer:
     @classmethod
     def set_num_tokens_per_rank(cls, num_tokens_per_rank):
         cls.num_tokens_per_rank = int(num_tokens_per_rank)
+
+    @classmethod
+    def set_rank_token_counts(cls, rank_token_counts):
+        """Publish the boundary-synchronized empty-rank decision.
+
+        ``rank_token_counts`` is a GPU tensor already produced by the worker's
+        decode all-gather.  This is intentionally the only host read here; the
+        graph path reuses the resulting Python boolean on every steady-state
+        token rather than calling ``.item()`` from the model forward.
+        """
+        cls.decode_all_ranks_nonempty = not bool(
+            (rank_token_counts == 0).any().item()
+        )
 
     @classmethod
     def prepare_prefill_output(cls, num_global, hidden_size, device):

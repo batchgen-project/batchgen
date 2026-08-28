@@ -656,6 +656,18 @@ def test_kimi_k3_startup_leaves_request_shaped_allocations_to_admission():
     assert "prepare_resident_ep_prefill_output" not in source
 
 
+def test_kimi_decode_graph_is_prewarmed_before_continuous_decode():
+    """The first measured decode forward must not capture graphs lazily."""
+    generate = _function(WORKER, "generate", "BatchGenWorker")
+    calls = _calls(generate)
+    assert len(calls["prewarm_decode_graphs"]) == 1
+    assert len(calls["decoding_continuous"]) == 1
+    assert calls["prewarm_decode_graphs"][0] < calls["decoding_continuous"][0]
+
+    source = _body_source(generate)
+    assert "self._get_cuda_graph_gpu_manager()" in source
+
+
 # --------------------------------------------------------------------------- #
 #  (3) the H2D queue installation is shared and happens exactly once
 # --------------------------------------------------------------------------- #

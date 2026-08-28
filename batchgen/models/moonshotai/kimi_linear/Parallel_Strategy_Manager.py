@@ -19,11 +19,11 @@ BF16-only design (simpler than K2.5):
   - Attention: NoPE-MLA layers use paged KV + FlashMLA decode; KDA layers
     use pooled conv/recurrent state (KimiLinearKDAWrapper pools).
   - Decode CUDA graphs (decode_graph_mode="graph"|"compare", M5.2 Phase A):
-    per-layer attention spans captured/replayed by KimiLinearDecodeGraph
-    (cuda_graph_segments.py); the MoE stays eager between replays because its
-    collectives cannot be captured. "eager" (default) installs the adapter but
-    replays nothing, so batchgen_debug can switch modes on a live server;
-    "off" installs nothing at all.
+    per-layer attention spans plus the K3 resident-MXFP4 MoE segments are
+    captured/replayed by KimiLinearDecodeGraph (cuda_graph_segments.py). A
+    startup prewarm captures the first admitted bucket before decode;
+    "eager" (default) installs the adapter but replays nothing, so
+    batchgen_debug can switch modes on a live server; "off" installs nothing.
 
 PSM <-> worker contract (methods, AttnWrapperBase class attrs the worker writes
 each step, injected module attributes, comm handoff, weight-storage sharing,
@@ -682,10 +682,11 @@ class KimiLinearParallelStrategyManager:
     def _init_decode_graph(self):
         """Install the Phase-A decode CUDA-graph adapter (M5.2), if asked for.
 
-        Per-layer attention spans are captured lazily (first use of a bucket)
-        and replayed with the MoE running eagerly between them — its resident-EP
-        forward does all_gather/all_reduce, which must not be captured in
-        Phase A. See cuda_graph_segments.py for the capture-structure rationale.
+        Per-layer attention spans and, for K3 resident-MXFP4, the companion
+        grouped-MoE segments are captured by the adapter. The worker invokes
+        ``prewarm_decode_graphs`` after binding the real GPU KV manager so the
+        first measured decode forward does not pay capture/setup time. See
+        cuda_graph_segments.py for the capture-structure rationale.
         """
         mode = self._decode_graph_mode()
         if mode == "off":
@@ -713,6 +714,22 @@ class KimiLinearParallelStrategyManager:
             rank=self.rank,
         )
         self._decode_graph.install()
+
+    def prewarm_decode_graphs(self, gpu_manager=None):
+        """Capture the first K3 decode bucket before measured decode starts.
+
+        GPU KV allocation is intentionally worker-owned and happens after this
+        manager's ``configure_decoding`` call.  The worker therefore passes
+        the initialized manager here so the graph's MLA capture can bind its
+        stable page-table/K-cache addresses without duplicating KV lifecycle
+        logic in the PSM.
+        """
+        if self._decode_graph is None:
+            return False
+        if gpu_manager is not None:
+            manager = getattr(gpu_manager, "primary", gpu_manager)
+            AttnWrapperBase.gpu_paged_kv_manager = manager
+        return self._decode_graph.prewarm_decode_graphs()
 
     def _init_resident_ep_decode(self):
         """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
@@ -860,6 +877,20 @@ class KimiLinearParallelStrategyManager:
 
         ResidentEPMoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
         ResidentEPMXFP4MoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
+
+    def set_rank_token_counts(self, rank_token_counts):
+        """Publish whether every global decode rank has a live row.
+
+        The K3 resident-MXFP4 MoE CUDA graph contains global EP collectives. Its
+        graph/eager decision must therefore be identical on all ranks; the
+        worker already has the synchronized count vector at the batch boundary,
+        so pass it to the resident layer once instead of probing it from every
+        forward.
+        """
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        ResidentEPMXFP4MoELayer.set_rank_token_counts(rank_token_counts)
 
     @property
     def attn_tp_size(self):

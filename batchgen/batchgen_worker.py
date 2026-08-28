@@ -6750,6 +6750,19 @@ class BatchGenWorker:
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
 
+				# Kimi-K3's segmented attention + resident-MXFP4 MoE graphs
+				# must be captured after the real GPU KV manager/page table and
+				# synchronized decode row counts exist, but before the first
+				# measured decode forward.  The PSM keeps the model-specific
+				# capture logic; this hook only supplies the worker-owned KV
+				# manager.  Other models have no such method and retain their
+				# existing warmup path below.
+				prewarm_kimi_graphs = getattr(
+					self.parallel_manager, "prewarm_decode_graphs", None
+				)
+				if prewarm_kimi_graphs is not None:
+					prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())
+
 				# CUDA Graph Warmup (configure-time, one-time for whole-model GLM).
 				# Whole-model graph captures every configured bucket before decode;
 				# segmented GLM-5 paths retain their existing partial-capture policy.

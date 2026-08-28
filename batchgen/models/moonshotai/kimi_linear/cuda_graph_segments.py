@@ -38,8 +38,10 @@ WHAT IS AND IS NOT IN THE GRAPH
 In:   layer norms, all projections, 3x causal_conv1d_update + fla
       fused_recurrent_kda_fwd (KDA), paged-KV token write + FlashMLA (MLA),
       the attention TP all-reduce, o_proj, residual adds, dense MLP of layer 0.
-Out:  MoE (collectives), embedding, final norm, lm_head, KV offload callback
-      (fired post-replay with a cloned k_tensor), KDA slot alloc/free/zeroing,
+K3 resident-MXFP4 MoE layers additionally use a companion graph segment; it
+      owns their EP/TP collectives, grouped Marlin path, and shared expert.
+Out:  embedding, final norm, lm_head, KV offload callback (fired post-replay
+      with a cloned k_tensor), KDA slot alloc/free/zeroing,
       and the per-step static-buffer refresh — all eager, same stream, ordered
       before/after the replay (test_kda_segment_capture.py contract).
 
@@ -70,10 +72,12 @@ Bucket padding rows must not corrupt live state:
   * FlashMLA reads pad rows with cache_seqlens=1 and page_table=0 (a valid
     page); the outputs are discarded by the bucket->bsz slice.
 
-Buckets are rank-local: the MoE all_gather/all_reduce sees the unpadded local
-rows (graph outputs are sliced back to bsz before the eager FFN), so no
-cross-rank bucket lockstep is required in Phase A. Phase B (whole-model graph
-with in-graph all_reduce) is out of scope here.
+Attention buckets remain rank-local. The K3 MoE graph uses a separate
+TP-group-sized bucket: the worker's globally synchronized
+``num_tokens_per_rank`` is converted to ``tp_size * ntp`` so every EP rank
+replays the same collective shapes even when DP groups have different local
+batch sizes. If any EP rank is empty, all ranks use eager MoE for that step;
+this avoids mixing graph and eager collectives.
 
 Mode is planner/config-driven (`Basic_Config.decode_graph_mode`, default
 "eager") with a batch-level override through
@@ -596,6 +600,30 @@ class KimiLinearDecodeGraph:
         self._slot_index_long: Optional[torch.Tensor] = None
         self._compare_arange: Optional[torch.Tensor] = None
 
+        # K3 resident-MXFP4 MoE graphs use a separate manager because the
+        # attention buckets include values (1, 2, 4) that are not divisible by
+        # the TP8 row group. Build this lazily only when the model actually has
+        # resident latent-MoE shards; other Kimi variants retain eager MoE.
+        self.moe_manager = None
+        self.moe_bucketing = None
+        self.moe_pool = None
+        self.moe_segments = {}
+        self._moe_built = False
+        self._moe_build_attempted = False
+        self._moe_captured = set()
+        self._moe_capture_stats = {}
+        self._moe_step_active = False
+        self._moe_bucket = 0
+        self._moe_group_bucket = 0
+        self._moe_ntp = 0
+        # One per-rank scalar input for the K3 MoE graph.  Its value is
+        # refreshed once per decode step; unlike a Python argument it is safe
+        # to read inside a captured graph and avoids rebuilding a validity mask
+        # from host-visible row counts in every MoE layer.
+        self._moe_valid_tokens = torch.empty(
+            (1,), dtype=torch.int32, device=self.device
+        )
+
     # ------------------------------------------------------------------ #
     #  Install / release                                                  #
     # ------------------------------------------------------------------ #
@@ -653,6 +681,7 @@ class KimiLinearDecodeGraph:
             self._orig_layer_forwards = {}
             self._installed = False
         self._drop_graphs()
+        self._drop_moe_graphs()
         if self._scratch_slot is not None:
             if KimiLinearKDAWrapper.slot_manager is not None:
                 KimiLinearKDAWrapper.slot_manager.free(GRAPH_SCRATCH_SEQ_ID)
@@ -661,6 +690,9 @@ class KimiLinearDecodeGraph:
     def get_capture_stats(self) -> dict:
         stats = dict(self.manager.get_capture_stats())
         stats["kimi_capture"] = dict(self._capture_stats)
+        if self.moe_manager is not None:
+            stats["kimi_moe_capture"] = dict(self._moe_capture_stats)
+            stats["kimi_moe_manager"] = self.moe_manager.get_capture_stats()
         return stats
 
     # ------------------------------------------------------------------ #
@@ -674,6 +706,7 @@ class KimiLinearDecodeGraph:
                 return orig_forward(*args, **kwargs)
             finally:
                 self._step_active = False
+                self._moe_step_active = False
         return forward
 
     def _make_new_block_residual(self, orig_new):
@@ -771,6 +804,223 @@ class KimiLinearDecodeGraph:
                 self.rank, n, reason,
             )
 
+    def _moe_all_ranks_nonempty(self) -> bool:
+        """Return the boundary-synchronized EP emptiness decision.
+
+        A graph MoE replay contains global EP collectives.  An empty rank
+        cannot enter the patched non-empty attention path, so allowing other
+        ranks to replay the MoE graph would mix graph and eager collective
+        sequences and deadlock.  The worker publishes this boolean only when
+        the decode rank-count vector changes; it is not recomputed per token.
+        """
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        return bool(
+            getattr(ResidentEPMXFP4MoELayer, "decode_all_ranks_nonempty", False)
+        )
+
+    def _ensure_moe_built(self) -> bool:
+        """Build/register the K3 resident-MoE graphs once.
+
+        The attention graph remains usable when this optional path is absent.
+        We only enable the MoE graph when every MoE layer has the same
+        resident MXFP4 latent layout and a valid TP group; a partial graph
+        would otherwise change collective ordering for just some layers.
+        """
+        if self._moe_built:
+            return True
+        if self._moe_build_attempted:
+            return False
+        self._moe_build_attempted = True
+
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        from .moe_cuda_graph_segments import (
+            K3MoEGraphBufferPool,
+            K3MoEGraphSegment,
+            k3_moe_graph_buckets,
+        )
+
+        layers = self.model.model.layers
+        if not any(
+            bool(getattr(getattr(layer, "block_sparse_moe", None),
+                        "use_latent_moe", False))
+            for layer in layers
+        ):
+            # The 48B Kimi-Linear variant has resident BF16 MoE, not the K3
+            # latent MXFP4 layout captured by this companion manager.
+            return False
+        moe_layers = []
+        for layer_idx, layer in enumerate(layers):
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None:
+                continue
+            resident = getattr(moe, "_resident_ep_moe", None)
+            if not isinstance(resident, ResidentEPMXFP4MoELayer):
+                self._fallback(
+                    f"K3 resident-MXFP4 MoE unavailable at layer {layer_idx}"
+                )
+                return False
+            moe_layers.append((layer_idx, moe, resident))
+
+        if not moe_layers:
+            return False
+
+        tp_size = int(getattr(moe_layers[0][1], "attn_tp_size", 1))
+        if tp_size <= 1:
+            self._fallback("K3 resident-MoE graph requires TP>1")
+            return False
+        ep_world_size = int(moe_layers[0][2].world_size)
+        if any(
+            int(getattr(moe, "attn_tp_size", 1)) != tp_size
+            or int(getattr(resident, "world_size", 0)) != ep_world_size
+            for _, moe, resident in moe_layers
+        ):
+            self._fallback("K3 MoE layers have inconsistent graph topology")
+            return False
+
+        moe_buckets = k3_moe_graph_buckets(self.bucketing.bucket_sizes, tp_size)
+        self.moe_bucketing = BatchSizeBucketing(moe_buckets)
+        self.moe_manager = CUDAGraphManager(
+            self.moe_bucketing, device=self.device
+        )
+        self.moe_manager.WARMUP_ITERATIONS = WARMUP_ITERATIONS
+        self.moe_manager.WARMUP_ITERATIONS_SUBSEQUENT = WARMUP_ITERATIONS
+
+        _, first_moe, first_resident = moe_layers[0]
+        shard = first_resident.shard
+        self.moe_pool = K3MoEGraphBufferPool(
+            world_size=first_resident.world_size,
+            tp_size=tp_size,
+            num_local_experts=shard.num_local,
+            intermediate_size=shard.N,
+            latent_size=shard.K_latent,
+            hidden_size=first_moe.hidden_dim,
+            top_k=first_moe.top_k,
+            expert_buckets=moe_buckets,
+            device=self.device,
+        )
+
+        for layer_idx, moe, resident in moe_layers:
+            segment = K3MoEGraphSegment(
+                moe, resident, self.moe_pool, device=self.device
+            )
+            name = self._moe_name(layer_idx)
+            self.moe_segments[layer_idx] = segment
+            self.moe_manager.register_segment(name, segment)
+
+        self._moe_built = True
+        logger.info(
+            "[KIMI_DECODE_GRAPH] rank=%s built K3 resident-MoE graphs: "
+            "%d layers, TP%d, EP%d, buckets=%s",
+            self.rank, len(moe_layers), tp_size, first_resident.world_size,
+            moe_buckets,
+        )
+        return True
+
+    def _moe_name(self, layer_idx: int) -> str:
+        return f"kimi_linear/moe_{layer_idx}"
+
+    def _moe_group_bucket_for_step(self) -> Optional[int]:
+        if self.moe_bucketing is None:
+            return None
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        ntp = int(
+            getattr(ResidentEPMXFP4MoELayer, "num_tokens_per_rank", 0) or 0
+        )
+        if ntp <= 0:
+            return None
+        tp_size = int(next(iter(self.moe_segments.values())).tp_size)
+        group_size = tp_size * ntp
+        try:
+            return self.moe_bucketing.get_padded_size(group_size)
+        except ValueError:
+            self._fallback(
+                f"K3 MoE group batch {group_size} exceeds graph buckets"
+            )
+            return None
+
+    def prewarm_decode_graphs(self) -> bool:
+        """Capture the first decode bucket before the decode loop starts.
+
+        The worker calls this after it has allocated/bound the real GPU KV
+        manager and synchronized the decode row counts.  Capture uses only the
+        dedicated KDA scratch state and zero-valued graph inputs, so it cannot
+        mutate a live request.  Keeping this operation explicit prevents the
+        first measured decode forward from paying CUDA-graph construction or
+        K3 MoE graph setup time.
+
+        Later bucket capture remains available as a guarded fallback in
+        ``_begin_step`` for debug/interactive workloads; the formal runner
+        prewarms the bucket it admits and therefore never includes capture in
+        its measured interval.
+        """
+        mode = _debug_mode() or self.mode
+        if mode == "eager":
+            return False
+        if AttnWrapperBase.phase != "decode":
+            self._fallback("decode graph prewarm requested outside decode")
+            return False
+        seq_ids = list(AttnWrapperBase.cur_batch or [])
+        bsz = len(seq_ids)
+        if bsz == 0:
+            return False
+        kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+        if kv_manager is None:
+            self._fallback("decode graph prewarm has no gpu_paged_kv_manager")
+            return False
+        try:
+            bucket = self.bucketing.get_padded_size(bsz)
+        except ValueError:
+            self._fallback(f"prewarm bsz {bsz} exceeds top bucket")
+            return False
+
+        ensure = getattr(kv_manager, "ensure_cuda_graph_page_table", None)
+        try:
+            page_table = (
+                ensure(seq_ids) if ensure is not None
+                else kv_manager.get_cuda_graph_page_table()
+            )
+        except (RuntimeError, KeyError) as exc:
+            self._fallback(f"prewarm page table unavailable ({exc})")
+            return False
+
+        signature = self._signature(kv_manager)
+        if signature != self._kv_signature:
+            if self._kv_signature is not None:
+                self._drop_graphs()
+            self._kv_signature = signature
+        if not self._ensure_built(kv_manager):
+            return False
+        if bucket not in self._captured:
+            self._capture_bucket(bucket)
+
+        moe_ready = self._ensure_moe_built()
+        moe_bucket = (
+            self._moe_group_bucket_for_step() if moe_ready else None
+        )
+        if moe_bucket is not None and moe_bucket not in self._moe_captured:
+            self._capture_moe_bucket(moe_bucket)
+
+        # Keep the same static metadata refresh that the first replay will
+        # consume.  This is not required by capture itself, but makes the
+        # prewarm contract observable and catches a page-table capacity/order
+        # error before the measured decode interval.
+        self._refresh_statics(bucket, bsz, seq_ids, page_table)
+        logger.info(
+            "[KIMI_DECODE_GRAPH] rank=%s prewarm complete: attention_bucket=%d "
+            "moe_bucket=%s captured_attention=%s captured_moe=%s",
+            self.rank, bucket, moe_bucket, bucket in self._captured,
+            moe_bucket in self._moe_captured if moe_bucket is not None else False,
+        )
+        return True
+
     def _begin_step(self) -> None:
         """Decide the step's path and refresh every static buffer.
 
@@ -778,6 +1028,7 @@ class KimiLinearDecodeGraph:
         replays that consume it.
         """
         self._step_active = False
+        self._moe_step_active = False
         if AttnWrapperBase.phase != "decode":
             return
         mode = _debug_mode() or self.mode
@@ -834,6 +1085,21 @@ class KimiLinearDecodeGraph:
         if bucket not in self._captured:
             self._capture_bucket(bucket)
 
+        # K3's resident latent MoE uses global EP collectives.  Derive its
+        # group-sized replay bucket from the worker-synchronized post-TP
+        # ``ntp`` rather than from this rank's local batch size.
+        if self._ensure_moe_built() and self._moe_all_ranks_nonempty():
+            moe_bucket = self._moe_group_bucket_for_step()
+            if moe_bucket is not None:
+                if moe_bucket not in self._moe_captured:
+                    self._capture_moe_bucket(moe_bucket)
+                self._moe_ntp = moe_bucket // next(
+                    iter(self.moe_segments.values())
+                ).tp_size
+                self._moe_group_bucket = moe_bucket
+                self._moe_bucket = moe_bucket
+                self._moe_step_active = True
+
         self._compare_step = (
             mode == "compare" and self.step % max(1, self.compare_every) == 0
         )
@@ -870,9 +1136,60 @@ class KimiLinearDecodeGraph:
 
         if segment.fold_ffn:
             return outputs["hidden"]
-        # MoE (NCCL collectives) stays eager, outside the graph.
+        if self._moe_step_active and layer_idx in self.moe_segments:
+            # The decoder's TP-G ranks hold the same group rows.  The resident
+            # EP contract needs distinct rows per global rank, so scatter the
+            # group batch with the same balanced split as the eager path.  The
+            # graph input keeps BOTH the full group rows (for the shared expert)
+            # and this rank's local slice (for router/down/EP work).
+            moe_input = outputs["normed"].reshape(-1, segment.hidden_size)
+            moe_segment = self.moe_segments[layer_idx]
+            local = self._scatter_moe_rows(moe_input, moe_segment.tp_size,
+                                           moe_segment.tp_rank)
+            self._moe_valid_tokens.fill_(local.shape[0])
+            moe_out = self.moe_manager.replay(
+                self._moe_name(layer_idx),
+                self._moe_group_bucket,
+                padded=moe_input,
+                local=local,
+                num_valid_tokens=self._moe_valid_tokens,
+            )["moe_output"]
+            # NCCL's all-gather is necessarily rank-major.  For a group batch
+            # not divisible by TP, remove each rank's deterministic pad span;
+            # a divisible batch is already in the original row order and takes
+            # the allocation-free fast path.
+            moe_out = self._reassemble_moe_rows(
+                moe_out, self._bsz, moe_segment.tp_size
+            )
+            return outputs["residual"] + moe_out.view(
+                self._bsz, 1, segment.hidden_size
+            )
+
+        # Unsupported variants, empty-rank steps, and explicit eager mode
+        # retain the production resident-EP implementation.
         ffn_out = segment.layer._run_ffn(outputs["normed"])
         return outputs["residual"] + ffn_out
+
+    @staticmethod
+    def _scatter_moe_rows(hidden_states, group_size, group_rank):
+        from .moe_tp_reshard import scatter_rows
+
+        return scatter_rows(hidden_states, group_size, group_rank)
+
+    @staticmethod
+    def _reassemble_moe_rows(gathered, num_rows, group_size):
+        if int(num_rows) % int(group_size) == 0:
+            return gathered[:num_rows]
+        from .moe_tp_reshard import reassemble_rows
+
+        ntp = (int(num_rows) + int(group_size) - 1) // int(group_size)
+        return reassemble_rows(
+            gathered[: int(group_size) * ntp].view(
+                int(group_size), ntp, gathered.shape[-1]
+            ),
+            int(num_rows),
+            int(group_size),
+        )
 
     # ------------------------------------------------------------------ #
     #  Build / capture                                                    #
@@ -965,6 +1282,26 @@ class KimiLinearDecodeGraph:
             self.rank, bucket, len(self.segments), elapsed, used_mib,
         )
 
+    def _capture_moe_bucket(self, bucket: int) -> None:
+        """Warm up and capture every K3 MoE layer for one global bucket."""
+        if self.moe_manager is None:
+            raise RuntimeError("K3 MoE graph manager is not initialized")
+        torch.cuda.synchronize(self.device)
+        start = time.perf_counter()
+        self.moe_manager.warmup_and_capture_buckets([bucket])
+        torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - start
+        self._moe_captured.add(bucket)
+        self._moe_capture_stats[bucket] = {
+            "seconds": elapsed,
+            "segments": len(self.moe_segments),
+        }
+        logger.warning(
+            "[KIMI_DECODE_GRAPH] rank=%s captured K3 MoE bucket=%d: "
+            "%d layers in %.2fs",
+            self.rank, bucket, len(self.moe_segments), elapsed,
+        )
+
     def _drop_graphs(self) -> None:
         """Release every captured bucket and the geometry derived from the KV
         manager. Segments are rebuilt (and re-registered on a fresh
@@ -979,6 +1316,23 @@ class KimiLinearDecodeGraph:
         self.manager = CUDAGraphManager(self.bucketing, device=self.device)
         self.manager.WARMUP_ITERATIONS = WARMUP_ITERATIONS
         self.manager.WARMUP_ITERATIONS_SUBSEQUENT = WARMUP_ITERATIONS
+
+    def _drop_moe_graphs(self) -> None:
+        """Release K3 MoE graphs and their shared static pool."""
+        if self.moe_manager is not None:
+            for bucket in list(self._moe_captured):
+                self.moe_manager.drop_bucket(bucket)
+        if self.moe_pool is not None:
+            self.moe_pool.release()
+        self.moe_manager = None
+        self.moe_bucketing = None
+        self.moe_pool = None
+        self.moe_segments = {}
+        self._moe_built = False
+        self._moe_build_attempted = False
+        self._moe_captured = set()
+        self._moe_capture_stats = {}
+        self._moe_step_active = False
 
     @staticmethod
     def _tensor_signature(tensor) -> tuple:

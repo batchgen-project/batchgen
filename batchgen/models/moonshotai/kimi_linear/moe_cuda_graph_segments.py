@@ -1,0 +1,478 @@
+# ---------------------------------------------------------------------------- #
+#  BatchGen                                                                      #
+#  copyright (c) EfficientMoE team 2025                                         #
+#                                                                               #
+#  licensed under the Apache License, Version 2.0                              #
+# ---------------------------------------------------------------------------- #
+
+"""CUDA-graph resident-MoE segment for Kimi-K3.
+
+The decode model uses TP8 attention groups over a world-size EP communicator.
+Each rank receives the same group rows, scatters them locally across its TP
+group, and the resident MXFP4 layer gathers the resulting latent/routing rows
+over EP.  This module captures that complete resident-MoE path with fixed
+buffers.  It deliberately does not call ``ResidentEPMXFP4MoELayer.forward``:
+that eager seam allocates its dispatch buffers and pointer tables on every
+step, which is precisely the host/launch overhead this graph removes.
+
+Padding is represented by zero rows in the fixed TP-group input.  K3's routed
+and shared projections are bias-free, so zero rows produce zero output; no
+host-side valid-row read is needed in the graph.  The graph is therefore
+collective-safe even when the two DP groups have different batch sizes, as long
+as every rank has at least one live row.  The caller disables this path for an
+empty global rank set.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, List
+
+import torch
+import torch.distributed as dist
+
+from batchgen.cuda_graph.graph_manager import TensorSpec
+from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d
+from batchgen.moe.marlin_grouped_moe import (
+    marlin_grouped_m16_mxfp4,
+    marlin_grouped_stage1_fused_mxfp4_situ,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def k3_moe_graph_buckets(attention_buckets: Iterable[int], tp_size: int) -> List[int]:
+    """Round attention buckets to the fixed TP-group MoE input geometry.
+
+    A K3 MoE graph input is the whole replicated TP-group batch.  Its rows are
+    split evenly across ``tp_size`` ranks, so a graph bucket must be a multiple
+    of that group size.  The returned set is deterministic and contains the
+    exact ``tp_size * ceil(B / tp_size)`` capacity for every attention bucket.
+    """
+    group = int(tp_size)
+    if group <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    buckets = sorted({int(b) for b in attention_buckets})
+    if not buckets or any(b <= 0 for b in buckets):
+        raise ValueError(f"attention_buckets must contain positive sizes, got {buckets}")
+    return sorted({group * math.ceil(b / group) for b in buckets})
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return ((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+
+@dataclass
+class _K3MoEGraphBuffers:
+    all_latent: torch.Tensor
+    all_indices: torch.Tensor
+    all_weights: torch.Tensor
+    dispatched: torch.Tensor
+    intermediate: torch.Tensor
+    expert_output: torch.Tensor
+    combined: torch.Tensor
+    local_combined: torch.Tensor
+    tp_output: torch.Tensor
+    expert_counts: torch.Tensor
+    expert_counters: torch.Tensor
+    topk_pos: torch.Tensor
+    expert_starts: torch.Tensor
+    s1_C_ptrs: torch.Tensor
+    s3_C_ptrs: torch.Tensor
+    s1_workspace: torch.Tensor
+    s3_workspace: torch.Tensor
+    local_tokens: int
+    global_tokens: int
+    max_tokens_padded: int
+    max_m_tiles: int
+
+
+class K3MoEGraphBufferPool:
+    """Static activation/routing storage shared by all K3 MoE layer graphs."""
+
+    def __init__(
+        self,
+        *,
+        world_size: int,
+        tp_size: int,
+        num_local_experts: int,
+        intermediate_size: int,
+        latent_size: int,
+        hidden_size: int,
+        top_k: int,
+        expert_buckets: Iterable[int],
+        device: torch.device,
+    ) -> None:
+        self.world_size = int(world_size)
+        self.tp_size = int(tp_size)
+        self.num_local_experts = int(num_local_experts)
+        self.intermediate_size = int(intermediate_size)
+        self.latent_size = int(latent_size)
+        self.hidden_size = int(hidden_size)
+        self.top_k = int(top_k)
+        self.device = device
+        self.bucket_sizes = sorted({int(b) for b in expert_buckets})
+        if self.world_size <= 0:
+            raise ValueError("world_size must be positive")
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
+        if self.num_local_experts <= 0:
+            raise ValueError("num_local_experts must be positive")
+        if not self.bucket_sizes or any(b <= 0 for b in self.bucket_sizes):
+            raise ValueError(f"expert_buckets must be positive, got {self.bucket_sizes}")
+        self._base: Dict[str, torch.Tensor] = {}
+        self._views: Dict[int, _K3MoEGraphBuffers] = {}
+        self._setup_done = False
+
+    def setup(self) -> None:
+        if self._setup_done:
+            return
+
+        max_bucket = max(self.bucket_sizes)
+        # Every graph bucket is a full TP-group batch.  The TP group size is
+        # inferred by the caller as bucket/local_tokens; local_tokens is always
+        # the same for the corresponding graph.  The pool only needs the EP
+        # global row count, so the caller supplies buckets in group geometry and
+        # records the local row count at view creation below.
+        # ``max_local_tokens`` is filled by the segment when it creates views.
+        # K3MoEGraphBufferPool is intentionally usable in CPU contract tests,
+        # hence all storage is ordinary torch allocation rather than CUDA-only
+        # helpers.
+        self._max_group_bucket = max_bucket
+        self._max_local_tokens = 0
+        self._max_global_tokens = 0
+        if any(bucket % self.tp_size for bucket in self.bucket_sizes):
+            raise ValueError(
+                f"all K3 MoE buckets must be divisible by tp_size={self.tp_size}: "
+                f"{self.bucket_sizes}"
+            )
+        self._max_local_tokens = max_bucket // self.tp_size
+        self._max_global_tokens = self.world_size * self._max_local_tokens
+        max_mtp = _round_up(self._max_global_tokens, 16)
+        e = self.num_local_experts
+        n = self.intermediate_size
+        k = self.latent_size
+        nk = self._max_global_tokens * self.top_k
+        d = self.device
+
+        b = self._base
+        b["all_latent"] = torch.empty((self._max_global_tokens, k), dtype=torch.bfloat16, device=d)
+        b["all_indices"] = torch.empty((self._max_global_tokens, self.top_k), dtype=torch.int32, device=d)
+        b["all_weights"] = torch.empty((self._max_global_tokens, self.top_k), dtype=torch.float32, device=d)
+        b["dispatched"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
+        b["intermediate"] = torch.empty((e * max_mtp, n), dtype=torch.bfloat16, device=d)
+        b["expert_output"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
+        b["combined"] = torch.empty((self._max_global_tokens, k), dtype=torch.float32, device=d)
+        # ``combined`` is rank-major [EP, local_tokens, latent].  The
+        # reduce-scatter writes one rank's chunk directly here, so the
+        # post-combine norm/up projection never needs a rank-local slice or a
+        # second device copy.
+        b["local_combined"] = torch.empty(
+            (self._max_local_tokens, k), dtype=torch.float32, device=d
+        )
+        b["tp_output"] = torch.empty((self._max_group_bucket, self.hidden_size), dtype=torch.bfloat16, device=d)
+        b["expert_counts"] = torch.empty((e,), dtype=torch.int32, device=d)
+        b["expert_counters"] = torch.empty((e,), dtype=torch.int32, device=d)
+        b["topk_pos"] = torch.empty((nk,), dtype=torch.int32, device=d)
+        b["s1_workspace"] = torch.empty((e * (n // 256 + 17),), dtype=torch.int32, device=d)
+        b["s3_workspace"] = torch.empty((e * (k // 256 + 17),), dtype=torch.int32, device=d)
+
+        for bucket in self.bucket_sizes:
+            self._create_view(bucket, max_mtp)
+        self._setup_done = True
+
+        total_bytes = sum(t.numel() * t.element_size() for t in b.values())
+        logger.info(
+            "K3MoEGraphBufferPool: allocated %.2f MiB "
+            "(world=%d, tp=%d, max_group=%d, max_global=%d, experts/rank=%d)",
+            total_bytes / (1024**2), self.world_size, self.tp_size,
+            self._max_group_bucket, self._max_global_tokens,
+            self.num_local_experts,
+        )
+
+    def _create_view(self, bucket: int, max_mtp: int) -> None:
+        local_tokens = int(bucket) // self.tp_size
+        global_tokens = self.world_size * local_tokens
+        mtp = _round_up(global_tokens, 16)
+        e = self.num_local_experts
+        n = self.intermediate_size
+        k = self.latent_size
+        b = self._base
+        row_n = n * 2
+        row_k = k * 2
+        expert_starts = torch.arange(e, dtype=torch.int32, device=self.device) * mtp
+        s1_ptrs = torch.tensor(
+            [b["intermediate"].data_ptr() + i * mtp * row_n for i in range(e)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        s3_ptrs = torch.tensor(
+            [b["expert_output"].data_ptr() + i * mtp * row_k for i in range(e)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._views[int(bucket)] = _K3MoEGraphBuffers(
+            all_latent=b["all_latent"][:global_tokens],
+            all_indices=b["all_indices"][:global_tokens],
+            all_weights=b["all_weights"][:global_tokens],
+            dispatched=b["dispatched"][: e * mtp],
+            intermediate=b["intermediate"][: e * mtp],
+            expert_output=b["expert_output"][: e * mtp],
+            combined=b["combined"][:global_tokens],
+            local_combined=b["local_combined"][:local_tokens],
+            tp_output=b["tp_output"][:bucket],
+            expert_counts=b["expert_counts"],
+            expert_counters=b["expert_counters"],
+            topk_pos=b["topk_pos"][: global_tokens * self.top_k],
+            expert_starts=expert_starts,
+            s1_C_ptrs=s1_ptrs,
+            s3_C_ptrs=s3_ptrs,
+            s1_workspace=b["s1_workspace"],
+            s3_workspace=b["s3_workspace"],
+            local_tokens=local_tokens,
+            global_tokens=global_tokens,
+            max_tokens_padded=mtp,
+            max_m_tiles=(min(global_tokens, mtp) + 15) // 16,
+        )
+
+    def get(self, bucket: int) -> _K3MoEGraphBuffers:
+        self.setup()
+        try:
+            return self._views[int(bucket)]
+        except KeyError as exc:
+            raise KeyError(
+                f"K3 MoE graph bucket {bucket} was not allocated; "
+                f"available={self.bucket_sizes}"
+            ) from exc
+
+    def release(self) -> None:
+        self._views.clear()
+        self._base.clear()
+        self._setup_done = False
+
+
+class K3MoEGraphSegment:
+    """Graph-capturable K3 latent resident-EP MoE for one layer."""
+
+    def __init__(self, moe, resident, pool: K3MoEGraphBufferPool, *, device):
+        self.moe = moe
+        self.resident = resident
+        self.pool = pool
+        self.device = device
+        self.hidden_size = int(moe.hidden_dim)
+        self.latent_size = int(resident.shard.K_latent)
+        self.intermediate_size = int(resident.shard.N)
+        self.top_k = int(moe.top_k)
+        self.world_size = int(resident.world_size)
+        self.rank = int(resident.rank)
+        self.expert_start = int(resident.expert_start)
+        self.num_local_experts = int(resident.shard.num_local)
+        self.tp_size = int(getattr(moe, "attn_tp_size", 1))
+        self.tp_rank = int(getattr(moe, "attn_tp_rank", 0))
+        self.tp_group = getattr(moe, "attn_tp_group", None)
+
+        if self.tp_size <= 1 or self.tp_group is None:
+            raise RuntimeError("K3 resident-MoE graph requires a TP8 process group")
+        if self.hidden_size <= 0 or self.latent_size <= 0:
+            raise ValueError("K3 resident-MoE graph received invalid model dimensions")
+        if self.top_k != 16:
+            raise ValueError(f"K3 resident-MoE graph expects top_k=16, got {self.top_k}")
+        if getattr(moe, "shared_experts", None) is None:
+            raise ValueError("K3 resident-MoE graph requires shared experts")
+        if resident.comm is None:
+            raise ValueError("K3 resident-MoE graph requires an EP communicator")
+        if self.tp_size != self.pool.tp_size:
+            raise ValueError(
+                f"K3 MoE TP mismatch: layer={self.tp_size}, pool={self.pool.tp_size}"
+            )
+        if self.world_size != self.pool.world_size:
+            raise ValueError(
+                f"K3 MoE EP mismatch: layer={self.world_size}, pool={self.pool.world_size}"
+            )
+
+        # The resident layer owns these pointers and keeps every weight tensor
+        # alive.  Do not copy any weight into the graph pool.
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        self.pool.setup()
+        if hasattr(self.resident.comm, "disabled"):
+            self.resident.comm.disabled = False
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        # The pool is shared by every layer; its owner releases it once when the
+        # decode graph driver is torn down.
+        return None
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            # ``padded`` is the full TP-group batch.  It is needed by the
+            # shared expert, which is replicated over the group and performs
+            # its own row-parallel all-reduce.
+            "padded": TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            ),
+            # ``local`` is this TP rank's balanced slice of the real group
+            # rows, copied into the first rows of a fixed-size buffer.  Keeping
+            # a second input avoids deriving a non-divisible balanced split
+            # from a graph-time constant bucket.
+            "local": TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            ),
+            "num_valid_tokens": TensorSpec((1,), torch.int32),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "moe_output": TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            )
+        }
+
+    def _combine_fp32(self, bufs: _K3MoEGraphBuffers) -> None:
+        """Combine K=16 routes without a host-visible index or allocation."""
+        pos = bufs.topk_pos.view(bufs.global_tokens, self.top_k).long()
+        valid = pos >= 0
+        rows = pos.clamp_min(0).reshape(-1)
+        gathered = bufs.expert_output.index_select(0, rows).float().view(
+            bufs.global_tokens, self.top_k, self.latent_size
+        )
+        # Non-local routes point at clamped row zero.  Mask before arithmetic so
+        # a stale/unwritten row cannot turn 0 * NaN into NaN.
+        gathered.masked_fill_(~valid.unsqueeze(-1), 0.0)
+        contribution = gathered * bufs.all_weights.unsqueeze(-1)
+        bufs.combined.copy_(contribution.sum(dim=1))
+
+    def forward(
+        self,
+        *,
+        padded: torch.Tensor,
+        local: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        bucket = int(padded.shape[0])
+        bufs = self.pool.get(bucket)
+        local_tokens = bufs.local_tokens
+        global_tokens = bufs.global_tokens
+        local = local[:local_tokens]
+
+        # The graph always executes the fixed local-token shape.  Mask the
+        # balanced-split padding before the EP all-gathers so zero rows do not
+        # turn into real routed assignments (the router's zero-input bias can
+        # otherwise select experts and waste grouped-GEMM work).  The scalar is
+        # a graph input refreshed once per replay and may differ by TP rank.
+        valid_rows = torch.arange(
+            local_tokens, dtype=torch.int32, device=local.device
+        ) < num_valid_tokens.reshape(1)
+
+        # Router/down-projection are executed once per distinct local row.  The
+        # graph input is already zero padded to the full TP-group bucket.
+        gate_out = self.moe.gate(local.view(local_tokens, 1, self.hidden_size))
+        # KimiMoEGate flattens its input internally and returns [T, K].  Keep
+        # this explicit because a wrapper may preserve the singleton sequence
+        # dimension; the static EP gather buffers are always two-dimensional.
+        topk_idx = gate_out[0].reshape(local_tokens, -1).to(torch.int32)
+        topk_weight = gate_out[1].reshape(local_tokens, -1)
+        topk_idx = torch.where(
+            valid_rows.unsqueeze(1), topk_idx, torch.full_like(topk_idx, -1)
+        )
+        topk_weight = torch.where(
+            valid_rows.unsqueeze(1), topk_weight, torch.zeros_like(topk_weight)
+        )
+        x_latent = self.resident.down_proj(local).reshape(
+            local_tokens, self.latent_size
+        ).contiguous()
+
+        # EP collectives are graph-captured on the current decode stream.  The
+        # order is identical to ResidentEPMXFP4MoELayer._forward_ep.
+        with self.resident.comm.change_state(enable=True):
+            self.resident.comm.all_gather(bufs.all_latent, x_latent)
+            self.resident.comm.all_gather(bufs.all_indices, topk_idx)
+            self.resident.comm.all_gather(bufs.all_weights, topk_weight)
+
+        expert_counts, topk_pos = dispatch_scatter_3d(
+            bufs.all_latent,
+            bufs.all_indices,
+            bufs.dispatched,
+            self.expert_start,
+            self.num_local_experts,
+            bufs.max_tokens_padded,
+            bufs.expert_counts,
+            bufs.expert_counters,
+            bufs.topk_pos,
+        )
+
+        # The resident layer's weight pointers and K3 SiTU kernel are reused;
+        # only the activation/metadata storage is graph-owned and static.
+        shard = self.resident.shard
+        marlin_grouped_stage1_fused_mxfp4_situ(
+            bufs.dispatched,
+            bufs.intermediate,
+            expert_counts,
+            bufs.expert_starts,
+            shard.gate_B_ptrs,
+            shard.gate_scales_ptrs,
+            shard.up_B_ptrs,
+            shard.up_scales_ptrs,
+            bufs.s1_C_ptrs,
+            self.intermediate_size,
+            self.latent_size,
+            bufs.s1_workspace,
+            bufs.max_m_tiles,
+            bufs.max_tokens_padded,
+            self.num_local_experts,
+            global_tokens,
+        )
+        marlin_grouped_m16_mxfp4(
+            bufs.intermediate,
+            shard.down_B_ptrs,
+            bufs.s3_C_ptrs,
+            shard.down_scales_ptrs,
+            bufs.expert_starts,
+            expert_counts,
+            self.num_local_experts,
+            self.latent_size,
+            self.intermediate_size,
+            bufs.s3_workspace,
+            self.num_local_experts,
+            self.latent_size // 256,
+            bufs.max_m_tiles,
+        )
+        self._combine_fp32(bufs)
+
+        # ``combined`` is rank-major because the EP all-gathers above are
+        # rank-major.  Reduce-scatter therefore returns exactly this rank's
+        # contiguous local chunk, replacing the old all-reduce + rank slice.
+        # It cuts the EP reduction traffic roughly in half and removes the
+        # explicit slice/copy from the critical path.
+        with self.resident.comm.change_state(enable=True):
+            self.resident.comm.reduce_scatter(
+                bufs.local_combined,
+                bufs.combined,
+                op=dist.ReduceOp.SUM,
+            )
+
+        local_latent = bufs.local_combined.to(torch.bfloat16)
+        if self.resident.norm is not None:
+            local_latent = self.resident.norm(local_latent)
+        local_output = self.resident.up_proj(local_latent)
+
+        # Reassemble the TP-group rows.  Each TP rank owns one contiguous slice
+        # of the full group input, so NCCL's rank-major output is already in the
+        # original row order.
+        with torch.cuda.device(self.device):
+            dist.all_gather_into_tensor(
+                bufs.tp_output,
+                local_output,
+                group=self.tp_group,
+            )
+        bufs.tp_output.add_(self.moe.shared_experts(padded))
+        return {"moe_output": bufs.tp_output}
+
+
+__all__ = [
+    "K3MoEGraphBufferPool",
+    "K3MoEGraphSegment",
+    "k3_moe_graph_buckets",
+]
