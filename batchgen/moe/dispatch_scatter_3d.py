@@ -13,6 +13,10 @@ dispatch_scatter_3d:
 reduce_weighted_scatter:
     Weighted sum from 3D output back to flat [G, H] using topk_pos indices.
     FP32 accumulation, BF16 output. Template-specialized for K=2,4,8.
+
+reduce_weighted_scatter_fp32:
+    K3 K=16 weighted sum into a preallocated FP32 [G, H] output.  This keeps
+    the downcast after the EP reduce-scatter and is CUDA-graph safe.
 """
 
 import logging
@@ -113,5 +117,26 @@ def reduce_weighted_scatter(
     if output is None:
         output = torch.zeros(N, H, dtype=torch.bfloat16, device=expert_output.device)
     return mod.reduce_weighted_scatter(
+        expert_output, topk_pos, topk_weights, N, H, K, output,
+    )
+
+
+def reduce_weighted_scatter_fp32(
+    expert_output: torch.Tensor,
+    topk_pos: torch.Tensor,
+    topk_weights: torch.Tensor,
+    N: int,
+    H: int,
+    K: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """K3 K=16 weighted combine directly into preallocated FP32 output.
+
+    Unlike :func:`reduce_weighted_scatter`, this intentionally does not cast
+    the result to BF16.  The K3 resident-EP graph reduce-scatters these FP32
+    partial sums before the one per-rank BF16 conversion.
+    """
+    mod = _load_dispatch_reduce_module()
+    return mod.reduce_weighted_scatter_fp32(
         expert_output, topk_pos, topk_weights, N, H, K, output,
     )

@@ -34,7 +34,10 @@ import torch
 import torch.distributed as dist
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
-from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d
+from batchgen.moe.dispatch_scatter_3d import (
+    dispatch_scatter_3d,
+    reduce_weighted_scatter_fp32,
+)
 from batchgen.moe.marlin_grouped_moe import (
     marlin_grouped_m16_mxfp4,
     marlin_grouped_stage1_fused_mxfp4_situ,
@@ -331,18 +334,16 @@ class K3MoEGraphSegment:
         }
 
     def _combine_fp32(self, bufs: _K3MoEGraphBuffers) -> None:
-        """Combine K=16 routes without a host-visible index or allocation."""
-        pos = bufs.topk_pos.view(bufs.global_tokens, self.top_k).long()
-        valid = pos >= 0
-        rows = pos.clamp_min(0).reshape(-1)
-        gathered = bufs.expert_output.index_select(0, rows).float().view(
-            bufs.global_tokens, self.top_k, self.latent_size
+        """Combine K=16 routes into the preallocated FP32 graph buffer."""
+        reduce_weighted_scatter_fp32(
+            bufs.expert_output,
+            bufs.topk_pos,
+            bufs.all_weights,
+            bufs.global_tokens,
+            self.latent_size,
+            self.top_k,
+            bufs.combined,
         )
-        # Non-local routes point at clamped row zero.  Mask before arithmetic so
-        # a stale/unwritten row cannot turn 0 * NaN into NaN.
-        gathered.masked_fill_(~valid.unsqueeze(-1), 0.0)
-        contribution = gathered * bufs.all_weights.unsqueeze(-1)
-        bufs.combined.copy_(contribution.sum(dim=1))
 
     def forward(
         self,

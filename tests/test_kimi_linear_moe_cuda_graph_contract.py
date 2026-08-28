@@ -4,7 +4,11 @@ These tests deliberately do not launch CUDA.  They pin the fixed geometry and
 the rank-major <-> balanced-row mapping that the remote CUDA gate exercises.
 """
 
+from types import SimpleNamespace
+
 import torch
+
+import batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments as k3_moe_graph
 
 from batchgen.models.moonshotai.kimi_linear.cuda_graph_segments import (
     KimiLinearDecodeGraph,
@@ -59,6 +63,37 @@ def test_k3_graph_segment_inputs_keep_group_and_local_rows_separate():
     assert specs["num_valid_tokens"].resolve_shape(24) == (1,)
 
 
+def test_k3_graph_combine_passes_preallocated_fp32_output(monkeypatch):
+    segment = K3MoEGraphSegment.__new__(K3MoEGraphSegment)
+    segment.top_k = 16
+    segment.latent_size = 128
+    output = torch.empty((3, 128), dtype=torch.float32)
+    called = {}
+
+    def fake_combine(expert_output, topk_pos, topk_weights, n, h, k, out):
+        called["args"] = (expert_output, topk_pos, topk_weights, n, h, k, out)
+        out.fill_(7.0)
+        return out
+
+    monkeypatch.setattr(k3_moe_graph, "reduce_weighted_scatter_fp32", fake_combine)
+    bufs = SimpleNamespace(
+        expert_output=torch.empty((48, 128), dtype=torch.bfloat16),
+        topk_pos=torch.empty((3 * 16,), dtype=torch.int32),
+        all_weights=torch.empty((3, 16), dtype=torch.float32),
+        global_tokens=3,
+        combined=output,
+    )
+
+    segment._combine_fp32(bufs)
+
+    args = called["args"]
+    assert args[3] == 3
+    assert args[4] == 128
+    assert args[5] == 16
+    assert args[6] is output
+    assert torch.equal(output, torch.full_like(output, 7.0))
+
+
 def test_nondivisible_tp_split_round_trips_through_graph_output():
     num_rows = 17
     group_size = 8
@@ -85,4 +120,3 @@ def test_nondivisible_tp_scatter_uses_balanced_rows():
         for rank in range(8)
     ]
     assert got == expected
-
