@@ -96,6 +96,22 @@ class KimiLinearWholeModelSegment:
             )
 
         self._bucket_maps: Dict[int, _WholeBucketMaps] = {}
+        # The graph keeps the model's logical layer numbering, but only MLA
+        # layers produce a paged-KV row.  Keep that mapping local to the graph
+        # so the post-replay staging copy does not clone 69 never-written KDA
+        # rows on every decode token.
+        self._primary_kv_layers = tuple(
+            layer_idx
+            for layer_idx, segment in enumerate(self.layer_segments)
+            if not bool(getattr(segment, "is_kda", False))
+        )
+        self._logical_to_physical_kv = tuple(
+            {
+                layer_idx: physical_idx
+                for physical_idx, layer_idx in enumerate(self._primary_kv_layers)
+            }.get(layer_idx, -1)
+            for layer_idx in range(self.num_layers)
+        )
         self._kv_key_buffer: Optional[torch.Tensor] = None
         self._kv_buffers: Optional[list[dict[str, torch.Tensor | None]]] = None
         self.primary_kv_offload_buffers = None
@@ -144,12 +160,13 @@ class KimiLinearWholeModelSegment:
             if setup is not None:
                 setup(bucket)
 
-        # One contiguous staging buffer covers all MLA layers.  It is kept for
-        # the lifetime of the outer segment so dropping one bucket cannot
-        # invalidate another captured graph's pointer.
+        # One contiguous staging buffer covers only the MLA layers.  It is
+        # kept for the lifetime of the outer segment so dropping one bucket
+        # cannot invalidate another captured graph's pointer.  KDA layers do
+        # not emit paged KV and must not consume staging capacity.
         if self._kv_key_buffer is None and self._primary_kv_dim > 0:
             self._kv_key_buffer = torch.zeros(
-                self.num_layers,
+                len(self._primary_kv_layers),
                 self.max_bucket_size,
                 1,
                 1,
@@ -159,7 +176,7 @@ class KimiLinearWholeModelSegment:
             )
             self._kv_buffers = [
                 {"key": self._kv_key_buffer[i], "value": None}
-                for i in range(self.num_layers)
+                for i in range(len(self._primary_kv_layers))
             ]
             self.primary_kv_offload_buffers = self._kv_buffers
 
@@ -263,6 +280,11 @@ class KimiLinearWholeModelSegment:
     def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor) -> None:
         if self._kv_key_buffer is None:
             raise RuntimeError("K3 whole graph KV staging is not initialized")
+        physical_layer_idx = self._logical_to_physical_kv[int(layer_idx)]
+        if physical_layer_idx < 0:
+            raise KeyError(
+                f"logical KDA layer {layer_idx} does not own paged KV"
+            )
         if k_tensor.dim() == 3:
             k_tensor = k_tensor.unsqueeze(2)
         expected = (k_tensor.shape[0], 1, 1, self._primary_kv_dim)
@@ -271,7 +293,7 @@ class KimiLinearWholeModelSegment:
                 f"K3 whole graph KV tensor mismatch: got {tuple(k_tensor.shape)}, "
                 f"expected (*, 1, 1, {self._primary_kv_dim})"
             )
-        self._kv_key_buffer[int(layer_idx), : k_tensor.shape[0]].copy_(k_tensor)
+        self._kv_key_buffer[physical_layer_idx, : k_tensor.shape[0]].copy_(k_tensor)
 
     # ------------------------------------------------------------------ #
     # TP row-map construction                                             #

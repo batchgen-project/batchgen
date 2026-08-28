@@ -6,6 +6,7 @@ the rank-major <-> balanced-row mapping that the remote CUDA gate exercises.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments as k3_moe_graph
@@ -168,3 +169,20 @@ def test_whole_model_row_maps_have_fixed_device_tables():
         maps.original_valid,
     ):
         assert table.device.type == "cpu"
+
+
+def test_k3_whole_graph_kv_staging_is_compact_and_logically_mapped():
+    segment = KimiLinearWholeModelSegment.__new__(KimiLinearWholeModelSegment)
+    segment.num_layers = 4
+    segment._primary_kv_layers = (1, 3)
+    segment._logical_to_physical_kv = (-1, 0, -1, 1)
+    segment._primary_kv_dim = 3
+    segment._kv_key_buffer = torch.zeros(2, 2, 1, 1, 3)
+
+    source = torch.arange(6, dtype=torch.float32).view(2, 1, 1, 3)
+    segment._copy_primary_kv(3, source)
+
+    assert tuple(segment._kv_key_buffer.shape) == (2, 2, 1, 1, 3)
+    assert torch.equal(segment._kv_key_buffer[1, :2], source)
+    with pytest.raises(KeyError, match="logical KDA layer 2"):
+        segment._copy_primary_kv(2, source)

@@ -1301,12 +1301,15 @@ class KimiLinearDecodeGraph:
         callback = AttnWrapperBase.kv_append_callback
         kv_buffer = self.whole_segment._kv_key_buffer
         if callback is not None and kv_buffer is not None and self._bsz > 0:
-            # One device clone for the complete MLA stack, then one lightweight
-            # callback per MLA layer. This replaces the per-layer clone path.
+            # One device clone for the compact MLA stack, then one lightweight
+            # callback per MLA layer.  The graph buffer is physically dense,
+            # while the callback still receives the logical engine layer id.
             staged = kv_buffer[:, : self._bsz].clone()
-            for layer_idx, segment in self.segments.items():
-                if not segment.is_kda:
-                    callback(layer_idx, staged[layer_idx], None)
+            for logical_layer_idx in self.whole_segment._primary_kv_layers:
+                physical_layer_idx = self.whole_segment._logical_to_physical_kv[
+                    logical_layer_idx
+                ]
+                callback(logical_layer_idx, staged[physical_layer_idx], None)
         return hidden_states
 
     def _run_layer(self, layer_idx: int, hidden_states: torch.Tensor):
