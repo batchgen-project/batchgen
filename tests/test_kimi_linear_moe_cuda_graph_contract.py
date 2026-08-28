@@ -137,11 +137,14 @@ def test_whole_model_row_maps_round_trip_nondivisible_batch_on_cpu():
     assert maps.local_bucket == 3
     assert maps.local_counts[17].item() == splits[3][1] - splits[3][0]
 
-    rank_major_rows = maps.padded_indices[17][maps.padded_valid[17]].tolist()
+    rank_major_rows = maps.padded_indices[17].tolist()
     expected_rank_major = [
         row for start, end in splits for row in range(start, end)
     ]
-    assert rank_major_rows == expected_rank_major
+    assert [
+        row for row, valid in zip(rank_major_rows, maps.padded_valid[17].tolist())
+        if valid
+    ] == expected_rank_major
 
     original_to_rank_major = maps.original_indices[17]
     restored = [rank_major_rows[int(original_to_rank_major[row])] for row in range(17)]
