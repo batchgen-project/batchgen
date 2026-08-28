@@ -60,7 +60,9 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor topk_indices,       // optional pre-allocated
     torch::Tensor topk_weights,       // optional pre-allocated
     torch::Tensor num_valid_tokens    // optional device int32 scalar; rows beyond
-                                      // it get idx=-1 / weight=0
+                                      // it get idx=-1 / weight=0. An undefined or
+                                      // empty tensor means "all rows"; the Python
+                                      // binding exposes this as c10::optional.
 );
 
 // GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits.

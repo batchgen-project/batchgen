@@ -30,7 +30,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_pos"),
           py::arg("num_valid_tokens") = -1);
 
-    m.def("gate_sigmoid_topk", &gate_sigmoid_topk_cuda,
+    // Bound through a lambda so the trailing argument is a genuine Python
+    // optional: a `py::arg` default of `torch::Tensor()` still displays a
+    // default but the CUDA 13 build rejects the six-argument call. `c10::nullopt`
+    // forwards the undefined tensor the CUDA implementation already reads as
+    // "all rows valid", matching the attention bindings.
+    m.def("gate_sigmoid_topk",
+          [](torch::Tensor router_logits,
+             torch::Tensor e_score_correction,
+             int k,
+             float routed_scaling_factor,
+             torch::Tensor topk_indices,
+             torch::Tensor topk_weights,
+             c10::optional<torch::Tensor> num_valid_tokens) {
+              return gate_sigmoid_topk_cuda(
+                  router_logits, e_score_correction, k, routed_scaling_factor,
+                  topk_indices, topk_weights,
+                  num_valid_tokens.value_or(torch::Tensor()));
+          },
           "Gate: fused sigmoid + top-k + normalize + scale (CUDA, K2.5/K3)",
           py::arg("router_logits"),
           py::arg("e_score_correction"),
@@ -38,7 +55,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("routed_scaling_factor"),
           py::arg("topk_indices"),
           py::arg("topk_weights"),
-          py::arg("num_valid_tokens") = torch::Tensor());
+          py::arg("num_valid_tokens") = c10::nullopt);
 
     m.def("router_bias_cast", &router_bias_cast_cuda,
           "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",
