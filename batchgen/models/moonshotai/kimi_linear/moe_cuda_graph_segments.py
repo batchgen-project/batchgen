@@ -116,6 +116,13 @@ class K3MoEGraphBufferPool:
         self.hidden_size = int(hidden_size)
         self.top_k = int(top_k)
         self.device = device
+        # Mirror SGLang's KimiLinear implementation: one model-wide auxiliary
+        # stream is enough to overlap the replicated shared expert with the
+        # routed-expert path.  Contract tests also construct this pool on CPU,
+        # where creating a CUDA stream would be invalid.
+        self.shared_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self.bucket_sizes = sorted({int(b) for b in expert_buckets})
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
@@ -275,6 +282,7 @@ class K3MoEGraphSegment:
         self.tp_size = int(getattr(moe, "attn_tp_size", 1))
         self.tp_rank = int(getattr(moe, "attn_tp_rank", 0))
         self.tp_group = getattr(moe, "attn_tp_group", None)
+        self.shared_stream = pool.shared_stream
 
         if self.tp_size <= 1 or self.tp_group is None:
             raise RuntimeError("K3 resident-MoE graph requires a TP8 process group")
@@ -381,6 +389,20 @@ class K3MoEGraphSegment:
         topk_weight = torch.where(
             valid_rows.unsqueeze(1), topk_weight, torch.zeros_like(topk_weight)
         )
+
+        # The shared expert reads only ``padded``; the routed path below reads
+        # it as well but never mutates it.  Start the replicated shared MLP on
+        # the model-wide auxiliary stream while the current stream performs
+        # EP dispatch, grouped expert GEMMs, and reduction.  CUDA Graph capture
+        # records these stream dependencies, so replay keeps the overlap with
+        # no per-token host synchronization.
+        shared_output = None
+        current_stream = torch.cuda.current_stream(device=self.device)
+        if self.shared_stream is not None:
+            self.shared_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.shared_stream):
+                shared_output = self.moe.shared_experts(padded)
+
         x_latent = self.resident.down_proj(local).reshape(
             local_tokens, self.latent_size
         ).contiguous()
@@ -468,7 +490,16 @@ class K3MoEGraphSegment:
                 local_output,
                 group=self.tp_group,
             )
-        bufs.tp_output.add_(self.moe.shared_experts(padded))
+        if shared_output is None:
+            # CPU contract path, and the defensive fallback for a non-CUDA
+            # device, preserve the original synchronous behavior.
+            shared_output = self.moe.shared_experts(padded)
+        else:
+            # The shared expert includes its TP all-reduce, which was enqueued
+            # on the auxiliary stream.  Wait before exposing the result to the
+            # final routed+shared add or to the next layer's graph work.
+            current_stream.wait_stream(self.shared_stream)
+        bufs.tp_output.add_(shared_output)
         return {"moe_output": bufs.tp_output}
 
 
