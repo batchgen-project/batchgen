@@ -31,13 +31,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("num_valid_tokens") = -1);
 
     m.def("gate_sigmoid_topk", &gate_sigmoid_topk_cuda,
-          "Gate: fused sigmoid + top-k + normalize + scale (CUDA, K2.5)",
+          "Gate: fused sigmoid + top-k + normalize + scale (CUDA, K2.5/K3)",
           py::arg("router_logits"),
           py::arg("e_score_correction"),
           py::arg("k"),
           py::arg("routed_scaling_factor"),
           py::arg("topk_indices"),
-          py::arg("topk_weights"));
+          py::arg("topk_weights"),
+          py::arg("num_valid_tokens") = torch::Tensor());
 
     m.def("router_bias_cast", &router_bias_cast_cuda,
           "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",

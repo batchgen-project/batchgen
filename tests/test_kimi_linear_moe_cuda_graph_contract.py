@@ -20,6 +20,7 @@ from batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments import (
     K3MoEGraphBufferPool,
     K3MoEGraphSegment,
     fuse_router_and_down_proj,
+    fused_gate_kernel_eligible,
     k3_moe_graph_buckets,
     split_fused_front,
 )
@@ -31,7 +32,16 @@ from batchgen.models.moonshotai.kimi_linear.whole_model_cuda_graph_segments impo
 )
 
 
-def _make_gate(*, num_experts=8, hidden=16, top_k=2, n_group=1, topk_group=1):
+def _make_gate(
+    *,
+    num_experts=8,
+    hidden=16,
+    top_k=2,
+    n_group=1,
+    topk_group=1,
+    scoring_func="sigmoid",
+    norm_topk_prob=True,
+):
     """A real ``KimiMoEGate`` on CPU; the model module pulls in fla/einops."""
     model = pytest.importorskip(
         "batchgen.models.moonshotai.kimi_linear.model",
@@ -42,10 +52,10 @@ def _make_gate(*, num_experts=8, hidden=16, top_k=2, n_group=1, topk_group=1):
         num_experts_per_tok=top_k,
         n_routed_experts=num_experts,
         routed_scaling_factor=2.5,
-        scoring_func="sigmoid",
+        scoring_func=scoring_func,
         n_group=n_group,
         topk_group=topk_group,
-        norm_topk_prob=True,
+        norm_topk_prob=norm_topk_prob,
     )
     gate = model.KimiMoEGate(config)
     with torch.no_grad():
@@ -88,6 +98,31 @@ def test_k3_graph_pool_has_one_local_reduce_scatter_output():
     # The route-capacity bound is one route per token per expert at most; it is
     # global_tokens, not global_tokens * top_k, because top-k indices are unique.
     assert view.max_tokens_padded < view.global_tokens * 16
+
+
+def test_k3_graph_pool_preallocates_native_gate_kernel_outputs():
+    pool = K3MoEGraphBufferPool(
+        world_size=16,
+        tp_size=8,
+        num_local_experts=2,
+        intermediate_size=256,
+        latent_size=128,
+        hidden_size=512,
+        top_k=16,
+        expert_buckets=[8, 16, 24, 32],
+        device=torch.device("cpu"),
+    )
+    view = pool.get(24)
+
+    # The gate kernel writes int32 indices and FP32 weights directly into these,
+    # so the eligible graph path needs no cast and no padding-mask ``where``.
+    assert tuple(view.local_indices.shape) == (3, 16)
+    assert view.local_indices.dtype == torch.int32
+    assert tuple(view.local_weights.shape) == (3, 16)
+    assert view.local_weights.dtype == torch.float32
+    # They must be the EP all-gather sources, hence contiguous rows.
+    assert view.local_indices.is_contiguous()
+    assert view.local_weights.is_contiguous()
 
 
 def test_k3_graph_segment_inputs_keep_group_and_local_rows_separate():
@@ -355,6 +390,105 @@ def test_split_fused_front_keeps_fp32_logits_and_casts_latent_once():
     assert torch.equal(logits, fused_out[:, :4])
     assert latent.dtype == torch.bfloat16
     assert torch.equal(latent, fused_out[:, 4:].to(torch.bfloat16))
+
+
+_CUDA = torch.device("cuda")
+_SLAB = torch.empty(0, dtype=torch.bfloat16)
+
+
+def test_fused_gate_kernel_eligible_accepts_the_k3_router():
+    gate = _make_gate(num_experts=32, top_k=16)
+
+    assert fused_gate_kernel_eligible(gate, fused_front=_SLAB, device=_CUDA)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"top_k": 8}, id="top_k_not_16"),
+        pytest.param({"scoring_func": "softmax", "top_k": 16}, id="softmax"),
+        pytest.param({"norm_topk_prob": False, "top_k": 16}, id="no_renormalize"),
+        pytest.param(
+            {"top_k": 16, "n_group": 4, "topk_group": 1}, id="group_routing"
+        ),
+    ],
+)
+def test_fused_gate_kernel_declines_recipes_the_kernel_cannot_reproduce(kwargs):
+    gate = _make_gate(num_experts=32, **kwargs)
+
+    assert not fused_gate_kernel_eligible(gate, fused_front=_SLAB, device=_CUDA)
+
+
+def test_fused_gate_kernel_declines_without_cuda_or_a_fused_front():
+    gate = _make_gate(num_experts=32, top_k=16)
+
+    assert not fused_gate_kernel_eligible(
+        gate, fused_front=_SLAB, device=torch.device("cpu")
+    )
+    assert not fused_gate_kernel_eligible(gate, fused_front=None, device=_CUDA)
+
+
+def test_fused_gate_kernel_declines_a_non_fp32_correction_bias():
+    gate = _make_gate(num_experts=32, top_k=16)
+    gate.e_score_correction_bias = nn.Parameter(
+        gate.e_score_correction_bias.detach().to(torch.bfloat16)
+    )
+
+    assert not fused_gate_kernel_eligible(gate, fused_front=_SLAB, device=_CUDA)
+
+
+def test_k3_graph_fused_front_routes_into_preallocated_native_buffers(monkeypatch):
+    class GateCalled(RuntimeError):
+        pass
+
+    local_tokens, hidden, experts, latent = 2, 4, 8, 6
+    local_indices = torch.empty(local_tokens, 16, dtype=torch.int32)
+    local_weights = torch.empty(local_tokens, 16, dtype=torch.float32)
+    bufs = SimpleNamespace(
+        local_tokens=local_tokens,
+        global_tokens=local_tokens,
+        local_indices=local_indices,
+        local_weights=local_weights,
+    )
+    valid = torch.tensor([1], dtype=torch.int32)
+    called = {}
+
+    segment = K3MoEGraphSegment.__new__(K3MoEGraphSegment)
+    segment.pool = SimpleNamespace(get=lambda bucket: bufs)
+    segment.hidden_size = hidden
+    segment.num_experts = experts
+    segment.top_k = 16
+    segment.fused_front = torch.empty(experts + latent, hidden)
+    segment.fused_gate_kernel = True
+    segment.moe = SimpleNamespace(
+        gate=SimpleNamespace(
+            e_score_correction_bias=torch.randn(experts),
+            routed_scaling_factor=2.5,
+        )
+    )
+
+    fused_out = torch.randn(local_tokens, experts + latent)
+    monkeypatch.setattr(k3_moe_graph.torch, "mm", lambda *args, **kwargs: fused_out)
+
+    def fake_gate(logits, bias, **kwargs):
+        called.update(logits=logits, bias=bias, **kwargs)
+        raise GateCalled
+
+    monkeypatch.setattr(k3_moe_graph, "gate_sigmoid_topk_cuda", fake_gate)
+
+    with pytest.raises(GateCalled):
+        segment.forward(
+            padded=torch.empty(local_tokens, hidden),
+            local=torch.empty(local_tokens, hidden),
+            num_valid_tokens=valid,
+        )
+
+    assert tuple(called["logits"].shape) == (local_tokens, experts)
+    assert called["logits"].stride(0) == experts + latent
+    assert called["topk_indices"] is local_indices
+    assert called["topk_weights"] is local_weights
+    assert called["num_valid_tokens"] is valid
+    assert called["k"] == 16
 
 
 def test_fused_slab_gemm_reproduces_the_router_and_down_projections():

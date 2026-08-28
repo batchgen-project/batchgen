@@ -43,6 +43,7 @@ from batchgen.moe.marlin_grouped_moe import (
     marlin_grouped_m16_mxfp4,
     marlin_grouped_stage1_fused_mxfp4_situ,
 )
+from batchgen.moe.routing import gate_sigmoid_topk_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,37 @@ def split_fused_front(
     )
 
 
+def fused_gate_kernel_eligible(gate, *, fused_front, device) -> bool:
+    """Whether ``gate_sigmoid_topk_cuda`` reproduces this gate's selection.
+
+    The kernel implements exactly one selection recipe: sigmoid scores, an FP32
+    additive correction bias, ungrouped top-k, renormalization, and a scalar
+    scaling factor.  Anything else — softmax scoring, an active expert-group
+    mask, a non-FP32 bias, a different ``top_k``, no renormalization — must keep
+    the eager ``select_experts`` path.  The kernel also only replaces the gate on
+    the fused-front CUDA graph path, where the FP32 router logits already exist
+    as the leading columns of the fused GEMM output.
+    """
+    if getattr(device, "type", None) != "cuda":
+        return False
+    if fused_front is None:
+        return False
+    if getattr(gate, "moe_router_activation_func", None) != "sigmoid":
+        return False
+    num_expert_group = int(getattr(gate, "num_expert_group", 1) or 1)
+    topk_group = int(getattr(gate, "topk_group", 1) or 1)
+    if num_expert_group > 1 and num_expert_group > topk_group:
+        return False
+    if int(getattr(gate, "top_k", 0)) != 16:
+        return False
+    if not bool(getattr(gate, "moe_renormalize", False)):
+        return False
+    bias = getattr(gate, "e_score_correction_bias", None)
+    if bias is None or bias.dtype is not torch.float32:
+        return False
+    return True
+
+
 _MM_OUT_FP32_SUPPORT: Dict[str, bool] = {}
 
 
@@ -158,6 +190,8 @@ class _K3MoEGraphBuffers:
     all_latent: torch.Tensor
     all_indices: torch.Tensor
     all_weights: torch.Tensor
+    local_indices: torch.Tensor
+    local_weights: torch.Tensor
     dispatched: torch.Tensor
     intermediate: torch.Tensor
     expert_output: torch.Tensor
@@ -257,6 +291,15 @@ class K3MoEGraphBufferPool:
         b["all_latent"] = torch.empty((self._max_global_tokens, k), dtype=torch.bfloat16, device=d)
         b["all_indices"] = torch.empty((self._max_global_tokens, self.top_k), dtype=torch.int32, device=d)
         b["all_weights"] = torch.empty((self._max_global_tokens, self.top_k), dtype=torch.float32, device=d)
+        # Per-rank routing outputs of the fused gate kernel. Preallocating them
+        # in the kernel's native int32/FP32 layout is what lets the graph drop
+        # the dtype cast and the padding-mask ``torch.where`` nodes.
+        b["local_indices"] = torch.empty(
+            (self._max_local_tokens, self.top_k), dtype=torch.int32, device=d
+        )
+        b["local_weights"] = torch.empty(
+            (self._max_local_tokens, self.top_k), dtype=torch.float32, device=d
+        )
         b["dispatched"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
         b["intermediate"] = torch.empty((e * max_mtp, n), dtype=torch.bfloat16, device=d)
         b["expert_output"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
@@ -313,6 +356,8 @@ class K3MoEGraphBufferPool:
             all_latent=b["all_latent"][:global_tokens],
             all_indices=b["all_indices"][:global_tokens],
             all_weights=b["all_weights"][:global_tokens],
+            local_indices=b["local_indices"][:local_tokens],
+            local_weights=b["local_weights"][:local_tokens],
             dispatched=b["dispatched"][: e * mtp],
             intermediate=b["intermediate"][: e * mtp],
             expert_output=b["expert_output"][: e * mtp],
@@ -372,6 +417,7 @@ class K3MoEGraphSegment:
         self.num_experts = int(moe.gate.weight.shape[0])
         # Set by ``setup_static_buffers`` once the fusion eligibility is known.
         self.fused_front = None
+        self.fused_gate_kernel = False
 
         if self.tp_size <= 1 or self.tp_group is None:
             raise RuntimeError("K3 resident-MoE graph requires a TP8 process group")
@@ -401,6 +447,9 @@ class K3MoEGraphSegment:
             self.fused_front = fuse_router_and_down_proj(
                 self.moe, self.resident.down_proj
             )
+        self.fused_gate_kernel = fused_gate_kernel_eligible(
+            self.moe.gate, fused_front=self.fused_front, device=self.device
+        )
         if hasattr(self.resident.comm, "disabled"):
             self.resident.comm.disabled = False
 
@@ -459,15 +508,6 @@ class K3MoEGraphSegment:
         global_tokens = bufs.global_tokens
         local = local[:local_tokens]
 
-        # The graph always executes the fixed local-token shape.  Mask the
-        # balanced-split padding before the EP all-gathers so zero rows do not
-        # turn into real routed assignments (the router's zero-input bias can
-        # otherwise select experts and waste grouped-GEMM work).  The scalar is
-        # a graph input refreshed once per replay and may differ by TP rank.
-        valid_rows = torch.arange(
-            local_tokens, dtype=torch.int32, device=local.device
-        ) < num_valid_tokens.reshape(1)
-
         # Router/down-projection are executed once per distinct local row.  The
         # graph input is already zero padded to the full TP-group bucket.  Both
         # read the same rows from the same activation, so when their weights are
@@ -476,26 +516,60 @@ class K3MoEGraphSegment:
         # BF16-input GEMM can differ from the eager FP32-input GEMM on near-tie
         # logits, so graph-vs-eager routing parity remains a remote gate.
         x_latent = None
+        gate_out = None
+        topk_idx = None
         if self.fused_front is not None:
             fused_out = torch.mm(
                 local, self.fused_front.t(), out_dtype=torch.float32
             )
             router_logits, latent = split_fused_front(fused_out, self.num_experts)
-            gate_out = self.moe.gate.select_experts(router_logits)
             x_latent = latent.contiguous()
+            if self.fused_gate_kernel:
+                # One kernel does sigmoid + top-16 + renormalize + scale and
+                # writes straight into the int32/FP32 EP gather sources.  It
+                # reads the router half in place (a strided view of the fused
+                # GEMM output) and applies the balanced-split padding mask from
+                # the device-resident scalar, so the graph carries no dtype cast
+                # and no ``torch.where`` after the gate.
+                gate = self.moe.gate
+                gate_sigmoid_topk_cuda(
+                    router_logits,
+                    gate.e_score_correction_bias,
+                    k=self.top_k,
+                    routed_scaling_factor=float(gate.routed_scaling_factor),
+                    topk_indices=bufs.local_indices,
+                    topk_weights=bufs.local_weights,
+                    num_valid_tokens=num_valid_tokens,
+                )
+                topk_idx = bufs.local_indices
+                topk_weight = bufs.local_weights
+            else:
+                gate_out = self.moe.gate.select_experts(router_logits)
         else:
             gate_out = self.moe.gate(local.view(local_tokens, 1, self.hidden_size))
-        # KimiMoEGate flattens its input internally and returns [T, K].  Keep
-        # this explicit because a wrapper may preserve the singleton sequence
-        # dimension; the static EP gather buffers are always two-dimensional.
-        topk_idx = gate_out[0].reshape(local_tokens, -1).to(torch.int32)
-        topk_weight = gate_out[1].reshape(local_tokens, -1)
-        topk_idx = torch.where(
-            valid_rows.unsqueeze(1), topk_idx, torch.full_like(topk_idx, -1)
-        )
-        topk_weight = torch.where(
-            valid_rows.unsqueeze(1), topk_weight, torch.zeros_like(topk_weight)
-        )
+
+        if topk_idx is None:
+            # The graph always executes the fixed local-token shape.  Mask the
+            # balanced-split padding before the EP all-gathers so zero rows do
+            # not turn into real routed assignments (the router's zero-input
+            # bias can otherwise select experts and waste grouped-GEMM work).
+            # The scalar is a graph input refreshed once per replay and may
+            # differ by TP rank.
+            valid_rows = torch.arange(
+                local_tokens, dtype=torch.int32, device=local.device
+            ) < num_valid_tokens.reshape(1)
+            # KimiMoEGate flattens its input internally and returns [T, K].
+            # Keep this explicit because a wrapper may preserve the singleton
+            # sequence dimension; the static EP gather buffers are always
+            # two-dimensional.
+            topk_idx = gate_out[0].reshape(local_tokens, -1).to(torch.int32)
+            topk_weight = gate_out[1].reshape(local_tokens, -1)
+            topk_idx = torch.where(
+                valid_rows.unsqueeze(1), topk_idx, torch.full_like(topk_idx, -1)
+            )
+            topk_weight = torch.where(
+                valid_rows.unsqueeze(1), topk_weight, torch.zeros_like(topk_weight)
+            )
 
         # The shared expert reads only ``padded``; the routed path below reads
         # it as well but never mutates it.  Start the replicated shared MLP on
@@ -615,6 +689,7 @@ __all__ = [
     "K3MoEGraphBufferPool",
     "K3MoEGraphSegment",
     "fuse_router_and_down_proj",
+    "fused_gate_kernel_eligible",
     "k3_moe_graph_buckets",
     "split_fused_front",
 ]

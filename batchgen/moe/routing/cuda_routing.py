@@ -70,9 +70,10 @@ def gate_sigmoid_topk_cuda(
     router_logits, e_score_correction,
     k=8, routed_scaling_factor=2.5,
     topk_indices=None, topk_weights=None,
+    num_valid_tokens=None,
 ):
     """
-    CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5).
+    CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5, K3).
 
     Algorithm:
         1. sigmoid(logits) → scores
@@ -81,13 +82,20 @@ def gate_sigmoid_topk_cuda(
         4. gather raw sigmoid scores at indices → weights
         5. normalize weights, multiply by routed_scaling_factor
 
+    ``router_logits`` rows may be strided (e.g. the leading expert columns of a
+    fused router/down-projection GEMM output); only each row itself has to be
+    contiguous.
+
     Args:
-        router_logits: [N, E] FP32
+        router_logits: [N, E] FP32 (row stride may exceed E)
         e_score_correction: [E] FP32
-        k: top-k (default 8)
+        k: top-k (default 8; supported 2, 4, 8, 16)
         routed_scaling_factor: scaling factor (default 2.5)
         topk_indices: [N, K] int32 pre-allocated output (optional)
         topk_weights: [N, K] FP32 pre-allocated output (optional)
+        num_valid_tokens: device int32 scalar (optional). Rows at or beyond it
+            are written as index -1 / weight 0 without a host read, so a
+            captured CUDA graph can vary the live row count across replays.
 
     Returns:
         topk_indices: [N, K] int32
@@ -106,10 +114,17 @@ def gate_sigmoid_topk_cuda(
         topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
     if topk_weights is None:
         topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
-
-    result = ext.gate_sigmoid_topk(
+    args = (
         router_logits, e_score_correction, k, routed_scaling_factor,
         topk_indices, topk_weights,
+    )
+    # Preserve the legacy K2.5/GLM call exactly: the extension's trailing
+    # tensor argument has a C++ default, so callers without a live-row scalar
+    # should not create even a zero-sized CUDA tensor inside graph capture.
+    result = (
+        ext.gate_sigmoid_topk(*args)
+        if num_valid_tokens is None
+        else ext.gate_sigmoid_topk(*args, num_valid_tokens)
     )
     return result[0], result[1]
 
