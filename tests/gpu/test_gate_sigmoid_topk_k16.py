@@ -24,6 +24,11 @@ What the CPU contracts cannot see, and this file pins:
   D  K=8 / E=384 regression: the K2.5 and GLM-5 callers pass contiguous logits
      and no valid-token scalar, and must match the eager reference within the
      established tolerance at their own geometry.
+  E  The optional latent epilogue: with ``latent_out``/``latent_offset`` the
+     kernel also casts the latent suffix of the same fused rows to BF16, which
+     must equal ``fused_out[:, num_experts:].to(torch.bfloat16)``, must leave
+     routing untouched, must zero padding rows, and must fail closed when the
+     requested columns do not fit inside the row stride.
 """
 
 import pytest
@@ -181,6 +186,169 @@ def test_device_num_valid_tokens_masks_padding_across_graph_replays():
         assert torch.equal(
             weight[live:], torch.zeros_like(weight[live:])
         ), f"padding weights not 0 at num_valid_tokens={live}"
+
+
+def test_latent_epilogue_casts_the_same_fused_rows_without_touching_routing():
+    num_tokens, num_experts, latent, k = 64, 896, 512, 16
+    fused_out = torch.randn(
+        num_tokens, num_experts + latent, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    router_logits = fused_out[:, :num_experts]
+    latent_out = torch.full(
+        (num_tokens, latent), -7.0, dtype=torch.bfloat16, device="cuda"
+    )
+
+    idx, weight = gate_sigmoid_topk_cuda(
+        router_logits, bias, k=k, routed_scaling_factor=SCALE,
+        latent_out=latent_out, latent_offset=num_experts,
+    )
+    ref_idx, ref_weight = gate_sigmoid_topk_cuda(
+        router_logits, bias, k=k, routed_scaling_factor=SCALE
+    )
+
+    # The epilogue is exactly the copy the K3 graph used to run separately.
+    assert torch.equal(latent_out, fused_out[:, num_experts:].to(torch.bfloat16))
+    # ...and it must not perturb the selection or the weights.
+    assert torch.equal(idx, ref_idx)
+    assert torch.equal(weight, ref_weight)
+
+
+def test_latent_epilogue_replays_with_device_valid_count_in_a_cuda_graph():
+    num_tokens, num_experts, latent, k = 32, 896, 512, 16
+    fused_out = torch.randn(
+        num_tokens, num_experts + latent, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    router_logits = fused_out[:, :num_experts]
+    idx = torch.empty(num_tokens, k, dtype=torch.int32, device="cuda")
+    weight = torch.empty(num_tokens, k, dtype=torch.float32, device="cuda")
+    latent_out = torch.empty(num_tokens, latent, dtype=torch.bfloat16, device="cuda")
+    valid = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    def run():
+        gate_sigmoid_topk_cuda(
+            router_logits, bias, k=k, routed_scaling_factor=SCALE,
+            topk_indices=idx, topk_weights=weight, num_valid_tokens=valid,
+            latent_out=latent_out, latent_offset=num_experts,
+        )
+
+    valid.fill_(num_tokens)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    ref_idx, ref_weight = _reference(router_logits, bias, k)
+    expected_latent = fused_out[:, num_experts:].to(torch.bfloat16)
+    for live in (num_tokens, 1, 17, 0, num_tokens):
+        idx.fill_(-7)
+        weight.fill_(-7.0)
+        latent_out.fill_(-7.0)
+        valid.fill_(live)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            idx[:live].sort(dim=-1).values, ref_idx[:live].sort(dim=-1).values
+        ), f"live routes changed at num_valid_tokens={live}"
+        torch.testing.assert_close(
+            _dense(idx[:live], weight[:live], num_experts),
+            _dense(ref_idx[:live], ref_weight[:live], num_experts),
+            rtol=1e-5,
+            atol=2e-6,
+        )
+        assert torch.equal(
+            latent_out[:live], expected_latent[:live]
+        ), f"live latent rows wrong at num_valid_tokens={live}"
+        assert torch.equal(
+            idx[live:], torch.full_like(idx[live:], -1)
+        ), f"padding indices not -1 at num_valid_tokens={live}"
+        assert torch.equal(
+            weight[live:], torch.zeros_like(weight[live:])
+        ), f"padding weights not 0 at num_valid_tokens={live}"
+        assert torch.equal(
+            latent_out[live:], torch.zeros_like(latent_out[live:])
+        ), f"padding latent rows not 0 at num_valid_tokens={live}"
+
+
+def test_latent_epilogue_zeroes_padding_rows_from_the_device_valid_count():
+    num_tokens, num_experts, latent, k = 32, 896, 512, 16
+    fused_out = torch.randn(
+        num_tokens, num_experts + latent, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    router_logits = fused_out[:, :num_experts]
+    idx = torch.empty(num_tokens, k, dtype=torch.int32, device="cuda")
+    weight = torch.empty(num_tokens, k, dtype=torch.float32, device="cuda")
+    latent_out = torch.empty(num_tokens, latent, dtype=torch.bfloat16, device="cuda")
+    valid = torch.zeros(1, dtype=torch.int32, device="cuda")
+    expected = fused_out[:, num_experts:].to(torch.bfloat16)
+
+    for live in (num_tokens, 1, 19, 0):
+        latent_out.fill_(-7.0)
+        valid.fill_(live)
+        gate_sigmoid_topk_cuda(
+            router_logits, bias, k=k, routed_scaling_factor=SCALE,
+            topk_indices=idx, topk_weights=weight, num_valid_tokens=valid,
+            latent_out=latent_out, latent_offset=num_experts,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            latent_out[:live], expected[:live]
+        ), f"live latent rows wrong at num_valid_tokens={live}"
+        # The zero-padded decode activation makes the bias-free fused GEMM emit
+        # zero rows, so padded latent rows must be deterministically zero.
+        assert torch.equal(
+            latent_out[live:], torch.zeros_like(latent_out[live:])
+        ), f"padding latent rows not 0 at num_valid_tokens={live}"
+
+
+def test_latent_epilogue_fails_closed_on_offsets_outside_the_row_stride():
+    num_tokens, num_experts, latent, k = 8, 896, 512, 16
+    fused_out = torch.randn(
+        num_tokens, num_experts + latent, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    router_logits = fused_out[:, :num_experts]
+    latent_out = torch.empty(num_tokens, latent, dtype=torch.bfloat16, device="cuda")
+
+    def run(logits, offset, out=latent_out):
+        gate_sigmoid_topk_cuda(
+            logits, bias, k=k, routed_scaling_factor=SCALE,
+            latent_out=out, latent_offset=offset,
+        )
+
+    # Overlapping the router columns would read the logits back as latent.
+    with pytest.raises(RuntimeError):
+        run(router_logits, num_experts - 1)
+    # Running past the end of the row would read the next row's logits.
+    with pytest.raises(RuntimeError):
+        run(router_logits, num_experts + 1)
+    # A genuinely contiguous [N, E] buffer has no latent columns at all.
+    with pytest.raises(RuntimeError):
+        run(router_logits.contiguous(), num_experts)
+    # A row count that does not match the logits cannot be indexed row-wise.
+    with pytest.raises(RuntimeError):
+        run(
+            router_logits,
+            num_experts,
+            torch.empty(num_tokens + 1, latent, dtype=torch.bfloat16, device="cuda"),
+        )
+    # FP32 output would silently reinterpret the BF16 stores.
+    with pytest.raises(RuntimeError):
+        run(
+            router_logits,
+            num_experts,
+            torch.empty(num_tokens, latent, dtype=torch.float32, device="cuda"),
+        )
 
 
 def test_k8_e384_regression_for_the_k25_and_glm5_callers():

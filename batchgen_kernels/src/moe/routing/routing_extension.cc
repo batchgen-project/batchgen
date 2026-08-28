@@ -30,11 +30,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_pos"),
           py::arg("num_valid_tokens") = -1);
 
-    // Bound through a lambda so the trailing argument is a genuine Python
-    // optional: a `py::arg` default of `torch::Tensor()` still displays a
+    // Bound through a lambda so the trailing arguments are genuine Python
+    // optionals: a `py::arg` default of `torch::Tensor()` still displays a
     // default but the CUDA 13 build rejects the six-argument call. `c10::nullopt`
     // forwards the undefined tensor the CUDA implementation already reads as
-    // "all rows valid", matching the attention bindings.
+    // "all rows valid" / "no latent epilogue", matching the attention bindings,
+    // so the legacy K2.5/GLM six-argument call keeps working unchanged.
     m.def("gate_sigmoid_topk",
           [](torch::Tensor router_logits,
              torch::Tensor e_score_correction,
@@ -42,11 +43,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              float routed_scaling_factor,
              torch::Tensor topk_indices,
              torch::Tensor topk_weights,
-             c10::optional<torch::Tensor> num_valid_tokens) {
+             c10::optional<torch::Tensor> num_valid_tokens,
+             c10::optional<torch::Tensor> latent_out,
+             c10::optional<int64_t> latent_offset) {
               return gate_sigmoid_topk_cuda(
                   router_logits, e_score_correction, k, routed_scaling_factor,
                   topk_indices, topk_weights,
-                  num_valid_tokens.value_or(torch::Tensor()));
+                  num_valid_tokens.value_or(torch::Tensor()),
+                  latent_out.value_or(torch::Tensor()),
+                  // 0 can never be a valid offset (it would overlap the router
+                  // columns), so an omitted offset fails closed in the CUDA
+                  // implementation rather than reading the wrong columns.
+                  latent_offset.value_or(0));
           },
           "Gate: fused sigmoid + top-k + normalize + scale (CUDA, K2.5/K3)",
           py::arg("router_logits"),
@@ -55,7 +63,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("routed_scaling_factor"),
           py::arg("topk_indices"),
           py::arg("topk_weights"),
-          py::arg("num_valid_tokens") = c10::nullopt);
+          py::arg("num_valid_tokens") = c10::nullopt,
+          py::arg("latent_out") = c10::nullopt,
+          py::arg("latent_offset") = c10::nullopt);
 
     m.def("router_bias_cast", &router_bias_cast_cuda,
           "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",

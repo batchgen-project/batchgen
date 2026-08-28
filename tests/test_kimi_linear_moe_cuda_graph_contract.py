@@ -120,9 +120,14 @@ def test_k3_graph_pool_preallocates_native_gate_kernel_outputs():
     assert view.local_indices.dtype == torch.int32
     assert tuple(view.local_weights.shape) == (3, 16)
     assert view.local_weights.dtype == torch.float32
+    # The same kernel casts the fused row's latent suffix into this buffer, so
+    # the graph needs no separate strided FP32->BF16 copy either.
+    assert tuple(view.local_latent.shape) == (3, 128)
+    assert view.local_latent.dtype == torch.bfloat16
     # They must be the EP all-gather sources, hence contiguous rows.
     assert view.local_indices.is_contiguous()
     assert view.local_weights.is_contiguous()
+    assert view.local_latent.is_contiguous()
 
 
 def test_k3_graph_segment_inputs_keep_group_and_local_rows_separate():
@@ -444,11 +449,13 @@ def test_k3_graph_fused_front_routes_into_preallocated_native_buffers(monkeypatc
     local_tokens, hidden, experts, latent = 2, 4, 8, 6
     local_indices = torch.empty(local_tokens, 16, dtype=torch.int32)
     local_weights = torch.empty(local_tokens, 16, dtype=torch.float32)
+    local_latent = torch.empty(local_tokens, latent, dtype=torch.bfloat16)
     bufs = SimpleNamespace(
         local_tokens=local_tokens,
         global_tokens=local_tokens,
         local_indices=local_indices,
         local_weights=local_weights,
+        local_latent=local_latent,
     )
     valid = torch.tensor([1], dtype=torch.int32)
     called = {}
@@ -489,6 +496,10 @@ def test_k3_graph_fused_front_routes_into_preallocated_native_buffers(monkeypatc
     assert called["topk_weights"] is local_weights
     assert called["num_valid_tokens"] is valid
     assert called["k"] == 16
+    # The latent half of the very same fused rows is cast in place, so no
+    # separate strided FP32->BF16 copy is left in the graph.
+    assert called["latent_out"] is local_latent
+    assert called["latent_offset"] == experts
 
 
 def test_fused_slab_gemm_reproduces_the_router_and_down_projections():

@@ -192,6 +192,7 @@ class _K3MoEGraphBuffers:
     all_weights: torch.Tensor
     local_indices: torch.Tensor
     local_weights: torch.Tensor
+    local_latent: torch.Tensor
     dispatched: torch.Tensor
     intermediate: torch.Tensor
     expert_output: torch.Tensor
@@ -300,6 +301,12 @@ class K3MoEGraphBufferPool:
         b["local_weights"] = torch.empty(
             (self._max_local_tokens, self.top_k), dtype=torch.float32, device=d
         )
+        # Destination for the gate kernel's latent epilogue: the fused GEMM's
+        # latent columns are cast to BF16 straight into the EP all-gather
+        # source, so the graph carries no separate strided FP32->BF16 copy.
+        b["local_latent"] = torch.empty(
+            (self._max_local_tokens, k), dtype=torch.bfloat16, device=d
+        )
         b["dispatched"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
         b["intermediate"] = torch.empty((e * max_mtp, n), dtype=torch.bfloat16, device=d)
         b["expert_output"] = torch.empty((e * max_mtp, k), dtype=torch.bfloat16, device=d)
@@ -358,6 +365,7 @@ class K3MoEGraphBufferPool:
             all_weights=b["all_weights"][:global_tokens],
             local_indices=b["local_indices"][:local_tokens],
             local_weights=b["local_weights"][:local_tokens],
+            local_latent=b["local_latent"][:local_tokens],
             dispatched=b["dispatched"][: e * mtp],
             intermediate=b["intermediate"][: e * mtp],
             expert_output=b["expert_output"][: e * mtp],
@@ -450,6 +458,16 @@ class K3MoEGraphSegment:
         self.fused_gate_kernel = fused_gate_kernel_eligible(
             self.moe.gate, fused_front=self.fused_front, device=self.device
         )
+        if self.fused_gate_kernel:
+            # The gate kernel writes ``latent_size`` columns starting at
+            # ``num_experts``.  A slab whose latent half is a different width
+            # would silently truncate rather than fail, so pin it here.
+            fused_latent = int(self.fused_front.shape[0]) - self.num_experts
+            if fused_latent != self.latent_size:
+                raise ValueError(
+                    f"K3 fused front latent width {fused_latent} does not match "
+                    f"the resident latent size {self.latent_size}"
+                )
         if hasattr(self.resident.comm, "disabled"):
             self.resident.comm.disabled = False
 
@@ -522,28 +540,34 @@ class K3MoEGraphSegment:
             fused_out = torch.mm(
                 local, self.fused_front.t(), out_dtype=torch.float32
             )
-            router_logits, latent = split_fused_front(fused_out, self.num_experts)
-            x_latent = latent.contiguous()
             if self.fused_gate_kernel:
                 # One kernel does sigmoid + top-16 + renormalize + scale and
                 # writes straight into the int32/FP32 EP gather sources.  It
                 # reads the router half in place (a strided view of the fused
                 # GEMM output) and applies the balanced-split padding mask from
                 # the device-resident scalar, so the graph carries no dtype cast
-                # and no ``torch.where`` after the gate.
+                # and no ``torch.where`` after the gate.  The same kernel also
+                # casts the latent half of those rows into the preallocated BF16
+                # gather source, replacing the separate strided copy; padding
+                # rows come out zero exactly as the zero-input GEMM made them.
                 gate = self.moe.gate
                 gate_sigmoid_topk_cuda(
-                    router_logits,
+                    fused_out[:, : self.num_experts],
                     gate.e_score_correction_bias,
                     k=self.top_k,
                     routed_scaling_factor=float(gate.routed_scaling_factor),
                     topk_indices=bufs.local_indices,
                     topk_weights=bufs.local_weights,
                     num_valid_tokens=num_valid_tokens,
+                    latent_out=bufs.local_latent,
+                    latent_offset=self.num_experts,
                 )
                 topk_idx = bufs.local_indices
                 topk_weight = bufs.local_weights
+                x_latent = bufs.local_latent
             else:
+                router_logits, latent = split_fused_front(fused_out, self.num_experts)
+                x_latent = latent.contiguous()
                 gate_out = self.moe.gate.select_experts(router_logits)
         else:
             gate_out = self.moe.gate(local.view(local_tokens, 1, self.hidden_size))
