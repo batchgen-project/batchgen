@@ -30,6 +30,7 @@ per-layer Python scatter is needed during replay.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional
 
@@ -37,6 +38,9 @@ import torch
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from .moe_tp_reshard import balanced_row_split
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -160,6 +164,25 @@ class KimiLinearWholeModelSegment:
             if setup is not None:
                 setup(bucket)
 
+        # The outer graph calls the resident-MoE segments directly rather than
+        # replaying their per-layer managers.  Give those children the same
+        # setup hook so weight-layout transforms happen before whole-model
+        # warmup/capture instead of leaving the fused front permanently idle.
+        for segment in self.moe_segments.values():
+            setup = getattr(segment, "setup_static_buffers", None)
+            if setup is not None:
+                setup(bucket)
+        fused_fronts = sum(
+            getattr(segment, "fused_front", None) is not None
+            for segment in self.moe_segments.values()
+        )
+        logger.info(
+            "K3 whole-model MoE setup: bucket=%d fused_front=%d/%d",
+            bucket,
+            fused_fronts,
+            len(self.moe_segments),
+        )
+
         # One contiguous staging buffer covers only the MLA layers.  It is
         # kept for the lifetime of the outer segment so dropping one bucket
         # cannot invalidate another captured graph's pointer.  KDA layers do
@@ -185,6 +208,10 @@ class KimiLinearWholeModelSegment:
         # calls this method once per dropped bucket, while another bucket may
         # still hold a graph that captured the same outer segment.
         for segment in self.layer_segments:
+            release = getattr(segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
+        for segment in self.moe_segments.values():
             release = getattr(segment, "release_static_buffers", None)
             if release is not None:
                 release(bucket_size)

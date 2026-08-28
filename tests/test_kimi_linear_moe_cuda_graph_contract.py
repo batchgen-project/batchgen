@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments as k3_moe_graph
 
@@ -17,7 +19,9 @@ from batchgen.models.moonshotai.kimi_linear.cuda_graph_segments import (
 from batchgen.models.moonshotai.kimi_linear.moe_cuda_graph_segments import (
     K3MoEGraphBufferPool,
     K3MoEGraphSegment,
+    fuse_router_and_down_proj,
     k3_moe_graph_buckets,
+    split_fused_front,
 )
 from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
     balanced_row_split,
@@ -25,6 +29,35 @@ from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
 from batchgen.models.moonshotai.kimi_linear.whole_model_cuda_graph_segments import (
     KimiLinearWholeModelSegment,
 )
+
+
+def _make_gate(*, num_experts=8, hidden=16, top_k=2, n_group=1, topk_group=1):
+    """A real ``KimiMoEGate`` on CPU; the model module pulls in fla/einops."""
+    model = pytest.importorskip(
+        "batchgen.models.moonshotai.kimi_linear.model",
+        reason="KimiMoEGate needs the fla/einops model dependencies",
+    )
+    config = SimpleNamespace(
+        hidden_size=hidden,
+        num_experts_per_tok=top_k,
+        n_routed_experts=num_experts,
+        routed_scaling_factor=2.5,
+        scoring_func="sigmoid",
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=True,
+    )
+    gate = model.KimiMoEGate(config)
+    with torch.no_grad():
+        gate.weight.copy_(torch.randn(num_experts, hidden))
+        gate.e_score_correction_bias.copy_(torch.randn(num_experts))
+    return gate
+
+
+def _make_fusable(*, num_experts=4, latent=6, hidden=8, gate_dtype=torch.bfloat16):
+    gate = nn.Linear(hidden, num_experts, bias=False).to(gate_dtype)
+    down_proj = nn.Linear(hidden, latent, bias=False).to(torch.bfloat16)
+    return SimpleNamespace(gate=gate), down_proj
 
 
 def test_k3_moe_graph_buckets_use_full_tp_group_geometry():
@@ -186,3 +219,160 @@ def test_k3_whole_graph_kv_staging_is_compact_and_logically_mapped():
     assert torch.equal(segment._kv_key_buffer[1, :2], source)
     with pytest.raises(KeyError, match="logical KDA layer 2"):
         segment._copy_primary_kv(2, source)
+
+
+def test_whole_model_setup_and_release_reach_inline_moe_segments(monkeypatch):
+    calls = []
+
+    class Child:
+        def __init__(self, name, *, fused_front=None):
+            self.name = name
+            self.fused_front = fused_front
+
+        def setup_static_buffers(self, bucket):
+            calls.append(("setup", self.name, bucket))
+
+        def release_static_buffers(self, bucket):
+            calls.append(("release", self.name, bucket))
+
+    segment = KimiLinearWholeModelSegment.__new__(KimiLinearWholeModelSegment)
+    segment.max_bucket_size = 8
+    segment._bucket_maps = {}
+    segment.layer_segments = [Child("attention")]
+    segment.moe_segments = {1: Child("moe", fused_front=torch.empty(0))}
+    segment._kv_key_buffer = None
+    segment._primary_kv_dim = 0
+    monkeypatch.setattr(segment, "_make_bucket_maps", lambda bucket: object())
+
+    segment.setup_static_buffers(8)
+    segment.release_static_buffers(8)
+
+    assert calls == [
+        ("setup", "attention", 8),
+        ("setup", "moe", 8),
+        ("release", "attention", 8),
+        ("release", "moe", 8),
+    ]
+    assert 8 not in segment._bucket_maps
+
+
+def test_gate_forward_equals_router_logits_plus_selector():
+    gate = _make_gate()
+    hidden = torch.randn(5, 1, gate.gating_dim)
+
+    ref_idx, ref_weight = gate(hidden)
+    logits = gate.router_logits(hidden.view(-1, gate.gating_dim))
+    idx, weight = gate.select_experts(logits)
+
+    assert logits.dtype == torch.float32
+    assert tuple(logits.shape) == (5, gate.num_experts)
+    assert torch.equal(ref_idx, idx)
+    assert torch.equal(ref_weight, weight)
+
+
+def test_gate_selector_accepts_fp32_logits_from_a_bf16_activation():
+    gate = _make_gate()
+    hidden = torch.randn(4, 1, gate.gating_dim, dtype=torch.bfloat16)
+
+    ref_idx, ref_weight = gate(hidden)
+    logits = gate.router_logits(hidden.view(-1, gate.gating_dim))
+    idx, weight = gate.select_experts(logits)
+
+    assert logits.dtype == torch.float32
+    assert weight.dtype == torch.float32
+    assert tuple(idx.shape) == (4, gate.top_k)
+    assert torch.equal(ref_idx, idx)
+    assert torch.equal(ref_weight, weight)
+
+
+def test_gate_group_topk_branch_still_masks_non_selected_groups():
+    gate = _make_gate(num_experts=8, top_k=2, n_group=4, topk_group=1)
+    hidden = torch.randn(6, 1, gate.gating_dim)
+
+    idx, _ = gate(hidden)
+
+    # topk_group=1 of 4 groups leaves exactly one 2-expert group live, so both
+    # selected experts must come from that group.
+    groups = idx // (gate.num_experts // gate.num_expert_group)
+    assert torch.equal(groups, groups[:, :1].expand_as(groups))
+
+
+def test_fuse_router_and_down_proj_rebinds_both_weights_onto_one_slab():
+    moe, down_proj = _make_fusable(num_experts=4, latent=6, hidden=8)
+    gate_ref = moe.gate.weight.detach().clone()
+    down_ref = down_proj.weight.detach().clone()
+
+    fused = fuse_router_and_down_proj(moe, down_proj)
+
+    assert fused is not None
+    assert fused.dtype == torch.bfloat16
+    assert tuple(fused.shape) == (4 + 6, 8)
+    assert torch.equal(fused[:4], gate_ref)
+    assert torch.equal(fused[4:], down_ref)
+    # Views, not copies: no duplicate weight storage is retained.
+    assert moe.gate.weight.data_ptr() == fused.data_ptr()
+    assert down_proj.weight.data_ptr() == fused[4:].data_ptr()
+
+
+def test_fuse_router_and_down_proj_is_idempotent():
+    moe, down_proj = _make_fusable()
+
+    fused = fuse_router_and_down_proj(moe, down_proj)
+    gate_ptr = moe.gate.weight.data_ptr()
+    again = fuse_router_and_down_proj(moe, down_proj)
+
+    assert again is fused
+    assert moe.gate.weight.data_ptr() == gate_ptr
+
+
+def test_fuse_router_and_down_proj_declines_a_non_bf16_router():
+    moe, down_proj = _make_fusable(gate_dtype=torch.float32)
+    gate_ptr = moe.gate.weight.data_ptr()
+    down_ptr = down_proj.weight.data_ptr()
+
+    assert fuse_router_and_down_proj(moe, down_proj) is None
+    assert moe.gate.weight.data_ptr() == gate_ptr
+    assert down_proj.weight.data_ptr() == down_ptr
+
+
+def test_fuse_router_and_down_proj_declines_mismatched_hidden_sizes():
+    moe, _ = _make_fusable(hidden=8)
+    down_proj = nn.Linear(16, 6, bias=False).to(torch.bfloat16)
+    gate_ptr = moe.gate.weight.data_ptr()
+    down_ptr = down_proj.weight.data_ptr()
+
+    assert fuse_router_and_down_proj(moe, down_proj) is None
+    assert moe.gate.weight.data_ptr() == gate_ptr
+    assert down_proj.weight.data_ptr() == down_ptr
+
+
+def test_split_fused_front_keeps_fp32_logits_and_casts_latent_once():
+    fused_out = torch.randn(3, 10, dtype=torch.float32)
+
+    logits, latent = split_fused_front(fused_out, 4)
+
+    assert logits.dtype == torch.float32
+    assert torch.equal(logits, fused_out[:, :4])
+    assert latent.dtype == torch.bfloat16
+    assert torch.equal(latent, fused_out[:, 4:].to(torch.bfloat16))
+
+
+def test_fused_slab_gemm_reproduces_the_router_and_down_projections():
+    num_experts, latent, hidden = 4, 6, 8
+    moe, down_proj = _make_fusable(
+        num_experts=num_experts, latent=latent, hidden=hidden
+    )
+    x = torch.randn(3, hidden, dtype=torch.bfloat16)
+    ref_logits = F.linear(x.float(), moe.gate.weight.float(), None)
+    ref_latent = torch.mm(x.float(), down_proj.weight.float().t())
+
+    fused = fuse_router_and_down_proj(moe, down_proj)
+    # CPU stand-in for the captured ``torch.mm(..., out_dtype=torch.float32)``.
+    logits, got_latent = split_fused_front(
+        torch.mm(x.float(), fused.float().t()), num_experts
+    )
+
+    assert torch.allclose(logits, ref_logits, atol=1e-5)
+    # The latent half is cast to BF16 exactly once, so it matches the separate
+    # projection to within one BF16 ulp.
+    assert torch.allclose(got_latent.float(), ref_latent, rtol=1e-2, atol=1e-2)

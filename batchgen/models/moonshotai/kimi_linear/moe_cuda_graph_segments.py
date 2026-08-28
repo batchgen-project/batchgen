@@ -28,10 +28,11 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.moe.dispatch_scatter_3d import (
@@ -65,6 +66,91 @@ def k3_moe_graph_buckets(attention_buckets: Iterable[int], tp_size: int) -> List
 
 def _round_up(value: int, multiple: int) -> int:
     return ((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+
+# The fused router/down-projection slab lives on the MoE block, not on the graph
+# segment: decode graphs are torn down and rebuilt across bucket changes and the
+# weights must be relocated exactly once per layer.
+_FUSED_FRONT_ATTR = "_k3_fused_front_weight"
+
+
+def fuse_router_and_down_proj(moe, down_proj) -> Optional[torch.Tensor]:
+    """Merge the router GEMM and the latent down-projection into one slab.
+
+    Both read the same ``[tokens, hidden]`` decode activation, so their weights
+    can share one contiguous ``[num_experts + latent, hidden]`` BF16 tensor and
+    be consumed by a single GEMM.  ``moe.gate.weight`` and ``down_proj.weight``
+    are rebound to views of that slab, so the old per-weight storage is dropped
+    rather than duplicated.  The slab is cached on ``moe`` and returned again on
+    every later call.  Returns ``None`` when the weight dtypes or shapes make
+    the fusion ineligible; the caller then keeps the unfused path.
+    """
+    cached = getattr(moe, _FUSED_FRONT_ATTR, None)
+    if cached is not None:
+        return cached
+
+    gate_weight = moe.gate.weight
+    down_weight = down_proj.weight
+    if gate_weight.dtype is not torch.bfloat16 or down_weight.dtype is not torch.bfloat16:
+        return None
+    if (
+        gate_weight.ndim != 2
+        or down_weight.ndim != 2
+        or gate_weight.shape[1] != down_weight.shape[1]
+    ):
+        return None
+
+    num_experts = int(gate_weight.shape[0])
+    with torch.no_grad():
+        fused = torch.empty(
+            (num_experts + int(down_weight.shape[0]), int(gate_weight.shape[1])),
+            dtype=torch.bfloat16,
+            device=gate_weight.device,
+        )
+        fused[:num_experts].copy_(gate_weight.detach())
+        fused[num_experts:].copy_(down_weight.detach())
+    moe.gate.weight = nn.Parameter(fused[:num_experts], requires_grad=False)
+    down_proj.weight = nn.Parameter(fused[num_experts:], requires_grad=False)
+    setattr(moe, _FUSED_FRONT_ATTR, fused)
+    return fused
+
+
+def split_fused_front(
+    fused_out: torch.Tensor, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split one fused GEMM output into FP32 router logits and BF16 latent rows."""
+    return (
+        fused_out[:, :num_experts],
+        fused_out[:, num_experts:].to(torch.bfloat16),
+    )
+
+
+_MM_OUT_FP32_SUPPORT: Dict[str, bool] = {}
+
+
+def _supports_mm_out_fp32(device: torch.device) -> bool:
+    """Probe once whether ``torch.mm`` accepts ``out_dtype=torch.float32`` here.
+
+    The BF16-input/FP32-output GEMM is what keeps the fused router logits in
+    FP32.  Older torch builds reject the keyword, so probe before capture and
+    fall back to the separate gate + down-projection path when unavailable.
+    """
+    key = str(device)
+    supported = _MM_OUT_FP32_SUPPORT.get(key)
+    if supported is None:
+        probe = torch.zeros((1, 1), dtype=torch.bfloat16, device=device)
+        try:
+            torch.mm(probe, probe, out_dtype=torch.float32)
+            supported = True
+        except (RuntimeError, TypeError):
+            supported = False
+        _MM_OUT_FP32_SUPPORT[key] = supported
+        logger.info(
+            "K3 fused router/down front out_dtype probe: device=%s supported=%s",
+            device,
+            supported,
+        )
+    return supported
 
 
 @dataclass
@@ -283,6 +369,9 @@ class K3MoEGraphSegment:
         self.tp_rank = int(getattr(moe, "attn_tp_rank", 0))
         self.tp_group = getattr(moe, "attn_tp_group", None)
         self.shared_stream = pool.shared_stream
+        self.num_experts = int(moe.gate.weight.shape[0])
+        # Set by ``setup_static_buffers`` once the fusion eligibility is known.
+        self.fused_front = None
 
         if self.tp_size <= 1 or self.tp_group is None:
             raise RuntimeError("K3 resident-MoE graph requires a TP8 process group")
@@ -308,6 +397,10 @@ class K3MoEGraphSegment:
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         self.pool.setup()
+        if self.fused_front is None and _supports_mm_out_fp32(self.device):
+            self.fused_front = fuse_router_and_down_proj(
+                self.moe, self.resident.down_proj
+            )
         if hasattr(self.resident.comm, "disabled"):
             self.resident.comm.disabled = False
 
@@ -376,8 +469,22 @@ class K3MoEGraphSegment:
         ) < num_valid_tokens.reshape(1)
 
         # Router/down-projection are executed once per distinct local row.  The
-        # graph input is already zero padded to the full TP-group bucket.
-        gate_out = self.moe.gate(local.view(local_tokens, 1, self.hidden_size))
+        # graph input is already zero padded to the full TP-group bucket.  Both
+        # read the same rows from the same activation, so when their weights are
+        # fused into one slab a single BF16-in/FP32-out GEMM replaces the two
+        # skinny launches; the router half stays FP32 for sigmoid/top-k.  The
+        # BF16-input GEMM can differ from the eager FP32-input GEMM on near-tie
+        # logits, so graph-vs-eager routing parity remains a remote gate.
+        x_latent = None
+        if self.fused_front is not None:
+            fused_out = torch.mm(
+                local, self.fused_front.t(), out_dtype=torch.float32
+            )
+            router_logits, latent = split_fused_front(fused_out, self.num_experts)
+            gate_out = self.moe.gate.select_experts(router_logits)
+            x_latent = latent.contiguous()
+        else:
+            gate_out = self.moe.gate(local.view(local_tokens, 1, self.hidden_size))
         # KimiMoEGate flattens its input internally and returns [T, K].  Keep
         # this explicit because a wrapper may preserve the singleton sequence
         # dimension; the static EP gather buffers are always two-dimensional.
@@ -403,9 +510,10 @@ class K3MoEGraphSegment:
             with torch.cuda.stream(self.shared_stream):
                 shared_output = self.moe.shared_experts(padded)
 
-        x_latent = self.resident.down_proj(local).reshape(
-            local_tokens, self.latent_size
-        ).contiguous()
+        if x_latent is None:
+            x_latent = self.resident.down_proj(local).reshape(
+                local_tokens, self.latent_size
+            ).contiguous()
 
         # EP collectives are graph-captured on the current decode stream.  The
         # order is identical to ResidentEPMXFP4MoELayer._forward_ep.
@@ -506,5 +614,7 @@ class K3MoEGraphSegment:
 __all__ = [
     "K3MoEGraphBufferPool",
     "K3MoEGraphSegment",
+    "fuse_router_and_down_proj",
     "k3_moe_graph_buckets",
+    "split_fused_front",
 ]

@@ -303,12 +303,15 @@ class KimiMoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.num_experts, self.gating_dim)))
         self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts))
 
-    def forward(self, hidden_states: torch.Tensor):
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FP32 router logits for a flat ``[tokens, hidden]`` activation."""
+        return F.linear(
             hidden_states.type(torch.float32), self.weight.type(torch.float32), None
         )
+
+    def select_experts(self, logits: torch.Tensor):
+        """Top-k selection from FP32 router logits ``[tokens, num_experts]``."""
+        num_tokens = logits.shape[0]
         if self.moe_router_activation_func == "sigmoid":
             scores = logits.sigmoid()
         elif self.moe_router_activation_func == "softmax":
@@ -318,11 +321,10 @@ class KimiMoEGate(nn.Module):
                 f"insupportable scoring function for MoE gating: {self.moe_router_activation_func}"
             )
 
-        scores = scores.view(bsz * seq_len, -1)
         scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
         if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
             group_scores = (
-                scores_for_choice.view(bsz * seq_len, self.num_expert_group, -1)
+                scores_for_choice.view(num_tokens, self.num_expert_group, -1)
                 .topk(2, dim=-1)[0]
                 .sum(dim=-1)
             )
@@ -333,9 +335,9 @@ class KimiMoEGate(nn.Module):
             group_mask.scatter_(1, group_idx, 1)
             score_mask = (
                 group_mask.unsqueeze(-1)
-                .expand(bsz * seq_len, self.num_expert_group,
+                .expand(num_tokens, self.num_expert_group,
                         self.num_experts // self.num_expert_group)
-                .reshape(bsz * seq_len, -1)
+                .reshape(num_tokens, -1)
             )
             tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         else:
@@ -350,6 +352,10 @@ class KimiMoEGate(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor
 
         return topk_idx, topk_weight
+
+    def forward(self, hidden_states: torch.Tensor):
+        _, _, h = hidden_states.shape
+        return self.select_experts(self.router_logits(hidden_states.view(-1, h)))
 
 
 class KimiSparseMoeBlock(nn.Module):
