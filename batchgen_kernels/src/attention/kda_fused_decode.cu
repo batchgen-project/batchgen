@@ -373,14 +373,17 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
             dot_q1 = warp_sum(dot_q1);
 
             float* output_tile = current_state;
-            output_tile[output_row0 * kHeadDim + key_base + 0] = h0[0];
-            output_tile[output_row0 * kHeadDim + key_base + 1] = h0[1];
-            output_tile[output_row0 * kHeadDim + key_base + 2] = h0[2];
-            output_tile[output_row0 * kHeadDim + key_base + 3] = h0[3];
-            output_tile[output_row1 * kHeadDim + key_base + 0] = h1[0];
-            output_tile[output_row1 * kHeadDim + key_base + 1] = h1[1];
-            output_tile[output_row1 * kHeadDim + key_base + 2] = h1[2];
-            output_tile[output_row1 * kHeadDim + key_base + 3] = h1[3];
+            // current_state is a chunk-local [32 values, K] tile; output_row*
+            // is the global value index used only for output_value and the
+            // transposed writeback.
+            output_tile[value_row0 * kHeadDim + key_base + 0] = h0[0];
+            output_tile[value_row0 * kHeadDim + key_base + 1] = h0[1];
+            output_tile[value_row0 * kHeadDim + key_base + 2] = h0[2];
+            output_tile[value_row0 * kHeadDim + key_base + 3] = h0[3];
+            output_tile[value_row1 * kHeadDim + key_base + 0] = h1[0];
+            output_tile[value_row1 * kHeadDim + key_base + 1] = h1[1];
+            output_tile[value_row1 * kHeadDim + key_base + 2] = h1[2];
+            output_tile[value_row1 * kHeadDim + key_base + 3] = h1[3];
             if (lane == 0) {
                 output_value[output_row0] = dot_q0;
                 output_value[output_row1] = dot_q1;
