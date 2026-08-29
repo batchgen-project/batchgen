@@ -295,10 +295,14 @@ class KimiLinearWholeModelSegment:
             padded = hidden_2d.index_select(0, padded_map)
             padded = padded * padded_valid.to(hidden_2d.dtype).unsqueeze(-1)
 
-            local_map = maps.local_indices[selector]
-            local_valid = maps.local_valid[selector]
-            local = hidden_2d.index_select(0, local_map)
-            local = local * local_valid.to(hidden_2d.dtype).unsqueeze(-1)
+            # ``padded`` is already rank-major: each TP rank's balanced rows
+            # occupy one contiguous slice.  Reusing that slice avoids a
+            # second index-select and mask over the 6144-wide activation on
+            # every MoE layer.  The slice is equivalent to
+            # ``maps.local_indices[selector]`` because ``padded_valid`` has
+            # already zeroed the underfilled tail for this rank.
+            local_start = self.tp_rank * maps.local_bucket
+            local = padded.narrow(0, local_start, maps.local_bucket)
             local_count = maps.local_counts.index_select(0, selector.reshape(1))
 
             moe_output = moe.forward(

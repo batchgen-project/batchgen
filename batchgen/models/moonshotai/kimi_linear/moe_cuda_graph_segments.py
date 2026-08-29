@@ -547,6 +547,21 @@ class K3MoEGraphSegment:
         global_tokens = bufs.global_tokens
         local = local[:local_tokens]
 
+        # The shared expert depends only on the replicated TP-group input.  It
+        # is independent of routing, so launch it before the current stream's
+        # router/down projection rather than after it.  This matches the
+        # overlap schedule used by SGLang: the current stream can then run the
+        # entire routed front and EP path while the auxiliary stream computes
+        # the shared partial.  The wait below still keeps the merged TP
+        # reduction ordered after the shared result.
+        shared_partial = None
+        current_stream = None
+        if self.shared_stream is not None:
+            current_stream = torch.cuda.current_stream(device=self.device)
+            self.shared_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.shared_stream):
+                shared_partial = self.moe.shared_experts._ffn(padded)
+
         # Router/down-projection are executed once per distinct local row.  The
         # graph input is already zero padded to the full TP-group bucket.  Both
         # read the same rows from the same activation, so when their weights are
@@ -615,26 +630,6 @@ class K3MoEGraphSegment:
             topk_weight = torch.where(
                 valid_rows.unsqueeze(1), topk_weight, torch.zeros_like(topk_weight)
             )
-
-        # The shared expert reads only ``padded``; the routed path below reads
-        # it as well but never mutates it.  Start the replicated shared MLP on
-        # the model-wide auxiliary stream while the current stream performs
-        # EP dispatch, grouped expert GEMMs, and reduction.  CUDA Graph capture
-        # records these stream dependencies, so replay keeps the overlap with
-        # no per-token host synchronization.
-        #
-        # ``_ffn`` is the shared expert's body WITHOUT its row-parallel TP
-        # all-reduce: the reduction is deferred so it can be merged with the
-        # routed path's TP collective below.  Decode buckets are far below the
-        # token tile at which ``KimiMLP.forward`` chunks, so this is the exact
-        # sequence of ops that call would run.
-        shared_partial = None
-        current_stream = None
-        if self.shared_stream is not None:
-            current_stream = torch.cuda.current_stream(device=self.device)
-            self.shared_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.shared_stream):
-                shared_partial = self.moe.shared_experts._ffn(padded)
 
         if x_latent is None:
             x_latent = self.resident.down_proj(local).reshape(
