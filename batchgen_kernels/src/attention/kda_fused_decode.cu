@@ -326,7 +326,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
                              state_slot_stride, chunk + 1);
         }
 
-        const float* current_state = state_tile
+        float* current_state = state_tile
             + (chunk & 1) * kStateChunkElements;
 #pragma unroll
         for (int row = 0; row < 4; row += 2) {
