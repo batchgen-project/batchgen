@@ -26,12 +26,13 @@ from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import (
 )
 
 
-def _shard(name, tensor, G, Hl, rank, hd=128):
+def _shard(name, tensor, G, Hl, rank, hd=128, *, is_k3=False):
     stub = types.SimpleNamespace(
         _attn_tp_head_dim=hd,
         _attn_tp_hl=Hl,
         _attn_tp_size=G,
         _attn_tp_rank=rank,
+        _is_k3=is_k3,
     )
     return PSM._head_shard_kda_tensor(stub, name, tensor)
 
@@ -69,6 +70,18 @@ def test_alog_wrong_numel_hard_fails():
     A = torch.zeros(1, 1, 30, 1)  # 30 not = 8*4
     with pytest.raises(ValueError):
         _shard("A_log", A, 8, 4, 0)
+
+
+def test_k3_padded_alog_shards_live_heads_not_padding_or_rank_zero():
+    """K3's [128] checkpoint row is [96 live heads] plus zero padding."""
+    G, Hl = 8, 12
+    A = torch.arange(128, dtype=torch.float32)
+    for r in range(G):
+        s = _shard("A_log", A, G, Hl, r, is_k3=True)
+        assert torch.equal(
+            s.flatten(),
+            torch.arange(r * Hl, (r + 1) * Hl, dtype=torch.float32),
+        ), f"rank {r} did not receive its K3 A_log head slice"
 
 
 def test_bproj_still_dim0_sharded():

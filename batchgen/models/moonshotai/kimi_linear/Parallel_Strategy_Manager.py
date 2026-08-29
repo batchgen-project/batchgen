@@ -1220,22 +1220,26 @@ class KimiLinearParallelStrategyManager:
             # scalar per head). Its stored shape is (1, 1, H, 1) on the 48B
             # checkpoint, so slice the flattened head axis -- a dim-0 slice
             # (tensor[lo:hi]) hits the size-1 leading axis and returns 0 rows.
-            # A_log LAYOUT differs by model: 48B is per-HEAD (numel ==
-            # kda_num_heads, stored (1,1,H,1)) -> slice this rank's heads; K3
-            # is per-HEAD_DIM (numel == kda_head_dim, like o_norm, shared
-            # across all heads) -> the head shard keeps every head_dim so each
-            # rank needs the FULL vector -> REPLICATE. (K3 A_log=(128,); the
-            # fla kda kernel consumes it as-is.)
+            # A_log LAYOUT differs only in its checkpoint padding: 48B stores
+            # one value per head (sometimes as (1,1,H,1)); K3 stores the same
+            # per-head vector padded from 96 to 128 entries.  K3's padding is
+            # not a per-head-dimension parameter: every rank must receive its
+            # own slice of the first 96 values, or all TP ranks would consume
+            # rank 0's decay constants.
+            from .k3.tensor_map import K3_A_LOG_PADDED_LEN
+
             a = tensor.reshape(-1)
             n = self._attn_tp_hl * self._attn_tp_size
-            if a.numel() == n:
+            if a.numel() == n or (
+                getattr(self, "_is_k3", False)
+                and a.numel() == K3_A_LOG_PADDED_LEN
+                and n < a.numel()
+            ):
                 return a[lo:hi]
-            if a.numel() == self._attn_tp_head_dim:
-                return tensor
             raise ValueError(
                 f"A_log has {a.numel()} elements (shape {tuple(tensor.shape)}); "
-                f"expected kda_num_heads={n} (per-head) or "
-                f"kda_head_dim={self._attn_tp_head_dim} (per-head-dim)"
+                f"expected kda_num_heads={n} or K3's padded length "
+                f"{K3_A_LOG_PADDED_LEN}"
             )
         if base == "b_proj":
             return tensor[lo:hi]

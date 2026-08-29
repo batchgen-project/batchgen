@@ -214,6 +214,15 @@ def get_registry():
                 "--threads", "4",
             ],
         },
+        "batchgen_kernels.attention._C_kda_fused_decode": {
+            "sources": ["src/attention/kda_fused_decode.cu"],
+            "nvcc_flags": [
+                "-O3", "--use_fast_math", "-std=c++17",
+                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads", "4",
+            ],
+        },
 
         # ── AOT MoE token permutation (SM80+) ──
 

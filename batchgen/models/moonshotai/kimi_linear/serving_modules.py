@@ -31,12 +31,17 @@ KDALayerState objects consumed here hold fixed-address VIEWS of the manager's
 tensors (see wrappers.py). This module only implements the math.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from .wrappers import KimiLinearExpertWrapper
+
+
+logger = logging.getLogger(__name__)
+_KDA_FUSED_DECODE_IMPORT_FAILED = False
 
 # ============================================================================
 #  NoPE-MLA
@@ -426,7 +431,8 @@ def fuse_kda_decode_projections(self) -> bool:
     return True
 
 
-def _kda_project(self, hidden_states_2d, *, decode=False):
+def _kda_project(self, hidden_states_2d, *, decode=False,
+                 return_mixed_qkv=False):
     """Run all KDA projections on packed (total_tokens, hidden) input.
 
     Returns q, k, v (total, proj), f gate (total, H, K), beta raw (total, H),
@@ -445,6 +451,9 @@ def _kda_project(self, hidden_states_2d, *, decode=False):
         )
         f = F.linear(f_a, self.f_b_proj.weight).view(-1, num_heads, head_dim)
         z = z.view(-1, num_heads, head_dim)
+        mixed_qkv = fused_states[:, : 3 * num_heads * head_dim]
+        if return_mixed_qkv:
+            return q, k, v, f, beta, z, mixed_qkv
         return q, k, v, f, beta, z
 
     q = self.q_proj(hidden_states_2d)
@@ -461,7 +470,99 @@ def _kda_project(self, hidden_states_2d, *, decode=False):
     else:
         z = self.g_b_proj(self.g_a_proj(hidden_states_2d))
         z = z.view(-1, num_heads, head_dim)
+    if return_mixed_qkv:
+        return q, k, v, f, beta, z, None
     return q, k, v, f, beta, z
+
+
+def _kda_fused_conv_args(conv):
+    """Expose a K3 ShortConvolution in the fused kernel's native layout.
+
+    K3 stores the depthwise weights as FP32 ``[channels, 1, 4]``.  Squeezing
+    the singleton axis produces a stride-preserving ``[channels, 4]`` view;
+    no per-layer transpose or dtype conversion is allowed on the decode path.
+    """
+    weight = getattr(conv, "weight", None)
+    if weight is None or weight.dtype is not torch.float32:
+        return None
+    if weight.ndim == 3:
+        if weight.shape[1] != 1:
+            return None
+        weight = weight[:, 0, :]
+    if weight.ndim != 2 or weight.shape[1] != 4:
+        return None
+    bias = getattr(conv, "bias", None)
+    if bias is not None and (
+        bias.dtype is not torch.float32 or bias.ndim != 1
+        or bias.shape[0] != weight.shape[0]
+    ):
+        return None
+    return weight, bias
+
+
+def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
+    """Try the AOT K3 end-to-end KDA decode kernel.
+
+    ``None`` means the established FLA chain must be used.  The fallback is
+    intentionally retained for non-K3 variants and for installations whose
+    wheel predates this optional kernel; production K3 startup still records
+    the fallback so it cannot be mistaken for the optimized path.
+    """
+    global _KDA_FUSED_DECODE_IMPORT_FAILED
+    if mixed_qkv is None or not bool(getattr(self, "use_full_rank_gate", False)):
+        return None
+    try:
+        from batchgen_kernels.attention.kda_fused_decode import (
+            covered,
+            kda_fused_decode,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        if not _KDA_FUSED_DECODE_IMPORT_FAILED:
+            logger.warning(
+                "K3 fused KDA decode extension unavailable; using FLA chain: %s",
+                exc,
+            )
+            _KDA_FUSED_DECODE_IMPORT_FAILED = True
+        return None
+
+    q_args = _kda_fused_conv_args(self.q_conv1d)
+    k_args = _kda_fused_conv_args(self.k_conv1d)
+    v_args = _kda_fused_conv_args(self.v_conv1d)
+    if q_args is None or k_args is None or v_args is None:
+        return None
+    q_weight, q_bias = q_args
+    k_weight, k_bias = k_args
+    v_weight, v_bias = v_args
+    f_flat = f.reshape(f.shape[0], -1)
+    z_flat = z.reshape(z.shape[0], -1)
+    if not covered(
+        mixed_qkv, f_flat, beta,
+        kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
+        q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
+        self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
+        kda_state.recurrent_pool, slot_ids,
+    ):
+        return None
+    try:
+        return kda_fused_decode(
+            mixed_qkv, f_flat, beta,
+            kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
+            q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
+            self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
+            kda_state.recurrent_pool, slot_ids,
+            scale=self.head_dim ** -0.5,
+            onorm_eps=self.o_norm.variance_epsilon,
+            lower_bound=self.gate_lower_bound,
+        )
+    except ImportError as exc:
+        # AOT import can succeed while the extension's transitive CUDA image
+        # is absent from an old wheel. Do not repeatedly probe every KDA layer.
+        if not _KDA_FUSED_DECODE_IMPORT_FAILED:
+            logger.warning(
+                "K3 fused KDA decode failed to load; using FLA chain: %s", exc
+            )
+            _KDA_FUSED_DECODE_IMPORT_FAILED = True
+        return None
 
 
 def _conv_weights(conv, dtype):
@@ -735,18 +836,36 @@ def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
     Returns:
         (bsz, 1, hidden) attention output.
     """
-    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
-
-    from batchgen_kernels.conv1d import causal_conv1d_update
-
     bsz = hidden_states.shape[0]
     device = hidden_states.device
     num_heads, head_dim = self.num_heads, self.head_dim
 
     hidden_2d = hidden_states.squeeze(1)
-    q, k, v, f, beta, z = _kda_project(self, hidden_2d, decode=True)
+    q, k, v, f, beta, z, mixed_qkv = _kda_project(
+        self, hidden_2d, decode=True, return_mixed_qkv=True
+    )
 
     slot_ids = kda_state.cur_decode_slots  # (bsz,) int32
+
+    fused_output = _kda_fused_decode(
+        self, mixed_qkv, f, beta, z, kda_state, slot_ids
+    )
+    if fused_output is not None:
+        o = self.o_proj(fused_output)
+        # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so
+        # the partial sums across the attn_tp sub-group must be reduced. Only
+        # when G>1.
+        if getattr(self, "attn_tp_size", 1) > 1:
+            import torch.distributed as dist
+
+            dist.all_reduce(o, group=self.attn_tp_group)
+        return o.unsqueeze(1)
+
+    # Established correctness fallback for Kimi-Linear-48B, old wheels, and
+    # any K3 tensor layout outside the AOT kernel's covered contract.
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+    from batchgen_kernels.conv1d import causal_conv1d_update
 
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_update(
