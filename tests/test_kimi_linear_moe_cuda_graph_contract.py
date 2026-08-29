@@ -533,6 +533,7 @@ def test_whole_model_setup_and_release_reach_inline_moe_segments(monkeypatch):
     segment._kv_key_buffer = None
     segment._primary_kv_dim = 0
     segment._kda_cu_seqlens = {}
+    segment.device = torch.device("cpu")
     monkeypatch.setattr(segment, "_make_bucket_maps", lambda bucket: object())
 
     segment.setup_static_buffers(8)
