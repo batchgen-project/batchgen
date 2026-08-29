@@ -212,6 +212,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
     // Load the first [K,V] state chunk into the value-major shared tile before
     // doing the independent convolution update.
     load_state_chunk(state_tile, state, slot, head, state_slot_stride, 0);
+    __syncthreads();
 
     if (tid < kHeadDim) {
         const int channel = channel_base + tid;
@@ -325,6 +326,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
             load_state_chunk(state_tile, state, slot, head,
                              state_slot_stride, chunk + 1);
         }
+        // The synchronous scalar/vector loads above must be published before
+        // any thread reads the newly populated stage.  The old cp.async path
+        // supplied this ordering with wait_all; the synchronous replacement
+        // does not.
+        __syncthreads();
 
         float* current_state = state_tile
             + (chunk & 1) * kStateChunkElements;
