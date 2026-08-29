@@ -6170,10 +6170,20 @@ class BatchGenWorker:
 		"""Load K3's first-forward CUDA extensions before HTTP readiness."""
 		from batchgen.moe.dispatch_scatter_3d import _load_dispatch_reduce_module
 		from batchgen_kernels.conv1d import _get_ext as _get_causal_conv1d_ext
+		try:
+			from batchgen_kernels.attention.kda_fused_decode import (
+				_get_ext as _get_kda_fused_decode_ext,
+			)
+		except ImportError as exc:
+			raise RuntimeError(
+				f"Rank {self.rank}: required Kimi-K3 extension "
+				f"kda_fused_decode failed to load - {exc}"
+			) from exc
 
 		required_extensions = (
 			("causal_conv1d", _get_causal_conv1d_ext),
 			("dispatch_scatter_3d", _load_dispatch_reduce_module),
+			("kda_fused_decode", _get_kda_fused_decode_ext),
 		)
 		for name, loader in required_extensions:
 			if loader() is None:

@@ -372,11 +372,14 @@ def _bind_preload(monkeypatch, trace, rank, flash_mla):
     """Bind the preload alone. ``flash_mla=None`` makes its import fail."""
     conv1d = ModuleType("batchgen_kernels.conv1d")
     conv1d._get_ext = lambda: trace.append("causal_conv1d") or object()
+    kda_fused_decode = ModuleType("batchgen_kernels.attention.kda_fused_decode")
+    kda_fused_decode._get_ext = lambda: trace.append("kda_fused_decode") or object()
     dispatch = ModuleType("batchgen.moe.dispatch_scatter_3d")
     dispatch._load_dispatch_reduce_module = (
         lambda: trace.append("dispatch_scatter_3d") or object()
     )
     monkeypatch.setitem(sys.modules, conv1d.__name__, conv1d)
+    monkeypatch.setitem(sys.modules, kda_fused_decode.__name__, kda_fused_decode)
     monkeypatch.setitem(sys.modules, dispatch.__name__, dispatch)
     # A None entry makes ``import flash_mla`` raise regardless of what is
     # installed on the host running the test.
@@ -409,6 +412,7 @@ def test_kimi_k3_startup_preloads_the_first_forward_extensions_and_flashmla(
     assert trace == [
         "causal_conv1d",
         "dispatch_scatter_3d",
+        "kda_fused_decode",
         "flash_mla.flash_mla_with_kvcache",
         "flash_mla.get_mla_metadata",
         "flash_mla.warmup",
