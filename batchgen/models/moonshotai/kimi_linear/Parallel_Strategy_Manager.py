@@ -48,6 +48,7 @@ from .block_residual import (
 )
 from .config import require_num_routed_experts
 from .serving_modules import (
+    fuse_kda_decode_projections,
     kda_decode_serving,
     kda_prefill_serving,
     mla_decoding_nope_with_pagekv,
@@ -1333,6 +1334,12 @@ class KimiLinearParallelStrategyManager:
             kda = self.model.model.layers[layer_idx].self_attn
             kda.kda_prefill_serving = types.MethodType(kda_prefill_serving, kda)
             kda.kda_decode_serving = types.MethodType(kda_decode_serving, kda)
+            if self._is_k3 and not self._stream_all_modules:
+                # K3's full-rank KDA gate is eligible for the decode-only
+                # projection fusion.  Prefill continues to use the original
+                # calls; the rebinding shares their storage with the fused
+                # buffer instead of duplicating HBM.
+                fuse_kda_decode_projections(kda)
             # M2a: stamp the head-parallel context the serving methods read
             # (attn_tp_size==1 -> the o_proj all_reduce is skipped, unchanged).
             kda.attn_tp_size = self._attn_tp_size

@@ -363,13 +363,90 @@ def mla_decoding_nope_with_pagekv(
 # ============================================================================
 
 
-def _kda_project(self, hidden_states_2d):
+_KDA_DECODE_FUSED_WEIGHT = "_kda_decode_fused_weight"
+_KDA_DECODE_FUSED_SIZES = "_kda_decode_fused_sizes"
+
+
+def fuse_kda_decode_projections(self) -> bool:
+    """Fuse K3's independent decode projections into one GEMM weight.
+
+    K3's KDA layer has four large projections (Q/K/V/full-rank output gate),
+    one small per-head beta projection, and the first projection of the
+    low-rank forget gate.  They all consume the same decode hidden row.  The
+    second forget-gate projection remains a dependent GEMM, so the fused path
+    reduces the projection front from seven GEMMs to two.
+
+    This is deliberately decode-only: prefill keeps the original projection
+    calls so its established numerical path is unchanged.  The original
+    ``Linear.weight`` parameters are rebound to views of the single buffer,
+    avoiding a second copy of the weights while retaining the prefill API.
+    Returns ``False`` for non-K3/low-rank variants or mixed/ineligible dtypes.
+    """
+    if getattr(self, _KDA_DECODE_FUSED_WEIGHT, None) is not None:
+        return True
+    if not bool(getattr(self, "use_full_rank_gate", False)):
+        return False
+
+    names = ("q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_a_proj")
+    weights = []
+    for name in names:
+        projection = getattr(self, name, None)
+        weight = getattr(projection, "weight", None)
+        if weight is None or weight.ndim != 2 or weight.is_meta:
+            return False
+        if getattr(projection, "bias", None) is not None:
+            return False
+        weights.append(weight)
+
+    hidden_size = weights[0].shape[1]
+    dtype = weights[0].dtype
+    device = weights[0].device
+    if any(
+        weight.shape[1] != hidden_size
+        or weight.dtype != dtype
+        or weight.device != device
+        for weight in weights
+    ):
+        return False
+
+    # The order is part of the serving contract consumed by _kda_project.
+    sizes = tuple(int(weight.shape[0]) for weight in weights)
+    with torch.no_grad():
+        fused = torch.cat([weight.detach() for weight in weights], dim=0)
+    self.register_buffer(_KDA_DECODE_FUSED_WEIGHT, fused, persistent=False)
+    setattr(self, _KDA_DECODE_FUSED_SIZES, sizes)
+
+    start = 0
+    for name, size in zip(names, sizes):
+        projection = getattr(self, name)
+        projection.weight = torch.nn.Parameter(
+            fused[start : start + size], requires_grad=False
+        )
+        start += size
+    return True
+
+
+def _kda_project(self, hidden_states_2d, *, decode=False):
     """Run all KDA projections on packed (total_tokens, hidden) input.
 
     Returns q, k, v (total, proj), f gate (total, H, K), beta raw (total, H),
     and the output gate z (total, H, K).
     """
     num_heads, head_dim = self.num_heads, self.head_dim
+    fused = getattr(self, _KDA_DECODE_FUSED_WEIGHT, None) if decode else None
+    if fused is not None:
+        # The six rows below are all independent linear maps of the same
+        # activation.  Keeping f_a in this GEMM is safe because only f_b is
+        # dependent; the fused output is still split into the exact native
+        # layouts consumed by the recurrent kernel.
+        fused_states = F.linear(hidden_states_2d, fused)
+        q, k, v, z, beta, f_a = torch.split(
+            fused_states, getattr(self, _KDA_DECODE_FUSED_SIZES), dim=-1
+        )
+        f = F.linear(f_a, self.f_b_proj.weight).view(-1, num_heads, head_dim)
+        z = z.view(-1, num_heads, head_dim)
+        return q, k, v, f, beta, z
+
     q = self.q_proj(hidden_states_2d)
     k = self.k_proj(hidden_states_2d)
     v = self.v_proj(hidden_states_2d)
@@ -667,7 +744,7 @@ def kda_decode_serving(self, hidden_states, kda_state):
     num_heads, head_dim = self.num_heads, self.head_dim
 
     hidden_2d = hidden_states.squeeze(1)
-    q, k, v, f, beta, z = _kda_project(self, hidden_2d)
+    q, k, v, f, beta, z = _kda_project(self, hidden_2d, decode=True)
 
     slot_ids = kda_state.cur_decode_slots  # (bsz,) int32
 
