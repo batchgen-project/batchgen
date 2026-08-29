@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from batchgen.models.moonshotai.kimi_linear.serving_modules import (
+    _kda_o_norm_eps,
     _kda_project,
     fuse_kda_decode_projections,
 )
@@ -72,3 +75,13 @@ def test_low_rank_gate_is_not_fused():
     attn = _AttentionStub(full_rank=False)
     assert not fuse_kda_decode_projections(attn)
     assert not hasattr(attn, "_kda_decode_fused_weight")
+
+
+def test_fused_kda_accepts_fla_output_norm_eps_alias():
+    """FLA names FusedRMSNormGated's epsilon ``eps``, not ``variance_epsilon``."""
+    attention = SimpleNamespace(
+        o_norm=SimpleNamespace(eps=2.5e-6),
+        config=SimpleNamespace(rms_norm_eps=1e-5),
+    )
+
+    assert _kda_o_norm_eps(attention) == 2.5e-6

@@ -500,6 +500,28 @@ def _kda_fused_conv_args(conv):
     return weight, bias
 
 
+def _kda_o_norm_eps(attention):
+    """Return the output-norm epsilon across the supported FLA APIs.
+
+    The local K3 model shim calls this field ``variance_epsilon``, while the
+    FLA ``FusedRMSNormGated`` used by the serving runtime exposes the same
+    value as ``eps``.  Keep the model config as a final fallback so the fused
+    kernel receives the checkpoint's configured epsilon instead of failing at
+    graph capture.
+    """
+    eps = getattr(attention.o_norm, "variance_epsilon", None)
+    if eps is None:
+        eps = getattr(attention.o_norm, "eps", None)
+    if eps is None:
+        eps = getattr(getattr(attention, "config", None), "rms_norm_eps", None)
+    if eps is None:
+        raise AttributeError(
+            "KDA output norm exposes neither variance_epsilon nor eps, and "
+            "the attention config has no rms_norm_eps"
+        )
+    return eps
+
+
 def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
     """Try the AOT K3 end-to-end KDA decode kernel.
 
@@ -543,6 +565,7 @@ def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
         kda_state.recurrent_pool, slot_ids,
     ):
         return None
+    onorm_eps = _kda_o_norm_eps(self)
     try:
         return kda_fused_decode(
             mixed_qkv, f_flat, beta,
@@ -551,7 +574,7 @@ def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
             self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
             kda_state.recurrent_pool, slot_ids,
             scale=self.head_dim ** -0.5,
-            onorm_eps=self.o_norm.variance_epsilon,
+            onorm_eps=onorm_eps,
             lower_bound=self.gate_lower_bound,
         )
     except ImportError as exc:
