@@ -198,7 +198,6 @@ class _K3MoEGraphBuffers:
     expert_output: torch.Tensor
     combined: torch.Tensor
     local_combined: torch.Tensor
-    tp_output: torch.Tensor
     expert_counts: torch.Tensor
     expert_counters: torch.Tensor
     topk_pos: torch.Tensor
@@ -318,7 +317,6 @@ class K3MoEGraphBufferPool:
         b["local_combined"] = torch.empty(
             (self._max_local_tokens, k), dtype=torch.float32, device=d
         )
-        b["tp_output"] = torch.empty((self._max_group_bucket, self.hidden_size), dtype=torch.bfloat16, device=d)
         b["expert_counts"] = torch.empty((e,), dtype=torch.int32, device=d)
         b["expert_counters"] = torch.empty((e,), dtype=torch.int32, device=d)
         b["topk_pos"] = torch.empty((nk,), dtype=torch.int32, device=d)
@@ -371,7 +369,6 @@ class K3MoEGraphBufferPool:
             expert_output=b["expert_output"][: e * mtp],
             combined=b["combined"][:global_tokens],
             local_combined=b["local_combined"][:local_tokens],
-            tp_output=b["tp_output"][:bucket],
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
             topk_pos=b["topk_pos"][: global_tokens * self.top_k],
@@ -433,8 +430,27 @@ class K3MoEGraphSegment:
             raise ValueError("K3 resident-MoE graph received invalid model dimensions")
         if self.top_k != 16:
             raise ValueError(f"K3 resident-MoE graph expects top_k=16, got {self.top_k}")
-        if getattr(moe, "shared_experts", None) is None:
+        shared = getattr(moe, "shared_experts", None)
+        if shared is None:
             raise ValueError("K3 resident-MoE graph requires shared experts")
+        # The graph folds the shared expert's row-parallel reduction into the
+        # routed TP all-reduce, so it needs the unreduced FFN body and the very
+        # same TP group.  A streamed/offloaded expert wrapper exposes neither;
+        # refuse capture instead of emitting a different collective pattern for
+        # it, which would silently change a non-K3 serving path.
+        if not callable(getattr(shared, "_ffn", None)):
+            raise RuntimeError(
+                "K3 resident-MoE graph requires an unwrapped shared expert "
+                f"exposing _ffn, got {type(shared).__name__}"
+            )
+        if (
+            int(getattr(shared, "_tp_size", 1)) != self.tp_size
+            or getattr(shared, "_tp_group", None) is not self.tp_group
+        ):
+            raise RuntimeError(
+                "K3 resident-MoE graph requires the shared expert to reduce "
+                "over the MoE TP group"
+            )
         if resident.comm is None:
             raise ValueError("K3 resident-MoE graph requires an EP communicator")
         if self.tp_size != self.pool.tp_size:
@@ -444,6 +460,11 @@ class K3MoEGraphSegment:
         if self.world_size != self.pool.world_size:
             raise ValueError(
                 f"K3 MoE EP mismatch: layer={self.world_size}, pool={self.pool.world_size}"
+            )
+        if self.hidden_size != int(self.pool.hidden_size):
+            raise ValueError(
+                f"K3 MoE hidden mismatch: layer={self.hidden_size}, "
+                f"pool={self.pool.hidden_size}"
             )
 
         # The resident layer owns these pointers and keeps every weight tensor
@@ -601,12 +622,19 @@ class K3MoEGraphSegment:
         # EP dispatch, grouped expert GEMMs, and reduction.  CUDA Graph capture
         # records these stream dependencies, so replay keeps the overlap with
         # no per-token host synchronization.
-        shared_output = None
-        current_stream = torch.cuda.current_stream(device=self.device)
+        #
+        # ``_ffn`` is the shared expert's body WITHOUT its row-parallel TP
+        # all-reduce: the reduction is deferred so it can be merged with the
+        # routed path's TP collective below.  Decode buckets are far below the
+        # token tile at which ``KimiMLP.forward`` chunks, so this is the exact
+        # sequence of ops that call would run.
+        shared_partial = None
+        current_stream = None
         if self.shared_stream is not None:
+            current_stream = torch.cuda.current_stream(device=self.device)
             self.shared_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.shared_stream):
-                shared_output = self.moe.shared_experts(padded)
+                shared_partial = self.moe.shared_experts._ffn(padded)
 
         if x_latent is None:
             x_latent = self.resident.down_proj(local).reshape(
@@ -693,26 +721,28 @@ class K3MoEGraphSegment:
             local_latent = self.resident.norm(local_latent)
         local_output = self.resident.up_proj(local_latent)
 
-        # Reassemble the TP-group rows.  Each TP rank owns one contiguous slice
-        # of the full group input, so NCCL's rank-major output is already in the
-        # original row order.
-        with torch.cuda.device(self.device):
-            dist.all_gather_into_tensor(
-                bufs.tp_output,
-                local_output,
-                group=self.tp_group,
-            )
-        if shared_output is None:
+        if shared_partial is None:
             # CPU contract path, and the defensive fallback for a non-CUDA
-            # device, preserve the original synchronous behavior.
-            shared_output = self.moe.shared_experts(padded)
+            # device, run the same body synchronously on the current stream.
+            shared_partial = self.moe.shared_experts._ffn(padded)
         else:
-            # The shared expert includes its TP all-reduce, which was enqueued
-            # on the auxiliary stream.  Wait before exposing the result to the
-            # final routed+shared add or to the next layer's graph work.
+            # ``_ffn`` carries no collective, so this only orders the auxiliary
+            # stream's local GEMMs before the fold and the TP reduction below.
             current_stream.wait_stream(self.shared_stream)
-        bufs.tp_output.add_(shared_output)
-        return {"moe_output": bufs.tp_output}
+
+        # One TP collective instead of two.  Each TP rank owns the contiguous
+        # rank-major slice ``[tp_rank * local_tokens, ...)`` of the group batch
+        # — exactly the layout NCCL's all-gather produced — so adding this
+        # rank's routed rows into its own shared partial makes a single
+        # all-reduce deliver both sums: the shared partials add up to the full
+        # replicated shared output, and every routed slice is contributed by
+        # exactly one rank.  This replaces the separate routed all-gather and
+        # the shared expert's own TP all-reduce.
+        start = self.tp_rank * local_tokens
+        shared_partial[start : start + local_tokens].add_(local_output)
+        with torch.cuda.device(self.device):
+            dist.all_reduce(shared_partial, group=self.tp_group)
+        return {"moe_output": shared_partial}
 
 
 __all__ = [

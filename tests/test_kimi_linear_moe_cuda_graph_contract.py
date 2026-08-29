@@ -4,6 +4,7 @@ These tests deliberately do not launch CUDA.  They pin the fixed geometry and
 the rank-major <-> balanced-row mapping that the remote CUDA gate exercises.
 """
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +99,9 @@ def test_k3_graph_pool_has_one_local_reduce_scatter_output():
     # The route-capacity bound is one route per token per expert at most; it is
     # global_tokens, not global_tokens * top_k, because top-k indices are unique.
     assert view.max_tokens_padded < view.global_tokens * 16
+    # The routed rows are folded into the shared expert's own TP partial, so
+    # the pool no longer carries a separate group-sized all-gather output.
+    assert not hasattr(view, "tp_output")
 
 
 def test_k3_graph_pool_preallocates_native_gate_kernel_outputs():
@@ -169,6 +173,252 @@ def test_k3_graph_combine_passes_preallocated_fp32_output(monkeypatch):
     assert args[5] == 16
     assert args[6] is output
     assert torch.equal(output, torch.full_like(output, 7.0))
+
+
+# ---------------------------------------------------------------------------
+#  Folded shared/routed TP reduction
+# ---------------------------------------------------------------------------
+
+_TP_GROUP = object()
+
+
+class _FakeEPComm:
+    """Records the EP collective order and fills the gather buffers in place."""
+
+    def __init__(self):
+        self.calls = []
+
+    @contextlib.contextmanager
+    def change_state(self, enable=True):
+        yield
+
+    def group_start(self):
+        self.calls.append("group_start")
+
+    def group_end(self):
+        self.calls.append("group_end")
+
+    def all_gather(self, out, src):
+        self.calls.append("all_gather")
+        out.zero_()
+        out[: src.shape[0]].copy_(src)
+
+    def reduce_scatter(self, out, src, op=None):
+        self.calls.append("reduce_scatter")
+        out.copy_(src[: out.shape[0]])
+
+
+def _make_cpu_pool(*, hidden, tp_size=4, world_size=4, bucket=8, latent=128):
+    return K3MoEGraphBufferPool(
+        world_size=world_size,
+        tp_size=tp_size,
+        num_local_experts=2,
+        intermediate_size=256,
+        latent_size=latent,
+        hidden_size=hidden,
+        top_k=16,
+        expert_buckets=[bucket],
+        device=torch.device("cpu"),
+    )
+
+
+def _make_cpu_forward_segment(monkeypatch, *, tp_rank, shared_ffn, routed_value):
+    """A K3 MoE segment whose kernels/collectives are CPU stand-ins.
+
+    Only the graph's own dataflow is real: the routing seam, the buffer views,
+    the rank-major fold, and the TP collective the fold replaces.
+    """
+    tp_size, hidden, latent, bucket = 4, 16, 128, 8
+    pool = _make_cpu_pool(hidden=hidden, tp_size=tp_size, latent=latent,
+                          bucket=bucket)
+    bufs = pool.get(bucket)
+
+    segment = K3MoEGraphSegment.__new__(K3MoEGraphSegment)
+    segment.pool = pool
+    segment.device = torch.device("cpu")
+    segment.hidden_size = hidden
+    segment.latent_size = latent
+    segment.intermediate_size = 256
+    segment.top_k = 16
+    segment.num_experts = 8
+    segment.world_size = tp_size
+    segment.rank = tp_rank
+    segment.expert_start = 0
+    segment.num_local_experts = 2
+    segment.tp_size = tp_size
+    segment.tp_rank = tp_rank
+    segment.tp_group = _TP_GROUP
+    segment.shared_stream = None
+    segment.fused_front = None
+    segment.fused_gate_kernel = False
+
+    gate_out = (
+        torch.zeros(bufs.local_tokens, 16, dtype=torch.int64),
+        torch.ones(bufs.local_tokens, 16, dtype=torch.float32),
+    )
+    segment.moe = SimpleNamespace(
+        gate=lambda hidden_states: gate_out,
+        shared_experts=SimpleNamespace(_ffn=shared_ffn),
+    )
+    segment.resident = SimpleNamespace(
+        shard=SimpleNamespace(
+            gate_B_ptrs=None, gate_scales_ptrs=None,
+            up_B_ptrs=None, up_scales_ptrs=None,
+            down_B_ptrs=None, down_scales_ptrs=None,
+        ),
+        comm=_FakeEPComm(),
+        down_proj=lambda x: torch.zeros(
+            x.shape[0], latent, dtype=torch.bfloat16
+        ),
+        norm=None,
+        up_proj=lambda x: torch.full(
+            (x.shape[0], hidden), routed_value, dtype=torch.bfloat16
+        ),
+    )
+
+    monkeypatch.setattr(
+        k3_moe_graph, "dispatch_scatter_3d", lambda *args: (args[6], args[8])
+    )
+    monkeypatch.setattr(
+        k3_moe_graph, "marlin_grouped_stage1_fused_mxfp4_situ",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        k3_moe_graph, "marlin_grouped_m16_mxfp4", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        k3_moe_graph, "reduce_weighted_scatter_fp32",
+        lambda expert_out, pos, weights, n, h, k, out: out.zero_(),
+    )
+    # The graph pins the NCCL device around its TP collective; on CPU that
+    # context manager is the only piece that cannot run as written.
+    monkeypatch.setattr(
+        k3_moe_graph.torch.cuda, "device",
+        lambda device: contextlib.nullcontext(),
+    )
+
+    def _refuse_all_gather(*args, **kwargs):
+        raise AssertionError("the folded path must not all-gather routed rows")
+
+    monkeypatch.setattr(
+        k3_moe_graph.dist, "all_gather_into_tensor", _refuse_all_gather
+    )
+    reduces = []
+    monkeypatch.setattr(
+        k3_moe_graph.dist, "all_reduce",
+        lambda tensor, group=None: reduces.append(
+            (tensor, tensor.clone(), group)
+        ),
+    )
+    return segment, bufs, reduces
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+def test_k3_graph_folds_routed_rows_into_one_tp_all_reduce(monkeypatch, tp_rank):
+    seen = {}
+
+    def shared_ffn(x):
+        seen["padded"] = x
+        return torch.zeros(x.shape[0], x.shape[1], dtype=torch.bfloat16)
+
+    segment, bufs, reduces = _make_cpu_forward_segment(
+        monkeypatch, tp_rank=tp_rank, shared_ffn=shared_ffn, routed_value=3.0
+    )
+    bucket = bufs.local_tokens * segment.tp_size
+    padded = torch.zeros(bucket, segment.hidden_size, dtype=torch.bfloat16)
+
+    moe_output = segment.forward(
+        padded=padded,
+        local=padded,
+        num_valid_tokens=torch.tensor([bufs.local_tokens], dtype=torch.int32),
+    )["moe_output"]
+
+    # The unreduced FFN body runs over the whole replicated group batch, ...
+    assert seen["padded"] is padded
+    # ... exactly one TP collective carries both halves, ...
+    assert len(reduces) == 1
+    reduced, before_reduce, group = reduces[0]
+    assert group is segment.tp_group
+    assert reduced is moe_output
+    # ... and this rank's routed rows land only in its rank-major slice.
+    expected = torch.zeros_like(padded)
+    start = tp_rank * bufs.local_tokens
+    expected[start : start + bufs.local_tokens] = 3.0
+    assert torch.equal(before_reduce, expected)
+
+
+def test_folded_tp_reduction_equals_gather_plus_reduced_shared():
+    """The fold is an algebraic identity, not an approximation."""
+    torch.manual_seed(0)
+    tp_size, local_tokens, hidden = 4, 3, 5
+    partials = [
+        torch.randn(tp_size * local_tokens, hidden) for _ in range(tp_size)
+    ]
+    routed = [torch.randn(local_tokens, hidden) for _ in range(tp_size)]
+
+    # Old: all_gather(routed rows) + all_reduce(shared partials).
+    old = torch.cat(routed, dim=0) + sum(partials)
+
+    # New: each rank folds its routed rows into its own shared partial first,
+    # then one all-reduce over the TP group.
+    folded = [p.clone() for p in partials]
+    for rank in range(tp_size):
+        start = rank * local_tokens
+        folded[rank][start : start + local_tokens] += routed[rank]
+    new = sum(folded)
+
+    assert torch.allclose(new, old, atol=1e-6)
+
+
+def _make_segment_ctor_inputs(shared):
+    hidden = 16
+    moe = SimpleNamespace(
+        hidden_dim=hidden,
+        top_k=16,
+        attn_tp_size=4,
+        attn_tp_rank=1,
+        attn_tp_group=_TP_GROUP,
+        shared_experts=shared,
+        gate=SimpleNamespace(weight=torch.zeros(8, hidden)),
+    )
+    resident = SimpleNamespace(
+        shard=SimpleNamespace(K_latent=128, N=256, num_local=2),
+        world_size=4,
+        rank=1,
+        expert_start=0,
+        comm=object(),
+    )
+    return moe, resident, _make_cpu_pool(hidden=hidden)
+
+
+def test_k3_graph_segment_accepts_a_tp_matched_shared_expert():
+    shared = SimpleNamespace(_ffn=lambda x: x, _tp_size=4, _tp_group=_TP_GROUP)
+    moe, resident, pool = _make_segment_ctor_inputs(shared)
+
+    segment = K3MoEGraphSegment(moe, resident, pool, device=torch.device("cpu"))
+
+    assert segment.tp_rank == 1
+    assert segment.tp_group is _TP_GROUP
+
+
+def test_k3_graph_segment_refuses_a_wrapped_shared_expert():
+    # A streamed KimiLinearExpertWrapper exposes only __call__, so its TP
+    # all-reduce cannot be deferred and folded.
+    moe, resident, pool = _make_segment_ctor_inputs(
+        SimpleNamespace(_tp_size=4, _tp_group=_TP_GROUP)
+    )
+
+    with pytest.raises(RuntimeError, match="_ffn"):
+        K3MoEGraphSegment(moe, resident, pool, device=torch.device("cpu"))
+
+
+def test_k3_graph_segment_refuses_a_shared_expert_outside_the_tp_group():
+    moe, resident, pool = _make_segment_ctor_inputs(
+        SimpleNamespace(_ffn=lambda x: x, _tp_size=1, _tp_group=None)
+    )
+
+    with pytest.raises(RuntimeError, match="TP group"):
+        K3MoEGraphSegment(moe, resident, pool, device=torch.device("cpu"))
 
 
 def test_nondivisible_tp_split_round_trips_through_graph_output():
@@ -521,3 +771,80 @@ def test_fused_slab_gemm_reproduces_the_router_and_down_projections():
     # The latent half is cast to BF16 exactly once, so it matches the separate
     # projection to within one BF16 ulp.
     assert torch.allclose(got_latent.float(), ref_latent, rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+#  Whole-model replay telemetry
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    def __init__(self, ready=True, elapsed=0.0):
+        self.ready = ready
+        self.elapsed = elapsed
+        self.records = 0
+
+    def record(self):
+        self.records += 1
+
+    def query(self):
+        return self.ready
+
+    def elapsed_time(self, other):
+        return self.elapsed
+
+
+def _make_telemetry_graph():
+    graph = KimiLinearDecodeGraph.__new__(KimiLinearDecodeGraph)
+    graph.rank = 0
+    graph._whole_bucket = 8
+    graph._whole_replay_events = None
+    graph._whole_replay_pending = False
+    graph._whole_replays = 0
+    graph._whole_replay_samples = 0
+    graph._whole_replay_ms = 0.0
+    graph._whole_kv_stage_samples = 0
+    graph._whole_kv_stage_host_ms = 0.0
+    return graph
+
+
+def test_whole_replay_telemetry_reads_only_completed_events():
+    graph = _make_telemetry_graph()
+    start, end = _FakeEvent(elapsed=4.0), _FakeEvent(ready=False)
+    graph._whole_replay_events = (start, end)
+    graph._whole_replay_pending = True
+
+    graph._collect_whole_replay_sample()
+
+    # A replay still in flight stays pending: the measured path is never
+    # synchronized just to read its own timing.
+    assert graph._whole_replay_pending
+    assert graph._whole_replay_samples == 0
+
+    end.ready = True
+    graph._collect_whole_replay_sample()
+
+    assert not graph._whole_replay_pending
+    assert graph._whole_replay_samples == 1
+    assert graph._whole_replay_ms == 4.0
+
+
+def test_get_capture_stats_reports_whole_model_replay_telemetry():
+    graph = _make_telemetry_graph()
+    graph.manager = SimpleNamespace(get_capture_stats=lambda: {})
+    graph._capture_stats = {}
+    graph.whole_manager = SimpleNamespace(get_capture_stats=lambda: {})
+    graph._whole_capture_stats = {}
+    graph.moe_manager = None
+    graph._whole_replays = 4
+    graph._whole_replay_samples = 2
+    graph._whole_replay_ms = 5.0
+    graph._whole_kv_stage_samples = 4
+    graph._whole_kv_stage_host_ms = 2.0
+
+    telemetry = graph.get_capture_stats()["kimi_whole_replay"]
+
+    assert telemetry["replays"] == 4
+    assert telemetry["replay_samples"] == 2
+    assert telemetry["replay_ms_avg"] == 2.5
+    assert telemetry["kv_stage_host_ms_avg"] == 0.5

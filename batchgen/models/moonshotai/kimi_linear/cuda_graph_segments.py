@@ -117,6 +117,12 @@ DEFAULT_DECODE_GRAPH_BUCKETS = [1, 2, 4, 8, 16]
 # Compare-mode rate limit (steps between graph-vs-eager comparisons).
 DEFAULT_COMPARE_EVERY = 64
 
+# Whole-model replay telemetry: whole-model replays between diagnostic log
+# lines. The CUDA event pair is read back only once its end event has already
+# completed, so neither the counters nor this log ever synchronize the decode
+# stream.
+WHOLE_TELEMETRY_LOG_EVERY = 512
+
 # fla's Triton kernels JIT/autotune on the first call per shape; a cold shape at
 # capture time compiles host-side inside the capture. 3 warmup iterations per
 # (segment, bucket) is the count validated by
@@ -628,6 +634,18 @@ class KimiLinearDecodeGraph:
         self._whole_step_active = False
         self._whole_bucket = 0
         self._whole_name = "kimi_linear/whole_model"
+        # Whole-model replay telemetry.  One reusable CUDA event pair brackets
+        # the replay; the elapsed time is folded in on a LATER step, once the
+        # end event reports complete, so the measured path never waits on it.
+        # The KV staging figure is host-side launch cost only, for the same
+        # reason: the clone and the callbacks are asynchronous.
+        self._whole_replay_events = None
+        self._whole_replay_pending = False
+        self._whole_replays = 0
+        self._whole_replay_samples = 0
+        self._whole_replay_ms = 0.0
+        self._whole_kv_stage_samples = 0
+        self._whole_kv_stage_host_ms = 0.0
         # One per-rank scalar input for the K3 MoE graph.  Its value is
         # refreshed once per decode step; unlike a Python argument it is safe
         # to read inside a captured graph and avoids rebuilding a validity mask
@@ -706,6 +724,7 @@ class KimiLinearDecodeGraph:
         if self.whole_manager is not None:
             stats["kimi_whole_capture"] = dict(self._whole_capture_stats)
             stats["kimi_whole_manager"] = self.whole_manager.get_capture_stats()
+            stats["kimi_whole_replay"] = self._whole_replay_telemetry()
         if self.moe_manager is not None:
             stats["kimi_moe_capture"] = dict(self._moe_capture_stats)
             stats["kimi_moe_manager"] = self.moe_manager.get_capture_stats()
@@ -1282,17 +1301,82 @@ class KimiLinearDecodeGraph:
         self.step += 1
         self._step_active = True
 
+    def _whole_replay_event_pair(self):
+        """The reusable ``(start, end)`` timing events for whole-model replay."""
+        if self._whole_replay_events is None:
+            self._whole_replay_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        return self._whole_replay_events
+
+    def _collect_whole_replay_sample(self) -> None:
+        """Fold in the previous replay's event pair once it has completed.
+
+        ``Event.query`` is a non-blocking poll: a replay still in flight stays
+        pending and is read on a later step rather than stalling this one, so
+        the timed path itself is never synchronized.
+        """
+        if not self._whole_replay_pending:
+            return
+        start, end = self._whole_replay_events
+        if not end.query():
+            return
+        self._whole_replay_ms += start.elapsed_time(end)
+        self._whole_replay_samples += 1
+        self._whole_replay_pending = False
+
+    def _whole_replay_telemetry(self) -> dict:
+        samples = self._whole_replay_samples
+        staged = self._whole_kv_stage_samples
+        return {
+            "replays": self._whole_replays,
+            "replay_samples": samples,
+            "replay_ms_total": self._whole_replay_ms,
+            "replay_ms_avg": (
+                self._whole_replay_ms / samples if samples else 0.0
+            ),
+            "kv_stage_samples": staged,
+            "kv_stage_host_ms_total": self._whole_kv_stage_host_ms,
+            "kv_stage_host_ms_avg": (
+                self._whole_kv_stage_host_ms / staged if staged else 0.0
+            ),
+        }
+
+    def _maybe_log_whole_telemetry(self) -> None:
+        if self._whole_replays % WHOLE_TELEMETRY_LOG_EVERY:
+            return
+        t = self._whole_replay_telemetry()
+        logger.info(
+            "[KIMI_DECODE_GRAPH] rank=%s whole-model bucket=%d replays=%d "
+            "replay=%.3fms (n=%d) kv_stage_host=%.3fms (n=%d)",
+            self.rank, self._whole_bucket, t["replays"],
+            t["replay_ms_avg"], t["replay_samples"],
+            t["kv_stage_host_ms_avg"], t["kv_stage_samples"],
+        )
+
     def _run_whole_model(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Replay the captured transformer body and stage MLA KV once."""
         if self.whole_manager is None or self.whole_segment is None:
             raise RuntimeError("K3 whole-model graph is active but not built")
         statics = self._statics[self._whole_bucket]
+        self._collect_whole_replay_sample()
+        # Only bracket a replay when the previous pair has been consumed; the
+        # events are reused, so re-recording a pending pair would drop it.
+        timed = not self._whole_replay_pending
+        if timed:
+            start_event, end_event = self._whole_replay_event_pair()
+            start_event.record()
         graph_out = self.whole_manager.replay(
             self._whole_name,
             self._whole_bucket,
             input_ids=input_ids,
             num_valid_tokens=statics.num_valid_tokens,
         )
+        if timed:
+            end_event.record()
+            self._whole_replay_pending = True
+        self._whole_replays += 1
 
         # The outer CausalLM applies lm_head after this method returns. Keep
         # only real local rows; the graph is globally bucketed so all ranks
@@ -1304,12 +1388,20 @@ class KimiLinearDecodeGraph:
             # One device clone for the compact MLA stack, then one lightweight
             # callback per MLA layer.  The graph buffer is physically dense,
             # while the callback still receives the logical engine layer id.
+            stage_start = time.perf_counter()
             staged = kv_buffer[:, : self._bsz].clone()
             for logical_layer_idx in self.whole_segment._primary_kv_layers:
                 physical_layer_idx = self.whole_segment._logical_to_physical_kv[
                     logical_layer_idx
                 ]
                 callback(logical_layer_idx, staged[physical_layer_idx], None)
+            # Host cost of issuing the staging work, not its device time: the
+            # clone and the callbacks are asynchronous and must stay that way.
+            self._whole_kv_stage_host_ms += (
+                time.perf_counter() - stage_start
+            ) * 1e3
+            self._whole_kv_stage_samples += 1
+        self._maybe_log_whole_telemetry()
         return hidden_states
 
     def _run_layer(self, layer_idx: int, hidden_states: torch.Tensor):
@@ -1556,6 +1648,9 @@ class KimiLinearDecodeGraph:
         self._whole_captured = set()
         self._whole_capture_stats = {}
         self._whole_step_active = False
+        # The in-flight event pair belongs to a graph that no longer exists;
+        # drop the sample rather than attributing it to the rebuilt graph.
+        self._whole_replay_pending = False
 
     def _drop_moe_graphs(self) -> None:
         """Release K3 MoE graphs and their shared static pool."""
