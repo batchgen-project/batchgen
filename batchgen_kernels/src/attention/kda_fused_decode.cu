@@ -59,29 +59,12 @@ __device__ float block_sum(float value, float* scratch) {
     return scratch[0];
 }
 
-__device__ __forceinline__ uint32_t shared_address(void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-}
-
-__device__ __forceinline__ void cp_async_16b(void* shared_dst,
-                                               const void* global_src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                 :: "r"(shared_address(shared_dst)), "l"(global_src)
-                 : "memory");
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;" ::: "memory");
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-    asm volatile("cp.async.wait_all;" ::: "memory");
-}
-
-// The BatchGen KDA manager stores each convolution pool as
-// [slots, channels, width-1].  The fused kernel deliberately consumes that
-// native layout instead of making the [slots, width-1, channels] staging copy
-// used by the upstream reference kernel.
+// The BatchGen KDA manager stores recurrent state in FLA's default [K,V]
+// layout: [slots, heads, key, value].  The recurrent math below uses a
+// value-major shared tile for convenient dot products, so load_state_chunk
+// transposes [K,V] into [V,K] while loading and the writeback does the inverse.
+// Do not change the pool's physical layout to make this kernel fit: the FLA
+// prefill and fallback decode paths share the same pool.
 __device__ void load_state_chunk(float* shared_state,
                                  const float* state,
                                  int slot,
@@ -90,21 +73,54 @@ __device__ void load_state_chunk(float* shared_state,
                                  int chunk) {
     const int tid = threadIdx.x;
     const int stage = chunk & 1;
-    const int v_base = chunk * kChunkV;
+    const int value_base = chunk * kChunkV;
+    const int values_per_float4 = kChunkV / 4;
+    const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
+    // Read four adjacent values from the native [K,V] row, then transpose
+    // them into the value-major shared tile.  The global reads remain
+    // coalesced along V; only the shared writes are strided.
+    for (int linear4 = tid;
+         linear4 < kHeadDim * values_per_float4;
+         linear4 += kThreads) {
+        const int key = linear4 / values_per_float4;
+        const int value = (linear4 % values_per_float4) * 4;
+        const float* src = state + slot_base
+                         + (static_cast<int64_t>(head * kHeadDim + key)
+                            * kHeadDim + value_base + value);
+        const float4 raw = *reinterpret_cast<const float4*>(src);
+        float* dst = shared_state + stage * kStateChunkElements;
+        dst[(value + 0) * kHeadDim + key] = raw.x;
+        dst[(value + 1) * kHeadDim + key] = raw.y;
+        dst[(value + 2) * kHeadDim + key] = raw.z;
+        dst[(value + 3) * kHeadDim + key] = raw.w;
+    }
+}
+
+__device__ void store_state_chunk(const float* shared_state,
+                                  float* state,
+                                  int slot,
+                                  int head,
+                                  int64_t state_slot_stride,
+                                  int chunk) {
+    const int tid = threadIdx.x;
+    const int value_base = chunk * kChunkV;
+    const int values_per_float4 = kChunkV / 4;
     const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
     for (int linear4 = tid;
-         linear4 < kStateChunkElements / 4;
+         linear4 < kHeadDim * values_per_float4;
          linear4 += kThreads) {
-        const int element = linear4 * 4;
-        const int row = element / kHeadDim;
-        const int key = element - row * kHeadDim;
-        float* dst = shared_state + stage * kStateChunkElements
-                   + row * kHeadDim + key;
-        const float* src = state + slot_base
-                         + ((head * kHeadDim + v_base + row) * kHeadDim + key);
-        cp_async_16b(dst, src);
+        const int key = linear4 / values_per_float4;
+        const int value = (linear4 % values_per_float4) * 4;
+        const float* src = shared_state
+                         + (value + 0) * kHeadDim + key;
+        const float4 raw = make_float4(
+            src[0 * kHeadDim], src[1 * kHeadDim],
+            src[2 * kHeadDim], src[3 * kHeadDim]);
+        float* dst = state + slot_base
+                   + (static_cast<int64_t>(head * kHeadDim + key)
+                      * kHeadDim + value_base + value);
+        *reinterpret_cast<float4*>(dst) = raw;
     }
-    cp_async_commit();
 }
 
 template <typename T>
@@ -193,8 +209,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
     const int64_t beta_base = static_cast<int64_t>(token) * beta_stride;
     const int64_t conv_base = static_cast<int64_t>(slot) * conv_slot_stride;
 
-    // Begin the first state transfer before doing the independent convolution
-    // update.  The second stage is issued while stage zero is consumed below.
+    // Load the first [K,V] state chunk into the value-major shared tile before
+    // doing the independent convolution update.
     load_state_chunk(state_tile, state, slot, head, state_slot_stride, 0);
 
     if (tid < kHeadDim) {
@@ -304,7 +320,6 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
 
 #pragma unroll
     for (int chunk = 0; chunk < kNumChunks; ++chunk) {
-        cp_async_wait_all();
         __syncthreads();
         if (chunk + 1 < kNumChunks) {
             load_state_chunk(state_tile, state, slot, head,
@@ -351,20 +366,25 @@ __global__ __launch_bounds__(kThreads, 2) void kda_fused_decode_kernel(
             dot_q0 = warp_sum(dot_q0);
             dot_q1 = warp_sum(dot_q1);
 
-            const int64_t state_base = static_cast<int64_t>(slot)
-                * state_slot_stride
-                + (static_cast<int64_t>(head) * kHeadDim * kHeadDim
-                   + static_cast<int64_t>(output_row0) * kHeadDim + key_base);
-            *reinterpret_cast<float4*>(state + state_base) =
-                make_float4(h0[0], h0[1], h0[2], h0[3]);
-            *reinterpret_cast<float4*>(state + state_base
-                + static_cast<int64_t>(kWarps) * kHeadDim) =
-                make_float4(h1[0], h1[1], h1[2], h1[3]);
+            float* output_tile = current_state;
+            output_tile[output_row0 * kHeadDim + key_base + 0] = h0[0];
+            output_tile[output_row0 * kHeadDim + key_base + 1] = h0[1];
+            output_tile[output_row0 * kHeadDim + key_base + 2] = h0[2];
+            output_tile[output_row0 * kHeadDim + key_base + 3] = h0[3];
+            output_tile[output_row1 * kHeadDim + key_base + 0] = h1[0];
+            output_tile[output_row1 * kHeadDim + key_base + 1] = h1[1];
+            output_tile[output_row1 * kHeadDim + key_base + 2] = h1[2];
+            output_tile[output_row1 * kHeadDim + key_base + 3] = h1[3];
             if (lane == 0) {
                 output_value[output_row0] = dot_q0;
                 output_value[output_row1] = dot_q1;
             }
         }
+        __syncthreads();
+        // The current shared stage is dead after this chunk.  Reuse it for a
+        // coalesced [K,V] writeback before the next iteration can recycle it.
+        store_state_chunk(current_state, state, slot, head,
+                          state_slot_stride, chunk);
         __syncthreads();
     }
 
