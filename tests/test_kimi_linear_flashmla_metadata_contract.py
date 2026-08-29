@@ -52,6 +52,26 @@ def test_whole_model_generates_one_flashmla_metadata_pair_per_forward():
     assert len(_call_names(metadata, "get_mla_metadata")) == 1
 
 
+def test_whole_model_reuses_one_static_kda_cu_vector_per_bucket():
+    source = (_MODEL_ROOT / "whole_model_cuda_graph_segments.py").read_text()
+    tree = ast.parse(source)
+    forward = _method(tree, "KimiLinearWholeModelSegment", "forward")
+    helper = _method(
+        tree, "KimiLinearWholeModelSegment", "_get_kda_cu_seqlens"
+    )
+
+    assert len(
+        [
+            call
+            for call in ast.walk(forward)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_get_kda_cu_seqlens"
+        ]
+    ) == 1
+    assert len(_call_names(helper, "arange")) == 1
+
+
 def test_layer_graph_keeps_standalone_flashmla_fallback():
     source = (_MODEL_ROOT / "cuda_graph_segments.py").read_text()
     tree = ast.parse(source)

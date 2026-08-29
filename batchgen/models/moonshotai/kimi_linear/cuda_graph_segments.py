@@ -163,6 +163,7 @@ def _mla_decode_graph_safe(
     page_size_tokens,
     flashmla_metadata=None,
     flashmla_num_splits=None,
+    kda_cu_seqlens=None,
 ):
     """Graph-safe inline of `serving_modules.mla_decoding_nope_with_pagekv`.
 
@@ -441,9 +442,14 @@ class KimiLinearSpanSegment:
         *,
         flashmla_metadata=None,
         flashmla_num_splits=None,
+        kda_cu_seqlens=None,
     ) -> Dict[str, torch.Tensor]:
         attention = self._graph_attention
-        if flashmla_metadata is not None or flashmla_num_splits is not None:
+        if (
+            flashmla_metadata is not None
+            or flashmla_num_splits is not None
+            or kda_cu_seqlens is not None
+        ):
             if flashmla_metadata is None or flashmla_num_splits is None:
                 raise ValueError(
                     "FlashMLA metadata and num_splits must be supplied together"
@@ -451,7 +457,10 @@ class KimiLinearSpanSegment:
 
             def attention(normed):
                 return self._graph_attention(
-                    normed, flashmla_metadata, flashmla_num_splits
+                    normed,
+                    flashmla_metadata,
+                    flashmla_num_splits,
+                    kda_cu_seqlens,
                 )
 
         if self.use_block_residual:
@@ -476,11 +485,20 @@ class KimiLinearSpanSegment:
         return out
 
     def _graph_attention(
-        self, normed, flashmla_metadata=None, flashmla_num_splits=None
+        self,
+        normed,
+        flashmla_metadata=None,
+        flashmla_num_splits=None,
+        kda_cu_seqlens=None,
     ):
         buf = self._buf
         if self.is_kda:
-            attn_out = kda_decode_serving(self.attn, normed, self.kda_state)
+            attn_out = kda_decode_serving(
+                self.attn,
+                normed,
+                self.kda_state,
+                cu_seqlens=kda_cu_seqlens,
+            )
             k_tensor = None
         else:
             attn_out, k_tensor = _mla_decode_graph_safe(

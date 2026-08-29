@@ -126,6 +126,11 @@ class KimiLinearWholeModelSegment:
         self._flashmla_metadata: Dict[
             int, tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        # Decode has one token per sequence, so KDA's packed cumulative
+        # lengths are always [0, 1, ..., bucket].  Keep one static vector per
+        # graph bucket instead of recording an identical torch.arange call in
+        # every one of K3's 69 KDA layers.
+        self._kda_cu_seqlens: Dict[int, torch.Tensor] = {}
         self._no_v_cache = True
         self._primary_kv_dim = 0
         for segment in self.layer_segments:
@@ -162,6 +167,7 @@ class KimiLinearWholeModelSegment:
             )
         if bucket not in self._bucket_maps:
             self._bucket_maps[bucket] = self._make_bucket_maps(bucket)
+        self._get_kda_cu_seqlens(bucket)
 
         # Child attention spans bind the bucket-owned KV/KDA/block-residual
         # statics.  The same objects are then called directly from this outer
@@ -223,6 +229,7 @@ class KimiLinearWholeModelSegment:
             if release is not None:
                 release(bucket_size)
         self._flashmla_metadata.pop(int(bucket_size), None)
+        self._kda_cu_seqlens.pop(int(bucket_size), None)
         self._bucket_maps.pop(int(bucket_size), None)
 
     # ------------------------------------------------------------------ #
@@ -256,12 +263,14 @@ class KimiLinearWholeModelSegment:
         flashmla_metadata, flashmla_num_splits = (
             self._get_flashmla_metadata(bucket)
         )
+        kda_cu_seqlens = self._get_kda_cu_seqlens(bucket)
 
         for layer_idx, layer_segment in enumerate(self.layer_segments):
             outputs = layer_segment.forward(
                 hidden_states,
                 flashmla_metadata=flashmla_metadata,
                 flashmla_num_splits=flashmla_num_splits,
+                kda_cu_seqlens=kda_cu_seqlens,
             )
             k_tensor = outputs.get("k_tensor")
             if k_tensor is not None and self._kv_key_buffer is not None:
@@ -363,6 +372,16 @@ class KimiLinearWholeModelSegment:
         )
         self._flashmla_metadata[int(bucket)] = metadata
         return metadata
+
+    def _get_kda_cu_seqlens(self, bucket: int) -> torch.Tensor:
+        """Return the fixed packed-length vector for a decode graph bucket."""
+        cu_seqlens = self._kda_cu_seqlens.get(int(bucket))
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(
+                int(bucket) + 1, dtype=torch.long, device=self.device
+            )
+            self._kda_cu_seqlens[int(bucket)] = cu_seqlens
+        return cu_seqlens
 
     def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor) -> None:
         if self._kv_key_buffer is None:

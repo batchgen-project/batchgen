@@ -725,7 +725,7 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     return o
 
 
-def kda_decode_serving(self, hidden_states, kda_state):
+def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
     """KDA single-token decode over pooled state.
 
     Args:
@@ -769,7 +769,10 @@ def kda_decode_serving(self, hidden_states, kda_state):
     v = v.view(1, bsz, num_heads, head_dim)
     f = f.view(1, bsz, num_heads, head_dim)
     beta = beta.view(1, bsz, num_heads)
-    cu = torch.arange(bsz + 1, dtype=torch.long, device=device)
+    if cu_seqlens is None:
+        cu = torch.arange(bsz + 1, dtype=torch.long, device=device)
+    else:
+        cu = cu_seqlens
 
     o = torch.empty(1, bsz, num_heads, head_dim, dtype=v.dtype, device=device)
     fused_recurrent_kda_fwd(
