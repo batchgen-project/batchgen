@@ -29,7 +29,7 @@ def _state(
     *, assigned_rank, completed=False, decoded_length=10,
     additional_pages_needed=0, gpu_pages_allocated=4, host_pages_allocated=2,
     needs_host_growth=False, host_growth_pages=0,
-    current_context_length=100, host_token_capacity=4096,
+    current_context_length=100, host_token_capacity=4096, decode_dp_group=None,
 ):
     return {
         "completed": completed,
@@ -43,6 +43,7 @@ def _state(
         "host_growth_pages": host_growth_pages,
         "current_context_length": current_context_length,
         "host_token_capacity": host_token_capacity,
+        "decode_dp_group": decode_dp_group,
     }
 
 
