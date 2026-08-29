@@ -5,6 +5,8 @@ the rank-major <-> balanced-row mapping that the remote CUDA gate exercises.
 """
 
 import contextlib
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +32,11 @@ from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
 )
 from batchgen.models.moonshotai.kimi_linear.whole_model_cuda_graph_segments import (
     KimiLinearWholeModelSegment,
+)
+
+
+_WHOLE_MODEL_SOURCE = Path(__file__).parents[1] / (
+    "batchgen/models/moonshotai/kimi_linear/whole_model_cuda_graph_segments.py"
 )
 
 
@@ -492,6 +499,37 @@ def test_whole_model_row_maps_have_fixed_device_tables():
         maps.original_valid,
     ):
         assert table.device.type == "cpu"
+
+
+def test_whole_model_graph_uses_capturable_map_lookup():
+    """Scalar CUDA-tensor advanced indexing invalidates graph capture."""
+    tree = ast.parse(_WHOLE_MODEL_SOURCE.read_text())
+    forward = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+
+    map_subscripts = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "maps"
+        and isinstance(node.slice, ast.Name)
+        and node.slice.id == "selector"
+    ]
+    assert not map_subscripts
+
+    index_selects = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "index_select"
+    ]
+    assert len(index_selects) >= 4
 
 
 def test_k3_whole_graph_kv_staging_is_compact_and_logically_mapped():

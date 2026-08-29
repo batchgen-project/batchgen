@@ -290,8 +290,12 @@ class KimiLinearWholeModelSegment:
             # K3's resident EP input uses rank-major TP-group rows.  The maps
             # implement the same balanced split as the eager path, including
             # underfilled/non-divisible batches, entirely on device.
-            padded_map = maps.padded_indices[selector]
-            padded_valid = maps.padded_valid[selector]
+            # CUDA graph capture rejects scalar-tensor advanced indexing
+            # (aten::index) on this PyTorch/CUDA stack.  ``index_select`` is
+            # equivalent for the one-row lookup and remains graph-capturable.
+            selector_row = selector.reshape(1)
+            padded_map = maps.padded_indices.index_select(0, selector_row).squeeze(0)
+            padded_valid = maps.padded_valid.index_select(0, selector_row).squeeze(0)
             padded = hidden_2d.index_select(0, padded_map)
             padded = padded * padded_valid.to(hidden_2d.dtype).unsqueeze(-1)
 
@@ -303,15 +307,15 @@ class KimiLinearWholeModelSegment:
             # already zeroed the underfilled tail for this rank.
             local_start = self.tp_rank * maps.local_bucket
             local = padded.narrow(0, local_start, maps.local_bucket)
-            local_count = maps.local_counts.index_select(0, selector.reshape(1))
+            local_count = maps.local_counts.index_select(0, selector_row)
 
             moe_output = moe.forward(
                 padded=padded,
                 local=local,
                 num_valid_tokens=local_count,
             )["moe_output"]
-            original_map = maps.original_indices[selector]
-            original_valid = maps.original_valid[selector]
+            original_map = maps.original_indices.index_select(0, selector_row).squeeze(0)
+            original_valid = maps.original_valid.index_select(0, selector_row).squeeze(0)
             reassembled = moe_output.index_select(0, original_map)
             reassembled = reassembled * original_valid.to(
                 reassembled.dtype
