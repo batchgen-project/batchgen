@@ -720,6 +720,7 @@ def test_k3_graph_fused_front_routes_into_preallocated_native_buffers(monkeypatc
     segment.top_k = 16
     segment.fused_front = torch.empty(experts + latent, hidden)
     segment.fused_gate_kernel = True
+    segment.shared_stream = None
     segment.moe = SimpleNamespace(
         gate=SimpleNamespace(
             e_score_correction_bias=torch.randn(experts),
