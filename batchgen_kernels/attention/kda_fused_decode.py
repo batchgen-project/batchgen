@@ -12,6 +12,7 @@ JIT build during decode.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -28,10 +29,21 @@ _CONV_WIDTH = 4
 def _get_ext():
     global _ext
     if _ext is None:
-        _ext = load_extension(
-            "batchgen_kernels.attention._C_kda_fused_decode",
-            allow_dev_jit=False,
-        )
+        module_name = "batchgen_kernels.attention._C_kda_fused_decode"
+        try:
+            _ext = load_extension(module_name, allow_dev_jit=False)
+        except ImportError:
+            # A staged AOT build lives outside the source package on remote
+            # machines.  Keep production AOT-only: this only adds the explicit
+            # artifact directory to the package search path, never JIT builds.
+            ext_dir = os.environ.get("K3_FUSED_DECODE_EXT_DIR")
+            if not ext_dir:
+                raise
+            import batchgen_kernels.attention as attention_pkg
+
+            if ext_dir not in attention_pkg.__path__:
+                attention_pkg.__path__.append(ext_dir)
+            _ext = load_extension(module_name, allow_dev_jit=False)
     return _ext
 
 

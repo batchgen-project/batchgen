@@ -28,14 +28,6 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("heads", [3, 6, 12])
 def test_fused_kda_matches_fla_and_preserves_padding(heads: int):
-    # A staged remote run may build the AOT module in an external persistent
-    # extension directory rather than placing an untracked .so in the repo.
-    # Production imports remain unchanged; this only makes the test discover
-    # that staged artifact.
-    if os.environ.get("K3_FUSED_DECODE_EXT_DIR"):
-        import batchgen_kernels.attention as _attention_pkg
-
-        _attention_pkg.__path__.append(os.environ["K3_FUSED_DECODE_EXT_DIR"])
     from batchgen_kernels.attention.kda_fused_decode import kda_fused_decode
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 
