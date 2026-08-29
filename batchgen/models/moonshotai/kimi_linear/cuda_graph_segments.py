@@ -161,6 +161,8 @@ def _mla_decode_graph_safe(
     cache_seqlens,
     num_valid_tokens,
     page_size_tokens,
+    flashmla_metadata=None,
+    flashmla_num_splits=None,
 ):
     """Graph-safe inline of `serving_modules.mla_decoding_nope_with_pagekv`.
 
@@ -191,10 +193,7 @@ def _mla_decode_graph_safe(
     # K3's graph path uses the same pure-BF16 FlashMLA entry points as the
     # eager path.  Import them directly so graph capture does not pull in the
     # unused legacy FP8/FA3 backend and its DeepGEMM dependency.
-    from flash_mla import (
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
+    from flash_mla import flash_mla_with_kvcache
 
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
@@ -262,9 +261,18 @@ def _mla_decode_graph_safe(
     query_states[:, :, :, attn.kv_lora_rank :] = q_pe
     query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, attn.num_heads, 1
-    )
+    if flashmla_metadata is None or flashmla_num_splits is None:
+        # The standalone per-layer graph path has no enclosing model graph,
+        # so it owns its metadata generation.  The K3 whole-model graph passes
+        # one pair shared by all NoPE-MLA layers instead.
+        from flash_mla import get_mla_metadata
+
+        tile_scheduler_metadata, num_splits = get_mla_metadata(
+            cache_seqlens, attn.num_heads, 1
+        )
+    else:
+        tile_scheduler_metadata = flashmla_metadata
+        num_splits = flashmla_num_splits
     attn_out, _ = flash_mla_with_kvcache(
         query_states,
         blocked_k,
@@ -427,18 +435,36 @@ class KimiLinearSpanSegment:
         if self.is_kda:
             self.kda_state.cur_decode_slots = self._buf.kda_slots
 
-    def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        flashmla_metadata=None,
+        flashmla_num_splits=None,
+    ) -> Dict[str, torch.Tensor]:
+        attention = self._graph_attention
+        if flashmla_metadata is not None or flashmla_num_splits is not None:
+            if flashmla_metadata is None or flashmla_num_splits is None:
+                raise ValueError(
+                    "FlashMLA metadata and num_splits must be supplied together"
+                )
+
+            def attention(normed):
+                return self._graph_attention(
+                    normed, flashmla_metadata, flashmla_num_splits
+                )
+
         if self.use_block_residual:
             return self._forward_block_residual(
                 hidden_states,
-                self._graph_attention,
+                attention,
                 self._buf.block_residual,
                 write_boundary=True,
             )
 
         layer = self.layer
         normed = layer.input_layernorm(hidden_states)
-        attn_out, k_tensor = self._graph_attention(normed)
+        attn_out, k_tensor = attention(normed)
         residual = hidden_states + attn_out
         normed_out = layer.post_attention_layernorm(residual)
         if self.fold_ffn:
@@ -449,7 +475,9 @@ class KimiLinearSpanSegment:
             out["k_tensor"] = k_tensor
         return out
 
-    def _graph_attention(self, normed):
+    def _graph_attention(
+        self, normed, flashmla_metadata=None, flashmla_num_splits=None
+    ):
         buf = self._buf
         if self.is_kda:
             attn_out = kda_decode_serving(self.attn, normed, self.kda_state)
@@ -465,6 +493,8 @@ class KimiLinearSpanSegment:
                 cache_seqlens=buf.cache_seqlens,
                 num_valid_tokens=buf.num_valid_tokens,
                 page_size_tokens=self.page_size_tokens,
+                flashmla_metadata=flashmla_metadata,
+                flashmla_num_splits=flashmla_num_splits,
             )
         return attn_out, k_tensor
 

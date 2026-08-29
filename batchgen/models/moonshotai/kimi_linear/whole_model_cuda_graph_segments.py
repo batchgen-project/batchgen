@@ -119,6 +119,13 @@ class KimiLinearWholeModelSegment:
         self._kv_key_buffer: Optional[torch.Tensor] = None
         self._kv_buffers: Optional[list[dict[str, torch.Tensor | None]]] = None
         self.primary_kv_offload_buffers = None
+        # FlashMLA's scheduler metadata depends on the decode batch's
+        # cache_seqlens but not on the layer.  Keep the capture-time pair per
+        # graph bucket; its one metadata-generation kernel is consumed by
+        # every NoPE-MLA layer.
+        self._flashmla_metadata: Dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self._no_v_cache = True
         self._primary_kv_dim = 0
         for segment in self.layer_segments:
@@ -215,6 +222,7 @@ class KimiLinearWholeModelSegment:
             release = getattr(segment, "release_static_buffers", None)
             if release is not None:
                 release(bucket_size)
+        self._flashmla_metadata.pop(int(bucket_size), None)
         self._bucket_maps.pop(int(bucket_size), None)
 
     # ------------------------------------------------------------------ #
@@ -245,8 +253,16 @@ class KimiLinearWholeModelSegment:
             hidden_states.dtype
         )
 
+        flashmla_metadata, flashmla_num_splits = (
+            self._get_flashmla_metadata(bucket)
+        )
+
         for layer_idx, layer_segment in enumerate(self.layer_segments):
-            outputs = layer_segment.forward(hidden_states)
+            outputs = layer_segment.forward(
+                hidden_states,
+                flashmla_metadata=flashmla_metadata,
+                flashmla_num_splits=flashmla_num_splits,
+            )
             k_tensor = outputs.get("k_tensor")
             if k_tensor is not None and self._kv_key_buffer is not None:
                 self._copy_primary_kv(layer_idx, k_tensor)
@@ -303,6 +319,50 @@ class KimiLinearWholeModelSegment:
             hidden_states.dtype
         )
         return {"hidden_states": hidden_states}
+
+    def _get_flashmla_metadata(
+        self, bucket: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the one FlashMLA schedule pair for this graph bucket.
+
+        K3 has 24 NoPE-MLA layers, but all of them use the same local head
+        count and the same per-step cache lengths.  The old inline path called
+        ``get_mla_metadata`` once in every layer, recording 24 identical
+        metadata kernels and allocations in the whole-model graph.  Generate
+        it once here so replay still adapts to refreshed cache lengths while
+        removing those duplicate scheduler launches.
+        """
+        metadata = self._flashmla_metadata.get(int(bucket))
+        # The graph manager runs eager warmups before capture.  Reuse the
+        # warmup pair there, but force one fresh call while capturing so the
+        # metadata kernel itself is recorded in the graph rather than leaving
+        # the replay with warmup-time lengths.
+        if metadata is not None and not torch.cuda.is_current_stream_capturing():
+            return metadata
+
+        from flash_mla import get_mla_metadata
+
+        mla_segments = [
+            segment
+            for segment in self.layer_segments
+            if not bool(getattr(segment, "is_kda", False))
+        ]
+        if not mla_segments:
+            raise RuntimeError("K3 whole graph requires a NoPE-MLA layer")
+        first_attn = mla_segments[0].attn
+        num_heads = int(first_attn.num_heads)
+        if any(
+            int(segment.attn.num_heads) != num_heads
+            for segment in mla_segments
+        ):
+            raise RuntimeError(
+                "K3 whole graph requires one local FlashMLA head geometry"
+            )
+        metadata = get_mla_metadata(
+            self.statics[bucket].cache_seqlens, num_heads, 1
+        )
+        self._flashmla_metadata[int(bucket)] = metadata
+        return metadata
 
     def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor) -> None:
         if self._kv_key_buffer is None:
