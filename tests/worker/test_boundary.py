@@ -58,6 +58,7 @@ def _req(
     *, decode_uuids, global_seq_state, per_rank_free, world_size,
     global_candidate_info=None, per_node_host_stats=None, seq_meta=None,
     chunk_size=64, enable_host_kv_eviction=False, host_kv_eviction_watermark=10,
+    attn_tp_size=1,
 ):
     if seq_meta is None:
         seq_meta = {u: _meta(i) for i, u in enumerate(decode_uuids)}
@@ -73,6 +74,7 @@ def _req(
         num_gpus_per_node=_GPN,
         enable_host_kv_eviction=enable_host_kv_eviction,
         host_kv_eviction_watermark=host_kv_eviction_watermark,
+        attn_tp_size=attn_tp_size,
     )
 
 
@@ -210,6 +212,64 @@ def test_loading_excludes_completed_and_onhold():
     )
     assert "done" not in plan.new_load_uuids
     assert "fresh" in plan.new_load_uuids
+
+
+def test_tp_loading_uses_group_capacity_and_not_assigned_rank():
+    state = {
+        "active": _state(assigned_rank=1),
+    }
+    candidates = {
+        # Both candidates are in group 0.  A rank-based planner would admit
+        # both because their stale assigned_rank values differ; TP8 must
+        # charge them to the same replicated GPU-capacity bucket.
+        "x": {
+            "decoded_length": 50, "pages_needed": 60,
+            "assigned_rank": 1, "decode_dp_group": 0,
+        },
+        "y": {
+            "decoded_length": 40, "pages_needed": 60,
+            "assigned_rank": 6, "decode_dp_group": 0,
+        },
+        "z": {
+            "decoded_length": 30, "pages_needed": 60,
+            "assigned_rank": 8, "decode_dp_group": 1,
+        },
+    }
+    seq_meta = {u: _meta(i) for i, u in enumerate(["active", "x", "y", "z"])}
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["active"],
+            global_seq_state=state,
+            per_rank_free=[100] * 16,
+            world_size=16,
+            global_candidate_info=candidates,
+            seq_meta=seq_meta,
+            attn_tp_size=8,
+        )
+    )
+    assert plan.new_load_uuids == ["x", "z"]
+
+
+def test_tp_extension_uses_tightest_rank_in_group():
+    state = {
+        "a": _state(
+            assigned_rank=3, decode_dp_group=0,
+            additional_pages_needed=8,
+        ),
+    }
+    # Group 0's rank 0 has only five free pages, so the replicated extension
+    # cannot be admitted even though the other seven ranks have capacity.
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["a"],
+            global_seq_state=state,
+            per_rank_free=[5] + [100] * 7 + [100] * 8,
+            world_size=16,
+            attn_tp_size=8,
+        )
+    )
+    assert plan.onhold_uuids == ["a"]
+    assert plan.decode_uuids_final == []
 
 
 def test_request_and_meta_are_frozen():

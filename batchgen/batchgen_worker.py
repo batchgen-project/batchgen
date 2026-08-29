@@ -8609,6 +8609,7 @@ class BatchGenWorker:
 			num_gpus_per_node=NUM_GPUS_PER_NODE,
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
 			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
+			attn_tp_size=self._decode_attn_tp_size(),
 		)
 
 	def _compute_boundary_decisions(
@@ -9276,8 +9277,13 @@ class BatchGenWorker:
 		new_load_global = []
 
 		if new_load_uuids:
-			my_new_uuids = [u for u in new_load_uuids
-						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
+			# Pure DP loads on one assigned rank.  TP decode replicates the GPU
+			# KV on every member of the sequence's serve-group, so every group
+			# rank must allocate and launch its own local host->GPU load.
+			my_new_uuids = [
+				u for u in new_load_uuids
+				if self._owns_local_sequence(self.global_batch.get_sequence(u))
+			]
 			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
 
 			if new_load_local:
@@ -9482,9 +9488,11 @@ class BatchGenWorker:
 			if idx in self._local_to_uuid_map
 		}
 
-		# VALIDATION: Verify all pending_uuids exist, have assigned ranks,
-		# and are owner-confirmed. pending_uuids must be the all-gathered set
-		# of successful owner-local load launches, not merely rank-0 proposals.
+		# VALIDATION: Verify all pending_uuids exist and every local rank that
+		# must hold a replica confirmed its load.  Under TP decode, the old
+		# assigned-rank-only check admitted a UUID after only one of the G ranks
+		# had GPU pages, causing the other ranks to enter decode with zero pages.
+		group_size = self._decode_attn_tp_size()
 		valid_pending_uuids = []
 		invalid_pending = []
 		for uuid in pending_uuids:
@@ -9495,9 +9503,16 @@ class BatchGenWorker:
 			if seq.assigned_rank is None:
 				invalid_pending.append(f"{uuid[:8]} gid={seq.global_idx} has no assigned_rank")
 				continue
-			if seq.assigned_rank == self.rank and uuid not in pending_local_uuid_set:
+			if group_size > 1:
+				from batchgen.decode_dp_group import rank_in_decode_group
+				must_confirm_local = rank_in_decode_group(
+					seq.decode_dp_group, self.rank, group_size
+				)
+			else:
+				must_confirm_local = seq.assigned_rank == self.rank
+			if must_confirm_local and uuid not in pending_local_uuid_set:
 				invalid_pending.append(
-					f"{uuid[:8]} gid={seq.global_idx} owner rank {self.rank} "
+					f"{uuid[:8]} gid={seq.global_idx} rank {self.rank} "
 					"did not confirm local load"
 				)
 				continue

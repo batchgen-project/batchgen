@@ -535,6 +535,7 @@ def select_sequences_for_loading(
     exclude_uuids: Set[str],
     strategy: LoadingStrategy = LoadingStrategy.LONGEST_FIRST,
     get_global_idx_fn: Optional[callable] = None,
+    group_size: int = 1,
 ) -> Tuple[List[str], Dict[int, int]]:
     """Select sequences to load from host to GPU.
 
@@ -548,7 +549,13 @@ def select_sequences_for_loading(
         get_global_idx_fn: Function to get global_idx for a uuid (for tie-breaking)
 
     Returns:
-        (list of uuids to load, dict of rank -> pages used)
+        (list of uuids to load, dict of capacity-group -> pages used)
+
+    ``group_size`` is the decode attention TP size.  With ``group_size > 1``
+    a sequence is replicated on the contiguous ranks named by
+    ``decode_dp_group``; it therefore consumes one page bucket per group, with
+    capacity equal to the tightest physical rank in that group.  The default
+    keeps the validated pure-DP behavior unchanged.
     """
     if not candidates:
         return [], {}
@@ -560,6 +567,21 @@ def select_sequences_for_loading(
 
     if not valid_candidates:
         return [], {}
+
+    if group_size <= 0 or len(per_rank_free_pages) % group_size != 0:
+        raise ValueError(
+            f"group_size={group_size} must divide the number of ranks="
+            f"{len(per_rank_free_pages)}"
+        )
+
+    num_capacity_groups = len(per_rank_free_pages) // group_size
+    if group_size == 1:
+        capacity_free_pages = list(per_rank_free_pages)
+    else:
+        capacity_free_pages = [
+            min(per_rank_free_pages[g * group_size:(g + 1) * group_size])
+            for g in range(num_capacity_groups)
+        ]
 
     # Sort based on strategy - CRITICAL: Use tie-breaker for determinism
     def sort_key(item):
@@ -579,22 +601,37 @@ def select_sequences_for_loading(
     sorted_candidates = sorted(valid_candidates, key=sort_key)
 
     load_uuids = []
-    rank_pages_used: Dict[int, int] = {r: 0 for r in range(len(per_rank_free_pages))}
+    rank_pages_used: Dict[int, int] = {
+        r: 0 for r in range(num_capacity_groups)
+    }
 
     for uuid, info in sorted_candidates:
         req_pages = info.get("pages_needed", 0)
-        assigned_rank = info.get("assigned_rank", 0)
+        if group_size > 1:
+            capacity_group = info.get("decode_dp_group")
+            if not isinstance(capacity_group, int):
+                raise ValueError(
+                    f"candidate {uuid} has no decode_dp_group for "
+                    f"group_size={group_size}"
+                )
+        else:
+            capacity_group = info.get("assigned_rank", 0)
 
         if req_pages == 0:
             continue
 
-        if assigned_rank >= len(per_rank_free_pages):
-            logger.warning(f"Invalid assigned_rank {assigned_rank} for {uuid}")
+        if capacity_group < 0 or capacity_group >= num_capacity_groups:
+            logger.warning(
+                f"Invalid capacity group {capacity_group} for {uuid}"
+            )
             continue
 
-        if rank_pages_used[assigned_rank] + req_pages <= per_rank_free_pages[assigned_rank]:
+        if (
+            rank_pages_used[capacity_group] + req_pages
+            <= capacity_free_pages[capacity_group]
+        ):
             load_uuids.append(uuid)
-            rank_pages_used[assigned_rank] += req_pages
+            rank_pages_used[capacity_group] += req_pages
 
     return load_uuids, rank_pages_used
 
