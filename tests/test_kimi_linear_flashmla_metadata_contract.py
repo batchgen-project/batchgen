@@ -69,7 +69,17 @@ def test_whole_model_reuses_one_static_kda_cu_vector_per_bucket():
             and call.func.attr == "_get_kda_cu_seqlens"
         ]
     ) == 1
-    assert len(_call_names(helper, "arange")) == 1
+    assert len(
+        [
+            call
+            for call in ast.walk(helper)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "arange"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+        ]
+    ) == 1
 
 
 def test_layer_graph_keeps_standalone_flashmla_fallback():

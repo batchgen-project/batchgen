@@ -532,6 +532,7 @@ def test_whole_model_setup_and_release_reach_inline_moe_segments(monkeypatch):
     segment.moe_segments = {1: Child("moe", fused_front=torch.empty(0))}
     segment._kv_key_buffer = None
     segment._primary_kv_dim = 0
+    segment._kda_cu_seqlens = {}
     monkeypatch.setattr(segment, "_make_bucket_maps", lambda bucket: object())
 
     segment.setup_static_buffers(8)
