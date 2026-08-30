@@ -753,6 +753,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BindCompressedStateHostManager<kv::NonOverlapCompressedState128HostManager>(
         m, "NonOverlapCompressedState128HostManager");
 
+    py::class_<tensor_meta>(m, "TensorMeta")
+        .def_readonly("offset", &tensor_meta::offset)
+        .def_readonly("tensor_shape", &tensor_meta::tensor_shape)
+        .def_readonly("byte_size", &tensor_meta::byte_size)
+        .def_readonly("dtype", &tensor_meta::dtype);
+
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
              py::arg("enable_memfd") = false)

@@ -220,13 +220,55 @@ class AttnWrapperBase(BaseModuleWrapper):
 
     @classmethod
     def start_prefill_offload_retirement_audit(cls) -> None:
+        if cls.prefill_offload_retirements is not None:
+            raise RuntimeError("Prefill KV offload retirement audit is already active")
+        if (
+            cls.pending_prefill_offload_tasks
+            or cls.pending_prefill_offload_tensors
+            or cls.pending_prefill_offload_layer_idx is not None
+        ):
+            raise RuntimeError(
+                "Cannot start prefill KV offload retirement audit with pending work"
+            )
         cls.prefill_offload_retirements = []
 
     @classmethod
     def finish_prefill_offload_retirement_audit(cls) -> list:
-        retirements = list(cls.prefill_offload_retirements or [])
+        retirements = cls.prefill_offload_retirements
         cls.prefill_offload_retirements = None
-        return retirements
+        if retirements is None:
+            raise RuntimeError("Prefill KV offload retirement audit was not active")
+        return list(retirements)
+
+    @classmethod
+    def abort_prefill_offload_retirement_audit(
+        cls,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Drain issued D2H work and reset all prefill-offload bookkeeping."""
+        first_error = None
+        try:
+            for task in list(cls.pending_prefill_offload_tasks):
+                try:
+                    task.wait()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+            try:
+                cls._prefill_offload_sync_device(device)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        finally:
+            cls.pending_prefill_offload_tasks.clear()
+            cls.pending_prefill_offload_tensors.clear()
+            cls.pending_prefill_offload_layer_idx = None
+            cls.prefill_offload_retirements = None
+        if first_error is not None:
+            raise RuntimeError(
+                "Failed to drain GLM-5 prefill KV offload work during abort"
+            ) from first_error
 
     @classmethod
     def retire_pending_prefill_offloads_before_layer(

@@ -59,9 +59,17 @@ class GLM5ParallelStrategyManager:
         self.global_rank = global_rank
         self.world_size = world_size
         self.rank = global_rank
-        # Detect FP8 variant by checking for expert scale tensors in skeleton
-        self.is_fp8_experts = any(
-            "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
+        quantization_config = getattr(
+            self.loaded_model_config, "quantization_config", {}
+        ) or {}
+        quant_method = quantization_config.get(
+            "quant_method",
+            getattr(self.loaded_model_config, "quantization", None),
+        )
+        self.is_fp8_experts = quant_method == "fp8"
+        self._observed_fp8_expert_scales = any(
+            ".mlp.experts." in key and key.endswith(".weight_scale_inv")
+            for key in skeleton_state_dict
         )
 
     def configure_prefill(self):
@@ -165,8 +173,10 @@ class GLM5ParallelStrategyManager:
 
     def _validate_prefill_weight_offload_contract(self):
         """Fail closed unless every bulk-attention module and expert is streamed."""
-        num_layers = self.model_config.num_hidden_layers
-        moe_layers = range(self.FIRST_K_DENSE, num_layers)
+        num_layers = self.loaded_model_config.num_hidden_layers
+        first_k_dense = self.loaded_model_config.first_k_dense_replace
+        num_routed_experts = self.loaded_model_config.n_routed_experts
+        moe_layers = range(first_k_dense, num_layers)
         expected_attn = [f"attn_{layer_idx}" for layer_idx in range(num_layers)]
         expected_shared = [
             f"shared_expert_{layer_idx}" for layer_idx in moe_layers
@@ -174,7 +184,7 @@ class GLM5ParallelStrategyManager:
         expected_routed = [
             f"routed_expert_{layer_idx}_{expert_idx}"
             for layer_idx in moe_layers
-            for expert_idx in range(self.NUM_TOTAL_EXPERTS)
+            for expert_idx in range(num_routed_experts)
         ]
 
         expected = {
@@ -208,7 +218,25 @@ class GLM5ParallelStrategyManager:
             "shared_expert": shared_wrappers,
             "routed_expert": routed_wrappers,
         }
+        expected_counts = {
+            kind: len(keys) for kind, keys in expected.items()
+        }
+        actual_wrapper_counts = {
+            kind: len(wrappers) for kind, wrappers in wrapper_groups.items()
+        }
+        if actual_wrapper_counts != expected_counts:
+            raise RuntimeError(
+                "GLM-5 prefill bulk-weight wrapper cardinality mismatch: "
+                f"expected={expected_counts}, actual={actual_wrapper_counts}"
+            )
         for kind, wrappers in wrapper_groups.items():
+            actual_wrapper_keys = [
+                getattr(wrapper, "module_key", None) for wrapper in wrappers
+            ]
+            if actual_wrapper_keys != expected[kind]:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} wrapper identity mismatch"
+                )
             persistent = [
                 idx for idx, wrapper in enumerate(wrappers)
                 if getattr(wrapper, "persistent", True)
@@ -219,14 +247,139 @@ class GLM5ParallelStrategyManager:
                     f"{len(persistent)} persistent wrappers"
                 )
 
+        scale_inventory = self._validate_prefill_expert_scale_residency(
+            wrapper_groups
+        )
+
         logging.info("[PREFILL_WEIGHT_OFFLOAD_CONTRACT] %s", json.dumps({
             "rank": self.rank,
             "data_parallel": True,
+            "scope": "bulk_weight_matrices",
             "attn_modules_streamed": len(expected_attn),
             "shared_experts_streamed": len(expected_shared),
             "routed_experts_streamed": len(expected_routed),
+            "expected_counts": expected_counts,
+            "actual_wrapper_counts": actual_wrapper_counts,
             "all_wrappers_nonpersistent": True,
+            "scale_metadata_offloaded": False,
+            "expert_scale_metadata": scale_inventory,
         }, separators=(",", ":")))
+
+    def _validate_prefill_expert_scale_residency(self, wrapper_groups):
+        scale_keys = {
+            "gate_proj.weight_scale_inv",
+            "up_proj.weight_scale_inv",
+            "down_proj.weight_scale_inv",
+        }
+        expert_groups = {
+            kind: wrapper_groups[kind]
+            for kind in ("shared_expert", "routed_expert")
+        }
+        observed_fp8_scales = getattr(
+            self, "_observed_fp8_expert_scales", self.is_fp8_experts
+        )
+        if self.is_fp8_experts and not observed_fp8_scales:
+            raise RuntimeError(
+                "GLM-5 checkpoint declares FP8 experts but the skeleton contains "
+                "no routed-expert scale metadata"
+            )
+        if not self.is_fp8_experts and observed_fp8_scales:
+            raise RuntimeError(
+                "GLM-5 checkpoint declares non-FP8 experts but the skeleton "
+                "contains routed-expert scale metadata"
+            )
+        if not self.is_fp8_experts:
+            unexpected = [
+                wrapper.module_key
+                for wrappers in expert_groups.values()
+                for wrapper in wrappers
+                if getattr(wrapper, "weight_dequant_scale", None)
+            ]
+            if unexpected:
+                raise RuntimeError(
+                    "GLM-5 non-FP8 prefill unexpectedly has expert scale metadata: "
+                    f"{unexpected[:5]}"
+                )
+            return {
+                "format": "none_non_fp8",
+                "expected_tensors": 0,
+                "actual_tensors": 0,
+                "resident_on_device": False,
+                "dtypes": [],
+            }
+
+        expected_device = torch.device(
+            self.engine_config.Basic_Config.device_torch
+        )
+        config = self.loaded_model_config
+        block_rows, block_cols = config.quantization_config["weight_block_size"]
+        hidden_size = config.hidden_size
+        intermediate_size = config.moe_intermediate_size
+        expected_shapes = {
+            "gate_proj.weight_scale_inv": (
+                (intermediate_size + block_rows - 1) // block_rows,
+                (hidden_size + block_cols - 1) // block_cols,
+            ),
+            "up_proj.weight_scale_inv": (
+                (intermediate_size + block_rows - 1) // block_rows,
+                (hidden_size + block_cols - 1) // block_cols,
+            ),
+            "down_proj.weight_scale_inv": (
+                (hidden_size + block_rows - 1) // block_rows,
+                (intermediate_size + block_cols - 1) // block_cols,
+            ),
+        }
+        actual_tensors = 0
+        dtypes = set()
+        for kind, wrappers in expert_groups.items():
+            for wrapper in wrappers:
+                scales = getattr(wrapper, "weight_dequant_scale", None)
+                actual_keys = set(scales or {})
+                if actual_keys != scale_keys:
+                    raise RuntimeError(
+                        f"GLM-5 prefill {kind} resident scale metadata mismatch "
+                        f"for {wrapper.module_key}: expected={sorted(scale_keys)}, "
+                        f"actual={sorted(actual_keys)}"
+                    )
+                for key, tensor in scales.items():
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tensor.numel() <= 0
+                        or tensor.dtype != torch.float32
+                        or tensor.device.type != "cuda"
+                        or tuple(tensor.shape) != expected_shapes[key]
+                        or (
+                            expected_device.index is not None
+                            and tensor.device.index != expected_device.index
+                        )
+                    ):
+                        raise RuntimeError(
+                            "GLM-5 prefill expert scale metadata is not a nonempty "
+                            "resident FP32 CUDA tensor with the expected block shape: "
+                            f"{wrapper.module_key}/{key} expected_shape="
+                            f"{expected_shapes[key]}, value={tensor!r}"
+                        )
+                    actual_tensors += 1
+                    dtypes.add(str(tensor.dtype))
+
+        expected_tensors = 3 * sum(len(wrappers) for wrappers in expert_groups.values())
+        if actual_tensors != expected_tensors:
+            raise RuntimeError(
+                "GLM-5 prefill resident expert scale cardinality mismatch: "
+                f"expected={expected_tensors}, actual={actual_tensors}"
+            )
+        return {
+            "format": "fp8_block_scale_inv",
+            "expected_tensors": expected_tensors,
+            "actual_tensors": actual_tensors,
+            "resident_on_device": True,
+            "device_type": "cuda",
+            "dtypes": sorted(dtypes),
+            "expected_shapes": {
+                key: list(shape) for key, shape in sorted(expected_shapes.items())
+            },
+            "all_shapes_validated": True,
+        }
 
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""
