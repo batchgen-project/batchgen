@@ -24,7 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -364,6 +364,38 @@ class Glm5Indexer(nn.Module):
     The K cached per token is only head_dim=128 (not n_heads*head_dim=4096).
     """
 
+    prefill_rope_hadamard_audit: ClassVar[Optional[Dict[str, Dict[int, int]]]] = None
+
+    @classmethod
+    def start_prefill_rope_hadamard_audit(cls) -> None:
+        if cls.prefill_rope_hadamard_audit is not None:
+            raise RuntimeError("GLM-5 prefill indexer fallback audit is already active")
+        cls.prefill_rope_hadamard_audit = {"fused": {}, "fallback": {}}
+
+    @classmethod
+    def record_prefill_rope_hadamard_path(cls, path: str, layer_idx: int) -> None:
+        audit = cls.prefill_rope_hadamard_audit
+        if audit is None:
+            return
+        if path not in audit:
+            raise RuntimeError(f"Unknown GLM-5 prefill indexer path: {path}")
+        layer_idx = int(layer_idx)
+        audit[path][layer_idx] = audit[path].get(layer_idx, 0) + 1
+
+    @classmethod
+    def finish_prefill_rope_hadamard_audit(cls) -> Dict[str, Dict[int, int]]:
+        audit = cls.prefill_rope_hadamard_audit
+        cls.prefill_rope_hadamard_audit = None
+        if audit is None:
+            raise RuntimeError("GLM-5 prefill indexer fallback audit was not active")
+        return {
+            path: dict(counts) for path, counts in audit.items()
+        }
+
+    @classmethod
+    def abort_prefill_rope_hadamard_audit(cls) -> None:
+        cls.prefill_rope_hadamard_audit = None
+
     def __init__(self, config: Glm5Config, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
@@ -434,12 +466,16 @@ class Glm5Indexer(nn.Module):
         if _fused_rope_hadamard_fn is not None:
             seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
             cos, sin = self.rotary_emb(k, seq_len)
-            return _fused_rope_hadamard_fn(
+            result = _fused_rope_hadamard_fn(
                 k.to(torch.bfloat16), cos.float(), sin.float(),
                 positions.reshape(-1), scale=k.shape[-1] ** -0.5,
             )
+            self.record_prefill_rope_hadamard_path("fused", self.layer_idx)
+            return result
         k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
-        return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+        result = _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+        self.record_prefill_rope_hadamard_path("fallback", self.layer_idx)
+        return result
 
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,

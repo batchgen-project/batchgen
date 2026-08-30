@@ -449,6 +449,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     @classmethod
     def start_prefill_kv_offload_audit(cls) -> None:
+        if cls.glm5_prefill_kv_offload_audit is not None:
+            raise RuntimeError("GLM-5 prefill KV offload audit is already active")
         cls.glm5_prefill_kv_offload_audit = {"primary": {}, "aux": {}}
 
     @classmethod
@@ -473,9 +475,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     @classmethod
     def finish_prefill_kv_offload_audit(cls) -> Dict[str, Dict[int, dict]]:
-        audit = cls.glm5_prefill_kv_offload_audit or {"primary": {}, "aux": {}}
+        audit = cls.glm5_prefill_kv_offload_audit
         cls.glm5_prefill_kv_offload_audit = None
+        if audit is None:
+            raise RuntimeError("GLM-5 prefill KV offload audit was not active")
         return audit
+
+    @classmethod
+    def abort_prefill_kv_offload_audit(cls) -> None:
+        cls.glm5_prefill_kv_offload_audit = None
 
     def __init__(
         self,

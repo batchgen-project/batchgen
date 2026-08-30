@@ -1378,26 +1378,97 @@ class BatchGenWorker:
 		layers = getattr(getattr(self.model, "model", None), "layers", None)
 		if not layers or not isinstance(layers[0].self_attn, GLM5AttnWrapper):
 			return False
-		GLM5AttnWrapper.start_prefill_kv_offload_audit()
-		AttnWrapperBase.start_prefill_offload_retirement_audit()
+		self._glm52_prefill_fallback_audit_active = False
+		try:
+			GLM5AttnWrapper.start_prefill_kv_offload_audit()
+			AttnWrapperBase.start_prefill_offload_retirement_audit()
+			model_type = getattr(layers[0].self_attn.module.config, "model_type", "")
+			self._glm52_prefill_fallback_audit_active = model_type == "glm_moe_dsa_5_2"
+			if self._glm52_prefill_fallback_audit_active:
+				from batchgen.models.glm.glm5.model import Glm5Indexer
+				Glm5Indexer.start_prefill_rope_hadamard_audit()
+		except BaseException:
+			try:
+				self._abort_glm5_prefill_offload_audit()
+			except BaseException:
+				logging.exception(
+					"GLM-5 prefill audit startup cleanup failed; preserving original exception"
+				)
+			raise
 		return True
+
+	def _abort_glm5_prefill_offload_audit(self) -> None:
+		cleanup_errors = []
+		try:
+			AttnWrapperBase.abort_prefill_offload_retirement_audit(
+				device=getattr(self, "torch_device", None),
+			)
+		except BaseException as error:
+			cleanup_errors.append(error)
+		GLM5AttnWrapper.abort_prefill_kv_offload_audit()
+		from batchgen.models.glm.glm5.model import Glm5Indexer
+		Glm5Indexer.abort_prefill_rope_hadamard_audit()
+		self._glm52_prefill_fallback_audit_active = False
+		if cleanup_errors:
+			raise RuntimeError(
+				"GLM-5 prefill audit abort encountered cleanup failures"
+			) from cleanup_errors[0]
 
 	def _finish_glm5_prefill_offload_audit(self, local_prefill_indices) -> None:
 		from collections import Counter
 
 		audit = GLM5AttnWrapper.finish_prefill_kv_offload_audit()
 		retirements = AttnWrapperBase.finish_prefill_offload_retirement_audit()
+		fallback_audit = None
+		if getattr(self, "_glm52_prefill_fallback_audit_active", False):
+			from batchgen.models.glm.glm5.model import Glm5Indexer
+			fallback_audit = Glm5Indexer.finish_prefill_rope_hadamard_audit()
+		self._glm52_prefill_fallback_audit_active = False
 		layers = self.model.model.layers
 		expected_primary_layers = list(range(len(layers)))
-		expected_aux_layers = [
+		actual_aux_layers = [
 			layer_idx
 			for layer_idx, layer in enumerate(layers)
 			if getattr(layer.self_attn.module, "indexer", None) is not None
 		]
+		if fallback_audit is not None:
+			from batchgen.models.glm.glm5.config import dsa_layer_skips_topk
+			config = layers[0].self_attn.module.config
+			if len(layers) != config.num_hidden_layers:
+				raise RuntimeError(
+					"GLM-5.2 prefill model/config layer count mismatch: "
+					f"model={len(layers)}, config={config.num_hidden_layers}"
+				)
+			expected_aux_layers = [
+				layer_idx for layer_idx in expected_primary_layers
+				if not dsa_layer_skips_topk(config, layer_idx)
+			]
+			if actual_aux_layers != expected_aux_layers:
+				raise RuntimeError(
+					"GLM-5.2 prefill indexer module schedule mismatch: "
+					f"expected={expected_aux_layers}, actual={actual_aux_layers}"
+				)
+		else:
+			expected_aux_layers = actual_aux_layers
+		sequence_uuids = []
 		expected_lengths = []
 		for local_idx in local_prefill_indices:
 			uuid = self._local_to_uuid_map[local_idx]
-			expected_lengths.append(self.global_batch.get_sequence(uuid).prompt_length)
+			sequence = self.global_batch.get_sequence(uuid)
+			sequence_uuid = getattr(sequence, "uuid", None)
+			if sequence_uuid != uuid:
+				raise RuntimeError(
+					"GLM-5 prefill local/sequence UUID mismatch: "
+					f"local_uuid={uuid}, sequence_uuid={sequence_uuid}"
+				)
+			if getattr(sequence, "assigned_rank", None) != self.rank:
+				raise RuntimeError(
+					"GLM-5 prefill sequence/rank assignment mismatch: "
+					f"uuid={uuid}, expected_rank={self.rank}, "
+					f"assigned_rank={getattr(sequence, 'assigned_rank', None)}"
+				)
+			sequence_uuids.append(sequence_uuid)
+			expected_lengths.append(sequence.prompt_length)
 		expected_sequences = len(expected_lengths)
 		expected_tokens = sum(expected_lengths)
 
@@ -1446,6 +1517,25 @@ class BatchGenWorker:
 				f"events={dict(retirement_events)} expected_events={dict(expected_events)} "
 				f"tasks={dict(retirement_tasks)} expected_tasks={dict(expected_tasks)}"
 			)
+		fused_indexer_calls = {}
+		fallback_count = 0
+		if fallback_audit is not None:
+			fused_indexer_calls = fallback_audit["fused"]
+			fallback_calls = fallback_audit["fallback"]
+			fallback_count = sum(fallback_calls.values())
+			if fallback_count:
+				raise RuntimeError(
+					"GLM-5.2 prefill indexer used the unfused RoPE/Hadamard fallback: "
+					f"calls={fallback_calls}"
+				)
+			expected_fused_calls = {
+				layer_idx: entry["calls"] for layer_idx, entry in aux.items()
+			}
+			if fused_indexer_calls != expected_fused_calls:
+				raise RuntimeError(
+					"GLM-5.2 prefill fused indexer layer coverage mismatch: "
+					f"expected={expected_fused_calls}, actual={fused_indexer_calls}"
+				)
 		if (
 			AttnWrapperBase.pending_prefill_offload_tasks
 			or AttnWrapperBase.pending_prefill_offload_tensors
@@ -1456,6 +1546,7 @@ class BatchGenWorker:
 		logging.info("[PREFILL_KV_OFFLOAD_CONTRACT] %s", json.dumps({
 			"rank": self.rank,
 			"sequences": expected_sequences,
+			"sequence_uuids": sequence_uuids,
 			"sequence_lengths": expected_lengths,
 			"tokens": expected_tokens,
 			"primary_layers": expected_primary_layers,
@@ -1464,8 +1555,48 @@ class BatchGenWorker:
 				set(expected_primary_layers) - set(expected_aux_layers)
 			),
 			"retirement_events": sum(retirement_events.values()),
+			"retirement_tasks": sum(retirement_tasks.values()),
+			"retirement_tasks_by_layer": dict(sorted(retirement_tasks.items())),
 			"pending_at_end": 0,
+			"fallback_count": fallback_count,
+			"fused_indexer_layers": sorted(fused_indexer_calls),
+			"fused_indexer_calls_by_layer": dict(sorted(fused_indexer_calls.items())),
 		}, separators=(",", ":")))
+
+	def _run_prefill_with_offload_audit(self, local_prefill_indices) -> float:
+		prefill_offload_audit = self._start_glm5_prefill_offload_audit()
+		try:
+			prefill_start = time.perf_counter()
+			with torch.inference_mode():
+				if self.enable_prepack:
+					self.prefill_prepacked(local_prefill_indices)
+				else:
+					self.prefill(local_prefill_indices)
+			prefill_elapsed = time.perf_counter() - prefill_start
+
+			# The async CPU tasks must issue their D2H copies before the device
+			# synchronization can prove every per-layer KV retirement complete.
+			from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+			num_retired = _AWB.retire_pending_prefill_offloads(
+				device=self.torch_device,
+				reason="end of prefill",
+			)
+			if num_retired and self.rank == 0:
+				logging.info(
+					f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
+				)
+			if prefill_offload_audit:
+				self._finish_glm5_prefill_offload_audit(local_prefill_indices)
+			return prefill_elapsed
+		except BaseException:
+			if prefill_offload_audit:
+				try:
+					self._abort_glm5_prefill_offload_audit()
+				except BaseException:
+					logging.exception(
+						"GLM-5 prefill audit cleanup failed; preserving original exception"
+					)
+			raise
 
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace")):
@@ -6902,33 +7033,9 @@ class BatchGenWorker:
 								f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
 								f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 							)
-						prefill_offload_audit = self._start_glm5_prefill_offload_audit()
-						prefill_start = time.perf_counter()
-						with torch.inference_mode():
-							if self.enable_prepack:
-								self.prefill_prepacked(local_prefill_indices)
-							else:
-								self.prefill(local_prefill_indices)
-						prefill_time += time.perf_counter() - prefill_start
-
-						# CRITICAL: Wait for all async KV offloads to complete before decode.
-						# async_offload_layer_kv_to_host returns a future backed by a
-						# std::async CPU thread that issues cudaMemcpyAsync on a d2h
-						# stream. Discarding the future (fire-and-forget) is unsafe —
-						# the CPU thread may not have run yet, so torch.cuda.synchronize
-						# would have nothing to wait for. Wait on every captured future
-						# first, then sync the device to flush the d2h stream.
-						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-						num_retired = _AWB.retire_pending_prefill_offloads(
-							device=self.torch_device,
-							reason="end of prefill",
+						prefill_time += self._run_prefill_with_offload_audit(
+							local_prefill_indices
 						)
-						if num_retired and self.rank == 0:
-							logging.info(
-								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
-							)
-						if prefill_offload_audit:
-							self._finish_glm5_prefill_offload_audit(local_prefill_indices)
 					self._nsys_prefill_profile_end(_prefill_profile_active)
 
 					# Cleanup & Status Update
