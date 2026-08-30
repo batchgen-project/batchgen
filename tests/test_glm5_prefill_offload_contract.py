@@ -7,7 +7,10 @@ import torch
 from batchgen.models.glm.glm5.Parallel_Strategy_Manager import (
     GLM5ParallelStrategyManager,
 )
-from batchgen.models.glm.glm5.glm5_parameter_server import GLM5_Parameter_Server
+from batchgen.models.glm.glm5.glm5_parameter_server import (
+    GLM5_Parameter_Server,
+    _emit_prefill_host_weight_inventory,
+)
 from batchgen.models.glm.glm5.config import dsa_layer_skips_topk
 from batchgen.models.glm.glm5.model import Glm5Indexer
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
@@ -242,6 +245,17 @@ def _fake_parameter_server_inventory():
                     ["gate_proj.weight", "up_proj.weight", "down_proj.weight"],
                 )
     return server, expected_tensor_keys
+
+
+def test_parameter_server_host_inventory_emits_without_logging_config(capsys):
+    record = {"init_complete": True, "host_backed": True}
+
+    _emit_prefill_host_weight_inventory(record)
+
+    assert capsys.readouterr().out == (
+        '[PREFILL_HOST_WEIGHT_INVENTORY] '
+        '{"init_complete":true,"host_backed":true}\n'
+    )
 
 
 def test_parameter_server_inventory_accepts_exact_modules_and_tensors():
