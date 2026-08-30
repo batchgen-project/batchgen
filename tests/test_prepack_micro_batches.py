@@ -25,6 +25,15 @@ def test_build_prefill_micro_batches_can_force_single_sequence_batches():
     assert l2_cap == 0
 
 
+def test_build_prefill_micro_batches_keeps_oversized_sequence_whole():
+    micro_batches, _ = build_prefill_micro_batches(
+        [262_144],
+        token_cap=131_072,
+    )
+
+    assert micro_batches == [(0, 1)]
+
+
 def test_build_prefill_micro_batches_requires_positive_token_cap():
     with pytest.raises(ValueError, match="token_cap must be positive"):
         build_prefill_micro_batches([16, 32], token_cap=0)

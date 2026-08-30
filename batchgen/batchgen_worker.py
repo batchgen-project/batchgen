@@ -1354,6 +1354,96 @@ class BatchGenWorker:
 						merged[key] = value
 		return merged or None
 
+	def _start_glm5_prefill_offload_audit(self) -> bool:
+		layers = getattr(getattr(self.model, "model", None), "layers", None)
+		if not layers or not isinstance(layers[0].self_attn, GLM5AttnWrapper):
+			return False
+		GLM5AttnWrapper.start_prefill_kv_offload_audit()
+		AttnWrapperBase.start_prefill_offload_retirement_audit()
+		return True
+
+	def _finish_glm5_prefill_offload_audit(self, local_prefill_indices) -> None:
+		from collections import Counter
+
+		audit = GLM5AttnWrapper.finish_prefill_kv_offload_audit()
+		retirements = AttnWrapperBase.finish_prefill_offload_retirement_audit()
+		layers = self.model.model.layers
+		expected_primary_layers = list(range(len(layers)))
+		expected_aux_layers = [
+			layer_idx
+			for layer_idx, layer in enumerate(layers)
+			if getattr(layer.self_attn.module, "indexer", None) is not None
+		]
+		expected_lengths = []
+		for local_idx in local_prefill_indices:
+			uuid = self._local_to_uuid_map[local_idx]
+			expected_lengths.append(self.global_batch.get_sequence(uuid).prompt_length)
+		expected_sequences = len(expected_lengths)
+		expected_tokens = sum(expected_lengths)
+
+		primary = audit["primary"]
+		aux = audit["aux"]
+		if sorted(primary) != expected_primary_layers:
+			raise RuntimeError(
+				"GLM-5 prefill primary KV offload missed or added layers: "
+				f"expected={expected_primary_layers}, actual={sorted(primary)}"
+			)
+		if sorted(aux) != expected_aux_layers:
+			raise RuntimeError(
+				"GLM-5 prefill auxiliary KV offload missed or added layers: "
+				f"expected={expected_aux_layers}, actual={sorted(aux)}"
+			)
+		for kind, entries in (("primary", primary), ("auxiliary", aux)):
+			for layer_idx, entry in entries.items():
+				if (
+					entry["sequences"] != expected_sequences
+					or entry["tokens"] != expected_tokens
+				):
+					raise RuntimeError(
+						f"GLM-5 prefill {kind} KV offload coverage mismatch at "
+						f"layer {layer_idx}: expected {expected_sequences} sequences/"
+						f"{expected_tokens} tokens, got {entry}"
+					)
+
+		retirement_events = Counter(item["layer_idx"] for item in retirements)
+		retirement_tasks = Counter()
+		for item in retirements:
+			retirement_tasks[item["layer_idx"]] += item["tasks"]
+		expected_events = Counter({
+			layer_idx: entry["calls"] for layer_idx, entry in primary.items()
+		})
+		expected_tasks = Counter({
+			layer_idx: primary[layer_idx]["sequences"]
+			+ (aux[layer_idx]["sequences"] if layer_idx in aux else 0)
+			for layer_idx in primary
+		})
+		if retirement_events != expected_events or retirement_tasks != expected_tasks:
+			raise RuntimeError(
+				"GLM-5 prefill per-layer KV retirement mismatch: "
+				f"events={dict(retirement_events)} expected_events={dict(expected_events)} "
+				f"tasks={dict(retirement_tasks)} expected_tasks={dict(expected_tasks)}"
+			)
+		if (
+			AttnWrapperBase.pending_prefill_offload_tasks
+			or AttnWrapperBase.pending_prefill_offload_tensors
+			or AttnWrapperBase.pending_prefill_offload_layer_idx is not None
+		):
+			raise RuntimeError("GLM-5 prefill KV offload references remain after retirement")
+
+		logging.info("[PREFILL_KV_OFFLOAD_CONTRACT] %s", json.dumps({
+			"rank": self.rank,
+			"sequences": expected_sequences,
+			"sequence_lengths": expected_lengths,
+			"tokens": expected_tokens,
+			"primary_layers": expected_primary_layers,
+			"auxiliary_layers": expected_aux_layers,
+			"layers_without_auxiliary_by_design": sorted(
+				set(expected_primary_layers) - set(expected_aux_layers)
+			),
+			"retirement_events": sum(retirement_events.values()),
+			"pending_at_end": 0,
+		}, separators=(",", ":")))
+
 	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
 		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace")):
 			return True
@@ -6728,6 +6818,7 @@ class BatchGenWorker:
 								f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
 								f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 							)
+						prefill_offload_audit = self._start_glm5_prefill_offload_audit()
 						prefill_start = time.perf_counter()
 						with torch.inference_mode():
 							if self.enable_prepack:
@@ -6752,6 +6843,8 @@ class BatchGenWorker:
 							logging.info(
 								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
 							)
+						if prefill_offload_audit:
+							self._finish_glm5_prefill_offload_audit(local_prefill_indices)
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -8134,6 +8227,16 @@ class BatchGenWorker:
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
 		)
+		planned_sequence_indices = [
+			seq_idx
+			for seq_start, seq_end in micro_batches
+			for seq_idx in range(seq_start, seq_end)
+		]
+		if planned_sequence_indices != list(range(num_sequences)):
+			raise RuntimeError(
+				"Prefill micro-batch plan must cover every whole sequence exactly once: "
+				f"planned={planned_sequence_indices}, expected={list(range(num_sequences))}"
+			)
 		total_tokens_all = sum(seq_lengths_list)
 
 		if self.rank == 0:
@@ -8363,6 +8466,12 @@ class BatchGenWorker:
 			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
 			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,
 			"micro_batches": len(micro_batches),
+			"micro_batch_sequence_ranges": [list(item) for item in micro_batches],
+			"sequence_token_splitting": False,
+			"oversized_sequence_indices": [
+				idx for idx, length in enumerate(seq_lengths_list)
+				if length > MAX_TOKENS_PER_MICRO_BATCH
+			],
 			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
 			"world_size": self.world_size,
 			"rank": self.rank,

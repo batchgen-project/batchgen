@@ -124,6 +124,9 @@ class AttnWrapperBase(BaseModuleWrapper):
     # retire point confirms the memcpy has completed.
     pending_prefill_offload_tensors: ClassVar[list] = []
     pending_prefill_offload_layer_idx: ClassVar[Optional[int]] = None
+    # Optional runtime qualification ledger. GLM-5 enables it immediately
+    # before prefill and consumes it after the final layer's offload retires.
+    prefill_offload_retirements: ClassVar[Optional[list]] = None
 
     @classmethod
     def record_glm5_dispatch(
@@ -202,6 +205,11 @@ class AttnWrapperBase(BaseModuleWrapper):
 
         layer_idx = cls.pending_prefill_offload_layer_idx
         cls.pending_prefill_offload_layer_idx = None
+        if num_tasks and cls.prefill_offload_retirements is not None:
+            cls.prefill_offload_retirements.append({
+                "layer_idx": layer_idx,
+                "tasks": num_tasks,
+            })
         if num_tasks:
             suffix = f" ({reason})" if reason else ""
             logging.debug(
@@ -209,6 +217,16 @@ class AttnWrapperBase(BaseModuleWrapper):
                 f" from layer {layer_idx}{suffix}"
             )
         return num_tasks
+
+    @classmethod
+    def start_prefill_offload_retirement_audit(cls) -> None:
+        cls.prefill_offload_retirements = []
+
+    @classmethod
+    def finish_prefill_offload_retirement_audit(cls) -> list:
+        retirements = list(cls.prefill_offload_retirements or [])
+        cls.prefill_offload_retirements = None
+        return retirements
 
     @classmethod
     def retire_pending_prefill_offloads_before_layer(
