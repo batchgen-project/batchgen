@@ -23,6 +23,13 @@ def _diag(msg):
     print(f"[DIAG {_diag_time.time():.3f}] glm5_ps_import: {msg}", flush=True)
     _diag_sys.stdout.flush()
 
+
+def _emit_prefill_host_weight_inventory(record):
+    """Emit before server logging is configured; this is qualification evidence."""
+    payload = json.dumps(record, separators=(",", ":"))
+    _diag_sys.stdout.write(f"[PREFILL_HOST_WEIGHT_INVENTORY] {payload}\n")
+    _diag_sys.stdout.flush()
+
 _diag("start")
 import gc
 import json
@@ -124,7 +131,7 @@ class GLM5_Parameter_Server:
         )
         inventory = self._validate_loaded_prefill_host_weight_inventory(byte_size)
         shm_objects = self._prefill_host_backing_inventory(byte_size)
-        logging.info("[PREFILL_HOST_WEIGHT_INVENTORY] %s", json.dumps({
+        _emit_prefill_host_weight_inventory({
             "init_complete": True,
             "host_backed": True,
             "backing": shm_objects[0]["backend"],
@@ -140,7 +147,7 @@ class GLM5_Parameter_Server:
             "scale_metadata_offloaded": False,
             "tensors_per_shared_expert": 3,
             "tensors_per_routed_expert": 3,
-        }, separators=(",", ":")))
+        })
         return self.shm_name, self.tensor_meta_shm_name
 
     def _prefill_host_backing_inventory(self, byte_size):
