@@ -14,10 +14,12 @@ Key differences from DeepSeek V3 PSM:
 - DSA dual KV cache handled automatically by batchgen_worker.py
 - MoE gate has e_score_correction_bias
 - Dense MLP layers 0-2, MoE layers 3-77
-- Prefill: all modules offloaded (DP), Decode: EP
+- Prefill: bulk attention and all MoE expert weights offloaded (DP); small
+  skeleton tensors remain resident. Decode: EP
 """
 
 import gc
+import json
 import logging
 import os
 import time
@@ -69,7 +71,7 @@ class GLM5ParallelStrategyManager:
         )
 
     def configure_prefill(self):
-        """Configure model for prefill (pure DP, all modules offloaded)."""
+        """Configure prefill (pure DP, streamed bulk attention/all experts)."""
         start_time = time.perf_counter()
         timings = {}
 
@@ -148,6 +150,8 @@ class GLM5ParallelStrategyManager:
         self._config_expert_module()
         timings['expert'] = time.perf_counter() - step_start
 
+        self._validate_prefill_weight_offload_contract()
+
         self._config_lm_head_hook()
         self.model.eval()
 
@@ -197,6 +201,71 @@ class GLM5ParallelStrategyManager:
                 f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
             )
         return self.model, self.weight_copy_task
+
+    def _validate_prefill_weight_offload_contract(self):
+        """Fail closed unless every bulk-attention module and expert is streamed."""
+        num_layers = self.model_config.num_hidden_layers
+        moe_layers = range(self.FIRST_K_DENSE, num_layers)
+        expected_attn = [f"attn_{layer_idx}" for layer_idx in range(num_layers)]
+        expected_shared = [
+            f"shared_expert_{layer_idx}" for layer_idx in moe_layers
+        ]
+        expected_routed = [
+            f"routed_expert_{layer_idx}_{expert_idx}"
+            for layer_idx in moe_layers
+            for expert_idx in range(self.NUM_TOTAL_EXPERTS)
+        ]
+
+        expected = {
+            "attn": expected_attn,
+            "shared_expert": expected_shared,
+            "routed_expert": expected_routed,
+        }
+        for kind, expected_keys in expected.items():
+            actual_keys = self.weight_copy_task.get(kind, [])
+            if actual_keys != expected_keys:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} offload contract mismatch: "
+                    f"expected {len(expected_keys)} ordered keys, got "
+                    f"{len(actual_keys)}"
+                )
+
+        attn_wrappers = [
+            layer.self_attn for layer in self.model.model.layers
+        ]
+        shared_wrappers = [
+            self.model.model.layers[layer_idx].mlp.shared_experts
+            for layer_idx in moe_layers
+        ]
+        routed_wrappers = [
+            expert
+            for layer_idx in moe_layers
+            for expert in self.model.model.layers[layer_idx].mlp.experts
+        ]
+        wrapper_groups = {
+            "attn": attn_wrappers,
+            "shared_expert": shared_wrappers,
+            "routed_expert": routed_wrappers,
+        }
+        for kind, wrappers in wrapper_groups.items():
+            persistent = [
+                idx for idx, wrapper in enumerate(wrappers)
+                if getattr(wrapper, "persistent", True)
+            ]
+            if persistent:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} offload contract found "
+                    f"{len(persistent)} persistent wrappers"
+                )
+
+        logging.info("[PREFILL_WEIGHT_OFFLOAD_CONTRACT] %s", json.dumps({
+            "rank": self.rank,
+            "data_parallel": True,
+            "attn_modules_streamed": len(expected_attn),
+            "shared_experts_streamed": len(expected_shared),
+            "routed_experts_streamed": len(expected_routed),
+            "all_wrappers_nonpersistent": True,
+        }, separators=(",", ":")))
 
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""

@@ -443,6 +443,39 @@ class GLM5AttnWrapper(AttnWrapperBase):
     glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     glm5_dsa_graph_forward_state: ClassVar[Optional[Dict[str, Any]]] = None
     glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
+    # Runtime proof that every prefill token's primary MLA KV and every
+    # applicable auxiliary/indexer KV were scheduled for host offload.
+    glm5_prefill_kv_offload_audit: ClassVar[Optional[Dict[str, Dict[int, dict]]]] = None
+
+    @classmethod
+    def start_prefill_kv_offload_audit(cls) -> None:
+        cls.glm5_prefill_kv_offload_audit = {"primary": {}, "aux": {}}
+
+    @classmethod
+    def record_prefill_kv_offload(
+        cls,
+        kind: str,
+        layer_idx: int,
+        *,
+        sequences: int,
+        tokens: int,
+    ) -> None:
+        audit = cls.glm5_prefill_kv_offload_audit
+        if audit is None:
+            return
+        entry = audit[kind].setdefault(
+            int(layer_idx),
+            {"calls": 0, "sequences": 0, "tokens": 0},
+        )
+        entry["calls"] += 1
+        entry["sequences"] += int(sequences)
+        entry["tokens"] += int(tokens)
+
+    @classmethod
+    def finish_prefill_kv_offload_audit(cls) -> Dict[str, Dict[int, dict]]:
+        audit = cls.glm5_prefill_kv_offload_audit or {"primary": {}, "aux": {}}
+        cls.glm5_prefill_kv_offload_audit = None
+        return audit
 
     def __init__(
         self,
@@ -937,6 +970,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
         AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        self.record_prefill_kv_offload(
+            "aux",
+            self.layer_idx,
+            sequences=len(sequence_lengths),
+            tokens=sum(sequence_lengths),
+        )
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload packed primary KV with one asynchronous task per layer."""
@@ -969,6 +1008,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
         AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        self.record_prefill_kv_offload(
+            "primary",
+            self.layer_idx,
+            sequences=len(sequence_lengths),
+            tokens=sum(sequence_lengths),
+        )
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward with DSA sparse attention.
