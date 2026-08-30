@@ -169,7 +169,7 @@ def test_glm5_prefill_weight_offload_contract_rejects_missing_fp8_scales():
         Basic_Config=SimpleNamespace(device_torch="cuda")
     )
 
-    with pytest.raises(RuntimeError, match="declares FP8 experts"):
+    with pytest.raises(RuntimeError, match="resident scale metadata mismatch"):
         manager._validate_prefill_weight_offload_contract()
 
 
@@ -393,7 +393,9 @@ def test_core_parameter_server_returns_bound_tensor_metadata(tmp_path):
     import json
     import uuid
 
-    from batchgen.core_engine import Parameter_Server
+    from batchgen.models.engine_loader import core_engine
+
+    Parameter_Server = core_engine.Parameter_Server
 
     (tmp_path / "tiny.bin").write_bytes(b"\0\0\0\0")
     (tmp_path / "tiny.json").write_text(json.dumps({
