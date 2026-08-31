@@ -6337,6 +6337,49 @@ class BatchGenWorker:
 		# Enter the persistent generate loop
 		return self.generate()
 
+	def _nsys_prefill_profile_begin(
+		self,
+		*,
+		local_bsz: int,
+		global_bsz: int,
+	) -> bool:
+		"""Start a batch-debug-gated nsys prefill capture window."""
+		debug = self._batchgen_debug or {}
+		if not self._debug_flag_enabled(debug.get("glm5_prefill_nsys_profile")):
+			return False
+
+		torch.cuda.synchronize(self.torch_device)
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+		if self.rank == 0:
+			logging.info(
+				"[NSYS_PREFILL_PROFILE] starting cuda profiler capture "
+				"global_bsz=%s",
+				global_bsz,
+			)
+			torch.cuda.cudart().cudaProfilerStart()
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+		torch.cuda.nvtx.range_push(
+			f"BatchGen_prefill_rank_{self.rank}_local_bsz_{local_bsz}"
+			f"_global_bsz_{global_bsz}"
+		)
+		return True
+
+	def _nsys_prefill_profile_end(self, active: bool) -> None:
+		"""Finish one batch-debug-gated nsys prefill capture window."""
+		if not active:
+			return
+		torch.cuda.nvtx.range_pop()
+		torch.cuda.synchronize(self.torch_device)
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+		if self.rank == 0:
+			logging.info("[NSYS_PREFILL_PROFILE] stopping cuda profiler capture")
+			torch.cuda.cudart().cudaProfilerStop()
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+
 	def _nsys_decode_profile_begin_forward(
 		self,
 		*,
@@ -6720,6 +6763,10 @@ class BatchGenWorker:
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
 
 					# B. Execute Prefill
+					_prefill_profile_active = self._nsys_prefill_profile_begin(
+						local_bsz=len(local_prefill_indices),
+						global_bsz=len(prefill_uuids),
+					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
 							free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -6752,6 +6799,7 @@ class BatchGenWorker:
 							logging.info(
 								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
 							)
+					self._nsys_prefill_profile_end(_prefill_profile_active)
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
