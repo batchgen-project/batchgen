@@ -2173,17 +2173,13 @@ class Glm5MoE(nn.Module):
         uses ``torch.zeros_like(hidden_states)`` keeping input dtype). Opt into
         the old FP32 accumulate path with ``BATCHGEN_GLM5_MOE_FP32_ACCUM=1``.
 
-        Scatter-add variant: ``BATCHGEN_GLM5_MOE_SCATTER_ADD=1`` replaces the
-        boolean-mask `output[expert_mask] += ...` (which goes through PyTorch's
-        index_put_ → may use parallel atomicAdd-style internal kernel for
-        accumulating duplicate row indices when a token is in K experts at once)
-        with an explicit `torch.scatter_add_` over precomputed token indices.
-        Probes the hypothesis that the boolean-mask path leaks state across
-        sequences in the multi-seq prepacked prefill batch.
+        Resolve each expert's token indices once. Reusing those indices for the
+        input, router weights, and output accumulation avoids repeating
+        dynamic-shape boolean indexing, which otherwise forces a GPU-to-CPU
+        size synchronization for every indexed tensor.
         """
         import os as _os_moe
         _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
-        _moe_scatter = _os_moe.environ.get("BATCHGEN_GLM5_MOE_SCATTER_ADD", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
@@ -2207,26 +2203,21 @@ class Glm5MoE(nn.Module):
             if not _active_cpu[i]:
                 continue
             expert_mask = (topk_indices == i).any(dim=-1)
-            expert_input = hidden_flat[expert_mask]
+            token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
+            expert_input = hidden_flat.index_select(0, token_idx)
             expert_output = expert(expert_input)
+            selected_topk_indices = topk_indices.index_select(0, token_idx)
+            selected_topk_weights = topk_weights.index_select(0, token_idx)
             expert_weight = torch.where(
-                topk_indices[expert_mask] == i,
-                topk_weights[expert_mask],
-                torch.zeros_like(topk_weights[expert_mask])
+                selected_topk_indices == i,
+                selected_topk_weights,
+                torch.zeros_like(selected_topk_weights),
             ).sum(dim=-1)
             if _moe_fp32:
                 weighted = expert_output.float() * expert_weight.unsqueeze(-1)
             else:
                 weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
-
-            if _moe_scatter:
-                # Explicit scatter_add_ — per-row indices are unique within this
-                # iteration's `expert_mask`, so accumulation is well-defined.
-                token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
-                idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
-                output.scatter_add_(0, idx2d, weighted)
-            else:
-                output[expert_mask] += weighted
+            output.index_add_(0, token_idx, weighted)
 
         if _moe_fp32:
             output = output.to(hidden_flat.dtype)
