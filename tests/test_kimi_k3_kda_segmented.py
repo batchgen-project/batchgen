@@ -335,10 +335,12 @@ def test_bias_free_output_projection_reuses_caller_storage_bit_exactly():
     with torch.no_grad():
         linear.weight.copy_(torch.randn(11, 7, generator=gen))
     x = torch.randn(13, 7, generator=gen)
-    expected = linear(x)
     out = torch.empty(13, 11)
 
-    actual = SM._linear_no_bias_into(linear, x, out)
+    # ``out=`` GEMMs are inference-only, matching the worker's prefill loop.
+    with torch.inference_mode():
+        expected = linear(x)
+        actual = SM._linear_no_bias_into(linear, x, out)
 
     assert actual.data_ptr() == out.data_ptr()
     assert torch.equal(actual, expected)
