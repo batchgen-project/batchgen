@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -179,12 +180,42 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    auto [module_type, buffer_idx] = this->module_in_buffers_[module_name];
-    this->module_in_buffers_.erase(module_name);
-    this->buffer_status_[module_type][buffer_idx] = 0;
+    auto module_it = this->module_in_buffers_.find(module_name);
+    if (module_it == this->module_in_buffers_.end()) {
+        throw std::runtime_error(
+            "Cannot release non-resident weight module: " + module_name);
+    }
+    const auto [module_type, buffer_idx] = module_it->second;
+    auto status_it = this->buffer_status_.find(module_type);
+    if (status_it == this->buffer_status_.end() || buffer_idx < 0 ||
+        buffer_idx >= static_cast<int64_t>(status_it->second.size())) {
+        throw std::runtime_error(
+            "Invalid weight-buffer ownership for module: " + module_name);
+    }
+    this->module_in_buffers_.erase(module_it);
+    status_it->second[buffer_idx] = 0;
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
                          module_name, module_type, buffer_idx);
 };
+
+module_weight_tensor_map GPU_Weight_Buffer::get_weights_pinned(
+    const std::string& module_name) {
+    constexpr auto timeout = std::chrono::seconds(120);
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    const bool ready = this->cv_.wait_for(lock, timeout, [this, &module_name] {
+        return this->module_in_buffers_.find(module_name) !=
+               this->module_in_buffers_.end();
+    });
+    if (!ready) {
+        this->logger_->error(
+            "Timeout waiting for pinned weight module: {}", module_name);
+        throw std::runtime_error(
+            "Timeout waiting for pinned weight module: " + module_name);
+    }
+    const auto [module_type, buffer_idx] =
+        this->module_in_buffers_.at(module_name);
+    return this->buffers_.at(module_type).at(buffer_idx);
+}
 
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     const std::string& module_name,

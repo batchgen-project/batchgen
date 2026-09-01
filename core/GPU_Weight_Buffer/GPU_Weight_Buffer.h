@@ -64,6 +64,9 @@ class GPU_Weight_Buffer {
             const std::string& module_name,
             std::string& phase);
 
+    module_weight_tensor_map get_weights_pinned(
+            const std::string& module_name);
+
     void weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
                                int64_t buffer_idx);

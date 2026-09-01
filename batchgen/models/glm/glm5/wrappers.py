@@ -357,6 +357,14 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         self.cached_up = None
         self.cached_down = None
 
+    def load_weights_pinned(self) -> Dict[str, torch.Tensor]:
+        """Wait without the single-expert sliding-window eviction policy.
+
+        Grouped prefill owns all 256 keys until its completion event; evicting
+        an earlier key while acquiring a later expert invalidates that layer.
+        """
+        return self.core_engine.get_weights_pinned(self.module_key)
+
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP8 forward using cached weight tensors directly (no nn.Module delegation)."""
         from batchgen.attention.mla.fa3_backend import w8a16_gemm
