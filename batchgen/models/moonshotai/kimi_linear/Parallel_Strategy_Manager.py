@@ -1115,6 +1115,21 @@ class KimiLinearParallelStrategyManager:
 
         self.model.eval()
         self.model.to(device)
+        if self._is_k3 and torch.cuda.is_available():
+            # The service wall starts at request admission, so neither Triton
+            # compilation nor the 187 per-stage folded score vectors may be a
+            # first-request lazy cost.  Do both before startup completes.
+            from .attn_residual_triton import warmup_attn_residual_triton
+
+            warmup_start = time.perf_counter()
+            num_score_vectors = warmup_attn_residual_triton(self.model.model)
+            if self.rank == 0:
+                logging.info(
+                    "K3 attention-residual Triton mixer prewarmed: %s score "
+                    "vectors in %.1fs",
+                    num_score_vectors,
+                    time.perf_counter() - warmup_start,
+                )
         if self.rank == 0:
             logging.info(
                 f"Kimi-Linear model configured in {time.perf_counter() - start:.1f}s "

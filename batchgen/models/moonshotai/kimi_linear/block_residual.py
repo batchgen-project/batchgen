@@ -67,7 +67,7 @@ def attn_res_score_weight(proj: nn.Linear, norm) -> torch.Tensor:
     return norm.weight.float() * proj.weight.squeeze(0).float()
 
 
-def _apply_attn_res_local(prefix_sum: torch.Tensor,
+def _apply_attn_res_eager(prefix_sum: torch.Tensor,
                           block_residual: torch.Tensor,
                           proj: nn.Linear,
                           norm,
@@ -138,6 +138,29 @@ def _apply_attn_res_local(prefix_sum: torch.Tensor,
         probs = scores.softmax(-1).unsqueeze(1)              # (c, 1, nb+1)
         out[start:end] = torch.matmul(probs, v).squeeze(1).to(out.dtype)
     return out
+
+
+def _apply_attn_res_local(prefix_sum: torch.Tensor,
+                          block_residual: torch.Tensor,
+                          proj: nn.Linear,
+                          norm,
+                          chunk_size: int = 1024) -> torch.Tensor:
+    """Use the fused K3 CUDA mixer when supported, else the eager fallback."""
+    if prefix_sum.is_cuda and not torch.is_grad_enabled():
+        # Lazy import keeps this module torch-only for CPU model and source
+        # tests on machines where Triton is intentionally not installed.
+        from .attn_residual_triton import (
+            mix_attn_residual_triton,
+            supports_attn_residual_triton,
+        )
+
+        if supports_attn_residual_triton(prefix_sum, block_residual):
+            return mix_attn_residual_triton(
+                prefix_sum, block_residual, proj, norm
+            )
+    return _apply_attn_res_eager(
+        prefix_sum, block_residual, proj, norm, chunk_size
+    )
 
 
 def apply_attn_res(prefix_sum: torch.Tensor,
