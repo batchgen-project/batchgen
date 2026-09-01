@@ -38,7 +38,7 @@ import torch.distributed as dist
 
 from batchgen.moe.fused_moe_mxfp4_resident import (
     ResidentEPMXFP4MoELayer,
-    compact_dispatch_max_rows_by_chunk,
+    compact_dispatch_route_stats_by_chunk,
 )
 from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
     MXFP4_GROUP_SIZE,
@@ -1169,7 +1169,7 @@ class StreamedSP8MXFP4MoELayer:
         combined = all_latent.new_empty(
             (num_node_rows, latent_size), dtype=torch.float32
         )
-        packed_max_rows = compact_dispatch_max_rows_by_chunk(
+        packed_route_stats = compact_dispatch_route_stats_by_chunk(
             all_idx,
             expert_start,
             num_local,
@@ -1180,12 +1180,14 @@ class StreamedSP8MXFP4MoELayer:
         ):
             end = min(start + self.chunk_rows, num_node_rows)
             count = end - start
+            packed_max_rows, packed_capacity = packed_route_stats[chunk_index]
             expert_path_span = cls.begin_profile_span() if profile else None
             expert_out, topk_pos = helper._expert_path(
                 all_latent[start:end],
                 all_idx[start:end],
                 count,
-                packed_max_rows=packed_max_rows[chunk_index],
+                packed_capacity=packed_capacity,
+                packed_max_rows=packed_max_rows,
             )
             if profile:
                 cls.end_profile_span(
@@ -1352,17 +1354,20 @@ class StreamedSP8MXFP4MoELayer:
                     0, safe_ids.reshape(-1).to(torch.int64), 1
                 )
 
-            packed_max_rows = compact_dispatch_max_rows_by_chunk(
-                all_idx,
-                expert_start,
-                num_local,
-                num_stripe_rows,
-            )[0]
+            packed_max_rows, packed_capacity = (
+                compact_dispatch_route_stats_by_chunk(
+                    all_idx,
+                    expert_start,
+                    num_local,
+                    num_stripe_rows,
+                )[0]
+            )
             expert_path_span = cls.begin_profile_span() if profile else None
             expert_out, topk_pos = helper._expert_path(
                 all_latent,
                 all_idx,
                 num_stripe_rows,
+                packed_capacity=packed_capacity,
                 packed_max_rows=packed_max_rows,
             )
             if profile:

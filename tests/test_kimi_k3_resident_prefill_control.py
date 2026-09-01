@@ -1565,6 +1565,7 @@ def _mock_sp8_moe_layer(
             x_latent,
             topk_idx,
             count,
+            packed_capacity=None,
             packed_max_rows=None,
         ):
             trace.append(("expert_path", count, tuple(topk_idx.shape)))
@@ -1656,9 +1657,9 @@ def _mock_sp8_moe_layer(
             "time": time,
             "dist": fake_dist,
             "ResidentEPMXFP4MoELayer": FakeHelper,
-            "compact_dispatch_max_rows_by_chunk": _isolated_function(
+            "compact_dispatch_route_stats_by_chunk": _isolated_function(
                 ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py",
-                "compact_dispatch_max_rows_by_chunk",
+                "compact_dispatch_route_stats_by_chunk",
                 {"torch": torch},
             ),
             # The real helper records a CUDA timing event; the mocks run on CPU
@@ -3468,19 +3469,19 @@ def test_packed_compact_dispatch_avoids_per_chunk_host_sync():
         and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
     }
-    assert assignments["capacity"] == "max(num_rows * K, 1)"
+    assert assignments["capacity"] == "max(packed_capacity, 1)"
     assert assignments["max_m_tiles"] == (
         "max((packed_max_rows + 15) // 16, 1)"
     )
     assert assignments["mtp"] == "max(packed_max_rows, 1)"
 
 
-def test_compact_dispatch_plans_all_chunk_bounds_in_one_transfer():
+def test_compact_dispatch_plans_all_chunk_route_stats_in_one_transfer():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     torch = pytest.importorskip("torch")
     plan = _isolated_function(
         path,
-        "compact_dispatch_max_rows_by_chunk",
+        "compact_dispatch_route_stats_by_chunk",
         {"torch": torch},
     )
     topk_idx = torch.tensor(
@@ -3493,7 +3494,7 @@ def test_compact_dispatch_plans_all_chunk_bounds_in_one_transfer():
         ],
         dtype=torch.int32,
     )
-    assert plan(topk_idx, 10, 3, 2) == [2, 2, 1]
+    assert plan(topk_idx, 10, 3, 2) == [[2, 4], [2, 2], [1, 1]]
     assert plan(topk_idx[:0], 10, 3, 2) == []
     with pytest.raises(ValueError, match="chunk_rows"):
         plan(topk_idx, 10, 3, 0)
@@ -3513,7 +3514,10 @@ def test_streamed_packed_dispatch_passes_precomputed_chunk_bounds():
     ]
     assert len(expert_calls) == 2
     assert all(
-        any(keyword.arg == "packed_max_rows" for keyword in call.keywords)
+        {
+            keyword.arg
+            for keyword in call.keywords
+        }.issuperset({"packed_capacity", "packed_max_rows"})
         for call in expert_calls
     )
 

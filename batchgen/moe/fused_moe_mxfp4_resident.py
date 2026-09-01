@@ -95,18 +95,18 @@ def compact_prefill_chunk_rows(num_global, configured_rows):
     return rows
 
 
-def compact_dispatch_max_rows_by_chunk(
+def compact_dispatch_route_stats_by_chunk(
     topk_idx_i32,
     expert_start,
     num_local_experts,
     chunk_rows,
 ):
-    """Read all packed-dispatch tile bounds in one host transfer.
+    """Read packed-dispatch capacities and tile bounds in one host transfer.
 
     Grouped Marlin needs a host-static upper bound on rows per expert. Build
-    exact per-chunk counts on the GPU, then transfer only one scalar per chunk.
-    This keeps the expert loop asynchronous instead of synchronizing once for
-    every chunk.
+    exact per-chunk counts on the GPU, then transfer only the maximum and sum
+    per chunk. This keeps the expert loop asynchronous instead of synchronizing
+    once for every chunk.
     """
     rows = int(topk_idx_i32.shape[0])
     top_k = int(topk_idx_i32.shape[1])
@@ -153,7 +153,11 @@ def compact_dispatch_max_rows_by_chunk(
         bins.reshape(-1),
         minlength=num_chunks * bins_per_chunk,
     ).view(num_chunks, bins_per_chunk)
-    return counts[:, :num_local_experts].amax(dim=1).tolist()
+    local_counts = counts[:, :num_local_experts]
+    return torch.stack(
+        (local_counts.amax(dim=1), local_counts.sum(dim=1)),
+        dim=1,
+    ).tolist()
 
 
 class MXFP4LayerShard:
@@ -451,6 +455,7 @@ class ResidentEPMXFP4MoELayer:
         topk_idx_i32,
         num_rows,
         dispatch_capacity=None,
+        packed_capacity=None,
         packed_max_rows=None,
     ):
         """Dispatch ``num_rows`` latent rows into this rank's local expert shard
@@ -470,24 +475,34 @@ class ResidentEPMXFP4MoELayer:
 
         # --- dispatch latent rows into the expert-ordered activation buffer ---
         if self.compact_dispatch and dispatch_capacity is None:
-            if packed_max_rows is None:
-                planned = compact_dispatch_max_rows_by_chunk(
+            if packed_capacity is None or packed_max_rows is None:
+                if packed_capacity is not None or packed_max_rows is not None:
+                    raise ValueError(
+                        "packed_capacity and packed_max_rows must be supplied "
+                        "together"
+                    )
+                planned = compact_dispatch_route_stats_by_chunk(
                     topk_idx_i32,
                     self.expert_start,
                     E,
                     max(num_rows, 1),
                 )
-                packed_max_rows = planned[0] if planned else 0
+                packed_max_rows, packed_capacity = (
+                    planned[0] if planned else (0, 0)
+                )
+            packed_capacity = int(packed_capacity)
             packed_max_rows = int(packed_max_rows)
+            if packed_capacity < 0 or packed_capacity > num_rows * K:
+                raise ValueError(
+                    f"packed_capacity={packed_capacity} is outside "
+                    f"[0, {num_rows * K}]"
+                )
             if packed_max_rows < 0 or packed_max_rows > num_rows:
                 raise ValueError(
                     f"packed_max_rows={packed_max_rows} is outside "
                     f"[0, {num_rows}]"
                 )
-            # The packed dispatcher writes at most K local assignments per
-            # row. Reserve that deterministic capacity, but retain the exact
-            # per-expert tile bound so grouped Marlin launches only real work.
-            capacity = max(num_rows * K, 1)
+            capacity = max(packed_capacity, 1)
             dispatched = torch.empty(
                 capacity,
                 K_latent,
