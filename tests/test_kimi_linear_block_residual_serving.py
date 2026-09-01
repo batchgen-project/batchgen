@@ -187,7 +187,9 @@ def _drive_serving(kl, hidden_states):
             use_cache=False,
         )
         hidden_states = layer_outputs[0]
-        trace.append((hidden_states, BlockResidualCarrier.peek()))
+        # The next layer is allowed to reuse this owned output as its residual
+        # destination. Preserve the per-layer value for this diagnostic trace.
+        trace.append((hidden_states.clone(), BlockResidualCarrier.peek()))
     return kl.norm(hidden_states), trace
 
 

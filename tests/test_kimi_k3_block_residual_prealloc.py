@@ -263,7 +263,10 @@ def _drive_kimi_linear(layers, out_model, final_norm, x, *, prealloc):
     for layer in layers:
         hidden_states, block_residual = KL.KimiDecoderLayer._forward_attn_residual(
             layer, hidden_states, None, None, None, None, block_residual)
-        trace.append((hidden_states, block_residual))
+        # The production stack owns each previous layer output and may reuse
+        # it as the next layer's residual destination. Snapshot values here;
+        # this trace is test instrumentation, not a production lifetime.
+        trace.append((hidden_states.clone(), block_residual))
     mixed = KL.KimiLinearModel._apply_output_attn_res(
         out_model, hidden_states.view(-1, _HIDDEN), block_residual)
     return trace, mixed, final_norm(mixed)
