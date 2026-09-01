@@ -95,6 +95,67 @@ def compact_prefill_chunk_rows(num_global, configured_rows):
     return rows
 
 
+def compact_dispatch_max_rows_by_chunk(
+    topk_idx_i32,
+    expert_start,
+    num_local_experts,
+    chunk_rows,
+):
+    """Read all packed-dispatch tile bounds in one host transfer.
+
+    Grouped Marlin needs a host-static upper bound on rows per expert. Build
+    exact per-chunk counts on the GPU, then transfer only one scalar per chunk.
+    This keeps the expert loop asynchronous instead of synchronizing once for
+    every chunk.
+    """
+    rows = int(topk_idx_i32.shape[0])
+    top_k = int(topk_idx_i32.shape[1])
+    chunk_rows = int(chunk_rows)
+    num_local_experts = int(num_local_experts)
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+    if num_local_experts <= 0:
+        raise ValueError("num_local_experts must be positive")
+    if rows == 0:
+        return []
+
+    num_chunks = (rows + chunk_rows - 1) // chunk_rows
+    padded_rows = num_chunks * chunk_rows
+    if padded_rows == rows:
+        padded = topk_idx_i32
+    else:
+        padded = torch.full(
+            (padded_rows, top_k),
+            -1,
+            dtype=topk_idx_i32.dtype,
+            device=topk_idx_i32.device,
+        )
+        padded[:rows].copy_(topk_idx_i32)
+
+    local = padded - int(expert_start)
+    local.masked_fill_(
+        (local < 0) | (local >= num_local_experts),
+        num_local_experts,
+    )
+    bins_per_chunk = num_local_experts + 1
+    chunk_base = (
+        torch.arange(
+            num_chunks,
+            dtype=torch.int64,
+            device=topk_idx_i32.device,
+        )
+        * bins_per_chunk
+    ).view(num_chunks, 1, 1)
+    bins = local.to(torch.int64).view(
+        num_chunks, chunk_rows, top_k
+    ) + chunk_base
+    counts = torch.bincount(
+        bins.reshape(-1),
+        minlength=num_chunks * bins_per_chunk,
+    ).view(num_chunks, bins_per_chunk)
+    return counts[:, :num_local_experts].amax(dim=1).tolist()
+
+
 class MXFP4LayerShard:
     """One MoE layer's local expert shard, repacked into marlin tile order once.
 
@@ -390,6 +451,7 @@ class ResidentEPMXFP4MoELayer:
         topk_idx_i32,
         num_rows,
         dispatch_capacity=None,
+        packed_max_rows=None,
     ):
         """Dispatch ``num_rows`` latent rows into this rank's local expert shard
         and run grouped marlin S1(gate+up+SiTU) -> S3(down); returns
@@ -408,12 +470,23 @@ class ResidentEPMXFP4MoELayer:
 
         # --- dispatch latent rows into the expert-ordered activation buffer ---
         if self.compact_dispatch and dispatch_capacity is None:
-            # Keep dispatch entirely asynchronous. Reading exact route counts
-            # to the host here serialized every expert chunk (23,552 times in
-            # the exact64 run). The packed dispatcher writes at most K local
-            # assignments per row, while top-k routing selects any one expert
-            # at most once per row. These deterministic bounds trade bounded
-            # scratch for removing the per-chunk GPU-to-host synchronization.
+            if packed_max_rows is None:
+                planned = compact_dispatch_max_rows_by_chunk(
+                    topk_idx_i32,
+                    self.expert_start,
+                    E,
+                    max(num_rows, 1),
+                )
+                packed_max_rows = planned[0] if planned else 0
+            packed_max_rows = int(packed_max_rows)
+            if packed_max_rows < 0 or packed_max_rows > num_rows:
+                raise ValueError(
+                    f"packed_max_rows={packed_max_rows} is outside "
+                    f"[0, {num_rows}]"
+                )
+            # The packed dispatcher writes at most K local assignments per
+            # row. Reserve that deterministic capacity, but retain the exact
+            # per-expert tile bound so grouped Marlin launches only real work.
             capacity = max(num_rows * K, 1)
             dispatched = torch.empty(
                 capacity,
@@ -445,11 +518,11 @@ class ResidentEPMXFP4MoELayer:
                 )
             )
             expert_starts = expert_offsets[:-1]
-            max_m_tiles = max((num_rows + 15) // 16, 1)
+            max_m_tiles = max((packed_max_rows + 15) // 16, 1)
             # The wrapper uses ``mtp`` only to prove max_m_tiles covers every
             # expert. Packed storage has no shared stride, so its admissible
-            # per-expert bound is one route per input row, not total capacity.
-            mtp = max(num_rows, 1)
+            # per-expert bound is the precomputed exact maximum.
+            mtp = max(packed_max_rows, 1)
         elif dispatch_capacity is not None:
             if not self.compact_dispatch:
                 raise ValueError(

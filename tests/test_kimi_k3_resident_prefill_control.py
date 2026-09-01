@@ -3428,7 +3428,7 @@ def test_compact_resident_prefill_chunks_before_one_all_reduce():
     assert len(bounded_calls) == 1
 
 
-def test_packed_compact_dispatch_avoids_route_count_host_sync():
+def test_packed_compact_dispatch_avoids_per_chunk_host_sync():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     function = _function(path, "ResidentEPMXFP4MoELayer", "_expert_path")
     compact_branch = next(
@@ -3458,8 +3458,53 @@ def test_packed_compact_dispatch_avoids_route_count_host_sync():
         and isinstance(node.targets[0], ast.Name)
     }
     assert assignments["capacity"] == "max(num_rows * K, 1)"
-    assert assignments["max_m_tiles"] == "max((num_rows + 15) // 16, 1)"
-    assert assignments["mtp"] == "max(num_rows, 1)"
+    assert assignments["max_m_tiles"] == (
+        "max((packed_max_rows + 15) // 16, 1)"
+    )
+    assert assignments["mtp"] == "max(packed_max_rows, 1)"
+
+
+def test_compact_dispatch_plans_all_chunk_bounds_in_one_transfer():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    torch = pytest.importorskip("torch")
+    plan = _isolated_function(
+        path,
+        "compact_dispatch_max_rows_by_chunk",
+        {"torch": torch},
+    )
+    topk_idx = torch.tensor(
+        [
+            [10, 11, 99],
+            [10, 12, 99],
+            [11, 11, 99],
+            [9, 99, 99],
+            [12, 99, 99],
+        ],
+        dtype=torch.int32,
+    )
+    assert plan(topk_idx, 10, 3, 2) == [2, 2, 1]
+    assert plan(topk_idx[:0], 10, 3, 2) == []
+    with pytest.raises(ValueError, match="chunk_rows"):
+        plan(topk_idx, 10, 3, 0)
+    with pytest.raises(ValueError, match="num_local_experts"):
+        plan(topk_idx, 10, 0, 2)
+
+
+def test_streamed_packed_dispatch_passes_precomputed_chunk_bounds():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    tree = ast.parse(path.read_text())
+    expert_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_expert_path"
+    ]
+    assert len(expert_calls) == 2
+    assert all(
+        any(keyword.arg == "packed_max_rows" for keyword in call.keywords)
+        for call in expert_calls
+    )
 
 
 def test_compact_resident_prefill_uses_preallocated_output():

@@ -36,7 +36,10 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-from batchgen.moe.fused_moe_mxfp4_resident import ResidentEPMXFP4MoELayer
+from batchgen.moe.fused_moe_mxfp4_resident import (
+    ResidentEPMXFP4MoELayer,
+    compact_dispatch_max_rows_by_chunk,
+)
 from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
     MXFP4_GROUP_SIZE,
     ROUTED_EXPERT_PROJECTIONS,
@@ -1166,7 +1169,15 @@ class StreamedSP8MXFP4MoELayer:
         combined = all_latent.new_empty(
             (num_node_rows, latent_size), dtype=torch.float32
         )
-        for start in range(0, num_node_rows, self.chunk_rows):
+        packed_max_rows = compact_dispatch_max_rows_by_chunk(
+            all_idx,
+            expert_start,
+            num_local,
+            self.chunk_rows,
+        )
+        for chunk_index, start in enumerate(
+            range(0, num_node_rows, self.chunk_rows)
+        ):
             end = min(start + self.chunk_rows, num_node_rows)
             count = end - start
             expert_path_span = cls.begin_profile_span() if profile else None
@@ -1174,6 +1185,7 @@ class StreamedSP8MXFP4MoELayer:
                 all_latent[start:end],
                 all_idx[start:end],
                 count,
+                packed_max_rows=packed_max_rows[chunk_index],
             )
             if profile:
                 cls.end_profile_span(
@@ -1340,11 +1352,18 @@ class StreamedSP8MXFP4MoELayer:
                     0, safe_ids.reshape(-1).to(torch.int64), 1
                 )
 
+            packed_max_rows = compact_dispatch_max_rows_by_chunk(
+                all_idx,
+                expert_start,
+                num_local,
+                num_stripe_rows,
+            )[0]
             expert_path_span = cls.begin_profile_span() if profile else None
             expert_out, topk_pos = helper._expert_path(
                 all_latent,
                 all_idx,
                 num_stripe_rows,
+                packed_max_rows=packed_max_rows,
             )
             if profile:
                 cls.end_profile_span(
