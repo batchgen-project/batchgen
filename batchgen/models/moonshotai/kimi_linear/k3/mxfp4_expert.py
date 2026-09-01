@@ -179,8 +179,10 @@ def repack_mxfp4_to_marlin_device(
 
     Step for step the same rearrangement as the CPU function that the frozen
     oracle gates (``marlin_weight_prep.py:384-440``) — unpack low-nibble-first,
-    transpose to [K, N], marlin tile permute, repack 8 nibbles per int32,
-    transpose + index-permute the E8M0 bytes, expand them EXACTLY to bf16.  It
+    transpose to [K, N], marlin tile permute, repack 8 nibbles per int32, then
+    transpose + index-permute the E8M0 bytes. Optional BF16 expansion is kept
+    for parity fixtures; production passes ``scale_bf16=False`` because the
+    K3 Marlin kernel consumes E8M0 directly. It
     exists only because the CPU one round-trips through ``.cpu().numpy()``,
     which would sync and stall the copy engine on every streamed expert.
 
@@ -192,7 +194,8 @@ def repack_mxfp4_to_marlin_device(
         weight_packed: [N, K//2] uint8, low nibble = even K index.
         weight_scale: [N, K//32] uint8 E8M0.
     Returns:
-        (marlin_qw [K//16, N*2] int32, marlin_s [K//32, N] bf16)
+        (marlin_qw [K//16, N*2] int32,
+         marlin_s [K//32, N] uint8 when ``scale_bf16=False`` else bf16)
     """
     from batchgen.moe.marlin_weight_prep import mxfp4_scale_e8m0_to_bf16
 
@@ -215,15 +218,15 @@ def repack_mxfp4_to_marlin_device(
     q = q.contiguous().view(K // _MARLIN_TILE, N * 8, 2)
     marlin_qw = (q[..., 0] | (q[..., 1] << 4)).contiguous().view(torch.int32)
 
-    # 5. scales: [N, K//32] -> [K//32, N], index-permute, EXACT bf16 expansion
-    #    (a bit shift; mxfp4_scale_e8m0_to_bf16 also rejects the 0x00/0xFF
-    #    edge bytes rather than clamping them).
+    # 5. scales: [N, K//32] -> [K//32, N], index-permute. The optional exact
+    #    BF16 expansion is a bit shift; mxfp4_scale_e8m0_to_bf16 also rejects
+    #    the 0x00/0xFF edge bytes rather than clamping them.
     s = weight_scale.t().contiguous()
     s = s.reshape(-1, scale_perm.numel())[:, scale_perm].reshape(-1, N).contiguous()
     if not scale_bf16:
-        # V1 (task #53): return marlin-order uint8 E8M0; caller runs
-        # mxfp4_scale_e8m0_to_bf16 per-forward. Bit-identical to the bf16
-        # branch after that expansion, by construction (same s).
+        # Return Marlin-order uint8 E8M0 for the production kernel. Expanding
+        # this tensor with mxfp4_scale_e8m0_to_bf16 remains bit-identical to
+        # the legacy BF16 branch by construction (same s).
         return marlin_qw, s
     return marlin_qw, mxfp4_scale_e8m0_to_bf16(s)
 
@@ -263,24 +266,21 @@ class K3MXFP4Projection(nn.Module):
         if K3_ROUTED_EXPERTS_MARLIN:
             # Offline marlin (task #53): the streamed slot already holds
             # marlin bytes, presented under the packed uint8 module_shape
-            # [n_out, k_in//2]. Reinterpret to marlin dims and dequant the
-            # E8M0 scale ONCE -- NO per-forward repack. The slot bytes are
+            # [n_out, k_in//2]. Reinterpret both tensors to Marlin dims; the
+            # kernel consumes E8M0 scale bytes directly. The slot bytes are
             # the exact linear bytes repack_mxfp4_to_marlin_device emits, so
             # the same-linear-order reshape recovers its marlin_qw/scale
             # bit-for-bit (validated: verify_k3_mxfp4_expert repack identity
             # + the gate below). marlin_qw [k_in//16, n_out*2] int32; marlin
-            # scale [k_in//32, n_out] uint8 E8M0 -> bf16.
-            from batchgen.moe.marlin_weight_prep import (
-                mxfp4_scale_e8m0_to_bf16,
-            )
+            # scale [k_in//32, n_out] uint8 E8M0.
             qw = self.weight_packed.data.contiguous().view(
                 torch.int32).reshape(self.k_in // _MARLIN_TILE, self.n_out * 2)
             s = self.weight_scale.data.contiguous().reshape(
                 self.k_in // MXFP4_GROUP_SIZE, self.n_out)
-            return qw, mxfp4_scale_e8m0_to_bf16(s)
+            return qw, s
         return repack_mxfp4_to_marlin_device(
             self.weight_packed.data, self.weight_scale.data,
-            self.k_in, self.n_out,
+            self.k_in, self.n_out, scale_bf16=False,
         )
 
     def extra_repr(self) -> str:

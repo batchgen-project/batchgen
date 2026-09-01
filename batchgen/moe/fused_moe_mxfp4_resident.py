@@ -98,7 +98,7 @@ def compact_prefill_chunk_rows(num_global, configured_rows):
 class MXFP4LayerShard:
     """One MoE layer's local expert shard, repacked into marlin tile order once.
 
-    Holds the resident (marlin_qw int32, marlin_s bf16) tensors for w1/w3/w2 of
+    Holds the resident (marlin_qw int32, marlin_s uint8 E8M0) tensors for w1/w3/w2 of
     every local expert (kept alive so their ``data_ptr()`` stays valid) plus the
     six per-expert int64 pointer arrays the grouped marlin kernels consume.
     """
@@ -162,7 +162,7 @@ def _stage_registration_boundary_packed(packed, scale):
 
 def _repack_projection(packed, scale, device):
     """Repack one MXFP4 projection ([n_out, k_in//pack] uint8 + [n_out, k_in//gs]
-    uint8 E8M0) into (marlin_qw int32, marlin_s bf16). Shapes are inferred from
+    uint8 E8M0) into (marlin_qw int32, marlin_s uint8 E8M0). Shapes are inferred from
     ``packed`` so the same helper serves w1/w3 (n_out=N, k_in=K) and w2
     (n_out=K, k_in=N)."""
     from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
@@ -174,14 +174,13 @@ def _repack_projection(packed, scale, device):
 
     if packed.dtype == torch.int32:
         # Stored marlin (task #53 offline): packed IS marlin_qw int32; scale
-        # IS the marlin-order uint8 E8M0. Direct-copy qw, dequant scale once.
-        from batchgen.moe.marlin_weight_prep import mxfp4_scale_e8m0_to_bf16
+        # IS the marlin-order uint8 E8M0 consumed directly by the K3 kernel.
         packed = _stage_registration_boundary_packed(packed, scale)
-        return packed.to(device), mxfp4_scale_e8m0_to_bf16(scale.to(device))
+        return packed.to(device), scale.to(device)
     n_out = int(packed.shape[0])
     k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
     return repack_mxfp4_to_marlin_device(
-        packed.to(device), scale.to(device), k_in, n_out
+        packed.to(device), scale.to(device), k_in, n_out, scale_bf16=False
     )
 
 

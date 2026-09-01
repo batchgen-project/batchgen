@@ -71,6 +71,13 @@ __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
       :: "r"(smem), "l"(glob_ptr), "n"(BYTES));
 }
 
+__device__ inline void cp_async8(void* smem_ptr, const void* glob_ptr) {
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  // PTX permits 8-byte copies only for the .ca cache operator; .cg is 16B.
+  asm volatile("{\n cp.async.ca.shared.global [%0], [%1], 8;\n}\n"
+      :: "r"(smem), "l"(glob_ptr));
+}
+
 __device__ inline void cp_async_fence() { asm volatile("cp.async.commit_group;\n" ::); }
 
 template <int n>
@@ -140,10 +147,10 @@ __device__ inline void dequant_u4b8(int q, scalar_t2* frag_b) {
 // device flushes it is a 2x PRMT byte-LUT (hi {00,3F,3F,3F,40,40,40,40},
 // lo {00,00,80,C0,00,40,80,C0}) + sign OR.
 //
-// Scales are handled OUTSIDE this function: E8M0 uint8 bytes are expanded to
-// exact bf16 powers of two at repack/fill time (marlin_weight_prep.
-// mxfp4_scale_e8m0_to_bf16), so scale_op and the whole scale SMEM pipeline are
-// reused byte-for-byte. Residual: scale byte 0x01 (2^-126) times a +-0.5 code
+// Scales are handled by fetch_scale_vec/load_scale_vec: Marlin-ordered E8M0
+// bytes are copied asynchronously and expanded to exact BF16 powers of two
+// when their shared-memory vector is consumed, so scale_op remains unchanged.
+// Residual: scale byte 0x01 (2^-126) times a +-0.5 code
 // makes the scale_op PRODUCT itself a bf16 subnormal — unreachable for K3
 // (observed scale floor is 112, and repack hard-fails only 0x00/0xFF), but
 // revisit this if the legal scale window is ever widened toward the bottom.
@@ -178,6 +185,48 @@ __device__ inline void dequant_e2m1(int q, scalar_t2* frag_b) {
 // ----------------------------------------------------------------------------
 enum class WCodec { U4B8, E2M1 };
 enum class Act { SILU, SITU };
+
+// K3 stores Marlin-ordered E8M0 scale bytes directly. Keep the established
+// BF16 shared-memory/fragment contract by expanding each consumed 8-byte
+// vector after its asynchronous global-to-shared copy. Byte e represents
+// 2^(e-127), whose exact BF16 encoding is uint16(e) << 7.
+__device__ inline int4 load_e8m0x8_as_bf16x8(const uint8_t* src) {
+  uint64_t packed = *reinterpret_cast<const uint64_t*>(src);
+  uint32_t lo = static_cast<uint32_t>(packed);
+  uint32_t hi = static_cast<uint32_t>(packed >> 32);
+  int4 out;
+  uint32_t* words = reinterpret_cast<uint32_t*>(&out);
+  words[0] = __byte_perm(lo, 0, 0x4140) << 7;
+  words[1] = __byte_perm(lo, 0, 0x4342) << 7;
+  words[2] = __byte_perm(hi, 0, 0x4140) << 7;
+  words[3] = __byte_perm(hi, 0, 0x4342) << 7;
+  return out;
+}
+
+template <WCodec CODEC>
+__device__ inline void fetch_scale_vec(
+    int4* sh_stage, int sh_logical_vec,
+    const int4* global_scales, int global_logical_vec) {
+  if constexpr (CODEC == WCodec::E2M1) {
+    cp_async8(
+        reinterpret_cast<uint8_t*>(sh_stage) + sh_logical_vec * 8,
+        reinterpret_cast<const uint8_t*>(global_scales) +
+            global_logical_vec * 8);
+  } else {
+    cp_async4(&sh_stage[sh_logical_vec], &global_scales[global_logical_vec]);
+  }
+}
+
+template <WCodec CODEC>
+__device__ inline int4 load_scale_vec(
+    const int4* sh_stage, int sh_logical_vec) {
+  if constexpr (CODEC == WCodec::E2M1) {
+    return load_e8m0x8_as_bf16x8(
+        reinterpret_cast<const uint8_t*>(sh_stage) + sh_logical_vec * 8);
+  } else {
+    return sh_stage[sh_logical_vec];
+  }
+}
 
 template <WCodec CODEC>
 __device__ inline void dequant_w4(int q, scalar_t2* frag_b) {
@@ -757,8 +806,11 @@ __global__ void MarlinGrouped_M16_S1(
       int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 #pragma unroll
       for (int i = 0; i < s_tb_groups; i++) {
-        if (s_sh_wr_pred)
-          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &cur_scales_ptr[s_gl_rd]);
+        if (s_sh_wr_pred) {
+          fetch_scale_vec<CODEC>(
+              sh_s_stage, i * s_sh_stride + threadIdx.x,
+              cur_scales_ptr, s_gl_rd);
+        }
         s_gl_rd += s_gl_stride;
       }
     }
@@ -780,8 +832,8 @@ __global__ void MarlinGrouped_M16_S1(
     int k_blocks = cur_k / 16;
     int cur_group_id = k_blocks / GROUP_BLOCKS;
     int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES);
-    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
-        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] = load_scale_vec<CODEC>(
+        sh_s_stage, s_sh_rd + cur_group_id * s_sh_stride);
   };
 
   auto matmul = [&](int k) {
@@ -1157,8 +1209,11 @@ __global__ void MarlinGrouped_M16(
       int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 #pragma unroll
       for (int i = 0; i < s_tb_groups; i++) {
-        if (s_sh_wr_pred)
-          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &scales_ptr[s_gl_rd]);
+        if (s_sh_wr_pred) {
+          fetch_scale_vec<CODEC>(
+              sh_s_stage, i * s_sh_stride + threadIdx.x,
+              scales_ptr, s_gl_rd);
+        }
         s_gl_rd += s_gl_stride;
       }
     }
@@ -1191,8 +1246,8 @@ __global__ void MarlinGrouped_M16(
     int cur_group_id = k_blocks / GROUP_BLOCKS;
 
     int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES);
-    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
-        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] = load_scale_vec<CODEC>(
+        sh_s_stage, s_sh_rd + cur_group_id * s_sh_stride);
   };
 
   // M16: standard mma_op with two calls per j (separate b0, b1)

@@ -137,7 +137,6 @@ class StreamedSP8LayerBuffer:
         self.local = None
         self.compute = None
         self._cross_status = None
-        self.scale_bf16 = {}
         self._expert_offsets = torch.arange(
             self.experts_per_rank, dtype=torch.int64, device=self.device
         )
@@ -380,13 +379,8 @@ class StreamedSP8LayerBuffer:
             scale_u8 = self.compute[scale_name].view(
                 self.experts_per_rank, k_in // MXFP4_GROUP_SIZE, n_out
             )
-            scale = self.scale_bf16.get(projection)
-            if scale is None or tuple(scale.shape) != tuple(scale_u8.shape):
-                scale = torch.empty_like(scale_u8, dtype=torch.bfloat16)
-                self.scale_bf16[projection] = scale
-            scales[projection] = self._expand_e8m0_into(scale_u8, scale)
+            scales[projection] = scale_u8
 
-        self.scale_bf16 = scales
         return SimpleNamespace(
             num_local=self.experts_per_rank,
             N=self.intermediate_size,
@@ -398,7 +392,7 @@ class StreamedSP8LayerBuffer:
             down_B_ptrs=self._ptrs(packed["w2"]),
             down_scales_ptrs=self._ptrs(scales["w2"]),
             # Keep all storage alive for the grouped kernel pointer arrays.
-            _tensors=(self.compute, self.scale_bf16),
+            _tensors=(self.compute,),
         )
 
     def _wait_pending(self):
@@ -670,16 +664,6 @@ class StreamedSP8LayerBuffer:
                 pending.overwrite_allowed.set()
         self._wait_pending()
         self._prefetch_stream.synchronize()
-
-    @staticmethod
-    def _expand_e8m0_into(
-        scale_u8: torch.Tensor, output: torch.Tensor
-    ) -> torch.Tensor:
-        # Exact bit construction: E8M0 byte e -> BF16 bits uint16(e) << 7.
-        bits = output.view(torch.int16)
-        bits.copy_(scale_u8)
-        bits.bitwise_left_shift_(7)
-        return output
 
     def _ptrs(self, tensor: torch.Tensor) -> torch.Tensor:
         stride_bytes = tensor[0].numel() * tensor.element_size()

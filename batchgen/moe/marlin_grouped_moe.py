@@ -156,7 +156,8 @@ def single_expert_marlin_decode(
 
     Args:
         x: [t, K] BF16 gathered tokens routed to this expert.
-        *_qw / *_scale: the expert's Marlin INT4 packed weights (int32) + BF16 scales.
+        *_qw / *_scale: the expert's Marlin MXFP4 packed weights (int32) +
+            uint8 E8M0 scales.
         N: moe_intermediate_size; K: hidden_size.
     Returns: [t, K] BF16.
     """
@@ -355,17 +356,14 @@ def _check_m_tile_bound(max_m_tiles: int, mtp: int, total_rows: int):
 
 def _check_marlin_mxfp4_tensors(name: str, qw: torch.Tensor, scale: torch.Tensor,
                                 prob_n: int, prob_k: int):
-    """L2 (tensor-visible call sites only): marlin layout + bf16 scales at the
-    kernel boundary. E8M0 bytes must be expanded (exactly) at fill time via
-    marlin_weight_prep.mxfp4_scale_e8m0_to_bf16 — never value-cast."""
+    """L2 (tensor-visible call sites only): marlin layout + raw E8M0 scales."""
     if qw.dtype != torch.int32:
         raise ValueError(
             f"{name}: marlin_qw must be int32 marlin-packed, got {qw.dtype}")
-    if scale.dtype != torch.bfloat16:
+    if scale.dtype != torch.uint8:
         raise ValueError(
-            f"{name}: scale dtype != bf16 at kernel boundary (got {scale.dtype}) "
-            f"— E8M0 uint8 bytes must be expanded exactly at fill "
-            f"(mxfp4_scale_e8m0_to_bf16), never value-cast, never fed raw")
+            f"{name}: scale dtype != uint8 E8M0 at kernel boundary "
+            f"(got {scale.dtype})")
     if tuple(qw.reshape(-1, qw.shape[-1]).shape) != (prob_k // 16, prob_n * 2):
         raise ValueError(
             f"{name}: marlin_qw shape {tuple(qw.shape)} != "
@@ -405,7 +403,7 @@ def marlin_grouped_stage1_fused_mxfp4_situ(
       (K2.5 computes it at plan build; the K3 seam must not trust it).
 
     Pointer arrays must point at tensors produced by
-    marlin_weight_prep.repack_mxfp4_to_marlin_gs32 with bf16 scales at the
+    marlin_weight_prep.repack_mxfp4_to_marlin_gs32 with uint8 E8M0 scales at the
     kernel boundary (L2 is checked at the tensor-visible call sites; the
     checkpoint stamp check L6 is model-side).
 
@@ -495,8 +493,8 @@ def single_expert_marlin_mxfp4_decode(
         gate_qw/up_qw: [K//16, N*2] int32 marlin MXFP4 (from
             repack_mxfp4_to_marlin_gs32); gate = w1, up = w3 (gate-first —
             swapped branches are silent, pinned by the GPU mutation test).
-        gate_scale/up_scale: [K//32, N] bf16 (exact E8M0 expansion).
-        down_qw: [N//16, K*2] int32; down_scale: [N//32, K] bf16.
+        gate_scale/up_scale: [K//32, N] uint8 E8M0.
+        down_qw: [N//16, K*2] int32; down_scale: [N//32, K] uint8 E8M0.
         N: moe_intermediate_size (K3: 3072); K: hidden_size (K3: 3584).
     Returns: [t, K] BF16.
     """

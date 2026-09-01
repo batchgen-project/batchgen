@@ -2538,7 +2538,6 @@ def test_streamed_sp8_make_shard_exposes_only_the_rank_expert_range():
     buffer.experts_per_rank = num_local
     buffer.intermediate_size = intermediate
     buffer.latent_size = latent
-    buffer.scale_bf16 = {}
     buffer.compute = {
         name: torch.zeros((num_local, *shape), dtype=torch.uint8)
         for name, shape in shapes.items()
@@ -2547,16 +2546,12 @@ def test_streamed_sp8_make_shard_exposes_only_the_rank_expert_range():
     buffer._ptrs = _isolated_method(
         path, "StreamedSP8LayerBuffer", "_ptrs", {"torch": torch}
     ).__get__(buffer)
-    # Both of these are ``@staticmethod`` on the real class, so binding them
-    # would shift their arguments.
-    for name in ("_expand_e8m0_into", "_offline_marlin_packed_view"):
-        setattr(
-            buffer,
-            name,
-            _isolated_method(
-                path, "StreamedSP8LayerBuffer", name, {"torch": torch}
-            ),
-        )
+    # This is a ``@staticmethod`` on the real class, so binding it would shift
+    # its arguments.
+    buffer._offline_marlin_packed_view = _isolated_method(
+        path, "StreamedSP8LayerBuffer", "_offline_marlin_packed_view",
+        {"torch": torch},
+    )
     buffer._make_shard = _isolated_method(
         path,
         "StreamedSP8LayerBuffer",
@@ -2587,6 +2582,10 @@ def test_streamed_sp8_make_shard_exposes_only_the_rank_expert_range():
     assert int(shard.gate_B_ptrs[0]) == (
         buffer.compute["w1.weight_packed"].data_ptr()
     )
+    assert int(shard.gate_scales_ptrs[0]) == (
+        buffer.compute["w1.weight_scale"].data_ptr()
+    )
+    assert shard._tensors == (buffer.compute,)
 
 
 def test_streamed_sp8_assembly_is_a_same_rank_copy_and_frees_the_local_shard():

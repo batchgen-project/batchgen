@@ -402,11 +402,10 @@ def repack_mxfp4_to_marlin_gs32(
         N: out_features (K3: 3072 for w1/w3, 3584 for w2)
         emit_scale:
             "e8m0" — carry E8M0 uint8 bytes through (index-permuted only).
-                For SHM/checkpoint storage; expand to bf16 at slot fill with
-                mxfp4_scale_e8m0_to_bf16 before the kernel sees them.
+                This is the K3 Marlin kernel boundary format.
             "bf16" — materialize the EXACT bf16 values 2^(e8-127) here
                 (bit shift, provably lossless; see mxfp4_scale_e8m0_to_bf16).
-                This is the dtype the marlin kernel consumes.
+                Retained for conversion parity and legacy test references.
 
     Returns:
         marlin_qw: [K//16, N*2] int32 — same nibbles, Marlin tile order

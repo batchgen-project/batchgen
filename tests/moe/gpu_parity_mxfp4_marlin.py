@@ -125,8 +125,9 @@ def rand_expert(K, N, seed, half_heavy=False, scale_lo=SCALE_LO, scale_hi=SCALE_
 
 
 def marlinize(packed, scale, K, N):
-    """CPU repack (proven by the CPU suite) -> CUDA marlin tensors, bf16 scales."""
-    qw, s = mwp.repack_mxfp4_to_marlin_gs32(packed, scale, K, N, emit_scale="bf16")
+    """CPU repack -> CUDA Marlin tensors with native uint8 E8M0 scales."""
+    qw, s = mwp.repack_mxfp4_to_marlin_gs32(packed, scale, K, N,
+                                             emit_scale="e8m0")
     return qw.to(DEV), s.to(DEV)
 
 
@@ -283,7 +284,7 @@ def t4_grouped_zero_token():
         p1, s1 = rand_expert(K, N, seed=1000 + e)
         p3, s3 = rand_expert(K, N, seed=2000 + e)
         qw, sc = mwp.repack_mxfp4_w13_to_marlin_gs32(p1, s1, p3, s3, K, N,
-                                                     emit_scale="bf16")
+                                                     emit_scale="e8m0")
         weights.append((qw.to(DEV), sc.to(DEV),
                         dense_expert_bf16(p1, s1), dense_expert_bf16(p3, s3)))
     qw_branch_bytes = weights[0][0][0].numel() * weights[0][0].element_size()
@@ -440,8 +441,9 @@ def t7_wrapper_hardfail_negatives():
     x = torch.randn(t, K, dtype=torch.bfloat16, device=DEV)
     p, s = rand_expert(K, N, seed=701)
     qw, ms = marlinize(p, s, K, N)
-    qw_e8, ms_e8 = mwp.repack_mxfp4_to_marlin_gs32(p, s, K, N)   # e8m0 uint8
-    qw_e8, ms_e8 = qw_e8.to(DEV), ms_e8.to(DEV)
+    qw_bf16, ms_bf16 = mwp.repack_mxfp4_to_marlin_gs32(
+        p, s, K, N, emit_scale="bf16")
+    qw_bf16, ms_bf16 = qw_bf16.to(DEV), ms_bf16.to(DEV)
     pd, sd = rand_expert(N, K, seed=702)
     dqw, dms = marlinize(pd, sd, N, K)
 
@@ -467,8 +469,8 @@ def t7_wrapper_hardfail_negatives():
         mgm.marlin_grouped_stage1_fused_mxfp4_situ(**args)
 
     arms = [
-        ("L2 raw-e8m0-scale-at-kernel", lambda: mgm.single_expert_marlin_mxfp4_decode(
-            x, qw_e8, ms_e8, qw, ms, dqw, dms, N=K3_N, K=K3_K)),
+        ("L2 bf16-scale-at-native-e8m0-kernel", lambda: mgm.single_expert_marlin_mxfp4_decode(
+            x, qw_bf16, ms_bf16, qw, ms, dqw, dms, N=K3_N, K=K3_K)),
         ("L2 wrong-marlin-shape", lambda: mgm.single_expert_marlin_mxfp4_decode(
             x, dqw, dms, qw, ms, dqw, dms, N=K3_N, K=K3_K)),
         ("L3 ptr-array-int32", lambda: fused(gate_B_ptrs=bp.to(torch.int32))),
