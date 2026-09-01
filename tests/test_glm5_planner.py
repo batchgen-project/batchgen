@@ -3,8 +3,6 @@ import types
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 _config_path = Path(__file__).resolve().parents[1] / "batchgen" / "config" / "config.py"
 _config_pkg = types.ModuleType("batchgen.config")
 _config_pkg.__path__ = [str(_config_path.parent)]
@@ -28,9 +26,14 @@ def _plan(world_size: int) -> EngineConfig:
     return GLM5Planner("zai-org/GLM-5-FP8").generate_config(config)
 
 
-def test_glm5_planner_rejects_single_node_full_mode3_plan():
-    with pytest.raises(RuntimeError, match="requires all local MoE experts"):
-        _plan(world_size=8)
+def test_glm5_planner_keeps_full_persistent_single_node_h200_decode():
+    config = _plan(world_size=8)
+
+    assert config.Basic_Config.attn_mode == 3
+    assert config.EP_Config.num_local_expert_per_layer == 32
+    assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 0
+    assert config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"] == 512
+    assert config.GPU_Buffer_Config.num_prefill_module_buffer["shared_expert"] == 2
 
 
 

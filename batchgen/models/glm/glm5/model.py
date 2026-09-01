@@ -2578,7 +2578,7 @@ class Glm5MoE(nn.Module):
         """
         import os as _os_moe
         if (
-            self._prefill_grouped_enabled
+            getattr(self, "_prefill_grouped_enabled", False)
             and _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") != "1"
         ):
             return self._forward_prefill_grouped(hidden_states)
