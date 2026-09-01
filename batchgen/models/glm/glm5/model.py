@@ -48,14 +48,20 @@ from .config import GLM5Config as Glm5Config, dsa_layer_skips_topk
 try:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
         grouped_fp8_blockwise_fused_s1,
+        grouped_fp8_blockwise_fused_s1_ptrs,
         grouped_fp8_blockwise_s3,
+        grouped_fp8_blockwise_s3_ptrs,
+        require_grouped_fp8_blockwise_ptr_kernels,
     )
     _GLM5_HAS_FP8_BLOCKWISE = True
 except ImportError:
     _GLM5_HAS_FP8_BLOCKWISE = False
 
 try:
-    from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
+    from batchgen.moe.dispatch_scatter_3d import (
+        reduce_weighted_scatter,
+        reduce_weighted_scatter_bf16_ordered,
+    )
     _GLM5_HAS_DISPATCH_3D = True
 except ImportError:
     _GLM5_HAS_DISPATCH_3D = False
@@ -66,6 +72,7 @@ from .moe_ragged import (
     dispatch_scatter_ragged as _glm5_dispatch_scatter_ragged,
     make_quant_buffers as _glm5_make_quant_buffers,
     ragged_row_capacity as _glm5_ragged_row_capacity,
+    require_ragged_kernels as _glm5_require_ragged_kernels,
 )
 
 # DEAD as of M1a-2 (compact ragged MoE dispatch): the dispatch/result buffers are
@@ -77,6 +84,8 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
+_GLM5_PREFILL_GROUPED_TOKEN_WINDOW = 16_384
+_GLM5_PREFILL_GROUPED_TILEM_AVG = 64
 
 
 def _debug_flag_enabled(value) -> bool:
@@ -1187,6 +1196,100 @@ class Glm5MoE3DBuffers:
                 self._alloc_row_buffers()
 
 
+class Glm5PrefillMoEBuffers:
+    """Bounded compact workspace shared by all grouped prefill MoE layers."""
+
+    def __init__(
+        self,
+        num_experts: int,
+        token_window: int,
+        hidden_size: int,
+        intermediate_size: int,
+        topk: int,
+        device: torch.device,
+    ):
+        self.num_experts = int(num_experts)
+        self.token_window = int(token_window)
+        self.hidden_size = int(hidden_size)
+        self.intermediate_size = int(intermediate_size)
+        self.topk = int(topk)
+        self.device = device
+        self.capacity = _glm5_ragged_row_capacity(
+            self.token_window, self.topk, self.num_experts
+        )
+
+        self.expert_counts = torch.zeros(
+            self.num_experts, dtype=torch.int32, device=device
+        )
+        self.expert_counters = torch.zeros_like(self.expert_counts)
+        self.cu_seqlens = torch.zeros(
+            self.num_experts + 1, dtype=torch.int32, device=device
+        )
+        self.topk_pos = torch.empty(
+            self.token_window * self.topk, dtype=torch.int32, device=device
+        )
+        self.dispatched_x = torch.empty(
+            self.capacity, self.hidden_size, dtype=torch.bfloat16, device=device
+        )
+        self.intermediate = torch.empty(
+            self.capacity,
+            self.intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.expert_out = torch.empty_like(self.dispatched_x)
+        self.x_fp8, self.x_scale = _glm5_make_quant_buffers(
+            self.capacity, self.hidden_size, device
+        )
+        self.inter_fp8, self.inter_scale = _glm5_make_quant_buffers(
+            self.capacity, self.intermediate_size, device
+        )
+
+        # Device descriptor preparation still runs for every token window, but
+        # its storage is persistent: no allocator calls occur in the MoE loop.
+        self.s1_tma_desc = torch.empty(
+            self.num_experts * 6, 128, dtype=torch.uint8, device=device
+        )
+        self.s3_tma_desc = torch.empty(
+            self.num_experts * 4, 128, dtype=torch.uint8, device=device
+        )
+        self.tiles = torch.empty(
+            self.num_experts, dtype=torch.int32, device=device
+        )
+        self.cu_tiles = torch.empty(
+            self.num_experts + 1, dtype=torch.int32, device=device
+        )
+
+        tensors = (
+            self.expert_counts,
+            self.expert_counters,
+            self.cu_seqlens,
+            self.topk_pos,
+            self.dispatched_x,
+            self.intermediate,
+            self.expert_out,
+            self.x_fp8,
+            self.x_scale,
+            self.inter_fp8,
+            self.inter_scale,
+            self.s1_tma_desc,
+            self.s3_tma_desc,
+            self.tiles,
+            self.cu_tiles,
+        )
+        total_bytes = sum(t.nelement() * t.element_size() for t in tensors)
+        logging.info(
+            "[GLM5_GROUPED_PREFILL] workspace: E=%d window=%d capacity=%d "
+            "H=%d N=%d total=%.2f GiB",
+            self.num_experts,
+            self.token_window,
+            self.capacity,
+            self.hidden_size,
+            self.intermediate_size,
+            total_bytes / (1024**3),
+        )
+
+
 # ============================================================================
 # MoE Layer (Decode with EP) — standalone nn.Module (K2.5 pattern)
 # ============================================================================
@@ -1229,6 +1332,16 @@ class Glm5MoE(nn.Module):
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
     _routed_moe_stream: Optional[torch.cuda.Stream] = None
 
+    # Pure-DP grouped prefill. The 512-slot core-engine ring owns two complete
+    # 256-expert FP8 layers; this class only owns bounded activation/workspace
+    # storage and one reusable pointer table.
+    _prefill_buf: Optional[Glm5PrefillMoEBuffers] = None
+    _prefill_ptrs_pinned: Optional[torch.Tensor] = None
+    _prefill_ptrs_dev: Optional[torch.Tensor] = None
+    _prefill_ring_pending = None  # (completion event, module keys, core engine)
+    _prefill_shared_pending = None  # (completion event, module key, core engine)
+    _prefill_grouped_logged = False
+
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
         super().__init__()
         self.config = config
@@ -1269,6 +1382,72 @@ class Glm5MoE(nn.Module):
         self._moe_cuda_graph_segment = None
         self._moe_cuda_graph_bucketing = None
         self._moe_cuda_graph_required = False
+        self._prefill_grouped_enabled = False
+        self._prefill_prepared_keys = None
+        self._prefill_weight_prototypes = None
+        self._prefill_release_event = None
+        self._prefill_shared_key = None
+        self._prefill_shared_release_event = None
+
+    @classmethod
+    def init_prefill_grouped_buffers(
+        cls,
+        config: Glm5Config,
+        device: torch.device,
+    ) -> None:
+        """Allocate and compile the fixed-window grouped prefill workspace."""
+        if not _GLM5_HAS_FP8_BLOCKWISE or not _GLM5_HAS_DISPATCH_3D:
+            raise RuntimeError(
+                "GLM-5 grouped prefill requires FP8 grouped GEMM and compact "
+                "dispatch/reduce kernels"
+            )
+        require_grouped_fp8_blockwise_ptr_kernels()
+        _glm5_require_ragged_kernels()
+        cls._prefill_buf = Glm5PrefillMoEBuffers(
+            num_experts=config.n_routed_experts,
+            token_window=_GLM5_PREFILL_GROUPED_TOKEN_WINDOW,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            topk=config.num_experts_per_tok,
+            device=device,
+        )
+        cls._prefill_ptrs_pinned = torch.empty(
+            6, config.n_routed_experts, dtype=torch.int64, pin_memory=True
+        )
+        cls._prefill_ptrs_dev = torch.empty(
+            6, config.n_routed_experts, dtype=torch.int64, device=device
+        )
+        cls._prefill_ring_pending = None
+        cls._prefill_shared_pending = None
+        cls._prefill_grouped_logged = False
+
+    @classmethod
+    def retire_prefill_grouped_weights(cls) -> None:
+        """Release the previous layer's ring slots after its CUDA event."""
+        pending = cls._prefill_ring_pending
+        if pending is not None:
+            event, keys, core_engine = pending
+            event.synchronize()
+            for key in keys:
+                core_engine.free_weights_buffer(key)
+            cls._prefill_ring_pending = None
+        shared_pending = cls._prefill_shared_pending
+        if shared_pending is not None:
+            event, key, core_engine = shared_pending
+            event.synchronize()
+            core_engine.free_weights_buffer(key)
+            cls._prefill_shared_pending = None
+
+    @classmethod
+    def reset_prefill_grouped_state(cls) -> None:
+        """Retire live slots, then drop prefill-only HBM before a phase flip."""
+        cls.retire_prefill_grouped_weights()
+        cls._prefill_buf = None
+        cls._prefill_ptrs_pinned = None
+        cls._prefill_ptrs_dev = None
+        cls._prefill_ring_pending = None
+        cls._prefill_shared_pending = None
+        cls._prefill_grouped_logged = False
 
     # ── Token count management (called by PSM) ──
 
@@ -2166,6 +2345,225 @@ class Glm5MoE(nn.Module):
     def shared_expert_forward(self, identity: torch.Tensor) -> torch.Tensor:
         return self.shared_experts(identity)
 
+    def _prefill_prepare_weights(self) -> None:
+        """Acquire one full FP8 expert layer from the async core-engine ring."""
+        if not self._prefill_grouped_enabled:
+            return
+        if getattr(self.config, "phase", "decode") == "decode":
+            return
+        if self._prefill_prepared_keys is not None:
+            return
+
+        cls = type(self)
+        if (
+            cls._prefill_buf is None
+            or cls._prefill_ptrs_pinned is None
+            or cls._prefill_ptrs_dev is None
+        ):
+            raise RuntimeError(
+                "GLM-5 grouped prefill is enabled without initialized workspace"
+            )
+
+        cls.retire_prefill_grouped_weights()
+        stage = cls._prefill_ptrs_pinned
+        keys = []
+        prototypes = None
+        core_engine = self.experts[0].core_engine
+        shared_key = None
+        try:
+            for expert_idx, expert in enumerate(self.experts):
+                if expert.persistent or not expert.is_fp8:
+                    raise RuntimeError(
+                        "GLM-5 grouped prefill requires every routed expert to "
+                        "be nonpersistent FP8"
+                    )
+                weights = expert.load_weights(expert.module_key)
+                gate = weights["gate_proj.weight"]
+                up = weights["up_proj.weight"]
+                down = weights["down_proj.weight"]
+                gate_scale = expert.weight_dequant_scale[
+                    "gate_proj.weight_scale_inv"
+                ]
+                up_scale = expert.weight_dequant_scale[
+                    "up_proj.weight_scale_inv"
+                ]
+                down_scale = expert.weight_dequant_scale[
+                    "down_proj.weight_scale_inv"
+                ]
+                stage[0, expert_idx] = gate.data_ptr()
+                stage[1, expert_idx] = gate_scale.data_ptr()
+                stage[2, expert_idx] = up.data_ptr()
+                stage[3, expert_idx] = up_scale.data_ptr()
+                stage[4, expert_idx] = down.data_ptr()
+                stage[5, expert_idx] = down_scale.data_ptr()
+                keys.append(expert.module_key)
+                if prototypes is None:
+                    prototypes = (
+                        gate,
+                        gate_scale,
+                        up,
+                        up_scale,
+                        down,
+                        down_scale,
+                    )
+
+            shared = self.shared_experts
+            if shared.persistent or not shared.is_fp8:
+                raise RuntimeError(
+                    "GLM-5 grouped prefill requires a nonpersistent FP8 shared expert"
+                )
+            shared_weights = shared.load_weights(shared.module_key)
+            shared.cached_gate = shared_weights["gate_proj.weight"]
+            shared.cached_up = shared_weights["up_proj.weight"]
+            shared.cached_down = shared_weights["down_proj.weight"]
+            shared_key = shared.module_key
+            cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
+        except Exception:
+            for key in keys:
+                core_engine.free_weights_buffer(key)
+            if shared_key is not None:
+                self.shared_experts.core_engine.free_weights_buffer(shared_key)
+            raise
+
+        self._prefill_prepared_keys = keys
+        self._prefill_weight_prototypes = prototypes
+        self._prefill_shared_key = shared_key
+
+    @torch.inference_mode()
+    def _forward_prefill_grouped(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run all 256 routed experts through compact pointer-array GEMMs."""
+        cls = type(self)
+        if self._prefill_prepared_keys is None:
+            self._prefill_prepare_weights()
+        keys = self._prefill_prepared_keys
+        prototypes = self._prefill_weight_prototypes
+        if keys is None or prototypes is None:
+            raise RuntimeError("GLM-5 grouped prefill weights were not prepared")
+
+        buf = cls._prefill_buf
+        ptrs = cls._prefill_ptrs_dev
+        if buf is None or ptrs is None:
+            raise RuntimeError("GLM-5 grouped prefill workspace was released")
+
+        orig_shape = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens, hidden_size = hidden_flat.shape
+        topk = self.num_experts_per_tok
+        topk_weights, topk_indices = self.gate(hidden_flat)
+        topk_indices_i32 = topk_indices.to(torch.int32)
+        output = torch.empty_like(hidden_flat)
+
+        gate_w, gate_scale, up_w, up_scale, down_w, down_scale = prototypes
+        for start in range(0, num_tokens, buf.token_window):
+            end = min(start + buf.token_window, num_tokens)
+            window_tokens = end - start
+            counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
+                hidden_flat[start:end],
+                topk_indices_i32[start:end],
+                buf.dispatched_x,
+                0,
+                buf.num_experts,
+                buf.expert_counts,
+                buf.expert_counters,
+                buf.cu_seqlens,
+                buf.topk_pos[: window_tokens * topk],
+            )
+            _glm5_act_quant_ragged(
+                buf.dispatched_x,
+                counts,
+                cu_seqlens,
+                buf.x_fp8,
+                buf.x_scale,
+            )
+            grouped_fp8_blockwise_fused_s1_ptrs(
+                buf.x_fp8.view(torch.float8_e4m3fn),
+                buf.x_scale,
+                gate_w,
+                ptrs[0],
+                up_w,
+                ptrs[2],
+                gate_scale,
+                ptrs[1],
+                up_scale,
+                ptrs[3],
+                counts,
+                cu_seqlens,
+                _GLM5_PREFILL_GROUPED_TILEM_AVG,
+                output=buf.intermediate,
+                tma_desc=buf.s1_tma_desc,
+                tiles=buf.tiles,
+                cu_tiles=buf.cu_tiles,
+            )
+            _glm5_act_quant_ragged(
+                buf.intermediate,
+                counts,
+                cu_seqlens,
+                buf.inter_fp8,
+                buf.inter_scale,
+            )
+            grouped_fp8_blockwise_s3_ptrs(
+                buf.inter_fp8.view(torch.float8_e4m3fn),
+                buf.inter_scale,
+                down_w,
+                ptrs[4],
+                down_scale,
+                ptrs[5],
+                counts,
+                cu_seqlens,
+                _GLM5_PREFILL_GROUPED_TILEM_AVG,
+                output=buf.expert_out,
+                tma_desc=buf.s3_tma_desc,
+                tiles=buf.tiles,
+                cu_tiles=buf.cu_tiles,
+            )
+            reduce_weighted_scatter_bf16_ordered(
+                buf.expert_out,
+                topk_pos,
+                topk_indices_i32[start:end],
+                topk_weights[start:end],
+                window_tokens,
+                hidden_size,
+                topk,
+                output=output[start:end],
+            )
+
+        if self._prefill_release_event is None:
+            self._prefill_release_event = torch.cuda.Event()
+        self._prefill_release_event.record(torch.cuda.current_stream(self.device))
+        cls._prefill_ring_pending = (
+            self._prefill_release_event,
+            keys,
+            self.experts[0].core_engine,
+        )
+        self._prefill_prepared_keys = None
+        self._prefill_weight_prototypes = None
+
+        shared = self.shared_experts
+        shared_output = shared._forward_impl(hidden_flat)
+        if self._prefill_shared_release_event is None:
+            self._prefill_shared_release_event = torch.cuda.Event()
+        self._prefill_shared_release_event.record(
+            torch.cuda.current_stream(self.device)
+        )
+        cls._prefill_shared_pending = (
+            self._prefill_shared_release_event,
+            self._prefill_shared_key,
+            shared.core_engine,
+        )
+        self._prefill_shared_key = None
+        shared.cached_gate = shared.cached_up = shared.cached_down = None
+
+        if not cls._prefill_grouped_logged:
+            cls._prefill_grouped_logged = True
+            logging.info(
+                "[GLM5_GROUPED_PREFILL] active: E=%d window=%d chunks=%d "
+                "pointer_table=device grouped_s1+s3 ordered_bf16_reduce",
+                buf.num_experts,
+                buf.token_window,
+                (num_tokens + buf.token_window - 1) // buf.token_window,
+            )
+        return (output + shared_output).view(*orig_shape)
+
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill: per-expert loop (no EP).
 
@@ -2179,6 +2577,11 @@ class Glm5MoE(nn.Module):
         size synchronization for every indexed tensor.
         """
         import os as _os_moe
+        if (
+            self._prefill_grouped_enabled
+            and _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") != "1"
+        ):
+            return self._forward_prefill_grouped(hidden_states)
         _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
@@ -2360,10 +2763,20 @@ class Glm5DecoderLayer(nn.Module):
         # self_attn is the GLM5AttnWrapper; the config (with .phase) lives on
         # the wrapped module.
         _attn_cfg = getattr(getattr(self.self_attn, 'module', self.self_attn), 'config', None)
-        dt = (get_decode_timer()
-              if getattr(_attn_cfg, 'phase', 'decode') == 'decode'
-              else None)
+        _is_decode = getattr(_attn_cfg, 'phase', 'decode') == 'decode'
+        dt = get_decode_timer() if _is_decode else None
         li = self.layer_idx
+
+        # Acquire this layer's full 256-expert pointer table at layer entry,
+        # while the GPU may still be draining layer L-1. Retiring L-1 here
+        # releases ring slots early enough for the core-engine H2D worker to
+        # fill layer L+1 while this layer's attention runs.
+        if (
+            not _is_decode
+            and isinstance(self.mlp, Glm5MoE)
+            and self.mlp._prefill_grouped_enabled
+        ):
+            self.mlp._prefill_prepare_weights()
 
         # Pre-norm attention
         residual = hidden_states
@@ -2392,6 +2805,14 @@ class Glm5DecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
         with (dt.timed("residual_add", li) if dt else _nullctx()):
             hidden_states = residual + hidden_states
+
+        if (
+            not _is_decode
+            and isinstance(self.mlp, Glm5MoE)
+            and self.mlp._prefill_grouped_enabled
+            and self.layer_idx == self.mlp.config.num_hidden_layers - 1
+        ):
+            Glm5MoE.retire_prefill_grouped_weights()
 
         return hidden_states, attn_weights, present
 

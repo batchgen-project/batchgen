@@ -370,7 +370,10 @@ torch::Tensor fp8_blockwise_grouped_gemm_ptrs(
     const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale,
     const torch::Tensor &w_scale_prototype, const torch::Tensor &w_scale_ptrs,
     const int64_t num_seq_per_group_avg,
-    std::optional<torch::Tensor> output) {
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> tma_desc,
+    std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x must be on CUDA");
   TORCH_CHECK(weight_prototype.device().is_cuda(),
@@ -408,11 +411,30 @@ torch::Tensor fp8_blockwise_grouped_gemm_ptrs(
   torch::Tensor y = output.has_value()
                         ? output.value()
                         : torch::empty({m, n}, x.options().dtype(torch::kBFloat16));
-  torch::Tensor tmas = torch::empty({num_group * 4, 128}, x.options());
-  torch::Tensor tiles =
-      torch::empty({num_group}, x.options().dtype(torch::kInt32));
-  torch::Tensor cu_tiles =
-      torch::empty({num_group + 1}, x.options().dtype(torch::kInt32));
+  torch::Tensor tmas = tma_desc.has_value()
+                           ? tma_desc.value()
+                           : torch::empty({num_group * 4, 128}, x.options());
+  torch::Tensor tiles = tiles_workspace.has_value()
+                            ? tiles_workspace.value()
+                            : torch::empty(
+                                  {num_group}, x.options().dtype(torch::kInt32));
+  torch::Tensor cu_tiles = cu_tiles_workspace.has_value()
+                               ? cu_tiles_workspace.value()
+                               : torch::empty(
+                                     {num_group + 1},
+                                     x.options().dtype(torch::kInt32));
+  TORCH_CHECK(tmas.device().is_cuda() && tmas.is_contiguous() &&
+                  tmas.element_size() == 1 &&
+                  tmas.numel() >= num_group * 4 * 128,
+              "tma_desc must be contiguous CUDA byte storage for 4E descriptors");
+  TORCH_CHECK(tiles.device().is_cuda() && tiles.is_contiguous() &&
+                  tiles.scalar_type() == torch::kInt32 &&
+                  tiles.numel() >= num_group,
+              "tiles workspace must be contiguous CUDA int32[E]");
+  TORCH_CHECK(cu_tiles.device().is_cuda() && cu_tiles.is_contiguous() &&
+                  cu_tiles.scalar_type() == torch::kInt32 &&
+                  cu_tiles.numel() >= num_group + 1,
+              "cu_tiles workspace must be contiguous CUDA int32[E+1]");
 
   fp8_blockwise_grouped_gemm_ptrs_async(
       y.mutable_data_ptr(), x.const_data_ptr(),
@@ -774,7 +796,10 @@ torch::Tensor fp8_blockwise_fused_s1_ptrs(
     const torch::Tensor &up_w_scale_prototype,
     const torch::Tensor &up_w_scale_ptrs,
     const int64_t num_seq_per_group_avg,
-    std::optional<torch::Tensor> output) {
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> tma_desc,
+    std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x must be on CUDA");
   TORCH_CHECK(gate_weight_prototype.device().is_cuda() &&
@@ -819,11 +844,30 @@ torch::Tensor fp8_blockwise_fused_s1_ptrs(
   torch::Tensor y = output.has_value()
                         ? output.value()
                         : torch::empty({m, n}, x.options().dtype(torch::kBFloat16));
-  torch::Tensor tmas = torch::empty({num_group * 6, 128}, x.options());
-  torch::Tensor tiles =
-      torch::empty({num_group}, x.options().dtype(torch::kInt32));
-  torch::Tensor cu_tiles =
-      torch::empty({num_group + 1}, x.options().dtype(torch::kInt32));
+  torch::Tensor tmas = tma_desc.has_value()
+                           ? tma_desc.value()
+                           : torch::empty({num_group * 6, 128}, x.options());
+  torch::Tensor tiles = tiles_workspace.has_value()
+                            ? tiles_workspace.value()
+                            : torch::empty(
+                                  {num_group}, x.options().dtype(torch::kInt32));
+  torch::Tensor cu_tiles = cu_tiles_workspace.has_value()
+                               ? cu_tiles_workspace.value()
+                               : torch::empty(
+                                     {num_group + 1},
+                                     x.options().dtype(torch::kInt32));
+  TORCH_CHECK(tmas.device().is_cuda() && tmas.is_contiguous() &&
+                  tmas.element_size() == 1 &&
+                  tmas.numel() >= num_group * 6 * 128,
+              "tma_desc must be contiguous CUDA byte storage for 6E descriptors");
+  TORCH_CHECK(tiles.device().is_cuda() && tiles.is_contiguous() &&
+                  tiles.scalar_type() == torch::kInt32 &&
+                  tiles.numel() >= num_group,
+              "tiles workspace must be contiguous CUDA int32[E]");
+  TORCH_CHECK(cu_tiles.device().is_cuda() && cu_tiles.is_contiguous() &&
+                  cu_tiles.scalar_type() == torch::kInt32 &&
+                  cu_tiles.numel() >= num_group + 1,
+              "cu_tiles workspace must be contiguous CUDA int32[E+1]");
   fp8_blockwise_fused_s1_ptrs_async(
       y.mutable_data_ptr(), x.const_data_ptr(),
       gate_weight_prototype.const_data_ptr(), gate_weight_ptrs.const_data_ptr(),
@@ -853,7 +897,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("weight_prototype"), py::arg("weight_ptrs"),
         py::arg("seqlens"), py::arg("cu_seqlens"), py::arg("x_scale"),
         py::arg("w_scale_prototype"), py::arg("w_scale_ptrs"),
-        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none());
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none(),
+        py::arg("tma_desc") = py::none(), py::arg("tiles") = py::none(),
+        py::arg("cu_tiles") = py::none());
   m.def("fp8_blockwise_fused_s1",
         &batchgen::moe::fp8_blockwise_fused_s1,
         "FP8 blockwise fused S1: gate+up+SiLU (CuTe persistent 3-WG, v19)",
@@ -870,5 +916,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("cu_seqlens"), py::arg("x_scale"),
         py::arg("gate_w_scale_prototype"), py::arg("gate_w_scale_ptrs"),
         py::arg("up_w_scale_prototype"), py::arg("up_w_scale_ptrs"),
-        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none());
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none(),
+        py::arg("tma_desc") = py::none(), py::arg("tiles") = py::none(),
+        py::arg("cu_tiles") = py::none());
 }

@@ -68,6 +68,7 @@ class GLM5ParallelStrategyManager:
         timings = {}
 
         self.loaded_model_config.phase = "prefill"
+        Glm5MoE.reset_prefill_grouped_state()
 
         step_start = time.perf_counter()
         self.model = Glm5ForCausalLM(self.loaded_model_config)
@@ -148,6 +149,28 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
+        if self.is_fp8_experts:
+            grouped_layers = [
+                layer.mlp
+                for layer in self.model.model.layers[self.FIRST_K_DENSE :]
+                if isinstance(layer.mlp, Glm5MoE)
+                and layer.mlp._prefill_grouped_enabled
+            ]
+            expected_layers = (
+                self.model_config.num_hidden_layers - self.FIRST_K_DENSE
+            )
+            if len(grouped_layers) != expected_layers:
+                raise RuntimeError(
+                    "GLM-5 FP8 prefill requires grouped full-offload MoE on "
+                    f"all {expected_layers} routed layers; got {len(grouped_layers)}"
+                )
+            Glm5MoE.init_prefill_grouped_buffers(
+                self.loaded_model_config,
+                self.engine_config.Basic_Config.device_torch,
+            )
+            for moe in grouped_layers:
+                moe._prefill_release_event = torch.cuda.Event()
+                moe._prefill_shared_release_event = torch.cuda.Event()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
@@ -161,6 +184,7 @@ class GLM5ParallelStrategyManager:
 
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""
+        Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
         self.model = None
@@ -556,6 +580,13 @@ class GLM5ParallelStrategyManager:
                 # Only register weights for experts that had weights loaded
                 if persistent and routed_key in local_set:
                     layer.mlp.experts[expert_idx]._register_fp8_weights()
+
+            layer.mlp._prefill_grouped_enabled = (
+                getattr(self.loaded_model_config, "phase", "decode") == "prefill"
+                and self.is_fp8_experts
+                and not layer.mlp.shared_experts.persistent
+                and all(not expert.persistent for expert in layer.mlp.experts)
+            )
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Expert module config time: {elapsed:.2f}s")

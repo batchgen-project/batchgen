@@ -109,6 +109,23 @@ def _get_fused_s1_ptrs_kernel():
     return kernel
 
 
+def require_grouped_fp8_blockwise_ptr_kernels():
+    """Load and validate both pointer-array grouped FP8 entry points."""
+    grouped = _get_ptrs_kernel()
+    fused_s1 = _get_fused_s1_ptrs_kernel()
+    if grouped is None or fused_s1 is None:
+        missing = []
+        if grouped is None:
+            missing.append("fp8_blockwise_grouped_gemm_ptrs")
+        if fused_s1 is None:
+            missing.append("fp8_blockwise_fused_s1_ptrs")
+        raise RuntimeError(
+            "FP8 pointer-array grouped kernels are incomplete: "
+            + ", ".join(missing)
+        )
+    return grouped, fused_s1
+
+
 def grouped_fp8_blockwise_gemm(
     x_fp8: Tensor,
     weight_3d: Tensor,
@@ -167,6 +184,9 @@ def grouped_fp8_blockwise_gemm_ptrs(
     w_scale_ptrs: Tensor,
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
 ) -> Tensor:
     """Grouped FP8 GEMM over independent core-engine weight allocations.
 
@@ -194,6 +214,9 @@ def grouped_fp8_blockwise_gemm_ptrs(
         w_scale_ptrs,
         num_seq_per_group_avg,
         output,
+        tma_desc,
+        tiles,
+        cu_tiles,
     )
 
 
@@ -320,6 +343,9 @@ def grouped_fp8_blockwise_fused_s1_ptrs(
     cu_seqlens: Tensor,
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
 ) -> Tensor:
     """Fused gate+up+SiLU over streamed expert pointer arrays."""
     kernel = _get_fused_s1_ptrs_kernel()
@@ -345,6 +371,9 @@ def grouped_fp8_blockwise_fused_s1_ptrs(
         up_scale_ptrs,
         num_seq_per_group_avg,
         output,
+        tma_desc,
+        tiles,
+        cu_tiles,
     )
 
 
@@ -393,6 +422,9 @@ def grouped_fp8_blockwise_s3_ptrs(
     cu_seqlens: Tensor,
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
 ) -> Tensor:
     """S3 down projection for streamed, independently allocated experts."""
     return grouped_fp8_blockwise_gemm_ptrs(
@@ -406,4 +438,7 @@ def grouped_fp8_blockwise_s3_ptrs(
         down_scale_ptrs,
         num_seq_per_group_avg,
         output=output,
+        tma_desc=tma_desc,
+        tiles=tiles,
+        cu_tiles=cu_tiles,
     )

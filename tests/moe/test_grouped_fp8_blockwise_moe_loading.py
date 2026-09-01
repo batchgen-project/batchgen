@@ -132,7 +132,7 @@ def test_pointer_array_wrapper_forwards_exact_abi(fp8_moe, monkeypatch):
         )
         == "result"
     )
-    assert calls == [(*args, 64, output)]
+    assert calls == [(*args, 64, output, None, None, None)]
 
 
 def test_pointer_array_fused_s1_forwards_exact_abi(fp8_moe, monkeypatch):
@@ -162,9 +162,50 @@ def test_pointer_array_fused_s1_forwards_exact_abi(fp8_moe, monkeypatch):
     expected = (
         args[0], args[2], args[3], args[4], args[5],
         args[10], args[11], args[1], args[6], args[7], args[8], args[9],
-        64, output,
+        64, output, None, None, None,
     )
     assert calls == [expected]
+
+
+def test_pointer_array_wrapper_forwards_persistent_workspace(fp8_moe, monkeypatch):
+    calls = []
+
+    def ptrs_kernel(*args):
+        calls.append(args)
+        return "result"
+
+    extension = SimpleNamespace(fp8_blockwise_grouped_gemm_ptrs=ptrs_kernel)
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels",
+        SimpleNamespace(load_extension=lambda _name: extension),
+    )
+    args = tuple(object() for _ in range(8))
+    output, tma_desc, tiles, cu_tiles = (object() for _ in range(4))
+
+    assert fp8_moe.grouped_fp8_blockwise_gemm_ptrs(
+        *args,
+        64,
+        output=output,
+        tma_desc=tma_desc,
+        tiles=tiles,
+        cu_tiles=cu_tiles,
+    ) == "result"
+    assert calls == [(*args, 64, output, tma_desc, tiles, cu_tiles)]
+
+
+def test_require_pointer_kernels_fails_if_either_symbol_is_missing(
+    fp8_moe, monkeypatch
+):
+    extension = SimpleNamespace(fp8_blockwise_grouped_gemm_ptrs=object())
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels",
+        SimpleNamespace(load_extension=lambda _name: extension),
+    )
+
+    with pytest.raises(RuntimeError, match="fp8_blockwise_fused_s1_ptrs"):
+        fp8_moe.require_grouped_fp8_blockwise_ptr_kernels()
 
 
 def test_missing_fused_symbol_preserves_unfused_allocating_fallback(

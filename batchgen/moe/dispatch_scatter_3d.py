@@ -115,3 +115,37 @@ def reduce_weighted_scatter(
     return mod.reduce_weighted_scatter(
         expert_output, topk_pos, topk_weights, N, H, K, output,
     )
+
+
+def reduce_weighted_scatter_bf16_ordered(
+    expert_output: torch.Tensor,
+    topk_pos: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    N: int,
+    H: int,
+    K: int,
+    output: torch.Tensor = None,
+) -> torch.Tensor:
+    """Reduce in ascending expert order with BF16 rounding at every add."""
+    mod = _load_dispatch_reduce_module()
+    kernel = getattr(mod, "reduce_weighted_scatter_bf16_ordered", None)
+    if kernel is None:
+        raise RuntimeError(
+            "dispatch_scatter_3d extension lacks "
+            "reduce_weighted_scatter_bf16_ordered"
+        )
+    if output is None:
+        output = torch.empty(
+            N, H, dtype=torch.bfloat16, device=expert_output.device
+        )
+    return kernel(
+        expert_output,
+        topk_pos,
+        topk_indices,
+        topk_weights,
+        N,
+        H,
+        K,
+        output,
+    )

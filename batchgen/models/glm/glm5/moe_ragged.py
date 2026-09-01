@@ -103,6 +103,17 @@ def _require_ops_module():
     return mod
 
 
+def require_ragged_kernels():
+    """Load both compact dispatch/reduce and FP8 quantization extensions."""
+    dispatch = _require_dispatch_module()
+    if not hasattr(dispatch, "reduce_weighted_scatter_bf16_ordered"):
+        raise RuntimeError(
+            "batchgen_kernels.moe._C_dispatch_scatter_3d has no "
+            "`reduce_weighted_scatter_bf16_ordered`"
+        )
+    return dispatch, _require_ops_module()
+
+
 def ragged_row_capacity(max_global_tokens: int, topk: int, num_local_experts: int) -> int:
     """Static worst-case row count of the compact dispatch buffer.
 

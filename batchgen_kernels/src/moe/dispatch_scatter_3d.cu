@@ -375,6 +375,102 @@ torch::Tensor reduce_weighted_scatter(
     return output;
 }
 
+template <int K>
+__global__ void reduce_weighted_scatter_bf16_ordered_kernel(
+    const __nv_bfloat16* __restrict__ expert_output,
+    const int32_t* __restrict__ topk_pos,
+    const int32_t* __restrict__ topk_indices,
+    const float* __restrict__ topk_weights,
+    __nv_bfloat16* __restrict__ output,
+    int N, int H
+) {
+    const int token_idx = blockIdx.x;
+    const int h_offset = blockIdx.y * BLOCK_H + threadIdx.x;
+    if (token_idx >= N || h_offset >= H) return;
+
+    int32_t expert[K];
+    int32_t pos[K];
+    float weight[K];
+    const int topk_base = token_idx * K;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+        expert[k] = topk_indices[topk_base + k];
+        pos[k] = topk_pos[topk_base + k];
+        weight[k] = topk_weights[topk_base + k];
+    }
+
+    // The reference prefill visits experts in ascending expert-id order and
+    // rounds both each weighted contribution and each index_add_ update to
+    // BF16. Preserve that order while computing all top-K slots in one kernel.
+    #pragma unroll
+    for (int i = 1; i < K; ++i) {
+        int32_t expert_i = expert[i];
+        int32_t pos_i = pos[i];
+        float weight_i = weight[i];
+        int j = i - 1;
+        while (j >= 0 && expert[j] > expert_i) {
+            expert[j + 1] = expert[j];
+            pos[j + 1] = pos[j];
+            weight[j + 1] = weight[j];
+            --j;
+        }
+        expert[j + 1] = expert_i;
+        pos[j + 1] = pos_i;
+        weight[j + 1] = weight_i;
+    }
+
+    __nv_bfloat16 acc = __float2bfloat16(0.0f);
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+        if (pos[k] >= 0) {
+            __nv_bfloat16 value =
+                expert_output[(int64_t)pos[k] * H + h_offset];
+            __nv_bfloat16 w_bf16 = __float2bfloat16(weight[k]);
+            __nv_bfloat16 weighted = __float2bfloat16(
+                __bfloat162float(value) * __bfloat162float(w_bf16));
+            acc = __float2bfloat16(
+                __bfloat162float(acc) + __bfloat162float(weighted));
+        }
+    }
+    output[(int64_t)token_idx * H + h_offset] = acc;
+}
+
+torch::Tensor reduce_weighted_scatter_bf16_ordered(
+    torch::Tensor expert_output, torch::Tensor topk_pos,
+    torch::Tensor topk_indices, torch::Tensor topk_weights,
+    int64_t N, int64_t H, int64_t K, torch::Tensor output
+) {
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32,
+                "topk_indices must be int32");
+    if (!output.defined() || output.numel() == 0) {
+        output = torch::empty(
+            {N, H},
+            torch::dtype(torch::kBFloat16).device(expert_output.device()));
+    }
+    dim3 grid(N, (H + BLOCK_H - 1) / BLOCK_H);
+    dim3 block(BLOCK_H);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    switch (K) {
+        case 2: reduce_weighted_scatter_bf16_ordered_kernel<2><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), N, H); break;
+        case 4: reduce_weighted_scatter_bf16_ordered_kernel<4><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), N, H); break;
+        case 8: reduce_weighted_scatter_bf16_ordered_kernel<8><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), N, H); break;
+        default: TORCH_CHECK(false, "Unsupported K=", K);
+    }
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_scatter_3d", &dispatch_scatter_3d,
           "3D dispatch scatter for strided MoE buffer layout");
@@ -383,4 +479,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "returns device cu_seqlens)");
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter,
           "Weighted reduce scatter from 3D to flat layout");
+    m.def("reduce_weighted_scatter_bf16_ordered",
+          &reduce_weighted_scatter_bf16_ordered,
+          "BF16 expert-order reduce scatter matching GLM-5 prefill semantics");
 }
