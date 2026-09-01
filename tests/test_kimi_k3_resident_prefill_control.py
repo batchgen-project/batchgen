@@ -3804,6 +3804,63 @@ def test_worker_counts_the_same_prefill_plan_that_execution_uses():
     assert calls_plan(execute) == 1
 
 
+def test_streamed_prefill_releases_phase_inactive_resident_decode_shards():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    trace = []
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(empty_cache=lambda: trace.append("empty_cache"))
+    )
+    fake_logging = SimpleNamespace(info=lambda *args: trace.append("log"))
+    release = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_release_resident_ep_decode",
+        {"torch": fake_torch, "logging": fake_logging},
+    )
+
+    class Shard:
+        def __init__(self, size):
+            self.size = size
+
+        def nbytes(self):
+            return self.size
+
+    residents = [
+        SimpleNamespace(shard=Shard(11)),
+        SimpleNamespace(shard=Shard(13)),
+    ]
+    layers = [
+        SimpleNamespace(
+            block_sparse_moe=SimpleNamespace(_resident_ep_moe=resident)
+        )
+        for resident in residents
+    ]
+    graph = SimpleNamespace(release=lambda: trace.append("graph_release"))
+    manager = SimpleNamespace(
+        _resident_ep_built=True,
+        _decode_graph=graph,
+        model=SimpleNamespace(model=SimpleNamespace(layers=layers)),
+        rank=0,
+    )
+
+    assert release(manager) == 24
+    assert manager._resident_ep_built is False
+    assert manager._decode_graph is None
+    assert all(
+        layer.block_sparse_moe._resident_ep_moe is None for layer in layers
+    )
+    assert trace[:2] == ["graph_release", "empty_cache"]
+    assert release(manager) == 0
+    assert trace.count("empty_cache") == 1
+
+
 def test_streamed_sp8_installer_selects_transport_specific_reentry():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(

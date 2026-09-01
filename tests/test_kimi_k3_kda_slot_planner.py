@@ -19,6 +19,7 @@ EngineConfig = _config_module.EngineConfig
 from batchgen.models.moonshotai.kimi_linear.planner import (
     KimiLinearPlanner,
     k3_kda_state_slots,
+    k3_prefill_micro_batch_token_cap,
 )
 
 
@@ -39,11 +40,30 @@ def test_h200_tp8_uses_32_user_slots():
     ) == 32
 
 
+def test_h20_tp8_keeps_single_long_prompt_prefill_cap():
+    assert k3_prefill_micro_batch_token_cap(
+        gpu_total_memory_bytes=96 * GIB,
+        attention_group_size=8,
+    ) == 16_384
+
+
+def test_h200_tp8_batches_eight_exact_64k_prompts_per_model_pass():
+    assert k3_prefill_micro_batch_token_cap(
+        gpu_total_memory_bytes=140 * GIB,
+        attention_group_size=8,
+    ) == 8 * 65_536
+
+
 def test_h200_non_tp8_fails_safe_to_four_slots():
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=1,
     ) == 4
+
+    assert k3_prefill_micro_batch_token_cap(
+        gpu_total_memory_bytes=140 * GIB,
+        attention_group_size=1,
+    ) == 16_384
 
 
 def test_unknown_memory_fails_safe_to_four_slots():
@@ -51,6 +71,10 @@ def test_unknown_memory_fails_safe_to_four_slots():
         gpu_total_memory_bytes=None,
         attention_group_size=8,
     ) == 4
+    assert k3_prefill_micro_batch_token_cap(
+        gpu_total_memory_bytes=None,
+        attention_group_size=8,
+    ) == 16_384
 
 
 @pytest.mark.parametrize(
@@ -96,3 +120,7 @@ def test_h200_plan_exposes_32_users_plus_separate_graph_scratch():
     assert config.Basic_Config.decode_graph_buckets == [
         1, 2, 4, 8, 16, 24, 32,
     ]
+    assert (
+        config.Module_Batching_Config.prefill_micro_batch_token_cap
+        == 8 * 65_536
+    )

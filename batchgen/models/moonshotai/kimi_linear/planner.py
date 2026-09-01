@@ -16,6 +16,8 @@ from batchgen.planner.base_planner import BasePlanner
 
 _GIB = 1024 ** 3
 _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
+_K3_H20_PREFILL_TOKEN_CAP = 16_384
+_K3_H200_PREFILL_TOKEN_CAP = 524_288
 
 
 def k3_kda_state_slots(
@@ -44,6 +46,30 @@ def k3_kda_state_slots(
     if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
         return 32
     return 4
+
+
+def k3_prefill_micro_batch_token_cap(
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+) -> int:
+    """Return the TP8 K3 prefill token cap for the current GPU class.
+
+    H20 keeps the validated single-long-sequence guard. H200 can release the
+    84-GiB resident decode expert shard while streamed-SP8 prefill is active,
+    leaving enough HBM to combine all eight 64K node-local prompts into one
+    layer-wise model pass. Unknown memory and non-TP8 layouts fail safe to the
+    H20 cap.
+    """
+    group_size = int(attention_group_size)
+    if group_size <= 0:
+        raise ValueError("attention_group_size must be positive")
+    if gpu_total_memory_bytes is None:
+        return _K3_H20_PREFILL_TOKEN_CAP
+    memory_bytes = int(gpu_total_memory_bytes)
+    if memory_bytes <= 0:
+        raise ValueError("gpu_total_memory_bytes must be positive")
+    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
+        return _K3_H200_PREFILL_TOKEN_CAP
+    return _K3_H20_PREFILL_TOKEN_CAP
 
 
 class KimiLinearPlanner(BasePlanner):
@@ -126,7 +152,12 @@ class KimiLinearPlanner(BasePlanner):
         # this token cap is a separate bound on temporary prefill scratch and
         # must not be mistaken for a KDA-slot limit.
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = (
-            16_384 if self.is_k3 and self.attention_group_size > 1 else 262_144
+            k3_prefill_micro_batch_token_cap(
+                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+                attention_group_size=self.attention_group_size,
+            )
+            if self.is_k3 and self.attention_group_size > 1
+            else 262_144
         )
 
         # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":

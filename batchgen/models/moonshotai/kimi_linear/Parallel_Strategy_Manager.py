@@ -377,7 +377,10 @@ class KimiLinearParallelStrategyManager:
         available = self._kda_pool_slots
         state_manager = getattr(KimiLinearKDAWrapper, "state_manager", None)
         if state_manager is not None:
-            available = state_manager.get_stats().num_free_state_items
+            available = min(
+                available,
+                state_manager.get_stats().num_free_state_items,
+            )
         available = max(0, int(available))
         if self._attn_tp_size > 1:
             return {"max_sequences_per_node": available}
@@ -425,6 +428,56 @@ class KimiLinearParallelStrategyManager:
                 resident = getattr(moe, "_resident_ep_moe", None)
                 if resident is not None:
                     resident.compact_dispatch = bool(enabled)
+
+    def _release_resident_ep_decode(self):
+        """Drop phase-inactive resident decode experts before streamed prefill.
+
+        A world16 K3 rank's resident MXFP4 EP shard occupies about 84 GiB. It
+        is never read by streamed-SP8 prefill, whose experts arrive through
+        the layer ring, so retaining both copies forces exact-64K prompts into
+        one-sequence model passes. Decode graphs bake the resident shard's
+        addresses and must be released first; configure_decoding rebuilds the
+        shard and reinstalls/captures graphs before the next decode forward.
+        """
+        if not self._resident_ep_built:
+            return 0
+
+        if self._decode_graph is not None:
+            self._decode_graph.release()
+            self._decode_graph = None
+
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        ResidentEPMXFP4MoELayer.release_prefill_output()
+        released_bytes = 0
+        released_layers = 0
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            resident = (
+                getattr(moe, "_resident_ep_moe", None)
+                if moe is not None
+                else None
+            )
+            if resident is None:
+                continue
+            shard = getattr(resident, "shard", None)
+            if shard is not None and hasattr(shard, "nbytes"):
+                released_bytes += int(shard.nbytes())
+            moe._resident_ep_moe = None
+            released_layers += 1
+
+        self._resident_ep_built = False
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            logging.info(
+                "[K3_PREFILL_MOE] released resident decode shards: "
+                "%d layers, %.2f GiB",
+                released_layers,
+                released_bytes / (1024 ** 3),
+            )
+        return released_bytes
 
     def _set_streamed_sp8_prefill_enabled(self, enabled):
         self._set_prefill_memory_tiling(enabled)
@@ -598,12 +651,13 @@ class KimiLinearParallelStrategyManager:
                     "experts, EP32 collectives, compact routed scratch"
                 )
         elif self.prefill_uses_streamed_sp8():
-            self._set_resident_ep_prefill_enabled(False)
             if self._stream_all_modules or self._attn_tp_size != 8:
                 raise RuntimeError(
                     "streamed-SP8 prefill requires K3's resident TP8 attention "
                     "layout (attention_group_size=8, stream_all_modules=False)"
                 )
+            self._set_resident_ep_prefill_enabled(False)
+            self._release_resident_ep_decode()
             self._init_streamed_sp8_prefill()
             self._set_streamed_sp8_prefill_enabled(True)
             if self.rank == 0:
@@ -743,7 +797,7 @@ class KimiLinearParallelStrategyManager:
         Source is the host copy-engine weight storage (core_engine.get_tensor,
         the exact tensors the streamed path consumes) — after this one-time
         H2D there is no per-step expert traffic in decode. HBM arithmetic for
-        the ~11.8 GB/rank shards lives at the allocation site
+        the ~84 GiB/rank K3 world16 shards lives at the allocation site
         (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
         """
         if self._resident_ep_built:
