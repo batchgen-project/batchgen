@@ -160,7 +160,7 @@ def test_mapped_mla_packed_prefill_offload_variable_lengths(bg):
             )
             assert torch.equal(flattened[:length], expected)
 
-        with pytest.raises(ValueError, match="sum\(sequence_lengths\)"):
+        with pytest.raises(ValueError, match=r"sum\(sequence_lengths\)"):
             view.async_offload_packed_layer_kv_to_host(
                 4, sequence_ids, packed, None, [1, 1, 1, 1]
             )
