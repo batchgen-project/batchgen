@@ -25,6 +25,8 @@ _KERNEL_MODULE_NAME = "batchgen_kernels.moe._C_fp8_blockwise_gemm"
 _kernel_module = None
 _warned_import = False
 _warned_fused_s1 = False
+_warned_ptrs = False
+_warned_fused_s1_ptrs = False
 
 
 def _get_kernel_module():
@@ -73,6 +75,40 @@ def _get_fused_s1_kernel():
     return kernel
 
 
+def _get_ptrs_kernel():
+    """Load the grouped GEMM ABI for independent expert weight addresses."""
+    global _warned_ptrs
+    try:
+        module = _get_kernel_module()
+    except ImportError:
+        module = None
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm_ptrs", None)
+    if kernel is None and not _warned_ptrs:
+        _warned_ptrs = True
+        logger.warning(
+            "FP8 pointer-array grouped GEMM kernel not available "
+            f"({_KERNEL_MODULE_NAME})"
+        )
+    return kernel
+
+
+def _get_fused_s1_ptrs_kernel():
+    """Load fused S1 for independently allocated expert weights."""
+    global _warned_fused_s1_ptrs
+    try:
+        module = _get_kernel_module()
+    except ImportError:
+        module = None
+    kernel = getattr(module, "fp8_blockwise_fused_s1_ptrs", None)
+    if kernel is None and not _warned_fused_s1_ptrs:
+        _warned_fused_s1_ptrs = True
+        logger.warning(
+            "FP8 pointer-array fused S1 kernel not available "
+            f"({_KERNEL_MODULE_NAME})"
+        )
+    return kernel
+
+
 def grouped_fp8_blockwise_gemm(
     x_fp8: Tensor,
     weight_3d: Tensor,
@@ -117,6 +153,47 @@ def grouped_fp8_blockwise_gemm(
         x_scale, w_scale_3d,
         num_seq_per_group_avg,
         output, tma_desc,
+    )
+
+
+def grouped_fp8_blockwise_gemm_ptrs(
+    x_fp8: Tensor,
+    weight_prototype: Tensor,
+    weight_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    x_scale: Tensor,
+    w_scale_prototype: Tensor,
+    w_scale_ptrs: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Grouped FP8 GEMM over independent core-engine weight allocations.
+
+    ``weight_prototype`` and ``w_scale_prototype`` provide only shape, stride,
+    dtype, and a valid descriptor seed. The CUDA preparation kernel replaces
+    their addresses with ``weight_ptrs[e]`` / ``w_scale_ptrs[e]`` for every
+    expert before launching the persistent grouped GEMM.
+    """
+    kernel = _get_ptrs_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 pointer-array grouped GEMM kernel not compiled. Rebuild "
+            "batchgen_kernels with SM90a support."
+        )
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+    return kernel(
+        x_fp8,
+        weight_prototype,
+        weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        w_scale_prototype,
+        w_scale_ptrs,
+        num_seq_per_group_avg,
+        output,
     )
 
 
@@ -228,6 +305,49 @@ def grouped_fp8_blockwise_fused_s1(
     )
 
 
+def grouped_fp8_blockwise_fused_s1_ptrs(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    gate_w_prototype: Tensor,
+    gate_weight_ptrs: Tensor,
+    up_w_prototype: Tensor,
+    up_weight_ptrs: Tensor,
+    gate_ws_prototype: Tensor,
+    gate_scale_ptrs: Tensor,
+    up_ws_prototype: Tensor,
+    up_scale_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Fused gate+up+SiLU over streamed expert pointer arrays."""
+    kernel = _get_fused_s1_ptrs_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 pointer-array fused S1 kernel not compiled. Rebuild "
+            "batchgen_kernels with SM90a support."
+        )
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+    return kernel(
+        x_fp8,
+        gate_w_prototype,
+        gate_weight_ptrs,
+        up_w_prototype,
+        up_weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        gate_ws_prototype,
+        gate_scale_ptrs,
+        up_ws_prototype,
+        up_scale_ptrs,
+        num_seq_per_group_avg,
+        output,
+    )
+
+
 def grouped_fp8_blockwise_s3(
     x_fp8: Tensor,
     x_scale: Tensor,
@@ -258,5 +378,32 @@ def grouped_fp8_blockwise_s3(
     return grouped_fp8_blockwise_gemm(
         x_fp8, down_w3d, seqlens, cu_seqlens,
         x_scale, down_ws3d, num_seq_per_group_avg,
+        output=output,
+    )
+
+
+def grouped_fp8_blockwise_s3_ptrs(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    down_w_prototype: Tensor,
+    down_weight_ptrs: Tensor,
+    down_ws_prototype: Tensor,
+    down_scale_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """S3 down projection for streamed, independently allocated experts."""
+    return grouped_fp8_blockwise_gemm_ptrs(
+        x_fp8,
+        down_w_prototype,
+        down_weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        down_ws_prototype,
+        down_scale_ptrs,
+        num_seq_per_group_avg,
         output=output,
     )

@@ -18,6 +18,98 @@ namespace batchgen {
 namespace moe {
 namespace kernels {
 
+// Device-only descriptor preparation for streamed gate/up expert weights.
+// Descriptor order per expert: X, Y, gate-W, gate-WS, up-W, up-WS.
+template <typename Tin, typename Tout, typename TS, typename TmaX, typename TmaY,
+          typename TmaW, typename TmaWS, int kTileM, int kGroupPerThread,
+          int kThreadPerBlock>
+__global__ void update_expert_tma_s1_ptrs(
+    const vec_t<cute::TmaDescriptor, 6> td_s1,
+    cute::TmaDescriptor *tma_s1, const Tin *x_ptr, const Tout *y_ptr,
+    const int64_t *gate_weight_ptrs, const int64_t *gate_scale_ptrs,
+    const int64_t *up_weight_ptrs, const int64_t *up_scale_ptrs,
+    const int *seqlens_ptr, const int *cu_seqlens_ptr,
+    int *tiles_ptr, int *cu_tiles_ptr, int num_group, int m, int n, int k,
+    int num_block_n, int num_block_k_pad4) {
+  using namespace cute;  // NOLINT
+
+  int idx = threadIdx.x;
+  int igroup = blockIdx.x;
+  if (igroup == num_group) {
+    int tiles[kGroupPerThread];
+#pragma unroll
+    for (int i = 0; i < kGroupPerThread; i++) {
+      int ig = idx * kGroupPerThread + i;
+      if (ig < num_group) {
+        tiles[i] = (seqlens_ptr[ig] + kTileM - 1) / kTileM;
+        tiles_ptr[ig] = tiles[i];
+      } else {
+        tiles[i] = 0;
+      }
+    }
+    using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+    int block_aggregate;
+    BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
+#pragma unroll
+    for (int i = 0; i < kGroupPerThread; i++) {
+      int ig = idx * kGroupPerThread + i;
+      if (ig < num_group) cu_tiles_ptr[ig] = tiles[i];
+    }
+    if (idx == 0) cu_tiles_ptr[num_group] = block_aggregate;
+    return;
+  }
+
+  __shared__ cute::TmaDescriptor smem_tma_desc[6];
+  int num_seq = seqlens_ptr[igroup];
+  int cu_seqlen = cu_seqlens_ptr[igroup];
+  if (idx == 0 && (cu_seqlen % kTileM) != 0) {
+    printf("[fp8_blockwise_s1_ptrs] FATAL: cu_seqlens[%d]=%d is not a "
+           "multiple of TileM=%d\n", igroup, cu_seqlen, kTileM);
+    __trap();
+  }
+  if (idx < 6) smem_tma_desc[idx] = td_s1[idx];
+  __syncwarp();
+
+  if (idx == 0) {
+    auto gX = make_tensor(
+        make_gmem_ptr(x_ptr + static_cast<int64_t>(cu_seqlen) * k),
+        make_shape(num_seq, k), make_stride(k, Int<1>{}));
+    update_tma_gtensor<TmaX>(smem_tma_desc[0], gX);
+  } else if (idx == 1) {
+    auto gY = make_tensor(
+        make_gmem_ptr(y_ptr + static_cast<int64_t>(cu_seqlen) * n),
+        make_shape(n, num_seq), make_stride(Int<1>{}, n));
+    update_tma_gtensor<TmaY>(smem_tma_desc[1], gY);
+  } else if (idx == 2 || idx == 4) {
+    const int64_t *ptrs = idx == 2 ? gate_weight_ptrs : up_weight_ptrs;
+    auto *w_ptr = reinterpret_cast<const Tin *>(ptrs[igroup]);
+    auto gW = make_tensor(make_gmem_ptr(w_ptr), make_shape(n, k, Int<1>{}),
+                          make_stride(k, Int<1>{}, n * k));
+    update_tma_gtensor<TmaW>(smem_tma_desc[idx], gW);
+  } else if (idx == 3 || idx == 5) {
+    const int64_t *ptrs = idx == 3 ? gate_scale_ptrs : up_scale_ptrs;
+    auto *ws_ptr = reinterpret_cast<const TS *>(ptrs[igroup]);
+    auto gWS = make_tensor(
+        make_gmem_ptr(ws_ptr),
+        make_shape(num_block_n, num_block_k_pad4, Int<1>{}),
+        make_stride(num_block_k_pad4, Int<1>{},
+                    num_block_n * num_block_k_pad4));
+    update_tma_gtensor<TmaWS>(smem_tma_desc[idx], gWS);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 6; i++) {
+    __syncwarp();
+    if (cute::elect_one_sync()) {
+      cute::tma_desc_commit_group();
+      cute::tma_desc_wait_group();
+    }
+    tma_descriptor_cp_fence_release(tma_s1 + igroup * 6 + i,
+                                    smem_tma_desc[i]);
+  }
+}
+
 // ============================================================================
 // Fused S1 kernel: gate GEMM + up GEMM + SiLU in single persistent launch.
 // 384 threads: 2 math WGs (256) + 1 TMA loader WG (128).
@@ -26,7 +118,8 @@ namespace kernels {
 // Warpgroup barriers use IDs 2/3 to avoid conflict with __syncthreads (barrier 0).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC,
-          typename TmaAS, typename TmaBS, bool IsLoopH>
+          typename TmaAS, typename TmaBS, bool IsLoopH,
+          bool UsePointerWeights = false>
 __global__ void __launch_bounds__(384, 1)
     fp8_blockwise_fused_s1_kernel(
         const __grid_constant__ TmaB tma_b_gate,
@@ -84,7 +177,8 @@ __global__ void __launch_bounds__(384, 1)
   TmaC tma_c;
 
   int num_total_warps = blockDim.x / 32;
-  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+  constexpr int kDescPerGroup = UsePointerWeights ? 6 : 2;
+  for (int i = iwarp; i < num_group * kDescPerGroup; i += num_total_warps) {
     tma_descriptor_fence_acquire(td_xy + i);
   }
 
@@ -104,8 +198,10 @@ __global__ void __launch_bounds__(384, 1)
   auto tASs = btma_as.partition_D(sAS);
 
   // Gate weight TMA partitions
-  auto gB_gate = tma_b_gate.get_tma_tensor(make_shape(n, k, num_group));
-  auto gBS_gate = tma_bs_gate.get_tma_tensor(make_shape(num_block_n, num_block_k_pad4, num_group));
+  int weight_groups = UsePointerWeights ? 1 : num_group;
+  auto gB_gate = tma_b_gate.get_tma_tensor(make_shape(n, k, weight_groups));
+  auto gBS_gate = tma_bs_gate.get_tma_tensor(
+      make_shape(num_block_n, num_block_k_pad4, weight_groups));
   auto btma_b_gate = tma_b_gate.get_slice(0);
   auto btma_bs_gate = tma_bs_gate.get_slice(0);
   auto tBg_gate = btma_b_gate.partition_S(gB_gate);
@@ -114,8 +210,9 @@ __global__ void __launch_bounds__(384, 1)
   auto tBSs_gate = btma_bs_gate.partition_D(sBS);
 
   // Up weight TMA partitions (same SMEM targets, different global sources)
-  auto gB_up = tma_b_up.get_tma_tensor(make_shape(n, k, num_group));
-  auto gBS_up = tma_bs_up.get_tma_tensor(make_shape(num_block_n, num_block_k_pad4, num_group));
+  auto gB_up = tma_b_up.get_tma_tensor(make_shape(n, k, weight_groups));
+  auto gBS_up = tma_bs_up.get_tma_tensor(
+      make_shape(num_block_n, num_block_k_pad4, weight_groups));
   auto btma_b_up = tma_b_up.get_slice(0);
   auto btma_bs_up = tma_bs_up.get_slice(0);
   auto tBg_up = btma_b_up.partition_S(gB_up);
@@ -190,21 +287,34 @@ __global__ void __launch_bounds__(384, 1)
 
       // ──── PHASE 1: Gate weight K-loop (leader only) ────
       if (is_leader_in_load) {
-        auto *td_x = td_xy + igroup * 2;
+        auto *td_group = td_xy + igroup * kDescPerGroup;
+        auto *td_x = td_group;
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(writable[ismem_write], pipe_phase);
           cute::copy(tma_a.with(td_x, readable[ismem_write]),
                      tAg(_, itile_m, itile_k), tAs(_, 0, 0, ismem_write));
-          cute::copy(tma_b_gate.with(readable[ismem_write]),
-                     tBg_gate(_, itile_n, itile_k, igroup),
-                     tBs_gate(_, 0, 0, ismem_write));
+          if constexpr (UsePointerWeights) {
+            cute::copy(tma_b_gate.with(td_group + 2, readable[ismem_write]),
+                       tBg_gate(_, itile_n, itile_k, Int<0>{}),
+                       tBs_gate(_, 0, 0, ismem_write));
+          } else {
+            cute::copy(tma_b_gate.with(readable[ismem_write]),
+                       tBg_gate(_, itile_n, itile_k, igroup),
+                       tBs_gate(_, 0, 0, ismem_write));
+          }
           cute::copy(tma_as.with(readable[ismem_write]),
                      tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
-          cute::copy(tma_bs_gate.with(readable[ismem_write]),
-                     tBSg_gate(_, itile_n, itile_k / 4, igroup),
-                     tBSs_gate(_, ismem_write, 0));
+          if constexpr (UsePointerWeights) {
+            cute::copy(tma_bs_gate.with(td_group + 3, readable[ismem_write]),
+                       tBSg_gate(_, itile_n, itile_k / 4, Int<0>{}),
+                       tBSs_gate(_, ismem_write, 0));
+          } else {
+            cute::copy(tma_bs_gate.with(readable[ismem_write]),
+                       tBSg_gate(_, itile_n, itile_k / 4, igroup),
+                       tBSs_gate(_, ismem_write, 0));
+          }
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
           ++ismem_write;
           if (ismem_write == kStage) { ismem_write = 0; pipe_phase ^= 1; }
@@ -221,21 +331,34 @@ __global__ void __launch_bounds__(384, 1)
 
       // ──── PHASE 2: Up weight K-loop (leader only) ────
       if (is_leader_in_load) {
-        auto *td_x = td_xy + igroup * 2;
+        auto *td_group = td_xy + igroup * kDescPerGroup;
+        auto *td_x = td_group;
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(writable[ismem_write], pipe_phase);
           cute::copy(tma_a.with(td_x, readable[ismem_write]),
                      tAg(_, itile_m, itile_k), tAs(_, 0, 0, ismem_write));
-          cute::copy(tma_b_up.with(readable[ismem_write]),
-                     tBg_up(_, itile_n, itile_k, igroup),
-                     tBs_up(_, 0, 0, ismem_write));
+          if constexpr (UsePointerWeights) {
+            cute::copy(tma_b_up.with(td_group + 4, readable[ismem_write]),
+                       tBg_up(_, itile_n, itile_k, Int<0>{}),
+                       tBs_up(_, 0, 0, ismem_write));
+          } else {
+            cute::copy(tma_b_up.with(readable[ismem_write]),
+                       tBg_up(_, itile_n, itile_k, igroup),
+                       tBs_up(_, 0, 0, ismem_write));
+          }
           cute::copy(tma_as.with(readable[ismem_write]),
                      tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
-          cute::copy(tma_bs_up.with(readable[ismem_write]),
-                     tBSg_up(_, itile_n, itile_k / 4, igroup),
-                     tBSs_up(_, ismem_write, 0));
+          if constexpr (UsePointerWeights) {
+            cute::copy(tma_bs_up.with(td_group + 5, readable[ismem_write]),
+                       tBSg_up(_, itile_n, itile_k / 4, Int<0>{}),
+                       tBSs_up(_, ismem_write, 0));
+          } else {
+            cute::copy(tma_bs_up.with(readable[ismem_write]),
+                       tBSg_up(_, itile_n, itile_k / 4, igroup),
+                       tBSs_up(_, ismem_write, 0));
+          }
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
           ++ismem_write;
           if (ismem_write == kStage) { ismem_write = 0; pipe_phase ^= 1; }
@@ -465,7 +588,7 @@ __global__ void __launch_bounds__(384, 1)
             auto btma_c = tma_c.get_slice(0);
             auto tDs = btma_c.partition_S(sCT);
             auto tDg = btma_c.partition_D(gD);
-            auto *td_y = td_xy + igroup * 2 + 1;
+            auto *td_y = td_xy + igroup * kDescPerGroup + 1;
             cute::copy(tma_c.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
                        tDg(_, itile_n * 2 + iwarpgroup, itile_m));
             tma_store_arrive();
