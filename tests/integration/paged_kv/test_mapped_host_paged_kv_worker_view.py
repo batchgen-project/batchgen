@@ -118,6 +118,57 @@ def _close_view(view, sequence_ids) -> None:
         pass
 
 
+def test_mapped_mla_packed_prefill_offload_variable_lengths(bg):
+    shm_name = _random_shm_name()
+    cfg = _make_mapped_mla_config(bg, shm_name)
+    view = None
+    sequence_ids = [11, 22, 33, 44]
+    sequence_lengths = [1, PAGE_TOKENS, PAGE_TOKENS + 3, PAGE_TOKENS * 2 + 5]
+
+    try:
+        torch.cuda.set_device(0)
+        view = bg.MappedMLAHostPagedKVWorkerView(cfg)
+        view.initialize(0, True)
+        view.register_sequences(sequence_ids)
+        view.allocate_pages_for_sequences(
+            list(zip(sequence_ids, sequence_lengths))
+        )
+
+        packed = torch.empty(
+            (sum(sequence_lengths), NUM_K_HEADS, K_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        offset = 0
+        for batch_idx, length in enumerate(sequence_lengths):
+            packed[offset : offset + length].fill_(float(30 + batch_idx))
+            offset += length
+
+        task = view.async_offload_packed_layer_kv_to_host(
+            4, sequence_ids, packed, None, sequence_lengths
+        )
+        task.wait()
+
+        for batch_idx, (sequence_id, length) in enumerate(
+            zip(sequence_ids, sequence_lengths)
+        ):
+            k_cpu, v_cpu = view.read_sequence_kv_to_cpu(sequence_id)
+            assert v_cpu.numel() == 0
+            flattened = k_cpu[2].reshape(-1, NUM_K_HEADS, K_HEAD_DIM)
+            expected = torch.full_like(
+                flattened[:length], float(30 + batch_idx)
+            )
+            assert torch.equal(flattened[:length], expected)
+
+        with pytest.raises(ValueError, match="sum\(sequence_lengths\)"):
+            view.async_offload_packed_layer_kv_to_host(
+                4, sequence_ids, packed, None, [1, 1, 1, 1]
+            )
+    finally:
+        _close_view(view, sequence_ids)
+        _shm_unlink(shm_name)
+
+
 def test_mapped_mla_view_routes_logical_layers_after_cpu_write(bg):
     shm_name = _random_shm_name()
     cfg = _make_mapped_mla_config(bg, shm_name)

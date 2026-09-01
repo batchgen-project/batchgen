@@ -1116,6 +1116,145 @@ class HostPagedKVWorkerView : private LayerMapper {
         });
     }
 
+    KVAsyncTask AsyncOffloadPackedLayerKVToHost(
+        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
+        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
+        // K: [sum(sequence_lengths), H, D]
+        SequenceLengths sequence_lengths) {
+        constexpr std::string_view kOpName =
+            "AsyncOffloadPackedLayerKVToHost";
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kOpName);
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+        const std::size_t total_tokens = ValidatePackedKTensorShape(k_tensor);
+        ValidateSequenceLengthsInput(sequence_lengths, batch, kOpName);
+
+        torch::Tensor prepared_k = k_tensor;
+        std::optional<torch::Tensor> prepared_v;
+        if (v_tensor.has_value()) {
+            if constexpr (kHasVCache) {
+                ValidatePackedVTensorShape(*v_tensor, total_tokens);
+                prepared_v = *v_tensor;
+            } else {
+                throw std::invalid_argument(
+                    "V tensor provided but V cache is disabled");
+            }
+        }
+
+        std::vector<std::size_t> packed_lengths;
+        packed_lengths.reserve(batch);
+        std::size_t resolved_tokens = 0;
+        for (std::size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+            const std::size_t length = ResolveSequenceLength(
+                sequence_lengths, batch_idx, sequence_ids[batch_idx],
+                total_tokens, kOpName);
+            if (length > total_tokens - resolved_tokens) {
+                throw std::invalid_argument(
+                    "AsyncOffloadPackedLayerKVToHost: sequence lengths exceed "
+                    "the packed tensor token dimension");
+            }
+            resolved_tokens += length;
+            packed_lengths.push_back(length);
+        }
+        if (resolved_tokens != total_tokens) {
+            std::ostringstream oss;
+            oss << kOpName << ": sum(sequence_lengths) (" << resolved_tokens
+                << ") must equal packed tensor token dimension (" << total_tokens
+                << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (batch == 0) {
+            return LaunchAsyncTask([] {});
+        }
+
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+
+        return LaunchAsyncTask([
+            this, physical_layer_idx,
+            sequence_ids = std::move(sequence_ids),
+            packed_lengths = std::move(packed_lengths), prepared_k, prepared_v,
+            producer_cuda_stream]() {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+
+            const auto* k_base =
+                static_cast<const std::byte*>(prepared_k.data_ptr());
+            const std::size_t k_token_bytes = geometry_.KTokenBytes();
+
+            const std::byte* v_base = nullptr;
+            std::size_t v_token_bytes = 0;
+            if (prepared_v.has_value()) {
+                if constexpr (kHasVCache) {
+                    v_base =
+                        static_cast<const std::byte*>(prepared_v->data_ptr());
+                    v_token_bytes =
+                        geometry_.template VTokenBytes<kHasVCache>();
+                }
+            }
+
+            std::byte* host_base = backend_.DataBase();
+            std::size_t packed_token_offset = 0;
+            for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
+                 ++batch_idx) {
+                const std::int64_t sequence_id = sequence_ids[batch_idx];
+                const std::size_t tokens_to_copy = packed_lengths[batch_idx];
+                if (tokens_to_copy == 0) {
+                    continue;
+                }
+                const auto pages = page_table_.Pages(sequence_id);
+                geometry_.ValidatePageCapacity(pages, tokens_to_copy, kOpName);
+                const auto* seq_k_src =
+                    k_base + packed_token_offset * k_token_bytes;
+
+                ForEachPageChunk(
+                    pages, 0, tokens_to_copy,
+                    [&](std::int32_t page_idx, std::size_t page_offset_tokens,
+                        std::size_t chunk_tokens,
+                        std::size_t relative_token_offset) {
+                        std::byte* dst = layout_.KPageAddress(
+                                             host_base, physical_layer_idx,
+                                             page_idx) +
+                                         page_offset_tokens * k_token_bytes;
+                        const std::byte* src =
+                            seq_k_src + relative_token_offset * k_token_bytes;
+                        EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                    });
+                if constexpr (kHasVCache) {
+                    if (v_base != nullptr) {
+                        const auto* seq_v_src =
+                            v_base + packed_token_offset * v_token_bytes;
+                        ForEachPageChunk(
+                            pages, 0, tokens_to_copy,
+                            [&](std::int32_t page_idx,
+                                std::size_t page_offset_tokens,
+                                std::size_t chunk_tokens,
+                                std::size_t relative_token_offset) {
+                                std::byte* dst =
+                                    layout_.template VPageAddress<>(
+                                        host_base, physical_layer_idx,
+                                        page_idx) +
+                                    page_offset_tokens * v_token_bytes;
+                                const std::byte* src =
+                                    seq_v_src +
+                                    relative_token_offset * v_token_bytes;
+                                EnqueueCopy(
+                                    src, dst, chunk_tokens * v_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                            });
+                    }
+                }
+                packed_token_offset += tokens_to_copy;
+            }
+
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
@@ -2757,6 +2896,26 @@ class HostPagedKVWorkerView : private LayerMapper {
         return static_cast<std::size_t>(tensor.size(1));
     }
 
+    std::size_t ValidatePackedKTensorShape(const torch::Tensor& tensor) const {
+        ValidateCudaTensor(tensor);
+        EnsureContiguousTensor(tensor, "packed K tensor");
+        if (tensor.dim() != 3) {
+            throw std::invalid_argument(
+                "Expected packed K tensor with shape [T, H, D]");
+        }
+        if (tensor.size(1) != static_cast<long>(config_.num_k_heads) ||
+            tensor.size(2) != static_cast<long>(config_.k_head_dim)) {
+            throw std::invalid_argument(
+                "Packed K tensor head dimensions do not match configuration");
+        }
+        if (tensor.element_size() !=
+            static_cast<int64_t>(config_.k_element_size_bytes)) {
+            throw std::invalid_argument(
+                "Packed K tensor element size does not match configuration");
+        }
+        return static_cast<std::size_t>(tensor.size(0));
+    }
+
     template <bool Enabled = Layout::kHasVCache>
     std::enable_if_t<Enabled, void> ValidateVTensorShape(
         const torch::Tensor& tensor, std::size_t expected_batch,
@@ -2791,6 +2950,37 @@ class HostPagedKVWorkerView : private LayerMapper {
     std::enable_if_t<!Enabled, void> ValidateVTensorShape(const torch::Tensor&,
                                                           std::size_t,
                                                           std::size_t) const {
+        throw std::logic_error("V cache is disabled for this worker view");
+    }
+
+    template <bool Enabled = Layout::kHasVCache>
+    std::enable_if_t<Enabled, void> ValidatePackedVTensorShape(
+        const torch::Tensor& tensor, std::size_t expected_tokens) const {
+        ValidateCudaTensor(tensor);
+        EnsureContiguousTensor(tensor, "packed V tensor");
+        if (tensor.dim() != 3) {
+            throw std::invalid_argument(
+                "Expected packed V tensor with shape [T, H, D]");
+        }
+        if (static_cast<std::size_t>(tensor.size(0)) != expected_tokens) {
+            throw std::invalid_argument(
+                "Packed V tensor token dimension does not match K tensor");
+        }
+        if (tensor.size(1) != static_cast<long>(config_.num_v_heads) ||
+            tensor.size(2) != static_cast<long>(config_.v_head_dim)) {
+            throw std::invalid_argument(
+                "Packed V tensor head dimensions do not match configuration");
+        }
+        if (tensor.element_size() !=
+            static_cast<int64_t>(config_.v_element_size_bytes)) {
+            throw std::invalid_argument(
+                "Packed V tensor element size does not match configuration");
+        }
+    }
+
+    template <bool Enabled = Layout::kHasVCache>
+    std::enable_if_t<!Enabled, void> ValidatePackedVTensorShape(
+        const torch::Tensor&, std::size_t) const {
         throw std::logic_error("V cache is disabled for this worker view");
     }
 

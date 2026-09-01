@@ -2051,7 +2051,7 @@ def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch)
         )
 
 
-def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
+def test_glm5_prefill_indexer_kv_passes_prepacked_max_seqlen(monkeypatch):
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.layer_idx = 0
     wrapper.prepack_mode = True
@@ -2065,7 +2065,7 @@ def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
         def compute_indexer_kv(self, hidden_states, *, positions, max_seqlen=None):
             assert hidden_states.shape == (1, 3, 4)
             assert positions.tolist() == [[0, 1, 2]]
-            assert max_seqlen is None
+            assert max_seqlen == 4096
             return torch.zeros(1, 3, 1, 128)
 
     class FakeModule:
@@ -2132,6 +2132,73 @@ def test_glm5_prefill_indexer_offload_requires_aux_host_view(monkeypatch):
         wrapper._offload_prepacked_indexer_kv(torch.zeros(2, 1, 128))
 
 
+def test_glm5_prefill_offloads_packed_primary_and_indexer_once(monkeypatch):
+    class DummyTask:
+        pass
+
+    class DummyView:
+        def __init__(self):
+            self.calls = []
+
+        def async_offload_packed_layer_kv_to_host(self, **kwargs):
+            self.calls.append(kwargs)
+            return DummyTask()
+
+    primary_view = DummyView()
+    auxiliary_view = DummyView()
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 7
+    wrapper.prepack_seq_lengths = [2, 1, 3]
+    wrapper.prepack_num_sequences = 3
+    wrapper.cur_batch = [101, 202, 303]
+    wrapper.core_engine = types.SimpleNamespace(
+        host_paged_kv_worker_view=primary_view
+    )
+
+    monkeypatch.setattr(
+        AttnWrapperBase, "host_paged_kv_worker_view_aux", auxiliary_view
+    )
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tasks", [])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tensors", [])
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_layer_idx", None
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Python producer event must not be created")
+        ),
+    )
+
+    wrapper._offload_prepacked_indexer_kv(torch.zeros(6, 1, 128))
+    wrapper._offload_prepacked_kv(torch.zeros(6, 576))
+
+    assert len(auxiliary_view.calls) == 1
+    assert len(primary_view.calls) == 1
+    assert auxiliary_view.calls[0]["sequence_ids"] == [101, 202, 303]
+    assert auxiliary_view.calls[0]["sequence_lengths"] == [2, 1, 3]
+    assert auxiliary_view.calls[0]["k_tensor"].shape == (6, 1, 128)
+    assert primary_view.calls[0]["sequence_ids"] == [101, 202, 303]
+    assert primary_view.calls[0]["sequence_lengths"] == [2, 1, 3]
+    assert primary_view.calls[0]["k_tensor"].shape == (6, 1, 576)
+    assert len(AttnWrapperBase.pending_prefill_offload_tasks) == 2
+    assert len(AttnWrapperBase.pending_prefill_offload_tensors) == 2
+
+
+def test_glm5_prefill_packed_offload_rejects_metadata_mismatch(monkeypatch):
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 7
+    wrapper.prepack_seq_lengths = [2, 1]
+    wrapper.cur_batch = [101, 202]
+    wrapper.core_engine = types.SimpleNamespace(
+        host_paged_kv_worker_view=object()
+    )
+
+    with pytest.raises(RuntimeError, match="primary KV token count mismatch"):
+        wrapper._offload_prepacked_kv(torch.zeros(4, 576))
+
+
 def test_prefill_offload_lifetime_retires_previous_layer(monkeypatch):
     class DummyTask:
         def __init__(self):
@@ -2156,6 +2223,33 @@ def test_prefill_offload_lifetime_retires_previous_layer(monkeypatch):
     assert AttnWrapperBase.pending_prefill_offload_tasks == []
     assert AttnWrapperBase.pending_prefill_offload_tensors == []
     assert AttnWrapperBase.pending_prefill_offload_layer_idx is None
+
+
+def test_prefill_offload_retirement_does_not_synchronize_device(monkeypatch):
+    class DummyTask:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("device-wide synchronization is redundant")
+        ),
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_tasks", [DummyTask()]
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_tensors", [torch.zeros(1)]
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_layer_idx", 3
+    )
+
+    assert AttnWrapperBase.retire_pending_prefill_offloads(
+        device=torch.device("cuda:0")
+    ) == 1
 
 
 def test_prefill_offload_lifetime_keeps_current_layer_refs(monkeypatch):

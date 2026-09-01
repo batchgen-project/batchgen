@@ -243,6 +243,14 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            "Offload one layer of prefill KV into host pages. For mapped "
            "worker views, layer_idx is a logical layer id and is resolved to "
            "a physical layer id before writing.")
+       .def("async_offload_packed_layer_kv_to_host",
+           &WorkerView::AsyncOffloadPackedLayerKVToHost,
+           py::arg("layer_idx"), py::arg("sequence_ids"),
+           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+           py::arg("sequence_lengths"),
+           "Offload one packed, variable-length prefill layer with one async "
+           "task. K/V tensors use [sum(sequence_lengths), H, D] layout. For "
+           "mapped worker views, layer_idx is resolved before writing.")
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),

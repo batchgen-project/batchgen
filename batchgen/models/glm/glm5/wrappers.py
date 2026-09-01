@@ -872,6 +872,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer_kv = self.module.indexer.compute_indexer_kv(
                     hidden_states_2d.unsqueeze(0),
                     positions=self.position_ids.to(hidden_states_2d.device),
+                    max_seqlen=self.prepack_max_seqlen,
                 )
                 if indexer_kv is None:
                     raise RuntimeError(
@@ -890,81 +891,49 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
-        """Offload indexer KV cache per-sequence to auxiliary host memory."""
+        """Offload packed indexer KV with one asynchronous task per layer."""
         if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
             raise RuntimeError(
                 "GLM-5 DSA auxiliary host KV worker view is required for "
                 "indexer KV offload"
             )
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
+        sequence_lengths = list(self.prepack_seq_lengths)
         global_sequence_ids = self.cur_batch
+        if len(sequence_lengths) != len(global_sequence_ids):
+            raise RuntimeError("GLM-5 packed indexer KV metadata size mismatch")
+        if sum(sequence_lengths) != offload_kv.shape[0]:
+            raise RuntimeError("GLM-5 packed indexer KV token count mismatch")
 
-        # Lifespan management mirrored from decode-side `_pending_kv_append_*`
-        # (worker.py:1898-1925). Drain compute stream via a CUDA event so the
-        # FA3 prefill kernel that wrote `offload_kv` has fully retired before
-        # the C++ async lambda's d2h memcpy reads the source memory; pin the
-        # source tensor (and the parent `offload_kv`) in the class-level list
-        # so PyTorch's caching allocator cannot re-hand the same physical
-        # pages to a later layer's K/V tensor while the d2h is in flight.
-        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
-
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
-        for seq_idx in range(num_sequences):
-            start_idx = cu[seq_idx]
-            end_idx = cu[seq_idx + 1]
-            seq_len = end_idx - start_idx
-            # indexer_kv is already [T, H=1, D=128] after caller's .squeeze(0),
-            # so only .unsqueeze(0) is needed to add the B dim; don't also
-            # .unsqueeze(2) (that would make 5D — the primary-MLA path copy-paste
-            # of this code was for a 2D [T, kv_lora+rope] input).
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
-                v_tensor=None,
-                sequence_lengths=[seq_len],
-            )
-            # Pin both the per-seq view AND the parent offload_kv (already
-            # pinned outside the loop) so neither's storage is reclaimed.
-            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        packed_kv = offload_kv.contiguous()
+        task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_packed_layer_kv_to_host(
+            layer_idx=self.layer_idx,
+            sequence_ids=global_sequence_ids,
+            k_tensor=packed_kv,
+            v_tensor=None,
+            sequence_lengths=sequence_lengths,
+        )
+        AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
+        AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
-        """Offload KV cache per-sequence to host memory."""
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
+        """Offload packed primary KV with one asynchronous task per layer."""
+        sequence_lengths = list(self.prepack_seq_lengths)
         global_sequence_ids = self.cur_batch
+        if len(sequence_lengths) != len(global_sequence_ids):
+            raise RuntimeError("GLM-5 packed primary KV metadata size mismatch")
+        if sum(sequence_lengths) != offload_kv.shape[0]:
+            raise RuntimeError("GLM-5 packed primary KV token count mismatch")
 
-        # See _offload_prepacked_indexer_kv for rationale.
-        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
-
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
-        for seq_idx in range(num_sequences):
-            start_idx = cu[seq_idx]
-            end_idx = cu[seq_idx + 1]
-            seq_len = end_idx - start_idx
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-            task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
-                v_tensor=None,
-                sequence_lengths=[seq_len],
-            )
-            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        packed_kv = offload_kv.unsqueeze(1).contiguous()
+        task = self.core_engine.host_paged_kv_worker_view.async_offload_packed_layer_kv_to_host(
+            layer_idx=self.layer_idx,
+            sequence_ids=global_sequence_ids,
+            k_tensor=packed_kv,
+            v_tensor=None,
+            sequence_lengths=sequence_lengths,
+        )
+        AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
+        AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward with DSA sparse attention.
