@@ -1,8 +1,12 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from batchgen.models.wrappers.attention import AttnWrapperBase
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _AsyncCore:
@@ -74,3 +78,16 @@ def test_clear_weight_bindings_preserves_skeleton_parameters():
 
     assert module.weight.numel() == 0
     torch.testing.assert_close(module.bias, original_bias)
+
+
+def test_h2d_weight_worker_paces_copies_before_publishing_ready_event():
+    source = (
+        _REPO_ROOT / "core" / "HtoD_Engine" / "HtoD_Engine.cu"
+    ).read_text()
+    worker = source[source.index("void HtoD_Engine::HtoD_Worker()") :]
+    copy_pos = worker.index("this->blocking_copy_(slot->second.data_ptr()")
+    publish_pos = worker.index(
+        "this->gpu_weight_buffer_.weights_copy_enqueued("
+    )
+
+    assert copy_pos < publish_pos
