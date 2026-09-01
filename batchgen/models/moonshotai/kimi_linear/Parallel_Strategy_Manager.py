@@ -520,6 +520,20 @@ class KimiLinearParallelStrategyManager:
                         ):
                             if hasattr(dense, name):
                                 delattr(dense, name)
+                    for norm in (
+                        getattr(layer, "self_attention_res_norm", None),
+                        getattr(layer, "mlp_res_norm", None),
+                    ):
+                        if norm is None:
+                            continue
+                        for name in (
+                            "_streamed_sp8_row_group",
+                            "_streamed_sp8_order_wait",
+                            "_streamed_sp8_profiler",
+                            "_streamed_sp8_profile_name",
+                        ):
+                            if hasattr(norm, name):
+                                delattr(norm, name)
                     if moe is not None:
                         moe._streamed_sp8_prefill_enabled = False
                         moe._streamed_sp8_moe = None
@@ -529,6 +543,18 @@ class KimiLinearParallelStrategyManager:
                             and hasattr(shared, "_streamed_sp8_profiler")
                         ):
                             del shared._streamed_sp8_profiler
+                output_norm = getattr(
+                    self.model.model, "output_attn_res_norm", None
+                )
+                if output_norm is not None:
+                    for name in (
+                        "_streamed_sp8_row_group",
+                        "_streamed_sp8_order_wait",
+                        "_streamed_sp8_profiler",
+                        "_streamed_sp8_profile_name",
+                    ):
+                        if hasattr(output_norm, name):
+                            delattr(output_norm, name)
             # Drop the callback with the buffer it closes over: decode reaches
             # the SAME ``_reduce_mla_tp_output`` helper, and a stale reference
             # there would park its all-reduce on a torn-down handshake. This
@@ -893,16 +919,33 @@ class KimiLinearParallelStrategyManager:
             cross_root=self._cross_weight_root,
             cross_source=self._cross_weight_source,
         )
+        row_group = (
+            self._attn_tp_size,
+            self._attn_tp_rank,
+            self._attn_tp_group,
+        )
+        order_wait = (
+            self._streamed_sp8_buffer.order_tp_collective_after_cross_launch
+        )
         for layer_idx, layer in enumerate(self.model.model.layers):
             moe = getattr(layer, "block_sparse_moe", None)
             dense = getattr(layer, "mlp", None)
             if dense is not None:
-                dense._streamed_sp8_row_group = (
-                    self._attn_tp_size,
-                    self._attn_tp_rank,
-                    self._attn_tp_group,
-                )
+                dense._streamed_sp8_row_group = row_group
                 dense._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+            for norm, profile_name in (
+                (
+                    getattr(layer, "self_attention_res_norm", None),
+                    "self_depth_mix",
+                ),
+                (getattr(layer, "mlp_res_norm", None), "mlp_depth_mix"),
+            ):
+                if norm is None:
+                    continue
+                norm._streamed_sp8_row_group = row_group
+                norm._streamed_sp8_order_wait = order_wait
+                norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+                norm._streamed_sp8_profile_name = profile_name
             if moe is None or moe.experts is None:
                 continue
             moe._streamed_sp8_moe = StreamedSP8MXFP4MoELayer(
@@ -929,13 +972,18 @@ class KimiLinearParallelStrategyManager:
             shared = getattr(moe, "shared_experts", None)
             if shared is not None:
                 shared._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
-        # The cross-node broadcast gate opens at the end of each MoE serving
-        # branch; the next TP8 launch is the following layer's attention
-        # all-reduce, which must observe every cross-node call already
-        # host-enqueued. Attach the wait there rather than inside the MoE.
-        order_wait = (
-            self._streamed_sp8_buffer.order_tp_collective_after_cross_launch
+        output_norm = getattr(
+            self.model.model, "output_attn_res_norm", None
         )
+        if output_norm is not None:
+            output_norm._streamed_sp8_row_group = row_group
+            output_norm._streamed_sp8_order_wait = order_wait
+            output_norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+            output_norm._streamed_sp8_profile_name = "output_depth_mix"
+        # The cross-node broadcast gate opens at the end of each MoE serving
+        # branch; whichever TP8 collective follows first (a depth-mix gather
+        # or the next attention all-reduce) must observe every cross-node call
+        # already host-enqueued.
         for module in self._streamed_sp8_attention_modules():
             module._streamed_sp8_order_wait = order_wait
             module._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer

@@ -96,12 +96,20 @@ def all_gather_rows(
     splits = balanced_row_split(num_rows, group_size)
     ntp = max((e - s) for s, e in splits)  # == ceil(num_rows / G)
     H = routed_local.shape[-1]
-    padded = routed_local.new_zeros((ntp, H))
     n = routed_local.shape[0]
-    if n > 0:
-        padded[:n].copy_(routed_local)
+    if n == ntp:
+        send = routed_local
+    else:
+        send = routed_local.new_zeros((ntp, H))
+        if n > 0:
+            send[:n].copy_(routed_local)
     gathered = routed_local.new_empty((group_size * ntp, H))
-    dist.all_gather_into_tensor(gathered, padded, group=group)
+    dist.all_gather_into_tensor(gathered, send, group=group)
+    if num_rows == group_size * ntp:
+        # Rank-major concatenation is already the original contiguous row
+        # order for an even split. Returning it directly avoids allocating and
+        # copying a second full hidden tensor on exact64 K3 prefill.
+        return gathered
     return reassemble_rows(gathered.view(group_size, ntp, H), num_rows, group_size)
 
 

@@ -67,11 +67,11 @@ def attn_res_score_weight(proj: nn.Linear, norm) -> torch.Tensor:
     return norm.weight.float() * proj.weight.squeeze(0).float()
 
 
-def apply_attn_res(prefix_sum: torch.Tensor,
-                   block_residual: torch.Tensor,
-                   proj: nn.Linear,
-                   norm,
-                   chunk_size: int = 1024) -> torch.Tensor:
+def _apply_attn_res_local(prefix_sum: torch.Tensor,
+                          block_residual: torch.Tensor,
+                          proj: nn.Linear,
+                          norm,
+                          chunk_size: int = 1024) -> torch.Tensor:
     """Memory-lean Block-Attention-Residual depth mixer.
 
     Port of ``kimi_k3/model.py::_apply_attn_res_lean`` (M2), gated against the
@@ -138,6 +138,65 @@ def apply_attn_res(prefix_sum: torch.Tensor,
         probs = scores.softmax(-1).unsqueeze(1)              # (c, 1, nb+1)
         out[start:end] = torch.matmul(probs, v).squeeze(1).to(out.dtype)
     return out
+
+
+def apply_attn_res(prefix_sum: torch.Tensor,
+                   block_residual: torch.Tensor,
+                   proj: nn.Linear,
+                   norm,
+                   chunk_size: int = 1024) -> torch.Tensor:
+    """Apply the depth mixer, row-sharded during streamed-SP8 TP8 prefill.
+
+    The mixer is independent in the token axis. The prefill strategy therefore
+    gives each TP rank a disjoint contiguous row slice, runs the unchanged
+    local implementation, and all-gathers the rows needed by the next
+    head-parallel attention/MLP. Decode and every non-streamed path leave the
+    strategy attribute absent and execute the original full-row body.
+    """
+    row_group = getattr(norm, "_streamed_sp8_row_group", None)
+    profiler = getattr(norm, "_streamed_sp8_profiler", None)
+    if (
+        profiler is not None
+        and not profiler._prefill_profile_enabled
+    ):
+        profiler = None
+    span = profiler.begin_profile_span() if profiler is not None else None
+
+    if row_group is None:
+        output = _apply_attn_res_local(
+            prefix_sum, block_residual, proj, norm, chunk_size
+        )
+    else:
+        group_size, group_rank, group = row_group
+        from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+        local_prefix = scatter_rows(prefix_sum, group_size, group_rank)
+        local_residual = scatter_rows(
+            block_residual, group_size, group_rank
+        )
+        local_output = _apply_attn_res_local(
+            local_prefix, local_residual, proj, norm, chunk_size
+        )
+        order_wait = getattr(norm, "_streamed_sp8_order_wait", None)
+        if order_wait is not None:
+            # The previous layer opened the cross-node weight gate after its
+            # MoE. This gather is now the next TP8 collective, so it must
+            # observe the same cross-then-TP host issue order on every rank.
+            order_wait()
+        output = all_gather_rows(
+            local_output,
+            prefix_sum.shape[0],
+            group_size,
+            group_rank,
+            group,
+        )
+
+    if profiler is not None:
+        profiler.end_profile_span(
+            getattr(norm, "_streamed_sp8_profile_name", "depth_mix"),
+            span,
+        )
+    return output
 
 
 # ============================================================================

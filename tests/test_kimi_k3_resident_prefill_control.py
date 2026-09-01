@@ -729,6 +729,13 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     )
     assert "dense._streamed_sp8_row_group =" in source
     assert "dense._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
+    assert "norm._streamed_sp8_row_group = row_group" in source
+    assert "norm._streamed_sp8_order_wait = order_wait" in source
+    assert "norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
+    assert "norm._streamed_sp8_profile_name = profile_name" in source
+    assert "output_norm._streamed_sp8_row_group = row_group" in source
+    assert "output_norm._streamed_sp8_order_wait = order_wait" in source
+    assert "output_norm._streamed_sp8_profile_name = 'output_depth_mix'" in source
 
 
 def _psm_layer(module, *, wrapped):
@@ -741,11 +748,29 @@ def _psm_layer(module, *, wrapped):
     dense = type("Dense", (), {})()
     dense._streamed_sp8_row_group = object()
     dense._streamed_sp8_profiler = object()
+    self_norm = type("Norm", (), {})()
+    mlp_norm = type("Norm", (), {})()
+    for norm in (self_norm, mlp_norm):
+        norm._streamed_sp8_row_group = object()
+        norm._streamed_sp8_order_wait = lambda: None
+        norm._streamed_sp8_profiler = object()
+        norm._streamed_sp8_profile_name = "depth_mix"
     return type("Layer", (), {
         "self_attn": SimpleNamespace(module=module) if wrapped else module,
         "block_sparse_moe": moe,
         "mlp": dense,
+        "self_attention_res_norm": self_norm,
+        "mlp_res_norm": mlp_norm,
     })()
+
+
+def _psm_output_norm():
+    norm = type("Norm", (), {})()
+    norm._streamed_sp8_row_group = object()
+    norm._streamed_sp8_order_wait = lambda: None
+    norm._streamed_sp8_profiler = object()
+    norm._streamed_sp8_profile_name = "output_depth_mix"
+    return norm
 
 
 def test_streamed_sp8_release_removes_the_attention_order_wait():
@@ -763,8 +788,12 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
         _psm_layer(modules[0], wrapped=True),
         _psm_layer(modules[1], wrapped=False),
     ]
+    output_norm = _psm_output_norm()
     manager.model = type("Model", (), {
-        "model": type("Inner", (), {"layers": layers})(),
+        "model": type("Inner", (), {
+            "layers": layers,
+            "output_attn_res_norm": output_norm,
+        })(),
     })()
     closed = []
     manager._streamed_sp8_buffer = SimpleNamespace(
@@ -797,6 +826,24 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
         )
         assert not hasattr(layer.mlp, "_streamed_sp8_row_group")
         assert not hasattr(layer.mlp, "_streamed_sp8_profiler")
+        for norm in (
+            layer.self_attention_res_norm,
+            layer.mlp_res_norm,
+        ):
+            for name in (
+                "_streamed_sp8_row_group",
+                "_streamed_sp8_order_wait",
+                "_streamed_sp8_profiler",
+                "_streamed_sp8_profile_name",
+            ):
+                assert not hasattr(norm, name)
+    for name in (
+        "_streamed_sp8_row_group",
+        "_streamed_sp8_order_wait",
+        "_streamed_sp8_profiler",
+        "_streamed_sp8_profile_name",
+    ):
+        assert not hasattr(output_norm, name)
     # Decode reaches the same attention all-reduce helper. A surviving callback
     # would close over the buffer this release just tore down.
     for module in modules:
@@ -816,8 +863,12 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
     module._streamed_sp8_order_wait = lambda: None
     module._streamed_sp8_profiler = object()
     layer = _psm_layer(module, wrapped=True)
+    output_norm = _psm_output_norm()
     manager.model = type("Model", (), {
-        "model": type("Inner", (), {"layers": [layer]})(),
+        "model": type("Inner", (), {
+            "layers": [layer],
+            "output_attn_res_norm": output_norm,
+        })(),
     })()
 
     def close():
@@ -850,6 +901,18 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
     )
     assert not hasattr(layer.mlp, "_streamed_sp8_row_group")
     assert not hasattr(layer.mlp, "_streamed_sp8_profiler")
+    for norm in (
+        layer.self_attention_res_norm,
+        layer.mlp_res_norm,
+        output_norm,
+    ):
+        for name in (
+            "_streamed_sp8_row_group",
+            "_streamed_sp8_order_wait",
+            "_streamed_sp8_profiler",
+            "_streamed_sp8_profile_name",
+        ):
+            assert not hasattr(norm, name)
     assert not hasattr(module, "_streamed_sp8_order_wait")
     assert not hasattr(module, "_streamed_sp8_profiler")
 
@@ -3205,6 +3268,8 @@ def test_streamed_sp8_detailed_profile_hooks_cover_the_non_load_gap():
     serving_source = _serving_modules_path().read_text()
     model_source = (ROOT / "batchgen" / "models" / "moonshotai" /
                     "kimi_linear" / "model.py").read_text()
+    residual_source = (ROOT / "batchgen" / "models" / "moonshotai" /
+                       "kimi_linear" / "block_residual.py").read_text()
 
     for name in ("kda_attention", "mla_attention", "mla_kv_offload"):
         assert f'end_profile_span("{name}"' in wrapper_source
@@ -3216,6 +3281,10 @@ def test_streamed_sp8_detailed_profile_hooks_cover_the_non_load_gap():
     ):
         assert f'"{name}"' in serving_source
     assert 'end_profile_span("shared_expert_reduce"' in model_source
+    assert "profiler.end_profile_span(" in residual_source
+    for name in ("self_depth_mix", "mlp_depth_mix", "output_depth_mix"):
+        assert f'"{name}"' in (ROOT / "batchgen" / "moe" /
+                               "streamed_sp8_mxfp4.py").read_text()
 
 
 def test_distributed_daemon_joins_bootstrap_threads_on_failure():

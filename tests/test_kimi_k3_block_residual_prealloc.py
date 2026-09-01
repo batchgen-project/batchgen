@@ -592,6 +592,50 @@ def test_score_multiply_in_place_is_bit_exact():
     assert torch.equal(actual, expected)
 
 
+def test_streamed_sp8_depth_mix_row_shard_is_bit_exact(monkeypatch):
+    """TP row sharding preserves the token-independent depth mixer exactly."""
+    tokens, num_blocks, hidden = 16, 5, 16
+    group_size, group_rank = 4, 2
+    gen = torch.Generator().manual_seed(260902)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+    reference = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    rows_per_rank = tokens // group_size
+    trace = []
+
+    def fake_all_gather(gathered, send, group):
+        assert group == "fake-group"
+        start = group_rank * rows_per_rank
+        end = start + rows_per_rank
+        assert trace == ["order_wait"]
+        assert torch.equal(send, reference[start:end])
+        gathered.copy_(reference)
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+    norm._streamed_sp8_row_group = (
+        group_size,
+        group_rank,
+        "fake-group",
+    )
+    norm._streamed_sp8_order_wait = lambda: trace.append("order_wait")
+
+    actual = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+
+    assert torch.equal(actual, reference)
+    assert trace == ["order_wait"]
+
+
 def test_resident_prefill_bounds_depth_mixer_chunk_exactly():
     """Resident prefill reuses its 512-row memory tile in the depth mixer."""
     tokens, num_blocks, hidden = 61, 5, 16

@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
+    all_gather_rows,
     all_gather_rows_into,
     balanced_row_split,
     reassemble_rows,
@@ -176,3 +177,27 @@ def test_chunked_gather_into_reassembles_exact_rows(monkeypatch, B, G):
         )
         assert call_index == math.ceil(ntp / chunk_rows)
         assert torch.equal(output, x)
+
+
+def test_even_all_gather_returns_collective_output_without_reassembly(monkeypatch):
+    """An even split is already rank-major contiguous after all-gather."""
+    B, G = 16, 4
+    x = torch.arange(B * H, dtype=torch.float32).view(B, H)
+    local = [scatter_rows(x, G, rank) for rank in range(G)]
+    captured = {}
+
+    def fake_all_gather(gathered, send, group):
+        assert group == "fake-group"
+        assert torch.equal(send, local[2])
+        gathered.copy_(torch.cat(local, dim=0))
+        captured["gathered"] = gathered
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+    output = all_gather_rows(local[2], B, G, 2, "fake-group")
+
+    assert output is captured["gathered"]
+    assert torch.equal(output, x)
