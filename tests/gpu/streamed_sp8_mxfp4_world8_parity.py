@@ -21,6 +21,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -174,6 +175,9 @@ def worker(rank, world, out_path, master_port):
         all_gather_rows_into,
         scatter_rows,
     )
+    from batchgen.models.moonshotai.kimi_linear.block_residual import (
+        apply_attn_res,
+    )
 
     block, cfg, _ = TT._build_mxfp4_serving_block("syn25_mxfp4")
     block = block.to(device)
@@ -271,6 +275,60 @@ def worker(rank, world, out_path, master_port):
         )
         uneven_copy_exact = torch.equal(uneven_copy, uneven)
 
+        # The K3 block-attention residual mixer is token-independent. The
+        # streamed-SP8 strategy computes one contiguous eighth per rank and
+        # restores the replicated rows for the following TP attention/MLP.
+        depth_gen = torch.Generator().manual_seed(260902)
+        depth_tokens, depth_blocks, depth_hidden = 64, 5, 128
+        depth_prefix = torch.randn(
+            depth_tokens,
+            depth_hidden,
+            generator=depth_gen,
+            dtype=torch.bfloat16,
+        ).to(device)
+        depth_residual = torch.randn(
+            depth_tokens,
+            depth_blocks,
+            depth_hidden,
+            generator=depth_gen,
+            dtype=torch.bfloat16,
+        ).to(device)
+        depth_proj = torch.nn.Linear(
+            depth_hidden, 1, bias=False, dtype=torch.float32
+        ).to(device)
+        depth_proj.weight.copy_(torch.randn(
+            1, depth_hidden, generator=depth_gen, dtype=torch.float32
+        ).to(device))
+        depth_norm = SimpleNamespace(
+            weight=torch.randn(
+                depth_hidden, generator=depth_gen, dtype=torch.float32
+            ).to(device),
+            variance_epsilon=1e-6,
+        )
+        depth_reference = apply_attn_res(
+            depth_prefix,
+            depth_residual,
+            depth_proj,
+            depth_norm,
+            chunk_size=depth_tokens // world,
+        )
+        depth_norm._streamed_sp8_row_group = (
+            world,
+            rank,
+            dist.group.WORLD,
+        )
+        depth_actual = apply_attn_res(
+            depth_prefix,
+            depth_residual,
+            depth_proj,
+            depth_norm,
+            chunk_size=depth_tokens // world,
+        )
+        depth_mix_exact = torch.equal(depth_actual, depth_reference)
+        depth_mix_max_abs = float(
+            (depth_actual.float() - depth_reference.float()).abs().max()
+        )
+
     wide_error = _err_ratio(wide, reference)
     striped_error = _err_ratio(striped, reference)
     striped_vs_wide = _err_ratio(striped, wide)
@@ -300,6 +358,11 @@ def worker(rank, world, out_path, master_port):
         raise AssertionError("uneven chunked row gather-add parity failed")
     if not uneven_copy_exact:
         raise AssertionError("uneven chunked row gather-copy parity failed")
+    if not depth_mix_exact:
+        raise AssertionError(
+            "row-sharded depth-mix parity failed: "
+            f"max_abs={depth_mix_max_abs}"
+        )
     if int(local_assignments.item()) != expected_assignments:
         raise AssertionError(
             f"duplicated assignments: got {int(local_assignments.item())}, "
@@ -324,6 +387,8 @@ def worker(rank, world, out_path, master_port):
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
             "uneven_gather_copy_exact": uneven_copy_exact,
+            "depth_mix_exact": depth_mix_exact,
+            "depth_mix_max_abs": depth_mix_max_abs,
             "verdict": "PASS",
         }
         Path(out_path).write_text(json.dumps(result, indent=2) + "\n")
