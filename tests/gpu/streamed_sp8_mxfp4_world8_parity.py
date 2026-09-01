@@ -279,7 +279,9 @@ def worker(rank, world, out_path, master_port):
         # streamed-SP8 strategy computes one contiguous eighth per rank and
         # restores the replicated rows for the following TP attention/MLP.
         depth_gen = torch.Generator().manual_seed(260902)
-        depth_tokens, depth_blocks, depth_hidden = 64, 5, 128
+        # Use K3's production H so both the replicated reference and every
+        # token shard exercise the Triton mixer rather than its shape fallback.
+        depth_tokens, depth_blocks, depth_hidden = 64, 5, 7168
         depth_prefix = torch.randn(
             depth_tokens,
             depth_hidden,
