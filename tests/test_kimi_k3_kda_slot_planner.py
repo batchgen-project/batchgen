@@ -20,6 +20,7 @@ from batchgen.models.moonshotai.kimi_linear.planner import (
     KimiLinearPlanner,
     k3_kda_state_slots,
     k3_prefill_collective_stripe_threshold_rows,
+    k3_prefill_grouped_chunk_rows,
     k3_prefill_micro_batch_token_cap,
 )
 
@@ -69,6 +70,20 @@ def test_h200_tp8_uses_one_wide_exact64_node_collective():
     ) == 8 * 65_536
 
 
+def test_h20_tp8_keeps_2k_grouped_expert_chunks():
+    assert k3_prefill_grouped_chunk_rows(
+        gpu_total_memory_bytes=96 * GIB,
+        attention_group_size=8,
+    ) == 2_048
+
+
+def test_h200_tp8_uses_32k_grouped_expert_chunks():
+    assert k3_prefill_grouped_chunk_rows(
+        gpu_total_memory_bytes=140 * GIB,
+        attention_group_size=8,
+    ) == 32_768
+
+
 def test_h200_non_tp8_fails_safe_to_four_slots():
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=140 * GIB,
@@ -83,6 +98,10 @@ def test_h200_non_tp8_fails_safe_to_four_slots():
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=1,
     ) == 32_768
+    assert k3_prefill_grouped_chunk_rows(
+        gpu_total_memory_bytes=140 * GIB,
+        attention_group_size=1,
+    ) == 2_048
 
 
 def test_unknown_memory_fails_safe_to_four_slots():
@@ -98,6 +117,10 @@ def test_unknown_memory_fails_safe_to_four_slots():
         gpu_total_memory_bytes=None,
         attention_group_size=8,
     ) == 32_768
+    assert k3_prefill_grouped_chunk_rows(
+        gpu_total_memory_bytes=None,
+        attention_group_size=8,
+    ) == 2_048
 
 
 @pytest.mark.parametrize(
@@ -107,6 +130,11 @@ def test_unknown_memory_fails_safe_to_four_slots():
 def test_invalid_capacity_inputs_fail_closed(memory_bytes, group_size):
     with pytest.raises(ValueError):
         k3_kda_state_slots(
+            gpu_total_memory_bytes=memory_bytes,
+            attention_group_size=group_size,
+        )
+    with pytest.raises(ValueError):
+        k3_prefill_grouped_chunk_rows(
             gpu_total_memory_bytes=memory_bytes,
             attention_group_size=group_size,
         )
@@ -151,4 +179,8 @@ def test_h200_plan_exposes_32_users_plus_separate_graph_scratch():
         config.Module_Batching_Config
         .k3_prefill_collective_stripe_threshold_rows
         == 8 * 65_536
+    )
+    assert (
+        config.Module_Batching_Config.k3_prefill_grouped_chunk_rows
+        == 32_768
     )

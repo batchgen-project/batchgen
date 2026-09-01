@@ -20,6 +20,8 @@ _K3_H20_PREFILL_TOKEN_CAP = 16_384
 _K3_H200_PREFILL_TOKEN_CAP = 524_288
 _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
 _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 524_288
+_K3_H20_PREFILL_GROUPED_CHUNK_ROWS = 2_048
+_K3_H200_PREFILL_GROUPED_CHUNK_ROWS = 32_768
 
 
 def k3_kda_state_slots(
@@ -96,6 +98,29 @@ def k3_prefill_collective_stripe_threshold_rows(
     if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
         return _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
     return _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
+
+
+def k3_prefill_grouped_chunk_rows(
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+) -> int:
+    """Return the routed-expert token chunk for streamed-SP8 prefill.
+
+    H20 retains the validated 2K-row bound. H200 has enough temporary HBM for
+    32K node rows, which gives each expert hundreds rather than tens of rows
+    per grouped Marlin launch and cuts the exact64 loop from 256 to 16 chunks
+    per layer. Unknown memory and non-TP8 layouts fail safe to the H20 bound.
+    """
+    group_size = int(attention_group_size)
+    if group_size <= 0:
+        raise ValueError("attention_group_size must be positive")
+    if gpu_total_memory_bytes is None:
+        return _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
+    memory_bytes = int(gpu_total_memory_bytes)
+    if memory_bytes <= 0:
+        raise ValueError("gpu_total_memory_bytes must be positive")
+    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
+        return _K3_H200_PREFILL_GROUPED_CHUNK_ROWS
+    return _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
 
 
 class KimiLinearPlanner(BasePlanner):
@@ -192,6 +217,14 @@ class KimiLinearPlanner(BasePlanner):
             )
             if self.is_k3 and self.attention_group_size > 1
             else _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
+        )
+        self.config.Module_Batching_Config.k3_prefill_grouped_chunk_rows = (
+            k3_prefill_grouped_chunk_rows(
+                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+                attention_group_size=self.attention_group_size,
+            )
+            if self.is_k3 and self.attention_group_size > 1
+            else _K3_H20_PREFILL_GROUPED_CHUNK_ROWS
         )
 
         # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":

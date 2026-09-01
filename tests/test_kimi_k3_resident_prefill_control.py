@@ -671,6 +671,28 @@ def test_streamed_sp8_layer_uses_planned_collective_stripe_threshold():
     assert "32768" in source
 
 
+def test_streamed_sp8_layer_uses_planned_grouped_chunk_rows():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    source = ast.unparse(
+        _function(
+            path,
+            "KimiLinearParallelStrategyManager",
+            "_init_streamed_sp8_prefill",
+        )
+    )
+
+    assert "chunk_rows=int(getattr(" in source
+    assert "'k3_prefill_grouped_chunk_rows'" in source
+    assert "2048" in source
+
+
 def _psm_path():
     return (
         ROOT
