@@ -1193,7 +1193,6 @@ def moe_forward_serving(self, hidden_states):
         profiler = type(streamed_sp8)
         profile = profiler._prefill_profile_enabled
         moe_span = profiler.begin_profile_span() if profile else None
-        identity = hidden_states
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, self.hidden_dim)
         G = int(getattr(self, "attn_tp_size", 1))
@@ -1201,7 +1200,7 @@ def moe_forward_serving(self, hidden_states):
             raise RuntimeError(
                 "streamed-SP8 prefill reached MoE without TP row sharding"
             )
-        from .moe_tp_reshard import all_gather_rows, scatter_rows
+        from .moe_tp_reshard import all_gather_rows_add_, scatter_rows
 
         num_rows = x.shape[0]
         x_local = scatter_rows(x, G, self.attn_tp_rank)
@@ -1209,10 +1208,18 @@ def moe_forward_serving(self, hidden_states):
         # pre-split row count to pad this slice to the shared ntp stride its
         # node-local latent gather and reduce-scatter are laid out on.
         routed_local = streamed_sp8.forward(x_local, self.gate, num_rows)
+        if getattr(self, "shared_experts", None) is not None:
+            shared_span = profiler.begin_profile_span() if profile else None
+            self.shared_experts.forward_into(x, x)
+            if profile:
+                profiler.end_profile_span("shared_expert", shared_span)
+        else:
+            x.zero_()
         routed_gather_span = (
             profiler.begin_profile_span() if profile else None
         )
-        routed = all_gather_rows(
+        all_gather_rows_add_(
+            x,
             routed_local,
             num_rows,
             G,
@@ -1223,12 +1230,7 @@ def moe_forward_serving(self, hidden_states):
             profiler.end_profile_span(
                 "routed_output_gather", routed_gather_span
             )
-        out = routed.reshape(orig_shape)
-        if getattr(self, "shared_experts", None) is not None:
-            shared_span = profiler.begin_profile_span() if profile else None
-            out.add_(self.shared_experts(identity))
-            if profile:
-                profiler.end_profile_span("shared_expert", shared_span)
+        out = x.reshape(orig_shape)
         # Every TP8 collective of this layer -- the node-local latent/routing
         # gathers, the FP32 reduce-scatter, the routed-output all-gather above
         # and the shared expert's row-parallel all-reduce -- has now been

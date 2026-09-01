@@ -103,3 +103,70 @@ def all_gather_rows(
     gathered = routed_local.new_empty((group_size * ntp, H))
     dist.all_gather_into_tensor(gathered, padded, group=group)
     return reassemble_rows(gathered.view(group_size, ntp, H), num_rows, group_size)
+
+
+def all_gather_rows_add_(
+    output: torch.Tensor,
+    routed_local: torch.Tensor,
+    num_rows: int,
+    group_size: int,
+    group_rank: int,
+    group,
+    chunk_rows: int = 256,
+) -> torch.Tensor:
+    """Add TP-row-sharded results into an existing full-row output.
+
+    This is the bounded-scratch counterpart of :func:`all_gather_rows`. The
+    full destination already contains the shared-expert result; each
+    rank-local row chunk is gathered and added in place, so no second
+    ``(num_rows, H)`` tensor is allocated.
+    """
+    import torch.distributed as dist
+
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+    if output.shape[0] != num_rows:
+        raise ValueError("output row count does not match num_rows")
+
+    splits = balanced_row_split(num_rows, group_size)
+    ntp = max((e - s) for s, e in splits)
+    H = routed_local.shape[-1]
+    if output.shape[-1] != H:
+        raise ValueError("output hidden size does not match routed rows")
+    local_rows = splits[group_rank][1] - splits[group_rank][0]
+    if routed_local.shape[0] != local_rows:
+        raise ValueError("routed_local row count does not match this TP rank")
+
+    even = num_rows == group_size * ntp
+    even_output = output.view(group_size, ntp, H) if even else None
+    for local_start in range(0, ntp, chunk_rows):
+        local_end = min(local_start + chunk_rows, ntp)
+        count = local_end - local_start
+        valid_end = min(local_end, local_rows)
+        valid_count = max(0, valid_end - local_start)
+        if valid_count == count:
+            send = routed_local[local_start:local_end]
+        else:
+            send = routed_local.new_zeros((count, H))
+            if valid_count:
+                send[:valid_count].copy_(
+                    routed_local[local_start:valid_end]
+                )
+        gathered = routed_local.new_empty((group_size * count, H))
+        dist.all_gather_into_tensor(gathered, send, group=group)
+        gathered = gathered.view(group_size, count, H)
+        if even:
+            even_output[:, local_start:local_end].add_(gathered)
+        else:
+            for rank, (start, end) in enumerate(splits):
+                rank_count = max(
+                    0, min(local_end, end - start) - local_start
+                )
+                if rank_count:
+                    output[
+                        start + local_start : start + local_start + rank_count
+                    ].add_(gathered[rank, :rank_count])
+        del gathered
+        if valid_count != count:
+            del send
+    return output

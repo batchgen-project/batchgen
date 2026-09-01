@@ -268,6 +268,52 @@ def test_resident_prefill_uses_smaller_tile_only_for_long_inputs(M, monkeypatch)
     assert torch.equal(ragged_out, real_ffn(ragged))
 
 
+@pytest.mark.parametrize("shape", [(4 * TILE + 1, HIDDEN),
+                                   (1, 4 * TILE + 1, HIDDEN)])
+def test_forward_into_may_alias_input(M, monkeypatch, shape):
+    """The streamed-prefill seam reuses its dead MoE input as FFN output."""
+    monkeypatch.setattr(M, "_FFN_TOKEN_TILE", TILE)
+    mlp = _mlp(M, "situ", torch.bfloat16)
+    source = torch.randn(
+        *shape, generator=torch.Generator().manual_seed(20260902)
+    ).bfloat16()
+
+    with torch.inference_mode():
+        expected = mlp(source.clone())
+        alias = source.clone()
+        result = mlp.forward_into(alias, alias)
+
+    assert result.data_ptr() == alias.data_ptr()
+    assert result.shape == expected.shape
+    assert torch.equal(result, expected)
+
+
+def test_forward_into_honors_resident_tile(M, monkeypatch):
+    monkeypatch.setattr(M, "_FFN_TOKEN_TILE", TILE)
+    mlp = _mlp(M, "situ", torch.bfloat16)
+    mlp._resident_prefill_token_tile = 8
+    source = torch.randn(4 * TILE, HIDDEN).bfloat16()
+    calls = []
+    real_ffn = mlp._ffn
+    mlp._ffn = lambda t: (calls.append(t.shape[0]), real_ffn(t))[1]
+
+    with torch.inference_mode():
+        expected = mlp(source.clone())
+        calls.clear()
+        alias = source.clone()
+        result = mlp.forward_into(alias, alias)
+
+    assert max(calls) <= 8
+    assert torch.equal(result, expected)
+
+
+def test_forward_into_rejects_mismatched_output(M):
+    mlp = _mlp(M, "situ", torch.bfloat16)
+    x = torch.randn(7, HIDDEN).bfloat16()
+    with pytest.raises(ValueError, match="matching tensors"):
+        mlp.forward_into(x, torch.empty(8, HIDDEN, dtype=x.dtype))
+
+
 def test_bf16_exact_at_native_thread_count(M, monkeypatch):
     """The production dtype, at the machine's real thread count — i.e. without
     the single-thread pin the fp32 sweeps need. MEASURED exact for every token

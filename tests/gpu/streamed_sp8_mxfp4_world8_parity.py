@@ -170,6 +170,7 @@ def worker(rank, world, out_path, master_port):
     )
     from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
         all_gather_rows,
+        all_gather_rows_add_,
         scatter_rows,
     )
 
@@ -225,6 +226,39 @@ def worker(rank, world, out_path, master_port):
             block, reference_shard, ResidentEPMXFP4MoELayer
         ).forward(x, block.gate)
 
+        shared = block.shared_experts(x)
+        combined_reference = shared + wide
+        combined = x.clone()
+        block.shared_experts.forward_into(combined, combined)
+        shared_alias_error = _err_ratio(combined, shared)
+        all_gather_rows_add_(
+            combined,
+            wide_local,
+            num_rows,
+            world,
+            rank,
+            dist.group.WORLD,
+            chunk_rows=2,
+        )
+        combined_error = _err_ratio(combined, combined_reference)
+
+        uneven_rows = world * 3 + 1
+        uneven = torch.arange(
+            uneven_rows * 7, dtype=torch.float32, device=device
+        ).view(uneven_rows, 7)
+        uneven_local = scatter_rows(uneven, world, rank)
+        uneven_output = torch.ones_like(uneven)
+        all_gather_rows_add_(
+            uneven_output,
+            uneven_local,
+            uneven_rows,
+            world,
+            rank,
+            dist.group.WORLD,
+            chunk_rows=2,
+        )
+        uneven_exact = torch.equal(uneven_output, uneven + 1)
+
     wide_error = _err_ratio(wide, reference)
     striped_error = _err_ratio(striped, reference)
     striped_vs_wide = _err_ratio(striped, wide)
@@ -245,6 +279,13 @@ def worker(rank, world, out_path, master_port):
         raise AssertionError(
             f"striped/wide parity failed: err_ratio={striped_vs_wide}"
         )
+    if shared_alias_error != 0.0 or combined_error >= 3e-3:
+        raise AssertionError(
+            "bounded output assembly parity failed: "
+            f"shared_alias={shared_alias_error} combined={combined_error}"
+        )
+    if not uneven_exact:
+        raise AssertionError("uneven chunked row gather-add parity failed")
     if int(local_assignments.item()) != expected_assignments:
         raise AssertionError(
             f"duplicated assignments: got {int(local_assignments.item())}, "
@@ -265,6 +306,9 @@ def worker(rank, world, out_path, master_port):
             "striped_err_ratio_vs_world1": striped_error,
             "striped_err_ratio_vs_wide": striped_vs_wide,
             "max_abs_vs_world1": max_abs,
+            "shared_forward_into_err_ratio": shared_alias_error,
+            "bounded_gather_add_err_ratio": combined_error,
+            "uneven_gather_add_exact": uneven_exact,
             "verdict": "PASS",
         }
         Path(out_path).write_text(json.dumps(result, indent=2) + "\n")

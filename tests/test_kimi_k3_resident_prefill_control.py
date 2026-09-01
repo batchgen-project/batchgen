@@ -875,7 +875,7 @@ def test_streamed_sp8_forward_uses_only_local_row_collective():
             calls.add(node.func.attr)
         elif isinstance(node.func, ast.Name):
             calls.add(node.func.id)
-    assert "all_gather_rows" in calls
+    assert "all_gather_rows_add_" in calls
     assert "all_reduce" not in calls
     assert "all_gather" not in calls
 
@@ -930,8 +930,12 @@ def test_streamed_sp8_serving_opens_the_cross_gate_last_in_the_branch():
     # The gate must trail EVERY TP8 collective of the layer: the routed-output
     # all-gather and the shared expert's row-parallel all-reduce both live out
     # here, past the streamed-SP8 layer forward.
-    assert last("forward") < last("all_gather_rows") < last("allow_cross_launch")
-    assert last("shared_experts") < last("allow_cross_launch")
+    assert (
+        last("forward")
+        < last("all_gather_rows_add_")
+        < last("allow_cross_launch")
+    )
+    assert last("forward_into") < last("allow_cross_launch")
     # ...and it must be the LAST thing the branch does, so nothing new can be
     # slipped in between the gate and the next layer's attention.
     assert last("allow_cross_launch") == max(line for line, _ in calls)

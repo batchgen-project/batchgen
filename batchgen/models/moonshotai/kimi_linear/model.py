@@ -257,6 +257,45 @@ class KimiMLP(nn.Module):
             out.view(*x.shape[:-1], out.shape[-1])
         )
 
+    def forward_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Run the token-tiled FFN into caller-owned storage.
+
+        ``out`` may alias ``x``. Each output row depends only on the matching
+        input row, so overwriting a completed tile cannot affect a later tile.
+        The TP reduction remains one full-shape collective after every local
+        tile is written, matching :meth:`forward` rather than changing its
+        reduction shape or order.
+        """
+        if (
+            out.shape != x.shape
+            or out.dtype != x.dtype
+            or out.device != x.device
+        ):
+            raise ValueError("KimiMLP forward_into requires matching tensors")
+
+        num_tokens = x.numel() // x.shape[-1]
+        token_tile = _FFN_TOKEN_TILE
+        resident_tile = self._resident_prefill_token_tile
+        if (
+            resident_tile is not None
+            and num_tokens > token_tile
+            and num_tokens % int(resident_tile) == 0
+        ):
+            token_tile = min(token_tile, int(resident_tile))
+        if token_tile <= 0:
+            raise ValueError("KimiMLP token tile must be positive")
+
+        flat_x = x.reshape(num_tokens, x.shape[-1])
+        flat_out = out.reshape(num_tokens, out.shape[-1])
+        n_tiles = max(1, math.ceil(num_tokens / token_tile))
+        for i in range(n_tiles):
+            start = (i * num_tokens) // n_tiles
+            end = ((i + 1) * num_tokens) // n_tiles
+            y = self._ffn(flat_x[start:end])
+            flat_out[start:end].copy_(y)
+            del y
+        return self._reduce_tp_output(out)
+
 
 class KimiBlockSparseMLP(nn.Module):
     """Routed-expert MLP (w1=gate, w2=down, w3=up naming, per checkpoint)."""
