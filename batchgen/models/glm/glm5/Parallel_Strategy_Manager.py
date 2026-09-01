@@ -30,6 +30,12 @@ from .model import Glm5ForCausalLM, Glm5MoE
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
+def _synchronize_prefill_preloads():
+    """Keep one rank's forward from overlapping another rank's preload."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 class GLM5ParallelStrategyManager:
     NUM_TOTAL_EXPERTS = 256
     NUM_LAYERS = 78
@@ -180,6 +186,7 @@ class GLM5ParallelStrategyManager:
             for moe in grouped_layers:
                 moe._prefill_release_event = torch.cuda.Event()
                 moe._prefill_shared_release_event = torch.cuda.Event()
+            _synchronize_prefill_preloads()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time

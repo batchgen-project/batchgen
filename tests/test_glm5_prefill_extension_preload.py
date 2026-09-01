@@ -41,3 +41,20 @@ def test_fused_attention_preload_is_idempotent(monkeypatch):
     assert ops.preload_fused_attention_kernels() is fake
     assert ops.preload_fused_attention_kernels() is fake
     assert calls == ["batchgen_kernels.attention._C_fused_ops"]
+
+
+def test_prefill_preload_sync_waits_for_every_distributed_rank(monkeypatch):
+    from batchgen.models.glm.glm5 import Parallel_Strategy_Manager as psm
+
+    calls = []
+    monkeypatch.setattr(psm.dist, "is_available", lambda: True)
+    monkeypatch.setattr(psm.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(psm.dist, "barrier", lambda: calls.append("barrier"))
+
+    psm._synchronize_prefill_preloads()
+    assert calls == ["barrier"]
+
+    calls.clear()
+    monkeypatch.setattr(psm.dist, "is_initialized", lambda: False)
+    psm._synchronize_prefill_preloads()
+    assert calls == []
