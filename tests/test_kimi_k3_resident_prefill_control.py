@@ -1560,7 +1560,13 @@ def _mock_sp8_moe_layer(
             self.shard = shard
             trace.append(("helper", world_size, expert_start))
 
-        def _expert_path(self, x_latent, topk_idx, count):
+        def _expert_path(
+            self,
+            x_latent,
+            topk_idx,
+            count,
+            packed_max_rows=None,
+        ):
             trace.append(("expert_path", count, tuple(topk_idx.shape)))
             return torch.zeros((count, 2, self.shard.K_latent)), None
 
@@ -1650,6 +1656,11 @@ def _mock_sp8_moe_layer(
             "time": time,
             "dist": fake_dist,
             "ResidentEPMXFP4MoELayer": FakeHelper,
+            "compact_dispatch_max_rows_by_chunk": _isolated_function(
+                ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py",
+                "compact_dispatch_max_rows_by_chunk",
+                {"torch": torch},
+            ),
             # The real helper records a CUDA timing event; the mocks run on CPU
             # tensors, so stand in for it and log the boundary instead.
             "_profile_mark": _tracing_profile_mark(trace),
