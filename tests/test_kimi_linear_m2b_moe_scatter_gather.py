@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
+    all_gather_rows_into,
     balanced_row_split,
     reassemble_rows,
     scatter_rows,
@@ -132,3 +133,46 @@ def test_scatter_gather_nonvacuity_wrong_split():
     out_bad = reassemble_rows(bad, B, G)
     ref = _stub_resident_forward(x)
     assert not torch.equal(out_bad, ref), "non-vacuity failed: wrong split matched"
+
+
+@pytest.mark.parametrize(("B", "G"), [(17, 8), (3, 8), (16, 4)])
+def test_chunked_gather_into_reassembles_exact_rows(monkeypatch, B, G):
+    x = torch.arange(B * H, dtype=torch.float32).view(B, H)
+    local = [scatter_rows(x, G, rank) for rank in range(G)]
+    splits = balanced_row_split(B, G)
+    ntp = max(end - start for start, end in splits)
+    chunk_rows = 2
+
+    for group_rank in range(G):
+        call_index = 0
+
+        def fake_all_gather(gathered, send, group):
+            nonlocal call_index
+            assert group == "fake-group"
+            start = call_index * chunk_rows
+            count = send.shape[0]
+            for rank, rows in enumerate(local):
+                chunk = rows.new_zeros((count, H))
+                valid_end = min(start + count, rows.shape[0])
+                if valid_end > start:
+                    chunk[:valid_end - start].copy_(rows[start:valid_end])
+                gathered[rank * count:(rank + 1) * count].copy_(chunk)
+            call_index += 1
+
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            fake_all_gather,
+        )
+        output = torch.empty_like(x)
+        all_gather_rows_into(
+            output,
+            local[group_rank],
+            B,
+            G,
+            group_rank,
+            "fake-group",
+            chunk_rows=chunk_rows,
+        )
+        assert call_index == math.ceil(ntp / chunk_rows)
+        assert torch.equal(output, x)

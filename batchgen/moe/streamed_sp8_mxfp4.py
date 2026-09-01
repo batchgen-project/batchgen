@@ -797,6 +797,7 @@ class StreamedSP8MXFP4MoELayer:
         "mla_attention",
         "mla_kv_offload",
         "attention_reduce",
+        "dense_mlp",
     )
     _prefill_profile_named_spans = {
         name: [] for name in _prefill_profile_span_names

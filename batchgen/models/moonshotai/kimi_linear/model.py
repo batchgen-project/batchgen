@@ -910,7 +910,38 @@ class KimiDecoderLayer(nn.Module):
     def _run_ffn(self, hidden_states):
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(hidden_states)
-        return self.mlp(hidden_states)
+        profiler = getattr(self.mlp, "_streamed_sp8_profiler", None)
+        profile = bool(
+            profiler is not None and profiler._prefill_profile_enabled
+        )
+        span = profiler.begin_profile_span() if profile else None
+        row_group = getattr(self.mlp, "_streamed_sp8_row_group", None)
+        if row_group is None:
+            output = self.mlp(hidden_states)
+        else:
+            group_size, group_rank, group = row_group
+            from .moe_tp_reshard import (
+                all_gather_rows_into,
+                scatter_rows,
+            )
+
+            original_shape = hidden_states.shape
+            flat = hidden_states.reshape(-1, original_shape[-1])
+            local_input = scatter_rows(flat, group_size, group_rank)
+            local_output = self.mlp(local_input)
+            output = flat.new_empty(flat.shape)
+            all_gather_rows_into(
+                output,
+                local_output,
+                flat.shape[0],
+                group_size,
+                group_rank,
+                group,
+            )
+            output = output.view(original_shape)
+        if profile:
+            profiler.end_profile_span("dense_mlp", span)
+        return output
 
     def forward(
         self,

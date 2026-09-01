@@ -705,6 +705,8 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     assert (
         "shared._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
     )
+    assert "dense._streamed_sp8_row_group =" in source
+    assert "dense._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
 
 
 def _psm_layer(module, *, wrapped):
@@ -714,9 +716,13 @@ def _psm_layer(module, *, wrapped):
     moe._streamed_sp8_moe = object()
     moe.shared_experts = type("Shared", (), {})()
     moe.shared_experts._streamed_sp8_profiler = object()
+    dense = type("Dense", (), {})()
+    dense._streamed_sp8_row_group = object()
+    dense._streamed_sp8_profiler = object()
     return type("Layer", (), {
         "self_attn": SimpleNamespace(module=module) if wrapped else module,
         "block_sparse_moe": moe,
+        "mlp": dense,
     })()
 
 
@@ -767,6 +773,8 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
             layer.block_sparse_moe.shared_experts,
             "_streamed_sp8_profiler",
         )
+        assert not hasattr(layer.mlp, "_streamed_sp8_row_group")
+        assert not hasattr(layer.mlp, "_streamed_sp8_profiler")
     # Decode reaches the same attention all-reduce helper. A surviving callback
     # would close over the buffer this release just tore down.
     for module in modules:
@@ -818,6 +826,8 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
         layer.block_sparse_moe.shared_experts,
         "_streamed_sp8_profiler",
     )
+    assert not hasattr(layer.mlp, "_streamed_sp8_row_group")
+    assert not hasattr(layer.mlp, "_streamed_sp8_profiler")
     assert not hasattr(module, "_streamed_sp8_order_wait")
     assert not hasattr(module, "_streamed_sp8_profiler")
 

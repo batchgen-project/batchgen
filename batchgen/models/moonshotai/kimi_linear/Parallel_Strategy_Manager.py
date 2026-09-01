@@ -512,6 +512,14 @@ class KimiLinearParallelStrategyManager:
             if self.model is not None:
                 for layer in self.model.model.layers:
                     moe = getattr(layer, "block_sparse_moe", None)
+                    dense = getattr(layer, "mlp", None)
+                    if dense is not None:
+                        for name in (
+                            "_streamed_sp8_row_group",
+                            "_streamed_sp8_profiler",
+                        ):
+                            if hasattr(dense, name):
+                                delattr(dense, name)
                     if moe is not None:
                         moe._streamed_sp8_prefill_enabled = False
                         moe._streamed_sp8_moe = None
@@ -887,6 +895,14 @@ class KimiLinearParallelStrategyManager:
         )
         for layer_idx, layer in enumerate(self.model.model.layers):
             moe = getattr(layer, "block_sparse_moe", None)
+            dense = getattr(layer, "mlp", None)
+            if dense is not None:
+                dense._streamed_sp8_row_group = (
+                    self._attn_tp_size,
+                    self._attn_tp_rank,
+                    self._attn_tp_group,
+                )
+                dense._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
             if moe is None or moe.experts is None:
                 continue
             moe._streamed_sp8_moe = StreamedSP8MXFP4MoELayer(

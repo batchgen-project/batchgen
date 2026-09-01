@@ -105,6 +105,74 @@ def all_gather_rows(
     return reassemble_rows(gathered.view(group_size, ntp, H), num_rows, group_size)
 
 
+def all_gather_rows_into(
+    output: torch.Tensor,
+    local_rows: torch.Tensor,
+    num_rows: int,
+    group_size: int,
+    group_rank: int,
+    group,
+    chunk_rows: int = 2048,
+) -> torch.Tensor:
+    """Reassemble row-sharded output into caller-owned full-row storage.
+
+    Unlike :func:`all_gather_rows`, this never holds a second full output.
+    The local-row axis is gathered in bounded chunks and copied directly into
+    ``output``.  This is used by K3's one dense prefill FFN: every TP rank runs
+    the unchanged FFN on a disjoint row slice, then restores the replicated
+    hidden state required by the following attention layer.
+    """
+    import torch.distributed as dist
+
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+    if output.shape[0] != num_rows:
+        raise ValueError("output row count does not match num_rows")
+
+    splits = balanced_row_split(num_rows, group_size)
+    ntp = max((end - start) for start, end in splits)
+    hidden = local_rows.shape[-1]
+    if output.shape[-1] != hidden:
+        raise ValueError("output hidden size does not match local rows")
+    expected_local = splits[group_rank][1] - splits[group_rank][0]
+    if local_rows.shape[0] != expected_local:
+        raise ValueError("local row count does not match this TP rank")
+
+    even = num_rows == group_size * ntp
+    even_output = output.view(group_size, ntp, hidden) if even else None
+    for local_start in range(0, ntp, chunk_rows):
+        local_end = min(local_start + chunk_rows, ntp)
+        count = local_end - local_start
+        valid_end = min(local_end, expected_local)
+        valid_count = max(0, valid_end - local_start)
+        if valid_count == count:
+            send = local_rows[local_start:local_end]
+        else:
+            send = local_rows.new_zeros((count, hidden))
+            if valid_count:
+                send[:valid_count].copy_(
+                    local_rows[local_start:valid_end]
+                )
+        gathered = local_rows.new_empty((group_size * count, hidden))
+        dist.all_gather_into_tensor(gathered, send, group=group)
+        gathered = gathered.view(group_size, count, hidden)
+        if even:
+            even_output[:, local_start:local_end].copy_(gathered)
+        else:
+            for rank, (start, end) in enumerate(splits):
+                rank_count = max(
+                    0, min(local_end, end - start) - local_start
+                )
+                if rank_count:
+                    output[
+                        start + local_start : start + local_start + rank_count
+                    ].copy_(gathered[rank, :rank_count])
+        del gathered
+        if valid_count != count:
+            del send
+    return output
+
+
 def all_gather_rows_add_(
     output: torch.Tensor,
     routed_local: torch.Tensor,

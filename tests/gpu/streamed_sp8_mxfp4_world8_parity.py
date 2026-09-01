@@ -171,6 +171,7 @@ def worker(rank, world, out_path, master_port):
     from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
         all_gather_rows,
         all_gather_rows_add_,
+        all_gather_rows_into,
         scatter_rows,
     )
 
@@ -258,6 +259,17 @@ def worker(rank, world, out_path, master_port):
             chunk_rows=2,
         )
         uneven_exact = torch.equal(uneven_output, uneven + 1)
+        uneven_copy = torch.empty_like(uneven)
+        all_gather_rows_into(
+            uneven_copy,
+            uneven_local,
+            uneven_rows,
+            world,
+            rank,
+            dist.group.WORLD,
+            chunk_rows=2,
+        )
+        uneven_copy_exact = torch.equal(uneven_copy, uneven)
 
     wide_error = _err_ratio(wide, reference)
     striped_error = _err_ratio(striped, reference)
@@ -286,6 +298,8 @@ def worker(rank, world, out_path, master_port):
         )
     if not uneven_exact:
         raise AssertionError("uneven chunked row gather-add parity failed")
+    if not uneven_copy_exact:
+        raise AssertionError("uneven chunked row gather-copy parity failed")
     if int(local_assignments.item()) != expected_assignments:
         raise AssertionError(
             f"duplicated assignments: got {int(local_assignments.item())}, "
@@ -309,6 +323,7 @@ def worker(rank, world, out_path, master_port):
             "shared_forward_into_err_ratio": shared_alias_error,
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
+            "uneven_gather_copy_exact": uneven_copy_exact,
             "verdict": "PASS",
         }
         Path(out_path).write_text(json.dumps(result, indent=2) + "\n")
