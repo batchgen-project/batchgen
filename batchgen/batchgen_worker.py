@@ -8421,7 +8421,19 @@ class BatchGenWorker:
 						"[PREFILL] first sampled token ids: %s",
 						batch_new_tokens.reshape(-1).tolist()[:16])
 
-		_prefill_forward_s = time.perf_counter() - _prefill_forward_t0
+		# Keep the historical host-enqueue boundary for backwards-compatible
+		# diagnostics, then establish two stronger completion boundaries.  A host
+		# perf-counter sample alone does not prove that a non-default CUDA stream
+		# has finished, and the last layer's KV D2H task is intentionally not on
+		# the compute stream.
+		_prefill_forward_host_s = time.perf_counter() - _prefill_forward_t0
+		torch.cuda.current_stream(self.torch_device).synchronize()
+		_prefill_forward_gpu_complete_s = time.perf_counter() - _prefill_forward_t0
+		_num_final_kv_tasks = AttnWrapperBase.retire_pending_prefill_offloads(
+			device=self.torch_device,
+			reason="prefill metrics KV-ready boundary",
+		)
+		_prefill_kv_ready_s = time.perf_counter() - _prefill_forward_t0
 
 		# Structured prefill record, one JSON line per rank that actually ran a
 		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
@@ -8436,10 +8448,17 @@ class BatchGenWorker:
 		# run reports `Prefill: 0.0s` with nothing to scrape. That is exactly
 		# what the 131,069-token run produced when rank 2 owned the sequence.
 		# Every participating rank emits its own tagged line; the wall time for
-		# the batch is the MAX of `prefill_s` over the emitting ranks.
+		# the batch is the MAX of each timing field over the emitting ranks.
+		# `prefill_s` retains its historical host-forward meaning; schema-aware
+		# reporters use `prefill_kv_ready_s` as the canonical capability boundary.
 		logging.info("[METRICS] %s", json.dumps({
 			"phase": "prefill",
-			"prefill_s": _prefill_forward_s,
+			"prefill_metrics_contract": "forward-host+gpu-complete+kv-ready-v1",
+			"prefill_s": _prefill_forward_host_s,
+			"prefill_forward_host_s": _prefill_forward_host_s,
+			"prefill_forward_gpu_complete_s": _prefill_forward_gpu_complete_s,
+			"prefill_kv_ready_s": _prefill_kv_ready_s,
+			"final_kv_offload_tasks_retired": _num_final_kv_tasks,
 			"sequences": num_sequences,
 			"tokens_total": total_tokens_all,
 			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
