@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
-from batchgen.timing import init_decode_timer
+from batchgen.timing import init_decode_timer, init_prefill_timer
 
 # Try importing FP8 absorb kernels (WP5)
 try:
@@ -74,6 +74,17 @@ _GLM5_MOE_CATEGORIES = [
 _glm5_decode_timer = init_decode_timer(
     "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
 )
+
+_GLM5_PREFILL_CATEGORIES = [
+    "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
+    "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
+    "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
+    "indexer_wk", "indexer_norm", "indexer_rope_hadamard",
+    "indexer_kv_materialize", "primary_kv_materialize",
+    "moe_router", "moe_dispatch", "moe_act_quant_s1", "moe_grouped_s1",
+    "moe_act_quant_s3", "moe_grouped_s3", "moe_reduce", "moe_shared",
+]
+_glm5_prefill_timer = init_prefill_timer("GLM-5", _GLM5_PREFILL_CATEGORIES)
 
 _GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
 _GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
@@ -904,14 +915,26 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if sum(sequence_lengths) != offload_kv.shape[0]:
             raise RuntimeError("GLM-5 packed indexer KV token count mismatch")
 
-        packed_kv = offload_kv.contiguous()
-        task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_packed_layer_kv_to_host(
-            layer_idx=self.layer_idx,
-            sequence_ids=global_sequence_ids,
-            k_tensor=packed_kv,
-            v_tensor=None,
-            sequence_lengths=sequence_lengths,
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+        materialize_ctx = (
+            timer.timed("indexer_kv_materialize", self.layer_idx)
+            if timer is not None else _nullctx()
         )
+        with materialize_ctx:
+            packed_kv = offload_kv.contiguous()
+        enqueue_ctx = (
+            timer.host_timed("indexer_kv_offload_enqueue", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with enqueue_ctx:
+            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_packed_layer_kv_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=global_sequence_ids,
+                k_tensor=packed_kv,
+                v_tensor=None,
+                sequence_lengths=sequence_lengths,
+            )
         AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
@@ -924,14 +947,26 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if sum(sequence_lengths) != offload_kv.shape[0]:
             raise RuntimeError("GLM-5 packed primary KV token count mismatch")
 
-        packed_kv = offload_kv.unsqueeze(1).contiguous()
-        task = self.core_engine.host_paged_kv_worker_view.async_offload_packed_layer_kv_to_host(
-            layer_idx=self.layer_idx,
-            sequence_ids=global_sequence_ids,
-            k_tensor=packed_kv,
-            v_tensor=None,
-            sequence_lengths=sequence_lengths,
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+        materialize_ctx = (
+            timer.timed("primary_kv_materialize", self.layer_idx)
+            if timer is not None else _nullctx()
         )
+        with materialize_ctx:
+            packed_kv = offload_kv.unsqueeze(1).contiguous()
+        enqueue_ctx = (
+            timer.host_timed("primary_kv_offload_enqueue", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with enqueue_ctx:
+            task = self.core_engine.host_paged_kv_worker_view.async_offload_packed_layer_kv_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=global_sequence_ids,
+                k_tensor=packed_kv,
+                v_tensor=None,
+                sequence_lengths=sequence_lengths,
+            )
         AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 

@@ -11,6 +11,7 @@ from .rotary_embedding import mla_rotary_pos_emb, rotary_pos_emb, apply_rotary_p
 import deep_gemm
 # from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
+from contextlib import nullcontext
 from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
@@ -1158,6 +1159,14 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
 	"""
 	total_tokens = hidden_states.shape[0]
+	from batchgen.timing import get_prefill_timer
+	_prefill_timer = get_prefill_timer()
+	_layer_idx = getattr(self, "layer_idx", -1)
+
+	def _timed(name: str):
+		if _prefill_timer is None:
+			return nullcontext()
+		return _prefill_timer.timed(name, _layer_idx)
 
 	# Default: FP8 act_quant + DeepGEMM fp8_gemm_nt (matches SGLang/DeepGEMM
 	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). Opt into
@@ -1167,17 +1176,20 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
 
 	# Project Q
-	query_states = _gemm(
-		self.q_a_proj.weight.data,
-		weight_scale["q_a_proj.weight_scale_inv"],
-		hidden_states
-	)
-	query_states = self.q_a_layernorm(query_states)
-	query_states = _gemm(
-		self.q_b_proj.weight.data,
-		weight_scale["q_b_proj.weight_scale_inv"],
-		query_states
-	)
+	with _timed("attn_q_a"):
+		query_states = _gemm(
+			self.q_a_proj.weight.data,
+			weight_scale["q_a_proj.weight_scale_inv"],
+			hidden_states
+		)
+	with _timed("attn_q_norm"):
+		query_states = self.q_a_layernorm(query_states)
+	with _timed("attn_q_b"):
+		query_states = _gemm(
+			self.q_b_proj.weight.data,
+			weight_scale["q_b_proj.weight_scale_inv"],
+			query_states
+		)
 
 	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -1185,76 +1197,84 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	)
 
 	# Project KV
-	compressed_kv = _gemm(
-		self.kv_a_proj_with_mqa.weight.data,
-		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-		hidden_states
-	)
+	with _timed("attn_kv_a"):
+		compressed_kv = _gemm(
+			self.kv_a_proj_with_mqa.weight.data,
+			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+			hidden_states
+		)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	normed_kv = self.kv_a_layernorm(compressed_kv)
+	with _timed("attn_kv_norm"):
+		normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Native interleaved RoPE (matches HF / SGLang / vLLM is_neox_style=False
 	# when rope_interleave=true).
 	from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
-	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	with _timed("attn_rope"):
+		cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
+		q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
 
-	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
-	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+	with _timed("attn_primary_kv_materialize"):
+		k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
+		offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
 	del compressed_kv, k_pe_flat
 
 	# Expand KV
-	kv = _gemm(
-		self.kv_b_proj.weight.data,
-		weight_scale["kv_b_proj.weight_scale_inv"],
-		normed_kv
-	)
+	with _timed("attn_kv_b"):
+		kv = _gemm(
+			self.kv_b_proj.weight.data,
+			weight_scale["kv_b_proj.weight_scale_inv"],
+			normed_kv
+		)
 	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
 	)
 
 	# Assemble Q and K
-	query_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
-	query_states[:, :, :self.qk_nope_head_dim] = q_nope
-	query_states[:, :, self.qk_nope_head_dim:] = q_pe
+	with _timed("attn_qkv_materialize"):
+		query_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+		query_states[:, :, :self.qk_nope_head_dim] = q_nope
+		query_states[:, :, self.qk_nope_head_dim:] = q_pe
 
-	key_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
-	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
-	key_states[:, :, :self.qk_nope_head_dim] = k_nope
-	key_states[:, :, self.qk_nope_head_dim:] = k_pe
-	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
+		key_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+		k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+		key_states[:, :, :self.qk_nope_head_dim] = k_nope
+		key_states[:, :, self.qk_nope_head_dim:] = k_pe
+		del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
-	query_states = query_states.contiguous()
-	key_states = key_states.contiguous()
-	value_states = value_states.contiguous()
+		query_states = query_states.contiguous()
+		key_states = key_states.contiguous()
+		value_states = value_states.contiguous()
 
-	attn_output = flash_attn_varlen_func(
-		query_states,
-		key_states,
-		value_states,
-		cu_seqlens_q=cu_seqlens,
-		cu_seqlens_k=cu_seqlens,
-		max_seqlen_q=max_seqlen,
-		max_seqlen_k=max_seqlen,
-		softmax_scale=self.softmax_scale,
-		causal=True
-	)
+	with _timed("attn_fa3"):
+		attn_output = flash_attn_varlen_func(
+			query_states,
+			key_states,
+			value_states,
+			cu_seqlens_q=cu_seqlens,
+			cu_seqlens_k=cu_seqlens,
+			max_seqlen_q=max_seqlen,
+			max_seqlen_k=max_seqlen,
+			softmax_scale=self.softmax_scale,
+			causal=True
+		)
 
 	del query_states, key_states, value_states
 
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
 
-	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
-	attn_output = _gemm(
-		self.o_proj.weight.data,
-		weight_scale["o_proj.weight_scale_inv"],
-		attn_output
-	)
+	with _timed("attn_o"):
+		attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
+		attn_output = _gemm(
+			self.o_proj.weight.data,
+			weight_scale["o_proj.weight_scale_inv"],
+			attn_output
+		)
 
 	return attn_output, offload_kv

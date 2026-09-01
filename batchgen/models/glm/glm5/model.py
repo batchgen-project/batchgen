@@ -22,6 +22,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -458,15 +459,28 @@ class Glm5Indexer(nn.Module):
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
                        head_dim=128 (single MQA head)
         """
-        if hasattr(self, 'wk_scale'):
-            from batchgen.attention.mla.fa3_backend import w8a16_gemm
-            k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
-        else:
-            k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
-        k = self.k_norm(k)
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+
+        def timed(name: str):
+            if timer is None:
+                return nullcontext()
+            return timer.timed(name, self.layer_idx)
+
+        with timed("indexer_wk"):
+            if hasattr(self, 'wk_scale'):
+                from batchgen.attention.mla.fa3_backend import w8a16_gemm
+                k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
+            else:
+                k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
+        with timed("indexer_norm"):
+            k = self.k_norm(k)
 
         if positions is not None and self.rotary_emb is not None:
-            k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
+            with timed("indexer_rope_hadamard"):
+                k = self._fused_rope_hadamard_or_fallback(
+                    k, positions, max_seqlen=max_seqlen
+                )
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
@@ -1431,6 +1445,7 @@ class Glm5MoE(nn.Module):
 
     @staticmethod
     def _release_prefill_grouped_pending(routed_pending, shared_pending) -> None:
+        release_t0 = time.perf_counter()
         if routed_pending is not None:
             event, keys, core_engine = routed_pending
             event.synchronize()
@@ -1440,13 +1455,33 @@ class Glm5MoE(nn.Module):
             event, key, core_engine = shared_pending
             event.synchronize()
             core_engine.free_weights_buffer(key)
+        try:
+            from batchgen.timing import get_prefill_timer
+            timer = get_prefill_timer()
+            if timer is not None and timer.enabled:
+                timer.record(
+                    "host:moe_weight_retire_worker",
+                    -1,
+                    (time.perf_counter() - release_t0) * 1000.0,
+                )
+        except ImportError:
+            pass
 
     @classmethod
-    def _schedule_prefill_grouped_retirement(cls) -> None:
+    def _schedule_prefill_grouped_retirement(cls, layer_idx: int = -1) -> None:
         """Fence and release layer L-1 without stalling layer L's model thread."""
         previous = cls._prefill_retire_future
         if previous is not None:
-            previous.result()
+            try:
+                from batchgen.timing import get_prefill_timer
+                timer = get_prefill_timer()
+            except ImportError:
+                timer = None
+            if timer is not None:
+                with timer.host_timed("moe_weight_retire_wait", layer_idx):
+                    previous.result()
+            else:
+                previous.result()
             cls._prefill_retire_future = None
 
         routed_pending = cls._prefill_ring_pending
@@ -2410,60 +2445,73 @@ class Glm5MoE(nn.Module):
                 "GLM-5 grouped prefill is enabled without initialized workspace"
             )
 
-        cls._schedule_prefill_grouped_retirement()
+        layer_idx = getattr(self, "layer_idx", -1)
+        cls._schedule_prefill_grouped_retirement(layer_idx)
         stage = cls._prefill_ptrs_pinned
         keys = []
         prototypes = None
         core_engine = self.experts[0].core_engine
         shared_key = None
         try:
-            for expert_idx, expert in enumerate(self.experts):
-                if expert.persistent or not expert.is_fp8:
-                    raise RuntimeError(
-                        "GLM-5 grouped prefill requires every routed expert to "
-                        "be nonpersistent FP8"
-                    )
-                weights = expert.load_weights_pinned()
-                gate = weights["gate_proj.weight"]
-                up = weights["up_proj.weight"]
-                down = weights["down_proj.weight"]
-                gate_scale = expert.weight_dequant_scale[
-                    "gate_proj.weight_scale_inv"
-                ]
-                up_scale = expert.weight_dequant_scale[
-                    "up_proj.weight_scale_inv"
-                ]
-                down_scale = expert.weight_dequant_scale[
-                    "down_proj.weight_scale_inv"
-                ]
-                stage[0, expert_idx] = gate.data_ptr()
-                stage[1, expert_idx] = gate_scale.data_ptr()
-                stage[2, expert_idx] = up.data_ptr()
-                stage[3, expert_idx] = up_scale.data_ptr()
-                stage[4, expert_idx] = down.data_ptr()
-                stage[5, expert_idx] = down_scale.data_ptr()
-                keys.append(expert.module_key)
-                if prototypes is None:
-                    prototypes = (
-                        gate,
-                        gate_scale,
-                        up,
-                        up_scale,
-                        down,
-                        down_scale,
-                    )
+            from batchgen.timing import get_prefill_timer
+            timer = get_prefill_timer()
+            acquire_ctx = (
+                timer.host_timed("moe_weight_acquire_bind", layer_idx)
+                if timer is not None else nullcontext()
+            )
+            with acquire_ctx:
+                for expert_idx, expert in enumerate(self.experts):
+                    if expert.persistent or not expert.is_fp8:
+                        raise RuntimeError(
+                            "GLM-5 grouped prefill requires every routed expert to "
+                            "be nonpersistent FP8"
+                        )
+                    weights = expert.load_weights_pinned()
+                    gate = weights["gate_proj.weight"]
+                    up = weights["up_proj.weight"]
+                    down = weights["down_proj.weight"]
+                    gate_scale = expert.weight_dequant_scale[
+                        "gate_proj.weight_scale_inv"
+                    ]
+                    up_scale = expert.weight_dequant_scale[
+                        "up_proj.weight_scale_inv"
+                    ]
+                    down_scale = expert.weight_dequant_scale[
+                        "down_proj.weight_scale_inv"
+                    ]
+                    stage[0, expert_idx] = gate.data_ptr()
+                    stage[1, expert_idx] = gate_scale.data_ptr()
+                    stage[2, expert_idx] = up.data_ptr()
+                    stage[3, expert_idx] = up_scale.data_ptr()
+                    stage[4, expert_idx] = down.data_ptr()
+                    stage[5, expert_idx] = down_scale.data_ptr()
+                    keys.append(expert.module_key)
+                    if prototypes is None:
+                        prototypes = (
+                            gate,
+                            gate_scale,
+                            up,
+                            up_scale,
+                            down,
+                            down_scale,
+                        )
 
-            shared = self.shared_experts
-            if shared.persistent or not shared.is_fp8:
-                raise RuntimeError(
-                    "GLM-5 grouped prefill requires a nonpersistent FP8 shared expert"
-                )
-            shared_weights = shared.load_weights_pinned()
-            shared.cached_gate = shared_weights["gate_proj.weight"]
-            shared.cached_up = shared_weights["up_proj.weight"]
-            shared.cached_down = shared_weights["down_proj.weight"]
-            shared_key = shared.module_key
-            cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
+                shared = self.shared_experts
+                if shared.persistent or not shared.is_fp8:
+                    raise RuntimeError(
+                        "GLM-5 grouped prefill requires a nonpersistent FP8 shared expert"
+                    )
+                shared_weights = shared.load_weights_pinned()
+                shared.cached_gate = shared_weights["gate_proj.weight"]
+                shared.cached_up = shared_weights["up_proj.weight"]
+                shared.cached_down = shared_weights["down_proj.weight"]
+                shared_key = shared.module_key
+            copy_ctx = (
+                timer.timed("moe_pointer_table_h2d", layer_idx)
+                if timer is not None else nullcontext()
+            )
+            with copy_ctx:
+                cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
         except Exception:
             for key in keys:
                 core_engine.free_weights_buffer(key)
@@ -2495,7 +2543,16 @@ class Glm5MoE(nn.Module):
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         num_tokens, hidden_size = hidden_flat.shape
         topk = self.num_experts_per_tok
-        topk_weights, topk_indices = self.gate(hidden_flat)
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+
+        def timed(name: str):
+            if timer is None:
+                return nullcontext()
+            return timer.timed(name, self.layer_idx)
+
+        with timed("moe_router"):
+            topk_weights, topk_indices = self.gate(hidden_flat)
         topk_indices_i32 = topk_indices.to(torch.int32)
         output = torch.empty_like(hidden_flat)
 
@@ -2503,75 +2560,81 @@ class Glm5MoE(nn.Module):
         for start in range(0, num_tokens, buf.token_window):
             end = min(start + buf.token_window, num_tokens)
             window_tokens = end - start
-            counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
-                hidden_flat[start:end],
-                topk_indices_i32[start:end],
-                buf.dispatched_x,
-                0,
-                buf.num_experts,
-                buf.expert_counts,
-                buf.expert_counters,
-                buf.cu_seqlens,
-                buf.topk_pos[: window_tokens * topk],
-            )
-            _glm5_act_quant_ragged(
-                buf.dispatched_x,
-                counts,
-                cu_seqlens,
-                buf.x_fp8,
-                buf.x_scale,
-            )
-            grouped_fp8_blockwise_fused_s1_ptrs(
-                buf.x_fp8.view(torch.float8_e4m3fn),
-                buf.x_scale,
-                gate_w,
-                ptrs[0],
-                up_w,
-                ptrs[2],
-                gate_scale,
-                ptrs[1],
-                up_scale,
-                ptrs[3],
-                counts,
-                cu_seqlens,
-                _GLM5_PREFILL_GROUPED_TILEM_AVG,
-                output=buf.intermediate,
-                tma_desc=buf.s1_tma_desc,
-                tiles=buf.tiles,
-                cu_tiles=buf.cu_tiles,
-            )
-            _glm5_act_quant_ragged(
-                buf.intermediate,
-                counts,
-                cu_seqlens,
-                buf.inter_fp8,
-                buf.inter_scale,
-            )
-            grouped_fp8_blockwise_s3_ptrs(
-                buf.inter_fp8.view(torch.float8_e4m3fn),
-                buf.inter_scale,
-                down_w,
-                ptrs[4],
-                down_scale,
-                ptrs[5],
-                counts,
-                cu_seqlens,
-                _GLM5_PREFILL_GROUPED_TILEM_AVG,
-                output=buf.expert_out,
-                tma_desc=buf.s3_tma_desc,
-                tiles=buf.tiles,
-                cu_tiles=buf.cu_tiles,
-            )
-            reduce_weighted_scatter_bf16_ordered(
-                buf.expert_out,
-                topk_pos,
-                topk_indices_i32[start:end],
-                topk_weights[start:end],
-                window_tokens,
-                hidden_size,
-                topk,
-                output=output[start:end],
-            )
+            with timed("moe_dispatch"):
+                counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
+                    hidden_flat[start:end],
+                    topk_indices_i32[start:end],
+                    buf.dispatched_x,
+                    0,
+                    buf.num_experts,
+                    buf.expert_counts,
+                    buf.expert_counters,
+                    buf.cu_seqlens,
+                    buf.topk_pos[: window_tokens * topk],
+                )
+            with timed("moe_act_quant_s1"):
+                _glm5_act_quant_ragged(
+                    buf.dispatched_x,
+                    counts,
+                    cu_seqlens,
+                    buf.x_fp8,
+                    buf.x_scale,
+                )
+            with timed("moe_grouped_s1"):
+                grouped_fp8_blockwise_fused_s1_ptrs(
+                    buf.x_fp8.view(torch.float8_e4m3fn),
+                    buf.x_scale,
+                    gate_w,
+                    ptrs[0],
+                    up_w,
+                    ptrs[2],
+                    gate_scale,
+                    ptrs[1],
+                    up_scale,
+                    ptrs[3],
+                    counts,
+                    cu_seqlens,
+                    _GLM5_PREFILL_GROUPED_TILEM_AVG,
+                    output=buf.intermediate,
+                    tma_desc=buf.s1_tma_desc,
+                    tiles=buf.tiles,
+                    cu_tiles=buf.cu_tiles,
+                )
+            with timed("moe_act_quant_s3"):
+                _glm5_act_quant_ragged(
+                    buf.intermediate,
+                    counts,
+                    cu_seqlens,
+                    buf.inter_fp8,
+                    buf.inter_scale,
+                )
+            with timed("moe_grouped_s3"):
+                grouped_fp8_blockwise_s3_ptrs(
+                    buf.inter_fp8.view(torch.float8_e4m3fn),
+                    buf.inter_scale,
+                    down_w,
+                    ptrs[4],
+                    down_scale,
+                    ptrs[5],
+                    counts,
+                    cu_seqlens,
+                    _GLM5_PREFILL_GROUPED_TILEM_AVG,
+                    output=buf.expert_out,
+                    tma_desc=buf.s3_tma_desc,
+                    tiles=buf.tiles,
+                    cu_tiles=buf.cu_tiles,
+                )
+            with timed("moe_reduce"):
+                reduce_weighted_scatter_bf16_ordered(
+                    buf.expert_out,
+                    topk_pos,
+                    topk_indices_i32[start:end],
+                    topk_weights[start:end],
+                    window_tokens,
+                    hidden_size,
+                    topk,
+                    output=output[start:end],
+                )
 
         if self._prefill_release_event is None:
             self._prefill_release_event = torch.cuda.Event()
@@ -2585,7 +2648,8 @@ class Glm5MoE(nn.Module):
         self._prefill_weight_prototypes = None
 
         shared = self.shared_experts
-        shared_output = shared._forward_impl(hidden_flat)
+        with timed("moe_shared"):
+            shared_output = shared._forward_impl(hidden_flat)
         if self._prefill_shared_release_event is None:
             self._prefill_shared_release_event = torch.cuda.Event()
         self._prefill_shared_release_event.record(

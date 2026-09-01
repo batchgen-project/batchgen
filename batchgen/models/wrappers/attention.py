@@ -25,6 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
+import time
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -186,8 +187,22 @@ class AttnWrapperBase(BaseModuleWrapper):
             return 0
 
         num_tasks = len(pending)
+        wait_t0 = time.perf_counter()
         for task in pending:
             task.wait()
+        wait_ms = (time.perf_counter() - wait_t0) * 1000.0
+        try:
+            from batchgen.timing import get_prefill_timer
+            timer = get_prefill_timer()
+            if timer is not None and timer.enabled:
+                timer.record(
+                    "host:kv_offload_retire_wait",
+                    cls.pending_prefill_offload_layer_idx
+                    if cls.pending_prefill_offload_layer_idx is not None else -1,
+                    wait_ms,
+                )
+        except ImportError:
+            pass
         pending.clear()
         # KVAsyncTask completes only after the dedicated D2H stream records and
         # synchronizes its completion event.  Waiting every task therefore
@@ -374,10 +389,26 @@ class AttnWrapperBase(BaseModuleWrapper):
         )
 
         # Load weights if not persistent (non-persistent attention modules)
+        prefill_timer = None
+        if self.phase == "prefill":
+            try:
+                from batchgen.timing import get_prefill_timer
+                prefill_timer = get_prefill_timer()
+            except ImportError:
+                pass
+
         if not self.persistent:
-            weights = self.load_weights(self.module_key)
-            dequant_weights = self.dequantize_weights(weights)
-            self.apply_weights(dequant_weights)
+            if prefill_timer is not None:
+                with prefill_timer.host_timed(
+                    "attn_weight_acquire_bind", self.layer_idx
+                ):
+                    weights = self.load_weights(self.module_key)
+                    dequant_weights = self.dequantize_weights(weights)
+                    self.apply_weights(dequant_weights)
+            else:
+                weights = self.load_weights(self.module_key)
+                dequant_weights = self.dequantize_weights(weights)
+                self.apply_weights(dequant_weights)
 
         # Route to appropriate phase handler
         # Extract hidden_states to avoid passing it twice (positionally and in kwargs)
@@ -390,9 +421,17 @@ class AttnWrapperBase(BaseModuleWrapper):
         # Release buffer for non-persistent attention so the H2D worker can
         # load the next layer's weights.
         if not self.persistent:
-            torch.cuda.current_stream().synchronize()
-            self.free_weights(self.module_key)
-            self.clear_weights()
+            if prefill_timer is not None:
+                with prefill_timer.host_timed(
+                    "attn_weight_release", self.layer_idx
+                ):
+                    torch.cuda.current_stream().synchronize()
+                    self.free_weights(self.module_key)
+                    self.clear_weights()
+            else:
+                torch.cuda.current_stream().synchronize()
+                self.free_weights(self.module_key)
+                self.clear_weights()
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "

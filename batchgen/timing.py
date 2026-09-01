@@ -186,7 +186,7 @@ class TimingStats:
     # -- Recording API -----------------------------------------------------
 
     @contextmanager
-    def host_timed(self, segment_name: str):
+    def host_timed(self, segment_name: str, layer_idx: int = -1):
         """Context manager: wall-clock a HOST-side segment (perf_counter).
 
         Rows land in the same records/CSV as GPU events, distinguished by
@@ -203,7 +203,7 @@ class TimingStats:
             yield
         finally:
             self.record(
-                f"host:{segment_name}", -1,
+                f"host:{segment_name}", layer_idx,
                 (_time.perf_counter() - _t0) * 1000.0,
             )
 

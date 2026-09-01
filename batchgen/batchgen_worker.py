@@ -1194,6 +1194,26 @@ class BatchGenWorker:
 				"graph boundary writeback, but BATCHGEN_SYNC_KV=1 writes KV inline"
 			)
 		self._batchgen_debug = resolved_debug
+		try:
+			from batchgen.timing import get_prefill_timer
+			prefill_timer = get_prefill_timer()
+		except ImportError:
+			prefill_timer = None
+		if prefill_timer is not None:
+			prefill_timing_requested = self._debug_flag_enabled(
+				debug_flags.get("glm5_prefill_timing")
+			)
+			prefill_timing_from_env = os.environ.get(
+				"BATCHGEN_PREFILL_TIMING", "0"
+			) == "1"
+			if prefill_timing_requested and not prefill_timer.enabled:
+				prefill_timer.enable()
+			elif (
+				not prefill_timing_requested
+				and not prefill_timing_from_env
+				and prefill_timer.enabled
+			):
+				prefill_timer.disable()
 		if self.rank == 0 and self._batchgen_debug:
 			logging.warning(f"[BATCHGEN_DEBUG] enabled flags: {sorted(self._batchgen_debug.keys())}")
 		self._resolve_suppress_decode_host_kv_writeback()
@@ -2159,7 +2179,21 @@ class BatchGenWorker:
 						)
 
 	def _log_prefill_timing(self):
-		"""Log prefill timing stats if available (GPT-OSS specific)."""
+		"""Resolve and log the active model's prefill timing records."""
+		try:
+			from batchgen.timing import get_prefill_timer
+			prefill_timer = get_prefill_timer()
+			if prefill_timer is not None and prefill_timer.enabled:
+				# One end-event synchronization after the complete prefill replaces
+				# per-operator synchronization in the instrumented path.
+				prefill_timer.step_done()
+				prefill_timer.log_summary()
+				prefill_timer.reset()
+		except ImportError:
+			pass
+
+		# Retain the older GPT-OSS-specific collector until that model migrates
+		# onto batchgen.timing's shared prefill timer.
 		try:
 			from batchgen.models.openai.gpt_oss_120b.wrappers import PrefillTimingStats
 			if PrefillTimingStats.enabled:
