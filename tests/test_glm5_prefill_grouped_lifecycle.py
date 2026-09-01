@@ -15,6 +15,26 @@ class _Event:
         self.log.append(("sync", self.name))
 
 
+class _DeferredFuture:
+    def __init__(self, fn, args):
+        self.fn = fn
+        self.args = args
+        self.completed = False
+
+    def result(self):
+        if not self.completed:
+            self.fn(*self.args)
+            self.completed = True
+
+
+class _DeferredExecutor:
+    def submit(self, fn, *args):
+        return _DeferredFuture(fn, args)
+
+    def shutdown(self, wait=True):
+        assert wait is True
+
+
 class _Core:
     def __init__(self, log):
         self.log = log
@@ -69,15 +89,20 @@ def _reset_prefill_class_state():
     Glm5MoE._prefill_ptrs_dev = torch.empty(6, 2, dtype=torch.int64)
     Glm5MoE._prefill_ring_pending = None
     Glm5MoE._prefill_shared_pending = None
+    Glm5MoE._prefill_retire_executor = _DeferredExecutor()
+    Glm5MoE._prefill_retire_future = None
     yield
+    Glm5MoE.retire_prefill_grouped_weights()
     Glm5MoE._prefill_buf = None
     Glm5MoE._prefill_ptrs_pinned = None
     Glm5MoE._prefill_ptrs_dev = None
     Glm5MoE._prefill_ring_pending = None
     Glm5MoE._prefill_shared_pending = None
+    Glm5MoE._prefill_retire_executor = None
+    Glm5MoE._prefill_retire_future = None
 
 
-def test_prepare_retires_previous_layers_before_acquiring_current_layer():
+def test_prepare_retires_previous_layers_without_blocking_current_acquisition():
     log = []
     core = _Core(log)
     experts = [_Expert("routed_0", core, log), _Expert("routed_1", core, log)]
@@ -98,11 +123,6 @@ def test_prepare_retires_previous_layers_before_acquiring_current_layer():
     moe._prefill_prepare_weights()
 
     assert log == [
-        ("sync", "routed_prev"),
-        ("free", "routed_prev_0"),
-        ("free", "routed_prev_1"),
-        ("sync", "shared_prev"),
-        ("free", "shared_prev"),
         ("load", "routed_0"),
         ("load", "routed_1"),
         ("load", "shared"),
@@ -111,6 +131,18 @@ def test_prepare_retires_previous_layers_before_acquiring_current_layer():
     assert moe._prefill_shared_key == "shared"
     assert Glm5MoE._prefill_ring_pending is None
     assert Glm5MoE._prefill_shared_pending is None
+
+    Glm5MoE.retire_prefill_grouped_weights()
+    assert log == [
+        ("load", "routed_0"),
+        ("load", "routed_1"),
+        ("load", "shared"),
+        ("sync", "routed_prev"),
+        ("free", "routed_prev_0"),
+        ("free", "routed_prev_1"),
+        ("sync", "shared_prev"),
+        ("free", "shared_prev"),
+    ]
 
     staged = Glm5MoE._prefill_ptrs_dev
     for expert_idx, expert in enumerate(experts):

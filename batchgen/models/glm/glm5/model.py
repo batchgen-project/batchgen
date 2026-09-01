@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -1340,6 +1341,8 @@ class Glm5MoE(nn.Module):
     _prefill_ptrs_dev: Optional[torch.Tensor] = None
     _prefill_ring_pending = None  # (completion event, module keys, core engine)
     _prefill_shared_pending = None  # (completion event, module key, core engine)
+    _prefill_retire_executor = None
+    _prefill_retire_future = None
     _prefill_grouped_logged = False
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
@@ -1419,34 +1422,77 @@ class Glm5MoE(nn.Module):
         )
         cls._prefill_ring_pending = None
         cls._prefill_shared_pending = None
+        cls._prefill_retire_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="glm5-prefill-retire",
+        )
+        cls._prefill_retire_future = None
         cls._prefill_grouped_logged = False
 
-    @classmethod
-    def retire_prefill_grouped_weights(cls) -> None:
-        """Release the previous layer's ring slots after its CUDA event."""
-        pending = cls._prefill_ring_pending
-        if pending is not None:
-            event, keys, core_engine = pending
+    @staticmethod
+    def _release_prefill_grouped_pending(routed_pending, shared_pending) -> None:
+        if routed_pending is not None:
+            event, keys, core_engine = routed_pending
             event.synchronize()
             for key in keys:
                 core_engine.free_weights_buffer(key)
-            cls._prefill_ring_pending = None
-        shared_pending = cls._prefill_shared_pending
         if shared_pending is not None:
             event, key, core_engine = shared_pending
             event.synchronize()
             core_engine.free_weights_buffer(key)
-            cls._prefill_shared_pending = None
+
+    @classmethod
+    def _schedule_prefill_grouped_retirement(cls) -> None:
+        """Fence and release layer L-1 without stalling layer L's model thread."""
+        previous = cls._prefill_retire_future
+        if previous is not None:
+            previous.result()
+            cls._prefill_retire_future = None
+
+        routed_pending = cls._prefill_ring_pending
+        shared_pending = cls._prefill_shared_pending
+        if routed_pending is None and shared_pending is None:
+            return
+
+        executor = cls._prefill_retire_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="glm5-prefill-retire",
+            )
+            cls._prefill_retire_executor = executor
+        future = executor.submit(
+            cls._release_prefill_grouped_pending,
+            routed_pending,
+            shared_pending,
+        )
+        cls._prefill_ring_pending = None
+        cls._prefill_shared_pending = None
+        cls._prefill_retire_future = future
+
+    @classmethod
+    def retire_prefill_grouped_weights(cls) -> None:
+        """Release every queued grouped-prefill weight slot."""
+        cls._schedule_prefill_grouped_retirement()
+        future = cls._prefill_retire_future
+        if future is not None:
+            future.result()
+            cls._prefill_retire_future = None
 
     @classmethod
     def reset_prefill_grouped_state(cls) -> None:
         """Retire live slots, then drop prefill-only HBM before a phase flip."""
         cls.retire_prefill_grouped_weights()
+        executor = cls._prefill_retire_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            cls._prefill_retire_executor = None
         cls._prefill_buf = None
         cls._prefill_ptrs_pinned = None
         cls._prefill_ptrs_dev = None
         cls._prefill_ring_pending = None
         cls._prefill_shared_pending = None
+        cls._prefill_retire_future = None
         cls._prefill_grouped_logged = False
 
     # ── Token count management (called by PSM) ──
@@ -2364,7 +2410,7 @@ class Glm5MoE(nn.Module):
                 "GLM-5 grouped prefill is enabled without initialized workspace"
             )
 
-        cls.retire_prefill_grouped_weights()
+        cls._schedule_prefill_grouped_retirement()
         stage = cls._prefill_ptrs_pinned
         keys = []
         prototypes = None
