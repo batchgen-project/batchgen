@@ -2636,30 +2636,53 @@ class Glm5MoE(nn.Module):
                     output=output[start:end],
                 )
 
-        if self._prefill_release_event is None:
-            self._prefill_release_event = torch.cuda.Event()
-        self._prefill_release_event.record(torch.cuda.current_stream(self.device))
-        cls._prefill_ring_pending = (
-            self._prefill_release_event,
-            keys,
-            self.experts[0].core_engine,
-        )
+        routed_core = self.experts[0].core_engine
+        if hasattr(routed_core, "free_weights_buffers_async"):
+            release_ctx = (
+                timer.host_timed("moe_weight_release_enqueue", self.layer_idx)
+                if timer is not None else nullcontext()
+            )
+            with release_ctx:
+                routed_core.free_weights_buffers_async(keys)
+        else:
+            if self._prefill_release_event is None:
+                self._prefill_release_event = torch.cuda.Event()
+            self._prefill_release_event.record(
+                torch.cuda.current_stream(self.device)
+            )
+            cls._prefill_ring_pending = (
+                self._prefill_release_event,
+                keys,
+                routed_core,
+            )
         self._prefill_prepared_keys = None
         self._prefill_weight_prototypes = None
 
         shared = self.shared_experts
         with timed("moe_shared"):
             shared_output = shared._forward_impl(hidden_flat)
-        if self._prefill_shared_release_event is None:
-            self._prefill_shared_release_event = torch.cuda.Event()
-        self._prefill_shared_release_event.record(
-            torch.cuda.current_stream(self.device)
-        )
-        cls._prefill_shared_pending = (
-            self._prefill_shared_release_event,
-            self._prefill_shared_key,
-            shared.core_engine,
-        )
+        if hasattr(shared.core_engine, "free_weights_buffer_async"):
+            release_ctx = (
+                timer.host_timed(
+                    "moe_shared_weight_release_enqueue", self.layer_idx
+                )
+                if timer is not None else nullcontext()
+            )
+            with release_ctx:
+                shared.core_engine.free_weights_buffer_async(
+                    self._prefill_shared_key
+                )
+        else:
+            if self._prefill_shared_release_event is None:
+                self._prefill_shared_release_event = torch.cuda.Event()
+            self._prefill_shared_release_event.record(
+                torch.cuda.current_stream(self.device)
+            )
+            cls._prefill_shared_pending = (
+                self._prefill_shared_release_event,
+                self._prefill_shared_key,
+                shared.core_engine,
+            )
         self._prefill_shared_key = None
         shared.cached_gate = shared.cached_up = shared.cached_down = None
 

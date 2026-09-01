@@ -421,17 +421,29 @@ class AttnWrapperBase(BaseModuleWrapper):
         # Release buffer for non-persistent attention so the H2D worker can
         # load the next layer's weights.
         if not self.persistent:
+            async_release = (
+                self.phase == "prefill"
+                and hasattr(self.core_engine, "free_weights_buffer_async")
+            )
             if prefill_timer is not None:
                 with prefill_timer.host_timed(
                     "attn_weight_release", self.layer_idx
                 ):
+                    if async_release:
+                        self.core_engine.free_weights_buffer_async(self.module_key)
+                        self.clear_weight_bindings()
+                    else:
+                        torch.cuda.current_stream().synchronize()
+                        self.free_weights(self.module_key)
+                        self.clear_weights()
+            else:
+                if async_release:
+                    self.core_engine.free_weights_buffer_async(self.module_key)
+                    self.clear_weight_bindings()
+                else:
                     torch.cuda.current_stream().synchronize()
                     self.free_weights(self.module_key)
                     self.clear_weights()
-            else:
-                torch.cuda.current_stream().synchronize()
-                self.free_weights(self.module_key)
-                self.clear_weights()
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "

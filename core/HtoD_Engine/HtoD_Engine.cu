@@ -473,15 +473,15 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        slot->second.data_ptr(), src_ptr, src_byte_size,
+                        cudaMemcpyHostToDevice, this->HtoD_stream));
                 }
-                this->logger_->debug("Copied module: {} to buffer: {}",
-                                    module_name, buffer_idx);
-                // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-                // CUDA_CHECK(cudaStreamSynchronize(0));
-                this->gpu_weight_buffer_.weights_copy_complete(
-                    module_type, module_name, buffer_idx);
+                this->logger_->debug(
+                    "Enqueued module copy: {} to buffer: {}", module_name,
+                    buffer_idx);
+                this->gpu_weight_buffer_.weights_copy_enqueued(
+                    module_type, module_name, buffer_idx, this->HtoD_stream);
                 /* PUSH THE TASK BACK */
                 {
                     std::lock_guard<std::mutex> lock(this->mutex_);

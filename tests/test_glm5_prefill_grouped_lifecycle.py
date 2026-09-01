@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from batchgen.models.glm.glm5 import model as glm5_model
 from batchgen.models.glm.glm5.model import Glm5MoE
 
 
@@ -41,6 +42,14 @@ class _Core:
 
     def free_weights_buffer(self, key):
         self.log.append(("free", key))
+
+
+class _AsyncCore(_Core):
+    def free_weights_buffers_async(self, keys):
+        self.log.append(("free_many_async", tuple(keys)))
+
+    def free_weights_buffer_async(self, key):
+        self.log.append(("free_async", key))
 
 
 class _Expert:
@@ -204,3 +213,95 @@ def test_terminal_retire_waits_once_then_releases_both_weight_classes():
         ("sync", "shared"),
         ("free", "shared_0"),
     ]
+
+
+def test_grouped_forward_uses_core_async_release_without_python_pending_state(
+    monkeypatch,
+):
+    log = []
+    routed_core = _AsyncCore(log)
+    shared_core = _AsyncCore(log)
+    moe = object.__new__(Glm5MoE)
+    torch.nn.Module.__init__(moe)
+    moe.layer_idx = 3
+    moe.num_experts_per_tok = 1
+    moe.device = torch.device("cpu")
+    moe.gate = lambda hidden: (
+        torch.ones(hidden.shape[0], 1),
+        torch.zeros(hidden.shape[0], 1, dtype=torch.int64),
+    )
+    moe.experts = [SimpleNamespace(core_engine=routed_core)]
+    moe.shared_experts = SimpleNamespace(
+        core_engine=shared_core,
+        cached_gate=torch.ones(1),
+        cached_up=torch.ones(1),
+        cached_down=torch.ones(1),
+        _forward_impl=lambda hidden: torch.ones_like(hidden),
+    )
+    moe._prefill_prepared_keys = ["routed_0", "routed_1"]
+    moe._prefill_weight_prototypes = tuple(torch.ones(1) for _ in range(6))
+    moe._prefill_shared_key = "shared"
+
+    Glm5MoE._prefill_ptrs_dev = torch.zeros(6, 2, dtype=torch.int64)
+    Glm5MoE._prefill_ring_pending = None
+    Glm5MoE._prefill_shared_pending = None
+    Glm5MoE._prefill_grouped_logged = True
+    Glm5MoE._prefill_buf = SimpleNamespace(
+        token_window=1,
+        num_experts=2,
+        dispatched_x=torch.empty(1, 1),
+        expert_counts=torch.zeros(2, dtype=torch.int32),
+        expert_counters=torch.zeros(2, dtype=torch.int32),
+        cu_seqlens=torch.zeros(3, dtype=torch.int32),
+        topk_pos=torch.zeros(1, dtype=torch.int32),
+        x_fp8=torch.empty(1, 1, dtype=torch.float8_e4m3fn),
+        x_scale=torch.empty(1, 1),
+        intermediate=torch.empty(1, 1),
+        inter_fp8=torch.empty(1, 1, dtype=torch.float8_e4m3fn),
+        inter_scale=torch.empty(1, 1),
+        expert_out=torch.empty(1, 1),
+        s1_tma_desc=None,
+        s3_tma_desc=None,
+        tiles=None,
+        cu_tiles=None,
+    )
+
+    monkeypatch.setattr(
+        glm5_model,
+        "_glm5_dispatch_scatter_ragged",
+        lambda *args, **kwargs: (
+            Glm5MoE._prefill_buf.expert_counts,
+            Glm5MoE._prefill_buf.cu_seqlens,
+            Glm5MoE._prefill_buf.topk_pos,
+        ),
+    )
+    monkeypatch.setattr(
+        glm5_model, "_glm5_act_quant_ragged", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        glm5_model,
+        "grouped_fp8_blockwise_fused_s1_ptrs",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        glm5_model,
+        "grouped_fp8_blockwise_s3_ptrs",
+        lambda *args, **kwargs: None,
+    )
+
+    def _reduce(*args, output, **kwargs):
+        output.fill_(2)
+
+    monkeypatch.setattr(glm5_model, "reduce_weighted_scatter_bf16_ordered", _reduce)
+
+    output = moe._forward_prefill_grouped(torch.ones(1, 1))
+
+    torch.testing.assert_close(output, torch.full((1, 1), 3.0))
+    assert log == [
+        ("free_many_async", ("routed_0", "routed_1")),
+        ("free_async", "shared"),
+    ]
+    assert Glm5MoE._prefill_ring_pending is None
+    assert Glm5MoE._prefill_shared_pending is None
+    assert moe._prefill_prepared_keys is None
+    assert moe._prefill_shared_key is None

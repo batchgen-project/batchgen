@@ -181,8 +181,17 @@ class BaseModuleWrapper(nn.Module):
         """Clear only the buffer-loaded module parameters populated by the
         most recent apply_weights call; preserve skeleton-loaded params.
         """
-        applied = getattr(self, "_applied_param_keys", None)
         self._sync_device_before_release()
+        self.clear_weight_bindings()
+
+    def clear_weight_bindings(self):
+        """Drop parameter views without synchronizing their backing storage.
+
+        The caller must first transfer buffer ownership to an asynchronous
+        release primitive that keeps the storage alive until the current CUDA
+        stream reaches its recorded completion event.
+        """
+        applied = getattr(self, "_applied_param_keys", None)
         for name, param in self.module.named_parameters():
             if applied is not None and name not in applied:
                 continue

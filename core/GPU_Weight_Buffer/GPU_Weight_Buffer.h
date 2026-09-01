@@ -20,6 +20,8 @@
 
 #pragma once
 #include <condition_variable>
+#include <cuda_runtime.h>
+#include <deque>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -46,7 +48,7 @@ using weight_buffers = std::vector<module_weight_tensor_map>;
 class GPU_Weight_Buffer {
    public:
     GPU_Weight_Buffer(EngineConfig& engine_config, ModelConfig& model_config);
-    ~GPU_Weight_Buffer() = default;
+    ~GPU_Weight_Buffer();
 
     /* APIs */
     void Init();
@@ -57,19 +59,24 @@ class GPU_Weight_Buffer {
     acquireEmptyBuffer(const std::string& module_name);
 
     void releaseBuffer(const std::string& module_name);
+    void releaseBuffersAsync(const std::vector<std::string>& module_names,
+                             cudaStream_t consumer_stream);
 
     // std::shared_ptr<module_weight_tensor_map> get_weights(
     //     const std::string& module_name);
     module_weight_tensor_map get_weights(
             const std::string& module_name,
-            std::string& phase);
+            std::string& phase,
+            cudaStream_t consumer_stream);
 
     module_weight_tensor_map get_weights_pinned(
-            const std::string& module_name);
+            const std::string& module_name,
+            cudaStream_t consumer_stream);
 
-    void weights_copy_complete(const std::string& module_type,
+    void weights_copy_enqueued(const std::string& module_type,
                                const std::string& module_name,
-                               int64_t buffer_idx);
+                               int64_t buffer_idx,
+                               cudaStream_t copy_stream);
 
     void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
     void reset_prefill_buffer();
@@ -79,6 +86,18 @@ class GPU_Weight_Buffer {
     }
 
    private:
+    struct PendingRelease {
+        cudaEvent_t event;
+        std::vector<std::pair<std::string, int64_t>> slots;
+    };
+
+    void reclaimCompletedReleasesLocked();
+    void clearPendingReleasesLocked();
+    void resetReadyEventsLocked(const std::string& module_type,
+                                int64_t num_buffers);
+    cudaEvent_t readyEventLocked(const std::string& module_type,
+                                 int64_t buffer_idx) const;
+
     EngineConfig& engine_config_;
     ModelConfig& model_config_;
     std::shared_ptr<spdlog::logger> logger_;
@@ -91,7 +110,9 @@ class GPU_Weight_Buffer {
     std::unordered_map<std::string, std::pair<std::string, int64_t>>
         module_in_buffers_;  // module_name -> (module_type, buffer_idx)
     std::unordered_map<std::string, std::vector<int64_t>>
-        buffer_status_;  // 0: empty, 1: in use
+        buffer_status_;  // 0: empty, 1: in use, 2: pending compute completion
+    std::unordered_map<std::string, std::vector<cudaEvent_t>> ready_events_;
+    std::deque<PendingRelease> pending_releases_;
     std::unordered_map<std::string, std::vector<std::string>>
         weight_copy_tasks_;
 };

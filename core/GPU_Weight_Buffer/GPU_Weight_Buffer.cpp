@@ -26,6 +26,7 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <condition_variable>
@@ -93,6 +94,80 @@ GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
     this->logger_->info("GPU_Weight_Buffer Instantiated.");
 };
 
+GPU_Weight_Buffer::~GPU_Weight_Buffer() {
+    cudaSetDevice(this->engine_config_.basic_config.device);
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->clearPendingReleasesLocked();
+    for (auto& [module_type, events] : this->ready_events_) {
+        for (auto event : events) {
+            if (event != nullptr) {
+                cudaEventDestroy(event);
+            }
+        }
+    }
+}
+
+void GPU_Weight_Buffer::clearPendingReleasesLocked() {
+    for (auto& pending : this->pending_releases_) {
+        if (pending.event != nullptr) {
+            cudaEventDestroy(pending.event);
+        }
+    }
+    this->pending_releases_.clear();
+}
+
+void GPU_Weight_Buffer::resetReadyEventsLocked(
+    const std::string& module_type, int64_t num_buffers) {
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    auto& events = this->ready_events_[module_type];
+    for (auto event : events) {
+        if (event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+    }
+    events.assign(num_buffers, nullptr);
+    for (auto& event : events) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+}
+
+cudaEvent_t GPU_Weight_Buffer::readyEventLocked(
+    const std::string& module_type, int64_t buffer_idx) const {
+    auto events_it = this->ready_events_.find(module_type);
+    if (events_it == this->ready_events_.end() || buffer_idx < 0 ||
+        buffer_idx >= static_cast<int64_t>(events_it->second.size())) {
+        throw std::runtime_error(
+            "Missing ready event for weight buffer type=" + module_type +
+            " idx=" + std::to_string(buffer_idx));
+    }
+    return events_it->second[buffer_idx];
+}
+
+void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
+    for (auto it = this->pending_releases_.begin();
+         it != this->pending_releases_.end();) {
+        const cudaError_t status = cudaEventQuery(it->event);
+        if (status == cudaErrorNotReady) {
+            ++it;
+            continue;
+        }
+        CUDA_CHECK(status);
+        for (const auto& [module_type, buffer_idx] : it->slots) {
+            auto status_it = this->buffer_status_.find(module_type);
+            if (status_it == this->buffer_status_.end() || buffer_idx < 0 ||
+                buffer_idx >= static_cast<int64_t>(status_it->second.size()) ||
+                status_it->second[buffer_idx] != 2) {
+                throw std::runtime_error(
+                    "Invalid pending weight-buffer release: type=" +
+                    module_type + " idx=" + std::to_string(buffer_idx));
+            }
+            status_it->second[buffer_idx] = 0;
+        }
+        CUDA_CHECK(cudaEventDestroy(it->event));
+        it = this->pending_releases_.erase(it);
+    }
+}
+
 void GPU_Weight_Buffer::Init() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
@@ -123,6 +198,7 @@ void GPU_Weight_Buffer::Init() {
                     torch::zeros(buffer_shape, options);
             }
         }
+        this->resetReadyEventsLocked(module_type, num_buffer);
     }
 };
 
@@ -134,6 +210,7 @@ void GPU_Weight_Buffer::resize_buffer() {
                                           // "shared_expert": 1}
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
         int64_t to_add_buffer = num_buffers["routed_expert"] -
                                 this->buffers_["routed_expert"].size();
         for (int64_t i = 0; i < to_add_buffer; i++) {
@@ -157,6 +234,10 @@ void GPU_Weight_Buffer::resize_buffer() {
             }
             this->buffers_["routed_expert"].push_back(new_buffer);
             this->buffer_status_["routed_expert"].push_back(0);
+            cudaEvent_t ready_event = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &ready_event, cudaEventDisableTiming));
+            this->ready_events_["routed_expert"].push_back(ready_event);
         }
     }
 }
@@ -165,6 +246,7 @@ std::optional<
     std::pair<std::reference_wrapper<module_weight_tensor_map>, int64_t>>
 GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
     std::lock_guard<std::mutex> lock(this->mutex_);
+    this->reclaimCompletedReleasesLocked();
     for (int64_t buffer_idx = 0;
          buffer_idx < this->buffer_status_[module_type].size(); buffer_idx++) {
         if (this->buffer_status_[module_type][buffer_idx] == 0) {
@@ -198,8 +280,66 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
                          module_name, module_type, buffer_idx);
 };
 
+void GPU_Weight_Buffer::releaseBuffersAsync(
+    const std::vector<std::string>& module_names,
+    cudaStream_t consumer_stream) {
+    if (module_names.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    std::unordered_set<std::string> unique_names;
+    std::vector<std::pair<std::string, int64_t>> slots;
+    slots.reserve(module_names.size());
+    for (const auto& module_name : module_names) {
+        if (!unique_names.insert(module_name).second) {
+            throw std::runtime_error(
+                "Duplicate module in asynchronous weight release: " +
+                module_name);
+        }
+        auto module_it = this->module_in_buffers_.find(module_name);
+        if (module_it == this->module_in_buffers_.end()) {
+            throw std::runtime_error(
+                "Cannot asynchronously release non-resident weight module: " +
+                module_name);
+        }
+        const auto [module_type, buffer_idx] = module_it->second;
+        auto status_it = this->buffer_status_.find(module_type);
+        if (status_it == this->buffer_status_.end() || buffer_idx < 0 ||
+            buffer_idx >= static_cast<int64_t>(status_it->second.size()) ||
+            status_it->second[buffer_idx] != 1) {
+            throw std::runtime_error(
+                "Invalid asynchronous weight-buffer ownership for module: " +
+                module_name);
+        }
+        slots.emplace_back(module_type, buffer_idx);
+    }
+
+    cudaEvent_t completion_event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(
+        &completion_event, cudaEventDisableTiming));
+    const cudaError_t record_status =
+        cudaEventRecord(completion_event, consumer_stream);
+    if (record_status != cudaSuccess) {
+        cudaEventDestroy(completion_event);
+        CUDA_CHECK(record_status);
+    }
+
+    for (size_t i = 0; i < module_names.size(); ++i) {
+        this->module_in_buffers_.erase(module_names[i]);
+        const auto& [module_type, buffer_idx] = slots[i];
+        this->buffer_status_[module_type][buffer_idx] = 2;
+    }
+    this->pending_releases_.push_back(
+        PendingRelease{completion_event, std::move(slots)});
+    this->logger_->debug(
+        "Queued asynchronous release for {} weight buffers",
+        module_names.size());
+}
+
 module_weight_tensor_map GPU_Weight_Buffer::get_weights_pinned(
-    const std::string& module_name) {
+    const std::string& module_name,
+    cudaStream_t consumer_stream) {
     constexpr auto timeout = std::chrono::seconds(120);
     std::unique_lock<std::mutex> lock(this->mutex_);
     const bool ready = this->cv_.wait_for(lock, timeout, [this, &module_name] {
@@ -214,12 +354,18 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights_pinned(
     }
     const auto [module_type, buffer_idx] =
         this->module_in_buffers_.at(module_name);
-    return this->buffers_.at(module_type).at(buffer_idx);
+    auto tensors = this->buffers_.at(module_type).at(buffer_idx);
+    const cudaEvent_t ready_event =
+        this->readyEventLocked(module_type, buffer_idx);
+    lock.unlock();
+    CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, ready_event, 0));
+    return tensors;
 }
 
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     const std::string& module_name,
-    std::string& phase) 
+    std::string& phase,
+    cudaStream_t consumer_stream)
 {
     this->logger_->debug("Get weights: {}", module_name);
     
@@ -239,7 +385,13 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                         })) {
                     auto [module_type, buffer_idx] =
                         this->module_in_buffers_[module_name];
-                    return this->buffers_[module_type][buffer_idx];
+                    auto tensors = this->buffers_[module_type][buffer_idx];
+                    const cudaEvent_t ready_event =
+                        this->readyEventLocked(module_type, buffer_idx);
+                    lock.unlock();
+                    CUDA_CHECK(cudaStreamWaitEvent(
+                        consumer_stream, ready_event, 0));
+                    return tensors;
                 }
                 this->logger_->debug("Waiting for module: {}", module_name);
             }
@@ -322,18 +474,26 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     }
 };
 
-void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
-                                              const std::string& module_name,
-                                              int64_t buffer_idx) {
+void GPU_Weight_Buffer::weights_copy_enqueued(
+    const std::string& module_type,
+    const std::string& module_name,
+    int64_t buffer_idx,
+    cudaStream_t copy_stream) {
+    cudaEvent_t ready_event = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        ready_event = this->readyEventLocked(module_type, buffer_idx);
+    }
+    CUDA_CHECK(cudaEventRecord(ready_event, copy_stream));
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->module_in_buffers_[module_name] =
             std::make_pair(module_type, buffer_idx);
-        this->logger_->debug("Module: {} is in buffer: {}", module_name,
-                             buffer_idx);
+        this->logger_->debug(
+            "Module: {} copy is enqueued in buffer: {}", module_name,
+            buffer_idx);
         this->cv_.notify_all();
     }
-    
 };
 
 
@@ -602,6 +762,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 c10::cuda::CUDACachingAllocator::emptyCache();
             }
         }
+        this->clearPendingReleasesLocked();
 
         // Reset the buffer size as the prefill buffer size
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
@@ -633,6 +794,8 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
             this->buffer_status_[module_type].clear();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
+        this->resetReadyEventsLocked(
+            "routed_expert", num_buffers["routed_expert"]);
 
         // Log the buffer status and size of each buffer (keep original debug level)
         for (auto& [module_type, num_buffer] : num_buffers) {
@@ -854,6 +1017,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 c10::cuda::CUDACachingAllocator::emptyCache();
             }
         }
+        this->clearPendingReleasesLocked();
 
         // Reset the buffer size
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
@@ -885,6 +1049,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
             this->buffer_status_[module_type].clear();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
+        this->resetReadyEventsLocked(
+            "routed_expert", num_buffers["routed_expert"]);
 
         // Log the buffer status and size of each buffer
         for (auto& [module_type, num_buffer] : num_buffers) {
