@@ -408,25 +408,13 @@ class ResidentEPMXFP4MoELayer:
 
         # --- dispatch latent rows into the expert-ordered activation buffer ---
         if self.compact_dispatch and dispatch_capacity is None:
-            # Real long prompts can route every row to the same expert. A
-            # strided [E * max_count, K_latent] buffer then multiplies one hot
-            # expert's capacity by every inactive expert in the shard. Count
-            # once so the packed CUDA dispatcher allocates exactly the local
-            # assignments, while its GPU prefix sums remain the authoritative
-            # expert starts consumed by grouped Marlin.
-            local = topk_idx_i32[
-                (topk_idx_i32 >= self.expert_start)
-                & (topk_idx_i32 < self.expert_start + E)
-            ] - self.expert_start
-            local_counts = torch.bincount(
-                local.reshape(-1).to(torch.int64),
-                minlength=E,
-            )
-            route_stats = torch.stack(
-                (local_counts.max(), local_counts.sum())
-            ).tolist()
-            max_local_count, total_local = map(int, route_stats)
-            capacity = max(total_local, 1)
+            # Keep dispatch entirely asynchronous. Reading exact route counts
+            # to the host here serialized every expert chunk (23,552 times in
+            # the exact64 run). The packed dispatcher writes at most K local
+            # assignments per row, while top-k routing selects any one expert
+            # at most once per row. These deterministic bounds trade bounded
+            # scratch for removing the per-chunk GPU-to-host synchronization.
+            capacity = max(num_rows * K, 1)
             dispatched = torch.empty(
                 capacity,
                 K_latent,
@@ -457,11 +445,11 @@ class ResidentEPMXFP4MoELayer:
                 )
             )
             expert_starts = expert_offsets[:-1]
-            max_m_tiles = max((max_local_count + 15) // 16, 1)
+            max_m_tiles = max((num_rows + 15) // 16, 1)
             # The wrapper uses ``mtp`` only to prove max_m_tiles covers every
             # expert. Packed storage has no shared stride, so its admissible
-            # per-expert bound is the measured maximum, not total capacity.
-            mtp = max(max_local_count, 1)
+            # per-expert bound is one route per input row, not total capacity.
+            mtp = max(num_rows, 1)
         elif dispatch_capacity is not None:
             if not self.compact_dispatch:
                 raise ValueError(

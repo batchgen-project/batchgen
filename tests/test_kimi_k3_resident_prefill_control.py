@@ -3428,6 +3428,40 @@ def test_compact_resident_prefill_chunks_before_one_all_reduce():
     assert len(bounded_calls) == 1
 
 
+def test_packed_compact_dispatch_avoids_route_count_host_sync():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    function = _function(path, "ResidentEPMXFP4MoELayer", "_expert_path")
+    compact_branch = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test)
+        == "self.compact_dispatch and dispatch_capacity is None"
+    )
+    compact_body = ast.Module(body=compact_branch.body, type_ignores=[])
+
+    attribute_calls = {
+        node.func.attr
+        for node in ast.walk(compact_body)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    }
+    assert "tolist" not in attribute_calls
+    assert "item" not in attribute_calls
+    assert "bincount" not in attribute_calls
+
+    assignments = {
+        node.targets[0].id: ast.unparse(node.value)
+        for node in ast.walk(compact_body)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    assert assignments["capacity"] == "max(num_rows * K, 1)"
+    assert assignments["max_m_tiles"] == "max((num_rows + 15) // 16, 1)"
+    assert assignments["mtp"] == "max(num_rows, 1)"
+
+
 def test_compact_resident_prefill_uses_preallocated_output():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     function = _function(path, "ResidentEPMXFP4MoELayer", "_forward_ep")
