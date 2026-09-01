@@ -18,6 +18,8 @@ _GIB = 1024 ** 3
 _K3_H200_MIN_MEMORY_BYTES = 120 * _GIB
 _K3_H20_PREFILL_TOKEN_CAP = 16_384
 _K3_H200_PREFILL_TOKEN_CAP = 524_288
+_K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
+_K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 524_288
 
 
 def k3_kda_state_slots(
@@ -70,6 +72,30 @@ def k3_prefill_micro_batch_token_cap(
     if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
         return _K3_H200_PREFILL_TOKEN_CAP
     return _K3_H20_PREFILL_TOKEN_CAP
+
+
+def k3_prefill_collective_stripe_threshold_rows(
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+) -> int:
+    """Return the node-row threshold above which streamed-SP8 is striped.
+
+    H20 keeps the validated 256-row stripe path. H200 streamed prefill first
+    releases the 84-GiB resident decode shard, so the exact64 node batch can
+    use one wide latent gather/reduce instead of issuing four collectives for
+    each 256-row stripe. Unknown memory and non-TP8 layouts fail safe to the
+    H20 threshold.
+    """
+    group_size = int(attention_group_size)
+    if group_size <= 0:
+        raise ValueError("attention_group_size must be positive")
+    if gpu_total_memory_bytes is None:
+        return _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
+    memory_bytes = int(gpu_total_memory_bytes)
+    if memory_bytes <= 0:
+        raise ValueError("gpu_total_memory_bytes must be positive")
+    if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
+        return _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
+    return _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
 
 
 class KimiLinearPlanner(BasePlanner):
@@ -158,6 +184,14 @@ class KimiLinearPlanner(BasePlanner):
             )
             if self.is_k3 and self.attention_group_size > 1
             else 262_144
+        )
+        self.config.Module_Batching_Config.k3_prefill_collective_stripe_threshold_rows = (
+            k3_prefill_collective_stripe_threshold_rows(
+                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+                attention_group_size=self.attention_group_size,
+            )
+            if self.is_k3 and self.attention_group_size > 1
+            else _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS
         )
 
         # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":

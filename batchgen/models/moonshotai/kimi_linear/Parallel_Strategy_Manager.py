@@ -899,6 +899,11 @@ class KimiLinearParallelStrategyManager:
                     else None
                 ),
                 up_proj=moe.routed_expert_up_proj,
+                collective_stripe_threshold_rows=int(getattr(
+                    self.engine_config.Module_Batching_Config,
+                    "k3_prefill_collective_stripe_threshold_rows",
+                    32_768,
+                )),
             )
             shared = getattr(moe, "shared_experts", None)
             if shared is not None:

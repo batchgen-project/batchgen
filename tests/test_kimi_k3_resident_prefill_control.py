@@ -649,6 +649,28 @@ def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
     assert "acquire_batch_size=16" not in source
 
 
+def test_streamed_sp8_layer_uses_planned_collective_stripe_threshold():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    source = ast.unparse(
+        _function(
+            path,
+            "KimiLinearParallelStrategyManager",
+            "_init_streamed_sp8_prefill",
+        )
+    )
+
+    assert "collective_stripe_threshold_rows=int(getattr(" in source
+    assert "'k3_prefill_collective_stripe_threshold_rows'" in source
+    assert "32768" in source
+
+
 def _psm_path():
     return (
         ROOT
