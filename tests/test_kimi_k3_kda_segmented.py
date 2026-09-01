@@ -329,6 +329,21 @@ def test_chunk_size_constant_matches_flas_own():
         pass                                # CPU dev box: the literal stands
 
 
+def test_bias_free_output_projection_reuses_caller_storage_bit_exactly():
+    gen = torch.Generator().manual_seed(20260902)
+    linear = torch.nn.Linear(7, 11, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.randn(11, 7, generator=gen))
+    x = torch.randn(13, 7, generator=gen)
+    expected = linear(x)
+    out = torch.empty(13, 11)
+
+    actual = SM._linear_no_bias_into(linear, x, out)
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("seed", range(20))
 def test_plan_invariants_on_random_batches(seed):
     rng = random.Random(seed)

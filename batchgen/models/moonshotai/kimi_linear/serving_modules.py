@@ -599,6 +599,17 @@ def _conv_weights(conv, dtype):
     return conv.weight.to(dtype), (None if bias is None else bias.to(dtype))
 
 
+def _linear_no_bias_into(linear, x, out):
+    """Evaluate a 2-D bias-free ``nn.Linear`` into caller-owned storage."""
+    if linear.bias is not None:
+        raise ValueError("linear output reuse requires bias=False")
+    if x.ndim != 2 or out.ndim != 2:
+        raise ValueError("linear output reuse requires 2-D tensors")
+    if out.shape != (x.shape[0], linear.weight.shape[0]):
+        raise ValueError("linear output reuse received an incompatible output")
+    return torch.mm(x, linear.weight.t(), out=out)
+
+
 # fla's chunk_kda internal chunk size (its `chunk_size` kwarg default). Every
 # segment cut must be a multiple of this measured from the start of the
 # sequence it falls in, so that a segment's per-sequence chunk grid is exactly
@@ -836,7 +847,16 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     )
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
-    o = self.o_proj(o.reshape(total, num_heads * head_dim))
+    # All projections from ``hidden_states_2d`` have completed, so its storage
+    # is dead until this attention result is returned. Reuse that exact
+    # (total, hidden) allocation for the row-parallel output projection. At
+    # exact 64K K3 this avoids a late 896 MiB allocation while preserving the
+    # same bias-free GEMM (verified bit-identical at the production shape).
+    o = _linear_no_bias_into(
+        self.o_proj,
+        o.reshape(total, num_heads * head_dim),
+        hidden_states_2d,
+    )
     # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so the
     # partial sums across the attn_tp sub-group must be reduced. Only when G>1.
     if getattr(self, "attn_tp_size", 1) > 1:

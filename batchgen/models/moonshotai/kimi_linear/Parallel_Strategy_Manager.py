@@ -393,7 +393,11 @@ class KimiLinearParallelStrategyManager:
                 module._resident_prefill_token_tile = tile
             if hasattr(module, "_resident_prefill_segment_tokens"):
                 module._resident_prefill_segment_tokens = (
-                    8192 if enabled else None
+                    # The resident decode shards and streamed-SP8 buffers are
+                    # co-resident during prefill. A 4K KDA segment releases
+                    # another ~1.1 GiB of scratch versus 8K, enough for the
+                    # next layer's normalized q/k rows at exact 64K.
+                    4096 if enabled else None
                 )
         for layer in self.model.model.layers:
             moe = getattr(layer, "block_sparse_moe", None)

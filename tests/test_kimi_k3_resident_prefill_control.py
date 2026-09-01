@@ -3560,7 +3560,7 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     assert dense._resident_prefill_token_tile == 512
     assert shared._resident_prefill_token_tile == 512
     assert norm._resident_prefill_token_tile == 512
-    assert kda._resident_prefill_segment_tokens == 8192
+    assert kda._resident_prefill_segment_tokens == 4096
     assert moe._resident_ep_prefill_enabled is True
 
     method(False)
