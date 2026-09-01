@@ -4,8 +4,11 @@ Env flags:
   BATCHGEN_DECODE_TIMING=1            enable decode timer
   BATCHGEN_PREFILL_TIMING=1           enable prefill timer
   BATCHGEN_DECODE_TIMING_CSV=<path>   write one row per invocation
+  BATCHGEN_PREFILL_TIMING_CSV=<path>  prefill CSV; ``{rank}`` is expanded
   BATCHGEN_DECODE_TIMING_INTERVAL=N   flush/log every N steps (default 50)
+  BATCHGEN_PREFILL_TIMING_INTERVAL=N  prefill flush interval
   BATCHGEN_DECODE_TIMING_RANKS=0,1    ranks that emit output (default "0")
+  BATCHGEN_PREFILL_TIMING_RANKS=0,1   prefill ranks that emit output
 
 Design (vs prior `torch.cuda.synchronize()` + `time.perf_counter()`):
 
@@ -110,20 +113,33 @@ class TimingStats:
         self._step_idx: int = 0
         self._call_counter: int = 0
 
-        # Rank filter for output.
+        env_prefix = "BATCHGEN_PREFILL" if phase == "prefill" else "BATCHGEN_DECODE"
+
+        # Rank filter for output. Keep the decode variables as a compatibility
+        # fallback because older prefill harnesses used the shared timer before
+        # phase-specific controls existed.
+        rank_filter = os.environ.get(f"{env_prefix}_TIMING_RANKS")
+        if rank_filter is None and phase == "prefill":
+            rank_filter = os.environ.get("BATCHGEN_DECODE_TIMING_RANKS")
         self._emit_ranks = _parse_rank_filter(
-            os.environ.get("BATCHGEN_DECODE_TIMING_RANKS", "")
+            rank_filter or ""
         )
 
         # CSV sink (lazy-opened on first flush).
-        self._csv_path: Optional[str] = os.environ.get("BATCHGEN_DECODE_TIMING_CSV") or None
+        csv_path = os.environ.get(f"{env_prefix}_TIMING_CSV")
+        if csv_path is None and phase == "prefill":
+            csv_path = os.environ.get("BATCHGEN_DECODE_TIMING_CSV")
+        self._csv_path: Optional[str] = csv_path or None
         self._csv_writer = None
         self._csv_file = None
         self._csv_rows_written = 0
 
         # Periodic flush cadence.
+        interval = os.environ.get(f"{env_prefix}_TIMING_INTERVAL")
+        if interval is None and phase == "prefill":
+            interval = os.environ.get("BATCHGEN_DECODE_TIMING_INTERVAL")
         try:
-            self._interval = int(os.environ.get("BATCHGEN_DECODE_TIMING_INTERVAL", "50"))
+            self._interval = int(interval or "50")
         except ValueError:
             self._interval = 50
 
@@ -312,7 +328,11 @@ class TimingStats:
         if self._csv_path is None or not self._should_emit():
             return
         # Append mode — multiple runs append to the same file.
-        self._csv_file = open(self._csv_path, "a", buffering=1, newline="")
+        csv_path = self._csv_path.replace("{rank}", str(_current_rank()))
+        csv_dir = os.path.dirname(csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        self._csv_file = open(csv_path, "a", buffering=1, newline="")
         self._csv_writer = csv.writer(self._csv_file)
         # Only write header if file is empty.
         if self._csv_file.tell() == 0:
@@ -472,5 +492,9 @@ def init_prefill_timer(model_name: str, categories: List[str]) -> TimingStats:
     _prefill_timer = TimingStats(model_name, "prefill", categories)
     if os.environ.get("BATCHGEN_PREFILL_TIMING", "0") == "1":
         _prefill_timer.enable()
-        logging.info(f"PrefillTimingStats enabled for {model_name}")
+        logging.info(
+            f"PrefillTimingStats enabled for {model_name} "
+            f"(csv={_prefill_timer._csv_path}, interval={_prefill_timer._interval}, "
+            f"ranks={sorted(_prefill_timer._emit_ranks)})"
+        )
     return _prefill_timer
