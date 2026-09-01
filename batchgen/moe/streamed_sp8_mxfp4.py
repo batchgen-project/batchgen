@@ -1098,7 +1098,10 @@ class StreamedSP8MXFP4MoELayer:
         # before the single BF16 downcast. W1/W2 retain the original wide path.
         ntp = (num_rows + tp_size - 1) // tp_size
         num_node_rows = tp_size * ntp
-        if num_node_rows > self.collective_stripe_threshold_rows:
+        stripe_threshold_rows = int(
+            getattr(self, "collective_stripe_threshold_rows", 32768)
+        )
+        if num_node_rows > stripe_threshold_rows:
             output = self._forward_striped(
                 x=x,
                 gate=gate,
@@ -1278,7 +1281,7 @@ class StreamedSP8MXFP4MoELayer:
         num_local = buffer.experts_per_rank
         latent_size = shard.K_latent
         stripe_rows = min(
-            self.collective_chunk_rows,
+            int(getattr(self, "collective_chunk_rows", 256)),
             max(1, self.chunk_rows // tp_size),
         )
 
