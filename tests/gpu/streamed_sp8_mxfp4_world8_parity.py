@@ -130,6 +130,27 @@ def _layer(block, shard, ResidentEPMXFP4MoELayer):
     )
 
 
+class _StaticSP8Buffer:
+    """Minimal weight-buffer contract for the activation-path parity gate."""
+
+    def __init__(self, shard, rank, world):
+        self._shard = shard
+        self.tp_group = dist.group.WORLD
+        self.tp_rank = rank
+        self.tp_size = world
+        self.experts_per_rank = shard.num_local
+        self.expert_start = rank * shard.num_local
+
+    def load(self, _layer_idx):
+        return self._shard
+
+    def begin_prefetch_next(self, _layer_idx):
+        return None
+
+    def allow_full_overwrite(self):
+        return None
+
+
 def worker(rank, world, out_path, master_port):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
@@ -144,6 +165,9 @@ def worker(rank, world, out_path, master_port):
         ResidentEPMXFP4MoELayer,
         build_layer_shard,
     )
+    from batchgen.moe.streamed_sp8_mxfp4 import (
+        StreamedSP8MXFP4MoELayer,
+    )
     from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
         all_gather_rows,
         scatter_rows,
@@ -157,16 +181,43 @@ def worker(rank, world, out_path, master_port):
         "streamed-sp8-world8", 1, num_rows, hidden, dtype=torch.bfloat16
     ).to(device).reshape(num_rows, hidden)
 
-    gathered_sources, experts_per_rank = _gather_sources(
-        block, rank, world, device
+    experts_per_rank = len(block.experts) // world
+    expert_start = rank * experts_per_rank
+    local_shard = build_layer_shard(
+        _sources(block.experts[expert_start:expert_start + experts_per_rank]),
+        device,
     )
-    gathered_shard = build_layer_shard(gathered_sources, device)
-    sp8_layer = _layer(block, gathered_shard, ResidentEPMXFP4MoELayer)
+    buffer = _StaticSP8Buffer(local_shard, rank, world)
+    common = dict(
+        layer_idx=0,
+        buffer=buffer,
+        down_proj=block.routed_expert_down_proj,
+        norm=(
+            block.routed_expert_norm
+            if block.latent_moe_use_norm
+            else None
+        ),
+        up_proj=block.routed_expert_up_proj,
+    )
+    wide_layer = StreamedSP8MXFP4MoELayer(
+        **common,
+        chunk_rows=4096,
+    )
+    striped_layer = StreamedSP8MXFP4MoELayer(
+        **common,
+        chunk_rows=2048,
+        collective_chunk_rows=2,
+        collective_stripe_threshold_rows=1,
+    )
     x_local = scatter_rows(x, world, rank)
     with torch.no_grad():
-        routed_local = sp8_layer.forward(x_local, block.gate)
-        routed = all_gather_rows(
-            routed_local, num_rows, world, rank, dist.group.WORLD
+        wide_local = wide_layer.forward(x_local, block.gate, num_rows)
+        striped_local = striped_layer.forward(x_local, block.gate, num_rows)
+        wide = all_gather_rows(
+            wide_local, num_rows, world, rank, dist.group.WORLD
+        )
+        striped = all_gather_rows(
+            striped_local, num_rows, world, rank, dist.group.WORLD
         )
 
         reference_shard = build_layer_shard(_sources(block.experts), device)
@@ -174,8 +225,10 @@ def worker(rank, world, out_path, master_port):
             block, reference_shard, ResidentEPMXFP4MoELayer
         ).forward(x, block.gate)
 
-    error = _err_ratio(routed, reference)
-    max_abs = float((routed.float() - reference.float()).abs().max())
+    wide_error = _err_ratio(wide, reference)
+    striped_error = _err_ratio(striped, reference)
+    striped_vs_wide = _err_ratio(striped, wide)
+    max_abs = float((striped.float() - reference.float()).abs().max())
     gate_out = block.gate(x_local.view(x_local.shape[0], 1, hidden))
     local_assignments = torch.tensor(
         [gate_out[0].numel()], dtype=torch.int64, device=device
@@ -183,9 +236,14 @@ def worker(rank, world, out_path, master_port):
     dist.all_reduce(local_assignments)
     expected_assignments = num_rows * gate_out[0].shape[-1]
 
-    if error >= 3e-3:
+    if wide_error >= 3e-3 or striped_error >= 3e-3:
         raise AssertionError(
-            f"SP8 row parity failed: err_ratio={error} max_abs={max_abs}"
+            "SP8 row parity failed: "
+            f"wide={wide_error} striped={striped_error} max_abs={max_abs}"
+        )
+    if striped_vs_wide >= 3e-3:
+        raise AssertionError(
+            f"striped/wide parity failed: err_ratio={striped_vs_wide}"
         )
     if int(local_assignments.item()) != expected_assignments:
         raise AssertionError(
@@ -203,7 +261,9 @@ def worker(rank, world, out_path, master_port):
             "top_k": gate_out[0].shape[-1],
             "routed_assignments": int(local_assignments.item()),
             "expected_assignments": expected_assignments,
-            "err_ratio_vs_world1": error,
+            "wide_err_ratio_vs_world1": wide_error,
+            "striped_err_ratio_vs_world1": striped_error,
+            "striped_err_ratio_vs_wide": striped_vs_wide,
             "max_abs_vs_world1": max_abs,
             "verdict": "PASS",
         }

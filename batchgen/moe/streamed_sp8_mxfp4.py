@@ -767,6 +767,7 @@ class StreamedSP8MXFP4MoELayer:
     _prefill_profile_expert_shard_size = 0
     _prefill_profile_grouped_chunks = 0
     _prefill_profile_active_experts = 0
+    _prefill_profile_striped_layers = 0
     _prefill_profile_wall_s = 0.0
     # Cross-node weight transport evidence (hierarchical_gdr). Counted by
     # StreamedSP8LayerBuffer, which owns the broadcasts; zero/False proves the
@@ -829,6 +830,7 @@ class StreamedSP8MXFP4MoELayer:
         cls._prefill_profile_expert_shard_size = 0
         cls._prefill_profile_grouped_chunks = 0
         cls._prefill_profile_active_experts = 0
+        cls._prefill_profile_striped_layers = 0
         cls._prefill_profile_wall_s = 0.0
         cls._prefill_profile_cross_broadcast_calls = 0
         cls._prefill_profile_cross_broadcast_bytes = 0
@@ -929,6 +931,7 @@ class StreamedSP8MXFP4MoELayer:
             "expert_shard_size": cls._prefill_profile_expert_shard_size,
             "grouped_chunks": cls._prefill_profile_grouped_chunks,
             "active_experts": scalar(cls._prefill_profile_active_experts),
+            "striped_layers": cls._prefill_profile_striped_layers,
             "wall_s": cls._prefill_profile_wall_s,
             "cross_broadcast_calls": (
                 cls._prefill_profile_cross_broadcast_calls
@@ -995,6 +998,8 @@ class StreamedSP8MXFP4MoELayer:
         up_proj,
         chunk_rows: int = 2048,
         post_chunk_rows: int = 8192,
+        collective_chunk_rows: int = 256,
+        collective_stripe_threshold_rows: int = 32768,
     ):
         self.layer_idx = int(layer_idx)
         self.buffer = buffer
@@ -1003,6 +1008,16 @@ class StreamedSP8MXFP4MoELayer:
         self.up_proj = up_proj
         self.chunk_rows = int(chunk_rows)
         self.post_chunk_rows = int(post_chunk_rows)
+        self.collective_chunk_rows = int(collective_chunk_rows)
+        if self.collective_chunk_rows <= 0:
+            raise ValueError("collective_chunk_rows must be positive")
+        self.collective_stripe_threshold_rows = int(
+            collective_stripe_threshold_rows
+        )
+        if self.collective_stripe_threshold_rows <= 0:
+            raise ValueError(
+                "collective_stripe_threshold_rows must be positive"
+            )
 
     def forward(self, x: torch.Tensor, gate, num_rows: int) -> torch.Tensor:
         """Run this rank's expert shard over the whole node's rows.
@@ -1072,11 +1087,36 @@ class StreamedSP8MXFP4MoELayer:
         )
         helper.compact_dispatch = True
 
+        # A full node-row gather plus FP32 combine is cheap for the W1/W2
+        # diagnostics, but it is not bounded in the number of prefill rows.
+        # At 64K, TP8 needs hundreds of MiB for ``all_latent`` and roughly
+        # twice that for ``combined`` on every rank, on top of the resident
+        # decode shard and K3 block-residual scratch. Stripe the independent
+        # LOCAL-row axis once the full node batch exceeds one existing expert
+        # compute chunk. Each stripe still gathers all TP slices, computes
+        # every routed assignment exactly once, and reduce-scatters in FP32
+        # before the single BF16 downcast. W1/W2 retain the original wide path.
+        ntp = (num_rows + tp_size - 1) // tp_size
+        num_node_rows = tp_size * ntp
+        if num_node_rows > self.collective_stripe_threshold_rows:
+            output = self._forward_striped(
+                x=x,
+                gate=gate,
+                num_rows=num_rows,
+                ntp=ntp,
+                helper=helper,
+                shard=shard,
+                marks=marks,
+                profile=profile,
+                profile_start=profile_start,
+            )
+            buffer.allow_full_overwrite()
+            return output
+
         # --- router + down-proj on this rank's OWN rows, padded to ntp ---
         # The router is row-local and the down-proj is per token, so running
         # them before the gather costs 1/8 of the work and makes the gathered
         # buffers line up with the caller's balanced row split.
-        ntp = (num_rows + tp_size - 1) // tp_size
         padded = x.new_zeros((ntp, H))
         if T > 0:
             padded[:T].copy_(x)
@@ -1095,7 +1135,6 @@ class StreamedSP8MXFP4MoELayer:
         latent_size = shard.K_latent
 
         # --- node-local gather of the LATENT + routing (never the hidden) ---
-        num_node_rows = tp_size * ntp
         all_latent = x_latent.new_empty((num_node_rows, latent_size))
         all_idx = topk_idx.new_empty((num_node_rows, top_k))
         all_weight = topk_weight.new_empty((num_node_rows, top_k))
@@ -1203,6 +1242,189 @@ class StreamedSP8MXFP4MoELayer:
                 y = self.norm(y)
             output[start:end].copy_(self.up_proj(y))
         if profile:
+            _profile_mark(marks)
+            cls._prefill_profile_layer_marks.append(tuple(marks))
+            cls._prefill_profile_wall_s += (
+                time.perf_counter() - profile_start
+            )
+        return output
+
+    def _forward_striped(
+        self,
+        *,
+        x,
+        gate,
+        num_rows,
+        ntp,
+        helper,
+        shard,
+        marks,
+        profile,
+        profile_start,
+    ):
+        """Bound streamed-SP8 activation scratch on the local-row axis.
+
+        A stripe contains the same row interval from every TP rank. Gathering
+        it produces the rank-major layout expected by reduce-scatter while
+        keeping both the gathered latent and FP32 combine no larger than one
+        existing expert-compute chunk.
+        """
+        T, H = x.shape
+        cls = type(self)
+        buffer = self.buffer
+        tp_size = buffer.tp_size
+        tp_group = buffer.tp_group
+        expert_start = buffer.expert_start
+        num_local = buffer.experts_per_rank
+        latent_size = shard.K_latent
+        stripe_rows = min(
+            self.collective_chunk_rows,
+            max(1, self.chunk_rows // tp_size),
+        )
+
+        output = x.new_empty((T, H))
+        if profile:
+            cls._prefill_profile_striped_layers += 1
+        layer_active = (
+            torch.zeros(
+                (num_local + 1,), dtype=torch.uint8, device=x.device
+            )
+            if profile
+            else None
+        )
+        top_k = None
+        if profile:
+            # The striped path interleaves gather, grouped compute and
+            # reduce-scatter. Boundary 1 starts that fused body; the remaining
+            # legacy boundaries are filled at its end below rather than
+            # mislabelling one stripe as a whole-layer phase.
+            _profile_mark(marks)
+
+        for local_start in range(0, ntp, stripe_rows):
+            local_end = min(local_start + stripe_rows, ntp)
+            count = local_end - local_start
+            valid_end = min(local_end, T)
+            valid_count = max(0, valid_end - local_start)
+
+            if valid_count == count:
+                local_hidden = x[local_start:local_end]
+            else:
+                local_hidden = x.new_zeros((count, H))
+                if valid_count:
+                    local_hidden[:valid_count].copy_(
+                        x[local_start:valid_end]
+                    )
+
+            gate_out = gate(local_hidden.view(count, 1, H))
+            topk_idx = gate_out[0].reshape(count, -1).to(torch.int32)
+            topk_weight = gate_out[1].reshape(count, -1).contiguous()
+            top_k = topk_idx.shape[-1]
+            if valid_count < count:
+                topk_idx[valid_count:].fill_(-1)
+                topk_weight[valid_count:].zero_()
+            x_latent = self.down_proj(local_hidden).contiguous()
+
+            num_stripe_rows = tp_size * count
+            all_latent = x_latent.new_empty(
+                (num_stripe_rows, latent_size)
+            )
+            all_idx = topk_idx.new_empty((num_stripe_rows, top_k))
+            all_weight = topk_weight.new_empty(
+                (num_stripe_rows, top_k)
+            )
+            dist.all_gather_into_tensor(
+                all_latent, x_latent, group=tp_group
+            )
+            dist.all_gather_into_tensor(all_idx, topk_idx, group=tp_group)
+            dist.all_gather_into_tensor(
+                all_weight, topk_weight, group=tp_group
+            )
+
+            owned = (all_idx >= expert_start) & (
+                all_idx < expert_start + num_local
+            )
+            if profile:
+                cls._prefill_profile_grouped_chunks += 1
+                cls._prefill_profile_routed_assignments += owned.sum()
+                local_ids = all_idx - expert_start
+                sentinel = torch.full_like(local_ids, num_local)
+                safe_ids = torch.where(owned, local_ids, sentinel)
+                layer_active.scatter_(
+                    0, safe_ids.reshape(-1).to(torch.int64), 1
+                )
+
+            expert_path_span = cls.begin_profile_span() if profile else None
+            expert_out, topk_pos = helper._expert_path(
+                all_latent,
+                all_idx,
+                num_stripe_rows,
+            )
+            if profile:
+                cls.end_profile_span(
+                    "grouped_expert_path", expert_path_span
+                )
+            combine_span = cls.begin_profile_span() if profile else None
+            combined = helper._combine_fp32(
+                expert_out,
+                topk_pos,
+                all_weight,
+                num_stripe_rows,
+                latent_size,
+                top_k,
+            )
+            if profile:
+                cls.end_profile_span("grouped_combine", combine_span)
+
+            local_latent = combined.new_empty((count, latent_size))
+            dist.reduce_scatter_tensor(
+                local_latent,
+                combined,
+                op=dist.ReduceOp.SUM,
+                group=tp_group,
+            )
+            if local_end == ntp:
+                # No later stripe reads the expert shard. Match the wide
+                # path's handoff point: release compute-buffer assembly before
+                # the post-combine norm/up projection, which does not touch
+                # routed-expert weights.
+                buffer.allow_full_overwrite()
+            if valid_count:
+                y = local_latent[:valid_count].to(torch.bfloat16)
+                if self.norm is not None:
+                    y = self.norm(y)
+                output[local_start:valid_end].copy_(self.up_proj(y))
+                del y
+
+            # Drop each stripe before allocating the next one. This is the
+            # memory contract of the path, not cosmetic lifetime management.
+            del (
+                gate_out,
+                topk_idx,
+                topk_weight,
+                x_latent,
+                all_latent,
+                all_idx,
+                all_weight,
+                owned,
+                expert_out,
+                topk_pos,
+                combined,
+                local_latent,
+            )
+            if profile:
+                del local_ids, sentinel, safe_ids
+            if valid_count != count:
+                del local_hidden
+
+        if profile:
+            cls._prefill_profile_active_experts += layer_active[:num_local].sum()
+            cls._prefill_profile_node_routed_assignments += num_rows * top_k
+            cls._prefill_profile_expert_shard_size = num_local
+            # Keep the existing fixed nine-event record shape. Named
+            # per-stripe grouped spans remain phase-accurate; the legacy
+            # boundaries 1--7 delimit the fused striped body as a whole.
+            while len(marks) < 8:
+                _profile_mark(marks)
             _profile_mark(marks)
             cls._prefill_profile_layer_marks.append(tuple(marks))
             cls._prefill_profile_wall_s += (
