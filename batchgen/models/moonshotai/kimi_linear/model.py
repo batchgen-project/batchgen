@@ -994,7 +994,10 @@ class KimiDecoderLayer(nn.Module):
         if prefix_sum is None:
             prefix_sum = hidden_states
         else:
-            prefix_sum = prefix_sum + hidden_states
+            # The FFN output is dead after this residual merge. Reuse the
+            # surviving prefix buffer instead of allocating another full
+            # (tokens, hidden) tensor; exact-64K K3 is 896 MiB per rank here.
+            prefix_sum.add_(hidden_states)
 
         return prefix_sum, block_residual
 

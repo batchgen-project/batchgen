@@ -945,6 +945,25 @@ def test_streamed_sp8_serving_opens_the_cross_gate_last_in_the_branch():
     }
 
 
+def test_block_residual_ffn_merge_reuses_the_surviving_prefix():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "model.py"
+    )
+    source = ast.unparse(
+        _function(path, "KimiDecoderLayer", "_forward_attn_residual")
+    )
+
+    # Exact-64K is 896 MiB per hidden tensor per rank. The streamed MoE has
+    # already produced its output in caller-owned storage, so the final depth
+    # residual must not allocate a third full hidden tensor.
+    assert source.count("prefix_sum.add_(hidden_states)") == 1
+
+
 def test_streamed_sp8_layer_forward_touches_neither_side_of_the_handshake():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     forward = _function(path, "StreamedSP8MXFP4MoELayer", "forward")
