@@ -86,6 +86,7 @@ def _make_moe(experts, shared):
     moe._prefill_prepared_keys = None
     moe._prefill_weight_prototypes = None
     moe._prefill_shared_key = None
+    moe.layer_idx = 3
     moe.experts = experts
     moe.shared_experts = shared
     return moe
@@ -94,7 +95,7 @@ def _make_moe(experts, shared):
 @pytest.fixture(autouse=True)
 def _reset_prefill_class_state():
     Glm5MoE._prefill_buf = object()
-    Glm5MoE._prefill_ptrs_pinned = torch.empty(6, 2, dtype=torch.int64)
+    Glm5MoE._prefill_ptrs_pinned = torch.empty(78, 6, 2, dtype=torch.int64)
     Glm5MoE._prefill_ptrs_dev = torch.empty(6, 2, dtype=torch.int64)
     Glm5MoE._prefill_ring_pending = None
     Glm5MoE._prefill_shared_pending = None
@@ -109,6 +110,31 @@ def _reset_prefill_class_state():
     Glm5MoE._prefill_shared_pending = None
     Glm5MoE._prefill_retire_executor = None
     Glm5MoE._prefill_retire_future = None
+
+
+def test_prepare_uses_distinct_pinned_h2d_source_per_layer():
+    log = []
+    core = _Core(log)
+    layer3 = _make_moe(
+        [_Expert("l3_e0", core, log), _Expert("l3_e1", core, log)],
+        _Expert("l3_shared", core, log),
+    )
+    layer3.layer_idx = 3
+    layer3._prefill_prepare_weights()
+    layer3_stage = Glm5MoE._prefill_ptrs_pinned[3].clone()
+
+    layer4 = _make_moe(
+        [_Expert("l4_e0", core, log), _Expert("l4_e1", core, log)],
+        _Expert("l4_shared", core, log),
+    )
+    layer4.layer_idx = 4
+    layer4._prefill_prepare_weights()
+
+    torch.testing.assert_close(Glm5MoE._prefill_ptrs_pinned[3], layer3_stage)
+    assert not torch.equal(
+        Glm5MoE._prefill_ptrs_pinned[3],
+        Glm5MoE._prefill_ptrs_pinned[4],
+    )
 
 
 def test_prepare_retires_previous_layers_without_blocking_current_acquisition():

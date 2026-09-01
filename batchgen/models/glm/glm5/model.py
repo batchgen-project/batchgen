@@ -1349,7 +1349,8 @@ class Glm5MoE(nn.Module):
 
     # Pure-DP grouped prefill. The 512-slot core-engine ring owns two complete
     # 256-expert FP8 layers; this class only owns bounded activation/workspace
-    # storage and one reusable pointer table.
+    # storage, one reusable device pointer table, and per-layer pinned H2D
+    # sources whose lifetime covers the non-blocking copies.
     _prefill_buf: Optional[Glm5PrefillMoEBuffers] = None
     _prefill_ptrs_pinned: Optional[torch.Tensor] = None
     _prefill_ptrs_dev: Optional[torch.Tensor] = None
@@ -1428,8 +1429,18 @@ class Glm5MoE(nn.Module):
             topk=config.num_experts_per_tok,
             device=device,
         )
+        # One pinned H2D source per transformer layer.  The copy below is
+        # deliberately non-blocking, so its pinned source must not be mutated
+        # until the DMA has consumed it.  Reusing one [6, E] host table was only
+        # accidentally safe while attention weight release synchronized the
+        # compute stream at every layer; event-ordered release exposed the race.
+        # A full layer bank is <1 MiB for GLM-5.2 and needs no host-side fence.
         cls._prefill_ptrs_pinned = torch.empty(
-            6, config.n_routed_experts, dtype=torch.int64, pin_memory=True
+            config.num_hidden_layers,
+            6,
+            config.n_routed_experts,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         cls._prefill_ptrs_dev = torch.empty(
             6, config.n_routed_experts, dtype=torch.int64, device=device
@@ -2447,7 +2458,12 @@ class Glm5MoE(nn.Module):
 
         layer_idx = getattr(self, "layer_idx", -1)
         cls._schedule_prefill_grouped_retirement(layer_idx)
-        stage = cls._prefill_ptrs_pinned
+        stage_bank = cls._prefill_ptrs_pinned
+        if stage_bank.ndim != 3 or not 0 <= layer_idx < stage_bank.shape[0]:
+            raise RuntimeError(
+                "GLM-5 grouped prefill pointer staging must be a per-layer bank"
+            )
+        stage = stage_bank[layer_idx]
         keys = []
         prototypes = None
         core_engine = self.experts[0].core_engine
