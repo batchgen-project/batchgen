@@ -459,7 +459,10 @@ class ResidentEPMXFP4MoELayer:
             )
             expert_starts = expert_offsets[:-1]
             max_m_tiles = max((max_local_count + 15) // 16, 1)
-            mtp = capacity
+            # The wrapper uses ``mtp`` only to prove max_m_tiles covers every
+            # expert. Packed storage has no shared stride, so its admissible
+            # per-expert bound is the measured maximum, not total capacity.
+            mtp = max(max_local_count, 1)
         elif dispatch_capacity is not None:
             if not self.compact_dispatch:
                 raise ValueError(
