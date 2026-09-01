@@ -68,11 +68,15 @@ import time
 import torch
 from torch.distributed import ReduceOp
 
-from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d
+from batchgen.moe.dispatch_scatter_3d import (
+    dispatch_scatter_3d,
+    reduce_weighted_scatter_fp32,
+)
 from batchgen.moe.marlin_grouped_moe import (
     marlin_grouped_m16_mxfp4,
     marlin_grouped_stage1_fused_mxfp4_situ,
 )
+from batchgen.moe.routing import dispatch_count_gather_cuda
 
 
 def compact_prefill_chunk_rows(num_global, configured_rows):
@@ -327,6 +331,20 @@ class ResidentEPMXFP4MoELayer:
         ``topk_pos`` [T*K] int32: absolute row of this (token, k) assignment in
         the strided expert_out buffer, or -1 (non-local / padding).
         """
+        if self.compact_dispatch and K == 16:
+            weight = topk_weight.reshape(T, K).float().contiguous()
+            combined = torch.empty(
+                (T, H), dtype=torch.float32, device=expert_out.device
+            )
+            return reduce_weighted_scatter_fp32(
+                expert_out,
+                topk_pos,
+                weight,
+                T,
+                H,
+                K,
+                combined,
+            )
         pos = topk_pos.view(T, K).long()
         weight = topk_weight.reshape(T, K).float()
         if self.compact_dispatch:
@@ -389,8 +407,60 @@ class ResidentEPMXFP4MoELayer:
         E, N, K_latent = shard.num_local, shard.N, shard.K_latent
         K = topk_idx_i32.shape[-1]
 
-        # --- dispatch latent rows into the strided [E*mtp, K_latent] buffer ---
-        if dispatch_capacity is not None:
+        # --- dispatch latent rows into the expert-ordered activation buffer ---
+        if self.compact_dispatch and dispatch_capacity is None:
+            # Real long prompts can route every row to the same expert. A
+            # strided [E * max_count, K_latent] buffer then multiplies one hot
+            # expert's capacity by every inactive expert in the shard. Count
+            # once so the packed CUDA dispatcher allocates exactly the local
+            # assignments, while its GPU prefix sums remain the authoritative
+            # expert starts consumed by grouped Marlin.
+            local = topk_idx_i32[
+                (topk_idx_i32 >= self.expert_start)
+                & (topk_idx_i32 < self.expert_start + E)
+            ] - self.expert_start
+            local_counts = torch.bincount(
+                local.reshape(-1).to(torch.int64),
+                minlength=E,
+            )
+            route_stats = torch.stack(
+                (local_counts.max(), local_counts.sum())
+            ).tolist()
+            max_local_count, total_local = map(int, route_stats)
+            capacity = max(total_local, 1)
+            dispatched = torch.empty(
+                capacity,
+                K_latent,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            expert_counts = torch.empty(E, dtype=torch.int32, device=device)
+            expert_offsets = torch.empty(
+                E + 1, dtype=torch.int32, device=device
+            )
+            expert_counters = torch.empty(
+                E, dtype=torch.int32, device=device
+            )
+            topk_pos = torch.empty(
+                num_rows * K, dtype=torch.int32, device=device
+            )
+            dispatched, expert_counts, expert_offsets, topk_pos = (
+                dispatch_count_gather_cuda(
+                    x_latent,
+                    topk_idx_i32,
+                    self.expert_start,
+                    E,
+                    expert_counts=expert_counts,
+                    expert_offsets=expert_offsets,
+                    expert_counters=expert_counters,
+                    dispatched_x=dispatched,
+                    topk_pos=topk_pos,
+                )
+            )
+            expert_starts = expert_offsets[:-1]
+            max_m_tiles = max((max_local_count + 15) // 16, 1)
+            mtp = capacity
+        elif dispatch_capacity is not None:
             if not self.compact_dispatch:
                 raise ValueError(
                     "dispatch_capacity is only valid for compact dispatch"
@@ -400,42 +470,49 @@ class ResidentEPMXFP4MoELayer:
                     "dispatch_capacity cannot be smaller than num_rows"
                 )
             mtp = max(((dispatch_capacity + 15) // 16) * 16, 16)
-        elif self.compact_dispatch:
-            local = topk_idx_i32[
-                (topk_idx_i32 >= self.expert_start)
-                & (topk_idx_i32 < self.expert_start + E)
-            ] - self.expert_start
-            if local.numel():
-                local_counts = torch.bincount(
-                    local.reshape(-1).to(torch.int64),
-                    minlength=E,
-                )
-                max_local_count = int(local_counts.max().item())
-            else:
-                max_local_count = 0
-            mtp = max(((max_local_count + 15) // 16) * 16, 16)
         else:
             mtp = max(((num_rows + 15) // 16) * 16, 16)
-        dispatched = torch.zeros(E * mtp, K_latent, dtype=torch.bfloat16,
-                                 device=device)
-        expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
-        expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
-        topk_pos = torch.full((num_rows * K,), -1, dtype=torch.int32,
-                              device=device)
-        expert_counts, topk_pos = dispatch_scatter_3d(
-            x_latent, topk_idx_i32, dispatched,
-            self.expert_start, E, mtp, expert_counts, expert_counters, topk_pos,
-        )
-        expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
-        max_m_tiles = (min(num_rows, mtp) + 15) // 16
+        if not (self.compact_dispatch and dispatch_capacity is None):
+            dispatched = torch.zeros(
+                E * mtp, K_latent, dtype=torch.bfloat16, device=device
+            )
+            expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
+            expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
+            topk_pos = torch.full(
+                (num_rows * K,), -1, dtype=torch.int32, device=device
+            )
+            expert_counts, topk_pos = dispatch_scatter_3d(
+                x_latent,
+                topk_idx_i32,
+                dispatched,
+                self.expert_start,
+                E,
+                mtp,
+                expert_counts,
+                expert_counters,
+                topk_pos,
+            )
+            expert_starts = (
+                torch.arange(E, dtype=torch.int32, device=device) * mtp
+            )
+            max_m_tiles = (min(num_rows, mtp) + 15) // 16
 
         # --- grouped S1: gate(w1) + up(w3) + SiTU -> intermediate [E*mtp, N] ---
-        intermediate = torch.empty(E * mtp, N, dtype=torch.bfloat16,
-                                   device=device)
+        activation_rows = dispatched.shape[0]
+        intermediate = torch.empty(
+            activation_rows, N, dtype=torch.bfloat16, device=device
+        )
         row_N = N * intermediate.element_size()
-        s1_C_ptrs = torch.tensor(
-            [intermediate.data_ptr() + e * mtp * row_N for e in range(E)],
-            dtype=torch.int64, device=device)
+        if self.compact_dispatch and dispatch_capacity is None:
+            s1_C_ptrs = expert_starts.to(torch.int64).mul_(row_N).add_(
+                intermediate.data_ptr()
+            )
+        else:
+            s1_C_ptrs = torch.tensor(
+                [intermediate.data_ptr() + e * mtp * row_N for e in range(E)],
+                dtype=torch.int64,
+                device=device,
+            )
         s1_ws = torch.zeros(E * (N // 256 + 17), dtype=torch.int32, device=device)
         marlin_grouped_stage1_fused_mxfp4_situ(
             dispatched, intermediate, expert_counts, expert_starts,
@@ -445,12 +522,20 @@ class ResidentEPMXFP4MoELayer:
         )
 
         # --- grouped S3: down(w2) -> expert_out [E*mtp, K_latent] ---
-        expert_out = torch.empty(E * mtp, K_latent, dtype=torch.bfloat16,
-                                 device=device)
+        expert_out = torch.empty(
+            activation_rows, K_latent, dtype=torch.bfloat16, device=device
+        )
         row_K = K_latent * expert_out.element_size()
-        s3_C_ptrs = torch.tensor(
-            [expert_out.data_ptr() + e * mtp * row_K for e in range(E)],
-            dtype=torch.int64, device=device)
+        if self.compact_dispatch and dispatch_capacity is None:
+            s3_C_ptrs = expert_starts.to(torch.int64).mul_(row_K).add_(
+                expert_out.data_ptr()
+            )
+        else:
+            s3_C_ptrs = torch.tensor(
+                [expert_out.data_ptr() + e * mtp * row_K for e in range(E)],
+                dtype=torch.int64,
+                device=device,
+            )
         s3_ws = torch.zeros(E * (K_latent // 256 + 17), dtype=torch.int32,
                             device=device)
         marlin_grouped_m16_mxfp4(
