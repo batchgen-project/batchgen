@@ -61,18 +61,16 @@ GEMM_TILEM_AVG = 32
 # always 16 B aligned for the scale TMA descriptor.
 _CAPACITY_BLOCK = 128
 
-_dispatch_module = None
 _ops_module = None
 
 
 def _require_dispatch_module():
     """Load the ragged dispatch extension, hard-failing on a stale build."""
-    global _dispatch_module
-    if _dispatch_module is not None:
-        return _dispatch_module
-    import batchgen_kernels
+    from batchgen.moe.dispatch_scatter_3d import (
+        require_dispatch_scatter_3d_kernels,
+    )
 
-    mod = batchgen_kernels.load_extension("batchgen_kernels.moe._C_dispatch_scatter_3d")
+    mod = require_dispatch_scatter_3d_kernels()
     if not hasattr(mod, "dispatch_scatter_ragged"):
         raise RuntimeError(
             "batchgen_kernels.moe._C_dispatch_scatter_3d has no "
@@ -80,7 +78,6 @@ def _require_dispatch_module():
             "compact ragged MoE layout (M1a-2). Rebuild batchgen_kernels on this "
             "node; there is no padded-layout fallback."
         )
-    _dispatch_module = mod
     return mod
 
 

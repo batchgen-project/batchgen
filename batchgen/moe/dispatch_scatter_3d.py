@@ -50,6 +50,18 @@ def _load_dispatch_reduce_module():
         return None
 
 
+def require_dispatch_scatter_3d_kernels():
+    """Load the dispatch/reduce extension once or fail closed.
+
+    Grouped prefill calls this during configuration so the first token window
+    never pays the development-loader/import-lock cost.
+    """
+    mod = _load_dispatch_reduce_module()
+    if mod is None:
+        raise RuntimeError("dispatch_scatter_3d kernels are unavailable")
+    return mod
+
+
 def dispatch_scatter_3d(
     x: torch.Tensor,
     topk_indices: torch.Tensor,

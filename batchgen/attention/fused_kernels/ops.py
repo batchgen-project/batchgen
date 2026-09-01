@@ -19,6 +19,11 @@ def _get_ext():
     return _ext
 
 
+def preload_fused_attention_kernels():
+    """Resolve the extension before a timed model forward."""
+    return _get_ext()
+
+
 def cuda_rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,

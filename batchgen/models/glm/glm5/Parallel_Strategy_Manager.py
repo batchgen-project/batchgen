@@ -150,6 +150,15 @@ class GLM5ParallelStrategyManager:
         self._setup_fp8_scales()
         self._init_fused_kernels()
         if self.is_fp8_experts:
+            # Keep the development-loader/import-lock cost outside the pure
+            # prefill timer. Grouped-buffer initialization below already
+            # preloads dispatch/reduce; fused RMSNorm is otherwise first
+            # resolved by layer 0 inside the model forward.
+            from batchgen.attention.fused_kernels import (
+                preload_fused_attention_kernels,
+            )
+
+            preload_fused_attention_kernels()
             grouped_layers = [
                 layer.mlp
                 for layer in self.model.model.layers[self.FIRST_K_DENSE :]
