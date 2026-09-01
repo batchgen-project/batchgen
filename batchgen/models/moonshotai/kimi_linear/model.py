@@ -977,7 +977,11 @@ class KimiDecoderLayer(nn.Module):
         )
 
         if prefix_sum is not None:
-            prefix_sum = prefix_sum + hidden_states
+            # The pre-attention prefix is the surviving residual buffer and
+            # the attention output is dead after this merge. Exact-64K K3 is
+            # 896 MiB per full hidden tensor, so update the prefix in place
+            # instead of materializing a third tensor before the depth mix.
+            prefix_sum.add_(hidden_states)
         else:
             prefix_sum = hidden_states
 
