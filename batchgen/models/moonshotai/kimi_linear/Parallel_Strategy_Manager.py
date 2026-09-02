@@ -326,6 +326,61 @@ class KimiLinearParallelStrategyManager:
     def prefill_uses_streamed_sp8(self):
         return self._prefill_moe_mode == "streamed_sp8"
 
+    def gather_prefill_last_token_hidden(
+        self, hidden_states, last_token_indices, num_global_rows
+    ):
+        """Reassemble only sequence-final rows from the TP8 token shards.
+
+        Streamed-SP8 carries one contiguous token-row shard through the final
+        depth mix and norm.  The worker still needs one final hidden vector per
+        replicated sequence for its unchanged sampling/writeback contract, but
+        gathering every token row here would discard the whole-stack sharding
+        win.  Exactly one TP rank owns each requested global row, so a small
+        zero-filled all-reduce reconstructs the requested vectors exactly.
+        """
+        if not self.prefill_uses_streamed_sp8():
+            return hidden_states[0, last_token_indices, :]
+
+        from .moe_tp_reshard import balanced_row_split
+
+        num_global_rows = int(num_global_rows)
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ValueError(
+                "streamed-SP8 final hidden state must have shape (1, rows, hidden)"
+            )
+        if hidden_states.shape[1] == num_global_rows:
+            return hidden_states[0, last_token_indices, :]
+
+        start, end = balanced_row_split(
+            num_global_rows, self._attn_tp_size
+        )[self._attn_tp_rank]
+        if hidden_states.shape[1] != end - start:
+            raise ValueError(
+                "streamed-SP8 final hidden state has the wrong local row count"
+            )
+
+        selected = hidden_states.new_zeros(
+            (last_token_indices.numel(), hidden_states.shape[-1])
+        )
+        owned = (last_token_indices >= start) & (last_token_indices < end)
+        selected[owned] = hidden_states[
+            0, (last_token_indices[owned] - start).long(), :
+        ]
+
+        output_norm = getattr(
+            self.model.model, "output_attn_res_norm", None
+        )
+        order_wait = getattr(
+            output_norm, "_streamed_sp8_order_wait", None
+        )
+        if order_wait is not None:
+            order_wait()
+
+        import torch.distributed as dist
+
+        dist.all_reduce(selected, group=self._attn_tp_group)
+        return selected
+
     def streamed_sp8_reseeds_h2d_on_reentry(self):
         """Whether each streamed-SP8 prefill starts a fresh local H2D cycle.
 

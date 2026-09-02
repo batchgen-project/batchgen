@@ -754,6 +754,66 @@ def test_mla_attention_is_stamped_with_tp_rank_for_row_reduce_scatter():
     assert "attn.attn_tp_rank = self._attn_tp_rank" in source
 
 
+def test_streamed_sp8_gathers_only_sequence_final_rows(monkeypatch):
+    torch = pytest.importorskip("torch")
+    method = _isolated_method(
+        _psm_path(),
+        "KimiLinearParallelStrategyManager",
+        "gather_prefill_last_token_hidden",
+        {"__package__": "batchgen.models.moonshotai.kimi_linear"},
+    )
+    global_rows, hidden = 17, 8
+    group_size, group_rank = 4, 2
+    full = torch.arange(global_rows * hidden, dtype=torch.float32).view(
+        global_rows, hidden
+    )
+    starts = (0, 5, 9, 13)
+    ends = (5, 9, 13, 17)
+    local = full[starts[group_rank] : ends[group_rank]].unsqueeze(0)
+    final_rows = torch.tensor([2, 8, 12, 16], dtype=torch.int32)
+    trace = []
+
+    def fake_all_reduce(selected, group):
+        assert group == "tp-group"
+        expected_local = torch.zeros_like(selected)
+        expected_local[2].copy_(full[12])
+        assert torch.equal(selected, expected_local)
+        selected.copy_(full[final_rows.long()])
+        trace.append("all_reduce")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    output_norm = SimpleNamespace(
+        _streamed_sp8_order_wait=lambda: trace.append("order_wait")
+    )
+    manager = SimpleNamespace(
+        _attn_tp_size=group_size,
+        _attn_tp_rank=group_rank,
+        _attn_tp_group="tp-group",
+        model=SimpleNamespace(
+            model=SimpleNamespace(output_attn_res_norm=output_norm)
+        ),
+        prefill_uses_streamed_sp8=lambda: True,
+    )
+
+    actual = method(manager, local, final_rows, global_rows)
+
+    assert torch.equal(actual, full[final_rows.long()])
+    assert trace == ["order_wait", "all_reduce"]
+
+
+def test_worker_uses_model_prefill_last_token_gather_seam():
+    source = ast.unparse(
+        _function(
+            ROOT / "batchgen" / "batchgen_worker.py",
+            "BatchGenWorker",
+            "prefill_prepacked",
+        )
+    )
+
+    assert "gather_prefill_last_token_hidden" in source
+    assert "batch_input_ids_flat.numel()" in source
+
+
 def _psm_layer(module, *, wrapped):
     """One decoder layer whose ``self_attn`` may or may not be wrapped."""
     moe = type("MoE", (), {})()

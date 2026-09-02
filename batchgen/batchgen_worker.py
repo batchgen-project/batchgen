@@ -8393,7 +8393,21 @@ class BatchGenWorker:
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
-				last_token_hidden = hidden_states[0, last_token_indices, :]
+				gather_last_token_hidden = getattr(
+					self.parallel_manager,
+					"gather_prefill_last_token_hidden",
+					None,
+				)
+				if gather_last_token_hidden is None:
+					last_token_hidden = hidden_states[
+						0, last_token_indices, :
+					]
+				else:
+					last_token_hidden = gather_last_token_hidden(
+						hidden_states,
+						last_token_indices,
+						batch_input_ids_flat.numel(),
+					)
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
 				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
