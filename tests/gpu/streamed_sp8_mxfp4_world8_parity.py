@@ -16,6 +16,7 @@ row gathering.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -176,6 +177,9 @@ def worker(rank, world, out_path, master_port):
         reduce_scatter_rows,
         scatter_rows,
     )
+    from batchgen.models.moonshotai.kimi_linear.tp_weight_sharding import (
+        shard_shared_expert_tensor,
+    )
     from batchgen.models.moonshotai.kimi_linear.block_residual import (
         apply_attn_res,
     )
@@ -233,10 +237,26 @@ def worker(rank, world, out_path, master_port):
         ).forward(x, block.gate)
 
         shared = block.shared_experts(x)
+        shared_tp = copy.deepcopy(block.shared_experts)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(shared_tp, name)
+            projection.weight = torch.nn.Parameter(
+                shard_shared_expert_tensor(
+                    projection.weight.detach(),
+                    name + ".weight",
+                    world,
+                    rank,
+                ),
+                requires_grad=False,
+            )
+        shared_tp.intermediate_size = shared_tp.gate_proj.weight.shape[0]
+        shared_tp.gate_proj.out_features = shared_tp.intermediate_size
+        shared_tp.up_proj.out_features = shared_tp.intermediate_size
+        shared_tp.down_proj.in_features = shared_tp.intermediate_size
         shared_input = all_gather_rows(
             x_local, num_rows, world, rank, dist.group.WORLD
         )
-        shared_partial = block.shared_experts._ffn_into(
+        shared_partial = shared_tp._ffn_into(
             shared_input, shared_input
         )
         shared_sharded = reduce_scatter_rows(
