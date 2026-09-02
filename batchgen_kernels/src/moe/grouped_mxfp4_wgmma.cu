@@ -7,6 +7,10 @@
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#if CUDA_VERSION >= 13000
+// CUDA 13 drops the unversioned alias; the v12000 signature is unchanged.
+typedef PFN_cuTensorMapEncodeTiled_v12000 PFN_cuTensorMapEncodeTiled;
+#endif
 #include <c10/cuda/CUDAStream.h>
 #include <cstdint>
 #include <utility>
