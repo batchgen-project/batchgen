@@ -783,11 +783,16 @@ def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
     for start, end, lo, hi, bounds in _kda_cached_segment_plan(
             cu_seqlens, segment_tokens):
         seg_slots = slots[lo:hi]
+        # A segment inside one sequence is a plain batch-1 call: fla's varlen
+        # entry prepares chunk indices from ``cu_seqlens`` on every call whose
+        # bounds tensor misses its cache (1.6 ms vs 0.75 ms per 4,096-token
+        # segment on H200, 128 segments per layer at exact 64K), while the
+        # batched kernel is bit-identical for a single sequence.
         o_seg, recurrent_out = chunk_kda_fn(
             q=q[:, start:end], k=k[:, start:end], v=v[:, start:end],
             g=f[:, start:end], beta=beta[:, start:end],
             initial_state=recurrent_pool.index_select(0, seg_slots),
-            cu_seqlens=bounds,
+            cu_seqlens=None if hi - lo == 1 else bounds,
             **kernel_kwargs,
         )
         # The sequence that straddles `end` gets a PARTIAL state here; the

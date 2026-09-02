@@ -133,7 +133,8 @@ def _cpu_chunk_kda(q, k, v, g, beta, A_log, dt_bias, use_qk_l2norm_in_kernel,
     assert use_beta_sigmoid_in_kernel and output_final_state
     assert q.shape[0] == 1
     scale = q.shape[-1] ** -0.5
-    bounds = cu_seqlens.tolist()
+    # ``cu_seqlens=None`` is fla's batch-1 entry: one sequence spanning the call.
+    bounds = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
 
     o = torch.zeros(1, q.shape[1], H, D, dtype=v.dtype)
     final = torch.zeros_like(initial_state)
