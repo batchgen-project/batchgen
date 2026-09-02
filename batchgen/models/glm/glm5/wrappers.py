@@ -76,7 +76,7 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 _GLM5_PREFILL_CATEGORIES = [
-    "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
+    "attn_input_act_quant", "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
     "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
     "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
     "indexer_wk", "indexer_norm", "indexer_rope_hadamard",

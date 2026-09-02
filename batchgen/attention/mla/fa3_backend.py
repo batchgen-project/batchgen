@@ -599,6 +599,7 @@ def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
 	weight_scale_inv_fp32: torch.Tensor,
 	activation_bf16: torch.Tensor,
+	activation_fp8: Tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
 	"""
 		activation_bf16: [n_group, m, k]
@@ -618,7 +619,7 @@ def w8a16_gemm(
 
 	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
 	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
-	x_fp8 = act_quant(x)
+	x_fp8 = activation_fp8 if activation_fp8 is not None else act_quant(x)
 	# disable_ue8m0_cast removed — on Hopper (SM90) the flag is a no-op
 	# (layout.hpp:22 early-exits for arch_major==9 regardless), and omitting
 	# lets DeepGEMM's default handling apply (same as SGLang). This also
@@ -1174,14 +1175,32 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	import os as _os_gemm
 	_w8a16_dequant_path = _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
 	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
+	_input_fp8 = None
+	if not _w8a16_dequant_path:
+		with _timed("attn_input_act_quant"):
+			_input_fp8 = act_quant(hidden_states)
 
-	# Project Q
+	def _input_gemm(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+		if _input_fp8 is None:
+			return _gemm(weight, scale, hidden_states)
+		return w8a16_gemm(
+			weight, scale, hidden_states, activation_fp8=_input_fp8
+		)
+
+	# Project both fan-outs while the shared quantized input is live, then drop
+	# it before the much larger Q-B output is materialized.
 	with _timed("attn_q_a"):
-		query_states = _gemm(
+		query_states = _input_gemm(
 			self.q_a_proj.weight.data,
 			weight_scale["q_a_proj.weight_scale_inv"],
-			hidden_states
 		)
+	with _timed("attn_kv_a"):
+		compressed_kv = _input_gemm(
+			self.kv_a_proj_with_mqa.weight.data,
+			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		)
+	_input_fp8 = None
+
 	with _timed("attn_q_norm"):
 		query_states = self.q_a_layernorm(query_states)
 	with _timed("attn_q_b"):
@@ -1196,13 +1215,6 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
 	)
 
-	# Project KV
-	with _timed("attn_kv_a"):
-		compressed_kv = _gemm(
-			self.kv_a_proj_with_mqa.weight.data,
-			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-			hidden_states
-		)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
