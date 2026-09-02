@@ -691,10 +691,12 @@ def test_block_boundary_restores_a_sharded_prefix(monkeypatch):
 
     def fake_all_gather(gathered, send, group):
         assert group == "fake-group"
-        assert torch.equal(send, local)
         # The helper's uneven path receives rank-major padded slots.
         splits = balanced_row_split(tokens, group_size)
         ntp = max(e - s for s, e in splits)
+        expected_send = local.new_zeros((ntp, hidden))
+        expected_send[: local.shape[0]].copy_(local)
+        assert torch.equal(send, expected_send)
         packed = prefix.new_zeros((group_size, ntp, hidden))
         for rank, (s, e) in enumerate(splits):
             packed[rank, : e - s].copy_(prefix[s:e])
