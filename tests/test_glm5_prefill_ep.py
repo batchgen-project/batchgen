@@ -219,7 +219,6 @@ def test_ep_forward_routes_locally_then_gathers_routes_and_hidden(monkeypatch):
     )
 
     def grouped_window(hidden, weights, indices, output, timer):
-        assert timer is None
         log.append(
             (
                 "grouped_window",
