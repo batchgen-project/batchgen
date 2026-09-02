@@ -41,6 +41,24 @@ def _err_ratio(actual, reference):
     )
 
 
+def _bf16_gemm_metrics(actual, reference):
+    actual = actual.float().reshape(-1)
+    reference = reference.float().reshape(-1)
+    diff = actual - reference
+    rel_l2 = float(diff.norm() / reference.norm().clamp_min(1e-12))
+    cosine = float(torch.nn.functional.cosine_similarity(
+        actual.unsqueeze(0), reference.unsqueeze(0)
+    ))
+    max_abs_over_std = float(
+        diff.abs().max() / reference.std().clamp_min(1e-12)
+    )
+    return {
+        "rel_l2": rel_l2,
+        "cosine": cosine,
+        "max_abs_over_std": max_abs_over_std,
+    }
+
+
 def _install_core_engine_from_cache():
     """Prevent synthetic model imports from rebuilding the unrelated core."""
     if "batchgen.core_engine" in sys.modules:
@@ -284,10 +302,18 @@ def worker(rank, world, out_path, master_port):
         shared_sharded = reduce_scatter_rows(
             shared_partial, world, rank, dist.group.WORLD
         )
-        shared_sharded_error = _err_ratio(
-            shared_sharded,
-            scatter_rows(shared_tp_reference, world, rank),
+        shared_sharded_repeat = reduce_scatter_rows(
+            shared_partial.clone(), world, rank, dist.group.WORLD
         )
+        shared_reference_local = scatter_rows(
+            shared_tp_reference, world, rank
+        )
+        shared_metrics = _bf16_gemm_metrics(
+            shared_sharded, shared_reference_local
+        )
+        shared_noise = _bf16_gemm_metrics(
+            shared_sharded_repeat, shared_sharded
+        )["rel_l2"]
         routed_full = shared_x.mul(0.125)
         routed_local = scatter_rows(routed_full, world, rank)
         combined_sharded = shared_sharded + routed_local
@@ -459,10 +485,16 @@ def worker(rank, world, out_path, master_port):
             "shared-expert sharded input/local FFN parity failed: "
             f"input={shared_input_exact} local={shared_local_exact}"
         )
-    if shared_sharded_error >= 3e-3 or combined_sharded_error >= 3e-3:
+    if (
+        shared_noise > 1.25e-3
+        or shared_metrics["rel_l2"] > 5e-3
+        or shared_metrics["cosine"] < 0.9999
+        or shared_metrics["max_abs_over_std"] > 3e-2
+        or combined_sharded_error >= 3e-3
+    ):
         raise AssertionError(
             "sharded shared/routed merge parity failed: "
-            f"shared={shared_sharded_error} "
+            f"shared={shared_metrics} noise={shared_noise} "
             f"combined={combined_sharded_error}"
         )
     if not uneven_exact:
@@ -502,7 +534,8 @@ def worker(rank, world, out_path, master_port):
             "striped_err_ratio_vs_wide": striped_vs_wide,
             "max_abs_vs_world1": max_abs,
             "shared_forward_into_err_ratio": shared_alias_error,
-            "shared_sharded_err_ratio": shared_sharded_error,
+            "shared_sharded_metrics": shared_metrics,
+            "shared_sharded_noise_rel_l2": shared_noise,
             "shared_tp_err_ratio_vs_world1": shared_tp_vs_world1,
             "shared_collective_rows": shared_rows,
             "shared_input_exact": shared_input_exact,
