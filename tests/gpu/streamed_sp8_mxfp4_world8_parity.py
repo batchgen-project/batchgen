@@ -253,6 +253,9 @@ def worker(rank, world, out_path, master_port):
         shared_tp.gate_proj.out_features = shared_tp.intermediate_size
         shared_tp.up_proj.out_features = shared_tp.intermediate_size
         shared_tp.down_proj.in_features = shared_tp.intermediate_size
+        shared_tp_reference = shared_tp._ffn(x)
+        dist.all_reduce(shared_tp_reference, group=dist.group.WORLD)
+        shared_tp_vs_world1 = _err_ratio(shared_tp_reference, shared)
         shared_input = all_gather_rows(
             x_local, num_rows, world, rank, dist.group.WORLD
         )
@@ -263,12 +266,13 @@ def worker(rank, world, out_path, master_port):
             shared_partial, world, rank, dist.group.WORLD
         )
         shared_sharded_error = _err_ratio(
-            shared_sharded, scatter_rows(shared, world, rank)
+            shared_sharded,
+            scatter_rows(shared_tp_reference, world, rank),
         )
         combined_sharded = shared_sharded + wide_local
         combined_sharded_error = _err_ratio(
             combined_sharded,
-            scatter_rows(shared + wide, world, rank),
+            scatter_rows(shared_tp_reference + wide, world, rank),
         )
         combined_reference = shared + wide
         combined = x.clone()
@@ -473,6 +477,7 @@ def worker(rank, world, out_path, master_port):
             "max_abs_vs_world1": max_abs,
             "shared_forward_into_err_ratio": shared_alias_error,
             "shared_sharded_err_ratio": shared_sharded_error,
+            "shared_tp_err_ratio_vs_world1": shared_tp_vs_world1,
             "combined_sharded_err_ratio": combined_sharded_error,
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
