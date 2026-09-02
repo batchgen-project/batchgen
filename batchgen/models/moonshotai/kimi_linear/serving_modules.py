@@ -800,7 +800,10 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     total = hidden_states_2d.shape[0]
     num_heads, head_dim = self.num_heads, self.head_dim
 
+    profiler, span = _begin_streamed_sp8_profile(self)
     q, k, v, f, beta, z = _kda_project(self, hidden_states_2d)
+    _end_streamed_sp8_profile(profiler, "kda_project", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
 
     # conv (silu) with final-state write into the pools at slot_ids.
     # overwrite_x=True: the conv result is transposed back into the projection's
@@ -836,6 +839,9 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         overwrite_x=True,
     )
 
+    _end_streamed_sp8_profile(profiler, "kda_conv", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
+
     q = rearrange(q, "l (h d) -> 1 l h d", h=num_heads)
     k = rearrange(k, "l (h d) -> 1 l h d", h=num_heads)
     v = rearrange(v, "l (h d) -> 1 l h d", h=num_heads)
@@ -855,6 +861,8 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         ),
         segment_tokens,
     )
+    _end_streamed_sp8_profile(profiler, "kda_chunk", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
     # All projections from ``hidden_states_2d`` have completed, so its storage
@@ -867,6 +875,7 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         o.reshape(total, num_heads * head_dim),
         hidden_states_2d,
     )
+    _end_streamed_sp8_profile(profiler, "kda_output", span)
     # M2a head-parallel KDA: sum the row-parallel o_proj shards. Streamed-SP8
     # retains only this rank's token rows; every other phase all-reduces.
     return _reduce_mla_tp_output(self, o)

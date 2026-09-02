@@ -802,6 +802,14 @@ class StreamedSP8MXFP4MoELayer:
         "self_depth_mix",
         "mlp_depth_mix",
         "output_depth_mix",
+        # Sub-spans inside kda_attention and grouped_expert_path.
+        "kda_project",
+        "kda_conv",
+        "kda_chunk",
+        "kda_output",
+        "grouped_dispatch",
+        "grouped_s1",
+        "grouped_s3",
     )
     _prefill_profile_named_spans = {
         name: [] for name in _prefill_profile_span_names

@@ -472,6 +472,15 @@ class ResidentEPMXFP4MoELayer:
         shard = self.shard
         E, N, K_latent = shard.num_local, shard.N, shard.K_latent
         K = topk_idx_i32.shape[-1]
+        # Diagnostic sub-spans; the lazy import avoids the module cycle and
+        # the profiler adds nothing unless the explicit K3 profile is on.
+        from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer
+        profiler = (
+            StreamedSP8MXFP4MoELayer
+            if StreamedSP8MXFP4MoELayer._prefill_profile_enabled
+            else None
+        )
+        span = profiler.begin_profile_span() if profiler is not None else None
 
         # --- dispatch latent rows into the expert-ordered activation buffer ---
         if self.compact_dispatch and dispatch_capacity is None:
@@ -575,6 +584,10 @@ class ResidentEPMXFP4MoELayer:
             )
             max_m_tiles = (min(num_rows, mtp) + 15) // 16
 
+        if profiler is not None:
+            profiler.end_profile_span("grouped_dispatch", span)
+            span = profiler.begin_profile_span()
+
         # --- grouped S1: gate(w1) + up(w3) + SiTU -> intermediate [E*mtp, N] ---
         activation_rows = dispatched.shape[0]
         intermediate = torch.empty(
@@ -599,6 +612,10 @@ class ResidentEPMXFP4MoELayer:
             N, K_latent, s1_ws, max_m_tiles, mtp, E, num_rows,
         )
 
+        if profiler is not None:
+            profiler.end_profile_span("grouped_s1", span)
+            span = profiler.begin_profile_span()
+
         # --- grouped S3: down(w2) -> expert_out [E*mtp, K_latent] ---
         expert_out = torch.empty(
             activation_rows, K_latent, dtype=torch.bfloat16, device=device
@@ -621,6 +638,8 @@ class ResidentEPMXFP4MoELayer:
             expert_starts, expert_counts, E, K_latent, N, s3_ws, E,
             K_latent // 256, max_m_tiles,
         )
+        if profiler is not None:
+            profiler.end_profile_span("grouped_s3", span)
         return expert_out, topk_pos
 
     def forward(self, x, gate):
