@@ -86,6 +86,13 @@ def _score_kernel(
             ).to(tl.float32)
         coefficient = tl.load(cw_ptr + offsets)
         dotv += tl.sum((value * rrms) * coefficient)
+
+    # ``sumsq`` may overflow to +inf even though every BF16 input is finite.
+    # PyTorch's eager reference then has rrms=0 and normalizes every value to
+    # zero, so the score is exactly zero.  Triton's reassociation of the dot
+    # expression may still form an overflowing intermediate and produce NaN;
+    # restore the eager result explicitly for this one well-defined case.
+    dotv = tl.where(rrms == 0.0, 0.0, dotv)
     tl.store(
         scores_ptr + token * stride_score_token + row,
         dotv,

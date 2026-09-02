@@ -127,7 +127,10 @@ def test_triton_mixer_normalizes_before_overflowing_score_dot():
     with torch.no_grad():
         prefix.fill_(1e38)
         bank.fill_(1e38)
-        proj.weight.fill_(1)
+        # Make a pre-normalization value*coefficient product overflow too.
+        # The eager path first obtains rrms=0, so its normalized score remains
+        # exactly zero and the two equal rows still average to the input.
+        proj.weight.fill_(4)
         norm.weight.fill_(1)
 
     with torch.inference_mode():
