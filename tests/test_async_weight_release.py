@@ -80,17 +80,26 @@ def test_clear_weight_bindings_preserves_skeleton_parameters():
     torch.testing.assert_close(module.bias, original_bias)
 
 
-def test_h2d_weight_worker_paces_copies_before_publishing_ready_event():
+def test_h2d_weight_worker_batches_tensor_copies_at_module_boundary():
     source = (
         _REPO_ROOT / "core" / "HtoD_Engine" / "HtoD_Engine.cu"
     ).read_text()
     worker = source[source.index("void HtoD_Engine::HtoD_Worker()") :]
-    copy_pos = worker.index("this->blocking_copy_(slot->second.data_ptr()")
-    publish_pos = worker.index(
+    module_loop = worker[
+        worker.index("for (auto& [tensor_name, host_tensor_storage] : src)") :
+    ]
+    copy_pos = module_loop.index("CUDA_CHECK(cudaMemcpyAsync(")
+    loop_end_pos = module_loop.index("\n                }\n", copy_pos)
+    sync_pos = module_loop.index(
+        "CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));",
+        loop_end_pos,
+    )
+    publish_pos = module_loop.index(
         "this->gpu_weight_buffer_.weights_copy_enqueued("
     )
 
-    assert copy_pos < publish_pos
+    assert copy_pos < loop_end_pos < sync_pos < publish_pos
+    assert "this->blocking_copy_(" not in module_loop[:publish_pos]
 
 
 def test_weight_wait_timeout_allows_long_prefill_but_keeps_decode_watchdog():

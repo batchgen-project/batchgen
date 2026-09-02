@@ -473,14 +473,17 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
-                    // The dedicated H2D worker is already asynchronous with
-                    // respect to the Python compute thread.  Pace this stream
-                    // one tensor at a time so a rank cannot queue multiple
-                    // complete expert layers ahead of their consumers and
-                    // monopolize shared host-memory/PCIe service.
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
+                    // Enqueue every tensor in this module before waiting.  The
+                    // module is not published to consumers until the stream is
+                    // synchronized below, so a consumer cannot observe a
+                    // partially copied weight set.  Keeping the wait at the
+                    // module boundary still paces each rank's H2D producer
+                    // without paying one stream synchronization per tensor.
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        slot->second.data_ptr(), src_ptr, src_byte_size,
+                        cudaMemcpyHostToDevice, this->HtoD_stream));
                 }
+                CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
                 this->logger_->debug(
                     "Enqueued module copy: {} to buffer: {}", module_name,
                     buffer_idx);
