@@ -797,6 +797,46 @@ def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
     return o
 
 
+_KDA_CONV_FALLBACK_WARNED = False
+
+
+def _kda_prefill_conv(x, weight, bias, conv_pool, cu_seqlens, slot_ids,
+                      has_initial_state):
+    """Causal conv with state, in ``x``'s storage; token-major Triton on CUDA.
+
+    The Triton path is bit-identical to ``causal_conv1d_fwd`` and about an
+    order of magnitude faster at exact 64K; any unsupported shape takes the
+    CUDA kernel and says so once.
+    """
+    global _KDA_CONV_FALLBACK_WARNED
+    if x.is_cuda:
+        from .kda_conv_triton import (
+            kda_causal_conv1d_triton,
+            supports_kda_conv_triton,
+        )
+
+        if supports_kda_conv_triton(x, weight, conv_pool):
+            return kda_causal_conv1d_triton(
+                x, weight, bias, conv_pool, cu_seqlens, slot_ids,
+                has_initial_state,
+            )
+        if not _KDA_CONV_FALLBACK_WARNED:
+            _KDA_CONV_FALLBACK_WARNED = True
+            logging.warning(
+                "Kimi-K3 KDA prefill conv shape %s/%s is outside the token-major "
+                "Triton contract; using the channel-major CUDA kernel",
+                tuple(x.shape), tuple(weight.shape),
+            )
+    from batchgen_kernels.conv1d import causal_conv1d_fwd
+
+    return causal_conv1d_fwd(
+        x, weight, bias=bias,
+        conv_states=conv_pool, query_start_loc=cu_seqlens,
+        cache_indices=slot_ids, has_initial_state=has_initial_state,
+        overwrite_x=True,
+    )
+
+
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
                         has_initial_state, kda_state,
                         segment_tokens=KDA_PREFILL_SEGMENT_TOKENS):
@@ -854,25 +894,16 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     # for the unsegmented sweep it was measured against. Still worth having:
     # nothing else makes the segment slices contiguous, and it is free.
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
-    q = causal_conv1d_fwd(
-        q, qw, bias=qb,
-        conv_states=kda_state.conv_q, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    q = _kda_prefill_conv(
+        q, qw, qb, kda_state.conv_q, cu_seqlens, slot_ids, has_initial_state
     )
     kw, kb = _conv_weights(self.k_conv1d, k.dtype)
-    k = causal_conv1d_fwd(
-        k, kw, bias=kb,
-        conv_states=kda_state.conv_k, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    k = _kda_prefill_conv(
+        k, kw, kb, kda_state.conv_k, cu_seqlens, slot_ids, has_initial_state
     )
     vw, vb = _conv_weights(self.v_conv1d, v.dtype)
-    v = causal_conv1d_fwd(
-        v, vw, bias=vb,
-        conv_states=kda_state.conv_v, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    v = _kda_prefill_conv(
+        v, vw, vb, kda_state.conv_v, cu_seqlens, slot_ids, has_initial_state
     )
 
     _end_streamed_sp8_profile(profiler, "kda_conv", span)
