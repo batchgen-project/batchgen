@@ -121,3 +121,24 @@ def test_triton_mixer_score_weight_cache_tracks_parameter_updates():
     assert not torch.equal(first, second)
     torch.testing.assert_close(second, expected, atol=1e-5, rtol=1.6e-2)
 
+
+def test_triton_mixer_normalizes_before_overflowing_score_dot():
+    prefix, bank, proj, norm = _inputs(4, 1)
+    with torch.no_grad():
+        prefix.fill_(1e38)
+        bank.fill_(1e38)
+        proj.weight.fill_(1)
+        norm.weight.fill_(1)
+
+    with torch.inference_mode():
+        expected = block_residual._apply_attn_res_eager(
+            prefix, bank, proj, norm
+        )
+        actual = attn_residual_triton.mix_attn_residual_triton(
+            prefix, bank, proj, norm
+        )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(expected).all()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -48,7 +48,28 @@ def _score_kernel(
     if row > num_bank_rows:
         return
 
+    # Match the eager reference's overflow behavior.  Computing dot(v, w)
+    # before RMS normalization can overflow to inf for a still-finite BF16
+    # activation; multiplying that inf by rrms=0 then creates NaN.  The eager
+    # path normalizes each value first, so scan H twice and form the dot only
+    # from ``value * rrms``.
     sumsq = 0.0
+    for h0 in tl.static_range(0, H, BLOCK_H):
+        offsets = h0 + tl.arange(0, BLOCK_H)
+        if row < num_bank_rows:
+            value = tl.load(
+                bank_ptr
+                + token * stride_bank_token
+                + row * stride_bank_row
+                + offsets
+            ).to(tl.float32)
+        else:
+            value = tl.load(
+                prefix_ptr + token * stride_prefix_token + offsets
+            ).to(tl.float32)
+        sumsq += tl.sum(value * value)
+
+    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
     dotv = 0.0
     for h0 in tl.static_range(0, H, BLOCK_H):
         offsets = h0 + tl.arange(0, BLOCK_H)
@@ -64,13 +85,10 @@ def _score_kernel(
                 prefix_ptr + token * stride_prefix_token + offsets
             ).to(tl.float32)
         coefficient = tl.load(cw_ptr + offsets)
-        sumsq += tl.sum(value * value)
-        dotv += tl.sum(value * coefficient)
-
-    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
+        dotv += tl.sum((value * rrms) * coefficient)
     tl.store(
         scores_ptr + token * stride_score_token + row,
-        dotv * rrms,
+        dotv,
     )
 
 
