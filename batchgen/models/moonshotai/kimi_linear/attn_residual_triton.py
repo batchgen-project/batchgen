@@ -269,13 +269,62 @@ def mix_attn_residual_triton(
             :, : num_bank_rows + 1
         ]
         output_sample = output.index_select(0, first_bad)
+
+        # Replay the same kernel first over the original view/grid and then
+        # over a contiguous one-row sample.  If only the original result is
+        # nonfinite, the arithmetic is exonerated and the remaining suspects
+        # are producer ordering, layout, or launch-scale behavior.  If both
+        # replays fail, the exact row is a deterministic kernel reproducer.
+        replay_scores = torch.empty_like(scores)
+        _score_kernel[(num_tokens, num_bank_rows + 1)](
+            prefix_sum,
+            block_residual,
+            coefficients,
+            replay_scores,
+            num_bank_rows,
+            norm.variance_epsilon,
+            prefix_sum.stride(0),
+            block_residual.stride(0),
+            block_residual.stride(1),
+            replay_scores.stride(0),
+            H=hidden,
+            BLOCK_H=_BLOCK_H,
+            num_warps=8,
+        )
+        replay_score_sample = replay_scores.index_select(0, first_bad)[
+            :, : num_bank_rows + 1
+        ]
+        row_replay_scores = torch.empty(
+            (1, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device
+        )
+        _score_kernel[(1, num_bank_rows + 1)](
+            prefix_sample,
+            bank_sample,
+            coefficients,
+            row_replay_scores,
+            num_bank_rows,
+            norm.variance_epsilon,
+            prefix_sample.stride(0),
+            bank_sample.stride(0),
+            bank_sample.stride(1),
+            row_replay_scores.stride(0),
+            H=hidden,
+            BLOCK_H=_BLOCK_H,
+            num_warps=8,
+        )
         eager_sample = _apply_attn_res_eager(
             prefix_sample, bank_sample, proj, norm
         )
         for stage, tensor in (
+            ("self_depth_mix_coefficients", coefficients),
             ("self_depth_mix_local_prefix", prefix_sample),
             ("self_depth_mix_local_bank", bank_sample),
             ("self_depth_mix_scores", score_sample),
+            ("self_depth_mix_scores_replay_full", replay_score_sample),
+            (
+                "self_depth_mix_scores_replay_row",
+                row_replay_scores[:, : num_bank_rows + 1],
+            ),
             ("self_depth_mix_local_output", output_sample),
             ("self_depth_mix_eager_replay", eager_sample),
         ):
