@@ -3999,6 +3999,64 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     assert moe._resident_ep_prefill_enabled is False
 
 
+
+def test_streamed_prefill_keeps_ffn_and_norm_on_even_tile():
+    """Streamed-SP8 bounds scratch with the validated 8,192-row tiler.
+
+    A 512-row tile turned the exact-64K shared expert into ~10,000 launches
+    per layer; resident-EP keeps 512 and the KDA segment stays 4,096.
+    """
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
+    dense = type("FFN", (), {"_resident_prefill_token_tile": None})()
+    shared = type("FFN", (), {"_resident_prefill_token_tile": None})()
+    norm = type("KimiRMSNorm", (), {
+        "_resident_prefill_token_tile": None,
+    })()
+    kda = type("KDAWrapper", (), {
+        "_resident_prefill_segment_tokens": None,
+    })()
+    moe = type("MoE", (), {
+        "_streamed_sp8_prefill_enabled": False,
+        "shared_experts": shared,
+    })()
+    layer = type("Layer", (), {"mlp": dense, "block_sparse_moe": moe})()
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": [layer]})(),
+        "modules": lambda self: [norm, kda],
+    })()
+    manager._set_prefill_memory_tiling = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_set_prefill_memory_tiling",
+    ).__get__(manager)
+    method = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_set_streamed_sp8_prefill_enabled",
+    ).__get__(manager)
+
+    method(True)
+    assert dense._resident_prefill_token_tile == 8192
+    assert shared._resident_prefill_token_tile == 8192
+    assert norm._resident_prefill_token_tile == 8192
+    assert kda._resident_prefill_segment_tokens == 4096
+    assert moe._streamed_sp8_prefill_enabled is True
+
+    method(False)
+    assert dense._resident_prefill_token_tile is None
+    assert shared._resident_prefill_token_tile is None
+    assert norm._resident_prefill_token_tile is None
+    assert kda._resident_prefill_segment_tokens is None
+    assert moe._streamed_sp8_prefill_enabled is False
+
 def test_worker_preallocates_resident_output_before_configure_prefill():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(

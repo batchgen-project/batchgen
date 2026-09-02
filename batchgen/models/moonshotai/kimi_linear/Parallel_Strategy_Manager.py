@@ -441,11 +441,19 @@ class KimiLinearParallelStrategyManager:
             return {"max_sequences_per_node": available}
         return {"max_sequences_per_rank": available}
 
-    def _set_prefill_memory_tiling(self, enabled):
-        """Bound K3 prefill temporaries for resident-EP and streamed-SP8."""
+    def _set_prefill_memory_tiling(self, enabled, token_tile=512):
+        """Bound K3 prefill temporaries for resident-EP and streamed-SP8.
+
+        ``token_tile`` is the row tile for the norms and the dense/shared
+        FFNs.  Resident-EP keeps 512.  Streamed-SP8 passes 8,192, the FFN's
+        validated even tiler: at exact 64K a 512-row tile issued about
+        10,000 launches per layer for the shared expert and ran it 3.6x
+        slower than the same GEMMs in isolation, to save about 250 MiB of
+        scratch.  The KDA segment stays at 4,096 in both modes.
+        """
         if self.model is None:
             return
-        tile = 512 if enabled else None
+        tile = int(token_tile) if enabled else None
         for module in self.model.modules():
             if hasattr(module, "_resident_prefill_token_tile"):
                 module._resident_prefill_token_tile = tile
@@ -535,7 +543,7 @@ class KimiLinearParallelStrategyManager:
         return released_bytes
 
     def _set_streamed_sp8_prefill_enabled(self, enabled):
-        self._set_prefill_memory_tiling(enabled)
+        self._set_prefill_memory_tiling(enabled, token_tile=8192)
         if self.model is None:
             return
         for layer in self.model.model.layers:
