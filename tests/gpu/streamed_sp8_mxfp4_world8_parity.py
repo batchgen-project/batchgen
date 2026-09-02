@@ -407,6 +407,19 @@ def worker(rank, world, out_path, master_port):
             depth_local, scatter_rows(depth_reference, world, rank)
         )
         del depth_norm._streamed_sp8_keep_sharded
+        del depth_norm._streamed_sp8_row_group
+        depth_next_reference = apply_attn_res(
+            depth_reference,
+            depth_residual,
+            depth_proj,
+            depth_norm,
+            chunk_size=depth_tokens // world,
+        )
+        depth_norm._streamed_sp8_row_group = (
+            world,
+            rank,
+            dist.group.WORLD,
+        )
         depth_regathered = apply_attn_res(
             depth_local,
             depth_residual,
@@ -415,7 +428,7 @@ def worker(rank, world, out_path, master_port):
             chunk_size=depth_tokens // world,
         )
         depth_regather_exact = torch.equal(
-            depth_regathered, depth_reference
+            depth_regathered, depth_next_reference
         )
 
     wide_error = _err_ratio(wide, reference)
