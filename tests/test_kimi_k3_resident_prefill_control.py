@@ -1210,20 +1210,16 @@ def test_prefill_attention_waits_before_its_tp_reduction():
         node.lineno
         for node in ast.walk(reducer)
         if isinstance(node, ast.Call)
-        and (
-            (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "all_reduce"
-            )
-            or (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "reduce_scatter_rows"
-            )
-        )
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "all_reduce"
     ]
     assert len(waits) == 1
-    assert len(reductions) == 2
+    assert len(reductions) == 1
     assert all(waits[0] < reduction for reduction in reductions)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "reduce_scatter_rows"
+        for node in ast.walk(reducer)
+    )
 
     kda = next(
         node
@@ -1254,6 +1250,7 @@ def test_mla_tp_reduce_calls_the_installed_order_wait_then_all_reduce(
         path,
         "_reduce_mla_tp_output",
         {
+            "__package__": "batchgen.models.moonshotai.kimi_linear",
             "_wait_streamed_sp8_cross_launch": _isolated_function(
                 path, "_wait_streamed_sp8_cross_launch"
             ),
@@ -1300,6 +1297,44 @@ def test_mla_tp_reduce_calls_the_installed_order_wait_then_all_reduce(
     trace.clear()
     reduce_output(SimpleNamespace(attn_tp_size=1), output)
     assert trace == []
+
+
+def test_streamed_sp8_attention_reduces_before_retaining_rows(monkeypatch):
+    torch = pytest.importorskip("torch")
+    dist = pytest.importorskip("torch.distributed")
+    path = _serving_modules_path()
+    trace = []
+
+    def fake_all_reduce(output, group=None):
+        trace.append(("all_reduce", group))
+        output.add_(100)
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    reduce_output = _isolated_function(
+        path,
+        "_reduce_mla_tp_output",
+        {
+            "__package__": "batchgen.models.moonshotai.kimi_linear",
+            "_wait_streamed_sp8_cross_launch": lambda module: trace.append(
+                ("order_wait",)
+            ),
+            "_begin_streamed_sp8_profile": lambda module: (None, None),
+            "_end_streamed_sp8_profile": lambda *args: None,
+        },
+    )
+    full = torch.arange(32, dtype=torch.float32).view(8, 4)
+    module = SimpleNamespace(
+        attn_tp_size=4,
+        attn_tp_rank=2,
+        attn_tp_group="tp4",
+        _streamed_sp8_output_row_shard=True,
+    )
+
+    local = reduce_output(module, full)
+
+    assert trace == [("order_wait",), ("all_reduce", "tp4")]
+    assert torch.equal(local, (torch.arange(32).view(8, 4) + 100)[4:6])
+    assert local._base is None
 
 
 def test_streamed_sp8_weight_batch_uses_non_evicting_phase():

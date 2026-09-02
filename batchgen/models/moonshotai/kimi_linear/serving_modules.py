@@ -87,17 +87,17 @@ def _reduce_mla_tp_output(module, output):
 
         _wait_streamed_sp8_cross_launch(module)
         profiler, span = _begin_streamed_sp8_profile(module)
+        # Preserve the established BF16 all-reduce reduction order.  A direct
+        # reduce-scatter changes that order and can amplify across K3's 93
+        # layers; streamed prefill retains the local row slice only after the
+        # same full reduction used by the resident/reference path.
+        dist.all_reduce(output, group=module.attn_tp_group)
         if getattr(module, "_streamed_sp8_output_row_shard", False):
-            from .moe_tp_reshard import reduce_scatter_rows
+            from .moe_tp_reshard import scatter_rows
 
-            output = reduce_scatter_rows(
-                output,
-                module.attn_tp_size,
-                module.attn_tp_rank,
-                module.attn_tp_group,
-            )
-        else:
-            dist.all_reduce(output, group=module.attn_tp_group)
+            output = scatter_rows(
+                output, module.attn_tp_size, module.attn_tp_rank
+            ).clone()
         _end_streamed_sp8_profile(profiler, "attention_reduce", span)
     return output
 
