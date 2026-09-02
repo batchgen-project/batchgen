@@ -1354,7 +1354,7 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
         )
     )
 
-    assert 'debug.get("k3_prefill_finite_check", False)' in record
+    assert "k3_prefill_finite_check" in record
     assert "torch.isfinite(tensor).all()" in record
     assert ".item()" not in record
     assert '.item()' in snapshot
@@ -2639,6 +2639,7 @@ def _isolated_profile_class(synchronizes):
         "begin_profile_span",
         "end_profile_span",
         "_profile_span_stats",
+        "prefill_finite_check_snapshot",
         "prefill_profile_snapshot",
     )
     body = [
@@ -2648,7 +2649,7 @@ def _isolated_profile_class(synchronizes):
             isinstance(node, ast.Assign)
             and all(
                 isinstance(target, ast.Name)
-                and target.id.startswith("_prefill_profile_")
+                and target.id.startswith("_prefill_")
                 for target in node.targets
             )
         )
