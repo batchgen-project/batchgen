@@ -1359,12 +1359,10 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
     assert ".item()" not in record
     assert '.item()' in snapshot
 
-    layer = ast.unparse(
-        _function(
-            ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "model.py",
-            "KimiDecoderLayer",
-            "_forward_attn_residual",
-        )
+    layer = _function(
+        ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "model.py",
+        "KimiDecoderLayer",
+        "_forward_attn_residual",
     )
     stages = (
         "entry",
@@ -1376,8 +1374,17 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
         "post_ffn",
         "output",
     )
-    positions = [layer.index(f'"{stage}"') for stage in stages]
-    assert positions == sorted(positions)
+    calls = sorted(
+        (
+            node
+            for node in ast.walk(layer)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_record_prefill_finite"
+        ),
+        key=lambda node: node.lineno,
+    )
+    assert tuple(call.args[0].value for call in calls) == stages
 
 
 def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
