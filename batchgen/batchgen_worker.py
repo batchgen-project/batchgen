@@ -8622,18 +8622,6 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
-				# The FIRST generated token, straight out of prefill. A
-				# max_tokens=1 request is now completed right after prefill
-				# (PREFILL_PLAN C4, _finish_prefill_completed_sequences) and
-				# the token reaches the client through the normal response
-				# path, so this log is a cross-check of that path rather than
-				# the only way to see the token. Rank 0 only; ids only (the
-				# worker has no tokenizer -- decode them client-side).
-				if self.rank == 0:
-					logging.info(
-						"[PREFILL] first sampled token ids: %s",
-						batch_new_tokens.reshape(-1).tolist()[:16])
-
 		# Keep the historical host-enqueue boundary for backwards-compatible
 		# diagnostics, then establish two stronger completion boundaries.  A host
 		# perf-counter sample alone does not prove that a non-default CUDA stream
@@ -8647,6 +8635,19 @@ class BatchGenWorker:
 			reason="prefill metrics KV-ready boundary",
 		)
 		_prefill_kv_ready_s = time.perf_counter() - _prefill_forward_t0
+		# Convert sampled tokens only after the completion boundaries.  Calling
+		# Tensor.tolist() above the host boundary would force an implicit D2H wait
+		# and make the nominal host-enqueue metric indistinguishable from GPU
+		# completion.  The token reaches the client through the normal response
+		# path; this rank-0 line is only a cross-check.
+		_first_sampled_token_ids = (
+			output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
+		)
+		if self.rank == 0:
+			logging.info(
+				"[PREFILL] first sampled token ids: %s",
+				_first_sampled_token_ids,
+			)
 
 		# Structured prefill record, one JSON line per rank that actually ran a
 		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
@@ -8686,11 +8687,7 @@ class BatchGenWorker:
 			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
 			"world_size": self.world_size,
 			"rank": self.rank,
-			# Guarded: the proposal's unguarded output_tokens[0] is an IndexError
-			# on a rank that ran zero micro-batches.
-			"first_sampled_token_ids": (
-				output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
-			),
+			"first_sampled_token_ids": _first_sampled_token_ids,
 		}, separators=(",", ":")))
 
 		# Reset prepack mode

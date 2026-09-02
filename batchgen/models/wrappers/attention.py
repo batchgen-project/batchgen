@@ -481,13 +481,19 @@ class AttnWrapperBase(BaseModuleWrapper):
                 and hasattr(self.core_engine, "free_weights_buffer_async")
             )
             if prefill_timer is not None:
-                with prefill_timer.host_timed(
-                    "attn_weight_release", self.layer_idx
-                ):
-                    if async_release:
+                if async_release:
+                    with prefill_timer.host_timed(
+                        "attn_weight_release_enqueue", self.layer_idx
+                    ):
                         self.core_engine.free_weights_buffer_async(self.module_key)
+                    with prefill_timer.host_timed(
+                        "attn_weight_clear_bindings", self.layer_idx
+                    ):
                         self.clear_weight_bindings()
-                    else:
+                else:
+                    with prefill_timer.host_timed(
+                        "attn_weight_release", self.layer_idx
+                    ):
                         torch.cuda.current_stream().synchronize()
                         self.free_weights(self.module_key)
                         self.clear_weights()
