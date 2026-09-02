@@ -1495,6 +1495,7 @@ class KimiLinearParallelStrategyManager:
                 mla_decoding_nope_with_pagekv, attn
             )
             attn.attn_tp_size = self._attn_tp_size
+            attn.attn_tp_rank = self._attn_tp_rank
             attn.attn_tp_group = self._attn_tp_group
             self.model.model.layers[layer_idx].self_attn = KimiLinearAttnWrapper(
                 attn, layer_idx, self.core_engine, self.engine_config,

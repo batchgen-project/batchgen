@@ -741,6 +741,18 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     assert "attn._streamed_sp8_output_row_shard = True" in source
 
 
+def test_mla_attention_is_stamped_with_tp_rank_for_row_reduce_scatter():
+    source = ast.unparse(
+        _function(
+            _psm_path(),
+            "KimiLinearParallelStrategyManager",
+            "_config_attn_modules",
+        )
+    )
+
+    assert "attn.attn_tp_rank = self._attn_tp_rank" in source
+
+
 def _psm_layer(module, *, wrapped):
     """One decoder layer whose ``self_attn`` may or may not be wrapped."""
     moe = type("MoE", (), {})()
