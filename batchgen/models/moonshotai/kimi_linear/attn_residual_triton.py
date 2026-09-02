@@ -25,6 +25,11 @@ import triton.language as tl
 
 _BLOCK_H = 1024
 _MAX_ROWS = 16
+# One 64 MiB workspace per GPU covers the requested one-million-token local
+# prefill envelope.  It is allocated and retained at server startup so the
+# score kernel never receives a caching-allocator block that a prior custom
+# stream may still be retiring.
+_SCORE_WORKSPACE_TOKENS = 1 << 20
 
 
 @triton.jit
@@ -206,11 +211,25 @@ def mix_attn_residual_triton(
     num_bank_rows = block_residual.shape[1]
     coefficients = score_weight(proj, norm)
 
-    scores = torch.empty(
-        (num_tokens, _MAX_ROWS),
-        dtype=torch.float32,
-        device=prefix_sum.device,
+    score_workspace = getattr(
+        norm, "_attn_res_triton_score_workspace", None
     )
+    if score_workspace is None:
+        # Standalone tests and non-server callers do not run the startup
+        # warmup.  Their ordinary allocation path remains supported.
+        scores = torch.empty(
+            (num_tokens, _MAX_ROWS),
+            dtype=torch.float32,
+            device=prefix_sum.device,
+        )
+    else:
+        if num_tokens > score_workspace.shape[0]:
+            raise RuntimeError(
+                "Kimi-K3 attention-residual score workspace supports at "
+                f"most {score_workspace.shape[0]} local tokens, got "
+                f"{num_tokens}"
+            )
+        scores = score_workspace[:num_tokens]
     _score_kernel[(num_tokens, num_bank_rows + 1)](
         prefix_sum,
         block_residual,
@@ -346,6 +365,13 @@ def warmup_attn_residual_triton(model) -> int:
 
     with torch.inference_mode():
         proj, norm = pairs[0]
+        score_workspace = torch.empty(
+            (_SCORE_WORKSPACE_TOKENS, _MAX_ROWS),
+            dtype=torch.float32,
+            device=proj.weight.device,
+        )
+        for _, site_norm in pairs:
+            site_norm._attn_res_triton_score_workspace = score_workspace
         hidden = proj.weight.shape[1]
         prefix = torch.zeros(
             (1, hidden),
