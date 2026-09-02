@@ -738,6 +738,7 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     assert "output_norm._streamed_sp8_row_group = row_group" in source
     assert "output_norm._streamed_sp8_order_wait = order_wait" in source
     assert "output_norm._streamed_sp8_profile_name = 'output_depth_mix'" in source
+    assert "output_norm._streamed_sp8_keep_sharded = True" in source
     assert "attn._streamed_sp8_output_row_shard = True" in source
 
 
@@ -789,6 +790,7 @@ def _psm_output_norm():
     norm._streamed_sp8_order_wait = lambda: None
     norm._streamed_sp8_profiler = object()
     norm._streamed_sp8_profile_name = "output_depth_mix"
+    norm._streamed_sp8_keep_sharded = True
     return norm
 
 
@@ -866,6 +868,7 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
         "_streamed_sp8_order_wait",
         "_streamed_sp8_profiler",
         "_streamed_sp8_profile_name",
+        "_streamed_sp8_keep_sharded",
     ):
         assert not hasattr(output_norm, name)
     # Decode reaches the same attention all-reduce helper. A surviving callback

@@ -559,6 +559,7 @@ class KimiLinearParallelStrategyManager:
                         "_streamed_sp8_order_wait",
                         "_streamed_sp8_profiler",
                         "_streamed_sp8_profile_name",
+                        "_streamed_sp8_keep_sharded",
                     ):
                         if hasattr(output_norm, name):
                             delattr(output_norm, name)
@@ -996,6 +997,7 @@ class KimiLinearParallelStrategyManager:
             output_norm._streamed_sp8_order_wait = order_wait
             output_norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
             output_norm._streamed_sp8_profile_name = "output_depth_mix"
+            output_norm._streamed_sp8_keep_sharded = True
         # The cross-node broadcast gate opens at the end of each MoE serving
         # branch; whichever TP8 collective follows first (a depth-mix gather
         # or the next attention all-reduce) must observe every cross-node call
