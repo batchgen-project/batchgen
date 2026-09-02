@@ -790,6 +790,7 @@ class StreamedSP8MXFP4MoELayer:
         "grouped_expert_path",
         "grouped_combine",
         "routed_output_gather",
+        "shared_input_gather",
         "shared_expert",
         "shared_expert_reduce",
         "moe_serving_total",

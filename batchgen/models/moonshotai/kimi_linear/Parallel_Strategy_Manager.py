@@ -531,12 +531,19 @@ class KimiLinearParallelStrategyManager:
                             "_streamed_sp8_order_wait",
                             "_streamed_sp8_profiler",
                             "_streamed_sp8_profile_name",
+                            "_streamed_sp8_keep_sharded",
                         ):
                             if hasattr(norm, name):
                                 delattr(norm, name)
                     if moe is not None:
                         moe._streamed_sp8_prefill_enabled = False
                         moe._streamed_sp8_moe = None
+                        for name in (
+                            "_streamed_sp8_sharded_carry",
+                            "_streamed_sp8_global_rows",
+                        ):
+                            if hasattr(moe, name):
+                                delattr(moe, name)
                         shared = getattr(moe, "shared_experts", None)
                         if (
                             shared is not None
@@ -560,10 +567,13 @@ class KimiLinearParallelStrategyManager:
             # there would park its all-reduce on a torn-down handshake. This
             # cleanup is required even when close() surfaces an ingress error.
             for module in self._streamed_sp8_attention_modules():
-                if hasattr(module, "_streamed_sp8_order_wait"):
-                    del module._streamed_sp8_order_wait
-                if hasattr(module, "_streamed_sp8_profiler"):
-                    del module._streamed_sp8_profiler
+                for name in (
+                    "_streamed_sp8_order_wait",
+                    "_streamed_sp8_profiler",
+                    "_streamed_sp8_output_row_shard",
+                ):
+                    if hasattr(module, name):
+                        delattr(module, name)
             self._streamed_sp8_buffer = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -929,6 +939,9 @@ class KimiLinearParallelStrategyManager:
         )
         for layer_idx, layer in enumerate(self.model.model.layers):
             moe = getattr(layer, "block_sparse_moe", None)
+            streamed_moe = (
+                moe is not None and getattr(moe, "experts", None) is not None
+            )
             dense = getattr(layer, "mlp", None)
             if dense is not None:
                 dense._streamed_sp8_row_group = row_group
@@ -946,8 +959,11 @@ class KimiLinearParallelStrategyManager:
                 norm._streamed_sp8_order_wait = order_wait
                 norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
                 norm._streamed_sp8_profile_name = profile_name
-            if moe is None or moe.experts is None:
+                if profile_name == "mlp_depth_mix" and streamed_moe:
+                    norm._streamed_sp8_keep_sharded = True
+            if not streamed_moe:
                 continue
+            moe._streamed_sp8_sharded_carry = True
             moe._streamed_sp8_moe = StreamedSP8MXFP4MoELayer(
                 layer_idx=layer_idx,
                 buffer=self._streamed_sp8_buffer,
@@ -987,6 +1003,14 @@ class KimiLinearParallelStrategyManager:
         for module in self._streamed_sp8_attention_modules():
             module._streamed_sp8_order_wait = order_wait
             module._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None or getattr(moe, "experts", None) is None:
+                continue
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                attn = getattr(attn, "module", attn)
+                attn._streamed_sp8_output_row_shard = True
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step

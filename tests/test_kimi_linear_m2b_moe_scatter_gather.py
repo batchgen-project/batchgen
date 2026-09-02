@@ -32,6 +32,7 @@ from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
     all_gather_rows,
     all_gather_rows_into,
     balanced_row_split,
+    reduce_scatter_rows,
     reassemble_rows,
     scatter_rows,
 )
@@ -201,3 +202,65 @@ def test_even_all_gather_returns_collective_output_without_reassembly(monkeypatc
 
     assert output is captured["gathered"]
     assert torch.equal(output, x)
+
+
+@pytest.mark.parametrize(("B", "G"), [(16, 4), (17, 8), (3, 8)])
+def test_reduce_scatter_rows_sums_and_keeps_the_balanced_slice(
+    monkeypatch, B, G
+):
+    partials = [
+        torch.arange(B * H, dtype=torch.float32).view(B, H) + rank * 1000
+        for rank in range(G)
+    ]
+    splits = balanced_row_split(B, G)
+    ntp = max(end - start for start, end in splits)
+
+    def pack(partial):
+        packed = partial.new_zeros((G, ntp, H))
+        for rank, (start, end) in enumerate(splits):
+            packed[rank, : end - start].copy_(partial[start:end])
+        return packed
+
+    packed = [pack(partial) for partial in partials]
+    reduced = torch.stack(packed).sum(dim=0)
+    reference = torch.stack(partials).sum(dim=0)
+
+    for group_rank in range(G):
+        calls = []
+
+        def fake_reduce_scatter(received, send, op, group):
+            assert group == "fake-group"
+            assert op == torch.distributed.ReduceOp.SUM
+            assert torch.equal(send.view(G, ntp, H), packed[group_rank])
+            received.copy_(reduced[group_rank])
+            calls.append(True)
+
+        monkeypatch.setattr(
+            torch.distributed,
+            "reduce_scatter_tensor",
+            fake_reduce_scatter,
+        )
+        output = reduce_scatter_rows(
+            partials[group_rank], G, group_rank, "fake-group"
+        )
+        start, end = splits[group_rank]
+        assert calls == [True]
+        assert torch.equal(output, reference[start:end])
+
+
+def test_reduce_scatter_rows_empty_matrix_needs_no_collective(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "reduce_scatter_tensor",
+        lambda *args, **kwargs: pytest.fail("empty rows entered NCCL"),
+    )
+    partial = torch.empty((0, H), dtype=torch.float32)
+    output = reduce_scatter_rows(partial, 8, 3, "fake-group")
+    assert output.shape == (0, H)
+
+
+def test_reduce_scatter_rows_rejects_non_matrix_input():
+    with pytest.raises(ValueError, match="2-D row matrix"):
+        reduce_scatter_rows(
+            torch.empty((1, 2, H)), 2, 0, "fake-group"
+        )

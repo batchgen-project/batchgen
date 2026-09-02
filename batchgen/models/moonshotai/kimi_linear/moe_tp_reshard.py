@@ -61,6 +61,53 @@ def scatter_rows(x: torch.Tensor, group_size: int, group_rank: int) -> torch.Ten
     return x[s:e]
 
 
+def reduce_scatter_rows(
+    partial: torch.Tensor,
+    group_size: int,
+    group_rank: int,
+    group,
+) -> torch.Tensor:
+    """SUM TP partials while retaining only this rank's balanced row slice.
+
+    ``partial`` is replicated in shape, not value: every TP rank owns one
+    row-parallel attention/shared-expert partial over all token rows.  A plain
+    all-reduce materializes the full SUM on every rank only for the following
+    MoE to throw seven eighths away.  This helper performs the reduction and
+    row split in one collective.  Uneven splits are packed into equal padded
+    rank slots because NCCL reduce-scatter requires the same receive count on
+    every rank.
+    """
+    import torch.distributed as dist
+
+    if partial.ndim != 2:
+        raise ValueError("reduce_scatter_rows requires a 2-D row matrix")
+    num_rows, hidden = partial.shape
+    splits = balanced_row_split(num_rows, group_size)
+    local_start, local_end = splits[group_rank]
+    local_rows = local_end - local_start
+    ntp = max((end - start) for start, end in splits)
+    if ntp == 0:
+        return partial[:0]
+
+    if num_rows == group_size * ntp:
+        send = partial
+    else:
+        send = partial.new_zeros((group_size, ntp, hidden))
+        for rank, (start, end) in enumerate(splits):
+            if end > start:
+                send[rank, : end - start].copy_(partial[start:end])
+        send = send.view(group_size * ntp, hidden)
+
+    received = partial.new_empty((ntp, hidden))
+    dist.reduce_scatter_tensor(
+        received,
+        send,
+        op=dist.ReduceOp.SUM,
+        group=group,
+    )
+    return received[:local_rows]
+
+
 def reassemble_rows(
     gathered: torch.Tensor, num_rows: int, group_size: int
 ) -> torch.Tensor:

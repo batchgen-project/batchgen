@@ -733,9 +733,12 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     assert "norm._streamed_sp8_order_wait = order_wait" in source
     assert "norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
     assert "norm._streamed_sp8_profile_name = profile_name" in source
+    assert "norm._streamed_sp8_keep_sharded = True" in source
+    assert "moe._streamed_sp8_sharded_carry = True" in source
     assert "output_norm._streamed_sp8_row_group = row_group" in source
     assert "output_norm._streamed_sp8_order_wait = order_wait" in source
     assert "output_norm._streamed_sp8_profile_name = 'output_depth_mix'" in source
+    assert "attn._streamed_sp8_output_row_shard = True" in source
 
 
 def _psm_layer(module, *, wrapped):
@@ -743,6 +746,8 @@ def _psm_layer(module, *, wrapped):
     moe = type("MoE", (), {})()
     moe._streamed_sp8_prefill_enabled = True
     moe._streamed_sp8_moe = object()
+    moe._streamed_sp8_sharded_carry = True
+    moe._streamed_sp8_global_rows = 17
     moe.shared_experts = type("Shared", (), {})()
     moe.shared_experts._streamed_sp8_profiler = object()
     dense = type("Dense", (), {})()
@@ -755,6 +760,8 @@ def _psm_layer(module, *, wrapped):
         norm._streamed_sp8_order_wait = lambda: None
         norm._streamed_sp8_profiler = object()
         norm._streamed_sp8_profile_name = "depth_mix"
+    mlp_norm._streamed_sp8_keep_sharded = True
+    module._streamed_sp8_output_row_shard = True
     return type("Layer", (), {
         "self_attn": SimpleNamespace(module=module) if wrapped else module,
         "block_sparse_moe": moe,
@@ -821,6 +828,10 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
         assert layer.block_sparse_moe._streamed_sp8_moe is None
         assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
         assert not hasattr(
+            layer.block_sparse_moe, "_streamed_sp8_sharded_carry"
+        )
+        assert not hasattr(layer.block_sparse_moe, "_streamed_sp8_global_rows")
+        assert not hasattr(
             layer.block_sparse_moe.shared_experts,
             "_streamed_sp8_profiler",
         )
@@ -835,6 +846,7 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
                 "_streamed_sp8_order_wait",
                 "_streamed_sp8_profiler",
                 "_streamed_sp8_profile_name",
+                "_streamed_sp8_keep_sharded",
             ):
                 assert not hasattr(norm, name)
     for name in (
@@ -849,6 +861,7 @@ def test_streamed_sp8_release_removes_the_attention_order_wait():
     for module in modules:
         assert not hasattr(module, "_streamed_sp8_order_wait")
         assert not hasattr(module, "_streamed_sp8_profiler")
+        assert not hasattr(module, "_streamed_sp8_output_row_shard")
 
     # configure_prefill -> configure_decoding releases twice; the second pass
     # has no buffer and no callback left and must still be a no-op.
@@ -895,6 +908,8 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
     assert manager._streamed_sp8_buffer is None
     assert layer.block_sparse_moe._streamed_sp8_moe is None
     assert layer.block_sparse_moe._streamed_sp8_prefill_enabled is False
+    assert not hasattr(layer.block_sparse_moe, "_streamed_sp8_sharded_carry")
+    assert not hasattr(layer.block_sparse_moe, "_streamed_sp8_global_rows")
     assert not hasattr(
         layer.block_sparse_moe.shared_experts,
         "_streamed_sp8_profiler",
@@ -911,10 +926,12 @@ def test_streamed_sp8_release_cleans_callbacks_when_close_raises():
             "_streamed_sp8_order_wait",
             "_streamed_sp8_profiler",
             "_streamed_sp8_profile_name",
+            "_streamed_sp8_keep_sharded",
         ):
             assert not hasattr(norm, name)
     assert not hasattr(module, "_streamed_sp8_order_wait")
     assert not hasattr(module, "_streamed_sp8_profiler")
+    assert not hasattr(module, "_streamed_sp8_output_row_shard")
 
 
 def test_streamed_sp8_attention_modules_unwraps_and_skips_missing_attention():
@@ -959,7 +976,7 @@ def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
     assert "num_prefill_module_buffer" not in source
 
 
-def test_streamed_sp8_forward_uses_only_local_row_collective():
+def test_streamed_sp8_sharded_carry_uses_row_collectives():
     path = (
         ROOT
         / "batchgen"
@@ -993,6 +1010,8 @@ def test_streamed_sp8_forward_uses_only_local_row_collective():
         elif isinstance(node.func, ast.Name):
             calls.add(node.func.id)
     assert "all_gather_rows_add_" in calls
+    assert "all_gather_rows" in calls
+    assert "reduce_scatter_rows" in calls
     assert "all_reduce" not in calls
     assert "all_gather" not in calls
 
@@ -1044,15 +1063,17 @@ def test_streamed_sp8_serving_opens_the_cross_gate_last_in_the_branch():
     def last(name):
         return max(line for line, called in calls if called == name)
 
-    # The gate must trail EVERY TP8 collective of the layer: the routed-output
-    # all-gather and the shared expert's row-parallel all-reduce both live out
-    # here, past the streamed-SP8 layer forward.
+    # The gate must trail EVERY TP8 collective in both layouts. The legacy
+    # full-row fallback gathers the routed output; the sharded-carry path
+    # gathers only the shared input and reduce-scatters its partial output.
     assert (
         last("forward")
         < last("all_gather_rows_add_")
         < last("allow_cross_launch")
     )
     assert last("forward_into") < last("allow_cross_launch")
+    assert last("all_gather_rows") < last("reduce_scatter_rows")
+    assert last("reduce_scatter_rows") < last("allow_cross_launch")
     # ...and it must be the LAST thing the branch does, so nothing new can be
     # slipped in between the gate and the next layer's attention.
     assert last("allow_cross_launch") == max(line for line, _ in calls)
@@ -1094,33 +1115,52 @@ def test_streamed_sp8_layer_forward_touches_neither_side_of_the_handshake():
     assert guards["allow_full_overwrite"]
 
 
-def test_prefill_attention_waits_for_cross_launch_before_its_tp_all_reduce():
+def test_prefill_attention_waits_before_its_tp_reduction():
     tree = ast.parse(_serving_modules_path().read_text())
-    for name in ("_reduce_mla_tp_output", "kda_prefill_serving"):
-        function = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == name
+    reducer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_reduce_mla_tp_output"
+    )
+    waits = [
+        node.lineno
+        for node in ast.walk(reducer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_wait_streamed_sp8_cross_launch"
+    ]
+    reductions = [
+        node.lineno
+        for node in ast.walk(reducer)
+        if isinstance(node, ast.Call)
+        and (
+            (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "all_reduce"
+            )
+            or (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "reduce_scatter_rows"
+            )
         )
-        waits = [
-            node.lineno
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_wait_streamed_sp8_cross_launch"
-        ]
-        reduces = [
-            node.lineno
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "all_reduce"
-        ]
-        # One wait per all-reduce, and it is issued first: this all-reduce is
-        # the next TP8 launch after the previous layer's MoE opened the gate.
-        assert len(waits) == 1, name
-        assert len(reduces) == 1, name
-        assert waits[0] < reduces[0], name
+    ]
+    assert len(waits) == 1
+    assert len(reductions) == 2
+    assert all(waits[0] < reduction for reduction in reductions)
+
+    kda = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "kda_prefill_serving"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_reduce_mla_tp_output"
+        for node in ast.walk(kda)
+    )
 
 
 def test_mla_tp_reduce_calls_the_installed_order_wait_then_all_reduce(

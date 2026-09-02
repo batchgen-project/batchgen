@@ -173,6 +173,7 @@ def worker(rank, world, out_path, master_port):
         all_gather_rows,
         all_gather_rows_add_,
         all_gather_rows_into,
+        reduce_scatter_rows,
         scatter_rows,
     )
     from batchgen.models.moonshotai.kimi_linear.block_residual import (
@@ -232,6 +233,23 @@ def worker(rank, world, out_path, master_port):
         ).forward(x, block.gate)
 
         shared = block.shared_experts(x)
+        shared_input = all_gather_rows(
+            x_local, num_rows, world, rank, dist.group.WORLD
+        )
+        shared_partial = block.shared_experts._ffn_into(
+            shared_input, shared_input
+        )
+        shared_sharded = reduce_scatter_rows(
+            shared_partial, world, rank, dist.group.WORLD
+        )
+        shared_sharded_error = _err_ratio(
+            shared_sharded, scatter_rows(shared, world, rank)
+        )
+        combined_sharded = shared_sharded + wide_local
+        combined_sharded_error = _err_ratio(
+            combined_sharded,
+            scatter_rows(shared + wide, world, rank),
+        )
         combined_reference = shared + wide
         combined = x.clone()
         block.shared_experts.forward_into(combined, combined)
@@ -274,6 +292,19 @@ def worker(rank, world, out_path, master_port):
             chunk_rows=2,
         )
         uneven_copy_exact = torch.equal(uneven_copy, uneven)
+        uneven_partial = uneven + rank * 1000
+        uneven_sum = uneven_partial.clone()
+        dist.all_reduce(uneven_sum, group=dist.group.WORLD)
+        uneven_reduced_local = reduce_scatter_rows(
+            uneven_partial,
+            world,
+            rank,
+            dist.group.WORLD,
+        )
+        uneven_reduce_scatter_exact = torch.equal(
+            uneven_reduced_local,
+            scatter_rows(uneven_sum, world, rank),
+        )
 
         # The K3 block-attention residual mixer is token-independent. The
         # streamed-SP8 strategy computes one contiguous eighth per rank and
@@ -330,6 +361,28 @@ def worker(rank, world, out_path, master_port):
         depth_mix_max_abs = float(
             (depth_actual.float() - depth_reference.float()).abs().max()
         )
+        depth_norm._streamed_sp8_keep_sharded = True
+        depth_local = apply_attn_res(
+            scatter_rows(depth_prefix, world, rank),
+            depth_residual,
+            depth_proj,
+            depth_norm,
+            chunk_size=depth_tokens // world,
+        )
+        depth_local_exact = torch.equal(
+            depth_local, scatter_rows(depth_reference, world, rank)
+        )
+        del depth_norm._streamed_sp8_keep_sharded
+        depth_regathered = apply_attn_res(
+            depth_local,
+            depth_residual,
+            depth_proj,
+            depth_norm,
+            chunk_size=depth_tokens // world,
+        )
+        depth_regather_exact = torch.equal(
+            depth_regathered, depth_reference
+        )
 
     wide_error = _err_ratio(wide, reference)
     striped_error = _err_ratio(striped, reference)
@@ -356,14 +409,27 @@ def worker(rank, world, out_path, master_port):
             "bounded output assembly parity failed: "
             f"shared_alias={shared_alias_error} combined={combined_error}"
         )
+    if shared_sharded_error >= 3e-3 or combined_sharded_error >= 3e-3:
+        raise AssertionError(
+            "sharded shared/routed merge parity failed: "
+            f"shared={shared_sharded_error} "
+            f"combined={combined_sharded_error}"
+        )
     if not uneven_exact:
         raise AssertionError("uneven chunked row gather-add parity failed")
     if not uneven_copy_exact:
         raise AssertionError("uneven chunked row gather-copy parity failed")
+    if not uneven_reduce_scatter_exact:
+        raise AssertionError("uneven row reduce-scatter parity failed")
     if not depth_mix_exact:
         raise AssertionError(
             "row-sharded depth-mix parity failed: "
             f"max_abs={depth_mix_max_abs}"
+        )
+    if not depth_local_exact or not depth_regather_exact:
+        raise AssertionError(
+            "sharded depth carry parity failed: "
+            f"local={depth_local_exact} regather={depth_regather_exact}"
         )
     if int(local_assignments.item()) != expected_assignments:
         raise AssertionError(
@@ -386,11 +452,16 @@ def worker(rank, world, out_path, master_port):
             "striped_err_ratio_vs_wide": striped_vs_wide,
             "max_abs_vs_world1": max_abs,
             "shared_forward_into_err_ratio": shared_alias_error,
+            "shared_sharded_err_ratio": shared_sharded_error,
+            "combined_sharded_err_ratio": combined_sharded_error,
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
             "uneven_gather_copy_exact": uneven_copy_exact,
+            "uneven_reduce_scatter_exact": uneven_reduce_scatter_exact,
             "depth_mix_exact": depth_mix_exact,
             "depth_mix_max_abs": depth_mix_max_abs,
+            "depth_local_exact": depth_local_exact,
+            "depth_regather_exact": depth_regather_exact,
             "verdict": "PASS",
         }
         Path(out_path).write_text(json.dumps(result, indent=2) + "\n")

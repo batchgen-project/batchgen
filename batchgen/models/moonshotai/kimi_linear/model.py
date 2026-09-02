@@ -43,7 +43,11 @@ from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
-from .block_residual import BlockResidualBuffer, num_block_residual_columns
+from .block_residual import (
+    BlockResidualBuffer,
+    gather_attn_residual_rows,
+    num_block_residual_columns,
+)
 from .block_residual import apply_attn_res as _block_residual_apply_attn_res
 from .config import KimiLinearConfig
 
@@ -257,21 +261,20 @@ class KimiMLP(nn.Module):
             out.view(*x.shape[:-1], out.shape[-1])
         )
 
-    def forward_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        """Run the token-tiled FFN into caller-owned storage.
+    def _ffn_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Run this rank's token-tiled FFN shard into caller-owned storage.
 
         ``out`` may alias ``x``. Each output row depends only on the matching
         input row, so overwriting a completed tile cannot affect a later tile.
-        The TP reduction remains one full-shape collective after every local
-        tile is written, matching :meth:`forward` rather than changing its
-        reduction shape or order.
+        This deliberately does not reduce TP partials; callers choose an
+        all-reduce or row reduce-scatter after the local body.
         """
         if (
             out.shape != x.shape
             or out.dtype != x.dtype
             or out.device != x.device
         ):
-            raise ValueError("KimiMLP forward_into requires matching tensors")
+            raise ValueError("KimiMLP _ffn_into requires matching tensors")
 
         num_tokens = x.numel() // x.shape[-1]
         token_tile = _FFN_TOKEN_TILE
@@ -294,7 +297,11 @@ class KimiMLP(nn.Module):
             y = self._ffn(flat_x[start:end])
             flat_out[start:end].copy_(y)
             del y
-        return self._reduce_tp_output(out)
+        return out
+
+    def forward_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Run the FFN into caller storage, then all-reduce TP partials."""
+        return self._reduce_tp_output(self._ffn_into(x, out))
 
 
 class KimiBlockSparseMLP(nn.Module):
@@ -978,7 +985,7 @@ class KimiDecoderLayer(nn.Module):
         self, hidden_states, attention_mask, position_ids, past_key_values,
         cu_seqlens, block_residual, **kwargs
     ):
-        batch_size, seq_len, hidden_size = hidden_states.shape
+        batch_size, _, hidden_size = hidden_states.shape
         prefix_sum = hidden_states
 
         if block_residual is not None and block_residual.shape[1] > 0:
@@ -987,7 +994,7 @@ class KimiDecoderLayer(nn.Module):
                 block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
-            ).view(batch_size, seq_len, hidden_size)
+            ).view(batch_size, -1, hidden_size)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             # Boundary: snapshot the PRE-mix prefix_sum, then RESET (assignment,
@@ -997,8 +1004,13 @@ class KimiDecoderLayer(nn.Module):
             # the (S,nb,H) and (S,nb+1,H) tensors are never co-live — 12.25 GiB
             # of transient at the last K3 boundary. What comes back is the
             # NARROWED (S,nb+1,H) view, so shape[1] still counts boundaries.
+            snapshot = gather_attn_residual_rows(
+                prefix_sum.view(-1, hidden_size),
+                block_residual,
+                self.self_attention_res_norm,
+            )
             block_residual = BlockResidualBuffer.append(
-                block_residual, prefix_sum.view(-1, hidden_size)
+                block_residual, snapshot
             )
             prefix_sum = None
 
@@ -1008,6 +1020,22 @@ class KimiDecoderLayer(nn.Module):
         )
 
         if prefix_sum is not None:
+            if prefix_sum.numel() != hidden_states.numel():
+                row_group = getattr(
+                    self.mlp_res_norm, "_streamed_sp8_row_group", None
+                )
+                if row_group is None:
+                    raise ValueError(
+                        "attention returned a row shard without streamed-SP8"
+                    )
+                from .moe_tp_reshard import scatter_rows
+
+                group_size, group_rank, _ = row_group
+                prefix_sum = scatter_rows(
+                    prefix_sum.view(-1, hidden_size),
+                    group_size,
+                    group_rank,
+                ).view(batch_size, -1, hidden_size)
             # The pre-attention prefix is the surviving residual buffer and
             # the attention output is dead after this merge. Exact-64K K3 is
             # 896 MiB per full hidden tensor, so update the prefix in place
@@ -1021,9 +1049,15 @@ class KimiDecoderLayer(nn.Module):
             block_residual,
             self.mlp_res_proj,
             self.mlp_res_norm,
-        ).view(batch_size, seq_len, hidden_size)
+        ).view(batch_size, -1, hidden_size)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
+        moe = getattr(self, "block_sparse_moe", None)
+        if (
+            moe is not None
+            and getattr(moe, "_streamed_sp8_sharded_carry", False)
+        ):
+            moe._streamed_sp8_global_rows = block_residual.shape[0]
         hidden_states = self._run_ffn(hidden_states)
 
         if prefix_sum is None:

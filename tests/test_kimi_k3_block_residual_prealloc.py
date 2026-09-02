@@ -148,6 +148,12 @@ num_block_residual_columns = KL.num_block_residual_columns
 BlockResidualCarrier = sys.modules[
     BlockResidualBuffer.__module__].BlockResidualCarrier
 apply_attn_res = sys.modules[BlockResidualBuffer.__module__].apply_attn_res
+gather_attn_residual_rows = sys.modules[
+    BlockResidualBuffer.__module__
+].gather_attn_residual_rows
+balanced_row_split = importlib.import_module(
+    BlockResidualBuffer.__module__.rsplit(".", 1)[0] + ".moe_tp_reshard"
+).balanced_row_split
 
 
 # --------------------------------------------------------------------------- #
@@ -634,6 +640,77 @@ def test_streamed_sp8_depth_mix_row_shard_is_bit_exact(monkeypatch):
 
     assert torch.equal(actual, reference)
     assert trace == ["order_wait"]
+
+
+def test_streamed_sp8_depth_mix_can_keep_and_reuse_local_rows(monkeypatch):
+    tokens, num_blocks, hidden = 17, 5, 16
+    group_size, group_rank = 4, 2
+    gen = torch.Generator().manual_seed(260903)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+    reference = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    start, end = balanced_row_split(tokens, group_size)[group_rank]
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda *args, **kwargs: pytest.fail("keep-sharded path gathered rows"),
+    )
+    norm._streamed_sp8_row_group = (
+        group_size,
+        group_rank,
+        "fake-group",
+    )
+    norm._streamed_sp8_keep_sharded = True
+
+    from_full = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    from_local = apply_attn_res(
+        prefix[start:end], block, proj, norm, chunk_size=4
+    )
+
+    assert torch.equal(from_full, reference[start:end])
+    assert torch.equal(from_local, reference[start:end])
+
+
+def test_block_boundary_restores_a_sharded_prefix(monkeypatch):
+    tokens, hidden = 17, 16
+    group_size, group_rank = 4, 2
+    prefix = torch.arange(tokens * hidden, dtype=torch.float32).view(
+        tokens, hidden
+    )
+    block = torch.empty(tokens, 3, hidden)
+    start, end = balanced_row_split(tokens, group_size)[group_rank]
+    local = prefix[start:end]
+
+    def fake_all_gather(gathered, send, group):
+        assert group == "fake-group"
+        assert torch.equal(send, local)
+        # The helper's uneven path receives rank-major padded slots.
+        splits = balanced_row_split(tokens, group_size)
+        ntp = max(e - s for s, e in splits)
+        packed = prefix.new_zeros((group_size, ntp, hidden))
+        for rank, (s, e) in enumerate(splits):
+            packed[rank, : e - s].copy_(prefix[s:e])
+        gathered.copy_(packed.view(-1, hidden))
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+    norm = types.SimpleNamespace(
+        _streamed_sp8_row_group=(group_size, group_rank, "fake-group")
+    )
+
+    restored = gather_attn_residual_rows(local, block, norm)
+    assert torch.equal(restored, prefix)
 
 
 def test_resident_prefill_bounds_depth_mixer_chunk_exactly():

@@ -87,7 +87,17 @@ def _reduce_mla_tp_output(module, output):
 
         _wait_streamed_sp8_cross_launch(module)
         profiler, span = _begin_streamed_sp8_profile(module)
-        dist.all_reduce(output, group=module.attn_tp_group)
+        if getattr(module, "_streamed_sp8_output_row_shard", False):
+            from .moe_tp_reshard import reduce_scatter_rows
+
+            output = reduce_scatter_rows(
+                output,
+                module.attn_tp_size,
+                module.attn_tp_rank,
+                module.attn_tp_group,
+            )
+        else:
+            dist.all_reduce(output, group=module.attn_tp_group)
         _end_streamed_sp8_profile(profiler, "attention_reduce", span)
     return output
 
@@ -857,16 +867,9 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         o.reshape(total, num_heads * head_dim),
         hidden_states_2d,
     )
-    # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so the
-    # partial sums across the attn_tp sub-group must be reduced. Only when G>1.
-    if getattr(self, "attn_tp_size", 1) > 1:
-        import torch.distributed as dist
-
-        _wait_streamed_sp8_cross_launch(self)
-        profiler, span = _begin_streamed_sp8_profile(self)
-        dist.all_reduce(o, group=self.attn_tp_group)
-        _end_streamed_sp8_profile(profiler, "attention_reduce", span)
-    return o
+    # M2a head-parallel KDA: sum the row-parallel o_proj shards. Streamed-SP8
+    # retains only this rank's token rows; every other phase all-reduces.
+    return _reduce_mla_tp_output(self, o)
 
 
 def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
@@ -895,13 +898,7 @@ def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
     )
     if fused_output is not None:
         o = self.o_proj(fused_output)
-        # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so
-        # the partial sums across the attn_tp sub-group must be reduced. Only
-        # when G>1.
-        if getattr(self, "attn_tp_size", 1) > 1:
-            import torch.distributed as dist
-
-            dist.all_reduce(o, group=self.attn_tp_group)
+        o = _reduce_mla_tp_output(self, o)
         return o.unsqueeze(1)
 
     # Established correctness fallback for Kimi-Linear-48B, old wheels, and
@@ -954,12 +951,7 @@ def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
 
     o = self.o_norm(o.reshape(bsz, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(bsz, num_heads * head_dim))
-    # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so the
-    # partial sums across the attn_tp sub-group must be reduced. Only when G>1.
-    if getattr(self, "attn_tp_size", 1) > 1:
-        import torch.distributed as dist
-
-        dist.all_reduce(o, group=self.attn_tp_group)
+    o = _reduce_mla_tp_output(self, o)
     return o.unsqueeze(1)
 
 
@@ -1220,21 +1212,88 @@ def moe_forward_serving(self, hidden_states):
             raise RuntimeError(
                 "streamed-SP8 prefill reached MoE without TP row sharding"
             )
-        from .moe_tp_reshard import all_gather_rows_add_, scatter_rows
+        from .moe_tp_reshard import (
+            all_gather_rows_add_,
+            all_gather_rows,
+            balanced_row_split,
+            reduce_scatter_rows,
+            scatter_rows,
+        )
 
-        num_rows = x.shape[0]
-        x_local = scatter_rows(x, G, self.attn_tp_rank)
+        global_rows = getattr(self, "_streamed_sp8_global_rows", None)
+        input_sharded = bool(
+            getattr(self, "_streamed_sp8_sharded_carry", False)
+            and global_rows is not None
+        )
+        num_rows = int(global_rows if input_sharded else x.shape[0])
+        splits = balanced_row_split(num_rows, G)
+        local_start, local_end = splits[self.attn_tp_rank]
+        if input_sharded:
+            if x.shape[0] != local_end - local_start:
+                raise ValueError(
+                    "streamed-SP8 MoE input has the wrong local row count"
+                )
+            x_local = x
+        else:
+            x_local = scatter_rows(x, G, self.attn_tp_rank)
         # The layer is expert-parallel inside the node, so it needs the node's
         # pre-split row count to pad this slice to the shared ntp stride its
         # node-local latent gather and reduce-scatter are laid out on.
         routed_local = streamed_sp8.forward(x_local, self.gate, num_rows)
         if getattr(self, "shared_experts", None) is not None:
             shared_span = profiler.begin_profile_span() if profile else None
-            self.shared_experts.forward_into(x, x)
+            if input_sharded:
+                # Shared-expert weights are row-parallel over their
+                # intermediate dimension, so every TP rank still needs every
+                # input row. Reassemble those rows, run the unchanged local
+                # weight shard, then SUM directly into this rank's row slice.
+                # Calling ``forward_into`` on distinct local rows would
+                # all-reduce unrelated tokens and is mathematically wrong.
+                gather_span = (
+                    profiler.begin_profile_span() if profile else None
+                )
+                shared_input = all_gather_rows(
+                    x,
+                    num_rows,
+                    G,
+                    self.attn_tp_rank,
+                    self.attn_tp_group,
+                )
+                if profile:
+                    profiler.end_profile_span(
+                        "shared_input_gather", gather_span
+                    )
+                shared_partial = self.shared_experts._ffn_into(
+                    shared_input, shared_input
+                )
+                reduce_span = (
+                    profiler.begin_profile_span() if profile else None
+                )
+                shared_output = reduce_scatter_rows(
+                    shared_partial,
+                    G,
+                    self.attn_tp_rank,
+                    self.attn_tp_group,
+                )
+                del shared_partial
+                if profile:
+                    profiler.end_profile_span(
+                        "shared_expert_reduce", reduce_span
+                    )
+            else:
+                shared_output = self.shared_experts.forward_into(x, x)
             if profile:
                 profiler.end_profile_span("shared_expert", shared_span)
         else:
-            x.zero_()
+            shared_output = x.zero_()
+        if input_sharded:
+            shared_output.add_(routed_local)
+            out = shared_output.reshape(orig_shape)
+            if profile:
+                profiler.end_profile_span("moe_serving_total", moe_span)
+            streamed_sp8.buffer.allow_cross_launch()
+            return out
+
         routed_gather_span = (
             profiler.begin_profile_span() if profile else None
         )

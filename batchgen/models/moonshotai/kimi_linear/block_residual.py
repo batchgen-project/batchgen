@@ -163,6 +163,35 @@ def _apply_attn_res_local(prefix_sum: torch.Tensor,
     )
 
 
+def gather_attn_residual_rows(prefix_sum: torch.Tensor,
+                              block_residual: torch.Tensor,
+                              norm) -> torch.Tensor:
+    """Restore a sharded prefix before a block-boundary bank snapshot."""
+    row_group = getattr(norm, "_streamed_sp8_row_group", None)
+    if row_group is None or prefix_sum.shape[0] == block_residual.shape[0]:
+        return prefix_sum
+
+    group_size, group_rank, group = row_group
+    from .moe_tp_reshard import (
+        all_gather_rows,
+        balanced_row_split,
+    )
+
+    global_rows = block_residual.shape[0]
+    start, end = balanced_row_split(global_rows, group_size)[group_rank]
+    if prefix_sum.shape[0] != end - start:
+        raise ValueError(
+            "sharded attention-residual prefix has the wrong local row count"
+        )
+    return all_gather_rows(
+        prefix_sum,
+        global_rows,
+        group_size,
+        group_rank,
+        group,
+    )
+
+
 def apply_attn_res(prefix_sum: torch.Tensor,
                    block_residual: torch.Tensor,
                    proj: nn.Linear,
@@ -191,28 +220,46 @@ def apply_attn_res(prefix_sum: torch.Tensor,
         )
     else:
         group_size, group_rank, group = row_group
-        from .moe_tp_reshard import all_gather_rows, scatter_rows
+        from .moe_tp_reshard import (
+            all_gather_rows,
+            balanced_row_split,
+            scatter_rows,
+        )
 
-        local_prefix = scatter_rows(prefix_sum, group_size, group_rank)
+        global_rows = block_residual.shape[0]
+        start, end = balanced_row_split(global_rows, group_size)[group_rank]
+        local_rows = end - start
+        if prefix_sum.shape[0] == global_rows:
+            local_prefix = scatter_rows(prefix_sum, group_size, group_rank)
+        elif prefix_sum.shape[0] == local_rows:
+            local_prefix = prefix_sum
+        else:
+            raise ValueError(
+                "attention-residual prefix is neither full nor this rank's "
+                "balanced row shard"
+            )
         local_residual = scatter_rows(
             block_residual, group_size, group_rank
         )
         local_output = _apply_attn_res_local(
             local_prefix, local_residual, proj, norm, chunk_size
         )
-        order_wait = getattr(norm, "_streamed_sp8_order_wait", None)
-        if order_wait is not None:
-            # The previous layer opened the cross-node weight gate after its
-            # MoE. This gather is now the next TP8 collective, so it must
-            # observe the same cross-then-TP host issue order on every rank.
-            order_wait()
-        output = all_gather_rows(
-            local_output,
-            prefix_sum.shape[0],
-            group_size,
-            group_rank,
-            group,
-        )
+        if getattr(norm, "_streamed_sp8_keep_sharded", False):
+            output = local_output
+        else:
+            order_wait = getattr(norm, "_streamed_sp8_order_wait", None)
+            if order_wait is not None:
+                # The previous layer opened the cross-node weight gate after
+                # its MoE. This gather is now the next TP8 collective, so it
+                # must observe the same cross-then-TP host issue order.
+                order_wait()
+            output = all_gather_rows(
+                local_output,
+                global_rows,
+                group_size,
+                group_rank,
+                group,
+            )
 
     if profiler is not None:
         profiler.end_profile_span(
