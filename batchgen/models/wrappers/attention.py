@@ -256,7 +256,7 @@ class AttnWrapperBase(BaseModuleWrapper):
         *,
         device: Optional[torch.device] = None,
     ) -> None:
-        """Drain issued D2H work and reset all prefill-offload bookkeeping."""
+        """Drain issued D2H tasks and reset all prefill-offload bookkeeping."""
         first_error = None
         try:
             for task in list(cls.pending_prefill_offload_tasks):
@@ -265,11 +265,6 @@ class AttnWrapperBase(BaseModuleWrapper):
                 except BaseException as error:
                     if first_error is None:
                         first_error = error
-            try:
-                cls._prefill_offload_sync_device(device)
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
         finally:
             cls.pending_prefill_offload_tasks.clear()
             cls.pending_prefill_offload_tensors.clear()

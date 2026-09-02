@@ -1574,8 +1574,8 @@ class BatchGenWorker:
 					self.prefill(local_prefill_indices)
 			prefill_elapsed = time.perf_counter() - prefill_start
 
-			# The async CPU tasks must issue their D2H copies before the device
-			# synchronization can prove every per-layer KV retirement complete.
+			# KVAsyncTask.wait() returns only after its D2H completion event has
+			# synchronized, so retiring the captured tasks proves cache readiness.
 			from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
 			num_retired = _AWB.retire_pending_prefill_offloads(
 				device=self.torch_device,
