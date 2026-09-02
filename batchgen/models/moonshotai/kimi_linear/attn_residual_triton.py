@@ -48,7 +48,11 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """Scan H once for one ``(token, bank-or-prefix row)`` score."""
-    token = tl.program_id(0)
+    # Form row offsets in 64-bit.  Exact-64K K3 prefill scans 65,536 local
+    # tokens against a bank whose token stride is 8 x 7168 elements, so a
+    # 32-bit ``token * stride`` wraps negative from token 37,450 and reads
+    # rows before this rank's slice of the shared bank buffer.
+    token = tl.program_id(0).to(tl.int64)
     row = tl.program_id(1)
     if row > num_bank_rows:
         return
@@ -120,7 +124,7 @@ def _combine_kernel(
     MAX_ROWS: tl.constexpr,
 ):
     """Softmax the row scores and form one output hidden-axis chunk."""
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     hidden_block = tl.program_id(1)
 
     row_offsets = tl.arange(0, MAX_ROWS)
