@@ -1216,7 +1216,6 @@ def moe_forward_serving(self, hidden_states):
             all_gather_rows_add_,
             all_gather_rows,
             balanced_row_split,
-            reduce_scatter_rows,
             scatter_rows,
         )
 
@@ -1246,9 +1245,12 @@ def moe_forward_serving(self, hidden_states):
                 # Shared-expert weights are row-parallel over their
                 # intermediate dimension, so every TP rank still needs every
                 # input row. Reassemble those rows, run the unchanged local
-                # weight shard, then SUM directly into this rank's row slice.
-                # Calling ``forward_into`` on distinct local rows would
-                # all-reduce unrelated tokens and is mathematically wrong.
+                # weight shard, then preserve the established BF16 all-reduce
+                # before retaining this rank's row slice. Calling
+                # ``forward_into`` on distinct local rows would all-reduce
+                # unrelated tokens and is mathematically wrong. A direct
+                # reduce-scatter was rejected by the world-8 parity gate: its
+                # different NCCL reduction order exceeded the max-error budget.
                 gather_span = (
                     profiler.begin_profile_span() if profile else None
                 )
@@ -1269,12 +1271,14 @@ def moe_forward_serving(self, hidden_states):
                 reduce_span = (
                     profiler.begin_profile_span() if profile else None
                 )
-                shared_output = reduce_scatter_rows(
-                    shared_partial,
-                    G,
-                    self.attn_tp_rank,
-                    self.attn_tp_group,
+                import torch.distributed as dist
+
+                dist.all_reduce(
+                    shared_partial, group=self.attn_tp_group
                 )
+                shared_output = scatter_rows(
+                    shared_partial, G, self.attn_tp_rank
+                ).clone()
                 del shared_partial
                 if profile:
                     profiler.end_profile_span(

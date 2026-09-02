@@ -41,24 +41,6 @@ def _err_ratio(actual, reference):
     )
 
 
-def _bf16_gemm_metrics(actual, reference):
-    actual = actual.float().reshape(-1)
-    reference = reference.float().reshape(-1)
-    diff = actual - reference
-    rel_l2 = float(diff.norm() / reference.norm().clamp_min(1e-12))
-    cosine = float(torch.nn.functional.cosine_similarity(
-        actual.unsqueeze(0), reference.unsqueeze(0)
-    ))
-    max_abs_over_std = float(
-        diff.abs().max() / reference.std().clamp_min(1e-12)
-    )
-    return {
-        "rel_l2": rel_l2,
-        "cosine": cosine,
-        "max_abs_over_std": max_abs_over_std,
-    }
-
-
 def _install_core_engine_from_cache():
     """Prevent synthetic model imports from rebuilding the unrelated core."""
     if "batchgen.core_engine" in sys.modules:
@@ -255,13 +237,6 @@ def worker(rank, world, out_path, master_port):
         ).forward(x, block.gate)
 
         shared = block.shared_experts(x)
-        # Use a production-scale collective payload for the all-reduce versus
-        # reduce-scatter comparison. At the tiny 64-row routed-kernel shape,
-        # NCCL selects a different reduction algorithm for the two APIs and
-        # measures that topology seam rather than the exact64 prefill path.
-        shared_rows = 65_536
-        shared_x = x.repeat(shared_rows // num_rows, 1)
-        shared_world1 = block.shared_experts(shared_x)
         shared_tp = copy.deepcopy(block.shared_experts)
         for name in ("gate_proj", "up_proj", "down_proj"):
             projection = getattr(shared_tp, name)
@@ -278,48 +253,36 @@ def worker(rank, world, out_path, master_port):
         shared_tp.gate_proj.out_features = shared_tp.intermediate_size
         shared_tp.up_proj.out_features = shared_tp.intermediate_size
         shared_tp.down_proj.in_features = shared_tp.intermediate_size
-        shared_local_reference = shared_tp._ffn(shared_x)
+        shared_local_reference = shared_tp._ffn(x)
         shared_tp_reference = shared_local_reference.clone()
         dist.all_reduce(shared_tp_reference, group=dist.group.WORLD)
-        shared_tp_vs_world1 = _err_ratio(
-            shared_tp_reference, shared_world1
-        )
-        shared_x_local = scatter_rows(shared_x, world, rank)
+        shared_tp_vs_world1 = _err_ratio(shared_tp_reference, shared)
         shared_input = all_gather_rows(
-            shared_x_local,
-            shared_rows,
+            x_local,
+            num_rows,
             world,
             rank,
             dist.group.WORLD,
         )
-        shared_input_exact = torch.equal(shared_input, shared_x)
+        shared_input_exact = torch.equal(shared_input, x)
         shared_partial = shared_tp._ffn_into(
             shared_input, shared_input
         )
         shared_local_exact = torch.equal(
             shared_partial, shared_local_reference
         )
-        shared_sharded = reduce_scatter_rows(
-            shared_partial, world, rank, dist.group.WORLD
+        dist.all_reduce(shared_partial, group=dist.group.WORLD)
+        shared_carried = scatter_rows(
+            shared_partial, world, rank
+        ).clone()
+        shared_carry_exact = torch.equal(
+            shared_carried,
+            scatter_rows(shared_tp_reference, world, rank),
         )
-        shared_sharded_repeat = reduce_scatter_rows(
-            shared_partial.clone(), world, rank, dist.group.WORLD
-        )
-        shared_reference_local = scatter_rows(
-            shared_tp_reference, world, rank
-        )
-        shared_metrics = _bf16_gemm_metrics(
-            shared_sharded, shared_reference_local
-        )
-        shared_noise = _bf16_gemm_metrics(
-            shared_sharded_repeat, shared_sharded
-        )["rel_l2"]
-        routed_full = shared_x.mul(0.125)
-        routed_local = scatter_rows(routed_full, world, rank)
-        combined_sharded = shared_sharded + routed_local
-        combined_sharded_error = _err_ratio(
-            combined_sharded,
-            scatter_rows(shared_tp_reference + routed_full, world, rank),
+        combined_carried = shared_carried + wide_local
+        combined_carry_error = _err_ratio(
+            combined_carried,
+            scatter_rows(shared_tp_reference + wide, world, rank),
         )
         combined_reference = shared + wide
         combined = x.clone()
@@ -485,17 +448,11 @@ def worker(rank, world, out_path, master_port):
             "shared-expert sharded input/local FFN parity failed: "
             f"input={shared_input_exact} local={shared_local_exact}"
         )
-    if (
-        shared_noise > 1.25e-3
-        or shared_metrics["rel_l2"] > 5e-3
-        or shared_metrics["cosine"] < 0.9999
-        or shared_metrics["max_abs_over_std"] > 3e-2
-        or combined_sharded_error >= 3e-3
-    ):
+    if not shared_carry_exact or combined_carry_error >= 3e-3:
         raise AssertionError(
             "sharded shared/routed merge parity failed: "
-            f"shared={shared_metrics} noise={shared_noise} "
-            f"combined={combined_sharded_error}"
+            f"shared_exact={shared_carry_exact} "
+            f"combined={combined_carry_error}"
         )
     if not uneven_exact:
         raise AssertionError("uneven chunked row gather-add parity failed")
@@ -534,13 +491,11 @@ def worker(rank, world, out_path, master_port):
             "striped_err_ratio_vs_wide": striped_vs_wide,
             "max_abs_vs_world1": max_abs,
             "shared_forward_into_err_ratio": shared_alias_error,
-            "shared_sharded_metrics": shared_metrics,
-            "shared_sharded_noise_rel_l2": shared_noise,
+            "shared_carry_exact": shared_carry_exact,
             "shared_tp_err_ratio_vs_world1": shared_tp_vs_world1,
-            "shared_collective_rows": shared_rows,
             "shared_input_exact": shared_input_exact,
             "shared_local_exact": shared_local_exact,
-            "combined_sharded_err_ratio": combined_sharded_error,
+            "combined_carry_err_ratio": combined_carry_error,
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
             "uneven_gather_copy_exact": uneven_copy_exact,

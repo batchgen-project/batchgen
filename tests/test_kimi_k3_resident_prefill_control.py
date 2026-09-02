@@ -976,7 +976,7 @@ def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
     assert "num_prefill_module_buffer" not in source
 
 
-def test_streamed_sp8_sharded_carry_uses_row_collectives():
+def test_streamed_sp8_sharded_carry_preserves_shared_all_reduce():
     path = (
         ROOT
         / "batchgen"
@@ -1011,8 +1011,8 @@ def test_streamed_sp8_sharded_carry_uses_row_collectives():
             calls.add(node.func.id)
     assert "all_gather_rows_add_" in calls
     assert "all_gather_rows" in calls
-    assert "reduce_scatter_rows" in calls
-    assert "all_reduce" not in calls
+    assert "all_reduce" in calls
+    assert "reduce_scatter_rows" not in calls
     assert "all_gather" not in calls
 
 
@@ -1065,15 +1065,16 @@ def test_streamed_sp8_serving_opens_the_cross_gate_last_in_the_branch():
 
     # The gate must trail EVERY TP8 collective in both layouts. The legacy
     # full-row fallback gathers the routed output; the sharded-carry path
-    # gathers only the shared input and reduce-scatters its partial output.
+    # gathers only the shared input and preserves the numerically established
+    # shared-expert all-reduce before retaining one row slice.
     assert (
         last("forward")
         < last("all_gather_rows_add_")
         < last("allow_cross_launch")
     )
     assert last("forward_into") < last("allow_cross_launch")
-    assert last("all_gather_rows") < last("reduce_scatter_rows")
-    assert last("reduce_scatter_rows") < last("allow_cross_launch")
+    assert last("all_gather_rows") < last("all_reduce")
+    assert last("all_reduce") < last("allow_cross_launch")
     # ...and it must be the LAST thing the branch does, so nothing new can be
     # slipped in between the gate and the next layer's attention.
     assert last("allow_cross_launch") == max(line for line, _ in calls)
