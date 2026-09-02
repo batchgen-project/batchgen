@@ -105,7 +105,7 @@ def test_triton_mixer_bf16_parity(tokens, bank_rows):
     assert num_fail == 0 or fail_fraction < 1e-4
 
 
-def test_triton_mixer_score_weight_cache_tracks_parameter_updates():
+def test_triton_mixer_score_weight_tracks_current_parameter_values():
     prefix, bank, proj, norm = _inputs(7, 4)
     with torch.inference_mode():
         first = attn_residual_triton.mix_attn_residual_triton(

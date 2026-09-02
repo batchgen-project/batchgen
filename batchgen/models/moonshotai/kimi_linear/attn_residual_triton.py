@@ -169,20 +169,18 @@ def supports_attn_residual_triton(
 
 
 def score_weight(proj, norm) -> torch.Tensor:
-    """Return the cached fp32 ``norm.weight * proj.weight`` vector."""
-    key = (
-        norm.weight.device,
-        norm.weight._version,
-        proj.weight._version,
-    )
-    cached = getattr(proj, "_attn_res_triton_score_weight", None)
-    if cached is None or cached[0] != key:
-        value = (
-            norm.weight.float() * proj.weight.squeeze(0).float()
-        ).contiguous()
-        cached = (key, value)
-        proj._attn_res_triton_score_weight = cached
-    return cached[1]
+    """Fold the current fp32 ``norm.weight * proj.weight`` vector.
+
+    Do not retain this across forwards.  K3 installs skeleton tensors through
+    the parameter server during startup, and a folded tensor computed before
+    the final parameter contents are visible can remain permanently stale even
+    though the source Parameters are correct by admission time.  Re-folding
+    7,168 elements is negligible beside scanning every token and guarantees
+    that the fused path observes the same weights as the eager oracle.
+    """
+    return (
+        norm.weight.float() * proj.weight.squeeze(0).float()
+    ).contiguous()
 
 
 def mix_attn_residual_triton(
@@ -279,7 +277,7 @@ def mix_attn_residual_triton(
 
 
 def warmup_attn_residual_triton(model) -> int:
-    """Compile both kernels and prepare every score vector at server start."""
+    """Compile both kernels and enumerate every depth-mix site at startup."""
     pairs = []
     for layer in model.layers:
         pairs.extend(
@@ -291,9 +289,6 @@ def warmup_attn_residual_triton(model) -> int:
     pairs.append((model.output_attn_res_proj, model.output_attn_res_norm))
 
     with torch.inference_mode():
-        for proj, norm in pairs:
-            score_weight(proj, norm)
-
         proj, norm = pairs[0]
         hidden = proj.weight.shape[1]
         prefix = torch.zeros(
