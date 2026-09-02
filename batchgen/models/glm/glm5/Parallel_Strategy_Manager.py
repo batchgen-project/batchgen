@@ -14,7 +14,8 @@ Key differences from DeepSeek V3 PSM:
 - DSA dual KV cache handled automatically by batchgen_worker.py
 - MoE gate has e_score_correction_bias
 - Dense MLP layers 0-2, MoE layers 3-77
-- Prefill: all modules offloaded (DP), Decode: EP
+- Prefill: balanced homogeneous batches use EP; other batches use DP
+- Decode: EP
 """
 
 import gc
@@ -34,6 +35,38 @@ def _synchronize_prefill_preloads():
     """Keep one rank's forward from overlapping another rank's preload."""
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+def _balanced_prefill_ep_eligible(
+    rank_prompt_lengths,
+    world_size: int,
+    token_cap: int,
+) -> bool:
+    """True when every rank will execute one identical prefill microbatch.
+
+    The first EP-prefill implementation deliberately accepts only this shape:
+    every rank participates, every rank sees the same ordered prompt lengths,
+    and their sum fits one worker microbatch. Anything else stays on the
+    existing independent-DP path rather than risking mismatched collectives.
+    """
+    if world_size <= 1 or len(rank_prompt_lengths) != world_size:
+        return False
+    normalized = [
+        tuple(int(length) for length in lengths)
+        for lengths in rank_prompt_lengths
+    ]
+    if any(
+        not lengths or any(length <= 0 for length in lengths)
+        for lengths in normalized
+    ):
+        return False
+    if any(lengths != normalized[0] for lengths in normalized[1:]):
+        return False
+    # The worker never splits one sequence, even when it is longer than the
+    # packing cap. Preserve that documented long-prefill behavior so a single
+    # 256K prompt/rank still takes the collective EP path. With multiple
+    # sequences, requiring their sum to fit the cap proves one microbatch.
+    return len(normalized[0]) == 1 or sum(normalized[0]) <= int(token_cap)
 
 
 class GLM5ParallelStrategyManager:
@@ -63,18 +96,63 @@ class GLM5ParallelStrategyManager:
         self.global_rank = global_rank
         self.world_size = world_size
         self.rank = global_rank
+        self._prefill_comm = None
+        self._prefill_rank_prompt_lengths = None
+        self._prefill_ep_enabled = False
         # Detect FP8 variant by checking for expert scale tensors in skeleton
         self.is_fp8_experts = any(
             "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
         )
 
+    def set_comm(self, comm):
+        self._prefill_comm = comm
+
+    def set_prefill_batch_plan(self, rank_prompt_lengths) -> None:
+        self._prefill_rank_prompt_lengths = rank_prompt_lengths
+
     def configure_prefill(self):
-        """Configure model for prefill (pure DP, all modules offloaded)."""
+        """Configure an offloaded prefill model, using EP when fail-safe."""
         start_time = time.perf_counter()
         timings = {}
 
         self.loaded_model_config.phase = "prefill"
         Glm5MoE.reset_prefill_grouped_state()
+
+        token_cap = (
+            self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+        )
+        comm_compatible = bool(
+            self._prefill_comm is not None
+            and getattr(self._prefill_comm, "available", False)
+            and getattr(self._prefill_comm, "world_size", None) == self.world_size
+            and getattr(self._prefill_comm, "rank", None) == self.global_rank
+        )
+        self._prefill_ep_enabled = bool(
+            self.is_fp8_experts
+            and comm_compatible
+            and self.NUM_TOTAL_EXPERTS % self.world_size == 0
+            and _balanced_prefill_ep_eligible(
+                self._prefill_rank_prompt_lengths or [],
+                self.world_size,
+                token_cap,
+            )
+        )
+        routed_experts_this_rank = (
+            self.NUM_TOTAL_EXPERTS // self.world_size
+            if self._prefill_ep_enabled
+            else self.NUM_TOTAL_EXPERTS
+        )
+        self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer[
+            "routed_expert"
+        ] = 2 * routed_experts_this_rank
+        if self.rank == 0:
+            logging.info(
+                "[PREFILL] routed MoE parallelism: %s "
+                "(experts/rank=%d, ring_slots=%d)",
+                "EP" if self._prefill_ep_enabled else "DP",
+                routed_experts_this_rank,
+                2 * routed_experts_this_rank,
+            )
 
         step_start = time.perf_counter()
         self.model = Glm5ForCausalLM(self.loaded_model_config)
@@ -117,9 +195,16 @@ class GLM5ParallelStrategyManager:
                     }
                 self.weight_copy_task["shared_expert"].append(f"shared_expert_{layer_idx}")
 
-                # Routed experts — use static param names (experts are placeholders)
+                # Routed experts — EP prefill streams only this rank's shard;
+                # DP fallback preserves the full 256-expert task sequence.
                 _expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
-                for expert_idx in range(self.NUM_TOTAL_EXPERTS):
+                if self._prefill_ep_enabled:
+                    experts_per_rank = self.NUM_TOTAL_EXPERTS // self.world_size
+                    expert_start = self.global_rank * experts_per_rank
+                    expert_end = expert_start + experts_per_rank
+                else:
+                    expert_start, expert_end = 0, self.NUM_TOTAL_EXPERTS
+                for expert_idx in range(expert_start, expert_end):
                     module_key = f"routed_expert_{layer_idx}_{expert_idx}"
                     for name in _expert_param_names:
                         tensor_full_name = (
@@ -182,6 +267,7 @@ class GLM5ParallelStrategyManager:
             Glm5MoE.init_prefill_grouped_buffers(
                 self.loaded_model_config,
                 self.engine_config.Basic_Config.device_torch,
+                ep_size=self.world_size if self._prefill_ep_enabled else 1,
             )
             for moe in grouped_layers:
                 moe._prefill_release_event = torch.cuda.Event()
@@ -601,8 +687,20 @@ class GLM5ParallelStrategyManager:
                 getattr(self.loaded_model_config, "phase", "decode") == "prefill"
                 and self.is_fp8_experts
                 and not layer.mlp.shared_experts.persistent
-                and all(not expert.persistent for expert in layer.mlp.experts)
+                and all(
+                    not expert.persistent
+                    for expert in (
+                        layer.mlp.experts[
+                            layer.mlp.routed_expert_start_idx:
+                            layer.mlp.routed_expert_end_idx
+                        ]
+                        if self._prefill_ep_enabled
+                        else layer.mlp.experts
+                    )
+                )
             )
+            layer.mlp._prefill_ep_enabled = self._prefill_ep_enabled
+            layer.mlp.comm = self._prefill_comm if self._prefill_ep_enabled else None
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Expert module config time: {elapsed:.2f}s")

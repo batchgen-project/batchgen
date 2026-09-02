@@ -7290,6 +7290,26 @@ class BatchGenWorker:
 			)
 
 		# STEP 1: Configure model for prefill
+		# Give model-specific managers the exact per-rank prompt shape before
+		# they choose DP or collective EP prefill. GLM-5 enables EP only when
+		# every rank will execute one identical microbatch; all other shapes
+		# retain the existing DP path.
+		if hasattr(self.parallel_manager, "set_prefill_batch_plan"):
+			rank_prompt_lengths = [[] for _ in range(self.world_size)]
+			for uuid in prefill_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					raise RuntimeError(
+						f"Rank {self.rank}: missing prefill sequence {uuid[:8]}"
+					)
+				assigned_rank = int(seq.assigned_rank)
+				if not 0 <= assigned_rank < self.world_size:
+					raise RuntimeError(
+						f"invalid assigned_rank={assigned_rank} for {uuid[:8]}"
+					)
+				rank_prompt_lengths[assigned_rank].append(int(seq.prompt_length))
+			self.parallel_manager.set_prefill_batch_plan(rank_prompt_lengths)
+
 		# Hand the NCCL communicator to managers that need it during prefill
 		# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
 		if hasattr(self.parallel_manager, "set_comm"):

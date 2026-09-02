@@ -83,18 +83,21 @@ def _make_moe(experts, shared):
     torch.nn.Module.__init__(moe)
     moe.config = SimpleNamespace(phase="prefill")
     moe._prefill_grouped_enabled = True
+    moe._prefill_ep_enabled = False
     moe._prefill_prepared_keys = None
     moe._prefill_weight_prototypes = None
     moe._prefill_shared_key = None
     moe.layer_idx = 3
     moe.experts = experts
+    moe.routed_expert_start_idx = 0
+    moe.routed_expert_end_idx = len(experts)
     moe.shared_experts = shared
     return moe
 
 
 @pytest.fixture(autouse=True)
 def _reset_prefill_class_state():
-    Glm5MoE._prefill_buf = object()
+    Glm5MoE._prefill_buf = SimpleNamespace(num_experts=2)
     Glm5MoE._prefill_ptrs_pinned = torch.empty(78, 6, 2, dtype=torch.int64)
     Glm5MoE._prefill_ptrs_dev = torch.empty(6, 2, dtype=torch.int64)
     Glm5MoE._prefill_ring_pending = None
@@ -251,7 +254,11 @@ def test_grouped_forward_uses_core_async_release_without_python_pending_state(
     torch.nn.Module.__init__(moe)
     moe.layer_idx = 3
     moe.num_experts_per_tok = 1
+    moe.world_size = 1
     moe.device = torch.device("cpu")
+    moe._prefill_ep_enabled = False
+    moe.routed_expert_start_idx = 0
+    moe.routed_expert_end_idx = 1
     moe.gate = lambda hidden: (
         torch.ones(hidden.shape[0], 1),
         torch.zeros(hidden.shape[0], 1, dtype=torch.int64),
@@ -274,7 +281,13 @@ def test_grouped_forward_uses_core_async_release_without_python_pending_state(
     Glm5MoE._prefill_grouped_logged = True
     Glm5MoE._prefill_buf = SimpleNamespace(
         token_window=1,
+        local_token_window=1,
+        ep_size=1,
         num_experts=2,
+        all_tokens=None,
+        all_topk_weights=None,
+        all_topk_indices=None,
+        global_result=None,
         dispatched_x=torch.empty(1, 1),
         expert_counts=torch.zeros(2, dtype=torch.int32),
         expert_counters=torch.zeros(2, dtype=torch.int32),
