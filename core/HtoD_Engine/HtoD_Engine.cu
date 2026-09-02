@@ -459,7 +459,7 @@ void HtoD_Engine::HtoD_Worker() {
                     }
                     int64_t dst_byte_size = slot->second.nbytes();
                     if (src_byte_size != dst_byte_size) {
-                        // blocking_copy_ writes src_byte_size bytes with no
+                        // cudaMemcpyAsync writes src_byte_size bytes with no
                         // bound check: a short slot is overrun into its
                         // neighbour, a long one keeps a stale tail. Both are
                         // silent and both produce wrong weights.
@@ -473,14 +473,15 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
-                    // The dedicated H2D worker is already asynchronous with
-                    // respect to the Python compute thread.  Pace this stream
-                    // one tensor at a time so a rank cannot queue multiple
-                    // complete expert layers ahead of their consumers and
-                    // monopolize shared host-memory/PCIe service.
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
+                    // Queue every tensor in this one module on the dedicated
+                    // stream, then pace at the module boundary below. This
+                    // preserves bounded PCIe service while avoiding a stream
+                    // synchronization after every FP8 weight/scale tensor.
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        slot->second.data_ptr(), src_ptr, src_byte_size,
+                        cudaMemcpyHostToDevice, this->HtoD_stream));
                 }
+                CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
                 this->logger_->debug(
                     "Enqueued module copy: {} to buffer: {}", module_name,
                     buffer_idx);
