@@ -715,6 +715,42 @@ def _kda_segment_plan(cu_list, segment_tokens):
     return plan
 
 
+# One-entry cache of the segment plan for the current prefill microbatch.
+# The worker builds ``prepack_cu_seqlens`` on the device once per microbatch
+# and every KDA layer receives that same tensor object, so keying on identity
+# is exact.  Without it each of the 69 KDA layers re-ran ``cu_seqlens.tolist()``
+# (a device sync) and built one small device tensor per segment from host
+# memory (a pageable copy that drains the stream): 128 stalls per layer at
+# exact 64K, measured as ~100 ms/layer of idle inside the chunk sweep.
+_KDA_SEGMENT_PLAN_CACHE = {}
+
+
+def _kda_cached_segment_plan(cu_seqlens, segment_tokens):
+    """Return ``[(start, end, seq_lo, seq_hi, bounds_tensor)]`` for this batch."""
+    entry = _KDA_SEGMENT_PLAN_CACHE.get("entry")
+    if (
+        entry is not None
+        and entry["cu_seqlens"] is cu_seqlens
+        and entry["segment_tokens"] == segment_tokens
+    ):
+        return entry["plan"]
+    plan = [
+        (
+            start, end, lo, hi,
+            torch.tensor(bounds, dtype=torch.long, device=cu_seqlens.device),
+        )
+        for start, end, lo, hi, bounds in _kda_segment_plan(
+            cu_seqlens.tolist(), segment_tokens
+        )
+    ]
+    _KDA_SEGMENT_PLAN_CACHE["entry"] = {
+        "cu_seqlens": cu_seqlens,
+        "segment_tokens": segment_tokens,
+        "plan": plan,
+    }
+    return plan
+
+
 def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
                         recurrent_pool, kernel_kwargs, segment_tokens):
     """Run chunk_kda over a packed range, in token segments, and write the
@@ -744,14 +780,14 @@ def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
 
     o = torch.empty(q.shape[0], total, v.shape[2], v.shape[3],
                     dtype=v.dtype, device=v.device)
-    for start, end, lo, hi, bounds in _kda_segment_plan(
-            cu_seqlens.tolist(), segment_tokens):
+    for start, end, lo, hi, bounds in _kda_cached_segment_plan(
+            cu_seqlens, segment_tokens):
         seg_slots = slots[lo:hi]
         o_seg, recurrent_out = chunk_kda_fn(
             q=q[:, start:end], k=k[:, start:end], v=v[:, start:end],
             g=f[:, start:end], beta=beta[:, start:end],
             initial_state=recurrent_pool.index_select(0, seg_slots),
-            cu_seqlens=torch.tensor(bounds, dtype=torch.long, device=q.device),
+            cu_seqlens=bounds,
             **kernel_kwargs,
         )
         # The sequence that straddles `end` gets a PARTIAL state here; the

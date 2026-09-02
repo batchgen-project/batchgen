@@ -458,3 +458,23 @@ def test_output_buffer_matches_v(dtype):
     assert o.shape == (1, cu[-1], H, D) and o.dtype == dtype
     assert o.is_contiguous(), (
         "the stitched output must be contiguous — o_norm/o_proj reshape it")
+
+
+def test_segment_plan_is_cached_per_cu_seqlens_object():
+    """Same cu_seqlens object -> the cached plan (no re-planning, no new
+    bounds tensors); a new object or segment size -> a fresh plan whose
+    bounds equal the pure planner's."""
+    cu = torch.tensor([0, 137, 320, 400], dtype=torch.int32)
+    seg = 2 * BT
+    first = SM._kda_cached_segment_plan(cu, seg)
+    again = SM._kda_cached_segment_plan(cu, seg)
+    assert again is first
+    for (s0, e0, lo0, hi0, b0), (s1, e1, lo1, hi1, b1) in zip(
+            first, SM._kda_segment_plan(cu.tolist(), seg)):
+        assert (s0, e0, lo0, hi0) == (s1, e1, lo1, hi1)
+        assert b0.dtype == torch.long and b0.tolist() == b1
+    other = SM._kda_cached_segment_plan(cu, 3 * BT)
+    assert other is not first
+    fresh = SM._kda_cached_segment_plan(cu.clone(), seg)
+    assert fresh is not first
+    assert [p[:4] for p in fresh] == [p[:4] for p in first]
