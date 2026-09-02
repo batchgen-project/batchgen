@@ -371,7 +371,15 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     
     // Start timer for timeout tracking
     auto start_time = std::chrono::steady_clock::now();
-    constexpr auto timeout_duration = std::chrono::seconds(2);
+    // Prefill may enqueue a very long attention layer and immediately request
+    // the next layer while the single attention ring slot is still protected
+    // by its asynchronous consumer-completion event.  At 256K context that is
+    // a valid multi-second wait, not a stalled H2D producer.  Keep the short
+    // decode watchdog, but use the same bounded wait as pinned grouped-prefill
+    // acquisitions while the engine is in prefill.
+    const auto timeout_duration =
+        phase == "prefill" ? std::chrono::seconds(120)
+                           : std::chrono::seconds(2);
     
     try {
         while (true) {

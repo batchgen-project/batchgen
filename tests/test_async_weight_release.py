@@ -91,3 +91,16 @@ def test_h2d_weight_worker_paces_copies_before_publishing_ready_event():
     )
 
     assert copy_pos < publish_pos
+
+
+def test_weight_wait_timeout_allows_long_prefill_but_keeps_decode_watchdog():
+    source = (
+        _REPO_ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
+    ).read_text()
+    get_weights = source[
+        source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights(") :
+        source.index("void GPU_Weight_Buffer::weights_copy_enqueued(")
+    ]
+
+    assert 'phase == "prefill" ? std::chrono::seconds(120)' in get_weights
+    assert ': std::chrono::seconds(2)' in get_weights
