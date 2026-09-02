@@ -237,6 +237,13 @@ def worker(rank, world, out_path, master_port):
         ).forward(x, block.gate)
 
         shared = block.shared_experts(x)
+        # Use a production-scale collective payload for the all-reduce versus
+        # reduce-scatter comparison. At the tiny 64-row routed-kernel shape,
+        # NCCL selects a different reduction algorithm for the two APIs and
+        # measures that topology seam rather than the exact64 prefill path.
+        shared_rows = 65_536
+        shared_x = x.repeat(shared_rows // num_rows, 1)
+        shared_world1 = block.shared_experts(shared_x)
         shared_tp = copy.deepcopy(block.shared_experts)
         for name in ("gate_proj", "up_proj", "down_proj"):
             projection = getattr(shared_tp, name)
@@ -253,14 +260,26 @@ def worker(rank, world, out_path, master_port):
         shared_tp.gate_proj.out_features = shared_tp.intermediate_size
         shared_tp.up_proj.out_features = shared_tp.intermediate_size
         shared_tp.down_proj.in_features = shared_tp.intermediate_size
-        shared_tp_reference = shared_tp._ffn(x)
+        shared_local_reference = shared_tp._ffn(shared_x)
+        shared_tp_reference = shared_local_reference.clone()
         dist.all_reduce(shared_tp_reference, group=dist.group.WORLD)
-        shared_tp_vs_world1 = _err_ratio(shared_tp_reference, shared)
-        shared_input = all_gather_rows(
-            x_local, num_rows, world, rank, dist.group.WORLD
+        shared_tp_vs_world1 = _err_ratio(
+            shared_tp_reference, shared_world1
         )
+        shared_x_local = scatter_rows(shared_x, world, rank)
+        shared_input = all_gather_rows(
+            shared_x_local,
+            shared_rows,
+            world,
+            rank,
+            dist.group.WORLD,
+        )
+        shared_input_exact = torch.equal(shared_input, shared_x)
         shared_partial = shared_tp._ffn_into(
             shared_input, shared_input
+        )
+        shared_local_exact = torch.equal(
+            shared_partial, shared_local_reference
         )
         shared_sharded = reduce_scatter_rows(
             shared_partial, world, rank, dist.group.WORLD
@@ -269,10 +288,12 @@ def worker(rank, world, out_path, master_port):
             shared_sharded,
             scatter_rows(shared_tp_reference, world, rank),
         )
-        combined_sharded = shared_sharded + wide_local
+        routed_full = shared_x.mul(0.125)
+        routed_local = scatter_rows(routed_full, world, rank)
+        combined_sharded = shared_sharded + routed_local
         combined_sharded_error = _err_ratio(
             combined_sharded,
-            scatter_rows(shared_tp_reference + wide, world, rank),
+            scatter_rows(shared_tp_reference + routed_full, world, rank),
         )
         combined_reference = shared + wide
         combined = x.clone()
@@ -433,6 +454,11 @@ def worker(rank, world, out_path, master_port):
             "bounded output assembly parity failed: "
             f"shared_alias={shared_alias_error} combined={combined_error}"
         )
+    if not shared_input_exact or not shared_local_exact:
+        raise AssertionError(
+            "shared-expert sharded input/local FFN parity failed: "
+            f"input={shared_input_exact} local={shared_local_exact}"
+        )
     if shared_sharded_error >= 3e-3 or combined_sharded_error >= 3e-3:
         raise AssertionError(
             "sharded shared/routed merge parity failed: "
@@ -478,6 +504,9 @@ def worker(rank, world, out_path, master_port):
             "shared_forward_into_err_ratio": shared_alias_error,
             "shared_sharded_err_ratio": shared_sharded_error,
             "shared_tp_err_ratio_vs_world1": shared_tp_vs_world1,
+            "shared_collective_rows": shared_rows,
+            "shared_input_exact": shared_input_exact,
+            "shared_local_exact": shared_local_exact,
             "combined_sharded_err_ratio": combined_sharded_error,
             "bounded_gather_add_err_ratio": combined_error,
             "uneven_gather_add_exact": uneven_exact,
