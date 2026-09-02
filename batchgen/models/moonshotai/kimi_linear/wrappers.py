@@ -308,10 +308,16 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         global_sequence_ids = list(AttnWrapperBase.cur_batch or [])
         num_sequences = AttnWrapperBase.prepack_num_sequences
         view = self.core_engine.host_paged_kv_worker_view
+        # The worker publishes the same lengths as a host list next to the
+        # device cu_seqlens; reading them here avoids two device syncs per
+        # sequence per MLA layer (16 per layer at exact 64K).
+        seq_lengths = AttnWrapperBase.prepack_seq_lengths
+        if seq_lengths is None or len(seq_lengths) != num_sequences:
+            seq_lengths = cu_seqlens.diff().tolist()
+        start_idx = 0
         for seq_idx in range(num_sequences):
-            start_idx = int(cu_seqlens[seq_idx].item())
-            end_idx = int(cu_seqlens[seq_idx + 1].item())
-            seq_len = end_idx - start_idx
+            seq_len = int(seq_lengths[seq_idx])
+            end_idx = start_idx + seq_len
             if seq_len == 0:
                 continue
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
@@ -322,6 +328,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            start_idx = end_idx
 
     def _forward_decode(self, hidden_states, **kwargs):
         position_ids = AttnWrapperBase.position_ids
