@@ -25,11 +25,6 @@ import triton.language as tl
 
 _BLOCK_H = 1024
 _MAX_ROWS = 16
-# One 64 MiB workspace per GPU covers the requested one-million-token local
-# prefill envelope.  It is allocated and retained at server startup so the
-# score kernel never receives a caching-allocator block that a prior custom
-# stream may still be retiring.
-_SCORE_WORKSPACE_TOKENS = 1 << 20
 
 
 @triton.jit
@@ -215,25 +210,11 @@ def mix_attn_residual_triton(
     num_bank_rows = block_residual.shape[1]
     coefficients = score_weight(proj, norm)
 
-    score_workspace = getattr(
-        norm, "_attn_res_triton_score_workspace", None
+    scores = torch.empty(
+        (num_tokens, _MAX_ROWS),
+        dtype=torch.float32,
+        device=prefix_sum.device,
     )
-    if score_workspace is None:
-        # Standalone tests and non-server callers do not run the startup
-        # warmup.  Their ordinary allocation path remains supported.
-        scores = torch.empty(
-            (num_tokens, _MAX_ROWS),
-            dtype=torch.float32,
-            device=prefix_sum.device,
-        )
-    else:
-        if num_tokens > score_workspace.shape[0]:
-            raise RuntimeError(
-                "Kimi-K3 attention-residual score workspace supports at "
-                f"most {score_workspace.shape[0]} local tokens, got "
-                f"{num_tokens}"
-            )
-        scores = score_workspace[:num_tokens]
     _score_kernel[(num_tokens, num_bank_rows + 1)](
         prefix_sum,
         block_residual,
@@ -267,91 +248,6 @@ def mix_attn_residual_triton(
         num_warps=4,
     )
 
-    # The exact-64K correctness diagnostic first diverged at the layer-2
-    # input depth mix.  Re-run only the first bad local row through the eager
-    # oracle while the batch-level finite trace is enabled.  All selection and
-    # reductions stay on the model stream; the existing final profile snapshot
-    # is still the only host synchronization.  This is deliberately narrow so
-    # normal serving and performance runs execute no extra kernels.
-    profiler = getattr(norm, "_streamed_sp8_profiler", None)
-    layer_idx = getattr(norm, "_streamed_sp8_layer_idx", None)
-    profile_name = getattr(norm, "_streamed_sp8_profile_name", "")
-    if (
-        profiler is not None
-        and profiler.prefill_finite_check_enabled()
-        and layer_idx == 2
-        and profile_name == "self_depth_mix"
-    ):
-        from .block_residual import _apply_attn_res_eager
-
-        bad_rows = ~torch.isfinite(output).all(dim=1)
-        first_bad = bad_rows.to(torch.int32).argmax().reshape(1)
-        prefix_sample = prefix_sum.index_select(0, first_bad)
-        bank_sample = block_residual.index_select(0, first_bad)
-        score_sample = scores.index_select(0, first_bad)[
-            :, : num_bank_rows + 1
-        ]
-        output_sample = output.index_select(0, first_bad)
-
-        # Replay the same kernel first over the original view/grid and then
-        # over a contiguous one-row sample.  If only the original result is
-        # nonfinite, the arithmetic is exonerated and the remaining suspects
-        # are producer ordering, layout, or launch-scale behavior.  If both
-        # replays fail, the exact row is a deterministic kernel reproducer.
-        replay_scores = torch.empty_like(scores)
-        _score_kernel[(num_tokens, num_bank_rows + 1)](
-            prefix_sum,
-            block_residual,
-            coefficients,
-            replay_scores,
-            num_bank_rows,
-            norm.variance_epsilon,
-            prefix_sum.stride(0),
-            block_residual.stride(0),
-            block_residual.stride(1),
-            replay_scores.stride(0),
-            H=hidden,
-            BLOCK_H=_BLOCK_H,
-            num_warps=8,
-        )
-        replay_score_sample = replay_scores.index_select(0, first_bad)[
-            :, : num_bank_rows + 1
-        ]
-        row_replay_scores = torch.empty(
-            (1, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device
-        )
-        _score_kernel[(1, num_bank_rows + 1)](
-            prefix_sample,
-            bank_sample,
-            coefficients,
-            row_replay_scores,
-            num_bank_rows,
-            norm.variance_epsilon,
-            prefix_sample.stride(0),
-            bank_sample.stride(0),
-            bank_sample.stride(1),
-            row_replay_scores.stride(0),
-            H=hidden,
-            BLOCK_H=_BLOCK_H,
-            num_warps=8,
-        )
-        eager_sample = _apply_attn_res_eager(
-            prefix_sample, bank_sample, proj, norm
-        )
-        for stage, tensor in (
-            ("self_depth_mix_coefficients", coefficients),
-            ("self_depth_mix_local_prefix", prefix_sample),
-            ("self_depth_mix_local_bank", bank_sample),
-            ("self_depth_mix_scores", score_sample),
-            ("self_depth_mix_scores_replay_full", replay_score_sample),
-            (
-                "self_depth_mix_scores_replay_row",
-                row_replay_scores[:, : num_bank_rows + 1],
-            ),
-            ("self_depth_mix_local_output", output_sample),
-            ("self_depth_mix_eager_replay", eager_sample),
-        ):
-            profiler.record_prefill_finite_check(layer_idx, stage, tensor)
     return output
 
 
@@ -369,13 +265,6 @@ def warmup_attn_residual_triton(model) -> int:
 
     with torch.inference_mode():
         proj, norm = pairs[0]
-        score_workspace = torch.empty(
-            (_SCORE_WORKSPACE_TOKENS, _MAX_ROWS),
-            dtype=torch.float32,
-            device=proj.weight.device,
-        )
-        for _, site_norm in pairs:
-            site_norm._attn_res_triton_score_workspace = score_workspace
         hidden = proj.weight.shape[1]
         prefix = torch.zeros(
             (1, hidden),
