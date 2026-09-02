@@ -811,6 +811,11 @@ class StreamedSP8MXFP4MoELayer:
     # by the following attention layer. The first synchronous layer has no
     # gate/order-wait timestamps but still records acquisition and enqueue.
     _prefill_profile_host_records = []
+    # Optional batch-level correctness trace.  Each record keeps only a GPU
+    # scalar, not the activation tensor: the finite reduction is enqueued on
+    # the model stream and read once after prefill, so diagnostics do not add
+    # a host synchronization at every layer boundary.
+    _prefill_finite_checks = []
 
     @classmethod
     def reset_prefill_profile(cls, enabled: bool) -> None:
@@ -835,8 +840,49 @@ class StreamedSP8MXFP4MoELayer:
         cls._prefill_profile_load_spans = []
         cls._prefill_profile_broadcast_spans = []
         cls._prefill_profile_host_records = []
+        cls._prefill_finite_checks = []
         cls._prefill_profile_named_spans = {
             name: [] for name in cls._prefill_profile_span_names
+        }
+
+    @classmethod
+    def record_prefill_finite_check(
+        cls, layer_idx: int, stage: str, tensor: torch.Tensor
+    ) -> None:
+        """Queue one non-synchronizing finite check for a diagnostic batch."""
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+
+        debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+        enabled = debug.get("k3_prefill_finite_check", False)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return
+        cls._prefill_finite_checks.append({
+            "layer": int(layer_idx),
+            "stage": str(stage),
+            "all_finite": torch.isfinite(tensor).all(),
+        })
+
+    @classmethod
+    def prefill_finite_check_snapshot(cls) -> dict:
+        records = [
+            {
+                "layer": record["layer"],
+                "stage": record["stage"],
+                "all_finite": bool(record["all_finite"].item()),
+            }
+            for record in cls._prefill_finite_checks
+        ]
+        first_nonfinite = next(
+            (record for record in records if not record["all_finite"]),
+            None,
+        )
+        return {
+            "enabled": bool(records),
+            "count": len(records),
+            "first_nonfinite": first_nonfinite,
+            "records": records,
         }
 
     @classmethod
@@ -978,6 +1024,7 @@ class StreamedSP8MXFP4MoELayer:
             ])
             for name in cls._prefill_profile_span_names
         })
+        snapshot["finite_checks"] = cls.prefill_finite_check_snapshot()
         return snapshot
 
     def __init__(

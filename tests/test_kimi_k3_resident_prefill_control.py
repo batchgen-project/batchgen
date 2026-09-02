@@ -1337,6 +1337,49 @@ def test_streamed_sp8_attention_reduces_before_retaining_rows(monkeypatch):
     assert local._base is None
 
 
+def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
+    moe_path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    record = ast.unparse(
+        _function(
+            moe_path,
+            "StreamedSP8MXFP4MoELayer",
+            "record_prefill_finite_check",
+        )
+    )
+    snapshot = ast.unparse(
+        _function(
+            moe_path,
+            "StreamedSP8MXFP4MoELayer",
+            "prefill_finite_check_snapshot",
+        )
+    )
+
+    assert 'debug.get("k3_prefill_finite_check", False)' in record
+    assert "torch.isfinite(tensor).all()" in record
+    assert ".item()" not in record
+    assert '.item()' in snapshot
+
+    layer = ast.unparse(
+        _function(
+            ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "model.py",
+            "KimiDecoderLayer",
+            "_forward_attn_residual",
+        )
+    )
+    stages = (
+        "entry",
+        "post_input_depth_mix",
+        "post_attention",
+        "post_attention_residual",
+        "post_mlp_depth_mix",
+        "post_mlp_norm",
+        "post_ffn",
+        "output",
+    )
+    positions = [layer.index(f'"{stage}"') for stage in stages]
+    assert positions == sorted(positions)
+
+
 def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(

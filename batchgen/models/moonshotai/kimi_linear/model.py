@@ -950,6 +950,18 @@ class KimiDecoderLayer(nn.Module):
             profiler.end_profile_span("dense_mlp", span)
         return output
 
+    def _record_prefill_finite(self, stage, tensor):
+        """Queue a streamed-SP8 finite check without synchronizing the host."""
+        profiler = getattr(
+            getattr(self, "mlp_res_norm", None),
+            "_streamed_sp8_profiler",
+            None,
+        )
+        if profiler is not None:
+            profiler.record_prefill_finite_check(
+                self.layer_idx, stage, tensor
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -986,6 +998,7 @@ class KimiDecoderLayer(nn.Module):
         cu_seqlens, block_residual, **kwargs
     ):
         batch_size, _, hidden_size = hidden_states.shape
+        self._record_prefill_finite("entry", hidden_states)
         prefix_sum = hidden_states
 
         if block_residual is not None and block_residual.shape[1] > 0:
@@ -995,6 +1008,9 @@ class KimiDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             ).view(batch_size, -1, hidden_size)
+            self._record_prefill_finite(
+                "post_input_depth_mix", hidden_states
+            )
 
         if self.layer_idx % self.attn_res_block_size == 0:
             # Boundary: snapshot the PRE-mix prefix_sum, then RESET (assignment,
@@ -1018,6 +1034,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self._run_attn(
             hidden_states, attention_mask, position_ids, past_key_values, cu_seqlens, **kwargs
         )
+        self._record_prefill_finite("post_attention", hidden_states)
 
         if prefix_sum is not None:
             if prefix_sum.numel() != hidden_states.numel():
@@ -1043,6 +1060,7 @@ class KimiDecoderLayer(nn.Module):
             prefix_sum.add_(hidden_states)
         else:
             prefix_sum = hidden_states
+        self._record_prefill_finite("post_attention_residual", prefix_sum)
 
         hidden_states = _apply_attn_res(
             prefix_sum.view(-1, hidden_size),
@@ -1050,8 +1068,10 @@ class KimiDecoderLayer(nn.Module):
             self.mlp_res_proj,
             self.mlp_res_norm,
         ).view(batch_size, -1, hidden_size)
+        self._record_prefill_finite("post_mlp_depth_mix", hidden_states)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
+        self._record_prefill_finite("post_mlp_norm", hidden_states)
         moe = getattr(self, "block_sparse_moe", None)
         if (
             moe is not None
@@ -1059,6 +1079,7 @@ class KimiDecoderLayer(nn.Module):
         ):
             moe._streamed_sp8_global_rows = block_residual.shape[0]
         hidden_states = self._run_ffn(hidden_states)
+        self._record_prefill_finite("post_ffn", hidden_states)
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -1067,6 +1088,8 @@ class KimiDecoderLayer(nn.Module):
             # surviving prefix buffer instead of allocating another full
             # (tokens, hidden) tensor; exact-64K K3 is 896 MiB per rank here.
             prefix_sum.add_(hidden_states)
+
+        self._record_prefill_finite("output", prefix_sum)
 
         return prefix_sum, block_residual
 
