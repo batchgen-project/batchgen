@@ -846,17 +846,22 @@ class StreamedSP8MXFP4MoELayer:
         }
 
     @classmethod
-    def record_prefill_finite_check(
-        cls, layer_idx: int, stage: str, tensor: torch.Tensor
-    ) -> None:
-        """Queue one non-synchronizing finite check for a diagnostic batch."""
+    def prefill_finite_check_enabled(cls) -> bool:
+        """Return whether the current batch requested the finite trace."""
         from batchgen.models.wrappers.attention import AttnWrapperBase
 
         debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
         enabled = debug.get("k3_prefill_finite_check", False)
         if isinstance(enabled, str):
             enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
-        if not enabled:
+        return bool(enabled)
+
+    @classmethod
+    def record_prefill_finite_check(
+        cls, layer_idx: int, stage: str, tensor: torch.Tensor
+    ) -> None:
+        """Queue one non-synchronizing finite check for a diagnostic batch."""
+        if not cls.prefill_finite_check_enabled():
             return
         cls._prefill_finite_checks.append({
             "layer": int(layer_idx),

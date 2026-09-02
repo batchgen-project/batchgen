@@ -733,6 +733,7 @@ def test_streamed_sp8_init_attaches_order_wait_and_profiler():
     assert "norm._streamed_sp8_order_wait = order_wait" in source
     assert "norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer" in source
     assert "norm._streamed_sp8_profile_name = profile_name" in source
+    assert "norm._streamed_sp8_layer_idx = layer_idx" in source
     assert "norm._streamed_sp8_keep_sharded = True" in source
     assert "moe._streamed_sp8_sharded_carry = True" in source
     assert "output_norm._streamed_sp8_row_group = row_group" in source
@@ -1354,7 +1355,16 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
         )
     )
 
-    assert "k3_prefill_finite_check" in record
+    enabled = ast.unparse(
+        _function(
+            moe_path,
+            "StreamedSP8MXFP4MoELayer",
+            "prefill_finite_check_enabled",
+        )
+    )
+
+    assert "k3_prefill_finite_check" in enabled
+    assert "prefill_finite_check_enabled" in record
     assert "torch.isfinite(tensor).all()" in record
     assert ".item()" not in record
     assert '.item()' in snapshot

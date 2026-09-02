@@ -586,6 +586,7 @@ class KimiLinearParallelStrategyManager:
                             "_streamed_sp8_order_wait",
                             "_streamed_sp8_profiler",
                             "_streamed_sp8_profile_name",
+                            "_streamed_sp8_layer_idx",
                             "_streamed_sp8_keep_sharded",
                         ):
                             if hasattr(norm, name):
@@ -1015,6 +1016,7 @@ class KimiLinearParallelStrategyManager:
                 norm._streamed_sp8_order_wait = order_wait
                 norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
                 norm._streamed_sp8_profile_name = profile_name
+                norm._streamed_sp8_layer_idx = layer_idx
                 if profile_name == "mlp_depth_mix" and streamed_moe:
                     norm._streamed_sp8_keep_sharded = True
             if not streamed_moe:

@@ -238,6 +238,43 @@ def mix_attn_residual_triton(
         MAX_ROWS=_MAX_ROWS,
         num_warps=4,
     )
+
+    # The exact-64K correctness diagnostic first diverged at the layer-2
+    # input depth mix.  Re-run only the first bad local row through the eager
+    # oracle while the batch-level finite trace is enabled.  All selection and
+    # reductions stay on the model stream; the existing final profile snapshot
+    # is still the only host synchronization.  This is deliberately narrow so
+    # normal serving and performance runs execute no extra kernels.
+    profiler = getattr(norm, "_streamed_sp8_profiler", None)
+    layer_idx = getattr(norm, "_streamed_sp8_layer_idx", None)
+    profile_name = getattr(norm, "_streamed_sp8_profile_name", "")
+    if (
+        profiler is not None
+        and profiler.prefill_finite_check_enabled()
+        and layer_idx == 2
+        and profile_name == "self_depth_mix"
+    ):
+        from .block_residual import _apply_attn_res_eager
+
+        bad_rows = ~torch.isfinite(output).all(dim=1)
+        first_bad = bad_rows.to(torch.int32).argmax().reshape(1)
+        prefix_sample = prefix_sum.index_select(0, first_bad)
+        bank_sample = block_residual.index_select(0, first_bad)
+        score_sample = scores.index_select(0, first_bad)[
+            :, : num_bank_rows + 1
+        ]
+        output_sample = output.index_select(0, first_bad)
+        eager_sample = _apply_attn_res_eager(
+            prefix_sample, bank_sample, proj, norm
+        )
+        for stage, tensor in (
+            ("self_depth_mix_local_prefix", prefix_sample),
+            ("self_depth_mix_local_bank", bank_sample),
+            ("self_depth_mix_scores", score_sample),
+            ("self_depth_mix_local_output", output_sample),
+            ("self_depth_mix_eager_replay", eager_sample),
+        ):
+            profiler.record_prefill_finite_check(layer_idx, stage, tensor)
     return output
 
 
