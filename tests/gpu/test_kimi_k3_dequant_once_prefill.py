@@ -105,9 +105,11 @@ def test_expert_path_matches_marlin_compact_path():
     one_owned[3, 5] = 8  # exactly one assignment to local expert 0
     o1, p1 = dq.expert_path(x[:64], one_owned, 64, 8)
     assert int((p1 >= 0).sum()) == 1 and int(p1[3 * top_k + 5]) >= 0
-    ref1_h, ref1_o = ref_expert(x[3:4], *(dequant(*raw[0][w]) for w in ("w1", "w3", "w2")))
-    d1 = (o1[p1[3 * top_k + 5].long()].float() - ref1_o[0].float()).abs()
-    assert bool((d1 <= 1e-5 + 1.6e-2 * ref1_o[0].float().abs()).float().mean() > 0.999)
+    pmr, pc = compact_dispatch_route_stats_by_chunk(one_owned, 8, E, 64)[0]
+    r1_out, r1_pos = helper._expert_path(x[:64], one_owned, 64, packed_capacity=pc, packed_max_rows=pmr)
+    a1 = r1_out[r1_pos[3 * top_k + 5].long()].float()
+    b1 = o1[p1[3 * top_k + 5].long()].float()
+    assert bool(((a1 - b1).abs() <= 1e-5 + 1.6e-2 * a1.abs()).float().mean() > 0.999)
 
     # streamed-SP8 shard shape (StreamedSP8LayerBuffer._make_shard): stacked
     # Marlin-order views instead of per-expert dicts -> identical staging
