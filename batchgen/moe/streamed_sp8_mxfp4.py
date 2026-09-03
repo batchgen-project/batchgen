@@ -853,6 +853,38 @@ class StreamedSP8MXFP4MoELayer:
             name: [] for name in cls._prefill_profile_span_names
         }
 
+    # Routed-expert kernel for the chunked prefill paths: "dequant_once" stages
+    # the layer's shard as BF16 once and runs grouped BF16 GEMMs (H200: 8.7 ms
+    # per 65K-row chunk vs 25.5 ms for the M16 Marlin path, kernel-dev
+    # k3_routed_mxfp4 v1); "marlin" keeps the grouped M16 Marlin kernels.
+    # ``batchgen_debug.k3_prefill_routed_kernel`` overrides per batch.
+    prefill_routed_kernel = "dequant_once"
+
+    @classmethod
+    def prefill_routed_kernel_selected(cls) -> str:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+
+        debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+        choice = str(debug.get("k3_prefill_routed_kernel", cls.prefill_routed_kernel)).strip().lower()
+        if choice not in {"dequant_once", "marlin"}:
+            raise ValueError(
+                f"k3_prefill_routed_kernel must be 'dequant_once' or 'marlin', got {choice!r}"
+            )
+        return choice
+
+    @classmethod
+    def prefill_dequant_once(cls, shard, device, profile):
+        """BF16-stage ``shard`` for this layer's prefill, or None for the Marlin path."""
+        if cls.prefill_routed_kernel_selected() != "dequant_once":
+            return None
+        from batchgen.moe.k3_prefill_dequant_once import K3PrefillDequantOnce
+
+        span = cls.begin_profile_span() if profile else None
+        staged = K3PrefillDequantOnce(shard, device)
+        if profile:
+            cls.end_profile_span("grouped_dequant_once", span)
+        return staged
+
     @classmethod
     def prefill_finite_check_enabled(cls) -> bool:
         """Return whether the current batch requested the finite trace."""
@@ -1240,6 +1272,7 @@ class StreamedSP8MXFP4MoELayer:
             num_local,
             self.chunk_rows,
         )
+        staged = cls.prefill_dequant_once(shard, x.device, profile)
         for chunk_index, start in enumerate(
             range(0, num_node_rows, self.chunk_rows)
         ):
@@ -1247,13 +1280,22 @@ class StreamedSP8MXFP4MoELayer:
             count = end - start
             packed_max_rows, packed_capacity = packed_route_stats[chunk_index]
             expert_path_span = cls.begin_profile_span() if profile else None
-            expert_out, topk_pos = helper._expert_path(
-                all_latent[start:end],
-                all_idx[start:end],
-                count,
-                packed_capacity=packed_capacity,
-                packed_max_rows=packed_max_rows,
-            )
+            if staged is not None:
+                expert_out, topk_pos = staged.expert_path(
+                    all_latent[start:end],
+                    all_idx[start:end],
+                    count,
+                    expert_start,
+                    packed_capacity=packed_capacity,
+                )
+            else:
+                expert_out, topk_pos = helper._expert_path(
+                    all_latent[start:end],
+                    all_idx[start:end],
+                    count,
+                    packed_capacity=packed_capacity,
+                    packed_max_rows=packed_max_rows,
+                )
             if profile:
                 cls.end_profile_span(
                     "grouped_expert_path", expert_path_span
@@ -1366,6 +1408,7 @@ class StreamedSP8MXFP4MoELayer:
             # mislabelling one stripe as a whole-layer phase.
             _profile_mark(marks)
 
+        staged = cls.prefill_dequant_once(shard, x.device, profile)
         for local_start in range(0, ntp, stripe_rows):
             local_end = min(local_start + stripe_rows, ntp)
             count = local_end - local_start
@@ -1428,13 +1471,22 @@ class StreamedSP8MXFP4MoELayer:
                 )[0]
             )
             expert_path_span = cls.begin_profile_span() if profile else None
-            expert_out, topk_pos = helper._expert_path(
-                all_latent,
-                all_idx,
-                num_stripe_rows,
-                packed_capacity=packed_capacity,
-                packed_max_rows=packed_max_rows,
-            )
+            if staged is not None:
+                expert_out, topk_pos = staged.expert_path(
+                    all_latent,
+                    all_idx,
+                    num_stripe_rows,
+                    expert_start,
+                    packed_capacity=packed_capacity,
+                )
+            else:
+                expert_out, topk_pos = helper._expert_path(
+                    all_latent,
+                    all_idx,
+                    num_stripe_rows,
+                    packed_capacity=packed_capacity,
+                    packed_max_rows=packed_max_rows,
+                )
             if profile:
                 cls.end_profile_span(
                     "grouped_expert_path", expert_path_span
