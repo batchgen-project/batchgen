@@ -96,6 +96,19 @@ def test_expert_path_matches_marlin_compact_path():
     cfrac = ((ca - cb).abs() > ctol).float().mean().item()
     assert cfrac < 1e-3, f"combine: {cfrac:.2e} outside tolerance"
 
+    # chunks that route nothing (or almost nothing) to this rank's experts: the
+    # wide prefill path produces them; the contract stays (all -1 positions)
+    none_owned = torch.randint(E + 8, E_global, (64, top_k), dtype=torch.int32, device=dev, generator=gen)
+    o0, p0 = dq.expert_path(x[:64], none_owned, 64, 8)
+    assert bool((p0 == -1).all()) and o0.shape[1] == K
+    one_owned = none_owned.clone()
+    one_owned[3, 5] = 8  # exactly one assignment to local expert 0
+    o1, p1 = dq.expert_path(x[:64], one_owned, 64, 8)
+    assert int((p1 >= 0).sum()) == 1 and int(p1[3 * top_k + 5]) >= 0
+    ref1_h, ref1_o = ref_expert(x[3:4], *(dequant(*raw[0][w]) for w in ("w1", "w3", "w2")))
+    d1 = (o1[p1[3 * top_k + 5].long()].float() - ref1_o[0].float()).abs()
+    assert bool((d1 <= 1e-5 + 1.6e-2 * ref1_o[0].float().abs()).float().mean() > 0.999)
+
     # streamed-SP8 shard shape (StreamedSP8LayerBuffer._make_shard): stacked
     # Marlin-order views instead of per-expert dicts -> identical staging
     from types import SimpleNamespace

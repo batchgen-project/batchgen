@@ -156,8 +156,15 @@ class K3PrefillDequantOnce:
         dst = pad_start[e_of_row] + (src - offsets[:-1].to(torch.int64)[e_of_row])
         A = torch.zeros(max(total, GROUP_ALIGN), K, dtype=torch.bfloat16, device=device)
         A.index_copy_(0, dst, dispatched[:src_rows])
+        if src_rows == 0:
+            # No assignment of this chunk routes to this rank's experts (small
+            # or padded chunks): topk_pos is already all -1, nothing to compute.
+            return torch.zeros(GROUP_ALIGN, K, dtype=torch.bfloat16, device=device), topk_pos
+        # map compact positions to padded rows without a data-dependent sync:
+        # the appended sentinel row keeps -1 for non-owned assignments
         pos = topk_pos.to(torch.int64)
-        topk_pos_padded = torch.where(pos >= 0, dst[pos.clamp_min(0)], pos).to(torch.int32)
+        dst_ext = torch.cat([dst, dst.new_full((1,), -1)])
+        topk_pos_padded = dst_ext[torch.where(pos >= 0, pos, src_rows)].to(torch.int32)
         offs = pad_end.to(torch.int32)
         gu = torch._grouped_mm(A, self.w_gu_t, offs=offs)            # [rows_p, 2N]
         h = torch.empty(A.shape[0], N, dtype=torch.bfloat16, device=device)
