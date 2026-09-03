@@ -10,6 +10,7 @@ from batchgen.models.glm.glm5.wrappers import _GLM5_PREFILL_CATEGORIES
 class _Timer:
     def __init__(self):
         self.ops = []
+        self.enabled = True
 
     @contextmanager
     def timed(self, name, layer_idx):

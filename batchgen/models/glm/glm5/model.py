@@ -2950,6 +2950,8 @@ class Glm5DecoderLayer(nn.Module):
         _attn_cfg = getattr(getattr(self.self_attn, 'module', self.self_attn), 'config', None)
         _is_decode = getattr(_attn_cfg, 'phase', 'decode') == 'decode'
         timer = get_decode_timer() if _is_decode else get_prefill_timer()
+        if timer is not None and not timer.enabled:
+            timer = None
         li = self.layer_idx
 
         # Acquire this layer's full 256-expert pointer table at layer entry,
