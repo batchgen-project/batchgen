@@ -76,13 +76,18 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 _GLM5_PREFILL_CATEGORIES = [
+    "scheduler_capacity_all_gather", "setup_prepack", "setup_flatten",
+    "microbatch_input_concat", "microbatch_cu_seqlens", "embedding",
+    "input_norm", "add_rmsnorm", "dense_mlp", "residual_add",
     "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
     "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
     "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
     "indexer_wk", "indexer_norm", "indexer_rope_hadamard",
     "indexer_kv_materialize", "primary_kv_materialize",
+    "moe_pointer_table_h2d",
     "moe_router", "moe_dispatch", "moe_act_quant_s1", "moe_grouped_s1",
     "moe_act_quant_s3", "moe_grouped_s3", "moe_reduce", "moe_shared",
+    "final_norm", "last_token_gather", "lm_head", "token_select",
 ]
 _glm5_prefill_timer = init_prefill_timer("GLM-5", _GLM5_PREFILL_CATEGORIES)
 

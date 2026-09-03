@@ -2943,13 +2943,13 @@ class Glm5DecoderLayer(nn.Module):
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         from contextlib import nullcontext as _nullctx
-        from batchgen.timing import get_decode_timer
+        from batchgen.timing import get_decode_timer, get_prefill_timer
 
         # self_attn is the GLM5AttnWrapper; the config (with .phase) lives on
         # the wrapped module.
         _attn_cfg = getattr(getattr(self.self_attn, 'module', self.self_attn), 'config', None)
         _is_decode = getattr(_attn_cfg, 'phase', 'decode') == 'decode'
-        dt = get_decode_timer() if _is_decode else None
+        timer = get_decode_timer() if _is_decode else get_prefill_timer()
         li = self.layer_idx
 
         # Acquire this layer's full 256-expert pointer table at layer entry,
@@ -2965,7 +2965,7 @@ class Glm5DecoderLayer(nn.Module):
 
         # Pre-norm attention
         residual = hidden_states
-        with (dt.timed("input_norm", li) if dt else _nullctx()):
+        with (timer.timed("input_norm", li) if timer else _nullctx()):
             hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
@@ -2977,7 +2977,7 @@ class Glm5DecoderLayer(nn.Module):
 
         # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        with (dt.timed("add_rmsnorm", li) if dt else _nullctx()):
+        with (timer.timed("add_rmsnorm", li) if timer else _nullctx()):
             hidden_states, residual = cuda_add_rmsnorm(
                 residual, hidden_states,
                 self.post_attention_layernorm.weight,
@@ -2985,10 +2985,10 @@ class Glm5DecoderLayer(nn.Module):
             )
 
         # MoE/FFN
-        with (dt.timed("dense_mlp", li)
-              if dt and isinstance(self.mlp, Glm5MLP) else _nullctx()):
+        with (timer.timed("dense_mlp", li)
+              if timer and isinstance(self.mlp, Glm5MLP) else _nullctx()):
             hidden_states = self.mlp(hidden_states)
-        with (dt.timed("residual_add", li) if dt else _nullctx()):
+        with (timer.timed("residual_add", li) if timer else _nullctx()):
             hidden_states = residual + hidden_states
 
         if (

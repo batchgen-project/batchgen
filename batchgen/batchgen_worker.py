@@ -5898,16 +5898,43 @@ class BatchGenWorker:
 			report_node = -1
 			report_free = 0  # Non-first ranks report 0
 
-		free_tensor = torch.tensor([report_node, report_free], dtype=torch.int64, device=self.torch_device)
-		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, free_tensor)
+		try:
+			from batchgen.timing import get_prefill_timer
+			_prefill_timer = get_prefill_timer()
+		except ImportError:
+			_prefill_timer = None
+		if _prefill_timer is not None and not _prefill_timer.enabled:
+			_prefill_timer = None
+
+		_gather_host_ctx = (
+			_prefill_timer.host_timed("scheduler_capacity_all_gather")
+			if _prefill_timer is not None else nullcontext()
+		)
+		_gather_gpu_ctx = (
+			_prefill_timer.timed("scheduler_capacity_all_gather", -1)
+			if _prefill_timer is not None else nullcontext()
+		)
+		with _gather_host_ctx:
+			with _gather_gpu_ctx:
+				free_tensor = torch.tensor(
+					[report_node, report_free],
+					dtype=torch.int64,
+					device=self.torch_device,
+				)
+				gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
+				dist.all_gather(gathered, free_tensor)
 
 		# Extract per-node host KV free pages
-		reports_by_node = {}
-		for item in gathered:
-			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = int(item[1].item())
+		_extract_ctx = (
+			_prefill_timer.host_timed("scheduler_capacity_gpu_to_cpu")
+			if _prefill_timer is not None else nullcontext()
+		)
+		with _extract_ctx:
+			reports_by_node = {}
+			for item in gathered:
+				node_id = int(item[0].item())
+				if node_id >= 0:
+					reports_by_node[node_id] = int(item[1].item())
 		per_node_host_free = []
 		for node in range(num_nodes):
 			per_node_host_free.append(reports_by_node.get(node, 0))
@@ -8300,6 +8327,24 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
+		try:
+			from batchgen.timing import get_prefill_timer
+			_prefill_timer = get_prefill_timer()
+		except ImportError:
+			_prefill_timer = None
+		if _prefill_timer is not None and not _prefill_timer.enabled:
+			_prefill_timer = None
+
+		def _prefill_gpu_timed(name: str):
+			if _prefill_timer is None:
+				return nullcontext()
+			return _prefill_timer.timed(name, -1)
+
+		def _prefill_host_timed(name: str):
+			if _prefill_timer is None:
+				return nullcontext()
+			return _prefill_timer.host_timed(name, -1)
+
 		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
 		# loop. Without this binding, GLM-5's prefill indexer-K offload at
 		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
@@ -8321,6 +8366,7 @@ class BatchGenWorker:
 		attention_mask_list = []
 		seq_lengths = []
 
+		_collect_t0 = time.perf_counter() if _prefill_timer is not None else None
 		for query_idx in batch:
 			uuid = self._local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -8360,16 +8406,24 @@ class BatchGenWorker:
 
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
+		if _collect_t0 is not None:
+			_prefill_timer.record(
+				"host:setup_collect_sequences",
+				-1,
+				(time.perf_counter() - _collect_t0) * 1000.0,
+			)
 
 		# Prepack sequences
 		# Row capacity is set by planner in config (None = no limit, use max sequence length)
 		row_capacity = self.engine_config.Module_Batching_Config.prepack_row_capacity
-		prepack_meta = prepack_sequences(
-			input_ids_list,
-			attention_mask_list,
-			row_capacity=row_capacity,
-			device=self.torch_device,
-		)
+		with _prefill_host_timed("setup_prepack_enqueue"):
+			with _prefill_gpu_timed("setup_prepack"):
+				prepack_meta = prepack_sequences(
+					input_ids_list,
+					attention_mask_list,
+					row_capacity=row_capacity,
+					device=self.torch_device,
+				)
 
 		# Log prepack statistics
 		if self.rank == 0:
@@ -8388,19 +8442,21 @@ class BatchGenWorker:
 		packed_input_ids_flat = []
 		packed_position_ids_flat = []
 
-		for seq_idx in range(prepack_meta.num_original_sequences):
-			row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
-			seq_len = prepack_meta.original_seq_lengths[seq_idx]
+		with _prefill_host_timed("setup_flatten_enqueue"):
+			with _prefill_gpu_timed("setup_flatten"):
+				for seq_idx in range(prepack_meta.num_original_sequences):
+					row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
+					seq_len = prepack_meta.original_seq_lengths[seq_idx]
 
-			# Extract tokens for this sequence
-			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
-			packed_input_ids_flat.append(seq_input_ids)
+					# Extract tokens for this sequence
+					seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
+					packed_input_ids_flat.append(seq_input_ids)
 
-			# Position IDs are 0, 1, 2, ... for each sequence
-			packed_position_ids_flat.append(torch.arange(seq_len, device=self.torch_device))
+					# Position IDs are 0, 1, 2, ... for each sequence
+					packed_position_ids_flat.append(torch.arange(seq_len, device=self.torch_device))
 
-		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
-		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
+				packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
+				packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
 
 		# Split sequences into micro-batches based on TOKEN count (not sequence count)
 		# This prevents OOM when sequences have varying lengths
@@ -8414,11 +8470,12 @@ class BatchGenWorker:
 		# on one micro-batch when a single very long sequence is present.
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-		micro_batches, l2_cap = build_prefill_micro_batches(
-			seq_lengths_list,
-			MAX_TOKENS_PER_MICRO_BATCH,
-			l2_balance=_USE_L2_MB,
-		)
+		with _prefill_host_timed("setup_plan_microbatches"):
+			micro_batches, l2_cap = build_prefill_micro_batches(
+				seq_lengths_list,
+				MAX_TOKENS_PER_MICRO_BATCH,
+				l2_balance=_USE_L2_MB,
+			)
 		planned_sequence_indices = [
 			seq_idx
 			for seq_start, seq_end in micro_batches
@@ -8452,6 +8509,9 @@ class BatchGenWorker:
 			):
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
+				_microbatch_setup_t0 = (
+					time.perf_counter() if _prefill_timer is not None else None
+				)
 
 				# Get sequences for this micro-batch
 				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
@@ -8471,8 +8531,9 @@ class BatchGenWorker:
 					batch_input_ids.append(packed_input_ids_flat[seq_token_start:seq_token_end])
 					batch_position_ids.append(packed_position_ids_flat[seq_token_start:seq_token_end])
 
-				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
-				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
+				with _prefill_gpu_timed("microbatch_input_concat"):
+					batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
+					batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
 
 				batch_local_indices = batch[seq_start:seq_end]
 				local_to_global_seq_id_map = {}
@@ -8495,11 +8556,12 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
-				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
-					dtype=torch.int32,
-					device=self.torch_device,
-				)
+				with _prefill_gpu_timed("microbatch_cu_seqlens"):
+					batch_cu_seqlens = torch.tensor(
+						prefill_sequence_spans_to_cu_seqlens(batch_spans),
+						dtype=torch.int32,
+						device=self.torch_device,
+					)
 				batch_max_seqlen = max(batch_seq_lengths)
 
 				# Set up Attn_Wrapper for this micro-batch.
@@ -8524,9 +8586,18 @@ class BatchGenWorker:
 				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+				if _microbatch_setup_t0 is not None:
+					_prefill_timer.record(
+						"host:microbatch_metadata_setup",
+						-1,
+						(time.perf_counter() - _microbatch_setup_t0) * 1000.0,
+					)
 
 				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+				with _prefill_gpu_timed("embedding"):
+					inputs_embeds = self.model.model.embed_tokens(
+						batch_input_ids_flat.to(self.torch_device)
+					)
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
@@ -8589,32 +8660,36 @@ class BatchGenWorker:
 					).view(batch_sz, seq_sz, hidden_dim)
 
 				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
+				with _prefill_gpu_timed("final_norm"):
+					hidden_states = self.model.model.norm(hidden_states)
 
 				# Extract last token hidden states for each sequence
-				last_token_indices = batch_cu_seqlens[1:] - 1
-				last_token_hidden = hidden_states[0, last_token_indices, :]
+				with _prefill_gpu_timed("last_token_gather"):
+					last_token_indices = batch_cu_seqlens[1:] - 1
+					last_token_hidden = hidden_states[0, last_token_indices, :]
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
 				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-				if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
+				with _prefill_gpu_timed("lm_head"):
+					if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+						logits = torch.nn.functional.linear(
+							last_token_hidden.float(),
+							self.model.lm_head.weight.float(),
+							self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						)
+					else:
+						logits = torch.nn.functional.linear(
+							last_token_hidden,
+							self.model.lm_head.weight,
+							self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						).float()
 
 				batch_sequences = [
 					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
 					for local_idx in batch_local_indices
 				]
-				batch_new_tokens = self._select_tokens(logits, batch_sequences)
+				with _prefill_gpu_timed("token_select"):
+					batch_new_tokens = self._select_tokens(logits, batch_sequences)
 				if batch_new_tokens.shape[0] != batch_num_seqs:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
