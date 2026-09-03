@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer, init_prefill_timer
+from .config import dsa_layer_skips_topk
 
 # Try importing FP8 absorb kernels (WP5)
 try:
@@ -82,6 +83,9 @@ _GLM5_PREFILL_CATEGORIES = [
     "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
     "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
     "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
+    "attn_input_quant", "attn_q_a_quant", "attn_kv_b_dequant",
+    "indexer_prefill_score", "attn_sparse_q_absorb",
+    "attn_sparse_flashmla", "attn_sparse_out_absorb",
     "indexer_wk", "indexer_norm", "indexer_rope_hadamard",
     "indexer_kv_materialize", "primary_kv_materialize",
     "moe_pointer_table_h2d",
@@ -441,6 +445,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
     # FULL layer, reused by subsequent shared layers. Reset per decode step by the
     # worker. For GLM-5 (all layers full) this is never read by a shared branch.
     _dsa_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_causal_starts: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_causal_ends: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_path_counts: ClassVar[Optional[Dict[str, Dict[int, int]]]] = None
     # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
     # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
     # rows instead of deriving slot count from cur_batch.
@@ -451,6 +459,79 @@ class GLM5AttnWrapper(AttnWrapperBase):
     # Runtime proof that every prefill token's primary MLA KV and every
     # applicable auxiliary/indexer KV were scheduled for host offload.
     glm5_prefill_kv_offload_audit: ClassVar[Optional[Dict[str, Dict[int, dict]]]] = None
+
+    @classmethod
+    def _reset_glm52_prefill_path_counts(cls) -> None:
+        cls._dsa_prefill_path_counts = {
+            "dense": {},
+            "sparse": {},
+            "indexer_compute": {},
+            "indexer_reuse": {},
+        }
+
+    @classmethod
+    def _record_glm52_prefill_path(cls, path: str, layer_idx: int) -> None:
+        counts = cls._dsa_prefill_path_counts
+        if counts is None:
+            cls._reset_glm52_prefill_path_counts()
+            counts = cls._dsa_prefill_path_counts
+        if path not in counts:
+            raise RuntimeError(f"unknown GLM-5.2 prefill path: {path}")
+        layer_idx = int(layer_idx)
+        counts[path][layer_idx] = counts[path].get(layer_idx, 0) + 1
+
+    def _finish_glm52_prefill_path_counts(self) -> None:
+        counts = type(self)._dsa_prefill_path_counts
+        type(self)._dsa_prefill_path_counts = None
+        if counts is None:
+            raise RuntimeError("GLM-5.2 prefill path audit was not initialized")
+
+        expected_layers = set(range(self.module.config.num_hidden_layers))
+        sparse_layers = set(counts["sparse"])
+        dense_layers = set(counts["dense"])
+        if sparse_layers:
+            expected_sparse = {
+                layer_idx: 1 for layer_idx in expected_layers
+            }
+            expected_compute = {
+                layer_idx: 1 for layer_idx in expected_layers
+                if not dsa_layer_skips_topk(self.module.config, layer_idx)
+            }
+            expected_reuse = {
+                layer_idx: 1
+                for layer_idx in expected_layers
+                if dsa_layer_skips_topk(self.module.config, layer_idx)
+            }
+            if (
+                counts["sparse"] != expected_sparse
+                or dense_layers
+                or counts["indexer_compute"] != expected_compute
+                or counts["indexer_reuse"] != expected_reuse
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 sparse prefill coverage mismatch: "
+                    f"sparse={sorted(sparse_layers)}, dense={sorted(dense_layers)}, "
+                    f"compute={sorted(counts['indexer_compute'])}, "
+                    f"reuse={sorted(counts['indexer_reuse'])}"
+                )
+            mode = "sparse"
+        else:
+            expected_dense = {layer_idx: 1 for layer_idx in expected_layers}
+            if counts["dense"] != expected_dense:
+                raise RuntimeError(
+                    "GLM-5.2 dense prefill coverage mismatch: "
+                    f"dense={counts['dense']}"
+                )
+            mode = "dense-short"
+
+        logging.info(
+            "[GLM52_PREFILL_PATH] mode=%s layers=%d "
+            "indexer_compute=%s indexer_reuse=%s",
+            mode,
+            len(expected_layers),
+            sorted(counts["indexer_compute"]),
+            sorted(counts["indexer_reuse"]),
+        )
 
     @classmethod
     def start_prefill_kv_offload_audit(cls) -> None:
@@ -489,6 +570,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
     @classmethod
     def abort_prefill_kv_offload_audit(cls) -> None:
         cls.glm5_prefill_kv_offload_audit = None
+        cls._dsa_prefill_prev_topk_indices = None
+        cls._dsa_prefill_causal_starts = None
+        cls._dsa_prefill_causal_ends = None
+        cls._dsa_prefill_path_counts = None
 
     def __init__(
         self,
@@ -894,23 +979,116 @@ class GLM5AttnWrapper(AttnWrapperBase):
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward with DSA auxiliary cache population.
 
-        1. Standard MLA prefill via FA3 (full attention)
-        2. Compute indexer K and write to auxiliary cache
+        GLM-5.2 long microbatches run sparse absorbed MLA with full/shared
+        indexer reuse. Short microbatches and older GLM variants retain dense
+        FA3. Full indexer layers also populate the auxiliary host KV cache.
         """
         AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
             self.layer_idx,
             device=hidden_states.device,
         )
         if self.prepack_mode:
+            if self.layer_idx == 0:
+                type(self)._dsa_prefill_prev_topk_indices = None
+                type(self)._dsa_prefill_causal_starts = None
+                type(self)._dsa_prefill_causal_ends = None
+                if (
+                    getattr(self.module.config, "model_type", None)
+                    == "glm_moe_dsa_5_2"
+                ):
+                    type(self)._reset_glm52_prefill_path_counts()
             hidden_states_2d = hidden_states.squeeze(0)
-            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-                self.weight_dequant_scale
+            position_ids = self.position_ids.to(hidden_states_2d.device)
+            cu_seqlens = self.prepack_cu_seqlens.to(hidden_states_2d.device)
+            config = getattr(self.module, "config", None)
+            from batchgen.models.glm.glm5.sparse_prefill import (
+                should_use_glm52_sparse_prefill,
             )
+            use_sparse_prefill = should_use_glm52_sparse_prefill(
+                getattr(config, "model_type", None),
+                self.prepack_max_seqlen,
+                getattr(config, "index_topk", 2048),
+            )
+            if use_sparse_prefill:
+                if type(self)._dsa_prefill_causal_starts is None:
+                    from batchgen.models.glm.glm5.sparse_prefill import (
+                        build_packed_causal_ranges,
+                    )
+
+                    (
+                        type(self)._dsa_prefill_causal_starts,
+                        type(self)._dsa_prefill_causal_ends,
+                    ) = build_packed_causal_ranges(
+                        cu_seqlens,
+                        position_ids,
+                        hidden_states_2d.shape[0],
+                        sequence_lengths=list(self.prepack_seq_lengths),
+                    )
+                if self.module.indexer is not None:
+                    reusable_topk_indices = (
+                        type(self)._dsa_prefill_prev_topk_indices
+                    )
+                    type(self)._record_glm52_prefill_path(
+                        "indexer_compute",
+                        self.layer_idx,
+                    )
+                    type(self)._dsa_prefill_prev_topk_indices = None
+                else:
+                    reusable_topk_indices = None
+                from batchgen.models.glm.glm5.sparse_prefill import (
+                    glm52_sparse_prefill_prepacked,
+                )
+
+                sparse_result = glm52_sparse_prefill_prepacked(
+                    attn=self.module,
+                    hidden_states=hidden_states_2d,
+                    position_ids=position_ids,
+                    max_seqlen=self.prepack_max_seqlen,
+                    weight_scale=self.weight_dequant_scale,
+                    indexer=self.module.indexer,
+                    carried_topk_indices=type(self)._dsa_prefill_prev_topk_indices,
+                    reusable_topk_indices=reusable_topk_indices,
+                    causal_starts=type(self)._dsa_prefill_causal_starts,
+                    causal_ends=type(self)._dsa_prefill_causal_ends,
+                )
+                attn_output = sparse_result.attn_output
+                offload_kv = sparse_result.primary_kv
+                indexer_kv = sparse_result.indexer_kv
+                if self.module.indexer is not None and self.module.next_skip_topk:
+                    type(self)._dsa_prefill_prev_topk_indices = (
+                        sparse_result.topk_indices
+                    )
+                elif (
+                    self.module.indexer is None
+                    and self.layer_idx == self.module.config.num_hidden_layers - 1
+                ):
+                    type(self)._dsa_prefill_prev_topk_indices = None
+                    type(self)._dsa_prefill_causal_starts = None
+                    type(self)._dsa_prefill_causal_ends = None
+                if self.module.indexer is None:
+                    type(self)._record_glm52_prefill_path(
+                        "indexer_reuse",
+                        self.layer_idx,
+                    )
+                type(self)._record_glm52_prefill_path(
+                    "sparse",
+                    self.layer_idx,
+                )
+            else:
+                if getattr(config, "model_type", None) == "glm_moe_dsa_5_2":
+                    type(self)._record_glm52_prefill_path(
+                        "dense",
+                        self.layer_idx,
+                    )
+                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                    hidden_states_2d,
+                    position_ids,
+                    cu_seqlens,
+                    self.prepack_max_seqlen,
+                    self.prepack_num_sequences,
+                    self.weight_dequant_scale
+                )
+                indexer_kv = None
 
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
@@ -926,11 +1104,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # skip the indexer-K compute + offload entirely. GLM-5 layers always
             # have a real indexer so this block always runs there.
             if self.module.indexer is not None:
-                indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0),
-                    positions=self.position_ids.to(hidden_states_2d.device),
-                    max_seqlen=self.prepack_max_seqlen,
-                )
+                if indexer_kv is None:
+                    indexer_kv = self.module.indexer.compute_indexer_kv(
+                        hidden_states_2d.unsqueeze(0),
+                        positions=position_ids,
+                        max_seqlen=self.prepack_max_seqlen,
+                    )
                 if indexer_kv is None:
                     raise RuntimeError(
                         "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
@@ -938,6 +1117,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             self._offload_prepacked_kv(offload_kv)
+            if (
+                getattr(config, "model_type", None) == "glm_moe_dsa_5_2"
+                and self.layer_idx == config.num_hidden_layers - 1
+            ):
+                self._finish_glm52_prefill_path_counts()
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
         else:

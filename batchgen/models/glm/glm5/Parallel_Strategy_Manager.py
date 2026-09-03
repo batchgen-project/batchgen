@@ -85,6 +85,10 @@ class GLM5ParallelStrategyManager:
 
         self.loaded_model_config.phase = "prefill"
         Glm5MoE.reset_prefill_grouped_state()
+        if self.loaded_model_config.model_type == "glm_moe_dsa_5_2":
+            from .sparse_prefill import validate_glm52_sparse_prefill_runtime
+
+            validate_glm52_sparse_prefill_runtime()
 
         step_start = time.perf_counter()
         self.model = Glm5ForCausalLM(self.loaded_model_config)
