@@ -27,7 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
-from batchgen.timing import init_decode_timer
+from batchgen.timing import init_decode_timer, init_prefill_timer
+from .config import dsa_layer_skips_topk
 
 # Try importing FP8 absorb kernels (WP5)
 try:
@@ -74,6 +75,25 @@ _GLM5_MOE_CATEGORIES = [
 _glm5_decode_timer = init_decode_timer(
     "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
 )
+
+_GLM5_PREFILL_CATEGORIES = [
+    "scheduler_capacity_all_gather", "setup_prepack", "setup_flatten",
+    "microbatch_input_concat", "microbatch_cu_seqlens", "embedding",
+    "input_norm", "add_rmsnorm", "dense_mlp", "residual_add",
+    "attn_q_a", "attn_q_norm", "attn_q_b", "attn_kv_a",
+    "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
+    "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
+    "attn_input_quant", "attn_q_a_quant", "attn_kv_b_dequant",
+    "indexer_prefill_score", "attn_sparse_q_absorb",
+    "attn_sparse_flashmla", "attn_sparse_out_absorb",
+    "indexer_wk", "indexer_norm", "indexer_rope_hadamard",
+    "indexer_kv_materialize", "primary_kv_materialize",
+    "moe_pointer_table_h2d",
+    "moe_router", "moe_dispatch", "moe_act_quant_s1", "moe_grouped_s1",
+    "moe_act_quant_s3", "moe_grouped_s3", "moe_reduce", "moe_shared",
+    "final_norm", "last_token_gather", "lm_head", "token_select",
+]
+_glm5_prefill_timer = init_prefill_timer("GLM-5", _GLM5_PREFILL_CATEGORIES)
 
 _GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
 _GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
@@ -357,6 +377,14 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         self.cached_up = None
         self.cached_down = None
 
+    def load_weights_pinned(self) -> Dict[str, torch.Tensor]:
+        """Wait without the single-expert sliding-window eviction policy.
+
+        Grouped prefill owns all 256 keys until its completion event; evicting
+        an earlier key while acquiring a later expert invalidates that layer.
+        """
+        return self.core_engine.get_weights_pinned(self.module_key)
+
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP8 forward using cached weight tensors directly (no nn.Module delegation)."""
         from batchgen.attention.mla.fa3_backend import w8a16_gemm
@@ -417,6 +445,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
     # FULL layer, reused by subsequent shared layers. Reset per decode step by the
     # worker. For GLM-5 (all layers full) this is never read by a shared branch.
     _dsa_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_causal_starts: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_causal_ends: ClassVar[Optional[torch.Tensor]] = None
+    _dsa_prefill_path_counts: ClassVar[Optional[Dict[str, Dict[int, int]]]] = None
     # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
     # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
     # rows instead of deriving slot count from cur_batch.
@@ -424,6 +456,124 @@ class GLM5AttnWrapper(AttnWrapperBase):
     glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     glm5_dsa_graph_forward_state: ClassVar[Optional[Dict[str, Any]]] = None
     glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
+    # Runtime proof that every prefill token's primary MLA KV and every
+    # applicable auxiliary/indexer KV were scheduled for host offload.
+    glm5_prefill_kv_offload_audit: ClassVar[Optional[Dict[str, Dict[int, dict]]]] = None
+
+    @classmethod
+    def _reset_glm52_prefill_path_counts(cls) -> None:
+        cls._dsa_prefill_path_counts = {
+            "dense": {},
+            "sparse": {},
+            "indexer_compute": {},
+            "indexer_reuse": {},
+        }
+
+    @classmethod
+    def _record_glm52_prefill_path(cls, path: str, layer_idx: int) -> None:
+        counts = cls._dsa_prefill_path_counts
+        if counts is None:
+            cls._reset_glm52_prefill_path_counts()
+            counts = cls._dsa_prefill_path_counts
+        if path not in counts:
+            raise RuntimeError(f"unknown GLM-5.2 prefill path: {path}")
+        layer_idx = int(layer_idx)
+        counts[path][layer_idx] = counts[path].get(layer_idx, 0) + 1
+
+    def _finish_glm52_prefill_path_counts(self) -> None:
+        counts = type(self)._dsa_prefill_path_counts
+        type(self)._dsa_prefill_path_counts = None
+        if counts is None:
+            raise RuntimeError("GLM-5.2 prefill path audit was not initialized")
+
+        expected_layers = set(range(self.module.config.num_hidden_layers))
+        sparse_layers = set(counts["sparse"])
+        dense_layers = set(counts["dense"])
+        if sparse_layers:
+            expected_sparse = {
+                layer_idx: 1 for layer_idx in expected_layers
+            }
+            expected_compute = {
+                layer_idx: 1 for layer_idx in expected_layers
+                if not dsa_layer_skips_topk(self.module.config, layer_idx)
+            }
+            expected_reuse = {
+                layer_idx: 1
+                for layer_idx in expected_layers
+                if dsa_layer_skips_topk(self.module.config, layer_idx)
+            }
+            if (
+                counts["sparse"] != expected_sparse
+                or dense_layers
+                or counts["indexer_compute"] != expected_compute
+                or counts["indexer_reuse"] != expected_reuse
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 sparse prefill coverage mismatch: "
+                    f"sparse={sorted(sparse_layers)}, dense={sorted(dense_layers)}, "
+                    f"compute={sorted(counts['indexer_compute'])}, "
+                    f"reuse={sorted(counts['indexer_reuse'])}"
+                )
+            mode = "sparse"
+        else:
+            expected_dense = {layer_idx: 1 for layer_idx in expected_layers}
+            if counts["dense"] != expected_dense:
+                raise RuntimeError(
+                    "GLM-5.2 dense prefill coverage mismatch: "
+                    f"dense={counts['dense']}"
+                )
+            mode = "dense-short"
+
+        logging.info(
+            "[GLM52_PREFILL_PATH] mode=%s layers=%d "
+            "indexer_compute=%s indexer_reuse=%s",
+            mode,
+            len(expected_layers),
+            sorted(counts["indexer_compute"]),
+            sorted(counts["indexer_reuse"]),
+        )
+
+    @classmethod
+    def start_prefill_kv_offload_audit(cls) -> None:
+        if cls.glm5_prefill_kv_offload_audit is not None:
+            raise RuntimeError("GLM-5 prefill KV offload audit is already active")
+        cls.glm5_prefill_kv_offload_audit = {"primary": {}, "aux": {}}
+
+    @classmethod
+    def record_prefill_kv_offload(
+        cls,
+        kind: str,
+        layer_idx: int,
+        *,
+        sequences: int,
+        tokens: int,
+    ) -> None:
+        audit = cls.glm5_prefill_kv_offload_audit
+        if audit is None:
+            return
+        entry = audit[kind].setdefault(
+            int(layer_idx),
+            {"calls": 0, "sequences": 0, "tokens": 0},
+        )
+        entry["calls"] += 1
+        entry["sequences"] += int(sequences)
+        entry["tokens"] += int(tokens)
+
+    @classmethod
+    def finish_prefill_kv_offload_audit(cls) -> Dict[str, Dict[int, dict]]:
+        audit = cls.glm5_prefill_kv_offload_audit
+        cls.glm5_prefill_kv_offload_audit = None
+        if audit is None:
+            raise RuntimeError("GLM-5 prefill KV offload audit was not active")
+        return audit
+
+    @classmethod
+    def abort_prefill_kv_offload_audit(cls) -> None:
+        cls.glm5_prefill_kv_offload_audit = None
+        cls._dsa_prefill_prev_topk_indices = None
+        cls._dsa_prefill_causal_starts = None
+        cls._dsa_prefill_causal_ends = None
+        cls._dsa_prefill_path_counts = None
 
     def __init__(
         self,
@@ -445,13 +595,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
-        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
+        self._fp8_folded_q_b_proj = None
+        self._fp8_folded_q_b_scale = None
+        self._folded_q_b_retained_rows = None
+        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step).
+        # These are BF16 WEIGHT copies, not workspaces. They are quantizer
+        # INPUT only: once _fp8_absorb_weights is built they are freed by
+        # initialize_decode_absorb, so decode must never read them.
         self._cached_q_absorb = None
         self._cached_out_absorb = None
-        # SGLang-aligned BF16 BMM absorb weights (set by
-        # initialize_decode_absorb). w_kc: [H, 192, 512] BF16 with
-        # SGLang's stride trick; w_vc: [H, 512, 256] BF16 non-contig view.
-        self.w_kc = None
+        # SGLang-aligned BF16 BMM absorb weight, built by
+        # initialize_decode_absorb ONLY when FP8 absorb is unavailable.
+        # w_vc: [H, 512, 256] BF16 non-contig view for the bmm fallback.
         self.w_vc = None
         # WP5: FP8 absorb weights (pre-quantized once at init)
         self._fp8_absorb_weights = None
@@ -476,6 +633,34 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
+        q_a_weight = self.module.q_a_proj.weight.data
+        kv_a_weight = self.module.kv_a_proj_with_mqa.weight.data
+        q_a_scale = self.weight_dequant_scale.get("q_a_proj.weight_scale_inv")
+        kv_a_scale = self.weight_dequant_scale.get(
+            "kv_a_proj_with_mqa.weight_scale_inv"
+        )
+        if q_a_scale is None or kv_a_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] fused Q-A/KV-A requires both FP8 scales"
+            )
+        self._fp8_qkv_a_proj = torch.cat(
+            (q_a_weight, kv_a_weight),
+            dim=0,
+        ).contiguous()
+        self._fp8_qkv_a_scale = torch.cat(
+            (q_a_scale, kv_a_scale),
+            dim=0,
+        ).contiguous()
+        q_rows = q_a_weight.shape[0]
+        q_scale_rows = q_a_scale.shape[0]
+        self.module.q_a_proj.weight.data = self._fp8_qkv_a_proj[:q_rows]
+        self.module.kv_a_proj_with_mqa.weight.data = self._fp8_qkv_a_proj[q_rows:]
+        self.weight_dequant_scale["q_a_proj.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[:q_scale_rows]
+        )
+        self.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[q_scale_rows:]
+        )
         self.fp8_q_a_proj = self.module.q_a_proj.weight.data
         self.fp8_q_b_proj = self.module.q_b_proj.weight.data
         self.fp8_kv_a_proj = self.module.kv_a_proj_with_mqa.weight.data
@@ -488,6 +673,118 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
+        self._fp8_folded_q_b_proj = None
+        self._fp8_folded_q_b_scale = None
+        self._folded_q_b_retained_rows = None
+
+    def _initialize_folded_q_b(self) -> None:
+        """Fold the static q-nope absorb into Q-B for graph decode."""
+        if self._fp8_folded_q_b_proj is not None:
+            return
+        q_b_scale = self.weight_dequant_scale.get("q_b_proj.weight_scale_inv")
+        kv_b_scale = self.weight_dequant_scale.get("kv_b_proj.weight_scale_inv")
+        if q_b_scale is None or kv_b_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] folded Q-B requires Q-B and KV-B FP8 scales"
+            )
+
+        import deep_gemm
+
+        attn = self.module
+        block_size = 128
+        q_b_weight = attn.q_b_proj.weight.data
+        q_absorb = self._cached_q_absorb
+        if q_absorb is None:
+            kv_b_proj = glm5_fp8_dequantization(
+                attn.kv_b_proj.weight.data,
+                kv_b_scale,
+            ).view(attn.num_heads, -1, attn.kv_lora_rank)
+            q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim].contiguous()
+        q_b_bf16 = glm5_fp8_dequantization(q_b_weight, q_b_scale)
+        q_b_heads_bf16 = q_b_bf16.view(
+            attn.num_heads,
+            attn.q_head_dim,
+            attn.q_lora_rank,
+        )
+        q_b_heads_fp8 = q_b_weight.view(
+            attn.num_heads,
+            attn.q_head_dim,
+            attn.q_lora_rank,
+        )
+        q_b_scale_heads = q_b_scale.view(
+            attn.num_heads,
+            attn.q_head_dim // block_size,
+            attn.q_lora_rank // block_size,
+        )
+        folded_q_nope = torch.bmm(
+            q_absorb.transpose(1, 2).float(),
+            q_b_heads_bf16[:, : attn.qk_nope_head_dim].float(),
+        )
+        folded_q_nope_fp8 = []
+        folded_q_nope_scale = []
+        for head in range(attn.num_heads):
+            weight, scale = deep_gemm.per_block_cast_to_fp8(
+                folded_q_nope[head],
+                use_ue8m0=False,
+            )
+            folded_q_nope_fp8.append(weight)
+            folded_q_nope_scale.append(scale)
+
+        retained_rows = block_size
+        self._folded_q_b_retained_rows = retained_rows
+        retained_weight = q_b_heads_fp8[:, -retained_rows:].flatten(0, 1)
+        retained_scale = q_b_scale_heads[:, -1:].flatten(0, 1)
+        self._fp8_folded_q_b_proj = torch.cat(
+            (torch.cat(folded_q_nope_fp8, dim=0), retained_weight),
+            dim=0,
+        ).contiguous()
+        self._fp8_folded_q_b_scale = torch.cat(
+            (torch.cat(folded_q_nope_scale, dim=0), retained_scale),
+            dim=0,
+        ).contiguous()
+
+        # The GLM-5.2 graph path is fail-closed, so the original Q-B/KV-B
+        # tensors and q-absorb FP8 copy have no remaining decode consumer.
+        # Releasing them offsets most of the wider folded projection.
+        attn.q_b_proj.weight.data = torch.empty(
+            0,
+            dtype=q_b_weight.dtype,
+            device=q_b_weight.device,
+        )
+        attn.kv_b_proj.weight.data = torch.empty(
+            0,
+            dtype=attn.kv_b_proj.weight.dtype,
+            device=attn.kv_b_proj.weight.device,
+        )
+        self.weight_dequant_scale["q_b_proj.weight_scale_inv"] = torch.empty(
+            0,
+            dtype=q_b_scale.dtype,
+            device=q_b_scale.device,
+        )
+        self.weight_dequant_scale["kv_b_proj.weight_scale_inv"] = torch.empty(
+            0,
+            dtype=kv_b_scale.dtype,
+            device=kv_b_scale.device,
+        )
+        self.fp8_q_b_proj = None
+        self.fp8_kv_b_proj = None
+        self._fp8_absorb_weights.q_absorb_fp8 = torch.empty(
+            0,
+            dtype=self._fp8_absorb_weights.q_absorb_fp8.dtype,
+            device=self._fp8_absorb_weights.q_absorb_fp8.device,
+        )
+        self._fp8_absorb_weights.q_absorb_scale = torch.empty(
+            0,
+            dtype=self._fp8_absorb_weights.q_absorb_scale.dtype,
+            device=self._fp8_absorb_weights.q_absorb_scale.device,
+        )
+        logging.info(
+            "[layer %s] initialized folded GLM-5.2 Q-B weight %s",
+            self.layer_idx,
+            tuple(self._fp8_folded_q_b_proj.shape),
+        )
 
     def initialize_decode_absorb(self):
         """Pre-compute absorbed projections from FP8 kv_b_proj weight.
@@ -508,23 +805,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
-        # SGLang-aligned absorb weights for BF16 BMM (matches
-        # deepseek_weight_loader.py:572-578 layout exactly).
-        #
-        #   self.w_kc — [H, qk_nope=192, kv_lora=512], BF16
-        #     `.transpose(1,2).contiguous().transpose(1,2)` is SGLang's stride
-        #     trick: physical memory laid out as [H, 512, 192] contiguous,
-        #     strides swapped on dim 1/2. Math-identical to [H, 192, 512] but
-        #     makes bmm/bmm_fp8 hit the same cuBLAS kernel SGLang triggers.
-        #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
-        #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
-        self.w_kc = self._cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-        # Mirror SGLang exactly: .contiguous() first, then .transpose — the
-        # final tensor is a non-contiguous view with physical [H, 256, 512]
-        # and logical [H, 512, 256]. Adding a trailing .contiguous() would
-        # re-lay it out and change which cuBLAS kernel bmm dispatches to.
-        self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
-
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
         if _HAS_FP8_ABSORB:
             try:
@@ -540,6 +820,28 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
                 )
                 self._fp8_absorb_weights = None
+
+        if self._fp8_absorb_weights is not None:
+            # The FP8 kernel owns both absorb GEMMs on every live decode path
+            # (glm5_decode_selector._build_query_states hard-fails without it),
+            # so the BF16 originals were quantizer input only. Free them here —
+            # BEFORE _init_gpu_kv_with_actual_size sizes the KV pool — instead
+            # of holding [H,192,512] + [H,256,512] BF16 per layer for nothing.
+            # H*448*512*2 B/layer freed; the BF16 bmm fallback (w_vc) is not
+            # built at all on this path.
+            self._cached_q_absorb = None
+            self._cached_out_absorb = None
+            self.w_vc = None
+        else:
+            # No FP8 absorb kernel: keep the SGLang-aligned BF16 BMM weight
+            # (matches deepseek_weight_loader.py:572-578 layout exactly).
+            #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
+            #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
+            # Mirror SGLang exactly: .contiguous() first, then .transpose — the
+            # final tensor is a non-contiguous view with physical [H, 256, 512]
+            # and logical [H, 512, 256]. Adding a trailing .contiguous() would
+            # re-lay it out and change which cuBLAS kernel bmm dispatches to.
+            self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 
@@ -677,23 +979,116 @@ class GLM5AttnWrapper(AttnWrapperBase):
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward with DSA auxiliary cache population.
 
-        1. Standard MLA prefill via FA3 (full attention)
-        2. Compute indexer K and write to auxiliary cache
+        GLM-5.2 long microbatches run sparse absorbed MLA with full/shared
+        indexer reuse. Short microbatches and older GLM variants retain dense
+        FA3. Full indexer layers also populate the auxiliary host KV cache.
         """
         AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
             self.layer_idx,
             device=hidden_states.device,
         )
         if self.prepack_mode:
+            if self.layer_idx == 0:
+                type(self)._dsa_prefill_prev_topk_indices = None
+                type(self)._dsa_prefill_causal_starts = None
+                type(self)._dsa_prefill_causal_ends = None
+                if (
+                    getattr(self.module.config, "model_type", None)
+                    == "glm_moe_dsa_5_2"
+                ):
+                    type(self)._reset_glm52_prefill_path_counts()
             hidden_states_2d = hidden_states.squeeze(0)
-            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-                self.weight_dequant_scale
+            position_ids = self.position_ids.to(hidden_states_2d.device)
+            cu_seqlens = self.prepack_cu_seqlens.to(hidden_states_2d.device)
+            config = getattr(self.module, "config", None)
+            from batchgen.models.glm.glm5.sparse_prefill import (
+                should_use_glm52_sparse_prefill,
             )
+            use_sparse_prefill = should_use_glm52_sparse_prefill(
+                getattr(config, "model_type", None),
+                self.prepack_max_seqlen,
+                getattr(config, "index_topk", 2048),
+            )
+            if use_sparse_prefill:
+                if type(self)._dsa_prefill_causal_starts is None:
+                    from batchgen.models.glm.glm5.sparse_prefill import (
+                        build_packed_causal_ranges,
+                    )
+
+                    (
+                        type(self)._dsa_prefill_causal_starts,
+                        type(self)._dsa_prefill_causal_ends,
+                    ) = build_packed_causal_ranges(
+                        cu_seqlens,
+                        position_ids,
+                        hidden_states_2d.shape[0],
+                        sequence_lengths=list(self.prepack_seq_lengths),
+                    )
+                if self.module.indexer is not None:
+                    reusable_topk_indices = (
+                        type(self)._dsa_prefill_prev_topk_indices
+                    )
+                    type(self)._record_glm52_prefill_path(
+                        "indexer_compute",
+                        self.layer_idx,
+                    )
+                    type(self)._dsa_prefill_prev_topk_indices = None
+                else:
+                    reusable_topk_indices = None
+                from batchgen.models.glm.glm5.sparse_prefill import (
+                    glm52_sparse_prefill_prepacked,
+                )
+
+                sparse_result = glm52_sparse_prefill_prepacked(
+                    attn=self.module,
+                    hidden_states=hidden_states_2d,
+                    position_ids=position_ids,
+                    max_seqlen=self.prepack_max_seqlen,
+                    weight_scale=self.weight_dequant_scale,
+                    indexer=self.module.indexer,
+                    carried_topk_indices=type(self)._dsa_prefill_prev_topk_indices,
+                    reusable_topk_indices=reusable_topk_indices,
+                    causal_starts=type(self)._dsa_prefill_causal_starts,
+                    causal_ends=type(self)._dsa_prefill_causal_ends,
+                )
+                attn_output = sparse_result.attn_output
+                offload_kv = sparse_result.primary_kv
+                indexer_kv = sparse_result.indexer_kv
+                if self.module.indexer is not None and self.module.next_skip_topk:
+                    type(self)._dsa_prefill_prev_topk_indices = (
+                        sparse_result.topk_indices
+                    )
+                elif (
+                    self.module.indexer is None
+                    and self.layer_idx == self.module.config.num_hidden_layers - 1
+                ):
+                    type(self)._dsa_prefill_prev_topk_indices = None
+                    type(self)._dsa_prefill_causal_starts = None
+                    type(self)._dsa_prefill_causal_ends = None
+                if self.module.indexer is None:
+                    type(self)._record_glm52_prefill_path(
+                        "indexer_reuse",
+                        self.layer_idx,
+                    )
+                type(self)._record_glm52_prefill_path(
+                    "sparse",
+                    self.layer_idx,
+                )
+            else:
+                if getattr(config, "model_type", None) == "glm_moe_dsa_5_2":
+                    type(self)._record_glm52_prefill_path(
+                        "dense",
+                        self.layer_idx,
+                    )
+                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                    hidden_states_2d,
+                    position_ids,
+                    cu_seqlens,
+                    self.prepack_max_seqlen,
+                    self.prepack_num_sequences,
+                    self.weight_dequant_scale
+                )
+                indexer_kv = None
 
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
@@ -709,10 +1104,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # skip the indexer-K compute + offload entirely. GLM-5 layers always
             # have a real indexer so this block always runs there.
             if self.module.indexer is not None:
-                indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0),
-                    positions=self.position_ids.to(hidden_states_2d.device),
-                )
+                if indexer_kv is None:
+                    indexer_kv = self.module.indexer.compute_indexer_kv(
+                        hidden_states_2d.unsqueeze(0),
+                        positions=position_ids,
+                        max_seqlen=self.prepack_max_seqlen,
+                    )
                 if indexer_kv is None:
                     raise RuntimeError(
                         "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
@@ -720,6 +1117,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             self._offload_prepacked_kv(offload_kv)
+            if (
+                getattr(config, "model_type", None) == "glm_moe_dsa_5_2"
+                and self.layer_idx == config.num_hidden_layers - 1
+            ):
+                self._finish_glm52_prefill_path_counts()
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
         else:
@@ -730,81 +1132,85 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
-        """Offload indexer KV cache per-sequence to auxiliary host memory."""
+        """Offload packed indexer KV with one asynchronous task per layer."""
         if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
             raise RuntimeError(
                 "GLM-5 DSA auxiliary host KV worker view is required for "
                 "indexer KV offload"
             )
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
+        sequence_lengths = list(self.prepack_seq_lengths)
         global_sequence_ids = self.cur_batch
+        if len(sequence_lengths) != len(global_sequence_ids):
+            raise RuntimeError("GLM-5 packed indexer KV metadata size mismatch")
+        if sum(sequence_lengths) != offload_kv.shape[0]:
+            raise RuntimeError("GLM-5 packed indexer KV token count mismatch")
 
-        # Lifespan management mirrored from decode-side `_pending_kv_append_*`
-        # (worker.py:1898-1925). Drain compute stream via a CUDA event so the
-        # FA3 prefill kernel that wrote `offload_kv` has fully retired before
-        # the C++ async lambda's d2h memcpy reads the source memory; pin the
-        # source tensor (and the parent `offload_kv`) in the class-level list
-        # so PyTorch's caching allocator cannot re-hand the same physical
-        # pages to a later layer's K/V tensor while the d2h is in flight.
-        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
-
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
-        for seq_idx in range(num_sequences):
-            start_idx = cu[seq_idx]
-            end_idx = cu[seq_idx + 1]
-            seq_len = end_idx - start_idx
-            # indexer_kv is already [T, H=1, D=128] after caller's .squeeze(0),
-            # so only .unsqueeze(0) is needed to add the B dim; don't also
-            # .unsqueeze(2) (that would make 5D — the primary-MLA path copy-paste
-            # of this code was for a 2D [T, kv_lora+rope] input).
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+        materialize_ctx = (
+            timer.timed("indexer_kv_materialize", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with materialize_ctx:
+            packed_kv = offload_kv.contiguous()
+        enqueue_ctx = (
+            timer.host_timed("indexer_kv_offload_enqueue", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with enqueue_ctx:
+            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_packed_layer_kv_to_host(
                 layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
+                sequence_ids=global_sequence_ids,
+                k_tensor=packed_kv,
                 v_tensor=None,
-                sequence_lengths=[seq_len],
+                sequence_lengths=sequence_lengths,
             )
-            # Pin both the per-seq view AND the parent offload_kv (already
-            # pinned outside the loop) so neither's storage is reclaimed.
-            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
+        AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        self.record_prefill_kv_offload(
+            "aux",
+            self.layer_idx,
+            sequences=len(sequence_lengths),
+            tokens=sum(sequence_lengths),
+        )
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
-        """Offload KV cache per-sequence to host memory."""
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
+        """Offload packed primary KV with one asynchronous task per layer."""
+        sequence_lengths = list(self.prepack_seq_lengths)
         global_sequence_ids = self.cur_batch
+        if len(sequence_lengths) != len(global_sequence_ids):
+            raise RuntimeError("GLM-5 packed primary KV metadata size mismatch")
+        if sum(sequence_lengths) != offload_kv.shape[0]:
+            raise RuntimeError("GLM-5 packed primary KV token count mismatch")
 
-        # See _offload_prepacked_indexer_kv for rationale.
-        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
-
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
-        for seq_idx in range(num_sequences):
-            start_idx = cu[seq_idx]
-            end_idx = cu[seq_idx + 1]
-            seq_len = end_idx - start_idx
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-            task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+        from batchgen.timing import get_prefill_timer
+        timer = get_prefill_timer()
+        materialize_ctx = (
+            timer.timed("primary_kv_materialize", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with materialize_ctx:
+            packed_kv = offload_kv.unsqueeze(1).contiguous()
+        enqueue_ctx = (
+            timer.host_timed("primary_kv_offload_enqueue", self.layer_idx)
+            if timer is not None else _nullctx()
+        )
+        with enqueue_ctx:
+            task = self.core_engine.host_paged_kv_worker_view.async_offload_packed_layer_kv_to_host(
                 layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
+                sequence_ids=global_sequence_ids,
+                k_tensor=packed_kv,
                 v_tensor=None,
-                sequence_lengths=[seq_len],
+                sequence_lengths=sequence_lengths,
             )
-            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
+        AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+        self.record_prefill_kv_offload(
+            "primary",
+            self.layer_idx,
+            sequences=len(sequence_lengths),
+            tokens=sum(sequence_lengths),
+        )
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward with DSA sparse attention.
@@ -1578,15 +1984,27 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
+            # WP5: FP8 out_absorb kernel, or the SGLang-aligned BF16 BMM when
+            # no FP8 absorb kernel was built for this layer.
             if self._fp8_absorb_weights is not None:
                 attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
-            else:
+            elif self.w_vc is not None:
                 # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
                 attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
                 attn_heads = torch.bmm(
                     attn_out_3d.transpose(0, 1), self.w_vc,
                 ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
+            else:
+                # No silent fallback: w_vc is only None when the FP8 weights
+                # existed at init (and freed it) but are gone now — i.e. state
+                # was torn down mid-flight, not a supported configuration.
+                raise RuntimeError(
+                    f"[layer {self.layer_idx}] GLM-5 out_absorb has neither FP8 "
+                    "absorb weights nor the BF16 w_vc fallback: the BF16 copies "
+                    "were freed by initialize_decode_absorb once FP8 absorb was "
+                    "built, so _fp8_absorb_weights must not be cleared "
+                    "afterwards. Re-run initialize_decode_absorb()."
+                )
             attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(

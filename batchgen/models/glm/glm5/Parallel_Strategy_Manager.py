@@ -14,10 +14,12 @@ Key differences from DeepSeek V3 PSM:
 - DSA dual KV cache handled automatically by batchgen_worker.py
 - MoE gate has e_score_correction_bias
 - Dense MLP layers 0-2, MoE layers 3-77
-- Prefill: all modules offloaded (DP), Decode: EP
+- Prefill: bulk attention and all MoE expert weights offloaded (DP); small
+  skeleton tensors remain resident. Decode: EP
 """
 
 import gc
+import json
 import logging
 import os
 import time
@@ -28,6 +30,12 @@ import torch.distributed as dist
 
 from .model import Glm5ForCausalLM, Glm5MoE
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
+
+
+def _synchronize_prefill_preloads():
+    """Keep one rank's forward from overlapping another rank's preload."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 class GLM5ParallelStrategyManager:
@@ -57,17 +65,30 @@ class GLM5ParallelStrategyManager:
         self.global_rank = global_rank
         self.world_size = world_size
         self.rank = global_rank
-        # Detect FP8 variant by checking for expert scale tensors in skeleton
-        self.is_fp8_experts = any(
-            "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
+        quantization_config = getattr(
+            self.loaded_model_config, "quantization_config", {}
+        ) or {}
+        quant_method = quantization_config.get(
+            "quant_method",
+            getattr(self.loaded_model_config, "quantization", None),
+        )
+        self.is_fp8_experts = quant_method == "fp8"
+        self._observed_fp8_expert_scales = any(
+            ".mlp.experts." in key and key.endswith(".weight_scale_inv")
+            for key in skeleton_state_dict
         )
 
     def configure_prefill(self):
-        """Configure model for prefill (pure DP, all modules offloaded)."""
+        """Configure prefill (pure DP, streamed bulk attention/all experts)."""
         start_time = time.perf_counter()
         timings = {}
 
         self.loaded_model_config.phase = "prefill"
+        Glm5MoE.reset_prefill_grouped_state()
+        if self.loaded_model_config.model_type == "glm_moe_dsa_5_2":
+            from .sparse_prefill import validate_glm52_sparse_prefill_runtime
+
+            validate_glm52_sparse_prefill_runtime()
 
         step_start = time.perf_counter()
         self.model = Glm5ForCausalLM(self.loaded_model_config)
@@ -141,6 +162,8 @@ class GLM5ParallelStrategyManager:
         self._config_expert_module()
         timings['expert'] = time.perf_counter() - step_start
 
+        self._validate_prefill_weight_offload_contract()
+
         self._config_lm_head_hook()
         self.model.eval()
 
@@ -148,6 +171,38 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
+        if self.is_fp8_experts:
+            # Keep the development-loader/import-lock cost outside the pure
+            # prefill timer. Grouped-buffer initialization below already
+            # preloads dispatch/reduce; fused RMSNorm is otherwise first
+            # resolved by layer 0 inside the model forward.
+            from batchgen.attention.fused_kernels import (
+                preload_fused_attention_kernels,
+            )
+
+            preload_fused_attention_kernels()
+            grouped_layers = [
+                layer.mlp
+                for layer in self.model.model.layers[self.FIRST_K_DENSE :]
+                if isinstance(layer.mlp, Glm5MoE)
+                and layer.mlp._prefill_grouped_enabled
+            ]
+            expected_layers = (
+                self.model_config.num_hidden_layers - self.FIRST_K_DENSE
+            )
+            if len(grouped_layers) != expected_layers:
+                raise RuntimeError(
+                    "GLM-5 FP8 prefill requires grouped full-offload MoE on "
+                    f"all {expected_layers} routed layers; got {len(grouped_layers)}"
+                )
+            Glm5MoE.init_prefill_grouped_buffers(
+                self.loaded_model_config,
+                self.engine_config.Basic_Config.device_torch,
+            )
+            for moe in grouped_layers:
+                moe._prefill_release_event = torch.cuda.Event()
+                moe._prefill_shared_release_event = torch.cuda.Event()
+            _synchronize_prefill_preloads()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
@@ -159,8 +214,219 @@ class GLM5ParallelStrategyManager:
             )
         return self.model, self.weight_copy_task
 
+    def _validate_prefill_weight_offload_contract(self):
+        """Fail closed unless every bulk-attention module and expert is streamed."""
+        num_layers = self.loaded_model_config.num_hidden_layers
+        first_k_dense = self.loaded_model_config.first_k_dense_replace
+        num_routed_experts = self.loaded_model_config.n_routed_experts
+        moe_layers = range(first_k_dense, num_layers)
+        expected_attn = [f"attn_{layer_idx}" for layer_idx in range(num_layers)]
+        expected_shared = [
+            f"shared_expert_{layer_idx}" for layer_idx in moe_layers
+        ]
+        expected_routed = [
+            f"routed_expert_{layer_idx}_{expert_idx}"
+            for layer_idx in moe_layers
+            for expert_idx in range(num_routed_experts)
+        ]
+
+        expected = {
+            "attn": expected_attn,
+            "shared_expert": expected_shared,
+            "routed_expert": expected_routed,
+        }
+        for kind, expected_keys in expected.items():
+            actual_keys = self.weight_copy_task.get(kind, [])
+            if actual_keys != expected_keys:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} offload contract mismatch: "
+                    f"expected {len(expected_keys)} ordered keys, got "
+                    f"{len(actual_keys)}"
+                )
+
+        attn_wrappers = [
+            layer.self_attn for layer in self.model.model.layers
+        ]
+        shared_wrappers = [
+            self.model.model.layers[layer_idx].mlp.shared_experts
+            for layer_idx in moe_layers
+        ]
+        routed_wrappers = [
+            expert
+            for layer_idx in moe_layers
+            for expert in self.model.model.layers[layer_idx].mlp.experts
+        ]
+        wrapper_groups = {
+            "attn": attn_wrappers,
+            "shared_expert": shared_wrappers,
+            "routed_expert": routed_wrappers,
+        }
+        expected_counts = {
+            kind: len(keys) for kind, keys in expected.items()
+        }
+        actual_wrapper_counts = {
+            kind: len(wrappers) for kind, wrappers in wrapper_groups.items()
+        }
+        if actual_wrapper_counts != expected_counts:
+            raise RuntimeError(
+                "GLM-5 prefill bulk-weight wrapper cardinality mismatch: "
+                f"expected={expected_counts}, actual={actual_wrapper_counts}"
+            )
+        for kind, wrappers in wrapper_groups.items():
+            actual_wrapper_keys = [
+                getattr(wrapper, "module_key", None) for wrapper in wrappers
+            ]
+            if actual_wrapper_keys != expected[kind]:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} wrapper identity mismatch"
+                )
+            persistent = [
+                idx for idx, wrapper in enumerate(wrappers)
+                if getattr(wrapper, "persistent", True)
+            ]
+            if persistent:
+                raise RuntimeError(
+                    f"GLM-5 prefill {kind} offload contract found "
+                    f"{len(persistent)} persistent wrappers"
+                )
+
+        scale_inventory = self._validate_prefill_expert_scale_residency(
+            wrapper_groups
+        )
+
+        logging.info("[PREFILL_WEIGHT_OFFLOAD_CONTRACT] %s", json.dumps({
+            "rank": self.rank,
+            "data_parallel": True,
+            "scope": "bulk_weight_matrices",
+            "attn_modules_streamed": len(expected_attn),
+            "shared_experts_streamed": len(expected_shared),
+            "routed_experts_streamed": len(expected_routed),
+            "expected_counts": expected_counts,
+            "actual_wrapper_counts": actual_wrapper_counts,
+            "all_wrappers_nonpersistent": True,
+            "scale_metadata_offloaded": False,
+            "expert_scale_metadata": scale_inventory,
+        }, separators=(",", ":")))
+
+    def _validate_prefill_expert_scale_residency(self, wrapper_groups):
+        scale_keys = {
+            "gate_proj.weight_scale_inv",
+            "up_proj.weight_scale_inv",
+            "down_proj.weight_scale_inv",
+        }
+        expert_groups = {
+            kind: wrapper_groups[kind]
+            for kind in ("shared_expert", "routed_expert")
+        }
+        observed_fp8_scales = getattr(
+            self, "_observed_fp8_expert_scales", self.is_fp8_experts
+        )
+        if self.is_fp8_experts and not observed_fp8_scales:
+            raise RuntimeError(
+                "GLM-5 checkpoint declares FP8 experts but the skeleton contains "
+                "no routed-expert scale metadata"
+            )
+        if not self.is_fp8_experts and observed_fp8_scales:
+            raise RuntimeError(
+                "GLM-5 checkpoint declares non-FP8 experts but the skeleton "
+                "contains routed-expert scale metadata"
+            )
+        if not self.is_fp8_experts:
+            unexpected = [
+                wrapper.module_key
+                for wrappers in expert_groups.values()
+                for wrapper in wrappers
+                if getattr(wrapper, "weight_dequant_scale", None)
+            ]
+            if unexpected:
+                raise RuntimeError(
+                    "GLM-5 non-FP8 prefill unexpectedly has expert scale metadata: "
+                    f"{unexpected[:5]}"
+                )
+            return {
+                "format": "none_non_fp8",
+                "expected_tensors": 0,
+                "actual_tensors": 0,
+                "resident_on_device": False,
+                "dtypes": [],
+            }
+
+        expected_device = torch.device(
+            self.engine_config.Basic_Config.device_torch
+        )
+        config = self.loaded_model_config
+        block_rows, block_cols = config.quantization_config["weight_block_size"]
+        hidden_size = config.hidden_size
+        intermediate_size = config.moe_intermediate_size
+        expected_shapes = {
+            "gate_proj.weight_scale_inv": (
+                (intermediate_size + block_rows - 1) // block_rows,
+                (hidden_size + block_cols - 1) // block_cols,
+            ),
+            "up_proj.weight_scale_inv": (
+                (intermediate_size + block_rows - 1) // block_rows,
+                (hidden_size + block_cols - 1) // block_cols,
+            ),
+            "down_proj.weight_scale_inv": (
+                (hidden_size + block_rows - 1) // block_rows,
+                (intermediate_size + block_cols - 1) // block_cols,
+            ),
+        }
+        actual_tensors = 0
+        dtypes = set()
+        for kind, wrappers in expert_groups.items():
+            for wrapper in wrappers:
+                scales = getattr(wrapper, "weight_dequant_scale", None)
+                actual_keys = set(scales or {})
+                if actual_keys != scale_keys:
+                    raise RuntimeError(
+                        f"GLM-5 prefill {kind} resident scale metadata mismatch "
+                        f"for {wrapper.module_key}: expected={sorted(scale_keys)}, "
+                        f"actual={sorted(actual_keys)}"
+                    )
+                for key, tensor in scales.items():
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tensor.numel() <= 0
+                        or tensor.dtype != torch.float32
+                        or tensor.device.type != "cuda"
+                        or tuple(tensor.shape) != expected_shapes[key]
+                        or (
+                            expected_device.index is not None
+                            and tensor.device.index != expected_device.index
+                        )
+                    ):
+                        raise RuntimeError(
+                            "GLM-5 prefill expert scale metadata is not a nonempty "
+                            "resident FP32 CUDA tensor with the expected block shape: "
+                            f"{wrapper.module_key}/{key} expected_shape="
+                            f"{expected_shapes[key]}, value={tensor!r}"
+                        )
+                    actual_tensors += 1
+                    dtypes.add(str(tensor.dtype))
+
+        expected_tensors = 3 * sum(len(wrappers) for wrappers in expert_groups.values())
+        if actual_tensors != expected_tensors:
+            raise RuntimeError(
+                "GLM-5 prefill resident expert scale cardinality mismatch: "
+                f"expected={expected_tensors}, actual={actual_tensors}"
+            )
+        return {
+            "format": "fp8_block_scale_inv",
+            "expected_tensors": expected_tensors,
+            "actual_tensors": actual_tensors,
+            "resident_on_device": True,
+            "device_type": "cuda",
+            "dtypes": sorted(dtypes),
+            "expected_shapes": {
+                key: list(shape) for key, shape in sorted(expected_shapes.items())
+            },
+            "all_shapes_validated": True,
+        }
+
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""
+        Glm5MoE.reset_prefill_grouped_state()
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
         self.model = None
@@ -556,6 +822,13 @@ class GLM5ParallelStrategyManager:
                 # Only register weights for experts that had weights loaded
                 if persistent and routed_key in local_set:
                     layer.mlp.experts[expert_idx]._register_fp8_weights()
+
+            layer.mlp._prefill_grouped_enabled = (
+                getattr(self.loaded_model_config, "phase", "decode") == "prefill"
+                and self.is_fp8_experts
+                and not layer.mlp.shared_experts.persistent
+                and all(not expert.persistent for expert in layer.mlp.experts)
+            )
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Expert module config time: {elapsed:.2f}s")
