@@ -814,6 +814,8 @@ class StreamedSP8MXFP4MoELayer:
         "grouped_dispatch",
         "grouped_s1",
         "grouped_s3",
+        # Once-per-layer BF16 staging of the shard (dequant_once prefill path).
+        "grouped_dequant_once",
     )
     _prefill_profile_named_spans = {
         name: [] for name in _prefill_profile_span_names

@@ -30,6 +30,23 @@ def _random_expert(n_out, k_in, gen, device):
     return packed, scale
 
 
+def test_streamed_layer_registers_the_staging_span_and_selector():
+    """The live path publishes a 'grouped_dequant_once' span on every layer
+    (the span profiler is on in production runs) and selects the kernel
+    through the class attribute / batchgen_debug override."""
+    from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer as L
+    assert "grouped_dequant_once" in L._prefill_profile_span_names
+    assert "grouped_dequant_once" in L._prefill_profile_named_spans
+    L.reset_prefill_profile(True)
+    try:
+        span = L.begin_profile_span()
+        L.end_profile_span("grouped_dequant_once", span)
+        assert len(L._prefill_profile_named_spans["grouped_dequant_once"]) == 1
+    finally:
+        L.reset_prefill_profile(False)
+    assert L.prefill_routed_kernel_selected() == "dequant_once"
+
+
 def test_dequant_from_marlin_order_is_bit_exact():
     from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import repack_mxfp4_to_marlin_device
     from batchgen.moe.k3_prefill_dequant_once import dequant_marlin_bf16
