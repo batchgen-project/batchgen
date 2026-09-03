@@ -394,6 +394,10 @@ class StreamedSP8LayerBuffer:
             up_scales_ptrs=self._ptrs(scales["w3"]),
             down_B_ptrs=self._ptrs(packed["w2"]),
             down_scales_ptrs=self._ptrs(scales["w2"]),
+            # Stacked Marlin-order views [E, k//16, n*2] int32 / [E, k//32, n]
+            # uint8 for the prefill dequant-once staging (k3_prefill_dequant_once).
+            marlin_packed=packed,
+            marlin_scales=scales,
             # Keep all storage alive for the grouped kernel pointer arrays.
             _tensors=(self.compute,),
         )

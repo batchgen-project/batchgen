@@ -78,3 +78,14 @@ def test_expert_path_matches_marlin_compact_path():
     ctol = 1e-4 + 1.6e-2 * ca.abs()
     cfrac = ((ca - cb).abs() > ctol).float().mean().item()
     assert cfrac < 1e-3, f"combine: {cfrac:.2e} outside tolerance"
+
+    # streamed-SP8 shard shape (StreamedSP8LayerBuffer._make_shard): stacked
+    # Marlin-order views instead of per-expert dicts -> identical staging
+    from types import SimpleNamespace
+    stacked = SimpleNamespace(
+        num_local=E, N=N, K_latent=K,
+        marlin_packed={p: torch.stack([t[p][0] for t in shard._tensors]) for p in ("w1", "w3", "w2")},
+        marlin_scales={p: torch.stack([t[p][1] for t in shard._tensors]) for p in ("w1", "w3", "w2")},
+    )
+    dq2 = K3PrefillDequantOnce(stacked, dev)
+    assert torch.equal(dq2.w_gu, dq.w_gu) and torch.equal(dq2.w_d, dq.w_d), "stacked-shard staging differs"

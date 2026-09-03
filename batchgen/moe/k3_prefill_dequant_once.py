@@ -115,7 +115,18 @@ class K3PrefillDequantOnce:
         self.device = device
         self.w_gu = torch.empty(self.E, 2 * self.N, self.K, dtype=torch.bfloat16, device=device)
         self.w_d = torch.empty(self.E, self.K, self.N, dtype=torch.bfloat16, device=device)
-        for e, t in enumerate(shard._tensors):
+        if hasattr(shard, "marlin_packed"):
+            # streamed-SP8 shard (StreamedSP8LayerBuffer._make_shard): stacked
+            # Marlin-order views [E, k//16, n*2] int32 and [E, k//32, n] uint8
+            packed, scales = shard.marlin_packed, shard.marlin_scales
+            per_expert = [
+                {p: (packed[p][e], scales[p][e]) for p in ("w1", "w3", "w2")}
+                for e in range(self.E)
+            ]
+        else:
+            # build_layer_shard: one dict of (marlin_qw, marlin_s) per expert
+            per_expert = shard._tensors
+        for e, t in enumerate(per_expert):
             dequant_marlin_bf16(*t["w1"], self.w_gu[e, : self.N])
             dequant_marlin_bf16(*t["w3"], self.w_gu[e, self.N:])
             dequant_marlin_bf16(*t["w2"], self.w_d[e])
