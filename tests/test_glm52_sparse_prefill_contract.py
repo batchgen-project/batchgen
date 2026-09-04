@@ -320,6 +320,212 @@ def test_glm52_shared_layer_validates_carried_topk_shape_and_dtype():
         )
 
 
+def _absorb_attn_stub():
+    return types.SimpleNamespace(
+        num_heads=2,
+        qk_nope_head_dim=3,
+        v_head_dim=4,
+        kv_lora_rank=5,
+        kv_b_proj=types.SimpleNamespace(weight=types.SimpleNamespace(data=object())),
+    )
+
+
+def _install_fake_dequantization(monkeypatch, kv_b):
+    """Stub the module the last-resort dequant path imports lazily."""
+
+    calls = []
+    module = types.ModuleType("batchgen.attention.mla.flashmla_backend")
+
+    def deepseek_v3_dequantization(weight, scale):
+        calls.append((weight, scale))
+        return kv_b
+
+    module.deepseek_v3_dequantization = deepseek_v3_dequantization
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen.attention.mla.flashmla_backend",
+        module,
+    )
+    return calls
+
+
+def test_sparse_absorb_reuses_wrapper_fp8_weights_without_dequant(monkeypatch):
+    calls = _install_fake_dequantization(monkeypatch, torch.zeros(14, 5))
+    weights = types.SimpleNamespace(
+        q_absorb_fp8=torch.zeros(2, 5, 3),
+        out_absorb_fp8=torch.zeros(2, 4, 5),
+    )
+
+    absorb = sparse_prefill._resolve_sparse_absorb(
+        attn=_absorb_attn_stub(),
+        weight_scale={},
+        fp8_absorb_weights=weights,
+        cached_q_absorb=None,
+        cached_out_absorb=None,
+        timed=lambda _name: nullcontext(),
+    )
+
+    assert absorb.fp8_weights is weights
+    assert absorb.q_absorb is None
+    assert absorb.out_absorb is None
+    assert calls == []
+
+
+def test_sparse_absorb_resolves_each_gemm_independently(monkeypatch):
+    calls = _install_fake_dequantization(monkeypatch, torch.zeros(14, 5))
+    # _initialize_folded_q_b frees only the FP8 q-absorb.
+    weights = types.SimpleNamespace(
+        q_absorb_fp8=torch.empty(0),
+        out_absorb_fp8=torch.zeros(2, 4, 5),
+    )
+    cached_q_absorb = torch.randn(2, 3, 5)
+
+    absorb = sparse_prefill._resolve_sparse_absorb(
+        attn=_absorb_attn_stub(),
+        weight_scale={},
+        fp8_absorb_weights=weights,
+        cached_q_absorb=cached_q_absorb,
+        cached_out_absorb=None,
+        timed=lambda _name: nullcontext(),
+    )
+
+    assert absorb.q_absorb is cached_q_absorb
+    assert absorb.out_absorb is None
+    assert calls == []
+
+
+def test_sparse_absorb_uses_cached_bf16_when_no_fp8_kernel(monkeypatch):
+    calls = _install_fake_dequantization(monkeypatch, torch.zeros(14, 5))
+    cached_q_absorb = torch.randn(2, 3, 5)
+    cached_out_absorb = torch.randn(2, 4, 5)
+
+    absorb = sparse_prefill._resolve_sparse_absorb(
+        attn=_absorb_attn_stub(),
+        weight_scale={},
+        fp8_absorb_weights=None,
+        cached_q_absorb=cached_q_absorb,
+        cached_out_absorb=cached_out_absorb,
+        timed=lambda _name: nullcontext(),
+    )
+
+    assert absorb.q_absorb is cached_q_absorb
+    assert torch.equal(absorb.out_absorb, cached_out_absorb.transpose(1, 2))
+    assert calls == []
+
+
+def test_sparse_absorb_last_resort_dequantizes_kv_b_once(monkeypatch):
+    kv_b = torch.arange(14 * 5, dtype=torch.float32).reshape(14, 5)
+    calls = _install_fake_dequantization(monkeypatch, kv_b)
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fp8_absorb",
+        types.ModuleType("batchgen_kernels.attention.dsa.fp8_absorb"),
+    )
+    scale = torch.ones(1)
+
+    absorb = sparse_prefill._resolve_sparse_absorb(
+        attn=_absorb_attn_stub(),
+        weight_scale={"kv_b_proj.weight_scale_inv": scale},
+        fp8_absorb_weights=None,
+        cached_q_absorb=None,
+        cached_out_absorb=None,
+        timed=lambda _name: nullcontext(),
+    )
+
+    heads = kv_b.view(2, 7, 5)
+    assert len(calls) == 1
+    assert calls[0][1] is scale
+    assert torch.equal(absorb.q_absorb, heads[:, :3, :])
+    assert torch.equal(absorb.out_absorb, heads[:, 3:, :].transpose(1, 2))
+
+
+def test_sparse_absorb_builds_fp8_weights_after_one_dequant(monkeypatch):
+    kv_b = torch.arange(14 * 5, dtype=torch.float32).reshape(14, 5)
+    calls = _install_fake_dequantization(monkeypatch, kv_b)
+    built = []
+    module = types.ModuleType("batchgen_kernels.attention.dsa.fp8_absorb")
+
+    class FakeFP8AbsorbWeights:
+        def __init__(self, q_absorb, out_absorb):
+            built.append((q_absorb, out_absorb))
+
+    module.FP8AbsorbWeights = FakeFP8AbsorbWeights
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fp8_absorb",
+        module,
+    )
+
+    absorb = sparse_prefill._resolve_sparse_absorb(
+        attn=_absorb_attn_stub(),
+        weight_scale={"kv_b_proj.weight_scale_inv": torch.ones(1)},
+        fp8_absorb_weights=None,
+        cached_q_absorb=None,
+        cached_out_absorb=None,
+        timed=lambda _name: nullcontext(),
+    )
+
+    assert len(calls) == 1
+    assert len(built) == 1
+    assert absorb.fp8_weights is not None
+    assert absorb.q_absorb is None
+    assert absorb.out_absorb is None
+
+
+def test_absorb_dispatch_keeps_layout_across_bf16_and_fp8(monkeypatch):
+    q_nope = torch.randn(3, 2, 4)
+    attn_latent = torch.randn(3, 2, 5)
+    q_absorb = torch.randn(2, 4, 5)
+    out_absorb = torch.randn(2, 5, 6)
+
+    bf16 = sparse_prefill._SparseAbsorb(
+        fp8_weights=None,
+        q_absorb=q_absorb,
+        out_absorb=out_absorb,
+    )
+    torch.testing.assert_close(
+        sparse_prefill._absorb_q_nope(q_nope, bf16),
+        torch.einsum("thd,hdc->thc", q_nope, q_absorb),
+    )
+    torch.testing.assert_close(
+        sparse_prefill._absorb_attn_latent(attn_latent, bf16),
+        torch.einsum("thc,hcv->thv", attn_latent, out_absorb),
+    )
+
+    seen = {}
+    module = types.ModuleType("batchgen_kernels.attention.dsa.fp8_absorb")
+
+    def fake_q_absorb(x, weights):
+        seen["q"] = (x, weights)
+        return x
+
+    def fake_out_absorb(x, weights):
+        seen["out"] = (x, weights)
+        return x
+
+    module.fp8_q_absorb = fake_q_absorb
+    module.fp8_out_absorb = fake_out_absorb
+    module.FP8AbsorbWeights = None
+    module.fp8_q_absorb_out = None
+    module.fp8_out_absorb_out = None
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fp8_absorb",
+        module,
+    )
+    weights = object()
+    fp8 = sparse_prefill._SparseAbsorb(
+        fp8_weights=weights,
+        q_absorb=None,
+        out_absorb=None,
+    )
+
+    assert sparse_prefill._absorb_q_nope(q_nope, fp8) is q_nope
+    assert sparse_prefill._absorb_attn_latent(attn_latent, fp8) is attn_latent
+    assert seen["q"][0] is q_nope and seen["q"][1] is weights
+    assert seen["out"][0] is attn_latent and seen["out"][1] is weights
+
+
 def test_glm52_sparse_prefill_path_audit_exact_schedule(caplog):
     from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 
@@ -387,6 +593,8 @@ def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):
     topk = torch.full((3, 2048), -1, dtype=torch.int32)
     calls = []
     offloads = []
+    absorb_kwargs = []
+    fp8_absorb_weights = object()
 
     def fake_sparse_prefill(**kwargs):
         carried = kwargs["carried_topk_indices"]
@@ -398,6 +606,13 @@ def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):
                 carried is topk,
                 reusable is topk,
                 None if carried is None else carried[0, 0].item(),
+            )
+        )
+        absorb_kwargs.append(
+            (
+                kwargs["fp8_absorb_weights"],
+                kwargs["cached_q_absorb"],
+                kwargs["cached_out_absorb"],
             )
         )
         output = reusable
@@ -449,6 +664,9 @@ def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):
         wrapper.prepack_seq_lengths = [3]
         wrapper.cur_batch = ["sequence-0"]
         wrapper.weight_dequant_scale = {}
+        wrapper._fp8_absorb_weights = fp8_absorb_weights
+        wrapper._cached_q_absorb = None
+        wrapper._cached_out_absorb = None
         wrapper.module = types.SimpleNamespace(
             layer_idx=layer_idx,
             config=config,
@@ -484,6 +702,7 @@ def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):
     assert GLM5AttnWrapper._dsa_prefill_causal_starts is None
     assert GLM5AttnWrapper._dsa_prefill_causal_ends is None
     assert GLM5AttnWrapper._dsa_prefill_path_counts is None
+    assert absorb_kwargs == [(fp8_absorb_weights, None, None)] * 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -713,6 +932,15 @@ def test_sparse_absorbed_layer_matches_dense_attention(monkeypatch):
         lambda weight, _scale, activation: (
             activation if weight is o_weight else None
         ),
+    )
+    # Keep this test on the BF16 reference absorption path. The production
+    # fast path is covered by the dedicated dispatch tests above; using the
+    # tiny qk_nope_dim=8 fixture with the decode-tuned FP8 kernel would test
+    # its unsupported K<16 tile shape rather than sparse attention semantics.
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fp8_absorb",
+        types.ModuleType("batchgen_kernels.attention.dsa.fp8_absorb"),
     )
 
     class IdentityRotary:

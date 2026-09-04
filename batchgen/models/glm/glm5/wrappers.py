@@ -1050,6 +1050,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     reusable_topk_indices=reusable_topk_indices,
                     causal_starts=type(self)._dsa_prefill_causal_starts,
                     causal_ends=type(self)._dsa_prefill_causal_ends,
+                    # Reuse decode-phase absorb weights when present; otherwise
+                    # sparse_prefill builds the FP8 representation after its
+                    # single per-layer kv_b_proj dequant.
+                    fp8_absorb_weights=self._fp8_absorb_weights,
+                    cached_q_absorb=self._cached_q_absorb,
+                    cached_out_absorb=self._cached_out_absorb,
                 )
                 attn_output = sparse_result.attn_output
                 offload_kv = sparse_result.primary_kv
