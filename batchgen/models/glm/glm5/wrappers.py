@@ -1003,7 +1003,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 type(self)._dsa_prefill_causal_starts = None
                 type(self)._dsa_prefill_causal_ends = None
                 if (
-                    getattr(self.module.config, "model_type", None)
+                    getattr(getattr(self.module, "config", None), "model_type", None)
                     == "glm_moe_dsa_5_2"
                 ):
                     type(self)._reset_glm52_prefill_path_counts()
