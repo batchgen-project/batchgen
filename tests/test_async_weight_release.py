@@ -80,7 +80,7 @@ def test_clear_weight_bindings_preserves_skeleton_parameters():
     torch.testing.assert_close(module.bias, original_bias)
 
 
-def test_h2d_weight_worker_paces_each_tensor_before_publication():
+def test_h2d_weight_worker_publishes_event_ordered_without_stream_sync():
     source = (
         _REPO_ROOT / "core" / "HtoD_Engine" / "HtoD_Engine.cu"
     ).read_text()
@@ -90,16 +90,32 @@ def test_h2d_weight_worker_paces_each_tensor_before_publication():
     ]
     copy_pos = module_loop.index("CUDA_CHECK(cudaMemcpyAsync(")
     loop_end_pos = module_loop.index("\n                }\n", copy_pos)
-    sync_pos = module_loop.index(
-        "CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));",
-        copy_pos,
-    )
     publish_pos = module_loop.index(
         "this->gpu_weight_buffer_.weights_copy_enqueued("
     )
 
-    assert copy_pos < sync_pos < loop_end_pos < publish_pos
+    assert copy_pos < loop_end_pos < publish_pos
+    assert "cudaStreamSynchronize" not in module_loop[loop_end_pos:publish_pos]
     assert "this->blocking_copy_(" not in module_loop[:publish_pos]
+
+    weight_buffer_source = (
+        _REPO_ROOT
+        / "core"
+        / "GPU_Weight_Buffer"
+        / "GPU_Weight_Buffer.cpp"
+    ).read_text()
+    publish = weight_buffer_source[
+        weight_buffer_source.index(
+            "void GPU_Weight_Buffer::weights_copy_enqueued("
+        ) :
+    ]
+    event_pos = publish.index(
+        "CUDA_CHECK(cudaEventRecord(ready_event, copy_stream));"
+    )
+    map_pos = publish.index("this->module_in_buffers_[module_name] =")
+    notify_pos = publish.index("this->cv_.notify_all();")
+
+    assert event_pos < map_pos < notify_pos
 
 
 def test_weight_wait_timeout_allows_long_prefill_but_keeps_decode_watchdog():
