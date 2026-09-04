@@ -88,11 +88,15 @@ def test_glm5_prefill_setup_uses_bounded_metadata_lookups():
 
     assert "attn_weight_tasks = set(" in attn
     assert "self.skeleton_state_dict.items()" not in attn
-    assert (
-        'for projection in (\"q_a_proj\", \"q_b_proj\", '
-        '\"kv_a_proj_with_mqa\", \"kv_b_proj\", \"o_proj\")'
-        in attn
-    )
+    assert "for projection in (" in attn
+    for projection in (
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+    ):
+        assert f'"{projection}"' in attn
     assert "shared_weight_tasks = set(" in expert
     assert "routed_weight_tasks = set(" in expert
     assert "local_set = set(" in expert
