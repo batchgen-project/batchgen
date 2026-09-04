@@ -17,12 +17,14 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import logging
 
 import torch
 import triton
 import triton.language as tl
 
 _VALIDATED_RUNTIME_DEVICES: set[int] = set()
+_FP8_ABSORB_FALLBACK_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -204,6 +206,141 @@ def _fp8_linear_from_quantized(
         output,
     )
     return output
+
+
+@dataclass(frozen=True)
+class _SparseAbsorb:
+    """Per-layer absorbed KV-B projections for one sparse prefill layer.
+
+    ``q_absorb``/``out_absorb`` are BF16 and take the BMM path; a ``None``
+    entry means the FP8 WGMMA kernel in ``fp8_weights`` owns that GEMM.
+    """
+
+    fp8_weights: object | None
+    q_absorb: torch.Tensor | None
+    out_absorb: torch.Tensor | None
+
+
+def _has_fp8_absorb(fp8_weights, attribute: str) -> bool:
+    if fp8_weights is None:
+        return False
+    weight = getattr(fp8_weights, attribute, None)
+    return weight is not None and weight.numel() > 0
+
+
+def _resolve_sparse_absorb(
+    *,
+    attn,
+    weight_scale: dict[str, torch.Tensor],
+    fp8_absorb_weights,
+    cached_q_absorb: torch.Tensor | None,
+    cached_out_absorb: torch.Tensor | None,
+    timed,
+) -> _SparseAbsorb:
+    """Reuse the wrapper's absorbed KV-B weights instead of dequantizing.
+
+    ``GLM5AttnWrapper.initialize_decode_absorb`` already dequantizes
+    ``kv_b_proj`` once per layer and pre-quantizes the FP8 absorb weights that
+    decode uses, so prefill reuses them through the same kernels.  The two
+    GEMMs are resolved independently because ``_initialize_folded_q_b`` frees
+    only the FP8 q-absorb.  BF16 wrapper caches cover the configuration where
+    no FP8 absorb kernel was built, and a per-layer dequantization stays as the
+    last resort: non-persistent layers reach prefill before
+    ``initialize_decode_absorb`` has run for them.
+    """
+
+    fp8_q = _has_fp8_absorb(fp8_absorb_weights, "q_absorb_fp8")
+    fp8_out = _has_fp8_absorb(fp8_absorb_weights, "out_absorb_fp8")
+    q_absorb = None if fp8_q else cached_q_absorb
+    out_absorb = None if fp8_out else cached_out_absorb
+    if (q_absorb is None and not fp8_q) or (out_absorb is None and not fp8_out):
+        from batchgen.attention.mla.flashmla_backend import (
+            deepseek_v3_dequantization,
+        )
+
+        with timed("attn_kv_b_dequant"):
+            kv_b = deepseek_v3_dequantization(
+                attn.kv_b_proj.weight.data,
+                weight_scale["kv_b_proj.weight_scale_inv"],
+            ).view(
+                attn.num_heads,
+                attn.qk_nope_head_dim + attn.v_head_dim,
+                attn.kv_lora_rank,
+            )
+        if q_absorb is None and not fp8_q:
+            q_absorb = kv_b[:, : attn.qk_nope_head_dim, :]
+        if out_absorb is None and not fp8_out:
+            out_absorb = kv_b[:, attn.qk_nope_head_dim :, :]
+
+        # Prefill wrappers are intentionally non-persistent, so their decode
+        # absorb cache is normally absent when this function is first called.
+        # Build the same FP8 absorb representation on demand after the single
+        # required kv_b dequant; otherwise the large-token BMMs below dominate
+        # the sparse path.  If the optional kernel is unavailable, retain the
+        # BF16 matrices above as the explicit fallback.
+        if (
+            not fp8_q
+            and not fp8_out
+            and q_absorb is not None
+            and out_absorb is not None
+        ):
+            try:
+                from batchgen_kernels.attention.dsa.fp8_absorb import (
+                    FP8AbsorbWeights,
+                )
+                fp8_absorb_weights = FP8AbsorbWeights(
+                    q_absorb,
+                    out_absorb,
+                )
+            except Exception as exc:
+                global _FP8_ABSORB_FALLBACK_WARNED
+                if not _FP8_ABSORB_FALLBACK_WARNED:
+                    logging.getLogger(__name__).warning(
+                        "GLM-5.2 sparse prefill using BF16 absorb fallback: %s",
+                        exc,
+                    )
+                    _FP8_ABSORB_FALLBACK_WARNED = True
+            else:
+                q_absorb = None
+                out_absorb = None
+
+    return _SparseAbsorb(
+        fp8_weights=fp8_absorb_weights,
+        q_absorb=q_absorb,
+        # [heads, v_head_dim, kv_lora] -> [heads, kv_lora, v_head_dim] for BMM.
+        out_absorb=None if out_absorb is None else out_absorb.transpose(1, 2),
+    )
+
+
+def _absorb_q_nope(q_nope: torch.Tensor, absorb: _SparseAbsorb) -> torch.Tensor:
+    """[tokens, heads, qk_nope] -> [tokens, heads, kv_lora]."""
+
+    if absorb.q_absorb is not None:
+        return torch.bmm(
+            q_nope.transpose(0, 1),
+            absorb.q_absorb,
+        ).transpose(0, 1)
+
+    from batchgen_kernels.attention.dsa.fp8_absorb import fp8_q_absorb
+
+    return fp8_q_absorb(q_nope, absorb.fp8_weights)
+
+
+def _absorb_attn_latent(
+    attn_latent: torch.Tensor,
+    absorb: _SparseAbsorb,
+) -> torch.Tensor:
+    """[tokens, heads, kv_lora] -> [tokens, heads, v_head_dim]."""
+
+    if absorb.out_absorb is not None:
+        return torch.bmm(
+            attn_latent.transpose(0, 1),
+            absorb.out_absorb,
+        ).transpose(0, 1)
+
+    from batchgen_kernels.attention.dsa.fp8_absorb import fp8_out_absorb
+
+    return fp8_out_absorb(attn_latent, absorb.fp8_weights)
 
 
 def _fused_rope_hadamard_q(
@@ -631,6 +768,9 @@ def glm52_sparse_prefill_prepacked(
     reusable_topk_indices: torch.Tensor | None,
     causal_starts: torch.Tensor | None,
     causal_ends: torch.Tensor | None,
+    fp8_absorb_weights=None,
+    cached_q_absorb: torch.Tensor | None = None,
+    cached_out_absorb: torch.Tensor | None = None,
 ) -> Glm52SparsePrefillResult:
     """Execute one GLM-5.2 packed sparse-attention prefill layer."""
 
@@ -643,7 +783,6 @@ def glm52_sparse_prefill_prepacked(
         ) from exc
 
     from batchgen.attention.mla.fa3_backend import act_quant, w8a16_gemm
-    from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
     from batchgen.attention.mla.rotary_embedding import (
         rotary_pos_emb_interleaved_native,
     )
@@ -741,17 +880,14 @@ def glm52_sparse_prefill_prepacked(
         )
     del hidden_fp8, hidden_scale
 
-    with timed("attn_kv_b_dequant"):
-        kv_b = deepseek_v3_dequantization(
-            attn.kv_b_proj.weight.data,
-            weight_scale["kv_b_proj.weight_scale_inv"],
-        ).view(
-            attn.num_heads,
-            attn.qk_nope_head_dim + attn.v_head_dim,
-            attn.kv_lora_rank,
-        )
-    q_absorb = kv_b[:, : attn.qk_nope_head_dim, :]
-    out_absorb = kv_b[:, attn.qk_nope_head_dim :, :].transpose(1, 2)
+    absorb = _resolve_sparse_absorb(
+        attn=attn,
+        weight_scale=weight_scale,
+        fp8_absorb_weights=fp8_absorb_weights,
+        cached_q_absorb=cached_q_absorb,
+        cached_out_absorb=cached_out_absorb,
+        timed=timed,
+    )
     kv_sparse = primary_kv.unsqueeze(1)
     attn_output = torch.empty(
         total_tokens,
@@ -783,10 +919,7 @@ def glm52_sparse_prefill_prepacked(
                 2,
             ).squeeze(0)
         with timed("attn_sparse_q_absorb"):
-            q_latent = torch.bmm(
-                q_nope.transpose(0, 1),
-                q_absorb,
-            ).transpose(0, 1)
+            q_latent = _absorb_q_nope(q_nope, absorb)
             q_sparse = torch.cat([q_latent, q_pe], dim=-1).contiguous()
         with timed("attn_sparse_flashmla"):
             attn_latent, _, _ = flash_mla_sparse_fwd(
@@ -797,10 +930,7 @@ def glm52_sparse_prefill_prepacked(
                 d_v=attn.kv_lora_rank,
             )
         with timed("attn_sparse_out_absorb"):
-            attn_heads = torch.bmm(
-                attn_latent.transpose(0, 1),
-                out_absorb,
-            ).transpose(0, 1)
+            attn_heads = _absorb_attn_latent(attn_latent, absorb)
         with timed("attn_o"):
             attn_output[start:end] = w8a16_gemm(
                 attn.o_proj.weight.data,
@@ -811,7 +941,7 @@ def glm52_sparse_prefill_prepacked(
                 ).contiguous(),
             )
         del q, q_nope, q_pe, q_latent, q_sparse, attn_latent, attn_heads
-    del q_a_fp8, q_a_scale, q_absorb, out_absorb, kv_b, kv_sparse
+    del q_a_fp8, q_a_scale, absorb, kv_sparse
 
     return Glm52SparsePrefillResult(
         attn_output=attn_output,
