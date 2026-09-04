@@ -82,6 +82,82 @@ torch::Dtype get_tensor_dtype(
     // 3. Fall back to global weight dtype
     return basic_config.weight_dtype_torch;
 }
+
+module_weight_tensor_map allocate_module_buffer(
+    const GPU_Buffer_Config& gpu_config,
+    const Basic_Config& basic_config,
+    const std::string& module_type,
+    const std::unordered_map<std::string, std::vector<int64_t>>& shapes,
+    const torch::Device& device) {
+    // GLM-5 routed/shared experts contain exactly three same-dtype matrices.
+    // Keep their named views in one allocation so the H2D worker can use one
+    // contiguous DMA when the host metadata has the matching layout. Any
+    // other module shape keeps the established per-tensor allocation path.
+    static constexpr const char* kExpertTensorNames[] = {
+        "down_proj.weight", "gate_proj.weight", "up_proj.weight"};
+    if ((module_type == "routed_expert" || module_type == "shared_expert") &&
+        shapes.size() == 3) {
+        int64_t total_elements = 0;
+        torch::Dtype common_dtype = torch::kFloat8_e4m3fn;
+        bool valid = true;
+        bool first = true;
+        for (const char* name : kExpertTensorNames) {
+            auto shape_it = shapes.find(name);
+            if (shape_it == shapes.end()) {
+                valid = false;
+                break;
+            }
+            const torch::Dtype dtype =
+                get_tensor_dtype(gpu_config, basic_config, module_type, name);
+            if (first) {
+                common_dtype = dtype;
+                first = false;
+            } else if (dtype != common_dtype) {
+                valid = false;
+                break;
+            }
+            int64_t elements = 1;
+            for (int64_t dim : shape_it->second) {
+                elements *= dim;
+            }
+            total_elements += elements;
+        }
+        if (valid) {
+            auto options = torch::TensorOptions()
+                               .dtype(common_dtype)
+                               .device(device)
+                               .requires_grad(false)
+                               .memory_format(torch::MemoryFormat::Contiguous);
+            auto slab = torch::empty({total_elements}, options);
+            module_weight_tensor_map result;
+            int64_t offset = 0;
+            for (const char* name : kExpertTensorNames) {
+                const auto& shape = shapes.at(name);
+                int64_t elements = 1;
+                for (int64_t dim : shape) {
+                    elements *= dim;
+                }
+                result.emplace(name,
+                               slab.narrow(0, offset, elements).view(shape));
+                offset += elements;
+            }
+            return result;
+        }
+    }
+
+    module_weight_tensor_map result;
+    for (const auto& [buffer_name, buffer_shape] : shapes) {
+        auto options = torch::TensorOptions()
+                           .dtype(get_tensor_dtype(
+                               gpu_config, basic_config, module_type,
+                               buffer_name))
+                           .device(device)
+                           .requires_grad(false)
+                           .memory_format(torch::MemoryFormat::Contiguous);
+        result.emplace(buffer_name, torch::zeros(buffer_shape, options));
+    }
+    return result;
+}
 }  // namespace
 
 GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
@@ -179,24 +255,13 @@ void GPU_Weight_Buffer::Init() {
         this->buffers_[module_type].resize(num_buffer);
         this->buffer_status_[module_type].clear();
         this->buffer_status_[module_type].resize(num_buffer, 0);
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
+        for (int64_t buffer_idx = 0; buffer_idx < num_buffer; buffer_idx++) {
+            this->buffers_[module_type][buffer_idx] = allocate_module_buffer(
                 this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                module_type,
-                buffer_name);
-            auto options =
-                torch::TensorOptions()
-                    .dtype(tensor_dtype)
-                    .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                    .requires_grad(false)
-                    .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
-                 buffer_idx++) {
-                this->buffers_[module_type][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
+                this->engine_config_.basic_config, module_type,
+                buffer_shapes[module_type],
+                torch::Device(torch::kCUDA,
+                              this->engine_config_.basic_config.device));
         }
         this->resetReadyEventsLocked(module_type, num_buffer);
     }
@@ -214,24 +279,12 @@ void GPU_Weight_Buffer::resize_buffer() {
         int64_t to_add_buffer = num_buffers["routed_expert"] -
                                 this->buffers_["routed_expert"].size();
         for (int64_t i = 0; i < to_add_buffer; i++) {
-            module_weight_tensor_map new_buffer;
-            for (auto& [buffer_name, buffer_shape] :
-                 buffer_shapes["routed_expert"]) {
-                // Get per-tensor dtype using the helper function
-                torch::Dtype tensor_dtype = get_tensor_dtype(
-                    this->engine_config_.gpu_buffer_config,
-                    this->engine_config_.basic_config,
-                    "routed_expert",
-                    buffer_name);
-                auto options =
-                    torch::TensorOptions()
-                        .dtype(tensor_dtype)
-                        .device(torch::kCUDA,
-                                this->engine_config_.basic_config.device)
-                        .requires_grad(false)
-                        .memory_format(torch::MemoryFormat::Contiguous);
-                new_buffer[buffer_name] = torch::zeros(buffer_shape, options);
-            }
+            auto new_buffer = allocate_module_buffer(
+                this->engine_config_.gpu_buffer_config,
+                this->engine_config_.basic_config, "routed_expert",
+                buffer_shapes["routed_expert"],
+                torch::Device(torch::kCUDA,
+                              this->engine_config_.basic_config.device));
             this->buffers_["routed_expert"].push_back(new_buffer);
             this->buffer_status_["routed_expert"].push_back(0);
             cudaEvent_t ready_event = nullptr;
@@ -776,22 +829,14 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
 
         // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
+        for (int64_t buffer_idx = 0;
+             buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+            this->buffers_["routed_expert"][buffer_idx] = allocate_module_buffer(
                 this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
+                this->engine_config_.basic_config, "routed_expert",
+                buffer_shapes["routed_expert"],
+                torch::Device(torch::kCUDA,
+                              this->engine_config_.basic_config.device));
         }
 
         // Clear module_in_buffers
@@ -1031,22 +1076,14 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
 
         // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
+        for (int64_t buffer_idx = 0;
+             buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+            this->buffers_["routed_expert"][buffer_idx] = allocate_module_buffer(
                 this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
-            }
+                this->engine_config_.basic_config, "routed_expert",
+                buffer_shapes["routed_expert"],
+                torch::Device(torch::kCUDA,
+                              this->engine_config_.basic_config.device));
         }
 
         // Clear module_in_buffers

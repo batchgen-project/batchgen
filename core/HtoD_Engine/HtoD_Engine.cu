@@ -19,6 +19,8 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <torch/extension.h>
@@ -32,6 +34,76 @@
 #include "../threadsafe_queue.h"
 #include "../utils.h"
 #include "HtoD_Engine.h"
+
+namespace {
+
+bool try_enqueue_contiguous_expert_copy(
+    const std::string& module_type,
+    const std::unordered_map<std::string, tensor_buffer>& src,
+    const module_weight_tensor_map& dst,
+    cudaStream_t stream) {
+    if ((module_type != "routed_expert" && module_type != "shared_expert") ||
+        src.size() != 3 || dst.size() != 3) {
+        return false;
+    }
+
+    static constexpr const char* kNames[] = {
+        "down_proj.weight", "gate_proj.weight", "up_proj.weight"};
+    std::vector<std::pair<std::string, std::uintptr_t>> src_order;
+    std::vector<std::pair<std::string, std::uintptr_t>> dst_order;
+    src_order.reserve(3);
+    dst_order.reserve(3);
+    for (const char* name : kNames) {
+        auto src_it = src.find(name);
+        auto dst_it = dst.find(name);
+        if (src_it == src.end() || dst_it == dst.end() ||
+            src_it->second.data_ptr == nullptr ||
+            !dst_it->second.defined() || !dst_it->second.has_storage() ||
+            src_it->second.byte_size !=
+                static_cast<int64_t>(dst_it->second.nbytes())) {
+            return false;
+        }
+        src_order.emplace_back(name,
+                               reinterpret_cast<std::uintptr_t>(
+                                   src_it->second.data_ptr));
+        dst_order.emplace_back(name,
+                               reinterpret_cast<std::uintptr_t>(
+                                   dst_it->second.data_ptr()));
+    }
+    std::sort(src_order.begin(), src_order.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    std::sort(dst_order.begin(), dst_order.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    for (size_t i = 0; i < src_order.size(); ++i) {
+        if (src_order[i].first != kNames[i] ||
+            dst_order[i].first != kNames[i]) {
+            return false;
+        }
+        if (i > 0) {
+            const auto& previous_src = src.at(src_order[i - 1].first);
+            const auto& previous_dst = dst.at(dst_order[i - 1].first);
+            if (src_order[i].second !=
+                    src_order[i - 1].second + previous_src.byte_size ||
+                dst_order[i].second !=
+                    dst_order[i - 1].second + previous_dst.nbytes()) {
+                return false;
+            }
+        }
+    }
+
+    const auto& first_src = src.at(kNames[0]);
+    const auto& first_dst = dst.at(kNames[0]);
+    int64_t total_bytes = 0;
+    for (const char* name : kNames) {
+        total_bytes += src.at(name).byte_size;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        first_dst.data_ptr(), first_src.data_ptr, total_bytes,
+        cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
+}  // namespace
 
 HtoD_Engine::HtoD_Engine(const EngineConfig& engine_config,
                          const ModelConfig& model_config,
@@ -433,56 +505,61 @@ void HtoD_Engine::HtoD_Worker() {
                 auto dst = buffer.get();
                 auto src = this->weights_storage_.get_module_weights_storage(
                     module_name);
-                torch::Tensor tmp_src;
-                void* src_ptr;
-                int64_t src_byte_size;
-                for (auto& [tensor_name, host_tensor_storage] : src) {
-                    src_ptr = host_tensor_storage.data_ptr;
-                    src_byte_size = host_tensor_storage.byte_size;
-                    // find(), not operator[]: dst is an unordered_map and
-                    // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
-                    // every miss, permanently growing a buffer map that is
-                    // reused across ring slots.
-                    auto slot = dst.find(tensor_name);
-                    if (slot == dst.end() || !slot->second.defined() ||
-                        !slot->second.has_storage()) {
-                        // The host map carries a tensor module_shapes declares
-                        // no slot for. Continuing drops it silently and the
-                        // consumer reads whatever the slot last held.
-                        this->logger_->error(
-                            "Module {}: host tensor {} has no GPU slot -- "
-                            "module_shapes declares no such key",
-                            module_name, tensor_name);
-                        throw std::runtime_error(
-                            "HtoD: host tensor has no GPU slot: " +
-                            tensor_name);
-                    }
-                    int64_t dst_byte_size = slot->second.nbytes();
-                    if (src_byte_size != dst_byte_size) {
-                        // blocking_copy_ writes src_byte_size bytes with no
-                        // bound check: a short slot is overrun into its
-                        // neighbour, a long one keeps a stale tail. Both are
-                        // silent and both produce wrong weights.
-                        this->logger_->error(
-                            "Module {}: tensor {} size mismatch -- host {} B, "
-                            "GPU slot {} B (module_shapes/dtype disagrees with "
-                            "the checkpoint)",
-                            module_name, tensor_name, src_byte_size,
-                            dst_byte_size);
-                        throw std::runtime_error(
-                            "HtoD: host/GPU byte size mismatch for " +
-                            tensor_name);
-                    }
-                    // The H2D worker is asynchronous with respect to the model
-                    // thread, but each rank must pace its producer at tensor
-                    // granularity. Larger module-sized or unbounded bursts
-                    // create severe cross-rank PCIe unfairness and increase the
-                    // max-rank prefill wall time. The module is published only
-                    // after all of its tensor copies complete.
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        slot->second.data_ptr(), src_ptr, src_byte_size,
-                        cudaMemcpyHostToDevice, this->HtoD_stream));
+                const bool contiguous_copy =
+                    try_enqueue_contiguous_expert_copy(
+                        module_type, src, dst, this->HtoD_stream);
+                if (contiguous_copy) {
+                    // One expert-sized transfer is still paced before the
+                    // module is published, preserving cross-rank fairness.
                     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    this->logger_->debug(
+                        "Enqueued contiguous expert copy: {} to buffer: {}",
+                        module_name, buffer_idx);
+                } else {
+                    void* src_ptr;
+                    int64_t src_byte_size;
+                    for (auto& [tensor_name, host_tensor_storage] : src) {
+                        src_ptr = host_tensor_storage.data_ptr;
+                        src_byte_size = host_tensor_storage.byte_size;
+                        // find(), not operator[]: dst is an unordered_map and
+                        // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
+                        // every miss, permanently growing a buffer map that is
+                        // reused across ring slots.
+                        auto slot = dst.find(tensor_name);
+                        if (slot == dst.end() || !slot->second.defined() ||
+                            !slot->second.has_storage()) {
+                            // The host map carries a tensor module_shapes declares
+                            // no slot for. Continuing drops it silently and the
+                            // consumer reads whatever the slot last held.
+                            this->logger_->error(
+                                "Module {}: host tensor {} has no GPU slot -- "
+                                "module_shapes declares no such key",
+                                module_name, tensor_name);
+                            throw std::runtime_error(
+                                "HtoD: host tensor has no GPU slot: " +
+                                tensor_name);
+                        }
+                        int64_t dst_byte_size = slot->second.nbytes();
+                        if (src_byte_size != dst_byte_size) {
+                            // A short slot would overrun its neighbour; a long
+                            // one would keep a stale tail. Reject both.
+                            this->logger_->error(
+                                "Module {}: tensor {} size mismatch -- host {} B, "
+                                "GPU slot {} B (module_shapes/dtype disagrees with "
+                                "the checkpoint)",
+                                module_name, tensor_name, src_byte_size,
+                                dst_byte_size);
+                            throw std::runtime_error(
+                                "HtoD: host/GPU byte size mismatch for " +
+                                tensor_name);
+                        }
+                        // Keep the established tensor-paced fallback for any
+                        // module whose metadata is not one contiguous expert span.
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slot->second.data_ptr(), src_ptr, src_byte_size,
+                            cudaMemcpyHostToDevice, this->HtoD_stream));
+                        CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    }
                 }
                 this->logger_->debug(
                     "Enqueued module copy: {} to buffer: {}", module_name,

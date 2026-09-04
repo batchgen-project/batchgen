@@ -102,6 +102,41 @@ def test_h2d_weight_worker_paces_each_tensor_before_publication():
     assert "this->blocking_copy_(" not in module_loop[:publish_pos]
 
 
+def test_h2d_worker_has_verified_contiguous_expert_fast_path_with_fallback():
+    source = (
+        _REPO_ROOT / "core" / "HtoD_Engine" / "HtoD_Engine.cu"
+    ).read_text()
+    helper = source[
+        source.index("bool try_enqueue_contiguous_expert_copy") :
+        source.index("HtoD_Engine::HtoD_Engine")
+    ]
+    compact_helper = " ".join(helper.split())
+
+    assert '"down_proj.weight", "gate_proj.weight", "up_proj.weight"' in compact_helper
+    assert "std::sort(src_order.begin()" in compact_helper
+    assert "std::sort(dst_order.begin()" in compact_helper
+    assert "src_order[i - 1].second + previous_src.byte_size" in compact_helper
+    assert "dst_order[i - 1].second + previous_dst.nbytes()" in compact_helper
+    assert "cudaMemcpyAsync(" in compact_helper
+    assert "if (contiguous_copy)" in source
+    assert "Keep the established tensor-paced fallback" in source
+
+
+def test_expert_buffers_use_named_views_over_one_contiguous_slab():
+    source = (
+        _REPO_ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
+    ).read_text()
+    helper = source[
+        source.index("module_weight_tensor_map allocate_module_buffer") :
+        source.index("GPU_Weight_Buffer::GPU_Weight_Buffer")
+    ]
+
+    assert "torch::empty({total_elements}, options)" in helper
+    assert "slab.narrow(0, offset, elements).view(shape)" in helper
+    assert '"down_proj.weight", "gate_proj.weight", "up_proj.weight"' in helper
+    assert "torch::zeros(buffer_shape, options)" in helper
+
+
 def test_weight_wait_timeout_allows_long_prefill_but_keeps_decode_watchdog():
     source = (
         _REPO_ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
