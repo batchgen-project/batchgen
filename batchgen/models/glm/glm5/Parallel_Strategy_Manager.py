@@ -702,6 +702,7 @@ class GLM5ParallelStrategyManager:
     def _config_attn_module(self):
         """Replace attention modules with GLM5AttnWrapper."""
         start_time = time.perf_counter()
+        attn_weight_tasks = set(self.weight_copy_task.get("attn", ()))
         for layer_idx in range(len(self.model.model.layers)):
             attn_module = self.model.model.layers[layer_idx].self_attn
             if self.engine_config.Basic_Config.gpu_arch in ("hopper", "blackwell"):
@@ -744,21 +745,24 @@ class GLM5ParallelStrategyManager:
                 raise ValueError(f"Unsupported GPU arch: {self.engine_config.Basic_Config.gpu_arch}")
 
             # Determine persistence
-            persistent = f"attn_{layer_idx}" not in self.weight_copy_task.get("attn", [])
+            persistent = f"attn_{layer_idx}" not in attn_weight_tasks
 
             # Extract FP8 dequant scales from skeleton
             weight_dequant_scales = {}
             prefix = f"model.layers.{layer_idx}.self_attn."
             postfix = ".weight_scale_inv"
-            for name, param in self.skeleton_state_dict.items():
-                if name.startswith(prefix) and name.endswith(postfix):
-                    # Skip indexer scales
-                    if ".indexer." in name:
-                        continue
-                    key = name[len(prefix):]
-                    weight_dequant_scales[key] = param.to(
-                        self.engine_config.Basic_Config.device_torch
-                    )
+            device = self.engine_config.Basic_Config.device_torch
+            for projection in (
+                "q_a_proj",
+                "q_b_proj",
+                "kv_a_proj_with_mqa",
+                "kv_b_proj",
+                "o_proj",
+            ):
+                key = f"{projection}{postfix}"
+                param = self.skeleton_state_dict.get(prefix + key)
+                if param is not None:
+                    weight_dequant_scales[key] = param.to(device)
 
             wrapper = GLM5AttnWrapper(
                 attn_module, layer_idx, self.core_engine,
@@ -778,12 +782,15 @@ class GLM5ParallelStrategyManager:
         start_time = time.perf_counter()
         mlp_names = ["gate_proj", "up_proj", "down_proj"]
         postfix = ".weight_scale_inv"
+        shared_weight_tasks = set(self.weight_copy_task.get("shared_expert", ()))
+        routed_weight_tasks = set(self.weight_copy_task.get("routed_expert", ()))
+        local_set = set(getattr(self, "local_routed_experts", ()))
 
         for layer_idx in range(self.FIRST_K_DENSE, len(self.model.model.layers)):
             layer = self.model.model.layers[layer_idx]
 
             # Shared expert
-            shared_persistent = f"shared_expert_{layer_idx}" not in self.weight_copy_task.get("shared_expert", [])
+            shared_persistent = f"shared_expert_{layer_idx}" not in shared_weight_tasks
             prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
             shared_scales = {}
             for name in mlp_names:
@@ -801,10 +808,9 @@ class GLM5ParallelStrategyManager:
                 layer.mlp.shared_experts._register_fp8_weights()
 
             # Routed experts — wrap placeholders directly (no nn.Module needed)
-            local_set = set(self.local_routed_experts) if hasattr(self, 'local_routed_experts') else set()
             for expert_idx in range(len(layer.mlp.experts)):
                 routed_key = f"routed_expert_{layer_idx}_{expert_idx}"
-                persistent = routed_key not in self.weight_copy_task.get("routed_expert", [])
+                persistent = routed_key not in routed_weight_tasks
 
                 prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
                 expert_scales = {}

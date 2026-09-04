@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,11 @@ from batchgen.models.glm.glm5.model import Glm5Indexer
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 from batchgen.models.wrappers.attention import AttnWrapperBase
 from batchgen.batchgen_worker import BatchGenWorker
+
+
+_PSM_SOURCE = Path(__file__).resolve().parents[1] / (
+    "batchgen/models/glm/glm5/Parallel_Strategy_Manager.py"
+)
 
 
 def _fake_prefill_manager(num_layers=5, first_k_dense=3, num_experts=4):
@@ -67,6 +73,29 @@ def _fake_prefill_manager(num_layers=5, first_k_dense=3, num_experts=4):
         ],
     }
     return manager
+
+
+def test_glm5_prefill_setup_uses_bounded_metadata_lookups():
+    source = _PSM_SOURCE.read_text()
+    attn = source[
+        source.index("    def _config_attn_module") :
+        source.index("    def _config_expert_module")
+    ]
+    expert = source[
+        source.index("    def _config_expert_module") :
+        source.index("    def _configure_decode_moe")
+    ]
+
+    assert "attn_weight_tasks = set(" in attn
+    assert "self.skeleton_state_dict.items()" not in attn
+    assert (
+        'for projection in (\"q_a_proj\", \"q_b_proj\", '
+        '\"kv_a_proj_with_mqa\", \"kv_b_proj\", \"o_proj\")'
+        in attn
+    )
+    assert "shared_weight_tasks = set(" in expert
+    assert "routed_weight_tasks = set(" in expert
+    assert "local_set = set(" in expert
 
 
 def test_glm5_prefill_manager_derives_fp8_from_checkpoint_config():
