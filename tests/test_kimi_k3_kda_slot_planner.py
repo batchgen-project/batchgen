@@ -35,11 +35,14 @@ def test_h20_tp8_keeps_four_user_slots():
     ) == 4
 
 
-def test_h200_tp8_uses_32_user_slots():
+def test_h200_tp8_uses_256_user_slots():
+    """H200's slot count IS the per-node decode admission cap, so it is sized
+    for decode concurrency (256 x 53.57 MiB = 13.4 GiB/rank beside the 84 GiB
+    resident expert shard), not for the old 32-slot KV-headroom guard."""
     assert k3_kda_state_slots(
         gpu_total_memory_bytes=140 * GIB,
         attention_group_size=8,
-    ) == 32
+    ) == 256
 
 
 def test_h20_tp8_keeps_single_long_prompt_prefill_cap():

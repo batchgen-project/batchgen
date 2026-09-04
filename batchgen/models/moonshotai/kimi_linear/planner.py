@@ -22,6 +22,9 @@ _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
 _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 524_288
 _K3_H20_PREFILL_GROUPED_CHUNK_ROWS = 2_048
 _K3_H200_PREFILL_GROUPED_CHUNK_ROWS = 32_768
+# Per-node decode admission cap on H200 (= KDA state slots). See
+# k3_kda_state_slots for the HBM budget behind this number.
+_K3_H200_KDA_STATE_SLOTS = 256
 
 
 def k3_kda_state_slots(
@@ -31,10 +34,28 @@ def k3_kda_state_slots(
 
     The distributed K3 topology uses TP8 KDA, so each rank stores only 1/8
     of every sequence's recurrent/conv state (53.57 MiB per slot). H20 keeps
-    the validated four-slot plan. GPUs with at least 120 GiB of HBM use 32
-    user slots, which cost 1.674 GiB/rank and remove the H20-only four-sequence
-    admission ceiling without consuming the H200 KV-cache headroom. The
-    planner allocates one additional physical item for CUDA-graph scratch.
+    the validated four-slot plan. The planner allocates one additional
+    physical item for CUDA-graph scratch.
+
+    H200 budget (2026-09-04). This value IS the per-node decode admission cap,
+    so it sets decode concurrency and therefore decode throughput: every step
+    re-reads the whole 84 GiB resident expert shard regardless of how many
+    sequences are in flight, so each extra admitted sequence rides on weight
+    traffic already paid for. At 256 slots the routed rows per expert are still
+    only 256*16/896 = 4.6, far below the M~16 efficiency shoulder measured in
+    the Phase-0 cost model, so the added concurrency is close to free.
+
+        resident expert shard   84.0 GiB   (measured, released during prefill)
+        KDA state, 256 slots    13.4 GiB   (256 x 53.57 MiB)
+        skeleton/dense/MLA/etc  ~15   GiB
+                               ---------
+                                ~112  GiB  against 143 GB of H200 HBM
+
+    The prior value was 32 (1.674 GiB/rank), chosen only to lift the H20
+    four-sequence ceiling "without consuming the H200 KV-cache headroom" —
+    conservative, never tuned for throughput. K3 offloads its MLA KV to host
+    paged memory, so GPU KV headroom is not the binding constraint that
+    reasoning assumed.
 
     Unknown memory and non-TP8 configurations fail safe to the validated
     four-slot plan.
@@ -48,7 +69,7 @@ def k3_kda_state_slots(
     if memory_bytes <= 0:
         raise ValueError("gpu_total_memory_bytes must be positive")
     if group_size == 8 and memory_bytes >= _K3_H200_MIN_MEMORY_BYTES:
-        return 32
+        return _K3_H200_KDA_STATE_SLOTS
     return 4
 
 
@@ -344,7 +365,7 @@ class KimiLinearPlanner(BasePlanner):
         )
         self.config.Basic_Config.decode_graph_buckets = [
             bucket
-            for bucket in (1, 2, 4, 8, 16, 24, 32)
+            for bucket in (1, 2, 4, 8, 16, 24, 32, 64, 128, 192, 256)
             if bucket <= sequence_slots
         ]
 
