@@ -166,13 +166,13 @@ def test_h20_plan_adds_graph_scratch_without_reducing_user_capacity():
     assert config.Basic_Config.decode_graph_buckets == [1, 2, 4]
 
 
-def test_h200_plan_exposes_32_users_plus_separate_graph_scratch():
+def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     config = _plan_k3(140 * GIB)
 
-    assert config.GPU_Buffer_Config.kda_state_slots == 33
-    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 32
+    assert config.GPU_Buffer_Config.kda_state_slots == 257
+    assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
     assert config.Basic_Config.decode_graph_buckets == [
-        1, 2, 4, 8, 16, 24, 32,
+        1, 2, 4, 8, 16, 24, 32, 64, 128, 192, 256,
     ]
     assert (
         config.Module_Batching_Config.prefill_micro_batch_token_cap
