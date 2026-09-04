@@ -84,6 +84,7 @@ _GLM5_PREFILL_CATEGORIES = [
     "attn_kv_norm", "attn_rope", "attn_primary_kv_materialize",
     "attn_kv_b", "attn_qkv_materialize", "attn_fa3", "attn_o",
     "attn_input_quant", "attn_q_a_quant", "attn_kv_b_dequant",
+    "attn_kv_b_absorb_init",
     "indexer_prefill_score", "attn_sparse_q_absorb",
     "attn_sparse_flashmla", "attn_sparse_out_absorb",
     "indexer_wk", "indexer_norm", "indexer_rope_hadamard",
@@ -793,6 +794,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         q_absorb and out_absorb matrices. Eliminates 78× per-step
         dequantization in _forward_decode_dsa().
         """
+        # A non-persistent prefill wrapper can serve several microbatches,
+        # while its streamed kv_b weight is released after each layer. Keep
+        # only the derived absorb representation so later microbatches do not
+        # repeat the dequantization/quantization work.
+        if self._fp8_absorb_weights is not None:
+            return
+        if self._cached_q_absorb is not None and self._cached_out_absorb is not None:
+            return
+
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
         attn = self.module
         weight_scale = self.weight_dequant_scale
@@ -1010,6 +1020,26 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 getattr(config, "index_topk", 2048),
             )
             if use_sparse_prefill:
+                # Prefill attention is streamed, so decode absorb setup did
+                # not run during model configuration. Build it after this
+                # layer's weights are bound and time the first-build cost.
+                if (
+                    self._fp8_absorb_weights is None
+                    and not (
+                        self._cached_q_absorb is not None
+                        and self._cached_out_absorb is not None
+                    )
+                ):
+                    from batchgen.timing import get_prefill_timer
+
+                    absorb_timer = get_prefill_timer()
+                    absorb_ctx = (
+                        absorb_timer.timed("attn_kv_b_absorb_init", self.layer_idx)
+                        if absorb_timer is not None
+                        else _nullctx()
+                    )
+                    with absorb_ctx:
+                        self.initialize_decode_absorb()
                 if type(self)._dsa_prefill_causal_starts is None:
                     from batchgen.models.glm.glm5.sparse_prefill import (
                         build_packed_causal_ranges,
