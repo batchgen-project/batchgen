@@ -9100,8 +9100,17 @@ class BatchGenWorker:
 							f"host_pages={seq.host_pages_allocated} "
 							f"tokens_saved={len(seq.evicted_token_ids)}"
 						)
+				# Host KV is ONE per-node SHARED shm region keyed by global_idx, so
+				# release/unregister must fire EXACTLY once per sequence. Under G>1
+				# all G ranks of a group hold the evicted uuid, so releasing on every
+				# rank double-frees: the first releaser tombstones the entry and the
+				# rest raise "Sequence ID ... not found during release". Filter to the
+				# group leader (_owns_host_kv), matching the validated release path in
+				# _release_host_kv_pages_for_batch. The all-ranks scalar-metadata loop
+				# below iterates host_evicted_uuids and is deliberately NOT filtered.
 				evicted_global_ids = [
 					self.global_batch.get_sequence(u).global_idx for u in my_evicted
+					if self._owns_host_kv(self.global_batch.get_sequence(u))
 				]
 				if worker_view is not None:
 					worker_view.release_sequence_pages(evicted_global_ids)

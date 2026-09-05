@@ -408,3 +408,47 @@ def test_put_on_hold_frees_tp_replica_on_non_assigned_rank():
     assert worker._sequences_with_gpu_kv == set()
     assert seq.gpu_pages_allocated == 0
     assert calls.barriers == 1
+
+
+def _assignment_targets(method_name, value_name):
+    """Names read by every assignment to `value_name` inside `method_name`."""
+    tree = ast.parse(WORKER.read_text())
+    worker = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    )
+    method = next(
+        node for node in worker.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    found = []
+    for node in ast.walk(method):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == value_name for t in node.targets
+        ):
+            found.append({
+                n.attr for n in ast.walk(node.value) if isinstance(n, ast.Attribute)
+            })
+    return found
+
+
+def test_page_boundary_eviction_releases_host_kv_on_owner_only():
+    """Host-KV eviction must filter by _owns_host_kv (single-owner invariant).
+
+    Regression for the G=8 decode failure `IndexError: Sequence ID N not found
+    during release`: `_page_boundary_fast` built `evicted_global_ids` from ALL
+    locally-evicted uuids and called `release_sequence_pages` on every rank.
+    Host KV is ONE shared per-node shm region keyed by global_idx, so under G>1
+    the first releaser tombstones the entry and the other G-1 ranks raise.
+    The validated release path already filters by `_owns_host_kv`; the eviction
+    path must too. Only reachable once GPU-KV pressure makes eviction routine
+    (a high decode admission cap), which is why 32-slot runs never hit it.
+    """
+    assignments = _assignment_targets("_page_boundary_fast", "evicted_global_ids")
+    assert assignments, "evicted_global_ids assignment not found"
+    for attrs in assignments:
+        assert "_owns_host_kv" in attrs, (
+            "evicted_global_ids feeds release_sequence_pages/unregister_sequences "
+            "on the SHARED per-node host-KV region; it must be filtered by "
+            "_owns_host_kv or G>1 ranks double-release"
+        )
