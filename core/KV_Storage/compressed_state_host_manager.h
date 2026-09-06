@@ -196,15 +196,13 @@ class CompressedStateHostManager {
             PrepareDecodeRows(layer_idx, sequence_ids, state_tensor,
                               raw_positions, CopyDirection::kDeviceToHost,
                               kOpName);
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
         auto task = transformed_detail::MakeAsyncTask(
             [this, prepared = std::move(prepared),
-             producer_cuda_stream]() mutable {
+             producer_event]() mutable {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
                 const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+                WaitForProducerEvent(cuda_stream, *producer_event);
                 CopyDecodeRowsAsync(prepared, CopyDirection::kDeviceToHost,
                                     cuda_stream);
                 SynchronizeWithEvent(cuda_stream);
@@ -258,9 +256,7 @@ class CompressedStateHostManager {
                 "AsyncAppendDecodeStateToHostBatchedKernel");
         }
 
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
 
         const std::size_t total = entries.size() * batch;
         std::vector<uint8_t*> src_host(total);
@@ -305,11 +301,11 @@ class CompressedStateHostManager {
             [this, src_host = std::move(src_host),
              dst_host = std::move(dst_host), total,
              rolling_updates = std::move(rolling_updates),
-             producer_cuda_stream]() mutable {
+             producer_event]() mutable {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
                 const auto cuda_stream =
                     CopyStream(CopyDirection::kDeviceToHost);
-                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+                WaitForProducerEvent(cuda_stream, *producer_event);
 
                 worker_detail::DeviceBuffer<uint8_t*> src_buf(total);
                 worker_detail::DeviceBuffer<uint8_t*> dst_buf(total);
@@ -339,15 +335,13 @@ class CompressedStateHostManager {
         auto prepared = PrepareStateItemRows(
             std::move(sequence_ids), std::move(state_device_ptrs),
             "AsyncOffloadStateItemsToHost");
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
         auto task = transformed_detail::MakeAsyncTask(
             [this, prepared = std::move(prepared),
-             producer_cuda_stream]() mutable {
+             producer_event]() mutable {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
                 const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+                WaitForProducerEvent(cuda_stream, *producer_event);
                 CopyStateItemsAsync(prepared, CopyDirection::kDeviceToHost,
                                     cuda_stream);
                 SynchronizeWithEvent(cuda_stream);
@@ -1005,13 +999,22 @@ class CompressedStateHostManager {
         CUDA_CHECK(cudaEventSynchronize(event.get()));
     }
 
-    void WaitForProducerStream(cudaStream_t consumer_stream,
-                               cudaStream_t producer_stream) const {
-        if (producer_stream == nullptr || consumer_stream == producer_stream) {
-            return;
-        }
-        worker_detail::ScopedCudaEvent event(logger_);
-        CUDA_CHECK(cudaEventRecord(event.get(), producer_stream));
+    // Same contract as HostPagedKVWorkerView::RecordProducerEvent: record on
+    // the issuing thread's current stream (the legacy default stream has a
+    // null handle and must still be recorded) so the non-blocking copy
+    // stream is ordered behind the kernel that produced the state rows.
+    std::shared_ptr<worker_detail::ScopedCudaEvent> RecordProducerEvent() const {
+        c10::cuda::OptionalCUDAGuard guard(device_index_);
+        auto event = std::make_shared<worker_detail::ScopedCudaEvent>(logger_);
+        const auto stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        CUDA_CHECK(cudaEventRecord(event->get(), stream));
+        return event;
+    }
+
+    void WaitForProducerEvent(
+        cudaStream_t consumer_stream,
+        const worker_detail::ScopedCudaEvent& event) const {
         CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, event.get(), 0));
     }
 
