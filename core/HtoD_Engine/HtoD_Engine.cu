@@ -353,6 +353,8 @@ void HtoD_Engine::reset_weight_copy_queue() {
 
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    int contiguous_expert_copies_since_sync = 0;
+    static constexpr int kContiguousExpertSyncWindow = 2;
     while (!terminate_flag_) {
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
@@ -509,9 +511,16 @@ void HtoD_Engine::HtoD_Worker() {
                     try_enqueue_contiguous_expert_copy(
                         module_type, src, dst, this->HtoD_stream);
                 if (contiguous_copy) {
-                    // One expert-sized transfer is still paced before the
-                    // module is published, preserving cross-rank fairness.
-                    CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    // Keep a small producer window: the ready event still
+                    // orders each published slot, while a two-module fence
+                    // reduces per-expert stream synchronization overhead
+                    // without recreating the rejected unbounded burst.
+                    ++contiguous_expert_copies_since_sync;
+                    if (contiguous_expert_copies_since_sync >=
+                        kContiguousExpertSyncWindow) {
+                        CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                        contiguous_expert_copies_since_sync = 0;
+                    }
                     this->logger_->debug(
                         "Enqueued contiguous expert copy: {} to buffer: {}",
                         module_name, buffer_idx);
