@@ -354,7 +354,7 @@ void HtoD_Engine::reset_weight_copy_queue() {
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     int contiguous_expert_copies_since_sync = 0;
-    static constexpr int kContiguousExpertSyncWindow = 2;
+    static constexpr int kContiguousExpertSyncWindow = 4;
     while (!terminate_flag_) {
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
