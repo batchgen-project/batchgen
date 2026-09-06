@@ -25,6 +25,8 @@ never uses hardcoded values.
 from abc import ABC, abstractmethod
 import logging
 
+import torch
+
 from batchgen.config.config import EngineConfig
 
 
@@ -43,6 +45,22 @@ class BasePlanner(ABC):
     def __init__(self):
         """Initialize planner. Config parameters set via generate_config()."""
         pass
+
+    def _available_gpu_memory_gb(self) -> float:
+        """Return the planner's usable GPU memory budget in GiB.
+
+        Prefer the actual current device when CUDA is available. Fall back to the
+        legacy 96 GiB planning assumption so CPU-only unit tests keep the same
+        behavior on non-GPU machines.
+        """
+        device = getattr(self.config.Basic_Config, "device_torch", None)
+        if torch.cuda.is_available():
+            try:
+                props = torch.cuda.get_device_properties(device) if device is not None else torch.cuda.get_device_properties(torch.cuda.current_device())
+                return float(props.total_memory) / (1024 ** 3) * self.DEFAULT_MEM_FRAC
+            except (AssertionError, RuntimeError, TypeError, ValueError):
+                pass
+        return 96 * self.DEFAULT_MEM_FRAC
 
     def generate_config(self, config: EngineConfig) -> EngineConfig:
         """Generate complete config for the model.
@@ -137,8 +155,9 @@ class BasePlanner(ABC):
             attn_decoding_micro_batch_size * self.max_context_length
         )
 
-        # Memory calculations (assuming 96GB GPU)
-        available_gpu_mem = 96 * self.DEFAULT_MEM_FRAC
+        # Memory calculations use the actual device when available; otherwise
+        # retain the legacy 96 GiB fallback for CPU-only tests.
+        available_gpu_mem = self._available_gpu_memory_gb()
         model_skeleton_size = 6
         cuda_page_table_default_size = 5
         nccl_default_buffer_usage = 2.5

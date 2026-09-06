@@ -71,7 +71,7 @@ class GLM5Planner(BasePlanner):
             attn_decoding_micro_batch_size * self.max_context_length
         )
 
-        available_gpu_mem = 96 * self.DEFAULT_MEM_FRAC
+        available_gpu_mem = self._available_gpu_memory_gb()
         model_skeleton_size = 6
         cuda_page_table_default_size = 5
         nccl_default_buffer_usage = 2.5
