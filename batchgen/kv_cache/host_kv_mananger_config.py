@@ -242,8 +242,12 @@ for canonical, aliases in {
 	"glm5_mla": (
 		"zai-org/glm-5-fp8",
 		"zai-org/glm-5",
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
 		"glm-5-fp8",
 		"glm-5",
+		"glm-5.2-fp8",
+		"glm-5.2",
 		# GLM-5.1: architecturally identical to GLM-5 (same 78-layer MLA graph,
 		# compressed_kv_dim=576), shares the MLA host-KV profile.
 		"zai-org/glm-5.1-fp8",
@@ -266,8 +270,12 @@ for canonical, aliases in {
 	"glm5_indexer": (
 		"zai-org/glm-5-fp8",
 		"zai-org/glm-5",
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
 		"glm-5-fp8",
 		"glm-5",
+		"glm-5.2-fp8",
+		"glm-5.2",
 		# GLM-5.1: identical DSA indexer (32 heads, head_dim=128, 78 layers).
 		"zai-org/glm-5.1-fp8",
 		"zai-org/glm-5.1",
