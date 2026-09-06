@@ -4,7 +4,7 @@ The GLM-5 MoE graph captures the full decode MoE module boundary:
 
     padded local tokens -> all_gather -> router -> rank padding mask
       -> dispatch_scatter_3d -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
-      -> all_reduce -> local slice + shared expert
+      -> reduce_scatter -> local slice + shared expert
 
 The decoder-layer residual add remains eager in the caller because it is owned
 by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
@@ -353,14 +353,13 @@ class Glm5MoEGraphSegment:
         import torch.distributed as dist
 
         with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
+            self.comm.reduce_scatter(
+                bufs.local_moe_output,
                 routed_global_output,
                 op=dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        start = self.rank * bucket_size
-        bufs.local_moe_output.copy_(routed_global_output[start:start + bucket_size])
         bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
         return {"moe_output": bufs.local_moe_output}
 

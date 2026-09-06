@@ -1758,7 +1758,7 @@ class Glm5MoE(nn.Module):
 
     @torch.inference_mode()
     def _forward_decode_3d(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """K2.5 pattern decode: AllGather → Gate → 3D dispatch → blockwise FP8 GEMM → weighted scatter → AllReduce → Shared.
+        """K2.5 pattern decode: AllGather → Gate → 3D dispatch → blockwise FP8 GEMM → weighted scatter → ReduceScatter → Shared.
 
         Mirrors MiniMaxM25MoE.moe_infer_allgather_allreduce_bf16_acc
         (model.py:1180-1287). Only difference is GLM-5's `shared_experts`
@@ -1848,19 +1848,19 @@ class Glm5MoE(nn.Module):
             num_global, hidden_size, topk,
             output=result_buf,
         )
+        local_results = buf.padded[:ntp]
 
-        # 6) AllReduce across EP ranks
+        # 6) ReduceScatter across EP ranks
         with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
+            self.comm.reduce_scatter(
+                local_results, global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
 
         # 7) Slice local + add shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * ntp
-        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
+        out = local_results[:num_tokens].to(hidden_states.dtype)
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
