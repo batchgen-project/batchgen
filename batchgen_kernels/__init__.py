@@ -13,12 +13,15 @@ from batchgen_kernels._version import __version__, __version_full__, version_inf
 import os
 import importlib
 import logging
+import threading
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 _DEV_MODE = os.environ.get("BATCHGEN_KERNELS_DEV", "0") == "1"
+_EXTENSION_CACHE = {}
+_EXTENSION_LOCK = threading.Lock()
 
 
 def load_extension(module_name: str):
@@ -30,14 +33,31 @@ def load_extension(module_name: str):
     With BATCHGEN_KERNELS_DEV=1, falls back to JIT compilation from source
     if the AOT module import fails.
     """
-    try:
-        return importlib.import_module(module_name)
-    except ImportError:
-        if not _DEV_MODE:
-            raise
+    cached = _EXTENSION_CACHE.get(module_name)
+    if cached is not None:
+        return cached
 
-    logger.warning(f"[DEV] AOT import failed for {module_name}, attempting JIT...")
-    return _jit_compile(module_name)
+    # A wrapper can request the same extension once per MoE layer and decode
+    # step. Serialize the first load so concurrent callers cannot repeatedly
+    # enter the JIT path, then reuse the successful module for this process.
+    with _EXTENSION_LOCK:
+        cached = _EXTENSION_CACHE.get(module_name)
+        if cached is not None:
+            return cached
+
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            if not _DEV_MODE:
+                raise
+
+            logger.warning(
+                f"[DEV] AOT import failed for {module_name}, attempting JIT..."
+            )
+            module = _jit_compile(module_name)
+
+        _EXTENSION_CACHE[module_name] = module
+        return module
 
 
 def _jit_compile(module_name: str):
