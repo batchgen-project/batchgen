@@ -38,8 +38,7 @@
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
-#include <numa.h>
-#include <numaif.h>
+#include "../numa_compat.h"
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>

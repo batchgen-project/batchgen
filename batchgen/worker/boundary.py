@@ -75,6 +75,9 @@ class BoundaryDecisionRequest:
     num_gpus_per_node: int
     enable_host_kv_eviction: bool
     host_kv_eviction_watermark: int
+    # Decode attention TP size.  G==1 is pure DP; G>1 makes each sequence
+    # resident on the contiguous G ranks of ``decode_dp_group``.
+    attn_tp_size: int = 1
 
 
 class BoundaryHandler:
@@ -98,6 +101,32 @@ class BoundaryHandler:
         gpn = req.num_gpus_per_node
         enable_host_kv_eviction = req.enable_host_kv_eviction
         host_kv_eviction_watermark = req.host_kv_eviction_watermark
+        group_size = int(req.attn_tp_size)
+        if group_size <= 0 or world_size % group_size != 0:
+            raise ValueError(
+                f"attn_tp_size={group_size} must divide world_size={world_size}"
+            )
+
+        def capacity_group(state: Mapping[str, object], uuid: str) -> int:
+            """Return the physical GPU capacity bucket for one sequence."""
+            if group_size > 1:
+                group = state.get('decode_dp_group')
+                if not isinstance(group, int):
+                    raise ValueError(
+                        f"sequence {uuid} has no decode_dp_group for "
+                        f"attn_tp_size={group_size}"
+                    )
+                return group
+            rank = state.get('assigned_rank')
+            if not isinstance(rank, int):
+                raise ValueError(f"sequence {uuid} has no assigned_rank")
+            return rank
+
+        num_capacity_groups = world_size // group_size
+        capacity_free_pages = [
+            min(per_rank_free[g * group_size:(g + 1) * group_size])
+            for g in range(num_capacity_groups)
+        ]
 
         def node_for_rank(rank: int) -> int:
             return rank // gpn
@@ -290,13 +319,13 @@ class BoundaryHandler:
         for uuid in decode_after_eviction:
             state = global_seq_state.get(uuid)
             if state and state['additional_pages_needed'] > 0:
-                assigned_rank = state['assigned_rank']
-                total_additional_by_rank[assigned_rank] += state['additional_pages_needed']
+                capacity = capacity_group(state, uuid)
+                total_additional_by_rank[capacity] += state['additional_pages_needed']
                 seqs_needing_extension.append(uuid)
 
         all_can_extend = all(
-            total_additional_by_rank[r] <= per_rank_free[r]
-            for r in range(world_size)
+            total_additional_by_rank[g] <= capacity_free_pages[g]
+            for g in range(num_capacity_groups)
         )
 
         onhold_uuids = []
@@ -305,12 +334,13 @@ class BoundaryHandler:
         if all_can_extend:
             actual_extension_by_rank = list(total_additional_by_rank)
         elif not all_can_extend:
-            for r in range(world_size):
-                if total_additional_by_rank[r] > per_rank_free[r]:
+            for g in range(num_capacity_groups):
+                if total_additional_by_rank[g] > capacity_free_pages[g]:
                     rank_seqs = [
                         (uuid, global_seq_state[uuid])
                         for uuid in decode_after_eviction
-                        if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
+                        if uuid in global_seq_state
+                        and capacity_group(global_seq_state[uuid], uuid) == g
                     ]
                     # Priority-aware: NORMAL (0) evicted before HIGH (1)
                     rank_seqs.sort(
@@ -318,7 +348,9 @@ class BoundaryHandler:
                                     x[1]['decoded_length'],
                                     meta_global_idx(x[0]))
                     )
-                    pages_to_free = total_additional_by_rank[r] - per_rank_free[r]
+                    pages_to_free = (
+                        total_additional_by_rank[g] - capacity_free_pages[g]
+                    )
                     freed = 0
                     for uuid, state in rank_seqs:
                         if freed >= pages_to_free:
@@ -331,9 +363,8 @@ class BoundaryHandler:
             for uuid in seqs_needing_extension:
                 if uuid not in onhold_set:
                     state = global_seq_state.get(uuid, {})
-                    r = state.get('assigned_rank')
-                    if r is not None:
-                        actual_extension_by_rank[r] += state.get('additional_pages_needed', 0)
+                    g = capacity_group(state, uuid)
+                    actual_extension_by_rank[g] += state.get('additional_pages_needed', 0)
 
         # Rows moved ON_HOLD are removed from decode before the next append, so
         # they no longer need immediate host growth at this boundary.
@@ -388,7 +419,8 @@ class BoundaryHandler:
         if global_candidate_info:
             # Compute adjusted free pages after extensions (arithmetic, no collective needed).
             adjusted_per_rank_free = [
-                per_rank_free[r] - actual_extension_by_rank[r]
+                per_rank_free[r]
+                - actual_extension_by_rank[r // group_size]
                 for r in range(world_size)
             ]
             new_load_uuids, _ = select_sequences_for_loading(
@@ -397,6 +429,7 @@ class BoundaryHandler:
                 exclude_uuids=completed_set | onhold_set | evicted_set,
                 strategy=LoadingStrategy.LONGEST_FIRST,
                 get_global_idx_fn=meta_global_idx,
+                group_size=group_size,
             )
 
         return BoundaryDecisions(

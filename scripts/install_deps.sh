@@ -60,8 +60,49 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# System (OS) packages required to BUILD the JIT-compiled `core_engine` extension.
+# The core_engine sources (core/Parameter_Server/posix_shm.cpp) `#include <numa.h>`
+# and link `-lnuma`, so the NUMA development headers must be present or the first
+# server launch fails with:
+#     fatal error: numa.h: No such file or directory
+# The runtime-only `numactl`/`numactl-libs` packages do NOT ship numa.h — the
+# *-devel (rpm) / *-dev (deb) package is required.
+install_system_deps() {
+    print_step "Installing system packages (NUMA dev headers for core_engine)..."
+
+    if [[ -f /usr/include/numa.h ]]; then
+        print_success "numa.h already present"
+        return 0
+    fi
+
+    local SUDO=""
+    [[ "$(id -u)" != "0" ]] && command -v sudo &>/dev/null && SUDO="sudo"
+
+    if command -v dnf &>/dev/null; then
+        $SUDO dnf install -y numactl-devel || print_warning "dnf install numactl-devel failed"
+    elif command -v yum &>/dev/null; then
+        $SUDO yum install -y numactl-devel || print_warning "yum install numactl-devel failed"
+    elif command -v apt-get &>/dev/null; then
+        $SUDO apt-get update -y && $SUDO apt-get install -y libnuma-dev || print_warning "apt-get install libnuma-dev failed"
+    elif command -v zypper &>/dev/null; then
+        $SUDO zypper install -y libnuma-devel || print_warning "zypper install libnuma-devel failed"
+    else
+        print_warning "No supported package manager found; install the NUMA dev headers manually"
+        print_warning "  (numactl-devel on RHEL/TencentOS, libnuma-dev on Debian/Ubuntu)."
+    fi
+
+    if [[ -f /usr/include/numa.h ]]; then
+        print_success "NUMA dev headers installed (numa.h present)"
+    else
+        print_warning "numa.h still missing — the core_engine JIT build will fail until installed."
+    fi
+}
+
 check_prerequisites() {
     print_step "Checking prerequisites..."
+
+    # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
+    install_system_deps
 
     # Check Python
     if ! command -v python &> /dev/null; then

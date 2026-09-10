@@ -56,8 +56,8 @@ def build_layer_shard(get_tensor, layer_idx, expert_start, num_local,
     ``routed_expert_{layer}_{expert}`` -> {"w1.weight", "w2.weight",
     "w3.weight"}; w1 = gate, w3 = up, w2 = down).
 
-    HBM budget (per rank, under the server's --gpu-memory-frac ceiling;
-    num_local = 256/8 = 32, 26 MoE layers, H = 2304, I = 1024):
+    HBM budget (per rank, H20 96 GB, server --gpu-memory-frac 0.90 -> 86.4 GB
+    ceiling; num_local = 256/8 = 32, 26 MoE layers, H = 2304, I = 1024):
       - resident EP shards: 26 x 32 x (2*1024*2304 + 2304*1024) el x 2 B
                             = 26 x 453.5 MiB ~= 11.8 GB
       - KDA state pools:    kda_state_slots(256) x 20 layers x

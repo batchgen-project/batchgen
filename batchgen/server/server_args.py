@@ -78,6 +78,11 @@ class ServerArgs:
     hf_cache_dir: Optional[Path] = None
     cache_dir: Optional[Path] = None
     converted_ckpt_dir: Optional[Path] = None
+    distributed_weight_config: Optional[Path] = None
+    # Kimi-K3 decode MoE exchange: auto (planner picks DeepEP when its K3 build is
+    # importable), nccl (force the NCCL all_gather + reduce_scatter path), deepep
+    # (require the DeepEP low-latency exchange; fail at startup if unavailable).
+    k3_moe_exchange: str = "auto"
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
@@ -153,6 +158,10 @@ class ServerArgs:
             self.cache_dir = Path(self.cache_dir)
         if isinstance(self.converted_ckpt_dir, str):
             self.converted_ckpt_dir = Path(self.converted_ckpt_dir)
+        if isinstance(self.distributed_weight_config, str):
+            self.distributed_weight_config = Path(
+                self.distributed_weight_config
+            )
         if isinstance(self.storage_path, str):
             self.storage_path = Path(self.storage_path)
 
@@ -179,6 +188,26 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Path to pre-converted checkpoint directory (skips conversion step)",
+    )
+    parser.add_argument(
+        "--k3-moe-exchange",
+        choices=["auto", "nccl", "deepep"],
+        default="auto",
+        help=(
+            "Kimi-K3 decode-graph MoE exchange: auto (DeepEP low-latency when its "
+            "K3 build is importable, else NCCL), nccl (force the NCCL all_gather + "
+            "reduce_scatter path), deepep (require DeepEP; fail at startup if unavailable)"
+        ),
+    )
+    parser.add_argument(
+        "--distributed-weight-config",
+        type=Path,
+        default=None,
+        help=(
+            "Node-local distributed host-weight source configuration. "
+            "When set, the server skips the replicated parameter server and "
+            "workers map the compact store described by this file."
+        ),
     )
     parser.add_argument(
         "--enable-hugetlbfs",
@@ -478,6 +507,21 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("world_size must be positive")
     if args.node_rank < 0 or args.node_rank >= args.nnodes:
         raise ValueError("node_rank must be in [0, nnodes)")
+    if args.distributed_weight_config is not None:
+        if not args.distributed_weight_config.is_file():
+            raise ValueError(
+                "distributed_weight_config does not exist: "
+                f"{args.distributed_weight_config}"
+            )
+        if "kimi-k3" not in args.model.lower():
+            raise ValueError(
+                "--distributed-weight-config currently supports Kimi-K3 only"
+            )
+        if args.nnodes not in (2, 4) or args.world_size != args.nnodes * 8:
+            raise ValueError(
+                "Kimi-K3 distributed host weights require "
+                "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
+            )
     if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
         raise ValueError("watchdog_timeout must be non-negative (0 to disable)")
     if args.watchdog_heartbeat_interval is not None:
@@ -547,6 +591,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
         converted_ckpt_dir=parsed.converted_ckpt_dir,
+        distributed_weight_config=parsed.distributed_weight_config,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
@@ -573,6 +618,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_thinking=parsed.parse_thinking,
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
+        k3_moe_exchange=parsed.k3_moe_exchange,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,

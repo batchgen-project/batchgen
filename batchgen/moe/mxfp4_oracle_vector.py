@@ -1,4 +1,4 @@
-"""FROZEN MXFP4 oracle verdict for Kimi-K3 (gate settled 2026-08-04).
+"""FROZEN MXFP4 oracle verdict for Kimi-K3 (task #34 gate; settled 2026-08-04).
 
 Single source of truth for the MXFP4 packing convention. Production code
 (marlin_weight_prep.repack_mxfp4_to_marlin_gs32) and the test suite both import

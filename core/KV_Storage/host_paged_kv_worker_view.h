@@ -450,14 +450,16 @@ class HostPagedKVWorkerView : private LayerMapper {
             "Prepared AsyncLoadLayerKVToDevice (num_layers={}, total_pages={}, "
             "prep_time_ms={:.3f})",
             num_layers, total_pages, prep_ms);
+        auto producer_event = RecordProducerEvent();
         return LaunchAsyncTask([this, batch = std::move(batch),
                                 page_table = std::move(page_table),
                                 sequence_offsets = std::move(sequence_offsets),
                                 total_pages, num_layers, pointer_columns,
-                                copy_entries]() mutable {
+                                copy_entries, producer_event]() mutable {
             const auto start = std::chrono::high_resolution_clock::now();
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
             const std::size_t k_page_bytes = layout_.KPageBytes();
             if (k_page_bytes == 0) {
                 return;
@@ -678,6 +680,7 @@ class HostPagedKVWorkerView : private LayerMapper {
             "Prepared AsyncLoadLayerPagedKVToDevice (num_layers={}, total_pages={}, max_sequence_pages={}, prep_time_ms={:.3f})",
             num_layers, total_pages, max_sequence_pages, prep_ms);
 
+        auto producer_event = RecordProducerEvent();
         return LaunchAsyncTask([
             this,
             page_table = std::move(page_table),
@@ -687,11 +690,13 @@ class HostPagedKVWorkerView : private LayerMapper {
             total_pages,
             num_layers,
             copy_entries,
-            kOpName
+            kOpName,
+            producer_event
         ]() mutable {
             const auto start = std::chrono::high_resolution_clock::now();
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
             const std::size_t k_page_bytes = layout_.KPageBytes();
             if (k_page_bytes == 0) {
                 return;
@@ -1018,18 +1023,16 @@ class HostPagedKVWorkerView : private LayerMapper {
                     "V tensor provided but V cache is disabled");
             }
         }
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
 
         return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v, tokens_per_sequence,
-                                 producer_cuda_stream]() {
+                                 producer_event]() {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
@@ -1145,18 +1148,16 @@ class HostPagedKVWorkerView : private LayerMapper {
                 "AsyncAppendDecodeKVToHost expects tensors with a single token "
                 "per sequence");
         }
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
 
         return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v,
-                                 producer_cuda_stream]() mutable {
+                                 producer_event]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
@@ -1278,9 +1279,7 @@ class HostPagedKVWorkerView : private LayerMapper {
             sequence_lengths, batch,
             "AsyncAppendDecodeKVToHostBatchedKernel");
 
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        auto producer_event = RecordProducerEvent();
 
         // Resolve per-seq page locations ONCE (shared across all layers).
         struct SeqLoc {
@@ -1355,10 +1354,10 @@ class HostPagedKVWorkerView : private LayerMapper {
                                  v_src_host = std::move(v_src_host),
                                  v_dst_host = std::move(v_dst_host),
                                  k_token_bytes, v_token_bytes, k_total,
-                                 v_total, producer_cuda_stream]() mutable {
+                                 v_total, producer_event]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
 
             worker_detail::DeviceBuffer<uint8_t*> k_src_buf(k_total);
             worker_detail::DeviceBuffer<uint8_t*> k_dst_buf(k_total);
@@ -2441,13 +2440,29 @@ class HostPagedKVWorkerView : private LayerMapper {
         CUDA_CHECK(cudaEventSynchronize(event.get()));
     }
 
-    void WaitForProducerStream(cudaStream_t consumer_stream,
-                               cudaStream_t producer_stream) const {
-        if (producer_stream == nullptr || consumer_stream == producer_stream) {
-            return;
-        }
-        worker_detail::ScopedCudaEvent event(logger_);
-        CUDA_CHECK(cudaEventRecord(event.get(), producer_stream));
+    // Record the calling thread's current stream position so a copy stream
+    // can be ordered behind every kernel enqueued before this call. The copy
+    // streams come from the PyTorch pool and are cudaStreamNonBlocking: they
+    // never synchronise implicitly with the legacy default stream, and the
+    // worker runs the model on that stream, whose handle is cudaStream_t 0.
+    // The previous helper skipped the wait for a null handle, so the d2h
+    // memcpy could read a KV buffer before the kernel producing it ran (the
+    // first sequence offloaded per MLA layer got the buffer's previous
+    // contents; garbage after a re-configure) and the h2d page load could
+    // land before the K-cache memset and be zeroed. Record here, on the
+    // issuing thread, not on the task thread.
+    std::shared_ptr<worker_detail::ScopedCudaEvent> RecordProducerEvent() const {
+        c10::cuda::OptionalCUDAGuard guard(device_index_);
+        auto event = std::make_shared<worker_detail::ScopedCudaEvent>(logger_);
+        const auto stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        CUDA_CHECK(cudaEventRecord(event->get(), stream));
+        return event;
+    }
+
+    void WaitForProducerEvent(
+        cudaStream_t consumer_stream,
+        const worker_detail::ScopedCudaEvent& event) const {
         CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, event.get(), 0));
     }
 

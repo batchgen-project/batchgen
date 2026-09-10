@@ -20,6 +20,7 @@
 
 #pragma once
 #include <condition_variable>
+#include <cstdint>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -71,6 +72,8 @@ class GPU_Weight_Buffer {
     void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
     void reset_prefill_buffer();
     void reset_decoding_buffer();
+    void reset_weight_stream_profile(bool enabled);
+    pybind11::dict get_weight_stream_profile();
     void set_weight_copy_task(std::unordered_map<std::string, std::vector<std::string>> task){
         this->weight_copy_tasks_ = task;
     }
@@ -91,4 +94,9 @@ class GPU_Weight_Buffer {
         buffer_status_;  // 0: empty, 1: in use
     std::unordered_map<std::string, std::vector<std::string>>
         weight_copy_tasks_;
+
+    std::mutex weight_profile_mutex_;
+    bool weight_profile_enabled_{false};
+    std::unordered_map<std::string, uint64_t> weight_profile_requests_;
+    std::unordered_map<std::string, double> weight_profile_wait_seconds_;
 };

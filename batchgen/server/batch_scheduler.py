@@ -936,7 +936,7 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch(batch_id, status="failed", error={
+            self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
                 "code": "capacity_exceeded", "message": error_msg,
             })
             return
@@ -1003,9 +1003,11 @@ class BatchScheduler:
 
         if batch_failed:
             error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
-            self.storage.update_batch(batch_id, status="failed", error={
-                "code": "batch_failed", "message": str(error_msg)
-            })
+            self.storage.update_batch_status(
+                batch_id,
+                BatchStatus.FAILED,
+                error=str(error_msg),
+            )
             return
 
         self._finalize_batch_output(batch_id, requests, prompts)
@@ -1093,6 +1095,9 @@ class BatchScheduler:
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
+                self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
+                    "code": "worker_fatal", "message": error_msg,
+                })
                 logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
 
     async def _pool_completion_listener(self) -> None:
@@ -1150,7 +1155,13 @@ class BatchScheduler:
                         if batch_done:
                             logger.info(f"[POOL] Batch {batch_id} completed")
                 elif msg_type == "pool_shutdown":
-                    logger.info("[POOL] Worker shutdown signal received")
+                    error = result.get("error")
+                    if error:
+                        logger.error("[POOL] Worker fatal received: %s", error)
+                        self._fail_all_active_batches(error)
+                        self.worker.report_worker_fatal(error)
+                    else:
+                        logger.info("[POOL] Worker shutdown signal received")
                     break
                 elif "error" in result:
                     logger.error(f"[POOL] Worker error: {result}")
@@ -1189,6 +1200,19 @@ class BatchScheduler:
 
         # Build response body based on endpoint type
         if url == "/v1/chat/completions":
+            content, reasoning_content, tool_calls = self._parse_output(
+                model, decoded_text
+            )
+            message = {
+                "role": "assistant",
+                "content": content,
+            }
+            if reasoning_content is not None:
+                message["reasoning_content"] = reasoning_content
+            if tool_calls:
+                message["tool_calls"] = [
+                    call.dict(exclude_none=True) for call in tool_calls
+                ]
             body = {
                 "id": f"chatcmpl-{uuid.uuid4().hex}",
                 "object": "chat.completion",
@@ -1196,10 +1220,7 @@ class BatchScheduler:
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": decoded_text,
-                    },
+                    "message": message,
                     "logprobs": None,
                     "finish_reason": finish_reason,
                 }],

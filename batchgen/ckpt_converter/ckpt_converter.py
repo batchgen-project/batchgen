@@ -4,7 +4,9 @@ from safetensors.torch import load_file
 import torch
 import os
 import logging
-import ctypes	
+import ctypes
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 class ckpt_converter:
 	"""
 		Convert .safetesors or .pt checkpoints to a format compatible with BatchGen.
@@ -26,7 +28,9 @@ class ckpt_converter:
 		We save the tensors in a file. And the metadata in a json file.
 	"""
 	def __init__(self):
-		pass
+		# Serializes the GPU marlin repack across parallel shard workers
+		# (convert_model_directory): single CUDA context, no contention/OOM.
+		self._marlin_lock = threading.Lock()
 
 	def _dtype_to_str(self, dtype):
 		"""
@@ -65,12 +69,16 @@ class ckpt_converter:
 
 		Returns: modified ckpt dict with weight_packed/weight_scale replaced by Marlin layout.
 		"""
-		from batchgen.moe.marlin_transform import raw_to_marlin_fused_gpu
+		# NOTE: raw_to_marlin_fused_gpu (INT4 path) imported lazily below so the
+		# K3 MXFP4 branch does not require the _C_marlin_transform kernel.
 		import re
 
 		# Pattern: *.mlp.experts.*.{gate,up,down}_proj.weight_packed
 		packed_pattern = re.compile(
 			r'(.+\.mlp\.experts\.\d+\.(gate|up|down)_proj)\.weight_packed$')
+		# K3 routed experts: block_sparse_moe.experts.N.w{1,2,3} (MXFP4 uint8 E8M0).
+		k3_pattern = re.compile(
+			r'(.+\.block_sparse_moe\.experts\.\d+\.w[123])\.weight_packed$')
 
 		device = "cuda" if torch.cuda.is_available() else None
 		if device is None:
@@ -80,15 +88,33 @@ class ckpt_converter:
 		count = 0
 		for name in list(ckpt.keys()):
 			m = packed_pattern.match(name)
-			if not m:
+			mk = k3_pattern.match(name)
+			if not m and not mk:
 				continue
-			prefix = m.group(1)
+			prefix = (m or mk).group(1)
 			scale_name = f"{prefix}.weight_scale"
 			if scale_name not in ckpt:
 				continue
 
 			packed = ckpt[name]       # [N, K//8] int32 or uint8
 			scale = ckpt[scale_name]  # [N, K//32] bf16
+
+			# K3 MXFP4 (task #53, V1): uint8 E2M1 packed + uint8 E8M0 scale ->
+			# marlin_qw int32 + marlin-order uint8 E8M0 scale; decode dequants
+			# per-forward. Bit-exact split of repack_mxfp4_to_marlin_device.
+			if mk and packed.dtype == torch.uint8 and scale.dtype == torch.uint8:
+				from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+					repack_mxfp4_to_marlin_device,
+				)
+				N = packed.shape[0]
+				K = packed.shape[1] * 2  # MXFP4 pack factor 2
+				marlin_qw, marlin_s = repack_mxfp4_to_marlin_device(
+					packed.to(device), scale.to(device), K, N, scale_bf16=False)
+				torch.cuda.synchronize()
+				ckpt[name] = marlin_qw.cpu()
+				ckpt[scale_name] = marlin_s.cpu()
+				count += 1
+				continue
 
 			# Refuse MXFP4. This path is uniform-INT4-only: it reinterprets the
 			# uint8 buffer as packed uint4b8 below, and converts the SCALE
@@ -121,6 +147,7 @@ class ckpt_converter:
 			# GPU transform: H2D → kernel → D2H
 			packed_gpu = packed.to(device)
 			scale_gpu = scale.to(device=device, dtype=torch.bfloat16)
+			from batchgen.moe.marlin_transform import raw_to_marlin_fused_gpu
 			marlin_qw, marlin_s = raw_to_marlin_fused_gpu(packed_gpu, scale_gpu, K, N)
 			torch.cuda.synchronize()
 
@@ -156,7 +183,8 @@ class ckpt_converter:
 
 		# Optional: repack INT4 expert weights to Marlin tile layout
 		if marlin:
-			ckpt = self._apply_marlin_repack(ckpt)
+			with self._marlin_lock:
+				ckpt = self._apply_marlin_repack(ckpt)
 
 		out_file_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".bin")).replace(".pt", ".bin")
 		out_metadata_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".json").replace(".pt", ".json"))	
@@ -278,7 +306,7 @@ class ckpt_converter:
 
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, max_workers=None):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -335,17 +363,35 @@ class ckpt_converter:
 		os.makedirs(output_dir, exist_ok=True)
 		logging.info(f"Converting {len(file_list)} checkpoint files to BatchGen format...")
 
-		# Convert each file with progress
+		# Convert shards in PARALLEL. Per-shard cost is dominated by taijifs
+		# I/O (safetensors read + .bin write), which overlaps across threads;
+		# the GPU marlin repack is serialized by self._marlin_lock (single CUDA
+		# context) so there is no GPU contention or transient-HBM OOM. A failed
+		# shard re-raises (fail-fast; no partial-output silent success).
+		workers = min(8, len(file_list)) if max_workers is None else int(max_workers)
+		workers = max(1, workers)
 		try:
 			from tqdm import tqdm
-			file_iterator = tqdm(file_list, desc="Converting checkpoint files", smoothing=0)
+			progress = tqdm(total=len(file_list), desc="Converting checkpoint files", smoothing=0)
 		except ImportError:
-			file_iterator = file_list
+			progress = None
 			logging.info("Install tqdm for progress bar: pip install tqdm")
 
-		for file_path in file_iterator:
-			logging.debug(f"Converting {file_path} to {output_dir}")
-			self.convert(file_path, output_dir, marlin=marlin)
+		logging.info(f"Converting {len(file_list)} shards with {workers} worker thread(s)")
+		if workers == 1:
+			for file_path in file_list:
+				self.convert(file_path, output_dir, marlin=marlin)
+				if progress is not None:
+					progress.update(1)
+		else:
+			with ThreadPoolExecutor(max_workers=workers) as pool:
+				futures = {pool.submit(self.convert, fp, output_dir, marlin): fp for fp in file_list}
+				for fut in as_completed(futures):
+					fut.result()  # re-raise any shard error (fail-fast)
+					if progress is not None:
+						progress.update(1)
+		if progress is not None:
+			progress.close()
 
 		logging.info(f"Conversion complete. Output directory: {output_dir}"
 		             f"{' (with Marlin repack)' if marlin else ''}")
