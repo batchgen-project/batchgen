@@ -18,15 +18,12 @@ Inputs: realistic magnitudes (randn * 0.1); routing from a random sigmoid
 gate with top-k renormalization (KimiMoEGate semantics, self-contained —
 no batchgen model imports).
 
-Run (GPU): python tests/kimi_linear/test_fused_moe_std.py
+Run (GPU): python batchgen_kernels/tests/kimi_linear/test_fused_moe_std.py
 """
 
-import logging
 import sys
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.fused_moe_std")
 import torch.nn.functional as F
 
 from batchgen_kernels.triton.fused_moe_bf16 import fused_moe_bf16
@@ -55,7 +52,7 @@ PASS = True
 def report(name, ok, detail=""):
     global PASS
     PASS = PASS and ok
-    _LOG.info(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
 def check_std_bf16(name, got, ref):
@@ -133,7 +130,7 @@ def run_case(name, M, w13, w2, gate_w, seed):
 
 def main():
     if not torch.cuda.is_available():
-        _LOG.info("CUDA required")
+        print("CUDA required")
         sys.exit(1)
 
     w13, w2, gate_w = make_weights(seed=7)
@@ -145,10 +142,9 @@ def main():
         run_case(f"prefill M={M} E={E} H={H} I={I} top{TOP_K}",
                  M, w13, w2, gate_w, seed=200 + M)
 
-    _LOG.info("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
+    print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

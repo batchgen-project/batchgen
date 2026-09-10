@@ -24,16 +24,13 @@ adapter — so the fallback path is covered too.
 Gates: logits/output bf16 <= 1e-2, KDA state <= 2e-2 (plan M5.5); bitwise
 agreement is reported when achieved.
 
-Run (GPU): python tests/kimi_linear/test_decode_graph_adapter.py
+Run (GPU): python batchgen_kernels/tests/kimi_linear/test_decode_graph_adapter.py
 """
 
-import logging
 import sys
 import types
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.decode_graph_adapter")
 
 from batchgen.models.moonshotai.kimi_linear.config import KimiLinearConfig
 from batchgen.models.moonshotai.kimi_linear.cuda_graph_segments import (
@@ -94,7 +91,7 @@ PASS = True
 def report(name, ok, detail=""):
     global PASS
     PASS = PASS and ok
-    _LOG.info(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
 def check(name, got, ref, tol):
@@ -321,7 +318,7 @@ def pool_restore(mgr, snap):
 
 def main():
     if not torch.cuda.is_available():
-        _LOG.info("CUDA required")
+        print("CUDA required")
         sys.exit(1)
     torch.set_grad_enabled(False)
     torch.manual_seed(11)
@@ -558,7 +555,7 @@ def main():
            f"layer-1 offset {old_off1} -> {new_off1}; "
            f"base ptr {'REUSED (true failure mode)' if reused else 'moved'}")
     report("adapter sees the new geometry in its signature",
-           tuple(shrunk.shape) in adapter._signature(kv))
+           adapter._signature(kv)[1] == adapter._tensor_signature(shrunk))
 
     geo_snap = kv.snapshot()
     geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts)
@@ -588,14 +585,22 @@ def main():
     # address with a different page count leaves data_ptr unchanged while every
     # slice above layer 0 moves -- graphs are then never dropped and replay
     # against relocated slices. That silently corrupted MLA output (KDA stayed
-    # bitwise clean) and materially degraded MMLU accuracy before it was caught.
+    # bitwise clean) and halved MMLU accuracy before it was caught. Task #12.
     sig = adapter._signature(kv)
     report("capture signature carries the K-cache shape",
-           tuple(kv._k.shape) in sig,
+           sig[1][1] == tuple(kv._k.shape),
            f"shape={tuple(kv._k.shape)} sig={sig}")
     report("capture signature carries the K-cache stride",
-           tuple(kv._k.stride()) in sig,
+           sig[1][2] == tuple(kv._k.stride()),
            f"stride={tuple(kv._k.stride())} sig={sig}")
+    kda_tensors = (
+        mgr.get_recurrent_tensors(),
+        *mgr.get_conv_tensors(),
+        mgr._prepared_state_slots,
+    )
+    report("capture signature carries every persistent KDA tensor",
+           sig[2] == tuple(adapter._tensor_signature(t) for t in kda_tensors),
+           f"num_kda_tensors={len(sig[2])}")
 
     # Proves the above is not a vacuous check: the per-layer slice really does
     # move when only num_pages changes, so a pointer-only signature is blind.
@@ -616,10 +621,9 @@ def main():
            not adapter._installed and not adapter._captured)
     KimiLinearKDAWrapper.reset()
 
-    _LOG.info("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
+    print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

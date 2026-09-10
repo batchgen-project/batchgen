@@ -31,16 +31,13 @@ Gate (plan M5.5): 32 replays with varying slot contents vs eager on the
 same inputs — outputs bf16 <= 1e-2, conv/recurrent state <= 2e-2; bitwise
 match is reported when achieved.
 
-Run (GPU): python tests/kimi_linear/test_kda_segment_capture.py
+Run (GPU): python batchgen_kernels/tests/kimi_linear/test_kda_segment_capture.py
 """
 
-import logging
 import sys
 from itertools import count
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.kda_segment_capture")
 import torch.nn as nn
 
 from batchgen.models.moonshotai.kimi_linear.serving_modules import (
@@ -73,7 +70,7 @@ PASS = True
 def report(name, ok, detail=""):
     global PASS
     PASS = PASS and ok
-    _LOG.info(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
 def check(name, got, ref, tol):
@@ -145,7 +142,7 @@ def randn_like_pool(pool, gen):
 
 
 def run_case(batch_size):
-    _LOG.info(f"\n=== KDA decode segment capture, B={batch_size} ===")
+    print(f"\n=== KDA decode segment capture, B={batch_size} ===")
     torch.manual_seed(1000 + batch_size)
     layer = build_layer()
 
@@ -271,17 +268,16 @@ def run_case(batch_size):
 
 def main():
     if not torch.cuda.is_available():
-        _LOG.info("CUDA required")
+        print("CUDA required")
         sys.exit(1)
     torch.set_grad_enabled(False)
 
     for batch_size in (1, 8):
         run_case(batch_size)
 
-    _LOG.info("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
+    print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()
