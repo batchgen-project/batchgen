@@ -170,6 +170,45 @@ __global__ void reduce_weighted_scatter_kernel(
     output[(int64_t)token_idx * H + h_offset] = __float2bfloat16(acc);
 }
 
+// K3 keeps the routed-expert reduction in FP32 until after the EP
+// reduce-scatter.  The existing BF16-output kernel cannot be used here: its
+// downcast would happen before ranks combine their disjoint expert subsets.
+// Keep the K=16 path separate so the decode graph has one fixed-shape launch
+// and writes directly into its preallocated FP32 reduction buffer.
+__global__ void reduce_weighted_scatter_fp32_k16_kernel(
+    const __nv_bfloat16* __restrict__ expert_output,
+    const int32_t* __restrict__ topk_pos,
+    const float* __restrict__ topk_weights,
+    float* __restrict__ output,
+    int N, int H
+) {
+    const int token_idx = blockIdx.x;
+    const int h_offset = blockIdx.y * BLOCK_H + threadIdx.x;
+
+    __shared__ int32_t shared_pos[16];
+    __shared__ float shared_weights[16];
+    if (threadIdx.x < 16) {
+        const int topk_base = token_idx * 16;
+        shared_pos[threadIdx.x] = topk_pos[topk_base + threadIdx.x];
+        shared_weights[threadIdx.x] = topk_weights[topk_base + threadIdx.x];
+    }
+    __syncthreads();
+
+    if (token_idx >= N || h_offset >= H) return;
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; k++) {
+        const int32_t pos = shared_pos[k];
+        if (pos >= 0) {
+            const float value = __bfloat162float(
+                expert_output[(int64_t)pos * H + h_offset]);
+            acc += value * shared_weights[k];
+        }
+    }
+    output[(int64_t)token_idx * H + h_offset] = acc;
+}
+
 torch::Tensor reduce_weighted_scatter(
     torch::Tensor expert_output, torch::Tensor topk_pos,
     torch::Tensor topk_weights, int64_t N, int64_t H, int64_t K,
@@ -201,9 +240,52 @@ torch::Tensor reduce_weighted_scatter(
     return output;
 }
 
+torch::Tensor reduce_weighted_scatter_fp32(
+    torch::Tensor expert_output, torch::Tensor topk_pos,
+    torch::Tensor topk_weights, int64_t N, int64_t H, int64_t K,
+    torch::Tensor output
+) {
+    TORCH_CHECK(N > 0 && H > 0, "N and H must be positive");
+    TORCH_CHECK(K == 16, "K3 FP32 weighted combine requires K=16, got ", K);
+    TORCH_CHECK(expert_output.is_cuda() && topk_pos.is_cuda() &&
+                topk_weights.is_cuda() && output.is_cuda(),
+                "K3 FP32 weighted combine requires CUDA tensors");
+    TORCH_CHECK(expert_output.scalar_type() == at::kBFloat16,
+                "expert_output must be BF16");
+    TORCH_CHECK(topk_pos.scalar_type() == at::kInt,
+                "topk_pos must be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == at::kFloat,
+                "topk_weights must be float32");
+    TORCH_CHECK(output.scalar_type() == at::kFloat,
+                "output must be float32");
+    TORCH_CHECK(expert_output.is_contiguous() && topk_pos.is_contiguous() &&
+                topk_weights.is_contiguous() && output.is_contiguous(),
+                "K3 FP32 weighted combine requires contiguous tensors");
+    TORCH_CHECK(topk_pos.numel() >= N * K,
+                "topk_pos is smaller than N*K");
+    TORCH_CHECK(topk_weights.numel() >= N * K,
+                "topk_weights is smaller than N*K");
+    TORCH_CHECK(output.dim() == 2 && output.size(0) >= N &&
+                output.size(1) >= H, "output must have shape [N, H]");
+    TORCH_CHECK(expert_output.dim() == 2 && expert_output.size(1) == H,
+                "expert_output must have shape [rows, H]");
+
+    dim3 grid(static_cast<unsigned int>(N),
+              static_cast<unsigned int>((H + BLOCK_H - 1) / BLOCK_H));
+    dim3 block(BLOCK_H);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    reduce_weighted_scatter_fp32_k16_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+        topk_pos.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
+        output.data_ptr<float>(), static_cast<int>(N), static_cast<int>(H));
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_scatter_3d", &dispatch_scatter_3d,
           "3D dispatch scatter for strided MoE buffer layout");
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter,
           "Weighted reduce scatter from 3D to flat layout");
+    m.def("reduce_weighted_scatter_fp32", &reduce_weighted_scatter_fp32,
+          "K3 K=16 weighted reduction with FP32 output");
 }

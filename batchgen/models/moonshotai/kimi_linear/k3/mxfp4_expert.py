@@ -40,41 +40,26 @@ green 9/9 GPU parity ladder (``tests/moe/gpu_parity_mxfp4_marlin.py``).  This
 also matches the 2026-08-04 decision ledger recorded in
 ``marlin_grouped_moe.py:253-261``.
 
-THE ONE COST
-------------
-The marlin kernels read weights in marlin TILE order; the engine streams them
-in CHECKPOINT order, because ``kimi_parameter_server.py:242-243`` converts with
-``marlin=False`` (and ``ckpt_converter._apply_marlin_repack`` explicitly
-REFUSES uint8/E8M0 scales — it is a uniform-INT4 path).  So this module repacks
-per forward, on device, and that is EXPENSIVE.  Measured at the real K3
-shapes, the repack dominates a single-token expert forward several-fold and
-is still the larger term at prefill-like token counts.
+CURRENT OFFLINE-MARLIN CONTRACT
+-------------------------------
+The converter now emits routed experts in Marlin tile order:
 
-The cost is FLAT in token count — it is per expert, not per token.  INFERRED
-from that: at prefill occupancy (>=4096 tokens x top-16 makes essentially all
-896 experts non-empty) the pure repack multiplies into a serious per-layer
-cost across the 92 MoE layers.  This is a blocker for a real 8K prefill, not
-a rounding error, and it is NOT fixable inside this file.
+  * ``weight_packed`` metadata is int32 Marlin tiles;
+  * ``weight_scale`` remains byte-neutral uint8 E8M0 in Marlin order.
 
-The end state is the converter emitting marlin order.  Two variants, and they
-are not interchangeable — ``marlin_grouped_moe.py:358`` hard-fails a non-bf16
-scale:
+Decode's host ``get_tensor`` exposes the true int32 shape. Prefill's fixed GPU
+ring presents the same linear bytes through its historical uint8
+``[N, K//2]`` slot shape; :meth:`K3MXFP4Projection.marlin` reinterprets that
+view back to Marlin without permuting the packed weights.
 
-  * converter emits marlin-order **uint8** E8M0 scales: per-expert byte count
-    unchanged, but ``mxfp4_scale_e8m0_to_bf16`` still runs every forward
-    (measured: a nontrivial per-expert cost).  Only the packed branch
-    collapses to a ``.view()``.
-  * converter emits **bf16** scales: both branches become ``.view()``s, but
-    per-expert bytes go 17,547,264 -> 18,579,456 (+5.88%), i.e. +85.1 GB across
-    82,432 experts against the 2.147 TB host ceiling in ``mxfp4_layout.py``
-    :26-30.
-
-Either way it is a ``batchgen/ckpt_converter/`` change plus a full
-re-conversion of the checkpoint, outside a model PR's allowlist.
-NAMED FOLLOW-UP, sized.
+There is no Marlin→WGMMA transform in K3 prefill. Both phases call the Marlin
+MXFP4 kernels with the SiTU epilogue. The remaining per-forward format work is
+the exact E8M0 uint8→BF16 scale expansion (a device tensor bit shift + view).
+Storing BF16 scales would remove it but adds ~85.1 GB across 82,432 experts.
 """
 
 import logging
+import time
 from typing import Dict, Tuple
 
 import torch
@@ -82,6 +67,7 @@ import torch.nn as nn
 
 from ..wrappers import KimiLinearExpertWrapper
 from .mxfp4_layout import (
+    K3_ROUTED_EXPERTS_MARLIN,
     MXFP4_DTYPE,
     MXFP4_GROUP_SIZE,
     MXFP4_PACK_FACTOR,
@@ -187,13 +173,16 @@ def repack_mxfp4_to_marlin_device(
     weight_scale: torch.Tensor,
     K: int,
     N: int,
+    scale_bf16: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Device-resident twin of ``repack_mxfp4_to_marlin_gs32(..., "bf16")``.
 
     Step for step the same rearrangement as the CPU function that the frozen
     oracle gates (``marlin_weight_prep.py:384-440``) — unpack low-nibble-first,
-    transpose to [K, N], marlin tile permute, repack 8 nibbles per int32,
-    transpose + index-permute the E8M0 bytes, expand them EXACTLY to bf16.  It
+    transpose to [K, N], marlin tile permute, repack 8 nibbles per int32, then
+    transpose + index-permute the E8M0 bytes. Optional BF16 expansion is kept
+    for parity fixtures; production passes ``scale_bf16=False`` because the
+    K3 Marlin kernel consumes E8M0 directly. It
     exists only because the CPU one round-trips through ``.cpu().numpy()``,
     which would sync and stall the copy engine on every streamed expert.
 
@@ -205,7 +194,8 @@ def repack_mxfp4_to_marlin_device(
         weight_packed: [N, K//2] uint8, low nibble = even K index.
         weight_scale: [N, K//32] uint8 E8M0.
     Returns:
-        (marlin_qw [K//16, N*2] int32, marlin_s [K//32, N] bf16)
+        (marlin_qw [K//16, N*2] int32,
+         marlin_s [K//32, N] uint8 when ``scale_bf16=False`` else bf16)
     """
     from batchgen.moe.marlin_weight_prep import mxfp4_scale_e8m0_to_bf16
 
@@ -228,11 +218,16 @@ def repack_mxfp4_to_marlin_device(
     q = q.contiguous().view(K // _MARLIN_TILE, N * 8, 2)
     marlin_qw = (q[..., 0] | (q[..., 1] << 4)).contiguous().view(torch.int32)
 
-    # 5. scales: [N, K//32] -> [K//32, N], index-permute, EXACT bf16 expansion
-    #    (a bit shift; mxfp4_scale_e8m0_to_bf16 also rejects the 0x00/0xFF
-    #    edge bytes rather than clamping them).
+    # 5. scales: [N, K//32] -> [K//32, N], index-permute. The optional exact
+    #    BF16 expansion is a bit shift; mxfp4_scale_e8m0_to_bf16 also rejects
+    #    the 0x00/0xFF edge bytes rather than clamping them.
     s = weight_scale.t().contiguous()
     s = s.reshape(-1, scale_perm.numel())[:, scale_perm].reshape(-1, N).contiguous()
+    if not scale_bf16:
+        # Return Marlin-order uint8 E8M0 for the production kernel. Expanding
+        # this tensor with mxfp4_scale_e8m0_to_bf16 remains bit-identical to
+        # the legacy BF16 branch by construction (same s).
+        return marlin_qw, s
     return marlin_qw, mxfp4_scale_e8m0_to_bf16(s)
 
 
@@ -268,9 +263,24 @@ class K3MXFP4Projection(nn.Module):
         )
 
     def marlin(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if K3_ROUTED_EXPERTS_MARLIN:
+            # Offline marlin (task #53): the streamed slot already holds
+            # marlin bytes, presented under the packed uint8 module_shape
+            # [n_out, k_in//2]. Reinterpret both tensors to Marlin dims; the
+            # kernel consumes E8M0 scale bytes directly. The slot bytes are
+            # the exact linear bytes repack_mxfp4_to_marlin_device emits, so
+            # the same-linear-order reshape recovers its marlin_qw/scale
+            # bit-for-bit (validated: verify_k3_mxfp4_expert repack identity
+            # + the gate below). marlin_qw [k_in//16, n_out*2] int32; marlin
+            # scale [k_in//32, n_out] uint8 E8M0.
+            qw = self.weight_packed.data.contiguous().view(
+                torch.int32).reshape(self.k_in // _MARLIN_TILE, self.n_out * 2)
+            s = self.weight_scale.data.contiguous().reshape(
+                self.k_in // MXFP4_GROUP_SIZE, self.n_out)
+            return qw, s
         return repack_mxfp4_to_marlin_device(
             self.weight_packed.data, self.weight_scale.data,
-            self.k_in, self.n_out,
+            self.k_in, self.n_out, scale_bf16=False,
         )
 
     def extra_repr(self) -> str:
@@ -355,6 +365,30 @@ class KimiK3MXFP4ExpertWrapper(KimiLinearExpertWrapper):
         ``else`` for K3 without touching the shared base class.
     """
 
+    _prefill_profile_enabled = False
+    _prefill_profile_calls = 0
+    _prefill_profile_active_calls = 0
+    _prefill_profile_token_rows = 0
+    _prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def reset_prefill_profile(cls, enabled: bool) -> None:
+        cls._prefill_profile_enabled = bool(enabled)
+        cls._prefill_profile_calls = 0
+        cls._prefill_profile_active_calls = 0
+        cls._prefill_profile_token_rows = 0
+        cls._prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def prefill_profile_snapshot(cls) -> dict:
+        return {
+            "enabled": cls._prefill_profile_enabled,
+            "calls": cls._prefill_profile_calls,
+            "active_calls": cls._prefill_profile_active_calls,
+            "token_rows": cls._prefill_profile_token_rows,
+            "wall_s": cls._prefill_profile_wall_s,
+        }
+
     def __init__(self, module, layer_idx, expert_idx, core_engine,
                  engine_config, model_config, persistent: bool = False):
         if persistent:
@@ -372,6 +406,20 @@ class KimiK3MXFP4ExpertWrapper(KimiLinearExpertWrapper):
             self.module_key, weights_dict, self.module.expected_slot_shapes()
         )
         return weights_dict
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not type(self)._prefill_profile_enabled:
+            return super().forward(hidden_states)
+        start = time.perf_counter()
+        result = super().forward(hidden_states)
+        cls = type(self)
+        cls._prefill_profile_calls += 1
+        rows = int(hidden_states.shape[0])
+        if rows:
+            cls._prefill_profile_active_calls += 1
+            cls._prefill_profile_token_rows += rows
+        cls._prefill_profile_wall_s += time.perf_counter() - start
+        return result
 
     def apply_weights(self, weights_dict):
         super().apply_weights(weights_dict)

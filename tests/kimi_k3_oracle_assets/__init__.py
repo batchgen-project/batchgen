@@ -3,8 +3,9 @@
 Provenance (byte-verified; the pins are asserted by
 tests/test_kimi_k3_model.py::test_oracle_md5_pins):
 
-  * ``modeling_kimi_linear.py`` — verbatim from the released Kimi-K3
-    checkpoint.
+  * ``modeling_kimi_linear.py`` — verbatim from the released checkpoint
+    ``/taijifs_zw35/share_304153846/hunyuan/tairanxu/models/Kimi-K3/``
+    (fetch: ``ssh h20-instance-2 'cat .../modeling_kimi_linear.py'``).
     md5 4e3de36ab2a5de1232c05ce346a3426e.  Owns the ENTIRE K3 text model:
     the VLM wrapper ``modeling_kimi_k3.py`` (md5 d5b7e2e6d4f1263cc390c0f6476aeea2,
     deliberately NOT vendored — it drags vision imports) instantiates

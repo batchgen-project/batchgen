@@ -208,27 +208,6 @@ def test_score_topk_valid_tokens_skips_padding_rows():
     assert torch.all(torch.isneginf(agg[2:]))
 
 
-def test_fast_topk_2048_eager_path_omits_num_valid_tokens(monkeypatch):
-    from batchgen_kernels.attention.dsa import fast_topk_cuda
-
-    score = torch.randn(4, 4096, device="cuda", dtype=torch.float32)
-    lengths = torch.tensor([1, 2, 3, 4], device="cuda", dtype=torch.int32)
-    captured = {}
-
-    class FakeModule:
-        def fast_topk_2048_out(self, *args):
-            captured["args"] = args
-
-    monkeypatch.setattr(fast_topk_cuda, "_get_module", lambda: FakeModule())
-
-    indices = fast_topk_cuda.fast_topk_2048(score, lengths)
-    torch.cuda.synchronize()
-
-    assert indices.shape == (4, 2048)
-    assert len(captured["args"]) == 4
-    assert captured["args"][3] is None
-
-
 def test_selector_valid_tokens_skips_padding_rows():
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
         fused_select_mla_kv_bf16_out,

@@ -47,8 +47,8 @@ What each group guards, and what it catches:
 Run:
     pytest tests/test_kimi_k3_tokenizer.py -v
 
-    # with the real checkpoint mounted:
-    KIMI_K3_CHECKPOINT=/path/to/Kimi-K3 \
+    # on h20-instance-1, with the checkpoint mounted:
+    KIMI_K3_CHECKPOINT=/taijifs_zw35/share_304153846/hunyuan/tairanxu/models/Kimi-K3 \
         KIMI_K3_STRICT=1 pytest tests/test_kimi_k3_tokenizer.py -v
 
 ``KIMI_K3_STRICT=1`` turns every skip in this file into a failure -- missing
@@ -75,7 +75,7 @@ K3_ASSETS = K3_PKG_DIR / "assets"
 LINEAR_48B_ASSETS = ROOT / "batchgen" / "models" / "moonshotai" / "kimi_linear" / "assets"
 K25_ASSETS = ROOT / "batchgen" / "models" / "moonshotai" / "kimi_k25" / "assets"
 
-DEFAULT_CHECKPOINT = "/path/to/Kimi-K3"
+DEFAULT_CHECKPOINT = "/taijifs_zw35/share_304153846/hunyuan/tairanxu/models/Kimi-K3"
 STRICT = os.environ.get("KIMI_K3_STRICT") == "1"
 
 

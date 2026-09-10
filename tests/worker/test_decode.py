@@ -12,23 +12,38 @@ from batchgen.worker.decode import (
     DecodeBatchRequest,
     DecodeCandidate,
     DecodeScheduler,
+    estimate_max_decode_replica_batch,
 )
 
 
-def _cand(uuid, *, rank=0, gidx=0, req_pages=10):
+def _cand(uuid, *, rank=0, gidx=0, req_pages=10, decode_dp_group=None):
     return DecodeCandidate(
-        uuid=uuid, assigned_rank=rank, global_idx=gidx, req_pages=req_pages
+        uuid=uuid,
+        assigned_rank=rank,
+        global_idx=gidx,
+        req_pages=req_pages,
+        decode_dp_group=decode_dp_group,
     )
 
 
-def _req(candidates, total_pages, world_size=8):
+def _req(candidates, total_pages, world_size=8, attn_tp_size=1):
     return DecodeBatchRequest(
-        candidates=tuple(candidates), total_pages=total_pages, world_size=world_size
+        candidates=tuple(candidates),
+        total_pages=total_pages,
+        world_size=world_size,
+        attn_tp_size=attn_tp_size,
     )
 
 
 def test_empty_candidates_returns_empty():
     assert DecodeScheduler.select_decode_batch(_req([], 1000)) == []
+
+
+def test_decode_replica_batch_estimate_accounts_for_tp_replication():
+    assert estimate_max_decode_replica_batch(64, 16, 8) == 32
+    assert estimate_max_decode_replica_batch(65, 16, 8) == 33
+    # Pure DP preserves the legacy total/world_size estimate.
+    assert estimate_max_decode_replica_batch(64, 16, 1) == 4
 
 
 def test_single_candidate_fits():
@@ -74,6 +89,26 @@ def test_per_rank_capacity_independent():
     plan = DecodeScheduler.select_decode_batch(_req(cands, 100))
     assert set(plan) == {"r0a", "r1a"}
     assert "r0b" not in plan
+
+
+def test_tp_group_replicas_share_one_page_capacity():
+    # Both candidates are replicated onto every rank of group 0. Although their
+    # legacy assigned ranks differ, their cumulative 120 pages exceed the
+    # per-rank capacity of 90 pages, so only the first candidate may enter.
+    cands = [
+        _cand("a", rank=0, gidx=0, req_pages=60, decode_dp_group=0),
+        _cand("b", rank=1, gidx=1, req_pages=60, decode_dp_group=0),
+        _cand("c", rank=8, gidx=2, req_pages=60, decode_dp_group=1),
+    ]
+    plan = DecodeScheduler.select_decode_batch(
+        _req(cands, 100, world_size=16, attn_tp_size=8)
+    )
+    assert plan == ["a", "c"]
+
+    # NON-VACUITY: pure DP still charges the two legacy ranks independently.
+    assert DecodeScheduler.select_decode_batch(
+        _req(cands[:2], 100, world_size=16, attn_tp_size=1)
+    ) == ["a", "b"]
 
 
 def test_greedy_fill_until_rank_full():

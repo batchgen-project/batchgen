@@ -27,7 +27,7 @@ hidden/2, the real ratio) and K3-SKEW-10 (latent != hidden/2, shared width 3x,
 rms_norm_eps 2e-5) — the second kills "derived the dim from the wrong source"
 bugs that a hidden/2 ratio would hide.
 
-Run on a CUDA GPU (keep it off the GPU the KDA stage is using):
+Run ON h20-instance-1, GPU 1 (GPU 0 is the M2 KDA stage's):
 
     K3_LATENT_MOE_GPU=1 CUDA_VISIBLE_DEVICES=1 \
     PYTHONPATH=<repo>:<fla-src> python -m pytest \
@@ -60,7 +60,7 @@ if os.environ.get("K3_LATENT_MOE_GPU") == "1" and not torch.cuda.is_available():
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="staged GPU validation (serving LatentMoE parity)")
+    reason="staged for h20-instance-1 GPU 1 (serving LatentMoE parity)")
 
 DEV = "cuda"
 CONFIGS = {

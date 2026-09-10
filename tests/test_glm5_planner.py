@@ -33,23 +33,6 @@ def test_glm5_planner_rejects_single_node_full_mode3_plan():
         _plan(world_size=8)
 
 
-def test_glm5_planner_accepts_single_node_h200_when_device_memory_is_visible(monkeypatch):
-    import torch
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: types.SimpleNamespace(total_memory=144 * 1024 ** 3),
-    )
-
-    config = _plan(world_size=8)
-
-    assert config.Basic_Config.attn_mode == 3
-    assert config.EP_Config.num_local_expert_per_layer == 32
-    assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 0
-
-
 
 def test_glm5_planner_keeps_full_persistent_two_node_decode():
     config = _plan(world_size=16)

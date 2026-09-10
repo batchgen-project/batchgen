@@ -8,12 +8,6 @@
 #include <cstdint>
 #include <utility>
 
-// CUDA 13 retains the versioned driver-entry typedef but drops the legacy
-// unversioned alias used by CUDA 12.x headers.
-#if CUDA_VERSION >= 13000
-using PFN_cuTensorMapEncodeTiled = PFN_cuTensorMapEncodeTiled_v12000;
-#endif
-
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -803,3 +797,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_int4_moe_stage2", &grouped_int4_moe_stage2,
           "Grouped INT4 Stage 2 (down projection) with TMA");
 }
+

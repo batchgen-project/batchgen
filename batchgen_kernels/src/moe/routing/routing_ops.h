@@ -48,16 +48,25 @@ void router_bias_cast_cuda(
     torch::Tensor output
 );
 
-// Gate: fused sigmoid + top-k + normalize + scale (K2.5)
-// Input:  router_logits [N, E] FP32, e_score_correction [E] FP32
+// Gate: fused sigmoid + top-k + normalize + scale (K2.5, K3)
+// Input:  router_logits [N, E] FP32 (row stride may exceed E),
+//         e_score_correction [E] FP32
 // Output: topk_indices [N, K] int32, topk_weights [N, K] FP32
 std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor router_logits,
     torch::Tensor e_score_correction,
     int k,
     float routed_scaling_factor,
-    torch::Tensor topk_indices,   // optional pre-allocated
-    torch::Tensor topk_weights    // optional pre-allocated
+    torch::Tensor topk_indices,       // optional pre-allocated
+    torch::Tensor topk_weights,       // optional pre-allocated
+    torch::Tensor num_valid_tokens,   // optional device int32 scalar; rows beyond
+                                      // it get idx=-1 / weight=0. An undefined or
+                                      // empty tensor means "all rows"; the Python
+                                      // binding exposes this as c10::optional.
+    torch::Tensor latent_out,         // optional [N, L] BF16 pre-allocated: K3's
+                                      // latent suffix of the same fused GEMM row,
+                                      // cast in place. Undefined/empty disables it.
+    int64_t latent_offset             // column where the latent suffix starts
 );
 
 // GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits.

@@ -17,7 +17,7 @@ broken variant by ``python tests/mutation_check_kimi_k3.py`` (registry in
 the mutation check.
 
 What CPU parity does NOT cover (closed by the staged GPU test
-tests/gpu/test_kimi_k3_kda_fla_parity.py):
+tests/gpu/test_kimi_k3_kda_fla_parity.py on h20-instance-1):
   * the fla `chunk_kda` kernel interior (both stacks share the vendored torch
     core on CPU, so it cancels here);
   * real fla ShortConvolution / FusedRMSNormGated vs the pure-torch ports;

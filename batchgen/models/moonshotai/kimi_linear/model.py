@@ -43,9 +43,39 @@ from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
-from .block_residual import BlockResidualBuffer, num_block_residual_columns
+from .block_residual import (
+    BlockResidualBuffer,
+    gather_attn_residual_rows,
+    num_block_residual_columns,
+)
 from .block_residual import apply_attn_res as _block_residual_apply_attn_res
 from .config import KimiLinearConfig
+
+
+def _view_rows_as_bsh(t, batch_size, seq_len, hidden_size):
+    """``(rows, H)`` -> ``(B, rows // B, H)``, valid when the batch is EMPTY.
+
+    ``view(batch_size, -1, hidden_size)`` cannot infer ``-1`` from a 0-element
+    tensor and raises "cannot reshape tensor of 0 elements ... is ambiguous".
+    A decode batch drains to zero rows whenever the last sequences of a run
+    complete, which killed a 512-request decode run at 506/512.
+
+    ONLY the empty case is special-cased; a non-empty tensor keeps exactly the
+    shape ``-1`` inferred. That matters: the row count here is NOT the caller's
+    entry ``seq_len`` -- ``scatter_rows`` shards rows across the TP group -- so
+    hoisting a fixed seq_len for the NON-empty case breaks prefill with
+    "shape '[1, N, H]' is invalid for input of size ...".
+
+    The empty case must reuse the caller's entry ``seq_len``, not 0. ``numel()
+    == 0`` means ``B == 0`` or ``seq_len == 0``, so every ``(B, seq_len, H)``
+    holds 0 elements and no sharding can invalidate the choice -- but the
+    residual that stays behind keeps the ENTRY shape, so emitting ``(B, 0, H)``
+    here makes ``prefix_sum.add_(hidden_states)`` fail with "output with shape
+    [0, 1, H] doesn't match the broadcast shape [0, 0, H]".
+    """
+    if t.numel() == 0:
+        return t.view(batch_size, seq_len, hidden_size)
+    return t.view(batch_size, -1, hidden_size)
 
 
 # ============================================================================
@@ -67,6 +97,15 @@ class SituAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            # One Triton launch instead of ~10 elementwise kernels (the K3
+            # decode graph runs this once per MoE layer for the shared expert).
+            from .situ_triton import situ_and_mul_triton, situ_triton_available
+            if situ_triton_available():
+                return situ_and_mul_triton(x, self.beta, self.linear_beta)
+        return self._forward_eager(x)
+
+    def _forward_eager(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         gate = x[..., :d].to(torch.float32)
         up = x[..., d:].to(torch.float32)
@@ -101,17 +140,84 @@ def build_activation(config: KimiLinearConfig) -> nn.Module | Callable:
 # ============================================================================
 #  Norm
 # ============================================================================
+_FUSED_RMSNORM = None   # None = untried, False = unavailable, else the op
+
+
+def _fused_rmsnorm_op():
+    """``batchgen_kernels.attention._C_fused_ops.rmsnorm_forward`` or None.
+
+    One kernel per norm call. The eager form below is 7 launches (cast, pow,
+    mean, add, rsqrt, mul, cast, mul); Kimi-K3 decode runs ~5 norms per
+    layer x 93 layers, ~3,000 tiny kernels (~10 ms) per whole-model graph
+    replay at every batch size. The extension is JIT-built once in dev mode;
+    a missing/unbuildable extension keeps the eager form (logged once).
+    """
+    global _FUSED_RMSNORM
+    if _FUSED_RMSNORM is None:
+        try:
+            # Triton row kernel first (~2-3 us per decode-shaped call); the
+            # CUDA extension (one launch, scalar loads, ~12 us) second.
+            from .rmsnorm_triton import triton_rmsnorm, triton_rmsnorm_available
+            if triton_rmsnorm_available():
+                _FUSED_RMSNORM = triton_rmsnorm
+        except Exception:  # pragma: no cover - environment dependent
+            pass
+    if _FUSED_RMSNORM is None:
+        try:
+            from batchgen.attention.fused_kernels.ops import cuda_rmsnorm
+            _FUSED_RMSNORM = cuda_rmsnorm
+        except Exception as exc:  # pragma: no cover - environment dependent
+            import logging
+            logging.warning(
+                "[K3] fused RMSNorm extension unavailable, using the eager "
+                "7-kernel norm: %s", exc,
+            )
+            _FUSED_RMSNORM = False
+    return _FUSED_RMSNORM or None
+
+
 class KimiRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self._resident_prefill_token_tile = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         dtype = hidden_states.dtype
         x = hidden_states.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return self.weight * x.to(dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            hidden_states.is_cuda
+            and hidden_states.dtype == self.weight.dtype
+            and hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            fused = _fused_rmsnorm_op()
+            if fused is not None:
+                # fp32 math, one rounding (the eager form rounds x to bf16
+                # before the bf16 weight multiply). No fp32 temporaries, so
+                # the resident-prefill token tiling below is unnecessary.
+                return fused(
+                    hidden_states, self.weight, float(self.variance_epsilon)
+                )
+        token_tile = self._resident_prefill_token_tile
+        num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+        if token_tile is None or num_tokens <= int(token_tile):
+            return self._norm(hidden_states)
+
+        flat = hidden_states.reshape(num_tokens, hidden_states.shape[-1])
+        output = None
+        for start in range(0, num_tokens, int(token_tile)):
+            end = min(start + int(token_tile), num_tokens)
+            y = self._norm(flat[start:end])
+            if output is None:
+                output = y.new_empty((num_tokens, y.shape[-1]))
+            output[start:end].copy_(y)
+            del y
+        return output.view_as(hidden_states)
 
 
 # ============================================================================
@@ -153,14 +259,63 @@ class KimiMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = build_activation(config)
+        self._resident_prefill_token_tile = None
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
         """The FFN body, verbatim. Applied to the whole input or to one token
         tile — same ops, same order, either way."""
         if self.config.hidden_act == "situ":
-            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+            if x.is_cuda and (
+                getattr(self, "_gate_up_fused", None) is not None
+                or not torch.cuda.is_current_stream_capturing()
+            ):
+                # One [2I, H] GEMM writes [gate | up] directly (no cat, one
+                # launch instead of two); gate_proj/up_proj keep their weights
+                # as views of the fused slab, so nothing else changes. The slab
+                # is built eagerly (never inside a graph capture).
+                gate_up = F.linear(x, self._fused_gate_up_weight())
+            else:
+                gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
             return self.down_proj(self.act_fn(gate_up))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+    def _fused_gate_up_weight(self) -> torch.Tensor:
+        fused = getattr(self, "_gate_up_fused", None)
+        gw, uw = self.gate_proj.weight, self.up_proj.weight
+        if (
+            fused is None
+            or fused.shape[0] != gw.shape[0] + uw.shape[0]
+            or fused.device != gw.device
+            or fused.dtype != gw.dtype
+            or gw.data_ptr() != fused.data_ptr()
+        ):
+            fused = torch.cat([gw.detach(), uw.detach()], dim=0).contiguous()
+            n = gw.shape[0]
+            # re-point the projections at views of the slab: same values,
+            # no second copy of the weights
+            self.gate_proj.weight = nn.Parameter(fused[:n], requires_grad=False)
+            self.up_proj.weight = nn.Parameter(fused[n:], requires_grad=False)
+            self._gate_up_fused = fused
+        return fused
+
+    def _reduce_tp_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Sum row-parallel shared-expert partials across its TP group."""
+        if getattr(self, "_tp_size", 1) > 1:
+            import torch.distributed as dist
+
+            profiler = getattr(self, "_streamed_sp8_profiler", None)
+            if (
+                profiler is not None
+                and not profiler._prefill_profile_enabled
+            ):
+                profiler = None
+            span = (
+                profiler.begin_profile_span() if profiler is not None else None
+            )
+            dist.all_reduce(output, group=self._tp_group)
+            if profiler is not None:
+                profiler.end_profile_span("shared_expert_reduce", span)
+        return output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Token-tiled FFN — BIT-EXACT against the unchunked body.
@@ -179,12 +334,26 @@ class KimiMLP(nn.Module):
         emitted. Pinned by tests/test_kimi_linear_ffn_chunk.py.
         """
         num_tokens = x.numel() // x.shape[-1]
-        if num_tokens <= _FFN_TOKEN_TILE:
+        token_tile = _FFN_TOKEN_TILE
+        resident_tile = self._resident_prefill_token_tile
+        if (
+            resident_tile is not None
+            and num_tokens > token_tile
+            and num_tokens % int(resident_tile) == 0
+        ):
+            # The registered W2 shape is 16,384 rows, exactly 32 x 512.
+            # Ragged 512-ish GEMMs can select a different cuBLAS reduction
+            # order, so non-divisible shapes keep the validated 8,192-row
+            # even tiler instead of forcing a 512-row remainder.
+            token_tile = min(token_tile, int(resident_tile))
+        if token_tile <= 0:
+            raise ValueError("KimiMLP token tile must be positive")
+        if num_tokens <= token_tile:
             # Decode and short prefill: the pre-chunking call, unchanged.
-            return self._ffn(x)
+            return self._reduce_tp_output(self._ffn(x))
 
         flat = x.reshape(num_tokens, x.shape[-1])
-        n_tiles = math.ceil(num_tokens / _FFN_TOKEN_TILE)
+        n_tiles = math.ceil(num_tokens / token_tile)
         out = None
         for i in range(n_tiles):
             start = (i * num_tokens) // n_tiles
@@ -201,7 +370,51 @@ class KimiMLP(nn.Module):
             # peak — MEASURED at +T*H*2 bytes = +0.109 GiB at K3 scale, which is
             # small but is carried into the prefill budget and is free to drop.
             del y
-        return out.view(*x.shape[:-1], out.shape[-1])
+        return self._reduce_tp_output(
+            out.view(*x.shape[:-1], out.shape[-1])
+        )
+
+    def _ffn_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Run this rank's token-tiled FFN shard into caller-owned storage.
+
+        ``out`` may alias ``x``. Each output row depends only on the matching
+        input row, so overwriting a completed tile cannot affect a later tile.
+        This deliberately does not reduce TP partials; callers choose an
+        all-reduce or row reduce-scatter after the local body.
+        """
+        if (
+            out.shape != x.shape
+            or out.dtype != x.dtype
+            or out.device != x.device
+        ):
+            raise ValueError("KimiMLP _ffn_into requires matching tensors")
+
+        num_tokens = x.numel() // x.shape[-1]
+        token_tile = _FFN_TOKEN_TILE
+        resident_tile = self._resident_prefill_token_tile
+        if (
+            resident_tile is not None
+            and num_tokens > token_tile
+            and num_tokens % int(resident_tile) == 0
+        ):
+            token_tile = min(token_tile, int(resident_tile))
+        if token_tile <= 0:
+            raise ValueError("KimiMLP token tile must be positive")
+
+        flat_x = x.reshape(num_tokens, x.shape[-1])
+        flat_out = out.reshape(num_tokens, out.shape[-1])
+        n_tiles = max(1, math.ceil(num_tokens / token_tile))
+        for i in range(n_tiles):
+            start = (i * num_tokens) // n_tiles
+            end = ((i + 1) * num_tokens) // n_tiles
+            y = self._ffn(flat_x[start:end])
+            flat_out[start:end].copy_(y)
+            del y
+        return out
+
+    def forward_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Run the FFN into caller storage, then all-reduce TP partials."""
+        return self._reduce_tp_output(self._ffn_into(x, out))
 
 
 class KimiBlockSparseMLP(nn.Module):
@@ -249,12 +462,15 @@ class KimiMoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((self.num_experts, self.gating_dim)))
         self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts))
 
-    def forward(self, hidden_states: torch.Tensor):
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FP32 router logits for a flat ``[tokens, hidden]`` activation."""
+        return F.linear(
             hidden_states.type(torch.float32), self.weight.type(torch.float32), None
         )
+
+    def select_experts(self, logits: torch.Tensor):
+        """Top-k selection from FP32 router logits ``[tokens, num_experts]``."""
+        num_tokens = logits.shape[0]
         if self.moe_router_activation_func == "sigmoid":
             scores = logits.sigmoid()
         elif self.moe_router_activation_func == "softmax":
@@ -264,11 +480,10 @@ class KimiMoEGate(nn.Module):
                 f"insupportable scoring function for MoE gating: {self.moe_router_activation_func}"
             )
 
-        scores = scores.view(bsz * seq_len, -1)
         scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
         if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
             group_scores = (
-                scores_for_choice.view(bsz * seq_len, self.num_expert_group, -1)
+                scores_for_choice.view(num_tokens, self.num_expert_group, -1)
                 .topk(2, dim=-1)[0]
                 .sum(dim=-1)
             )
@@ -279,9 +494,9 @@ class KimiMoEGate(nn.Module):
             group_mask.scatter_(1, group_idx, 1)
             score_mask = (
                 group_mask.unsqueeze(-1)
-                .expand(bsz * seq_len, self.num_expert_group,
+                .expand(num_tokens, self.num_expert_group,
                         self.num_experts // self.num_expert_group)
-                .reshape(bsz * seq_len, -1)
+                .reshape(num_tokens, -1)
             )
             tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         else:
@@ -296,6 +511,10 @@ class KimiMoEGate(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor
 
         return topk_idx, topk_weight
+
+    def forward(self, hidden_states: torch.Tensor):
+        _, _, h = hidden_states.shape
+        return self.select_experts(self.router_logits(hidden_states.view(-1, h)))
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -743,7 +962,7 @@ class KimiKDAAttention(nn.Module):
 # unchunked reference to < 1e-6 max_abs, NOT bitwise: every op is token-parallel
 # so no reduction crosses a chunk, but a ragged final chunk (T not a multiple of
 # chunk_size) is a differently-shaped tensor and ATen/cuBLAS pick a different
-# batched-GEMM/reduction strategy for it. MEASURED at H=512, fp32:
+# batched-GEMM/reduction strategy for it. MEASURED on H20, H=512, fp32:
 # torch.equal True at T in {13,1024,2048,8192}, False at T in {1025,4097} with
 # max_abs 2.4e-7 (nb=3) / 2.6e-6 (nb=9). The gate is the 1e-6 tolerance in
 # tests/test_kimi_k3_model.py::test_attn_res_lean_equiv, not bit equality.
@@ -811,7 +1030,50 @@ class KimiDecoderLayer(nn.Module):
     def _run_ffn(self, hidden_states):
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(hidden_states)
-        return self.mlp(hidden_states)
+        profiler = getattr(self.mlp, "_streamed_sp8_profiler", None)
+        profile = bool(
+            profiler is not None and profiler._prefill_profile_enabled
+        )
+        span = profiler.begin_profile_span() if profile else None
+        row_group = getattr(self.mlp, "_streamed_sp8_row_group", None)
+        if row_group is None:
+            output = self.mlp(hidden_states)
+        else:
+            group_size, group_rank, group = row_group
+            from .moe_tp_reshard import (
+                all_gather_rows_into,
+                scatter_rows,
+            )
+
+            original_shape = hidden_states.shape
+            flat = hidden_states.reshape(-1, original_shape[-1])
+            local_input = scatter_rows(flat, group_size, group_rank)
+            local_output = self.mlp(local_input)
+            output = flat.new_empty(flat.shape)
+            all_gather_rows_into(
+                output,
+                local_output,
+                flat.shape[0],
+                group_size,
+                group_rank,
+                group,
+            )
+            output = output.view(original_shape)
+        if profile:
+            profiler.end_profile_span("dense_mlp", span)
+        return output
+
+    def _record_prefill_finite(self, stage, tensor):
+        """Queue a streamed-SP8 finite check without synchronizing the host."""
+        profiler = getattr(
+            getattr(self, "mlp_res_norm", None),
+            "_streamed_sp8_profiler",
+            None,
+        )
+        if profiler is not None:
+            profiler.record_prefill_finite_check(
+                self.layer_idx, stage, tensor
+            )
 
     def forward(
         self,
@@ -849,15 +1111,24 @@ class KimiDecoderLayer(nn.Module):
         cu_seqlens, block_residual, **kwargs
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
+        self._record_prefill_finite("entry", hidden_states)
         prefix_sum = hidden_states
 
         if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states = _apply_attn_res(
-                prefix_sum.view(-1, hidden_size),
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-            ).view(batch_size, seq_len, hidden_size)
+            hidden_states = _view_rows_as_bsh(
+                _apply_attn_res(
+                    prefix_sum.view(-1, hidden_size),
+                    block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                ),
+                batch_size,
+                seq_len,
+                hidden_size,
+            )
+            self._record_prefill_finite(
+                "post_input_depth_mix", hidden_states
+            )
 
         if self.layer_idx % self.attn_res_block_size == 0:
             # Boundary: snapshot the PRE-mix prefix_sum, then RESET (assignment,
@@ -867,8 +1138,13 @@ class KimiDecoderLayer(nn.Module):
             # the (S,nb,H) and (S,nb+1,H) tensors are never co-live — 12.25 GiB
             # of transient at the last K3 boundary. What comes back is the
             # NARROWED (S,nb+1,H) view, so shape[1] still counts boundaries.
+            snapshot = gather_attn_residual_rows(
+                prefix_sum.view(-1, hidden_size),
+                block_residual,
+                self.self_attention_res_norm,
+            )
             block_residual = BlockResidualBuffer.append(
-                block_residual, prefix_sum.view(-1, hidden_size)
+                block_residual, snapshot
             )
             prefix_sum = None
 
@@ -876,26 +1152,72 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self._run_attn(
             hidden_states, attention_mask, position_ids, past_key_values, cu_seqlens, **kwargs
         )
+        self._record_prefill_finite("post_attention", hidden_states)
 
         if prefix_sum is not None:
-            prefix_sum = prefix_sum + hidden_states
+            if prefix_sum.numel() != hidden_states.numel():
+                row_group = getattr(
+                    self.mlp_res_norm, "_streamed_sp8_row_group", None
+                )
+                if row_group is None:
+                    raise ValueError(
+                        "attention returned a row shard without streamed-SP8"
+                    )
+                from .moe_tp_reshard import scatter_rows
+
+                group_size, group_rank, _ = row_group
+                prefix_sum = _view_rows_as_bsh(
+                    scatter_rows(
+                        prefix_sum.view(-1, hidden_size),
+                        group_size,
+                        group_rank,
+                    ),
+                    batch_size,
+                    seq_len,
+                    hidden_size,
+                )
+            # The pre-attention prefix is the surviving residual buffer and
+            # the attention output is dead after this merge. Exact-64K K3 is
+            # 896 MiB per full hidden tensor, so update the prefix in place
+            # instead of materializing a third tensor before the depth mix.
+            prefix_sum.add_(hidden_states)
         else:
             prefix_sum = hidden_states
+        self._record_prefill_finite("post_attention_residual", prefix_sum)
 
-        hidden_states = _apply_attn_res(
-            prefix_sum.view(-1, hidden_size),
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-        ).view(batch_size, seq_len, hidden_size)
+        hidden_states = _view_rows_as_bsh(
+            _apply_attn_res(
+                prefix_sum.view(-1, hidden_size),
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+            ),
+            batch_size,
+            seq_len,
+            hidden_size,
+        )
+        self._record_prefill_finite("post_mlp_depth_mix", hidden_states)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
+        self._record_prefill_finite("post_mlp_norm", hidden_states)
+        moe = getattr(self, "block_sparse_moe", None)
+        if (
+            moe is not None
+            and getattr(moe, "_streamed_sp8_sharded_carry", False)
+        ):
+            moe._streamed_sp8_global_rows = block_residual.shape[0]
         hidden_states = self._run_ffn(hidden_states)
+        self._record_prefill_finite("post_ffn", hidden_states)
 
         if prefix_sum is None:
             prefix_sum = hidden_states
         else:
-            prefix_sum = prefix_sum + hidden_states
+            # The FFN output is dead after this residual merge. Reuse the
+            # surviving prefix buffer instead of allocating another full
+            # (tokens, hidden) tensor; exact-64K K3 is 896 MiB per rank here.
+            prefix_sum.add_(hidden_states)
+
+        self._record_prefill_finite("output", prefix_sum)
 
         return prefix_sum, block_residual
 

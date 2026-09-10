@@ -85,7 +85,7 @@ So `apply_chat_template(tokenize=False)` renders the string and then re-encodes
 it with this tokenizer's own `encode()` — the exact function the worker will
 call — and requires the result to equal the reference segment ids. Exact, no
 marker heuristics, no blind spots. Measured: 400/400 realistic conversations
-pass; verification costs a fraction of one encode.
+pass; verification costs ~58% of one encode (8 ms on an 88 KB prompt).
 
 Two consequences worth remembering:
 
@@ -109,8 +109,8 @@ Two consequences worth remembering:
 ```bash
 pytest tests/test_kimi_k3_tokenizer.py -q
 
-# with the real checkpoint mounted, oracle enabled and skips banned:
-KIMI_K3_CHECKPOINT=/path/to/Kimi-K3 \
+# with the real checkpoint (h20-instance-1), oracle enabled and skips banned:
+KIMI_K3_CHECKPOINT=/taijifs_zw35/share_304153846/hunyuan/tairanxu/models/Kimi-K3 \
   KIMI_K3_STRICT=1 pytest tests/test_kimi_k3_tokenizer.py -q
 ```
 

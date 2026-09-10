@@ -81,18 +81,79 @@ class KimiLinearInitializer:
         self.local_rank = input_arguments.local_rank
         self.global_rank = input_arguments.global_rank
         self.world_size = input_arguments.world_size
-        # hugetlbfs opt-in is not wired for kimi-linear yet; enabling it is a
-        # dedicated follow-up PR (policy: no new server-side env guards here).
-        self.enable_hugetlbfs = False
+        self.distributed_weight_config = getattr(
+            input_arguments, "distributed_weight_config", None
+        )
+        self.distributed_weight_sharded = bool(self.distributed_weight_config)
+        if self.distributed_weight_sharded and (
+            not self.is_k3 or self.world_size not in (16, 32)
+        ):
+            raise ValueError(
+                "K3 distributed host weights require model_type='kimi_k3' "
+                "and world_size=16 (2 nodes) or world_size=32 (4 nodes)"
+            )
+        # Weight transport is selected in the distributed store config, not by
+        # an env var. Re-reading the (small) JSON here keeps the allowed-value
+        # check in the one loader that already validates the store.
+        self.distributed_weight_transport = "host_rdma"
+        if self.distributed_weight_sharded:
+            from .distributed_weight_store import load_distributed_weight_config
+
+            distributed_config = load_distributed_weight_config(
+                self.distributed_weight_config
+            )
+            if distributed_config["num_nodes"] * 8 != self.world_size:
+                raise ValueError(
+                    "distributed weight config topology does not match "
+                    f"world_size={self.world_size}: "
+                    f"num_nodes={distributed_config['num_nodes']}"
+                )
+            self.distributed_weight_transport = distributed_config["transport"]
+        self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
         self.model_config = self._parse_model_config()
 
         self.engine_config = EngineConfig()
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        self.planner = KimiLinearPlanner(is_k3=self.is_k3)
-        self.engine_config = self.planner.generate_config(self.engine_config)
+        # M2b: decode head-parallel TP degree G (attention_group_size). A
+        # distributed K3 store is only valid with TP8: each node's eight
+        # workers own disjoint 112-expert ingress shards and the node-local
+        # group reconstructs the current layer.
+        requested_G = int(
+            os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1")
+        )
+        if self.distributed_weight_sharded:
+            if requested_G != 8 and self.global_rank == 0:
+                logging.warning(
+                    "[K3] distributed host weights require attention_group_size=8; "
+                    "overriding requested G=%d",
+                    requested_G,
+                )
+            G = 8
+        else:
+            G = requested_G
+        self.planner = KimiLinearPlanner(
+            is_k3=self.is_k3,
+            attention_group_size=G,
+            gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+            moe_exchange=getattr(input_arguments, "k3_moe_exchange", "auto"),
+        )
         if self.global_rank == 0:
+            logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
+        self.engine_config = self.planner.generate_config(self.engine_config)
+        self.engine_config.Basic_Config.distributed_weight_sharded = (
+            self.distributed_weight_sharded
+        )
+        self.engine_config.Basic_Config.distributed_weight_transport = (
+            self.distributed_weight_transport
+        )
+        if self.global_rank == 0:
+            logging.info(
+                "K3 distributed weight transport = "
+                f"{self.distributed_weight_transport}"
+            )
             logging.info(f"Engine config after planning: {self.engine_config}")
 
         self.shm_name = input_arguments.shm_name
@@ -141,8 +202,9 @@ class KimiLinearInitializer:
         props = torch.cuda.get_device_properties(
             self.engine_config.Basic_Config.device
         )
+        self.gpu_total_memory_bytes = int(props.total_memory)
         logging.info(
-            f"Current device total memory: {props.total_memory / (1024**3):.2f} GB"
+            f"Current device total memory: {self.gpu_total_memory_bytes / (1024**3):.2f} GB"
         )
 
         cfg = self.batchgen_config
