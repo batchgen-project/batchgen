@@ -22,16 +22,13 @@ Checks:
      directly — the in-place state roll lands in the manager's memory
      (no copy).
 
-Run (GPU): python tests/kimi_linear/test_kda_manager_graphready.py
+Run (GPU): python batchgen_kernels/tests/kimi_linear/test_kda_manager_graphready.py
 """
 
-import logging
 import sys
 from itertools import count
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.kda_manager_graphready")
 
 from batchgen.models.moonshotai.kimi_linear.wrappers import (
     KimiLinearKDAWrapper,
@@ -55,7 +52,7 @@ PASS = True
 def report(name, ok, detail=""):
     global PASS
     PASS = PASS and ok
-    _LOG.info(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
 def slot_is_zero(state, slot):
@@ -69,7 +66,7 @@ def slot_is_zero(state, slot):
 
 def main():
     if not torch.cuda.is_available():
-        _LOG.info("CUDA required")
+        print("CUDA required")
         sys.exit(1)
 
     KimiLinearKDAWrapper.reset()
@@ -192,10 +189,9 @@ def main():
     report("causal_conv1d_update rolls state in place in manager memory", ok)
 
     KimiLinearKDAWrapper.reset()
-    _LOG.info("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
+    print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

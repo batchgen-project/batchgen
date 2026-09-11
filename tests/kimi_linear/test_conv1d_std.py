@@ -23,17 +23,14 @@ Cases (bias=None, SiLU on — the Kimi-Linear KDA configuration):
      BIT-IDENTICAL to the default strided-view path (layout only, no numerics)
 Inputs: realistic magnitudes (randn * 0.1).
 
-Run (GPU): python tests/kimi_linear/test_conv1d_std.py
+Run (GPU): python batchgen_kernels/tests/kimi_linear/test_conv1d_std.py
 (BATCHGEN_KERNELS_DEV=1 needed only when running from the source tree
 without the rebuilt AOT wheel.)
 """
 
-import logging
 import sys
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.conv1d_std")
 import torch.nn.functional as F
 
 from batchgen_kernels.conv1d import causal_conv1d_fwd, causal_conv1d_update
@@ -59,7 +56,7 @@ PASS = True
 def report(name, ok, detail=""):
     global PASS
     PASS = PASS and ok
-    _LOG.info(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
 def check_std_bf16(name, got, ref):
@@ -122,7 +119,7 @@ def cu_seqlens_of(lens):
 
 def main():
     if not torch.cuda.is_available():
-        _LOG.info("CUDA required")
+        print("CUDA required")
         sys.exit(1)
 
     # ── case 1: varlen prefill + pooled state write ──────────────────────────
@@ -212,10 +209,9 @@ def main():
     report("overwrite_x pooled final states bit-identical",
            torch.equal(pool_a, pool_b))
 
-    _LOG.info("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
+    print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

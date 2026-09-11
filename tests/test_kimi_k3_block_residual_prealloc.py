@@ -147,6 +147,13 @@ num_block_residual_columns = KL.num_block_residual_columns
 # import dance above resolved to.
 BlockResidualCarrier = sys.modules[
     BlockResidualBuffer.__module__].BlockResidualCarrier
+apply_attn_res = sys.modules[BlockResidualBuffer.__module__].apply_attn_res
+gather_attn_residual_rows = sys.modules[
+    BlockResidualBuffer.__module__
+].gather_attn_residual_rows
+balanced_row_split = importlib.import_module(
+    BlockResidualBuffer.__module__.rsplit(".", 1)[0] + ".moe_tp_reshard"
+).balanced_row_split
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +269,10 @@ def _drive_kimi_linear(layers, out_model, final_norm, x, *, prealloc):
     for layer in layers:
         hidden_states, block_residual = KL.KimiDecoderLayer._forward_attn_residual(
             layer, hidden_states, None, None, None, None, block_residual)
-        trace.append((hidden_states, block_residual))
+        # The production stack owns each previous layer output and may reuse
+        # it as the next layer's residual destination. Snapshot values here;
+        # this trace is test instrumentation, not a production lifetime.
+        trace.append((hidden_states.clone(), block_residual))
     mixed = KL.KimiLinearModel._apply_output_attn_res(
         out_model, hidden_states.view(-1, _HIDDEN), block_residual)
     return trace, mixed, final_norm(mixed)
@@ -550,6 +560,183 @@ def test_consumer_cat_erases_the_stride_difference():
         assert from_contiguous.stride() == from_view.stride()
         assert from_contiguous.shape == from_view.shape
         assert from_view.is_contiguous()
+
+
+def test_score_multiply_in_place_is_bit_exact():
+    """The W2 scratch fix may reuse ``k`` only if scoring stays bit-exact."""
+    tokens, num_blocks, hidden = 61, 5, 16
+    gen = torch.Generator().manual_seed(260821)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+
+    expected = torch.empty_like(prefix)
+    w = norm.weight.float() * proj.weight.squeeze(0).float()
+    for start in range(0, tokens, 32):
+        end = min(start + 32, tokens)
+        v = torch.cat(
+            (block[start:end], prefix[start:end].unsqueeze(1)), dim=1
+        ).float()
+        k = v * torch.rsqrt(
+            v.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon
+        )
+        scores = (k * w).sum(-1)
+        probs = scores.softmax(-1).unsqueeze(1)
+        expected[start:end] = torch.matmul(probs, v).squeeze(1).to(
+            expected.dtype
+        )
+
+    actual = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=32
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_streamed_sp8_depth_mix_row_shard_is_bit_exact(monkeypatch):
+    """TP row sharding preserves the token-independent depth mixer exactly."""
+    tokens, num_blocks, hidden = 16, 5, 16
+    group_size, group_rank = 4, 2
+    gen = torch.Generator().manual_seed(260902)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+    reference = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    rows_per_rank = tokens // group_size
+    trace = []
+
+    def fake_all_gather(gathered, send, group):
+        assert group == "fake-group"
+        start = group_rank * rows_per_rank
+        end = start + rows_per_rank
+        assert trace == ["order_wait"]
+        assert torch.equal(send, reference[start:end])
+        gathered.copy_(reference)
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+    norm._streamed_sp8_row_group = (
+        group_size,
+        group_rank,
+        "fake-group",
+    )
+    norm._streamed_sp8_order_wait = lambda: trace.append("order_wait")
+
+    actual = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+
+    assert torch.equal(actual, reference)
+    assert trace == ["order_wait"]
+
+
+def test_streamed_sp8_depth_mix_can_keep_and_reuse_local_rows(monkeypatch):
+    tokens, num_blocks, hidden = 17, 5, 16
+    group_size, group_rank = 4, 2
+    gen = torch.Generator().manual_seed(260903)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+    reference = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    start, end = balanced_row_split(tokens, group_size)[group_rank]
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda *args, **kwargs: pytest.fail("keep-sharded path gathered rows"),
+    )
+    norm._streamed_sp8_row_group = (
+        group_size,
+        group_rank,
+        "fake-group",
+    )
+    norm._streamed_sp8_keep_sharded = True
+
+    from_full = apply_attn_res(prefix, block, proj, norm, chunk_size=4)
+    from_local = apply_attn_res(
+        prefix[start:end], block, proj, norm, chunk_size=4
+    )
+
+    assert torch.equal(from_full, reference[start:end])
+    assert torch.equal(from_local, reference[start:end])
+
+
+def test_block_boundary_restores_a_sharded_prefix(monkeypatch):
+    tokens, hidden = 17, 16
+    group_size, group_rank = 4, 2
+    prefix = torch.arange(tokens * hidden, dtype=torch.float32).view(
+        tokens, hidden
+    )
+    block = torch.empty(tokens, 3, hidden)
+    start, end = balanced_row_split(tokens, group_size)[group_rank]
+    local = prefix[start:end]
+
+    def fake_all_gather(gathered, send, group):
+        assert group == "fake-group"
+        # The helper's uneven path receives rank-major padded slots.
+        splits = balanced_row_split(tokens, group_size)
+        ntp = max(e - s for s, e in splits)
+        expected_send = local.new_zeros((ntp, hidden))
+        expected_send[: local.shape[0]].copy_(local)
+        assert torch.equal(send, expected_send)
+        packed = prefix.new_zeros((group_size, ntp, hidden))
+        for rank, (s, e) in enumerate(splits):
+            packed[rank, : e - s].copy_(prefix[s:e])
+        gathered.copy_(packed.view(-1, hidden))
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+    norm = types.SimpleNamespace(
+        _streamed_sp8_row_group=(group_size, group_rank, "fake-group")
+    )
+
+    restored = gather_attn_residual_rows(local, block, norm)
+    assert torch.equal(restored, prefix)
+
+
+def test_resident_prefill_bounds_depth_mixer_chunk_exactly():
+    """Resident prefill reuses its 512-row memory tile in the depth mixer."""
+    tokens, num_blocks, hidden = 61, 5, 16
+    gen = torch.Generator().manual_seed(260821)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+        _resident_prefill_token_tile=16,
+    )
+
+    expected = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=16
+    )
+    actual = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=1024
+    )
+    assert torch.equal(actual, expected)
 
 
 def test_append_falls_back_to_cat_for_a_foreign_tensor():

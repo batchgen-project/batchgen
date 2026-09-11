@@ -127,8 +127,8 @@ Two things make the check cheap and almost never fire:
     prompt body.
   * Measured on a realistic 400-conversation corpus (multi-turn, tools,
     reasoning_content, code, CJK, ``&``/quotes, and prose mentioning ``[EOS]``/
-    ``[PAD]``): **400/400 pass**. Verification costs a fraction of one
-    encode.
+    ``[PAD]``): **400/400 pass**. Verification cost is ~58% of one encode
+    (8 ms on an 88 KB prompt).
 
 ``tokenize=True`` returns the reference segment ids and is exact for any input,
 so it is never verified and never rejected.

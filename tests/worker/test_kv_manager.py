@@ -272,6 +272,7 @@ def _make_cap_req(
     engine_basic_num_queries=None,
     model_max_position_embeddings=None,
     args_cuda_graph_max_bucket_size=None,
+    engine_basic_decode_graph_max_bucket=None,
 ) -> PageTableCapacityRequest:
     return PageTableCapacityRequest(
         sequence_tokens=tuple(sequence_tokens),
@@ -284,6 +285,7 @@ def _make_cap_req(
         engine_basic_num_queries=engine_basic_num_queries,
         model_max_position_embeddings=model_max_position_embeddings,
         args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
+        engine_basic_decode_graph_max_bucket=engine_basic_decode_graph_max_bucket,
     )
 
 
@@ -383,6 +385,18 @@ def test_slot_capacity_max_of_all():
         engine_basic_num_queries=256,
     )
     assert KVCacheManager.page_table_slot_capacity(req) == 512
+
+
+def test_slot_capacity_covers_the_largest_decode_graph_bucket():
+    """A whole-model decode graph addresses one row per sequence of its top
+    bucket (K3 H200 plans 160 KDA slots > the 128 arg default); the graph
+    page table must not fall back to eager for a full bucket."""
+    req = _make_cap_req(
+        args_cuda_graph_max_bucket_size=128,
+        engine_module_attn_decoding_micro_batch_size=64,
+        engine_basic_decode_graph_max_bucket=160,
+    )
+    assert KVCacheManager.page_table_slot_capacity(req) == 160
 
 
 def test_slot_capacity_skips_nonpositive():

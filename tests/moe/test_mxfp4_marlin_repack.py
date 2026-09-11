@@ -1,4 +1,4 @@
-"""CPU suite for the K3 MXFP4 → Marlin repack.
+"""CPU suite for the K3 MXFP4 → Marlin repack (task #34).
 
 Proves, on CPU with no compiled kernels:
   1. The frozen compressed-tensors oracle vector pins the dequant convention

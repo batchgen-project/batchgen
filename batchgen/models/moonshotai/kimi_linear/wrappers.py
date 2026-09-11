@@ -139,6 +139,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         super().__init__(module, layer_idx, core_engine, engine_config,
                          model_config, persistent=persistent)
         self.module_key = f"kda_attn_{layer_idx}"
+        self._resident_prefill_segment_tokens = None
 
     @classmethod
     def init_state_pools(cls, kda_layer_indices, num_slots, num_heads, head_dim,
@@ -207,6 +208,15 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
                 "Kimi-Linear serving requires prepack prefill (default). "
                 "Standard padded prefill is not supported."
             )
+        profiler = getattr(self.module, "_streamed_sp8_profiler", None)
+        if (
+            profiler is not None
+            and not profiler._prefill_profile_enabled
+        ):
+            profiler = None
+        attention_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         state = KimiLinearKDAWrapper.layer_pools[self.layer_idx]
         seq_ids = list(AttnWrapperBase.cur_batch or [])
         device = hidden_states.device
@@ -214,9 +224,22 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         slot_ids = state.prepare_prefill(seq_ids)
-        out = self.module.kda_prefill_serving(
-            hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state
-        )
+        segment_tokens = self._resident_prefill_segment_tokens
+        if segment_tokens is None:
+            out = self.module.kda_prefill_serving(
+                hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state
+            )
+        else:
+            out = self.module.kda_prefill_serving(
+                hidden_2d,
+                cu_seqlens,
+                slot_ids,
+                state.has_initial_state,
+                state,
+                segment_tokens=segment_tokens,
+            )
+        if profiler is not None:
+            profiler.end_profile_span("kda_attention", attention_span)
         return out.unsqueeze(0)
 
     def _forward_decode(self, hidden_states, **kwargs):
@@ -244,6 +267,13 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         return weights_dict
 
     def _forward_prefill(self, hidden_states, **kwargs):
+        # Retire the PREVIOUS MLA layer's async KV offloads before this layer
+        # allocates: the d2h memcpy must land before the caching allocator can
+        # hand its source storage to this layer's K/V (expandable_segments).
+        AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+            self.layer_idx,
+            device=hidden_states.device,
+        )
         # Prepack (varlen) prefill: hidden_states is [1, total_tokens, H].
         if not getattr(AttnWrapperBase, "prepack_mode", False):
             raise RuntimeError(
@@ -254,6 +284,15 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
         cu_seqlens = AttnWrapperBase.prepack_cu_seqlens.to(device)
 
+        profiler = getattr(self.module, "_streamed_sp8_profiler", None)
+        if (
+            profiler is not None
+            and not profiler._prefill_profile_enabled
+        ):
+            profiler = None
+        attention_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         attn_output, offload_kv = self.module.mla_prefill_nope_prepacked(
             hidden_2d,
             AttnWrapperBase.position_ids,
@@ -261,7 +300,14 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             AttnWrapperBase.prepack_max_seqlen,
             AttnWrapperBase.prepack_num_sequences,
         )
+        if profiler is not None:
+            profiler.end_profile_span("mla_attention", attention_span)
+        offload_span = (
+            profiler.begin_profile_span() if profiler is not None else None
+        )
         self._offload_prepacked_kv(offload_kv, cu_seqlens)
+        if profiler is not None:
+            profiler.end_profile_span("mla_kv_offload", offload_span)
         return attn_output.unsqueeze(0)
 
     def _offload_prepacked_kv(self, offload_kv, cu_seqlens):
@@ -269,20 +315,47 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         global_sequence_ids = list(AttnWrapperBase.cur_batch or [])
         num_sequences = AttnWrapperBase.prepack_num_sequences
         view = self.core_engine.host_paged_kv_worker_view
+        # The worker publishes the same lengths as a host list next to the
+        # device cu_seqlens; reading them here avoids two device syncs per
+        # sequence per MLA layer (16 per layer at exact 64K).
+        seq_lengths = AttnWrapperBase.prepack_seq_lengths
+        if seq_lengths is None or len(seq_lengths) != num_sequences:
+            seq_lengths = cu_seqlens.diff().tolist()
+        start_idx = 0
         for seq_idx in range(num_sequences):
-            start_idx = int(cu_seqlens[seq_idx].item())
-            end_idx = int(cu_seqlens[seq_idx + 1].item())
-            seq_len = end_idx - start_idx
+            seq_len = int(seq_lengths[seq_idx])
+            end_idx = start_idx + seq_len
             if seq_len == 0:
                 continue
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
-            view.async_offload_layer_kv_to_host(
+            task = view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=[global_sequence_ids[seq_idx]],
                 k_tensor=seq_kv,
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            # The offload is a std::async thread issuing cudaMemcpyAsync on a
+            # d2h stream. Dropping the future is fire-and-forget: decode's
+            # host->GPU load (a different stream, a different thread) then
+            # reads pinned host pages the memcpy has not written yet -- and
+            # pinned memory is not zeroed. Register the task so the worker's
+            # end-of-prefill retire waits on it, and pin the source so the
+            # allocator cannot reuse its storage mid-copy (GLM-5 pattern).
+            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+            # Complete the copy before issuing the next one. Tracking alone
+            # left a residual: with one std::async thread per sequence per MLA
+            # layer (768/rank) the worker view's page table is read on the task
+            # thread with no synchronisation, and the busiest TP ranks still
+            # came back with partially written physical-layer-1 pages (probed
+            # at FlashMLA's input: non-finite prompt K on ranks 0-1 only,
+            # ranks 2-7 clean, surviving a full barrier around the load).
+            # Waiting here is correct by construction and measured no slower
+            # (38K-token prefill 15.0 s vs 16.5 s async): the D2H volume is
+            # ~75 MB per MLA layer per rank at exact-64K, ~0.1 s in total.
+            task.wait()
+            start_idx = end_idx
 
     def _forward_decode(self, hidden_states, **kwargs):
         position_ids = AttnWrapperBase.position_ids
@@ -301,7 +374,9 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             None,
         )
 
-        if (AttnWrapperBase.kv_append_callback is not None
+        import os as _os
+        _skip_cb = _os.environ.get("BATCHGEN_SKIP_KV_CALLBACK", "0") == "1"
+        if (not _skip_cb and AttnWrapperBase.kv_append_callback is not None
                 and k_tensor.shape[0] > 0):
             AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
         return attn_output

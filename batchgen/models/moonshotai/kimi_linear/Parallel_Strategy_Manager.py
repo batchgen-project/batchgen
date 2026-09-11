@@ -19,11 +19,11 @@ BF16-only design (simpler than K2.5):
   - Attention: NoPE-MLA layers use paged KV + FlashMLA decode; KDA layers
     use pooled conv/recurrent state (KimiLinearKDAWrapper pools).
   - Decode CUDA graphs (decode_graph_mode="graph"|"compare", M5.2 Phase A):
-    per-layer attention spans captured/replayed by KimiLinearDecodeGraph
-    (cuda_graph_segments.py); the MoE stays eager between replays because its
-    collectives cannot be captured. "eager" (default) installs the adapter but
-    replays nothing, so batchgen_debug can switch modes on a live server;
-    "off" installs nothing at all.
+    per-layer attention spans plus the K3 resident-MXFP4 MoE segments are
+    captured/replayed by KimiLinearDecodeGraph (cuda_graph_segments.py). A
+    startup prewarm captures the first admitted bucket before decode;
+    "eager" (default) installs the adapter but replays nothing, so
+    batchgen_debug can switch modes on a live server; "off" installs nothing.
 
 PSM <-> worker contract (methods, AttnWrapperBase class attrs the worker writes
 each step, injected module attributes, comm handoff, weight-storage sharing,
@@ -33,6 +33,7 @@ Read that first when modifying this file or batchgen_worker.py.
 """
 
 import logging
+import os
 import time
 import types
 
@@ -47,12 +48,17 @@ from .block_residual import (
 )
 from .config import require_num_routed_experts
 from .serving_modules import (
+    fuse_kda_decode_projections,
     kda_decode_serving,
     kda_prefill_serving,
     mla_decoding_nope_with_pagekv,
     mla_prefill_nope,
     mla_prefill_nope_prepacked,
     moe_forward_serving,
+)
+from .tp_weight_sharding import (
+    shard_mla_tensor,
+    shard_shared_expert_tensor,
 )
 from .wrappers import (
     KimiLinearAttnWrapper,
@@ -70,6 +76,12 @@ def _replace_param(root_module, dotted_name, tensor):
     *parent, leaf = dotted_name.split(".")
     mod = root_module.get_submodule(".".join(parent)) if parent else root_module
     mod._parameters[leaf] = torch.nn.Parameter(tensor.detach(), requires_grad=False)
+
+
+# Slots in the KDA state pool reserved for decode-graph scratch rather than
+# user sequences. The planner allocates the pool as ``sequence_slots + 1``
+# (planner.py kda_state_slots); this is that "+ 1".
+_KDA_GRAPH_SCRATCH_SLOTS = 1
 
 
 class KimiLinearParallelStrategyManager:
@@ -104,6 +116,43 @@ class KimiLinearParallelStrategyManager:
         # rest of the family uses (kimi_initializer.is_k3,
         # kimi_parameter_server._detect_kimi_family).
         self._is_k3 = getattr(loaded_model_config, "model_type", None) == "kimi_k3"
+        self._distributed_weight_sharded = bool(
+            getattr(
+                engine_config.Basic_Config,
+                "distributed_weight_sharded",
+                False,
+            )
+        )
+        if self._distributed_weight_sharded and (
+            not self._is_k3 or world_size not in (16, 32)
+        ):
+            raise ValueError(
+                "distributed host weights require K3 with world_size=16 "
+                "(2 nodes) or world_size=32 (4 nodes)"
+            )
+        # Weight transport (initializer-set from the distributed store config,
+        # no env var). "host_rdma" is the validated default in which every rank
+        # pulls its own 112-expert shard; "hierarchical_gdr" pulls on eight
+        # source ranks and replicates GPU-to-GPU across nodes.
+        self._distributed_weight_transport = str(
+            getattr(
+                engine_config.Basic_Config,
+                "distributed_weight_transport",
+                "host_rdma",
+            )
+        )
+        if self._distributed_weight_transport not in (
+            "host_rdma",
+            "hierarchical_gdr",
+        ):
+            raise ValueError(
+                "distributed_weight_transport must be 'host_rdma' or "
+                f"'hierarchical_gdr', got "
+                f"{self._distributed_weight_transport!r}"
+            )
+        self._hierarchical_gdr = (
+            self._distributed_weight_transport == "hierarchical_gdr"
+        )
 
         # `model_config` is a ModelConfig, which has NO `n_routed_experts`
         # field at all — the old `getattr(..., 256) or 256` here therefore
@@ -124,19 +173,586 @@ class KimiLinearParallelStrategyManager:
         self._stream_all_modules = bool(getattr(
             engine_config.Basic_Config, "stream_all_modules", False
         ))
+
+        # M2a: head-parallel TP for KDA. G=1 is the validated single-shard
+        # path (every derived value collapses to "all heads on this rank", so
+        # every KDA seam below is byte-identical to before). G>1 slices
+        # kda_num_heads across G contiguous ranks (one attn_tp sub-group per
+        # block of G ranks); this rank owns heads [rank%G * Hl : +Hl].
+        G = int(getattr(engine_config.Basic_Config, "attention_group_size", 1))
+        kda_num_heads = int(loaded_model_config.kda_num_heads)
+        assert kda_num_heads % G == 0, (
+            f"kda_num_heads {kda_num_heads} not divisible by "
+            f"attention_group_size {G}"
+        )
+        assert world_size % G == 0, (
+            f"world_size {world_size} not divisible by "
+            f"attention_group_size {G}"
+        )
+        self._attn_tp_size = G
+        self._attn_tp_rank = global_rank % G
+        self._attn_tp_group_id = global_rank // G
+        self._attn_tp_hl = kda_num_heads // G
+        self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
+        self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        # Weight assembly has its own communicator.  The streamed-SP8
+        # prefetcher launches the next layer's six all-gathers from a host
+        # thread while the main thread runs the next layer's attention.  A
+        # separate process group prevents those collectives from being
+        # ordered against attention's all-reduces when ranks reach the
+        # prefetch point at slightly different times.
+        self._weight_tp_group = None
+        # Hierarchical GDR adds a third communicator family: eight cross-node
+        # groups, one per local TP slot, each carrying that slot's 112-expert
+        # shard from its single source rank to the remaining nodes.
+        self._cross_weight_group = None
+        self._cross_weight_root = None
+        self._cross_weight_source = False
+        if self._hierarchical_gdr and not (
+            self._distributed_weight_sharded
+            and world_size in (16, 32)
+            and self._attn_tp_size == 8
+        ):
+            raise ValueError(
+                "hierarchical_gdr weight transport is defined only for the "
+                "distributed K3 TP8/world16 or TP8/world32 topology; got "
+                f"distributed_weight_sharded={self._distributed_weight_sharded}, "
+                f"world_size={world_size}, "
+                f"attention_group_size={self._attn_tp_size}"
+            )
+        if self._hierarchical_gdr:
+            self._require_hierarchical_gdr_runtime()
+        if self._stream_all_modules and self._attn_tp_size > 1:
+            # Streamed KDA feeds full-96-head tensors from the copy-engine
+            # ring, which _load_kda_modules never sees, so the head slice
+            # below cannot run — the DP x TP token-flow + streamed-shard seam
+            # is M2b (core), out of M2a scope. Fail by name here rather than
+            # crash on a shape mismatch 93 layers into decode.
+            raise NotImplementedError(
+                "attention_group_size>1 with stream_all_modules is not wired "
+                "(M2a shards the RESIDENT KDA load path; streamed-KDA head "
+                "sharding is M2b). Run head-parallel KDA with "
+                "stream_all_modules off."
+            )
         self._comm = None
         self._resident_ep_built = False
+        self._streamed_sp8_buffer = None
+        self._prefill_moe_mode = (
+            "streamed_sp8" if self._distributed_weight_sharded else "streamed"
+        )
         self._decode_graph = None
 
     # ------------------------------------------------------------------ #
     #  Phase configuration                                                #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _require_hierarchical_gdr_runtime():
+        """Fail closed unless implicit NCCL launch ordering is supported."""
+        if os.environ.get("NCCL_LAUNCH_ORDER_IMPLICIT") != "1":
+            raise RuntimeError(
+                "hierarchical_gdr requires NCCL_LAUNCH_ORDER_IMPLICIT=1 "
+                "before process-group initialization so cross-node weight "
+                "broadcasts can overlap TP8 collectives without a "
+                "cross-communicator launch-order deadlock"
+            )
+
+        nccl_version = torch.cuda.nccl.version()
+        if not isinstance(nccl_version, tuple) or len(nccl_version) < 2:
+            raise RuntimeError(
+                "hierarchical_gdr could not verify the NCCL runtime version; "
+                f"torch.cuda.nccl.version() returned {nccl_version!r}"
+            )
+        nccl_major_minor = tuple(int(value) for value in nccl_version[:2])
+        if nccl_major_minor < (2, 26):
+            raise RuntimeError(
+                "hierarchical_gdr requires NCCL >=2.26 for implicit launch "
+                f"ordering, got {nccl_version!r}"
+            )
+
+        cuda_version = torch.version.cuda
+        try:
+            cuda_major_minor = tuple(
+                int(value) for value in cuda_version.split(".")[:2]
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "hierarchical_gdr could not verify torch.version.cuda; "
+                f"got {cuda_version!r}"
+            ) from exc
+        if len(cuda_major_minor) < 2 or cuda_major_minor < (12, 3):
+            raise RuntimeError(
+                "hierarchical_gdr requires CUDA >=12.3 for implicit launch "
+                f"ordering, got {cuda_version!r}"
+            )
+
     def set_comm(self, comm):
         """Receive the BatchGen NCCL communicator from the worker. Consumed by
         the resident-EP decode MoE (all_gather + all_reduce per MoE layer);
         the streamed prefill path uses no collectives."""
         self._comm = comm
+
+    def set_prefill_moe_mode(self, mode):
+        """Select the K3 prefill MoE control for the next active batch.
+
+        ``streamed`` is the legacy replicated pure-DP path. ``resident_ep`` is
+        the R5 control. ``streamed_sp8`` keeps TP8 attention but scatters token
+        rows locally across the eight GPUs, runs one grouped all-expert MoE per
+        layer, and gathers rows only inside the node.
+        """
+        value = str(mode or "streamed").strip().lower()
+        if value not in {"streamed", "resident_ep", "streamed_sp8"}:
+            raise ValueError(
+                "k3_prefill_moe_mode must be 'streamed', 'resident_ep' or "
+                "'streamed_sp8', "
+                f"got {mode!r}"
+            )
+        if value in {"resident_ep", "streamed_sp8"} and not self._is_k3:
+            raise ValueError(
+                f"{value} prefill is implemented only for Kimi-K3"
+            )
+        if (
+            getattr(self, "_distributed_weight_sharded", False)
+            and value != "streamed_sp8"
+            and not (value == "resident_ep" and self._resident_ep_built)
+        ):
+            # resident_ep is legal once the shard exists: it was built from
+            # this node's ingress store and the resident layer never requests
+            # an expert by name, so no cross-shard fetch can happen.
+            raise ValueError(
+                "distributed K3 host weights require k3_prefill_moe_mode="
+                "'streamed_sp8' (the legacy replicated path would request "
+                "experts outside this worker's ingress shard); 'resident_ep' "
+                "is accepted only after the resident EP shard has been built"
+            )
+        self._prefill_moe_mode = value
+
+    def default_prefill_moe_mode(self):
+        """Return the safe batch default for this weight-source topology."""
+        return "streamed_sp8" if self._distributed_weight_sharded else "streamed"
+
+    def prefill_uses_resident_ep(self):
+        return self._prefill_moe_mode == "resident_ep"
+
+    def resident_ep_prefill_available(self):
+        """True once a decode phase has materialized the resident EP shard.
+
+        A later admission wave can then prefill through the resident experts
+        (EP collectives, chunked by the resident token cap) instead of
+        releasing the ~84 GiB shard for streamed-SP8 and rebuilding it from
+        the node store afterwards — measured at 22-139 s per rank per wave
+        on H200 (the repack reads 8 x 84 GiB through the page cache), the
+        slowest rank gating every rank at the decode barrier.
+        """
+        return bool(
+            self._is_k3
+            and self._resident_ep_built
+            and self._attn_tp_size > 1
+            and not self._stream_all_modules
+        )
+
+    def release_decode_graph(self):
+        """Drop captured decode graphs; they bake GPU KV-pool addresses."""
+        if self._decode_graph is not None:
+            self._decode_graph.release()
+            self._decode_graph = None
+
+    def prefill_uses_streamed_sp8(self):
+        return self._prefill_moe_mode == "streamed_sp8"
+
+    def gather_prefill_last_token_hidden(
+        self, hidden_states, last_token_indices, num_global_rows
+    ):
+        """Reassemble only sequence-final rows from the TP8 token shards.
+
+        Streamed-SP8 carries one contiguous token-row shard through the final
+        depth mix and norm.  The worker still needs one final hidden vector per
+        replicated sequence for its unchanged sampling/writeback contract, but
+        gathering every token row here would discard the whole-stack sharding
+        win.  Exactly one TP rank owns each requested global row, so a small
+        zero-filled all-reduce reconstructs the requested vectors exactly.
+        """
+        if not self.prefill_uses_streamed_sp8():
+            return hidden_states[0, last_token_indices, :]
+
+        from .moe_tp_reshard import balanced_row_split
+
+        num_global_rows = int(num_global_rows)
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ValueError(
+                "streamed-SP8 final hidden state must have shape (1, rows, hidden)"
+            )
+        if hidden_states.shape[1] == num_global_rows:
+            return hidden_states[0, last_token_indices, :]
+
+        start, end = balanced_row_split(
+            num_global_rows, self._attn_tp_size
+        )[self._attn_tp_rank]
+        if hidden_states.shape[1] != end - start:
+            raise ValueError(
+                "streamed-SP8 final hidden state has the wrong local row count"
+            )
+
+        selected = hidden_states.new_zeros(
+            (last_token_indices.numel(), hidden_states.shape[-1])
+        )
+        owned = (last_token_indices >= start) & (last_token_indices < end)
+        selected[owned] = hidden_states[
+            0, (last_token_indices[owned] - start).long(), :
+        ]
+        # s4/s5 (256 sequences per node, 307K tokens): the last 7 sequences'
+        # final rows came back all-zero from this gather.
+        logging.info(
+            "[K3_PREFILL_GATHER] rank %s: rows=%d shard=[%d, %d) local=%d "
+            "owned=%d last_idx=%s last_owned_rows_nonzero=%s",
+            self.global_rank, num_global_rows, start, end,
+            int(hidden_states.shape[1]), int(owned.sum().item()),
+            last_token_indices[-8:].tolist(),
+            [bool(selected[i].abs().sum().item() > 0) for i in range(-8, 0)],
+        )
+
+        output_norm = getattr(
+            self.model.model, "output_attn_res_norm", None
+        )
+        order_wait = getattr(
+            output_norm, "_streamed_sp8_order_wait", None
+        )
+        if order_wait is not None:
+            order_wait()
+
+        import torch.distributed as dist
+
+        dist.all_reduce(selected, group=self._attn_tp_group)
+        return selected
+
+    def streamed_sp8_reseeds_h2d_on_reentry(self):
+        """Whether each streamed-SP8 prefill starts a fresh local H2D cycle.
+
+        Hierarchical GDR sources read their owned shard directly from the local
+        compact store; the other ranks have an empty host-copy task.  No rank
+        acquires a remote daemon generation, so carrying a partially filled GPU
+        ring across resident decode is unnecessary and can strand a full-batch
+        consumer behind stale leases.  Host-RDMA still depends on the daemon's
+        acquire/release generations and must preserve its cursor.
+        """
+        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
+
+    def streamed_sp8_requires_global_pass_alignment(self):
+        """Whether every node must join each streamed prefill model pass."""
+        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
+
+    def run_streamed_sp8_transport_only_prefill(self, num_passes):
+        """Join hierarchical weight broadcasts for passes with no local rows."""
+        num_passes = int(num_passes)
+        if num_passes < 0:
+            raise ValueError("streamed-SP8 transport-only pass count must be >= 0")
+        if num_passes == 0:
+            return
+        if not self.streamed_sp8_requires_global_pass_alignment():
+            raise RuntimeError(
+                "streamed-SP8 transport-only prefill is only valid for "
+                "hierarchical GDR"
+            )
+        if self._streamed_sp8_buffer is None:
+            raise RuntimeError(
+                "streamed-SP8 transport-only prefill requires an initialized "
+                "layer buffer"
+            )
+        for _ in range(num_passes):
+            self._streamed_sp8_buffer.participate_empty_prefill_pass()
+
+    def run_resident_ep_collective_only_prefill(self):
+        """Join one resident-EP prefill pass with zero local rows.
+
+        A resident-EP prefill pass issues, per MoE layer and in layer order,
+        the EP-world all_gathers and all_reduce inside ``resident.forward``;
+        everything else in the pass is node-local. A rank whose admission
+        wave has fewer micro-batches than the global maximum (or none) joins
+        those collectives here so its resident experts keep serving the other
+        ranks' tokens — the caller runs the worker's rank-count sync first,
+        exactly as a real pass does before its forward.
+        """
+        if not self._resident_ep_built or self.model is None:
+            raise RuntimeError(
+                "resident-EP collective-only prefill needs the resident shard"
+            )
+        hidden = int(self.loaded_model_config.hidden_size)
+        device = self.engine_config.Basic_Config.device_torch
+        empty = torch.empty((0, hidden), dtype=torch.bfloat16, device=device)
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            resident = getattr(moe, "_resident_ep_moe", None) if moe is not None else None
+            if resident is None:
+                continue
+            # TP-sharded latent projections apply down_proj to the TP group's
+            # (here empty) replicated rows; the collective shapes still follow
+            # the synced per-rank count, so an empty group is a valid pass.
+            resident.forward(
+                empty, moe.gate,
+                x_group=empty if resident.latent_tp_size > 1 else None,
+            )
+
+    def prefill_sequence_limits(self):
+        """Return the persistent KDA-state capacity available to prefill.
+
+        The prefill token cap bounds temporary activation/scratch work. KDA
+        state is different: one slot is retained for each sequence until it
+        completes or is evicted, so the scheduler must not admit more local
+        sequences than the fixed GPU pool can retain. With TP8 KDA, each
+        sequence is replicated across the eight ranks in one node-local
+        attention group; expose the free-slot count as a node limit. The
+        manager is absent before the first model build, so the configured
+        capacity is the available capacity at initial admission.
+        """
+        available = self._kda_pool_slots
+        state_manager = getattr(KimiLinearKDAWrapper, "state_manager", None)
+        if state_manager is not None:
+            available = min(
+                available,
+                state_manager.get_stats().num_free_state_items,
+            )
+        # The planner sizes the pool as ``sequence_slots + 1`` (planner.py:
+        # kda_state_slots), where the extra slot is decode-graph scratch, NOT
+        # user capacity. Nothing else reserves it, so reporting the whole pool
+        # let admission fill every slot: with a 193-slot pool the scheduler was
+        # told "193 free", selected 193 sequences for the node, and prefill died
+        # with "Insufficient free KDA state items" because the scratch slot had
+        # been consumed. Hold it back here, where capacity is reported.
+        available -= _KDA_GRAPH_SCRATCH_SLOTS
+        available = max(0, int(available))
+        if self._attn_tp_size > 1:
+            return {"max_sequences_per_node": available}
+        return {"max_sequences_per_rank": available}
+
+    def _set_prefill_memory_tiling(self, enabled, token_tile=512):
+        """Bound K3 prefill temporaries for resident-EP and streamed-SP8.
+
+        ``token_tile`` is the row tile for the norms and the dense/shared
+        FFNs.  Resident-EP keeps 512.  Streamed-SP8 passes 8,192, the FFN's
+        validated even tiler: at exact 64K a 512-row tile issued about
+        10,000 launches per layer for the shared expert and ran it 3.6x
+        slower than the same GEMMs in isolation, to save about 250 MiB of
+        scratch.  The KDA segment stays at 4,096 in both modes.
+        """
+        if self.model is None:
+            return
+        tile = int(token_tile) if enabled else None
+        for module in self.model.modules():
+            if hasattr(module, "_resident_prefill_token_tile"):
+                module._resident_prefill_token_tile = tile
+            if hasattr(module, "_resident_prefill_segment_tokens"):
+                module._resident_prefill_segment_tokens = (
+                    # The resident decode shards and streamed-SP8 buffers are
+                    # co-resident during prefill. A 4K KDA segment releases
+                    # another ~1.1 GiB of scratch versus 8K, enough for the
+                    # next layer's normalized q/k rows at exact 64K.
+                    4096 if enabled else None
+                )
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            dense = getattr(layer, "mlp", None)
+            if dense is not None:
+                dense._resident_prefill_token_tile = tile
+            shared = getattr(moe, "shared_experts", None) if moe is not None else None
+            if shared is not None:
+                shared._resident_prefill_token_tile = tile
+
+    def _set_resident_ep_prefill_enabled(self, enabled):
+        """Route K3 MoE through resident EP in prefill and compact its scratch."""
+        if not enabled:
+            from batchgen.moe.fused_moe_mxfp4_resident import (
+                ResidentEPMXFP4MoELayer,
+            )
+            ResidentEPMXFP4MoELayer.release_prefill_output()
+        self._set_prefill_memory_tiling(enabled)
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is not None:
+                moe._resident_ep_prefill_enabled = bool(enabled)
+                resident = getattr(moe, "_resident_ep_moe", None)
+                if resident is not None:
+                    resident.compact_dispatch = bool(enabled)
+                    chunk_rows = int(getattr(
+                        self.engine_config.Module_Batching_Config,
+                        "k3_resident_prefill_chunk_rows", 0,
+                    ) or 0)
+                    if chunk_rows > 0:
+                        resident.compact_large_pass_rows = chunk_rows
+
+    def _release_resident_ep_decode(self):
+        """Drop phase-inactive resident decode experts before streamed prefill.
+
+        A world16 K3 rank's resident MXFP4 EP shard occupies about 84 GiB. It
+        is never read by streamed-SP8 prefill, whose experts arrive through
+        the layer ring, so retaining both copies forces exact-64K prompts into
+        one-sequence model passes. Decode graphs bake the resident shard's
+        addresses and must be released first; configure_decoding rebuilds the
+        shard and reinstalls/captures graphs before the next decode forward.
+        """
+        if not self._resident_ep_built:
+            return 0
+
+        self.release_decode_graph()
+
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        ResidentEPMXFP4MoELayer.release_prefill_output()
+        released_bytes = 0
+        released_layers = 0
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            resident = (
+                getattr(moe, "_resident_ep_moe", None)
+                if moe is not None
+                else None
+            )
+            if resident is None:
+                continue
+            shard = getattr(resident, "shard", None)
+            if shard is not None and hasattr(shard, "nbytes"):
+                released_bytes += int(shard.nbytes())
+            moe._resident_ep_moe = None
+            released_layers += 1
+
+        self._resident_ep_built = False
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            logging.info(
+                "[K3_PREFILL_MOE] released resident decode shards: "
+                "%d layers, %.2f GiB",
+                released_layers,
+                released_bytes / (1024 ** 3),
+            )
+        return released_bytes
+
+    def _set_streamed_sp8_prefill_enabled(self, enabled):
+        self._set_prefill_memory_tiling(enabled, token_tile=8192)
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is not None:
+                moe._streamed_sp8_prefill_enabled = bool(enabled)
+
+    def _streamed_sp8_attention_modules(self):
+        """The UNDERLYING attention module of every layer.
+
+        ``self_attn`` is the streaming wrapper by the time prefill is
+        configured, but the serving methods that run the TP all-reduce are
+        installed on the module it wraps, so the launch-order callback the
+        streamed-SP8 schedule needs has to live there too.
+        """
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            yield getattr(attn, "module", attn)
+
+    def _release_streamed_sp8_prefill(self):
+        try:
+            if self._streamed_sp8_buffer is not None:
+                self._streamed_sp8_buffer.close()
+        finally:
+            self._drop_streamed_full_latent_projections()
+            if self.model is not None:
+                for layer in self.model.model.layers:
+                    moe = getattr(layer, "block_sparse_moe", None)
+                    dense = getattr(layer, "mlp", None)
+                    if dense is not None:
+                        for name in (
+                            "_streamed_sp8_row_group",
+                            "_streamed_sp8_profiler",
+                        ):
+                            if hasattr(dense, name):
+                                delattr(dense, name)
+                    for norm in (
+                        getattr(layer, "self_attention_res_norm", None),
+                        getattr(layer, "mlp_res_norm", None),
+                    ):
+                        if norm is None:
+                            continue
+                        for name in (
+                            "_streamed_sp8_row_group",
+                            "_streamed_sp8_order_wait",
+                            "_streamed_sp8_profiler",
+                            "_streamed_sp8_profile_name",
+                            "_streamed_sp8_layer_idx",
+                            "_streamed_sp8_keep_sharded",
+                        ):
+                            if hasattr(norm, name):
+                                delattr(norm, name)
+                    if moe is not None:
+                        moe._streamed_sp8_prefill_enabled = False
+                        moe._streamed_sp8_moe = None
+                        for name in (
+                            "_streamed_sp8_sharded_carry",
+                            "_streamed_sp8_global_rows",
+                        ):
+                            if hasattr(moe, name):
+                                delattr(moe, name)
+                        shared = getattr(moe, "shared_experts", None)
+                        if (
+                            shared is not None
+                            and hasattr(shared, "_streamed_sp8_profiler")
+                        ):
+                            del shared._streamed_sp8_profiler
+                output_norm = getattr(
+                    self.model.model, "output_attn_res_norm", None
+                )
+                if output_norm is not None:
+                    for name in (
+                        "_streamed_sp8_row_group",
+                        "_streamed_sp8_order_wait",
+                        "_streamed_sp8_profiler",
+                        "_streamed_sp8_profile_name",
+                        "_streamed_sp8_keep_sharded",
+                    ):
+                        if hasattr(output_norm, name):
+                            delattr(output_norm, name)
+            # Drop the callback with the buffer it closes over: decode reaches
+            # the SAME ``_reduce_mla_tp_output`` helper, and a stale reference
+            # there would park its all-reduce on a torn-down handshake. This
+            # cleanup is required even when close() surfaces an ingress error.
+            for module in self._streamed_sp8_attention_modules():
+                for name in (
+                    "_streamed_sp8_order_wait",
+                    "_streamed_sp8_profiler",
+                    "_streamed_sp8_output_row_shard",
+                ):
+                    if hasattr(module, name):
+                        delattr(module, name)
+            self._streamed_sp8_buffer = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def prepare_resident_ep_prefill_output(self, num_global):
+        """Reserve the reusable global FP32 combine output before expert HBM."""
+        if not self.prefill_uses_resident_ep():
+            return
+        hidden_size = self.loaded_model_config.routed_expert_hidden_size
+        if hidden_size is None:
+            raise RuntimeError(
+                "resident-EP prefill output requires LatentMoE hidden size"
+            )
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        output = ResidentEPMXFP4MoELayer.prepare_prefill_output(
+            num_global,
+            hidden_size,
+            self.engine_config.Basic_Config.device_torch,
+        )
+        logging.info(
+            "[K3_PREFILL_MOE] preallocated FP32 output shape=%s bytes=%s",
+            tuple(output.shape),
+            output.numel() * output.element_size(),
+        )
 
     def _build_weight_copy_task(self):
         """Modules the copy engine must stream (host-offloaded), in layer-major
@@ -178,16 +794,35 @@ class KimiLinearParallelStrategyManager:
                 moe, "shared_experts", None
             ) is not None:
                 task["shared_expert"].append(f"shared_expert_{layer_idx}")
+            if (
+                self._hierarchical_gdr
+                and self.prefill_uses_streamed_sp8()
+                and not self._cross_weight_source
+            ):
+                # Hierarchical GDR: every rank that is not one of the eight
+                # sources receives this layer's shard over the cross-node
+                # broadcast, so it must request nothing at all from the host
+                # store.
+                continue
             for e_idx in range(len(moe.experts)):
+                if self.prefill_uses_streamed_sp8():
+                    start = self._attn_tp_rank * (
+                        len(moe.experts) // self._attn_tp_size
+                    )
+                    end = start + len(moe.experts) // self._attn_tp_size
+                    if not (start <= e_idx < end):
+                        continue
                 task["routed_expert"].append(
                     f"routed_expert_{layer_idx}_{e_idx}"
                 )
         return task
 
     def configure_prefill(self):
-        """Build the model (if needed) and switch to prefill phase (pure DP)."""
+        """Build the model and switch to streamed or resident-EP prefill."""
         self.loaded_model_config.phase = "prefill"
-        self.loaded_model_config.ep_size = 1  # pure DP; routed experts streamed
+        self.loaded_model_config.ep_size = (
+            self.world_size if self.prefill_uses_resident_ep() else 1
+        )
         if self.model is None:
             self._build_model()
         AttnWrapperBase.phase = "prefill"
@@ -197,6 +832,42 @@ class KimiLinearParallelStrategyManager:
         # this phase starts from the seeded-at-layer-0 state.
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
+        if self.prefill_uses_resident_ep():
+            self._release_streamed_sp8_prefill()
+            if self._stream_all_modules or self._attn_tp_size <= 1:
+                raise RuntimeError(
+                    "resident-EP prefill requires K3's resident TP attention "
+                    "layout (attention_group_size>1, stream_all_modules=False)"
+                )
+            self._init_resident_ep_decode()
+            self._set_resident_ep_prefill_enabled(True)
+            self.weight_copy_task["routed_expert"] = []
+            if self.rank == 0:
+                logging.info(
+                    "[K3_PREFILL_MOE] resident_ep enabled: rank-owned Marlin "
+                    "experts, EP32 collectives, compact routed scratch"
+                )
+        elif self.prefill_uses_streamed_sp8():
+            if self._stream_all_modules or self._attn_tp_size != 8:
+                raise RuntimeError(
+                    "streamed-SP8 prefill requires K3's resident TP8 attention "
+                    "layout (attention_group_size=8, stream_all_modules=False)"
+                )
+            self._set_resident_ep_prefill_enabled(False)
+            self._release_resident_ep_decode()
+            self._init_streamed_sp8_prefill()
+            self._set_streamed_sp8_prefill_enabled(True)
+            if self.rank == 0:
+                logging.info(
+                    "[K3_PREFILL_MOE] streamed_sp8 enabled: transport=%s, "
+                    "112 experts/shard, no TP8 weight all-gather, "
+                    "node-local latent gather/FP32 reduce-scatter, "
+                    "zero cross-node MoE activation collectives",
+                    self._distributed_weight_transport,
+                )
+        else:
+            self._release_streamed_sp8_prefill()
+            self._set_resident_ep_prefill_enabled(False)
         return self.model, self.weight_copy_task
 
     def configure_decoding(self, padding_bsz=None, comm=None):
@@ -209,6 +880,15 @@ class KimiLinearParallelStrategyManager:
         non-empty routed_expert list). "streamed": legacy pure-DP streaming,
         identical to prefill.
         """
+        if (
+            self._distributed_weight_sharded
+            and self._decode_moe_mode() != "resident_ep"
+        ):
+            raise RuntimeError(
+                "distributed K3 host weights require resident-EP decode; "
+                "streamed decode would replace the preserved streamed-SP8 "
+                "prefill schedule"
+            )
         if self._stream_all_modules:
             # Decode under stream_all_modules is NOT wired: the worker starts
             # the decode H2D streamer only when the routed_expert task is
@@ -225,6 +905,13 @@ class KimiLinearParallelStrategyManager:
                 "C4) or turn the flag off."
             )
         self.loaded_model_config.phase = "decode"
+        # Stage timings on every rank: r29 (2x8 H200) showed node 1 reaching
+        # the resident shard build 36 s after entering configure_decoding
+        # (node 0: 7 s) with nothing logged in between.
+        _t0 = time.perf_counter()
+        self._release_streamed_sp8_prefill()
+        _t1 = time.perf_counter()
+        self._set_resident_ep_prefill_enabled(False)
         if comm is not None:
             self._comm = comm
         if self.model is None:
@@ -233,12 +920,20 @@ class KimiLinearParallelStrategyManager:
         KimiLinearExpertWrapper.phase = "decode"
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
+        _t2 = time.perf_counter()
         if self._decode_moe_mode() == "resident_ep":
             self._init_resident_ep_decode()
             # Resident shards serve every routed expert: decode streams
             # nothing, so the copy engine gets no decode expert tasks.
             self.weight_copy_task["routed_expert"] = []
+        _t3 = time.perf_counter()
         self._init_decode_graph()
+        logging.info(
+            "[K3] configure_decoding rank %s: release_streamed=%.1fs "
+            "build/copy_task=%.1fs resident_ep=%.1fs decode_graph=%.1fs",
+            self.global_rank, _t1 - _t0, _t2 - _t1, _t3 - _t2,
+            time.perf_counter() - _t3,
+        )
         return self.model, self.weight_copy_task
 
     def _decode_moe_mode(self):
@@ -256,44 +951,14 @@ class KimiLinearParallelStrategyManager:
     def _init_decode_graph(self):
         """Install the Phase-A decode CUDA-graph adapter (M5.2), if asked for.
 
-        Per-layer attention spans are captured lazily (first use of a bucket)
-        and replayed with the MoE running eagerly between them — its resident-EP
-        forward does all_gather/all_reduce, which must not be captured in
-        Phase A. See cuda_graph_segments.py for the capture-structure rationale.
+        Per-layer attention spans and, for K3 resident-MXFP4, the companion
+        grouped-MoE segments are captured by the adapter. The worker invokes
+        ``prewarm_decode_graphs`` after binding the real GPU KV manager so the
+        first measured decode forward does not pay capture/setup time. See
+        cuda_graph_segments.py for the capture-structure rationale.
         """
         mode = self._decode_graph_mode()
         if mode == "off":
-            return
-        if getattr(self.loaded_model_config, "attn_res_block_size", None) is not None:
-            # Block Attention Residuals and the Phase-A adapter cannot coexist:
-            # the adapter's patched layer forward returns a 1-tuple
-            # (cuda_graph_segments.py::_make_layer_forward) and its captured
-            # span runs the classic residual body, so a replayed layer neither
-            # produces nor consumes block_residual.
-            #
-            # The failure is LOUD, not silent — MEASURED: model.py:880 unpacks
-            # two values from every layer under use_attn_residuals, so a
-            # replayed 1-tuple dies on the first decode step with
-            # `ValueError: not enough values to unpack (expected 2, got 1)`.
-            # The guard is still worth it: that error names neither CUDA graphs
-            # nor block residuals, and it lands 93 layers into a live server
-            # instead of at configure time. Refuse here, by name.
-            if mode != "eager":
-                raise NotImplementedError(
-                    f"decode_graph_mode={mode!r} is not implemented for a "
-                    "Block-Attention-Residual model (attn_res_block_size="
-                    f"{self.loaded_model_config.attn_res_block_size}): the "
-                    "captured per-layer span carries no block_residual, so a "
-                    "replayed layer returns a 1-tuple and model.py:880 dies on "
-                    "`not enough values to unpack (expected 2, got 1)` at the "
-                    "first decode step. Run decode_graph_mode='eager'."
-                )
-            if self.rank == 0:
-                logging.info(
-                    "Decode CUDA-graph adapter NOT installed: Block Attention "
-                    "Residuals have no captured-span representation. "
-                    "batchgen_debug.kimi_decode_graph_mode is inert for K3."
-                )
             return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
@@ -316,8 +981,64 @@ class KimiLinearParallelStrategyManager:
             mode=mode,
             compare_every=getattr(basic, "decode_graph_compare_every", None),
             rank=self.rank,
+            deepep_ll=bool(getattr(
+                self.engine_config.Module_Batching_Config, "k3_deepep_ll", False)),
         )
         self._decode_graph.install()
+
+    def prewarm_deepep_exchange(self) -> bool:
+        """Build the process-lifetime DeepEP low-latency buffer at startup.
+
+        The first decode configure otherwise pays the 16-rank NVSHMEM
+        handshake (~5 s of the ~19 s first configure, r38) inside the measured
+        wall; the exchange only depends on the graph geometry (max group
+        bucket / TP, latent width, expert counts), so it can exist before the
+        first admission. ~1.9 GiB of HBM for the prefill phase (98 GiB free).
+        """
+        if not bool(getattr(self.engine_config.Module_Batching_Config, "k3_deepep_ll", False)):
+            return False
+        import torch.distributed as dist
+        from batchgen.moe.deepep_ll import get_low_latency_exchange
+        from .moe_cuda_graph_segments import k3_moe_graph_buckets
+        if not dist.is_initialized() or dist.get_world_size() != self.world_size:
+            raise RuntimeError("k3_deepep_ll: torch.distributed world != EP world")
+        basic = self.engine_config.Basic_Config
+        buckets = list(getattr(basic, "decode_graph_buckets", None) or [])
+        if not buckets:
+            from .cuda_graph_segments import DEFAULT_DECODE_GRAPH_BUCKETS
+            buckets = list(DEFAULT_DECODE_GRAPH_BUCKETS)
+        tp = int(self._attn_tp_size)
+        max_lt = max(k3_moe_graph_buckets(buckets, tp)) // tp
+        # the routed latent width (the TP-sharded down_proj only holds 1/tp of it)
+        latent = int(getattr(self.loaded_model_config, "routed_expert_hidden_size", 0) or 0)
+        if latent <= 0:
+            raise RuntimeError("k3_deepep_ll: routed_expert_hidden_size missing from the model config")
+        t0 = time.perf_counter()
+        ex = get_low_latency_exchange(
+            dist.group.WORLD, max_tokens_per_rank=max_lt, hidden=latent,
+            num_experts=self.num_experts, num_local_experts=self.experts_per_rank)
+        logging.info(
+            "[K3] DeepEP low-latency exchange prewarmed at startup: max %d tokens/rank, hidden %d, "
+            "%d experts, rdma buffer %.0f MiB (%.1fs)",
+            ex.max_tokens_per_rank, ex.hidden, ex.num_experts, ex.rdma_bytes / 2**20,
+            time.perf_counter() - t0)
+        return True
+
+    def prewarm_decode_graphs(self, gpu_manager=None):
+        """Capture the first K3 decode bucket before measured decode starts.
+
+        GPU KV allocation is intentionally worker-owned and happens after this
+        manager's ``configure_decoding`` call.  The worker therefore passes
+        the initialized manager here so the graph's MLA capture can bind its
+        stable page-table/K-cache addresses without duplicating KV lifecycle
+        logic in the PSM.
+        """
+        if self._decode_graph is None:
+            return False
+        if gpu_manager is not None:
+            manager = getattr(gpu_manager, "primary", gpu_manager)
+            AttnWrapperBase.gpu_paged_kv_manager = manager
+        return self._decode_graph.prewarm_decode_graphs()
 
     def _init_resident_ep_decode(self):
         """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
@@ -326,43 +1047,257 @@ class KimiLinearParallelStrategyManager:
         Source is the host copy-engine weight storage (core_engine.get_tensor,
         the exact tensors the streamed path consumes) — after this one-time
         H2D there is no per-step expert traffic in decode. HBM arithmetic for
-        the ~11.8 GB/rank shards lives at the allocation site
+        the ~84 GiB/rank K3 world16 shards lives at the allocation site
         (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
         """
         if self._resident_ep_built:
             return
-        from batchgen.moe.fused_moe_bf16_resident import (
-            build_resident_ep_layers,
-        )
-
         assert self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
             "it via configure_decoding(comm=...) or set_comm)"
         )
         cfg = self.loaded_model_config
-        build_resident_ep_layers(
-            self.model.model.layers,
-            self.core_engine.get_tensor,
-            self._comm,
-            self.world_size,
-            self.global_rank,
-            self.local_expert_start,
-            self.experts_per_rank,
-            cfg.moe_intermediate_size,
-            self.engine_config.Basic_Config.device_torch,
-        )
+        device = self.engine_config.Basic_Config.device_torch
+        from .k3.mxfp4_expert import is_mxfp4_quantized
+
+        if is_mxfp4_quantized(cfg):
+            # K3 MXFP4 LatentMoE (M3.1a): repack-once marlin shards + a resident
+            # layer that runs the latent dataflow (down/norm/up seam). The BF16
+            # stacked shard cannot represent it (hidden-space, no latent seam).
+            from batchgen.moe.fused_moe_mxfp4_resident import (
+                build_resident_ep_mxfp4_layers,
+            )
+
+            build_resident_ep_mxfp4_layers(
+                self.model.model.layers,
+                self.core_engine.get_tensor,
+                self._comm,
+                self.world_size,
+                self.global_rank,
+                self.local_expert_start,
+                self.experts_per_rank,
+                device,
+            )
+            if self._latent_projections_sharded():
+                for layer in self.model.model.layers:
+                    moe = getattr(layer, "block_sparse_moe", None)
+                    resident = getattr(moe, "_resident_ep_moe", None) if moe is not None else None
+                    if resident is not None:
+                        resident.set_latent_tp(
+                            self._attn_tp_size, self._attn_tp_rank, self._attn_tp_group
+                        )
+        else:
+            from batchgen.moe.fused_moe_bf16_resident import (
+                build_resident_ep_layers,
+            )
+
+            build_resident_ep_layers(
+                self.model.model.layers,
+                self.core_engine.get_tensor,
+                self._comm,
+                self.world_size,
+                self.global_rank,
+                self.local_expert_start,
+                self.experts_per_rank,
+                cfg.moe_intermediate_size,
+                device,
+            )
         self._resident_ep_built = True
+
+    def _init_streamed_sp8_prefill(self):
+        """Attach one reusable layer-wise all-expert buffer to every K3 MoE."""
+        if self._streamed_sp8_buffer is not None:
+            return
+        cfg = self.loaded_model_config
+        from batchgen.moe.streamed_sp8_mxfp4 import (
+            StreamedSP8LayerBuffer,
+            StreamedSP8MXFP4MoELayer,
+        )
+
+        expert_ring_depth = int(
+            self.engine_config.GPU_Buffer_Config
+            .num_prefill_module_buffer["routed_expert"]
+        )
+        if expert_ring_depth <= 0:
+            raise RuntimeError(
+                "streamed-SP8 prefill requires a positive routed-expert "
+                "prefill ring depth"
+            )
+        self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
+            core_engine=self.core_engine,
+            device=self.engine_config.Basic_Config.device_torch,
+            tp_group=self._weight_tp_group,
+            tp_rank=self._attn_tp_rank,
+            tp_size=self._attn_tp_size,
+            num_experts=cfg.n_routed_experts,
+            intermediate_size=cfg.moe_intermediate_size,
+            latent_size=cfg.routed_expert_hidden_size,
+            acquire_batch_size=expert_ring_depth,
+            layer_indices=[
+                layer_idx
+                for layer_idx, layer in enumerate(self.model.model.layers)
+                if getattr(layer, "block_sparse_moe", None) is not None
+                and getattr(layer.block_sparse_moe, "experts", None) is not None
+            ],
+            cross_group=self._cross_weight_group,
+            cross_root=self._cross_weight_root,
+            cross_source=self._cross_weight_source,
+        )
+        row_group = (
+            self._attn_tp_size,
+            self._attn_tp_rank,
+            self._attn_tp_group,
+        )
+        order_wait = (
+            self._streamed_sp8_buffer.order_tp_collective_after_cross_launch
+        )
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            moe = getattr(layer, "block_sparse_moe", None)
+            streamed_moe = (
+                moe is not None and getattr(moe, "experts", None) is not None
+            )
+            dense = getattr(layer, "mlp", None)
+            if dense is not None:
+                dense._streamed_sp8_row_group = row_group
+                dense._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+            for norm, profile_name in (
+                (
+                    getattr(layer, "self_attention_res_norm", None),
+                    "self_depth_mix",
+                ),
+                (getattr(layer, "mlp_res_norm", None), "mlp_depth_mix"),
+            ):
+                if norm is None:
+                    continue
+                norm._streamed_sp8_row_group = row_group
+                norm._streamed_sp8_order_wait = order_wait
+                norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+                norm._streamed_sp8_profile_name = profile_name
+                norm._streamed_sp8_layer_idx = layer_idx
+                if profile_name == "mlp_depth_mix" and streamed_moe:
+                    norm._streamed_sp8_keep_sharded = True
+            if not streamed_moe:
+                continue
+            moe._streamed_sp8_sharded_carry = True
+            moe._streamed_sp8_moe = StreamedSP8MXFP4MoELayer(
+                layer_idx=layer_idx,
+                buffer=self._streamed_sp8_buffer,
+                down_proj=(
+                    self._streamed_full_latent_projection(layer_idx, "routed_expert_down_proj")
+                    if self._latent_projections_sharded()
+                    else moe.routed_expert_down_proj
+                ),
+                norm=(
+                    moe.routed_expert_norm
+                    if getattr(moe, "latent_moe_use_norm", False)
+                    else None
+                ),
+                up_proj=(
+                    self._streamed_full_latent_projection(layer_idx, "routed_expert_up_proj")
+                    if self._latent_projections_sharded()
+                    else moe.routed_expert_up_proj
+                ),
+                chunk_rows=int(getattr(
+                    self.engine_config.Module_Batching_Config,
+                    "k3_prefill_grouped_chunk_rows",
+                    2_048,
+                )),
+                collective_stripe_threshold_rows=int(getattr(
+                    self.engine_config.Module_Batching_Config,
+                    "k3_prefill_collective_stripe_threshold_rows",
+                    32_768,
+                )),
+            )
+            shared = getattr(moe, "shared_experts", None)
+            if shared is not None:
+                shared._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+        output_norm = getattr(
+            self.model.model, "output_attn_res_norm", None
+        )
+        if output_norm is not None:
+            output_norm._streamed_sp8_row_group = row_group
+            output_norm._streamed_sp8_order_wait = order_wait
+            output_norm._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+            output_norm._streamed_sp8_profile_name = "output_depth_mix"
+            output_norm._streamed_sp8_keep_sharded = True
+        # The cross-node broadcast gate opens at the end of each MoE serving
+        # branch; whichever TP8 collective follows first (a depth-mix gather
+        # or the next attention all-reduce) must observe every cross-node call
+        # already host-enqueued.
+        for module in self._streamed_sp8_attention_modules():
+            module._streamed_sp8_order_wait = order_wait
+            module._streamed_sp8_profiler = StreamedSP8MXFP4MoELayer
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None or getattr(moe, "experts", None) is None:
+                continue
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                attn = getattr(attn, "module", attn)
+                attn._streamed_sp8_output_row_shard = True
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step
         MAX decode rows across ranks. Defines the padded all_gather /
         all_reduce layout of the resident-EP decode MoE — every rank
-        (including empty ones) sizes the global buffer from this scalar."""
-        if not self._resident_ep_built:
-            return
+        (including empty ones) sizes the global buffer from this scalar.
+
+        M2b: under TP-G decode the worker passes the POST-scatter share
+        ceil(B_grp/G) (each rank owns 1/G of the group's rows after
+        moe_forward_resident_ep_decode's scatter), so this scalar stays the
+        per-rank distinct-row count the DP-32 resident layer expects."""
+        # Drive BOTH resident classes' per-rank layout scalar. Only one is
+        # ever materialized per model (BF16 stacked hidden shard vs MXFP4
+        # latent shard), but num_tokens_per_rank is a class attribute so
+        # setting the unused one is a harmless no-op — and the MXFP4 EP
+        # forward (_forward_ep) asserts it before the collectives.
         from batchgen.moe.fused_moe_bf16_resident import ResidentEPMoELayer
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
 
         ResidentEPMoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
+        ResidentEPMXFP4MoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
+
+    def set_rank_token_counts(self, rank_token_counts):
+        """Publish whether every global decode rank has a live row.
+
+        The K3 resident-MXFP4 MoE CUDA graph contains global EP collectives. Its
+        graph/eager decision must therefore be identical on all ranks; the
+        worker already has the synchronized count vector at the batch boundary,
+        so pass it to the resident layer once instead of probing it from every
+        forward.
+        """
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        ResidentEPMXFP4MoELayer.set_rank_token_counts(rank_token_counts)
+
+    @property
+    def attn_tp_size(self):
+        """G — the head-parallel (TP-KDA) sub-group size. 1 == pure DP-32. The
+        worker reads this (getattr, default 1) to size the decode MoE padding
+        and to gate the decode DP-group assignment / KDA reshard (M2b)."""
+        return self._attn_tp_size
+
+    @staticmethod
+    def scatter_rows(x, group_size, group_rank):
+        """Intra-group decode-MoE row scatter (M2b). Pure local slice — the
+        group's rows are replicated across its G ranks, so no collective is
+        needed. See moe_tp_reshard for the contract."""
+        from .moe_tp_reshard import scatter_rows
+
+        return scatter_rows(x, group_size, group_rank)
+
+    @staticmethod
+    def all_gather_rows(routed_local, num_rows, group_size, group_rank, group):
+        """Intra-group decode-MoE row gather (M2b): reassemble the full group
+        batch on every rank from each rank's routed slice over attn_tp_group."""
+        from .moe_tp_reshard import all_gather_rows
+
+        return all_gather_rows(
+            routed_local, num_rows, group_size, group_rank, group
+        )
 
     # ------------------------------------------------------------------ #
     #  Model build                                                        #
@@ -396,6 +1331,17 @@ class KimiLinearParallelStrategyManager:
         self._load_kda_modules()
         self._load_shared_expert_modules()
 
+        # 2b. head-parallel KDA sub-group (M2a). Collective across ALL ranks;
+        #     no-op when attention_group_size==1. Built before _config_kda_
+        #     modules stamps it onto the KDA modules.
+        self._build_attn_tp_group()
+        # 2c. TP-shard the LatentMoE projections across the attention TP group
+        #     (DECODE_CONCURRENCY_PLAN.md): -8.3 GiB/rank on the world16 K3.
+        self._shard_latent_projections()
+        # 2d. vocab-parallel embed_tokens / lm_head across the same group
+        #     (slice 2): -3.84 GiB/rank. Before the lm_head hook is attached.
+        self._shard_vocab_parallel()
+
         # 3. serving method injection + wrappers
         self._config_attn_modules()
         self._config_kda_modules()
@@ -408,19 +1354,37 @@ class KimiLinearParallelStrategyManager:
         kda_indices = [
             i for i in range(cfg.num_hidden_layers) if cfg.is_kda_layer(i)
         ]
+        # M2a: the pools hold this rank's LOCAL heads (Hl == kda_num_heads for
+        # G==1). The conv/recurrent kernels only ever see the local shard.
         KimiLinearKDAWrapper.init_state_pools(
             kda_indices,
             num_slots=self._kda_pool_slots,
-            num_heads=cfg.kda_num_heads,
+            num_heads=self._attn_tp_hl,
             head_dim=cfg.kda_head_dim,
             conv_width=cfg.kda_conv_size,
-            proj_size=cfg.kda_num_heads * cfg.kda_head_dim,
+            proj_size=self._attn_tp_hl * cfg.kda_head_dim,
             device=device,
             dtype=torch.bfloat16,
         )
 
         self.model.eval()
         self.model.to(device)
+        if self._is_k3 and torch.cuda.is_available():
+            # The service wall starts at request admission, so neither Triton
+            # compilation may be a first-request lazy cost.  Compile both
+            # kernels before startup completes; the tiny score fold is a
+            # deliberate per-forward read of the final Parameter contents.
+            from .attn_residual_triton import warmup_attn_residual_triton
+
+            warmup_start = time.perf_counter()
+            num_score_vectors = warmup_attn_residual_triton(self.model.model)
+            if self.rank == 0:
+                logging.info(
+                    "K3 attention-residual Triton mixer prewarmed: %s depth "
+                    "mix sites in %.1fs",
+                    num_score_vectors,
+                    time.perf_counter() - warmup_start,
+                )
         if self.rank == 0:
             logging.info(
                 f"Kimi-Linear model configured in {time.perf_counter() - start:.1f}s "
@@ -528,9 +1492,302 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"attn_{layer_idx}")
             for name, p in list(attn.named_parameters()):
                 if name in tensors:
-                    _replace_param(attn, name, tensors[name].to(device=device))
+                    tensor = tensors[name]
+                    if self._attn_tp_size > 1:
+                        tensor = shard_mla_tensor(
+                            tensor,
+                            name,
+                            self._attn_tp_size,
+                            self._attn_tp_rank,
+                        )
+                    _replace_param(attn, name, tensor.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"attn_{layer_idx}: missing tensor {name}")
+            if self._attn_tp_size > 1:
+                local_heads = attn.num_heads // self._attn_tp_size
+                attn.num_heads = local_heads
+                attn.num_key_value_heads = local_heads
+                attn.num_key_value_groups = 1
+                if hasattr(attn, "q_b_proj"):
+                    attn.q_b_proj.out_features = (
+                        local_heads * attn.q_head_dim
+                    )
+                if hasattr(attn, "q_proj"):
+                    attn.q_proj.out_features = (
+                        local_heads * attn.q_head_dim
+                    )
+                attn.kv_b_proj.out_features = local_heads * (
+                    attn.qk_nope_head_dim + attn.v_head_dim
+                )
+                if hasattr(attn, "g_proj"):
+                    attn.g_proj.out_features = (
+                        local_heads * attn.v_head_dim
+                    )
+                attn.o_proj.in_features = local_heads * attn.v_head_dim
+
+    def _latent_projections_sharded(self):
+        return bool(getattr(self, "_latent_tp_sharded", False))
+
+    def _shard_vocab_parallel(self):
+        """Replace ``embed_tokens`` / ``lm_head`` by vocab-parallel modules that
+        keep this rank's ``[c*V/G, (c+1)*V/G)`` rows (planner
+        ``k3_shard_vocab_parallel``, TP8 K3 on H200). The lookup all_reduces
+        and the head all_gathers over the attention TP group, so callers see
+        the same tensors as before (see vocab_parallel.py)."""
+        self._vocab_tp_sharded = False
+        G = self._attn_tp_size
+        want = bool(getattr(
+            self.engine_config.Module_Batching_Config,
+            "k3_shard_vocab_parallel", False,
+        ))
+        if not (self._is_k3 and want and G > 1 and self._attn_tp_group is not None):
+            return
+        from .vocab_parallel import (
+            VocabParallelEmbedding, VocabParallelLMHead, vocab_shard_bounds,
+        )
+        device = self.engine_config.Basic_Config.device_torch
+        embed = self.model.model.embed_tokens
+        head = self.model.lm_head
+        vocab = int(embed.weight.shape[0])
+        start, end = vocab_shard_bounds(vocab, G, self._attn_tp_rank)
+        hosts = {}
+        for key in ("model.embed_tokens.weight", "lm_head.weight"):
+            ckpt_key = self._skeleton_ckpt_key(key)
+            host = self.skeleton_state_dict.get(ckpt_key)
+            if host is None:
+                raise RuntimeError(
+                    f"{key} is not in the skeleton state dict (looked up {ckpt_key})")
+            if int(host.shape[0]) != vocab:
+                raise RuntimeError(
+                    f"{key} has {host.shape[0]} rows, expected the vocab size {vocab}")
+            hosts[key] = host
+        freed = (embed.weight.numel() * embed.weight.element_size()
+                 + head.weight.numel() * head.weight.element_size())
+        self.model.model.embed_tokens = VocabParallelEmbedding(
+            hosts["model.embed_tokens.weight"][start:end].contiguous().to(device=device),
+            start, self._attn_tp_group, padding_idx=getattr(embed, "padding_idx", None),
+        )
+        self.model.lm_head = VocabParallelLMHead(
+            hosts["lm_head.weight"][start:end].contiguous().to(device=device),
+            vocab, G, self._attn_tp_group,
+        )
+        freed -= (self.model.model.embed_tokens.weight.numel() + self.model.lm_head.weight.numel()) \
+            * self.model.lm_head.weight.element_size()
+        del embed, head
+        self._vocab_tp_sharded = True
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            logging.info(
+                "[K3] embed_tokens/lm_head vocab-parallel over TP%d: rows [%d, %d) of %d, "
+                "%.2f GiB/rank released", G, start, end, vocab, freed / (1024 ** 3),
+            )
+
+    def _shard_latent_projections(self):
+        """Keep only this rank's column slice of ``routed_expert_down_proj``
+        (and the matching input rows of ``routed_expert_up_proj``) on the GPU.
+
+        Enabled by the planner (``k3_shard_latent_projections``) on TP8 K3.
+        The skeleton loader materialized the full tensors; the shm host
+        tensors stay referenced so streamed-SP8 prefill (row-sharded tokens,
+        needs the full projections) can build temporary full modules per
+        phase. Resident decode / resident-EP prefill consume the slices
+        through ``ResidentEPMXFP4MoELayer`` (set_latent_tp).
+        """
+        self._latent_tp_sharded = False
+        self._latent_full_host = {}
+        G = self._attn_tp_size
+        want = bool(getattr(
+            self.engine_config.Module_Batching_Config,
+            "k3_shard_latent_projections", False,
+        ))
+        if not (self._is_k3 and want and G > 1 and self._attn_tp_group is not None):
+            return
+        device = self.engine_config.Basic_Config.device_torch
+        c = self._attn_tp_rank
+        n_layers = 0
+        freed = 0
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            moe = getattr(layer, "block_sparse_moe", None)
+            down = getattr(moe, "routed_expert_down_proj", None) if moe is not None else None
+            up = getattr(moe, "routed_expert_up_proj", None) if moe is not None else None
+            if down is None or up is None:
+                continue
+            k_latent = int(down.weight.shape[0])
+            if k_latent % G != 0:
+                raise RuntimeError(
+                    f"latent width {k_latent} is not divisible by the TP size {G}")
+            cols = k_latent // G
+            for name, module, slicer in (
+                ("routed_expert_down_proj", down,
+                 lambda w: w[c * cols:(c + 1) * cols, :]),
+                ("routed_expert_up_proj", up,
+                 lambda w: w[:, c * cols:(c + 1) * cols]),
+            ):
+                key = f"model.layers.{layer_idx}.block_sparse_moe.{name}.weight"
+                ckpt_key = self._skeleton_ckpt_key(key)
+                host = self.skeleton_state_dict.get(ckpt_key)
+                if host is None:
+                    raise RuntimeError(
+                        f"latent projection {key} is not in the skeleton state dict "
+                        f"(looked up {ckpt_key})")
+                self._latent_full_host[(layer_idx, name)] = host
+                freed += module.weight.numel() * module.weight.element_size()
+                _replace_param(module, "weight", slicer(host).contiguous().to(device=device))
+                freed -= module.weight.numel() * module.weight.element_size()
+            down.out_features = cols
+            up.in_features = cols
+            n_layers += 1
+        self._latent_tp_sharded = n_layers > 0
+        if self._latent_tp_sharded:
+            torch.cuda.empty_cache()
+            if self.rank == 0:
+                logging.info(
+                    "[K3] latent projections TP%d-sharded on %d MoE layers: "
+                    "%.2f GiB/rank released", G, n_layers, freed / (1024 ** 3))
+
+    def _streamed_full_latent_projection(self, layer_idx, name):
+        """Temporary full-weight module for streamed-SP8 prefill (its rows are
+        sharded across the node, so it needs the unsharded projection). Built
+        from the shm host tensor per prefill phase, dropped on release."""
+        cache = getattr(self, "_streamed_full_latent", None)
+        if cache is None:
+            cache = self._streamed_full_latent = {}
+        mod = cache.get((layer_idx, name))
+        if mod is None:
+            host = self._latent_full_host[(layer_idx, name)]
+            device = self.engine_config.Basic_Config.device_torch
+            mod = torch.nn.Linear(host.shape[1], host.shape[0], bias=False, device="meta")
+            _replace_param(mod, "weight", host.to(device=device))
+            cache[(layer_idx, name)] = mod
+        return mod
+
+    def _drop_streamed_full_latent_projections(self):
+        cache = getattr(self, "_streamed_full_latent", None)
+        if cache:
+            cache.clear()
+            torch.cuda.empty_cache()
+
+    def _build_attn_tp_group(self):
+        """Build the head-parallel (KDA TP) NCCL sub-groups (M2a).
+
+        COLLECTIVE: every rank creates every group, in the same order, and
+        keeps the one it belongs to as ``self._attn_tp_group``. No-op for
+        G==1. The global PyNccl communicator (``self._comm``, EP-32) is
+        untouched; this is a separate torch NCCL group, exactly like the
+        worker's own ``dist.new_group`` usage.
+        """
+        if self._attn_tp_size <= 1:
+            return
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "attention_group_size>1 needs torch.distributed initialized "
+                "(head-parallel KDA builds NCCL sub-groups at configure time)."
+            )
+        G = self._attn_tp_size
+        for g in range(self.world_size // G):
+            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
+            if g == self._attn_tp_group_id:
+                self._attn_tp_group = grp
+        # Do not reuse the attention group for streamed weight assembly.  The
+        # prefetch thread can otherwise enqueue a weight all-gather after one
+        # rank has already entered the next attention all-reduce, which is an
+        # invalid NCCL ordering even though both collectives are node-local.
+        for g in range(self.world_size // G):
+            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
+            if g == self._attn_tp_group_id:
+                self._weight_tp_group = grp
+        self._build_cross_weight_group()
+
+    def _build_cross_weight_group(self):
+        """Build the eight cross-node weight groups (hierarchical GDR only).
+
+        COLLECTIVE, like the two node-local families above: every rank creates
+        all eight groups in the same order and keeps the one it belongs to.
+        They are created LAST so that the creation order of the attention and
+        node-local weight groups is unchanged for host_rdma.
+
+        Group ``g`` is ``[g + n*8 for n in range(num_nodes)]`` — local TP slot
+        ``g`` on each node, i.e. exactly the ranks that need experts
+        ``[112g, 112(g+1))``. Its source is local slot ``g`` on node
+        ``(g * num_nodes) // 8``, so the eight sources spread evenly over the
+        nodes (two per node on four nodes, four per node on two nodes) and
+        every node drives an egress stream instead of one node fanning out all
+        896 experts.
+        """
+        if not self._hierarchical_gdr:
+            return
+        import torch.distributed as dist
+
+        G = self._attn_tp_size
+        num_nodes = self.world_size // G
+        for g in range(G):
+            grp = dist.new_group(
+                ranks=[g + node * G for node in range(num_nodes)]
+            )
+            if g == self._attn_tp_rank:
+                self._cross_weight_group = grp
+                self._cross_weight_root = ((g * num_nodes) // G) * G + g
+        self._cross_weight_source = (
+            self.global_rank == self._cross_weight_root
+        )
+
+    def _head_shard_kda_tensor(self, name, tensor):
+        """Slice a KDA weight/param to this rank's head shard (M2a, G>1).
+
+        head block = [rank%G * Hl : +Hl]; projection block = that * head_dim.
+          * f_a_proj / g_a_proj / o_norm : REPLICATE (per-head over head_dim
+            or a shared low-rank latent) -> no slice.
+          * o_proj                       : COLS (dim1) -> row-parallel, summed
+            by the all_reduce in serving_modules.
+          * A_log                         : per-HEAD, sliced on the FLATTENED
+            head axis (the 48B checkpoint ships it as (1, 1, H, 1) -- heads on
+            axis 2, NOT axis 0 -- so a dim-0 slice empties every rank but rank 0
+            into a null-pointer tensor that the fla gate kernel dereferences;
+            G=8 prefill IMA, bug_log 2026-08-14).
+          * b_proj                        : per-HEAD rows [lo:hi] ((H, hidden)).
+          * everything else (q/k/v_proj, {q,k,v}_conv1d weight+bias, f_b_proj,
+            g_proj, g_b_proj, dt_bias): per-(head*head_dim) rows [rlo:rhi].
+        """
+        hd = self._attn_tp_head_dim
+        lo = self._attn_tp_rank * self._attn_tp_hl
+        hi = lo + self._attn_tp_hl
+        rlo, rhi = lo * hd, hi * hd
+        base = name.split(".")[0]
+        if base in ("f_a_proj", "g_a_proj", "o_norm"):
+            return tensor
+        if base == "o_proj":
+            return tensor[:, rlo:rhi]
+        if base == "A_log":
+            # The fla gate kernel reads A_log FLAT as A_log[i_h] (one log-decay
+            # scalar per head). Its stored shape is (1, 1, H, 1) on the 48B
+            # checkpoint, so slice the flattened head axis -- a dim-0 slice
+            # (tensor[lo:hi]) hits the size-1 leading axis and returns 0 rows.
+            # A_log LAYOUT differs only in its checkpoint padding: 48B stores
+            # one value per head (sometimes as (1,1,H,1)); K3 stores the same
+            # per-head vector padded from 96 to 128 entries.  K3's padding is
+            # not a per-head-dimension parameter: every rank must receive its
+            # own slice of the first 96 values, or all TP ranks would consume
+            # rank 0's decay constants.
+            from .k3.tensor_map import K3_A_LOG_PADDED_LEN
+
+            a = tensor.reshape(-1)
+            n = self._attn_tp_hl * self._attn_tp_size
+            if a.numel() == n or (
+                getattr(self, "_is_k3", False)
+                and a.numel() == K3_A_LOG_PADDED_LEN
+                and n < a.numel()
+            ):
+                return a[lo:hi]
+            raise ValueError(
+                f"A_log has {a.numel()} elements (shape {tuple(tensor.shape)}); "
+                f"expected kda_num_heads={n} or K3's padded length "
+                f"{K3_A_LOG_PADDED_LEN}"
+            )
+        if base == "b_proj":
+            return tensor[lo:hi]
+        return tensor[rlo:rhi]
 
     def _load_kda_modules(self):
         device = self.engine_config.Basic_Config.device_torch
@@ -545,9 +1802,16 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"kda_attn_{layer_idx}")
             for name, p in list(kda.named_parameters()):
                 if name in tensors:
-                    _replace_param(kda, name, tensors[name].to(device=device))
+                    t = tensors[name]
+                    if self._attn_tp_size > 1:
+                        t = self._head_shard_kda_tensor(name, t).contiguous()
+                    _replace_param(kda, name, t.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"kda_attn_{layer_idx}: missing tensor {name}")
+            if self._attn_tp_size > 1:
+                # After sharding, this module owns Hl heads: the serving math
+                # (reshapes, conv/recurrent grids) reads num_heads/num_k_heads.
+                kda.num_heads = kda.num_k_heads = self._attn_tp_hl
 
     def _load_shared_expert_modules(self):
         device = self.engine_config.Basic_Config.device_torch
@@ -568,9 +1832,23 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"shared_expert_{layer_idx}")
             for name, p in list(shared.named_parameters()):
                 if name in tensors:
-                    _replace_param(shared, name, tensors[name].to(device=device))
+                    tensor = tensors[name]
+                    if self._attn_tp_size > 1:
+                        tensor = shard_shared_expert_tensor(
+                            tensor,
+                            name,
+                            self._attn_tp_size,
+                            self._attn_tp_rank,
+                        )
+                    _replace_param(shared, name, tensor.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"shared_expert_{layer_idx}: missing {name}")
+            if self._attn_tp_size > 1:
+                local_intermediate = shared.gate_proj.weight.shape[0]
+                shared.intermediate_size = local_intermediate
+                shared.gate_proj.out_features = local_intermediate
+                shared.up_proj.out_features = local_intermediate
+                shared.down_proj.in_features = local_intermediate
 
     # ------------------------------------------------------------------ #
     #  Serving method injection                                           #
@@ -589,6 +1867,9 @@ class KimiLinearParallelStrategyManager:
             attn.mla_decoding_nope_with_pagekv = types.MethodType(
                 mla_decoding_nope_with_pagekv, attn
             )
+            attn.attn_tp_size = self._attn_tp_size
+            attn.attn_tp_rank = self._attn_tp_rank
+            attn.attn_tp_group = self._attn_tp_group
             self.model.model.layers[layer_idx].self_attn = KimiLinearAttnWrapper(
                 attn, layer_idx, self.core_engine, self.engine_config,
                 self.model_config, persistent=not self._stream_all_modules,
@@ -602,6 +1883,18 @@ class KimiLinearParallelStrategyManager:
             kda = self.model.model.layers[layer_idx].self_attn
             kda.kda_prefill_serving = types.MethodType(kda_prefill_serving, kda)
             kda.kda_decode_serving = types.MethodType(kda_decode_serving, kda)
+            if self._is_k3 and not self._stream_all_modules:
+                # K3's full-rank KDA gate is eligible for the decode-only
+                # projection fusion.  Prefill continues to use the original
+                # calls; the rebinding shares their storage with the fused
+                # buffer instead of duplicating HBM.
+                fuse_kda_decode_projections(kda)
+            # M2a: stamp the head-parallel context the serving methods read
+            # (attn_tp_size==1 -> the o_proj all_reduce is skipped, unchanged).
+            kda.attn_tp_size = self._attn_tp_size
+            kda.attn_tp_rank = self._attn_tp_rank
+            kda.attn_tp_group = self._attn_tp_group
+            kda.Hl = self._attn_tp_hl
             self.model.model.layers[layer_idx].self_attn = KimiLinearKDAWrapper(
                 kda, layer_idx, self.core_engine, self.engine_config,
                 self.model_config, persistent=not self._stream_all_modules,
@@ -659,6 +1952,16 @@ class KimiLinearParallelStrategyManager:
                     self.engine_config, self.model_config,
                     persistent=False,
                 )
+            elif shared is not None and self._attn_tp_size > 1:
+                shared._tp_size = self._attn_tp_size
+                shared._tp_group = self._attn_tp_group
+            # M2b: stamp the head-parallel (TP) context the resident-EP decode
+            # forward reads for the intra-group token scatter/gather. G==1 leaves
+            # attn_tp_size==1, so moe_forward_resident_ep_decode skips it and the
+            # validated pure-DP path is byte-identical.
+            moe.attn_tp_size = self._attn_tp_size
+            moe.attn_tp_rank = self._attn_tp_rank
+            moe.attn_tp_group = self._attn_tp_group
             moe.forward = types.MethodType(moe_forward_serving, moe)
 
     def _config_block_residual(self):
