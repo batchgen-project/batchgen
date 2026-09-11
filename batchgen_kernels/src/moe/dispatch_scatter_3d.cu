@@ -375,8 +375,16 @@ torch::Tensor reduce_weighted_scatter(
     return output;
 }
 
+// Ordered BF16 reduce: one block per token. The token's top-K metadata is
+// loaded and sorted once into shared memory, then each thread reduces 8
+// contiguous BF16 columns with 16-byte loads. Per-element arithmetic, order
+// and rounding match the reference exactly, so the result is bit-identical.
+constexpr int kOrderedReduceThreads = 256;
+constexpr int kOrderedReduceVec = 8;  // BF16 elements per 16-byte access
+
 template <int K>
-__global__ void reduce_weighted_scatter_bf16_ordered_kernel(
+__global__ void __launch_bounds__(kOrderedReduceThreads)
+reduce_weighted_scatter_bf16_ordered_kernel(
     const __nv_bfloat16* __restrict__ expert_output,
     const int32_t* __restrict__ topk_pos,
     const int32_t* __restrict__ topk_indices,
@@ -385,54 +393,83 @@ __global__ void reduce_weighted_scatter_bf16_ordered_kernel(
     int N, int H
 ) {
     const int token_idx = blockIdx.x;
-    const int h_offset = blockIdx.y * BLOCK_H + threadIdx.x;
-    if (token_idx >= N || h_offset >= H) return;
+    if (token_idx >= N) return;
 
-    int32_t expert[K];
-    int32_t pos[K];
-    float weight[K];
-    const int topk_base = token_idx * K;
-    #pragma unroll
-    for (int k = 0; k < K; ++k) {
-        expert[k] = topk_indices[topk_base + k];
-        pos[k] = topk_pos[topk_base + k];
-        weight[k] = topk_weights[topk_base + k];
-    }
+    __shared__ int32_t s_pos[K];
+    __shared__ float s_weight[K];
 
-    // The reference prefill visits experts in ascending expert-id order and
-    // rounds both each weighted contribution and each index_add_ update to
-    // BF16. Preserve that order while computing all top-K slots in one kernel.
-    #pragma unroll
-    for (int i = 1; i < K; ++i) {
-        int32_t expert_i = expert[i];
-        int32_t pos_i = pos[i];
-        float weight_i = weight[i];
-        int j = i - 1;
-        while (j >= 0 && expert[j] > expert_i) {
-            expert[j + 1] = expert[j];
-            pos[j + 1] = pos[j];
-            weight[j + 1] = weight[j];
-            --j;
+    if (threadIdx.x == 0) {
+        int32_t expert[K];
+        int32_t pos[K];
+        float weight[K];
+        const int64_t topk_base = (int64_t)token_idx * K;
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            expert[k] = topk_indices[topk_base + k];
+            pos[k] = topk_pos[topk_base + k];
+            weight[k] = topk_weights[topk_base + k];
         }
-        expert[j + 1] = expert_i;
-        pos[j + 1] = pos_i;
-        weight[j + 1] = weight_i;
-    }
 
-    __nv_bfloat16 acc = __float2bfloat16(0.0f);
-    #pragma unroll
-    for (int k = 0; k < K; ++k) {
-        if (pos[k] >= 0) {
-            __nv_bfloat16 value =
-                expert_output[(int64_t)pos[k] * H + h_offset];
-            __nv_bfloat16 w_bf16 = __float2bfloat16(weight[k]);
-            __nv_bfloat16 weighted = __float2bfloat16(
-                __bfloat162float(value) * __bfloat162float(w_bf16));
-            acc = __float2bfloat16(
-                __bfloat162float(acc) + __bfloat162float(weighted));
+        // The reference prefill visits experts in ascending expert-id order and
+        // rounds both each weighted contribution and each index_add_ update to
+        // BF16. Stable insertion sort, so equal ids keep their slot order.
+        #pragma unroll
+        for (int i = 1; i < K; ++i) {
+            int32_t expert_i = expert[i];
+            int32_t pos_i = pos[i];
+            float weight_i = weight[i];
+            int j = i - 1;
+            while (j >= 0 && expert[j] > expert_i) {
+                expert[j + 1] = expert[j];
+                pos[j + 1] = pos[j];
+                weight[j + 1] = weight[j];
+                --j;
+            }
+            expert[j + 1] = expert_i;
+            pos[j + 1] = pos_i;
+            weight[j + 1] = weight_i;
+        }
+
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            s_pos[k] = pos[k];
+            s_weight[k] = __bfloat162float(__float2bfloat16(weight[k]));
         }
     }
-    output[(int64_t)token_idx * H + h_offset] = acc;
+    __syncthreads();
+
+    const int H_vec = H / kOrderedReduceVec;
+    for (int v = threadIdx.x; v < H_vec; v += blockDim.x) {
+        const int64_t h0 = (int64_t)v * kOrderedReduceVec;
+        __nv_bfloat16 acc[kOrderedReduceVec];
+        #pragma unroll
+        for (int j = 0; j < kOrderedReduceVec; ++j) acc[j] = __float2bfloat16(0.0f);
+
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const int32_t p = s_pos[k];
+            if (p >= 0) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(
+                    expert_output + (int64_t)p * H + h0);
+                const __nv_bfloat16* vals =
+                    reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const float w = s_weight[k];
+                #pragma unroll
+                for (int j = 0; j < kOrderedReduceVec; ++j) {
+                    const __nv_bfloat16 weighted = __float2bfloat16(
+                        __fmul_rn(__bfloat162float(vals[j]), w));
+                    acc[j] = __float2bfloat16(__fadd_rn(
+                        __bfloat162float(acc[j]), __bfloat162float(weighted)));
+                }
+            }
+        }
+
+        uint4 out_raw;
+        __nv_bfloat16* out_vals = reinterpret_cast<__nv_bfloat16*>(&out_raw);
+        #pragma unroll
+        for (int j = 0; j < kOrderedReduceVec; ++j) out_vals[j] = acc[j];
+        *reinterpret_cast<uint4*>(output + (int64_t)token_idx * H + h0) = out_raw;
+    }
 }
 
 torch::Tensor reduce_weighted_scatter_bf16_ordered(
@@ -442,13 +479,23 @@ torch::Tensor reduce_weighted_scatter_bf16_ordered(
 ) {
     TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32,
                 "topk_indices must be int32");
+    TORCH_CHECK(H % kOrderedReduceVec == 0,
+                "reduce_weighted_scatter_bf16_ordered requires H % 8 == 0, got H=", H);
     if (!output.defined() || output.numel() == 0) {
         output = torch::empty(
             {N, H},
             torch::dtype(torch::kBFloat16).device(expert_output.device()));
     }
-    dim3 grid(N, (H + BLOCK_H - 1) / BLOCK_H);
-    dim3 block(BLOCK_H);
+    TORCH_CHECK(expert_output.is_contiguous() && output.is_contiguous(),
+                "reduce_weighted_scatter_bf16_ordered requires contiguous "
+                "expert_output and output");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(expert_output.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0,
+        "reduce_weighted_scatter_bf16_ordered requires 16-byte aligned "
+        "expert_output and output");
+    dim3 grid(N);
+    dim3 block(kOrderedReduceThreads);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     switch (K) {
         case 2: reduce_weighted_scatter_bf16_ordered_kernel<2><<<grid, block, 0, stream>>>(
