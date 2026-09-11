@@ -6,7 +6,7 @@ and with it a JIT build of the core engine — is never required.
 
 The checkpoint fixture is built from the template tables below: the 60 name
 templates of the released checkpoint with the shape and dtype read out of all 96
-shard headers.  It is INDEPENDENT of the module under test
+shard headers on <gpu-host>.  It is INDEPENDENT of the module under test
 (nothing in it is computed from ``k3_module_shapes``), and
 ``test_fixture_reproduces_the_released_index`` asserts that summing it gives the
 index's own ``metadata.total_size`` — so a mutation of the declarations moves
@@ -772,10 +772,13 @@ def test_the_real_import_path_resolves():
 
 
 # --------------------------------------------------------------------------- #
-#  The real checkpoint (K3_CKPT_DIR); skipped when it is not mounted           #
+#  The real checkpoint (<gpu-host>); skipped when it is not mounted        #
 # --------------------------------------------------------------------------- #
 
-_CKPT = os.environ.get("K3_CKPT_DIR", "/path/to/Kimi-K3")
+_CKPT = os.environ.get(
+    "K3_CKPT_DIR",
+    "/path/to/models/Kimi-K3",
+)
 
 
 @pytest.mark.skipif(

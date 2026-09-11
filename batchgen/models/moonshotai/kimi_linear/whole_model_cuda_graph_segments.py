@@ -1,0 +1,503 @@
+# ---------------------------------------------------------------------------- #
+#  BatchGen                                                                      #
+#  copyright (c) EfficientMoE team 2025                                          #
+#                                                                               #
+#  licensed under the apache license, version 2.0 (the "License");              #
+#  you may not use this file except in compliance with the License.              #
+# ---------------------------------------------------------------------------- #
+
+"""Whole-model decode graph for Kimi-K3.
+
+The existing K3 graph driver captures one attention span and one resident-MoE
+segment at a time.  That removes kernel setup inside a layer, but Python still
+returns to the driver between all 93 layers.  This segment composes the same
+already-validated child forwards into one graph:
+
+    embedding -> [attention span + resident grouped MoE] x 93
+               -> block-attention-residual output mix -> final RMSNorm
+
+The language-model head intentionally remains outside this segment.  The
+worker already owns token selection, and keeping the head outside avoids
+capturing a vocabulary-sized output buffer on every rank.
+
+K3's TP8 attention groups replicate the batch before the resident EP path
+scatters it.  A graph bucket is global-EP safe, but an admitted batch can be
+smaller than that bucket and need a non-divisible TP8 split.  The integer maps
+below encode every possible valid row count for a bucket.  The graph selects a
+row-count map on device from ``num_valid_tokens``; no host ``.item()`` or
+per-layer Python scatter is needed during replay.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Dict, Iterable, Mapping, Optional
+
+import torch
+
+from .row_gather_triton import (
+    add_gathered_rows_masked,
+    gather_rows_masked,
+    row_gather_triton_available as _row_gather_available,
+)
+
+from batchgen.cuda_graph.graph_manager import TensorSpec
+from .moe_tp_reshard import balanced_row_split
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _WholeBucketMaps:
+    """Device-resident row maps for one model/TP bucket."""
+
+    padded_indices: torch.Tensor
+    padded_valid: torch.Tensor
+    local_indices: torch.Tensor
+    local_valid: torch.Tensor
+    local_counts: torch.Tensor
+    original_indices: torch.Tensor
+    original_valid: torch.Tensor
+    group_bucket: int
+    local_bucket: int
+
+
+class KimiLinearWholeModelSegment:
+    """Graph-capturable K3 transformer body with inline resident MoE."""
+
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        layer_segments: Iterable[object],
+        moe_segments: Mapping[int, object],
+        statics: Dict[int, object],
+        tp_size: int,
+        tp_rank: int,
+        device: torch.device,
+        hidden_size: int,
+        dtype: torch.dtype,
+        max_bucket_size: int,
+    ) -> None:
+        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+            raise ValueError(
+                f"invalid TP coordinates tp_size={tp_size}, tp_rank={tp_rank}"
+            )
+        self.model = model
+        self.layer_segments = list(layer_segments)
+        if not self.layer_segments:
+            raise ValueError("KimiLinearWholeModelSegment needs decoder layers")
+        self.moe_segments = dict(moe_segments)
+        self.statics = statics
+        self.tp_size = int(tp_size)
+        self.tp_rank = int(tp_rank)
+        self.device = device
+        self.hidden_size = int(hidden_size)
+        self.dtype = dtype
+        self.max_bucket_size = int(max_bucket_size)
+        self.num_layers = len(self.layer_segments)
+
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if layers is None or len(layers) != self.num_layers:
+            raise ValueError(
+                "KimiLinearWholeModelSegment layer count does not match model"
+            )
+
+        self._bucket_maps: Dict[int, _WholeBucketMaps] = {}
+        # The graph keeps the model's logical layer numbering, but only MLA
+        # layers produce a paged-KV row.  Keep that mapping local to the graph
+        # so the post-replay staging copy does not clone 69 never-written KDA
+        # rows on every decode token.
+        self._primary_kv_layers = tuple(
+            layer_idx
+            for layer_idx, segment in enumerate(self.layer_segments)
+            if not bool(getattr(segment, "is_kda", False))
+        )
+        self._logical_to_physical_kv = tuple(
+            {
+                layer_idx: physical_idx
+                for physical_idx, layer_idx in enumerate(self._primary_kv_layers)
+            }.get(layer_idx, -1)
+            for layer_idx in range(self.num_layers)
+        )
+        self._kv_key_buffer: Optional[torch.Tensor] = None
+        self._kv_buffers: Optional[list[dict[str, torch.Tensor | None]]] = None
+        self.primary_kv_offload_buffers = None
+        # FlashMLA's scheduler metadata depends on the decode batch's
+        # cache_seqlens but not on the layer.  Keep the capture-time pair per
+        # graph bucket; its one metadata-generation kernel is consumed by
+        # every NoPE-MLA layer.
+        self._flashmla_metadata: Dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        # Decode has one token per sequence, so KDA's packed cumulative
+        # lengths are always [0, 1, ..., bucket].  Keep one static vector per
+        # graph bucket instead of recording an identical torch.arange call in
+        # every one of K3's 69 KDA layers.
+        self._kda_cu_seqlens: Dict[int, torch.Tensor] = {}
+        self._no_v_cache = True
+        self._primary_kv_dim = 0
+        for segment in self.layer_segments:
+            if not bool(getattr(segment, "is_kda", False)):
+                self._primary_kv_dim = int(getattr(segment, "kv_dim", 0))
+                if self._primary_kv_dim > 0:
+                    break
+
+    # ------------------------------------------------------------------ #
+    # CapturableSegment protocol                                         #
+    # ------------------------------------------------------------------ #
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "input_ids": TensorSpec(("batch_size", 1), torch.int64),
+            # This is the local rank's real row count.  The graph bucket is
+            # selected from the globally synchronized maximum, so this scalar
+            # may be smaller on a DP group with fewer admitted sequences.
+            "num_valid_tokens": TensorSpec((1,), torch.int32),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "hidden_states": TensorSpec(
+                ("batch_size", 1, self.hidden_size), self.dtype
+            )
+        }
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        bucket = int(bucket_size)
+        if bucket <= 0 or bucket > self.max_bucket_size:
+            raise ValueError(
+                f"whole-model bucket {bucket} is outside 1..{self.max_bucket_size}"
+            )
+        if bucket not in self._bucket_maps:
+            self._bucket_maps[bucket] = self._make_bucket_maps(bucket)
+        self._get_kda_cu_seqlens(bucket)
+
+        # Child attention spans bind the bucket-owned KV/KDA/block-residual
+        # statics.  The same objects are then called directly from this outer
+        # segment, never through a nested graph replay.
+        for segment in self.layer_segments:
+            setup = getattr(segment, "setup_static_buffers", None)
+            if setup is not None:
+                setup(bucket)
+
+        # The outer graph calls the resident-MoE segments directly rather than
+        # replaying their per-layer managers.  Give those children the same
+        # setup hook so weight-layout transforms happen before whole-model
+        # warmup/capture instead of leaving the fused front permanently idle.
+        for segment in self.moe_segments.values():
+            setup = getattr(segment, "setup_static_buffers", None)
+            if setup is not None:
+                setup(bucket)
+        fused_fronts = sum(
+            getattr(segment, "fused_front", None) is not None
+            for segment in self.moe_segments.values()
+        )
+        logger.info(
+            "K3 whole-model MoE setup: bucket=%d fused_front=%d/%d",
+            bucket,
+            fused_fronts,
+            len(self.moe_segments),
+        )
+
+        # One contiguous staging buffer covers only the MLA layers.  It is
+        # kept for the lifetime of the outer segment so dropping one bucket
+        # cannot invalidate another captured graph's pointer.  KDA layers do
+        # not emit paged KV and must not consume staging capacity.
+        if self._kv_key_buffer is None and self._primary_kv_dim > 0:
+            self._kv_key_buffer = torch.zeros(
+                len(self._primary_kv_layers),
+                self.max_bucket_size,
+                1,
+                1,
+                self._primary_kv_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._kv_buffers = [
+                {"key": self._kv_key_buffer[i], "value": None}
+                for i in range(len(self._primary_kv_layers))
+            ]
+            self.primary_kv_offload_buffers = self._kv_buffers
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        # Do not release the shared KV staging buffer here: CUDAGraphManager
+        # calls this method once per dropped bucket, while another bucket may
+        # still hold a graph that captured the same outer segment.
+        for segment in self.layer_segments:
+            release = getattr(segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
+        for segment in self.moe_segments.values():
+            release = getattr(segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
+        self._flashmla_metadata.pop(int(bucket_size), None)
+        self._kda_cu_seqlens.pop(int(bucket_size), None)
+        self._bucket_maps.pop(int(bucket_size), None)
+
+    # ------------------------------------------------------------------ #
+    # Forward                                                             #
+    # ------------------------------------------------------------------ #
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        bucket = int(input_ids.shape[0])
+        maps = self._bucket_maps[bucket]
+        selector = num_valid_tokens.reshape(()).to(torch.long).clamp(
+            min=0, max=bucket
+        )
+
+        hidden_states = self.model.model.embed_tokens(input_ids)
+        valid = (
+            torch.arange(bucket, dtype=torch.int32, device=hidden_states.device)
+            < num_valid_tokens.reshape(1)
+        )
+        # Embedding id 0 is a real vocabulary entry, not guaranteed zero.  Mask
+        # graph padding before the first KDA/MLA layer rather than relying on a
+        # padding token convention.
+        hidden_states = hidden_states * valid.view(bucket, 1, 1).to(
+            hidden_states.dtype
+        )
+
+        flashmla_metadata, flashmla_num_splits = (
+            self._get_flashmla_metadata(bucket)
+        )
+        kda_cu_seqlens = self._get_kda_cu_seqlens(bucket)
+        # The balanced-split row maps depend only on ``selector`` (fixed for
+        # the step), so look them up once instead of once per MoE layer:
+        # 5 index_selects + 2 bool->dtype casts x 92 layers of graph nodes.
+        # CUDA graph capture rejects scalar-tensor advanced indexing
+        # (aten::index) on this PyTorch/CUDA stack; ``index_select`` is
+        # equivalent for the one-row lookup and remains graph-capturable.
+        selector_row = selector.reshape(1)
+        padded_map = maps.padded_indices.index_select(0, selector_row).squeeze(0)
+        padded_valid = maps.padded_valid.index_select(0, selector_row).squeeze(0)
+        local_count = maps.local_counts.index_select(0, selector_row)
+        original_map = maps.original_indices.index_select(0, selector_row).squeeze(0)
+        original_valid = maps.original_valid.index_select(0, selector_row).squeeze(0)
+        local_start = self.tp_rank * maps.local_bucket
+        # Fused masked row gathers (one Triton launch each) on CUDA; the
+        # index_select / mask / add form elsewhere.
+        fused_rows = hidden_states.is_cuda and _row_gather_available()
+        if fused_rows:
+            padded_valid_i32 = padded_valid.to(torch.int32)
+            original_valid_i32 = original_valid.to(torch.int32)
+        else:
+            padded_valid_col = padded_valid.to(hidden_states.dtype).unsqueeze(-1)
+            original_valid_col = original_valid.to(hidden_states.dtype).unsqueeze(-1)
+
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            outputs = layer_segment.forward(
+                hidden_states,
+                flashmla_metadata=flashmla_metadata,
+                flashmla_num_splits=flashmla_num_splits,
+                kda_cu_seqlens=kda_cu_seqlens,
+            )
+            k_tensor = outputs.get("k_tensor")
+            if k_tensor is not None and self._kv_key_buffer is not None:
+                self._copy_primary_kv(layer_idx, k_tensor)
+
+            if bool(getattr(layer_segment, "fold_ffn", False)):
+                hidden_states = outputs["hidden"]
+                continue
+
+            moe = self.moe_segments.get(layer_idx)
+            if moe is None:
+                raise RuntimeError(
+                    f"Kimi-K3 whole graph has no resident MoE for layer {layer_idx}"
+                )
+
+            hidden_2d = outputs["normed"].reshape(bucket, self.hidden_size)
+            # K3's resident EP input uses rank-major TP-group rows.  The maps
+            # implement the same balanced split as the eager path, including
+            # underfilled/non-divisible batches, entirely on device.
+            if fused_rows:
+                padded = gather_rows_masked(hidden_2d, padded_map, padded_valid_i32)
+            else:
+                padded = hidden_2d.index_select(0, padded_map)
+                padded = padded * padded_valid_col
+
+            # ``padded`` is already rank-major: each TP rank's balanced rows
+            # occupy one contiguous slice.  Reusing that slice avoids a
+            # second index-select and mask over the 6144-wide activation on
+            # every MoE layer.  The slice is equivalent to
+            # ``maps.local_indices[selector]`` because ``padded_valid`` has
+            # already zeroed the underfilled tail for this rank.
+            local = padded.narrow(0, local_start, maps.local_bucket)
+
+            moe_output = moe.forward(
+                padded=padded,
+                local=local,
+                num_valid_tokens=local_count,
+            )["moe_output"]
+            residual = outputs["residual"]
+            if fused_rows:
+                hidden_states = add_gathered_rows_masked(
+                    residual.reshape(bucket, self.hidden_size), moe_output,
+                    original_map, original_valid_i32,
+                ).view_as(residual)
+            else:
+                reassembled = moe_output.index_select(0, original_map)
+                reassembled = reassembled * original_valid_col
+                hidden_states = residual + reassembled.view_as(residual)
+
+        if bool(getattr(self.model.model, "use_attn_residuals", False)):
+            statics = self.statics[bucket]
+            mixed = self.model.model._apply_output_attn_res(
+                hidden_states.reshape(-1, self.hidden_size),
+                statics.block_residual,
+            )
+            hidden_states = mixed.view_as(hidden_states)
+        hidden_states = self.model.model.norm(hidden_states)
+        hidden_states = hidden_states * valid.view(bucket, 1, 1).to(
+            hidden_states.dtype
+        )
+        return {"hidden_states": hidden_states}
+
+    def _get_flashmla_metadata(
+        self, bucket: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the one FlashMLA schedule pair for this graph bucket.
+
+        K3 has 24 NoPE-MLA layers, but all of them use the same local head
+        count and the same per-step cache lengths.  The old inline path called
+        ``get_mla_metadata`` once in every layer, recording 24 identical
+        metadata kernels and allocations in the whole-model graph.  Generate
+        it once here so replay still adapts to refreshed cache lengths while
+        removing those duplicate scheduler launches.
+        """
+        metadata = self._flashmla_metadata.get(int(bucket))
+        # The graph manager runs eager warmups before capture.  Reuse the
+        # warmup pair there, but force one fresh call while capturing so the
+        # metadata kernel itself is recorded in the graph rather than leaving
+        # the replay with warmup-time lengths.
+        if metadata is not None and not torch.cuda.is_current_stream_capturing():
+            return metadata
+
+        from flash_mla import get_mla_metadata
+
+        mla_segments = [
+            segment
+            for segment in self.layer_segments
+            if not bool(getattr(segment, "is_kda", False))
+        ]
+        if not mla_segments:
+            raise RuntimeError("K3 whole graph requires a NoPE-MLA layer")
+        first_attn = mla_segments[0].attn
+        num_heads = int(first_attn.num_heads)
+        if any(
+            int(segment.attn.num_heads) != num_heads
+            for segment in mla_segments
+        ):
+            raise RuntimeError(
+                "K3 whole graph requires one local FlashMLA head geometry"
+            )
+        metadata = get_mla_metadata(
+            self.statics[bucket].cache_seqlens, num_heads, 1
+        )
+        self._flashmla_metadata[int(bucket)] = metadata
+        return metadata
+
+    def _get_kda_cu_seqlens(self, bucket: int) -> torch.Tensor:
+        """Return the fixed packed-length vector for a decode graph bucket."""
+        cu_seqlens = self._kda_cu_seqlens.get(int(bucket))
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(
+                int(bucket) + 1, dtype=torch.long, device=self.device
+            )
+            self._kda_cu_seqlens[int(bucket)] = cu_seqlens
+        return cu_seqlens
+
+    def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor) -> None:
+        if self._kv_key_buffer is None:
+            raise RuntimeError("K3 whole graph KV staging is not initialized")
+        physical_layer_idx = self._logical_to_physical_kv[int(layer_idx)]
+        if physical_layer_idx < 0:
+            raise KeyError(
+                f"logical KDA layer {layer_idx} does not own paged KV"
+            )
+        if k_tensor.dim() == 3:
+            k_tensor = k_tensor.unsqueeze(2)
+        expected = (k_tensor.shape[0], 1, 1, self._primary_kv_dim)
+        if tuple(k_tensor.shape) != expected:
+            raise RuntimeError(
+                f"K3 whole graph KV tensor mismatch: got {tuple(k_tensor.shape)}, "
+                f"expected (*, 1, 1, {self._primary_kv_dim})"
+            )
+        self._kv_key_buffer[physical_layer_idx, : k_tensor.shape[0]].copy_(k_tensor)
+
+    # ------------------------------------------------------------------ #
+    # TP row-map construction                                             #
+    # ------------------------------------------------------------------ #
+
+    def _make_bucket_maps(self, bucket: int) -> _WholeBucketMaps:
+        local_bucket = (bucket + self.tp_size - 1) // self.tp_size
+        group_bucket = self.tp_size * local_bucket
+
+        # Construct the lookup tables on the CPU and transfer each complete
+        # table once.  The old version performed one CUDA write per map entry
+        # (O(bucket**2 * TP)) during setup; for a startup capture this created
+        # thousands of tiny host launches and could also leave a partially
+        # initialized device table visible if setup was interrupted.
+        padded_indices_cpu = torch.zeros(
+            (bucket + 1, group_bucket), dtype=torch.long
+        )
+        padded_valid_cpu = torch.zeros(
+            (bucket + 1, group_bucket), dtype=torch.bool
+        )
+        local_indices_cpu = torch.zeros(
+            (bucket + 1, local_bucket), dtype=torch.long
+        )
+        local_valid_cpu = torch.zeros(
+            (bucket + 1, local_bucket), dtype=torch.bool
+        )
+        local_counts_cpu = torch.zeros((bucket + 1,), dtype=torch.int32)
+        original_indices_cpu = torch.zeros(
+            (bucket + 1, bucket), dtype=torch.long
+        )
+        original_valid_cpu = torch.zeros(
+            (bucket + 1, bucket), dtype=torch.bool
+        )
+
+        # These are setup-time CPU loops.  All tensors selected by ``forward``
+        # are already on-device before capture begins.
+        for valid_rows in range(bucket + 1):
+            splits = balanced_row_split(valid_rows, self.tp_size)
+            for group_rank, (start, end) in enumerate(splits):
+                for local_pos, row in enumerate(range(start, end)):
+                    rank_major_pos = group_rank * local_bucket + local_pos
+                    padded_indices_cpu[valid_rows, rank_major_pos] = row
+                    padded_valid_cpu[valid_rows, rank_major_pos] = True
+                    if group_rank == self.tp_rank:
+                        local_indices_cpu[valid_rows, local_pos] = row
+                        local_valid_cpu[valid_rows, local_pos] = True
+                    original_indices_cpu[valid_rows, row] = rank_major_pos
+                    original_valid_cpu[valid_rows, row] = True
+            local_counts_cpu[valid_rows] = (
+                splits[self.tp_rank][1] - splits[self.tp_rank][0]
+            )
+
+        def to_device(table: torch.Tensor) -> torch.Tensor:
+            return table.to(device=self.device, non_blocking=True)
+
+        return _WholeBucketMaps(
+            padded_indices=to_device(padded_indices_cpu),
+            padded_valid=to_device(padded_valid_cpu),
+            local_indices=to_device(local_indices_cpu),
+            local_valid=to_device(local_valid_cpu),
+            local_counts=to_device(local_counts_cpu),
+            original_indices=to_device(original_indices_cpu),
+            original_valid=to_device(original_valid_cpu),
+            group_bucket=group_bucket,
+            local_bucket=local_bucket,
+        )
+
+
+__all__ = ["KimiLinearWholeModelSegment"]

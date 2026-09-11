@@ -31,6 +31,7 @@ KDALayerState objects consumed here hold fixed-address VIEWS of the manager's
 tensors (see wrappers.py). This module only implements the math.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -38,9 +39,67 @@ import torch.nn.functional as F
 
 from .wrappers import KimiLinearExpertWrapper
 
+
+logger = logging.getLogger(__name__)
+_KDA_FUSED_DECODE_IMPORT_FAILED = False
+
 # ============================================================================
 #  NoPE-MLA
 # ============================================================================
+
+
+def _wait_streamed_sp8_cross_launch(module):
+    """Host-enqueue the pending cross-node weight calls before a TP collective.
+
+    Installed on the underlying attention module by the PSM for streamed-SP8
+    prefill only, and removed again on release, so decode and every other
+    prefill mode see no attribute and pay nothing. The next layer's
+    cross-node broadcast gate opened at the end of the previous layer's MoE;
+    under ``NCCL_LAUNCH_ORDER_IMPLICIT=1`` this all-reduce is the next TP8
+    launch, so every rank must observe the same cross-then-TP8 host order
+    here or the implicit ordering serializes them against each other.
+    """
+    order_wait = getattr(module, "_streamed_sp8_order_wait", None)
+    if order_wait is not None:
+        order_wait()
+
+
+def _begin_streamed_sp8_profile(module):
+    profiler = getattr(module, "_streamed_sp8_profiler", None)
+    if (
+        profiler is not None
+        and not profiler._prefill_profile_enabled
+    ):
+        profiler = None
+    span = profiler.begin_profile_span() if profiler is not None else None
+    return profiler, span
+
+
+def _end_streamed_sp8_profile(profiler, name, start):
+    if profiler is not None:
+        profiler.end_profile_span(name, start)
+
+
+def _reduce_mla_tp_output(module, output):
+    """Sum the row-parallel MLA output projection across the TP group."""
+    if getattr(module, "attn_tp_size", 1) > 1:
+        import torch.distributed as dist
+
+        _wait_streamed_sp8_cross_launch(module)
+        profiler, span = _begin_streamed_sp8_profile(module)
+        # Preserve the established BF16 all-reduce reduction order.  A direct
+        # reduce-scatter changes that order and can amplify across K3's 93
+        # layers; streamed prefill retains the local row slice only after the
+        # same full reduction used by the resident/reference path.
+        dist.all_reduce(output, group=module.attn_tp_group)
+        if getattr(module, "_streamed_sp8_output_row_shard", False):
+            from .moe_tp_reshard import scatter_rows
+
+            output = scatter_rows(
+                output, module.attn_tp_size, module.attn_tp_rank
+            ).clone()
+        _end_streamed_sp8_profile(profiler, "attention_reduce", span)
+    return output
 
 
 def mla_prefill_nope(self, hidden_states, attention_mask, position_ids):
@@ -102,7 +161,7 @@ def mla_prefill_nope(self, hidden_states, attention_mask, position_ids):
     out = out.transpose(1, 2).reshape(bsz, seq_len, -1).contiguous()
     if self.use_output_gate:
         out = out * self.g_proj(hidden_states).sigmoid()
-    return self.o_proj(out), offload_kv
+    return _reduce_mla_tp_output(self, self.o_proj(out)), offload_kv
 
 
 def mla_prefill_nope_prepacked(
@@ -125,8 +184,8 @@ def mla_prefill_nope_prepacked(
         attn_output: (total_tokens, hidden)
         offload_kv: (total_tokens, kv_lora_rank + qk_rope_head_dim)
     """
-    # FA3 (flash_attn_interface); FA2 `flash_attn` is not assumed to be
-    # installed. Same kwargs; the tuple return is normalized below.
+    # FA3 (flash_attn_interface); FA2 `flash_attn` is not installed on the
+    # H20 node. Same kwargs; the tuple return is normalized below.
     from flash_attn_interface import flash_attn_varlen_func
 
     total_tokens = hidden_states_2d.shape[0]
@@ -184,6 +243,7 @@ def mla_prefill_nope_prepacked(
     if self.use_output_gate:
         attn_output = attn_output * self.g_proj(hidden_states_2d).sigmoid()
     attn_output = self.o_proj(attn_output)
+    attn_output = _reduce_mla_tp_output(self, attn_output)
     return attn_output, offload_kv
 
 
@@ -205,7 +265,12 @@ def mla_decoding_nope_with_pagekv(
         attn_output: (bsz, 1, hidden)
         k_tensor: (bsz, 1, 1, 576) new KV (already written into pages)
     """
-    from batchgen.attention.mla.flashmla_backend import (
+    # K3's pure-BF16 NoPE path only consumes the two FlashMLA entry points.
+    # Importing the legacy BatchGen backend here also imports fa3_backend and
+    # DeepGEMM, neither of which participates in this forward.  The K3 server
+    # has already imported, validated, and kernel-warmed flash_mla before HTTP
+    # readiness, so this cached import performs no first-admission setup.
+    from flash_mla import (
         flash_mla_with_kvcache,
         get_mla_metadata,
     )
@@ -304,6 +369,7 @@ def mla_decoding_nope_with_pagekv(
         gate = F.linear(hidden_states, self.g_proj.weight).sigmoid()
         attn_output = attn_output * gate
     attn_output = F.linear(attn_output, self.o_proj.weight)
+    attn_output = _reduce_mla_tp_output(self, attn_output)
     return attn_output.view(bsz, 1, -1), k_tensor
 
 
@@ -312,13 +378,106 @@ def mla_decoding_nope_with_pagekv(
 # ============================================================================
 
 
-def _kda_project(self, hidden_states_2d):
+_KDA_DECODE_FUSED_WEIGHT = "_kda_decode_fused_weight"
+_KDA_DECODE_FUSED_SIZES = "_kda_decode_fused_sizes"
+
+
+def fuse_kda_decode_projections(self) -> bool:
+    """Fuse K3's independent decode projections into one GEMM weight.
+
+    K3's KDA layer has four large projections (Q/K/V/full-rank output gate),
+    one small per-head beta projection, and the first projection of the
+    low-rank forget gate.  They all consume the same decode hidden row.  The
+    second forget-gate projection remains a dependent GEMM, so the fused path
+    reduces the projection front from seven GEMMs to two.
+
+    This is deliberately decode-only: prefill keeps the original projection
+    calls so its established numerical path is unchanged.  The original
+    ``Linear.weight`` parameters are rebound to views of the single buffer,
+    avoiding a second copy of the weights while retaining the prefill API.
+    Returns ``False`` for non-K3/low-rank variants or mixed/ineligible dtypes.
+    """
+    if getattr(self, _KDA_DECODE_FUSED_WEIGHT, None) is not None:
+        return True
+    if not bool(getattr(self, "use_full_rank_gate", False)):
+        return False
+
+    names = ("q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_a_proj")
+    weights = []
+    for name in names:
+        projection = getattr(self, name, None)
+        weight = getattr(projection, "weight", None)
+        if weight is None or weight.ndim != 2 or weight.is_meta:
+            return False
+        if getattr(projection, "bias", None) is not None:
+            return False
+        weights.append(weight)
+
+    hidden_size = weights[0].shape[1]
+    dtype = weights[0].dtype
+    device = weights[0].device
+    if any(
+        weight.shape[1] != hidden_size
+        or weight.dtype != dtype
+        or weight.device != device
+        for weight in weights
+    ):
+        return False
+
+    # The order is part of the serving contract consumed by _kda_project.
+    sizes = tuple(int(weight.shape[0]) for weight in weights)
+    total = sum(sizes)
+    # Pad the fused N to a multiple of 16 with zero rows. K3 TP8 gives
+    # q/k/v/g 4x1536 + beta 12 + f_a 128 = 6284: cuBLAS then falls back to an
+    # sm80 kernel (MEASURED H200, [M,7168]x[7168,N] bf16: 89 us at M=160,
+    # 37 us at M=24 for N=6284 vs 30 / 26.5 us for N=6288 through the sm90
+    # nvjet kernel at the 27 us weight-read floor; 69 KDA layers per step).
+    # _kda_project slices the first ``total`` columns before splitting.
+    padded_rows = (-total) % 16
+    with torch.no_grad():
+        parts = [weight.detach() for weight in weights]
+        if padded_rows:
+            parts.append(parts[0].new_zeros((padded_rows, hidden_size)))
+        fused = torch.cat(parts, dim=0)
+    self.register_buffer(_KDA_DECODE_FUSED_WEIGHT, fused, persistent=False)
+    setattr(self, _KDA_DECODE_FUSED_SIZES, sizes)
+
+    start = 0
+    for name, size in zip(names, sizes):
+        projection = getattr(self, name)
+        projection.weight = torch.nn.Parameter(
+            fused[start : start + size], requires_grad=False
+        )
+        start += size
+    return True
+
+
+def _kda_project(self, hidden_states_2d, *, decode=False,
+                 return_mixed_qkv=False):
     """Run all KDA projections on packed (total_tokens, hidden) input.
 
     Returns q, k, v (total, proj), f gate (total, H, K), beta raw (total, H),
     and the output gate z (total, H, K).
     """
     num_heads, head_dim = self.num_heads, self.head_dim
+    fused = getattr(self, _KDA_DECODE_FUSED_WEIGHT, None) if decode else None
+    if fused is not None:
+        # The six rows below are all independent linear maps of the same
+        # activation.  Keeping f_a in this GEMM is safe because only f_b is
+        # dependent; the fused output is still split into the exact native
+        # layouts consumed by the recurrent kernel.
+        fused_states = F.linear(hidden_states_2d, fused)
+        sizes = getattr(self, _KDA_DECODE_FUSED_SIZES)
+        q, k, v, z, beta, f_a = torch.split(
+            fused_states[:, : sum(sizes)], sizes, dim=-1
+        )
+        f = F.linear(f_a, self.f_b_proj.weight).view(-1, num_heads, head_dim)
+        z = z.view(-1, num_heads, head_dim)
+        mixed_qkv = fused_states[:, : 3 * num_heads * head_dim]
+        if return_mixed_qkv:
+            return q, k, v, f, beta, z, mixed_qkv
+        return q, k, v, f, beta, z
+
     q = self.q_proj(hidden_states_2d)
     k = self.k_proj(hidden_states_2d)
     v = self.v_proj(hidden_states_2d)
@@ -333,7 +492,122 @@ def _kda_project(self, hidden_states_2d):
     else:
         z = self.g_b_proj(self.g_a_proj(hidden_states_2d))
         z = z.view(-1, num_heads, head_dim)
+    if return_mixed_qkv:
+        return q, k, v, f, beta, z, None
     return q, k, v, f, beta, z
+
+
+def _kda_fused_conv_args(conv):
+    """Expose a K3 ShortConvolution in the fused kernel's native layout.
+
+    K3 stores the depthwise weights as FP32 ``[channels, 1, 4]``.  Squeezing
+    the singleton axis produces a stride-preserving ``[channels, 4]`` view;
+    no per-layer transpose or dtype conversion is allowed on the decode path.
+    """
+    weight = getattr(conv, "weight", None)
+    if weight is None or weight.dtype is not torch.float32:
+        return None
+    if weight.ndim == 3:
+        if weight.shape[1] != 1:
+            return None
+        weight = weight[:, 0, :]
+    if weight.ndim != 2 or weight.shape[1] != 4:
+        return None
+    bias = getattr(conv, "bias", None)
+    if bias is not None and (
+        bias.dtype is not torch.float32 or bias.ndim != 1
+        or bias.shape[0] != weight.shape[0]
+    ):
+        return None
+    return weight, bias
+
+
+def _kda_o_norm_eps(attention):
+    """Return the output-norm epsilon across the supported FLA APIs.
+
+    The local K3 model shim calls this field ``variance_epsilon``, while the
+    FLA ``FusedRMSNormGated`` used by the serving runtime exposes the same
+    value as ``eps``.  Keep the model config as a final fallback so the fused
+    kernel receives the checkpoint's configured epsilon instead of failing at
+    graph capture.
+    """
+    eps = getattr(attention.o_norm, "variance_epsilon", None)
+    if eps is None:
+        eps = getattr(attention.o_norm, "eps", None)
+    if eps is None:
+        eps = getattr(getattr(attention, "config", None), "rms_norm_eps", None)
+    if eps is None:
+        raise AttributeError(
+            "KDA output norm exposes neither variance_epsilon nor eps, and "
+            "the attention config has no rms_norm_eps"
+        )
+    return eps
+
+
+def _kda_fused_decode(self, mixed_qkv, f, beta, z, kda_state, slot_ids):
+    """Try the AOT K3 end-to-end KDA decode kernel.
+
+    ``None`` means the established FLA chain must be used.  The fallback is
+    intentionally retained for non-K3 variants and for installations whose
+    wheel predates this optional kernel; production K3 startup still records
+    the fallback so it cannot be mistaken for the optimized path.
+    """
+    global _KDA_FUSED_DECODE_IMPORT_FAILED
+    if mixed_qkv is None or not bool(getattr(self, "use_full_rank_gate", False)):
+        return None
+    try:
+        from batchgen_kernels.attention.kda_fused_decode import (
+            covered,
+            kda_fused_decode,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        if not _KDA_FUSED_DECODE_IMPORT_FAILED:
+            logger.warning(
+                "K3 fused KDA decode extension unavailable; using FLA chain: %s",
+                exc,
+            )
+            _KDA_FUSED_DECODE_IMPORT_FAILED = True
+        return None
+
+    q_args = _kda_fused_conv_args(self.q_conv1d)
+    k_args = _kda_fused_conv_args(self.k_conv1d)
+    v_args = _kda_fused_conv_args(self.v_conv1d)
+    if q_args is None or k_args is None or v_args is None:
+        return None
+    q_weight, q_bias = q_args
+    k_weight, k_bias = k_args
+    v_weight, v_bias = v_args
+    f_flat = f.reshape(f.shape[0], -1)
+    z_flat = z.reshape(z.shape[0], -1)
+    if not covered(
+        mixed_qkv, f_flat, beta,
+        kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
+        q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
+        self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
+        kda_state.recurrent_pool, slot_ids,
+    ):
+        return None
+    onorm_eps = _kda_o_norm_eps(self)
+    try:
+        return kda_fused_decode(
+            mixed_qkv, f_flat, beta,
+            kda_state.conv_q, kda_state.conv_k, kda_state.conv_v,
+            q_weight, k_weight, v_weight, q_bias, k_bias, v_bias,
+            self.A_log, self.dt_bias, z_flat, self.o_norm.weight,
+            kda_state.recurrent_pool, slot_ids,
+            scale=self.head_dim ** -0.5,
+            onorm_eps=onorm_eps,
+            lower_bound=self.gate_lower_bound,
+        )
+    except ImportError as exc:
+        # AOT import can succeed while the extension's transitive CUDA image
+        # is absent from an old wheel. Do not repeatedly probe every KDA layer.
+        if not _KDA_FUSED_DECODE_IMPORT_FAILED:
+            logger.warning(
+                "K3 fused KDA decode failed to load; using FLA chain: %s", exc
+            )
+            _KDA_FUSED_DECODE_IMPORT_FAILED = True
+        return None
 
 
 def _conv_weights(conv, dtype):
@@ -345,6 +619,17 @@ def _conv_weights(conv, dtype):
     """
     bias = getattr(conv, "bias", None)
     return conv.weight.to(dtype), (None if bias is None else bias.to(dtype))
+
+
+def _linear_no_bias_into(linear, x, out):
+    """Evaluate a 2-D bias-free ``nn.Linear`` into caller-owned storage."""
+    if linear.bias is not None:
+        raise ValueError("linear output reuse requires bias=False")
+    if x.ndim != 2 or out.ndim != 2:
+        raise ValueError("linear output reuse requires 2-D tensors")
+    if out.shape != (x.shape[0], linear.weight.shape[0]):
+        raise ValueError("linear output reuse received an incompatible output")
+    return torch.mm(x, linear.weight.t(), out=out)
 
 
 # fla's chunk_kda internal chunk size (its `chunk_size` kwarg default). Every
@@ -442,6 +727,42 @@ def _kda_segment_plan(cu_list, segment_tokens):
     return plan
 
 
+# One-entry cache of the segment plan for the current prefill microbatch.
+# The worker builds ``prepack_cu_seqlens`` on the device once per microbatch
+# and every KDA layer receives that same tensor object, so keying on identity
+# is exact.  Without it each of the 69 KDA layers re-ran ``cu_seqlens.tolist()``
+# (a device sync) and built one small device tensor per segment from host
+# memory (a pageable copy that drains the stream): 128 stalls per layer at
+# exact 64K, measured as ~100 ms/layer of idle inside the chunk sweep.
+_KDA_SEGMENT_PLAN_CACHE = {}
+
+
+def _kda_cached_segment_plan(cu_seqlens, segment_tokens):
+    """Return ``[(start, end, seq_lo, seq_hi, bounds_tensor)]`` for this batch."""
+    entry = _KDA_SEGMENT_PLAN_CACHE.get("entry")
+    if (
+        entry is not None
+        and entry["cu_seqlens"] is cu_seqlens
+        and entry["segment_tokens"] == segment_tokens
+    ):
+        return entry["plan"]
+    plan = [
+        (
+            start, end, lo, hi,
+            torch.tensor(bounds, dtype=torch.long, device=cu_seqlens.device),
+        )
+        for start, end, lo, hi, bounds in _kda_segment_plan(
+            cu_seqlens.tolist(), segment_tokens
+        )
+    ]
+    _KDA_SEGMENT_PLAN_CACHE["entry"] = {
+        "cu_seqlens": cu_seqlens,
+        "segment_tokens": segment_tokens,
+        "plan": plan,
+    }
+    return plan
+
+
 def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
                         recurrent_pool, kernel_kwargs, segment_tokens):
     """Run chunk_kda over a packed range, in token segments, and write the
@@ -471,14 +792,19 @@ def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
 
     o = torch.empty(q.shape[0], total, v.shape[2], v.shape[3],
                     dtype=v.dtype, device=v.device)
-    for start, end, lo, hi, bounds in _kda_segment_plan(
-            cu_seqlens.tolist(), segment_tokens):
+    for start, end, lo, hi, bounds in _kda_cached_segment_plan(
+            cu_seqlens, segment_tokens):
         seg_slots = slots[lo:hi]
+        # A segment inside one sequence is a plain batch-1 call: fla's varlen
+        # entry prepares chunk indices from ``cu_seqlens`` on every call whose
+        # bounds tensor misses its cache (1.6 ms vs 0.75 ms per 4,096-token
+        # segment on H200, 128 segments per layer at exact 64K), while the
+        # batched kernel is bit-identical for a single sequence.
         o_seg, recurrent_out = chunk_kda_fn(
             q=q[:, start:end], k=k[:, start:end], v=v[:, start:end],
             g=f[:, start:end], beta=beta[:, start:end],
             initial_state=recurrent_pool.index_select(0, seg_slots),
-            cu_seqlens=torch.tensor(bounds, dtype=torch.long, device=q.device),
+            cu_seqlens=None if hi - lo == 1 else bounds,
             **kernel_kwargs,
         )
         # The sequence that straddles `end` gets a PARTIAL state here; the
@@ -486,6 +812,46 @@ def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
         recurrent_pool.index_copy_(0, seg_slots, recurrent_out)
         o[:, start:end] = o_seg
     return o
+
+
+_KDA_CONV_FALLBACK_WARNED = False
+
+
+def _kda_prefill_conv(x, weight, bias, conv_pool, cu_seqlens, slot_ids,
+                      has_initial_state):
+    """Causal conv with state, in ``x``'s storage; token-major Triton on CUDA.
+
+    The Triton path is bit-identical to ``causal_conv1d_fwd`` and about an
+    order of magnitude faster at exact 64K; any unsupported shape takes the
+    CUDA kernel and says so once.
+    """
+    global _KDA_CONV_FALLBACK_WARNED
+    if x.is_cuda:
+        from .kda_conv_triton import (
+            kda_causal_conv1d_triton,
+            supports_kda_conv_triton,
+        )
+
+        if supports_kda_conv_triton(x, weight, conv_pool):
+            return kda_causal_conv1d_triton(
+                x, weight, bias, conv_pool, cu_seqlens, slot_ids,
+                has_initial_state,
+            )
+        if not _KDA_CONV_FALLBACK_WARNED:
+            _KDA_CONV_FALLBACK_WARNED = True
+            logging.warning(
+                "Kimi-K3 KDA prefill conv shape %s/%s is outside the token-major "
+                "Triton contract; using the channel-major CUDA kernel",
+                tuple(x.shape), tuple(weight.shape),
+            )
+    from batchgen_kernels.conv1d import causal_conv1d_fwd
+
+    return causal_conv1d_fwd(
+        x, weight, bias=bias,
+        conv_states=conv_pool, query_start_loc=cu_seqlens,
+        cache_indices=slot_ids, has_initial_state=has_initial_state,
+        overwrite_x=True,
+    )
 
 
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
@@ -527,7 +893,10 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     total = hidden_states_2d.shape[0]
     num_heads, head_dim = self.num_heads, self.head_dim
 
+    profiler, span = _begin_streamed_sp8_profile(self)
     q, k, v, f, beta, z = _kda_project(self, hidden_states_2d)
+    _end_streamed_sp8_profile(profiler, "kda_project", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
 
     # conv (silu) with final-state write into the pools at slot_ids.
     # overwrite_x=True: the conv result is transposed back into the projection's
@@ -542,26 +911,20 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     # for the unsegmented sweep it was measured against. Still worth having:
     # nothing else makes the segment slices contiguous, and it is free.
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
-    q = causal_conv1d_fwd(
-        q, qw, bias=qb,
-        conv_states=kda_state.conv_q, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    q = _kda_prefill_conv(
+        q, qw, qb, kda_state.conv_q, cu_seqlens, slot_ids, has_initial_state
     )
     kw, kb = _conv_weights(self.k_conv1d, k.dtype)
-    k = causal_conv1d_fwd(
-        k, kw, bias=kb,
-        conv_states=kda_state.conv_k, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    k = _kda_prefill_conv(
+        k, kw, kb, kda_state.conv_k, cu_seqlens, slot_ids, has_initial_state
     )
     vw, vb = _conv_weights(self.v_conv1d, v.dtype)
-    v = causal_conv1d_fwd(
-        v, vw, bias=vb,
-        conv_states=kda_state.conv_v, query_start_loc=cu_seqlens,
-        cache_indices=slot_ids, has_initial_state=has_initial_state,
-        overwrite_x=True,
+    v = _kda_prefill_conv(
+        v, vw, vb, kda_state.conv_v, cu_seqlens, slot_ids, has_initial_state
     )
+
+    _end_streamed_sp8_profile(profiler, "kda_conv", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
 
     q = rearrange(q, "l (h d) -> 1 l h d", h=num_heads)
     k = rearrange(k, "l (h d) -> 1 l h d", h=num_heads)
@@ -582,13 +945,27 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         ),
         segment_tokens,
     )
+    _end_streamed_sp8_profile(profiler, "kda_chunk", span)
+    span = profiler.begin_profile_span() if profiler is not None else None
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
-    o = self.o_proj(o.reshape(total, num_heads * head_dim))
-    return o
+    # All projections from ``hidden_states_2d`` have completed, so its storage
+    # is dead until this attention result is returned. Reuse that exact
+    # (total, hidden) allocation for the row-parallel output projection. At
+    # exact 64K K3 this avoids a late 896 MiB allocation while preserving the
+    # same bias-free GEMM (verified bit-identical at the production shape).
+    o = _linear_no_bias_into(
+        self.o_proj,
+        o.reshape(total, num_heads * head_dim),
+        hidden_states_2d,
+    )
+    _end_streamed_sp8_profile(profiler, "kda_output", span)
+    # M2a head-parallel KDA: sum the row-parallel o_proj shards. Streamed-SP8
+    # retains only this rank's token rows; every other phase all-reduces.
+    return _reduce_mla_tp_output(self, o)
 
 
-def kda_decode_serving(self, hidden_states, kda_state):
+def kda_decode_serving(self, hidden_states, kda_state, *, cu_seqlens=None):
     """KDA single-token decode over pooled state.
 
     Args:
@@ -598,18 +975,30 @@ def kda_decode_serving(self, hidden_states, kda_state):
     Returns:
         (bsz, 1, hidden) attention output.
     """
-    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
-
-    from batchgen_kernels.conv1d import causal_conv1d_update
-
     bsz = hidden_states.shape[0]
     device = hidden_states.device
     num_heads, head_dim = self.num_heads, self.head_dim
 
     hidden_2d = hidden_states.squeeze(1)
-    q, k, v, f, beta, z = _kda_project(self, hidden_2d)
+    q, k, v, f, beta, z, mixed_qkv = _kda_project(
+        self, hidden_2d, decode=True, return_mixed_qkv=True
+    )
 
     slot_ids = kda_state.cur_decode_slots  # (bsz,) int32
+
+    fused_output = _kda_fused_decode(
+        self, mixed_qkv, f, beta, z, kda_state, slot_ids
+    )
+    if fused_output is not None:
+        o = self.o_proj(fused_output)
+        o = _reduce_mla_tp_output(self, o)
+        return o.unsqueeze(1)
+
+    # Established correctness fallback for Kimi-Linear-48B, old wheels, and
+    # any K3 tensor layout outside the AOT kernel's covered contract.
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+    from batchgen_kernels.conv1d import causal_conv1d_update
 
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_update(
@@ -632,7 +1021,10 @@ def kda_decode_serving(self, hidden_states, kda_state):
     v = v.view(1, bsz, num_heads, head_dim)
     f = f.view(1, bsz, num_heads, head_dim)
     beta = beta.view(1, bsz, num_heads)
-    cu = torch.arange(bsz + 1, dtype=torch.long, device=device)
+    if cu_seqlens is None:
+        cu = torch.arange(bsz + 1, dtype=torch.long, device=device)
+    else:
+        cu = cu_seqlens
 
     o = torch.empty(1, bsz, num_heads, head_dim, dtype=v.dtype, device=device)
     fused_recurrent_kda_fwd(
@@ -652,6 +1044,7 @@ def kda_decode_serving(self, hidden_states, kda_state):
 
     o = self.o_norm(o.reshape(bsz, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(bsz, num_heads * head_dim))
+    o = _reduce_mla_tp_output(self, o)
     return o.unsqueeze(1)
 
 
@@ -737,6 +1130,12 @@ def _require_k3_latent_moe(self):
         )
 
 
+def _merge_resident_prefill_shared(routed, shared):
+    """Add the shared path without allocating a second full hidden output."""
+    routed.add_(shared)
+    return routed
+
+
 def moe_forward_resident_ep_decode(self, hidden_states, resident):
     """KimiSparseMoeBlock DECODE forward — resident EP-8 + fused BF16 MoE.
 
@@ -751,20 +1150,92 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
     hidden space, so a LatentMoE config has no representation here.
     """
     if getattr(self, "use_latent_moe", False):
-        raise NotImplementedError(
-            "resident-EP decode does not implement LatentMoE: the stacked "
-            "shard (batchgen.moe.fused_moe_bf16_resident) routes and runs the "
-            "experts in the hidden space, with no routed_expert_down_proj / "
-            "routed_expert_norm / routed_expert_up_proj seam. Run K3 decode "
-            "with decode_moe_mode='streamed' (moe_forward_serving's streamed "
-            "path implements the latent form) until the resident shard grows "
-            "one."
-        )
+        # M3.1a (A13): MXFP4 LatentMoE resident decode. The resident layer runs
+        # the full latent expert path (routed_expert_down_proj once/token ->
+        # grouped MXFP4 S1(SiTU)+S3 on the resident shard -> fp32 top-k combine
+        # -> routed_expert_norm -> routed_expert_up_proj); THIS seam only adds
+        # the DP-local shared expert, exactly like the BF16 branch below. A
+        # latent config MUST have built ResidentEPMXFP4MoELayer (PSM
+        # is_mxfp4_quantized branch); the BF16 stacked shard has no latent seam
+        # and is refused here rather than silently run in the wrong space.
+        from batchgen.moe.fused_moe_mxfp4_resident import ResidentEPMXFP4MoELayer
+
+        if not isinstance(resident, ResidentEPMXFP4MoELayer):
+            raise RuntimeError(
+                "LatentMoE decode reached moe_forward_resident_ep_decode with a "
+                f"non-MXFP4 resident ({type(resident).__name__}): the BF16 "
+                "stacked shard (fused_moe_bf16_resident) has no "
+                "routed_expert_down/norm/up latent seam. A K3 latent config must "
+                "build ResidentEPMXFP4MoELayer via the PSM is_mxfp4_quantized "
+                "branch."
+            )
+        # M3.1b (A13/A16): the EP all_gather/all_reduce now live INSIDE
+        # resident.forward. Under TP-G decode the G ranks of a group hold the
+        # SAME rows (replicated attention) but the resident layer is a DP
+        # contract, so — exactly like the BF16 branch below — scatter the
+        # group's rows into G distinct DP slices, route each through the
+        # UNCHANGED latent forward, then gather back to the full group batch.
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_dim)
+        G = int(getattr(self, "attn_tp_size", 1))
+        if G > 1 and getattr(resident, "latent_tp_size", 1) > 1:
+            # TP-sharded latent projections: the resident forward returns a
+            # [B_grp, H] row-parallel up_proj PARTIAL over the whole group's
+            # rows; sum it with the shared expert's own TP partial in ONE
+            # all_reduce (the graph segment does the same).
+            import torch.distributed as dist
+            from .moe_tp_reshard import scatter_rows
+
+            x_local = scatter_rows(x, G, self.attn_tp_rank)
+            total = resident.forward(x_local, self.gate, x_group=x)
+            shared = getattr(self, "shared_experts", None)
+            if shared is not None:
+                total = total + shared._ffn(identity.reshape(-1, self.hidden_dim))
+            dist.all_reduce(total, group=self.attn_tp_group)
+            return total.reshape(orig_shape)
+        if G > 1:
+            from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+            B_grp = x.shape[0]
+            x_local = scatter_rows(x, G, self.attn_tp_rank)
+            routed_local = resident.forward(x_local, self.gate)
+            routed = all_gather_rows(
+                routed_local, B_grp, G, self.attn_tp_rank, self.attn_tp_group
+            )
+        else:
+            routed = resident.forward(x, self.gate)
+        out = routed.reshape(orig_shape)
+        if getattr(self, "shared_experts", None) is not None:
+            shared = self.shared_experts(identity)
+            if getattr(self, "_resident_ep_prefill_enabled", False):
+                out = _merge_resident_prefill_shared(out, shared)
+            else:
+                out = out + shared
+        return out
+
     identity = hidden_states
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)
 
-    routed = resident.forward(x, self.gate)
+    # M2b: under DP-(world/G) x TP-G decode the G ranks of a group hold the SAME
+    # rows (replicated attention), but ResidentEPMoELayer is a DP-32 contract.
+    # Scatter the group's rows into G distinct slices (DP-32 restored), route
+    # each slice through the UNCHANGED resident forward, then gather back to the
+    # full group batch (attention downstream needs all rows on every rank). An
+    # empty rank (B_grp<G) still runs resident.forward + the gather (lockstep).
+    G = int(getattr(self, "attn_tp_size", 1))
+    if G > 1:
+        from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+        B_grp = x.shape[0]
+        x_local = scatter_rows(x, G, self.attn_tp_rank)
+        routed_local = resident.forward(x_local, self.gate)
+        routed = all_gather_rows(
+            routed_local, B_grp, G, self.attn_tp_rank, self.attn_tp_group
+        )
+    else:
+        routed = resident.forward(x, self.gate)
 
     out = routed.reshape(orig_shape)
     if getattr(self, "shared_experts", None) is not None:
@@ -825,8 +1296,143 @@ def moe_forward_serving(self, hidden_states):
     _require_k3_latent_moe(self)
 
     resident = getattr(self, "_resident_ep_moe", None)
-    if resident is not None and KimiLinearExpertWrapper.phase == "decode":
+    resident_prefill = bool(
+        getattr(self, "_resident_ep_prefill_enabled", False)
+    )
+    if resident is not None and (
+        KimiLinearExpertWrapper.phase == "decode" or resident_prefill
+    ):
         return moe_forward_resident_ep_decode(self, hidden_states, resident)
+
+    streamed_sp8 = getattr(self, "_streamed_sp8_moe", None)
+    if (
+        streamed_sp8 is not None
+        and getattr(self, "_streamed_sp8_prefill_enabled", False)
+        and KimiLinearExpertWrapper.phase == "prefill"
+    ):
+        profiler = type(streamed_sp8)
+        profile = profiler._prefill_profile_enabled
+        moe_span = profiler.begin_profile_span() if profile else None
+        orig_shape = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_dim)
+        G = int(getattr(self, "attn_tp_size", 1))
+        if G <= 1:
+            raise RuntimeError(
+                "streamed-SP8 prefill reached MoE without TP row sharding"
+            )
+        from .moe_tp_reshard import (
+            all_gather_rows_add_,
+            all_gather_rows,
+            balanced_row_split,
+            scatter_rows,
+        )
+
+        global_rows = getattr(self, "_streamed_sp8_global_rows", None)
+        input_sharded = bool(
+            getattr(self, "_streamed_sp8_sharded_carry", False)
+            and global_rows is not None
+        )
+        num_rows = int(global_rows if input_sharded else x.shape[0])
+        splits = balanced_row_split(num_rows, G)
+        local_start, local_end = splits[self.attn_tp_rank]
+        if input_sharded:
+            if x.shape[0] != local_end - local_start:
+                raise ValueError(
+                    "streamed-SP8 MoE input has the wrong local row count"
+                )
+            x_local = x
+        else:
+            x_local = scatter_rows(x, G, self.attn_tp_rank)
+        # The layer is expert-parallel inside the node, so it needs the node's
+        # pre-split row count to pad this slice to the shared ntp stride its
+        # node-local latent gather and reduce-scatter are laid out on.
+        routed_local = streamed_sp8.forward(x_local, self.gate, num_rows)
+        if getattr(self, "shared_experts", None) is not None:
+            shared_span = profiler.begin_profile_span() if profile else None
+            if input_sharded:
+                # Shared-expert weights are row-parallel over their
+                # intermediate dimension, so every TP rank still needs every
+                # input row. Reassemble those rows, run the unchanged local
+                # weight shard, then preserve the established BF16 all-reduce
+                # before retaining this rank's row slice. Calling
+                # ``forward_into`` on distinct local rows would all-reduce
+                # unrelated tokens and is mathematically wrong. A direct
+                # reduce-scatter was rejected by the world-8 parity gate: its
+                # different NCCL reduction order exceeded the max-error budget.
+                gather_span = (
+                    profiler.begin_profile_span() if profile else None
+                )
+                shared_input = all_gather_rows(
+                    x,
+                    num_rows,
+                    G,
+                    self.attn_tp_rank,
+                    self.attn_tp_group,
+                )
+                if profile:
+                    profiler.end_profile_span(
+                        "shared_input_gather", gather_span
+                    )
+                shared_partial = self.shared_experts._ffn_into(
+                    shared_input, shared_input
+                )
+                reduce_span = (
+                    profiler.begin_profile_span() if profile else None
+                )
+                import torch.distributed as dist
+
+                dist.all_reduce(
+                    shared_partial, group=self.attn_tp_group
+                )
+                shared_output = scatter_rows(
+                    shared_partial, G, self.attn_tp_rank
+                ).clone()
+                del shared_partial
+                if profile:
+                    profiler.end_profile_span(
+                        "shared_expert_reduce", reduce_span
+                    )
+            else:
+                shared_output = self.shared_experts.forward_into(x, x)
+            if profile:
+                profiler.end_profile_span("shared_expert", shared_span)
+        else:
+            shared_output = x.zero_()
+        if input_sharded:
+            shared_output.add_(routed_local)
+            out = shared_output.reshape(orig_shape)
+            if profile:
+                profiler.end_profile_span("moe_serving_total", moe_span)
+            streamed_sp8.buffer.allow_cross_launch()
+            return out
+
+        routed_gather_span = (
+            profiler.begin_profile_span() if profile else None
+        )
+        all_gather_rows_add_(
+            x,
+            routed_local,
+            num_rows,
+            G,
+            self.attn_tp_rank,
+            self.attn_tp_group,
+        )
+        if profile:
+            profiler.end_profile_span(
+                "routed_output_gather", routed_gather_span
+            )
+        out = x.reshape(orig_shape)
+        # Every TP8 collective of this layer -- the node-local latent/routing
+        # gathers, the FP32 reduce-scatter, the routed-output all-gather above
+        # and the shared expert's row-parallel all-reduce -- has now been
+        # issued. Only here may the parked prefetch thread launch the next
+        # layer's cross-node broadcasts, so under NCCL_LAUNCH_ORDER_IMPLICIT=1
+        # their payloads overlap the next layer's attention compute instead of
+        # pushing the peers' wait into one of the collectives above (E1).
+        if profile:
+            profiler.end_profile_span("moe_serving_total", moe_span)
+        streamed_sp8.buffer.allow_cross_launch()
+        return out
 
     identity = hidden_states
     orig_shape = hidden_states.shape

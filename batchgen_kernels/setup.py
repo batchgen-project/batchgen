@@ -271,6 +271,19 @@ _sm90a_extensions = [
                      "--threads", _nvcc_threads],
         },
     ),
+    # Fused K3 KDA decode: short-conv update + recurrent delta rule + gated
+    # RMSNorm.  The kernel is K3/SM90a-specific and is AOT-only at runtime.
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_kda_fused_decode",
+        sources=["src/attention/kda_fused_decode.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads],
+        },
+    ),
 ]
 
 _sm80_extensions = [

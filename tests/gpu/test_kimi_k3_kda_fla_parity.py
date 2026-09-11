@@ -3,7 +3,7 @@
 #  copyright (c) EfficientMoE team 2025                                         #
 #  Licensed under the Apache License, Version 2.0                               #
 # ---------------------------------------------------------------------------- #
-"""STAGED GPU validation for Kimi-K3 M2 — run on a CUDA GPU.
+"""STAGED GPU validation for Kimi-K3 M2 — run on <gpu-host>, GPU 0.
 
 This is the closure for everything the CPU suite cannot see (the fla CPU shim
 backs BOTH stacks there, so the kernel interior cancels):
@@ -42,7 +42,7 @@ backs BOTH stacks there, so the kernel interior cancels):
        of test_E_kernel_seam_amplification, measured and explained in
        test_F_varlen_full_depth_limit.
 
-Launch (from the repo root on the GPU machine; see run_kimi_k3_kda.sh):
+Launch (from the repo root ON <gpu-host>; see run_kimi_k3_kda_gpu.sh):
     K3_GPU_STAGE=1 CUDA_VISIBLE_DEVICES=0 python -m pytest \
         tests/gpu/test_kimi_k3_kda_fla_parity.py -x -q -rA
 
@@ -72,11 +72,11 @@ import kimi_k3_harness as H  # noqa: E402
 if os.environ.get("K3_GPU_STAGE") == "1" and not torch.cuda.is_available():
     raise RuntimeError(
         "K3_GPU_STAGE=1 but CUDA is unavailable — this staged run must not "
-        "silently skip. Check CUDA_VISIBLE_DEVICES / the driver.")
+        "silently skip. Check CUDA_VISIBLE_DEVICES / the driver on <gpu-host>.")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="staged GPU validation (see tests/gpu/run_kimi_k3_kda.sh)")
+    reason="staged for <gpu-host> GPU 0 (see tests/gpu/run_kimi_k3_kda_gpu.sh)")
 
 DEV = "cuda"
 
@@ -414,10 +414,11 @@ def test_D_lean_mixer_gpu():
     assert out.shape == (T, hidden)
 
     # The bound is DERIVED, not a round number. The old `1 << 30` was
-    # arbitrary and the true peak sat slightly over it, which says
+    # arbitrary and the true peak (1138 MiB) sat 8% over it, which says
     # nothing about correctness. Peak = output + N live fp32 chunk working
-    # sets (N measured just under 4 at chunk 1024, and the peak scales
-    # linearly with chunk_size, confirming the model). Allow N = 4.
+    # sets; measured N = 3.63 at chunk 1024 (2026-08-05, H20), and the
+    # measured peak scales linearly with chunk_size (1138 / 665 / 446 MiB at
+    # 1024 / 512 / 256), confirming the model. Allow N = 4.
     out_bytes = out.numel() * out.element_size()
     chunk_set = 1024 * (nb + 1) * hidden * 4
     limit = out_bytes + 4 * chunk_set
@@ -615,7 +616,7 @@ def test_E_full_model_gpu():
         ref_logits = oracle_model(input_ids=ids, use_cache=False).logits
     # TIGHTENED, not loosened: with the kernel seam removed the two stacks are
     # BIT-identical, so this is a stronger assertion than the bf16 gate it
-    # replaces. Measured 2026-08-06: err_ratio 0.000000, top-1 100.00%,
+    # replaces. Measured 2026-08-06 on H20: err_ratio 0.000000, top-1 100.00%,
     # max_abs 0.0, in BOTH fp32 and bf16.
     assert torch.equal(ours_logits, ref_logits), (
         "full model GPU: our stack and the oracle must be bit-identical once "
@@ -634,7 +635,7 @@ def test_E_full_model_gpu():
 #: Deliberately unequal, and none of them a multiple of chunk_kda's internal
 #: 64 except the last: 37 is a segment SHORTER than one kernel chunk, 53 puts a
 #: boundary inside a chunk, 128 is chunk-aligned.  Every number quoted in this
-#: section was measured at these seqlens, 2026-08-06.
+#: section was measured at these seqlens on H20, 2026-08-06.
 PACKED_SEQLENS = (37, 53, 128)
 
 
@@ -817,7 +818,7 @@ def test_F_varlen_full_depth_limit():
     unattainable there, so nobody "fixes" a future failure by loosening a gate
     — and asserts the part that IS attainable.
 
-    Measured 2026-08-06, seqlens (37, 53, 128), against the oracle run per
+    Measured 2026-08-06, H20, seqlens (37, 53, 128), against the oracle run per
     sequence:  packed err_ratio 1.62e-1 (bf16) / 4.29e-1 (fp32), while the
     cu_seqlens=None control sits at 1.25.  Those are not packing bugs; the
     chain was traced end to end:

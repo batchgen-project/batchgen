@@ -17,12 +17,9 @@ What it pins:
 Run: python -m batchgen_kernels.tests.kimi_linear.test_conv1d_layout_cpu
 """
 
-import logging
 import sys
 
 import torch
-
-_LOG = logging.getLogger("batchgen_kernels.tests.kimi_linear.conv1d_layout_cpu")
 from einops import rearrange
 
 import batchgen_kernels.conv1d as conv1d_mod
@@ -94,7 +91,7 @@ def main():
     fails = []
 
     def check(name, ok, detail=""):
-        _LOG.info(f"{'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
+        print(f"{'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
         if not ok:
             fails.append(name)
 
@@ -166,11 +163,11 @@ def main():
     check("...and refuses before the kernel touches conv_states",
           torch.equal(pool_c, pool_c0))
 
-    _LOG.info("")
+    print()
     if fails:
-        _LOG.info(f"{len(fails)} FAILED: {fails}")
+        print(f"{len(fails)} FAILED: {fails}")
         return 1
-    _LOG.info("all checks passed")
+    print("all checks passed")
     return 0
 
 
@@ -181,5 +178,4 @@ def test_conv1d_layout_cpu():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     sys.exit(main())

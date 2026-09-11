@@ -562,7 +562,7 @@ class CausalConv1dSilu(nn.Module):
         conv is applied PER SEGMENT.  A single dense conv over the packed axis
         leaks across every boundary: the left zero-pad is replaced by the tail
         of the previous sequence, so exactly the first ``W-1`` tokens of every
-        non-first sequence are wrong (measured with syn25, W=4: the first 3
+        non-first sequence are wrong (measured on H20, syn25, W=4: the first 3
         tokens of each of sequences 2 and 3 differ by max abs 1.598e-1 while
         every other token is bit-exact).
         """
@@ -818,7 +818,7 @@ def _apply_attn_res_lean(prefix_sum: torch.Tensor,
 
     Chunking along tokens changes no reduction (variance, score-dot, softmax
     and the value matmul are all per-token), so the result agrees with the
-    reference to well inside the 1e-6 gate — but NOT bitwise.  MEASURED
+    reference to well inside the 1e-6 gate — but NOT bitwise.  MEASURED on H20
     (H=512, fp32, chunk 1024): ``torch.equal`` is True at T in
     {13, 1024, 2048, 8192} and False at T in {1025, 4097}, max_abs 2.4e-7
     (nb=3) / 2.6e-6 (nb=9).  A ragged final chunk is a differently-shaped
@@ -975,7 +975,7 @@ def _build_block_causal_mask(cu_seqlens: torch.Tensor, seq_len: int, device,
     batch: -inf above the diagonal AND across every sequence boundary.
 
     The plain triangular mask is not merely imprecise here, it is catastrophic:
-    with it, sequence 2 attends to all of sequence 1.  Measured (syn25,
+    with it, sequence 2 attends to all of sequence 1.  Measured on H20 (syn25,
     seqlens [37, 53, 128], bf16): relative error 1.08 on sequence 1 and 0.95 on
     sequence 2 — i.e. the output is unrelated to the truth.  With this mask the
     packed MLA module is BIT-EXACT to the per-sequence oracle.

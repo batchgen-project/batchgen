@@ -24,7 +24,8 @@ startup gate, not merely into a test: BatchGen has never exercised
 resident in every shipped model), so K3 is the first consumer of three quarters
 of that surface.
 
-Facts below were read out of the released checkpoint's shard headers:
+Facts below were read out of the released checkpoint on ``<gpu-host>``
+(``/path/to/models/Kimi-K3``):
 
   * 497,220 index entries, ``metadata.total_size`` 1,560,860,324,864 B, 60
     distinct name templates (29 module + 19 skeleton + 12 ignored).

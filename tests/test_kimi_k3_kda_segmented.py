@@ -133,7 +133,8 @@ def _cpu_chunk_kda(q, k, v, g, beta, A_log, dt_bias, use_qk_l2norm_in_kernel,
     assert use_beta_sigmoid_in_kernel and output_final_state
     assert q.shape[0] == 1
     scale = q.shape[-1] ** -0.5
-    bounds = cu_seqlens.tolist()
+    # ``cu_seqlens=None`` is fla's batch-1 entry: one sequence spanning the call.
+    bounds = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
 
     o = torch.zeros(1, q.shape[1], H, D, dtype=v.dtype)
     final = torch.zeros_like(initial_state)
@@ -329,6 +330,23 @@ def test_chunk_size_constant_matches_flas_own():
         pass                                # CPU dev box: the literal stands
 
 
+def test_bias_free_output_projection_reuses_caller_storage_bit_exactly():
+    gen = torch.Generator().manual_seed(20260902)
+    linear = torch.nn.Linear(7, 11, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.randn(11, 7, generator=gen))
+    x = torch.randn(13, 7, generator=gen)
+    out = torch.empty(13, 11)
+
+    # ``out=`` GEMMs are inference-only, matching the worker's prefill loop.
+    with torch.inference_mode():
+        expected = linear(x)
+        actual = SM._linear_no_bias_into(linear, x, out)
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("seed", range(20))
 def test_plan_invariants_on_random_batches(seed):
     rng = random.Random(seed)
@@ -441,3 +459,23 @@ def test_output_buffer_matches_v(dtype):
     assert o.shape == (1, cu[-1], H, D) and o.dtype == dtype
     assert o.is_contiguous(), (
         "the stitched output must be contiguous — o_norm/o_proj reshape it")
+
+
+def test_segment_plan_is_cached_per_cu_seqlens_object():
+    """Same cu_seqlens object -> the cached plan (no re-planning, no new
+    bounds tensors); a new object or segment size -> a fresh plan whose
+    bounds equal the pure planner's."""
+    cu = torch.tensor([0, 137, 320, 400], dtype=torch.int32)
+    seg = 2 * BT
+    first = SM._kda_cached_segment_plan(cu, seg)
+    again = SM._kda_cached_segment_plan(cu, seg)
+    assert again is first
+    for (s0, e0, lo0, hi0, b0), (s1, e1, lo1, hi1, b1) in zip(
+            first, SM._kda_segment_plan(cu.tolist(), seg)):
+        assert (s0, e0, lo0, hi0) == (s1, e1, lo1, hi1)
+        assert b0.dtype == torch.long and b0.tolist() == b1
+    other = SM._kda_cached_segment_plan(cu, 3 * BT)
+    assert other is not first
+    fresh = SM._kda_cached_segment_plan(cu.clone(), seg)
+    assert fresh is not first
+    assert [p[:4] for p in fresh] == [p[:4] for p in first]

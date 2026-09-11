@@ -67,11 +67,11 @@ def attn_res_score_weight(proj: nn.Linear, norm) -> torch.Tensor:
     return norm.weight.float() * proj.weight.squeeze(0).float()
 
 
-def apply_attn_res(prefix_sum: torch.Tensor,
-                   block_residual: torch.Tensor,
-                   proj: nn.Linear,
-                   norm,
-                   chunk_size: int = 1024) -> torch.Tensor:
+def _apply_attn_res_eager(prefix_sum: torch.Tensor,
+                          block_residual: torch.Tensor,
+                          proj: nn.Linear,
+                          norm,
+                          chunk_size: int = 1024) -> torch.Tensor:
     """Memory-lean Block-Attention-Residual depth mixer.
 
     Port of ``kimi_k3/model.py::_apply_attn_res_lean`` (M2), gated against the
@@ -87,22 +87,22 @@ def apply_attn_res(prefix_sum: torch.Tensor,
     no per-sequence awareness here — so the mixer runs in token CHUNKS with the
     verbatim reference op order inside each chunk.
 
-    MEMORY, MEASURED (real K3 scale H=7168, nb=8, bf16 in/out, chunk 1024,
-    under ``torch.inference_mode``; peak EXTRA device allocation over the
-    call): the peak grows only mildly with T.
+    MEMORY, MEASURED (H20, real K3 scale H=7168, nb=8, bf16 in/out, chunk 1024,
+    under ``torch.inference_mode``; peak EXTRA device allocation over the call):
+
+        T =  1024   770 MiB        T =  8192    994 MiB
+        T =  2048   910 MiB        T = 32768   1330 MiB
 
     Nothing of shape ``(T, nb+1, hidden)`` is materialized in fp32, and that is
     the win: the fp32 part is ``O(chunk_size * (nb+1) * hidden)`` per live
-    tensor.  But do NOT read that as "one small buffer, independent of T" —
+    tensor.  But do NOT read that as "one 252 MiB buffer, independent of T" —
     several fp32 chunk tensors are live at once (``v``, ``v.pow(2)``, ``k``,
-    ``k*w``, plus the bf16 ``cat``), giving a floor of a few chunk working
-    sets, and ``out`` is ``torch.empty_like(prefix_sum)``, i.e.
-    ``O(T * hidden)`` on top.
+    ``k*w``, plus the bf16 ``cat``), giving a ~0.75 GiB floor, and ``out`` is
+    ``torch.empty_like(prefix_sum)``, i.e. ``O(T * hidden)`` on top.
 
     ``torch.inference_mode`` is load-bearing, not incidental: with grad enabled
-    the same call allocates an order of magnitude more at large T, because
-    ``proj.weight`` is a leaf Parameter and autograd pins every chunk's
-    ``v``/``k``.  The worker's
+    the same call reaches 16.8 GiB at T=32768, because ``proj.weight`` is a leaf
+    Parameter and autograd pins every chunk's ``v``/``k``.  The worker's
     prepack-prefill loop is inside ``with torch.inference_mode()``
     (batchgen_worker.py:6939) — any new caller must be too.
 
@@ -119,6 +119,9 @@ def apply_attn_res(prefix_sum: torch.Tensor,
     num_tokens, hidden = prefix_sum.shape
     eps = norm.variance_epsilon
     w = attn_res_score_weight(proj, norm)
+    resident_tile = getattr(norm, "_resident_prefill_token_tile", None)
+    if resident_tile is not None:
+        chunk_size = min(int(chunk_size), int(resident_tile))
     out = torch.empty_like(prefix_sum)
     for start in range(0, num_tokens, chunk_size):
         end = min(start + chunk_size, num_tokens)
@@ -126,10 +129,144 @@ def apply_attn_res(prefix_sum: torch.Tensor,
             (block_residual[start:end], prefix_sum[start:end].unsqueeze(1)),
             dim=1).float()                                   # (c, nb+1, H) fp32
         k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
-        scores = (k * w).sum(-1)                             # (c, nb+1)
+        # k is dead after scoring. Multiplying it in place preserves the same
+        # elementwise FP32 product and hidden-axis reduction while avoiding a
+        # second (c, nb+1, H) temporary (140 MiB at W2, nb+1=5).
+        k.mul_(w)
+        scores = k.sum(-1)                                   # (c, nb+1)
+        del k
         probs = scores.softmax(-1).unsqueeze(1)              # (c, 1, nb+1)
         out[start:end] = torch.matmul(probs, v).squeeze(1).to(out.dtype)
     return out
+
+
+def _apply_attn_res_local(prefix_sum: torch.Tensor,
+                          block_residual: torch.Tensor,
+                          proj: nn.Linear,
+                          norm,
+                          chunk_size: int = 1024) -> torch.Tensor:
+    """Use the fused K3 CUDA mixer when supported, else the eager fallback."""
+    if prefix_sum.is_cuda and not torch.is_grad_enabled():
+        # Lazy import keeps this module torch-only for CPU model and source
+        # tests on machines where Triton is intentionally not installed.
+        from .attn_residual_triton import (
+            mix_attn_residual_triton,
+            supports_attn_residual_triton,
+        )
+
+        if supports_attn_residual_triton(prefix_sum, block_residual):
+            return mix_attn_residual_triton(
+                prefix_sum, block_residual, proj, norm
+            )
+    return _apply_attn_res_eager(
+        prefix_sum, block_residual, proj, norm, chunk_size
+    )
+
+
+def gather_attn_residual_rows(prefix_sum: torch.Tensor,
+                              block_residual: torch.Tensor,
+                              norm) -> torch.Tensor:
+    """Restore a sharded prefix before a block-boundary bank snapshot."""
+    row_group = getattr(norm, "_streamed_sp8_row_group", None)
+    if row_group is None or prefix_sum.shape[0] == block_residual.shape[0]:
+        return prefix_sum
+
+    group_size, group_rank, group = row_group
+    from .moe_tp_reshard import (
+        all_gather_rows,
+        balanced_row_split,
+    )
+
+    global_rows = block_residual.shape[0]
+    start, end = balanced_row_split(global_rows, group_size)[group_rank]
+    if prefix_sum.shape[0] != end - start:
+        raise ValueError(
+            "sharded attention-residual prefix has the wrong local row count"
+        )
+    return all_gather_rows(
+        prefix_sum,
+        global_rows,
+        group_size,
+        group_rank,
+        group,
+    )
+
+
+def apply_attn_res(prefix_sum: torch.Tensor,
+                   block_residual: torch.Tensor,
+                   proj: nn.Linear,
+                   norm,
+                   chunk_size: int = 1024) -> torch.Tensor:
+    """Apply the depth mixer, row-sharded during streamed-SP8 TP8 prefill.
+
+    The mixer is independent in the token axis. The prefill strategy therefore
+    gives each TP rank a disjoint contiguous row slice, runs the unchanged
+    local implementation, and all-gathers the rows needed by the next
+    head-parallel attention/MLP. Decode and every non-streamed path leave the
+    strategy attribute absent and execute the original full-row body.
+    """
+    row_group = getattr(norm, "_streamed_sp8_row_group", None)
+    profiler = getattr(norm, "_streamed_sp8_profiler", None)
+    if (
+        profiler is not None
+        and not profiler._prefill_profile_enabled
+    ):
+        profiler = None
+    span = profiler.begin_profile_span() if profiler is not None else None
+
+    if row_group is None:
+        output = _apply_attn_res_local(
+            prefix_sum, block_residual, proj, norm, chunk_size
+        )
+    else:
+        group_size, group_rank, group = row_group
+        from .moe_tp_reshard import (
+            all_gather_rows,
+            balanced_row_split,
+            scatter_rows,
+        )
+
+        global_rows = block_residual.shape[0]
+        start, end = balanced_row_split(global_rows, group_size)[group_rank]
+        local_rows = end - start
+        if prefix_sum.shape[0] == global_rows:
+            local_prefix = scatter_rows(prefix_sum, group_size, group_rank)
+        elif prefix_sum.shape[0] == local_rows:
+            local_prefix = prefix_sum
+        else:
+            raise ValueError(
+                "attention-residual prefix is neither full nor this rank's "
+                "balanced row shard"
+            )
+        local_residual = scatter_rows(
+            block_residual, group_size, group_rank
+        )
+        local_output = _apply_attn_res_local(
+            local_prefix, local_residual, proj, norm, chunk_size
+        )
+        if getattr(norm, "_streamed_sp8_keep_sharded", False):
+            output = local_output
+        else:
+            order_wait = getattr(norm, "_streamed_sp8_order_wait", None)
+            if order_wait is not None:
+                # The previous layer opened the cross-node weight gate after
+                # its MoE. This gather is now the next TP8 collective, so it
+                # must observe the same cross-then-TP host issue order.
+                order_wait()
+            output = all_gather_rows(
+                local_output,
+                global_rows,
+                group_size,
+                group_rank,
+                group,
+            )
+
+    if profiler is not None:
+        profiler.end_profile_span(
+            getattr(norm, "_streamed_sp8_profile_name", "depth_mix"),
+            span,
+        )
+    return output
 
 
 # ============================================================================
