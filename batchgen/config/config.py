@@ -46,6 +46,7 @@ class BasicConfig:
     rank: Optional[int] = None
     world_size: Optional[int] = None
     gpu_arch: Optional[str] = None
+    distributed_weight_sharded: bool = False
     enable_cuda_graphs: bool = False  # Default off (128K+ NCCL corruption when graph warmup runs MoE AllGather)
     cuda_graph_bucket_sizes: Optional[List[int]] = None
 
@@ -84,7 +85,8 @@ class BasicConfig:
             f"  num_queries: {self.num_queries}\n"
             f"  rank: {self.rank}\n"
             f"  world_size: {self.world_size}\n"
-            f"  gpu_arch: {self.gpu_arch}"
+            f"  gpu_arch: {self.gpu_arch}\n"
+            f"  distributed_weight_sharded: {self.distributed_weight_sharded}"
         )
 
 
@@ -94,6 +96,18 @@ class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
     # Token-based prefill config (for prepack mode, always recommended)
     prefill_micro_batch_token_cap: int = 131_072  # Max tokens per prefill micro-batch (= max_position_embeddings)
+    # Kimi-K3: token cap for admission waves prefilled through the resident
+    # EP experts after the first decode phase (0 = always release the shard
+    # and prefill streamed). Set by the planner; see resident_ep_prefill_available.
+    k3_resident_prefill_token_cap: int = 0
+    k3_resident_prefill_chunk_rows: int = 0  # 0 = the 256-row large-pass clamp
+    # Kimi-K3: TP-shard routed_expert_down/up_proj across the attention TP
+    # group (DECODE_CONCURRENCY_PLAN.md). Set by the planner.
+    k3_shard_latent_projections: bool = False
+    k3_shard_vocab_parallel: bool = False  # vocab-parallel embed_tokens / lm_head across the attention TP group
+    # Kimi-K3 slice 3: DeepEP low-latency EP exchange in the decode graph (needs the
+    # K3 DeepEP build + NVSHMEM env; planner-set, see batchgen/moe/deepep_ll.py).
+    k3_deepep_ll: bool = False
     prepack_row_capacity: Optional[int] = None  # Token budget per packed row (None = no limit)
     # Sequence-count based prefill config (for non-prepack mode)
     attn_prefill_micro_batch_size: Optional[int] = 0

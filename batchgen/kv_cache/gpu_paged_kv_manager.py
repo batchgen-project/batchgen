@@ -472,23 +472,27 @@ class _GPUPageTableManager:
 
 		fill_region = table[:num_slots, :desired_pages]
 
-		# Fill table rows from sequence state pages.
-		# Always clear unused columns to prevent stale page IDs from
-		# polluting page 0 (the first allocated page).
-		for slot, seq_id in enumerate(wanted_order):
-			state = sequences.get(seq_id)
-			if state is None or state.pages.numel() == 0:
-				fill_region[slot, :] = -1
-				continue
-			pages = state.pages.to(self.device, dtype=torch.int32)
-			count = int(pages.numel())
-			fill_region[slot, :count] = pages[:count]
-			if count < desired_pages:
-				fill_region[slot, count:] = -1
+		# The active and graph-stable tables may have been created while the
+		# decode loop was under inference_mode. Watermark-driven rebuilds can run
+		# outside that context, where mutating an inference tensor is illegal.
+		with torch.inference_mode():
+			# Fill table rows from sequence state pages.
+			# Always clear unused columns to prevent stale page IDs from
+			# polluting page 0 (the first allocated page).
+			for slot, seq_id in enumerate(wanted_order):
+				state = sequences.get(seq_id)
+				if state is None or state.pages.numel() == 0:
+					fill_region[slot, :] = -1
+					continue
+				pages = state.pages.to(self.device, dtype=torch.int32)
+				count = int(pages.numel())
+				fill_region[slot, :count] = pages[:count]
+				if count < desired_pages:
+					fill_region[slot, count:] = -1
 
-		if not reuse_existing:
-			self.gpu_table = table
-		self._update_cuda_graph_table(wanted_order, sequences, max_required)
+			if not reuse_existing:
+				self.gpu_table = table
+				self._update_cuda_graph_table(wanted_order, sequences, max_required)
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
@@ -903,7 +907,9 @@ class GPUPagedKVCacheManager:
 		mgr.gpu_table = torch.full(
 			(0, max_pages), -1, dtype=torch.int32, device=mgr.device
 		)
-		mgr._ensure_cuda_graph_table().fill_(-1)
+		# The graph table can have been lazily created under inference_mode.
+		with torch.inference_mode():
+			mgr._ensure_cuda_graph_table().fill_(-1)
 		mgr._cuda_graph_table_valid = True
 		mgr._cuda_graph_slot_count = 0
 		

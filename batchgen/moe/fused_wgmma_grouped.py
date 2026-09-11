@@ -64,9 +64,25 @@ def _load_grouped_module():
 
     try:
         import batchgen_kernels
-        _grouped_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_grouped_mxfp4_wgmma")
+        # AOT-only: skip the doomed DEV-JIT. The kernel's `-arch=sm_90a`
+        # shorthand makes nvcc ALSO emit a compute_90 PTX fallback image, whose
+        # `ptxas -arch=compute_90` step rejects wgmma.* (fatal). A failed JIT
+        # caches no artifact, so every mp.spawn worker re-runs the ~2 min doomed
+        # compile serialized on the ninja lock (the resident-boot storm). These
+        # kernels are NOT on the K3/kimi-linear marlin decode path.
+        _grouped_module = batchgen_kernels.load_extension(
+            "batchgen_kernels.moe._C_grouped_mxfp4_wgmma", allow_dev_jit=False
+        )
         logging.info("Loaded pre-compiled WGMMA fused grouped MXFP4 MoE kernels")
         return _grouped_module
+    except ImportError:
+        logging.warning(
+            "WGMMA grouped MXFP4 MoE kernels unavailable (no AOT extension; "
+            "DEV-JIT skipped — `-arch=sm_90a` shorthand emits a compute_90 PTX "
+            "fallback that ptxas rejects for wgmma). Not on the K3 marlin decode "
+            "path; using the non-WGMMA fallback."
+        )
+        return None
     except Exception as e:
         logging.warning(f"Failed to load WGMMA grouped MoE kernels: {e}")
         return None

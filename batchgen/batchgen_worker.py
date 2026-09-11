@@ -127,6 +127,7 @@ from batchgen.worker.decode import (
 	DecodeBatchRequest,
 	DecodeCandidate,
 	DecodeScheduler,
+	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
 	GpuKvManagerPlan,
@@ -144,6 +145,7 @@ import dataclasses as _dataclasses
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_host_kv_config,
+	build_host_kv_worker_view,
 	is_dsa_model,
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
@@ -210,6 +212,16 @@ BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS'
 # this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
 # the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
 _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
+
+# The one served model whose workload-independent startup work runs before the
+# server reports ready (prepare_kimi_k3_startup). Matched EXACTLY: the sibling
+# Kimi-Linear/K2.5 checkpoints share this architecture but not this lifecycle.
+KIMI_K3_MODEL_ID = "moonshotai/Kimi-K3"
+
+# Decode budget the startup pass uses. max_decoding_length only sizes scheduler
+# hints at this point; the real per-batch value arrives with the pool "init"
+# message, which re-enters Init() before any sequence is admitted.
+_K3_STARTUP_MAX_DECODING_LENGTH = 4096
 
 # Optional Nsight Systems capture window for decode-forward profiling.
 # Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
@@ -458,6 +470,8 @@ class InputArguments:
 	enable_ep_with_offloading: bool = False
 	ep_offloading_ratio: float = 0.0
 	pre_dequantize_weights: bool = False
+	distributed_weight_config: Optional[str] = None
+	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 
 	def __post_init__(self):
 		if self.max_prompt_length is None and self.padding_length is not None:
@@ -560,6 +574,7 @@ class BatchGenWorkerArgs:
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -581,6 +596,7 @@ class BatchGenWorkerArgs:
 	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
 	weights_memfd_pid: int = -1
 	weights_memfd_fd: int = -1
+	distributed_weight_config: Optional[str] = None
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Default enables pool mode. 0 = legacy batch-FIFO.
 
@@ -710,6 +726,17 @@ class BatchGenWorker:
 		self._decode_cache_seqlens_cpu_staging = None
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
+		# Kimi-K3 streamed-SP8 prefill pipeline identity. Host-RDMA preserves its
+		# remote-daemon cursor after the first install; hierarchical GDR uses the
+		# same fingerprint but reseeds its local queue/ring on each admission.
+		self._streamed_sp8_h2d_installed = False
+		self._streamed_sp8_weight_copy_fingerprint = None
+		# Kimi-K3 pre-readiness startup (prepare_kimi_k3_startup). The first
+		# flag makes that pass idempotent; the second hands the prepared prefill
+		# phase to the first real admission so it is not torn down and rebuilt.
+		self._k3_startup_completed = False
+		self._k3_startup_prefill_ready = False
+		self._k3_startup_prefill_mode = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -753,15 +780,27 @@ class BatchGenWorker:
 		import time as _time
 		_t0 = _time.monotonic()
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-		self.weights_storage.Init(
-			self.shm_name,
-			self.weight_byte_size,
-			self.tensor_meta_shm_name,
-			self.enable_hugetlbfs,
-			args.fast_init,
-			args.weights_memfd_pid,
-			args.weights_memfd_fd,
-		)
+		if args.distributed_weight_config:
+			self.weights_storage.InitDistributed(
+				args.distributed_weight_config
+			)
+			self.skeleton_state_dict = self.weights_storage.get_tensor(
+				"__skeleton__"
+			)
+			logging.info(
+				f"Rank {self.rank}: Loaded compact skeleton state dict "
+				f"with {len(self.skeleton_state_dict)} keys"
+			)
+		else:
+			self.weights_storage.Init(
+				self.shm_name,
+				self.weight_byte_size,
+				self.tensor_meta_shm_name,
+				self.enable_hugetlbfs,
+				args.fast_init,
+				args.weights_memfd_pid,
+				args.weights_memfd_fd,
+			)
 		logging.info(f"Rank {self.rank}: [startup] Weights storage init: {_time.monotonic() - _t0:.2f}s")
 
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
@@ -795,12 +834,11 @@ class BatchGenWorker:
 				worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
 				worker_kv_config.memfd_fd = args.kv_memfd_fd
 
-			# Select worker view based on model's KV cache configuration
-			# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
-			if worker_kv_config.num_v_heads == 0:
-				self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-			else:
-				self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
+			# K3 keeps 93 logical engine-layer ids over 24 dense physical MLA
+			# rows, so the worker view must honor the profile's layer map.
+			self.host_paged_kv_worker_view = build_host_kv_worker_view(
+				core_engine, worker_kv_config
+			)
 
 			# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
 			_t0 = _time.monotonic()
@@ -1385,6 +1423,15 @@ class BatchGenWorker:
 		# Step 3: Assign ranks (round-robin, continuing from existing)
 		self._assign_admitted_sequences_to_ranks(new_uuids)
 
+		# Step 3b (Option 1, CORE): assign the serve-group at ADMISSION. Under
+		# unified resident TP (G>1) a sequence binds to ALL G ranks of its
+		# decode_dp_group from PREFILL onward (head-sharded KDA state + o_proj
+		# all_reduce need the group replicated at prefill, not reshuffled at the
+		# decode transition). No-op for G==1 (the validated pure-DP path never
+		# carries a group id). _config_prefill_for_batch re-runs this idempotently
+		# so evicted re-entries (whose group was cleared) re-group before binding.
+		self._assign_decode_dp_groups(new_uuids)
+
 		# Step 4: Build local query book entries for new sequences
 		self._build_local_query_book_for_admitted(new_uuids)
 
@@ -1606,6 +1653,94 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
+	def _decode_attn_tp_size(self) -> int:
+		"""G (attn_tp_size) for decode; 1 (pure-DP) unless the PSM head-shards."""
+		pm = getattr(self, "parallel_manager", None)
+		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
+
+	def _owns_local_sequence(self, seq) -> bool:
+		"""Which ranks bind a sequence into the LOCAL maps (query_book +
+		_uuid_to_local_map) and drive it through prefill/decode.
+
+		Pure DP (G==1, the validated path): the single ``assigned_rank`` owns it.
+		Option 1 unified resident TP (G>1): ALL G ranks of the sequence's
+		``decode_dp_group`` hold it — the group runs prefill+decode in TP-G
+		lockstep on identical sequences (replicated attention, head-sharded KDA
+		state), so the o_proj all_reduce couples matching tokens and no
+		prefill->decode reshard is ever needed. Requires ``decode_dp_group`` to
+		be stamped (done at admission / prefill config before binding)."""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return seq.assigned_rank == self.rank
+		from batchgen.decode_dp_group import rank_in_decode_group
+		return rank_in_decode_group(seq.decode_dp_group, self.rank, G)
+
+	def _owns_host_kv(self, seq) -> bool:
+		"""Which SINGLE rank drives the per-node SHARED host-KV region for a seq.
+
+		The host paged KV cache is ONE shm region per node
+		(``batchgen_host_kv_cache``) keyed by ``global_idx``, so register /
+		allocate / grow / release must fire EXACTLY once per sequence. This is
+		NARROWER than ``_owns_local_sequence``: G>1 replicates a seq onto all G
+		ranks of its group (they each hold GPU KV + head-sharded KDA state), but
+		only the group LEADER ``decode_dp_group*G`` may touch the shared host
+		region — otherwise the G ranks double-register (G x host reservation) and
+		double-release (2nd releaser hits ``IndexError: Sequence ID ... not found
+		during release``). G==1 is the validated single-owner path: the
+		``assigned_rank`` owner, identical to ``uuid in _uuid_to_local_map``."""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return seq.assigned_rank == self.rank
+		from batchgen.decode_dp_group import host_kv_owner_rank
+		return (
+			seq.decode_dp_group is not None
+			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
+		)
+
+	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
+		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
+		BEFORE the group-predicate binding — not at the decode transition).
+
+		ADDITIVE — ``assigned_rank`` is untouched. For G==1 the group equals the
+		rank and nothing keys on this field, so we skip entirely: the validated
+		pure-DP path never carries a group id. For G>1 the G ranks of a group own
+		the SAME sequences from prefill onward, so the assignment is over
+		``num_dp = world_size // G`` groups, L^2-balanced against the sequences
+		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
+		Idempotent (skips already-grouped seqs) and deterministic across ranks:
+		identical inputs -> identical map.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1 or not uuids:
+			return
+		from batchgen.decode_dp_group import (
+			assign_decode_dp_groups,
+			num_decode_dp_groups,
+		)
+		num_dp = num_decode_dp_groups(self.world_size, G)
+		prior = [0.0] * num_dp
+		to_assign = set(uuids)
+		for seq in self.global_batch:
+			if seq.uuid in to_assign or seq.decode_dp_group is None:
+				continue
+			L = getattr(seq, "prompt_length", 0) or 0
+			prior[seq.decode_dp_group] += float(L) * float(L)
+		lengths, seqs = [], []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			# Idempotent: only FIRST entry (PREFILLED->IN_DECODE). A re-entry
+			# (ON_HOLD->IN_DECODE) keeps its group — its head-sharded KDA state
+			# already lives on that group's ranks, so re-grouping would strand it.
+			if seq is None or seq.decode_dp_group is not None:
+				continue
+			lengths.append(getattr(seq, "prompt_length", 0) or 0)
+			seqs.append(seq)
+		if not seqs:
+			return
+		groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+		for seq, g in zip(seqs, groups):
+			seq.decode_dp_group = g
+
 	def _bind_local_sequence_to_query_book(
 		self,
 		uuid: str,
@@ -1628,10 +1763,15 @@ class BatchGenWorker:
 		return local_idx
 
 	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
-		"""Build local query book entries for newly admitted sequences on this rank."""
+		"""Build local query book entries for newly admitted sequences on this rank.
+
+		Option 1: under G>1 every rank of a sequence's serve-group binds it (see
+		``_owns_local_sequence``), so the group holds the sequence replicated from
+		admission. G==1 keeps the single-owner (assigned_rank) binding unchanged.
+		"""
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq is None or seq.assigned_rank != self.rank:
+			if seq is None or not self._owns_local_sequence(seq):
 				continue
 			self._bind_local_sequence_to_query_book(uuid)
 
@@ -2202,17 +2342,11 @@ class BatchGenWorker:
 	def _flush_deferred_kv_to_host(self) -> None:
 		"""Flush all deferred KV host offload entries accumulated during forward.
 
-		ONE event.synchronize() covers all layers (primary MLA KV + the
-		DSA auxiliary indexer KV if present), then batch-launch D2H
-		copies. Replaces N per-layer syncs with a single post-forward
-		sync for both caches.
+		Batch-launch D2H copies for all layers (primary MLA KV + the DSA
+		auxiliary indexer KV if present). The C++ async append APIs order their
+		dedicated D2H stream after the producer stream with a CUDA event, so this
+		function must not synchronize the CPU with the producer stream first.
 		"""
-		# Whether this call reached the event.synchronize() below. The caller
-		# enqueues the token-readback copy before calling us and relies on this
-		# flag to know if our single sync already drained that copy (so it can
-		# skip a second sync). Set False up-front so every early-return path
-		# leaves it False.
-		self._kv_offload_synced_this_step = False
 		entries = getattr(self, '_deferred_kv_entries', [])
 		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
 		if not entries and not entries_aux:
@@ -2244,15 +2378,6 @@ class BatchGenWorker:
 					f"gids={sequence_ids[:8] if sequence_ids is not None else []}, "
 					f"write_pos={sequence_lengths[:8] if sequence_lengths is not None else []}"
 				)
-
-		# ONE sync for ALL layers across BOTH caches — the key optimization
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-		# Recorded after the caller's token-readback copy (enqueued before this
-		# call), so this one sync covers it too.
-		self._kv_offload_synced_this_step = True
 
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -2342,8 +2467,18 @@ class BatchGenWorker:
 					if task is not None:
 						self._pending_kv_append_tasks.append(task)
 
-		# Throttle: prevent thread exhaustion from std::async
-		if len(self._pending_kv_append_tasks) >= 256:
+		# Complete this step's host appends before returning to the decode loop.
+		# Each task is a std::async thread that reads the worker view's page
+		# table on its own thread at execution time, with no lock. Letting up to
+		# 256 of them stay in flight across steps meant they could overlap the
+		# next admission wave's register/allocate on the main thread; a torn
+		# read then lands one token's KV in a page that now belongs to a freshly
+		# prefilled sequence. Measured on the 512x4096 K3 contract: every victim
+		# was in a wave after the first and collapsed at its 2nd or ~28th token,
+		# while the first wave (no page-table mutation in flight) was clean.
+		# The D2H is one token per sequence per MLA layer (~2.6 MB at 96
+		# sequences), sub-millisecond against a decode step.
+		if self._pending_kv_append_tasks:
 			self._wait_pending_kv_append_tasks(defer_errors=True)
 
 		self._deferred_kv_entries = []
@@ -2666,6 +2801,8 @@ class BatchGenWorker:
 			"enable_ep_with_offloading": self.args.enable_ep_with_offloading,
 			"ep_offloading_ratio": self.args.ep_offloading_ratio,
 			"pre_dequantize_weights": self.args.pre_dequantize_weights,
+			"distributed_weight_config": self.args.distributed_weight_config,
+			"enable_deepep": getattr(self.args, "enable_deepep", False),
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -2864,6 +3001,7 @@ class BatchGenWorker:
 		engine_module_global_batch_size: Optional[int] = None
 		engine_module_attn_decoding_micro_batch_size: Optional[int] = None
 		engine_basic_num_queries: Optional[int] = None
+		engine_basic_decode_graph_max_bucket: Optional[int] = None
 		if engine_config is not None:
 			basic = engine_config.Basic_Config
 			module_batching = engine_config.Module_Batching_Config
@@ -2872,6 +3010,11 @@ class BatchGenWorker:
 			engine_module_global_batch_size = module_batching.global_batch_size
 			engine_module_attn_decoding_micro_batch_size = module_batching.attn_decoding_micro_batch_size
 			engine_basic_num_queries = basic.num_queries
+			# A whole-model decode graph addresses one page-table row per
+			# sequence of its bucket; the planner's top bucket (K3 H200: the
+			# KDA slot count, 160 > the 128 arg default) must fit.
+			graph_buckets = getattr(basic, "decode_graph_buckets", None) or ()
+			engine_basic_decode_graph_max_bucket = max(graph_buckets) if graph_buckets else None
 		model_config = getattr(self, "model_config", None)
 		model_max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
 		args = getattr(self, "args", None)
@@ -2887,6 +3030,7 @@ class BatchGenWorker:
 			engine_basic_num_queries=engine_basic_num_queries,
 			model_max_position_embeddings=model_max_position_embeddings,
 			args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
+			engine_basic_decode_graph_max_bucket=engine_basic_decode_graph_max_bucket,
 		)
 
 	def _cuda_graph_page_table_token_capacity(
@@ -3178,6 +3322,13 @@ class BatchGenWorker:
 			self.rank, len(global_sequence_ids), load_duration,
 		)
 
+		# Option 1 (unified resident TP): NO prefill->decode KDA reshard. Under
+		# G>1 the sequence's serve-group ran prefill in TP-G lockstep, so each of
+		# its G ranks already holds its own head-shard of the KDA recurrent/conv
+		# state in the GPU state pool (slot keyed by global seq id, persists
+		# prefill->decode). This host->GPU load handles only the MLA paged KV,
+		# which is REPLICATED across the group — nothing to reshard.
+
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
 		manager = self.gpu_paged_kv_cache_manager
@@ -3199,14 +3350,7 @@ class BatchGenWorker:
 			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 		)
 
-		# Kimi-Linear: release KDA state slots alongside GPU KV pages (no-op for
-		# other models — slot_manager is None).
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-			if KimiLinearKDAWrapper.slot_manager is not None:
-				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
-		except ImportError:
-			pass
+		self._release_kda_state_slots(global_sequence_ids)
 
 		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
 		for local_idx in local_sequence_ids:
@@ -3216,6 +3360,17 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
 					seq.gpu_pages_allocated = 0
+
+	def _release_kda_state_slots(self, global_sequence_ids: List[int]) -> None:
+		"""Release Kimi-Linear KDA state independently of paged GPU KV."""
+		if not global_sequence_ids:
+			return
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+			if KimiLinearKDAWrapper.slot_manager is not None:
+				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
+		except ImportError:
+			pass
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Destroy the GPU paged KV cache manager if it is present."""
@@ -3590,6 +3745,25 @@ class BatchGenWorker:
 		Returns:
 			List of MigrationOp objects describing planned migrations.
 		"""
+		# Unified resident TP (G>1): a sequence is physically owned by ALL G
+		# ranks of its decode_dp_group, so the legacy planner/executor -- which
+		# keys from_rank/to_rank and the local-map update on the SINGLE
+		# ``assigned_rank`` -- targets a rank that may hold no HostKVPageTable
+		# registration at all (IndexError), and a correct move would have to
+		# carry the replicated query-book / KDA / local-map state across all G
+		# ranks, which this executor does not implement. Decode-group admission
+		# already balances host KV across groups, so fail safe: no migrations,
+		# BEFORE any Gloo group creation or NCCL execution. G==1 is unchanged.
+		G = self._decode_attn_tp_size()
+		if G > 1:
+			if not getattr(self, '_logged_migration_skip_tp', False) and self.rank == 0:
+				logging.info(
+					f"MIGRATION: attn_tp_size={G} (>1): decode-group admission owns "
+					f"host-KV balancing; skipping legacy single-rank migration"
+				)
+				self._logged_migration_skip_tp = True
+			return []
+
 		# Gather host KV stats from all local_rank 0 (NCCL side effect)
 		if self.local_rank == 0:
 			local_stats = self._get_host_kv_utilization()
@@ -4902,20 +5076,38 @@ class BatchGenWorker:
 		gpus_per_node = NUM_GPUS_PER_NODE
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
+		sequence_limits = self._prefill_sequence_limits()
+		node_sequence_free = sequence_limits.get("max_sequences_per_node")
+		rank_sequence_free = sequence_limits.get("max_sequences_per_rank")
+		if node_sequence_free is not None and rank_sequence_free is not None:
+			raise ValueError(
+				"prefill sequence capacity must be scoped to rank or node, not both"
+			)
+		if node_sequence_free is not None:
+			limit_scope = 2
+			local_sequence_free = int(node_sequence_free)
+		elif rank_sequence_free is not None:
+			limit_scope = 1
+			local_sequence_free = int(rank_sequence_free)
+		else:
+			limit_scope = 0
+			local_sequence_free = -1
 
 		# Step 1: Get this node's host KV free pages
 		local_host_free = self._get_host_kv_free_pages()
 
-		# Step 2: Gather host KV free pages from first rank on each node
-		# Only rank 0, 8, 16, ... (first on each node) reports actual value
-		if self.local_rank == 0:
-			report_node = self.rank // gpus_per_node
-			report_free = local_host_free
-		else:
-			report_node = -1
-			report_free = 0  # Non-first ranks report 0
-
-		free_tensor = torch.tensor([report_node, report_free], dtype=torch.int64, device=self.torch_device)
+		# Step 2: Gather host KV plus persistent sequence capacity. Host KV is
+		# one shared region per node, so only the node leader reports it. KDA
+		# state is per GPU; every rank reports its free count and the scheduler
+		# uses the node minimum. This keeps every rank's selection identical
+		# even if a prior lifecycle bug left one TP group asymmetric.
+		report_node = self.rank // gpus_per_node
+		report_host_free = local_host_free if self.local_rank == 0 else -1
+		free_tensor = torch.tensor(
+			[report_node, report_host_free, limit_scope, local_sequence_free],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
 
@@ -4923,21 +5115,74 @@ class BatchGenWorker:
 		reports_by_node = {}
 		for item in gathered:
 			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = int(item[1].item())
+			host_free = int(item[1].item())
+			if node_id >= 0 and host_free >= 0:
+				reports_by_node[node_id] = host_free
 		per_node_host_free = []
 		for node in range(num_nodes):
 			per_node_host_free.append(reports_by_node.get(node, 0))
 
+		gathered_scopes = {int(item[2].item()) for item in gathered}
+		if len(gathered_scopes) != 1:
+			raise RuntimeError(
+				f"prefill sequence-capacity scope diverged across ranks: "
+				f"{sorted(gathered_scopes)}"
+			)
+		per_rank_sequence_free = None
+		per_node_sequence_free = None
+		gathered_scope = next(iter(gathered_scopes))
+		if gathered_scope == 1:
+			per_rank_sequence_free = [int(item[3].item()) for item in gathered]
+		elif gathered_scope == 2:
+			per_node_sequence_free = []
+			for node in range(num_nodes):
+				values = [
+					int(item[3].item())
+					for item in gathered
+					if int(item[0].item()) == node
+				]
+				if not values:
+					raise RuntimeError(
+						f"missing persistent sequence-capacity report for node {node}"
+					)
+				per_node_sequence_free.append(min(values))
+		elif gathered_scope != 0:
+			raise RuntimeError(
+				f"unknown prefill sequence-capacity scope {gathered_scope}"
+			)
+
 		if self.rank == 0:
 			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
+			if per_node_sequence_free is not None:
+				logging.info(
+					f"[PREFILL] Persistent sequence slots free by node: "
+					f"{per_node_sequence_free}"
+				)
+
+		# Under G>1 the selection request maps each candidate to a node via its
+		# decode_dp_group, so every candidate must already carry one. Newly
+		# queued sequences are grouped later (at the decode transition), so a
+		# wave mixing queued with evicted candidates would raise "sequence ...
+		# has no decode_dp_group before TP prefill selection". Stamp them here:
+		# _assign_decode_dp_groups is documented to run at admission/prefill
+		# config, is idempotent (re-entrant sequences keep the group their
+		# head-sharded KDA state lives on), and is deterministic across ranks.
+		self._assign_decode_dp_groups(all_candidates)
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
-		# per-node admission is delegated to PrefillScheduler.
+		# per-node admission is delegated to PrefillScheduler. Kimi-Linear
+		# additionally supplies a persistent KDA-state limit: unlike the token
+		# cap used later by prepack, a KDA slot remains occupied until the
+		# sequence completes or is evicted.
 		prefill_batch = PrefillScheduler.select_prefill_batch(
 			self._make_prefill_selection_request(
-				all_candidates, per_node_host_free, num_nodes, chunk_size
+				all_candidates,
+				per_node_host_free,
+				num_nodes,
+				chunk_size,
+				per_rank_sequence_free=per_rank_sequence_free,
+				per_node_sequence_free=per_node_sequence_free,
 			)
 		)
 
@@ -4953,18 +5198,130 @@ class BatchGenWorker:
 
 		return prefill_batch
 
+	def _prefill_sequence_limits(self) -> dict:
+		"""Return persistent model-state limits for prefill admission.
+
+		Kimi-K3's TP8 attention group replicates each sequence's KDA state on
+		all eight ranks of one node. Its limit is therefore per node, not per
+		rank. Other models/PSMs return no limits and retain the host-KV-only
+		selection contract.
+		"""
+		manager = getattr(self, "parallel_manager", None)
+		method = getattr(manager, "prefill_sequence_limits", None)
+		if method is None:
+			return {}
+		limits = method()
+		if limits is None:
+			return {}
+		if not isinstance(limits, dict):
+			raise TypeError(
+				"parallel_manager.prefill_sequence_limits() must return a dict"
+			)
+		return limits
+
+	def _plan_prefill_micro_batches(
+		self, seq_lengths: List[int]
+	) -> Tuple[List[Tuple[int, int]], int, bool]:
+		"""Build the one authoritative prepacked-forward plan for local rows."""
+		token_cap = (
+			self.engine_config.Module_Batching_Config
+			.prefill_micro_batch_token_cap
+		)
+		use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		single_sequence_only = (
+			token_cap > 0
+			and max(seq_lengths) > token_cap
+			and hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
+		micro_batches, l2_cap = build_prefill_micro_batches(
+			seq_lengths,
+			token_cap,
+			l2_balance=use_l2,
+			single_sequence_only=single_sequence_only,
+		)
+		return micro_batches, l2_cap, single_sequence_only
+
+	def _prefill_model_pass_count(self, batch: List[int]) -> int:
+		"""Return the number of complete model forwards local prefill will run."""
+		if not batch:
+			return 0
+		if not self.enable_prepack:
+			micro_batch_size = (
+				self.engine_config.Module_Batching_Config
+				.MoE_prefill_micro_batch_size
+			)
+			return math.ceil(len(batch) / micro_batch_size)
+
+		seq_lengths = [
+			self.global_batch.get_sequence(
+				self._local_to_uuid_map[local_idx]
+			).prompt_length
+			for local_idx in batch
+		]
+		micro_batches, _, _ = self._plan_prefill_micro_batches(seq_lengths)
+		return len(micro_batches)
+
+	def _streamed_sp8_prefill_pass_alignment(
+		self, local_prefill_indices: List[int]
+	) -> Tuple[int, int]:
+		"""Return local/global pass counts for hierarchical streamed-SP8 and
+		for resident-EP prefill (every pass joins EP-world collectives, so a
+		rank with fewer micro-batches pads with collective-only passes)."""
+		method = getattr(
+			self.parallel_manager,
+			"streamed_sp8_requires_global_pass_alignment",
+			None,
+		)
+		resident = (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		)
+		if not resident and (method is None or not method()):
+			return 0, 0
+
+		local_passes = self._prefill_model_pass_count(local_prefill_indices)
+		global_passes = torch.tensor(
+			[local_passes],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		dist.all_reduce(global_passes, op=dist.ReduceOp.MAX)
+		global_passes = int(global_passes.item())
+		if global_passes < local_passes:
+			raise RuntimeError(
+				f"Rank {self.rank}: global streamed-SP8 prefill pass count "
+				f"{global_passes} is below local count {local_passes}"
+			)
+		return local_passes, global_passes
+
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
-		num_nodes: int, chunk_size: int,
+		num_nodes: int, chunk_size: int, *,
+		per_rank_sequence_free=None, per_node_sequence_free=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
+			seq_node = seq.assigned_rank // NUM_GPUS_PER_NODE
+			G = self._decode_attn_tp_size()
+			if G > 1:
+				if seq.decode_dp_group is None:
+					raise RuntimeError(
+						f"sequence {uuid[:8]} has no decode_dp_group before "
+						"TP prefill selection"
+					)
+				from batchgen.decode_dp_group import host_kv_owner_rank
+				seq_node = (
+					host_kv_owner_rank(seq.decode_dp_group, G)
+					// NUM_GPUS_PER_NODE
+				)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
 				assigned_rank=seq.assigned_rank,
+				node_id=seq_node,
 				is_evicted=(seq.status == SequenceStatus.EVICTED),
 				global_idx=seq.global_idx,
 				total_decoded_before_eviction=getattr(
@@ -4973,6 +5330,7 @@ class BatchGenWorker:
 				prompt_length=seq.prompt_length,
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
+				host_kv_replication_factor=G,
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -4981,6 +5339,14 @@ class BatchGenWorker:
 			num_nodes=num_nodes,
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+			per_rank_sequence_free=(
+				tuple(per_rank_sequence_free)
+				if per_rank_sequence_free is not None else None
+			),
+			per_node_sequence_free=(
+				tuple(per_node_sequence_free)
+				if per_node_sequence_free is not None else None
+			),
 		)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
@@ -5004,10 +5370,8 @@ class BatchGenWorker:
 			global_seq_ids = []
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				if seq.assigned_rank == self.rank:
-					# Verify sequence is in local map (should be for IN_DECODE sequences)
-					if uuid in self._uuid_to_local_map:
-						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
+				if uuid in self._uuid_to_local_map:
+					global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
 			if global_seq_ids:
 				# Filter to only sequences the GPU manager actually tracks
@@ -5022,8 +5386,7 @@ class BatchGenWorker:
 					)
 				# Also remove from tracking set
 				for uuid in uuids:
-					seq = self.global_batch.get_sequence(uuid)
-					if seq.assigned_rank == self.rank:
+					if uuid in self._uuid_to_local_map:
 						self._sequences_with_gpu_kv.discard(uuid)
 
 		# Update sequence status and reset GPU allocation
@@ -5089,12 +5452,14 @@ class BatchGenWorker:
 				assigned_rank=seq.assigned_rank,
 				global_idx=seq.global_idx,
 				req_pages=seq.get_gpu_pages_for_two_page_buffer(),
+				decode_dp_group=seq.decode_dp_group,
 			))
 		return DecodeBatchRequest(
 			candidates=tuple(candidates),
 			total_pages=total_pages,
 			world_size=self.world_size,
 			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
+			attn_tp_size=self._decode_attn_tp_size(),
 		)
 
 	def _check_and_handle_completions(
@@ -5296,8 +5661,14 @@ class BatchGenWorker:
 			# prefill_prepacked writes KV straight to host, so most of these
 			# never registered with the GPU paged manager.
 			gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+			kda_only = [u for u in my_completed if u not in self._sequences_with_gpu_kv]
 			if gpu_allocated:
 				self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+			if kda_only:
+				self._release_kda_state_slots([
+					self.global_batch.get_sequence(uuid).global_idx
+					for uuid in kda_only
+				])
 			self._release_host_kv_pages_for_batch(my_completed)
 		for uuid in completed_uuids:
 			seq = self.global_batch.get_sequence(uuid)
@@ -5376,6 +5747,9 @@ class BatchGenWorker:
 		# Get local indices for sequences belonging to THIS rank
 		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
 		
+		# M2b: assign the decode DP-group before the transition (no-op for G==1).
+		self._assign_decode_dp_groups(new_uuids)
+
 		if new_local_indices:
 			# Allocate and load (without final rebuild)
 			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
@@ -5642,6 +6016,62 @@ class BatchGenWorker:
 		torch.cuda.nvtx.range_push(range_name)
 		return forward_idx
 
+	def _k3_decode_profile_step(self, batchgen_debug, batch_rows: int) -> None:
+		"""Batch-level ``batchgen_debug.k3_decode_profile_steps = N``: after 3
+		warm-up steps, wrap the next N decode steps of rank 0 in
+		``torch.profiler`` (CUDA + CPU) and log the kernel table sorted by CUDA
+		time — a per-kernel breakdown of the GPU-bound step without a server
+		restart. One capture per server lifetime."""
+		# ``k3_decode_profile_ranks``: which ranks profile (default rank 0; the
+		# first rank of every node shows cross-node skew inside the exchange).
+		_prof_ranks = (batchgen_debug or {}).get("k3_decode_profile_ranks") or [0]
+		if self.rank not in _prof_ranks or getattr(self, "_k3_decode_profile_done", False):
+			return
+		try:
+			steps = int((batchgen_debug or {}).get("k3_decode_profile_steps", 0) or 0)
+		except (TypeError, ValueError):
+			return
+		if steps <= 0:
+			return
+		count = getattr(self, "_k3_decode_profile_count", 0) + 1
+		self._k3_decode_profile_count = count
+		warmup = 3
+		if count == warmup + 1:
+			from torch.profiler import ProfilerActivity, profile
+			self._k3_decode_profiler = profile(
+				activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+			)
+			self._k3_decode_profiler.__enter__()
+			self._k3_decode_profile_rows = batch_rows
+			logging.info("[K3_DECODE_PROFILE] capturing %d decode steps at %d rows", steps, batch_rows)
+		elif count == warmup + 1 + steps:
+			prof = getattr(self, "_k3_decode_profiler", None)
+			if prof is None:
+				return
+			torch.cuda.synchronize(self.torch_device)
+			prof.__exit__(None, None, None)
+			self._k3_decode_profiler = None
+			self._k3_decode_profile_done = True
+			table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=40)
+			logging.info(
+				"[K3_DECODE_PROFILE] %d steps at %d rows (per-step = table / %d)\n%s",
+				steps, self._k3_decode_profile_rows, steps, table,
+			)
+			# ``k3_decode_profile_trace = "<dir>"``: also dump the Chrome trace
+			# (kernel sequence per step, for per-layer node counts); the table
+			# alone loses the order.
+			trace_dir = (batchgen_debug or {}).get("k3_decode_profile_trace")
+			if trace_dir:
+				try:
+					os.makedirs(trace_dir, exist_ok=True)
+					path = os.path.join(
+						trace_dir, f"k3_decode_profile_rows{self._k3_decode_profile_rows}_rank{self.rank}.json"
+					)
+					prof.export_chrome_trace(path)
+					logging.info("[K3_DECODE_PROFILE] trace written to %s", path)
+				except Exception as exc:  # noqa: BLE001 - diagnostics only
+					logging.warning("[K3_DECODE_PROFILE] trace export failed: %s", exc)
+
 	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
 		"""End one env-gated nsys decode-forward range and optionally exit."""
 		if forward_idx is None:
@@ -5678,6 +6108,237 @@ class BatchGenWorker:
 			sys.stderr.flush()
 			os._exit(0)
 
+	def _ensure_pynccl_communicator(self) -> None:
+		"""Create the PyNccl communicator unless every rank already holds one.
+
+		Collective and idempotent: the need-init vote, the port broadcast and
+		the pre-TCPStore barrier are all torch.distributed collectives, so every
+		rank must call this together. Once all ranks have a communicator the
+		vote fails and nothing is created.
+		"""
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") != "0":
+			return
+
+		# Verify rank consistency
+		if dist.is_initialized():
+			assert self.rank == dist.get_rank(), \
+				f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
+
+		# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
+		if self.world_size == 1:
+			logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
+			return
+
+		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+
+		# Coordinate PyNccl initialization across all ranks
+		# Use all_reduce to check if ANY rank needs to (re)init the communicator
+		need_init = 1 if self.comm is None else 0
+		need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+		dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
+		any_rank_needs_init = need_init_tensor.item() > 0
+
+		if not any_rank_needs_init:
+			return
+
+		# All ranks must participate in init - destroy any existing comm first
+		if self.comm is not None:
+			logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
+			try:
+				self.comm.destroy()
+			except Exception:
+				pass
+			self.comm = None
+			if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+				del self._nccl_group
+				self._nccl_group = None
+
+		device = torch.device("cuda", self.local_rank)
+
+		if comm_master_addr is None:
+			logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+		elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+			# Track port - incremented in _check_and_reinit_pynccl on failures
+			if not hasattr(self, '_nccl_port'):
+				self._nccl_port = 20003
+
+			# Rank 0 finds an available port, then broadcasts to all ranks
+			if self.rank == 0:
+				try:
+					self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
+					logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+				except RuntimeError as e:
+					logging.error(f"Rank 0: Failed to find available port: {e}")
+					raise
+
+			# Broadcast the chosen port from rank 0 to all ranks
+			port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+			dist.broadcast(port_tensor, src=0)
+			self._nccl_port = port_tensor.item()
+
+			# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
+			# is ready before other ranks try to connect. Different ranks may reach
+			# this point at very different times due to tokenization workload.
+			logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+			dist.barrier()
+
+			try:
+				logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+
+				# Store group separately so we can properly destroy it on reinit
+				self._nccl_group = StatelessProcessGroup.create(
+					host=comm_master_addr,
+					port=self._nccl_port,
+					rank=self.rank,
+					world_size=self.world_size,
+					data_expiration_seconds=36000,  # 10 hours
+				)
+				self.comm = PyNcclCommunicator(
+					group=self._nccl_group,
+					device=device
+				)
+				# Only rank 0 logs at INFO level to reduce verbosity
+				if self.rank == 0:
+					logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
+				else:
+					logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+			except Exception as e:
+				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+	def prepare_kimi_k3_startup(self) -> None:
+		"""Run Kimi-K3's workload-independent one-time work before readiness.
+
+		Everything here is fixed by the checkpoint and the topology, not by the
+		request: core components, required CUDA-extension loading, the PyNccl
+		communicator, the model build, the resident-EP decode shards, and — on
+		the distributed weight store — the streamed-SP8 buffers plus the single
+		H2D weight schedule. Doing it on the first admission instead made a
+		healthy server take minutes to answer its first request.
+
+		What stays at admission time cannot be sized here: the QueryBook buffer
+		pool needs the tokenized prompt/decode widths, and the resident prefill
+		output needs the micro-batch token count of the admitted sequences.
+
+		Collective (Init, _ensure_pynccl_communicator and configure_decoding all
+		run torch.distributed collectives) and idempotent.
+		"""
+		if self._k3_startup_completed:
+			return
+
+		logging.info(
+			f"Rank {self.rank}: [K3_STARTUP] Building model and weight pipeline "
+			f"before readiness"
+		)
+		self.Init(None, _K3_STARTUP_MAX_DECODING_LENGTH, 0)
+		self._preload_kimi_k3_runtime_extensions()
+		self._ensure_pynccl_communicator()
+		# The resident-EP decode MoE runs its own all_gather/all_reduce, so the
+		# manager needs the communicator before configure_decoding, not at the
+		# first decode phase.
+		self.parallel_manager.set_comm(self.comm)
+
+		# Decode first: configure_decoding materializes the stacked MXFP4 EP
+		# shard that both phases keep resident. _MAX_DECODE_RANK_BSZ is the cap
+		# the runtime decode path applies to its own estimate, so the padded MoE
+		# buffers are already sized for the largest batch that can be admitted.
+		self._load_decode_model(self._max_decode_rank_bsz(), comm=self.comm)
+
+		# Then hand the built model to the prefill mode this weight topology
+		# will actually use, so the first admission inherits this phase directly
+		# instead of rebuilding the streamed-SP8 buffers itself.
+		startup_prefill_mode = self.parallel_manager.default_prefill_moe_mode()
+		self.parallel_manager.set_prefill_moe_mode(startup_prefill_mode)
+		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		self.set_phase("prefill")
+		self._install_prefill_weight_copy_pipeline(k3_prefill_profile=False)
+
+		# Slice 3: the DeepEP buffer lives for the process; build it before
+		# readiness so the first decode configure does not pay the NVSHMEM
+		# handshake inside the measured wall.
+		prewarm_exchange = getattr(self.parallel_manager, "prewarm_deepep_exchange", None)
+		if prewarm_exchange is not None:
+			prewarm_exchange()
+
+		self._k3_startup_completed = True
+		self._k3_startup_prefill_ready = True
+		self._k3_startup_prefill_mode = startup_prefill_mode
+		logging.info(f"Rank {self.rank}: [K3_STARTUP] Prefill phase ready")
+
+	def _preload_kimi_k3_runtime_extensions(self) -> None:
+		"""Load K3's first-forward CUDA extensions before HTTP readiness."""
+		from batchgen.moe.dispatch_scatter_3d import _load_dispatch_reduce_module
+		from batchgen_kernels.conv1d import _get_ext as _get_causal_conv1d_ext
+		try:
+			from batchgen_kernels.attention.kda_fused_decode import (
+				_get_ext as _get_kda_fused_decode_ext,
+			)
+		except ImportError as exc:
+			raise RuntimeError(
+				f"Rank {self.rank}: required Kimi-K3 extension "
+				f"kda_fused_decode failed to load - {exc}"
+			) from exc
+
+		required_extensions = (
+			("causal_conv1d", _get_causal_conv1d_ext),
+			("dispatch_scatter_3d", _load_dispatch_reduce_module),
+			("kda_fused_decode", _get_kda_fused_decode_ext),
+		)
+		for name, loader in required_extensions:
+			if loader() is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: required Kimi-K3 extension {name} failed to load"
+				)
+			logging.info(
+				f"Rank {self.rank}: [K3_STARTUP] Loaded runtime extension {name}"
+			)
+
+		# K3's pure-BF16 NoPE decode consumes these two symbols directly.  Import,
+		# validate, and kernel-warm them here so its function-local cached import
+		# cannot trigger extension setup after the server has reported ready.
+		try:
+			import flash_mla
+		except ImportError as e:
+			raise RuntimeError(
+				f"Rank {self.rank}: required Kimi-K3 extension flash_mla failed to load - {e}"
+			)
+		for symbol in ("flash_mla_with_kvcache", "get_mla_metadata"):
+			if not callable(getattr(flash_mla, symbol, None)):
+				raise RuntimeError(
+					f"Rank {self.rank}: required Kimi-K3 extension flash_mla is "
+					f"missing callable {symbol}"
+				)
+		self._warmup_kimi_k3_flash_mla(flash_mla)
+		logging.info(
+			f"Rank {self.rank}: [K3_STARTUP] Loaded and warmed runtime extension flash_mla"
+		)
+
+	def _warmup_kimi_k3_flash_mla(self, flash_mla) -> None:
+		"""Launch the exact K3 decode kernel once before HTTP readiness."""
+		device = torch.device("cuda", torch.cuda.current_device())
+		cache_seqlens = torch.ones((1,), dtype=torch.int32, device=device)
+		query = torch.zeros(
+			(1, 1, 12, 576), dtype=torch.bfloat16, device=device
+		)
+		blocked_k = torch.zeros(
+			(1, 64, 1, 576), dtype=torch.bfloat16, device=device
+		)
+		block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+		tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+			cache_seqlens, 12, 1
+		)
+		flash_mla.flash_mla_with_kvcache(
+			query,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			causal=True,
+		)
+		torch.cuda.synchronize(device)
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -5707,90 +6368,7 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: Distributed connections verified")
 		
 		# Ensure communicator is ready
-		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
-			# Verify rank consistency
-			if dist.is_initialized():
-				assert self.rank == dist.get_rank(), \
-					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
-
-			# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
-			if self.world_size == 1:
-				logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
-			else:
-				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-
-				# Coordinate PyNccl initialization across all ranks
-				# Use all_reduce to check if ANY rank needs to (re)init the communicator
-				need_init = 1 if self.comm is None else 0
-				need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
-				dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
-				any_rank_needs_init = need_init_tensor.item() > 0
-
-				if any_rank_needs_init:
-					# All ranks must participate in init - destroy any existing comm first
-					if self.comm is not None:
-						logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
-						try:
-							self.comm.destroy()
-						except Exception:
-							pass
-						self.comm = None
-						if hasattr(self, '_nccl_group') and self._nccl_group is not None:
-							del self._nccl_group
-							self._nccl_group = None
-
-					device = torch.device("cuda", self.local_rank)
-
-					if comm_master_addr is None:
-						logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-					elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-						# Track port - incremented in _check_and_reinit_pynccl on failures
-						if not hasattr(self, '_nccl_port'):
-							self._nccl_port = 20003
-
-						# Rank 0 finds an available port, then broadcasts to all ranks
-						if self.rank == 0:
-							try:
-								self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
-								logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
-							except RuntimeError as e:
-								logging.error(f"Rank 0: Failed to find available port: {e}")
-								raise
-
-						# Broadcast the chosen port from rank 0 to all ranks
-						port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
-						dist.broadcast(port_tensor, src=0)
-						self._nccl_port = port_tensor.item()
-
-						# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-						# is ready before other ranks try to connect. Different ranks may reach
-						# this point at very different times due to tokenization workload.
-						logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
-						dist.barrier()
-
-						try:
-							logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
-
-							# Store group separately so we can properly destroy it on reinit
-							self._nccl_group = StatelessProcessGroup.create(
-								host=comm_master_addr,
-								port=self._nccl_port,
-								rank=self.rank,
-								world_size=self.world_size,
-								data_expiration_seconds=36000,  # 10 hours
-							)
-							self.comm = PyNcclCommunicator(
-								group=self._nccl_group,
-								device=device
-							)
-							# Only rank 0 logs at INFO level to reduce verbosity
-							if self.rank == 0:
-								logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
-							else:
-								logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
-						except Exception as e:
-							logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-							raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		self._ensure_pynccl_communicator()
 
 		iteration = 0
 
@@ -5985,6 +6563,12 @@ class BatchGenWorker:
 
 					# Get local indices AFTER config (new sequences now in map)
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
+					local_prefill_passes, global_prefill_passes = (
+						self._streamed_sp8_prefill_pass_alignment(
+							local_prefill_indices
+						)
+					)
+					self._prefill_global_passes = global_prefill_passes
 
 					# B. Execute Prefill
 					if local_prefill_indices:
@@ -5995,12 +6579,55 @@ class BatchGenWorker:
 								f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
 								f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 							)
+						# DEBUG instrumentation (env-gated, off by default):
+						# per-allocation attribution of the prefill HBM peak.
+						# BATCHGEN_MEM_PROFILE=1 turns on torch's allocator history
+						# recorder around the prefill forward and dumps a snapshot
+						# (also on OOM, via the finally) to BATCHGEN_MEM_PROFILE_DIR.
+						_memprof = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
+						if _memprof:
+							_memprof_base = torch.cuda.memory_allocated()
+							# context="alloc"/stacks="python": frames on allocation
+							# events only. K3 prefill does ~1e6 allocations (the
+							# 896-expert moe_infer loop), so recording free-event
+							# and C++ stacks too would double cost for no signal.
+							torch.cuda.memory._record_memory_history(
+								context="alloc",
+								stacks=os.environ.get("BATCHGEN_MEM_PROFILE_STACKS", "python"),
+								max_entries=int(os.environ.get("BATCHGEN_MEM_PROFILE_ENTRIES", "3000000")),
+							)
+							torch.cuda.reset_peak_memory_stats()
+							logging.info(
+								f"[MEMPROF] Rank {self.rank}: recording ON, "
+								f"baseline_alloc={_memprof_base/2**30:.3f}GiB"
+							)
 						prefill_start = time.perf_counter()
-						with torch.inference_mode():
-							if self.enable_prepack:
-								self.prefill_prepacked(local_prefill_indices)
-							else:
-								self.prefill(local_prefill_indices)
+						try:
+							with torch.inference_mode():
+								if self.enable_prepack:
+									self.prefill_prepacked(local_prefill_indices)
+								else:
+									self.prefill(local_prefill_indices)
+						finally:
+							if _memprof:
+								logging.info(
+									f"[MEMPROF] Rank {self.rank}: "
+									f"peak_alloc={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
+									f"cur_alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
+									f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
+									f"peak_reserved={torch.cuda.max_memory_reserved()/2**30:.3f}GiB "
+									f"baseline_alloc={_memprof_base/2**30:.3f}GiB"
+								)
+								_memprof_path = os.path.join(
+									os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
+									f"memprof_rank{self.rank}_{int(time.time())}.pickle",
+								)
+								try:
+									torch.cuda.memory._dump_snapshot(_memprof_path)
+									logging.info(f"[MEMPROF] Rank {self.rank}: snapshot -> {_memprof_path}")
+								except Exception as _memprof_err:
+									logging.error(f"[MEMPROF] Rank {self.rank}: dump failed: {_memprof_err}")
+								torch.cuda.memory._record_memory_history(enabled=None)
 						prefill_time += time.perf_counter() - prefill_start
 
 						# CRITICAL: Wait for all async KV offloads to complete before decode.
@@ -6011,14 +6638,49 @@ class BatchGenWorker:
 						# would have nothing to wait for. Wait on every captured future
 						# first, then sync the device to flush the d2h stream.
 						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+						_offload_wait_start = time.perf_counter()
 						num_retired = _AWB.retire_pending_prefill_offloads(
 							device=self.torch_device,
 							reason="end of prefill",
 						)
-						if num_retired and self.rank == 0:
+						if num_retired:
+							# Every rank logs: r28 showed node 1 entering the first
+							# decode configure ~30 s after node 0 with nothing in
+							# its log; the offload wait is the first suspect.
 							logging.info(
-								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
+								f"[PREFILL_SYNC] Rank {self.rank}: waited on {num_retired} "
+								f"async KV offload tasks in "
+								f"{time.perf_counter() - _offload_wait_start:.2f}s"
 							)
+
+					transport_only_passes = (
+						global_prefill_passes - local_prefill_passes
+					)
+					if transport_only_passes:
+						resident_padding = (
+							hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+							and self.parallel_manager.prefill_uses_resident_ep()
+						)
+						logging.info(
+							f"Rank {self.rank}: joining {transport_only_passes} "
+							+ ("resident-EP prefill passes with no local rows"
+							   if resident_padding else
+							   "streamed-SP8 prefill weight schedules with no local rows")
+						)
+						transport_start = time.perf_counter()
+						for _ in range(transport_only_passes):
+							self.feed_watchdog()
+							with torch.inference_mode():
+								if resident_padding:
+									self._sync_prefill_moe_rank_counts(
+										0, reason="resident_padding_pass",
+									)
+									self.parallel_manager.run_resident_ep_collective_only_prefill()
+								else:
+									self.parallel_manager.run_streamed_sp8_transport_only_prefill(
+										1
+									)
+						prefill_time += time.perf_counter() - transport_start
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -6066,16 +6728,25 @@ class BatchGenWorker:
 				onhold_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
 				in_decode_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE))
 				total_candidates = prefilled_count + onhold_count + in_decode_count
-				# Estimate max per rank (ceiling division)
-				max_num_seq_estimate = (total_candidates + self.world_size - 1) // self.world_size
+				# TP attention replicates one group's sequences across all G ranks,
+				# so each rank needs the per-group batch, not total/world_size.
+				max_num_seq_estimate = estimate_max_decode_replica_batch(
+					total_candidates,
+					self.world_size,
+					self._decode_attn_tp_size(),
+				)
 				# Ensure at least some minimum
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
 				# Cap per-rank decode batch so the MoE buffer's mtp (= round_up(world_size *
 				# this)) stays bounded — a large candidate pool must NOT inflate the padded
 				# buffers (that re-OOMs init). The page-boundary admission also caps in-decode
 				# at this value (decode.py max_rank_bsz), so the buffer never overflows.
-				max_num_seq_estimate = min(max_num_seq_estimate, _MAX_DECODE_RANK_BSZ)
+				max_num_seq_estimate = min(max_num_seq_estimate, self._max_decode_rank_bsz())
 
+				logging.info(
+					f"[DECODE] Rank {self.rank}: entering decode configure "
+					f"(max_num_seq_estimate={max_num_seq_estimate})"
+				)
 				self._load_decode_model(max_num_seq_estimate, self.comm)
 
 				if torch.cuda.is_available():
@@ -6189,6 +6860,9 @@ class BatchGenWorker:
 				if decode_uuids:
 					self._sync_sequence_metadata(decode_uuids)
 
+				# M2b: stamp the decode DP-group before local-index resolution so
+				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
+				self._assign_decode_dp_groups(decode_uuids)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
@@ -6207,6 +6881,19 @@ class BatchGenWorker:
 				config_decode_time += time.perf_counter() - config_start
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
+
+				# Kimi-K3's segmented attention + resident-MXFP4 MoE graphs
+				# must be captured after the real GPU KV manager/page table and
+				# synchronized decode row counts exist, but before the first
+				# measured decode forward.  The PSM keeps the model-specific
+				# capture logic; this hook only supplies the worker-owned KV
+				# manager.  Other models have no such method and retain their
+				# existing warmup path below.
+				prewarm_kimi_graphs = getattr(
+					self.parallel_manager, "prewarm_decode_graphs", None
+				)
+				if prewarm_kimi_graphs is not None:
+					prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())
 
 				# CUDA Graph Warmup (configure-time, one-time for whole-model GLM).
 				# Whole-model graph captures every configured bucket before decode;
@@ -6410,9 +7097,132 @@ class BatchGenWorker:
 
 	# ============ Phase Configuration ============
 
+	@staticmethod
+	def _weight_copy_task_fingerprint(weight_copy_task) -> tuple:
+		"""Immutable identity of an H2D weight-copy schedule.
+
+		Both the module types and the per-type ORDER matter: the copy engine
+		drains each type's list front to front and the consumer blocks on the
+		head, so two tasks are interchangeable only if their lists are equal.
+		"""
+		return tuple(
+			(str(module_type), tuple(str(name) for name in names))
+			for module_type, names in sorted((weight_copy_task or {}).items())
+		)
+
+	def _install_prefill_weight_copy_pipeline(self, k3_prefill_profile: bool) -> None:
+		"""Point the H2D copy engine at the prefill weight-copy schedule.
+
+		Requires ``self.weight_copy_task`` from the configure_prefill that just
+		ran. Shared by the pre-readiness Kimi-K3 startup and by every per-batch
+		prefill config, so first-install and transport-specific reentry rules live
+		in one place no matter which caller runs first.
+		"""
+		# Host-RDMA drives one free-running remote-daemon schedule and erases each
+		# generation it releases, so that transport must preserve its queue cursor
+		# and prefetched GPU leases. Hierarchical GDR is different: source ranks
+		# read their local compact store directly and non-sources have an empty H2D
+		# task. Start that transport at the schedule boundary on every admission;
+		# preserving an arbitrary partially filled ring across resident decode can
+		# leave a full-batch consumer holding the published leases while it waits
+		# for a slot that can no longer be produced.
+		streamed_sp8 = (
+			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
+		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
+		reseed_reentry = (
+			sp8_reentry
+			and hasattr(
+				self.parallel_manager,
+				"streamed_sp8_reseeds_h2d_on_reentry",
+			)
+			and self.parallel_manager.streamed_sp8_reseeds_h2d_on_reentry()
+		)
+		self.core_engine.stop_h2d_worker()
+		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
+		if sp8_reentry:
+			# configure_prefill rebuilt the task from scratch. Both a preserved
+			# cursor and a fresh schedule boundary require the same immutable task.
+			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
+					raise RuntimeError(
+					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
+					"changed after the H2D pipeline was installed; the "
+					"installed pipeline no longer matches the rebuilt task"
+				)
+		if not sp8_reentry or reseed_reentry:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_prefill_buffer()
+		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
+		if streamed_sp8 or k3_prefill_profile:
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(k3_prefill_profile)
+			from batchgen.moe.streamed_sp8_mxfp4 import (
+				StreamedSP8MXFP4MoELayer,
+			)
+			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
+		if not sp8_reentry or reseed_reentry:
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			if any(self.weight_copy_task.values()):
+				self.core_engine.start_h2d_worker()
+		elif any(self.weight_copy_task.values()):
+			self.core_engine.start_h2d_worker()
+		self._streamed_sp8_h2d_installed = streamed_sp8
+		self._streamed_sp8_weight_copy_fingerprint = (
+			fingerprint if streamed_sp8 else None
+		)
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
+		prefill_sequences = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				prefill_sequences.append(seq)
+		prefill_debug = (
+			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		)
+		k3_prefill_profile = self._debug_flag_enabled(
+			prefill_debug.get("k3_prefill_profile")
+		)
+		AttnWrapperBase.batchgen_debug = prefill_debug or None
+		_default_k3_prefill_mode = "streamed"
+		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
+			_default_k3_prefill_mode = (
+				self.parallel_manager.default_prefill_moe_mode()
+			)
+		k3_prefill_moe_mode = prefill_debug.get(
+			"k3_prefill_moe_mode", _default_k3_prefill_mode
+		)
+		reuse_startup_prefill = (
+			self._k3_startup_prefill_ready
+			and k3_prefill_moe_mode == self._k3_startup_prefill_mode
+			and not k3_prefill_profile
+		)
+		# Kimi-K3 resident handoff: once a decode phase has materialized the
+		# resident EP shard, later admission waves prefill through it (chunked
+		# by k3_resident_prefill_token_cap) instead of releasing the ~84 GiB
+		# shard for streamed-SP8 and rebuilding it from the node store after
+		# the wave (22-139 s per rank per wave on H200). An explicit
+		# batchgen_debug.k3_prefill_moe_mode still wins.
+		resident_token_cap = int(getattr(
+			self.engine_config.Module_Batching_Config,
+			"k3_resident_prefill_token_cap", 0,
+		) or 0)
+		resident_handoff = (
+			not reuse_startup_prefill
+			and "k3_prefill_moe_mode" not in prefill_debug
+			and resident_token_cap > 0
+			and hasattr(self.parallel_manager, "resident_ep_prefill_available")
+			and self.parallel_manager.resident_ep_prefill_available()
+		)
+		if resident_handoff:
+			k3_prefill_moe_mode = "resident_ep"
+		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
+			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)
 		if self.rank == 0:
 			logging.info(
 				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
@@ -6451,16 +7261,87 @@ class BatchGenWorker:
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
 
+		# Resident TP groups must be known before sizing the reusable global
+		# FP32 MoE output. Fresh admissions are already grouped; this also
+		# restores groups for evicted re-entries before the normal idempotent
+		# assignment later in this method.
+		self._assign_decode_dp_groups(prefill_uuids)
+
 		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
-		logging.info("Deep freeing model memory before prefill config...")
-		self.deep_free_model_memory()
+		if reuse_startup_prefill:
+			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
+			# decode model has run yet, and this prefill phase — model,
+			# streamed-SP8 buffers, installed H2D schedule — is the one startup
+			# built. deep_free_model_memory() would release those buffers and
+			# strand the weight daemon's preserved cursor. Consumed here, so every
+			# later prefill (which does follow a decode phase) frees normally.
+			self._k3_startup_prefill_ready = False
+			logging.info("Reusing Kimi-K3 startup-prepared prefill model...")
+		elif resident_handoff:
+			# Keep the model and its resident EP shard. Captured decode graphs
+			# bake the GPU KV-pool addresses and the pool is rebuilt below, so
+			# they are released here and re-captured by configure_decoding.
+			self._k3_startup_prefill_ready = False
+			self.parallel_manager.release_decode_graph()
+			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap = (
+				resident_token_cap
+			)
+			if torch.cuda.is_available():
+				torch.cuda.synchronize(self.torch_device)
+			logging.info(
+				"[K3] resident-EP prefill handoff: keeping the resident expert "
+				f"shard across the decode->prefill transition, token cap "
+				f"{resident_token_cap}"
+			)
+		else:
+			# Consume a startup handoff that the request cannot reuse (for example,
+			# a diagnostic mode/profile override) before rebuilding that phase.
+			self._k3_startup_prefill_ready = False
+			logging.info("Deep freeing model memory before prefill config...")
+			self.deep_free_model_memory()
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		self._destroy_gpu_paged_kv_cache()
+		if k3_prefill_profile and torch.cuda.is_available():
+			torch.cuda.reset_peak_memory_stats(self.local_rank)
+
+		if (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			local_lengths = [
+				int(seq.prompt_length)
+				for seq in prefill_sequences
+				if self._owns_local_sequence(seq)
+			]
+			token_cap = (
+				self.engine_config.Module_Batching_Config
+				.prefill_micro_batch_token_cap
+			)
+			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+			predicted_batches, _ = build_prefill_micro_batches(
+				local_lengths,
+				token_cap,
+				l2_balance=use_l2,
+			)
+			local_max_tokens = max(
+				(
+					sum(local_lengths[start:end])
+					for start, end in predicted_batches
+				),
+				default=0,
+			)
+			moe_ntp = self._sync_prefill_moe_rank_counts(
+				local_max_tokens,
+				reason="prefill_output_preallocate",
+			)
+			self.parallel_manager.prepare_resident_ep_prefill_output(
+				self.world_size * moe_ntp
+			)
 
 		if torch.cuda.is_available():
 			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -6471,13 +7352,16 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
 			)
 
-		# STEP 1: Configure model for prefill
-		# Hand the NCCL communicator to managers that need it during prefill
-		# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
-		if hasattr(self.parallel_manager, "set_comm"):
-			self.parallel_manager.set_comm(self.comm)
-		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
-		self.set_phase("prefill")
+		# STEP 1: Configure model for prefill. The normal first K3 admission
+		# inherits the exact phase installed before readiness; do not re-enter
+		# configure_prefill or stop/restart its H2D pipeline lazily here.
+		if not reuse_startup_prefill:
+			# Hand the NCCL communicator to managers that need it during prefill
+			# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
+			if hasattr(self.parallel_manager, "set_comm"):
+				self.parallel_manager.set_comm(self.comm)
+			self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+			self.set_phase("prefill")
 
 		if torch.cuda.is_available():
 			torch.cuda.synchronize(self.torch_device)
@@ -6488,11 +7372,8 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 			)
 
-		self.core_engine.stop_h2d_worker()
-		self.core_engine.clear_weight_copy_queue()
-		self.core_engine.reset_prefill_buffer()
-		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-		self.core_engine.start_h2d_worker()
+		if not reuse_startup_prefill:
+			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
 
 		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
@@ -6630,12 +7511,22 @@ class BatchGenWorker:
 				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
 			)
 
-		# STEP 4: Allocate host KV pages for sequences (only THIS RANK's sequences)
-		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
+		# STEP 3.5 (Option 1, CORE): (re)assign the serve-group before binding.
+		# Idempotent for fresh admits (already grouped at admission); RE-groups
+		# evicted re-entries (whose decode_dp_group was cleared on eviction) so
+		# the group predicate below binds them on all G ranks. No-op for G==1.
+		self._assign_decode_dp_groups(prefill_uuids)
+
+		# STEP 4: Allocate host KV pages for sequences this rank serves.
+		# Ownership: G==1 -> the single assigned_rank; G>1 (Option 1) -> ALL G
+		# ranks of the sequence's serve-group, so the group holds the sequence's
+		# replicated MLA KV and head-sharded KDA state from prefill onward.
+		# Check by _owns_local_sequence, NOT _uuid_to_local_map (which may not
+		# have new sequences yet).
 		my_prefill_uuids = []
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq.assigned_rank == self.rank:
+			if self._owns_local_sequence(seq):
 				my_prefill_uuids.append(uuid)
 				# Add to local maps if not already present (for new sequences)
 				if uuid not in self._uuid_to_local_map:
@@ -6730,7 +7621,11 @@ class BatchGenWorker:
 			comm: NCCL communicator for distributed MoE forward.
 		"""
 		self.deep_free_model_memory()
+		_nv_t0 = time.perf_counter()
 		self.init_nvshmem()
+		_nv_dt = time.perf_counter() - _nv_t0
+		if _nv_dt > 1.0:
+			logging.info(f"[DECODE] Rank {self.rank}: init_nvshmem took {_nv_dt:.1f}s")
 
 		# Unified method handles all deployment scenarios
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
@@ -6743,16 +7638,76 @@ class BatchGenWorker:
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
-		self.core_engine.clear_weight_copy_queue()
-		self.core_engine.reset_decoding_buffer()
+		# Resident decode does not stream routed experts. Keep the installed
+		# streamed-SP8 state through this transition: host-RDMA needs its daemon
+		# cursor, while hierarchical GDR resets its local queue/ring at the next
+		# prefill boundary. reset_decoding_buffer() must not resize those slots to
+		# the decode layout in either case.
+		if not self._streamed_sp8_h2d_installed:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
 
 		# Only start H2D worker if there are experts to offload
 		if self.weight_copy_task.get("routed_expert"):
+			if self._streamed_sp8_h2d_installed:
+				raise RuntimeError(
+					f"Rank {self.rank}: streamed decode cannot replace an "
+					"installed streamed-SP8 prefill pipeline; use resident-EP "
+					"decode so the distributed weight schedule stays aligned"
+				)
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 
 		if self.rank == 0:
 			logging.info(f"[DECODE] Model loaded for decoding phase")
+			self._log_decode_parameter_residency()
+
+	def _max_decode_rank_bsz(self) -> int:
+		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
+		per-node cap when a TP-group model (every rank holds the same rows)
+		plans more slots than the guard — e.g. K3 H200 with sharded latent
+		projections plans 160 rows per node."""
+		planned = int(getattr(
+			self.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
+		) or 0)
+		if self._decode_attn_tp_size() > 1 and planned > _MAX_DECODE_RANK_BSZ:
+			return planned
+		return _MAX_DECODE_RANK_BSZ
+
+	def _log_decode_parameter_residency(self) -> None:
+		"""One-line HBM breakdown of the decode model's resident parameters and
+		buffers by top-level module kind (rank 0, once per decode config), so
+		the non-expert residency — what competes with KV pool and KDA slots
+		for concurrency — is visible next to the resident expert shard line."""
+		model = getattr(self, "model", None)
+		if model is None or not hasattr(model, "named_parameters"):
+			return
+		try:
+			by_kind = {}
+			seen = set()
+			for name, t in list(model.named_parameters()) + list(model.named_buffers()):
+				if not t.is_cuda or t.data_ptr() in seen:
+					continue
+				seen.add(t.data_ptr())
+				parts = name.split(".")
+				kind = parts[0]
+				for i, part in enumerate(parts):
+					if part == "layers" and i + 2 < len(parts):
+						kind = parts[i + 2]
+						break
+					if part in ("embed_tokens", "lm_head", "norm"):
+						kind = part
+						break
+				by_kind[kind] = by_kind.get(kind, 0) + t.numel() * t.element_size()
+			total = sum(by_kind.values())
+			items = sorted(by_kind.items(), key=lambda kv: -kv[1])
+			logging.info(
+				"[HBM] decode parameters/buffers resident on rank %s: %.2f GiB total | %s",
+				self.rank, total / (1024 ** 3),
+				", ".join(f"{k}={v / (1024 ** 3):.2f}" for k, v in items[:12]),
+			)
+		except Exception as e:  # informational only
+			logging.debug("parameter residency breakdown failed: %r", e)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
 		"""
@@ -6949,17 +7904,11 @@ class BatchGenWorker:
 					seq.mark_initial_gpu_reservation_done()
 					self._sequences_with_gpu_kv.add(uuid)
 			else:
-				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
-				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
-				# do NOT add these sequences to tracking. Otherwise subsequent
-				# rebuild_page_table() calls will crash with KeyError because the
-				# sequences exist in _sequences_with_gpu_kv / batch but were never
-				# registered in gpu_manager._sequences.
-				logging.error(
-					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
-					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
+				raise RuntimeError(
+					f"Rank {self.rank}: GPU KV allocation failed for "
+					f"{len(local_decode_indices)} locally owned sequences; "
+					"decode admission exceeded the available replica capacity"
 				)
-				local_decode_indices.clear()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
@@ -7094,18 +8043,30 @@ class BatchGenWorker:
 			return
 		
 		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
-		
-		if my_uuids:
+
+		# Host KV is ONE per-node SHARED shm region (batchgen_host_kv_cache) keyed
+		# by global_idx. Under Option 1 (G>1) all G ranks of a group hold the uuid
+		# in _uuid_to_local_map, so releasing on every rank double-frees the single
+		# shared entry -- the first releaser tombstones it and the rest raise
+		# "Sequence ID ... not found during release". Release the shared entry on
+		# EXACTLY the group leader (_owns_host_kv). G==1: host_release_uuids ==
+		# my_uuids, so the validated single-owner path is byte-identical.
+		host_release_uuids = [
+			uuid for uuid in my_uuids
+			if self._owns_host_kv(self.global_batch.get_sequence(uuid))
+		]
+
+		if host_release_uuids:
 			global_sequence_ids = [
 				self.global_batch.get_sequence(uuid).global_idx
-				for uuid in my_uuids
+				for uuid in host_release_uuids
 			]
 
 			logging.debug(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
-			
+
 			# NOTE: GPU KV pages should already be released by caller
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
-			
+
 			# Release host KV pages
 			# NOTE: release_sequence_pages already calls unregister_sequences internally,
 			# so we don't need to call unregister_sequences separately
@@ -7115,7 +8076,10 @@ class BatchGenWorker:
 			if aux_view is not None:
 				aux_view.release_sequence_pages(global_sequence_ids)
 
-			# Rebuild GPU page table with remaining active sequences
+		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
+		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
+		# its own remaining page table -- keyed on my_uuids, not the leader subset.
+		if my_uuids:
 			manager = self.gpu_paged_kv_cache_manager
 			if manager is not None and manager.is_initialized:
 				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
@@ -7124,7 +8088,7 @@ class BatchGenWorker:
 					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
 						seq = self.global_batch.get_sequence(uuid)
 						remaining_global_ids.append(seq.global_idx)
-				
+
 				if remaining_global_ids:
 					remaining_global_ids.sort()
 					manager.rebuild_page_table(remaining_global_ids)
@@ -7383,23 +8347,54 @@ class BatchGenWorker:
 		# Create micro-batches bounded by token count, optionally also by sum(L^2)
 		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
 		# on one micro-batch when a single very long sequence is present.
-		import os as _os_mb
-		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-		micro_batches, l2_cap = build_prefill_micro_batches(
-			seq_lengths_list,
-			MAX_TOKENS_PER_MICRO_BATCH,
-			l2_balance=_USE_L2_MB,
+		# The planner's token cap is a bound between sequence boundaries.  A
+		# single K3 prompt may itself be much larger than that cap, so the
+		# ordinary greedy planner cannot split it and would still co-reside two
+		# 262K-token sequences in one decoder pass.  That pass allocates the
+		# block-attention-residual scratch for *all* rows and exceeded H20 HBM
+		# before the first streamed-SP8 expert layer.  K3's KDA/MLA state is
+		# persistent per sequence, so keeping each long sequence in its own
+		# prepack pass preserves the state contract; it is not a token-axis
+		# split pretending to be a resumable model forward.
+		micro_batches, l2_cap, _use_single_sequence_mb = (
+			self._plan_prefill_micro_batches(seq_lengths_list)
 		)
 		total_tokens_all = sum(seq_lengths_list)
+		if (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			# Pass counts were aligned across ALL ranks before this call (a
+			# rank with no local rows never enters here, so no collective may
+			# live in this function); ranks short of the global count pad with
+			# collective-only passes afterwards.
+			global_passes = getattr(self, "_prefill_global_passes", None)
+			if global_passes is not None and len(micro_batches) > global_passes:
+				raise RuntimeError(
+					"resident-EP prefill planned more micro-batches than the "
+					f"aligned global count: {len(micro_batches)} > {global_passes}"
+				)
 
 		if self.rank == 0:
 			logging.info(
 				f"Prepacked prefill: {len(micro_batches)} micro batches, "
 				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
+				+ (", single-sequence long-prompt guard" if _use_single_sequence_mb else "")
 				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
 
 		output_tokens = []
+		prefill_sequences = [
+			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+			for local_idx in batch
+		]
+		prefill_debug = (
+			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		)
+		_k3_profile_enabled = self._debug_flag_enabled(
+			prefill_debug.get("k3_prefill_profile")
+		)
+		_k3_profile_logits = []
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
@@ -7434,6 +8429,14 @@ class BatchGenWorker:
 
 				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
 				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
+				if (
+					hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+					and self.parallel_manager.prefill_uses_resident_ep()
+				):
+					self._sync_prefill_moe_rank_counts(
+						int(batch_input_ids_flat.numel()),
+						reason=f"prefill_microbatch_{batch_idx}",
+					)
 
 				batch_local_indices = batch[seq_start:seq_end]
 				local_to_global_seq_id_map = {}
@@ -7518,6 +8521,20 @@ class BatchGenWorker:
 					# allocated.
 					block_residual = self.model.model._new_block_residual(hidden_states)
 
+				# DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
+				# bookkeeping is CPU-side, no sync) and independent of the
+				# allocator-history trace, so it still localises the peak layer
+				# if the trace ring buffer wraps.
+				_memprof_layers = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
+				# The allocator-history ring buffer only holds the LAST max_entries
+				# events, and one K3 prefill emits ~2e7 of them (896-expert
+				# moe_infer loop x 92 layers), so a whole-forward trace only ever
+				# retains the tail. The HBM peak is set in the FIRST layer, so
+				# BATCHGEN_MEM_PROFILE_STOP_LAYER=N dumps and stops recording right
+				# after layer N: a short, wrap-free trace of the window that
+				# actually contains the peak.
+				_memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
+
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					if use_attn_res:
 						hidden_states, block_residual = decoder_layer(
@@ -7539,6 +8556,26 @@ class BatchGenWorker:
 							use_cache=False,
 						)
 						hidden_states = layer_outputs[0]
+					if _memprof_layers:
+						logging.info(
+							f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
+							f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
+							f"alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
+							f"cum_peak={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
+							f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
+							f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
+						)
+						if layer_idx == _memprof_stop_layer:
+							_p = os.path.join(
+								os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
+								f"memprof_rank{self.rank}_thru_layer{layer_idx}_{int(time.time())}.pickle",
+							)
+							torch.cuda.memory._dump_snapshot(_p)
+							torch.cuda.memory._record_memory_history(enabled=None)
+							logging.info(
+								f"[MEMPROF] Rank {self.rank}: stop-layer snapshot -> {_p} "
+								f"(peak_alloc so far={torch.cuda.max_memory_allocated()/2**30:.3f}GiB)"
+							)
 
 				# Output depth-mix, then norm -- that ORDER is load-bearing
 				# (kimi_linear/model.py:904-913).
@@ -7554,11 +8591,31 @@ class BatchGenWorker:
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
-				last_token_hidden = hidden_states[0, last_token_indices, :]
+				gather_last_token_hidden = getattr(
+					self.parallel_manager,
+					"gather_prefill_last_token_hidden",
+					None,
+				)
+				if gather_last_token_hidden is None:
+					last_token_hidden = hidden_states[
+						0, last_token_indices, :
+					]
+				else:
+					last_token_hidden = gather_last_token_hidden(
+						hidden_states,
+						last_token_indices,
+						batch_input_ids_flat.numel(),
+					)
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
 				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-				if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+				if getattr(self.model.lm_head, "tp_size", 1) > 1:
+					# vocab-parallel head (K3 TP8): the module all_gathers the
+					# full logits; the raw shard weight must not be used here.
+					# .forward skips the decode-only pre-hook (``[:, -1, :]``
+					# expects [bsz, seq, H]; this input is the gathered [n, H]).
+					logits = self.model.lm_head.forward(last_token_hidden).float()
+				elif os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
 					logits = torch.nn.functional.linear(
 						last_token_hidden.float(),
 						self.model.lm_head.weight.float(),
@@ -7570,6 +8627,8 @@ class BatchGenWorker:
 						self.model.lm_head.weight,
 						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					).float()
+				if _k3_profile_enabled:
+					_k3_profile_logits.append(logits.detach())
 
 				batch_sequences = [
 					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
@@ -7591,11 +8650,66 @@ class BatchGenWorker:
 				# the only way to see the token. Rank 0 only; ids only (the
 				# worker has no tokenizer -- decode them client-side).
 				if self.rank == 0:
+					_ids = batch_new_tokens.reshape(-1).tolist()
 					logging.info(
-						"[PREFILL] first sampled token ids: %s",
-						batch_new_tokens.reshape(-1).tolist()[:16])
+						"[PREFILL] first sampled token ids: %s ... last: %s (n=%d)",
+						_ids[:16], _ids[-8:], len(_ids))
 
 		_prefill_forward_s = time.perf_counter() - _prefill_forward_t0
+		if _k3_profile_enabled:
+			# Freeze the cyclic producer before any Python import or JSON work.
+			# Otherwise it can refill newly released slots after the final
+			# expert and make one completed prefill look like a partial second
+			# pass.
+			self.core_engine.stop_h2d_worker()
+			_k3_profile_topk = []
+			for profile_logits in _k3_profile_logits:
+				top_values, top_indices = torch.topk(
+					profile_logits,
+					k=min(8, profile_logits.shape[-1]),
+					dim=-1,
+				)
+				_k3_profile_topk.append({
+					"ids": top_indices.cpu().tolist(),
+					"values": top_values.cpu().tolist(),
+				})
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			from batchgen.moe.streamed_sp8_mxfp4 import (
+				StreamedSP8MXFP4MoELayer,
+			)
+			free_hbm, total_hbm = torch.cuda.mem_get_info(self.local_rank)
+			# The top-k ``.cpu()`` transfers above have drained the compute stream.
+			# Pending ingress events precede the ready events that stream waited on,
+			# so every timing pair is complete before ``elapsed_time`` is queried.
+			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
+				"rank": self.rank,
+				"hbm": {
+					"current_allocated_bytes": torch.cuda.memory_allocated(
+						self.local_rank
+					),
+					"current_reserved_bytes": torch.cuda.memory_reserved(
+						self.local_rank
+					),
+					"peak_allocated_bytes": torch.cuda.max_memory_allocated(
+						self.local_rank
+					),
+					"peak_reserved_bytes": torch.cuda.max_memory_reserved(
+						self.local_rank
+					),
+					"free_bytes": free_hbm,
+					"total_bytes": total_hbm,
+				},
+				"weight_stream": self.core_engine.get_weight_stream_profile(),
+				"expert_consumer": (
+					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
+				),
+				"streamed_sp8": (
+					StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
+				),
+				"logit_topk": _k3_profile_topk,
+			}, separators=(",", ":")))
 
 		# Structured prefill record, one JSON line per rank that actually ran a
 		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
@@ -7714,6 +8828,7 @@ class BatchGenWorker:
 			num_gpus_per_node=NUM_GPUS_PER_NODE,
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
 			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
+			attn_tp_size=self._decode_attn_tp_size(),
 		)
 
 	def _compute_boundary_decisions(
@@ -7874,6 +8989,10 @@ class BatchGenWorker:
 					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
+					# Option 1 (G>1): the serve-group id. The boundary validator keys
+					# group ownership on this (a uuid is reported by exactly its G
+					# contiguous ranks [g*G,(g+1)*G)), not on a single assigned_rank.
+					'decode_dp_group': seq.decode_dp_group,
 					# Host KV growth fields
 					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
@@ -7918,6 +9037,7 @@ class BatchGenWorker:
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
 				'assigned_rank': seq.assigned_rank,
+				'decode_dp_group': seq.decode_dp_group,  # Option 1 group-ownership key
 				'status': seq.status.name,  # Include status for debugging
 				'decoded_length': seq.decoded_length,  # For prioritized loading
 			}
@@ -7931,7 +9051,9 @@ class BatchGenWorker:
 		
 		all_payloads = [None] * self.world_size
 		dist.all_gather_object(all_payloads, local_payload)
-		validate_boundary_payload_alignment(decode_uuids, all_payloads)
+		validate_boundary_payload_alignment(
+			decode_uuids, all_payloads, group_size=self._decode_attn_tp_size()
+		)
 		
 		timing.gather_ms = (time.perf_counter() - t0) * 1000
 		
@@ -7941,13 +9063,23 @@ class BatchGenWorker:
 		# Extract per-rank free pages
 		per_rank_free = [p['free_pages'] for p in all_payloads]
 
-		# Merge sequence state - each uuid appears exactly once (owned by one rank)
+		# Merge sequence state. G==1: each uuid appears exactly once (single owner).
+		# G>1 (Option 1): the uuid is reported by all G ranks of its group, so pin a
+		# CANONICAL owning_rank = decode_dp_group*G (the group leader) instead of
+		# last-writer-wins (which would arbitrarily land on the highest group rank).
+		_G_merge = self._decode_attn_tp_size()
 		global_seq_state = {}
 		for rank_idx, payload in enumerate(all_payloads):
 			if payload and payload['seq_state']:
 				for uuid, state in payload['seq_state'].items():
 					global_seq_state[uuid] = state
-					global_seq_state[uuid]['owning_rank'] = rank_idx
+					if _G_merge > 1:
+						_g = state.get('decode_dp_group')
+						global_seq_state[uuid]['owning_rank'] = (
+							_g * _G_merge if _g is not None else rank_idx
+						)
+					else:
+						global_seq_state[uuid]['owning_rank'] = rank_idx
 
 		# Merge candidate state
 		global_candidate_info = {}
@@ -8173,8 +9305,17 @@ class BatchGenWorker:
 							f"host_pages={seq.host_pages_allocated} "
 							f"tokens_saved={len(seq.evicted_token_ids)}"
 						)
+				# Host KV is ONE per-node SHARED shm region keyed by global_idx, so
+				# release/unregister must fire EXACTLY once per sequence. Under G>1
+				# all G ranks of a group hold the evicted uuid, so releasing on every
+				# rank double-frees: the first releaser tombstones the entry and the
+				# rest raise "Sequence ID ... not found during release". Filter to the
+				# group leader (_owns_host_kv), matching the validated release path in
+				# _release_host_kv_pages_for_batch. The all-ranks scalar-metadata loop
+				# below iterates host_evicted_uuids and is deliberately NOT filtered.
 				evicted_global_ids = [
 					self.global_batch.get_sequence(u).global_idx for u in my_evicted
+					if self._owns_host_kv(self.global_batch.get_sequence(u))
 				]
 				if worker_view is not None:
 					worker_view.release_sequence_pages(evicted_global_ids)
@@ -8216,6 +9357,13 @@ class BatchGenWorker:
 				seq.host_pages_allocated = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
+				# M2b (d): eviction destroys the head-sharded KDA state on the
+				# group's ranks, so drop the decode DP-group. A re-prefilled
+				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
+				# treats the stale non-None group id as a preserved re-entry and
+				# skips it, stranding the sequence with no live state. No-op for
+				# G==1 (the field is always None on the validated pure-DP path).
+				seq.decode_dp_group = None
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)
@@ -8357,8 +9505,13 @@ class BatchGenWorker:
 		new_load_global = []
 
 		if new_load_uuids:
-			my_new_uuids = [u for u in new_load_uuids
-						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
+			# Pure DP loads on one assigned rank.  TP decode replicates the GPU
+			# KV on every member of the sequence's serve-group, so every group
+			# rank must allocate and launch its own local host->GPU load.
+			my_new_uuids = [
+				u for u in new_load_uuids
+				if self._owns_local_sequence(self.global_batch.get_sequence(u))
+			]
 			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
 
 			if new_load_local:
@@ -8563,9 +9716,11 @@ class BatchGenWorker:
 			if idx in self._local_to_uuid_map
 		}
 
-		# VALIDATION: Verify all pending_uuids exist, have assigned ranks,
-		# and are owner-confirmed. pending_uuids must be the all-gathered set
-		# of successful owner-local load launches, not merely rank-0 proposals.
+		# VALIDATION: Verify all pending_uuids exist and every local rank that
+		# must hold a replica confirmed its load.  Under TP decode, the old
+		# assigned-rank-only check admitted a UUID after only one of the G ranks
+		# had GPU pages, causing the other ranks to enter decode with zero pages.
+		group_size = self._decode_attn_tp_size()
 		valid_pending_uuids = []
 		invalid_pending = []
 		for uuid in pending_uuids:
@@ -8576,9 +9731,16 @@ class BatchGenWorker:
 			if seq.assigned_rank is None:
 				invalid_pending.append(f"{uuid[:8]} gid={seq.global_idx} has no assigned_rank")
 				continue
-			if seq.assigned_rank == self.rank and uuid not in pending_local_uuid_set:
+			if group_size > 1:
+				from batchgen.decode_dp_group import rank_in_decode_group
+				must_confirm_local = rank_in_decode_group(
+					seq.decode_dp_group, self.rank, group_size
+				)
+			else:
+				must_confirm_local = seq.assigned_rank == self.rank
+			if must_confirm_local and uuid not in pending_local_uuid_set:
 				invalid_pending.append(
-					f"{uuid[:8]} gid={seq.global_idx} owner rank {self.rank} "
+					f"{uuid[:8]} gid={seq.global_idx} rank {self.rank} "
 					"did not confirm local load"
 				)
 				continue
@@ -8784,8 +9946,17 @@ class BatchGenWorker:
 		self._current_decode_rank_token_counts = all_rank_counts
 
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+			# M2b: under DP-(world/G) x TP-G decode the 32-way max above is the
+			# per-GROUP batch B_grp (the G ranks of a group hold identical
+			# sequences). Decode scatters those rows across the group's G ranks
+			# before the DP-32 resident MoE, so the padded all_gather/all_reduce
+			# layout is sized by the POST-scatter share ceil(B_grp/G), not B_grp.
+			# G==1 -> ceil(max/1)==max, byte-identical to the pure-DP path.
+			from batchgen.decode_dp_group import moe_ntp_from_group_max
+			_G = getattr(self.parallel_manager, "attn_tp_size", 1)
+			moe_ntp = moe_ntp_from_group_max(max_batch_size, _G)
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+				self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
 			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
 				self.parallel_manager.set_rank_token_counts(all_rank_counts)
 
@@ -8799,6 +9970,42 @@ class BatchGenWorker:
 				f"local={local_count} max={max_batch_size} counts={counts_list}"
 			)
 		return max_batch_size
+
+	def _sync_prefill_moe_rank_counts(
+		self, local_token_count: int, *, reason: str
+	) -> int:
+		"""Size resident-EP prefill collectives after TP-group row scattering."""
+		local = torch.tensor(
+			[int(local_token_count)],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		counts = torch.empty(
+			(self.world_size,), dtype=torch.int64, device=self.torch_device
+		)
+		dist.all_gather_into_tensor(counts, local)
+		G = self._decode_attn_tp_size()
+		counts_list = [int(value) for value in counts.cpu().tolist()]
+		for start in range(0, self.world_size, G):
+			group = counts_list[start:start + G]
+			if len(set(group)) != 1:
+				raise RuntimeError(
+					"resident-EP prefill requires identical token rows within "
+					f"each TP group; ranks {start}:{start + G} reported {group}"
+				)
+		max_group_tokens = max(counts_list)
+		from batchgen.decode_dp_group import moe_ntp_from_group_max
+		moe_ntp = moe_ntp_from_group_max(max_group_tokens, G)
+		self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
+		if self.rank == 0:
+			logging.info(
+				"[K3_PREFILL_MOE] reason=%s group_token_counts=%s "
+				"post_scatter_ntp=%s",
+				reason,
+				[counts_list[start] for start in range(0, self.world_size, G)],
+				moe_ntp,
+			)
+		return moe_ntp
 
 	def _warmup_cuda_graphs(self):
 		"""One-time CUDA graph warmup phase with model guard.
@@ -10123,8 +11330,10 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
+		# P0: Pre-allocate pinned memory and one reusable completion event for the
+		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
+		_new_tokens_ready = torch.cuda.Event()
 
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
@@ -10146,10 +11355,20 @@ class BatchGenWorker:
 			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
 				_hb_elapsed = time.perf_counter() - _hb_last_time
 				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+				_split = getattr(self, "_decode_step_split", None)
+				_split_txt = ""
+				if _split and _split[0] > 0:
+					_n = _split[0]
+					_split_txt = (
+						f" step_ms={_split[1] / _n:.1f} (setup {_split[2] / _n:.1f}, "
+						f"forward+sample {_split[3] / _n:.1f}, kv_flush {_split[4] / _n:.1f}, "
+						f"token_readback {_split[5] / _n:.1f}, bookkeeping {_split[6] / _n:.1f})"
+					)
+					self._decode_step_split = [0.0] * 7
 				logging.info(
 					f"[DECODE] step={self._cumulative_decode_iterations} "
 					f"active={len(decode_uuids)} finished={_hb_finished} "
-					f"tok/s={_hb_tokens / _hb_elapsed:.2f}"
+					f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
 				)
 				_hb_last_time = time.perf_counter()
 				_hb_tokens = 0
@@ -10329,6 +11548,7 @@ class BatchGenWorker:
 			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
 				global_decode_sequences
 			)
+			self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
 			self._configure_glm5_dispatch_trace(global_decode_sequences)
 
 			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
@@ -10353,6 +11573,7 @@ class BatchGenWorker:
 							f"{max_tokens} for {seq.uuid[:8]}"
 						)
 
+			_split_t0 = time.perf_counter()
 			with torch.inference_mode():
 				if batch:
 					# Collect context lengths with invariant validation
@@ -11001,22 +12222,24 @@ class BatchGenWorker:
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
+			_split_t1 = time.perf_counter()
 
-			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Enqueue
-			# the copy BEFORE flushing KV so _flush_deferred_kv_to_host's single
-			# event.synchronize() (recorded after this copy on the same stream)
-			# covers it too — collapses the two per-step host syncs into one.
+			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
+			# exact token-readback boundary before launching host-KV copies on their
+			# independent D2H stream.
 			bs = new_tokens.shape[0]
 			if bs > _new_tokens_pinned.shape[0]:
 				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
 			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
+			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
 
-			# Flush deferred KV entries — its single sync covers all layers plus
-			# the token copy above. Only sync again if it had nothing to flush
-			# (early return without syncing) so the token copy isn't read stale.
+			# Host-KV offload orders its own stream with a device-side event. Wait
+			# only for the sampled-token readback required by exact EOS and output
+			# bookkeeping; do not drain host-KV copies or the whole CUDA device.
 			self._flush_deferred_kv_to_host()
-			if not getattr(self, '_kv_offload_synced_this_step', False):
-				torch.cuda.current_stream(self.torch_device).synchronize()
+			_split_t2 = time.perf_counter()
+			_new_tokens_ready.synchronize()
+			_split_t3 = time.perf_counter()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
@@ -11084,7 +12307,21 @@ class BatchGenWorker:
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 
-			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+			_split_t4 = time.perf_counter()
+			self._cumulative_forward_ms += (_split_t4 - forward_start) * 1000
+			# Per-step wall split, averaged into the rank-0 heartbeat: where a
+			# decode step's time goes (host bookkeeping vs GPU wait), without
+			# adding any device sync of its own.
+			_sp = getattr(self, "_decode_step_split", None)
+			if _sp is None:
+				_sp = self._decode_step_split = [0.0] * 7
+			_sp[0] += 1
+			_sp[1] += (_split_t4 - forward_start) * 1000
+			_sp[2] += (_split_t0 - forward_start) * 1000
+			_sp[3] += (_split_t1 - _split_t0) * 1000
+			_sp[4] += (_split_t2 - _split_t1) * 1000
+			_sp[5] += (_split_t3 - _split_t2) * 1000
+			_sp[6] += (_split_t4 - _split_t3) * 1000
 
 			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
 			from batchgen.timing import get_decode_timer
@@ -11098,6 +12335,18 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
+		# Decode intervals shorter than the 30 s heartbeat (128-token probes,
+		# small admission waves) would otherwise never report their step split.
+		_split = getattr(self, "_decode_step_split", None)
+		if self.rank == 0 and _split and _split[0] > 0:
+			_n = _split[0]
+			logging.info(
+				f"[DECODE] interval end: steps={int(_n)} step_ms={_split[1] / _n:.1f} "
+				f"(setup {_split[2] / _n:.1f}, forward+sample {_split[3] / _n:.1f}, "
+				f"kv_flush {_split[4] / _n:.1f}, token_readback {_split[5] / _n:.1f}, "
+				f"bookkeeping {_split[6] / _n:.1f})"
+			)
+			self._decode_step_split = [0.0] * 7
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
@@ -12573,19 +13822,27 @@ class BatchGenWorker:
 		if not hasattr(self, 'model') or self.model is None:
 			return
 
+		# Stage timings on every rank: the first decode configure after the
+		# streamed wave-1 prefill spent 34 s here on rank 0 (r30) / ~30 s on
+		# node 1 (r29), intermittently, with nothing logged.
+		_df_t0 = time.perf_counter()
 		# Ensure all GPU operations complete before deletion
 		if torch.cuda.is_available():
 			torch.cuda.synchronize(self.torch_device)
+		_df_t1 = time.perf_counter()
 
-		# Free WGMMA shared buffers if they exist (class-level, survives model deletion)
-		try:
-			from batchgen.models.glm.glm5.model import Glm5MoE
-			if getattr(Glm5MoE, '_wgmma_shared_bufs', None) is not None:
+		# Free WGMMA shared buffers if they exist (class-level, survives model deletion).
+		# Only when the GLM-5 model module is already loaded: importing it here
+		# on a non-GLM-5 server walks the GLM-5 JIT extensions -- MEASURED r33
+		# (K3, 2x8 H200, shared TORCH_EXTENSIONS_DIR): del=30.2 s on every rank
+		# of one node (0.2 s on the other) at the first decode configure.
+		_glm5_model_module = sys.modules.get("batchgen.models.glm.glm5.model")
+		if _glm5_model_module is not None:
+			Glm5MoE = getattr(_glm5_model_module, "Glm5MoE", None)
+			if Glm5MoE is not None and getattr(Glm5MoE, '_wgmma_shared_bufs', None) is not None:
 				Glm5MoE._wgmma_shared_bufs.free_buffers()
 				Glm5MoE._wgmma_shared_bufs = None
 				Glm5MoE._wgmma_next_layer_id = 0
-		except ImportError:
-			pass
 
 		# Delete model directly without CPU transfer
 		del self.model
@@ -12614,11 +13871,15 @@ class BatchGenWorker:
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)
+		_df_t2 = time.perf_counter()
 		if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			pm = self.parallel_manager
+			if hasattr(pm, "_release_streamed_sp8_prefill"):
+				pm._release_streamed_sp8_prefill()
 			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
 				if hasattr(pm, attr):
 					delattr(pm, attr)
+		_df_t3 = time.perf_counter()
 
 		# Adapter holds Python refs to model/segment/KV manager via _ctx;
 		# without release_context() the captured segment's static KV buffers
@@ -12629,7 +13890,13 @@ class BatchGenWorker:
 		# Release memory
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
+		_df_t4 = time.perf_counter()
 		gc.collect()
+		logging.info(
+			f"[DECODE] Rank {self.rank}: deep_free_model_memory sync={_df_t1 - _df_t0:.1f}s "
+			f"del={_df_t2 - _df_t1:.1f}s release_streamed={_df_t3 - _df_t2:.1f}s "
+			f"empty_cache={_df_t4 - _df_t3:.1f}s gc={time.perf_counter() - _df_t4:.1f}s"
+		)
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 

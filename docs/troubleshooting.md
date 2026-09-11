@@ -40,9 +40,9 @@ Verify `ls /usr/include/numa.h`. This is now handled automatically by
 `Failed to load WGMMA grouped MoE kernels: No module named 'batchgen_kernels.moe._C_grouped_mxfp4_wgmma'`.
 
 **Cause** — the `batchgen_kernels` CUDA extensions were not built (or built for the wrong
-arch). On Hopper-generation GPUs the arch flag must carry the `a` suffix (`sm90a`).
+arch). On H20 the arch flag must be Hopper-`a`.
 
-**Fix** — build the kernels with the matching arch flag:
+**Fix** — build the kernels with the H20 arch flag:
 
 ```bash
 cd batchgen_kernels

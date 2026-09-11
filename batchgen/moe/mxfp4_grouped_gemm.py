@@ -10,7 +10,7 @@ has ZERO production callers, was NEVER gated by a numerics test, and carries
 that produces finite, plausible, WRONG numbers on the first K3-shaped call.
 See batchgen_design/model_support/kimi_k3/KERNEL_WORKUNIT.md.
 
-Per the 2026-08-04 POIS decision: Kimi-K3 MXFP4 MoE numerics run
+Per the 2026-08-04 POIS decision (task #34): Kimi-K3 MXFP4 MoE numerics run
 on the PRODUCTION-PROVEN Marlin machinery instead —
   - repack:  batchgen/moe/marlin_weight_prep.py::repack_mxfp4_to_marlin_gs32
   - kernels: batchgen_kernels/src/moe/marlin_grouped_gemm.cu
