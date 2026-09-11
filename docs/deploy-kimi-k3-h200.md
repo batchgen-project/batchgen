@@ -51,6 +51,8 @@ and [Manual Installation](manual-installation.md). The default decode/prefill ex
 **NCCL**, which needs no extra build. (An optional DeepEP low-latency exchange is covered in
 §6.)
 
+Kimi-K3's KDA (Kimi Delta Attention) needs `fla-core>=0.5.0` (flash-linear-attention, the `fla` package). It is listed in `requirements.txt`, so the standard install pulls it automatically — no separate step.
+
 ## 4. Start the Server (2 × 8 H200)
 
 ### Mount shared memory

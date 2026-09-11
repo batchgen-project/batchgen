@@ -9,6 +9,7 @@
   `libnuma-dev` on Debian/Ubuntu) — required for the `core_engine` JIT build
   (`#include <numa.h>`). `install_deps.sh` installs these automatically; without them
   the first server launch fails with `numa.h: No such file or directory`.
+- **Model-specific (Kimi-K3 / Kimi-linear)**: `fla-core>=0.5.0` (flash-linear-attention) provides the `fla` Kimi-Delta-Attention kernels. It is listed in `requirements.txt`, so `pip install .` (and `install_deps.sh`) pull it automatically — no separate step.
 - **GitHub access**: the repository is currently **private** — anonymous
   `git clone` and raw release-asset URLs fail (404). Authenticate first
   (e.g. `gh auth login`), clone via `gh repo clone batchgen-project/batchgen`,
