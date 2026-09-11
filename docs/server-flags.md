@@ -343,6 +343,8 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
+| `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
+| `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. |
 | `--max-pool-size` | `10240` | Max QueryBook pool capacity for persistent request scheduling. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
