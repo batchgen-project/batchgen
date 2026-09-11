@@ -282,13 +282,18 @@ void HtoD_Engine::reset_weight_copy_queue() {
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     while (!terminate_flag_) {
+        // Set when this pass copies or runs anything; an idle pass backs off
+        // below instead of immediately re-taking the weight-buffer mutex.
+        bool progressed = false;
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
             task();
+            progressed = true;
         }
         if (!this->kv_copy_task_queue_.empty()) {
             auto optional_buffer = this->gpu_kv_buffer_.acquireEmptyBuffer();
             if (optional_buffer.has_value()) {
+                progressed = true;
                 if (this->model_config_.model_type.find("deepseek") ==
                     std::string::npos) {
                     // this->logger_->debug("DeepSeek model detected. Copying
@@ -420,6 +425,7 @@ void HtoD_Engine::HtoD_Worker() {
             auto optional_buffer =
                 this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
             if (optional_buffer.has_value()) {
+                progressed = true;
                 this->logger_->debug("Acquired buffer for module type: {}",
                                      module_type);
                 CUDA_CHECK(
@@ -496,6 +502,13 @@ void HtoD_Engine::HtoD_Worker() {
                         module_name);
                 }
             }
+        }
+        // With every ring slot full, a pass without sleep re-locks the
+        // weight-buffer mutex in a tight loop and starves the consumer's
+        // get_weights_pinned (measured: 5-33 s before the first MoE layer at
+        // 128K-256K). 50 us is negligible against a slot's copy time.
+        if (!progressed) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 };
