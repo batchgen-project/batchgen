@@ -25,6 +25,7 @@
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
 #include "Weights_Storage/Weights_Storage.h" 
+#include "Weights_Storage/distributed_weight_daemon.h"
 #include "allocator.h"
 #include "data_structures.h"
 #include <ATen/cuda/CachingHostAllocator.h>
@@ -496,7 +497,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // .def("set_batching_plan", &BatchGen::set_batching_plan)
         .def("kv_offload", &BatchGen::kv_offload)
         // .def("add_weight_storage", &BatchGen::add_weight_storage)
-        .def("get_weights", &BatchGen::get_weights)
+        // Streamed-SP8 starts the next layer's blocking host-weight acquire
+        // from a Python prefetch thread.  Release the interpreter lock while
+        // get_weights waits for the daemon/ring so the main thread can run
+        // attention and MoE compute concurrently.
+        .def("get_weights", &BatchGen::get_weights,
+             py::call_guard<py::gil_scoped_release>())
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
         .def("attn", &BatchGen::attn)
         .def("submit_to_KV_queue", &BatchGen::submit_to_KV_queue)
@@ -519,6 +525,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("cuda_enable_peer_access", &BatchGen::cuda_enable_peer_access)
         .def("save_compressed_kv", &BatchGen::save_compressed_kv)
         .def("set_weight_copy_queue", &BatchGen::set_weight_copy_queue)
+        .def("reset_weight_stream_profile",
+             &BatchGen::reset_weight_stream_profile)
+        .def("get_weight_stream_profile",
+             &BatchGen::get_weight_stream_profile)
         .def("reset_decoding_buffer", &BatchGen::reset_decoding_buffer)
         .def("stop_h2d_worker", &BatchGen::stop_h2d_worker)
         .def("copy_kv_to_worker",
@@ -557,8 +567,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("enable_memfd") = false,
             py::arg("memfd_creator_pid") = -1,
             py::arg("memfd_fd") = -1)
+        .def("InitDistributed", &Weights_Storage::InitDistributed,
+            py::arg("config_path"))
         .def("get_tensor", &Weights_Storage::get_tensor,
             py::arg("module_key"));
+
+    py::class_<DistributedWeightDaemon>(m, "DistributedWeightDaemon")
+        .def(py::init<const std::string&>(), py::arg("config_path"))
+        .def("start", &DistributedWeightDaemon::Start)
+        .def("wait_ready", &DistributedWeightDaemon::WaitReady,
+             py::arg("timeout_seconds"))
+        .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
+        .def("stop", &DistributedWeightDaemon::Stop);
     
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())

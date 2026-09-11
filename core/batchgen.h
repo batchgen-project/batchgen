@@ -116,6 +116,8 @@ class BatchGen {
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&
             weight_copy_tasks);
+    void reset_weight_stream_profile(bool enabled);
+    py::dict get_weight_stream_profile();
 
     void reset_decoding_buffer();
     void stop_h2d_worker();

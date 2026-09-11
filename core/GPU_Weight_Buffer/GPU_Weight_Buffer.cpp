@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,6 +92,29 @@ GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
             std::to_string(this->engine_config_.basic_config.device));
     this->logger_->info("GPU_Weight_Buffer Instantiated.");
 };
+
+void GPU_Weight_Buffer::reset_weight_stream_profile(bool enabled) {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    this->weight_profile_enabled_ = enabled;
+    this->weight_profile_requests_.clear();
+    this->weight_profile_wait_seconds_.clear();
+}
+
+pybind11::dict GPU_Weight_Buffer::get_weight_stream_profile() {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    pybind11::dict result;
+    result["enabled"] = this->weight_profile_enabled_;
+    pybind11::dict by_type;
+    for (const auto& [module_type, requests] :
+         this->weight_profile_requests_) {
+        pybind11::dict entry;
+        entry["requests"] = requests;
+        entry["wait_s"] = this->weight_profile_wait_seconds_[module_type];
+        by_type[module_type.c_str()] = entry;
+    }
+    result["by_type"] = by_type;
+    return result;
+}
 
 void GPU_Weight_Buffer::Init() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
@@ -179,8 +203,22 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    auto [module_type, buffer_idx] = this->module_in_buffers_[module_name];
-    this->module_in_buffers_.erase(module_name);
+    auto module_it = this->module_in_buffers_.find(module_name);
+    if (module_it == this->module_in_buffers_.end()) {
+        std::ostringstream oss;
+        oss << "Cannot release missing weight-buffer lease for "
+            << module_name << ". Current modules: ";
+        size_t count = 0;
+        for (const auto& [key, value] : this->module_in_buffers_) {
+            oss << key;
+            if (++count < this->module_in_buffers_.size()) {
+                oss << ", ";
+            }
+        }
+        throw std::runtime_error(oss.str());
+    }
+    auto [module_type, buffer_idx] = module_it->second;
+    this->module_in_buffers_.erase(module_it);
     this->buffer_status_[module_type][buffer_idx] = 0;
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
                          module_name, module_type, buffer_idx);
@@ -194,7 +232,10 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     
     // Start timer for timeout tracking
     auto start_time = std::chrono::steady_clock::now();
-    constexpr auto timeout_duration = std::chrono::seconds(2);
+    const bool hold_layer_batch = phase == "prefill_sp8";
+    const auto timeout_duration = hold_layer_batch
+                                      ? std::chrono::seconds(300)
+                                      : std::chrono::seconds(2);
     
     try {
         while (true) {
@@ -208,6 +249,18 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                         })) {
                     auto [module_type, buffer_idx] =
                         this->module_in_buffers_[module_name];
+                    auto wait_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> profile_lock(
+                            this->weight_profile_mutex_);
+                        if (this->weight_profile_enabled_) {
+                            this->weight_profile_requests_[module_type] += 1;
+                            this->weight_profile_wait_seconds_[module_type] +=
+                                std::chrono::duration<double>(wait_end -
+                                                              start_time)
+                                    .count();
+                        }
+                    }
                     return this->buffers_[module_type][buffer_idx];
                 }
                 this->logger_->debug("Waiting for module: {}", module_name);
@@ -236,7 +289,8 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
             
             // Check if module_name starts with "routed_expert" and has enough
             // length
-            if (module_name.substr(0, 13) == "routed_expert") {
+            if (!hold_layer_batch &&
+                module_name.substr(0, 13) == "routed_expert") {
                 // Find the last two underscores
                 size_t last_underscore = module_name.rfind('_');
                 size_t second_last_underscore =

@@ -184,6 +184,7 @@ class PageTableCapacityRequest:
     engine_basic_num_queries: Optional[int]
     model_max_position_embeddings: Optional[int]
     args_cuda_graph_max_bucket_size: Optional[int]
+    engine_basic_decode_graph_max_bucket: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +471,8 @@ class KVCacheManager:
 
         Takes the max of (``args.cuda_graph_max_bucket_size`` if set,
         ``engine.global_batch_size``, ``engine.attn_decoding_micro_batch_size``,
-        ``engine.num_queries``). Falls back to ``1`` when none are set.
+        ``engine.num_queries``, the largest planner ``decode_graph_buckets``
+        entry). Falls back to ``1`` when none are set.
         """
         candidates: list = []
         v = req.args_cuda_graph_max_bucket_size
@@ -480,6 +482,7 @@ class KVCacheManager:
             req.engine_module_global_batch_size,
             req.engine_module_attn_decoding_micro_batch_size,
             req.engine_basic_num_queries,
+            req.engine_basic_decode_graph_max_bucket,
         ):
             if v is not None and int(v) > 0:
                 candidates.append(int(v))

@@ -29,11 +29,11 @@ def _get_kernel():
     """Load the compiled FP8 blockwise GEMM kernel."""
     global _warned_import
     try:
-        import batchgen_kernels
-
-        module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_fp8_blockwise_gemm")
-        return module.fp8_blockwise_grouped_gemm
-    except Exception:
+        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
+            fp8_blockwise_grouped_gemm,
+        )
+        return fp8_blockwise_grouped_gemm
+    except ImportError:
         if not _warned_import:
             _warned_import = True
             logger.warning(
@@ -48,11 +48,11 @@ def _get_fused_s1_kernel():
     """Load the compiled fused S1 kernel (gate+up+SiLU)."""
     global _warned_fused_s1
     try:
-        import batchgen_kernels
-
-        module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_fp8_blockwise_gemm")
-        return module.fp8_blockwise_fused_s1
-    except Exception:
+        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
+            fp8_blockwise_fused_s1,
+        )
+        return fp8_blockwise_fused_s1
+    except ImportError:
         if not _warned_fused_s1:
             _warned_fused_s1 = True
             logger.warning(

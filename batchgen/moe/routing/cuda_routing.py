@@ -70,9 +70,11 @@ def gate_sigmoid_topk_cuda(
     router_logits, e_score_correction,
     k=8, routed_scaling_factor=2.5,
     topk_indices=None, topk_weights=None,
+    num_valid_tokens=None,
+    latent_out=None, latent_offset=None,
 ):
     """
-    CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5).
+    CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5, K3).
 
     Algorithm:
         1. sigmoid(logits) → scores
@@ -81,13 +83,27 @@ def gate_sigmoid_topk_cuda(
         4. gather raw sigmoid scores at indices → weights
         5. normalize weights, multiply by routed_scaling_factor
 
+    ``router_logits`` rows may be strided (e.g. the leading expert columns of a
+    fused router/down-projection GEMM output); only each row itself has to be
+    contiguous.
+
     Args:
-        router_logits: [N, E] FP32
+        router_logits: [N, E] FP32 (row stride may exceed E)
         e_score_correction: [E] FP32
-        k: top-k (default 8)
+        k: top-k (default 8; supported 2, 4, 8, 16)
         routed_scaling_factor: scaling factor (default 2.5)
         topk_indices: [N, K] int32 pre-allocated output (optional)
         topk_weights: [N, K] FP32 pre-allocated output (optional)
+        num_valid_tokens: device int32 scalar (optional). Rows at or beyond it
+            are written as index -1 / weight 0 without a host read, so a
+            captured CUDA graph can vary the live row count across replays.
+        latent_out: [N, L] BF16 pre-allocated output (optional, K3). When given,
+            the kernel also casts columns ``[latent_offset, latent_offset + L)``
+            of the same ``router_logits`` rows to BF16, which removes the
+            separate strided FP32->BF16 contiguous copy. Rows at or beyond
+            ``num_valid_tokens`` are written as zero.
+        latent_offset: first latent column within the ``router_logits`` row
+            stride. Required whenever ``latent_out`` is given.
 
     Returns:
         topk_indices: [N, K] int32
@@ -98,6 +114,10 @@ def gate_sigmoid_topk_cuda(
     device = router_logits.device
 
     if router_logits.dtype != torch.float32:
+        if latent_out is not None:
+            # The cast would repack the router columns into their own buffer,
+            # detaching them from the fused row the latent suffix lives in.
+            raise ValueError("latent_out requires FP32 router_logits")
         router_logits = router_logits.float()
     if e_score_correction.dtype != torch.float32:
         e_score_correction = e_score_correction.float()
@@ -106,11 +126,24 @@ def gate_sigmoid_topk_cuda(
         topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
     if topk_weights is None:
         topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
-
-    result = ext.gate_sigmoid_topk(
+    args = (
         router_logits, e_score_correction, k, routed_scaling_factor,
         topk_indices, topk_weights,
     )
+    # Preserve the legacy K2.5/GLM call exactly: the extension's trailing
+    # arguments are Python optionals, so callers without a live-row scalar or a
+    # latent epilogue should not create even a zero-sized CUDA tensor inside
+    # graph capture.
+    if latent_out is not None:
+        if latent_offset is None:
+            raise ValueError("latent_offset is required when latent_out is given")
+        result = ext.gate_sigmoid_topk(
+            *args, num_valid_tokens, latent_out, int(latent_offset)
+        )
+    elif num_valid_tokens is not None:
+        result = ext.gate_sigmoid_topk(*args, num_valid_tokens)
+    else:
+        result = ext.gate_sigmoid_topk(*args)
     return result[0], result[1]
 
 

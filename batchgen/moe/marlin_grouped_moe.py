@@ -20,7 +20,13 @@ import logging
 
 import torch
 
-import batchgen_kernels.moe._C_marlin_grouped_gemm as _module
+from batchgen_kernels import load_extension as _load_extension
+
+try:
+    _module = _load_extension("batchgen_kernels.moe._C_marlin_grouped_gemm")
+except Exception as _e:  # kernel unavailable (AOT-only env without a build)
+    logging.warning("Marlin grouped GEMM kernel unavailable: %s", _e)
+    _module = None
 
 _warned_m8 = False
 _warned_m16 = False
@@ -150,7 +156,8 @@ def single_expert_marlin_decode(
 
     Args:
         x: [t, K] BF16 gathered tokens routed to this expert.
-        *_qw / *_scale: the expert's Marlin INT4 packed weights (int32) + BF16 scales.
+        *_qw / *_scale: the expert's Marlin MXFP4 packed weights (int32) +
+            uint8 E8M0 scales.
         N: moe_intermediate_size; K: hidden_size.
     Returns: [t, K] BF16.
     """
@@ -251,7 +258,7 @@ def marlin_grouped_stage1_unified(
 
 
 # ============================================================================
-# Kimi-K3 MXFP4 (E2M1 + E8M0) wrappers. HARD-FAIL policy:
+# Kimi-K3 MXFP4 (E2M1 + E8M0) wrappers — task #34. HARD-FAIL policy:
 # every contract violation RAISES; there is no warn-and-degrade. The unfused
 # reference path survives only behind the explicit batchgen_debug opt-in
 # (`k3_moe_reference`) as the parity oracle — it is not a fallback. NOTE the
@@ -292,7 +299,7 @@ def _require_mxfp4_kernels():
             f"K3 refuses to run. "
             f"The designated parity-debug opt-in is batchgen_debug."
             f"k3_moe_reference; its model-side wiring is a named follow-up "
-            f"of the K3 MXFP4 work — if it is not wired yet there is NO alternative "
+            f"of task #34 — if it is not wired yet there is NO alternative "
             f"path and rebuilding is the only fix.")
 
 
@@ -349,17 +356,14 @@ def _check_m_tile_bound(max_m_tiles: int, mtp: int, total_rows: int):
 
 def _check_marlin_mxfp4_tensors(name: str, qw: torch.Tensor, scale: torch.Tensor,
                                 prob_n: int, prob_k: int):
-    """L2 (tensor-visible call sites only): marlin layout + bf16 scales at the
-    kernel boundary. E8M0 bytes must be expanded (exactly) at fill time via
-    marlin_weight_prep.mxfp4_scale_e8m0_to_bf16 — never value-cast."""
+    """L2 (tensor-visible call sites only): marlin layout + raw E8M0 scales."""
     if qw.dtype != torch.int32:
         raise ValueError(
             f"{name}: marlin_qw must be int32 marlin-packed, got {qw.dtype}")
-    if scale.dtype != torch.bfloat16:
+    if scale.dtype != torch.uint8:
         raise ValueError(
-            f"{name}: scale dtype != bf16 at kernel boundary (got {scale.dtype}) "
-            f"— E8M0 uint8 bytes must be expanded exactly at fill "
-            f"(mxfp4_scale_e8m0_to_bf16), never value-cast, never fed raw")
+            f"{name}: scale dtype != uint8 E8M0 at kernel boundary "
+            f"(got {scale.dtype})")
     if tuple(qw.reshape(-1, qw.shape[-1]).shape) != (prob_k // 16, prob_n * 2):
         raise ValueError(
             f"{name}: marlin_qw shape {tuple(qw.shape)} != "
@@ -399,7 +403,7 @@ def marlin_grouped_stage1_fused_mxfp4_situ(
       (K2.5 computes it at plan build; the K3 seam must not trust it).
 
     Pointer arrays must point at tensors produced by
-    marlin_weight_prep.repack_mxfp4_to_marlin_gs32 with bf16 scales at the
+    marlin_weight_prep.repack_mxfp4_to_marlin_gs32 with uint8 E8M0 scales at the
     kernel boundary (L2 is checked at the tensor-visible call sites; the
     checkpoint stamp check L6 is model-side).
 
@@ -489,8 +493,8 @@ def single_expert_marlin_mxfp4_decode(
         gate_qw/up_qw: [K//16, N*2] int32 marlin MXFP4 (from
             repack_mxfp4_to_marlin_gs32); gate = w1, up = w3 (gate-first —
             swapped branches are silent, pinned by the GPU mutation test).
-        gate_scale/up_scale: [K//32, N] bf16 (exact E8M0 expansion).
-        down_qw: [N//16, K*2] int32; down_scale: [N//32, K] bf16.
+        gate_scale/up_scale: [K//32, N] uint8 E8M0.
+        down_qw: [N//16, K*2] int32; down_scale: [N//32, K] uint8 E8M0.
         N: moe_intermediate_size (K3: 3072); K: hidden_size (K3: 3584).
     Returns: [t, K] BF16.
     """

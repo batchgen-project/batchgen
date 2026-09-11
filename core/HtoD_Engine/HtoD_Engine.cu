@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <chrono>
 #include <memory>
 #include <string>
 #include <torch/extension.h>
@@ -279,6 +280,32 @@ void HtoD_Engine::reset_weight_copy_queue() {
     this->weights_copy_task_queue_ = new_weights_copy_task_queue;
 };
 
+void HtoD_Engine::reset_weight_stream_profile(bool enabled) {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    this->weight_profile_enabled_ = enabled;
+    this->weight_profile_modules_.clear();
+    this->weight_profile_tensors_.clear();
+    this->weight_profile_bytes_.clear();
+    this->weight_profile_copy_seconds_.clear();
+}
+
+py::dict HtoD_Engine::get_weight_stream_profile() {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    py::dict result;
+    result["enabled"] = this->weight_profile_enabled_;
+    py::dict by_type;
+    for (const auto& [module_type, modules] : this->weight_profile_modules_) {
+        py::dict entry;
+        entry["modules"] = modules;
+        entry["tensors"] = this->weight_profile_tensors_[module_type];
+        entry["bytes"] = this->weight_profile_bytes_[module_type];
+        entry["copy_s"] = this->weight_profile_copy_seconds_[module_type];
+        by_type[module_type.c_str()] = entry;
+    }
+    result["by_type"] = by_type;
+    return result;
+}
+
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     while (!terminate_flag_) {
@@ -436,45 +463,73 @@ void HtoD_Engine::HtoD_Worker() {
                 torch::Tensor tmp_src;
                 void* src_ptr;
                 int64_t src_byte_size;
-                for (auto& [tensor_name, host_tensor_storage] : src) {
-                    src_ptr = host_tensor_storage.data_ptr;
-                    src_byte_size = host_tensor_storage.byte_size;
-                    // find(), not operator[]: dst is an unordered_map and
-                    // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
-                    // every miss, permanently growing a buffer map that is
-                    // reused across ring slots.
-                    auto slot = dst.find(tensor_name);
-                    if (slot == dst.end() || !slot->second.defined() ||
-                        !slot->second.has_storage()) {
-                        // The host map carries a tensor module_shapes declares
-                        // no slot for. Continuing drops it silently and the
-                        // consumer reads whatever the slot last held.
-                        this->logger_->error(
-                            "Module {}: host tensor {} has no GPU slot -- "
-                            "module_shapes declares no such key",
-                            module_name, tensor_name);
-                        throw std::runtime_error(
-                            "HtoD: host tensor has no GPU slot: " +
-                            tensor_name);
+                try {
+                    for (auto& [tensor_name, host_tensor_storage] : src) {
+                        src_ptr = host_tensor_storage.data_ptr;
+                        src_byte_size = host_tensor_storage.byte_size;
+                        // find(), not operator[]: dst is an unordered_map and
+                        // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
+                        // every miss, permanently growing a buffer map that is
+                        // reused across ring slots.
+                        auto slot = dst.find(tensor_name);
+                        if (slot == dst.end() || !slot->second.defined() ||
+                            !slot->second.has_storage()) {
+                            // The host map carries a tensor module_shapes declares
+                            // no slot for. Continuing drops it silently and the
+                            // consumer reads whatever the slot last held.
+                            this->logger_->error(
+                                "Module {}: host tensor {} has no GPU slot -- "
+                                "module_shapes declares no such key",
+                                module_name, tensor_name);
+                            throw std::runtime_error(
+                                "HtoD: host tensor has no GPU slot: " +
+                                tensor_name);
+                        }
+                        int64_t dst_byte_size = slot->second.nbytes();
+                        if (src_byte_size != dst_byte_size) {
+                            // blocking_copy_ writes src_byte_size bytes with no
+                            // bound check: a short slot is overrun into its
+                            // neighbour, a long one keeps a stale tail. Both are
+                            // silent and both produce wrong weights.
+                            this->logger_->error(
+                                "Module {}: tensor {} size mismatch -- host {} B, "
+                                "GPU slot {} B (module_shapes/dtype disagrees with "
+                                "the checkpoint)",
+                                module_name, tensor_name, src_byte_size,
+                                dst_byte_size);
+                            throw std::runtime_error(
+                                "HtoD: host/GPU byte size mismatch for " +
+                                tensor_name);
+                        }
+                        auto copy_start = std::chrono::steady_clock::now();
+                        this->blocking_copy_(slot->second.data_ptr(), src_ptr,
+                                             src_byte_size);
+                        auto copy_end = std::chrono::steady_clock::now();
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                this->weight_profile_mutex_);
+                            if (this->weight_profile_enabled_) {
+                                this->weight_profile_tensors_[module_type] += 1;
+                                this->weight_profile_bytes_[module_type] +=
+                                    static_cast<uint64_t>(src_byte_size);
+                                this->weight_profile_copy_seconds_[module_type] +=
+                                    std::chrono::duration<double>(copy_end -
+                                                                  copy_start)
+                                        .count();
+                            }
+                        }
                     }
-                    int64_t dst_byte_size = slot->second.nbytes();
-                    if (src_byte_size != dst_byte_size) {
-                        // blocking_copy_ writes src_byte_size bytes with no
-                        // bound check: a short slot is overrun into its
-                        // neighbour, a long one keeps a stale tail. Both are
-                        // silent and both produce wrong weights.
-                        this->logger_->error(
-                            "Module {}: tensor {} size mismatch -- host {} B, "
-                            "GPU slot {} B (module_shapes/dtype disagrees with "
-                            "the checkpoint)",
-                            module_name, tensor_name, src_byte_size,
-                            dst_byte_size);
-                        throw std::runtime_error(
-                            "HtoD: host/GPU byte size mismatch for " +
-                            tensor_name);
+                } catch (...) {
+                    this->weights_storage_.release_module(module_name);
+                    throw;
+                }
+                this->weights_storage_.release_module(module_name);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        this->weight_profile_mutex_);
+                    if (this->weight_profile_enabled_) {
+                        this->weight_profile_modules_[module_type] += 1;
                     }
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
                 }
                 this->logger_->debug("Copied module: {} to buffer: {}",
                                     module_name, buffer_idx);

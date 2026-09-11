@@ -22,10 +22,12 @@
 
 #include "spdlog/spdlog.h"
 #include <memory>
+#include <mutex>
 #include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "../Parameter_Server/Parameter_Server.h"
@@ -55,6 +57,14 @@ struct tensor_buffer {
           dtype(dtype) {};
 };
 
+struct distributed_tensor_meta {
+    std::vector<int64_t> tensor_shape;
+    int64_t byte_size;
+    std::string dtype;
+    uint64_t compact_offset;
+    uint64_t module_offset;
+};
+
 class Weights_Storage {
    public:
     // Simplified Constructor: takes device_id directly
@@ -66,12 +76,16 @@ class Weights_Storage {
                 std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
                 bool enable_memfd = false, int memfd_creator_pid = -1,
                 int memfd_fd = -1);
+
+    void InitDistributed(const std::string& config_path);
                   
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);
 
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
+
+    void release_module(const std::string& module_key);
 
    private:
     int device_id_; // Stored device ID
@@ -85,4 +99,46 @@ class Weights_Storage {
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_buffer>>
         module_weights_storage_;
+
+    struct active_lease {
+        int slot = -1;
+        uint64_t generation = 0;
+    };
+
+    bool distributed_ = false;
+    bool hierarchical_gdr_ = false;
+    int local_node_rank_ = -1;
+    // hierarchical_gdr pins only the routed experts this worker streams:
+    // TP slot device_id_ owns experts [pin_expert_begin_, pin_expert_end_),
+    // and only the node that sources that slot registers them.
+    bool pin_source_ = false;
+    int pin_expert_begin_ = -1;
+    int pin_expert_end_ = -1;
+    // The resident-EP decode shard of this worker (EP rank
+    // local_node_rank_ * 8 + device_id_) is always local to this node's
+    // store; pin it too, so the one-time shard materialization after the
+    // first streamed prefill is a pinned H2D copy on every rank (not just
+    // the one whose slot range happens to cover it).
+    int resident_expert_begin_ = -1;
+    int resident_expert_end_ = -1;
+    // Every cudaHostRegister that actually succeeded, so the destructor can
+    // unregister exactly those ranges before munmap, including after a
+    // partially completed InitDistributed.
+    std::vector<std::pair<void*, size_t>> registered_ranges_;
+    int compact_fd_ = -1;
+    int staging_fd_ = -1;
+    int daemon_socket_ = -1;
+    void* compact_ptr_ = nullptr;
+    int64_t compact_bytes_ = 0;
+    void* staging_ptr_ = nullptr;
+    int64_t staging_bytes_ = 0;
+    int64_t distributed_module_bytes_ = 0;
+    std::mutex daemon_mutex_;
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string,
+                                          distributed_tensor_meta>>
+        remote_module_weights_;
+    std::unordered_map<std::string, active_lease> active_leases_;
+
+    active_lease acquire_remote_module(const std::string& module_key);
 };
