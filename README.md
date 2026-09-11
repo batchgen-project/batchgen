@@ -40,7 +40,6 @@ BatchGen introduces the sequence coroutine compute model, which treats each sequ
 
 ## Roadmap
 
-- 🚧 Kimi-K2.5 (1T) support and H20 performance results.
 - 🚧 Stabilize and release the partition and migration primitives.
 - 🚧 Develop more adaptive scheduling policies for better resource utilization and workload balance.
 - 🚧 Support OpenAI-compatible tool-calling.
@@ -79,6 +78,7 @@ For complete deployment instructions including model download, checkpoint conver
 ## Documentation
 
 - **[Deployment Guide](docs/deploy-deepseek-r1-h20.md)** - Step-by-step guide for multi-node deployment
+- **[Deploy Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)** - Multi-node Kimi-K3 (2.8T MXFP4) deployment on 2×8 H200
 - **[Server Flags Reference](docs/server-flags.md)** - Complete list of all server configuration flags
 - **[Client API Reference](docs/client-api.md)** - Python client usage and parameters
 - **[Manual Installation](docs/manual-installation.md)** - Step-by-step manual installation instructions
