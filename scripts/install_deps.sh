@@ -122,7 +122,9 @@ check_prerequisites() {
     fi
 
     PYTHON_VERSION=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if [[ $(echo "$PYTHON_VERSION < 3.11" | bc -l) -eq 1 ]]; then
+    # Pure-python comparison (avoids a hard dependency on `bc`, which is absent on
+    # many minimal images).
+    if ! python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
         print_error "Python 3.11+ required. Found: $PYTHON_VERSION"
         exit 1
     fi
@@ -135,13 +137,27 @@ check_prerequisites() {
     fi
     print_success "git found"
 
-    # Check CUDA
+    # Check CUDA. If nvcc is not on PATH, try common toolkit locations — prefer a
+    # 12.x toolkit (the reference build is CUDA 12.8), then fall back to any.
     if ! command -v nvcc &> /dev/null; then
-        print_warning "nvcc not found. CUDA may not be properly configured."
-        print_warning "Make sure CUDA toolkit is installed and in PATH."
+        for _cudadir in /usr/local/cuda-12*/bin /usr/local/cuda/bin; do
+            if [[ -x "$_cudadir/nvcc" ]]; then
+                export PATH="$_cudadir:$PATH"
+                print_step "Added $_cudadir to PATH (nvcc)"
+                break
+            fi
+        done
+    fi
+    if ! command -v nvcc &> /dev/null; then
+        print_warning "nvcc not found (no CUDA toolkit on PATH or under /usr/local/cuda*)."
+        print_warning "Install the CUDA 12.8 toolkit and put nvcc on PATH before building from source."
     else
         CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
-        print_success "CUDA $CUDA_VERSION found"
+        print_success "CUDA $CUDA_VERSION found (nvcc: $(command -v nvcc))"
+        if [[ "${CUDA_VERSION%%.*}" != "12" ]]; then
+            print_warning "Reference build targets CUDA 12.8 (torch 2.9.0+cu128); found CUDA $CUDA_VERSION."
+            print_warning "A different major CUDA will likely fail the FA3/FlashMLA/DeepGEMM builds or mismatch the pinned torch."
+        fi
     fi
 
     # Check ninja (for fast builds)
