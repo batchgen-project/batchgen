@@ -366,6 +366,13 @@ class GLM5ParallelStrategyManager:
             dst.copy_(src, non_blocking=True)
         torch.cuda.current_stream().synchronize()
 
+    def share_skeleton_on_device(self):
+        """Upload the skeleton once so both persistent instances alias one copy."""
+        device = self.engine_config.Basic_Config.device_torch
+        self.skeleton_state_dict = {
+            key: tensor.to(device) for key, tensor in self.skeleton_state_dict.items()
+        }
+
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
             layer = self.model.model.layers[layer_idx].mlp

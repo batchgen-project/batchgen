@@ -6382,6 +6382,9 @@ class BatchGenWorker:
 
 		iteration = 0
 
+		if self._persistent_phase_enabled():
+			self._build_persistent_phase_instances()
+
 		# Persistent loop: continues until all completed AND no more admissions expected
 		while True:
 			# --- ADMISSION CHECK: Poll for new sequences from IntakePool ---
@@ -6897,6 +6900,8 @@ class BatchGenWorker:
 					reason="pre_decode_warmup",
 				)
 				self._bind_decode_attention_metadata_for_graph_config(local_decode_indices)
+				if self._persistent_phase_enabled():
+					self._recapture_persistent_graphs_if_span_grew()
 				config_decode_time += time.perf_counter() - config_start
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
@@ -7798,6 +7803,64 @@ class BatchGenWorker:
 			return
 		self._destroy_gpu_paged_kv_cache(keep_buffers=True)
 		pm.release_decode_routed_experts()
+
+	def _build_persistent_phase_instances(self) -> None:
+		"""Build both phase instances and the decode KV pools before the first request.
+
+		When BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN fixes the graph
+		attention span, the decode graphs are captured here as well, so no
+		phase switch builds a model or captures a graph. Otherwise the span is
+		taken from the first decode batch and the graphs are captured there.
+		"""
+		pm = self.parallel_manager
+		if pm.decode_instance is not None:
+			return
+		start = time.perf_counter()
+		if hasattr(pm, "set_comm"):
+			pm.set_comm(self.comm)
+		pm.share_skeleton_on_device()
+		pm.configure_prefill()
+		self._activate_persistent_decode_instance(self.comm)
+		self._init_gpu_kv_with_actual_size()
+		capture = bool(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN"))
+		if capture:
+			# No resident rows: every rank captures the way an empty rank does
+			# (zero valid tokens); replays bind real rows through static inputs.
+			self._sync_decode_moe_rank_counts([], reason="startup_graph_capture")
+			self._current_decode_max_rank_batch_size = 1
+			self._bind_decode_attention_metadata_for_graph_config([])
+			self._warmup_cuda_graphs()
+		self._release_persistent_decode_instance()
+		logging.info(
+			"[PERSISTENT_PHASE] rank=%d instances built at startup in %.1fs graphs_captured=%s",
+			self.rank,
+			time.perf_counter() - start,
+			capture,
+		)
+
+	def _recapture_persistent_graphs_if_span_grew(self) -> None:
+		"""Persistent decode graphs are kept across batches; drop them only when
+		the current batch needs a longer attention span than they were captured
+		for, so the regular warmup recaptures them instead of decoding eagerly."""
+		segment = getattr(self, "_whole_model_segment", None)
+		if segment is None or os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN"):
+			return
+		manager = self._get_cuda_graph_gpu_manager()
+		primary = getattr(manager, "primary", manager)
+		required = self._glm5_dsa_graph_required_tokens(
+			list(AttnWrapperBase.cur_batch or []),
+			page_size=int(primary.config.page_size_tokens),
+		)
+		if required <= int(segment.max_seqlen):
+			return
+		logging.info(
+			"Rank %d: persistent decode graphs cover %d tokens, batch needs %d; recapturing",
+			self.rank,
+			int(segment.max_seqlen),
+			required,
+		)
+		self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
+		self._glm5_whole_model_graph_capture_attempted_for_batch = False
 
 	def _mark_phase_end(self, phase: str) -> None:
 		# [phase, running since (None while idle), busy seconds so far]
