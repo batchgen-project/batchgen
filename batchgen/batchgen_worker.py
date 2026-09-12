@@ -579,6 +579,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	persistent_phase_instances: bool = False  # Keep prefill/decode instances across phase switches
 	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 	# Dynamic host KV reservation
 	host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens
@@ -3372,8 +3373,14 @@ class BatchGenWorker:
 		except ImportError:
 			pass
 
-	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
-		"""Destroy the GPU paged KV cache manager if it is present."""
+	def _destroy_gpu_paged_kv_cache(
+		self, *, empty_cuda_cache: bool = False, keep_buffers: bool = False
+	) -> None:
+		"""Destroy the GPU paged KV cache manager if it is present.
+
+		With ``keep_buffers`` the manager only drops every sequence; its KV
+		pools and CUDA-graph page-table storage stay at their addresses.
+		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return
@@ -3399,7 +3406,10 @@ class BatchGenWorker:
 					f"First 5: {seqs_with_gpu_alloc[:5]}"
 				)
 
-		manager.destroy(empty_cuda_cache=empty_cuda_cache)
+		if keep_buffers:
+			manager.reset_allocations()
+		else:
+			manager.destroy(empty_cuda_cache=empty_cuda_cache)
 		
 		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
 		self._sequences_with_gpu_kv.clear()
@@ -6571,6 +6581,11 @@ class BatchGenWorker:
 					self._prefill_global_passes = global_prefill_passes
 
 					# B. Execute Prefill
+					self._log_phase_switch("prefill")
+					_prefill_profile_active = self._nsys_prefill_profile_begin(
+						local_bsz=len(local_prefill_indices),
+						global_bsz=len(prefill_uuids),
+					)
 					if local_prefill_indices:
 						if torch.cuda.is_available():
 							free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -6681,6 +6696,8 @@ class BatchGenWorker:
 										1
 									)
 						prefill_time += time.perf_counter() - transport_start
+					self._nsys_prefill_profile_end(_prefill_profile_active)
+					self._mark_phase_end("prefill")
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -6935,12 +6952,15 @@ class BatchGenWorker:
 					else:
 						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
+					self._log_phase_switch("decode")
 					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+				self._mark_phase_end("decode")
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
-				self._unregister_fp8_weights()
-				self.deep_free_model_memory()
+				if not self._persistent_phase_enabled():
+					self._unregister_fp8_weights()
+					self.deep_free_model_memory()
 				dist.barrier()
 
 				# Poll for new admissions after each decode interval.
@@ -7270,7 +7290,10 @@ class BatchGenWorker:
 		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
-		if reuse_startup_prefill:
+		persistent = self._persistent_phase_enabled()
+		if persistent:
+			self._release_persistent_decode_instance()
+		elif reuse_startup_prefill:
 			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
 			# decode model has run yet, and this prefill phase — model,
 			# streamed-SP8 buffers, installed H2D schedule — is the one startup
@@ -7305,43 +7328,44 @@ class BatchGenWorker:
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
-		self._destroy_gpu_paged_kv_cache()
-		if k3_prefill_profile and torch.cuda.is_available():
-			torch.cuda.reset_peak_memory_stats(self.local_rank)
+		if not persistent:
+			self._destroy_gpu_paged_kv_cache()
+			if k3_prefill_profile and torch.cuda.is_available():
+				torch.cuda.reset_peak_memory_stats(self.local_rank)
 
-		if (
-			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-			and self.parallel_manager.prefill_uses_resident_ep()
-		):
-			local_lengths = [
-				int(seq.prompt_length)
-				for seq in prefill_sequences
-				if self._owns_local_sequence(seq)
-			]
-			token_cap = (
-				self.engine_config.Module_Batching_Config
-				.prefill_micro_batch_token_cap
-			)
-			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-			predicted_batches, _ = build_prefill_micro_batches(
-				local_lengths,
-				token_cap,
-				l2_balance=use_l2,
-			)
-			local_max_tokens = max(
-				(
-					sum(local_lengths[start:end])
-					for start, end in predicted_batches
-				),
-				default=0,
-			)
-			moe_ntp = self._sync_prefill_moe_rank_counts(
-				local_max_tokens,
-				reason="prefill_output_preallocate",
-			)
-			self.parallel_manager.prepare_resident_ep_prefill_output(
-				self.world_size * moe_ntp
-			)
+			if (
+				hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+				and self.parallel_manager.prefill_uses_resident_ep()
+			):
+				local_lengths = [
+					int(seq.prompt_length)
+					for seq in prefill_sequences
+					if self._owns_local_sequence(seq)
+				]
+				token_cap = (
+					self.engine_config.Module_Batching_Config
+					.prefill_micro_batch_token_cap
+				)
+				use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+				predicted_batches, _ = build_prefill_micro_batches(
+					local_lengths,
+					token_cap,
+					l2_balance=use_l2,
+				)
+				local_max_tokens = max(
+					(
+						sum(local_lengths[start:end])
+						for start, end in predicted_batches
+					),
+					default=0,
+				)
+				moe_ntp = self._sync_prefill_moe_rank_counts(
+					local_max_tokens,
+					reason="prefill_output_preallocate",
+				)
+				self.parallel_manager.prepare_resident_ep_prefill_output(
+					self.world_size * moe_ntp
+				)
 
 		if torch.cuda.is_available():
 			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -7355,7 +7379,10 @@ class BatchGenWorker:
 		# STEP 1: Configure model for prefill. The normal first K3 admission
 		# inherits the exact phase installed before readiness; do not re-enter
 		# configure_prefill or stop/restart its H2D pipeline lazily here.
-		if not reuse_startup_prefill:
+		if persistent and self.parallel_manager.prefill_instance is not None:
+			self.model, self.weight_copy_task = self.parallel_manager.activate_prefill()
+			self.set_phase("prefill")
+		elif not reuse_startup_prefill:
 			# Hand the NCCL communicator to managers that need it during prefill
 			# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
 			if hasattr(self.parallel_manager, "set_comm"):
@@ -7620,6 +7647,9 @@ class BatchGenWorker:
 			max_num_seq: Maximum number of sequences per rank for buffer allocation.
 			comm: NCCL communicator for distributed MoE forward.
 		"""
+		if self._persistent_phase_enabled():
+			self._activate_persistent_decode_instance(comm)
+			return
 		self.deep_free_model_memory()
 		_nv_t0 = time.perf_counter()
 		self.init_nvshmem()
@@ -7708,6 +7738,82 @@ class BatchGenWorker:
 			)
 		except Exception as e:  # informational only
 			logging.debug("parameter residency breakdown failed: %r", e)
+
+	def _persistent_phase_enabled(self) -> bool:
+		"""True when --persistent-phase-instances keeps both phase instances."""
+		if not getattr(self.args, "persistent_phase_instances", False):
+			return False
+		if self._max_pool_size <= 0:
+			raise RuntimeError(
+				"--persistent-phase-instances requires pool mode (--max-pool-size > 0)"
+			)
+		pm = self.parallel_manager
+		if not hasattr(pm, "activate_decoding"):
+			raise RuntimeError(
+				f"--persistent-phase-instances is not supported by {type(pm).__name__}"
+			)
+		pm.persistent_phase_instances = True
+		return True
+
+	def _activate_persistent_decode_instance(self, comm) -> None:
+		"""P->D with persistent instances: free the prefill ring, then build the
+		decode instance once or refill its routed experts. The decode model, its
+		KV pools and its CUDA graphs are reused as they are."""
+		pm = self.parallel_manager
+		if pm.decode_instance is not None and pm.decode_experts_resident:
+			return  # decode -> decode interval
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		self.core_engine.clear_weight_copy_queue()
+		# Decode keeps no routed-expert slots, so this frees the prefill ring
+		# before the decode experts are mapped back in.
+		self.core_engine.reset_decoding_buffer()
+		if pm.decode_instance is None:
+			self.init_nvshmem()
+			# Sized once for the largest admissible decode batch: the instance,
+			# its MoE buffers and its graphs are never rebuilt.
+			padding_bsz = self._decode_rank_batch_cap()
+			self.model, self.weight_copy_task = pm.configure_decoding(
+				padding_bsz=padding_bsz, comm=comm
+			)
+			self._initialize_glm52_folded_q_b_for_decode()
+			self._decode_padding_bsz = padding_bsz
+		else:
+			self.model, self.weight_copy_task = pm.activate_decoding()
+		if self.weight_copy_task.get("routed_expert"):
+			raise RuntimeError(
+				"persistent decode instance must hold every local routed expert"
+			)
+		self.set_phase("decode")
+		if self.rank == 0:
+			logging.info("[DECODE] Persistent decode instance active")
+
+	def _release_persistent_decode_instance(self) -> None:
+		"""D->P with persistent instances: drop every sequence's GPU KV (pools and
+		page-table storage stay in place) and release the decode routed experts."""
+		pm = self.parallel_manager
+		if pm.decode_instance is None or not pm.decode_experts_resident:
+			return
+		self._destroy_gpu_paged_kv_cache(keep_buffers=True)
+		pm.release_decode_routed_experts()
+
+	def _mark_phase_end(self, phase: str) -> None:
+		self._phase_end = (phase, time.perf_counter())
+
+	def _log_phase_switch(self, phase: str) -> None:
+		"""Per-rank time from the previous phase's compute end to this phase's start."""
+		previous = getattr(self, "_phase_end", None)
+		self._phase_end = None
+		if previous is None or previous[0] == phase:
+			return
+		logging.info(
+			"[PHASE_SWITCH] rank=%d direction=%s_to_%s seconds=%.3f persistent=%s",
+			self.rank,
+			previous[0],
+			phase,
+			time.perf_counter() - previous[1],
+			self._persistent_phase_enabled(),
+		)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
 		"""
