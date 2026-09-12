@@ -137,9 +137,15 @@ check_prerequisites() {
     fi
     print_success "git found"
 
-    # Check CUDA. If nvcc is not on PATH, try common toolkit locations — prefer a
-    # 12.x toolkit (the reference build is CUDA 12.8), then fall back to any.
-    if ! command -v nvcc &> /dev/null; then
+    # Check CUDA. An explicitly-set CUDA_HOME wins: it lets a user point at a
+    # toolkit provisioned to a non-standard prefix, or override a mismatched
+    # system nvcc (e.g. a CUDA 13 fleet image) with a CUDA 12.8 toolkit. Else
+    # look for nvcc on PATH, then scan common locations, preferring a 12.x
+    # toolkit (the reference build is CUDA 12.8).
+    if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
+        export PATH="${CUDA_HOME}/bin:$PATH"
+        print_step "Using nvcc from CUDA_HOME=${CUDA_HOME}"
+    elif ! command -v nvcc &> /dev/null; then
         for _cudadir in /usr/local/cuda-12*/bin /usr/local/cuda/bin; do
             if [[ -x "$_cudadir/nvcc" ]]; then
                 export PATH="$_cudadir:$PATH"
@@ -149,14 +155,16 @@ check_prerequisites() {
         done
     fi
     if ! command -v nvcc &> /dev/null; then
-        print_warning "nvcc not found (no CUDA toolkit on PATH or under /usr/local/cuda*)."
-        print_warning "Install the CUDA 12.8 toolkit and put nvcc on PATH before building from source."
+        print_warning "nvcc not found (no CUDA toolkit on PATH, under /usr/local/cuda*, or via CUDA_HOME)."
+        print_warning "A source build needs the CUDA 12.8 toolkit; install it and re-run with"
+        print_warning "  CUDA_HOME=/path/to/cuda-12.8 bash scripts/install_deps.sh   (wheel fast-path needs no toolkit)."
     else
         CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
         print_success "CUDA $CUDA_VERSION found (nvcc: $(command -v nvcc))"
         if [[ "${CUDA_VERSION%%.*}" != "12" ]]; then
             print_warning "Reference build targets CUDA 12.8 (torch 2.9.0+cu128); found CUDA $CUDA_VERSION."
             print_warning "A different major CUDA will likely fail the FA3/FlashMLA/DeepGEMM builds or mismatch the pinned torch."
+            print_warning "Point CUDA_HOME at a 12.8 toolkit to override: CUDA_HOME=/path/to/cuda-12.8 bash scripts/install_deps.sh"
         fi
     fi
 
