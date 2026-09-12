@@ -6393,6 +6393,7 @@ class BatchGenWorker:
 
 			# --- TERMINATION CHECK ---
 			if self.global_batch.all_completed():
+				self._pause_phase_switch_clock()
 				# Print timing summary when all current work is done
 				if not self._timing_logged and self.rank == 0:
 					gen_time = time.perf_counter() - generation_start_time
@@ -6494,6 +6495,7 @@ class BatchGenWorker:
 					continue  # Keep waiting
 
 			iteration += 1
+			self._resume_phase_switch_clock()
 			if self.rank == 0:
 				logging.info(f"--- Iteration {iteration} ---")
 
@@ -7798,20 +7800,36 @@ class BatchGenWorker:
 		pm.release_decode_routed_experts()
 
 	def _mark_phase_end(self, phase: str) -> None:
-		self._phase_end = (phase, time.perf_counter())
+		# [phase, running since (None while idle), busy seconds so far]
+		self._phase_end = [phase, time.perf_counter(), 0.0]
+
+	def _pause_phase_switch_clock(self) -> None:
+		"""Stop counting while the pool is idle and waits for new admissions."""
+		end = getattr(self, "_phase_end", None)
+		if end is not None and end[1] is not None:
+			end[2] += time.perf_counter() - end[1]
+			end[1] = None
+
+	def _resume_phase_switch_clock(self) -> None:
+		end = getattr(self, "_phase_end", None)
+		if end is not None and end[1] is None:
+			end[1] = time.perf_counter()
 
 	def _log_phase_switch(self, phase: str) -> None:
-		"""Per-rank time from the previous phase's compute end to this phase's start."""
+		"""Per-rank busy time from the previous phase's compute end to this phase's start."""
 		previous = getattr(self, "_phase_end", None)
 		self._phase_end = None
 		if previous is None or previous[0] == phase:
 			return
+		seconds = previous[2]
+		if previous[1] is not None:
+			seconds += time.perf_counter() - previous[1]
 		logging.info(
 			"[PHASE_SWITCH] rank=%d direction=%s_to_%s seconds=%.3f persistent=%s",
 			self.rank,
 			previous[0],
 			phase,
-			time.perf_counter() - previous[1],
+			seconds,
 			self._persistent_phase_enabled(),
 		)
 
