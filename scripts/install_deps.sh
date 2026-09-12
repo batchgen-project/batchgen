@@ -481,10 +481,6 @@ main() {
     SKIP_GPU_CHECK=0
     WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
 
-    if [[ $# -eq 0 ]]; then
-        INSTALL_ALL=1
-    fi
-
     while [[ $# -gt 0 ]]; do
         case $1 in
             --all)
@@ -538,6 +534,15 @@ main() {
                 ;;
         esac
     done
+
+    # Default to a full install unless the user explicitly narrowed the targets.
+    # Modifier-only invocations (--from-source, --skip-gpu-check, --wheel-dir,
+    # --release-tag, --keep-build) must still install everything, not silently
+    # no-op into a misleading "Installation complete!".
+    if [[ $INSTALL_ALL -eq 0 && $INSTALL_FLASH_ATTN -eq 0 && $INSTALL_FLASHMLA -eq 0 \
+          && $INSTALL_DEEPGEMM -eq 0 && $INSTALL_BATCHGEN -eq 0 ]]; then
+        INSTALL_ALL=1
+    fi
 
     # Check prerequisites
     check_prerequisites
