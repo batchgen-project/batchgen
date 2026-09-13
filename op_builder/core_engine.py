@@ -5,6 +5,29 @@ from .builder import CUDAOpBuilder
 BATCHGEN_CORE_ROOT = "core/"
 
 
+def _libucx_paths():
+    """Locate the pip-installed ``libucx-cu12`` wheel's headers/libs.
+
+    The core_engine's distributed-weight daemon uses the UCP memory-handle API
+    (``UCP_OP_ATTR_FIELD_MEMH``), which needs UCX >= 1.14. The ``libucx-cu12``
+    wheel (declared in requirements.txt) ships a modern UCX (headers + libs) as
+    a portable manylinux package, so no system UCX / source build is required.
+    Returns ``(include_dir, lib_dir)`` or ``(None, None)`` if the wheel is absent
+    (then the build falls back to a system UCX via the plain ``-lucp`` flags).
+    """
+    try:
+        import libucx
+
+        base = os.path.dirname(os.path.abspath(libucx.__file__))
+        inc = os.path.join(base, "include")
+        lib = os.path.join(base, "lib")
+        if os.path.isdir(inc) and os.path.isdir(lib):
+            return inc, lib
+    except Exception:
+        pass
+    return None, None
+
+
 class CoreEngineBuilder(CUDAOpBuilder):
     BUILD_VAR = "MOE_BUILD_CORE_ENGINE"
     NAME = "core_engine"
@@ -41,7 +64,11 @@ class CoreEngineBuilder(CUDAOpBuilder):
         ]
 
     def include_paths(self):
-        return ["core/", "external"]
+        paths = ["core/", "external"]
+        ucx_inc, _ = _libucx_paths()
+        if ucx_inc:
+            paths.append(ucx_inc)
+        return paths
 
     def cxx_args(self):
         """C++ compiler flags - DON'T call super() to avoid conflicts"""
@@ -94,6 +121,14 @@ class CoreEngineBuilder(CUDAOpBuilder):
             stubs_dir = os.path.join(conda_prefix, "lib", "stubs")
             if os.path.isdir(stubs_dir):
                 flags.append(f"-L{stubs_dir}")
+
+        # UCX from the pip libucx-cu12 wheel: link against it and bake an rpath so
+        # the .so resolves libucp/libuct/libucs/libucm at runtime with no
+        # LD_LIBRARY_PATH. Falls back to a system UCX when the wheel is absent.
+        _, ucx_lib = _libucx_paths()
+        if ucx_lib:
+            flags.append(f"-L{ucx_lib}")
+            flags.append(f"-Wl,-rpath,{ucx_lib}")
 
         flags += [
             '-lnuma',
