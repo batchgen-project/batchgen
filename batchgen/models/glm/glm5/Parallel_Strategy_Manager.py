@@ -343,6 +343,7 @@ class GLM5ParallelStrategyManager:
 
     def activate_decoding(self):
         """Switch the already-built decode instance in and refill its experts."""
+        prep_start = time.perf_counter()
         Glm5MoE.reset_prefill_grouped_state()
         torch.cuda.empty_cache()
         self.loaded_model_config.phase = "decode"
@@ -354,8 +355,9 @@ class GLM5ParallelStrategyManager:
         done = time.perf_counter()
         nbytes = sum(dst.nbytes for dst, _ in self._expert_copy_pairs)
         logging.info(
-            "[PERSISTENT_PHASE] rank=%d map=%.3fs refill=%.3fs %.1f GB/s",
+            "[PERSISTENT_PHASE] rank=%d prep=%.3fs map=%.3fs refill=%.3fs %.1f GB/s",
             self.rank,
+            start - prep_start,
             mapped - start,
             done - mapped,
             nbytes / (done - mapped) / 1e9,

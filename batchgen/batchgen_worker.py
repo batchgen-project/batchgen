@@ -7769,12 +7769,18 @@ class BatchGenWorker:
 		pm = self.parallel_manager
 		if pm.decode_instance is not None and pm.decode_experts_resident:
 			return  # decode -> decode interval
+		ring_start = time.perf_counter()
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
 		self.core_engine.clear_weight_copy_queue()
 		# Decode keeps no routed-expert slots, so this frees the prefill ring
 		# before the decode experts are mapped back in.
 		self.core_engine.reset_decoding_buffer()
+		logging.info(
+			"[PERSISTENT_PHASE] rank=%d ring_release=%.3fs",
+			self.rank,
+			time.perf_counter() - ring_start,
+		)
 		if pm.decode_instance is None:
 			self.init_nvshmem()
 			# Sized once for the largest admissible decode batch: the instance,
