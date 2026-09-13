@@ -109,11 +109,43 @@ install_system_deps() {
     fi
 }
 
+# The core_engine's distributed-weight daemon (Weights_Storage/distributed_weight_daemon.cpp)
+# uses the UCP memory-handle API (UCP_OP_ATTR_FIELD_MEMH), which needs UCX >= 1.14.
+# Ubuntu's apt UCX is 1.12 (too old), so build a modern UCX from source when a
+# suitable one is not already present. Without this the first server launch fails
+# the core_engine JIT with "ucp/api/ucp.h: No such file" or the memh compile error.
+install_ucx_dev() {
+    local minor=""
+    for _h in /usr/local/include/ucp/api/ucp_version.h /usr/include/ucp/api/ucp_version.h; do
+        [[ -f "$_h" ]] || continue
+        minor=$(sed -n 's/.*UCP_API_MINOR[^0-9]*\([0-9][0-9]*\).*/\1/p' "$_h" | head -1)
+        [[ -n "$minor" && "$minor" -ge 14 ]] && { print_success "UCX >= 1.14 present ($_h, minor=$minor)"; return 0; }
+    done
+    print_step "Building UCX 1.17 from source (core_engine distributed-weight daemon needs UCP memh API)..."
+    command -v curl &>/dev/null || { print_warning "curl missing; install UCX >= 1.14 manually (core_engine will not build)."; return 0; }
+    local V=1.17.0 T=/tmp/_batchgen_ucx_build
+    rm -rf "$T" && mkdir -p "$T" && cd "$T" || { print_warning "cannot create UCX build dir"; return 0; }
+    if ! curl -fsSL -o "ucx-$V.tar.gz" "https://github.com/openucx/ucx/releases/download/v$V/ucx-$V.tar.gz"; then
+        print_warning "UCX download failed (github egress?). Install UCX >= 1.14 manually."; cd - >/dev/null; return 0
+    fi
+    tar xf "ucx-$V.tar.gz" && cd "ucx-$V" || { print_warning "UCX extract failed"; cd - >/dev/null; return 0; }
+    if ./configure --prefix=/usr/local --enable-mt --without-go --without-java --disable-numa >/dev/null 2>&1 \
+        && make -j"$(nproc)" >/dev/null 2>&1 && make install >/dev/null 2>&1; then
+        ldconfig 2>/dev/null || true
+        print_success "UCX $V installed to /usr/local"
+    else
+        print_warning "UCX build failed; install UCX >= 1.14 manually (core_engine will not build)."
+    fi
+    cd - >/dev/null
+}
+
 check_prerequisites() {
     print_step "Checking prerequisites..."
 
     # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
     install_system_deps
+    # UCX >= 1.14 headers/libs needed by the core_engine distributed-weight daemon.
+    install_ucx_dev
 
     # Check Python
     if ! command -v python &> /dev/null; then
