@@ -477,6 +477,20 @@ show_help() {
     echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
 }
 
+# Pre-build (warm) the core_engine JIT extension now, while the CUDA toolkit is on
+# hand from the source build, so the FIRST server launch does not require CUDA_HOME
+# / nvcc on PATH. The compile is CPU-only (no GPU needed). Non-fatal: on failure the
+# engine JIT-builds at first launch instead (which then needs CUDA_HOME set).
+warm_core_engine() {
+    python -c "import batchgen" &> /dev/null || return 0   # batchgen not installed; skip
+    print_step "Warming the core_engine JIT build (so the first server launch needs no CUDA toolkit)..."
+    if python -c "from batchgen.models.engine_loader import core_engine" > /tmp/batchgen_core_engine_warm.log 2>&1; then
+        print_success "core_engine JIT built and cached"
+    else
+        print_warning "core_engine warm build failed; it will JIT-build on first server launch (set CUDA_HOME then). Log: /tmp/batchgen_core_engine_warm.log"
+    fi
+}
+
 main() {
     echo "========================================"
     echo "  BatchGen Dependency Installer"
@@ -632,6 +646,10 @@ main() {
             install_batchgen
         fi
     fi
+
+    # Warm the core_engine JIT now (CUDA toolkit is available during install) so
+    # the first server launch needs no CUDA_HOME / nvcc on PATH.
+    warm_core_engine
 
     # Cleanup
     cleanup

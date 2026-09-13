@@ -534,9 +534,16 @@ class WorkerManager:
         _diag(f"  paths resolved: endpoint={endpoint!r}, cache_dir={self.args.cache_dir!r}")
 
         if not endpoint and self.args.cache_dir is None:
-            _diag("  >>> _download_model_snapshot")
-            self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
-            _diag("  <<< _download_model_snapshot")
+            if os.path.isdir(self.args.model):
+                # --model is a local checkpoint directory: use it directly as the
+                # cache dir. Avoids treating a filesystem path as an HF repo id
+                # (which fails HFValidationError) and skips any network download.
+                _diag(f"  local model dir -> cache_dir={self.args.model}")
+                self.args.cache_dir = Path(self.args.model)
+            else:
+                _diag("  >>> _download_model_snapshot")
+                self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
+                _diag("  <<< _download_model_snapshot")
 
         if endpoint:
             _diag("  >>> _load_model_from_remote_server")
