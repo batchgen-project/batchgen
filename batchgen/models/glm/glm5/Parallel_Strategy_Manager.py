@@ -347,8 +347,19 @@ class GLM5ParallelStrategyManager:
         torch.cuda.empty_cache()
         self.loaded_model_config.phase = "decode"
         self.model, self.weight_copy_task = self.decode_instance
+        start = time.perf_counter()
         self._expert_arena.map()
+        mapped = time.perf_counter()
         self.refill_local_routed_experts()
+        done = time.perf_counter()
+        nbytes = sum(dst.nbytes for dst, _ in self._expert_copy_pairs)
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d map=%.3fs refill=%.3fs %.1f GB/s",
+            self.rank,
+            mapped - start,
+            done - mapped,
+            nbytes / (done - mapped) / 1e9,
+        )
         return self.model, self.weight_copy_task
 
     @property
@@ -358,7 +369,13 @@ class GLM5ParallelStrategyManager:
     def release_decode_routed_experts(self):
         """Return the decode routed experts' HBM; their addresses stay reserved."""
         torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        start = time.perf_counter()
         self._expert_arena.unmap()
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d unmap=%.3fs",
+            self.rank,
+            time.perf_counter() - start,
+        )
 
     def refill_local_routed_experts(self):
         """H2D-copy every local routed expert into its fixed-address stack row."""
