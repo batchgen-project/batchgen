@@ -517,6 +517,13 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("world_size must be positive")
     if args.node_rank < 0 or args.node_rank >= args.nnodes:
         raise ValueError("node_rank must be in [0, nnodes)")
+    if args.host_kv_cache_size is None:
+        raise ValueError(
+            "--host-kv-cache-size is required: the size (in GB) of the host-side "
+            "KV-cache pool the engine uses for KV offload (e.g. --host-kv-cache-size 64)."
+        )
+    if args.host_kv_cache_size <= 0:
+        raise ValueError("--host-kv-cache-size must be a positive number of GB")
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(

@@ -44,6 +44,17 @@ fi
 # Installation directory (defaults to temp, can be overridden)
 INSTALL_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_deps}"
 
+# --- Pre-built wheel auto-download (Hopper fast path) -------------------------
+# By default the installer first tries to fetch matching pre-built wheels
+# (flash-attn 3, FlashMLA, DeepGEMM, batchgen_kernels) from the public GitHub
+# release and install them (no compilation, ~2 min). If any required wheel is
+# missing for this Python/GPU-arch it transparently falls back to building from
+# source. `--from-source` forces the build; `--release-tag TAG` (or
+# BATCHGEN_RELEASE_TAG) pins the release; `--wheel-dir DIR` uses local wheels.
+BATCHGEN_REPO="${BATCHGEN_REPO:-batchgen-project/batchgen}"
+RELEASE_TAG="${BATCHGEN_RELEASE_TAG:-}"   # empty => latest release
+FROM_SOURCE=0
+
 print_step() {
     echo -e "${BLUE}==>${NC} $1"
 }
@@ -102,6 +113,9 @@ check_prerequisites() {
     print_step "Checking prerequisites..."
 
     # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
+    # UCX (for the core_engine distributed-weight daemon's UCP memory-handle API) is
+    # provided by the `libucx-cu12` pip wheel declared in requirements.txt (installed
+    # with the batchgen package), so no system UCX or source build is needed here.
     install_system_deps
 
     # Check Python
@@ -111,7 +125,9 @@ check_prerequisites() {
     fi
 
     PYTHON_VERSION=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if [[ $(echo "$PYTHON_VERSION < 3.11" | bc -l) -eq 1 ]]; then
+    # Pure-python comparison (avoids a hard dependency on `bc`, which is absent on
+    # many minimal images).
+    if ! python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
         print_error "Python 3.11+ required. Found: $PYTHON_VERSION"
         exit 1
     fi
@@ -124,13 +140,35 @@ check_prerequisites() {
     fi
     print_success "git found"
 
-    # Check CUDA
+    # Check CUDA. An explicitly-set CUDA_HOME wins: it lets a user point at a
+    # toolkit provisioned to a non-standard prefix, or override a mismatched
+    # system nvcc (e.g. a CUDA 13 fleet image) with a CUDA 12.8 toolkit. Else
+    # look for nvcc on PATH, then scan common locations, preferring a 12.x
+    # toolkit (the reference build is CUDA 12.8).
+    if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
+        export PATH="${CUDA_HOME}/bin:$PATH"
+        print_step "Using nvcc from CUDA_HOME=${CUDA_HOME}"
+    elif ! command -v nvcc &> /dev/null; then
+        for _cudadir in /usr/local/cuda-12*/bin /usr/local/cuda/bin; do
+            if [[ -x "$_cudadir/nvcc" ]]; then
+                export PATH="$_cudadir:$PATH"
+                print_step "Added $_cudadir to PATH (nvcc)"
+                break
+            fi
+        done
+    fi
     if ! command -v nvcc &> /dev/null; then
-        print_warning "nvcc not found. CUDA may not be properly configured."
-        print_warning "Make sure CUDA toolkit is installed and in PATH."
+        print_warning "nvcc not found (no CUDA toolkit on PATH, under /usr/local/cuda*, or via CUDA_HOME)."
+        print_warning "A source build needs the CUDA 12.8 toolkit; install it and re-run with"
+        print_warning "  CUDA_HOME=/path/to/cuda-12.8 bash scripts/install_deps.sh   (wheel fast-path needs no toolkit)."
     else
         CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
-        print_success "CUDA $CUDA_VERSION found"
+        print_success "CUDA $CUDA_VERSION found (nvcc: $(command -v nvcc))"
+        if [[ "${CUDA_VERSION%%.*}" != "12" ]]; then
+            print_warning "Reference build targets CUDA 12.8 (torch 2.9.0+cu128); found CUDA $CUDA_VERSION."
+            print_warning "A different major CUDA will likely fail the FA3/FlashMLA/DeepGEMM builds or mismatch the pinned torch."
+            print_warning "Point CUDA_HOME at a 12.8 toolkit to override: CUDA_HOME=/path/to/cuda-12.8 bash scripts/install_deps.sh"
+        fi
     fi
 
     # Check ninja (for fast builds)
@@ -299,6 +337,12 @@ install_deepgemm() {
 }
 
 install_batchgen_kernels() {
+    # Already provided by a pre-built wheel (auto-download / --wheel-dir)? Skip the compile.
+    if python -c "import batchgen_kernels" &>/dev/null 2>&1; then
+        print_success "batchgen_kernels already installed (wheel); skipping compilation"
+        return 0
+    fi
+
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
@@ -335,6 +379,73 @@ cleanup() {
     fi
 }
 
+# Hopper fast path: stage matching pre-built wheels (flash-attn 3, FlashMLA,
+# DeepGEMM, batchgen_kernels) from the public GitHub release into a local dir so
+# the caller installs them instead of compiling (~2 min vs ~40-60 min). All four
+# must be present for this Python/GPU-arch; otherwise WHEEL_DIR is left empty and
+# the caller falls back to building from source. Never fatal.
+try_download_wheels() {
+    [[ -n "$WHEEL_DIR" ]] && return 0          # explicit local --wheel-dir wins
+    [[ $FROM_SOURCE -eq 1 ]] && return 0        # user forced a source build
+    command -v curl &>/dev/null || { print_warning "curl not found; building from source."; return 0; }
+
+    local pytag api urls tmp w
+    pytag="cp$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo cp311)"
+    if [[ -n "$RELEASE_TAG" ]]; then
+        api="https://api.github.com/repos/${BATCHGEN_REPO}/releases/tags/${RELEASE_TAG}"
+    else
+        api="https://api.github.com/repos/${BATCHGEN_REPO}/releases/latest"
+    fi
+    print_step "Looking for pre-built Hopper wheels on ${BATCHGEN_REPO} (${RELEASE_TAG:-latest}, ${pytag}/${BUILD_ARCH})..."
+
+    # Select matching asset download URLs (python-ABI + GPU-arch aware).
+    urls="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
+import sys, os, json
+pytag = os.environ["PYTAG"]; arch = os.environ["WANT_ARCH"]
+try:
+    assets = json.load(sys.stdin).get("assets", [])
+except Exception:
+    sys.exit(0)
+want = ("flash_attn", "flash_mla", "deep_gemm", "batchgen_kernels")
+for a in assets:
+    n = a.get("name", "")
+    if not n.endswith(".whl") or not any(n.startswith(w) for w in want):
+        continue
+    if ("abi3" not in n) and ("py3-none" not in n) and (pytag not in n):
+        continue                                    # python-ABI mismatch
+    if n.startswith("batchgen_kernels") and (arch not in n):
+        continue                                    # GPU-arch mismatch
+    u = a.get("browser_download_url", "")
+    if u:
+        print(u)
+' || true)"
+
+    # Require all four deps; otherwise fall back to a full source build.
+    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
+        if ! printf '%s\n' "$urls" | grep -q "/${w}"; then
+            print_warning "no pre-built '${w}' wheel for this env (${pytag}/${BUILD_ARCH}) — building from source."
+            return 0
+        fi
+    done
+
+    tmp="$INSTALL_DIR/prebuilt_wheels"          # under INSTALL_DIR so cleanup() removes it
+    rm -rf "$tmp"; mkdir -p "$tmp"
+    ( cd "$tmp" && printf '%s\n' "$urls" | while read -r u; do
+        [[ -n "$u" ]] && { curl -fsSL -O "$u" || print_warning "download failed: $u"; }
+      done )
+
+    # Accept only a COMPLETE set; a partial download falls back to source.
+    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
+        if ! ls "$tmp/${w}"*.whl &>/dev/null 2>&1; then
+            print_warning "incomplete wheel set (missing ${w}); building from source."
+            rm -rf "$tmp"
+            return 0
+        fi
+    done
+    WHEEL_DIR="$tmp"
+    print_success "Fetched pre-built wheels into $WHEEL_DIR (skipping ~40-60 min compilation)"
+}
+
 show_help() {
     echo "BatchGen Dependency Installation Script"
     echo ""
@@ -346,7 +457,9 @@ show_help() {
     echo "  --flashmla        Install FlashMLA only"
     echo "  --deepgemm        Install DeepGEMM only"
     echo "  --batchgen        Install BatchGen only"
-    echo "  --wheel-dir DIR   Use pre-built wheels for FA3/FA4/FlashMLA/DeepGEMM (auto-detects arch)"
+    echo "  --wheel-dir DIR   Use pre-built wheels from a LOCAL dir (offline; auto-detects arch)"
+    echo "  --release-tag TAG Fetch pre-built wheels from this GitHub release tag (default: latest)"
+    echo "  --from-source     Force building all deps from source (skip the wheel fast path)"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -354,6 +467,7 @@ show_help() {
     echo "Environment Variables:"
     echo "  BATCHGEN_INSTALL_DIR  Directory for cloning repos (default: /tmp/batchgen_deps)"
     echo "  WHEEL_DIR             Pre-built wheel directory (same as --wheel-dir)"
+    echo "  BATCHGEN_RELEASE_TAG  Release tag to fetch pre-built wheels from (default: latest)"
     echo "  KEEP_BUILD_DIR        Set to 1 to keep build directory"
     echo ""
     echo "Examples:"
@@ -361,6 +475,20 @@ show_help() {
     echo "  $0 --flash-attn                     # Install only flash-attention 3"
     echo "  $0 --wheel-dir /path/to/wheels      # Install deps from pre-built wheels"
     echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
+}
+
+# Pre-build (warm) the core_engine JIT extension now, while the CUDA toolkit is on
+# hand from the source build, so the FIRST server launch does not require CUDA_HOME
+# / nvcc on PATH. The compile is CPU-only (no GPU needed). Non-fatal: on failure the
+# engine JIT-builds at first launch instead (which then needs CUDA_HOME set).
+warm_core_engine() {
+    python -c "import batchgen" &> /dev/null || return 0   # batchgen not installed; skip
+    print_step "Warming the core_engine JIT build (so the first server launch needs no CUDA toolkit)..."
+    if python -c "from batchgen.models.engine_loader import core_engine" > /tmp/batchgen_core_engine_warm.log 2>&1; then
+        print_success "core_engine JIT built and cached"
+    else
+        print_warning "core_engine warm build failed; it will JIT-build on first server launch (set CUDA_HOME then). Log: /tmp/batchgen_core_engine_warm.log"
+    fi
 }
 
 main() {
@@ -377,10 +505,6 @@ main() {
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
     WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
-
-    if [[ $# -eq 0 ]]; then
-        INSTALL_ALL=1
-    fi
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -412,6 +536,14 @@ main() {
                 WHEEL_DIR="$2"
                 shift 2
                 ;;
+            --from-source)
+                FROM_SOURCE=1
+                shift
+                ;;
+            --release-tag)
+                RELEASE_TAG="$2"
+                shift 2
+                ;;
             --keep-build)
                 export KEEP_BUILD_DIR=1
                 shift
@@ -427,6 +559,15 @@ main() {
                 ;;
         esac
     done
+
+    # Default to a full install unless the user explicitly narrowed the targets.
+    # Modifier-only invocations (--from-source, --skip-gpu-check, --wheel-dir,
+    # --release-tag, --keep-build) must still install everything, not silently
+    # no-op into a misleading "Installation complete!".
+    if [[ $INSTALL_ALL -eq 0 && $INSTALL_FLASH_ATTN -eq 0 && $INSTALL_FLASHMLA -eq 0 \
+          && $INSTALL_DEEPGEMM -eq 0 && $INSTALL_BATCHGEN -eq 0 ]]; then
+        INSTALL_ALL=1
+    fi
 
     # Check prerequisites
     check_prerequisites
@@ -450,6 +591,7 @@ main() {
     # Install dependencies based on options
     if [[ $INSTALL_ALL -eq 1 ]]; then
         if [[ $IS_HOPPER -eq 1 ]]; then
+            try_download_wheels   # populate WHEEL_DIR from the public release; else source-build below
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
                 pip install --find-links "$WHEEL_DIR" --no-index \
@@ -504,6 +646,10 @@ main() {
             install_batchgen
         fi
     fi
+
+    # Warm the core_engine JIT now (CUDA toolkit is available during install) so
+    # the first server launch needs no CUDA_HOME / nvcc on PATH.
+    warm_core_engine
 
     # Cleanup
     cleanup
