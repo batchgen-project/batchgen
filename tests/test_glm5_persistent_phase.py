@@ -229,23 +229,17 @@ def test_persistent_decode_instance_uses_runtime_rank_cap():
     assert worker._decode_padding_bsz == 128
 
 
-def test_persistent_phase_methods_only_call_worker_methods_that_exist():
+def test_worker_only_calls_worker_methods_that_exist():
     worker = _worker_class_ast()
     methods = {
         node.name: node
         for node in worker.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    lifecycle = {
-        "_persistent_phase_enabled",
-        "_activate_persistent_decode_instance",
-        "_release_persistent_decode_instance",
-        "_build_persistent_phase_instances",
-    }
 
     missing = set()
-    for name in lifecycle:
-        for node in ast.walk(methods[name]):
+    for name, method in methods.items():
+        for node in ast.walk(method):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -259,6 +253,20 @@ def test_persistent_phase_methods_only_call_worker_methods_that_exist():
                 missing.add((name, func.attr))
 
     assert not missing
+
+
+def test_prefill_nsys_profile_is_inert_without_batch_debug():
+    begin = _isolated_worker_method("_nsys_prefill_profile_begin")
+    end = _isolated_worker_method("_nsys_prefill_profile_end")
+    worker = SimpleNamespace(
+        _batchgen_debug={},
+        _debug_flag_enabled=lambda value: False,
+    )
+
+    active = begin(worker, local_bsz=42, global_bsz=336)
+    end(worker, active)
+
+    assert active is False
 
 
 def test_cuda_python_runtime_dependency_is_declared():
