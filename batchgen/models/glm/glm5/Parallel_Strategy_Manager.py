@@ -30,6 +30,12 @@ from .model import Glm5ForCausalLM, Glm5MoE
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
+def _synchronize_prefill_preloads():
+    """Keep one rank's forward from overlapping another rank's preload."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 class GLM5ParallelStrategyManager:
     NUM_TOTAL_EXPERTS = 256
     NUM_LAYERS = 78
@@ -150,6 +156,11 @@ class GLM5ParallelStrategyManager:
         self._setup_fp8_scales()
         self._init_fused_kernels()
         if self.is_fp8_experts:
+            from batchgen.attention.fused_kernels import (
+                preload_fused_attention_kernels,
+            )
+
+            preload_fused_attention_kernels()
             grouped_layers = [
                 layer.mlp
                 for layer in self.model.model.layers[self.FIRST_K_DENSE :]
@@ -171,6 +182,7 @@ class GLM5ParallelStrategyManager:
             for moe in grouped_layers:
                 moe._prefill_release_event = torch.cuda.Event()
                 moe._prefill_shared_release_event = torch.cuda.Event()
+            _synchronize_prefill_preloads()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
