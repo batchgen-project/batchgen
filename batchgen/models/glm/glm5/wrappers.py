@@ -621,6 +621,42 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """Return FP8 weights unchanged — deepgemm handles FP8 directly."""
         return weights_dict
 
+    def _clear_nonpersistent_weight_bindings(self) -> None:
+        """Drop buffer-backed parameters without draining the CUDA stream."""
+        applied = getattr(self, "_applied_param_keys", None)
+        for name, param in self.module.named_parameters():
+            if applied is not None and name not in applied:
+                continue
+            param.data = torch.empty(0, device=param.data.device)
+        self._applied_param_keys = None
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        if self.persistent or self.phase != "prefill":
+            return super().forward(*args, **kwargs)
+
+        rank = self.get_rank_safe()
+        logging.debug(
+            f"[Rank {rank} Layer {self.layer_idx}] "
+            f"Attn forward. Phase: {self.phase}"
+        )
+
+        weights = self.load_weights(self.module_key)
+        self.apply_weights(self.dequantize_weights(weights))
+        hidden_states = kwargs.pop("hidden_states", None)
+        result = self._forward_prefill(hidden_states, **kwargs)
+
+        # The core records an event on this thread's active CUDA stream and
+        # keeps the backing slot unavailable until all queued consumers finish.
+        # Python bindings can therefore be cleared without a host stream drain.
+        self._clear_nonpersistent_weight_bindings()
+        self.core_engine.free_weights_buffer_async(self.module_key)
+
+        logging.debug(
+            f"[Rank {rank} Layer {self.layer_idx}] "
+            f"Attn forward complete. Phase: {self.phase}"
+        )
+        return result
+
     def enable_dsa_cuda_graph(
         self,
         manager,
