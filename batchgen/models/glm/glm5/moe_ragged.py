@@ -13,7 +13,31 @@ ROW_ALIGN = 64
 QUANT_BLOCK = 128
 _CAPACITY_BLOCK = 128
 
+_dispatch_module = None
 _ops_module = None
+
+
+def _require_dispatch_module():
+    global _dispatch_module
+    if _dispatch_module is not None:
+        return _dispatch_module
+
+    import batchgen_kernels
+
+    module = batchgen_kernels.load_extension(
+        "batchgen_kernels.moe._C_dispatch_scatter_3d"
+    )
+    for symbol in (
+        "dispatch_scatter_ragged",
+        "reduce_weighted_scatter_bf16_ordered",
+    ):
+        if not hasattr(module, symbol):
+            raise RuntimeError(
+                "batchgen_kernels.moe._C_dispatch_scatter_3d has no "
+                f"{symbol}; rebuild batchgen_kernels"
+            )
+    _dispatch_module = module
+    return module
 
 
 def _require_ops_module():
@@ -37,21 +61,7 @@ def _require_ops_module():
 
 def require_ragged_kernels():
     """Load every compact-ragged kernel required by grouped prefill."""
-    import batchgen_kernels
-
-    dispatch = batchgen_kernels.load_extension(
-        "batchgen_kernels.moe._C_dispatch_scatter_3d"
-    )
-    for symbol in (
-        "dispatch_scatter_ragged",
-        "reduce_weighted_scatter_bf16_ordered",
-    ):
-        if not hasattr(dispatch, symbol):
-            raise RuntimeError(
-                "batchgen_kernels.moe._C_dispatch_scatter_3d has no "
-                f"{symbol}; rebuild batchgen_kernels"
-            )
-    return dispatch, _require_ops_module()
+    return _require_dispatch_module(), _require_ops_module()
 
 
 def ragged_row_capacity(
