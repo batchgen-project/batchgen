@@ -1268,7 +1268,7 @@ class Glm5MoE(nn.Module):
 
     # Pure-DP grouped prefill. The 512-slot core-engine ring owns two complete
     # 256-expert FP8 layers; this class only owns bounded activation/workspace
-    # storage and one reusable pointer table.
+    # storage and one pointer-table source per transformer layer.
     _prefill_buf: Optional[Glm5PrefillMoEBuffers] = None
     _prefill_ptrs_pinned: Optional[torch.Tensor] = None
     _prefill_ptrs_dev: Optional[torch.Tensor] = None
@@ -1344,8 +1344,15 @@ class Glm5MoE(nn.Module):
             topk=config.num_experts_per_tok,
             device=device,
         )
+        # Pointer-table H2D is nonblocking. Keep a distinct pinned source per
+        # layer so preparing layer L+1 cannot mutate layer L's source before
+        # its DMA has consumed it.
         cls._prefill_ptrs_pinned = torch.empty(
-            6, config.n_routed_experts, dtype=torch.int64, pin_memory=True
+            config.num_hidden_layers,
+            6,
+            config.n_routed_experts,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         cls._prefill_ptrs_dev = torch.empty(
             6, config.n_routed_experts, dtype=torch.int64, device=device
@@ -2309,7 +2316,13 @@ class Glm5MoE(nn.Module):
             )
 
         cls._schedule_prefill_grouped_retirement()
-        stage = cls._prefill_ptrs_pinned
+        stage_bank = cls._prefill_ptrs_pinned
+        layer_idx = self.layer_idx
+        if stage_bank.ndim != 3 or not 0 <= layer_idx < stage_bank.shape[0]:
+            raise RuntimeError(
+                "GLM-5 grouped prefill pointer staging must be a per-layer bank"
+            )
+        stage = stage_bank[layer_idx]
         keys = []
         prototypes = None
         core_engine = self.experts[0].core_engine
