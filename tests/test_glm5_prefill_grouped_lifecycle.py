@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from batchgen.models.glm.glm5.model import Glm5MoE
+from batchgen.models.glm.glm5.model import Glm5DecoderLayer, Glm5MoE
 
 
 class _Event:
@@ -70,6 +70,15 @@ class _Expert:
         if self.fail:
             raise RuntimeError("load failed")
         return self.weights
+
+
+class _FailingAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(phase="prefill")
+
+    def forward(self, **kwargs):
+        raise RuntimeError("attention failed")
 
 
 def _make_moe(experts, shared):
@@ -251,6 +260,41 @@ def test_forward_failure_fences_and_releases_every_owned_slot(monkeypatch):
     assert shared.cached_gate is None
     assert shared.cached_up is None
     assert shared.cached_down is None
+
+
+def test_attention_failure_releases_weights_prefetched_by_decoder(monkeypatch):
+    log = []
+    core = _Core(log)
+    experts = [_Expert("routed_0", core, log), _Expert("routed_1", core, log)]
+    shared = _Expert("shared", core, log)
+    moe = _make_moe(experts, shared)
+    moe._prefill_release_event = _Event(log, "routed")
+    moe._prefill_shared_release_event = _Event(log, "shared")
+
+    layer = object.__new__(Glm5DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.layer_idx = 3
+    layer.mlp = moe
+    layer.self_attn = _FailingAttention()
+    layer.input_layernorm = torch.nn.Identity()
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: object())
+
+    with pytest.raises(RuntimeError, match="attention failed"):
+        layer(torch.ones(1, 1))
+
+    assert log == [
+        ("load", "routed_0"),
+        ("load", "routed_1"),
+        ("load", "shared"),
+        ("record", "routed"),
+        ("record", "shared"),
+        ("sync", "routed"),
+        ("free", "routed_0"),
+        ("free", "routed_1"),
+        ("sync", "shared"),
+        ("free", "shared"),
+    ]
 
 
 def test_terminal_retire_waits_once_then_releases_both_weight_classes():
