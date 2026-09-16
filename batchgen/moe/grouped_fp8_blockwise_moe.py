@@ -88,39 +88,30 @@ def _get_fused_s1_kernel():
 
 
 def _get_ptrs_kernel():
-    """Load the grouped GEMM ABI for independent expert weight addresses."""
+    """Return grouped GEMM for independent expert weight addresses."""
     global _warned_ptrs
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_grouped_gemm_ptrs,
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm_ptrs", None)
+    if kernel is None and module is not None and not _warned_ptrs:
+        _warned_ptrs = True
+        logger.warning(
+            "FP8 pointer-array grouped GEMM symbol missing from %s",
+            _MODULE_NAME,
         )
-        return fp8_blockwise_grouped_gemm_ptrs
-    except ImportError:
-        if not _warned_ptrs:
-            _warned_ptrs = True
-            logger.warning(
-                "FP8 pointer-array grouped GEMM kernel not available "
-                "(batchgen_kernels.moe._C_fp8_blockwise_gemm)"
-            )
-        return None
+    return kernel
 
 
 def _get_fused_s1_ptrs_kernel():
-    """Load fused S1 for independently allocated expert weights."""
+    """Return fused S1 for independently allocated expert weights."""
     global _warned_fused_s1_ptrs
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_fused_s1_ptrs,
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_fused_s1_ptrs", None)
+    if kernel is None and module is not None and not _warned_fused_s1_ptrs:
+        _warned_fused_s1_ptrs = True
+        logger.warning(
+            "FP8 pointer-array fused S1 symbol missing from %s", _MODULE_NAME
         )
-        return fp8_blockwise_fused_s1_ptrs
-    except ImportError:
-        if not _warned_fused_s1_ptrs:
-            _warned_fused_s1_ptrs = True
-            logger.warning(
-                "FP8 pointer-array fused S1 kernel not available "
-                "(batchgen_kernels.moe._C_fp8_blockwise_gemm)"
-            )
-        return None
+    return kernel
 
 
 def require_grouped_fp8_blockwise_ptr_kernels():
