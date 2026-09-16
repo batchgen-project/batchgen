@@ -46,6 +46,15 @@ def _isolated_worker_method(name):
     return getattr(namespace["Worker"], name)
 
 
+def _worker_class_ast():
+    tree = ast.parse(WORKER.read_text())
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    )
+
+
 def _load_server_args_module():
     package_name = "batchgen.server"
     previous = sys.modules.get(package_name)
@@ -211,7 +220,6 @@ def test_persistent_decode_instance_uses_runtime_rank_cap():
         ),
         init_nvshmem=lambda: None,
         _max_decode_rank_bsz=lambda: 128,
-        _initialize_glm52_folded_q_b_for_decode=lambda: None,
         set_phase=lambda phase: None,
     )
 
@@ -219,6 +227,38 @@ def test_persistent_decode_instance_uses_runtime_rank_cap():
 
     assert configured == [(128, "comm")]
     assert worker._decode_padding_bsz == 128
+
+
+def test_persistent_phase_methods_only_call_worker_methods_that_exist():
+    worker = _worker_class_ast()
+    methods = {
+        node.name: node
+        for node in worker.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    lifecycle = {
+        "_persistent_phase_enabled",
+        "_activate_persistent_decode_instance",
+        "_release_persistent_decode_instance",
+        "_build_persistent_phase_instances",
+    }
+
+    missing = set()
+    for name in lifecycle:
+        for node in ast.walk(methods[name]):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+                and func.attr.startswith("_")
+                and func.attr not in methods
+            ):
+                missing.add((name, func.attr))
+
+    assert not missing
 
 
 def test_cuda_python_runtime_dependency_is_declared():

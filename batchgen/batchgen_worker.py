@@ -6900,8 +6900,6 @@ class BatchGenWorker:
 					reason="pre_decode_warmup",
 				)
 				self._bind_decode_attention_metadata_for_graph_config(local_decode_indices)
-				if self._persistent_phase_enabled():
-					self._recapture_persistent_graphs_if_span_grew()
 				config_decode_time += time.perf_counter() - config_start
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
@@ -7789,7 +7787,6 @@ class BatchGenWorker:
 			self.model, self.weight_copy_task = pm.configure_decoding(
 				padding_bsz=padding_bsz, comm=comm
 			)
-			self._initialize_glm52_folded_q_b_for_decode()
 			self._decode_padding_bsz = padding_bsz
 		else:
 			self.model, self.weight_copy_task = pm.activate_decoding()
@@ -7843,30 +7840,6 @@ class BatchGenWorker:
 			time.perf_counter() - start,
 			capture,
 		)
-
-	def _recapture_persistent_graphs_if_span_grew(self) -> None:
-		"""Persistent decode graphs are kept across batches; drop them only when
-		the current batch needs a longer attention span than they were captured
-		for, so the regular warmup recaptures them instead of decoding eagerly."""
-		segment = getattr(self, "_whole_model_segment", None)
-		if segment is None or os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN"):
-			return
-		manager = self._get_cuda_graph_gpu_manager()
-		primary = getattr(manager, "primary", manager)
-		required = self._glm5_dsa_graph_required_tokens(
-			list(AttnWrapperBase.cur_batch or []),
-			page_size=int(primary.config.page_size_tokens),
-		)
-		if required <= int(segment.max_seqlen):
-			return
-		logging.info(
-			"Rank %d: persistent decode graphs cover %d tokens, batch needs %d; recapturing",
-			self.rank,
-			int(segment.max_seqlen),
-			required,
-		)
-		self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
-		self._glm5_whole_model_graph_capture_attempted_for_batch = False
 
 	def _mark_phase_end(self, phase: str) -> None:
 		# [phase, running since (None while idle), busy seconds so far]
