@@ -323,8 +323,19 @@ except (ImportError, Exception):
 # Fused RoPE+Hadamard kernel — validated: 99/99 tests passed, 16.5x speedup over separate ops.
 try:
     from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
-except (ImportError, Exception):
+    _FUSED_ROPE_HADAMARD_IMPORT_ERROR = None
+except Exception as _e:
     _fused_rope_hadamard_fn = None
+    _FUSED_ROPE_HADAMARD_IMPORT_ERROR = _e
+
+
+def _required_dsa_model_kernel_import_failures():
+    """Return unavailable DSA kernels imported by the model module."""
+    if _fused_rope_hadamard_fn is None:
+        return {
+            "fused RoPE+Hadamard": _FUSED_ROPE_HADAMARD_IMPORT_ERROR,
+        }
+    return {}
 
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 
@@ -432,16 +443,18 @@ class Glm5Indexer(nn.Module):
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Fused interleaved RoPE + Hadamard, falling back to separate ops."""
-        if _fused_rope_hadamard_fn is not None:
-            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
-            cos, sin = self.rotary_emb(k, seq_len)
-            return _fused_rope_hadamard_fn(
-                k.to(torch.bfloat16), cos.float(), sin.float(),
-                positions.reshape(-1), scale=k.shape[-1] ** -0.5,
+        """Run the required fused interleaved RoPE + Hadamard kernel."""
+        if _fused_rope_hadamard_fn is None:
+            raise RuntimeError(
+                "GLM-5 DSA requires fused RoPE+Hadamard; separate-op fallback "
+                "is disabled"
             )
-        k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
-        return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+        cos, sin = self.rotary_emb(k, seq_len)
+        return _fused_rope_hadamard_fn(
+            k.to(torch.bfloat16), cos.float(), sin.float(),
+            positions.reshape(-1), scale=k.shape[-1] ** -0.5,
+        )
 
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,
