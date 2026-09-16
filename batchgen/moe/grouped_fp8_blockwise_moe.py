@@ -2,7 +2,15 @@
 
 Provides S1 (gate+up+SiLU) and S3 (down) grouped GEMM functions for
 FP8 blockwise-scaled MoE layers. Uses pre-allocated reserved buffers
-with uniform mtp-stride layout [E * mtp, dim].
+[M, dim] where expert e owns rows starting at cu_seqlens[e]: either the
+uniform mtp-stride layout (cu_seqlens[e] = e * mtp) or a compact ragged
+layout with 64-aligned cu_seqlens (see dispatch_scatter_ragged and
+batchgen_kernels.moe._C_fp8_blockwise_ops.act_quant_ragged).
+
+x_scale tiles are addressed per expert as cu_seqlens[e] / TileM. The kernel
+traps on device if any cu_seqlens[e] is not TileM-aligned or an expert's
+tiled span exceeds x_scale's columns. Host checks reject mismatched devices,
+dtypes, ranks, non-contiguous tensors, and shapes before any launch.
 
 Architecture: persistent 3-WG CuTe kernel, adaptive TileM (16/32/64),
 TileN=128, TileK=128, 8-stage TMA pipeline, FastDivmod tile scheduling.
@@ -91,18 +99,22 @@ def grouped_fp8_blockwise_gemm(
     """Single FP8 blockwise grouped GEMM.
 
     Args:
-        x_fp8:      [E*mtp, K] fp8 — activations in reserved buffer
-        weight_3d:  [E, N, K] fp8 — pre-stacked expert weights
+        x_fp8:      [M, K] fp8 — activations in reserved buffer (K % 128 == 0)
+        weight_3d:  [E, N, K] fp8 — pre-stacked expert weights (N % 128 == 0)
         seqlens:    [E] int32 — actual tokens per expert
-        cu_seqlens: [E+1] int32 — [0, mtp, 2*mtp, ..., E*mtp]
-        x_scale:    [K/128, E*mtp] f32 — transposed, uniform mtp stride
+        cu_seqlens: [E+1] int32 — expert row offsets, each a multiple of the
+                    selected TileM: uniform [0, mtp, ..., E*mtp] or ragged
+                    64-aligned offsets
+        x_scale:    [K/128, M_pad] f32 — transposed; M_pad <= M and
+                    M_pad % TileM == 0
         w_scale_3d: [E, N/128, (K/128+3)//4*4] f32 — K-dim padded to 4
         num_seq_per_group_avg: int — controls TileM selection (16/32/64)
-        output:     [E*mtp, N] bf16 — pre-allocated output (optional)
-        tma_desc:   cached TMA descriptors (optional, for reuse)
+        output:     [M, N] bf16 — pre-allocated output (optional)
+        tma_desc:   caller-owned 64-byte-aligned TMA scratch [2*E, 128]
+                    (optional; descriptors are refreshed for current offsets)
 
     Returns:
-        [E*mtp, N] bf16 output
+        [M, N] bf16 output
     """
     kernel = _get_kernel()
     if kernel is None:
@@ -192,6 +204,8 @@ def grouped_fp8_blockwise_fused_s1(
     Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable
     and ``output`` is None; raises RuntimeError if ``output`` is supplied,
     since the allocating fallback cannot honor the persistent output buffer.
+    Accepts the same uniform or ragged cu_seqlens / x_scale layouts as
+    :func:`grouped_fp8_blockwise_gemm` (E*mtp below reads as M / M_pad).
 
     Args:
         x_fp8:      [E*mtp, K] fp8 — quantized activations
