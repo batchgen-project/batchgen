@@ -17,7 +17,7 @@
 
 ## News
 
-- [2026/09] Kimi-K3 (2.8T-parameter, 896-expert MXFP4, top-16) support on 2×8 H200.
+- [2026/09] Kimi-K3 (2.8T-parameter, 896-expert MXFP4, top-16) support — multi-node deployment on [2×8 H200](docs/deploy-kimi-k3-h200.md) or [4×8 H20](docs/deploy-kimi-k3-h20.md).
 - [2026/01] BatchGen v1.0 released with support for DeepSeek-R1/V3-671B.
 
 ---
@@ -79,6 +79,7 @@ For complete deployment instructions including model download, checkpoint conver
 
 - **[Deployment Guide](docs/deploy-deepseek-r1-h20.md)** - Step-by-step guide for multi-node deployment
 - **[Deploy Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)** - Multi-node Kimi-K3 (2.8T MXFP4) deployment on 2×8 H200
+- **[Deploy Kimi-K3 on H20](docs/deploy-kimi-k3-h20.md)** - Multi-node Kimi-K3 (2.8T MXFP4) deployment on 4×8 H20
 - **[Server Flags Reference](docs/server-flags.md)** - Complete list of all server configuration flags
 - **[Client API Reference](docs/client-api.md)** - Python client usage and parameters
 - **[Manual Installation](docs/manual-installation.md)** - Step-by-step manual installation instructions
