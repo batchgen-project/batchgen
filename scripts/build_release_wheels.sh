@@ -8,7 +8,7 @@
 #  compiling on the user's machine.                                             #
 #                                                                               #
 #  There is intentionally NO tag-triggered GitHub Actions workflow (no stable   #
-#  GPU runner yet). Run this MANUALLY on a Hopper node (e.g. h200-instance-3),  #
+#  GPU runner yet). Run this MANUALLY on any 8-GPU Hopper node,                #
 #  inside the batchgen conda env / container, from the repo root, BEFORE        #
 #  cutting a new release:                                                        #
 #                                                                               #
@@ -44,7 +44,7 @@ warn() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
 
 usage() {
     cat <<EOF
-BatchGen release-wheel builder (run on a Hopper node, e.g. h200-instance-3)
+BatchGen release-wheel builder (run on any 8-GPU Hopper node)
 
 Usage: bash scripts/build_release_wheels.sh [OPTIONS]
 
