@@ -26,8 +26,16 @@ import types
 import torch
 import torch.distributed as dist
 
-from .model import Glm5ForCausalLM, Glm5MoE
-from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
+from .model import (
+    Glm5ForCausalLM,
+    Glm5MoE,
+    _required_dsa_model_kernel_import_failures,
+)
+from .wrappers import (
+    GLM5ExpertWrapper,
+    GLM5AttnWrapper,
+    _required_dsa_kernel_import_failures,
+)
 
 
 def _synchronize_prefill_preloads():
@@ -748,38 +756,73 @@ class GLM5ParallelStrategyManager:
                             self.dequant_scale[key].to(device))
 
     def _init_fused_kernels(self):
-        """Initialize TMA-based CUDA kernels after FP8 scales are attached.
+        """Initialize and require the production DSA kernels before serving."""
+        dsa_wrappers = []
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            wrapper = layer.self_attn
+            inner = wrapper.module if hasattr(wrapper, "module") else wrapper
+            if getattr(inner, "indexer", None) is not None:
+                dsa_wrappers.append((layer_idx, wrapper))
 
-        Counts WP2/WP4 init failures so a silent fallback to PyTorch
-        doesn't regress perf unnoticed.
-
-        Skipped entirely in dense-MLA mode (no indexer module → nothing to
-        fuse). Structural check on the first attention layer — more robust
-        than threading a config flag through two parallel config types.
-        """
-        first_attn = self.model.model.layers[0].self_attn
-        first_inner = first_attn.module if hasattr(first_attn, "module") else first_attn
-        if not hasattr(first_inner, "indexer"):
+        if not dsa_wrappers:
             if self.rank == 0:
-                logging.info("[DSA kernels] skipped (no indexer — dense-MLA mode)")
+                logging.info("[DSA kernels] skipped (no active indexer layers)")
             return
-        total = len(self.model.model.layers)
-        inited = 0
-        wp2_ok = 0
-        wp4_ok = 0
-        for layer_idx in range(total):
-            wrapper = self.model.model.layers[layer_idx].self_attn
-            if hasattr(wrapper, 'initialize_fused_kernels'):
-                wrapper.initialize_fused_kernels()
-                inited += 1
-                if getattr(wrapper, '_indexer_cuda_weights', None) is not None:
-                    wp2_ok += 1
-                if getattr(wrapper, '_fused_wqb_weights', None) is not None:
-                    wp4_ok += 1
+
+        import_failures = {
+            **_required_dsa_model_kernel_import_failures(),
+            **_required_dsa_kernel_import_failures(),
+        }
+        if import_failures:
+            details = "; ".join(
+                f"{name}: {error!r}" for name, error in import_failures.items()
+            )
+            raise RuntimeError(
+                "GLM-5 DSA required kernel imports are unavailable before "
+                f"serving: {details}"
+            )
+
+        for _, wrapper in dsa_wrappers:
+            wrapper.initialize_fused_kernels()
+
+        missing = {}
+        for name, attr in (
+            ("WP2 fused indexer KV projection", "_indexer_cuda_weights"),
+            ("WP4 fused indexer scoring", "_fused_wqb_weights"),
+        ):
+            layers = [
+                layer_idx
+                for layer_idx, wrapper in dsa_wrappers
+                if getattr(wrapper, attr, None) is None
+            ]
+            if layers:
+                missing[name] = layers
+
+        phase = getattr(self.loaded_model_config, "phase", None)
+        if phase == "decode":
+            layers = [
+                layer_idx
+                for layer_idx, wrapper in dsa_wrappers
+                if getattr(wrapper, "_fp8_absorb_weights", None) is None
+            ]
+            if layers:
+                missing["WP5 FP8 absorb"] = layers
+
+        if missing:
+            details = "; ".join(
+                f"{name} missing on layers {layers}"
+                for name, layers in missing.items()
+            )
+            raise RuntimeError(
+                "GLM-5 DSA required kernels failed to initialize before "
+                f"serving (phase={phase!r}): {details}"
+            )
+
         if self.rank == 0:
+            total = len(dsa_wrappers)
             logging.info(
-                f"[DSA kernels] init={inited}/{total} layers, "
-                f"WP2={wp2_ok}/{inited}, WP4={wp4_ok}/{inited}"
+                f"[DSA kernels] WP2={total}/{total}, WP4={total}/{total}, "
+                f"WP5={'import-ready' if phase != 'decode' else f'{total}/{total}'}"
             )
 
     def _lm_head_forward_pre_hook(self, module, input):

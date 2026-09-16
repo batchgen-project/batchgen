@@ -35,8 +35,10 @@ try:
         FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb,
     )
     _HAS_FP8_ABSORB = True
+    _FP8_ABSORB_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FP8_ABSORB = False
+    _FP8_ABSORB_IMPORT_ERROR = _e
     logging.debug(f"[WP5] FP8 absorb import failed: {_e}")
 
 # Try importing fused indexer KV proj (WP2)
@@ -46,8 +48,10 @@ try:
         FP8IndexerWeightsCUDA,
     )
     _HAS_FUSED_INDEXER_KV = True
+    _FUSED_INDEXER_KV_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_INDEXER_KV = False
+    _FUSED_INDEXER_KV_IMPORT_ERROR = _e
     logging.debug(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
 # Try importing fused scoring pipeline (WP4)
@@ -57,9 +61,23 @@ try:
         fused_score_pipeline,
     )
     _HAS_FUSED_SCORE = True
+    _FUSED_SCORE_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_SCORE = False
+    _FUSED_SCORE_IMPORT_ERROR = _e
     logging.debug(f"[WP4] Fused scoring import failed: {_e}")
+
+
+def _required_dsa_kernel_import_failures():
+    """Return unavailable production DSA kernels and their import errors."""
+    failures = {}
+    if not _HAS_FUSED_INDEXER_KV:
+        failures["WP2 fused indexer KV projection"] = _FUSED_INDEXER_KV_IMPORT_ERROR
+    if not _HAS_FUSED_SCORE:
+        failures["WP4 fused indexer scoring"] = _FUSED_SCORE_IMPORT_ERROR
+    if not _HAS_FP8_ABSORB:
+        failures["WP5 FP8 absorb"] = _FP8_ABSORB_IMPORT_ERROR
+    return failures
 
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
 _GLM5_ATTN_CATEGORIES = [
@@ -1590,15 +1608,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
-            if self._fp8_absorb_weights is not None:
-                attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
-            else:
-                # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
-                attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
-                attn_heads = torch.bmm(
-                    attn_out_3d.transpose(0, 1), self.w_vc,
-                ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
+            if self._fp8_absorb_weights is None:
+                raise RuntimeError(
+                    f"[layer {self.layer_idx}] GLM-5 DSA requires WP5 FP8 "
+                    "out_absorb; PyTorch/BF16 fallback is disabled"
+                )
+            attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
