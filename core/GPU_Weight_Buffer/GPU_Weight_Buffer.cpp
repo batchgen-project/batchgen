@@ -450,6 +450,38 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     }
 };
 
+module_weight_tensor_map GPU_Weight_Buffer::get_weights_pinned(
+    const std::string& module_name) {
+    /* Wait for an already-owned buffer without evicting or releasing it. */
+    this->logger_->debug("Get pinned weights: {}", module_name);
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    if (!this->cv_.wait_for(lock, std::chrono::seconds(120),
+                            [this, &module_name] {
+                                return this->module_in_buffers_.find(
+                                           module_name) !=
+                                       this->module_in_buffers_.end();
+                            })) {
+        std::ostringstream oss;
+        size_t count = 0;
+        for (const auto& [key, value] : this->module_in_buffers_) {
+            oss << key;
+            if (++count < this->module_in_buffers_.size()) {
+                oss << ", ";
+            }
+        }
+        this->logger_->error(
+            "Timeout reached while waiting for pinned module: {}. Buffer "
+            "contents: {}",
+            module_name, oss.str());
+        throw std::runtime_error(
+            "Timeout reached while waiting for pinned module: " + module_name +
+            ". Current modules: " + oss.str());
+    }
+    const auto& [module_type, buffer_idx] =
+        this->module_in_buffers_.at(module_name);
+    return this->buffers_.at(module_type).at(buffer_idx);
+};
+
 void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
                                               const std::string& module_name,
                                               int64_t buffer_idx) {
