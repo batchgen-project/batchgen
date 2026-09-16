@@ -72,6 +72,13 @@ struct HasGrowPagesForSequences<
            std::declval<const std::vector<std::size_t>&>()))>>
     : std::true_type {};
 
+template <typename T>
+struct IsDirectHostPagedKVWorkerView : std::false_type {};
+
+template <kv::HostKVMode Mode, typename Layout, typename LayerMapper>
+struct IsDirectHostPagedKVWorkerView<
+    kv::HostPagedKVWorkerView<Mode, Layout, LayerMapper>> : std::true_type {};
+
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
     py::class_<Manager>(m, name)
@@ -387,6 +394,17 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
     if constexpr (HasCompressionRatio<WorkerView>::value) {
         cls.def_property_readonly("compression_ratio",
                                   &WorkerView::compression_ratio);
+    }
+    if constexpr (IsDirectHostPagedKVWorkerView<WorkerView>::value) {
+        cls.def("async_offload_packed_layer_kv_to_host",
+                &WorkerView::AsyncOffloadPackedLayerKVToHost,
+                py::arg("layer_idx"), py::arg("sequence_ids"),
+                py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+                py::arg("sequence_lengths"),
+                "Offload one packed, variable-length prefill layer with one "
+                "async task. K/V tensors use [sum(sequence_lengths), H, D] "
+                "layout. For mapped worker views, layer_idx is resolved "
+                "before writing.");
     }
 }
 
