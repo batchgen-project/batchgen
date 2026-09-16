@@ -7,6 +7,8 @@
 
 import logging
 
+import torch
+
 from batchgen.planner.base_planner import BasePlanner
 
 
@@ -39,6 +41,19 @@ class GLM5Planner(BasePlanner):
 
     def __version__(self):
         return "0.1.0"
+
+    def _available_gpu_memory_gb(self) -> float:
+        """Return usable memory for the configured device, with H20 fallback."""
+        device = getattr(self.config.Basic_Config, "device_torch", None)
+        if torch.cuda.is_available():
+            try:
+                if device is None:
+                    device = torch.cuda.current_device()
+                total = torch.cuda.get_device_properties(device).total_memory
+                return float(total) / (1024 ** 3) * self.DEFAULT_MEM_FRAC
+            except (AssertionError, RuntimeError, TypeError, ValueError):
+                pass
+        return 96 * self.DEFAULT_MEM_FRAC
 
     def _adjust_config_for_model(self):
         """GLM-5 specific config adjustments."""

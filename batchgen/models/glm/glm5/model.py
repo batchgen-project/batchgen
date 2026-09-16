@@ -2313,6 +2313,7 @@ class Glm5MoE(nn.Module):
         keys = []
         prototypes = None
         core_engine = self.experts[0].core_engine
+        shared = self.shared_experts
         shared_key = None
         try:
             for expert_idx, expert in enumerate(self.experts):
@@ -2351,7 +2352,6 @@ class Glm5MoE(nn.Module):
                         down_scale,
                     )
 
-            shared = self.shared_experts
             if shared.persistent or not shared.is_fp8:
                 raise RuntimeError(
                     "GLM-5 grouped prefill requires a nonpersistent FP8 shared expert"
