@@ -18,6 +18,8 @@ def loader(monkeypatch):
     monkeypatch.setattr(fp8_moe, "_module_loaded", False)
     monkeypatch.setattr(fp8_moe, "_warned_gemm", False)
     monkeypatch.setattr(fp8_moe, "_warned_fused_s1", False)
+    monkeypatch.setattr(fp8_moe, "_warned_ptrs", False)
+    monkeypatch.setattr(fp8_moe, "_warned_fused_s1_ptrs", False)
     monkeypatch.setattr(fp8_moe, "logger", mock.MagicMock())
     fake_pkg = types.ModuleType("batchgen_kernels")
     fake_pkg.load_extension = mock.MagicMock()
@@ -46,13 +48,18 @@ def test_source_has_no_direct_extension_imports():
     assert "from batchgen_kernels.moe._C_fp8_blockwise_gemm import" not in src
 
 
-def test_one_loader_call_for_both_symbols(loader):
-    gemm, fused = object(), object()
+def test_one_loader_call_for_all_symbols(loader):
+    gemm, fused, ptrs, fused_ptrs = object(), object(), object(), object()
     loader.return_value = types.SimpleNamespace(
-        fp8_blockwise_grouped_gemm=gemm, fp8_blockwise_fused_s1=fused,
+        fp8_blockwise_grouped_gemm=gemm,
+        fp8_blockwise_fused_s1=fused,
+        fp8_blockwise_grouped_gemm_ptrs=ptrs,
+        fp8_blockwise_fused_s1_ptrs=fused_ptrs,
     )
     assert fp8_moe._get_kernel() is gemm
     assert fp8_moe._get_fused_s1_kernel() is fused
+    assert fp8_moe._get_ptrs_kernel() is ptrs
+    assert fp8_moe._get_fused_s1_ptrs_kernel() is fused_ptrs
     assert fp8_moe._get_kernel() is gemm
     loader.assert_called_once_with("batchgen_kernels.moe._C_fp8_blockwise_gemm")
     fp8_moe.logger.warning.assert_not_called()
