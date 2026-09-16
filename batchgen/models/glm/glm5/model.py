@@ -2752,44 +2752,53 @@ class Glm5DecoderLayer(nn.Module):
         # while the GPU may still be draining layer L-1. Retiring L-1 here
         # releases ring slots early enough for the core-engine H2D worker to
         # fill layer L+1 while this layer's attention runs.
-        if (
+        grouped_prefill = (
             not _is_decode
             and isinstance(self.mlp, Glm5MoE)
             and self.mlp._prefill_grouped_enabled
-        ):
-            self.mlp._prefill_prepare_weights()
-        # Pre-norm attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, attn_weights, present = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
         )
+        try:
+            if grouped_prefill:
+                self.mlp._prefill_prepare_weights()
+            # Pre-norm attention
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, attn_weights, present = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
 
-        # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
-        from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        hidden_states, residual = cuda_add_rmsnorm(
-            residual, hidden_states,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
-        )
+            # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
+            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
 
-        # MoE/FFN
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            # MoE/FFN
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
-        if (
-            not _is_decode
-            and isinstance(self.mlp, Glm5MoE)
-            and self.mlp._prefill_grouped_enabled
-            and self.layer_idx == self.mlp.config.num_hidden_layers - 1
-        ):
-            Glm5MoE.retire_prefill_grouped_weights()
+            if (
+                grouped_prefill
+                and self.layer_idx == self.mlp.config.num_hidden_layers - 1
+            ):
+                Glm5MoE.retire_prefill_grouped_weights()
 
-        return hidden_states, attn_weights, present
+            return hidden_states, attn_weights, present
+        except Exception:
+            if grouped_prefill:
+                try:
+                    self.mlp._abort_prefill_grouped_weights()
+                except Exception:
+                    logging.exception(
+                        "GLM-5 decoder layer failed to retire prefetched weights"
+                    )
+            raise
 
 
 # ============================================================================
