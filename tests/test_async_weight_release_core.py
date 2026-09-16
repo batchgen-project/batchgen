@@ -50,6 +50,19 @@ def test_async_release_binding_records_the_current_cuda_stream():
     assert '.def("free_weights_buffers_async"' in binding
 
 
+def test_glm5_streamed_prefill_core_api_bindings_are_complete():
+    wrappers = _source("batchgen/models/glm/glm5/wrappers.py")
+    binding = _source("core/batchgen_Binding.cpp")
+
+    required_methods = {
+        "get_weights_pinned",
+        "free_weights_buffer_async",
+    }
+    for method in required_methods:
+        assert f"self.core_engine.{method}(" in wrappers
+        assert f'.def("{method}"' in binding
+
+
 def test_reset_waits_for_pending_consumers_before_replacing_storage():
     source = _source("core/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp")
     synchronize = source[
