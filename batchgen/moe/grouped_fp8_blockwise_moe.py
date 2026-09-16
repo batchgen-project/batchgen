@@ -21,44 +21,60 @@ from typing import Optional
 
 logger = logging.getLogger("batchgen.moe.fp8_blockwise")
 
-_warned_import = False
+_MODULE_NAME = "batchgen_kernels.moe._C_fp8_blockwise_gemm"
+
+# Loaded once on first use; None after a failed import.
+_module = None
+_module_loaded = False
+_warned_gemm = False
 _warned_fused_s1 = False
 
 
-def _get_kernel():
-    """Load the compiled FP8 blockwise GEMM kernel."""
-    global _warned_import
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_grouped_gemm,
-        )
-        return fp8_blockwise_grouped_gemm
-    except ImportError:
-        if not _warned_import:
-            _warned_import = True
+def _get_module():
+    """Load the compiled FP8 blockwise extension once (None if not built).
+
+    Only ImportError is treated as "not available"; JIT/build/runtime errors
+    propagate so they are not mistaken for a missing kernel.
+    """
+    global _module, _module_loaded
+    if not _module_loaded:
+        try:
+            import batchgen_kernels
+            _module = batchgen_kernels.load_extension(_MODULE_NAME)
+        except ImportError as e:
+            _module = None
             logger.warning(
-                "FP8 blockwise grouped GEMM kernel not available "
-                "(batchgen_kernels.moe._C_fp8_blockwise_gemm). "
-                "Falling back to Triton implementation."
+                "FP8 blockwise kernel extension not available (%s): %s",
+                _MODULE_NAME, e,
             )
-        return None
+        _module_loaded = True
+    return _module
+
+
+def _get_kernel():
+    """Return the compiled FP8 blockwise grouped GEMM kernel, or None."""
+    global _warned_gemm
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm", None)
+    if kernel is None and module is not None and not _warned_gemm:
+        _warned_gemm = True
+        logger.warning(
+            "FP8 blockwise grouped GEMM symbol missing from %s", _MODULE_NAME
+        )
+    return kernel
 
 
 def _get_fused_s1_kernel():
-    """Load the compiled fused S1 kernel (gate+up+SiLU)."""
+    """Return the compiled fused S1 kernel (gate+up+SiLU), or None."""
     global _warned_fused_s1
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_fused_s1,
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_fused_s1", None)
+    if kernel is None and module is not None and not _warned_fused_s1:
+        _warned_fused_s1 = True
+        logger.warning(
+            "FP8 fused S1 symbol missing from %s", _MODULE_NAME
         )
-        return fp8_blockwise_fused_s1
-    except ImportError:
-        if not _warned_fused_s1:
-            _warned_fused_s1 = True
-            logger.warning(
-                "FP8 fused S1 kernel not available — falling back to 2× GEMM + SiLU"
-            )
-        return None
+    return kernel
 
 
 def grouped_fp8_blockwise_gemm(
@@ -173,7 +189,9 @@ def grouped_fp8_blockwise_fused_s1(
     Two-phase CuTe persistent kernel (v19). Gate result stays in SMEM,
     SiLU applied in the epilogue. 1.75× faster than 2× GEMM + SiLU at decode.
 
-    Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable.
+    Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable
+    and ``output`` is None; raises RuntimeError if ``output`` is supplied,
+    since the allocating fallback cannot honor the persistent output buffer.
 
     Args:
         x_fp8:      [E*mtp, K] fp8 — quantized activations
@@ -198,6 +216,13 @@ def grouped_fp8_blockwise_fused_s1(
             gate_ws3d, up_ws3d,
             num_seq_per_group_avg,
             output,
+        )
+    if output is not None:
+        raise RuntimeError(
+            "FP8 fused S1 kernel (fp8_blockwise_fused_s1) not available in "
+            f"{_MODULE_NAME}, but a pre-allocated output buffer was supplied; "
+            "the 2× GEMM + SiLU fallback allocates a new tensor and cannot "
+            "write into it. Rebuild batchgen_kernels with the fused S1 kernel."
         )
     # Fallback: 2× GEMM + SiLU
     return grouped_fp8_blockwise_s1_silu(
