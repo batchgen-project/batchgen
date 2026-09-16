@@ -6,7 +6,7 @@ This guide provides step-by-step instructions for deploying OpenAI's GPT-OSS-120
 
 1. [Download Model Checkpoints](#1-download-model-checkpoints)
 2. [Convert Checkpoints to BatchGen Format](#2-convert-checkpoints-to-batchgen-format)
-3. [Build Docker Container](#3-build-docker-container)
+3. [Build Docker Container or Install BatchGen](#3-build-docker-container-or-install-batchgen)
 4. [Start BatchGen Server](#4-start-batchgen-server)
 5. [Submit Jobs with Python APIs](#5-submit-jobs-with-python-apis)
 
@@ -54,12 +54,32 @@ python -m batchgen.tools.convert_checkpoint \
 
 ---
 
-## 3. Build Docker Container
+## 3. Build Docker Container or Install BatchGen
+
+Two supported install paths — Docker (recommended for production) or a bare-metal / conda source
+install via `scripts/install_deps.sh`. See the [Install Guide](INSTALL.md) and
+[Manual Installation](manual-installation.md) for the full matrix.
+
+### Option A — Docker
 
 ```bash
 # From BatchGen project root
 docker buildx build --progress=plain -f docker/Dockerfile -t batchgen:latest .
 ```
+
+### Option B — Source install (bare metal / conda)
+
+`scripts/install_deps.sh` provisions the toolchain (CUDA via `CUDA_HOME`, UCX from the
+`libucx-cu12` pip wheel, numa headers), takes the prebuilt-wheel fast path when a complete wheel
+set is published for the release tag, and otherwise compiles from source — then warms the
+core_engine JIT so the first server launch needs no nvcc / `CUDA_HOME`:
+
+```bash
+# From the BatchGen project root (Hopper: H20 / H200)
+./scripts/install_deps.sh                 # add --from-source to force a full compile
+```
+
+See the [Install Guide](INSTALL.md) for prerequisites and options.
 
 ### Run Container
 

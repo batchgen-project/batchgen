@@ -17,7 +17,7 @@
 
 ## News
 
-- [2026/09] Kimi-K3 (2.8T-parameter, 896-expert MXFP4, top-16) support on 2×8 H200.
+- [2026/09] Kimi-K3 (2.8T-parameter, 896-expert MXFP4, top-16) support on 2×8 H200 — see the [deployment guide](docs/deploy-kimi-k3-h200.md).
 - [2026/01] BatchGen v1.0 released with support for DeepSeek-R1/V3-671B.
 
 ---
