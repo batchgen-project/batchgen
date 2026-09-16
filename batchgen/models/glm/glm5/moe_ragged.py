@@ -13,20 +13,15 @@ ROW_ALIGN = 64
 QUANT_BLOCK = 128
 _CAPACITY_BLOCK = 128
 
-_dispatch_module = None
 _ops_module = None
 
 
 def _require_dispatch_module():
-    global _dispatch_module
-    if _dispatch_module is not None:
-        return _dispatch_module
-
-    import batchgen_kernels
-
-    module = batchgen_kernels.load_extension(
-        "batchgen_kernels.moe._C_dispatch_scatter_3d"
+    from batchgen.moe.dispatch_scatter_3d import (
+        require_dispatch_scatter_3d_kernels,
     )
+
+    module = require_dispatch_scatter_3d_kernels()
     for symbol in (
         "dispatch_scatter_ragged",
         "reduce_weighted_scatter_bf16_ordered",
@@ -36,7 +31,6 @@ def _require_dispatch_module():
                 "batchgen_kernels.moe._C_dispatch_scatter_3d has no "
                 f"{symbol}; rebuild batchgen_kernels"
             )
-    _dispatch_module = module
     return module
 
 
