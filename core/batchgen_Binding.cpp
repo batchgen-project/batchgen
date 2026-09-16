@@ -521,6 +521,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // attention and MoE compute concurrently.
         .def("get_weights", &BatchGen::get_weights,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_weights_pinned", &BatchGen::get_weights_pinned,
+             py::call_guard<py::gil_scoped_release>())
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
         .def("free_weights_buffer_async",
              &BatchGen::free_weights_buffer_async)

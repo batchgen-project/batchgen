@@ -67,6 +67,9 @@ class GPU_Weight_Buffer {
     module_weight_tensor_map get_weights(
             const std::string& module_name,
             std::string& phase);
+    // Return an existing lease without eviction; the caller owns its release.
+    module_weight_tensor_map get_weights_pinned(
+            const std::string& module_name);
 
     void weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
