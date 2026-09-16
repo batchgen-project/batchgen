@@ -65,6 +65,14 @@ def _load_dispatch_reduce_module():
         return None
 
 
+def require_dispatch_scatter_3d_kernels():
+    """Resolve the dispatch/reduce extension once or fail closed."""
+    mod = _load_dispatch_reduce_module()
+    if mod is None:
+        raise RuntimeError("dispatch_scatter_3d kernels are unavailable")
+    return mod
+
+
 def dispatch_scatter_3d(
     x: torch.Tensor,
     topk_indices: torch.Tensor,
