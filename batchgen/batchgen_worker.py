@@ -7785,7 +7785,7 @@ class BatchGenWorker:
 			self.init_nvshmem()
 			# Sized once for the largest admissible decode batch: the instance,
 			# its MoE buffers and its graphs are never rebuilt.
-			padding_bsz = self._decode_rank_batch_cap()
+			padding_bsz = self._max_decode_rank_bsz()
 			self.model, self.weight_copy_task = pm.configure_decoding(
 				padding_bsz=padding_bsz, comm=comm
 			)

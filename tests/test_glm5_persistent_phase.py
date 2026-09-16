@@ -184,6 +184,43 @@ def test_persistent_phase_worker_gate_rejects_invalid_flag_on_modes():
     assert worker.parallel_manager.persistent_phase_instances is True
 
 
+def test_persistent_decode_instance_uses_runtime_rank_cap():
+    activate = _isolated_worker_method("_activate_persistent_decode_instance")
+    activate.__globals__["time"] = SimpleNamespace(perf_counter=lambda: 0.0)
+    activate.__globals__["logging"] = SimpleNamespace(info=lambda *args: None)
+
+    configured = []
+    manager = SimpleNamespace(
+        decode_instance=None,
+        decode_experts_resident=False,
+    )
+
+    def configure_decoding(*, padding_bsz, comm):
+        configured.append((padding_bsz, comm))
+        return object(), {}
+
+    manager.configure_decoding = configure_decoding
+    worker = SimpleNamespace(
+        rank=1,
+        parallel_manager=manager,
+        core_engine=SimpleNamespace(
+            stop_h2d_worker=lambda: None,
+            clear_kv_copy_queue=lambda: None,
+            clear_weight_copy_queue=lambda: None,
+            reset_decoding_buffer=lambda: None,
+        ),
+        init_nvshmem=lambda: None,
+        _max_decode_rank_bsz=lambda: 128,
+        _initialize_glm52_folded_q_b_for_decode=lambda: None,
+        set_phase=lambda phase: None,
+    )
+
+    activate(worker, "comm")
+
+    assert configured == [(128, "comm")]
+    assert worker._decode_padding_bsz == 128
+
+
 def test_cuda_python_runtime_dependency_is_declared():
     requirements = (ROOT / "requirements.txt").read_text().splitlines()
     assert "cuda-python==13.3.1" in requirements
