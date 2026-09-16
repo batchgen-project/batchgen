@@ -424,6 +424,97 @@ __global__ void reduce_weighted_scatter_fp32_k16_kernel(
     output[(int64_t)token_idx * H + h_offset] = acc;
 }
 
+// Ordered BF16 combine.  The result for each token is a function only of the
+// token's routed (expert id, row, weight) set on this rank, independent of
+// slot order when expert ids are unique:
+//   acc = +0
+//   for slots in stable ascending expert-id order, skipping pos < 0:
+//     acc = bf16(fadd_rn(acc, bf16(fmul_rn(x[pos], bf16(w)))))
+// Every product and every partial sum is rounded to BF16, so the sequence can
+// be replayed bitwise by a reference that follows the same order.
+//
+// One 256-thread block per token.  Thread 0 stable-sorts the token's K slots
+// into shared memory; after the sync each thread owns the 8-column groups
+// v = tid, tid + 256, ... and moves them with 16-byte loads/stores.
+constexpr int kOrderedReduceThreads = 256;
+constexpr int kOrderedReduceVec = 8;
+
+template <int K>
+__global__ void __launch_bounds__(kOrderedReduceThreads)
+reduce_weighted_scatter_bf16_ordered_kernel(
+    const __nv_bfloat16* __restrict__ expert_output,
+    const int32_t* __restrict__ topk_pos,
+    const int32_t* __restrict__ topk_indices,
+    const float* __restrict__ topk_weights,
+    __nv_bfloat16* __restrict__ output,
+    int H
+) {
+    const int token_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ int32_t shared_pos[K];
+    __shared__ float shared_weights[K];
+    if (tid == 0) {
+        const int64_t base = (int64_t)token_idx * K;
+        int32_t eid[K];
+        int32_t pos[K];
+        float w[K];
+        // Insertion sort; strict '>' keeps equal expert ids in slot order.
+        for (int k = 0; k < K; k++) {
+            const int32_t e = topk_indices[base + k];
+            int j = k;
+            while (j > 0 && eid[j - 1] > e) {
+                eid[j] = eid[j - 1];
+                pos[j] = pos[j - 1];
+                w[j] = w[j - 1];
+                j--;
+            }
+            eid[j] = e;
+            pos[j] = topk_pos[base + k];
+            w[j] = __bfloat162float(__float2bfloat16(topk_weights[base + k]));
+        }
+        for (int k = 0; k < K; k++) {
+            shared_pos[k] = pos[k];
+            shared_weights[k] = w[k];
+        }
+    }
+    __syncthreads();
+
+    const int vec_count = H / kOrderedReduceVec;
+    const int64_t out_base = (int64_t)token_idx * H;
+    for (int v = tid; v < vec_count; v += blockDim.x) {
+        const int64_t col = (int64_t)v * kOrderedReduceVec;
+        __nv_bfloat16 acc[kOrderedReduceVec];
+#pragma unroll
+        for (int i = 0; i < kOrderedReduceVec; i++) {
+            acc[i] = __float2bfloat16(0.0f);
+        }
+
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int32_t pos = shared_pos[k];
+            if (pos >= 0) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(
+                    expert_output + (int64_t)pos * H + col);
+                const __nv_bfloat16* x = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                const float w = shared_weights[k];
+#pragma unroll
+                for (int i = 0; i < kOrderedReduceVec; i++) {
+                    const __nv_bfloat16 prod = __float2bfloat16(
+                        __fmul_rn(__bfloat162float(x[i]), w));
+                    acc[i] = __float2bfloat16(
+                        __fadd_rn(__bfloat162float(acc[i]), __bfloat162float(prod)));
+                }
+            }
+        }
+        uint4 out_raw;
+        __nv_bfloat16* out_values = reinterpret_cast<__nv_bfloat16*>(&out_raw);
+#pragma unroll
+        for (int i = 0; i < kOrderedReduceVec; i++) out_values[i] = acc[i];
+        *reinterpret_cast<uint4*>(output + out_base + col) = out_raw;
+    }
+}
+
 torch::Tensor reduce_weighted_scatter(
     torch::Tensor expert_output, torch::Tensor topk_pos,
     torch::Tensor topk_weights, int64_t N, int64_t H, int64_t K,
@@ -496,6 +587,78 @@ torch::Tensor reduce_weighted_scatter_fp32(
     return output;
 }
 
+torch::Tensor reduce_weighted_scatter_bf16_ordered(
+    torch::Tensor expert_output, torch::Tensor topk_pos,
+    torch::Tensor topk_indices, torch::Tensor topk_weights,
+    int64_t N, int64_t H, int64_t K, torch::Tensor output
+) {
+    TORCH_CHECK(N > 0 && H > 0, "N and H must be positive");
+    TORCH_CHECK(K == 2 || K == 4 || K == 8,
+                "ordered BF16 combine supports K=2,4,8, got ", K);
+    TORCH_CHECK(H % 8 == 0, "ordered BF16 combine requires H % 8 == 0, got H=", H);
+    TORCH_CHECK(expert_output.is_cuda(), "expert_output must be a CUDA tensor");
+    const auto device = expert_output.device();
+    TORCH_CHECK(topk_pos.device() == device && topk_indices.device() == device &&
+                topk_weights.device() == device && output.device() == device,
+                "ordered BF16 combine requires all tensors on ", device);
+    TORCH_CHECK(expert_output.scalar_type() == at::kBFloat16,
+                "expert_output must be BF16");
+    TORCH_CHECK(topk_pos.scalar_type() == at::kInt, "topk_pos must be int32");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt,
+                "topk_indices must be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == at::kFloat,
+                "topk_weights must be float32");
+    TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
+    TORCH_CHECK(expert_output.is_contiguous() && topk_pos.is_contiguous() &&
+                topk_indices.is_contiguous() && topk_weights.is_contiguous() &&
+                output.is_contiguous(),
+                "ordered BF16 combine requires contiguous tensors");
+    TORCH_CHECK(expert_output.dim() == 2 && expert_output.size(1) == H,
+                "expert_output must have shape [rows, H]");
+    // dispatch_scatter_ragged returns topk_pos as a flat [N*K] buffer, while
+    // focused callers may use [N, K]. Both are the same contiguous ABI.
+    TORCH_CHECK(topk_pos.numel() == N * K,
+                "topk_pos must contain N*K elements");
+    TORCH_CHECK(topk_indices.dim() == 2 && topk_indices.size(0) == N &&
+                topk_indices.size(1) == K, "topk_indices must have shape [N, K]");
+    TORCH_CHECK(topk_weights.dim() == 2 && topk_weights.size(0) == N &&
+                topk_weights.size(1) == K, "topk_weights must have shape [N, K]");
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == N && output.size(1) == H,
+                "output must have shape [N, H]");
+    // The kernel moves 8 BF16 columns per 16-byte load/store.
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(expert_output.data_ptr()) % 16 == 0,
+                "expert_output data must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0,
+                "output data must be 16-byte aligned");
+
+    const c10::cuda::CUDAGuard guard(device);
+    dim3 grid(static_cast<unsigned int>(N));
+    dim3 block(kOrderedReduceThreads);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    switch (K) {
+        case 2: reduce_weighted_scatter_bf16_ordered_kernel<2><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            static_cast<int>(H)); break;
+        case 4: reduce_weighted_scatter_bf16_ordered_kernel<4><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            static_cast<int>(H)); break;
+        case 8: reduce_weighted_scatter_bf16_ordered_kernel<8><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
+            topk_pos.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+            topk_weights.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            static_cast<int>(H)); break;
+    }
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_scatter_3d", &dispatch_scatter_3d,
           "3D dispatch scatter for strided MoE buffer layout");
@@ -505,4 +668,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Weighted reduce scatter from 3D to flat layout");
     m.def("reduce_weighted_scatter_fp32", &reduce_weighted_scatter_fp32,
           "K3 K=16 weighted reduction with FP32 output");
+    m.def("reduce_weighted_scatter_bf16_ordered",
+          &reduce_weighted_scatter_bf16_ordered,
+          "Expert-id-ordered weighted reduction with BF16 rounding per step");
 }
