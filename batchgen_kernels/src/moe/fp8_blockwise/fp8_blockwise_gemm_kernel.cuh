@@ -1,7 +1,8 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Kernel
 // Persistent 3-WG CuTe kernel: 2 math WGs (TiledMma N-split) + 1 TMA loader WG.
 // Adaptive TileM (16/32/64), TileN=128, TileK=128, 8-stage TMA pipeline.
-// Supports uniform mtp-stride buffer layout via mtp_tiles parameter.
+// x_scale tiles are addressed per expert as cu_seqlens[e] / TileM, which covers
+// both the uniform mtp-stride layout and compact ragged 64-aligned layouts.
 
 #ifndef BATCHGEN_FP8_BLOCKWISE_GEMM_KERNEL_CUH_
 #define BATCHGEN_FP8_BLOCKWISE_GEMM_KERNEL_CUH_
@@ -20,6 +21,27 @@ namespace batchgen {
 namespace moe {
 
 namespace kernels {
+
+// Device fail-loud trap for a malformed device-side expert layout. The host
+// never dereferences device cu_seqlens, so misalignment is caught here.
+__device__ __forceinline__ void fp8_blockwise_layout_trap() { asm volatile("trap;" ::); }
+
+// Per-expert x_scale tile base (cu_seqlens[e] / TileM) into shared memory.
+// Traps unless consecutive offsets are TileM-aligned, monotonic, inside
+// m_pad, and the expert's valid rows fit its assigned span.
+__device__ __forceinline__ void load_xscale_tile_base(int *shm_xs_tile, const int *seqlens_ptr,
+                                                      const int *cu_seqlens_ptr, int igroup,
+                                                      int m_pad, int tile_m) {
+  const int cu = cu_seqlens_ptr[igroup];
+  const int cu_next = cu_seqlens_ptr[igroup + 1];
+  const int num_seq = seqlens_ptr[igroup];
+  if (cu < 0 || cu_next < cu || cu_next > m_pad || num_seq < 0 ||
+      (cu % tile_m) != 0 || (cu_next % tile_m) != 0 ||
+      (int64_t)cu + (int64_t)num_seq > (int64_t)cu_next) {
+    fp8_blockwise_layout_trap();
+  }
+  shm_xs_tile[igroup] = cu / tile_m;
+}
 
 // ============================================================================
 // Tile scheduling: horizontal scan through expert tiles
@@ -113,8 +135,8 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 
     int num_seq = seqlens_ptr[igroup];
     int cu_seqlen = cu_seqlens_ptr[igroup];
-    auto *x_ibatch_ptr = x_ptr + cu_seqlen * k;
-    auto *y_ibatch_ptr = y_ptr + cu_seqlen * n;
+    auto *x_ibatch_ptr = x_ptr + (int64_t)cu_seqlen * k;
+    auto *y_ibatch_ptr = y_ptr + (int64_t)cu_seqlen * n;
 
     if (idx < 2) {
       smem_tma_desc[idx] = td_xy[idx];
@@ -150,7 +172,7 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 // ============================================================================
 // Main persistent kernel: FP8 blockwise grouped GEMM
 // 384 threads: 2 math WGs (256 threads) + 1 loader WG (128 threads)
-// Supports uniform mtp-stride x_scale layout via mtp_tiles parameter.
+// x_scale tile base per expert is cu_seqlens[e] / TileM (uniform or ragged).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC, typename TmaAS,
           typename TmaBS, bool IsLoopH>
@@ -159,10 +181,11 @@ __global__ void __launch_bounds__(384, 1)
                                       const __grid_constant__ TmaAS tma_as,
                                       const __grid_constant__ TmaBS tma_bs,
                                       cute::TmaDescriptor *td_xy, int *seqlens_ptr,
+                                      int *cu_seqlens_ptr,
                                       float *xscale_ptr, float *wscale_ptr,
                                       int *tiles_ptr, int *cu_tiles_ptr,
                                       int num_group, int m, int n, int k,
-                                      int m_pad, int mtp_tiles,
+                                      int m_pad,
                                       int num_block_n, int num_block_k,
                                       int num_block_k_pad4,
                                       cutlass::FastDivmod flat_divider) {
@@ -200,6 +223,7 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_as = reinterpret_cast<float *>(shm_c + cosize(SLayoutCT{}));
   auto *shm_bs = reinterpret_cast<float *>(shm_as + cosize(SLayoutAS{}));
   int *shm_tiles = reinterpret_cast<int *>(shm_bs + cosize(SLayoutBS{}));
+  int *shm_xs_tile = shm_tiles + (num_group + 1);
 
   TmaA tma_a;
   TmaC tma_c;
@@ -246,10 +270,13 @@ __global__ void __launch_bounds__(384, 1)
     }
   }
 
-  int total_m = cu_tiles_ptr[num_group];
-  if (total_m <= 0) {
-    return;
+  for (int i = idx; i < num_group; i += blockDim.x) {
+    load_xscale_tile_base(shm_xs_tile, seqlens_ptr, cu_seqlens_ptr, i, m_pad, kTileM);
   }
+  __syncthreads();
+
+  int total_m = cu_tiles_ptr[num_group];
+  if (total_m <= 0) return;
 
   if constexpr (IsLoopH) {
     for (int i = idx; i < num_group; i += blockDim.x) {
@@ -260,7 +287,6 @@ __global__ void __launch_bounds__(384, 1)
       shm_tiles[i] = cu_tiles_ptr[i];
     }
   }
-
   __syncthreads();
 
   constexpr int kNumThreads = size(TiledMma{});
@@ -305,9 +331,9 @@ __global__ void __launch_bounds__(384, 1)
           cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
                      tBs(_, 0, 0, ismem_write));
 
-          // x_scale: use mtp_tiles for uniform-stride buffer layout
+          // x_scale: per-expert tile base cu_seqlens[igroup] / TileM
           cute::copy(tma_as.with(readable[ismem_write]),
-                     tASg(_, itile_k, igroup * mtp_tiles + itile_m), tASs(_, ismem_write, 0));
+                     tASg(_, itile_k, shm_xs_tile[igroup] + itile_m), tASs(_, ismem_write, 0));
           cute::copy(tma_bs.with(readable[ismem_write]), tBSg(_, itile_n, itile_k / 4, igroup),
                      tBSs(_, ismem_write, 0));
 
