@@ -1055,6 +1055,25 @@ class TestOutputParsing:
         assert tok.parse_thinking(self._completion(tok, messages)) == (
             "REASON", "ANSWER")
 
+    def test_final_response_close_without_sep_is_stripped(self, tok):
+        """The last turn ends '<|close|>response<|end_of_msg|>': the model drops
+        the trailing '<|sep|>' the renderer emits between segments. The close
+        must still be recognized or the structure leaks into visible content
+        (observed in serving: '8<|close|>response')."""
+        assert tok.parse_thinking(
+            "REASON<|close|>think<|sep|><|open|>response<|sep|>8"
+            "<|close|>response<|end_of_msg|>") == ("REASON", "8")
+
+    def test_final_response_close_without_sep_no_think(self, tok):
+        # thinking disabled: the completion starts inside the response channel.
+        _, visible = tok.parse_thinking("8<|close|>response<|end_of_msg|>")
+        assert visible == "8"
+
+    def test_final_response_close_bare_at_eos(self, tok):
+        # Stopped at EOS with neither the trailing sep nor an end_of_msg token.
+        _, visible = tok.parse_thinking("8<|close|>response")
+        assert visible == "8"
+
     def test_truncated_generation_keeps_partial_output(self, tok):
         assert tok.parse_thinking(
             "REASON<|close|>think<|sep|><|open|>response<|sep|>PARTIAL") == (
