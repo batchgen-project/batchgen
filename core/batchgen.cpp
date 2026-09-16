@@ -278,6 +278,13 @@ std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights(
     return this->gpu_weight_buffer_.get_weights(module_key, phase);  // blocking.
 };
 
+std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights_pinned(
+    const std::string& module_name) {
+    /* Get already-owned weights without evicting or releasing buffers. */
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    return this->gpu_weight_buffer_.get_weights_pinned(module_name);  // blocking.
+};
+
 void BatchGen::free_weights_buffer(const std::string& module_name) {
     /* Free the weights buffer. */
     this->gpu_weight_buffer_.releaseBuffer(module_name);
