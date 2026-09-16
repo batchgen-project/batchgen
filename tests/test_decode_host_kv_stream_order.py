@@ -143,10 +143,27 @@ def test_cpp_every_async_copy_records_the_producer_on_the_issuing_thread():
         waits = source.count("WaitForProducerEvent(cuda_stream, *producer_event);")
         assert records == waits, (header.name, records, waits)
     view = HOST_VIEW.read_text()
-    # two h2d loads, the prefill offload, the per-layer append, the batched append
-    assert view.count("auto producer_event = RecordProducerEvent();") == 5
+    # two h2d loads, fixed-stride and packed prefill offloads, the per-layer
+    # append, and the batched append
+    assert view.count("auto producer_event = RecordProducerEvent();") == 6
     state = (ROOT / "core" / "KV_Storage" / "compressed_state_host_manager.h").read_text()
     assert state.count("auto producer_event = RecordProducerEvent();") == 3
+
+
+def test_cpp_packed_prefill_offload_orders_copy_after_producer():
+    source = HOST_VIEW.read_text()
+    start = source.index("    KVAsyncTask AsyncOffloadPackedLayerKVToHost(")
+    end = source.index("\n    KVAsyncTask AsyncAppendDecodeKVToHost(", start)
+    method = source[start:end]
+
+    record = method.index("auto producer_event = RecordProducerEvent();")
+    launch_task = method.index("return LaunchAsyncTask([", record)
+    wait = method.index(
+        "this->WaitForProducerEvent(cuda_stream, *producer_event);"
+    )
+    copy = method.index("EnqueueCopy(")
+    completion = method.index("this->SynchronizeWithEvent(cuda_stream);")
+    assert record < launch_task < wait < copy < completion
 
 
 def test_decode_waits_only_for_token_event_after_host_kv_launch():
