@@ -186,12 +186,15 @@ def _make_case(counts=(5, 0, 17), n=128, k=128, seed=1):
     )
     seqlens = torch.tensor(counts, dtype=torch.int32, device=device)
     cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
-    rows = torch.cat(
-        [
-            torch.arange(cu[i], cu[i] + count, device=device)
-            for i, count in enumerate(counts)
-            if count
-        ]
+    active_rows = [
+        torch.arange(cu[i], cu[i] + count, device=device)
+        for i, count in enumerate(counts)
+        if count
+    ]
+    rows = (
+        torch.cat(active_rows)
+        if active_rows
+        else torch.empty(0, dtype=torch.int64, device=device)
     )
     return {
         "x": x,
@@ -380,7 +383,7 @@ def test_pointer_gemm_cuda_graph_refreshes_descriptors(extension):
 
 def test_pointer_tables_reject_wrong_device_or_dtype(extension):
     case = _make_case(seed=8)
-    with pytest.raises(RuntimeError, match="weight_ptrs must be on"):
+    with pytest.raises(RuntimeError, match="weight_ptrs must be a CUDA tensor"):
         extension.fp8_blockwise_grouped_gemm_ptrs(
             case["x"], case["weights"][0], case["weight_ptrs"].cpu(),
             case["seqlens"], case["cu_seqlens"], case["x_scale"],
