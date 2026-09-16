@@ -400,16 +400,23 @@ class KimiLinearParallelStrategyManager:
         selected[owned] = hidden_states[
             0, (last_token_indices[owned] - start).long(), :
         ]
-        # s4/s5 (256 sequences per node, 307K tokens): the last 7 sequences'
-        # final rows came back all-zero from this gather.
-        logging.info(
-            "[K3_PREFILL_GATHER] rank %s: rows=%d shard=[%d, %d) local=%d "
-            "owned=%d last_idx=%s last_owned_rows_nonzero=%s",
-            self.global_rank, num_global_rows, start, end,
-            int(hidden_states.shape[1]), int(owned.sum().item()),
-            last_token_indices[-8:].tolist(),
-            [bool(selected[i].abs().sum().item() > 0) for i in range(-8, 0)],
-        )
+        # Canary for the s4/s5 gather bug (an int32 row-offset wrap in the
+        # Triton RMSNorm, since fixed): every last-token row this rank owns must
+        # carry a real hidden state, so an all-zero owned row means the gather
+        # dropped it. Check the owned rows directly and warn only on the anomaly
+        # -- the old form sampled a fixed trailing window (range(-8, 0)), which
+        # both missed non-tail drops and IndexError'd on <8-sequence batches.
+        if owned.any():
+            owned_all_zero = int(
+                (selected[owned].abs().sum(dim=-1) == 0).sum().item()
+            )
+            if owned_all_zero:
+                logging.warning(
+                    "[K3_PREFILL_GATHER] rank %s: %d of %d owned last-token rows "
+                    "are all-zero (shard=[%d, %d), global_rows=%d)",
+                    self.global_rank, owned_all_zero, int(owned.sum().item()),
+                    start, end, num_global_rows,
+                )
 
         output_norm = getattr(
             self.model.model, "output_attn_res_norm", None
