@@ -135,7 +135,12 @@ def _load_vmm_arena(monkeypatch, driver):
 
 def test_persistent_phase_cli_is_opt_in():
     server_args = _load_server_args_module()
-    base = ["--model", "zai-org/GLM-5.2-FP8"]
+    base = [
+        "--model",
+        "zai-org/GLM-5.2-FP8",
+        "--host-kv-cache-size",
+        "64",
+    ]
 
     default = server_args.prepare_server_args(base)
     enabled = server_args.prepare_server_args(
