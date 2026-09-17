@@ -184,38 +184,36 @@ class Glm5WholeModelSegment:
             raise ValueError(
                 f"bucket_size {bucket_size} exceeds max_bucket_size {self.max_bucket_size}"
             )
-        if self._kv_buffers is not None and self._aux_kv_buffers is not None:
-            return
-
-        alloc_size = self.max_bucket_size
-        self._kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.primary_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._aux_kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.aux_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._kv_buffers = [
-            {"key": self._kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self._aux_kv_buffers = [
-            {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self.primary_kv_offload_buffers = self._kv_buffers
-        self.aux_kv_offload_buffers = self._aux_kv_buffers
+        if self._kv_buffers is None or self._aux_kv_buffers is None:
+            alloc_size = self.max_bucket_size
+            self._kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.primary_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._aux_kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.aux_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._kv_buffers = [
+                {"key": self._kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self._aux_kv_buffers = [
+                {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self.primary_kv_offload_buffers = self._kv_buffers
+            self.aux_kv_offload_buffers = self._aux_kv_buffers
         for layer_segment in self.layer_segments:
             setup = getattr(layer_segment, "setup_static_buffers", None)
             if setup is not None:
