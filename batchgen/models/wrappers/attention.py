@@ -242,6 +242,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     prepack_max_seqlen: ClassVar[Optional[int]] = None
     prepack_num_sequences: ClassVar[Optional[int]] = None
     prepack_seq_lengths: ClassVar[Optional[List[int]]] = None
+    prepack_full_seq_lengths: ClassVar[Optional[List[int]]] = None
+    prepack_compute_cached_tokens: ClassVar[Optional[List[int]]] = None
+    prepack_attached_tokens: ClassVar[Optional[List[int]]] = None
+    prefill_prefix_materialization: ClassVar[Optional[object]] = None
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None
