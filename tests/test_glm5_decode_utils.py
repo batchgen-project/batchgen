@@ -1031,6 +1031,11 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
         enable_cuda_graph=True,
         environ=env,
     )
+    assert glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
     assert not glm5_dsa_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
@@ -1048,6 +1053,11 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
     assert glm5_any_cuda_graph_requested_for_model(
         "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_any_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
