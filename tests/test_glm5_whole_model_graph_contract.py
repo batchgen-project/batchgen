@@ -101,6 +101,25 @@ def test_glm5_whole_model_segment_allocates_primary_and_aux_offload_buffers():
     assert segment._no_v_cache
 
 
+def test_glm5_whole_model_segment_sets_up_children_for_each_bucket():
+    class _FakeLayerSegment:
+        def __init__(self):
+            self.setup_calls = []
+
+        def setup_static_buffers(self, bucket_size):
+            self.setup_calls.append(bucket_size)
+
+    layers = [_FakeLayerSegment(), _FakeLayerSegment()]
+    segment = _make_segment(max_bucket_size=4, layer_segments=layers)
+
+    segment.setup_static_buffers(bucket_size=1)
+    kv_buffer = segment._kv_key_buffer
+    segment.setup_static_buffers(bucket_size=2)
+
+    assert segment._kv_key_buffer is kv_buffer
+    assert [layer.setup_calls for layer in layers] == [[1, 2], [1, 2]]
+
+
 def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
     segment = _make_segment(max_bucket_size=2)
     specs = segment.get_static_input_specs(bucket_size=2)
