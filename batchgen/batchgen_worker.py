@@ -5263,16 +5263,93 @@ class BatchGenWorker:
 		# additionally supplies a persistent KDA-state limit: unlike the token
 		# cap used later by prepack, a KDA slot remains occupied until the
 		# sequence completes or is evicted.
-		prefill_batch = PrefillScheduler.select_prefill_batch(
-			self._make_prefill_selection_request(
-				all_candidates,
-				per_node_host_free,
-				num_nodes,
-				chunk_size,
-				per_rank_sequence_free=per_rank_sequence_free,
-				per_node_sequence_free=per_node_sequence_free,
-			)
+		selection = self._make_prefill_selection_request(
+			all_candidates,
+			per_node_host_free,
+			num_nodes,
+			chunk_size,
+			per_rank_sequence_free=per_rank_sequence_free,
+			per_node_sequence_free=per_node_sequence_free,
 		)
+		prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+		if (
+			self.enable_prefix_cache and not prefill_batch
+			and per_rank_sequence_free is None
+			and per_node_sequence_free is None
+		):
+			# Admission sees only physically free pages. If cached pages hold the
+			# last free space, no sequence reaches the later allocation-time
+			# eviction path; reclaim enough for one fitting candidate here instead.
+			failure = 0
+			has_fitting_candidate = 0
+			updated_local_free = -1
+			if self.local_rank == 0:
+				try:
+					worker_view = self.core_engine.host_paged_kv_worker_view
+					stats = worker_view.get_stats()
+					requirements = [
+						PrefillScheduler.required_host_pages(candidate, selection)
+						for candidate in selection.candidates
+						if candidate.node_id == report_node
+					]
+					fitting = [
+						pages for pages in requirements
+						if pages <= int(stats.num_total_pages)
+					]
+					updated_local_free = int(stats.num_free_pages)
+					if fitting:
+						has_fitting_candidate = 1
+						required = min(fitting)
+						from batchgen.prefix_reuse.eviction import (
+							reclaim_prefix_pages_for_host_admission,
+						)
+						released = reclaim_prefix_pages_for_host_admission(
+								core_engine_module=core_engine,
+								coordinator=self.prefix_cache_coordinator,
+								worker_views_by_group={0: worker_view},
+								group_id=0,
+								page_target=max(0, required - updated_local_free),
+								max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+							)
+						updated_local_free = self._get_host_kv_free_pages()
+						logging.info(
+							"[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
+							"(free=%s, target=%s)",
+							released, report_node, updated_local_free, required,
+						)
+				except Exception:
+					logging.exception("[PREFIX_CACHE] admission eviction failed")
+					failure = 1
+			live_sequences = (
+				self.global_batch.has_prefilled()
+				or self.global_batch.has_in_decode()
+				or self.global_batch.has_on_hold()
+			)
+			failed = torch.tensor(
+				[failure, has_fitting_candidate, int(live_sequences)],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+			if int(failed[0].item()) != 0:
+				raise RuntimeError("prefix cache admission eviction failed on a worker")
+			if int(failed[1].item()) == 0:
+				raise RuntimeError("no prefix-cache request fits the total Host KV pool")
+			updated = torch.tensor(
+				[report_node, updated_local_free],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
+			dist.all_gather(gathered, updated)
+			for item in gathered:
+				node, free = int(item[0].item()), int(item[1].item())
+				if free >= 0:
+					per_node_host_free[node] = free
+			selection = replace(selection, per_node_host_free=tuple(per_node_host_free))
+			prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+			if not prefill_batch:
+				if int(failed[2].item()) == 1:
+					return []
+				raise RuntimeError("prefix cache prefill admission made no progress after eviction")
 
 		if self.rank == 0:
 			n_evicted = sum(

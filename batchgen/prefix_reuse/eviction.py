@@ -63,12 +63,39 @@ def evict_prefix_pages_for_host_allocation(
 ) -> int:
     """Release at least ``page_deficit`` unprotected resident Host pages."""
 
-    deficit = int(page_deficit)
-    if deficit <= 0:
+    released_pages = reclaim_prefix_pages_for_host_admission(
+        core_engine_module=core_engine_module,
+        coordinator=coordinator,
+        worker_views_by_group=worker_views_by_group,
+        group_id=group_id,
+        page_target=page_deficit,
+        max_scan_nodes=max_scan_nodes,
+    )
+    if released_pages < int(page_deficit):
+        raise RuntimeError(
+            "prefix cache eviction could not release enough Host KV pages: "
+            f"needed={page_deficit}, released={released_pages}"
+        )
+    return released_pages
+
+
+def reclaim_prefix_pages_for_host_admission(
+    *,
+    core_engine_module: object,
+    coordinator: object,
+    worker_views_by_group: Mapping[int, object],
+    group_id: int,
+    page_target: int,
+    max_scan_nodes: int,
+) -> int:
+    """Reclaim up to a target; live attachments may leave a shortfall."""
+
+    target = int(page_target)
+    if target <= 0:
         return 0
     requirement = core_engine_module.GroupPageRequirement()
     requirement.group_id = int(group_id)
-    requirement.min_pages = deficit
+    requirement.min_pages = target
     eviction = coordinator.evict_until_releasable_pages(
         [requirement], int(max_scan_nodes)
     )
@@ -76,11 +103,4 @@ def evict_prefix_pages_for_host_allocation(
         eviction_result=eviction,
         worker_views_by_group=worker_views_by_group,
     )
-    released_pages = int(released.get(int(group_id), 0))
-    if released_pages < deficit:
-        raise RuntimeError(
-            "prefix cache eviction could not release enough Host KV pages: "
-            f"needed={deficit}, released={released_pages}, "
-            f"protected_nodes={int(eviction.protected_nodes)}"
-        )
-    return released_pages
+    return int(released.get(int(group_id), 0))
