@@ -1,0 +1,19 @@
+"""Host-side prefix-cache reuse primitives."""
+
+from batchgen.prefix_reuse.config import (
+    PrefixCacheRuntimeConfig,
+    PrefixKVGroupSemantic,
+    PrefixKVGroupSpec,
+    build_prefix_cache_runtime_config,
+    create_host_prefix_cache_coordinator,
+    require_prefix_cache_model_support,
+)
+
+__all__ = [
+    "PrefixCacheRuntimeConfig",
+    "PrefixKVGroupSemantic",
+    "PrefixKVGroupSpec",
+    "build_prefix_cache_runtime_config",
+    "create_host_prefix_cache_coordinator",
+    "require_prefix_cache_model_support",
+]
