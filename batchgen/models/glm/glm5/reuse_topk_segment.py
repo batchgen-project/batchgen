@@ -5,10 +5,11 @@
 
 """Graph-capturable GLM-5.2 attention segment for skip_topk layers.
 
-DRAFT / UNVALIDATED (2026-08-13, perf plan glm52-h200-perf-optimization P3):
-compile-checked only; has NOT been captured, replayed, or compared against
-eager. Validate with the graph-vs-eager compare + the standard gauntlet
-before any use.
+Runtime-qualified on exact ``h200-instance-3`` (2026-09-17): all 16 default
+whole-model graph buckets through 128 were captured, and a 10,240-token prompt
+replayed the whole graph through decode completion. Focused contract tests
+cover shared-layer setup and output wiring. A dedicated graph-vs-eager numeric
+comparison remains part of the final release-candidate validation.
 
 GLM-5.2 places a DSA indexer on 21 of 78 layers; the other 57 ``skip_topk``
 layers REUSE the top-k selected by the most recent indexer layer
