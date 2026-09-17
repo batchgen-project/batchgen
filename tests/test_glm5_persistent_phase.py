@@ -142,7 +142,7 @@ def _load_vmm_arena(monkeypatch, driver):
     return module.VmmArena
 
 
-def test_persistent_phase_cli_is_opt_in():
+def test_persistent_phase_cli_is_opt_in_without_context_cap():
     server_args = _load_server_args_module()
     base = [
         "--model",
@@ -152,23 +152,14 @@ def test_persistent_phase_cli_is_opt_in():
     ]
 
     default = server_args.prepare_server_args(base)
-    enabled = server_args.prepare_server_args(
-        [
-            *base,
-            "--persistent-phase-instances",
-            "--cuda-graph-max-seqlen",
-            "8192",
-        ]
-    )
+    enabled = server_args.prepare_server_args([*base, "--persistent-phase-instances"])
 
     assert default.persistent_phase_instances is False
-    assert default.cuda_graph_max_seqlen is None
     assert enabled.persistent_phase_instances is True
-    assert enabled.cuda_graph_max_seqlen == 8192
 
-    with pytest.raises(ValueError, match="cuda_graph_max_seqlen must be positive"):
+    with pytest.raises(SystemExit):
         server_args.prepare_server_args(
-            [*base, "--cuda-graph-max-seqlen", "0"]
+            [*base, "--cuda-graph-max-seqlen", "8192"]
         )
 
 
@@ -239,6 +230,43 @@ def test_persistent_decode_instance_uses_runtime_rank_cap():
 
     assert configured == [(128, "comm")]
     assert worker._decode_padding_bsz == 128
+
+
+def test_persistent_startup_capture_follows_cuda_graph_enablement():
+    build = _isolated_worker_method("_build_persistent_phase_instances")
+    build.__globals__["time"] = SimpleNamespace(perf_counter=lambda: 0.0)
+    build.__globals__["logging"] = SimpleNamespace(info=lambda *args: None)
+
+    calls = []
+    manager = SimpleNamespace(
+        decode_instance=None,
+        set_comm=lambda comm: calls.append(("set_comm", comm)),
+        share_skeleton_on_device=lambda: calls.append("share_skeleton"),
+        configure_prefill=lambda: calls.append("configure_prefill"),
+    )
+    worker = SimpleNamespace(
+        rank=0,
+        comm="comm",
+        parallel_manager=manager,
+        _activate_persistent_decode_instance=lambda comm: calls.append(
+            ("activate_decode", comm)
+        ),
+        _init_gpu_kv_with_actual_size=lambda: calls.append("init_gpu_kv"),
+        _glm5_whole_model_graph_requested_for_current_batch=lambda: True,
+        _sync_decode_moe_rank_counts=lambda rows, reason: calls.append(
+            ("sync_counts", rows, reason)
+        ),
+        _bind_decode_attention_metadata_for_graph_config=lambda rows: calls.append(
+            ("bind_metadata", rows)
+        ),
+        _warmup_cuda_graphs=lambda: calls.append("capture_graphs"),
+        _release_persistent_decode_instance=lambda: calls.append("release_decode"),
+    )
+
+    build(worker)
+
+    assert "capture_graphs" in calls
+    assert "release_decode" in calls
 
 
 def test_worker_only_calls_worker_methods_that_exist():

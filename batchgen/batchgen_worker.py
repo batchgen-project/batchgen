@@ -579,7 +579,6 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
-	cuda_graph_max_seqlen: Optional[int] = None  # Optional fixed decode graph span
 	persistent_phase_instances: bool = False  # Keep prefill/decode instances across phase switches
 	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 	# Dynamic host KV reservation
@@ -7855,10 +7854,9 @@ class BatchGenWorker:
 	def _build_persistent_phase_instances(self) -> None:
 		"""Build both phase instances and the decode KV pools before the first request.
 
-		When --cuda-graph-max-seqlen fixes the graph attention span, the decode
-		graphs are captured here as well, so no phase switch builds a model or
-		captures a graph. Otherwise the span is taken from the first decode
-		batch and the graphs are captured there.
+		When decode CUDA graphs are enabled, capture them here from the model and
+		KV page-table capacity so no phase switch builds a model or captures a
+		graph. Context length remains runtime metadata, not a serving limit.
 		"""
 		pm = self.parallel_manager
 		if pm.decode_instance is not None:
@@ -7870,7 +7868,7 @@ class BatchGenWorker:
 		pm.configure_prefill()
 		self._activate_persistent_decode_instance(self.comm)
 		self._init_gpu_kv_with_actual_size()
-		capture = getattr(self.args, "cuda_graph_max_seqlen", None) is not None
+		capture = self._glm5_whole_model_graph_requested_for_current_batch()
 		if capture:
 			# No resident rows: every rank captures the way an empty rank does
 			# (zero valid tokens); replays bind real rows through static inputs.
@@ -10877,29 +10875,11 @@ class BatchGenWorker:
 				aux_page_size,
 				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
 			)
-			env_graph_max_seqlen = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN")
-			cli_graph_max_seqlen = getattr(self.args, "cuda_graph_max_seqlen", None)
-			configured_graph_max_seqlen = (
-				cli_graph_max_seqlen
-				if cli_graph_max_seqlen is not None
-				else env_graph_max_seqlen
-			)
-			graph_max_seqlen = (
-				int(configured_graph_max_seqlen)
-				if configured_graph_max_seqlen is not None
-				else int(capacity_seqlen)
-			)
-			if graph_max_seqlen <= 0:
-				raise RuntimeError("CUDA graph max_seqlen must be positive")
+			graph_max_seqlen = int(capacity_seqlen)
 			if int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) > graph_max_seqlen:
 				raise RuntimeError(
 					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "
-					f"exceeds cap {graph_max_seqlen}"
-				)
-			if graph_max_seqlen > int(capacity_seqlen):
-				raise RuntimeError(
-					f"GLM-5 whole-model CUDA graph max_seqlen={graph_max_seqlen} "
-					f"exceeds page-table capacity {capacity_seqlen}"
+					f"exceeds model/KV capacity {graph_max_seqlen}"
 				)
 
 			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
@@ -11062,7 +11042,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank {self.rank}: capturing GLM-5 whole-model CUDA graph "
 				f"segment={segment_name} buckets={capture_buckets}, "
-				f"max_seqlen_cap={graph_max_seqlen}"
+				f"context_capacity={graph_max_seqlen}"
 			)
 			torch.cuda.synchronize(self.torch_device)
 			dist.barrier()
