@@ -185,3 +185,91 @@ def test_async_load_prefix_pages_to_device_uses_host_page_ids(gpu_page_size):
         except Exception:
             pass
         _shm_unlink(shm_name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shared_gpu_prefix_page_survives_one_sequence_release():
+    shm_name = _random_shm_name()
+    source_seq = 301
+    target_seqs = [401, 402]
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    host_manager = bg.DefaultHostPagedKVManager(_host_config(shm_name))
+    host_manager.initialize(True)
+    worker = bg.DefaultHostPagedKVWorkerView(_host_config(shm_name))
+    worker.initialize(0, False)
+    gpu_manager = None
+    try:
+        worker.register_sequences([source_seq])
+        host_page = worker.allocate_pages_for_sequences([(source_seq, 4)])[0][0]
+        expected = {}
+        for layer_idx in range(2):
+            key = torch.arange(
+                8, dtype=torch.float32, device=device
+            ).reshape(1, 4, 1, 2).add(10 * layer_idx).to(torch.bfloat16)
+            value = (key + 100).contiguous()
+            expected[layer_idx] = (key.cpu().squeeze(0), value.cpu().squeeze(0))
+            worker.async_offload_layer_kv_to_host(
+                layer_idx=layer_idx,
+                sequence_ids=[source_seq],
+                k_tensor=key.contiguous(),
+                v_tensor=value,
+                sequence_lengths=[4],
+            ).wait()
+
+        gpu_manager = GPUPagedKVCacheManager(
+            config=_gpu_config(4), device=device
+        )
+        gpu_manager.initialize()
+        gpu_manager.allocate_pages_for_sequences_with_page_keys(
+            target_seqs,
+            [4, 4],
+            [[host_page], [host_page]],
+        )
+        first_page = int(gpu_manager._sequences[target_seqs[0]].pages[0])
+        second_page = int(gpu_manager._sequences[target_seqs[1]].pages[0])
+        assert first_page == second_page
+
+        gpu_manager.rebuild_page_table(target_seqs)
+        k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+        worker.async_load_prefix_pages_to_device(
+            host_page_ids=torch.tensor(
+                [[host_page], [host_page]], dtype=torch.int64
+            ),
+            active_page_counts=torch.tensor([1, 1], dtype=torch.int64),
+            k_device_ptrs=k_ptrs,
+            v_device_ptrs=v_ptrs,
+        ).wait()
+        torch.cuda.synchronize(device)
+
+        gpu_manager.free_pages_for_sequences([target_seqs[0]])
+        assert gpu_manager.get_stats().num_used_pages == 1
+        for layer_idx in range(2):
+            actual_k = _read_sequence_tokens(
+                gpu_manager,
+                sequence_id=target_seqs[1],
+                layer_idx=layer_idx,
+                length=4,
+                value_cache=False,
+            )
+            actual_v = _read_sequence_tokens(
+                gpu_manager,
+                sequence_id=target_seqs[1],
+                layer_idx=layer_idx,
+                length=4,
+                value_cache=True,
+            )
+            torch.testing.assert_close(actual_k, expected[layer_idx][0])
+            torch.testing.assert_close(actual_v, expected[layer_idx][1])
+
+        gpu_manager.free_pages_for_sequences([target_seqs[1]])
+        assert gpu_manager.get_stats().num_used_pages == 0
+    finally:
+        if gpu_manager is not None:
+            gpu_manager.destroy()
+        try:
+            host_manager.free_sequence(source_seq)
+        except Exception:
+            pass
+        _shm_unlink(shm_name)

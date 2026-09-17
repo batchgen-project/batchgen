@@ -1390,6 +1390,22 @@ class HostPagedKVWorkerView : private LayerMapper {
         std::vector<uint8_t*> device_dests;
     };
 
+    struct CopyPointerPair {
+        std::uintptr_t host = 0;
+        std::uintptr_t device = 0;
+
+        bool operator==(const CopyPointerPair& other) const {
+            return host == other.host && device == other.device;
+        }
+    };
+
+    struct CopyPointerPairHash {
+        std::size_t operator()(const CopyPointerPair& pair) const {
+            return static_cast<std::size_t>(
+                HashCombine(pair.host, pair.device));
+        }
+    };
+
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
 
@@ -1980,10 +1996,11 @@ class HostPagedKVWorkerView : private LayerMapper {
                                         ": device pointer tensor is null");
         }
         PageCopyPlan plan;
-        plan.host_sources.resize(total_entries);
-        plan.device_dests.resize(total_entries);
+        plan.host_sources.reserve(total_entries);
+        plan.device_dests.reserve(total_entries);
+        std::unordered_set<CopyPointerPair, CopyPointerPairHash> seen_copies;
+        seen_copies.reserve(total_entries);
         auto&& provider = std::forward<HostPtrProvider>(host_ptr_provider);
-        std::size_t cursor = 0;
         for (std::size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
             const std::size_t layer_offset = layer_idx * row_stride;
             for (std::size_t seq_idx = 0; seq_idx < page_table.size();
@@ -2019,17 +2036,16 @@ class HostPagedKVWorkerView : private LayerMapper {
                         static_cast<uint8_t*>(provider(layer_idx, page_idx));
                     auto* device_ptr = reinterpret_cast<uint8_t*>(
                         static_cast<std::uintptr_t>(dest_raw));
-                    plan.host_sources[cursor] = host_ptr;
-                    plan.device_dests[cursor] = device_ptr;
-                    ++cursor;
+                    const CopyPointerPair copy_key{
+                        reinterpret_cast<std::uintptr_t>(host_ptr),
+                        reinterpret_cast<std::uintptr_t>(device_ptr),
+                    };
+                    if (seen_copies.insert(copy_key).second) {
+                        plan.host_sources.emplace_back(host_ptr);
+                        plan.device_dests.emplace_back(device_ptr);
+                    }
                 }
             }
-        }
-        if (cursor != total_entries) {
-            std::ostringstream oss;
-            oss << op_name << ": expected " << total_entries
-                << " entries but prepared " << cursor;
-            throw std::logic_error(oss.str());
         }
         return plan;
     }

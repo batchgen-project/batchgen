@@ -2,15 +2,21 @@ import pytest
 import torch
 
 from batchgen.attention.gqa import gqa_extend_fa, gqa_prefill_fa
+from batchgen.attention.gqa import fa_extend, fa_prefill
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
 )
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+    pytest.mark.skipif(
+        fa_extend._flash_with_kvcache is None
+        or fa_prefill._flash_varlen_func is None,
+        reason="FlashAttention paged and varlen kernels are required",
+    ),
+]
 
 
 def _split_suffix_rows(

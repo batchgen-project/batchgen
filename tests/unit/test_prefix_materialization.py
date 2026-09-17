@@ -138,8 +138,12 @@ def test_materialization_maps_host_pages_into_larger_gpu_pages():
     )
 
     # One Host page is 4 tokens * 1 head * dim 2 * bf16 = 16 bytes.
-    assert host.kwargs["k_device_ptrs"].tolist() == [[[100, 116, 200]]]
-    assert host.kwargs["v_device_ptrs"].tolist() == [[[500, 516, 600]]]
+    assert host.kwargs["k_device_ptrs"].tolist() == [
+        [[100, 116, 200], [300, 316, 400]]
+    ]
+    assert host.kwargs["v_device_ptrs"].tolist() == [
+        [[500, 516, 600], [700, 716, 800]]
+    ]
     materialization.close()
 
 
