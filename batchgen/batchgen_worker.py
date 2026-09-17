@@ -7724,6 +7724,29 @@ class BatchGenWorker:
 				math.ceil(tokens / self.PAGE_SIZE)
 				for tokens in private_sequence_tokens
 			)
+			page_deficit = max(
+				0, total_pages_needed - int(kv_stats.num_free_pages)
+			)
+			if page_deficit and self.enable_prefix_cache:
+				from batchgen.prefix_reuse.eviction import (
+					evict_prefix_pages_for_host_allocation,
+				)
+
+				evict_prefix_pages_for_host_allocation(
+					core_engine_module=core_engine,
+					coordinator=self.prefix_cache_coordinator,
+					worker_views_by_group={
+						0: self.core_engine.host_paged_kv_worker_view
+					},
+					group_id=0,
+					page_deficit=page_deficit,
+					max_scan_nodes=(
+						self.prefix_cache_runtime_config.max_nodes
+					),
+				)
+				kv_stats = (
+					self.core_engine.host_paged_kv_worker_view.get_stats()
+				)
 			if total_pages_needed > kv_stats.num_free_pages:
 				# Log per-sequence breakdown to help diagnose the selection bug.
 				seq_details = []
@@ -8328,8 +8351,10 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.commit import (
 			build_prefix_commit_request,
 			collect_group_pages_for_commit,
-			release_evicted_prefix_pages,
 			retain_inserted_prefix_pages,
+		)
+		from batchgen.prefix_reuse.eviction import (
+			commit_prefix_pages_with_capacity_retry,
 		)
 
 		worker_view = self.core_engine.host_paged_kv_worker_view
@@ -8361,30 +8386,13 @@ class BatchGenWorker:
 			if request is None:
 				continue
 
-			estimate = self.prefix_cache_coordinator.estimate_lookup(
-				list(runtime.namespace_digest), token_ids
+			commit_outcome = commit_prefix_pages_with_capacity_retry(
+				request=request,
+				coordinator=self.prefix_cache_coordinator,
+				worker_views_by_group={0: worker_view},
+				max_scan_nodes=runtime.max_nodes,
 			)
-			existing_tokens = min(
-				int(estimate.common_cached_tokens), request.commit_tokens
-			)
-			missing_tokens = request.commit_tokens - existing_tokens
-			missing_nodes = (
-				missing_tokens // runtime.publish_boundary_tokens
-			)
-			missing_pages = missing_tokens // page_size
-			if missing_nodes or missing_pages:
-				eviction = self.prefix_cache_coordinator.evict_until_free(
-					missing_nodes,
-					missing_nodes,
-					missing_pages,
-					runtime.max_nodes,
-				)
-				release_evicted_prefix_pages(
-					eviction_result=eviction,
-					worker_views_by_group={0: worker_view},
-				)
-
-			result = request.commit(self.prefix_cache_coordinator)
+			result = commit_outcome.commit_result
 			retained = retain_inserted_prefix_pages(
 				commit_result=result,
 				request=request,
