@@ -2028,13 +2028,11 @@ def test_glm5_gpu_kv_config_uses_model_max_for_graph_page_table():
     assert updated.cuda_graph_max_slots == 64
 
 
-def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
+def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity():
     from batchgen.batchgen_worker import BatchGenWorker
 
     primary_page_table = torch.empty(2, 320, dtype=torch.int32)
     aux_page_table = torch.empty(2, 512, dtype=torch.int32)
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN", "8192")
-
     assert BatchGenWorker._glm5_dsa_graph_score_capacity_tokens(
         primary_page_table,
         64,
@@ -2494,6 +2492,39 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
         "eager",
         1,
         "max_seqlen_exceeds_capture",
+    )
+
+
+def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        bucketing = BatchSizeBucketing([1, 2, 4])
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return True
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = FakeManager()
+    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
+    worker._glm5_whole_model_graph = True
+    worker._glm5_whole_model_graph_failed_buckets = set()
+    worker._glm5_whole_model_graph_signature = ("same",)
+    worker._glm5_whole_model_graph_unavailable_reason = None
+    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_capture_signature",
+        lambda *args: ("same",),
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 9000, raising=False)
+
+    assert worker._glm5_whole_graph_path_state(1) == (
+        "graph",
+        1,
+        "captured",
     )
 
 
