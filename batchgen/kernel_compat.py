@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum batchgen_kernels version required by this batchgen release.
 # Bump this when batchgen starts using new kernel APIs.
-MIN_KERNELS_VERSION = (0, 4, 0)
+MIN_KERNELS_VERSION = (0, 4, 4)
 
 
 def check_kernels_version():
