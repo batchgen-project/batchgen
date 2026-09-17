@@ -651,13 +651,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<kv::HostPageHandle>(m, "HostPageHandle")
         .def(py::init<>())
-        .def_readwrite("host_region_id", &kv::HostPageHandle::host_region_id)
         .def_readwrite("page_id", &kv::HostPageHandle::page_id);
 
     py::class_<kv::GroupCommitPages>(m, "GroupCommitPages")
         .def(py::init<>())
         .def_readwrite("group_id", &kv::GroupCommitPages::group_id)
         .def_readwrite("pages", &kv::GroupCommitPages::pages);
+
+    py::class_<kv::GroupPageRequirement>(m, "GroupPageRequirement")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::GroupPageRequirement::group_id)
+        .def_readwrite("min_pages", &kv::GroupPageRequirement::min_pages);
 
     py::class_<kv::GroupMaterializationSpan>(
         m, "GroupMaterializationSpan")
@@ -682,7 +686,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("inserted_nodes",
                       &kv::PrefixCommitResult::inserted_nodes)
         .def_readonly("existing_nodes",
-                      &kv::PrefixCommitResult::existing_nodes);
+                      &kv::PrefixCommitResult::existing_nodes)
+        .def_readonly("inserted_group_pages",
+                      &kv::PrefixCommitResult::inserted_group_pages);
 
     py::class_<kv::PrefixEvictionResult>(m, "PrefixEvictionResult")
         .def_readonly("evicted_nodes",
@@ -702,6 +708,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPrefixCacheStats::resident_nodes)
         .def_readwrite("active_attachments",
                        &kv::HostPrefixCacheStats::active_attachments)
+        .def_readwrite("pending_load_entries",
+                       &kv::HostPrefixCacheStats::pending_load_entries)
+        .def_readwrite("pending_load_refs",
+                       &kv::HostPrefixCacheStats::pending_load_refs)
         .def_readwrite("used_group_entries",
                        &kv::HostPrefixCacheStats::used_group_entries)
         .def_readwrite("used_page_handles",
@@ -709,6 +719,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("lookup_hits", &kv::HostPrefixCacheStats::lookup_hits)
         .def_readwrite("lookup_misses",
                        &kv::HostPrefixCacheStats::lookup_misses)
+        .def_readwrite("evicted_nodes",
+                       &kv::HostPrefixCacheStats::evicted_nodes)
+        .def_readwrite("eviction_protected_skips",
+                       &kv::HostPrefixCacheStats::eviction_protected_skips)
         .def("__repr__", [](const kv::HostPrefixCacheStats& self) {
             return kv::ToString(self);
         });
@@ -737,6 +751,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
              py::arg("namespace_digest"), py::arg("token_ids"),
              py::arg("commit_tokens"), py::arg("group_pages"))
+        .def(
+            "commit_prefix_page_ids",
+            [](kv::HostPrefixCacheCoordinator& self,
+               kv::PrefixDigest namespace_digest,
+               const std::vector<std::int64_t>& token_ids,
+               std::uint32_t commit_tokens,
+               const std::vector<
+                   std::pair<std::uint32_t, std::vector<std::uint32_t>>>&
+                   group_page_ids) {
+                std::vector<kv::GroupCommitPages> group_pages;
+                group_pages.reserve(group_page_ids.size());
+                for (const auto& [group_id, page_ids] : group_page_ids) {
+                    kv::GroupCommitPages group;
+                    group.group_id = group_id;
+                    group.pages.reserve(page_ids.size());
+                    for (std::uint32_t page_id : page_ids) {
+                        group.pages.push_back(kv::HostPageHandle{page_id});
+                    }
+                    group_pages.emplace_back(std::move(group));
+                }
+                return self.CommitPrefixPages(namespace_digest, token_ids,
+                                              commit_tokens, group_pages);
+            },
+            py::arg("namespace_digest"), py::arg("token_ids"),
+            py::arg("commit_tokens"), py::arg("group_page_ids"))
         .def("lookup_and_attach",
              &kv::HostPrefixCacheCoordinator::LookupAndAttach,
              py::arg("namespace_digest"), py::arg("token_ids"))
@@ -746,13 +785,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("release_attachment",
              &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
              py::arg("attachment_handle"))
+        .def("begin_attachment_load",
+             &kv::HostPrefixCacheCoordinator::BeginAttachmentLoad,
+             py::arg("attachment_handle"))
+        .def("end_attachment_load",
+             &kv::HostPrefixCacheCoordinator::EndAttachmentLoad,
+             py::arg("attachment_handle"))
         .def("evict_until_free",
              &kv::HostPrefixCacheCoordinator::EvictUntilFree,
              py::arg("min_free_nodes"),
              py::arg("min_free_group_entries"),
              py::arg("min_free_page_handles"), py::arg("max_scan_nodes"))
+        .def("evict_until_releasable_pages",
+             &kv::HostPrefixCacheCoordinator::EvictUntilReleasablePages,
+             py::arg("requirements"), py::arg("max_scan_nodes"))
         .def("clear_unprotected",
              &kv::HostPrefixCacheCoordinator::ClearUnprotected)
+        .def("clear_namespace",
+             &kv::HostPrefixCacheCoordinator::ClearNamespace,
+             py::arg("namespace_digest"))
         .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
         .def_property_readonly(
             "hash_block_tokens",
@@ -764,6 +815,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_prefix_hash_chain", &kv::BuildPrefixHashChain,
           py::arg("namespace_digest"), py::arg("token_ids"),
           py::arg("block_tokens"));
+
     py::class_<kv::CompressedStateHostStats>(m,
                                              "CompressedStateHostStats")
         .def(py::init<>())

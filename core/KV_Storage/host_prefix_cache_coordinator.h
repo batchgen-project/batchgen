@@ -27,13 +27,17 @@ struct HostKVGroupSpec {
 };
 
 struct HostPageHandle {
-    std::uint32_t host_region_id = 0;
     std::uint32_t page_id = 0;
 };
 
 struct GroupCommitPages {
     std::uint32_t group_id = 0;
     std::vector<HostPageHandle> pages;
+};
+
+struct GroupPageRequirement {
+    std::uint32_t group_id = 0;
+    std::uint32_t min_pages = 0;
 };
 
 struct GroupMaterializationSpan {
@@ -53,6 +57,7 @@ struct PrefixCommitResult {
     std::uint32_t committed_tokens = 0;
     std::uint32_t inserted_nodes = 0;
     std::uint32_t existing_nodes = 0;
+    std::vector<GroupCommitPages> inserted_group_pages;
 };
 
 struct PrefixEvictionResult {
@@ -66,10 +71,14 @@ struct PrefixEvictionResult {
 struct HostPrefixCacheStats {
     std::uint32_t resident_nodes = 0;
     std::uint32_t active_attachments = 0;
+    std::uint32_t pending_load_entries = 0;
+    std::uint32_t pending_load_refs = 0;
     std::uint32_t used_group_entries = 0;
     std::uint32_t used_page_handles = 0;
     std::uint64_t lookup_hits = 0;
     std::uint64_t lookup_misses = 0;
+    std::uint64_t evicted_nodes = 0;
+    std::uint64_t eviction_protected_skips = 0;
 };
 
 struct HostPrefixCacheConfig {
@@ -103,8 +112,7 @@ class HostPrefixCacheCoordinator {
 
     PrefixCommitResult CommitPrefixPages(
         PrefixDigest namespace_digest,
-        const std::vector<std::int64_t>& token_ids,
-        std::uint32_t commit_tokens,
+        const std::vector<std::int64_t>& token_ids, std::uint32_t commit_tokens,
         const std::vector<GroupCommitPages>& group_pages);
 
     PrefixLookupResult LookupAndAttach(
@@ -117,13 +125,19 @@ class HostPrefixCacheCoordinator {
 
     void ReleaseAttachment(std::uint64_t attachment_handle);
 
-    PrefixEvictionResult EvictUntilFree(
-        std::uint32_t min_free_nodes,
-        std::uint32_t min_free_group_entries,
-        std::uint32_t min_free_page_handles,
+    void BeginAttachmentLoad(std::uint64_t attachment_handle);
+    void EndAttachmentLoad(std::uint64_t attachment_handle);
+
+    PrefixEvictionResult EvictUntilFree(std::uint32_t min_free_nodes,
+                                        std::uint32_t min_free_group_entries,
+                                        std::uint32_t min_free_page_handles,
+                                        std::uint32_t max_scan_nodes);
+    PrefixEvictionResult EvictUntilReleasablePages(
+        const std::vector<GroupPageRequirement>& requirements,
         std::uint32_t max_scan_nodes);
 
     PrefixEvictionResult ClearUnprotected();
+    PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
 
     HostPrefixCacheStats GetStats() const;
 
