@@ -10,14 +10,10 @@ from batchgen.prefix_reuse.materialization import (
 
 class _Task:
     def __init__(self):
-        self.layers = []
-        self.waited = False
-
-    def wait_for_layer(self, layer_idx):
-        self.layers.append(int(layer_idx))
+        self.wait_count = 0
 
     def wait(self):
-        self.waited = True
+        self.wait_count += 1
 
 
 class _Manager:
@@ -114,9 +110,9 @@ def test_materializes_mixed_hit_and_miss_and_releases_load_protection():
     assert host.kwargs["host_page_ids"].tolist() == [[101, 102], [0, 0]]
 
     materialization.wait_for_layer(3)
+    materialization.wait_for_layer(4)
     materialization.close(empty_cuda_cache=True)
-    assert host.task.layers == [3]
-    assert host.task.waited
+    assert host.task.wait_count == 1
     assert coordinator.ended == [9]
     assert manager.destroyed
     assert manager.empty_cuda_cache

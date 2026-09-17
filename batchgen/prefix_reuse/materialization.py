@@ -10,8 +10,6 @@ import torch
 
 
 class _AsyncTask(Protocol):
-    def wait_for_layer(self, layer_idx: int) -> None: ...
-
     def wait(self) -> None: ...
 
 
@@ -22,20 +20,25 @@ class PrefixMaterialization:
     load_task: _AsyncTask | None
     coordinator: object
     attachment_handles: tuple[int, ...]
+    _load_complete: bool = False
     _closed: bool = False
 
     def wait_for_layer(self, layer_idx: int) -> None:
         if self._closed:
             raise RuntimeError("prefix materialization is already closed")
-        if self.load_task is not None:
-            self.load_task.wait_for_layer(int(layer_idx))
+        del layer_idx
+        self._wait_for_load()
+
+    def _wait_for_load(self) -> None:
+        if self.load_task is not None and not self._load_complete:
+            self.load_task.wait()
+            self._load_complete = True
 
     def close(self, *, empty_cuda_cache: bool = False) -> None:
         if self._closed:
             return
         try:
-            if self.load_task is not None:
-                self.load_task.wait()
+            self._wait_for_load()
         finally:
             for handle in reversed(self.attachment_handles):
                 self.coordinator.end_attachment_load(handle)
