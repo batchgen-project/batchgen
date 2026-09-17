@@ -308,7 +308,11 @@ def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 	return _PROFILE_REGISTRY[_PROFILE_ALIASES[alias]]
 
 
-def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
+def build_host_kv_config(
+	model_name: str,
+	host_kv_cache_size: int,
+	shm_name: str = HOST_KV_SHM_NAME,
+) -> Any:
 	"""Builds a core HostPagedKVConfig for the given model and host budget."""
 
 	if host_kv_cache_size is None:
@@ -322,6 +326,8 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 
 	if host_budget <= 0:
 		raise ValueError("host_kv_cache_size must be a positive integer")
+	if not isinstance(shm_name, str) or not shm_name:
+		raise ValueError("shm_name must be a non-empty string")
 
 	profile = _resolve_profile(model_name)
 	bytes_per_page = profile.bytes_per_page()
@@ -336,7 +342,7 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 
 	num_pages_per_layer = host_budget // denom
 	config = bg_lib.HostPagedKVConfig()
-	config.shm_name = HOST_KV_SHM_NAME
+	config.shm_name = shm_name
 	config.num_layers = profile.num_layers
 	config.num_pages = num_pages_per_layer
 	config.page_size_tokens = profile.page_size
@@ -461,7 +467,11 @@ def build_gpu_kv_config_aux(
 	)
 
 
-def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | None:
+def build_host_kv_config_aux(
+	model_name: str,
+	host_kv_cache_size: int,
+	shm_name: str = HOST_KV_AUX_SHM_NAME,
+) -> Any | None:
 	"""Builds a HostPagedKVConfig for the DSA indexer host cache, or None."""
 
 	profile = _resolve_indexer_profile(model_name)
@@ -471,13 +481,15 @@ def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | 
 	host_budget = int(host_kv_cache_size)
 	if host_budget <= 0:
 		raise ValueError("host_kv_cache_size must be a positive integer")
+	if not isinstance(shm_name, str) or not shm_name:
+		raise ValueError("shm_name must be a non-empty string")
 
 	bytes_per_page = profile.bytes_per_page()
 	denom = profile.num_layers * bytes_per_page
 	num_pages_per_layer = host_budget // denom
 
 	config = bg_lib.HostPagedKVConfig()
-	config.shm_name = HOST_KV_AUX_SHM_NAME
+	config.shm_name = shm_name
 	config.num_layers = profile.num_layers
 	config.num_pages = num_pages_per_layer
 	config.page_size_tokens = profile.page_size
