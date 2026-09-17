@@ -7639,6 +7639,7 @@ class BatchGenWorker:
 				from batchgen.prefix_reuse.prefill import (
 					PrefixCacheSequenceState,
 					lookup_prefix_cache_for_prefill,
+					release_prefix_lookup_attachments,
 				)
 
 				prompt_token_ids = []
@@ -7658,20 +7659,29 @@ class BatchGenWorker:
 						.raw_page_tokens
 					),
 				)
-				for uuid, result, attached, compute_cached in zip(
-					my_prefill_uuids,
-					lookup.lookup_results,
-					lookup.attached_tokens,
-					lookup.compute_cached_tokens,
-				):
-					seq = self.global_batch.get_sequence(uuid)
-					state = PrefixCacheSequenceState(
-						lookup_result=result,
-						attached_tokens=int(attached),
-						compute_cached_tokens=int(compute_cached),
+				try:
+					for uuid, result, attached, compute_cached in zip(
+						my_prefill_uuids,
+						lookup.lookup_results,
+						lookup.attached_tokens,
+						lookup.compute_cached_tokens,
+					):
+						seq = self.global_batch.get_sequence(uuid)
+						state = PrefixCacheSequenceState(
+							lookup_result=result,
+							attached_tokens=int(attached),
+							compute_cached_tokens=int(compute_cached),
+						)
+						prefix_states[seq.global_idx] = state
+						self._prefix_sequence_states[seq.global_idx] = state
+				except Exception:
+					for sequence_id in prefix_states:
+						self._prefix_sequence_states.pop(sequence_id, None)
+					release_prefix_lookup_attachments(
+						coordinator=self.prefix_cache_coordinator,
+						lookup=lookup,
 					)
-					prefix_states[seq.global_idx] = state
-					self._prefix_sequence_states[seq.global_idx] = state
+					raise
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
@@ -7707,6 +7717,9 @@ class BatchGenWorker:
 				attached_pages = attached // page_size
 				private_pages = total_pages - attached_pages
 				if private_pages < 0:
+					self._release_prefix_cache_attachments(
+						list(prefix_states)
+					)
 					raise RuntimeError(
 						"prefix attachment exceeds Host KV reservation: "
 						f"sequence={global_id}, attached_pages={attached_pages}, "
@@ -7719,34 +7732,40 @@ class BatchGenWorker:
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
 			# if it fires, there's another selection bug to investigate.
-			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
-			total_pages_needed = sum(
-				math.ceil(tokens / self.PAGE_SIZE)
-				for tokens in private_sequence_tokens
-			)
-			page_deficit = max(
-				0, total_pages_needed - int(kv_stats.num_free_pages)
-			)
-			if page_deficit and self.enable_prefix_cache:
-				from batchgen.prefix_reuse.eviction import (
-					evict_prefix_pages_for_host_allocation,
-				)
-
-				evict_prefix_pages_for_host_allocation(
-					core_engine_module=core_engine,
-					coordinator=self.prefix_cache_coordinator,
-					worker_views_by_group={
-						0: self.core_engine.host_paged_kv_worker_view
-					},
-					group_id=0,
-					page_deficit=page_deficit,
-					max_scan_nodes=(
-						self.prefix_cache_runtime_config.max_nodes
-					),
-				)
+			try:
 				kv_stats = (
 					self.core_engine.host_paged_kv_worker_view.get_stats()
 				)
+				total_pages_needed = sum(
+					math.ceil(tokens / self.PAGE_SIZE)
+					for tokens in private_sequence_tokens
+				)
+				page_deficit = max(
+					0, total_pages_needed - int(kv_stats.num_free_pages)
+				)
+				if page_deficit and self.enable_prefix_cache:
+					from batchgen.prefix_reuse.eviction import (
+						evict_prefix_pages_for_host_allocation,
+					)
+
+					evict_prefix_pages_for_host_allocation(
+						core_engine_module=core_engine,
+						coordinator=self.prefix_cache_coordinator,
+						worker_views_by_group={
+							0: self.core_engine.host_paged_kv_worker_view
+						},
+						group_id=0,
+						page_deficit=page_deficit,
+						max_scan_nodes=(
+							self.prefix_cache_runtime_config.max_nodes
+						),
+					)
+					kv_stats = (
+						self.core_engine.host_paged_kv_worker_view.get_stats()
+					)
+			except Exception:
+				self._release_prefix_cache_attachments(list(prefix_states))
+				raise
 			if total_pages_needed > kv_stats.num_free_pages:
 				# Log per-sequence breakdown to help diagnose the selection bug.
 				seq_details = []
