@@ -805,6 +805,7 @@ class GPUPagedKVCacheManager:
 				f"Insufficient free pages: need {missing}, have {self._free_pages.size}"
 			)
 		new_pages = self._free_pages.pop(missing)
+		self._retain_gpu_pages(new_pages)
 		if state is None:
 			state = _SequenceState(pages=new_pages)
 			self._sequences[sequence_id] = state
@@ -850,6 +851,7 @@ class GPUPagedKVCacheManager:
 				)
 
 			new_pages = self._free_pages.pop(missing)
+			self._retain_gpu_pages(new_pages)
 			if state is None:
 				self._sequences[seq_id] = _SequenceState(pages=new_pages)
 			else:
@@ -857,6 +859,92 @@ class GPUPagedKVCacheManager:
 			allocations[seq_id] = new_pages.tolist()
 			any_changes = True
 		if any_changes:
+			self._clear_active_page_pointer_tables()
+		return allocations
+
+	def allocate_pages_for_sequences_with_page_keys(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		page_keys_by_sequence: Sequence[Sequence[int]],
+	) -> Dict[int, List[int]]:
+		"""Allocate logical pages while sharing identical physical page keys.
+
+		``page_keys_by_sequence`` contains stable Host physical page ids in
+		logical order. Equal keys map to one GPU physical page and are released
+		only after the last sequence reference disappears.
+		"""
+
+		self._ensure_initialized()
+		if not (
+			len(sequence_ids)
+			== len(num_tokens)
+			== len(page_keys_by_sequence)
+		):
+			raise ValueError(
+				"shared GPU allocation inputs must have equal lengths"
+			)
+		if len(set(int(seq_id) for seq_id in sequence_ids)) != len(sequence_ids):
+			raise ValueError("shared GPU allocation sequence ids must be unique")
+
+		required_counts = self._geometry.required_pages(num_tokens).tolist()
+		normalized_rows: List[List[int]] = []
+		new_keys: set[int] = set()
+		for seq_id, required, raw_keys in zip(
+			sequence_ids, required_counts, page_keys_by_sequence
+		):
+			if int(seq_id) in self._sequences:
+				raise ValueError(
+					"shared GPU allocation requires a new sequence: "
+					f"{seq_id}"
+				)
+			keys = [int(key) for key in raw_keys]
+			if len(keys) != int(required):
+				raise ValueError(
+					"Host page-key count does not match required GPU pages: "
+					f"sequence={seq_id}, keys={len(keys)}, required={required}"
+				)
+			if len(keys) != len(set(keys)):
+				raise ValueError(
+					f"sequence {seq_id} contains duplicate Host page keys"
+				)
+			normalized_rows.append(keys)
+			new_keys.update(
+				key for key in keys if key not in self._shared_page_key_to_gpu_page
+			)
+
+		if len(new_keys) > self._free_pages.size:
+			raise RuntimeError(
+				"Insufficient free pages for shared GPU allocation: "
+				f"need {len(new_keys)}, have {self._free_pages.size}"
+			)
+
+		new_page_by_key: Dict[int, int] = {}
+		if new_keys:
+			new_pages = self._free_pages.pop(len(new_keys)).tolist()
+			for key, page in zip(sorted(new_keys), new_pages):
+				new_page_by_key[key] = int(page)
+				self._shared_page_key_to_gpu_page[key] = int(page)
+				self._gpu_page_to_shared_key[int(page)] = key
+
+		allocations: Dict[int, List[int]] = {}
+		for seq_id, keys in zip(sequence_ids, normalized_rows):
+			pages = [
+				self._shared_page_key_to_gpu_page[key]
+				for key in keys
+			]
+			page_tensor = torch.tensor(pages, dtype=torch.int32)
+			self._retain_gpu_pages(page_tensor)
+			self._sequences[int(seq_id)] = _SequenceState(
+				pages=page_tensor
+			)
+			allocations[int(seq_id)] = [
+				new_page_by_key[key]
+				for key in keys
+				if key in new_page_by_key
+			]
+
+		if allocations:
 			self._clear_active_page_pointer_tables()
 		return allocations
 
@@ -907,6 +995,7 @@ class GPUPagedKVCacheManager:
 		allocations: Dict[int, List[int]] = {}
 		for seq_id, count in zip(sequence_ids, normalized_counts):
 			new_pages = self._free_pages.pop(count)
+			self._retain_gpu_pages(new_pages)
 			state = self._sequences[seq_id]
 			state.append_pages(new_pages)
 			allocations[seq_id] = new_pages.tolist()
@@ -1176,15 +1265,11 @@ class GPUPagedKVCacheManager:
 				+ ", ".join(str(seq_id) for seq_id in missing)
 			)
 
-		reclaimed: List[torch.Tensor] = []
 		for seq_id in sequence_ids:
 			state = self._sequences.pop(seq_id)
-			reclaimed.append(state.pages)
+			self._release_gpu_pages(state.pages)
 
-		if reclaimed:
-			concatenated = torch.cat(reclaimed, dim=0)
-			self._free_pages.push(concatenated)
-		if reclaimed:
+		if sequence_ids:
 			self._clear_active_page_pointer_tables()
 
 	def _release_sequence_prefix_pages(
@@ -1221,7 +1306,7 @@ class GPUPagedKVCacheManager:
 
 		released = state.pages[:num_pages].clone()
 		state.pages = state.pages[num_pages:].clone()
-		self._free_pages.push(released)
+		self._release_gpu_pages(released)
 		self._clear_active_page_pointer_tables()
 		return released.tolist()
 
@@ -1625,6 +1710,41 @@ class GPUPagedKVCacheManager:
 			raise KeyError(f"Sequence {sequence_id} not registered on GPU")
 		return state
 
+	def _retain_gpu_pages(self, pages: torch.Tensor) -> None:
+		for page in pages.tolist():
+			page_id = int(page)
+			self._gpu_page_refcounts[page_id] = (
+				self._gpu_page_refcounts.get(page_id, 0) + 1
+			)
+
+	def _release_gpu_pages(self, pages: torch.Tensor) -> None:
+		reclaimed: List[int] = []
+		for page in pages.tolist():
+			page_id = int(page)
+			count = self._gpu_page_refcounts.get(page_id)
+			if count is None or count <= 0:
+				raise RuntimeError(
+					f"GPU page {page_id} has no live reference"
+				)
+			if count > 1:
+				self._gpu_page_refcounts[page_id] = count - 1
+				continue
+			del self._gpu_page_refcounts[page_id]
+			shared_key = self._gpu_page_to_shared_key.pop(page_id, None)
+			if shared_key is not None:
+				mapped_page = self._shared_page_key_to_gpu_page.pop(
+					shared_key, None
+				)
+				if mapped_page != page_id:
+					raise RuntimeError(
+						"GPU shared-page registry is inconsistent"
+					)
+			reclaimed.append(page_id)
+		if reclaimed:
+			self._free_pages.push(
+				torch.tensor(reclaimed, dtype=torch.int32)
+			)
+
 	def _normalize_cpu_int_vector(
 		self,
 		values: Sequence[int] | torch.Tensor,
@@ -1890,6 +2010,9 @@ class GPUPagedKVCacheManager:
 		self._v_active_page_ptr_table = None
 		self._free_pages = _TensorStack(self.config.num_pages)
 		self._sequences: Dict[int, _SequenceState] = {}
+		self._gpu_page_refcounts: Dict[int, int] = {}
+		self._shared_page_key_to_gpu_page: Dict[int, int] = {}
+		self._gpu_page_to_shared_key: Dict[int, int] = {}
 		max_pages_per_seq = self._resolve_page_table_max_pages_per_sequence()
 		max_slots = self._resolve_page_table_max_slots()
 		self._gpu_page_table_manager = _GPUPageTableManager(
@@ -2154,6 +2277,7 @@ class GPUPagedKVCacheManager:
 			)
 		
 		new_pages = self._free_pages.pop(additional_pages)
+		self._retain_gpu_pages(new_pages)
 		
 		if state is None:
 			self._sequences[sequence_id] = _SequenceState(pages=new_pages)

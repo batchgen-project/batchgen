@@ -17,6 +17,28 @@ class PrefixCachePrefillLookup:
         return any(tokens > 0 for tokens in self.compute_cached_tokens)
 
 
+@dataclass(frozen=True)
+class PrefixCacheSequenceState:
+    lookup_result: object
+    attached_tokens: int
+    compute_cached_tokens: int
+
+    @property
+    def attachment_handle(self) -> int:
+        return int(getattr(self.lookup_result, "attachment_handle", 0))
+
+    @property
+    def shared_page_ids(self) -> tuple[int, ...]:
+        if self.attached_tokens == 0:
+            return ()
+        spans = list(getattr(self.lookup_result, "materialization_spans", ()))
+        if len(spans) != 1 or int(spans[0].group_id) != 0:
+            raise RuntimeError(
+                "GPT-OSS prefix state requires exactly one FULL_KV group"
+            )
+        return tuple(int(page.page_id) for page in spans[0].pages)
+
+
 def lookup_prefix_cache_for_prefill(
     *,
     coordinator: object,

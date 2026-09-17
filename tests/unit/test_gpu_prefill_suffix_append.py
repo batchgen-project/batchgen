@@ -99,3 +99,48 @@ def test_reused_prefix_requires_preallocated_gpu_pages():
         manager.prepare_prefill_suffix_append(
             sequence_ids=[101], prefix_lens=[2], suffix_lens=[3]
         )
+
+
+def test_host_page_identity_shares_gpu_pages_until_last_release():
+    manager = _manager()
+    before = manager.get_stats()
+
+    manager.allocate_pages_for_sequences_with_page_keys(
+        [101, 102],
+        [12, 12],
+        [
+            [1001, 1002, 2001],
+            [1001, 1002, 2002],
+        ],
+    )
+
+    pages_101 = manager._sequences[101].pages.tolist()
+    pages_102 = manager._sequences[102].pages.tolist()
+    assert pages_101[:2] == pages_102[:2]
+    assert pages_101[2] != pages_102[2]
+    assert manager.get_stats().num_used_pages == before.num_used_pages + 4
+
+    manager.free_pages_for_sequences([101])
+    assert manager.get_stats().num_used_pages == before.num_used_pages + 3
+    assert 1001 in manager._shared_page_key_to_gpu_page
+    assert 1002 in manager._shared_page_key_to_gpu_page
+
+    manager.free_pages_for_sequences([102])
+    assert manager.get_stats().num_used_pages == before.num_used_pages
+    assert manager._shared_page_key_to_gpu_page == {}
+    assert manager._gpu_page_refcounts == {}
+
+
+def test_shared_gpu_allocation_is_transactional_on_capacity_failure():
+    manager = _manager()
+    before = manager.get_stats()
+
+    with pytest.raises(RuntimeError, match="Insufficient free pages"):
+        manager.allocate_pages_for_sequences_with_page_keys(
+            [101],
+            [68],
+            [list(range(17))],
+        )
+
+    assert manager.get_stats() == before
+    assert manager._sequences == {}
