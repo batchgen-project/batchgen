@@ -75,6 +75,13 @@ class GLM5ParallelStrategyManager:
         self.is_fp8_experts = any(
             "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
         )
+        # --persistent-phase-instances: each phase's (model, weight_copy_task)
+        # is built once and switched in by activate_prefill/activate_decoding.
+        self.persistent_phase_instances = False
+        self.prefill_instance = None
+        self.decode_instance = None
+        self._expert_arena = None
+        self._expert_copy_pairs = []
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
@@ -200,6 +207,8 @@ class GLM5ParallelStrategyManager:
                 f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
                 f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
             )
+        if self.persistent_phase_instances:
+            self.prefill_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
     def configure_decoding(self, padding_bsz=None, comm=None):
@@ -289,7 +298,10 @@ class GLM5ParallelStrategyManager:
         torch.cuda.empty_cache()
         self._extract_dequantize_scale()
         self._load_model_skeleton()
-        self._load_local_routed_experts()
+        if self.persistent_phase_instances:
+            self._load_local_routed_experts_into_arena()
+        else:
+            self._load_local_routed_experts()
         self._load_attn_module()
         self._load_shared_expert_module()
         self._config_attn_module()
@@ -313,7 +325,72 @@ class GLM5ParallelStrategyManager:
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
             self._init_ata_comms(effective_bsz)
 
+        if self.persistent_phase_instances:
+            self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
+
+    def activate_prefill(self):
+        """Switch the already-built prefill instance in (persistent instances)."""
+        Glm5MoE.reset_prefill_grouped_state()
+        self.loaded_model_config.phase = "prefill"
+        self.model, self.weight_copy_task = self.prefill_instance
+        Glm5MoE.init_prefill_grouped_buffers(
+            self.loaded_model_config,
+            self.engine_config.Basic_Config.device_torch,
+        )
+        _synchronize_prefill_preloads()
+        return self.model, self.weight_copy_task
+
+    def activate_decoding(self):
+        """Switch the already-built decode instance in and refill its experts."""
+        prep_start = time.perf_counter()
+        Glm5MoE.reset_prefill_grouped_state()
+        torch.cuda.empty_cache()
+        self.loaded_model_config.phase = "decode"
+        self.model, self.weight_copy_task = self.decode_instance
+        start = time.perf_counter()
+        self._expert_arena.map()
+        mapped = time.perf_counter()
+        self.refill_local_routed_experts()
+        done = time.perf_counter()
+        nbytes = sum(dst.nbytes for dst, _ in self._expert_copy_pairs)
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d prep=%.3fs map=%.3fs refill=%.3fs %.1f GB/s",
+            self.rank,
+            start - prep_start,
+            mapped - start,
+            done - mapped,
+            nbytes / (done - mapped) / 1e9,
+        )
+        return self.model, self.weight_copy_task
+
+    @property
+    def decode_experts_resident(self) -> bool:
+        return self._expert_arena is not None and self._expert_arena.is_mapped
+
+    def release_decode_routed_experts(self):
+        """Return the decode routed experts' HBM; their addresses stay reserved."""
+        torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        start = time.perf_counter()
+        self._expert_arena.unmap()
+        logging.info(
+            "[PERSISTENT_PHASE] rank=%d unmap=%.3fs",
+            self.rank,
+            time.perf_counter() - start,
+        )
+
+    def refill_local_routed_experts(self):
+        """H2D-copy every local routed expert into its fixed-address stack row."""
+        for dst, src in self._expert_copy_pairs:
+            dst.copy_(src, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+    def share_skeleton_on_device(self):
+        """Upload the skeleton once so both persistent instances alias one copy."""
+        device = self.engine_config.Basic_Config.device_torch
+        self.skeleton_state_dict = {
+            key: tensor.to(device) for key, tensor in self.skeleton_state_dict.items()
+        }
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
@@ -476,6 +553,66 @@ class GLM5ParallelStrategyManager:
             expert.fp8_up = tensors["up_proj.weight"].to(device)
             expert.fp8_down = tensors["down_proj.weight"].to(device)
         logging.debug("Local routed experts loaded")
+
+    def _load_local_routed_experts_into_arena(self):
+        """Load this rank's routed experts into fixed-address per-layer 3D stacks.
+
+        Persistent decode keeps its CUDA graphs across prefill phases, so the
+        stacks those graphs read must never move. They live in one VmmArena
+        whose physical memory is released while prefill runs and refilled
+        from the pinned host copy on the way back.
+        """
+        from batchgen.cuda_graph.vmm_arena import VmmArena
+
+        experts_per_rank = self.NUM_TOTAL_EXPERTS // self.world_size
+        if self.num_local_expert_per_layer != experts_per_rank:
+            raise RuntimeError(
+                "persistent phase instances need every local routed expert resident: "
+                f"{self.num_local_expert_per_layer}/{experts_per_rank} per layer"
+            )
+        names = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+        first = self.core_engine.get_tensor(self.local_routed_experts[0])
+        moe_layers = range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers)
+        layer_bytes = sum(
+            experts_per_rank * first[name].numel() * first[name].element_size() + 256
+            for name in names
+        )
+        # 512 MiB chunks keep the round-up waste under 0.5 GiB of HBM.
+        self._expert_arena = VmmArena(
+            self.engine_config.Basic_Config.device_torch,
+            layer_bytes * len(moe_layers),
+            chunk_bytes=512 << 20,
+        )
+        self._expert_arena.map()
+        start = self.global_rank * experts_per_rank
+        self._expert_copy_pairs = []
+        for layer_idx in moe_layers:
+            moe = self.model.model.layers[layer_idx].mlp
+            stacks = tuple(
+                self._expert_arena.carve(
+                    (experts_per_rank, *first[name].shape), first[name].dtype
+                )
+                for name in names
+            )
+            moe._w3d_prealloc = stacks
+            for i in range(experts_per_rank):
+                tensors = self.core_engine.get_tensor(
+                    f"routed_expert_{layer_idx}_{start + i}"
+                )
+                for stack, name in zip(stacks, names):
+                    src = tensors[name]
+                    if src.shape != stack.shape[1:] or src.dtype != stack.dtype:
+                        raise RuntimeError(
+                            f"routed_expert_{layer_idx}_{start + i}.{name}: host "
+                            f"{tuple(src.shape)}/{src.dtype} does not match stack row "
+                            f"{tuple(stack.shape[1:])}/{stack.dtype}"
+                        )
+                    self._expert_copy_pairs.append((stack[i], src))
+                expert = moe.experts[start + i]
+                expert.fp8_gate, expert.fp8_up, expert.fp8_down = (
+                    stack[i] for stack in stacks
+                )
+        self.refill_local_routed_experts()
 
     def _config_attn_module(self):
         """Replace attention modules with GLM5AttnWrapper."""

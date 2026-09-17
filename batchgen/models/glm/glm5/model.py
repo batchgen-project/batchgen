@@ -1639,47 +1639,63 @@ class Glm5MoE(nn.Module):
         # per-expert allocation becomes refcount=0 and the CUDA allocator
         # reclaims it before the next expert's copy.
         start = self.routed_expert_start_idx
-        gate_shape = self.gate_list[0].shape
-        self.fp8_gate_w3d = torch.empty(
-            (E, *gate_shape), dtype=self.gate_list[0].dtype, device=self.device)
-        for i in range(E):
-            self.fp8_gate_w3d[i].copy_(self.gate_list[i])
-            view = self.fp8_gate_w3d[i]
-            wrapper = self.experts[start + i]
-            wrapper.cached_gate = view
-            if hasattr(wrapper.module, 'fp8_gate'):
-                wrapper.module.fp8_gate = view
-            self.gate_list[i] = view
+        prealloc = getattr(self, "_w3d_prealloc", None)
+        if prealloc is not None:
+            # Persistent decode: the PSM already copied every local expert into
+            # fixed-address stacks and pointed each expert at its row.
+            self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d = prealloc
+            for i in range(E):
+                if (
+                    self.gate_list[i].data_ptr() != self.fp8_gate_w3d[i].data_ptr()
+                    or self.up_list[i].data_ptr() != self.fp8_up_w3d[i].data_ptr()
+                    or self.down_list[i].data_ptr() != self.fp8_down_w3d[i].data_ptr()
+                ):
+                    raise RuntimeError(
+                        f"GLM-5 layer {self.layer_idx}: expert {start + i} does "
+                        "not alias its preallocated 3D stack row"
+                    )
+        else:
+            gate_shape = self.gate_list[0].shape
+            self.fp8_gate_w3d = torch.empty(
+                (E, *gate_shape), dtype=self.gate_list[0].dtype, device=self.device)
+            for i in range(E):
+                self.fp8_gate_w3d[i].copy_(self.gate_list[i])
+                view = self.fp8_gate_w3d[i]
+                wrapper = self.experts[start + i]
+                wrapper.cached_gate = view
+                if hasattr(wrapper.module, 'fp8_gate'):
+                    wrapper.module.fp8_gate = view
+                self.gate_list[i] = view
+
+            up_shape = self.up_list[0].shape
+            self.fp8_up_w3d = torch.empty(
+                (E, *up_shape), dtype=self.up_list[0].dtype, device=self.device)
+            for i in range(E):
+                self.fp8_up_w3d[i].copy_(self.up_list[i])
+                view = self.fp8_up_w3d[i]
+                wrapper = self.experts[start + i]
+                wrapper.cached_up = view
+                if hasattr(wrapper.module, 'fp8_up'):
+                    wrapper.module.fp8_up = view
+                self.up_list[i] = view
+
+            down_shape = self.down_list[0].shape
+            self.fp8_down_w3d = torch.empty(
+                (E, *down_shape), dtype=self.down_list[0].dtype, device=self.device)
+            for i in range(E):
+                self.fp8_down_w3d[i].copy_(self.down_list[i])
+                view = self.fp8_down_w3d[i]
+                wrapper = self.experts[start + i]
+                wrapper.cached_down = view
+                if hasattr(wrapper.module, 'fp8_down'):
+                    wrapper.module.fp8_down = view
+                self.down_list[i] = view
         self.gate_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.gate_list],
             dtype=torch.int64, device=self.device)
-
-        up_shape = self.up_list[0].shape
-        self.fp8_up_w3d = torch.empty(
-            (E, *up_shape), dtype=self.up_list[0].dtype, device=self.device)
-        for i in range(E):
-            self.fp8_up_w3d[i].copy_(self.up_list[i])
-            view = self.fp8_up_w3d[i]
-            wrapper = self.experts[start + i]
-            wrapper.cached_up = view
-            if hasattr(wrapper.module, 'fp8_up'):
-                wrapper.module.fp8_up = view
-            self.up_list[i] = view
         self.up_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.up_list],
             dtype=torch.int64, device=self.device)
-
-        down_shape = self.down_list[0].shape
-        self.fp8_down_w3d = torch.empty(
-            (E, *down_shape), dtype=self.down_list[0].dtype, device=self.device)
-        for i in range(E):
-            self.fp8_down_w3d[i].copy_(self.down_list[i])
-            view = self.fp8_down_w3d[i]
-            wrapper = self.experts[start + i]
-            wrapper.cached_down = view
-            if hasattr(wrapper.module, 'fp8_down'):
-                wrapper.module.fp8_down = view
-            self.down_list[i] = view
         self.down_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.down_list],
             dtype=torch.int64, device=self.device)

@@ -249,6 +249,10 @@ for canonical, aliases in {
 		"kimi_k3",
 	),
 	"glm5_mla": (
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
+		"glm-5.2-fp8",
+		"glm-5.2",
 		"zai-org/glm-5-fp8",
 		"zai-org/glm-5",
 		"glm-5-fp8",
@@ -273,6 +277,10 @@ for canonical, aliases in {
 		"deepseek-v3.2",
 	),
 	"glm5_indexer": (
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
+		"glm-5.2-fp8",
+		"glm-5.2",
 		"zai-org/glm-5-fp8",
 		"zai-org/glm-5",
 		"glm-5-fp8",

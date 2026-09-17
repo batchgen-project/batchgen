@@ -119,6 +119,8 @@ class ServerArgs:
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+    cuda_graph_max_seqlen: Optional[int] = None  # Optional fixed decode graph span
+    persistent_phase_instances: bool = False  # Keep prefill/decode model instances across phase switches
     detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
     # Dynamic host KV reservation settings
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
@@ -411,6 +413,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of CUDA graph bucket sizes (default: 16). For GLM, use 7 with max bucket 64 for [1,2,4,8,16,32,64].",
     )
     parser.add_argument(
+        "--cuda-graph-max-seqlen",
+        type=int,
+        default=None,
+        help="Fix the maximum sequence span captured by supported decode CUDA graphs. "
+        "Persistent GLM phase instances capture at startup when this is set.",
+    )
+    parser.add_argument(
+        "--persistent-phase-instances",
+        action="store_true",
+        default=False,
+        help="Build the prefill and decode model instances once and keep them, with their "
+        "decode CUDA graphs, across phase switches; a switch only releases or refills the "
+        "decode routed experts (GLM-5 only).",
+    )
+    parser.add_argument(
         "--detokenization-include-special-tokens",
         action="store_true",
         default=False,
@@ -550,6 +567,8 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("extension_gpu_page_buffer must be positive")
     if args.decision_frequency_pages <= 0:
         raise ValueError("decision_frequency_pages must be positive")
+    if args.cuda_graph_max_seqlen is not None and args.cuda_graph_max_seqlen <= 0:
+        raise ValueError("cuda_graph_max_seqlen must be positive")
     if args.extension_gpu_page_buffer < args.decision_frequency_pages:
         raise ValueError(
             f"extension_gpu_page_buffer ({args.extension_gpu_page_buffer}) must be >= "
@@ -624,6 +643,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
+        cuda_graph_max_seqlen=parsed.cuda_graph_max_seqlen,
+        persistent_phase_instances=parsed.persistent_phase_instances,
         detokenization_include_special_tokens=parsed.detokenization_include_special_tokens,
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
