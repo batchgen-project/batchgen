@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -121,6 +122,16 @@ def create_host_prefix_cache_coordinator(
     )
     coordinator.initialize(bool(create_region))
     return coordinator
+
+
+def unlink_prefix_cache_shared_memory(runtime_config: PrefixCacheRuntimeConfig):
+    """Remove the exact POSIX SHM name after every worker has exited."""
+
+    path = f"/dev/shm/{runtime_config.shm_name.lstrip('/')}"
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _derive_prefix_cache_shm_name(model_name: str) -> str:

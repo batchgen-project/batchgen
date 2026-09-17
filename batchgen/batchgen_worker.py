@@ -550,6 +550,8 @@ class BatchGenWorkerArgs:
 	device: int
 	kv_dtype: str
 	gpu_arch: str
+	enable_prefix_cache: bool = False
+	prefix_cache_debug_stats: bool = False
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -806,6 +808,16 @@ class BatchGenWorker:
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
+		self.enable_prefix_cache = bool(args.enable_prefix_cache)
+		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self.prefix_cache_runtime_config = None
+		self.prefix_cache_coordinator = None
+		if self.enable_prefix_cache:
+			from batchgen.prefix_reuse.config import (
+				require_prefix_cache_model_support,
+			)
+
+			require_prefix_cache_model_support(args.model_name)
 
 		# DSA models: create DualHostKVCoordinator with proportional budget split.
 		# Non-DSA models get a single-view worker below.
@@ -845,6 +857,28 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: Initializing Host KV view with cudaHostRegister (local_rank={self.local_rank}, fast_init={args.fast_init})")
 			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
+
+			if self.enable_prefix_cache:
+				from batchgen.prefix_reuse.config import (
+					build_prefix_cache_runtime_config,
+					create_host_prefix_cache_coordinator,
+				)
+
+				self.prefix_cache_runtime_config = (
+					build_prefix_cache_runtime_config(
+						model_name=args.model_name,
+						kv_dtype=args.kv_dtype,
+						host_kv_config=worker_kv_config,
+						debug_stats=self.prefix_cache_debug_stats,
+					)
+				)
+				self.prefix_cache_coordinator = (
+					create_host_prefix_cache_coordinator(
+						core_engine_module=core_engine,
+						runtime_config=self.prefix_cache_runtime_config,
+						create_region=False,
+					)
+				)
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components

@@ -7,6 +7,7 @@ from batchgen.prefix_reuse.config import (
     build_prefix_cache_runtime_config,
     create_host_prefix_cache_coordinator,
     require_prefix_cache_model_support,
+    unlink_prefix_cache_shared_memory,
 )
 from batchgen.prefix_reuse.commit import (
     PrefixCommitRequest,
@@ -33,6 +34,7 @@ __all__ = [
     "collect_group_pages_for_commit",
     "create_host_prefix_cache_coordinator",
     "require_prefix_cache_model_support",
+    "unlink_prefix_cache_shared_memory",
     "PrefixCachePrefillLookup",
     "lookup_prefix_cache_for_prefill",
     "release_prefix_lookup_attachments",

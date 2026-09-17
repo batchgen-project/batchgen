@@ -20,6 +20,7 @@ _SPEC.loader.exec_module(_CONFIG)
 PrefixKVGroupSemantic = _CONFIG.PrefixKVGroupSemantic
 build_prefix_cache_runtime_config = _CONFIG.build_prefix_cache_runtime_config
 require_prefix_cache_model_support = _CONFIG.require_prefix_cache_model_support
+unlink_prefix_cache_shared_memory = _CONFIG.unlink_prefix_cache_shared_memory
 
 
 def _host_config(**overrides):
@@ -91,6 +92,20 @@ def test_runtime_config_converts_to_core_types():
     assert converted.group_specs[0].semantic == "full-kv-enum"
     assert converted.group_specs[0].raw_page_tokens == 64
     assert converted.max_page_handles == 4096
+
+
+def test_unlink_targets_only_the_derived_prefix_region(monkeypatch):
+    runtime = build_prefix_cache_runtime_config(
+        model_name="openai/gpt-oss-120b",
+        kv_dtype="bfloat16",
+        host_kv_config=_host_config(),
+    )
+    removed = []
+    monkeypatch.setattr(_CONFIG.os, "unlink", removed.append)
+
+    unlink_prefix_cache_shared_memory(runtime)
+
+    assert removed == [f"/dev/shm/{runtime.shm_name}"]
 
 
 def test_namespace_changes_with_kv_dtype_or_page_geometry():
