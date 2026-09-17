@@ -2590,6 +2590,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     import batchgen.cuda_graph as cuda_graph_module
     import batchgen.models.glm.glm5.cuda_graph_segments as dsa_segments
     import batchgen.models.glm.glm5.layer_cuda_graph_segments as layer_segments_module
+    import batchgen.models.glm.glm5.reuse_topk_segment as reuse_segments
     import batchgen.models.glm.glm5.whole_model_cuda_graph_segments as whole_segments
 
     class FakeManager:
@@ -2628,7 +2629,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         def __init__(self):
             self.config = types.SimpleNamespace(page_size_tokens=64)
             self.storage = torch.empty(4, 8, dtype=torch.int32)
-            self.k_cache = torch.empty(1, 1, 64, 1, 4, dtype=torch.bfloat16)
+            self.k_cache = torch.empty(2, 1, 64, 1, 4, dtype=torch.bfloat16)
 
         def ensure_cuda_graph_page_table(self, _sequence_ids):
             return None
@@ -2647,21 +2648,25 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             return torch.empty(seq_len, 1), torch.empty(seq_len, 1)
 
     class FakeWrapper:
-        def __init__(self):
+        def __init__(self, *, has_indexer=True):
             self.module = types.SimpleNamespace(
-                indexer=FakeIndexer(),
+                indexer=FakeIndexer() if has_indexer else None,
                 num_heads=64,
             )
             self._fp8_absorb_weights = object()
-            self._fused_wqb_weights = object()
-            self._indexer_cuda_module = object()
+            self._fused_wqb_weights = object() if has_indexer else None
+            self._indexer_cuda_module = object() if has_indexer else None
+
+        def initialize_fused_kernels(self):
+            raise AssertionError("shared layer must not initialize indexer kernels")
 
     class FakeLayer:
-        def __init__(self):
-            self.self_attn = FakeWrapper()
+        def __init__(self, *, has_indexer=True):
+            self.self_attn = FakeWrapper(has_indexer=has_indexer)
             self.mlp = None
 
     bucket_inputs = []
+    reuse_segment_kwargs = []
     monkeypatch.setattr(cuda_graph_module, "CUDAGraphManager", FakeManager)
     monkeypatch.setattr(
         dsa_segments,
@@ -2672,6 +2677,11 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         layer_segments_module,
         "Glm5DecoderLayerGraphSegment",
         lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        reuse_segments,
+        "Glm5ReuseTopkAttnSegment",
+        lambda **kwargs: reuse_segment_kwargs.append(kwargs) or object(),
     )
     monkeypatch.setattr(whole_segments, "Glm5WholeModelSegment", FakeWholeSegment)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
@@ -2692,7 +2702,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker.torch_device = torch.device("cpu")
     worker._batchgen_debug = {}
     worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(layers=[FakeLayer()]),
+        model=types.SimpleNamespace(
+            layers=[FakeLayer(), FakeLayer(has_indexer=False)],
+        ),
         config=types.SimpleNamespace(vocab_size=16, hidden_size=4),
         vocab_size=16,
     )
@@ -2753,6 +2765,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
+    assert len(reuse_segment_kwargs) == 1
+    assert reuse_segment_kwargs[0]["wrapper"].module.indexer is None
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
 
