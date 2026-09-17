@@ -579,6 +579,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	cuda_graph_max_seqlen: Optional[int] = None  # Optional fixed decode graph span
 	persistent_phase_instances: bool = False  # Keep prefill/decode instances across phase switches
 	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 	# Dynamic host KV reservation
@@ -7378,42 +7379,43 @@ class BatchGenWorker:
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		if not persistent:
 			self._destroy_gpu_paged_kv_cache()
-			if k3_prefill_profile and torch.cuda.is_available():
-				torch.cuda.reset_peak_memory_stats(self.local_rank)
+		if not persistent and k3_prefill_profile and torch.cuda.is_available():
+			torch.cuda.reset_peak_memory_stats(self.local_rank)
 
-			if (
-				hasattr(self.parallel_manager, "prefill_uses_resident_ep")
-				and self.parallel_manager.prefill_uses_resident_ep()
-			):
-				local_lengths = [
-					int(seq.prompt_length)
-					for seq in prefill_sequences
-					if self._owns_local_sequence(seq)
-				]
-				token_cap = (
-					self.engine_config.Module_Batching_Config
-					.prefill_micro_batch_token_cap
-				)
-				use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-				predicted_batches, _ = build_prefill_micro_batches(
-					local_lengths,
-					token_cap,
-					l2_balance=use_l2,
-				)
-				local_max_tokens = max(
-					(
-						sum(local_lengths[start:end])
-						for start, end in predicted_batches
-					),
-					default=0,
-				)
-				moe_ntp = self._sync_prefill_moe_rank_counts(
-					local_max_tokens,
-					reason="prefill_output_preallocate",
-				)
-				self.parallel_manager.prepare_resident_ep_prefill_output(
-					self.world_size * moe_ntp
-				)
+		if (
+			not persistent
+			and hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			local_lengths = [
+				int(seq.prompt_length)
+				for seq in prefill_sequences
+				if self._owns_local_sequence(seq)
+			]
+			token_cap = (
+				self.engine_config.Module_Batching_Config
+				.prefill_micro_batch_token_cap
+			)
+			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+			predicted_batches, _ = build_prefill_micro_batches(
+				local_lengths,
+				token_cap,
+				l2_balance=use_l2,
+			)
+			local_max_tokens = max(
+				(
+					sum(local_lengths[start:end])
+					for start, end in predicted_batches
+				),
+				default=0,
+			)
+			moe_ntp = self._sync_prefill_moe_rank_counts(
+				local_max_tokens,
+				reason="prefill_output_preallocate",
+			)
+			self.parallel_manager.prepare_resident_ep_prefill_output(
+				self.world_size * moe_ntp
+			)
 
 		if torch.cuda.is_available():
 			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -7853,10 +7855,10 @@ class BatchGenWorker:
 	def _build_persistent_phase_instances(self) -> None:
 		"""Build both phase instances and the decode KV pools before the first request.
 
-		When BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN fixes the graph
-		attention span, the decode graphs are captured here as well, so no
-		phase switch builds a model or captures a graph. Otherwise the span is
-		taken from the first decode batch and the graphs are captured there.
+		When --cuda-graph-max-seqlen fixes the graph attention span, the decode
+		graphs are captured here as well, so no phase switch builds a model or
+		captures a graph. Otherwise the span is taken from the first decode
+		batch and the graphs are captured there.
 		"""
 		pm = self.parallel_manager
 		if pm.decode_instance is not None:
@@ -7868,7 +7870,7 @@ class BatchGenWorker:
 		pm.configure_prefill()
 		self._activate_persistent_decode_instance(self.comm)
 		self._init_gpu_kv_with_actual_size()
-		capture = bool(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN"))
+		capture = getattr(self.args, "cuda_graph_max_seqlen", None) is not None
 		if capture:
 			# No resident rows: every rank captures the way an empty rank does
 			# (zero valid tokens); replays bind real rows through static inputs.
@@ -10876,9 +10878,19 @@ class BatchGenWorker:
 				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
 			)
 			env_graph_max_seqlen = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN")
-			graph_max_seqlen = int(env_graph_max_seqlen) if env_graph_max_seqlen else int(capacity_seqlen)
+			cli_graph_max_seqlen = getattr(self.args, "cuda_graph_max_seqlen", None)
+			configured_graph_max_seqlen = (
+				cli_graph_max_seqlen
+				if cli_graph_max_seqlen is not None
+				else env_graph_max_seqlen
+			)
+			graph_max_seqlen = (
+				int(configured_graph_max_seqlen)
+				if configured_graph_max_seqlen is not None
+				else int(capacity_seqlen)
+			)
 			if graph_max_seqlen <= 0:
-				raise RuntimeError("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN must be positive")
+				raise RuntimeError("CUDA graph max_seqlen must be positive")
 			if int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) > graph_max_seqlen:
 				raise RuntimeError(
 					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "

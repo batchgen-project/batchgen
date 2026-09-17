@@ -153,11 +153,23 @@ def test_persistent_phase_cli_is_opt_in():
 
     default = server_args.prepare_server_args(base)
     enabled = server_args.prepare_server_args(
-        [*base, "--persistent-phase-instances"]
+        [
+            *base,
+            "--persistent-phase-instances",
+            "--cuda-graph-max-seqlen",
+            "8192",
+        ]
     )
 
     assert default.persistent_phase_instances is False
+    assert default.cuda_graph_max_seqlen is None
     assert enabled.persistent_phase_instances is True
+    assert enabled.cuda_graph_max_seqlen == 8192
+
+    with pytest.raises(ValueError, match="cuda_graph_max_seqlen must be positive"):
+        server_args.prepare_server_args(
+            [*base, "--cuda-graph-max-seqlen", "0"]
+        )
 
 
 def test_persistent_phase_worker_gate_preserves_flag_off_behavior():
