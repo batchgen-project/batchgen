@@ -2506,6 +2506,10 @@ def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
 
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        disable_cuda_graphs=False,
+        enable_cuda_graph=True,
+    )
     worker._batchgen_debug = {}
     worker._cuda_graph_manager = FakeManager()
     worker._whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
