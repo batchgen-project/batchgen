@@ -22,6 +22,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace batchgen::kv {
@@ -34,6 +35,13 @@ constexpr std::int32_t kInvalidPageIndex = -1;
 constexpr std::int64_t kEmptySequenceId =
     std::numeric_limits<std::int64_t>::min();
 constexpr std::int64_t kTombstoneSequenceId = kEmptySequenceId + 1;
+constexpr std::int64_t kPrefixResidentSequenceId = kEmptySequenceId + 2;
+
+constexpr bool IsReservedSequenceId(std::int64_t sequence_id) {
+    return sequence_id == kEmptySequenceId ||
+           sequence_id == kTombstoneSequenceId ||
+           sequence_id == kPrefixResidentSequenceId;
+}
 
 enum class InitState : std::uint32_t {
     kUninitialized = 0,
@@ -203,6 +211,10 @@ struct HostPagedKVBackend::SharedState {
     void ReleaseSequence(std::int64_t sequence_id);
     std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
                                                  std::size_t num_pages);
+    std::vector<std::int32_t> RetainPages(
+        std::int64_t sequence_id,
+        const std::vector<std::int32_t>& page_ids);
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids);
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
     HostPagedKVStats CollectStats() const;
@@ -680,6 +692,9 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
     if (num_pages == 0) {
         return {};
     }
+    if (IsReservedSequenceId(sequence_id)) {
+        throw std::invalid_argument("Sequence ID is reserved by HostPagedKV");
+    }
     std::vector<std::int32_t> pages(num_pages);
     {
         ScopedMutexLock lock(&header->allocation_mutex);
@@ -815,6 +830,124 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
         header->free_stack_top.store(top, std::memory_order_relaxed);
     }
     return pages;
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::SharedState::RetainPages(
+    std::int64_t sequence_id, const std::vector<std::int32_t>& page_ids) {
+    if (page_ids.empty()) {
+        return {};
+    }
+    {
+        ScopedMutexLock lock(&header->sequence_mutex);
+        SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
+        if (entry == nullptr) {
+            throw std::out_of_range("Sequence ID " +
+                                    std::to_string(sequence_id) +
+                                    " not found during page retain");
+        }
+
+        std::unordered_set<std::int32_t> requested_pages;
+        requested_pages.reserve(page_ids.size());
+        for (const std::int32_t page : page_ids) {
+            if (page < 0 ||
+                static_cast<std::size_t>(page) >= config.num_pages) {
+                throw std::out_of_range("Retained page id out of range: " +
+                                        std::to_string(page));
+            }
+            if (!requested_pages.insert(page).second) {
+                throw std::runtime_error(
+                    "Duplicate retained page id: " + std::to_string(page));
+            }
+            if (page_owners[page] != sequence_id) {
+                throw std::runtime_error(
+                    "Cannot retain page " + std::to_string(page) +
+                    " for sequence " + std::to_string(sequence_id) +
+                    " because it is not sequence-owned");
+            }
+        }
+
+        std::size_t found = 0;
+        std::int32_t page = entry->head_page;
+        while (page != kInvalidPageIndex) {
+            if (requested_pages.find(page) != requested_pages.end()) {
+                ++found;
+            }
+            page = page_links[page];
+        }
+        if (found != requested_pages.size()) {
+            throw std::logic_error(
+                "Sequence-owned retained pages are not present in the "
+                "sequence page chain for sequence " +
+                std::to_string(sequence_id));
+        }
+
+        std::int32_t previous_page = kInvalidPageIndex;
+        page = entry->head_page;
+        while (page != kInvalidPageIndex) {
+            const std::int32_t next = page_links[page];
+            if (requested_pages.find(page) != requested_pages.end()) {
+                if (previous_page == kInvalidPageIndex) {
+                    entry->head_page = next;
+                } else {
+                    page_links[previous_page] = next;
+                }
+                if (entry->tail_page == page) {
+                    entry->tail_page = previous_page;
+                }
+                page_links[page] = kInvalidPageIndex;
+                page_owners[page] = kPrefixResidentSequenceId;
+                --entry->num_pages;
+            } else {
+                previous_page = page;
+            }
+            page = next;
+        }
+        if (entry->num_pages == 0) {
+            entry->head_page = kInvalidPageIndex;
+            entry->tail_page = kInvalidPageIndex;
+        }
+    }
+    return page_ids;
+}
+
+void HostPagedKVBackend::SharedState::ReleaseResidentPages(
+    const std::vector<std::int32_t>& page_ids) {
+    if (page_ids.empty()) {
+        return;
+    }
+    {
+        ScopedMutexLock lock(&header->sequence_mutex);
+        std::unordered_set<std::int32_t> requested_pages;
+        requested_pages.reserve(page_ids.size());
+        for (const std::int32_t page : page_ids) {
+            if (page < 0 ||
+                static_cast<std::size_t>(page) >= config.num_pages) {
+                throw std::out_of_range("Resident page id out of range: " +
+                                        std::to_string(page));
+            }
+            if (!requested_pages.insert(page).second) {
+                throw std::runtime_error(
+                    "Duplicate resident page id: " + std::to_string(page));
+            }
+            if (page_owners[page] != kPrefixResidentSequenceId) {
+                throw std::runtime_error(
+                    "Cannot release page " + std::to_string(page) +
+                    " because it is not prefix-resident");
+            }
+        }
+        for (const std::int32_t page : page_ids) {
+            page_owners[page] = kEmptySequenceId;
+            page_links[page] = kInvalidPageIndex;
+        }
+    }
+
+    ScopedMutexLock lock(&header->allocation_mutex);
+    std::uint32_t top =
+        header->free_stack_top.load(std::memory_order_relaxed);
+    for (const std::int32_t page : page_ids) {
+        free_stack[top++] = page;
+    }
+    header->free_stack_top.store(top, std::memory_order_relaxed);
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
@@ -977,6 +1110,17 @@ void HostPagedKVBackend::ReleaseSequences(
 std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
     return state_->ReleasePrefixPages(sequence_id, num_pages);
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::RetainSequencePages(
+    std::int64_t sequence_id,
+    const std::vector<std::int32_t>& page_ids) {
+    return state_->RetainPages(sequence_id, page_ids);
+}
+
+void HostPagedKVBackend::ReleaseResidentPages(
+    const std::vector<std::int32_t>& page_ids) {
+    state_->ReleaseResidentPages(page_ids);
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SequencePages(

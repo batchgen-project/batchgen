@@ -366,6 +366,17 @@ class HostPagedKVWorkerView : private LayerMapper {
             return;
         }
         EnsureSequenceRegistered(sequence_id);
+        const auto current_pages = page_table_.Pages(sequence_id);
+        if (current_pages.size() >= page_ids.size() &&
+            std::equal(page_ids.begin(), page_ids.end(),
+                       current_pages.begin())) {
+            return;
+        }
+        if (!current_pages.empty()) {
+            throw std::logic_error(
+                "AttachSharedPrefixPages requires an empty page table or an "
+                "identical existing prefix");
+        }
         page_table_.PrependPages(sequence_id, page_ids);
     }
 
@@ -380,8 +391,8 @@ class HostPagedKVWorkerView : private LayerMapper {
         EnsureSequencesRegistered(sequence_ids);
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             if (!page_ids_by_sequence[i].empty()) {
-                page_table_.PrependPages(sequence_ids[i],
-                                         page_ids_by_sequence[i]);
+                AttachSharedPrefixPages(sequence_ids[i],
+                                        page_ids_by_sequence[i]);
             }
         }
     }
@@ -904,6 +915,20 @@ class HostPagedKVWorkerView : private LayerMapper {
                 "mismatch");
         }
         return released;
+    }
+
+    std::vector<std::int32_t> RetainSequencePages(
+        std::int64_t sequence_id,
+        const std::vector<std::int32_t>& page_ids) {
+        if (page_ids.empty()) {
+            return {};
+        }
+        EnsureSequenceRegistered(sequence_id);
+        return backend_.RetainSequencePages(sequence_id, page_ids);
+    }
+
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {
+        backend_.ReleaseResidentPages(page_ids);
     }
 
     KVAsyncTask AsyncOffloadLayerKVToHost(
