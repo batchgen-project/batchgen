@@ -211,31 +211,12 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            py::arg("sequence_ids"))
        .def("register_sequences", &WorkerView::RegisterSequences,
            py::arg("sequence_ids"))
-       .def("attach_shared_prefix_pages",
-            &WorkerView::AttachSharedPrefixPages,
-            py::arg("sequence_id"), py::arg("page_ids"),
-            "Prepend shared prefix Host page ids to a registered sequence's "
-            "logical page table. Ownership remains with the prefix cache.")
-       .def("attach_shared_prefix_pages_for_sequences",
-            &WorkerView::AttachSharedPrefixPagesForSequences,
-            py::arg("sequence_ids"), py::arg("page_ids_by_sequence"),
-            "Prepend shared prefix Host pages for multiple registered "
-            "sequences.")
        .def("unregister_sequence", &WorkerView::UnregisterSequence,
            py::arg("sequence_id"))
        .def("unregister_sequences", &WorkerView::UnregisterSequences,
            py::arg("sequence_ids"))
        .def("release_sequence_pages", &WorkerView::ReleaseSequencePages,
             py::arg("sequence_ids"))
-       .def("retain_sequence_pages",
-            &WorkerView::RetainSequencePages,
-            py::arg("sequence_id"), py::arg("page_ids"),
-            "Move exact sequence-owned pages into prefix-cache resident "
-            "ownership without changing the worker logical page table.")
-       .def("release_resident_pages", &WorkerView::ReleaseResidentPages,
-            py::arg("page_ids"),
-            "Release prefix-cache resident pages returned by coordinator "
-            "eviction.")
        .def("read_sequence_kv_to_cpu", &WorkerView::ReadSequenceKVToCPU,
             py::arg("sequence_id"),
             "Read all KV pages for a sequence directly to CPU tensors (no GPU). "
@@ -315,23 +296,6 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             "tables. This loads all physical layers; destination pointer "
             "tensors are indexed by physical layer id even for mapped worker "
             "views.")
-        .def(
-            "async_load_prefix_pages_to_device",
-            [](WorkerView& self, torch::Tensor host_page_ids,
-               torch::Tensor active_page_counts,
-               torch::Tensor k_device_ptrs,
-               std::optional<torch::Tensor> v_device_ptrs) {
-                return self.AsyncLoadPrefixPagesToDevice(
-                    std::move(host_page_ids), std::move(active_page_counts),
-                    std::move(k_device_ptrs), std::move(v_device_ptrs));
-            },
-            py::arg("host_page_ids"), py::arg("active_page_counts"),
-            py::arg("k_device_ptrs"),
-            py::arg("v_device_ptrs") = py::none(),
-            "Load prefix-cache Host page ids into pre-allocated GPU pages. "
-            "Unlike async_load_layer_paged_kv_to_device, this reads directly "
-            "from the provided physical Host page ids instead of resolving "
-            "pages through sequence ids.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(
@@ -428,11 +392,51 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
 }
 
 template <typename WorkerView>
+void BindPrefixHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
+    cls.def("attach_shared_prefix_pages",
+            &WorkerView::AttachSharedPrefixPages,
+            py::arg("sequence_id"), py::arg("page_ids"),
+            "Prepend shared prefix Host page ids to a registered sequence's "
+            "logical page table. Ownership remains with the prefix cache.")
+        .def("attach_shared_prefix_pages_for_sequences",
+             &WorkerView::AttachSharedPrefixPagesForSequences,
+             py::arg("sequence_ids"), py::arg("page_ids_by_sequence"),
+             "Prepend shared prefix Host pages for multiple registered "
+             "sequences.")
+        .def("retain_sequence_pages", &WorkerView::RetainSequencePages,
+             py::arg("sequence_id"), py::arg("page_ids"),
+             "Move exact sequence-owned pages into prefix-cache resident "
+             "ownership without changing the worker logical page table.")
+        .def("release_resident_pages", &WorkerView::ReleaseResidentPages,
+             py::arg("page_ids"),
+             "Release prefix-cache resident pages returned by coordinator "
+             "eviction.")
+        .def(
+            "async_load_prefix_pages_to_device",
+            [](WorkerView& self, torch::Tensor host_page_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadPrefixPagesToDevice(
+                    std::move(host_page_ids), std::move(active_page_counts),
+                    std::move(k_device_ptrs), std::move(v_device_ptrs));
+            },
+            py::arg("host_page_ids"), py::arg("active_page_counts"),
+            py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load prefix-cache Host page ids into pre-allocated GPU pages. "
+            "Unlike async_load_layer_paged_kv_to_device, this reads directly "
+            "from the provided physical Host page ids instead of resolving "
+            "pages through sequence ids.");
+}
+
+template <typename WorkerView>
 void BindHostPagedWorkerView(py::module& m, const char* name) {
     auto cls = py::class_<WorkerView>(m, name);
     cls.def(py::init<EngineConfig, ModelConfig>())
         .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"));
     BindCommonHostPagedWorkerViewMethods(cls);
+    BindPrefixHostPagedWorkerViewMethods(cls);
 }
 
 template <typename WorkerView>
