@@ -95,6 +95,17 @@ def test_single_candidate_one_page_short():
     assert plan == []
 
 
+def test_admission_reclaim_target_uses_exact_scheduler_reservation():
+    candidate = _cand("a", prompt=100)
+    request = _req([candidate], [33])
+    required = PrefillScheduler.required_host_pages(candidate, request)
+    assert required == 34
+    assert PrefillScheduler.select_prefill_batch(request) == []
+    assert PrefillScheduler.select_prefill_batch(
+        _req([candidate], [33 + (required - 33)])
+    ) == ["a"]
+
+
 def test_kv_token_budget_caps_capacity():
     # budget 200 → initial_capacity = min(2176, 200) = 200 → req_pages = ceil(200/64)=4
     plan = PrefillScheduler.select_prefill_batch(

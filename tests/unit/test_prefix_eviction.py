@@ -5,6 +5,7 @@ import pytest
 from batchgen.prefix_reuse.eviction import (
     commit_prefix_pages_with_capacity_retry,
     evict_prefix_pages_for_host_allocation,
+    reclaim_prefix_pages_for_host_admission,
 )
 
 
@@ -64,6 +65,28 @@ def test_host_allocation_eviction_fails_when_attachments_protect_pages():
             page_deficit=2,
             max_scan_nodes=16,
         )
+
+
+def test_admission_reclaim_returns_partial_pages_without_failing():
+    coordinator = SimpleNamespace()
+    coordinator.evict_until_releasable_pages = lambda reqs, scan: _eviction(
+        [7], protected=3
+    )
+    core = SimpleNamespace()
+    core.GroupPageRequirement = type("Requirement", (), {})
+    view = _View()
+
+    released = reclaim_prefix_pages_for_host_admission(
+        core_engine_module=core,
+        coordinator=coordinator,
+        worker_views_by_group={0: view},
+        group_id=0,
+        page_target=2,
+        max_scan_nodes=16,
+    )
+
+    assert released == 1
+    assert view.released == [[7]]
 
 
 def test_commit_retries_once_after_capacity_eviction():

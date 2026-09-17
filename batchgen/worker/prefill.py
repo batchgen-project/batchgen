@@ -80,6 +80,26 @@ class PrefillScheduler:
     """Prefill admission decision — pure, deterministic across ranks."""
 
     @staticmethod
+    def required_host_pages(
+        candidate: PrefillCandidate, req: PrefillSelectionRequest
+    ) -> int:
+        """Return the same initial Host-KV reservation used by admission."""
+        post_prefill_length = candidate.prompt_length + 1
+        gpu_initial_pages = (
+            math.ceil(post_prefill_length / candidate.page_size)
+            + req.initial_gpu_page_buffer
+        )
+        gpu_initial_tokens = gpu_initial_pages * candidate.page_size
+        initial_capacity = max(
+            candidate.prompt_length + req.chunk_size, gpu_initial_tokens
+        )
+        initial_capacity = min(initial_capacity, candidate.kv_token_budget)
+        return (
+            math.ceil(initial_capacity / candidate.page_size)
+            * candidate.host_kv_replication_factor
+        )
+
+    @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:
         """Select which candidate sequences to prefill, bounded by host KV.
 
@@ -167,18 +187,7 @@ class PrefillScheduler:
                     f"candidate {c.uuid} has invalid host_kv_replication_factor="
                     f"{c.host_kv_replication_factor}"
                 )
-            post_prefill_length = c.prompt_length + 1
-            gpu_initial_pages = (
-                math.ceil(post_prefill_length / c.page_size)
-                + req.initial_gpu_page_buffer
-            )
-            gpu_initial_tokens = gpu_initial_pages * c.page_size
-            initial_capacity = max(c.prompt_length + req.chunk_size, gpu_initial_tokens)
-            initial_capacity = min(initial_capacity, c.kv_token_budget)
-            req_pages = (
-                math.ceil(initial_capacity / c.page_size)
-                * c.host_kv_replication_factor
-            )
+            req_pages = PrefillScheduler.required_host_pages(c, req)
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
