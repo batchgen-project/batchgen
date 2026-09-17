@@ -318,6 +318,10 @@ class _FakeDsaSegment:
         self.release_calls.append(bucket_size)
 
 
+class _FakeReuseDsaSegment(_FakeDsaSegment):
+    aux_blocked_k = None
+
+
 def test_glm5_layer_graph_segment_static_contract_and_delegation():
     dsa = _FakeDsaSegment()
     segment = Glm5DecoderLayerGraphSegment(
@@ -358,6 +362,21 @@ def test_glm5_layer_graph_segment_static_contract_and_delegation():
     assert dsa.init_calls == [2]
     assert dsa.release_calls == [2]
     assert static_inputs["rank_token_counts"].tolist() == [1] * 16
+
+
+def test_glm52_reuse_layer_graph_segment_omits_indexer_output():
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=_FakeReuseDsaSegment(),
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+    )
+
+    outputs = segment.get_static_output_specs(bucket_size=2)
+
+    assert outputs["primary_k_tensor"].resolve_shape(2) == (2, 1, 1, 6)
+    assert "indexer_k_tensor" not in outputs
 
 
 def test_glm5_layer_graph_segment_empty_rank_capture_context():
