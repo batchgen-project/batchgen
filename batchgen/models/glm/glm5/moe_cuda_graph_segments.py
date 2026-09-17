@@ -28,11 +28,30 @@ from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
 
 logger = logging.getLogger(__name__)
 
+_fp8_ops_module = None
+
+
+def _require_fp8_ops_module():
+    global _fp8_ops_module
+    if _fp8_ops_module is not None:
+        return _fp8_ops_module
+
+    import batchgen_kernels
+
+    module = batchgen_kernels.load_extension(
+        "batchgen_kernels.moe._C_fp8_blockwise_ops"
+    )
+    if not hasattr(module, "act_quant_3d"):
+        raise RuntimeError(
+            "batchgen_kernels.moe._C_fp8_blockwise_ops has no "
+            "act_quant_3d; rebuild batchgen_kernels"
+        )
+    _fp8_ops_module = module
+    return module
+
 
 def _act_quant_3d(x: torch.Tensor, seqlens: torch.Tensor):
-    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d
-
-    return act_quant_3d(x, seqlens)
+    return _require_fp8_ops_module().act_quant_3d(x, seqlens)
 
 
 def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
