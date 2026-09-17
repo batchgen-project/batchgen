@@ -8829,11 +8829,26 @@ class BatchGenWorker:
 						materialize_gpt_oss_prefixes,
 					)
 
-					temporary_manager = GPUPagedKVCacheManager(
-						config=build_gpu_kv_config(
-							self.huggingface_ckpt_name,
-							batch_full_seq_lengths,
+					host_page_tokens = int(
+						self.prefix_cache_runtime_config.group_specs[0]
+						.raw_page_tokens
+					)
+					gpu_config = build_gpu_kv_config(
+						self.huggingface_ckpt_name,
+						batch_full_seq_lengths,
+					)
+					fa_page_tokens = max(256, int(gpu_config.page_size_tokens))
+					fa_page_tokens = math.ceil(fa_page_tokens / 256) * 256
+					gpu_config = replace(
+						gpu_config,
+						num_pages=sum(
+							math.ceil(max(1, int(tokens)) / fa_page_tokens)
+							for tokens in batch_full_seq_lengths
 						),
+						page_size_tokens=fa_page_tokens,
+					)
+					temporary_manager = GPUPagedKVCacheManager(
+						config=gpu_config,
 						device=self.local_rank,
 					)
 					temporary_manager.initialize()
@@ -8849,10 +8864,7 @@ class BatchGenWorker:
 						),
 						prompt_lengths=batch_full_seq_lengths,
 						compute_cached_tokens=batch_compute_cached,
-						raw_page_tokens=(
-							self.prefix_cache_runtime_config.group_specs[0]
-							.raw_page_tokens
-						),
+						raw_page_tokens=host_page_tokens,
 					)
 					self._active_prefix_materializations.append(
 						prefix_materialization

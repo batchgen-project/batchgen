@@ -22,7 +22,14 @@ class _Task:
 
 class _Manager:
     def __init__(self, page_size=4):
-        self.config = SimpleNamespace(page_size_tokens=page_size)
+        self.config = SimpleNamespace(
+            page_size_tokens=page_size,
+            num_k_heads=1,
+            k_head_dim=2,
+            num_v_heads=1,
+            v_head_dim=2,
+            kv_dtype=torch.bfloat16,
+        )
         self.allocated = None
         self.rebuilt = None
         self.destroyed = False
@@ -39,8 +46,8 @@ class _Manager:
         return self.plan
 
     def get_padded_3d_page_pointers(self):
-        return torch.tensor([[11, 12], [21, 22]]), torch.tensor(
-            [[31, 32], [41, 42]]
+        return torch.tensor([[[100, 200], [300, 400]]]), torch.tensor(
+            [[[500, 600], [700, 800]]]
         )
 
     def destroy(self, *, empty_cuda_cache=False):
@@ -115,10 +122,31 @@ def test_materializes_mixed_hit_and_miss_and_releases_load_protection():
     assert manager.empty_cuda_cache
 
 
-def test_materialization_rejects_host_gpu_page_size_mismatch():
-    with pytest.raises(RuntimeError, match="equal Host/GPU page sizes"):
+def test_materialization_maps_host_pages_into_larger_gpu_pages():
+    manager = _Manager(page_size=8)
+    host = _Host()
+
+    materialization = materialize_gpt_oss_prefixes(
+        gpu_manager=manager,
+        host_worker_view=host,
+        coordinator=_Coordinator(),
+        lookup_results=[_lookup(1, [7, 8, 9])],
+        sequence_ids=[11],
+        prompt_lengths=[13],
+        compute_cached_tokens=[12],
+        raw_page_tokens=4,
+    )
+
+    # One Host page is 4 tokens * 1 head * dim 2 * bf16 = 16 bytes.
+    assert host.kwargs["k_device_ptrs"].tolist() == [[[100, 116, 200]]]
+    assert host.kwargs["v_device_ptrs"].tolist() == [[[500, 516, 600]]]
+    materialization.close()
+
+
+def test_materialization_rejects_non_multiple_page_sizes():
+    with pytest.raises(ValueError, match="must be a multiple"):
         materialize_gpt_oss_prefixes(
-            gpu_manager=_Manager(page_size=8),
+            gpu_manager=_Manager(page_size=6),
             host_worker_view=_Host(),
             coordinator=_Coordinator(),
             lookup_results=[_lookup(1, [7])],

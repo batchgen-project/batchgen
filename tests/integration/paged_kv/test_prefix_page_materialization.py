@@ -12,6 +12,9 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVConfig,
 )
 from batchgen.models.engine_loader import core_engine as bg
+from batchgen.prefix_reuse.materialization import (
+    _expand_device_ptrs_for_host_pages,
+)
 
 
 _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -49,11 +52,11 @@ def _host_config(shm_name: str) -> bg.HostPagedKVConfig:
     return cfg
 
 
-def _gpu_config() -> GPUPagedKVConfig:
+def _gpu_config(page_size_tokens: int) -> GPUPagedKVConfig:
     return GPUPagedKVConfig(
         num_layers=2,
         num_pages=16,
-        page_size_tokens=4,
+        page_size_tokens=page_size_tokens,
         num_k_heads=1,
         k_head_dim=2,
         num_v_heads=1,
@@ -84,7 +87,8 @@ def _read_sequence_tokens(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_async_load_prefix_pages_to_device_uses_host_page_ids():
+@pytest.mark.parametrize("gpu_page_size", [4, 8])
+def test_async_load_prefix_pages_to_device_uses_host_page_ids(gpu_page_size):
     shm_name = _random_shm_name()
     source_seq = 101
     target_seq = 202
@@ -129,7 +133,7 @@ def test_async_load_prefix_pages_to_device_uses_host_page_ids():
             task.wait()
 
         gpu_manager = GPUPagedKVCacheManager(
-            config=_gpu_config(),
+            config=_gpu_config(gpu_page_size),
             device=device,
         )
         gpu_manager.initialize()
@@ -137,6 +141,13 @@ def test_async_load_prefix_pages_to_device_uses_host_page_ids():
         gpu_manager.rebuild_page_table([target_seq])
         k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
         active_page_counts = torch.tensor([prefix_pages], dtype=torch.int64)
+        k_ptrs, v_ptrs = _expand_device_ptrs_for_host_pages(
+            gpu_manager=gpu_manager,
+            k_device_ptrs=k_ptrs,
+            v_device_ptrs=v_ptrs,
+            active_page_counts=active_page_counts,
+            host_page_tokens=page_size,
+        )
         host_page_ids = torch.tensor(
             [host_pages[:prefix_pages]],
             dtype=torch.int64,

@@ -67,13 +67,9 @@ def materialize_gpt_oss_prefixes(
     if count == 0:
         raise ValueError("prefix materialization requires at least one sequence")
 
-    gpu_page_tokens = int(gpu_manager.config.page_size_tokens)
     host_page_tokens = int(raw_page_tokens)
-    if gpu_page_tokens != host_page_tokens:
-        raise RuntimeError(
-            "GPT-OSS prefix materialization requires equal Host/GPU page sizes: "
-            f"host={host_page_tokens}, gpu={gpu_page_tokens}"
-        )
+    if host_page_tokens <= 0:
+        raise ValueError("raw_page_tokens must be positive")
 
     prefix_lens = [int(value) for value in compute_cached_tokens]
     full_lens = [int(value) for value in prompt_lengths]
@@ -136,6 +132,13 @@ def materialize_gpt_oss_prefixes(
     host_page_ids = torch.tensor(host_rows, dtype=torch.int64)
     active_page_counts = torch.tensor(page_counts, dtype=torch.int64)
     k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+    k_ptrs, v_ptrs = _expand_device_ptrs_for_host_pages(
+        gpu_manager=gpu_manager,
+        k_device_ptrs=k_ptrs,
+        v_device_ptrs=v_ptrs,
+        active_page_counts=active_page_counts,
+        host_page_tokens=host_page_tokens,
+    )
 
     begun: list[int] = []
     try:
@@ -161,3 +164,106 @@ def materialize_gpt_oss_prefixes(
         coordinator=coordinator,
         attachment_handles=tuple(begun),
     )
+
+
+def _expand_device_ptrs_for_host_pages(
+    *,
+    gpu_manager: object,
+    k_device_ptrs: torch.Tensor,
+    v_device_ptrs: torch.Tensor | None,
+    active_page_counts: torch.Tensor,
+    host_page_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Map smaller Host pages into byte ranges within GPU FA pages."""
+
+    gpu_page_tokens = int(gpu_manager.config.page_size_tokens)
+    host_page_tokens = int(host_page_tokens)
+    if host_page_tokens <= 0 or gpu_page_tokens <= 0:
+        raise ValueError("Host and GPU page sizes must be positive")
+    if host_page_tokens == gpu_page_tokens:
+        return k_device_ptrs, v_device_ptrs
+    if host_page_tokens > gpu_page_tokens or gpu_page_tokens % host_page_tokens:
+        raise ValueError(
+            "GPU page size must be a multiple of Host page size for prefix "
+            f"materialization, got gpu={gpu_page_tokens}, "
+            f"host={host_page_tokens}"
+        )
+
+    pages_per_gpu_page = gpu_page_tokens // host_page_tokens
+    k_page_bytes = _host_page_bytes(
+        gpu_manager=gpu_manager,
+        host_page_tokens=host_page_tokens,
+        is_value=False,
+    )
+    expanded_k = _expand_pointer_tensor_for_host_pages(
+        k_device_ptrs,
+        active_page_counts=active_page_counts,
+        host_page_bytes=k_page_bytes,
+        host_pages_per_gpu_page=pages_per_gpu_page,
+    )
+
+    expanded_v = None
+    if v_device_ptrs is not None:
+        v_page_bytes = _host_page_bytes(
+            gpu_manager=gpu_manager,
+            host_page_tokens=host_page_tokens,
+            is_value=True,
+        )
+        expanded_v = _expand_pointer_tensor_for_host_pages(
+            v_device_ptrs,
+            active_page_counts=active_page_counts,
+            host_page_bytes=v_page_bytes,
+            host_pages_per_gpu_page=pages_per_gpu_page,
+        )
+    return expanded_k, expanded_v
+
+
+def _host_page_bytes(
+    *,
+    gpu_manager: object,
+    host_page_tokens: int,
+    is_value: bool,
+) -> int:
+    config = gpu_manager.config
+    if is_value:
+        heads = int(config.num_v_heads)
+        head_dim = int(config.v_head_dim)
+    else:
+        heads = int(config.num_k_heads)
+        head_dim = int(config.k_head_dim)
+    element_size = torch.empty((), dtype=config.kv_dtype).element_size()
+    return int(host_page_tokens) * heads * head_dim * element_size
+
+
+def _expand_pointer_tensor_for_host_pages(
+    pointer_tensor: torch.Tensor,
+    *,
+    active_page_counts: torch.Tensor,
+    host_page_bytes: int,
+    host_pages_per_gpu_page: int,
+) -> torch.Tensor:
+    max_host_pages = int(active_page_counts.max().item())
+    if max_host_pages == 0:
+        return pointer_tensor[:, :, :0].contiguous()
+
+    host_slots = torch.arange(max_host_pages, dtype=torch.long)
+    gpu_slots = torch.div(
+        host_slots,
+        int(host_pages_per_gpu_page),
+        rounding_mode="floor",
+    )
+    if int(gpu_slots[-1].item()) >= int(pointer_tensor.shape[2]):
+        raise ValueError(
+            "GPU page pointer tensor is too small for Host prefix pages: "
+            f"host_pages={max_host_pages}, "
+            f"host_pages_per_gpu_page={host_pages_per_gpu_page}, "
+            f"gpu_pointer_pages={pointer_tensor.shape[2]}"
+        )
+    offsets = (
+        torch.remainder(host_slots, int(host_pages_per_gpu_page)).to(
+            dtype=torch.int64
+        )
+        * int(host_page_bytes)
+    )
+    expanded = pointer_tensor.index_select(2, gpu_slots).contiguous()
+    return expanded + offsets.view(1, 1, -1)
