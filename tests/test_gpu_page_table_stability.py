@@ -20,12 +20,16 @@ def _load_gpu_manager_module():
 
     previous_config_pkg = sys.modules.get("batchgen.config")
     previous_config_module = sys.modules.get("batchgen.config.config")
+    previous_kv_cache_pkg = sys.modules.get("batchgen.kv_cache")
     previous_gpu_kv_kernels = sys.modules.get("batchgen.kv_cache.gpu_kv_kernels")
     config_pkg = types.ModuleType("batchgen.config")
     config_pkg.__path__ = [str(repo_root / "batchgen" / "config")]
     config_pkg.config = config_module
     sys.modules["batchgen.config"] = config_pkg
     sys.modules["batchgen.config.config"] = config_module
+    kv_cache_pkg = types.ModuleType("batchgen.kv_cache")
+    kv_cache_pkg.__path__ = [str(repo_root / "batchgen" / "kv_cache")]
+    sys.modules["batchgen.kv_cache"] = kv_cache_pkg
     gpu_kv_kernels = types.ModuleType("batchgen.kv_cache.gpu_kv_kernels")
 
     def _unused_gpu_kernel(*args, **kwargs):
@@ -53,6 +57,10 @@ def _load_gpu_manager_module():
             sys.modules.pop("batchgen.config.config", None)
         else:
             sys.modules["batchgen.config.config"] = previous_config_module
+        if previous_kv_cache_pkg is None:
+            sys.modules.pop("batchgen.kv_cache", None)
+        else:
+            sys.modules["batchgen.kv_cache"] = previous_kv_cache_pkg
         if previous_gpu_kv_kernels is None:
             sys.modules.pop("batchgen.kv_cache.gpu_kv_kernels", None)
         else:
@@ -172,6 +180,28 @@ def test_clear_page_table_preserves_graph_storage_and_active_empty_api():
     assert torch.all(cleared_graph_state.table == -1)
     assert cleared_graph_state.slot_indices.numel() == 0
     assert cleared_graph_state.slot_to_seq_id.numel() == 0
+
+
+def test_reset_allocations_preserves_cache_and_graph_storage():
+    manager = _make_manager(num_pages=8)
+    manager.allocate_pages_for_sequences([10, 20], [8, 4])
+    manager.rebuild_page_table([10, 20])
+    k_cache, _ = manager.get_kv_tensors()
+    k_cache.fill_(7)
+    cache_ptr = k_cache.data_ptr()
+    graph_ptr = manager.get_cuda_graph_page_table().data_ptr()
+
+    manager.reset_allocations()
+
+    reset_cache, _ = manager.get_kv_tensors()
+    state = manager.get_cuda_graph_page_table_state()
+    assert reset_cache.data_ptr() == cache_ptr
+    assert state.table.data_ptr() == graph_ptr
+    assert manager._sequences == {}
+    assert manager.get_stats().num_free_pages == manager.config.num_pages
+    assert state.num_valid_slots == 0
+    assert torch.count_nonzero(reset_cache).item() == 0
+    assert torch.all(state.table == -1)
 
 
 def test_rebuild_and_clear_accept_inference_created_page_tables():

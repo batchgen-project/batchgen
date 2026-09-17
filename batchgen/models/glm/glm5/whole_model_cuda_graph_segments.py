@@ -184,38 +184,36 @@ class Glm5WholeModelSegment:
             raise ValueError(
                 f"bucket_size {bucket_size} exceeds max_bucket_size {self.max_bucket_size}"
             )
-        if self._kv_buffers is not None and self._aux_kv_buffers is not None:
-            return
-
-        alloc_size = self.max_bucket_size
-        self._kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.primary_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._aux_kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.aux_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._kv_buffers = [
-            {"key": self._kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self._aux_kv_buffers = [
-            {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self.primary_kv_offload_buffers = self._kv_buffers
-        self.aux_kv_offload_buffers = self._aux_kv_buffers
+        if self._kv_buffers is None or self._aux_kv_buffers is None:
+            alloc_size = self.max_bucket_size
+            self._kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.primary_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._aux_kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.aux_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._kv_buffers = [
+                {"key": self._kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self._aux_kv_buffers = [
+                {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self.primary_kv_offload_buffers = self._kv_buffers
+            self.aux_kv_offload_buffers = self._aux_kv_buffers
         for layer_segment in self.layer_segments:
             setup = getattr(layer_segment, "setup_static_buffers", None)
             if setup is not None:
@@ -358,7 +356,11 @@ class Glm5WholeModelSegment:
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
-                self._copy_aux_kv(layer_idx, graph_out["indexer_k_tensor"], None)
+                # GLM-5.2 skip layers have no indexer KV (reuse-topk segments
+                # return no indexer_k_tensor).
+                _indexer_k = graph_out.get("indexer_k_tensor")
+                if _indexer_k is not None:
+                    self._copy_aux_kv(layer_idx, _indexer_k, None)
                 if layer_idx in self._compare_probe_layer_set:
                     outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
         else:
