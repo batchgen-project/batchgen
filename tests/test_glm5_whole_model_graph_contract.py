@@ -1,6 +1,7 @@
 import torch
 import pytest
 
+import batchgen.models.glm.glm5.moe_cuda_graph_segments as glm5_moe_graph
 from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
     Glm5DecoderLayerGraphSegment,
     make_glm5_layer_graph_segment_name,
@@ -37,6 +38,34 @@ class _FakeInnerModel:
 
 class _FakeModel:
     model = _FakeInnerModel()
+
+
+def test_glm5_moe_graph_loads_fp8_ops_through_shared_loader_once(monkeypatch):
+    import batchgen_kernels
+
+    calls = []
+
+    class _FakeFp8Ops:
+        @staticmethod
+        def act_quant_3d(x, seqlens):
+            calls.append((x, seqlens))
+            return "quantized"
+
+    loads = []
+
+    def _load_extension(name):
+        loads.append(name)
+        return _FakeFp8Ops()
+
+    monkeypatch.setattr(batchgen_kernels, "load_extension", _load_extension)
+    monkeypatch.setattr(glm5_moe_graph, "_fp8_ops_module", None)
+    x = object()
+    seqlens = object()
+
+    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
+    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
+    assert loads == ["batchgen_kernels.moe._C_fp8_blockwise_ops"]
+    assert calls == [(x, seqlens), (x, seqlens)]
 
 
 def _make_segment(**kwargs):
