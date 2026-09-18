@@ -237,7 +237,7 @@ def test_parent_close_does_not_unlock_child_open_file_description(tmp_path):
         lane_runtime._close_fd(child_fd)
 
 
-def test_pid_identity_uses_boot_id_start_time_and_process_group(
+def test_pid_identity_uses_boot_id_start_time_group_and_command(
     tmp_path, monkeypatch
 ):
     proc_root = tmp_path / "proc"
@@ -248,15 +248,28 @@ def test_pid_identity_uses_boot_id_start_time_and_process_group(
     prefix = "123 (batchgen worker) "
     fields = ["S"] + ["0"] * 18 + ["987"] + ["0"] * 4
     (pid_dir / "stat").write_text(prefix + " ".join(fields))
+    command = [
+        "/usr/bin/python3", "-m", "batchgen.launch_http_server",
+        "--instance-id", "lane-0",
+    ]
+    (pid_dir / "cmdline").write_bytes(
+        b"\0".join(arg.encode() for arg in command) + b"\0"
+    )
     monkeypatch.setattr(lane_runtime.os, "getpgid", lambda pid: 456)
     manifest = {
         "pid": 123,
         "boot_id": "boot-a",
         "pid_start_time": 987,
         "process_group": 456,
+        "command": command,
     }
 
     assert lane_runtime._pid_identity_matches(manifest, proc_root)
+    manifest["command"] = [*command[:-1], "lane-1"]
+    assert not lane_runtime._pid_identity_matches(manifest, proc_root)
+    manifest.pop("command")
+    assert not lane_runtime._pid_identity_matches(manifest, proc_root)
+    manifest["command"] = command
     manifest["pid_start_time"] = 988
     assert not lane_runtime._pid_identity_matches(manifest, proc_root)
 
@@ -309,10 +322,8 @@ def test_pidfd_owner_change_after_open_refuses_signal(monkeypatch):
     reason="Linux pidfd APIs are required",
 )
 def test_pidfd_signals_only_the_verified_process():
-    process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        start_new_session=True,
-    )
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+    process = subprocess.Popen(command, start_new_session=True)
     pidfd = None
     try:
         manifest = {
@@ -320,7 +331,13 @@ def test_pidfd_signals_only_the_verified_process():
             "boot_id": lane_runtime._boot_id(),
             "pid_start_time": lane_runtime._proc_start_time(process.pid),
             "process_group": os.getpgid(process.pid),
+            "command": command,
         }
+        with pytest.raises(lane_runtime.LaneError, match="identity changed"):
+            lane_runtime._open_verified_owner_pidfd(
+                {**manifest, "command": [*command[:-1], "import time; time.sleep(59)"]}
+            )
+        assert process.poll() is None
         pidfd = lane_runtime._open_verified_owner_pidfd(manifest)
         lane_runtime._signal_pidfd(pidfd, lane_runtime.signal.SIGTERM)
         assert process.wait(timeout=5) == -lane_runtime.signal.SIGTERM
