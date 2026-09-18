@@ -778,7 +778,14 @@ def stop_lane(args: argparse.Namespace) -> dict[str, Any]:
 
     temp_root = Path(manifest["paths"]["temp"])
     runtime_dirs = list(temp_root.glob(f"batchgen_{args.instance_id}_*"))
-    shm_objects = list(Path("/dev/shm").glob(f"batchgen_{args.instance_id}_*"))
+    shm_name = re.compile(
+        rf"batchgen_{re.escape(args.instance_id)}_[0-9a-f]{{32}}\."
+    )
+    shm_objects = [
+        path
+        for path in Path("/dev/shm").glob(f"batchgen_{args.instance_id}_*")
+        if shm_name.match(path.name)
+    ]
     gpu_processes = [
         (uuid, process_pid)
         for uuid, process_pid in _gpu_processes()

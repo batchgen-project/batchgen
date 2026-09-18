@@ -625,6 +625,49 @@ def test_verify_rejects_foreign_process_only_on_assigned_gpu(tmp_path, monkeypat
     assert lane_runtime._read_json(state_path) == manifest
 
 
+@pytest.mark.parametrize("same_lane", [False, True])
+def test_dead_lane_closeout_matches_only_exact_instance_shm(
+    tmp_path, monkeypatch, same_lane
+):
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    shm_name = (
+        f"batchgen_lane_{'a' * 32}.host_kv"
+        if same_lane
+        else f"batchgen_lane_{'a' * 32}_b_{'b' * 32}.host_kv"
+    )
+    shm_object = shm_dir / shm_name
+    shm_object.touch()
+    state_root = tmp_path / "state"
+    manifest = _candidate("lane")
+    manifest.update(
+        {
+            "state": "admitted",
+            "process_group": 456,
+            "paths": {"temp": str(tmp_path / "lane-tmp")},
+        }
+    )
+    lane_runtime._atomic_json(state_root / "lane.json", manifest)
+    real_path = Path
+    monkeypatch.setattr(
+        lane_runtime,
+        "Path",
+        lambda value: shm_dir if value == "/dev/shm" else real_path(value),
+    )
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_process_group_exists", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_gpu_processes", lambda: [])
+    args = SimpleNamespace(state_root=state_root, instance_id="lane")
+
+    if same_lane:
+        with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
+            lane_runtime.stop_lane(args)
+        assert lane_runtime._read_json(state_root / "lane.json")["state"] == "failed"
+    else:
+        assert lane_runtime.stop_lane(args)["state"] == "stopped"
+    assert shm_object.exists()
+
+
 def test_prepare_paths_pins_both_packages_to_one_worktree(tmp_path):
     worktree = tmp_path / "worktree"
     (worktree / "batchgen").mkdir(parents=True)
