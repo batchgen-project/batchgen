@@ -162,11 +162,90 @@ def test_http_shutdown_has_no_host_global_cleanup_fallback():
     assert "clean_hugepages=True" not in http_source
     assert "if self._runtime_namespace_owned:" in manager_source
     assert "shm_prefix=(" in manager_source
-    assert "self.args.runtime_identity.resource_prefix" in manager_source
+    assert "self.args.runtime_identity.shm_prefix" in manager_source
     assert "kill_workers=False" in manager_source
     assert http_source.index("worker._acquire_runtime_admission()") < (
         http_source.index("StorageManager(server_args.storage_path)")
     )
+
+
+def test_runtime_namespace_preflight_does_not_claim_longer_instance_id(tmp_path):
+    run_id = "a" * 32
+    prefix = f"batchgen_lane_{run_id}"
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    neighbor = shm_dir / f"{prefix}_b_{'b' * 32}_host_kv"
+    neighbor.touch()
+    runtime_dir = tmp_path / "runtime"
+    manager_type = _worker_manager_method(
+        "_prepare_runtime_dir",
+        {"Path": lambda value: shm_dir if value == "/dev/shm" else Path(value)},
+    )
+    manager = manager_type()
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(
+            shm_prefix=f"{prefix}.", runtime_dir=runtime_dir
+        )
+    )
+    manager._runtime_dir_created = False
+    manager._runtime_namespace_owned = False
+
+    manager._prepare_runtime_dir()
+
+    assert manager._runtime_namespace_owned
+    assert neighbor.exists()
+
+
+def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
+    run_id = "a" * 32
+    prefix = f"batchgen_lane_{run_id}"
+    own = tmp_path / f"{prefix}.host_kv"
+    neighbor = tmp_path / f"{prefix}_b_{'b' * 32}.host_kv"
+    own.touch()
+    neighbor.touch()
+
+    def cleanup_resources(*, shm_prefix, **kwargs):
+        for entry in tmp_path.iterdir():
+            if entry.name.startswith(shm_prefix):
+                entry.unlink()
+
+    fake_logger = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+    manager_type = _worker_manager_method(
+        "stop",
+        {
+            "cleanup_resources": cleanup_resources,
+            "cleanup_model_shm_files": lambda model_info: None,
+            "logger": fake_logger,
+        },
+    )
+    manager = manager_type()
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(
+            shm_prefix=f"{prefix}.", runtime_dir=tmp_path / "unused"
+        )
+    )
+    manager._stopping = False
+    manager.started = True
+    manager._runtime_dir_created = False
+    manager._runtime_namespace_owned = True
+    manager._runtime_locks = None
+    manager._lane_lease = None
+    manager.worker_process = None
+    manager.distributed_weight_daemon = None
+    manager.model_info = {}
+    manager.skeleton_state_dict_file = None
+    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
+    manager._monitor_thread = None
+    manager._hugepages_enabled = False
+    manager._cleanup_skeleton_state_dict_file = lambda: None
+
+    manager.stop()
+
+    assert not own.exists()
+    assert neighbor.exists()
 
 
 def test_worker_start_rolls_back_partial_startup_before_reraising():
@@ -231,7 +310,7 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     manager._cleanup_skeleton_state_dict_file = lambda: None
     manager.args = SimpleNamespace(
         runtime_identity=SimpleNamespace(
-            resource_prefix="batchgen_lane-0_run",
+            shm_prefix="batchgen_lane-0_run.",
             runtime_dir=tmp_path / "runtime",
         )
     )
