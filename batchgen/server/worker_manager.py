@@ -5,14 +5,14 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import pickle
 import signal
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import psutil
 
 import torch
 import torch.multiprocessing as mp
@@ -24,6 +24,7 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
+    cleanup_model_shm_files,
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
@@ -183,7 +184,7 @@ class WorkerManager:
         runtime_dir.mkdir(mode=0o700, exist_ok=False)
         self._runtime_dir_created = True
         shm_dir = Path("/dev/shm")
-        prefix = self.args.runtime_identity.resource_prefix
+        prefix = self.args.runtime_identity.shm_prefix
         if shm_dir.is_dir() and any(
             entry.name.startswith(prefix) for entry in shm_dir.iterdir()
         ):
@@ -321,6 +322,7 @@ class WorkerManager:
                 self.worker_process is not None,
                 self.distributed_weight_daemon is not None,
                 bool(self.model_info.get("shm_name")),
+                bool(self.model_info.get("tensor_meta_shm_name")),
                 self.skeleton_state_dict_file is not None,
             )
         )
@@ -344,66 +346,8 @@ class WorkerManager:
             if self.distributed_weight_daemon is not None:
                 self.distributed_weight_daemon.prepare_stop()
 
-            # Collect worker PIDs before sending shutdown signal
-            worker_pids = self._get_worker_pids()
-
-            # Send SIGTERM to workers immediately for faster shutdown
-            # This is critical for Node 1 workers that may be blocked in NCCL
-            # waiting for Node 0 (which may already be shutting down)
-            if worker_pids:
-                logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
-                for pid in worker_pids:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        pass  # Process already exited
-
-            # Also send poison pill in case workers are not blocked in NCCL
             if self.worker_process is not None:
-                try:
-                    self.request_queue.put(None)
-                except Exception:
-                    logger.warning("Failed to signal worker shutdown", exc_info=True)
-
-            # Wait for workers to exit (reduced timeout for interactive use)
-            workers_joined = False
-            if self.worker_process is not None:
-                try:
-                    with self._join_lock:
-                        self.worker_process.join(timeout=5)  # Reduced from 30s
-                    workers_joined = not any(
-                        psutil.pid_exists(pid) for pid in worker_pids
-                    )
-                except Exception:
-                    logger.warning("Failed to join worker process", exc_info=True)
-
-            # Force-kill workers that didn't exit after SIGTERM
-            if not workers_joined and worker_pids:
-                logger.warning(
-                    "Workers did not exit gracefully, force-killing..."
-                )
-                for pid in worker_pids:
-                    try:
-                        proc = psutil.Process(pid)
-                        proc.kill()
-                        proc.wait(timeout=5)
-                        logger.info(f"Force-killed worker process {pid}")
-                    except psutil.NoSuchProcess:
-                        pass
-                    except Exception:
-                        logger.warning(
-                            "Failed to force-kill worker process %d",
-                            pid,
-                            exc_info=True,
-                        )
-            surviving_pids = [
-                pid for pid in worker_pids if psutil.pid_exists(pid)
-            ]
-            if surviving_pids:
-                raise RuntimeError(
-                    "worker teardown left live owned PIDs; preserving runtime "
-                    f"artifacts for investigation: {surviving_pids}"
-                )
+                self._stop_workers()
             worker_teardown_safe = True
 
             if self.distributed_weight_daemon is not None:
@@ -415,19 +359,21 @@ class WorkerManager:
                 # model-weight region predates RuntimeIdentity and has its own
                 # UUID name.
                 if worker_teardown_safe:
-                    shm_name = self.model_info.get("shm_name")
                     if self._runtime_namespace_owned:
                         cleanup_resources(
                             shm_prefix=(
-                                self.args.runtime_identity.resource_prefix
+                                self.args.runtime_identity.shm_prefix
                             ),
                             clean_hugepages=self._hugepages_enabled,
                             kill_workers=False,  # Already handled above
                         )
-                    if shm_name:
-                        from batchgen.server.process_utils import cleanup_shm_files
-                        cleanup_shm_files(shm_name)
+                    if self.parameter_server_instance is not None:
+                        cleanup_model_shm_files(self.model_info)
+                    else:
+                        # Remote parameter servers and distributed stores own
+                        # their names; this worker only borrowed them.
                         self.model_info.pop("shm_name", None)
+                        self.model_info.pop("tensor_meta_shm_name", None)
 
                     self._cleanup_skeleton_state_dict_file()
                     runtime_dir = self.args.runtime_identity.runtime_dir
@@ -461,18 +407,59 @@ class WorkerManager:
                         "WorkerManager stop incomplete; admission locks remain held"
                     )
 
-    def _get_worker_pids(self) -> List[int]:
-        """Get PIDs of all worker processes."""
-        pids = []
-        if self.worker_process is None:
-            return pids
-        processes = getattr(self.worker_process, "processes", None)
+    def _stop_workers(self) -> None:
+        """Signal only the original child processes, never a reused numeric PID."""
+        processes = self.worker_process.processes
         if not processes:
-            return pids
-        for proc in processes:
-            if proc.pid is not None:
-                pids.append(proc.pid)
-        return pids
+            raise RuntimeError("worker process context has no child processes")
+        pidfds = []
+        with self._join_lock:
+            try:
+                # An unjoined child cannot have its PID reused. Open handles
+                # before joining; the handles remain bound to these children.
+                for proc in processes:
+                    if proc.exitcode is None:
+                        pidfds.append((proc, os.pidfd_open(proc.pid)))
+
+                for _, pidfd in pidfds:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    self.request_queue.put(None)
+                except Exception:
+                    logger.warning("Failed to signal worker shutdown", exc_info=True)
+
+                deadline = time.monotonic() + 5
+                for proc in processes:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                remaining = [
+                    (proc, fd) for proc, fd in pidfds if proc.exitcode is None
+                ]
+                if remaining:
+                    logger.warning("Workers did not exit gracefully, force-killing...")
+                for _, pidfd in remaining:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                deadline = time.monotonic() + 5
+                for proc, _ in remaining:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                surviving_pids = [
+                    proc.pid for proc in processes if proc.exitcode is None
+                ]
+                if surviving_pids:
+                    raise RuntimeError(
+                        "worker teardown left live owned PIDs; preserving runtime "
+                        f"artifacts for investigation: {surviving_pids}"
+                    )
+            finally:
+                for _, pidfd in pidfds:
+                    os.close(pidfd)
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
@@ -897,7 +884,8 @@ class WorkerManager:
                 return
             try:
                 with self._join_lock:
-                    self.worker_process.join(timeout=self._monitor_interval_s)
+                    for proc in self.worker_process.processes:
+                        proc.join(timeout=0)
             except Exception as exc:
                 if self._stopping:
                     return
@@ -915,6 +903,7 @@ class WorkerManager:
                 logger.error(exit_reason)
                 self._handle_worker_failure(exit_reason, None)
                 return
+            self._monitor_stop_event.wait(self._monitor_interval_s)
 
     def _collect_worker_exit_reason(self) -> Optional[str]:
         if self.worker_process is None:
@@ -923,10 +912,19 @@ class WorkerManager:
         if not processes:
             return None
         exited = []
+        error_files = getattr(self.worker_process, "error_files", ())
         for idx, proc in enumerate(processes):
             if proc.exitcode is None:
                 continue
-            exited.append(f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}")
+            detail = f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}"
+            if (
+                idx < len(error_files)
+                and error_files[idx]
+                and os.path.isfile(error_files[idx])
+            ):
+                with open(error_files[idx], "rb") as error_file:
+                    detail += " Python traceback:\n" + pickle.load(error_file)
+            exited.append(detail)
         if not exited:
             return None
         return "Detected worker process exit: " + ", ".join(exited)

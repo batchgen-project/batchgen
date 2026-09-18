@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import psutil
 
@@ -230,6 +230,39 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
     if removed > 0:
         logger.info(f"Cleaned up {removed} shared memory files from /dev/shm")
 
+    return removed
+
+
+def cleanup_model_shm_files(
+    model_info: Dict[str, Any], *, shm_dir: Path = Path("/dev/shm")
+) -> int:
+    """Unlink this model's exact weight and metadata SHM names after workers exit."""
+    keys = ("shm_name", "tensor_meta_shm_name")
+    paths = []
+    for key in keys:
+        name = model_info.get(key)
+        if not name:
+            continue
+        entry_name = name[1:] if name.startswith("/") else name
+        if not entry_name or "/" in entry_name or entry_name in (".", ".."):
+            raise ValueError(f"Invalid model SHM name: {name!r}")
+        paths.append(shm_dir / entry_name)
+
+    if paths and not shm_dir.is_dir():
+        raise RuntimeError(f"Model SHM directory is unavailable: {shm_dir}")
+
+    removed = 0
+    for path in paths:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError(f"Refusing non-file model SHM: {path}")
+        if path.exists():
+            path.unlink()
+            removed += 1
+        if path.exists() or path.is_symlink():
+            raise RuntimeError(f"Model SHM remains after cleanup: {path}")
+
+    for key in keys:
+        model_info.pop(key, None)
     return removed
 
 
