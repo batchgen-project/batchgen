@@ -515,6 +515,34 @@ def test_stop_preserves_dead_owner_with_live_group(tmp_path, monkeypatch):
     assert lane_runtime._read_json(state_path)["state"] == "admitted"
 
 
+def test_stop_cannot_overwrite_manifest_during_admission(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    state_path = state_root / "lane-0.json"
+    manifest = _candidate()
+    manifest.update(
+        {
+            "state": "admitted",
+            "process_group": 456,
+            "paths": {"temp": str(tmp_path / "lane-tmp")},
+        }
+    )
+    lane_runtime._atomic_json(state_path, manifest)
+    monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_process_group_exists", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_gpu_processes", lambda: [])
+    lock_root = lane_runtime._ensure_private_dir(lane_runtime.HOST_LOCK_ROOT)
+    admission_fd = lane_runtime._open_lock(lock_root / "admission.lock", fcntl.LOCK_EX)
+    try:
+        args = SimpleNamespace(state_root=state_root, instance_id="lane-0", timeout=0)
+        with pytest.raises(BlockingIOError):
+            lane_runtime.stop_lane(args)
+        assert lane_runtime._read_json(state_path) == manifest
+    finally:
+        lane_runtime._close_fd(admission_fd)
+    assert lane_runtime.stop_lane(args)["state"] == "stopped"
+
+
 def test_stop_preserves_dead_owner_with_residual_gpu(tmp_path, monkeypatch):
     state_root = tmp_path / "state"
     manifest = _candidate()
