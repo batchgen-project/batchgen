@@ -744,6 +744,10 @@ def start_lane(args: argparse.Namespace) -> dict[str, Any]:
         log_file = open(log_path, "ab", buffering=0)
         pass_fds = tuple([host_fd, manifest_fd, *resource_fds])
         _require_pidfd_signaling()
+        state_path = state_root / f"{args.instance_id}.json"
+        # If launch fails after this point, an ambiguous lane blocks admission
+        # instead of leaving a detached process without a manifest.
+        _atomic_json(state_path, {**candidate, "state": "starting"})
         process = subprocess.Popen(
             command,
             cwd=args.worktree,
@@ -755,7 +759,6 @@ def start_lane(args: argparse.Namespace) -> dict[str, Any]:
             close_fds=True,
             pass_fds=pass_fds,
         )
-        process_pidfd = os.pidfd_open(process.pid)
         manifest = {
             **candidate,
             "state": "starting",
@@ -776,8 +779,8 @@ def start_lane(args: argparse.Namespace) -> dict[str, Any]:
             ).stdout.strip(),
             "started_at": time.time(),
         }
-        state_path = state_root / f"{args.instance_id}.json"
         _atomic_json(state_path, manifest)
+        process_pidfd = os.pidfd_open(process.pid)
         _wait_for_instance_lock(args.instance_id, process, args.admission_timeout)
         manifest["state"] = "admitted"
         _atomic_json(state_path, manifest)
@@ -832,7 +835,9 @@ def stop_lane(args: argparse.Namespace) -> dict[str, Any]:
 def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
     state_path = _lane_state_path(args)
     manifest = _read_json(state_path)
-    process_group = manifest["process_group"]
+    process_group = manifest.get("process_group")
+    if not isinstance(process_group, int) or process_group <= 0:
+        raise LaneError("lane owner identity is unavailable; preserving manifest")
     if _pid_identity_matches(manifest):
         pidfd = _open_verified_owner_pidfd(manifest)
         try:
@@ -857,11 +862,7 @@ def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
                 raise LaneError("lane process group remains live after owner SIGKILL")
         finally:
             os.close(pidfd)
-    elif (
-        not isinstance(process_group, int)
-        or process_group <= 0
-        or _process_group_exists(process_group)
-    ):
+    elif _process_group_exists(process_group):
         raise LaneError("refusing to signal an unverified lane owner")
 
     temp_root = Path(manifest["paths"]["temp"])
