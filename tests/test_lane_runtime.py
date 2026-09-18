@@ -237,6 +237,30 @@ def test_parent_close_does_not_unlock_child_open_file_description(tmp_path):
         lane_runtime._close_fd(child_fd)
 
 
+def test_exclusive_run_refuses_while_shared_lane_lease_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path)
+    commands = []
+    monkeypatch.setattr(
+        lane_runtime.subprocess,
+        "run",
+        lambda command, check: commands.append(command)
+        or SimpleNamespace(returncode=0),
+    )
+    args = SimpleNamespace(command=["--", "true"])
+    parent_fd = lane_runtime._open_lock(tmp_path / "host.lock", fcntl.LOCK_SH)
+    lane_fd = os.dup(parent_fd)
+    lane_runtime._close_inherited_parent_fd(parent_fd)
+    try:
+        with pytest.raises(BlockingIOError):
+            lane_runtime.exclusive_run(args)
+        assert commands == []
+    finally:
+        lane_runtime._close_fd(lane_fd)
+
+    assert lane_runtime.exclusive_run(args) == 0
+    assert commands == [["true"]]
+
+
 def test_pid_identity_uses_boot_id_start_time_group_and_command(
     tmp_path, monkeypatch
 ):
