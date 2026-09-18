@@ -932,3 +932,55 @@ def test_ambiguous_stale_manifest_blocks_without_ttl_takeover(
 
     with pytest.raises(lane_runtime.LaneError, match="ambiguous stale"):
         lane_runtime._active_manifests(state_root)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "valid",
+        "missing_gpu_uuids",
+        "unhashable_gpu",
+        "missing_host_reservation",
+        "missing_shm_reservation",
+        "missing_temp_path",
+        "filename_mismatch",
+        "stopped_live_owner",
+    ],
+)
+def test_manifest_admission_validates_live_ownership(
+    tmp_path, monkeypatch, corruption
+):
+    state_root = tmp_path / "state"
+    lane_root = tmp_path / "lane-0"
+    paths = lane_runtime._canonical_paths(lane_root, lane_root / "converted")
+    manifest = _candidate(paths=paths)
+    manifest.update(
+        version=1,
+        state="admitted",
+        lane_root=str(lane_root),
+        host_memory_reservation_bytes=192 * 1024**3,
+        shm_reservation_bytes=128 * 1024**3,
+        pid=123,
+        process_group=123,
+    )
+    if corruption == "missing_gpu_uuids":
+        del manifest["gpu_uuids"]
+    elif corruption == "unhashable_gpu":
+        manifest["gpu_uuids"] = [{"uuid": "GPU-a"}]
+    elif corruption == "missing_host_reservation":
+        del manifest["host_memory_reservation_bytes"]
+    elif corruption == "missing_shm_reservation":
+        del manifest["shm_reservation_bytes"]
+    elif corruption == "missing_temp_path":
+        del manifest["paths"]["temp"]
+    elif corruption == "stopped_live_owner":
+        manifest["state"] = "stopped"
+    name = "other.json" if corruption == "filename_mismatch" else "lane-0.json"
+    lane_runtime._atomic_json(state_root / name, manifest)
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: True)
+
+    if corruption == "valid":
+        assert lane_runtime._active_manifests(state_root) == [manifest]
+    else:
+        with pytest.raises(lane_runtime.LaneError, match="manifest"):
+            lane_runtime._active_manifests(state_root)

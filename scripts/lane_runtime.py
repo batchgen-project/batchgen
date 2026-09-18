@@ -216,14 +216,72 @@ def _state_manifests(state_root: Path) -> Iterable[tuple[Path, dict[str, Any]]]:
 def _active_manifests(state_root: Path) -> list[dict[str, Any]]:
     active = []
     for path, manifest in _state_manifests(state_root):
+        instance_id = manifest.get("instance_id")
+        if (
+            not isinstance(instance_id, str)
+            or not _INSTANCE_ID_RE.fullmatch(instance_id)
+            or path.name != f"{instance_id}.json"
+        ):
+            raise LaneError(f"invalid lane manifest identity: {path}")
         if manifest.get("state") == "stopped":
+            if _pid_identity_matches(manifest):
+                raise LaneError(f"stopped lane manifest has a live owner: {path}")
             continue
         if not _pid_identity_matches(manifest):
             raise LaneError(
                 f"ambiguous stale lane manifest blocks admission: {path}"
             )
+        _validate_active_manifest(manifest, path)
         active.append(manifest)
     return active
+
+
+def _validate_active_manifest(manifest: dict[str, Any], path: Path) -> None:
+    gpus = manifest.get("gpu_uuids")
+    ports = (
+        manifest.get("listen_port"),
+        manifest.get("dist_init_port"),
+        manifest.get("pynccl_port_base"),
+        manifest.get("pynccl_port_span"),
+    )
+    paths = manifest.get("paths")
+    lane_root = manifest.get("lane_root")
+    budgets = (
+        manifest.get("host_memory_reservation_bytes"),
+        manifest.get("shm_reservation_bytes"),
+    )
+    if (
+        manifest.get("version") != 1
+        or manifest.get("state") not in {"starting", "admitted", "stopping", "failed"}
+        or not isinstance(gpus, list)
+        or len(gpus) not in {1, 2, 4, 8}
+        or any(
+            not isinstance(gpu, str) or not gpu.startswith("GPU-")
+            for gpu in gpus
+        )
+        or len(set(gpus)) != len(gpus)
+        or any(type(port) is not int or port <= 0 for port in ports)
+        or any(type(budget) is not int or budget <= 0 for budget in budgets)
+        or not isinstance(lane_root, str)
+        or not Path(lane_root).is_absolute()
+        or not isinstance(paths, dict)
+        or set(paths) != {"storage", "converted_checkpoint", *_CACHE_DIRS}
+        or any(
+            not isinstance(value, str) or not Path(value).is_absolute()
+            for value in paths.values()
+        )
+    ):
+        raise LaneError(f"invalid active lane manifest resources: {path}")
+    if (
+        ports[0] > 65535
+        or ports[1] > 65535
+        or ports[2] + ports[3] > 65536
+        or not Path(paths["converted_checkpoint"]).is_relative_to(lane_root)
+        or paths != _canonical_paths(
+            Path(lane_root), Path(paths["converted_checkpoint"])
+        )
+    ):
+        raise LaneError(f"invalid active lane manifest resources: {path}")
 
 
 def _ranges_overlap(first: tuple[int, int], second: tuple[int, int]) -> bool:
