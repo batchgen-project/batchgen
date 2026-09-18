@@ -100,6 +100,37 @@ def release_prefix_lookup_attachments(
             coordinator.release_attachment(handle)
 
 
+def estimate_prefix_cached_pages_for_prefill(
+    *,
+    coordinator: object,
+    namespace_digest: Sequence[int],
+    prompt_token_ids: Sequence[int],
+    page_size_tokens: int,
+) -> int:
+    """Estimate reusable Host pages without attaching or evicting them."""
+    page_size = int(page_size_tokens)
+    if page_size <= 0:
+        raise ValueError("page_size_tokens must be positive")
+    token_ids = [int(token_id) for token_id in prompt_token_ids]
+    if not token_ids:
+        raise ValueError("prefix cache estimate requires a non-empty prompt")
+    result = coordinator.estimate_lookup(
+        [int(value) for value in namespace_digest], token_ids
+    )
+    cached = int(result.common_cached_tokens)
+    if cached < 0 or cached > len(token_ids):
+        raise RuntimeError(
+            "prefix cache estimate returned an invalid token count: "
+            f"cached={cached}, prompt_length={len(token_ids)}"
+        )
+    if cached % page_size:
+        raise RuntimeError(
+            "prefix cache estimate returned a non-page-aligned hit: "
+            f"cached={cached}, page_size={page_size}"
+        )
+    return cached // page_size
+
+
 def _validate_lookup_result(
     *, result: object, prompt_length: int, page_size_tokens: int
 ) -> int:
