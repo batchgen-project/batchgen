@@ -8,6 +8,7 @@ import string
 import time
 from concurrent.futures import ProcessPoolExecutor
 
+import pytest
 import torch
 from tqdm import tqdm
 
@@ -146,6 +147,110 @@ def test_parallel_worker_allocate_sequences():
         finally:
             del manager
             _shm_unlink(shm_name)
+
+
+def test_worker_view_attaches_shared_prefix_pages_without_owning_them():
+    shm_name = _random_shm_name()
+    cfg = _make_deepseek_r1_config(shm_name)
+    cfg.num_pages = 32
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(0, True)
+        source_seq = 101
+        target_seq = 202
+        worker.register_sequences([source_seq, target_seq])
+
+        shared_pages = worker.allocate_pages_for_sequences(
+            [(source_seq, cfg.page_size_tokens * 2)]
+        )[0]
+        worker.attach_shared_prefix_pages(target_seq, shared_pages)
+        worker.attach_shared_prefix_pages(target_seq, shared_pages)
+        with pytest.raises(RuntimeError, match="identical existing prefix"):
+            worker.attach_shared_prefix_pages(
+                target_seq, list(reversed(shared_pages))
+            )
+        private_pages = worker.allocate_pages_for_sequences(
+            [(target_seq, cfg.page_size_tokens)]
+        )[0]
+
+        assert worker.build_page_table([target_seq]) == [
+            shared_pages + private_pages
+        ]
+
+        before_release = worker.get_stats()
+        worker.release_sequence_pages([target_seq])
+        after_release = worker.get_stats()
+
+        assert (
+            after_release.num_used_pages
+            == before_release.num_used_pages - len(private_pages)
+        )
+        assert worker.build_page_table([source_seq]) == [shared_pages]
+    finally:
+        for sequence_id in (202, 101):
+            try:
+                worker.release_sequence_pages([sequence_id])
+            except Exception:
+                pass
+        try:
+            worker.shutdown()
+        except Exception:
+            pass
+        del worker
+        _shm_unlink(shm_name)
+
+
+def test_worker_view_retains_exact_prefix_pages_until_eviction_release():
+    shm_name = _random_shm_name()
+    cfg = _make_deepseek_r1_config(shm_name)
+    cfg.num_pages = 16
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+    sequence_id = 303
+    retained = []
+
+    try:
+        worker.initialize(0, True)
+        worker.register_sequences([sequence_id])
+        pages = worker.allocate_pages_for_sequences(
+            [(sequence_id, cfg.page_size_tokens * 4)]
+        )[0]
+
+        retained = worker.retain_sequence_pages(
+            sequence_id, [pages[1], pages[3]]
+        )
+        assert retained == [pages[1], pages[3]]
+        assert worker.build_page_table([sequence_id]) == [pages]
+
+        before_sequence_release = worker.get_stats()
+        worker.release_sequence_pages([sequence_id])
+        after_sequence_release = worker.get_stats()
+        assert (
+            after_sequence_release.num_used_pages
+            == before_sequence_release.num_used_pages - 2
+        )
+
+        with pytest.raises(RuntimeError, match="Duplicate resident page id"):
+            worker.release_resident_pages([retained[0], retained[0]])
+        assert worker.get_stats().num_used_pages == 2
+
+        worker.release_resident_pages(retained)
+        assert worker.get_stats().num_used_pages == 0
+    finally:
+        try:
+            worker.release_sequence_pages([sequence_id])
+        except Exception:
+            pass
+        try:
+            worker.release_resident_pages(retained)
+        except Exception:
+            pass
+        try:
+            worker.shutdown()
+        except Exception:
+            pass
+        del worker
+        _shm_unlink(shm_name)
 
 
 def _worker_proc_copy_prefill(shm_name, device_index, requests):

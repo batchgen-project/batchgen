@@ -15,6 +15,7 @@ This is implemented as a post-correction: output *= sigmoid(lse - sinks)
 """
 
 from .fa_prefill import gqa_prefill_fa
+from .fa_extend import gqa_extend_fa
 from .fa_decode import gqa_decode_fa, gqa_decode_fa_contiguous
 from .sink_correction import apply_sink_correction
 from .reference import attention_ref, attention_ref_no_sinks
@@ -23,6 +24,7 @@ from .gqa_attention import gqa_attention_with_sinks
 
 __all__ = [
     'gqa_prefill_fa',
+    'gqa_extend_fa',
     'gqa_decode_fa',
     'gqa_decode_fa_contiguous',
     'apply_sink_correction',
