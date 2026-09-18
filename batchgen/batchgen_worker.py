@@ -5277,9 +5277,61 @@ class BatchGenWorker:
 			and per_rank_sequence_free is None
 			and per_node_sequence_free is None
 		):
-			# Admission sees only physically free pages. If cached pages hold the
-			# last free space, no sequence reaches the later allocation-time
-			# eviction path; reclaim enough for one fitting candidate here instead.
+			# A cached prefix already occupies Host pages. Estimate on each node
+			# leader before reclaiming those pages; the actual lookup and attach
+			# still happen in _config_prefill_for_batch. EVICTED prompts are
+			# reconstructed there, so retain their existing full-page path.
+			from batchgen.prefix_reuse.prefill import (
+				estimate_prefix_cached_pages_for_prefill,
+			)
+			estimated_values = [0] * (len(selection.candidates) + 1)
+			if self.local_rank == 0:
+				try:
+					for index, candidate in enumerate(selection.candidates):
+						if candidate.node_id != report_node or candidate.is_evicted:
+							continue
+						seq = self.global_batch.get_sequence(candidate.uuid)
+						estimated_values[index] = estimate_prefix_cached_pages_for_prefill(
+							coordinator=self.prefix_cache_coordinator,
+							namespace_digest=(
+								self.prefix_cache_runtime_config.namespace_digest
+							),
+							prompt_token_ids=seq.input_ids[0, :seq.prompt_length].tolist(),
+							page_size_tokens=(
+								self.prefix_cache_runtime_config.group_specs[0]
+								.raw_page_tokens
+							),
+						)
+				except Exception:
+					logging.exception("[PREFIX_CACHE] admission estimate failed")
+					estimated_values[-1] = 1
+			estimated = torch.tensor(
+				estimated_values, dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_reduce(estimated, op=dist.ReduceOp.MAX)
+			if int(estimated[-1].item()):
+				raise RuntimeError("prefix cache admission estimate failed on a worker")
+			cached_pages = estimated[:-1].tolist()
+			if any(cached_pages):
+				estimated_selection = replace(
+					selection,
+					candidates=tuple(
+						replace(candidate, cached_prefix_pages=int(cached_pages[index]))
+						for index, candidate in enumerate(selection.candidates)
+					),
+				)
+				prefill_batch = PrefillScheduler.select_prefill_batch(
+					estimated_selection
+				)
+		if (
+			self.enable_prefix_cache and not prefill_batch
+			and per_rank_sequence_free is None
+			and per_node_sequence_free is None
+		):
+			# No candidate fits even after a non-mutating prefix estimate.
+			# Reclaim against the original full-page requirement so a later
+			# lookup miss cannot make the allocation unsafe.
 			failure = 0
 			has_fitting_candidate = 0
 			updated_local_free = -1

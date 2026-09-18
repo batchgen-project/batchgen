@@ -19,6 +19,9 @@ _SPEC.loader.exec_module(_MODULE)
 
 lookup_prefix_cache_for_prefill = _MODULE.lookup_prefix_cache_for_prefill
 release_prefix_lookup_attachments = _MODULE.release_prefix_lookup_attachments
+estimate_prefix_cached_pages_for_prefill = (
+    _MODULE.estimate_prefix_cached_pages_for_prefill
+)
 
 
 def _result(cached_tokens, handle, page_size=4):
@@ -52,6 +55,36 @@ class _Coordinator:
 
     def release_attachment(self, handle):
         self.released.append(int(handle))
+
+
+def test_estimate_prefill_pages_is_read_only_and_page_aligned():
+    class EstimateOnly:
+        def estimate_lookup(self, namespace_digest, token_ids):
+            assert namespace_digest == [1, 2, 3, 4]
+            assert token_ids == list(range(10))
+            return SimpleNamespace(common_cached_tokens=8)
+
+    assert estimate_prefix_cached_pages_for_prefill(
+        coordinator=EstimateOnly(),
+        namespace_digest=(1, 2, 3, 4),
+        prompt_token_ids=list(range(10)),
+        page_size_tokens=4,
+    ) == 2
+
+
+@pytest.mark.parametrize("cached", [-4, 3, 12])
+def test_estimate_prefill_pages_rejects_invalid_cache_counts(cached):
+    class EstimateOnly:
+        def estimate_lookup(self, namespace_digest, token_ids):
+            return SimpleNamespace(common_cached_tokens=cached)
+
+    with pytest.raises(RuntimeError, match="invalid|non-page-aligned"):
+        estimate_prefix_cached_pages_for_prefill(
+            coordinator=EstimateOnly(),
+            namespace_digest=(1, 2, 3, 4),
+            prompt_token_ids=list(range(10)),
+            page_size_tokens=4,
+        )
 
 
 def test_lookup_separates_host_attachment_from_full_hit_compute_boundary():

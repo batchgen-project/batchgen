@@ -13,13 +13,22 @@ initial_gpu_page_buffer=32):
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+
 import pytest
 
-from batchgen.worker.prefill import (
-    PrefillCandidate,
-    PrefillScheduler,
-    PrefillSelectionRequest,
-)
+_MODULE_PATH = Path(__file__).parents[2] / "batchgen" / "worker" / "prefill.py"
+_SPEC = importlib.util.spec_from_file_location("test_worker_prefill", _MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
+_SPEC.loader.exec_module(_MODULE)
+
+PrefillCandidate = _MODULE.PrefillCandidate
+PrefillScheduler = _MODULE.PrefillScheduler
+PrefillSelectionRequest = _MODULE.PrefillSelectionRequest
 
 _PAGE = 64
 _BUF = 32
@@ -37,6 +46,7 @@ def _cand(
     prompt=100,
     budget=100000,
     host_kv_replication_factor=1,
+    cached_prefix_pages=0,
 ):
     return PrefillCandidate(
         uuid=uuid,
@@ -49,6 +59,7 @@ def _cand(
         kv_token_budget=budget,
         page_size=_PAGE,
         host_kv_replication_factor=host_kv_replication_factor,
+        cached_prefix_pages=cached_prefix_pages,
     )
 
 
@@ -104,6 +115,37 @@ def test_admission_reclaim_target_uses_exact_scheduler_reservation():
     assert PrefillScheduler.select_prefill_batch(
         _req([candidate], [33 + (required - 33)])
     ) == ["a"]
+
+
+def test_long_cached_prefix_fits_private_pages_without_evicting_its_seed():
+    # H200 16K repro: 455 total pages, 245 retained by seed, 210 free.
+    # A full admission reservation needs 248 pages, but a 245-page hit
+    # needs only 3 private pages. Reclaiming 38 before lookup destroys it.
+    cold = _cand("hit", prompt=15719, budget=15847)
+    warm = _cand(
+        "hit", prompt=15719, budget=15847,
+        cached_prefix_pages=245,
+    )
+    assert PrefillScheduler.required_host_pages(cold, _req([cold], [210])) == 248
+    assert PrefillScheduler.select_prefill_batch(_req([cold], [210])) == []
+    assert PrefillScheduler.required_host_pages(warm, _req([warm], [210])) == 3
+    assert PrefillScheduler.select_prefill_batch(_req([warm], [210])) == ["hit"]
+
+
+def test_cached_pages_reduce_each_replicated_host_reservation():
+    candidate = _cand(
+        "tp", prompt=15719, budget=15847,
+        host_kv_replication_factor=8, cached_prefix_pages=245,
+    )
+    request = _req([candidate], [24])
+    assert PrefillScheduler.required_host_pages(candidate, request) == 24
+    assert PrefillScheduler.select_prefill_batch(request) == ["tp"]
+
+
+def test_cached_pages_cannot_exceed_initial_reservation():
+    candidate = _cand("bad", prompt=100, cached_prefix_pages=35)
+    with pytest.raises(ValueError, match="invalid cached_prefix_pages"):
+        PrefillScheduler.required_host_pages(candidate, _req([candidate], [100]))
 
 
 def test_kv_token_budget_caps_capacity():

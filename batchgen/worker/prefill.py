@@ -51,6 +51,9 @@ class PrefillCandidate:
     # rank in its serve group.  The node-level allocator therefore consumes
     # this many copies of ``req_pages`` for one admitted sequence.
     host_kv_replication_factor: int = 1
+    # Read-only prefix estimate used only when physical free pages cannot
+    # admit any candidate. Attached pages already occupy the Host pool.
+    cached_prefix_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,10 +97,15 @@ class PrefillScheduler:
             candidate.prompt_length + req.chunk_size, gpu_initial_tokens
         )
         initial_capacity = min(initial_capacity, candidate.kv_token_budget)
+        pages_per_replica = math.ceil(initial_capacity / candidate.page_size)
+        if not 0 <= candidate.cached_prefix_pages <= pages_per_replica:
+            raise ValueError(
+                f"candidate {candidate.uuid} has invalid cached_prefix_pages="
+                f"{candidate.cached_prefix_pages} for reservation {pages_per_replica}"
+            )
         return (
-            math.ceil(initial_capacity / candidate.page_size)
-            * candidate.host_kv_replication_factor
-        )
+            pages_per_replica - candidate.cached_prefix_pages
+        ) * candidate.host_kv_replication_factor
 
     @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:
