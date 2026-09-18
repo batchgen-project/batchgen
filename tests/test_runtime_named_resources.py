@@ -66,6 +66,10 @@ def test_runtime_identity_derives_disjoint_run_names():
     )
 
     assert first.resource_prefix != second.resource_prefix
+    assert first.shm_prefix == f"{first.resource_prefix}."
+    assert first.host_kv_shm_name.startswith(first.shm_prefix)
+    assert first.host_kv_aux_shm_name.startswith(first.shm_prefix)
+    assert first.query_book_shm_prefix.startswith(first.shm_prefix)
     assert first.host_kv_shm_name != second.host_kv_shm_name
     assert first.host_kv_aux_shm_name != second.host_kv_aux_shm_name
     assert first.query_book_shm_prefix != second.query_book_shm_prefix

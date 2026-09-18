@@ -58,16 +58,20 @@ class RuntimeIdentity:
         return f"batchgen_{self.instance_id}_{self.run_id}"
 
     @property
+    def shm_prefix(self) -> str:
+        return f"{self.resource_prefix}."
+
+    @property
     def host_kv_shm_name(self) -> str:
-        return f"{self.resource_prefix}_host_kv"
+        return f"{self.shm_prefix}host_kv"
 
     @property
     def host_kv_aux_shm_name(self) -> str:
-        return f"{self.resource_prefix}_host_kv_aux"
+        return f"{self.shm_prefix}host_kv_aux"
 
     @property
     def query_book_shm_prefix(self) -> str:
-        return f"{self.resource_prefix}_input_ids"
+        return f"{self.shm_prefix}input_ids"
 
     @property
     def runtime_dir(self) -> Path:
