@@ -52,6 +52,9 @@ overlapping GPU UUIDs, ports, PyNccl ranges, or writable paths, foreign compute
 processes on assigned GPUs, and unsafe memory/SHM budgets. It transfers live
 resource-lock descriptors into the server and waits until the server holds its
 logical-instance lock before returning.
+A `starting` intent is written before detached spawn. If launch fails before
+the exact owner identity can be recorded, that incomplete manifest blocks new
+admissions; it is not evidence that no process was created.
 A `stopped` record still blocks admission if its boot ID, PID start time, and
 process group identify a live owner, even when its recorded command is wrong.
 
@@ -85,6 +88,9 @@ sends KILL only to that same owner descriptor while its identity still matches;
 it never signals a numeric PID or process group. If the owner exits while its
 process group remains, or run-owned SHM/runtime directories remain, stop fails
 closed and leaves evidence in place. There is no TTL or stale-state takeover.
+`stop` also refuses an incomplete spawn intent with no verified process group.
+Inspect processes, GPU UUIDs, ports, lock holders, and SHM before any manual
+recovery; do not discard the manifest on the assumption that spawn failed.
 
 ## Exclusive whole-node operations
 
