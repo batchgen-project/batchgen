@@ -184,7 +184,7 @@ class WorkerManager:
         runtime_dir.mkdir(mode=0o700, exist_ok=False)
         self._runtime_dir_created = True
         shm_dir = Path("/dev/shm")
-        prefix = self.args.runtime_identity.resource_prefix
+        prefix = self.args.runtime_identity.shm_prefix
         if shm_dir.is_dir() and any(
             entry.name.startswith(prefix) for entry in shm_dir.iterdir()
         ):
@@ -362,7 +362,7 @@ class WorkerManager:
                     if self._runtime_namespace_owned:
                         cleanup_resources(
                             shm_prefix=(
-                                self.args.runtime_identity.resource_prefix
+                                self.args.runtime_identity.shm_prefix
                             ),
                             clean_hugepages=self._hugepages_enabled,
                             kill_workers=False,  # Already handled above
