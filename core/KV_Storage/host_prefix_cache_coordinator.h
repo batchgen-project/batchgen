@@ -57,6 +57,7 @@ struct PrefixCommitResult {
     std::uint32_t committed_tokens = 0;
     std::uint32_t inserted_nodes = 0;
     std::uint32_t existing_nodes = 0;
+    std::uint64_t active_attachment_handle = 0;
     std::vector<GroupCommitPages> inserted_group_pages;
 };
 

@@ -22,6 +22,7 @@ class PrefixCacheSequenceState:
     lookup_result: object
     attached_tokens: int
     compute_cached_tokens: int
+    commit_attachment_handles: tuple[int, ...] = ()
 
     @property
     def attachment_handle(self) -> int:

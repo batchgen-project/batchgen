@@ -1524,6 +1524,8 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
             GroupCommitPages{group_id, std::move(pages)});
     }
 
+    std::vector<std::uint32_t> inserted_node_indices;
+    inserted_node_indices.reserve(new_nodes_needed);
     raw_start_token = 0;
     for (const auto& [raw_end_token, digest] : chain) {
         if (raw_end_token > commit_tokens ||
@@ -1630,8 +1632,15 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         header->next_page_handle.store(next_page_handle,
                                        std::memory_order_relaxed);
         InsertNodeIndexLocked(digest, node_index);
+        inserted_node_indices.push_back(node_index);
         ++result.inserted_nodes;
         raw_start_token = raw_end_token;
+    }
+    if (!inserted_node_indices.empty()) {
+        // The publishing sequence still decodes from these pages. Pin them
+        // before another worker can evict the newly resident nodes.
+        result.active_attachment_handle =
+            AttachNodesLocked(inserted_node_indices);
     }
     return result;
 }

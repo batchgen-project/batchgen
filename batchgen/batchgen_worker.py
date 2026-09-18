@@ -8484,10 +8484,11 @@ class BatchGenWorker:
 			return
 		for sequence_id in global_sequence_ids:
 			state = self._prefix_sequence_states.pop(int(sequence_id), None)
-			if state is not None and state.attachment_handle:
-				self.prefix_cache_coordinator.release_attachment(
-					state.attachment_handle
-				)
+			if state is None:
+				continue
+			for handle in (*state.commit_attachment_handles, state.attachment_handle):
+				if handle:
+					self.prefix_cache_coordinator.release_attachment(handle)
 
 	def _commit_prefix_cache_for_prefill(
 		self, local_sequence_ids: Sequence[int]
@@ -8541,6 +8542,26 @@ class BatchGenWorker:
 				max_scan_nodes=runtime.max_nodes,
 			)
 			result = commit_outcome.commit_result
+			commit_handle = int(result.active_attachment_handle)
+			if result.inserted_nodes and not commit_handle:
+				raise RuntimeError(
+					"prefix commit inserted pages without protecting the active sequence"
+				)
+			if commit_handle:
+				# Keep the new resident pages pinned until this sequence releases
+				# its Host page table, including during back-to-back prefill.
+				state = self._prefix_sequence_states.get(seq.global_idx)
+				if state is None:
+					self.prefix_cache_coordinator.release_attachment(commit_handle)
+					raise RuntimeError(
+						"prefix commit has no active sequence state"
+					)
+				self._prefix_sequence_states[seq.global_idx] = replace(
+					state,
+					commit_attachment_handles=(
+						*state.commit_attachment_handles, commit_handle
+					),
+				)
 			retained = retain_inserted_prefix_pages(
 				commit_result=result,
 				request=request,

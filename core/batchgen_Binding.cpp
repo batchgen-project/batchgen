@@ -733,6 +733,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       &kv::PrefixCommitResult::inserted_nodes)
         .def_readonly("existing_nodes",
                       &kv::PrefixCommitResult::existing_nodes)
+        .def_readonly("active_attachment_handle",
+                      &kv::PrefixCommitResult::active_attachment_handle)
         .def_readonly("inserted_group_pages",
                       &kv::PrefixCommitResult::inserted_group_pages);
 
