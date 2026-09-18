@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 import copy
 import os
+import pickle
 import signal
 import subprocess
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 import pytest
 
 
@@ -336,3 +338,50 @@ def test_worker_stop_real_child_pidfd():
         if child_process.poll() is None:
             child_process.kill()
         child_process.wait()
+
+
+def test_worker_monitor_does_not_invoke_context_auto_kill():
+    events = []
+
+    class StopEvent:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            self.stopped = True
+
+    manager_type = _worker_manager_method("_monitor_worker_processes")
+    manager = manager_type()
+    manager._monitor_stop_event = StopEvent()
+    manager.worker_process = SimpleNamespace(
+        processes=[SimpleNamespace(join=lambda timeout: events.append("child-join"))],
+        join=lambda timeout: events.append("context-join"),
+    )
+    manager._join_lock = nullcontext()
+    manager._monitor_interval_s = 1
+    manager._collect_worker_exit_reason = lambda: None
+
+    manager._monitor_worker_processes()
+
+    assert events == ["child-join"]
+
+
+def test_worker_exit_reason_preserves_python_traceback(tmp_path):
+    error_file = tmp_path / "worker-error.pickle"
+    error_file.write_bytes(pickle.dumps("Traceback: worker ValueError"))
+    manager_type = _worker_manager_method(
+        "_collect_worker_exit_reason",
+        {"Optional": Optional, "os": os, "pickle": pickle},
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(
+        processes=[SimpleNamespace(pid=123, exitcode=1)],
+        error_files=[str(error_file)],
+    )
+
+    reason = manager._collect_worker_exit_reason()
+
+    assert "idx=0 pid=123 exitcode=1" in reason
+    assert "Traceback: worker ValueError" in reason
