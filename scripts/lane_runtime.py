@@ -800,6 +800,16 @@ def lane_status(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def stop_lane(args: argparse.Namespace) -> dict[str, Any]:
+    _validate_instance_id(args.instance_id)
+    host_root = _ensure_private_dir(HOST_LOCK_ROOT)
+    admission_fd = _open_lock(host_root / "admission.lock", fcntl.LOCK_EX)
+    try:
+        return _stop_lane_under_admission_lock(args)
+    finally:
+        _close_fd(admission_fd)
+
+
+def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
     state_path = _lane_state_path(args)
     manifest = _read_json(state_path)
     process_group = manifest["process_group"]
