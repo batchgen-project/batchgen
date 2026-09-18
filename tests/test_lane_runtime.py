@@ -986,6 +986,14 @@ def test_memory_admission_keeps_active_lane_safety_reserve(monkeypatch):
         "statvfs",
         lambda path: SimpleNamespace(f_bavail=400, f_blocks=400, f_frsize=gib),
     )
+    lane_runtime._check_memory(
+        {
+            "host_memory_reservation_bytes": 100 * gib,
+            "shm_reservation_bytes": 100 * gib,
+            "safety_reserve_bytes": 64 * gib,
+        },
+        [],
+    )
     active = [
         {
             "host_memory_reservation_bytes": 250 * gib,
