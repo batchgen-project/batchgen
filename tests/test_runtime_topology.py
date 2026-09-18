@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import ast
 import copy
+import os
+import signal
+import subprocess
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -188,22 +192,6 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     tmp_path,
 ):
     events = []
-
-    class FakeProcess:
-        def __init__(self, pid):
-            self.pid = pid
-
-        def kill(self):
-            events.append(("kill", self.pid))
-
-        def wait(self, timeout):
-            events.append(("wait", self.pid, timeout))
-
-    fake_psutil = SimpleNamespace(
-        pid_exists=lambda pid: True,
-        Process=FakeProcess,
-        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
-    )
     fake_logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
         warning=lambda *args, **kwargs: None,
@@ -214,9 +202,6 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
         {
             "cleanup_resources": lambda **kwargs: events.append("cleanup"),
             "logger": fake_logger,
-            "os": SimpleNamespace(kill=lambda pid, sig: None),
-            "psutil": fake_psutil,
-            "signal": SimpleNamespace(SIGTERM=15),
         },
     )
     manager = manager_type()
@@ -230,15 +215,15 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     manager._lane_lease = SimpleNamespace(
         close=lambda: events.append("lane-lease-close")
     )
-    manager.worker_process = SimpleNamespace(
-        join=lambda timeout: events.append(("join", timeout))
-    )
+    manager.worker_process = SimpleNamespace(processes=[SimpleNamespace(pid=123)])
     manager.distributed_weight_daemon = None
     manager.model_info = {}
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._get_worker_pids = lambda: [123]
+    manager._stop_workers = lambda: (_ for _ in ()).throw(
+        RuntimeError("worker teardown left live owned PIDs")
+    )
     manager.request_queue = SimpleNamespace(put=lambda value: None)
     manager._join_lock = nullcontext()
     manager._cleanup_skeleton_state_dict_file = lambda: None
@@ -260,3 +245,94 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     assert manager._runtime_namespace_owned
     assert manager._runtime_locks is not None
     assert manager._lane_lease is not None
+
+
+@pytest.mark.parametrize("exits_after_term", [True, False])
+def test_worker_stop_signals_only_original_child_handles(exits_after_term):
+    events = []
+
+    class Child:
+        pid = 123
+        exitcode = None
+
+        def join(self, timeout):
+            events.append(("join", timeout))
+            if exits_after_term and ("signal", 9, 15) in events:
+                self.exitcode = 0
+
+    child = Child()
+    fake_os = SimpleNamespace(
+        pidfd_open=lambda pid: events.append(("open", pid)) or 9,
+        close=lambda fd: events.append(("close", fd)),
+    )
+    fake_signal = SimpleNamespace(
+        SIGTERM=15,
+        SIGKILL=9,
+        pidfd_send_signal=lambda fd, sig: events.append(("signal", fd, sig)),
+    )
+    fake_logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": fake_logger,
+            "os": fake_os,
+            "signal": fake_signal,
+            "time": __import__("time"),
+        },
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(processes=[child])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
+
+    if exits_after_term:
+        manager._stop_workers()
+        assert ("signal", 9, 9) not in events
+    else:
+        with pytest.raises(RuntimeError, match="live owned PIDs"):
+            manager._stop_workers()
+        assert ("signal", 9, 9) in events
+    assert events[0:2] == [("open", 123), ("signal", 9, 15)]
+    assert events[-1] == ("close", 9)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"),
+    reason="Linux PIDFD support required",
+)
+def test_worker_stop_real_child_pidfd():
+    child_process = subprocess.Popen(["sleep", "30"])
+
+    class Child:
+        pid = child_process.pid
+
+        @property
+        def exitcode(self):
+            return child_process.poll()
+
+        def join(self, timeout):
+            try:
+                child_process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
+            "os": os,
+            "signal": signal,
+            "time": time,
+        },
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(processes=[Child()])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: None)
+    try:
+        manager._stop_workers()
+        assert child_process.poll() is not None
+    finally:
+        if child_process.poll() is None:
+            child_process.kill()
+        child_process.wait()
