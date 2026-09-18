@@ -18,6 +18,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
+POSIX_SHM = ROOT / "core" / "Parameter_Server" / "posix_shm.cpp"
+PARAMETER_SERVER = ROOT / "core" / "Parameter_Server" / "Parameter_Server.cpp"
 
 
 def _load_runtime_identity_module():
@@ -121,6 +123,56 @@ def test_query_book_duplicate_creator_cannot_unlink_existing_segment():
             assert bytes(attached.buf[: len(sentinel)]) == sentinel
         finally:
             attached.close()
+    finally:
+        owner.close()
+        owner.unlink()
+
+
+def test_model_shm_creators_and_destructor_preserve_foreign_names():
+    shm_source = POSIX_SHM.read_text()
+    server_source = PARAMETER_SERVER.read_text()
+    assert shm_source.count("create ? O_CREAT | O_EXCL : 0") >= 2
+    assert "shm_open(shm_name.c_str(), O_RDWR | O_CREAT | O_EXCL" in shm_source
+    destructor = server_source.split("Parameter_Server::~Parameter_Server()", 1)[1]
+    destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
+    assert "if (weight_posix_shm_owned_)" in destructor
+    assert "if (tensor_meta_shm_owned_)" in destructor
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not torch.cuda.is_available(),
+    reason="native parameter-server collision check requires Linux CUDA",
+)
+@pytest.mark.parametrize("collision", ["weight", "metadata"])
+def test_native_model_shm_collision_preserves_existing_region(tmp_path, collision):
+    from batchgen.models.engine_loader import core_engine
+
+    weight_name = f"/shm_{uuid.uuid4()}"
+    metadata_name = f"/shm_{uuid.uuid4()}"
+    collided_name = weight_name if collision == "weight" else metadata_name
+    owner = shared_memory.SharedMemory(
+        name=collided_name[1:], create=True, size=64
+    )
+    sentinel = b"lane-owner-alive"
+    owner.buf[: len(sentinel)] = sentinel
+    parameter_server = core_engine.Parameter_Server(False, False)
+    try:
+        try:
+            with pytest.raises(RuntimeError, match="File exists"):
+                parameter_server.Init(
+                    weight_name, metadata_name, 4096, str(tmp_path), {}
+                )
+        finally:
+            del parameter_server
+        attached = shared_memory.SharedMemory(name=collided_name[1:])
+        try:
+            assert attached.size == 64
+            assert bytes(attached.buf[: len(sentinel)]) == sentinel
+        finally:
+            attached.close()
+        if collision == "metadata":
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=weight_name[1:])
     finally:
         owner.close()
         owner.unlink()

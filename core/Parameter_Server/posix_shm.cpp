@@ -279,10 +279,12 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     bool enable_memfd,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
-                                    int* out_memfd_fd) {
+                                    int* out_memfd_fd,
+                                    bool* out_posix_shm_owned) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
+    if (out_posix_shm_owned) *out_posix_shm_owned = false;
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
@@ -301,7 +303,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     // STAGE 1: Attempt allocation using hugetlbfs if enabled
     if (enable_hugetlbfs) {
         logger->info("Attempting hugepage allocation...");
-        int flags = O_RDWR | (create ? O_CREAT : 0);
+        int flags = O_RDWR | (create ? O_CREAT | O_EXCL : 0);
         int fd = open(hugepage_path.c_str(), flags, 0666);
 
         if (fd >= 0) {
@@ -365,6 +367,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 unlink(hugepage_path.c_str());
             }
         } else {
+            if (create && errno == EEXIST) {
+                throw std::runtime_error("hugetlbfs path already exists: " + hugepage_path);
+            }
             logger->warn("Could not open hugetlbfs path '{}': {}. Check permissions and mount.", hugepage_path, strerror(errno));
         }
     }
@@ -469,17 +474,19 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
              logger->info("Falling back to regular shared memory...");
         }
 
-        int flags = O_RDWR | (create ? O_CREAT : 0);
+        int flags = O_RDWR | (create ? O_CREAT | O_EXCL : 0);
         int fd = shm_open(shm_name.c_str(), flags, 0666);
         if (fd < 0) {
             throw std::runtime_error("shm_open failed for '" + shm_name + "': " + strerror(errno));
         }
+        if (create && out_posix_shm_owned) *out_posix_shm_owned = true;
 
         if (create) {
             int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
             if (ftruncate64(fd, aligned_size) == -1) {
                 close(fd);
                 shm_unlink(shm_name.c_str());
+                if (out_posix_shm_owned) *out_posix_shm_owned = false;
                 throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
             }
             // Use mmap_aligned with 2MB alignment (or system page size) even for regular shm
@@ -513,6 +520,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
         if (ptr == MAP_FAILED) {
             if (create) shm_unlink(shm_name.c_str());
+            if (out_posix_shm_owned) *out_posix_shm_owned = false;
             throw std::runtime_error("mmap for regular shm failed: " + std::string(strerror(errno)));
         }
         
@@ -555,6 +563,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                     unlink(hugepage_path.c_str());
                 } else {
                     shm_unlink(shm_name.c_str());
+                    if (out_posix_shm_owned) *out_posix_shm_owned = false;
                 }
             }
             throw;
@@ -597,11 +606,9 @@ void verify_numa_allocation(void* ptr, size_t size) {
 }
 
 
-void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
-                               bool create) {
+void free_shared_pinned_memory(void* ptr, int64_t size) {
     cudaHostUnregister(ptr);
     munmap(ptr, size);
-    shm_unlink(shm_name.c_str());
 }
 
 // -----------------------------------------------------------------------------
@@ -844,9 +851,10 @@ void serialize_to_shared_memory(
     size_t total_size = compute_serialized_size(map);
 
     // Open (or create) the shared memory region.
-    int fd = shm_open(shm_name.c_str(), O_RDWR | O_CREAT, 0666);
+    int fd = shm_open(shm_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
     if (fd == -1)
-        throw std::runtime_error("Failed to create shared memory: " + shm_name);
+        throw std::runtime_error("Failed to create shared memory '" + shm_name +
+                                 "': " + strerror(errno));
 
     // Set the size.
     if (ftruncate(fd, total_size) == -1) {

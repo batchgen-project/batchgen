@@ -82,8 +82,10 @@ class Parameter_Server {
     /* "attn_0" -> "o_proj" -> ptr */
     std::string shm_name;
     std::string tensor_meta_shm_name;
-    void* weight_ptr_;
-    int64_t byte_size_;
+    void* weight_ptr_ = nullptr;
+    int64_t byte_size_ = 0;
+    bool weight_posix_shm_owned_ = false;
+    bool tensor_meta_shm_owned_ = false;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;
