@@ -73,17 +73,16 @@ python scripts/lane_runtime.py verify --instance-id lane-0
 python scripts/lane_runtime.py stop --instance-id lane-0 --timeout 30
 ```
 
-`verify` revalidates boot ID, PID start time, process group, GPU ownership, and
-every resource lock. Linux PIDFD support is required to start and stop live
-lanes. `start` and `stop` share a nonblocking admission lock; a concurrent
-lifecycle operation fails before changing the manifest and can be retried
-after the lock holder finishes. `stop` opens a PIDFD, revalidates the owner
-after opening it, and sends TERM only through that descriptor. If graceful
-stop times out, it sends KILL only to that same owner descriptor while its
-identity still matches; it never signals a numeric PID or process group. If
-the owner exits while its process
-group remains, or run-owned SHM/runtime directories remain, stop fails closed
-and leaves evidence in place. There is no TTL or stale-state takeover.
+`verify` revalidates boot ID, PID start time, launch command, process group,
+GPU ownership, and every resource lock. Linux PIDFD support is required to
+start and stop live lanes. Both operations share a nonblocking admission lock;
+a concurrent operation fails before changing the manifest and can be retried
+after the lock holder finishes. `stop` opens a PIDFD, revalidates the owner,
+and sends TERM only through that descriptor. If graceful stop times out, it
+sends KILL only to that same owner descriptor while its identity still matches;
+it never signals a numeric PID or process group. If the owner exits while its
+process group remains, or run-owned SHM/runtime directories remain, stop fails
+closed and leaves evidence in place. There is no TTL or stale-state takeover.
 
 ## Exclusive whole-node operations
 
