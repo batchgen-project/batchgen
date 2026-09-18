@@ -33,6 +33,7 @@ _GIB = 1024**3
 _GPTOSS_WEIGHT_SHM_GIB = 70
 _SHM_TRANSIENT_RESERVE_GIB = 16
 _HOST_PRIVATE_RESERVE_GIB = 64
+_MIN_SAFETY_RESERVE_GIB = 64
 _INSTANCE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 _O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 _O200K_BASE_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790"
@@ -269,6 +270,7 @@ def _validate_active_manifest(manifest: dict[str, Any], path: Path) -> None:
     budgets = (
         manifest.get("host_memory_reservation_bytes"),
         manifest.get("shm_reservation_bytes"),
+        manifest.get("safety_reserve_bytes"),
     )
     if (
         manifest.get("version") != 1
@@ -282,6 +284,7 @@ def _validate_active_manifest(manifest: dict[str, Any], path: Path) -> None:
         or len(set(gpus)) != len(gpus)
         or any(type(port) is not int or port <= 0 for port in ports)
         or any(type(budget) is not int or budget <= 0 for budget in budgets)
+        or budgets[2] < _MIN_SAFETY_RESERVE_GIB * _GIB
         or not isinstance(lane_root, str)
         or not Path(lane_root).is_absolute()
         or not isinstance(paths, dict)
@@ -380,7 +383,11 @@ def _check_memory(
 ) -> None:
     active = list(active)
     meminfo = _parse_meminfo(meminfo_path)
-    memory_limit = meminfo["MemTotal"] - candidate["safety_reserve_bytes"]
+    safety_reserve = max(
+        candidate["safety_reserve_bytes"],
+        *(item["safety_reserve_bytes"] for item in active),
+    )
+    memory_limit = meminfo["MemTotal"] - safety_reserve
     reserved = sum(item.get("host_memory_reservation_bytes", 0) for item in active)
     requested = candidate["host_memory_reservation_bytes"]
     if reserved + requested > memory_limit:
@@ -555,6 +562,8 @@ def _validate_start_args(args: argparse.Namespace) -> None:
         )
     ):
         raise LaneError("memory budgets and PyNccl span must be positive")
+    if args.safety_gb < _MIN_SAFETY_RESERVE_GIB:
+        raise LaneError("host safety reserve must be at least 64 GiB")
     min_shm_gb = (
         args.host_kv_cache_gb
         + _GPTOSS_WEIGHT_SHM_GIB
