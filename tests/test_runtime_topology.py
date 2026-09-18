@@ -235,6 +235,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     manager._lane_lease = None
     manager.worker_process = None
     manager.distributed_weight_daemon = None
+    manager.parameter_server_instance = None
     manager.model_info = {}
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
@@ -246,6 +247,59 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
 
     assert not own.exists()
     assert neighbor.exists()
+
+
+@pytest.mark.parametrize("local_owner", [False, True])
+def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner):
+    weight = tmp_path / "shm_weight"
+    metadata = tmp_path / "shm_metadata"
+    weight.touch()
+    metadata.touch()
+    cleaned = []
+
+    def cleanup_model_shm_files(model_info):
+        cleaned.append(True)
+        for key in ("shm_name", "tensor_meta_shm_name"):
+            (tmp_path / model_info.pop(key).lstrip("/")).unlink()
+
+    fake_logger = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+    manager_type = _worker_manager_method(
+        "stop",
+        {"cleanup_model_shm_files": cleanup_model_shm_files, "logger": fake_logger},
+    )
+    manager = manager_type()
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(runtime_dir=tmp_path / "unused")
+    )
+    manager._stopping = False
+    manager.started = True
+    manager._runtime_dir_created = False
+    manager._runtime_namespace_owned = False
+    manager._runtime_locks = None
+    manager._lane_lease = None
+    manager.worker_process = None
+    manager.distributed_weight_daemon = None
+    manager.parameter_server_instance = object() if local_owner else None
+    manager.model_info = {
+        "shm_name": f"/{weight.name}",
+        "tensor_meta_shm_name": f"/{metadata.name}",
+    }
+    manager.skeleton_state_dict_file = None
+    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
+    manager._monitor_thread = None
+    manager._hugepages_enabled = False
+    manager._cleanup_skeleton_state_dict_file = lambda: None
+
+    manager.stop()
+
+    assert cleaned == ([True] if local_owner else [])
+    assert weight.exists() is not local_owner
+    assert metadata.exists() is not local_owner
+    assert "shm_name" not in manager.model_info
+    assert "tensor_meta_shm_name" not in manager.model_info
 
 
 def test_worker_start_rolls_back_partial_startup_before_reraising():

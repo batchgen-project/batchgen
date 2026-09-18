@@ -367,7 +367,13 @@ class WorkerManager:
                             clean_hugepages=self._hugepages_enabled,
                             kill_workers=False,  # Already handled above
                         )
-                    cleanup_model_shm_files(self.model_info)
+                    if self.parameter_server_instance is not None:
+                        cleanup_model_shm_files(self.model_info)
+                    else:
+                        # Remote parameter servers and distributed stores own
+                        # their names; this worker only borrowed them.
+                        self.model_info.pop("shm_name", None)
+                        self.model_info.pop("tensor_meta_shm_name", None)
 
                     self._cleanup_skeleton_state_dict_file()
                     runtime_dir = self.args.runtime_identity.runtime_dir
