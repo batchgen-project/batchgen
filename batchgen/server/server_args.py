@@ -76,6 +76,7 @@ class ServerArgs:
     model: str
     instance_id: str = "default"
     runtime_mode: str = "exclusive"
+    lane_lease_manifest_fd: Optional[int] = None
     listen_ip: str = "0.0.0.0"
     listen_port: int = 10900
     hf_cache_dir: Optional[Path] = None
@@ -89,6 +90,8 @@ class ServerArgs:
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
+    pynccl_port_base: int = 20003
+    pynccl_port_span: int = 100
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
     gpu_arch: Optional[str] = None
@@ -189,6 +192,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--runtime-mode",
+        choices=("exclusive", "shared"),
+        default="exclusive",
+        help="Host admission mode (shared requires a launcher lease bundle)",
+    )
+    parser.add_argument(
+        "--lane-lease-manifest-fd",
+        type=int,
+        default=None,
+        help="Inherited descriptor for the shared-lane lease manifest",
+    )
+    parser.add_argument(
         "--listen-ip", type=str, default="0.0.0.0", help="Server listen IP"
     )
     parser.add_argument(
@@ -246,6 +261,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="localhost:12355",
         help="torch.distributed init addr",
+    )
+    parser.add_argument(
+        "--pynccl-port-base",
+        type=int,
+        default=20003,
+        help="First port in this runtime's bounded PyNccl range",
+    )
+    parser.add_argument(
+        "--pynccl-port-span",
+        type=int,
+        default=100,
+        help="Number of ports reserved for PyNccl initialization and recovery",
     )
     parser.add_argument(
         "--kv-dtype", type=str, default="bfloat16", help="KV cache dtype"
@@ -513,16 +540,24 @@ def validate_server_args(args: ServerArgs) -> None:
     _, dist_port = parse_host_port(args.dist_init_addr)
     _validate_port_range("dist_init_addr port", dist_port)
 
+    _validate_port_range("PyNccl base port", args.pynccl_port_base)
+    if args.pynccl_port_span <= 0:
+        raise ValueError("pynccl_port_span must be positive")
+    pynccl_port_end = args.pynccl_port_base + args.pynccl_port_span
+    if pynccl_port_end > 65536:
+        raise ValueError("PyNccl port range must end at or before 65535")
+
     if args.nnodes > 1 and args.node_rank == 0:
         _ensure_local_port_free(dist_port, "dist_init_addr")
-        communicator_port = 20003
-        _validate_port_range("communicator port", communicator_port)
-        _ensure_local_port_free(communicator_port, "COMM")
+    if args.world_size > 1 and args.node_rank == 0:
+        _ensure_local_port_free(args.pynccl_port_base, "PyNccl")
 
     if args.nnodes <= 0:
         raise ValueError("nnodes must be positive")
     if args.world_size <= 0:
         raise ValueError("world_size must be positive")
+    if args.world_size % args.nnodes != 0:
+        raise ValueError("world_size must be divisible by nnodes")
     if args.node_rank < 0 or args.node_rank >= args.nnodes:
         raise ValueError("node_rank must be in [0, nnodes)")
     if args.host_kv_cache_size is None:
@@ -532,6 +567,7 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_cache_size <= 0:
         raise ValueError("--host-kv-cache-size must be a positive number of GB")
+    validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(
@@ -600,6 +636,61 @@ def validate_server_args(args: ServerArgs) -> None:
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
+def validate_shared_runtime_capability(args: ServerArgs) -> None:
+    """Reject any unqualified shared-host configuration before allocation."""
+    if args.runtime_mode == "exclusive":
+        if args.lane_lease_manifest_fd is not None:
+            raise ValueError(
+                "--lane-lease-manifest-fd requires --runtime-mode shared"
+            )
+        return
+    if args.runtime_mode != "shared":
+        raise ValueError("runtime_mode must be 'exclusive' or 'shared'")
+    if args.lane_lease_manifest_fd is None or args.lane_lease_manifest_fd < 0:
+        raise ValueError("shared mode requires --lane-lease-manifest-fd")
+    if args.model != "openai/gpt-oss-120b":
+        raise ValueError("shared mode is qualified only for openai/gpt-oss-120b")
+    if args.nnodes != 1 or args.node_rank != 0:
+        raise ValueError("shared mode requires one node with node_rank 0")
+    if args.world_size not in {1, 2, 4, 8}:
+        raise ValueError("shared mode world_size must be one of 1, 2, 4, or 8")
+    if args.fast_init or args.enable_hugetlbfs or args.enable_deepep:
+        raise ValueError(
+            "shared mode rejects fast-init, hugetlbfs, and DeepEP"
+        )
+    if args.enable_ep_with_offloading or args.enable_cuda_graph:
+        raise ValueError(
+            "shared mode rejects EP offloading and CUDA graph capture"
+        )
+    if args.distributed_weight_config is not None:
+        raise ValueError("shared mode rejects distributed host weights")
+    if args.cache_dir is None or args.converted_ckpt_dir is None:
+        raise ValueError(
+            "shared mode requires explicit cache_dir and converted_ckpt_dir"
+        )
+    storage_path = Path(args.storage_path).expanduser().resolve()
+    if storage_path == _default_storage_path().resolve():
+        raise ValueError("shared mode requires an explicit storage_path")
+    _, dist_port = parse_host_port(args.dist_init_addr)
+    pynccl_ports = range(
+        args.pynccl_port_base,
+        args.pynccl_port_base + args.pynccl_port_span,
+    )
+    if args.listen_port == dist_port:
+        raise ValueError("shared mode listen and distributed ports must differ")
+    if args.world_size > 1 and (
+        args.listen_port in pynccl_ports or dist_port in pynccl_ports
+    ):
+        raise ValueError("shared mode communication port allocations overlap")
+    incremental = args.incremental_output_dir
+    if incremental is not None:
+        incremental_path = Path(incremental).expanduser().resolve()
+        if not incremental_path.is_relative_to(storage_path):
+            raise ValueError(
+                "shared mode incremental_output_dir must be within storage_path"
+            )
+
+
 def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     """Parse CLI arguments and return a validated ServerArgs."""
     parser = _build_parser()
@@ -613,6 +704,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     server_args = ServerArgs(
         model=parsed.model,
         instance_id=parsed.instance_id,
+        runtime_mode=parsed.runtime_mode,
+        lane_lease_manifest_fd=parsed.lane_lease_manifest_fd,
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
@@ -621,6 +714,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
+        pynccl_port_base=parsed.pynccl_port_base,
+        pynccl_port_span=parsed.pynccl_port_span,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
         gpu_arch=parsed.gpu_arch,

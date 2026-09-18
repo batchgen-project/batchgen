@@ -28,12 +28,44 @@ from batchgen.server.process_utils import (
     get_hugepage_size,
     get_model_byte_size,
 )
-from batchgen.server.server_args import ServerArgs
+from batchgen.server.runtime_locks import RuntimeLocks
+from batchgen.server.runtime_lease import LaneLease
+from batchgen.server.server_args import (
+    ServerArgs,
+    validate_shared_runtime_capability,
+)
 from batchgen.utils import config_torch_module_initializer
 
 logger = logging.getLogger(__name__)
 
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
+
+
+def _resolve_local_world_size(
+    world_size: int,
+    nnodes: int,
+    visible_device_count: int,
+    *,
+    require_exact_visibility: bool = False,
+) -> int:
+    if nnodes <= 0 or world_size <= 0:
+        raise ValueError("world_size and nnodes must be positive")
+    if world_size % nnodes != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by nnodes ({nnodes})"
+        )
+    local_world_size = world_size // nnodes
+    if local_world_size > visible_device_count:
+        raise ValueError(
+            f"world_size ({world_size}) requires {local_world_size} GPUs per "
+            f"node, but only {visible_device_count} GPUs are visible"
+        )
+    if require_exact_visibility and local_world_size != visible_device_count:
+        raise ValueError(
+            f"shared mode requires exactly {local_world_size} visible GPUs, "
+            f"got {visible_device_count}"
+        )
+    return local_world_size
 
 
 def _validate_shmem_enabled() -> None:
@@ -126,6 +158,11 @@ class WorkerManager:
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
         self._fatal_ack_event = self._mp_ctx.Event()
+        self._local_world_size: Optional[int] = None
+        self._runtime_dir_created = False
+        self._runtime_namespace_owned = False
+        self._runtime_locks: Optional[RuntimeLocks] = None
+        self._lane_lease: Optional[LaneLease] = None
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
@@ -144,15 +181,55 @@ class WorkerManager:
     def _prepare_runtime_dir(self) -> None:
         runtime_dir = self.args.runtime_identity.runtime_dir
         runtime_dir.mkdir(mode=0o700, exist_ok=False)
+        self._runtime_dir_created = True
+        shm_dir = Path("/dev/shm")
+        prefix = self.args.runtime_identity.resource_prefix
+        if shm_dir.is_dir() and any(
+            entry.name.startswith(prefix) for entry in shm_dir.iterdir()
+        ):
+            raise RuntimeError(
+                f"runtime namespace {prefix!r} already has shared-memory objects"
+            )
+        self._runtime_namespace_owned = True
 
     # ---------------------- Public API ----------------------
-    def start(self) -> None:
-        import time as _time
+    def _acquire_runtime_admission(self) -> None:
+        if self._runtime_locks is not None:
+            return
+        validate_shared_runtime_capability(self.args)
+        if (
+            self.args.runtime_mode == "shared"
+            and os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
+        ):
+            raise ValueError("shared mode rejects an external parameter server")
 
+        self._local_world_size = _resolve_local_world_size(
+            self.args.world_size,
+            self.args.nnodes,
+            torch.cuda.device_count(),
+            require_exact_visibility=self.args.runtime_mode == "shared",
+        )
+        self._runtime_locks = RuntimeLocks.acquire(self.args.runtime_identity)
+        if self.args.runtime_mode == "shared":
+            self._lane_lease = LaneLease.acquire(self.args)
+
+    def start(self) -> None:
         if self.started:
             return
+        try:
+            self._start_impl()
+        except BaseException:
+            try:
+                self.stop()
+            except BaseException:
+                logger.exception("Runtime rollback failed after startup error")
+            raise
+
+    def _start_impl(self) -> None:
+        import time as _time
 
         startup_start = _time.monotonic()
+        self._acquire_runtime_admission()
 
         self._stopping = False
         self._monitor_stop_event.clear()
@@ -232,82 +309,157 @@ class WorkerManager:
         )
 
     def stop(self) -> None:
-        if not self.started:
+        if self._stopping:
+            return
+        has_partial_runtime = any(
+            (
+                self.started,
+                self._runtime_dir_created,
+                self._runtime_namespace_owned,
+                self._runtime_locks is not None,
+                self._lane_lease is not None,
+                self.worker_process is not None,
+                self.distributed_weight_daemon is not None,
+                bool(self.model_info.get("shm_name")),
+                self.skeleton_state_dict_file is not None,
+            )
+        )
+        if not has_partial_runtime:
             return
         self._stopping = True
-        self._monitor_stop_event.set()
-        logger.info("Stopping WorkerManager...")
-
-        # Stop the monitor thread
-        if self._monitor_thread is not None:
-            self._monitor_thread.join(timeout=5)
-
-        # Worker teardown closes the daemon control sockets. Mark the daemon as
-        # stopping first so those expected disconnects are not recorded as a
-        # transport failure; full daemon teardown still follows worker exit.
-        if self.distributed_weight_daemon is not None:
-            self.distributed_weight_daemon.prepare_stop()
-
-        # Collect worker PIDs before sending shutdown signal
-        worker_pids = self._get_worker_pids()
-
-        # Send SIGTERM to workers immediately for faster shutdown
-        # This is critical for Node 1 workers that may be blocked in NCCL
-        # waiting for Node 0 (which may already be shutting down)
-        if worker_pids:
-            logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
-            for pid in worker_pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass  # Process already exited
-
-        # Also send poison pill in case workers are not blocked in NCCL
+        worker_teardown_safe = self.worker_process is None
+        artifacts_cleaned = False
         try:
-            self.request_queue.put(None)
-        except Exception:
-            logger.warning("Failed to signal worker shutdown", exc_info=True)
+            self._monitor_stop_event.set()
+            logger.info("Stopping WorkerManager...")
 
-        # Wait for workers to exit (reduced timeout for interactive use)
-        workers_joined = False
-        if self.worker_process is not None:
-            try:
-                with self._join_lock:
-                    self.worker_process.join(timeout=5)  # Reduced from 30s
-                workers_joined = True
-            except Exception:
-                logger.warning("Failed to join worker process", exc_info=True)
+            # Stop the monitor thread
+            if self._monitor_thread is not None:
+                self._monitor_thread.join(timeout=5)
+                self._monitor_thread = None
 
-        # Force-kill workers that didn't exit after SIGTERM
-        if not workers_joined and worker_pids:
-            logger.warning(
-                "Workers did not exit gracefully, force-killing..."
-            )
-            for pid in worker_pids:
+            # Worker teardown closes the daemon control sockets. Mark the daemon as
+            # stopping first so those expected disconnects are not recorded as a
+            # transport failure; full daemon teardown still follows worker exit.
+            if self.distributed_weight_daemon is not None:
+                self.distributed_weight_daemon.prepare_stop()
+
+            # Collect worker PIDs before sending shutdown signal
+            worker_pids = self._get_worker_pids()
+
+            # Send SIGTERM to workers immediately for faster shutdown
+            # This is critical for Node 1 workers that may be blocked in NCCL
+            # waiting for Node 0 (which may already be shutting down)
+            if worker_pids:
+                logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
+                for pid in worker_pids:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        pass  # Process already exited
+
+            # Also send poison pill in case workers are not blocked in NCCL
+            if self.worker_process is not None:
                 try:
-                    proc = psutil.Process(pid)
-                    proc.kill()
-                    logger.info(f"Force-killed worker process {pid}")
+                    self.request_queue.put(None)
                 except Exception:
-                    pass
+                    logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-        if self.distributed_weight_daemon is not None:
-            self.distributed_weight_daemon.stop()
-            self.distributed_weight_daemon = None
+            # Wait for workers to exit (reduced timeout for interactive use)
+            workers_joined = False
+            if self.worker_process is not None:
+                try:
+                    with self._join_lock:
+                        self.worker_process.join(timeout=5)  # Reduced from 30s
+                    workers_joined = not any(
+                        psutil.pid_exists(pid) for pid in worker_pids
+                    )
+                except Exception:
+                    logger.warning("Failed to join worker process", exc_info=True)
 
-        # Get shm_name for cleanup if available
-        shm_name = self.model_info.get("shm_name")
-        shm_prefix = shm_name if shm_name else "batchgen"
+            # Force-kill workers that didn't exit after SIGTERM
+            if not workers_joined and worker_pids:
+                logger.warning(
+                    "Workers did not exit gracefully, force-killing..."
+                )
+                for pid in worker_pids:
+                    try:
+                        proc = psutil.Process(pid)
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        logger.info(f"Force-killed worker process {pid}")
+                    except psutil.NoSuchProcess:
+                        pass
+                    except Exception:
+                        logger.warning(
+                            "Failed to force-kill worker process %d",
+                            pid,
+                            exc_info=True,
+                        )
+            surviving_pids = [
+                pid for pid in worker_pids if psutil.pid_exists(pid)
+            ]
+            if surviving_pids:
+                raise RuntimeError(
+                    "worker teardown left live owned PIDs; preserving runtime "
+                    f"artifacts for investigation: {surviving_pids}"
+                )
+            worker_teardown_safe = True
 
-        # Cleanup resources (shared memory, hugepages, etc.)
-        cleanup_resources(
-            shm_prefix=shm_prefix,
-            clean_hugepages=self._hugepages_enabled,
-            kill_workers=False,  # Already handled above
-        )
+            if self.distributed_weight_daemon is not None:
+                self.distributed_weight_daemon.stop()
+                self.distributed_weight_daemon = None
+        finally:
+            try:
+                # Clean only resources owned by this immutable run. The
+                # model-weight region predates RuntimeIdentity and has its own
+                # UUID name.
+                if worker_teardown_safe:
+                    shm_name = self.model_info.get("shm_name")
+                    if self._runtime_namespace_owned:
+                        cleanup_resources(
+                            shm_prefix=(
+                                self.args.runtime_identity.resource_prefix
+                            ),
+                            clean_hugepages=self._hugepages_enabled,
+                            kill_workers=False,  # Already handled above
+                        )
+                    if shm_name:
+                        from batchgen.server.process_utils import cleanup_shm_files
+                        cleanup_shm_files(shm_name)
+                        self.model_info.pop("shm_name", None)
 
-        self.started = False
-        logger.info("WorkerManager stopped")
+                    self._cleanup_skeleton_state_dict_file()
+                    runtime_dir = self.args.runtime_identity.runtime_dir
+                    if self._runtime_dir_created and runtime_dir.is_dir():
+                        import shutil
+                        shutil.rmtree(runtime_dir)
+                    artifacts_cleaned = True
+                else:
+                    logger.error(
+                        "Preserving runtime artifacts because owned worker "
+                        "termination was not confirmed"
+                    )
+            finally:
+                if artifacts_cleaned:
+                    self._runtime_dir_created = False
+                    self._runtime_namespace_owned = False
+                    self.worker_process = None
+                self.started = False
+                self._stopping = False
+                if artifacts_cleaned:
+                    if self._lane_lease is not None:
+                        self._lane_lease.close()
+                        self._lane_lease = None
+                    if self._runtime_locks is not None:
+                        self._runtime_locks.close()
+                        self._runtime_locks = None
+                if artifacts_cleaned:
+                    logger.info("WorkerManager stopped")
+                else:
+                    logger.error(
+                        "WorkerManager stop incomplete; admission locks remain held"
+                    )
 
     def _get_worker_pids(self) -> List[int]:
         """Get PIDs of all worker processes."""
@@ -582,16 +734,9 @@ class WorkerManager:
             # Auto-detect only if not explicitly specified
             world_size = local_device_count * self.args.nnodes
 
-        # Calculate local world size (workers per node)
-        local_world_size = world_size // self.args.nnodes
-
-        # Validate: can't spawn more workers than visible GPUs
-        if local_world_size > local_device_count:
-            raise ValueError(
-                f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
-                f"but only {local_device_count} GPUs are visible. "
-                f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
-            )
+        local_world_size = self._local_world_size
+        if local_world_size is None:
+            raise RuntimeError("runtime topology was not validated before startup")
 
         logger.info(
             "Spawning %d DDP workers (world_size=%d, nnodes=%d)",
@@ -609,6 +754,7 @@ class WorkerManager:
             kv_dtype=self.args.kv_dtype,
             dist_init_addr=self.args.dist_init_addr,
             world_size=world_size,
+            local_world_size=local_world_size,
             nnode_rank=self.args.node_rank,
             nnodes=self.args.nnodes,
             gpu_arch=gpu_arch,
@@ -673,6 +819,8 @@ class WorkerManager:
             reload_status_dir=str(
                 self.args.runtime_identity.reload_status_dir
             ),
+            pynccl_port_base=self.args.pynccl_port_base,
+            pynccl_port_span=self.args.pynccl_port_span,
         )
         from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
