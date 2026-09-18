@@ -209,9 +209,9 @@ class WorkerManager:
             torch.cuda.device_count(),
             require_exact_visibility=self.args.runtime_mode == "shared",
         )
-        self._runtime_locks = RuntimeLocks.acquire(self.args.runtime_identity)
         if self.args.runtime_mode == "shared":
             self._lane_lease = LaneLease.acquire(self.args)
+        self._runtime_locks = RuntimeLocks.acquire(self.args.runtime_identity)
 
     def start(self) -> None:
         if self.started:
