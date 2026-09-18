@@ -813,6 +813,93 @@ def test_lane_root_admission_fails_closed_on_unknown_or_parent_root(tmp_path):
     )
 
 
+def test_spawn_intent_survives_pidfd_acquisition_failure(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(lane_runtime, "STATE_ROOT", state_root)
+    monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path / "host-locks")
+    monkeypatch.setattr(lane_runtime, "LANE_LOCK_ROOT", tmp_path / "lane-locks")
+    worktree = tmp_path / "worktree"
+    (worktree / "batchgen").mkdir(parents=True)
+    (worktree / "batchgen_kernels").mkdir()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    lane_root = tmp_path / "lane"
+    args = argparse.Namespace(
+        instance_id="lane-0",
+        model="openai/gpt-oss-120b",
+        gpu_uuid=["GPU-a"],
+        listen_port=11000,
+        dist_port=12000,
+        pynccl_port_base=21000,
+        pynccl_port_span=4,
+        host_kv_cache_gb=1,
+        host_memory_gb=160,
+        shm_gb=96,
+        safety_gb=1,
+        checkpoint=checkpoint,
+        converted_ckpt_dir=lane_root / "converted",
+        worktree=worktree,
+        lane_root=lane_root,
+        python="/usr/bin/python3",
+        o200k_base_file=tmp_path / "o200k_base.tiktoken",
+        admission_timeout=1,
+    )
+    monkeypatch.setattr(lane_runtime, "_check_memory", lambda *args: None)
+    monkeypatch.setattr(lane_runtime, "_check_ports_free", lambda *args: None)
+    monkeypatch.setattr(lane_runtime, "_check_gpus_free", lambda *args: None)
+    monkeypatch.setattr(lane_runtime, "_seed_o200k_base", lambda *args: tmp_path)
+    monkeypatch.setattr(lane_runtime, "_require_pidfd_signaling", lambda: None)
+    monkeypatch.setattr(lane_runtime.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(lane_runtime, "_proc_start_time", lambda pid: 1234)
+    monkeypatch.setattr(lane_runtime, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(
+        lane_runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="deadbeef\n"),
+    )
+
+    def fake_popen(*args, **kwargs):
+        intent = lane_runtime._read_json(state_root / "lane-0.json")
+        assert intent["state"] == "starting"
+        assert intent["instance_id"] == "lane-0"
+        assert "pid" not in intent
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(lane_runtime.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        lane_runtime.os,
+        "pidfd_open",
+        lambda pid: (_ for _ in ()).throw(OSError("injected pidfd failure")),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="injected pidfd failure"):
+        lane_runtime.start_lane(args)
+
+    manifest = lane_runtime._read_json(state_root / "lane-0.json")
+    assert manifest["state"] == "starting"
+    assert manifest["pid"] == 123
+    assert manifest["pid_start_time"] == 1234
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
+    with pytest.raises(lane_runtime.LaneError, match="ambiguous stale lane"):
+        lane_runtime._active_manifests(state_root)
+
+
+def test_stop_preserves_spawn_intent_without_verified_owner(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    state_path = state_root / "lane-0.json"
+    manifest = {**_candidate(), "state": "starting"}
+    lane_runtime._atomic_json(state_path, manifest)
+    monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path / "locks")
+
+    with pytest.raises(lane_runtime.LaneError, match="owner identity is unavailable"):
+        lane_runtime.stop_lane(
+            SimpleNamespace(state_root=state_root, instance_id="lane-0", timeout=0)
+        )
+
+    assert lane_runtime._read_json(state_path) == manifest
+
+
 def test_o200k_base_cache_is_verified_and_lane_local(tmp_path, monkeypatch):
     data = b"qualified-encoding-asset"
     monkeypatch.setattr(
