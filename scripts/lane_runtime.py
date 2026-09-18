@@ -383,10 +383,9 @@ def _check_memory(
 ) -> None:
     active = list(active)
     meminfo = _parse_meminfo(meminfo_path)
-    safety_reserve = max(
-        candidate["safety_reserve_bytes"],
-        *(item["safety_reserve_bytes"] for item in active),
-    )
+    safety_reserve = candidate["safety_reserve_bytes"]
+    for item in active:
+        safety_reserve = max(safety_reserve, item["safety_reserve_bytes"])
     memory_limit = meminfo["MemTotal"] - safety_reserve
     reserved = sum(item.get("host_memory_reservation_bytes", 0) for item in active)
     requested = candidate["host_memory_reservation_bytes"]
