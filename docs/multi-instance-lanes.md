@@ -95,19 +95,11 @@ recovery; do not discard the manifest on the assumption that spawn failed.
 
 ## Exclusive whole-node operations
 
-Whole-node cleanup must hold the exclusive host lock. For the qualified H200
-family, the workspace's cleanup wrapper acquires that lock on the exact
-requested machine before it checks or removes anything. Set
-`EXACT_ASSIGNED_ALIAS` from the approved private registry first:
-
-```bash
-bash scripts/remote/server_clean_h200.sh \
-  --machine "$EXACT_ASSIGNED_ALIAS" \
-  --purpose multi-instance-preflight
-bash scripts/remote/verify_clean_h200.sh \
-  --machine "$EXACT_ASSIGNED_ALIAS" \
-  --purpose multi-instance-preflight
-```
+Whole-node cleanup must hold the exclusive host lock on the exact authorized
+machine before it checks or removes anything. Use the private fleet-specific
+clean and strict-verify procedure; those machine-access scripts are not
+distributed in this repository. Never substitute a lane `stop` or `verify`
+for exclusive whole-node maintenance.
 
 The clean command fails immediately while any shared lane (including an orphaned
 worker that inherited the host lock) is alive. The strict zero-GPU, clean-SHM,
