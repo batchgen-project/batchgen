@@ -26,6 +26,8 @@ python -m batchgen.launch_http_server \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--instance-id` | `default` | Logical instance name used in this run's mutable resource namespace. This does not enable shared-host operation. |
+| `--runtime-mode` | `exclusive` | Host admission mode. `shared` is accepted only for the qualified GPT-OSS topology with a valid inherited lane lease. |
+| `--lane-lease-manifest-fd` | None | Inherited lease-manifest descriptor supplied by the lane launcher; required for `shared`. |
 | `--listen-ip` | `0.0.0.0` | IP address the server listens on |
 | `--listen-port` | `10900` | Port the server listens on |
 
@@ -54,6 +56,29 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 | `--nnodes` | `1` | Number of nodes in the cluster |
 | `--node-rank` | `0` | Rank of this node (0-indexed, master node is 0) |
 | `--dist-init-addr` | `localhost:12355` | Address for torch.distributed initialization (`host:port`) |
+| `--pynccl-port-base` | `20003` | First port in this runtime's bounded PyNccl range |
+| `--pynccl-port-span` | `100` | Number of ports reserved for PyNccl initialization and recovery |
+
+`--world-size` must divide evenly by `--nnodes`. The derived local world size
+is passed explicitly to every worker; PyNccl initialization and recovery never
+scan outside `[pynccl-port-base, pynccl-port-base + pynccl-port-span)`.
+
+### Shared-host admission
+
+`--runtime-mode shared` is fail-closed and currently accepts only
+`openai/gpt-oss-120b`, one node, and world sizes 1, 2, 4, or 8. It rejects
+fast-init, hugetlbfs, DeepEP, EP offloading, CUDA graph capture, distributed
+host weights, default writable paths, and missing launcher leases.
+
+The lane launcher passes `--lane-lease-manifest-fd`. The inherited JSON
+manifest names the instance, ordered physical GPU UUIDs, communication ports,
+and exact storage, conversion, temporary, and compiler-cache paths. Its
+`resources` map contains a live inherited lock descriptor for every GPU, port
+allocation, and writable-path hash. BatchGen verifies the manifest against its
+arguments and environment, marks all lease descriptors close-on-exec, and
+holds them until owner-scoped resource teardown completes. Operators should
+not construct this internal descriptor bundle by hand; the versioned lane
+launcher owns its schema and admission checks.
 
 **Example: 2 Nodes x 8 GPUs**
 

@@ -163,6 +163,9 @@ class BatchGenServer:
 			# Auto-detect only if not explicitly specified
 			world_size = local_device_count * self.args.nnodes
 
+		if world_size % self.args.nnodes != 0:
+			raise ValueError("world_size must be divisible by nnodes")
+
 		# Calculate local world size (workers per node)
 		local_world_size = world_size // self.args.nnodes
 
@@ -186,6 +189,7 @@ class BatchGenServer:
 			kv_dtype=self.args.kv_dtype,
 			dist_init_addr=self.args.dist_init_addr,
 			world_size=world_size,
+			local_world_size=local_world_size,
 			nnode_rank=self.args.node_rank,
 			nnodes=self.args.nnodes,
 			gpu_arch=self.args.gpu_arch,
