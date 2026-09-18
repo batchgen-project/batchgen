@@ -82,7 +82,6 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
         )
         assert request is not None
         result = request.commit(worker)
-        assert result.active_attachment_handle != 0
         retained = retain_inserted_prefix_pages(
             commit_result=result,
             request=request,
@@ -97,6 +96,7 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
             worker_views_by_group={0: host},
         ) == {}
         assert host.get_stats().num_used_pages == 3
+        assert result.active_attachment_handle != 0
 
         host.release_sequence_pages([source_sequence])
         assert host.get_stats().num_used_pages == 3
