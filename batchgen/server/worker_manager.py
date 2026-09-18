@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import pickle
 import signal
 import subprocess
 import tempfile
@@ -905,10 +906,19 @@ class WorkerManager:
         if not processes:
             return None
         exited = []
+        error_files = getattr(self.worker_process, "error_files", ())
         for idx, proc in enumerate(processes):
             if proc.exitcode is None:
                 continue
-            exited.append(f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}")
+            detail = f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}"
+            if (
+                idx < len(error_files)
+                and error_files[idx]
+                and os.path.isfile(error_files[idx])
+            ):
+                with open(error_files[idx], "rb") as error_file:
+                    detail += " Python traceback:\n" + pickle.load(error_file)
+            exited.append(detail)
         if not exited:
             return None
         return "Detected worker process exit: " + ", ".join(exited)
