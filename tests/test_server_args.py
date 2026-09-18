@@ -168,6 +168,8 @@ def test_shared_capability_accepts_only_qualified_shape(tmp_path):
         ({"enable_deepep": True}, "rejects fast-init"),
         ({"enable_ep_with_offloading": True}, "EP offloading"),
         ({"enable_cuda_graph": True}, "CUDA graph"),
+        ({"watchdog_timeout": 30}, "watchdog"),
+        ({"decode_step_timeout": 30}, "watchdog"),
         ({"lane_lease_manifest_fd": None}, "lease-manifest"),
         ({"cache_dir": None}, "explicit cache_dir"),
     ],

@@ -662,6 +662,10 @@ def validate_shared_runtime_capability(args: ServerArgs) -> None:
         raise ValueError(
             "shared mode rejects EP offloading and CUDA graph capture"
         )
+    if args.watchdog_timeout is not None or args.decode_step_timeout is not None:
+        raise ValueError(
+            "shared mode rejects watchdogs that signal a parent PID"
+        )
     if args.distributed_weight_config is not None:
         raise ValueError("shared mode rejects distributed host weights")
     if args.cache_dir is None or args.converted_ckpt_dir is None:
