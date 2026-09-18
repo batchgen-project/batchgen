@@ -267,8 +267,10 @@ def test_pid_identity_uses_boot_id_start_time_group_and_command(
     assert lane_runtime._pid_identity_matches(manifest, proc_root)
     manifest["command"] = [*command[:-1], "lane-1"]
     assert not lane_runtime._pid_identity_matches(manifest, proc_root)
+    assert lane_runtime._pid_process_identity_matches(manifest, proc_root)
     manifest.pop("command")
     assert not lane_runtime._pid_identity_matches(manifest, proc_root)
+    assert lane_runtime._pid_process_identity_matches(manifest, proc_root)
     manifest["command"] = command
     manifest["pid_start_time"] = 988
     assert not lane_runtime._pid_identity_matches(manifest, proc_root)
@@ -321,7 +323,7 @@ def test_pidfd_owner_change_after_open_refuses_signal(monkeypatch):
     not hasattr(os, "pidfd_open") or not hasattr(lane_runtime.signal, "pidfd_send_signal"),
     reason="Linux pidfd APIs are required",
 )
-def test_pidfd_signals_only_the_verified_process():
+def test_pidfd_signals_only_the_verified_process(tmp_path):
     command = [sys.executable, "-c", "import time; time.sleep(60)"]
     process = subprocess.Popen(command, start_new_session=True)
     pidfd = None
@@ -338,6 +340,12 @@ def test_pidfd_signals_only_the_verified_process():
                 {**manifest, "command": [*command[:-1], "import time; time.sleep(59)"]}
             )
         assert process.poll() is None
+        stopped_manifest = {
+            **_candidate(), **manifest, "state": "stopped", "command": ["wrong"],
+        }
+        lane_runtime._atomic_json(tmp_path / "lane-0.json", stopped_manifest)
+        with pytest.raises(lane_runtime.LaneError, match="live owner"):
+            lane_runtime._active_manifests(tmp_path)
         pidfd = lane_runtime._open_verified_owner_pidfd(manifest)
         lane_runtime._signal_pidfd(pidfd, lane_runtime.signal.SIGTERM)
         assert process.wait(timeout=5) == -lane_runtime.signal.SIGTERM
@@ -979,6 +987,23 @@ def test_ambiguous_stale_manifest_blocks_without_ttl_takeover(
         lane_runtime._active_manifests(state_root)
 
 
+def test_stopped_manifest_cannot_hide_live_pid_with_mismatched_command(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "state"
+    manifest = _candidate()
+    manifest.update({"state": "stopped", "pid": 123, "command": ["wrong"]})
+    lane_runtime._atomic_json(state_root / "lane-0.json", manifest)
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
+    monkeypatch.setattr(
+        lane_runtime, "_pid_process_identity_matches", lambda value: True,
+        raising=False,
+    )
+
+    with pytest.raises(lane_runtime.LaneError, match="live owner"):
+        lane_runtime._active_manifests(state_root)
+
+
 @pytest.mark.parametrize(
     "corruption",
     [
@@ -1020,6 +1045,9 @@ def test_manifest_admission_validates_live_ownership(
         del manifest["paths"]["temp"]
     elif corruption == "stopped_live_owner":
         manifest["state"] = "stopped"
+        monkeypatch.setattr(
+            lane_runtime, "_pid_process_identity_matches", lambda value: True
+        )
     name = "other.json" if corruption == "filename_mismatch" else "lane-0.json"
     lane_runtime._atomic_json(state_root / name, manifest)
     monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: True)
