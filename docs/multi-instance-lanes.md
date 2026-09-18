@@ -52,6 +52,8 @@ overlapping GPU UUIDs, ports, PyNccl ranges, or writable paths, foreign compute
 processes on assigned GPUs, and unsafe memory/SHM budgets. It transfers live
 resource-lock descriptors into the server and waits until the server holds its
 logical-instance lock before returning.
+A `stopped` record still blocks admission if its boot ID, PID start time, and
+process group identify a live owner, even when its recorded command is wrong.
 
 For the qualified GPT-OSS model, each SHM reservation must cover the model
 weight region, Host-KV allocation, and transient SHM headroom. The host-memory

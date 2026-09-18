@@ -127,18 +127,11 @@ def _proc_start_time(pid: int, proc_root: Path = Path("/proc")) -> int:
     return int(fields[19])
 
 
-def _pid_identity_matches(
+def _pid_process_identity_matches(
     manifest: dict[str, Any], proc_root: Path = Path("/proc")
 ) -> bool:
     pid = manifest.get("pid")
-    command = manifest.get("command")
-    if (
-        not isinstance(pid, int)
-        or pid <= 0
-        or not isinstance(command, list)
-        or not command
-        or any(not isinstance(arg, str) or "\0" in arg for arg in command)
-    ):
+    if not isinstance(pid, int) or pid <= 0:
         return False
     try:
         return (
@@ -146,8 +139,6 @@ def _pid_identity_matches(
             and manifest.get("pid_start_time")
             == _proc_start_time(pid, proc_root)
             and manifest.get("process_group") == os.getpgid(pid)
-            and (proc_root / str(pid) / "cmdline").read_bytes()
-            == b"\0".join(os.fsencode(arg) for arg in command) + b"\0"
         )
     except (
         FileNotFoundError,
@@ -157,6 +148,25 @@ def _pid_identity_matches(
         ValueError,
         UnicodeError,
     ):
+        return False
+
+
+def _pid_identity_matches(
+    manifest: dict[str, Any], proc_root: Path = Path("/proc")
+) -> bool:
+    command = manifest.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(arg, str) or "\0" in arg for arg in command)
+        or not _pid_process_identity_matches(manifest, proc_root)
+    ):
+        return False
+    try:
+        return (proc_root / str(manifest["pid"]) / "cmdline").read_bytes() == (
+            b"\0".join(os.fsencode(arg) for arg in command) + b"\0"
+        )
+    except (FileNotFoundError, PermissionError, UnicodeError):
         return False
 
 
@@ -234,7 +244,7 @@ def _active_manifests(state_root: Path) -> list[dict[str, Any]]:
         ):
             raise LaneError(f"invalid lane manifest identity: {path}")
         if manifest.get("state") == "stopped":
-            if _pid_identity_matches(manifest):
+            if _pid_process_identity_matches(manifest):
                 raise LaneError(f"stopped lane manifest has a live owner: {path}")
             continue
         if not _pid_identity_matches(manifest):
