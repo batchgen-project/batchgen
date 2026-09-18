@@ -82,6 +82,7 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
         )
         assert request is not None
         result = request.commit(worker)
+        assert result.active_attachment_handle != 0
         retained = retain_inserted_prefix_pages(
             commit_result=result,
             request=request,
@@ -89,6 +90,13 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
             sequence_id=source_sequence,
         )
         assert retained == {0: pages[0]}
+
+        eviction = owner.clear_unprotected()
+        assert release_evicted_prefix_pages(
+            eviction_result=eviction,
+            worker_views_by_group={0: host},
+        ) == {}
+        assert host.get_stats().num_used_pages == 3
 
         host.release_sequence_pages([source_sequence])
         assert host.get_stats().num_used_pages == 3
@@ -118,6 +126,14 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
             lookup.lookup_results[0].attachment_handle
         )
         assert host.get_stats().num_used_pages == 3
+
+        eviction = owner.clear_unprotected()
+        assert release_evicted_prefix_pages(
+            eviction_result=eviction,
+            worker_views_by_group={0: host},
+        ) == {}
+
+        worker.release_attachment(result.active_attachment_handle)
 
         eviction = owner.clear_unprotected()
         released = release_evicted_prefix_pages(
