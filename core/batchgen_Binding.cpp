@@ -733,6 +733,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       &kv::PrefixCommitResult::inserted_nodes)
         .def_readonly("existing_nodes",
                       &kv::PrefixCommitResult::existing_nodes)
+        .def_readonly("active_attachment_handle",
+                      &kv::PrefixCommitResult::active_attachment_handle)
         .def_readonly("inserted_group_pages",
                       &kv::PrefixCommitResult::inserted_group_pages);
 
@@ -796,7 +798,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("commit_prefix_pages",
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
              py::arg("namespace_digest"), py::arg("token_ids"),
-             py::arg("commit_tokens"), py::arg("group_pages"))
+             py::arg("commit_tokens"), py::arg("group_pages"),
+             py::arg("protect_active") = false)
         .def(
             "commit_prefix_page_ids",
             [](kv::HostPrefixCacheCoordinator& self,
@@ -805,7 +808,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                std::uint32_t commit_tokens,
                const std::vector<
                    std::pair<std::uint32_t, std::vector<std::uint32_t>>>&
-                   group_page_ids) {
+                   group_page_ids,
+               bool protect_active) {
                 std::vector<kv::GroupCommitPages> group_pages;
                 group_pages.reserve(group_page_ids.size());
                 for (const auto& [group_id, page_ids] : group_page_ids) {
@@ -818,10 +822,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     group_pages.emplace_back(std::move(group));
                 }
                 return self.CommitPrefixPages(namespace_digest, token_ids,
-                                              commit_tokens, group_pages);
+                                              commit_tokens, group_pages,
+                                              protect_active);
             },
             py::arg("namespace_digest"), py::arg("token_ids"),
-            py::arg("commit_tokens"), py::arg("group_page_ids"))
+            py::arg("commit_tokens"), py::arg("group_page_ids"),
+            py::arg("protect_active") = false)
         .def("lookup_and_attach",
              &kv::HostPrefixCacheCoordinator::LookupAndAttach,
              py::arg("namespace_digest"), py::arg("token_ids"))

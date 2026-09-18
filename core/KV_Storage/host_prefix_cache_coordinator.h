@@ -57,6 +57,7 @@ struct PrefixCommitResult {
     std::uint32_t committed_tokens = 0;
     std::uint32_t inserted_nodes = 0;
     std::uint32_t existing_nodes = 0;
+    std::uint64_t active_attachment_handle = 0;
     std::vector<GroupCommitPages> inserted_group_pages;
 };
 
@@ -113,7 +114,8 @@ class HostPrefixCacheCoordinator {
     PrefixCommitResult CommitPrefixPages(
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids, std::uint32_t commit_tokens,
-        const std::vector<GroupCommitPages>& group_pages);
+        const std::vector<GroupCommitPages>& group_pages,
+        bool protect_active = false);
 
     PrefixLookupResult LookupAndAttach(
         PrefixDigest namespace_digest,

@@ -25,6 +25,7 @@ class PrefixCommitRequest:
                     self.page_ids_by_group.items()
                 )
             ],
+            True,
         )
 
     def capacity_requirements(self) -> tuple[int, int, int]:
