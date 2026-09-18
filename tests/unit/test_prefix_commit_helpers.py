@@ -62,7 +62,7 @@ def test_commit_request_aligns_tokens_and_uses_fast_page_id_binding():
     assert request is not None
     assert request.commit_tokens == 8
     assert request.commit(coordinator) == "ok"
-    assert calls == [([1, 2, 3, 4], list(range(10)), 8, [(0, [100, 101])])]
+    assert calls == [([1, 2, 3, 4], list(range(10)), 8, [(0, [100, 101])], True)]
 
 
 def test_collect_group_pages_requires_complete_logical_prefix():

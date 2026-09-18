@@ -358,7 +358,8 @@ struct HostPrefixCacheCoordinator::SharedState {
     PrefixCommitResult CommitPrefixPages(
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids, std::uint32_t commit_tokens,
-        const std::vector<GroupCommitPages>& group_pages);
+        const std::vector<GroupCommitPages>& group_pages,
+        bool protect_active);
     PrefixLookupResult LookupAndAttach(
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids);
@@ -1415,7 +1416,8 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
 PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
     PrefixDigest namespace_digest, const std::vector<std::int64_t>& token_ids,
     std::uint32_t commit_tokens,
-    const std::vector<GroupCommitPages>& group_pages) {
+    const std::vector<GroupCommitPages>& group_pages,
+    bool protect_active) {
     const std::uint32_t token_count =
         static_cast<std::uint32_t>(token_ids.size());
     commit_tokens = std::min(commit_tokens, token_count);
@@ -1636,7 +1638,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         ++result.inserted_nodes;
         raw_start_token = raw_end_token;
     }
-    if (!inserted_node_indices.empty()) {
+    if (protect_active && !inserted_node_indices.empty()) {
         // The publishing sequence still decodes from these pages. Pin them
         // before another worker can evict the newly resident nodes.
         result.active_attachment_handle =
@@ -2104,9 +2106,10 @@ void HostPrefixCacheCoordinator::Initialize(bool create_region) {
 PrefixCommitResult HostPrefixCacheCoordinator::CommitPrefixPages(
     PrefixDigest namespace_digest, const std::vector<std::int64_t>& token_ids,
     std::uint32_t commit_tokens,
-    const std::vector<GroupCommitPages>& group_pages) {
+    const std::vector<GroupCommitPages>& group_pages,
+    bool protect_active) {
     return state_->CommitPrefixPages(namespace_digest, token_ids, commit_tokens,
-                                     group_pages);
+                                     group_pages, protect_active);
 }
 
 PrefixLookupResult HostPrefixCacheCoordinator::LookupAndAttach(

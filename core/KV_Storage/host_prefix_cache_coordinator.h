@@ -114,7 +114,8 @@ class HostPrefixCacheCoordinator {
     PrefixCommitResult CommitPrefixPages(
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids, std::uint32_t commit_tokens,
-        const std::vector<GroupCommitPages>& group_pages);
+        const std::vector<GroupCommitPages>& group_pages,
+        bool protect_active = false);
 
     PrefixLookupResult LookupAndAttach(
         PrefixDigest namespace_digest,
