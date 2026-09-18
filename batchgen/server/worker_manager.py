@@ -24,6 +24,7 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
+    cleanup_model_shm_files,
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
@@ -321,6 +322,7 @@ class WorkerManager:
                 self.worker_process is not None,
                 self.distributed_weight_daemon is not None,
                 bool(self.model_info.get("shm_name")),
+                bool(self.model_info.get("tensor_meta_shm_name")),
                 self.skeleton_state_dict_file is not None,
             )
         )
@@ -415,7 +417,6 @@ class WorkerManager:
                 # model-weight region predates RuntimeIdentity and has its own
                 # UUID name.
                 if worker_teardown_safe:
-                    shm_name = self.model_info.get("shm_name")
                     if self._runtime_namespace_owned:
                         cleanup_resources(
                             shm_prefix=(
@@ -424,10 +425,7 @@ class WorkerManager:
                             clean_hugepages=self._hugepages_enabled,
                             kill_workers=False,  # Already handled above
                         )
-                    if shm_name:
-                        from batchgen.server.process_utils import cleanup_shm_files
-                        cleanup_shm_files(shm_name)
-                        self.model_info.pop("shm_name", None)
+                    cleanup_model_shm_files(self.model_info)
 
                     self._cleanup_skeleton_state_dict_file()
                     runtime_dir = self.args.runtime_identity.runtime_dir
