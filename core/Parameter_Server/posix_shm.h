@@ -28,9 +28,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     bool enable_memfd = false,
                                     int memfd_creator_pid = -1,
                                     int memfd_fd = -1,
-                                    int* out_memfd_fd = nullptr);
-void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
-                               bool create);
+                                    int* out_memfd_fd = nullptr,
+                                    bool* out_posix_shm_owned = nullptr);
+void free_shared_pinned_memory(void* ptr, int64_t size);
 void serialize_to_shared_memory(
     const std::unordered_map<std::string,
                              std::unordered_map<std::string, tensor_meta>>& map,

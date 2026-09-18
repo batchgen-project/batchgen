@@ -413,8 +413,6 @@ void Parameter_Server::Init(
                        std::unordered_map<std::string, std::string>>&
         state_dict_name_map) {
     this->logger->info("Parameter Server Initializing...");
-    this->shm_name = weight_shm_name;
-    this->tensor_meta_shm_name = tensor_meta_shm_name;
 
     size_t free_memory = 0;
     size_t total_memory = 0;
@@ -428,10 +426,14 @@ void Parameter_Server::Init(
     // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
     int memfd_fd_out = -1;
+    bool weight_posix_shm_owned = false;
     weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
                                                this->enable_memfd_, -1, -1,
-                                               &memfd_fd_out);
+                                               &memfd_fd_out,
+                                               &weight_posix_shm_owned);
+    this->shm_name = weight_shm_name;
+    this->weight_posix_shm_owned_ = weight_posix_shm_owned;
     if (this->enable_memfd_ && memfd_fd_out >= 0) {
         this->weights_memfd_fd_ = memfd_fd_out;
     }
@@ -443,6 +445,8 @@ void Parameter_Server::Init(
 
     // Serialize the module weights storage to shared memory
     serialize_to_shared_memory(this->module_weights_storage_, tensor_meta_shm_name);
+    this->tensor_meta_shm_name = tensor_meta_shm_name;
+    this->tensor_meta_shm_owned_ = true;
     
     std::cout << std::endl;
     this->logger->info("Parameter Server Initialized.");
@@ -597,10 +601,15 @@ Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
 // };
 
 Parameter_Server::~Parameter_Server() {
-    free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
-                              this->byte_size_, true);
-    shm_unlink(this->shm_name.c_str());
-    shm_unlink(this->tensor_meta_shm_name.c_str());
+    if (this->weight_ptr_ != nullptr) {
+        free_shared_pinned_memory(this->weight_ptr_, this->byte_size_);
+    }
+    if (weight_posix_shm_owned_) {
+        shm_unlink(this->shm_name.c_str());
+    }
+    if (tensor_meta_shm_owned_) {
+        shm_unlink(this->tensor_meta_shm_name.c_str());
+    }
     this->logger->info("Parameter Server Destroyed.");
 };
 
