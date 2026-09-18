@@ -61,7 +61,8 @@ process group identify a live owner, even when its recorded command is wrong.
 For the qualified GPT-OSS model, each SHM reservation must cover the model
 weight region, Host-KV allocation, and transient SHM headroom. The host-memory
 reservation must additionally cover private runtime headroom. Underreported
-lane budgets are rejected before launch.
+lane budgets are rejected before launch. The host safety reserve is at least
+64 GiB; admitting a later lane preserves the largest active-lane reserve.
 
 The GPT-OSS tokenizer uses `tiktoken`'s `o200k_base` encoding. Supply the
 encoding asset via `--o200k-base-file`; startup verifies its SHA-256

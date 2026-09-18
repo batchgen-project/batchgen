@@ -786,7 +786,7 @@ def test_nested_lane_root_is_rejected_before_touching_active_lane(tmp_path, monk
         host_kv_cache_gb=1,
         host_memory_gb=192,
         shm_gb=128,
-        safety_gb=1,
+        safety_gb=64,
         checkpoint=checkpoint,
         converted_ckpt_dir=nested_root / "converted",
         worktree=worktree,
@@ -835,7 +835,7 @@ def test_spawn_intent_survives_pidfd_acquisition_failure(tmp_path, monkeypatch):
         host_kv_cache_gb=1,
         host_memory_gb=160,
         shm_gb=96,
-        safety_gb=1,
+        safety_gb=64,
         checkpoint=checkpoint,
         converted_ckpt_dir=lane_root / "converted",
         worktree=worktree,
@@ -967,6 +967,42 @@ def test_memory_formula_charges_shmem_as_nonreclaimable():
     assert lane_runtime._nonreclaimable_bytes(meminfo) == 61 * gib
 
 
+def test_memory_admission_keeps_active_lane_safety_reserve(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(
+        lane_runtime,
+        "_parse_meminfo",
+        lambda path: {
+            "MemTotal": 400 * gib,
+            "MemFree": 400 * gib,
+            "Buffers": 0,
+            "Cached": 0,
+            "Shmem": 0,
+            "SReclaimable": 0,
+        },
+    )
+    monkeypatch.setattr(
+        lane_runtime.os,
+        "statvfs",
+        lambda path: SimpleNamespace(f_bavail=400, f_blocks=400, f_frsize=gib),
+    )
+    active = [
+        {
+            "host_memory_reservation_bytes": 250 * gib,
+            "shm_reservation_bytes": 100 * gib,
+            "safety_reserve_bytes": 64 * gib,
+        }
+    ]
+    candidate = {
+        "host_memory_reservation_bytes": 100 * gib,
+        "shm_reservation_bytes": 100 * gib,
+        "safety_reserve_bytes": 1 * gib,
+    }
+
+    with pytest.raises(lane_runtime.LaneError, match="host-memory reservations"):
+        lane_runtime._check_memory(candidate, active)
+
+
 def test_gptoss_admission_rejects_underreported_lane_memory(tmp_path):
     args = SimpleNamespace(
         instance_id="lane-0",
@@ -992,6 +1028,10 @@ def test_gptoss_admission_rejects_underreported_lane_memory(tmp_path):
 
     args.host_memory_gb = 214
     lane_runtime._validate_start_args(args)
+
+    args.safety_gb = 1
+    with pytest.raises(lane_runtime.LaneError, match="safety reserve"):
+        lane_runtime._validate_start_args(args)
 
 
 def test_supervisor_bundle_is_accepted_by_core_lane_lease(
@@ -1099,6 +1139,7 @@ def test_stopped_manifest_cannot_hide_live_pid_with_mismatched_command(
         "unhashable_gpu",
         "missing_host_reservation",
         "missing_shm_reservation",
+        "missing_safety_reservation",
         "missing_temp_path",
         "filename_mismatch",
         "stopped_live_owner",
@@ -1117,6 +1158,7 @@ def test_manifest_admission_validates_live_ownership(
         lane_root=str(lane_root),
         host_memory_reservation_bytes=192 * 1024**3,
         shm_reservation_bytes=128 * 1024**3,
+        safety_reserve_bytes=64 * 1024**3,
         pid=123,
         process_group=123,
     )
@@ -1128,6 +1170,8 @@ def test_manifest_admission_validates_live_ownership(
         del manifest["host_memory_reservation_bytes"]
     elif corruption == "missing_shm_reservation":
         del manifest["shm_reservation_bytes"]
+    elif corruption == "missing_safety_reservation":
+        del manifest["safety_reserve_bytes"]
     elif corruption == "missing_temp_path":
         del manifest["paths"]["temp"]
     elif corruption == "stopped_live_owner":
