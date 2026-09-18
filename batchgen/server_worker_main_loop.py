@@ -347,9 +347,14 @@ def _server_worker_main_impl(
 	_setup_nccl_env()
 	
 	# Step 1: Hydrate the rank of this process
-	num_gpus_per_node = torch.cuda.device_count()
+	visible_device_count = torch.cuda.device_count()
+	if visible_device_count < args.local_world_size:
+		raise RuntimeError(
+			f"local_world_size={args.local_world_size} exceeds visible GPU count "
+			f"{visible_device_count}"
+		)
 	args.local_rank = rank_idx
-	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
+	args.global_rank = args.local_world_size * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
 	# Reconfigure logging with actual global rank for clearer log output

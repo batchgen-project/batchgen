@@ -251,9 +251,6 @@ ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '
 # If set, overrides the automatic calculation. Otherwise, size is computed as:
 # gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
-NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
-
-
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
 
@@ -526,6 +523,7 @@ class BatchGenWorkerArgs:
 	local_rank: int
 	global_rank: int
 	world_size: int
+	local_world_size: int
 	nnode_rank: int
 	nnodes: int
 	dist_init_addr: str
@@ -599,6 +597,8 @@ class BatchGenWorkerArgs:
 	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
 	query_book_shm_prefix: str = "batchgen_input_ids"
 	reload_status_dir: str = "/tmp/batchgen_reload_status"
+	pynccl_port_base: int = 20003
+	pynccl_port_span: int = 100
 
 
 class BatchGenWorker:
@@ -674,6 +674,10 @@ class BatchGenWorker:
 		self.global_rank = args.global_rank
 		self.rank = args.global_rank # Alias for compatibility
 		self.world_size = args.world_size
+		self.local_world_size = args.local_world_size
+		self.pynccl_port_base = args.pynccl_port_base
+		self.pynccl_port_span = args.pynccl_port_span
+		self._nccl_port = self.pynccl_port_base
 		self.gpu_arch = args.gpu_arch
 		self.kv_dtype = args.kv_dtype
 		self.device = args.device
@@ -3465,7 +3469,7 @@ class BatchGenWorker:
 			rank=self.rank,
 			world_size=self.world_size,
 			local_rank=self.local_rank,
-			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			num_gpus_per_node=self.local_world_size,
 			global_batch=self.global_batch,
 		)
 
@@ -3535,9 +3539,9 @@ class BatchGenWorker:
 
 		# Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
 		# Host KV is shared across all GPUs on a node
-		node_id = self.rank // NUM_GPUS_PER_NODE
-		node_rank_start = node_id * NUM_GPUS_PER_NODE
-		node_rank_end = min(node_rank_start + NUM_GPUS_PER_NODE, self.world_size)
+		node_id = self.rank // self.local_world_size
+		node_rank_start = node_id * self.local_world_size
+		node_rank_end = min(node_rank_start + self.local_world_size, self.world_size)
 
 		# CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
 		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
@@ -3568,7 +3572,7 @@ class BatchGenWorker:
 
 		return {
 			'rank': self.rank,
-			'node_id': self.rank // NUM_GPUS_PER_NODE,
+			'node_id': self.rank // self.local_world_size,
 			'num_free_pages': free_pages,
 			'num_total_pages': stats.num_total_pages,
 			'num_used_pages': used_pages,
@@ -3587,7 +3591,7 @@ class BatchGenWorker:
 		these per-node stats to plan dynamic host growth against the same pool
 		that each owner rank will later allocate from.
 		"""
-		gpus_per_node = NUM_GPUS_PER_NODE
+		gpus_per_node = self.local_world_size
 		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
 		report_free = 0
 		report_total = 0
@@ -3735,7 +3739,7 @@ class BatchGenWorker:
 		return MigrationPlanRequest(
 			node_stats=node_stats,
 			candidates=tuple(candidates),
-			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			num_gpus_per_node=self.local_world_size,
 			world_size=self.world_size,
 		)
 
@@ -3868,7 +3872,7 @@ class BatchGenWorker:
 		stays in ``_execute_kv_migrations_parallel``.
 		"""
 		return HostKVRebalancer.group_migrations_for_parallel_execution(
-			migrations, NUM_GPUS_PER_NODE
+			migrations, self.local_world_size
 		)
 
 	def _execute_single_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
@@ -4617,12 +4621,12 @@ class BatchGenWorker:
 		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
 
 		self._buffer_pool_generation += 1
-		node_id = self.rank // NUM_GPUS_PER_NODE
+		node_id = self.rank // self.local_world_size
 		name = (
 			f"{self._query_book_shm_prefix}"
 			f"_n{node_id}_g{self._buffer_pool_generation}"
 		)
-		is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
+		is_creator = (self.rank % self.local_world_size) == 0
 		shared_input_ids, shm = allocate_node_shared_int64(
 			name, rows, in_w, is_creator, dist.barrier
 		)
@@ -5010,13 +5014,13 @@ class BatchGenWorker:
 
 	def _get_node_for_rank(self, rank: int) -> int:
 		"""Get physical host-KV node ID for a rank."""
-		if self.world_size <= NUM_GPUS_PER_NODE:
+		if self.world_size <= self.local_world_size:
 			return 0
-		return rank // NUM_GPUS_PER_NODE
+		return rank // self.local_world_size
 
 	def _get_num_nodes(self) -> int:
 		"""Get total number of physical host-KV nodes."""
-		return max(1, math.ceil(self.world_size / NUM_GPUS_PER_NODE))
+		return max(1, math.ceil(self.world_size / self.local_world_size))
 
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
@@ -5069,7 +5073,7 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 
-		gpus_per_node = NUM_GPUS_PER_NODE
+		gpus_per_node = self.local_world_size
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
 		sequence_limits = self._prefill_sequence_limits()
@@ -5301,7 +5305,7 @@ class BatchGenWorker:
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
-			seq_node = seq.assigned_rank // NUM_GPUS_PER_NODE
+			seq_node = seq.assigned_rank // self.local_world_size
 			G = self._decode_attn_tp_size()
 			if G > 1:
 				if seq.decode_dp_group is None:
@@ -5312,7 +5316,7 @@ class BatchGenWorker:
 				from batchgen.decode_dp_group import host_kv_owner_rank
 				seq_node = (
 					host_kv_owner_rank(seq.decode_dp_group, G)
-					// NUM_GPUS_PER_NODE
+					// self.local_world_size
 				)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
@@ -5333,7 +5337,7 @@ class BatchGenWorker:
 			per_node_host_free=tuple(per_node_host_free),
 			chunk_size=chunk_size,
 			num_nodes=num_nodes,
-			gpus_per_node=NUM_GPUS_PER_NODE,
+			gpus_per_node=self.local_world_size,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
 			per_rank_sequence_free=(
 				tuple(per_rank_sequence_free)
@@ -6154,23 +6158,27 @@ class BatchGenWorker:
 		if comm_master_addr is None:
 			logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
 		elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-			# Track port - incremented in _check_and_reinit_pynccl on failures
-			if not hasattr(self, '_nccl_port'):
-				self._nccl_port = 20003
-
 			# Rank 0 finds an available port, then broadcasts to all ranks
+			selected_port = self._nccl_port
 			if self.rank == 0:
 				try:
-					self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
-					logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+					selected_port = self._find_available_pynccl_port(
+						comm_master_addr,
+						self._nccl_port,
+					)
+					logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl")
 				except RuntimeError as e:
 					logging.error(f"Rank 0: Failed to find available port: {e}")
-					raise
+					selected_port = -1
 
 			# Broadcast the chosen port from rank 0 to all ranks
-			port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+			port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
 			dist.broadcast(port_tensor, src=0)
 			self._nccl_port = port_tensor.item()
+			if self._nccl_port < 0:
+				raise RuntimeError(
+					"No available port remains in this runtime's PyNccl range"
+				)
 
 			# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
 			# is ready before other ranks try to connect. Different ranks may reach
@@ -6201,6 +6209,17 @@ class BatchGenWorker:
 			except Exception as e:
 				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+	def _find_available_pynccl_port(self, host: str, start_port: int) -> int:
+		end_port = self.pynccl_port_base + self.pynccl_port_span
+		start_port = max(start_port, self.pynccl_port_base)
+		remaining = end_port - start_port
+		if remaining <= 0:
+			raise RuntimeError(
+				"PyNccl port range exhausted: "
+				f"[{self.pynccl_port_base}, {end_port})"
+			)
+		return _find_available_port(host, start_port, remaining)
 
 	def prepare_kimi_k3_startup(self) -> None:
 		"""Run Kimi-K3's workload-independent one-time work before readiness.
@@ -8821,7 +8840,7 @@ class BatchGenWorker:
 			per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
 			seq_meta=seq_meta,
 			world_size=self.world_size,
-			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			num_gpus_per_node=self.local_world_size,
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
 			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
 			attn_tp_size=self._decode_attn_tp_size(),
@@ -12950,7 +12969,8 @@ class BatchGenWorker:
 		Architecture:
 		- Host KV cache is PER NODE
 		- GPU KV cache is PER RANK
-		- A sequence prefilled by rank R has host KV on node (R // NUM_GPUS_PER_NODE)
+		- A sequence prefilled by rank R has host KV on node
+		  (R // local_world_size)
 		- Only ranks on THAT node can load this sequence to their GPU
 		
 		Sync strategy:
@@ -13632,20 +13652,24 @@ class BatchGenWorker:
 
 			# Find next available port for reinitialization
 			# Rank 0 finds the port, then broadcasts to all ranks
-			if not hasattr(self, '_nccl_port'):
-				self._nccl_port = 20003
 			comm_master_addr = os.getenv("COMM_MASTER_ADDR", "127.0.0.1")
+			selected_port = self._nccl_port
 			if self.rank == 0:
 				try:
-					self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port + 1)
-					logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl reinit")
+					selected_port = self._find_available_pynccl_port(
+						comm_master_addr,
+						self._nccl_port + 1,
+					)
+					logging.debug(f"Rank 0: Found available port {selected_port} for PyNccl reinit")
 				except RuntimeError as e:
 					logging.error(f"Rank 0: Failed to find available port: {e}")
-					return False
+					selected_port = -1
 			# Broadcast port to all ranks
-			port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+			port_tensor = torch.tensor([selected_port], dtype=torch.int32, device=self.torch_device)
 			dist.broadcast(port_tensor, src=0)
 			self._nccl_port = port_tensor.item()
+			if self._nccl_port < 0:
+				return False
 			logging.debug(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
 
 			# Delay to allow OS to fully release resources

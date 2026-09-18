@@ -15,7 +15,7 @@ _RUN_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 
 @dataclass(frozen=True)
 class RuntimeIdentity:
-    """Names one immutable server run without enabling shared-host mode."""
+    """Names one immutable server run."""
 
     mode: str
     instance_id: str
@@ -29,11 +29,8 @@ class RuntimeIdentity:
         mode: str = "exclusive",
         run_id: str | None = None,
     ) -> "RuntimeIdentity":
-        if mode != "exclusive":
-            raise ValueError(
-                "shared runtime mode is not available until scoped lifecycle "
-                "and lane admission are implemented"
-            )
+        if mode not in {"exclusive", "shared"}:
+            raise ValueError("runtime mode must be 'exclusive' or 'shared'")
         if not isinstance(instance_id, str) or not _INSTANCE_ID_RE.fullmatch(
             instance_id
         ):
