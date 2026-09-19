@@ -28,6 +28,13 @@ def _host_config(**overrides):
         "page_size_tokens": 64,
         "num_pages": 4096,
         "sequence_table_capacity": 2048,
+        "num_layers": 36,
+        "num_k_heads": 8,
+        "k_head_dim": 64,
+        "k_element_size_bytes": 2,
+        "num_v_heads": 8,
+        "v_head_dim": 64,
+        "v_element_size_bytes": 2,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -47,6 +54,7 @@ def test_gpt_oss_runtime_config_is_derived_from_host_geometry():
     assert config.max_group_entries == 4097
     assert config.max_page_handles == 4096
     assert config.max_attachments == 2048
+    assert config.host_page_bytes_all_layers == 36 * 64 * 8 * 64 * 2 * 2
     assert config.debug_stats is True
     assert len(config.namespace_digest) == 4
     assert config.group_specs[0].semantic is PrefixKVGroupSemantic.FULL_KV

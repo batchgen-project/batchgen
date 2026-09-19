@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
@@ -10,6 +11,8 @@ import torch
 
 
 class _AsyncTask(Protocol):
+    def done(self) -> bool: ...
+
     def wait(self) -> None: ...
 
 
@@ -20,6 +23,17 @@ class PrefixMaterialization:
     load_task: _AsyncTask | None
     coordinator: object
     attachment_handles: tuple[int, ...]
+    collect_metrics: bool = False
+    sequence_count: int = 0
+    cached_tokens: int = 0
+    host_pages: int = 0
+    host_bytes: int = 0
+    _load_launched_at: float | None = None
+    load_done_before_wait: bool | None = None
+    load_wait_s: float = 0.0
+    load_launch_to_wait_return_s: float = 0.0
+    _load_failed: bool = False
+    _metrics_emitted: bool = False
     _load_complete: bool = False
     _closed: bool = False
 
@@ -31,8 +45,60 @@ class PrefixMaterialization:
 
     def _wait_for_load(self) -> None:
         if self.load_task is not None and not self._load_complete:
-            self.load_task.wait()
-            self._load_complete = True
+            if not self.collect_metrics:
+                self.load_task.wait()
+                self._load_complete = True
+                return
+            self.load_done_before_wait = bool(self.load_task.done())
+            wait_started_at = time.perf_counter()
+            try:
+                self.load_task.wait()
+            except Exception:
+                self._load_failed = True
+                raise
+            else:
+                self._load_complete = True
+            finally:
+                wait_returned_at = time.perf_counter()
+                self.load_wait_s = wait_returned_at - wait_started_at
+                if self._load_launched_at is not None:
+                    self.load_launch_to_wait_return_s = (
+                        wait_returned_at - self._load_launched_at
+                    )
+
+    def take_metrics_fields(
+        self,
+    ) -> dict[str, int | float | bool | None | str] | None:
+        """Return the one-shot evidence record after close is attempted.
+
+        ``launch_to_wait_return_s`` is an observed upper bound on GPU-complete
+        H2D latency.  If ``done_before_wait`` is true, completion occurred at
+        an unknown earlier point within that interval.
+        """
+
+        if not self.collect_metrics or self._metrics_emitted:
+            return None
+        self._metrics_emitted = True
+        if self.load_task is None:
+            status = "no_load"
+        elif self._load_failed:
+            status = "failed"
+        elif self._load_complete:
+            status = "complete"
+        else:
+            status = "pending"
+        return {
+            "sequences": int(self.sequence_count),
+            "cached_tokens": int(self.cached_tokens),
+            "host_pages": int(self.host_pages),
+            "host_bytes": int(self.host_bytes),
+            "load_status": status,
+            "done_before_wait": self.load_done_before_wait,
+            "wait_s": float(self.load_wait_s),
+            "launch_to_wait_return_s": float(
+                self.load_launch_to_wait_return_s
+            ),
+        }
 
     def close(self, *, empty_cuda_cache: bool = False) -> None:
         if self._closed:
@@ -56,6 +122,8 @@ def materialize_gpt_oss_prefixes(
     prompt_lengths: Sequence[int],
     compute_cached_tokens: Sequence[int],
     raw_page_tokens: int,
+    collect_metrics: bool = False,
+    host_page_bytes_all_layers: int = 0,
 ) -> PrefixMaterialization:
     """Build one mixed hit/miss GPT-OSS prefill materialization."""
 
@@ -69,6 +137,10 @@ def materialize_gpt_oss_prefixes(
         raise ValueError("prefix materialization inputs must have equal lengths")
     if count == 0:
         raise ValueError("prefix materialization requires at least one sequence")
+    if collect_metrics and int(host_page_bytes_all_layers) <= 0:
+        raise ValueError(
+            "host_page_bytes_all_layers must be positive when metrics are enabled"
+        )
 
     host_page_tokens = int(raw_page_tokens)
     if host_page_tokens <= 0:
@@ -107,6 +179,8 @@ def materialize_gpt_oss_prefixes(
             load_task=None,
             coordinator=coordinator,
             attachment_handles=(),
+            collect_metrics=bool(collect_metrics),
+            sequence_count=count,
         )
 
     host_rows: list[list[int]] = []
@@ -148,6 +222,7 @@ def materialize_gpt_oss_prefixes(
         for handle in attachment_handles:
             coordinator.begin_attachment_load(handle)
             begun.append(handle)
+        load_launched_at = time.perf_counter() if collect_metrics else None
         load_task = host_worker_view.async_load_prefix_pages_to_device(
             host_page_ids=host_page_ids,
             active_page_counts=active_page_counts,
@@ -166,6 +241,16 @@ def materialize_gpt_oss_prefixes(
         load_task=load_task,
         coordinator=coordinator,
         attachment_handles=tuple(begun),
+        collect_metrics=bool(collect_metrics),
+        sequence_count=count,
+        cached_tokens=sum(prefix_lens) if collect_metrics else 0,
+        host_pages=sum(page_counts) if collect_metrics else 0,
+        host_bytes=(
+            sum(page_counts) * int(host_page_bytes_all_layers)
+            if collect_metrics
+            else 0
+        ),
+        _load_launched_at=load_launched_at,
     )
 
 

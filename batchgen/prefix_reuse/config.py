@@ -38,6 +38,7 @@ class PrefixCacheRuntimeConfig:
     max_group_entries: int
     max_page_handles: int
     max_attachments: int
+    host_page_bytes_all_layers: int
     debug_stats: bool = False
 
     def to_core_config(self, core_engine_module: Any):
@@ -84,6 +85,16 @@ def build_prefix_cache_runtime_config(
     sequence_capacity = int(host_kv_config.sequence_table_capacity)
     if page_tokens <= 0 or num_pages <= 0 or sequence_capacity <= 0:
         raise ValueError("host KV configuration must have positive capacities")
+    host_page_bytes_all_layers = int(host_kv_config.num_layers) * page_tokens * (
+        int(host_kv_config.num_k_heads)
+        * int(host_kv_config.k_head_dim)
+        * int(host_kv_config.k_element_size_bytes)
+        + int(host_kv_config.num_v_heads)
+        * int(host_kv_config.v_head_dim)
+        * int(host_kv_config.v_element_size_bytes)
+    )
+    if host_page_bytes_all_layers <= 0:
+        raise ValueError("host KV page byte size must be positive")
 
     group_specs = (
         PrefixKVGroupSpec(
@@ -107,6 +118,7 @@ def build_prefix_cache_runtime_config(
         max_group_entries=num_pages + 1,
         max_page_handles=num_pages,
         max_attachments=max(1024, sequence_capacity),
+        host_page_bytes_all_layers=host_page_bytes_all_layers,
         debug_stats=bool(debug_stats),
     )
 
