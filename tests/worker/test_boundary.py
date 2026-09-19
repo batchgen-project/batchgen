@@ -21,6 +21,10 @@ from batchgen.worker.boundary import (
     BoundaryHandler,
     BoundarySeqMeta,
 )
+from batchgen.continuous_batching import (
+    BoundaryDecisions,
+    requires_host_kv_release_barrier,
+)
 
 _GPN = 8
 
@@ -79,6 +83,23 @@ def _req(
     )
 
 
+def _decisions(**overrides):
+    values = {
+        "completed_uuids": [],
+        "active_uuids": [],
+        "host_growth_uuids": [],
+        "host_growth_pages": [],
+        "growth_feasible": False,
+        "host_evicted_uuids": [],
+        "onhold_uuids": [],
+        "seqs_needing_extension": [],
+        "new_load_uuids": [],
+        "decode_uuids_final": [],
+    }
+    values.update(overrides)
+    return BoundaryDecisions(**values)
+
+
 def test_completion_split():
     state = {
         "a": _state(assigned_rank=0, completed=True),
@@ -95,6 +116,59 @@ def test_completion_split():
     assert plan.onhold_uuids == []
     assert plan.host_evicted_uuids == []
     assert plan.scheduler_error is None
+    assert requires_host_kv_release_barrier(plan) is False
+
+
+def test_growth_waits_for_completed_pages_counted_by_plan():
+    """A rank must not grow before another owner releases completed pages."""
+    state = {
+        "done": _state(
+            assigned_rank=0, completed=True, host_pages_allocated=99,
+        ),
+        "grow": _state(
+            assigned_rank=2, needs_host_growth=True, host_growth_pages=17,
+        ),
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["done", "grow"],
+            global_seq_state=state,
+            per_rank_free=[100] * 8,
+            world_size=8,
+            per_node_host_stats=[{
+                "node_id": 0,
+                "num_total_pages": 455,
+                "num_free_pages": 15,
+            }],
+        )
+    )
+
+    assert plan.growth_feasible is True
+    assert plan.host_growth_pages == [17]
+    assert requires_host_kv_release_barrier(plan) is True
+
+
+@pytest.mark.parametrize(
+    ("decisions", "expected"),
+    [
+        (_decisions(
+            growth_feasible=True,
+            host_growth_uuids=["grow"],
+            host_evicted_uuids=["victim"],
+        ), True),
+        (_decisions(
+            growth_feasible=False,
+            host_growth_uuids=["grow"],
+            completed_uuids=["done"],
+        ), False),
+        (_decisions(
+            growth_feasible=True,
+            host_growth_uuids=["grow"],
+        ), False),
+    ],
+)
+def test_release_barrier_predicate_edges(decisions, expected):
+    assert requires_host_kv_release_barrier(decisions) is expected
 
 
 def test_no_stats_no_growth_is_clean():

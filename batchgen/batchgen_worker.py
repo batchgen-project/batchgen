@@ -170,6 +170,7 @@ from batchgen.continuous_batching import (
 	LoadingStrategy,
 	select_sequences_for_loading,
 	validate_boundary_payload_alignment,
+	requires_host_kv_release_barrier,
 )
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
@@ -10102,6 +10103,14 @@ class BatchGenWorker:
 				logging.info(
 					f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences"
 				)
+
+		# The rank-0 plan may count pages released above by a different owner
+		# rank.  Do not let a faster rank grow from the shared Host-KV pool until
+		# every owner has finished its completed/evicted release.  The predicate
+		# uses only broadcast decisions, so every rank enters this collective
+		# together.
+		if requires_host_kv_release_barrier(decisions):
+			dist.barrier()
 
 		# C. Host KV growth. This intentionally runs after completed/evicted
 		# host pages have been released so worker_view free pages match the

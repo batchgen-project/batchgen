@@ -94,6 +94,21 @@ class BoundaryDecisions:
     scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
 
 
+def requires_host_kv_release_barrier(decisions: BoundaryDecisions) -> bool:
+    """Whether Host-KV releases must become visible before local growth.
+
+    The rank-0 growth plan counts pages from completed and evicted sequences,
+    but their shared Host-KV entries are released by the owning ranks.  Every
+    rank receives the same ``BoundaryDecisions``, so this predicate is also a
+    safe collective condition.
+    """
+    return bool(
+        decisions.growth_feasible
+        and decisions.host_growth_uuids
+        and (decisions.completed_uuids or decisions.host_evicted_uuids)
+    )
+
+
 def _format_ranked_reports(reports: Dict[str, List[int]], limit: int = 8) -> str:
     items = sorted(reports.items(), key=lambda item: item[0])[:limit]
     return ", ".join(f"{uuid}:{ranks}" for uuid, ranks in items)
