@@ -256,12 +256,17 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 | `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. Mutually exclusive with `--enable-cuda-graph`. |
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
+| `--persistent-phase-instances` | `false` | Keep supported prefill and decode model instances alive across phase switches. For GLM-5/5.1/5.2 this also retains decode graphs and swaps only the routed experts needed by the active phase. |
 
 **How it works:**
 - At startup, CUDA graphs are captured at multiple discrete batch sizes (buckets) from 1 to `--cuda-graph-max-bucket-size`
 - During decode, the actual batch size is rounded up to the nearest bucket and the pre-captured graph is replayed
 - If the batch size exceeds the max bucket on any rank, all ranks fall back to eager execution for that step
 - Use `BATCHGEN_SEGMENTED_GRAPH=1` to switch from whole-model graph to per-segment graph mode
+
+For GLM-5/5.1/5.2, graph context capacity is derived from the model and its
+primary and auxiliary KV page tables. `--cuda-graph-max-bucket-size` limits
+decode batch size per rank; it does not limit prompt or context length.
 
 ---
 
