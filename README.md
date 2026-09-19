@@ -74,6 +74,7 @@ For a manual or component-by-component setup, see [INSTALL.md](docs/INSTALL.md).
 
 Choose the guide that matches your model and topology:
 
+- [GLM-5.2-FP8 on H200](docs/support-glm-5.2.md)
 - [DeepSeek-R1 on H20](docs/deploy-deepseek-r1-h20.md)
 - [Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)
 - [Kimi-K3 on H20](docs/deploy-kimi-k3-h20.md)
@@ -104,6 +105,7 @@ See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, ret
 ## Documentation
 
 - [Support matrix](docs/support-matrix.md) — models, hardware, maturity, and evidence level
+- [GLM-5.2-FP8 on H200](docs/support-glm-5.2.md) — one-node launch, persistent mode, 1M-context qualification, and memory limits
 - [Installation](docs/INSTALL.md) — dependency and source-install details
 - [Batch API guide](docs/batch-api-guide.md) — request format and lifecycle
 - [Server flags](docs/server-flags.md) — runtime configuration
