@@ -640,6 +640,7 @@ class GLM5ParallelStrategyManager:
                     mla_prefill_flashattention3_prepacked, attn_module))
                 setattr(attn_module, "prefill_attn_w8a16_prepacked", types.MethodType(
                     mla_prefill_flashattention3_w8a16_deepgemm_prepacked, attn_module))
+                attn_module.single_sequence_prefill_chunk_size = 16_384
                 setattr(attn_module, "decoding_attn", types.MethodType(
                     mla_decoding_flashmla, attn_module))
                 setattr(attn_module, "decoding_attn_mode_3_bf16", types.MethodType(
