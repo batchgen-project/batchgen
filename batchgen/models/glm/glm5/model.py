@@ -2736,6 +2736,18 @@ class Glm5MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3 and x.shape[0] == 1 and x.shape[1] > 262_144:
+            return self._forward_chunked(x, 16_384)
+        return self._forward_slice(x)
+
+    def _forward_chunked(self, x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        output = torch.empty_like(x)
+        for start in range(0, x.shape[1], chunk_size):
+            end = min(start + chunk_size, x.shape[1])
+            output[:, start:end] = self._forward_slice(x[:, start:end])
+        return output
+
+    def _forward_slice(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, 'gate_scale'):
             from batchgen.attention.mla.fa3_backend import w8a16_gemm
             gate = w8a16_gemm(self.gate_proj.weight.data, self.gate_scale, x)
