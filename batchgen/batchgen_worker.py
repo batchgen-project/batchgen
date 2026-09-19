@@ -1456,6 +1456,10 @@ class BatchGenWorker:
 		Optimization: uses padding=False to avoid creating a large padded 2D
 		tensor on CPU. The tokenizer returns List[List[int]] directly, which
 		is lighter than a [N, max_len] padded tensor + attention_mask.
+
+		Before the object collective, compact each prompt's ``List[int]`` into
+		a contiguous CPU int64 tensor. This bounds the gathered token payload by
+		the token count instead of replicating boxed Python integers on every rank.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
 		all_texts = [seq.text for seq in sequences]
@@ -1478,14 +1482,26 @@ class BatchGenWorker:
 				padding=False,
 				return_attention_mask=False,
 			)
-			my_tokenized = [
-				{
+			# Compact to contiguous CPU int64 tensors and drop each raw Python
+			# list as soon as it is copied, so the boxed-int representation is
+			# never alive alongside the gathered payload. `list(...)` takes our
+			# own pointer array so clearing entries cannot mutate a tokenizer
+			# container that only exposes an immutable sequence.
+			raw_input_ids = list(my_batch_tokenized["input_ids"])
+			del my_batch_tokenized
+			my_tokenized = []
+			for i in range(len(my_texts)):
+				token_ids = raw_input_ids[i]
+				raw_input_ids[i] = None
+				my_tokenized.append({
 					"idx": my_indices[i],
-					"input_ids": my_batch_tokenized["input_ids"][i],
-					"length": len(my_batch_tokenized["input_ids"][i]),
-				}
-				for i in range(len(my_texts))
-			]
+					"input_ids": torch.tensor(
+						token_ids, dtype=torch.int64, device="cpu"
+					),
+					"length": len(token_ids),
+				})
+				del token_ids
+			del raw_input_ids
 		else:
 			my_tokenized = []
 
@@ -1569,7 +1585,7 @@ class BatchGenWorker:
 			if seq.uuid in rejected_uuids:
 				continue
 			item = tokenized_by_idx[i]
-			input_ids_list = item["input_ids"]
+			input_ids_tensor = item["input_ids"]
 			actual_prompt_len = item["length"]
 
 			seq_extended_size = min(
@@ -1580,7 +1596,9 @@ class BatchGenWorker:
 			slot = self._buffer_pool.allocate_slot()
 			try:
 				input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-				input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+				# Direct copy out of the gathered tensor — no intermediate
+				# per-sequence allocation.
+				input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)
 				seq.input_ids = input_ids_view
 				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			except Exception:
