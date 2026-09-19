@@ -141,6 +141,19 @@ class SchedulingPool:
         with self._lock:
             return self._active_slots.get(request_id)
 
+    def active_request_ids(self, request_ids: Set[str]) -> Set[str]:
+        """Return the requested IDs that currently own scheduling slots."""
+        with self._lock:
+            return request_ids.intersection(self._active_slots)
+
+    def free_slot_if_allocated(self, request_id: str) -> Optional[int]:
+        """Free *request_id* when active, tolerating a completion/cancel race."""
+        with self._lock:
+            slot = self._active_slots.pop(request_id, None)
+            if slot is not None:
+                self._free_slots.append(slot)
+            return slot
+
     # -------------------- Batch Tracking --------------------
 
     def register_batch(

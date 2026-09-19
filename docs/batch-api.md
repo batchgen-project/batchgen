@@ -223,9 +223,19 @@ Get current status of a batch job. Use this endpoint to poll for completion.
 
 ### POST /v1/batches/{batch_id}/cancel
 
-Cancel a batch in `validating` or `in_progress` state (other states return an error). The batch is marked `cancelled` immediately; `cancelling_at` and `cancelled_at` are set to the same timestamp. A cancelled batch that has not started yet is skipped by the scheduler; sequences already executing are not interrupted.
+Cancel a batch in `validating` or `in_progress` state (other states return an
+error). Work still in the intake queue is removed immediately. If no request
+has reached a worker, the response is already `cancelled`. Otherwise the
+response is `cancelling`: the worker stops the batch at its next scheduling
+boundary, releases its sequence resources on every rank, and acknowledges the
+cleanup before the status becomes `cancelled`. A running GPU kernel is not
+preempted mid-launch. Completions arriving after cancellation begins are not
+published; incremental results published before cancellation are retained.
+Active cancellation requires persistent pool mode
+(`--max-pool-size > 0`); an in-progress legacy blocking-inference batch returns
+HTTP 409 instead of reporting a cancellation it cannot enforce.
 
-**Response:** `BatchObject` with `status: "cancelled"`
+**Response:** `BatchObject` with `status: "cancelling"` or `"cancelled"`
 
 ---
 
@@ -234,7 +244,7 @@ Cancel a batch in `validating` or `in_progress` state (other states return an er
 ```
 validating → in_progress → completed
                          → failed
-                         → cancelled
+                         → cancelling → cancelled
 ```
 
 | Status | Description |
@@ -243,8 +253,8 @@ validating → in_progress → completed
 | `in_progress` | Sequences are being processed |
 | `completed` | All sequences finished. `output_file_id` is set. |
 | `failed` | Processing failed. `error` field has details. |
-| `cancelling` | Reserved. Defined in the API schema but currently never emitted — cancel sets `cancelled` directly. |
-| `cancelled` | Batch was cancelled. `cancelled_at` is set. |
+| `cancelling` | Cancellation was accepted and worker resource cleanup is pending. `cancelling_at` is set. |
+| `cancelled` | Worker cleanup completed, or the batch had no admitted requests. `cancelled_at` is set. |
 
 **Timestamps:** `started_at`, `completed_at`, `cancelled_at`, `cancelling_at` are set as the batch transitions through states.
 

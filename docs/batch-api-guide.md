@@ -339,7 +339,12 @@ Returns `{"status": "healthy"}` (200) or `{"status": "unhealthy", "reason": "...
 
 ## Limitations
 
-- **Coarse batch cancellation.** `POST /v1/batches/{batch_id}/cancel` cancels a `validating` or `in_progress` batch: a batch that has not started is skipped by the scheduler, but sequences already executing are not interrupted mid-flight.
+- **Boundary-safe batch cancellation.** `POST /v1/batches/{batch_id}/cancel`
+  removes queued requests immediately. Admitted work becomes `cancelling` and
+  stops at the next worker scheduling boundary after all ranks release its
+  resources; an in-flight GPU kernel is not preempted mid-launch. Active
+  cancellation requires persistent pool mode (`--max-pool-size > 0`); legacy
+  blocking inference rejects it instead of returning a false success.
 - **No streaming.** Results are available only after each sequence finishes (via incremental output) or when the entire batch completes.
 - **Single model.** The server loads one model at startup. All batches use that model; the `model` field in request bodies is for validation only.
 
