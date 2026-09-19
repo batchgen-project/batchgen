@@ -60,8 +60,9 @@ __global__ void rmsnorm_kernel(
     // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
     if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
 
-    const T* x_row = input + row * hidden_size;
-    T* o_row = output + row * hidden_size;
+    const int64_t offset = static_cast<int64_t>(row) * hidden_size;
+    const T* x_row = input + offset;
+    T* o_row = output + offset;
 
     // Phase 1: Compute sum of squares with vectorized loads
     float sum_sq = 0.0f;
@@ -107,9 +108,10 @@ __global__ void add_rmsnorm_kernel(
     // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
     if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
 
-    T* r_row = residual + row * hidden_size;
-    const T* h_row = hidden + row * hidden_size;
-    T* o_row = normed_out + row * hidden_size;
+    const int64_t offset = static_cast<int64_t>(row) * hidden_size;
+    T* r_row = residual + offset;
+    const T* h_row = hidden + offset;
+    T* o_row = normed_out + offset;
 
     // Phase 1: Add and compute sum of squares
     float sum_sq = 0.0f;
