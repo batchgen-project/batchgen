@@ -43,6 +43,37 @@ def _load_tokenize_method():
 TOKENIZE_ADMITTED, FAKE_DIST = _load_tokenize_method()
 
 
+def _load_module_function(name):
+    """Load a module-level helper without importing the full inference engine."""
+    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
+    trim_threshold = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_TOKENIZER_TRIM_TOKENS_PER_RANK"
+            for target in node.targets
+        )
+    )
+    func = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    namespace = {"ctypes": types.SimpleNamespace()}
+    module = ast.Module(body=[trim_threshold, func], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
+    return namespace[name], namespace
+
+
+RELEASE_ARENAS, ARENAS_NAMESPACE = _load_module_function("_release_tokenizer_arenas")
+
+
+def install_fake_ctypes(monkeypatch, cdll):
+    monkeypatch.setitem(ARENAS_NAMESPACE, "ctypes", types.SimpleNamespace(CDLL=cdll))
+
+
 def encode(text):
     return [ord(ch) for ch in text]
 
@@ -274,6 +305,68 @@ def test_tokenizer_lists_are_released_before_collective(monkeypatch):
 
     assert raw_refs
     assert alive_at_gather == [[False] * len(raw_refs)]
+
+
+def test_release_tokenizer_arenas_trims_the_process_heap(monkeypatch):
+    handles = []
+
+    class FakeMallocTrim:
+        def __init__(self):
+            self.args = []
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, pad):
+            self.args.append(pad)
+            return 1
+
+    class FakeLibc:
+        def __init__(self):
+            self.malloc_trim = FakeMallocTrim()
+
+    libc = FakeLibc()
+
+    def fake_cdll(handle):
+        handles.append(handle)
+        return libc
+
+    fake_ctypes = types.SimpleNamespace(
+        CDLL=fake_cdll,
+        c_size_t=object(),
+        c_int=object(),
+    )
+    monkeypatch.setitem(ARENAS_NAMESPACE, "ctypes", fake_ctypes)
+
+    RELEASE_ARENAS(8 * (1 << 20), 8)
+
+    assert handles == [None]
+    assert libc.malloc_trim.args == [0]
+    assert libc.malloc_trim.argtypes == [fake_ctypes.c_size_t]
+    assert libc.malloc_trim.restype is fake_ctypes.c_int
+
+
+def test_release_tokenizer_arenas_skips_small_admission(monkeypatch):
+    calls = []
+    install_fake_ctypes(monkeypatch, lambda handle: calls.append(handle))
+
+    RELEASE_ARENAS(8 * (1 << 20) - 1, 8)
+
+    assert calls == []
+
+
+def test_release_tokenizer_arenas_is_noop_without_malloc_trim(monkeypatch):
+    install_fake_ctypes(monkeypatch, lambda handle: types.SimpleNamespace())
+
+    RELEASE_ARENAS(1 << 20, 1)
+
+
+def test_release_tokenizer_arenas_is_noop_when_libc_cannot_be_opened(monkeypatch):
+    def failing_cdll(handle):
+        raise OSError("no such library")
+
+    install_fake_ctypes(monkeypatch, failing_cdll)
+
+    RELEASE_ARENAS(1 << 20, 1)
 
 
 if __name__ == "__main__":
