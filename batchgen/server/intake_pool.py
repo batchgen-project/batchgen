@@ -165,6 +165,23 @@ class IntakePool:
         with self._lock:
             self._batch_info.pop(batch_id, None)
 
+    def cancel_batch(self, batch_id: str) -> List[IntakeEntry]:
+        """Remove and return entries that have not left intake for *batch_id*."""
+        with self._lock:
+            removed = []
+            for name in ("_high", "_normal"):
+                entries = getattr(self, name)
+                kept = deque()
+                while entries:
+                    entry = entries.popleft()
+                    if entry.batch_id == batch_id:
+                        removed.append(entry)
+                    else:
+                        kept.append(entry)
+                setattr(self, name, kept)
+            self._batch_info.pop(batch_id, None)
+        return removed
+
     # -------------------- Internal --------------------
 
     def _decrement_batch_remaining(self, batch_id: str) -> None:
