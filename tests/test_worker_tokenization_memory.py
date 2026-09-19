@@ -1,4 +1,5 @@
-"""Pool-admission tokenization must gather compact token tensors."""
+"""Pool-admission tokenization must move compact token tensors, and must
+serialize tokenizer execution across ranks for very large admissions."""
 
 import ast
 import logging
@@ -13,14 +14,36 @@ import torch
 
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+WORKER_TREE = ast.parse(WORKER.read_text(), filename=str(WORKER))
+
+
+def _module_nodes(*names):
+    """Module-level constants and functions, in source order."""
+    return [
+        node
+        for node in WORKER_TREE.body
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in names
+                for target in node.targets
+            )
+        )
+    ]
+
+
+def _exec_nodes(nodes, namespace):
+    module = ast.Module(body=nodes, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
+    return namespace
 
 
 def _load_tokenize_method():
     """Load the real method without importing the full inference engine."""
-    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
     worker_class = next(
         node
-        for node in tree.body
+        for node in WORKER_TREE.body
         if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
     )
     method = next(
@@ -29,41 +52,29 @@ def _load_tokenize_method():
         if isinstance(node, ast.FunctionDef)
         and node.name == "_tokenize_admitted_sequences"
     )
-    namespace = {
-        "List": List,
-        "dist": types.SimpleNamespace(),
-        "logging": logging,
-        "torch": torch,
-    }
-    module = ast.Module(body=[method], type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
-    return namespace["_tokenize_admitted_sequences"], namespace["dist"]
+    namespace = _exec_nodes(
+        _module_nodes("_TOKENIZER_SERIALIZE_CHARS_PER_RANK", "_malloc_trim") + [method],
+        {
+            "List": List,
+            "ctypes": types.SimpleNamespace(),
+            "dist": types.SimpleNamespace(),
+            "logging": logging,
+            "torch": torch,
+        },
+    )
+    return namespace["_tokenize_admitted_sequences"], namespace
 
 
-TOKENIZE_ADMITTED, FAKE_DIST = _load_tokenize_method()
+TOKENIZE_ADMITTED, TOKENIZE_NAMESPACE = _load_tokenize_method()
+FAKE_DIST = TOKENIZE_NAMESPACE["dist"]
 
 
 def _load_module_function(name):
     """Load a module-level helper without importing the full inference engine."""
-    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
-    trim_threshold = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id == "_TOKENIZER_TRIM_TOKENS_PER_RANK"
-            for target in node.targets
-        )
+    namespace = _exec_nodes(
+        _module_nodes("_TOKENIZER_TRIM_TOKENS_PER_RANK", "_malloc_trim", name),
+        {"ctypes": types.SimpleNamespace()},
     )
-    func = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
-    namespace = {"ctypes": types.SimpleNamespace()}
-    module = ast.Module(body=[trim_threshold, func], type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
     return namespace[name], namespace
 
 
@@ -180,6 +191,18 @@ def install_fake_collective(monkeypatch, worker, sent, other_rank_payloads=None)
     monkeypatch.setattr(
         FAKE_DIST, "all_gather_object", fake_all_gather_object, raising=False
     )
+
+
+def strided_payload(texts, rank, world_size):
+    """The compact payload a remote rank owns under the rank-strided split."""
+    return [
+        {
+            "idx": index,
+            "input_ids": torch.tensor(encode(texts[index]), dtype=torch.int64),
+            "length": len(texts[index]),
+        }
+        for index in range(rank, len(texts), world_size)
+    ]
 
 
 def assert_compact_payload(payload):
@@ -305,6 +328,170 @@ def test_tokenizer_lists_are_released_before_collective(monkeypatch):
 
     assert raw_refs
     assert alive_at_gather == [[False] * len(raw_refs)]
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected_events"),
+    [
+        (0, ["tokenize", "trim", "broadcast-0", "broadcast-1"]),
+        (1, ["broadcast-0", "tokenize", "trim", "broadcast-1"]),
+    ],
+)
+def test_large_admission_tokenizes_one_source_rank_at_a_time(
+    monkeypatch, rank, expected_events
+):
+    texts = ["aaaa", "bb", "ccc", "d", "eeeee"]
+    worker, uuids = make_worker(texts, rank=rank, world_size=2)
+    # 15 chars over 2 ranks: forces the serialized path in a small test.
+    monkeypatch.setitem(TOKENIZE_NAMESPACE, "_TOKENIZER_SERIALIZE_CHARS_PER_RANK", 7)
+    events = []
+    sent = []
+
+    class RecordingTokenizer(FakeTokenizer):
+        def __call__(self, texts, **kwargs):
+            events.append("tokenize")
+            return super().__call__(texts, **kwargs)
+
+    worker.tokenizer = RecordingTokenizer()
+
+    def fake_broadcast_object_list(object_list, src):
+        assert len(object_list) == 1
+        assert (object_list[0] is not None) == (src == worker.rank)
+        events.append(f"broadcast-{src}")
+        if src == worker.rank:
+            sent.append(object_list[0])
+        else:
+            object_list[0] = pickle.loads(
+                pickle.dumps(strided_payload(texts, src, worker.world_size))
+            )
+
+    def forbidden_all_gather(out_list, obj):
+        raise AssertionError("the serialized path must not all_gather")
+
+    monkeypatch.setattr(
+        FAKE_DIST, "broadcast_object_list", fake_broadcast_object_list, raising=False
+    )
+    monkeypatch.setattr(
+        FAKE_DIST, "all_gather_object", forbidden_all_gather, raising=False
+    )
+    monkeypatch.setitem(
+        TOKENIZE_NAMESPACE, "_malloc_trim", lambda: events.append("trim")
+    )
+
+    run_tokenize(worker, uuids)
+
+    # Identical ascending source order on both ranks, each rank tokenizes only
+    # at its own turn, and trims its freed arenas before the next source runs.
+    assert events == expected_events
+    assert len(sent) == 1
+    assert_compact_payload(sent[0])
+    assert [item["idx"] for item in sent[0]] == list(range(rank, len(texts), 2))
+    for uuid, text in zip(uuids, texts):
+        seq = worker.global_batch.get_sequence(uuid)
+        assert seq.prompt_length == len(text)
+        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+    slots = [worker.global_batch.get_sequence(uuid)._buffer_slot for uuid in uuids]
+    assert slots == list(range(len(uuids)))
+
+
+@pytest.mark.parametrize(
+    ("world_size", "expect_serialized"),
+    [(1, True), (2, False)],
+)
+def test_serialize_gate_is_inclusive_and_scales_with_world_size(
+    monkeypatch, world_size, expect_serialized
+):
+    texts = ["aaaa", "bb", "ccc", "d", "eeeee"]  # 15 chars
+    worker, uuids = make_worker(texts, world_size=world_size)
+    # world_size=1 assigns all 15 chars to one rank; world_size=2 assigns at
+    # most 12, so only world_size=1 reaches the per-rank threshold.
+    monkeypatch.setitem(TOKENIZE_NAMESPACE, "_TOKENIZER_SERIALIZE_CHARS_PER_RANK", 15)
+    used = []
+
+    def fake_broadcast_object_list(object_list, src):
+        used.append("broadcast")
+
+    def fake_all_gather_object(out_list, obj):
+        used.append("all_gather")
+        for other in range(world_size):
+            out_list[other] = (
+                obj if other == worker.rank else strided_payload(texts, other, world_size)
+            )
+
+    monkeypatch.setattr(
+        FAKE_DIST, "broadcast_object_list", fake_broadcast_object_list, raising=False
+    )
+    monkeypatch.setattr(
+        FAKE_DIST, "all_gather_object", fake_all_gather_object, raising=False
+    )
+
+    run_tokenize(worker, uuids)
+
+    assert used == (["broadcast"] if expect_serialized else ["all_gather"])
+    for uuid, text in zip(uuids, texts):
+        seq = worker.global_batch.get_sequence(uuid)
+        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+
+
+def test_serialized_path_stops_sources_at_sequence_count(monkeypatch):
+    texts = ["alpha", "beta"]
+    worker, uuids = make_worker(texts, rank=3, world_size=4)
+    monkeypatch.setitem(TOKENIZE_NAMESPACE, "_TOKENIZER_SERIALIZE_CHARS_PER_RANK", 1)
+    sources = []
+
+    def fake_broadcast_object_list(object_list, src):
+        assert object_list == [None]
+        sources.append(src)
+        object_list[0] = strided_payload(texts, src, worker.world_size)
+
+    monkeypatch.setattr(
+        FAKE_DIST, "broadcast_object_list", fake_broadcast_object_list, raising=False
+    )
+    monkeypatch.setattr(
+        FAKE_DIST,
+        "all_gather_object",
+        lambda *_: (_ for _ in ()).throw(AssertionError("unexpected all_gather")),
+        raising=False,
+    )
+
+    run_tokenize(worker, uuids)
+
+    assert sources == [0, 1]
+    assert worker.tokenizer.kwargs_seen == []
+    for uuid, text in zip(uuids, texts):
+        seq = worker.global_batch.get_sequence(uuid)
+        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+
+
+def test_tokenizer_lists_are_released_before_broadcast(monkeypatch):
+    worker, uuids = make_worker(["alpha", "beta"], world_size=1)
+    monkeypatch.setitem(TOKENIZE_NAMESPACE, "_TOKENIZER_SERIALIZE_CHARS_PER_RANK", 1)
+    raw_refs = []
+
+    class TrackedList(list):
+        pass
+
+    class TrackingTokenizer(FakeTokenizer):
+        def __call__(self, texts, **kwargs):
+            result = super().__call__(texts, **kwargs)
+            result["input_ids"] = [
+                TrackedList(token_ids) for token_ids in result["input_ids"]
+            ]
+            raw_refs.extend(weakref.ref(token_ids) for token_ids in result["input_ids"])
+            return result
+
+    worker.tokenizer = TrackingTokenizer()
+    alive_at_broadcast = []
+
+    def record(object_list, src):
+        alive_at_broadcast.append([ref() is not None for ref in raw_refs])
+
+    monkeypatch.setattr(FAKE_DIST, "broadcast_object_list", record, raising=False)
+
+    run_tokenize(worker, uuids)
+
+    assert raw_refs
+    assert alive_at_broadcast == [[False] * len(raw_refs)]
 
 
 def test_release_tokenizer_arenas_trims_the_process_heap(monkeypatch):
