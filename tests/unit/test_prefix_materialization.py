@@ -11,15 +11,26 @@ from batchgen.prefix_reuse.materialization import (
 class _Task:
     def __init__(self):
         self.wait_count = 0
+        self.done_count = 0
+        self.is_done = False
+        self.fail_on_wait = False
+
+    def done(self):
+        self.done_count += 1
+        return self.is_done
 
     def wait(self):
         self.wait_count += 1
+        if self.fail_on_wait:
+            raise RuntimeError("load failed")
+        self.is_done = True
 
 
 class _Manager:
     def __init__(self, page_size=4):
         self.config = SimpleNamespace(
             page_size_tokens=page_size,
+            num_layers=2,
             num_k_heads=1,
             k_head_dim=2,
             num_v_heads=1,
@@ -100,6 +111,8 @@ def test_materializes_mixed_hit_and_miss_and_releases_load_protection():
         prompt_lengths=[7, 5],
         compute_cached_tokens=[6, 0],
         raw_page_tokens=4,
+        collect_metrics=True,
+        host_page_bytes_all_layers=64,
     )
 
     assert manager.allocated == ([11, 12], [7, 5])
@@ -116,6 +129,82 @@ def test_materializes_mixed_hit_and_miss_and_releases_load_protection():
     assert coordinator.ended == [9]
     assert manager.destroyed
     assert manager.empty_cuda_cache
+    metrics = materialization.take_metrics_fields()
+    assert metrics is not None
+    assert metrics["load_status"] == "complete"
+    assert metrics["done_before_wait"] is False
+    assert metrics["sequences"] == 2
+    assert metrics["cached_tokens"] == 6
+    assert metrics["host_pages"] == 2
+    # 2 pages * 2 layers * (16-byte K page + 16-byte V page).
+    assert metrics["host_bytes"] == 128
+    assert metrics["wait_s"] >= 0.0
+    assert metrics["launch_to_wait_return_s"] >= metrics["wait_s"]
+    assert materialization.take_metrics_fields() is None
+
+
+def test_metrics_disabled_does_not_poll_or_measure_task():
+    host = _Host()
+    materialization = materialize_gpt_oss_prefixes(
+        gpu_manager=_Manager(),
+        host_worker_view=host,
+        coordinator=_Coordinator(),
+        lookup_results=[_lookup(9, [101])],
+        sequence_ids=[11],
+        prompt_lengths=[5],
+        compute_cached_tokens=[4],
+        raw_page_tokens=4,
+    )
+
+    materialization.close()
+
+    assert host.task.wait_count == 1
+    assert host.task.done_count == 0
+    assert materialization.take_metrics_fields() is None
+
+
+def test_metrics_record_precompleted_and_failed_loads_once():
+    completed_host = _Host()
+    completed = materialize_gpt_oss_prefixes(
+        gpu_manager=_Manager(),
+        host_worker_view=completed_host,
+        coordinator=_Coordinator(),
+        lookup_results=[_lookup(9, [101])],
+        sequence_ids=[11],
+        prompt_lengths=[5],
+        compute_cached_tokens=[4],
+        raw_page_tokens=4,
+        collect_metrics=True,
+        host_page_bytes_all_layers=64,
+    )
+    completed_host.task.is_done = True
+    completed.close()
+    completed_metrics = completed.take_metrics_fields()
+    assert completed_metrics is not None
+    assert completed_metrics["done_before_wait"] is True
+    assert completed_metrics["load_status"] == "complete"
+
+    failed_host = _Host()
+    failed_host.task.fail_on_wait = True
+    failed = materialize_gpt_oss_prefixes(
+        gpu_manager=_Manager(),
+        host_worker_view=failed_host,
+        coordinator=_Coordinator(),
+        lookup_results=[_lookup(9, [101])],
+        sequence_ids=[11],
+        prompt_lengths=[5],
+        compute_cached_tokens=[4],
+        raw_page_tokens=4,
+        collect_metrics=True,
+        host_page_bytes_all_layers=64,
+    )
+    with pytest.raises(RuntimeError, match="load failed"):
+        failed.close()
+    failed_metrics = failed.take_metrics_fields()
+    assert failed_metrics is not None
+    assert failed_metrics["load_status"] == "failed"
+    assert failed_metrics["wait_s"] >= 0.0
+    assert failed.take_metrics_fields() is None
 
 
 def test_materialization_maps_host_pages_into_larger_gpu_pages():

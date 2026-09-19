@@ -3041,11 +3041,30 @@ class BatchGenWorker:
 					f"required={required}"
 				)
 			page_keys.append([int(page) for page in host_pages[:required]])
-		return manager.allocate_pages_for_sequences_with_page_keys(
+		allocations = manager.allocate_pages_for_sequences_with_page_keys(
 			global_sequence_ids,
 			sequence_tokens,
 			page_keys,
 		)
+		if self.prefix_cache_debug_stats:
+			sharing = manager.get_prefix_gpu_share_stats()
+			new_physical_pages = {
+				int(page)
+				for row in allocations.values()
+				for page in row
+			}
+			self._emit_prefix_cache_metric(
+				"prefix_gpu_share",
+				sequences=len(global_sequence_ids),
+				requested_logical_pages=sum(len(row) for row in page_keys),
+				new_physical_pages=len(new_physical_pages),
+				logical_page_references=sharing.logical_page_references,
+				physical_pages=sharing.physical_pages,
+				keyed_physical_pages=sharing.keyed_physical_pages,
+				multi_referenced_pages=sharing.multi_referenced_pages,
+				reused_logical_references=sharing.reused_logical_references,
+			)
+		return allocations
 
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
 		"""Bind GPU KV manager to both worker and core_engine.
@@ -5373,6 +5392,17 @@ class BatchGenWorker:
 							"(free=%s, target=%s)",
 							released, report_node, updated_local_free, required,
 						)
+						if self.prefix_cache_debug_stats:
+							self._emit_prefix_cache_metric(
+								"prefix_reclaim",
+								reason="scheduler_admission",
+								node=int(report_node),
+								page_target=max(
+									0, required - int(stats.num_free_pages)
+								),
+								released_pages=int(released),
+								**self._prefix_host_resource_fields(),
+							)
 				except Exception:
 					logging.exception("[PREFIX_CACHE] admission eviction failed")
 					failure = 1
@@ -7881,7 +7911,7 @@ class BatchGenWorker:
 						evict_prefix_pages_for_host_allocation,
 					)
 
-					evict_prefix_pages_for_host_allocation(
+					released = evict_prefix_pages_for_host_allocation(
 						core_engine_module=core_engine,
 						coordinator=self.prefix_cache_coordinator,
 						worker_views_by_group={
@@ -7896,6 +7926,14 @@ class BatchGenWorker:
 					kv_stats = (
 						self.core_engine.host_paged_kv_worker_view.get_stats()
 					)
+					if self.prefix_cache_debug_stats:
+						self._emit_prefix_cache_metric(
+							"prefix_reclaim",
+							reason="host_allocation",
+							page_target=int(page_deficit),
+							released_pages=int(released),
+							**self._prefix_host_resource_fields(),
+						)
 			except Exception:
 				self._release_prefix_cache_attachments(list(prefix_states))
 				raise
@@ -8453,6 +8491,39 @@ class BatchGenWorker:
 					remaining_global_ids.sort()
 					manager.rebuild_page_table(remaining_global_ids)
 
+	def _emit_prefix_cache_metric(self, phase: str, **fields) -> None:
+		if not self.prefix_cache_debug_stats:
+			return
+		from batchgen.prefix_reuse.metrics import emit_prefix_cache_metric
+
+		emit_prefix_cache_metric(
+			phase=phase,
+			rank=self.rank,
+			**fields,
+		)
+
+	def _prefix_host_resource_fields(self) -> dict[str, int]:
+		from batchgen.prefix_reuse.metrics import host_resource_fields
+
+		return host_resource_fields(
+			coordinator=self.prefix_cache_coordinator,
+			worker_view=self.core_engine.host_paged_kv_worker_view,
+		)
+
+	def _close_prefix_materialization(
+		self, materialization, *, empty_cuda_cache: bool
+	) -> None:
+		try:
+			materialization.close(empty_cuda_cache=empty_cuda_cache)
+		finally:
+			if self.prefix_cache_debug_stats:
+				fields = materialization.take_metrics_fields()
+				if fields is not None:
+					self._emit_prefix_cache_metric(
+						"prefix_h2d",
+						**fields,
+					)
+
 	def _close_active_prefix_materializations(self) -> None:
 		"""Release temporary prefix-prefill GPU buffers after success or error."""
 
@@ -8474,7 +8545,10 @@ class BatchGenWorker:
 		while self._active_prefix_materializations:
 			materialization = self._active_prefix_materializations.pop()
 			try:
-				materialization.close(empty_cuda_cache=True)
+				self._close_prefix_materialization(
+					materialization,
+					empty_cuda_cache=True,
+				)
 			except Exception:
 				logging.exception(
 					"Rank %s failed to close prefix materialization",
@@ -8581,6 +8655,39 @@ class BatchGenWorker:
 				result.inserted_nodes,
 				sum(len(value) for value in retained.values()),
 			)
+			if self.prefix_cache_debug_stats:
+				eviction = commit_outcome.eviction_result
+				self._emit_prefix_cache_metric(
+					"prefix_host_commit",
+					sequence_id=int(seq.global_idx),
+					committed_tokens=int(result.committed_tokens),
+					inserted_nodes=int(result.inserted_nodes),
+					existing_nodes=int(result.existing_nodes),
+					retained_pages=sum(
+						len(value) for value in retained.values()
+					),
+					retry_evicted_nodes=(
+						int(eviction.evicted_nodes)
+						if eviction is not None
+						else 0
+					),
+					retry_protected_nodes=(
+						int(eviction.protected_nodes)
+						if eviction is not None
+						else 0
+					),
+					retry_freed_group_entries=(
+						int(eviction.freed_group_entries)
+						if eviction is not None
+						else 0
+					),
+					retry_freed_page_handles=(
+						int(eviction.freed_page_handles)
+						if eviction is not None
+						else 0
+					),
+					**self._prefix_host_resource_fields(),
+				)
 
 	# ============ Prefill and Decode ============
 
@@ -9038,6 +9145,11 @@ class BatchGenWorker:
 						prompt_lengths=batch_full_seq_lengths,
 						compute_cached_tokens=batch_compute_cached,
 						raw_page_tokens=host_page_tokens,
+						collect_metrics=self.prefix_cache_debug_stats,
+						host_page_bytes_all_layers=(
+							self.prefix_cache_runtime_config
+							.host_page_bytes_all_layers
+						),
 					)
 					self._active_prefix_materializations.append(
 						prefix_materialization
@@ -9242,7 +9354,10 @@ class BatchGenWorker:
 						device=self.torch_device,
 						reason="before releasing prefix materialization",
 					)
-					prefix_materialization.close(empty_cuda_cache=True)
+					self._close_prefix_materialization(
+						prefix_materialization,
+						empty_cuda_cache=True,
+					)
 					self._active_prefix_materializations.remove(
 						prefix_materialization
 					)

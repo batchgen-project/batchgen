@@ -101,6 +101,15 @@ class GPUPagedKVStats:
 
 
 @dataclass(frozen=True)
+class PrefixGPUShareStats:
+	logical_page_references: int
+	physical_pages: int
+	keyed_physical_pages: int
+	multi_referenced_pages: int
+	reused_logical_references: int
+
+
+@dataclass(frozen=True)
 class CUDAGraphPageTableState:
 	"""Fixed-capacity page-table state for CUDA graph consumers."""
 
@@ -1584,6 +1593,20 @@ class GPUPagedKVCacheManager:
 			num_free_pages=self._free_pages.size,
 			num_used_pages=num_used,
 			num_total_pages_allocated=num_used,
+		)
+
+	def get_prefix_gpu_share_stats(self) -> PrefixGPUShareStats:
+		"""Return aggregate physical-page sharing without exposing page ids."""
+
+		refcounts = tuple(self._gpu_page_refcounts.values())
+		return PrefixGPUShareStats(
+			logical_page_references=sum(refcounts),
+			physical_pages=len(refcounts),
+			keyed_physical_pages=len(self._shared_page_key_to_gpu_page),
+			multi_referenced_pages=sum(count > 1 for count in refcounts),
+			reused_logical_references=sum(
+				max(0, count - 1) for count in refcounts
+			),
 		)
 
 	def copy_kv_to_tensor(self, sequence_id: int) -> torch.Tensor:
