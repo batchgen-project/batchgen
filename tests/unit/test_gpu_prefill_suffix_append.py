@@ -105,7 +105,7 @@ def test_host_page_identity_shares_gpu_pages_until_last_release():
     manager = _manager()
     before = manager.get_stats()
 
-    manager.allocate_pages_for_sequences_with_page_keys(
+    allocations = manager.allocate_pages_for_sequences_with_page_keys(
         [101, 102],
         [12, 12],
         [
@@ -119,6 +119,13 @@ def test_host_page_identity_shares_gpu_pages_until_last_release():
     assert pages_101[:2] == pages_102[:2]
     assert pages_101[2] != pages_102[2]
     assert manager.get_stats().num_used_pages == before.num_used_pages + 4
+    sharing = manager.get_prefix_gpu_share_stats()
+    assert sharing.logical_page_references == 6
+    assert sharing.physical_pages == 4
+    assert sharing.keyed_physical_pages == 4
+    assert sharing.multi_referenced_pages == 2
+    assert sharing.reused_logical_references == 2
+    assert len({page for row in allocations.values() for page in row}) == 4
 
     manager.free_pages_for_sequences([101])
     assert manager.get_stats().num_used_pages == before.num_used_pages + 3
@@ -129,6 +136,7 @@ def test_host_page_identity_shares_gpu_pages_until_last_release():
     assert manager.get_stats().num_used_pages == before.num_used_pages
     assert manager._shared_page_key_to_gpu_page == {}
     assert manager._gpu_page_refcounts == {}
+    assert manager.get_prefix_gpu_share_stats().physical_pages == 0
 
 
 def test_shared_gpu_allocation_is_transactional_on_capacity_failure():
