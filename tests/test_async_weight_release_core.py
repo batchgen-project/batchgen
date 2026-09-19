@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -48,6 +49,45 @@ def test_async_release_binding_records_the_current_cuda_stream():
     assert "releaseBuffersAsync(\n        module_names, consumer_stream)" in method
     assert '.def("free_weights_buffer_async"' in binding
     assert '.def("free_weights_buffers_async"' in binding
+
+
+def test_glm5_weight_buffer_calls_exist_in_core_header_and_bindings():
+    # Keep GLM-5.2's Python wrapper and the JIT-built core extension in sync.
+    # A stale extension once hid a missing get_weights_pinned source dependency,
+    # then the first non-persistent attention release exposed the absent
+    # free_weights_buffer_async binding.
+    wrappers = _source("batchgen/models/glm/glm5/wrappers.py")
+    header = _source("core/batchgen.h")
+    implementation = _source("core/batchgen.cpp")
+    binding = _source("core/batchgen_Binding.cpp")
+
+    called = set(
+        re.findall(
+            r"self\.core_engine\."
+            r"(get_weights_pinned|free_weights_buffers?_async)\(",
+            wrappers,
+        )
+    )
+    assert called, "no async weight-release core call found in GLM-5.2 wrappers"
+
+    for name in sorted(called):
+        return_type = (
+            "std::unordered_map<std::string, torch::Tensor>"
+            if name == "get_weights_pinned"
+            else "void"
+        )
+        assert f"{return_type} {name}(" in header, (
+            f"wrappers.py calls core_engine.{name} but core/batchgen.h "
+            f"does not declare it"
+        )
+        assert f"BatchGen::{name}(" in implementation, (
+            f"wrappers.py calls core_engine.{name} but core/batchgen.cpp "
+            f"does not define it"
+        )
+        assert f'.def("{name}"' in binding, (
+            f"wrappers.py calls core_engine.{name} but "
+            f"core/batchgen_Binding.cpp does not pybind-expose it"
+        )
 
 
 def test_reset_waits_for_pending_consumers_before_replacing_storage():
