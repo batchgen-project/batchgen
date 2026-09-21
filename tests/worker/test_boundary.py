@@ -64,7 +64,7 @@ def _req(
     *, decode_uuids, global_seq_state, per_rank_free, world_size,
     global_candidate_info=None, per_node_host_stats=None, seq_meta=None,
     chunk_size=64, enable_host_kv_eviction=False, host_kv_eviction_watermark=10,
-    attn_tp_size=1,
+    attn_tp_size=1, max_rank_bsz=0,
 ):
     if seq_meta is None:
         seq_meta = {u: _meta(i) for i, u in enumerate(decode_uuids)}
@@ -81,6 +81,7 @@ def _req(
         enable_host_kv_eviction=enable_host_kv_eviction,
         host_kv_eviction_watermark=host_kv_eviction_watermark,
         attn_tp_size=attn_tp_size,
+        max_rank_bsz=max_rank_bsz,
     )
 
 
@@ -329,6 +330,79 @@ def test_tp_loading_uses_group_capacity_and_not_assigned_rank():
     assert plan.new_load_uuids == ["x", "z"]
 
 
+def test_loading_fills_only_rows_left_under_decode_padding_cap():
+    # Regression: loads were limited only by free GPU pages, so a large pool
+    # grew per-rank decode batches to ~306 against MoE buffers padded for 128
+    # and every rank hung in the next decode step.
+    state = {
+        "r1a": _state(assigned_rank=1), "r1b": _state(assigned_rank=1),
+        "r2a": _state(assigned_rank=2), "r2b": _state(assigned_rank=2),
+        "r2c": _state(assigned_rank=2),
+    }
+    candidates = {
+        f"c{rank}{i}": {"decoded_length": 100 - i, "pages_needed": 1, "assigned_rank": rank}
+        for rank, n in ((1, 3), (2, 2), (3, 1)) for i in range(n)
+    }
+    seq_meta = {u: _meta(i) for i, u in enumerate([*state, *candidates])}
+    kwargs = dict(decode_uuids=list(state), global_seq_state=state, per_rank_free=[100] * 8,
+                  world_size=8, global_candidate_info=candidates, seq_meta=seq_meta)
+    capped = BoundaryHandler.compute_decisions(_req(**kwargs, max_rank_bsz=3))
+    assert capped.new_load_uuids == ["c10", "c30"]
+    uncapped = BoundaryHandler.compute_decisions(_req(**kwargs))
+    assert sorted(uncapped.new_load_uuids) == sorted(candidates)
+
+
+def test_loading_cap_counts_rows_after_completion_and_onhold():
+    # Rank 1 starts at the cap (3 rows); one completes and one goes on hold
+    # (no GPU pages for its extension), so exactly two slots open this boundary.
+    state = {
+        "done": _state(assigned_rank=1, completed=True),
+        "held": _state(assigned_rank=1, additional_pages_needed=5),
+        "keep": _state(assigned_rank=1),
+    }
+    candidates = {
+        f"c{i}": {"decoded_length": 100 - i, "pages_needed": 1, "assigned_rank": 1}
+        for i in range(4)
+    }
+    seq_meta = {u: _meta(i) for i, u in enumerate([*state, *candidates])}
+    per_rank_free = [100] * 8
+    per_rank_free[1] = 4  # "held" needs 5 pages -> on hold; loads use the 4 left
+    plan = BoundaryHandler.compute_decisions(
+        _req(decode_uuids=list(state), global_seq_state=state, per_rank_free=per_rank_free,
+             world_size=8, global_candidate_info=candidates, seq_meta=seq_meta, max_rank_bsz=3)
+    )
+    assert plan.completed_uuids == ["done"]
+    assert plan.onhold_uuids == ["held"]
+    assert plan.new_load_uuids == ["c0", "c1"]
+
+
+def test_tp_loading_cap_counts_decode_groups():
+    state = {"active": _state(assigned_rank=3, decode_dp_group=0)}
+    candidates = {
+        "x": {"decoded_length": 50, "pages_needed": 1, "assigned_rank": 1, "decode_dp_group": 0},
+        "z": {"decoded_length": 30, "pages_needed": 1, "assigned_rank": 8, "decode_dp_group": 1},
+        "w": {"decoded_length": 20, "pages_needed": 1, "assigned_rank": 9, "decode_dp_group": 1},
+    }
+    seq_meta = {u: _meta(i) for i, u in enumerate(["active", "x", "z", "w"])}
+    plan = BoundaryHandler.compute_decisions(
+        _req(decode_uuids=["active"], global_seq_state=state, per_rank_free=[100] * 16,
+             world_size=16, global_candidate_info=candidates, seq_meta=seq_meta,
+             attn_tp_size=8, max_rank_bsz=1)
+    )
+    assert plan.new_load_uuids == ["z"]
+
+
+def test_worker_passes_decode_padding_cap_to_boundary_request():
+    """Wiring guard: the worker is not unit-instantiable, so check the source."""
+    import ast
+    from pathlib import Path
+
+    worker = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
+    fn = next(n for n in ast.walk(ast.parse(worker.read_text()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_make_boundary_decision_request")
+    assert 'max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0' in ast.unparse(fn).replace("'", '"')
+
+
 def test_tp_extension_uses_tightest_rank_in_group():
     state = {
         "a": _state(
@@ -370,3 +444,20 @@ def test_empty_decode_uuids():
     assert plan.decode_uuids_final == []
     assert plan.new_load_uuids == []
     assert plan.scheduler_error is None
+
+
+def test_select_for_loading_checks_slots_before_pages_and_counts_admitted_only():
+    from batchgen.continuous_batching import select_sequences_for_loading
+
+    candidates = {
+        "big": {"decoded_length": 90, "pages_needed": 50, "assigned_rank": 0},
+        "a": {"decoded_length": 80, "pages_needed": 1, "assigned_rank": 0},
+        "b": {"decoded_length": 70, "pages_needed": 1, "assigned_rank": 0},
+        "c": {"decoded_length": 60, "pages_needed": 1, "assigned_rank": 1},
+    }
+    # "big" does not fit rank 0's pages, so it must not use up rank 0's slot.
+    loads, _ = select_sequences_for_loading(
+        candidates, per_rank_free_pages=[10, 10], exclude_uuids=set(),
+        per_group_seq_slots=[1, 0],
+    )
+    assert loads == ["a"]
