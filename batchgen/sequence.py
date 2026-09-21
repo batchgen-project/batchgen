@@ -81,6 +81,7 @@ class SequenceEntry:
         # Dynamic host KV reservation tracking
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
+        'host_owned_pages',      # Pages in this sequence's own Host chain (what release frees)
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -158,6 +159,7 @@ class SequenceEntry:
         # Dynamic host KV reservation: starts at 0, set by worker at prefill time
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
+        self.host_owned_pages: int = 0
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None
