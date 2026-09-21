@@ -32,6 +32,8 @@ PrefixIntegrityError = _INTEGRITY.PrefixIntegrityError
 assert_drained = _INTEGRITY.assert_drained
 check_compute_cached = _INTEGRITY.check_compute_cached
 check_host_growth_accounting = _INTEGRITY.check_host_growth_accounting
+gpu_chunk_hashes = _INTEGRITY.gpu_chunk_hashes
+keyed_gpu_pages = _INTEGRITY.keyed_gpu_pages
 page_hashes = _INTEGRITY.page_hashes
 page_identity = _INTEGRITY.page_identity
 page_positions = _INTEGRITY.page_positions
@@ -382,3 +384,78 @@ def test_owner_unlink_drops_a_stale_ledger():
     finally:
         fresh.close()
         fresh.unlink()
+
+
+def _gpu_cache(num_pages, page_tokens, seed):
+    """Fake ``GPUPagedKVCacheManager`` cache ``[L, pages, tokens, 8, 64]``."""
+    generator = torch.Generator().manual_seed(seed)
+    shape = (_LAYERS, num_pages, page_tokens, *_PAGE_SHAPE[1:])
+    return torch.randn(shape, generator=generator).to(torch.bfloat16)
+
+
+def test_gpu_chunk_hashes_read_64_token_subranges_of_256_token_pages(monkeypatch):
+    k, v = _gpu_cache(3, 256, seed=41), _gpu_cache(3, 256, seed=42)
+    chunks = [5, 2, 11]  # page 1 tokens 64-127, page 0 128-191, page 2 192-255
+    monkeypatch.setattr(_INTEGRITY, "_HASH_BLOCK_PAGES", 2)  # two blocks
+    k_hashes, v_hashes = gpu_chunk_hashes(k, v, chunks, 64)
+    assert k_hashes.shape == v_hashes.shape == (3, _LAYERS, 2)
+    for row, chunk in enumerate(chunks):
+        page, start = chunk // 4, (chunk % 4) * 64
+        for layer in range(_LAYERS):
+            want_k = page_hashes(k[layer, page, start : start + 64][None])[0]
+            want_v = page_hashes(v[layer, page, start : start + 64][None])[0]
+            assert torch.equal(k_hashes[row, layer], want_k)
+            assert torch.equal(v_hashes[row, layer], want_v)
+    with pytest.raises(ValueError, match="multiple of 64"):
+        gpu_chunk_hashes(k[:, :, :100], v[:, :, :100], [0], 64)
+
+
+def test_fa_subpage_gather_catches_offset_and_kv_swap(ledger):
+    """H2 layout: Host slot s of a hit sits at sub-page s of FA page 1."""
+    host_k, host_v = _sequence_kv(3, seed=51)
+    host_ids = [7, 8, 9]
+    k_hashes, v_hashes = sequence_page_hashes(host_k, host_v, range(3), "cpu")
+    ledger.record(host_ids, k_hashes, v_hashes, [1, 2, 3], [4, 5, 6], rank=0)
+    k, v = _gpu_cache(2, 256, seed=52), _gpu_cache(2, 256, seed=53)
+    for slot in range(3):
+        k[:, 1, slot * 64 : (slot + 1) * 64] = host_k[:, slot]
+        v[:, 1, slot * 64 : (slot + 1) * 64] = host_v[:, slot]
+    chunks = [4, 5, 6]
+    assert ledger.verify(host_ids, *gpu_chunk_hashes(k, v, chunks, 64), context="H2") == 3
+    with pytest.raises(PrefixIntegrityError, match="H2: page 7 layer 0 K hash mismatch"):
+        ledger.verify(host_ids, *gpu_chunk_hashes(k, v, [5, 6, 7], 64), context="H2")
+    with pytest.raises(PrefixIntegrityError, match="H2: page 7 layer 0 K hash mismatch"):
+        ledger.verify(host_ids, *gpu_chunk_hashes(v, k, chunks, 64), context="H2")
+
+
+def test_decode_pages_keyed_by_host_page_verify_and_catch_overwrite(ledger):
+    """H4 layout: 64-token decode pages keyed by Host page id."""
+    host_k, host_v = _sequence_kv(3, seed=61)
+    host_ids = [3, 12, 5]
+    k_hashes, v_hashes = sequence_page_hashes(host_k, host_v, range(3), "cpu")
+    ledger.record(host_ids, k_hashes, v_hashes, [1, 2, 3], [4, 5, 6], rank=2)
+    gpu_page_by_key = {3: 6, 12: 0, 5: 2, 99: 4}
+    k, v = _gpu_cache(8, 64, seed=62), _gpu_cache(8, 64, seed=63)
+    for pos, page in enumerate(host_ids):
+        k[:, gpu_page_by_key[page]] = host_k[:, pos]
+        v[:, gpu_page_by_key[page]] = host_v[:, pos]
+    gpu_pages = keyed_gpu_pages(gpu_page_by_key, host_ids, context="H4-gpu-load")
+    assert gpu_pages == [6, 0, 2]
+    hashes = gpu_chunk_hashes(k, v, gpu_pages, 64)
+    assert ledger.verify(host_ids, *hashes, context="H4-gpu-load") == 3
+    with pytest.raises(PrefixIntegrityError, match="H4-gpu-load: page 5 layer 0 K"):
+        ledger.verify(
+            host_ids, *gpu_chunk_hashes(k, v, [6, 0, 4], 64), context="H4-gpu-load"
+        )
+    v.view(torch.int16)[1, 0, 63, 7, 63] ^= 1  # layer 1 of Host page 12
+    with pytest.raises(
+        PrefixIntegrityError,
+        match=r"H4-gpu-load: page 12 layer 1 V hash mismatch.*rank 2",
+    ):
+        ledger.verify(
+            host_ids, *gpu_chunk_hashes(k, v, gpu_pages, 64), context="H4-gpu-load"
+        )
+    with pytest.raises(
+        PrefixIntegrityError, match=r"H4-gpu-load: Host pages \[7\] have no decode"
+    ):
+        keyed_gpu_pages(gpu_page_by_key, [3, 7], context="H4-gpu-load")

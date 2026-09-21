@@ -3451,6 +3451,8 @@ class BatchGenWorker:
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
+		if self._prefix_integrity:
+			self._verify_prefix_pages_after_gpu_load(manager, global_sequence_ids)
 
 		# Option 1 (unified resident TP): NO prefill->decode KDA reshard. Under
 		# G>1 the sequence's serve-group ran prefill in TP-G lockstep, so each of
@@ -8548,10 +8550,17 @@ class BatchGenWorker:
 		)
 
 	def _close_prefix_materialization(
-		self, materialization, *, empty_cuda_cache: bool
+		self,
+		materialization,
+		*,
+		empty_cuda_cache: bool,
+		verify_integrity: bool = False,
 	) -> None:
 		try:
-			materialization.close(empty_cuda_cache=empty_cuda_cache)
+			materialization.close(
+				empty_cuda_cache=empty_cuda_cache,
+				verify_integrity=verify_integrity,
+			)
 		finally:
 			if self.prefix_cache_debug_stats:
 				fields = materialization.take_metrics_fields()
@@ -8560,6 +8569,8 @@ class BatchGenWorker:
 						"prefix_h2d",
 						**fields,
 					)
+		if verify_integrity:
+			self._emit_prefix_integrity_metric("H2-materialization")
 
 	def _close_active_prefix_materializations(self) -> None:
 		"""Release temporary prefix-prefill GPU buffers after success or error."""
@@ -8865,6 +8876,52 @@ class BatchGenWorker:
 				)
 			)
 		self._emit_prefix_integrity_metric("H5-release")
+
+	def _verify_prefix_pages_after_gpu_load(
+		self, manager, global_sequence_ids: Sequence[int]
+	) -> None:
+		"""H4: decode GPU pages hold the ledgered bytes of every prefix Host page."""
+		from batchgen.prefix_reuse.integrity import (
+			PrefixIntegrityError,
+			gpu_chunk_hashes,
+			keyed_gpu_pages,
+		)
+
+		page_ids = set()
+		for sequence_id in global_sequence_ids:
+			state = self._prefix_sequence_states.get(int(sequence_id))
+			page_ids.update(state.shared_page_ids if state is not None else ())
+			page_ids.update(
+				self._prefix_integrity_retained.get(int(sequence_id), ())
+			)
+		if page_ids:
+			page_ids = sorted(int(page) for page in page_ids)
+			page_tokens = int(
+				self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
+			)
+			if int(manager.config.page_size_tokens) != page_tokens:
+				raise PrefixIntegrityError(
+					"H4-gpu-load: decode GPU pages hold "
+					f"{manager.config.page_size_tokens} tokens, Host pages "
+					f"{page_tokens}"
+				)
+			# _allocate_gpu_pages_with_host_identity keys every decode GPU
+			# page by its Host page id, so one GPU page backs each Host page.
+			gpu_pages = keyed_gpu_pages(
+				manager._shared_page_key_to_gpu_page,
+				page_ids,
+				context="H4-gpu-load",
+			)
+			k_cache, v_cache = manager.get_kv_tensors()
+			k_hashes, v_hashes = gpu_chunk_hashes(
+				k_cache, v_cache, gpu_pages, page_tokens
+			)
+			self._prefix_integrity_counters.pages_verified["H4-gpu-load"] += (
+				self._prefix_integrity_ledger.verify(
+					page_ids, k_hashes, v_hashes, context="H4-gpu-load"
+				)
+			)
+		self._emit_prefix_integrity_metric("H4-gpu-load")
 
 	def _check_prefix_integrity_drained(self) -> None:
 		"""H6: no prefix attachment, load, or GPU page outlives a drained batch."""
@@ -9380,6 +9437,8 @@ class BatchGenWorker:
 							self.prefix_cache_runtime_config
 							.host_page_bytes_all_layers
 						),
+						integrity_ledger=self._prefix_integrity_ledger,
+						integrity_counters=self._prefix_integrity_counters,
 					)
 					self._active_prefix_materializations.append(
 						prefix_materialization
@@ -9587,6 +9646,7 @@ class BatchGenWorker:
 					self._close_prefix_materialization(
 						prefix_materialization,
 						empty_cuda_cache=True,
+						verify_integrity=self._prefix_integrity,
 					)
 					self._active_prefix_materializations.remove(
 						prefix_materialization
@@ -10675,6 +10735,10 @@ class BatchGenWorker:
 		"""Minimal finalize without extra rebuilds - rebuild done once at end."""
 		Attn_Wrapper.async_kv_load_active = False
 		Attn_Wrapper.async_kv_load_task = None
+		if self._prefix_integrity and pending_global_ids:
+			# H4 for boundary reloads/admissions; both callers already waited
+			# on the async load and synchronized the device.
+			self._verify_prefix_pages_after_gpu_load(gpu_manager, pending_global_ids)
 
 		if pending_local_indices and isinstance(gpu_manager, DualKVCacheCoordinator):
 			if not isinstance(async_task, DualAsyncKVTask):
