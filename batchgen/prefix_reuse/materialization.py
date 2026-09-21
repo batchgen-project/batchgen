@@ -36,6 +36,11 @@ class PrefixMaterialization:
     _metrics_emitted: bool = False
     _load_complete: bool = False
     _closed: bool = False
+    # Host pages loaded per sequence, in ``append_plan`` order.
+    host_page_ids: tuple[tuple[int, ...], ...] = ()
+    host_page_tokens: int = 0
+    integrity_ledger: object | None = None
+    integrity_counters: object | None = None
 
     def wait_for_layer(self, layer_idx: int) -> None:
         if self._closed:
@@ -100,16 +105,62 @@ class PrefixMaterialization:
             ),
         }
 
-    def close(self, *, empty_cuda_cache: bool = False) -> None:
+    def close(
+        self, *, empty_cuda_cache: bool = False, verify_integrity: bool = False
+    ) -> None:
+        """Release the load protection and the temporary GPU pages.
+
+        Only the successful prefill path passes ``verify_integrity``; cleanup
+        after an exception closes without it.
+        """
         if self._closed:
             return
         try:
             self._wait_for_load()
+            if verify_integrity and self.integrity_ledger is not None:
+                self._verify_gpu_prefix_pages()
         finally:
             for handle in reversed(self.attachment_handles):
                 self.coordinator.end_attachment_load(handle)
             self.manager.destroy(empty_cuda_cache=empty_cuda_cache)
             self._closed = True
+
+    def _verify_gpu_prefix_pages(self) -> None:
+        """H2: the GPU prefix bytes attention read equal their ledgered Host pages.
+
+        Runs after every layer appended its suffix, so it also proves no suffix
+        write landed in the prefix. A raw full hit recomputes its last prompt
+        token into the last loaded page, so only pages wholly below the
+        computed-prefix boundary are compared.
+        """
+        from batchgen.prefix_reuse.integrity import gpu_chunk_hashes
+
+        plan = self.append_plan
+        page_table = plan.page_table.cpu()
+        per_gpu_page = (
+            int(self.manager.config.page_size_tokens) // self.host_page_tokens
+        )
+        page_ids: list[int] = []
+        chunk_ids: list[int] = []
+        for slot, prefix, pages in zip(
+            plan.slot_values, plan.prefix_values, self.host_page_ids
+        ):
+            count = int(prefix) // self.host_page_tokens
+            page_ids.extend(pages[:count])
+            chunk_ids.extend(
+                _host_page_chunks(page_table[slot].tolist(), count, per_gpu_page)
+            )
+        if not page_ids:
+            return
+        k_cache, v_cache = self.manager.get_kv_tensors()
+        k_hashes, v_hashes = gpu_chunk_hashes(
+            k_cache, v_cache, chunk_ids, self.host_page_tokens
+        )
+        self.integrity_counters.pages_verified["H2-materialization"] += (
+            self.integrity_ledger.verify(
+                page_ids, k_hashes, v_hashes, context="H2-materialization"
+            )
+        )
 
 
 def materialize_gpt_oss_prefixes(
@@ -124,6 +175,8 @@ def materialize_gpt_oss_prefixes(
     raw_page_tokens: int,
     collect_metrics: bool = False,
     host_page_bytes_all_layers: int = 0,
+    integrity_ledger: object | None = None,
+    integrity_counters: object | None = None,
 ) -> PrefixMaterialization:
     """Build one mixed hit/miss GPT-OSS prefill materialization."""
 
@@ -184,6 +237,7 @@ def materialize_gpt_oss_prefixes(
         )
 
     host_rows: list[list[int]] = []
+    loaded_pages: list[tuple[int, ...]] = []
     attachment_handles: list[int] = []
     for result, page_count in zip(lookup_results, page_counts):
         pages: list[int] = []
@@ -203,6 +257,7 @@ def materialize_gpt_oss_prefixes(
                 raise RuntimeError("prefix hit is missing its attachment handle")
             attachment_handles.append(handle)
         row = pages[:page_count]
+        loaded_pages.append(tuple(row))
         row.extend([0] * (max_pages - len(row)))
         host_rows.append(row)
 
@@ -251,6 +306,10 @@ def materialize_gpt_oss_prefixes(
             else 0
         ),
         _load_launched_at=load_launched_at,
+        host_page_ids=tuple(loaded_pages),
+        host_page_tokens=host_page_tokens,
+        integrity_ledger=integrity_ledger,
+        integrity_counters=integrity_counters,
     )
 
 
@@ -304,6 +363,18 @@ def _expand_device_ptrs_for_host_pages(
             host_pages_per_gpu_page=pages_per_gpu_page,
         )
     return expanded_k, expanded_v
+
+
+def _host_page_chunks(
+    gpu_page_row: Sequence[int], num_host_pages: int, host_pages_per_gpu_page: int
+) -> list[int]:
+    """``gpu_chunk_hashes`` ids of one sequence's first Host slots.
+
+    Host slot ``s`` fills sub-page ``s % r`` of GPU page ``row[s // r]``: the
+    byte range ``_expand_pointer_tensor_for_host_pages`` targets.
+    """
+    r = int(host_pages_per_gpu_page)
+    return [int(gpu_page_row[s // r]) * r + s % r for s in range(num_host_pages)]
 
 
 def _host_page_bytes(
