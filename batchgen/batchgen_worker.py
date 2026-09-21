@@ -817,6 +817,9 @@ class BatchGenWorker:
 		self.enable_prefix_cache = bool(args.enable_prefix_cache)
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self._prefix_integrity = bool(args.prefix_cache_integrity_check)
+		self._prefix_integrity_ledger = None
+		self._prefix_integrity_counters = None
+		self._prefix_integrity_retained = {}  # global_idx -> committed page ids
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
 		self._prefix_sequence_states = {}
@@ -888,6 +891,20 @@ class BatchGenWorker:
 						create_region=False,
 					)
 				)
+				if self._prefix_integrity:
+					from batchgen.prefix_reuse.integrity import (
+						IntegrityCounters,
+						IntegrityLedger,
+					)
+
+					# The region owner (WorkerManager) unlinked any stale
+					# ledger before spawning workers.
+					self._prefix_integrity_ledger = IntegrityLedger(
+						self.prefix_cache_runtime_config.shm_name,
+						worker_kv_config.num_pages,
+						worker_kv_config.num_layers,
+					)
+					self._prefix_integrity_counters = IntegrityCounters()
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -6627,6 +6644,7 @@ class BatchGenWorker:
 		self._ensure_pynccl_communicator()
 
 		iteration = 0
+		prefix_integrity_drained_iteration = 0
 
 		# Persistent loop: continues until all completed AND no more admissions expected
 		while True:
@@ -6639,6 +6657,14 @@ class BatchGenWorker:
 
 			# --- TERMINATION CHECK ---
 			if self.global_batch.all_completed():
+				# H6 once per drain; `iteration` advances identically on every
+				# rank, so every rank enters the check's barrier together.
+				if (
+					self._prefix_integrity
+					and iteration != prefix_integrity_drained_iteration
+				):
+					self._check_prefix_integrity_drained()
+					prefix_integrity_drained_iteration = iteration
 				# Print timing summary when all current work is done
 				if not self._timing_logged and self.rank == 0:
 					gen_time = time.perf_counter() - generation_start_time
@@ -7840,6 +7866,12 @@ class BatchGenWorker:
 						)
 						prefix_states[seq.global_idx] = state
 						self._prefix_sequence_states[seq.global_idx] = state
+					if self._prefix_integrity:
+						# prefix_states is in my_prefill_uuids order, as is
+						# prompt_token_ids.
+						self._verify_prefix_attach_identity(
+							list(prefix_states.values()), prompt_token_ids
+						)
 				except Exception:
 					for sequence_id in prefix_states:
 						self._prefix_sequence_states.pop(sequence_id, None)
@@ -8467,6 +8499,8 @@ class BatchGenWorker:
 			# NOTE: GPU KV pages should already be released by caller
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
 
+			if self._prefix_integrity:
+				self._verify_prefix_pages_before_release(global_sequence_ids)
 			# Release host KV pages
 			# NOTE: release_sequence_pages already calls unregister_sequences internally,
 			# so we don't need to call unregister_sequences separately
@@ -8564,6 +8598,8 @@ class BatchGenWorker:
 		if not self.enable_prefix_cache:
 			return
 		for sequence_id in global_sequence_ids:
+			if self._prefix_integrity:
+				self._prefix_integrity_retained.pop(int(sequence_id), None)
 			state = self._prefix_sequence_states.pop(int(sequence_id), None)
 			if state is None:
 				continue
@@ -8615,6 +8651,9 @@ class BatchGenWorker:
 			)
 			if request is None:
 				continue
+			if self._prefix_integrity:
+				# Ledger before publishing so no rank can hit an unledgered page.
+				self._ledger_prefix_pages_before_commit(seq, token_ids, pages[0])
 
 			commit_outcome = commit_prefix_pages_with_capacity_retry(
 				request=request,
@@ -8649,6 +8688,11 @@ class BatchGenWorker:
 				worker_views_by_group={0: worker_view},
 				sequence_id=seq.global_idx,
 			)
+			if self._prefix_integrity:
+				self._prefix_integrity_retained[seq.global_idx] = (
+					*self._prefix_integrity_retained.get(seq.global_idx, ()),
+					*retained.get(0, ()),
+				)
 			logging.info(
 				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
 				"inserted_nodes=%s retained_pages=%s",
@@ -8691,6 +8735,189 @@ class BatchGenWorker:
 					),
 					**self._prefix_host_resource_fields(),
 				)
+		if self._prefix_integrity:
+			self._emit_prefix_integrity_metric("H1-commit")
+
+	def _emit_prefix_integrity_metric(self, phase: str, **fields) -> None:
+		from batchgen.prefix_reuse.metrics import emit_prefix_cache_metric
+
+		emit_prefix_cache_metric(
+			rank=self.rank,
+			**self._prefix_integrity_counters.metric_record(phase),
+			**fields,
+		)
+
+	def _ledger_prefix_pages_before_commit(
+		self, seq, token_ids: Sequence[int], page_ids: Sequence[int]
+	) -> None:
+		"""H1: record the Host bytes of new pages; verify already-committed ones."""
+		from batchgen.prefix_reuse.integrity import (
+			page_identity,
+			sequence_page_hashes,
+			split_commit_pages,
+		)
+
+		sequence_id = int(seq.global_idx)
+		state = self._prefix_sequence_states.get(sequence_id)
+		committed = (
+			*(state.shared_page_ids if state is not None else ()),
+			*self._prefix_integrity_retained.get(sequence_id, ()),
+		)
+		verify_pos, record_pos = split_commit_pages(
+			page_ids, committed, context="H1-recommit"
+		)
+		# page_ids are the leading logical pages of the sequence page table,
+		# which is also the page axis of read_sequence_kv_to_cpu.
+		k, v = self.core_engine.host_paged_kv_worker_view.read_sequence_kv_to_cpu(
+			sequence_id
+		)
+		k_hashes, v_hashes = sequence_page_hashes(
+			k, v, range(len(page_ids)), self.torch_device
+		)
+		ledger = self._prefix_integrity_ledger
+		counters = self._prefix_integrity_counters
+		if verify_pos:
+			counters.pages_verified["H1-recommit"] += ledger.verify(
+				[page_ids[pos] for pos in verify_pos],
+				k_hashes[verify_pos],
+				v_hashes[verify_pos],
+				context="H1-recommit",
+			)
+		if record_pos:
+			chains, raw_ends = page_identity(
+				token_ids,
+				len(page_ids),
+				int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens),
+			)
+			# Pages the commit finds already cached are not retained; their rows
+			# stay unreachable until that page id is committed and re-recorded.
+			ledger.record(
+				[page_ids[pos] for pos in record_pos],
+				k_hashes[record_pos],
+				v_hashes[record_pos],
+				[chains[pos] for pos in record_pos],
+				[raw_ends[pos] for pos in record_pos],
+				rank=self.rank,
+			)
+			counters.pages_ledgered += len(record_pos)
+
+	def _verify_prefix_attach_identity(
+		self, states: Sequence[object], prompt_token_ids: Sequence[Sequence[int]]
+	) -> None:
+		"""H3: attached Host pages hold, in order, this prompt's leading pages."""
+		from batchgen.prefix_reuse.integrity import check_compute_cached
+
+		page_tokens = int(
+			self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
+		)
+		counters = self._prefix_integrity_counters
+		for state, token_ids in zip(states, prompt_token_ids):
+			check_compute_cached(
+				state.attached_tokens,
+				state.compute_cached_tokens,
+				len(token_ids),
+				context="H3-identity",
+			)
+			if state.shared_page_ids:
+				counters.identity_checks += 1
+				counters.pages_verified["H3-identity"] += (
+					self._prefix_integrity_ledger.verify_identity(
+						state.shared_page_ids,
+						token_ids,
+						page_tokens,
+						context="H3-identity",
+					)
+				)
+		self._emit_prefix_integrity_metric("H3-identity")
+
+	def _verify_prefix_pages_before_release(
+		self, global_sequence_ids: Sequence[int]
+	) -> None:
+		"""H5: every Host page a sequence shared or committed is still intact."""
+		from batchgen.prefix_reuse.integrity import (
+			page_positions,
+			sequence_page_hashes,
+		)
+
+		worker_view = self.core_engine.host_paged_kv_worker_view
+		counters = self._prefix_integrity_counters
+		for sequence_id in global_sequence_ids:
+			sequence_id = int(sequence_id)
+			state = self._prefix_sequence_states.get(sequence_id)
+			page_ids = [
+				*(state.shared_page_ids if state is not None else ()),
+				*self._prefix_integrity_retained.get(sequence_id, ()),
+			]
+			if not page_ids:
+				continue
+			positions = page_positions(
+				worker_view.build_page_table([sequence_id])[0],
+				page_ids,
+				context="H5-release",
+			)
+			k, v = worker_view.read_sequence_kv_to_cpu(sequence_id)
+			k_hashes, v_hashes = sequence_page_hashes(
+				k, v, positions, self.torch_device
+			)
+			counters.pages_verified["H5-release"] += (
+				self._prefix_integrity_ledger.verify(
+					page_ids, k_hashes, v_hashes, context="H5-release"
+				)
+			)
+		self._emit_prefix_integrity_metric("H5-release")
+
+	def _check_prefix_integrity_drained(self) -> None:
+		"""H6: no prefix attachment, load, or GPU page outlives a drained batch."""
+		from batchgen.prefix_reuse.integrity import assert_drained
+
+		# Coordinator stats are node-shared: wait until every rank has released.
+		dist.barrier()
+		prefix = self.prefix_cache_coordinator.get_stats()
+		live = {
+			"sequence_states": len(self._prefix_sequence_states),
+			"prefix_materializations": len(self._active_prefix_materializations),
+			"active_attachments": int(prefix.active_attachments),
+			"pending_load_entries": int(prefix.pending_load_entries),
+			"pending_load_refs": int(prefix.pending_load_refs),
+		}
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None and manager.is_initialized:
+			share = manager.get_prefix_gpu_share_stats()
+			live["gpu_physical_pages"] = int(share.physical_pages)
+			live["gpu_keyed_physical_pages"] = int(share.keyed_physical_pages)
+		self._emit_prefix_integrity_metric("H6-drain", **live)
+		assert_drained(live, context="H6-drain")
+
+	def _check_prefix_host_growth_accounting(self, decisions) -> None:
+		"""H8: the rank-0 growth plan must not credit pages releases never freed."""
+		from batchgen.prefix_reuse.integrity import check_host_growth_accounting
+
+		# Without the release barrier another owner's release may be in flight.
+		if (
+			decisions.completed_uuids or decisions.host_evicted_uuids
+		) and not requires_host_kv_release_barrier(decisions):
+			return
+		node = self.rank // NUM_GPUS_PER_NODE
+		planned = (decisions.host_planned_free_pages or {}).get(node)
+		actual = None
+		if self.local_rank == 0 and planned is not None:
+			actual = int(
+				self.core_engine.host_paged_kv_worker_view.get_stats().num_free_pages
+			)
+		if decisions.growth_feasible and decisions.host_growth_uuids:
+			# No rank may grow from the node pool before local rank 0 read it.
+			dist.barrier()
+		if actual is None:
+			return
+		self._emit_prefix_integrity_metric(
+			"H8-growth-accounting",
+			node=node,
+			planned_free_pages=int(planned),
+			actual_free_pages=actual,
+		)
+		check_host_growth_accounting(
+			node=node, planned_free=int(planned), actual_free=actual
+		)
 
 	# ============ Prefill and Decode ============
 
@@ -10046,6 +10273,8 @@ class BatchGenWorker:
 					if self._owns_host_kv(self.global_batch.get_sequence(u))
 				]
 				if worker_view is not None:
+					if self._prefix_integrity and evicted_global_ids:
+						self._verify_prefix_pages_before_release(evicted_global_ids)
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
 					# DSA: mirror release + unregister on auxiliary host KV
@@ -10113,6 +10342,8 @@ class BatchGenWorker:
 		# together.
 		if requires_host_kv_release_barrier(decisions):
 			dist.barrier()
+		if self._prefix_integrity:
+			self._check_prefix_host_growth_accounting(decisions)
 
 		# C. Host KV growth. This intentionally runs after completed/evicted
 		# host pages have been released so worker_view free pages match the
@@ -14732,6 +14963,7 @@ class BatchGenWorker:
 		# 7. Reset GPU KV tracking
 		self._sequences_with_gpu_kv = set()
 		self._prefix_sequence_states = {}
+		self._prefix_integrity_retained = {}
 		self._active_prefix_materializations = []
 		
 		# 8. Clean up model weights (but NOT core_engine or parallel_manager)

@@ -1160,6 +1160,11 @@ class WorkerManager:
             host_kv_config=host_config,
             debug_stats=self.args.prefix_cache_debug_stats,
         )
+        if self.args.prefix_cache_integrity_check:
+            from batchgen.prefix_reuse.integrity import unlink_integrity_ledger
+
+            # Workers create-or-attach the ledger; drop a stale one first.
+            unlink_integrity_ledger(self.prefix_cache_runtime_config.shm_name)
         self.prefix_cache_coordinator = create_host_prefix_cache_coordinator(
             core_engine_module=bg_lib,
             runtime_config=self.prefix_cache_runtime_config,
@@ -1175,6 +1180,10 @@ class WorkerManager:
 
         self.prefix_cache_coordinator = None
         unlink_prefix_cache_shared_memory(self.prefix_cache_runtime_config)
+        if self.args.prefix_cache_integrity_check:
+            from batchgen.prefix_reuse.integrity import unlink_integrity_ledger
+
+            unlink_integrity_ledger(self.prefix_cache_runtime_config.shm_name)
         self.prefix_cache_runtime_config = None
 
     @staticmethod

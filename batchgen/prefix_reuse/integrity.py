@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -87,6 +87,85 @@ def page_identity(
         chains.append(int.from_bytes(hasher.copy().digest(), "little") & _INT63_MASK)
         raw_ends.append(int(data[end - 1]))
     return chains, raw_ends
+
+
+def sequence_page_hashes(
+    k: torch.Tensor, v: torch.Tensor, positions: Sequence[int], device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K and V hashes ``[len(positions), L, 2]`` (CPU) of one sequence's pages.
+
+    ``k``/``v`` use the ``read_sequence_kv_to_cpu`` layout
+    ``[L, P, page_tokens, heads, head_dim]``; the page axis follows the
+    sequence's Host page table, so ``positions`` are logical page indices.
+    Each layer is hashed separately on ``device`` to bound temporary memory.
+    """
+    index = torch.as_tensor(list(positions), dtype=torch.long)
+
+    def per_layer(kv: torch.Tensor) -> torch.Tensor:
+        if kv.dim() != 5:
+            raise ValueError(f"expected [L, P, tokens, heads, dim] KV, got {tuple(kv.shape)}")
+        return torch.stack(
+            [page_hashes(kv[layer].index_select(0, index).to(device))
+             for layer in range(kv.shape[0])],
+            dim=1,
+        ).cpu()
+
+    return per_layer(k), per_layer(v)
+
+
+def page_positions(
+    page_table: Sequence[int], page_ids: Sequence[int], *, context: str
+) -> list[int]:
+    """Logical positions of ``page_ids`` in one sequence's Host page table."""
+    index = {int(page): pos for pos, page in enumerate(page_table)}
+    missing = [int(page) for page in page_ids if int(page) not in index]
+    if missing:
+        raise PrefixIntegrityError(
+            f"{context}: pages {missing[:8]} are not in the sequence page table"
+        )
+    return [index[int(page)] for page in page_ids]
+
+
+def split_commit_pages(
+    page_ids: Sequence[int], committed_ids: Sequence[int], *, context: str
+) -> tuple[list[int], list[int]]:
+    """Positions in ``page_ids`` to verify (already committed) and to record."""
+    verify = page_positions(page_ids, committed_ids, context=context)
+    taken = set(verify)
+    return verify, [pos for pos in range(len(page_ids)) if pos not in taken]
+
+
+def check_compute_cached(
+    attached: int, compute_cached: int, prompt_length: int, *, context: str
+) -> None:
+    """Compute resumes at the hit, except a raw full hit recomputes its last token."""
+    expected = attached - 1 if attached == prompt_length else attached
+    if compute_cached != expected:
+        raise PrefixIntegrityError(
+            f"{context}: compute_cached_tokens={compute_cached}, expected "
+            f"{expected} (attached={attached}, prompt_length={prompt_length})"
+        )
+
+
+def check_host_growth_accounting(
+    *, node: int, planned_free: int, actual_free: int
+) -> None:
+    """Fail when the growth plan credited more free Host pages than exist."""
+    if actual_free < planned_free:
+        raise PrefixIntegrityError(
+            f"H8-growth-accounting: node {node} planned {planned_free} free "
+            f"Host pages before growth but has {actual_free} "
+            f"(over-credited by {planned_free - actual_free})"
+        )
+
+
+def assert_drained(live: Mapping[str, int], *, context: str) -> None:
+    """Fail if any prefix bookkeeping is still live after a batch drained."""
+    leaked = {name: int(count) for name, count in live.items() if count}
+    if leaked:
+        raise PrefixIntegrityError(
+            f"{context}: prefix state still live after the batch drained: {leaked}"
+        )
 
 
 def _as_numpy(values: Any) -> np.ndarray:
@@ -234,6 +313,16 @@ def _attach(name: str, size: int) -> shared_memory.SharedMemory:
                 f"{_ATTACH_TIMEOUT_S}s, expected {size}"
             )
         time.sleep(0.05)
+
+
+def unlink_integrity_ledger(base_name: str) -> None:
+    """Remove the ledger segment, if any; the prefix region owner calls this."""
+    try:
+        shm = shared_memory.SharedMemory(name=f"{base_name}_integrity")
+    except FileNotFoundError:
+        return
+    shm.close()
+    shm.unlink()
 
 
 @dataclass

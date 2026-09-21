@@ -29,9 +29,16 @@ _INTEGRITY = _load(
 IntegrityCounters = _INTEGRITY.IntegrityCounters
 IntegrityLedger = _INTEGRITY.IntegrityLedger
 PrefixIntegrityError = _INTEGRITY.PrefixIntegrityError
+assert_drained = _INTEGRITY.assert_drained
+check_compute_cached = _INTEGRITY.check_compute_cached
+check_host_growth_accounting = _INTEGRITY.check_host_growth_accounting
 page_hashes = _INTEGRITY.page_hashes
 page_identity = _INTEGRITY.page_identity
+page_positions = _INTEGRITY.page_positions
+sequence_page_hashes = _INTEGRITY.sequence_page_hashes
+split_commit_pages = _INTEGRITY.split_commit_pages
 token_chain_hash = _INTEGRITY.token_chain_hash
+unlink_integrity_ledger = _INTEGRITY.unlink_integrity_ledger
 
 _PAGE_SHAPE = (64, 8, 64)  # GPT-OSS host page: tokens x KV heads x head dim
 _LAYERS = 3
@@ -261,3 +268,117 @@ def test_integrity_flag_requires_prefix_cache(tmp_path, monkeypatch):
     assert parsed.prefix_cache_integrity_check is True
     default = server_args.prepare_server_args(argv[:-1])
     assert default.prefix_cache_integrity_check is False
+
+
+def _sequence_kv(num_pages, seed):
+    """Fake ``read_sequence_kv_to_cpu`` output: ``[L, P, 64, 8, 64]`` K and V."""
+    k = torch.stack([_pages(num_pages, seed + layer) for layer in range(_LAYERS)])
+    v = torch.stack([_pages(num_pages, seed + 50 + layer) for layer in range(_LAYERS)])
+    return k, v
+
+
+def test_sequence_page_hashes_follow_the_page_axis_per_layer():
+    k, v = _sequence_kv(5, seed=11)
+    positions = [3, 0, 4]
+    k_hashes, v_hashes = sequence_page_hashes(k, v, positions, "cpu")
+    assert k_hashes.shape == v_hashes.shape == (3, _LAYERS, 2)
+    for row, pos in enumerate(positions):
+        for layer in range(_LAYERS):
+            assert torch.equal(k_hashes[row, layer], page_hashes(k[layer, pos : pos + 1])[0])
+            assert torch.equal(v_hashes[row, layer], page_hashes(v[layer, pos : pos + 1])[0])
+    with pytest.raises(ValueError, match=r"\[L, P, tokens, heads, dim\]"):
+        sequence_page_hashes(k[0], v[0], [0], "cpu")
+
+
+def test_page_positions_and_commit_split():
+    assert page_positions([7, 3, 9, 11], [9, 7], context="H5-release") == [2, 0]
+    with pytest.raises(PrefixIntegrityError, match=r"H5-release: pages \[5\] are not"):
+        page_positions([7, 3], [3, 5], context="H5-release")
+    # Attached shared pages lead the commit pages and are verified, not recorded.
+    assert split_commit_pages([7, 3, 9, 11], [7, 3], context="H1-recommit") == (
+        [0, 1],
+        [2, 3],
+    )
+    assert split_commit_pages([9, 11], [], context="H1-recommit") == ([], [0, 1])
+    with pytest.raises(PrefixIntegrityError, match="H1-recommit"):
+        split_commit_pages([9, 11], [4], context="H1-recommit")
+
+
+def test_commit_then_release_round_trip_catches_a_changed_shared_page(ledger):
+    """H1 records a committer's pages; H5 re-hashes a reader's page table."""
+    tokens = list(range(1000, 1000 + 256))
+    committer_table = [4, 9, 2]
+    committer_k, committer_v = _sequence_kv(4, seed=21)  # one decode page extra
+    k_hashes, v_hashes = sequence_page_hashes(committer_k, committer_v, range(3), "cpu")
+    chains, raw_ends = page_identity(tokens, 3)
+    ledger.record(committer_table, k_hashes, v_hashes, chains, raw_ends, rank=1)
+
+    # A reader attached pages 4 and 9 (prepended) and owns private pages 13, 14.
+    reader_table = [4, 9, 13, 14]
+    reader_k, reader_v = _sequence_kv(4, seed=31)
+    reader_k[:, :2] = committer_k[:, :2]
+    reader_v[:, :2] = committer_v[:, :2]
+    shared = [4, 9]
+    assert ledger.verify_identity(shared, tokens, context="H3-identity") == 2
+    positions = page_positions(reader_table, shared, context="H5-release")
+    k_hashes, v_hashes = sequence_page_hashes(reader_k, reader_v, positions, "cpu")
+    assert ledger.verify(shared, k_hashes, v_hashes, context="H5-release") == 2
+
+    reader_v.view(torch.int16)[2, 1, 17, 3, 5] ^= 1  # layer 2 of page 9
+    k_hashes, v_hashes = sequence_page_hashes(reader_k, reader_v, positions, "cpu")
+    with pytest.raises(
+        PrefixIntegrityError,
+        match=r"H5-release: page 9 layer 2 V hash mismatch.*rank 1",
+    ):
+        ledger.verify(shared, k_hashes, v_hashes, context="H5-release")
+
+
+def test_compute_cached_matches_attached_except_full_hit():
+    check_compute_cached(0, 0, 100, context="H3-identity")
+    check_compute_cached(64, 64, 100, context="H3-identity")
+    check_compute_cached(128, 127, 128, context="H3-identity")
+    with pytest.raises(PrefixIntegrityError, match="expected 127"):
+        check_compute_cached(128, 128, 128, context="H3-identity")
+    with pytest.raises(PrefixIntegrityError, match="expected 64"):
+        check_compute_cached(64, 63, 100, context="H3-identity")
+
+
+def test_host_growth_accounting_fails_only_on_over_credit():
+    check_host_growth_accounting(node=0, planned_free=114, actual_free=114)
+    check_host_growth_accounting(node=0, planned_free=114, actual_free=200)
+    with pytest.raises(
+        PrefixIntegrityError,
+        match=r"H8-growth-accounting: node 1 planned 114 .* has 90 \(over-credited by 24\)",
+    ):
+        check_host_growth_accounting(node=1, planned_free=114, actual_free=90)
+
+
+def test_assert_drained_names_every_live_counter():
+    assert_drained({"active_attachments": 0, "gpu_physical_pages": 0}, context="H6-drain")
+    with pytest.raises(
+        PrefixIntegrityError,
+        match=r"H6-drain: .*\{'active_attachments': 2, 'pending_load_refs': 1\}",
+    ):
+        assert_drained(
+            {"active_attachments": 2, "sequence_states": 0, "pending_load_refs": 1},
+            context="H6-drain",
+        )
+
+
+def test_owner_unlink_drops_a_stale_ledger():
+    base = f"bgi_{uuid.uuid4().hex[:8]}"
+    stale = IntegrityLedger(base, 4, 1)
+    k, v = torch.zeros((1, 1, 2), dtype=torch.int64), torch.ones((1, 1, 2), dtype=torch.int64)
+    stale.record([2], k, v, [5], [6], rank=3)
+    stale.close()  # a crashed run leaves the segment behind
+    unlink_integrity_ledger(base)
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=f"{base}_integrity")
+    unlink_integrity_ledger(base)  # already gone: no-op
+    fresh = IntegrityLedger(base, 4, 1)
+    try:
+        with pytest.raises(PrefixIntegrityError, match="page 2 has no ledger row"):
+            fresh.verify([2], k, v, context="after-restart")
+    finally:
+        fresh.close()
+        fresh.unlink()
