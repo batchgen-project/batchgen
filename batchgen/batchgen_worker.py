@@ -557,6 +557,7 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 	enable_prefix_cache: bool = False
 	prefix_cache_debug_stats: bool = False
+	prefix_cache_integrity_check: bool = False
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -815,6 +816,7 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		self.enable_prefix_cache = bool(args.enable_prefix_cache)
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self._prefix_integrity = bool(args.prefix_cache_integrity_check)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
 		self._prefix_sequence_states = {}

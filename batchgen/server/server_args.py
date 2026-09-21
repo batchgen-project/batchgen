@@ -90,6 +90,7 @@ class ServerArgs:
     host_kv_cache_size: Optional[int] = None
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
+    prefix_cache_integrity_check: bool = False
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -252,6 +253,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Log prefix-cache lifecycle statistics",
+    )
+    parser.add_argument(
+        "--prefix-cache-integrity-check",
+        action="store_true",
+        default=False,
+        help="Diagnostic: hash-check prefix-cache KV pages and identities on reuse",
     )
     parser.add_argument(
         "--gpu-arch", type=str, default=None, help="GPU architecture hint"
@@ -535,6 +542,10 @@ def validate_server_args(args: ServerArgs) -> None:
         )
 
         require_prefix_cache_model_support(args.model)
+    if args.prefix_cache_integrity_check and not args.enable_prefix_cache:
+        raise ValueError(
+            "--prefix-cache-integrity-check requires --enable-prefix-cache"
+        )
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(
@@ -627,6 +638,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_cache_size=parsed.host_kv_cache_size,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
+        prefix_cache_integrity_check=parsed.prefix_cache_integrity_check,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,
