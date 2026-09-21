@@ -24,6 +24,7 @@ import torch
 _WEIGHT_SEED = 0x5EED_CAFE
 _WEIGHT_LIMIT = 1 << 29
 _MAX_PAGE_ELEMENTS = 1 << 16
+_HASH_BLOCK_PAGES = 256  # <= 64 MiB per int64 page_hashes temporary
 _ATTACH_TIMEOUT_S = 30.0
 _INT63_MASK = (1 << 63) - 1
 
@@ -111,6 +112,54 @@ def sequence_page_hashes(
         ).cpu()
 
     return per_layer(k), per_layer(v)
+
+
+def gpu_chunk_hashes(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    chunk_ids: Sequence[int],
+    page_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K and V hashes ``[len(chunk_ids), L, 2]`` (CPU) of Host-page-sized GPU chunks.
+
+    ``k_cache``/``v_cache`` use the ``GPUPagedKVCacheManager`` layout
+    ``[L, gpu_pages, gpu_page_tokens, heads, head_dim]`` (token-major). With
+    ``r = gpu_page_tokens // page_tokens``, chunk ``c`` is tokens
+    ``[(c % r) * page_tokens, (c % r + 1) * page_tokens)`` of GPU page
+    ``c // r``: the bytes one Host page is loaded into, in the Host page's
+    ``[tokens, heads, dim]`` order. Layer ``l`` is the raw cache row, the row
+    Host loads write for Host layer ``l``. Hashed in blocks to bound memory.
+    """
+    index = torch.as_tensor(list(chunk_ids), dtype=torch.long, device=k_cache.device)
+
+    def per_layer(cache: torch.Tensor) -> torch.Tensor:
+        if cache.dim() != 5 or cache.shape[2] % page_tokens:
+            raise ValueError(
+                f"expected [L, pages, tokens, heads, dim] cache with tokens a "
+                f"multiple of {page_tokens}, got {tuple(cache.shape)}"
+            )
+        # A view, never a copy: the paged caches are contiguous.
+        chunks = cache.view(cache.shape[0], -1, page_tokens, *cache.shape[3:])
+        return torch.stack(
+            [torch.cat([page_hashes(chunks[layer].index_select(0, block))
+                        for block in index.split(_HASH_BLOCK_PAGES)])
+             for layer in range(cache.shape[0])],
+            dim=1,
+        ).cpu()
+
+    return per_layer(k_cache), per_layer(v_cache)
+
+
+def keyed_gpu_pages(
+    gpu_page_by_key: Mapping[int, int], page_ids: Sequence[int], *, context: str
+) -> list[int]:
+    """GPU pages that decode shares by Host page id, in ``page_ids`` order."""
+    missing = [int(page) for page in page_ids if int(page) not in gpu_page_by_key]
+    if missing:
+        raise PrefixIntegrityError(
+            f"{context}: Host pages {missing[:8]} have no decode GPU page"
+        )
+    return [int(gpu_page_by_key[int(page)]) for page in page_ids]
 
 
 def page_positions(
