@@ -536,6 +536,7 @@ def select_sequences_for_loading(
     strategy: LoadingStrategy = LoadingStrategy.LONGEST_FIRST,
     get_global_idx_fn: Optional[callable] = None,
     group_size: int = 1,
+    per_group_seq_slots: Optional[List[int]] = None,
 ) -> Tuple[List[str], Dict[int, int]]:
     """Select sequences to load from host to GPU.
 
@@ -547,6 +548,8 @@ def select_sequences_for_loading(
         exclude_uuids: UUIDs to exclude (completed, just evicted, etc.)
         strategy: Loading strategy to use
         get_global_idx_fn: Function to get global_idx for a uuid (for tie-breaking)
+        per_group_seq_slots: Optional max number of sequences to load per
+            capacity group (the decode rows left under the padding cap)
 
     Returns:
         (list of uuids to load, dict of capacity-group -> pages used)
@@ -604,6 +607,7 @@ def select_sequences_for_loading(
     rank_pages_used: Dict[int, int] = {
         r: 0 for r in range(num_capacity_groups)
     }
+    loaded_per_group = [0] * num_capacity_groups
 
     for uuid, info in sorted_candidates:
         req_pages = info.get("pages_needed", 0)
@@ -627,11 +631,18 @@ def select_sequences_for_loading(
             continue
 
         if (
+            per_group_seq_slots is not None
+            and loaded_per_group[capacity_group] >= per_group_seq_slots[capacity_group]
+        ):
+            continue
+
+        if (
             rank_pages_used[capacity_group] + req_pages
             <= capacity_free_pages[capacity_group]
         ):
             load_uuids.append(uuid)
             rank_pages_used[capacity_group] += req_pages
+            loaded_per_group[capacity_group] += 1
 
     return load_uuids, rank_pages_used
 
