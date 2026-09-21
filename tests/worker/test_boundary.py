@@ -43,6 +43,7 @@ def _state(
         "additional_pages_needed": additional_pages_needed,
         "gpu_pages_allocated": gpu_pages_allocated,
         "host_pages_allocated": host_pages_allocated,
+        "host_owned_pages": host_pages_allocated,  # prefix-free row
         "needs_host_growth": needs_host_growth,
         "host_growth_pages": host_growth_pages,
         "current_context_length": current_context_length,

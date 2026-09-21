@@ -2602,6 +2602,7 @@ class BatchGenWorker:
 		for seq, growth_pages, old_capacity, required_tokens in grow_metadata:
 			seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
 			seq.host_pages_allocated += growth_pages
+			seq.host_owned_pages += growth_pages
 			logging.warning(
 				f"Rank {self.rank}: [HOST_KV_APPEND_GROW] grew gid={seq.global_idx} "
 				f"old_cap={old_capacity} new_cap={seq.host_token_capacity} "
@@ -4214,6 +4215,8 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is not None:
 				seq.host_pages_allocated = mig.host_pages
+				# Dest allocates all host_pages into the sequence's own chain.
+				seq.host_owned_pages = mig.host_pages
 				seq.host_token_capacity = mig.host_pages * self.PAGE_SIZE
 
 		# Barrier to ensure all ranks have updated global_batch
@@ -4590,6 +4593,7 @@ class BatchGenWorker:
 					'max_decode_length': seq.max_decode_length,
 					'original_max_decode_length': seq.original_max_decode_length,
 					'host_pages_allocated': seq.host_pages_allocated,
+					'host_owned_pages': seq.host_owned_pages,
 					'host_token_capacity': seq.host_token_capacity,
 					# total_decoded_before_eviction: needed so non-owning ranks
 					# sort eviction candidates consistently in _prepare_prefill_batch.
@@ -4629,6 +4633,7 @@ class BatchGenWorker:
 							# Sync host KV fields for consistent migration planning
 							if 'host_pages_allocated' in state:
 								seq.host_pages_allocated = state['host_pages_allocated']
+							seq.host_owned_pages = state['host_owned_pages']
 							if 'host_token_capacity' in state:
 								seq.host_token_capacity = state['host_token_capacity']
 							# Eviction-related fields
@@ -5927,6 +5932,7 @@ class BatchGenWorker:
 			if seq is not None:
 				seq.gpu_pages_allocated = 0
 				seq.host_pages_allocated = 0
+				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
 
@@ -7077,6 +7083,7 @@ class BatchGenWorker:
 						if seq is not None:
 							seq.gpu_pages_allocated = 0
 							seq.host_pages_allocated = 0
+							seq.host_owned_pages = 0
 							seq.host_token_capacity = 0
 							self._sequences_with_gpu_kv.discard(uuid)
 					# Report completions (pops local_map; runs LAST).
@@ -7867,8 +7874,8 @@ class BatchGenWorker:
 
 			private_sequence_ids = []
 			private_sequence_tokens = []
-			for global_id, total_tokens in zip(
-				global_sequence_ids, sequence_tokens
+			for uuid, global_id, total_tokens in zip(
+				my_prefill_uuids, global_sequence_ids, sequence_tokens
 			):
 				state = prefix_states.get(global_id)
 				attached = state.attached_tokens if state is not None else 0
@@ -7889,6 +7896,8 @@ class BatchGenWorker:
 						f"sequence={global_id}, attached_pages={attached_pages}, "
 						f"total_pages={total_pages}"
 					)
+				# Attached prefix pages never enter the sequence's own chain.
+				self.global_batch.get_sequence(uuid).host_owned_pages = private_pages
 				if private_pages:
 					private_sequence_ids.append(global_id)
 					private_sequence_tokens.append(private_pages * page_size)
@@ -8647,6 +8656,8 @@ class BatchGenWorker:
 				worker_views_by_group={0: worker_view},
 				sequence_id=seq.global_idx,
 			)
+			# Retained pages left the sequence chain for prefix residency.
+			seq.host_owned_pages -= sum(len(value) for value in retained.values())
 			logging.info(
 				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
 				"inserted_nodes=%s retained_pages=%s",
@@ -9723,6 +9734,7 @@ class BatchGenWorker:
 					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
 					'host_pages_allocated': seq.host_pages_allocated,
+					'host_owned_pages': seq.host_owned_pages,
 					'host_token_capacity': seq.host_token_capacity,
 					# prompt_length: required so Phase 4.C can compute the
 					# re-entry reconstruction length on ALL ranks deterministically,
@@ -9847,6 +9859,7 @@ class BatchGenWorker:
 						seq._rep_detected = True
 					# Sync host KV fields to keep all ranks consistent for migration planning
 					seq.host_pages_allocated = state['host_pages_allocated']
+					seq.host_owned_pages = state['host_owned_pages']
 					seq.host_token_capacity = state['host_token_capacity']
 					# Sync prompt_length (may have been rewritten by a prior
 					# eviction on the owner) and total_decoded_before_eviction
@@ -9943,6 +9956,7 @@ class BatchGenWorker:
 				if seq is not None:
 					seq.gpu_pages_allocated = 0
 					seq.host_pages_allocated = 0
+					seq.host_owned_pages = 0
 					seq.host_token_capacity = 0
 					self._sequences_with_gpu_kv.discard(uuid)
 
@@ -10084,6 +10098,7 @@ class BatchGenWorker:
 					f"new_this_cycle={new_decoded_count}")
 				seq.gpu_pages_allocated = 0
 				seq.host_pages_allocated = 0
+				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
 				# M2b (d): eviction destroys the head-sharded KDA state on the
@@ -10124,6 +10139,7 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
 				seq.host_pages_allocated += growth_pages
+				seq.host_owned_pages += growth_pages
 				# Only do actual host page allocation on owner rank
 				if uuid in self._uuid_to_local_map:
 					host_grow_requests.append((seq.global_idx, growth_pages))
