@@ -19,7 +19,6 @@ This page is the README-specific map of current model support. It is deliberatel
 | GLM-5.2 | ≈744B MoE | FP8 | 8× H200 prefill campaign | Benchmark evidence · Experimental | Recent 128K and 256K prefill snapshots are 1.32× and 1.39× faster than SGLang 0.5.18, respectively. |
 | GPT-OSS-120B | 117B (≈5.1B active) | MXFP4 | H20 deployment guide | Documented deployment · Experimental | Functional path is documented; no comparable recent end-to-end advantage is claimed here. |
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
-| DeepSeek-V4-Flash | Model-dependent | Model-specific | Development harness | Experimental | Code path exists; use the model-specific test instructions and verify the exact checkpoint. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
 
 ### How to read this table

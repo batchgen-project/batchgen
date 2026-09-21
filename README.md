@@ -50,7 +50,7 @@ Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 u
 
 ## Supported models and hardware
 
-The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, and GLM-5.1; recent benchmark evidence also covers Kimi-K2.5 and GLM-5.2. Experimental paths include MiniMax-M2.5, DeepSeek-V4-Flash, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
+The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, and GLM-5.1; recent benchmark evidence also covers Kimi-K2.5 and GLM-5.2. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
 
 ## Quick start
 
