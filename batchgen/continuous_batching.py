@@ -92,6 +92,9 @@ class BoundaryDecisions:
     new_load_uuids: List[str]            # Sequences to async-load into GPU
     decode_uuids_final: List[str]        # Final decode_uuids after all decisions
     scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
+    # node -> free Host pages the growth plan expects after completed/evicted
+    # releases and before growth (None when no node was planned)
+    host_planned_free_pages: Optional[Dict[int, int]] = None
 
 
 def requires_host_kv_release_barrier(decisions: BoundaryDecisions) -> bool:

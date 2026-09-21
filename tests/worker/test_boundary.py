@@ -146,6 +146,8 @@ def test_growth_waits_for_completed_pages_counted_by_plan():
     assert plan.growth_feasible is True
     assert plan.host_growth_pages == [17]
     assert requires_host_kv_release_barrier(plan) is True
+    # Free pages the plan expects before growth: 15 free + 99 completed.
+    assert plan.host_planned_free_pages == {0: 114}
 
 
 @pytest.mark.parametrize(
@@ -181,6 +183,7 @@ def test_no_stats_no_growth_is_clean():
     assert plan.host_growth_uuids == []
     assert plan.growth_feasible is False  # no growth needed
     assert plan.scheduler_error is None
+    assert plan.host_planned_free_pages is None  # no host stats, no plan
 
 
 def test_growth_requested_without_stats_sets_scheduler_error():
