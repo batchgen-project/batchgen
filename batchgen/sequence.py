@@ -276,6 +276,10 @@ class SequenceEntry:
         )
 
         require(self.host_pages_allocated >= 0, f"host_pages_allocated must be non-negative, got {self.host_pages_allocated}")
+        require(
+            0 <= self.host_owned_pages <= self.host_pages_allocated,
+            f"host_owned_pages={self.host_owned_pages} must be within [0, host_pages_allocated={self.host_pages_allocated}]",
+        )
         require(self.host_token_capacity >= 0, f"host_token_capacity must be non-negative, got {self.host_token_capacity}")
         require(self.gpu_pages_allocated >= 0, f"gpu_pages_allocated must be non-negative, got {self.gpu_pages_allocated}")
         if self.host_pages_allocated:
@@ -312,6 +316,7 @@ class SequenceEntry:
             require(self.assigned_rank is not None, "EVICTED requires assigned_rank for deterministic re-entry")
             require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
             require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
+            require(self.host_owned_pages == 0, f"EVICTED requires host_owned_pages=0, got {self.host_owned_pages}")
             if require_owner_tensors:
                 require(self.evicted_token_ids is not None, "EVICTED owner requires evicted_token_ids")
             else:
