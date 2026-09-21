@@ -39,14 +39,16 @@ The numbers below are workload-specific measurements, not a universal ranking. C
 
 | Model and hardware | Workload | BatchGen | Reference | Advantage |
 | --- | --- | ---: | ---: | ---: |
-| Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18: 166.3 s | **1.42× faster** |
-| Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | Tuned SGLang: 1,202.9 s | **1.61× faster** |
-| GLM-5.2-FP8 (≈744B), 8× H200 | 128K-token prefill | 33,588 prompt tok/s | SGLang 0.5.18: 25,539 prompt tok/s | **1.32× faster** |
-| GLM-5.2-FP8 (≈744B), 8× H200 | 256K-token prefill | 33,191 prompt tok/s | SGLang 0.5.18: 23,860 prompt tok/s | **1.39× faster** |
+| Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16 Marlin+NCCL · 8,192-token chunk · no radix cache: 166.3 s | **1.42× faster** |
+| Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8 · 8,192-token/rank chunk: 1,202.9 s | **1.61× faster** |
+| GLM-5.2-FP8 (≈744B), 8× H200 | 128K-token prefill | 33,588 prompt tok/s | SGLang 0.5.18 · DP8 · 8,192-token/rank chunk: 25,539 prompt tok/s | **1.32× faster** |
+| GLM-5.2-FP8 (≈744B), 8× H200 | 256K-token prefill | 33,191 prompt tok/s | SGLang 0.5.18 · DP8 · 2,048-token/rank chunk · capped pool: 23,860 prompt tok/s | **1.39× faster** |
 
 These snapshots come from the latest gated campaigns available to this repository. The 64K GLM-5.2 point is intentionally omitted because that workload currently favors the reference system; this keeps the table focused on demonstrated strengths rather than cherry-picking a model-wide claim.
 
 Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 uses the 2026-07-10 long-context campaign; GLM-5.2 uses the 2026-09-12 strict H200 prefill campaign. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
+
+The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
 
 ## Supported models and hardware
 
