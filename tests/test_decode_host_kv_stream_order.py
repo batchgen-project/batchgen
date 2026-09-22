@@ -181,3 +181,28 @@ def test_decode_waits_only_for_token_event_after_host_kv_launch():
     hot_path = "\n".join(source.splitlines()[token_copy.lineno - 1 : token_wait.end_lineno])
     assert "torch.cuda.synchronize" not in hot_path
     assert "current_stream(self.torch_device).synchronize" not in hot_path
+
+
+def test_cpp_host_kv_tasks_make_no_device_allocations_or_pageable_copies():
+    """Regression for the GPT-OSS H200 decode deadlock (2026-09-22): the task
+    lambdas run on std::async threads, and a per-call cudaMalloc/cudaFree plus
+    a pageable cudaMemcpyAsync of std::vector pointer arrays there serialized
+    with the compute stream and hung every rank at 1,400 concurrent requests.
+    The UVA kernel reads pinned pointer slots allocated on the issuing thread."""
+    state_header = ROOT / "core" / "KV_Storage" / "compressed_state_host_manager.h"
+    for header in (HOST_VIEW, state_header):
+        source = header.read_text()
+        assert "DeviceBuffer" not in source, header.name
+        assert "cudaMalloc(" not in source, header.name
+        assert "cudaFree(" not in source, header.name
+        assert "pinned_memory(true)" in source, header.name
+
+    view = HOST_VIEW.read_text()
+    # two h2d layer loads and the batched decode append
+    assert view.count("auto pointer_slots = PinnedPointerSlots(") == 3
+    assert view.count("pointer_slots = std::move(pointer_slots)") == 3
+    start = view.index("    KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(")
+    method = view[start:view.index("return LaunchAsyncTask([this", start) + 1]
+    assert "PinnedPointerSlots(" in method
+    state = state_header.read_text()
+    assert state.count("pointer_slots = std::move(pointer_slots)") == 1

@@ -47,58 +47,6 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
 void UnregisterPinnedRange(void* base, int device_index,
                            const std::shared_ptr<spdlog::logger>& logger);
 
-template <typename T>
-class DeviceBuffer {
-   public:
-    DeviceBuffer() = default;
-    explicit DeviceBuffer(std::size_t count) { Allocate(count); }
-
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    DeviceBuffer(DeviceBuffer&& other) noexcept { Swap(other); }
-    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-        if (this != &other) {
-            Swap(other);
-        }
-        return *this;
-    }
-
-    ~DeviceBuffer() { Reset(); }
-
-    void Allocate(std::size_t count) {
-        Reset();
-        if (count == 0) {
-            return;
-        }
-        CUDA_CHECK(
-            cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)));
-        size_ = count;
-    }
-
-    void Reset() noexcept {
-        if (data_ == nullptr) {
-            return;
-        }
-        cudaFree(data_);
-        data_ = nullptr;
-        size_ = 0;
-    }
-
-    [[nodiscard]] T* get() const noexcept { return data_; }
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
-
-   private:
-    void Swap(DeviceBuffer& other) noexcept {
-        using std::swap;
-        swap(data_, other.data_);
-        swap(size_, other.size_);
-    }
-
-    T* data_ = nullptr;
-    std::size_t size_ = 0;
-};
-
 class ScopedCudaEvent final {
    public:
     explicit ScopedCudaEvent(std::shared_ptr<spdlog::logger> logger,
@@ -1179,7 +1127,7 @@ class HostPagedKVWorkerView : private LayerMapper {
      * pinned pages. GPU issues PCIe writes directly — no cudaMemcpyAsync
      * per copy pair. Replaces 78×batch_size cudaMemcpyAsync launches +
      * per-layer thread-pool task + per-task producer-stream wait with:
-     *   - 2 small HtoD of ptr arrays (~KiB each)
+     *   - pointer arrays in pinned host memory, read by the kernel over UVA
      *   - 1 UvaPageCopyKernel launch
      *   - 1 event record
      */
@@ -2432,15 +2380,6 @@ class HostPagedKVWorkerView : private LayerMapper {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
-
-    // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
-    // pointer arrays (src + dst) uploaded once per batched call. Sized
-    // lazily (grow-only) on first use; typical steady-state usage is
-    // num_layers × max_batch_size entries per cache (~few KiB).
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_src_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_dst_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_src_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_dst_buf_;
 
     inline static std::atomic<std::uint64_t> task_id_counter_{0};
 };
