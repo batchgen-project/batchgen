@@ -16,7 +16,7 @@ This page is the README-specific map of current model support. It is deliberatel
 | Kimi-K2.5 | 1.04T | INT4 / W4A16 | 16× H20 long-context campaign | Benchmark evidence | 255K prefill comparison uses SGLang 0.5.9 DP8/TP16: 1.61× faster in the recorded workload. |
 | Kimi-K3 | 2.8T | MXFP4, 896 experts | 2×8 H200; 4×8 H20 guides | Documented deployment · Benchmark evidence | Exact-64K comparison uses SGLang 0.5.18 TP16/EP16: 1.42× faster in the recorded workload. |
 | GLM-5 / GLM-5.1 | 754B (≈40B active) | FP8 | H20 support note | Documented deployment | Deployment and validation instructions are available; performance coverage is workload-dependent. |
-| GLM-5.2 | ≈744B MoE | FP8 | 8× H200 prefill campaign | Benchmark evidence · Experimental | SGLang 0.5.18 uses DP8 attention in the recorded long-context comparisons: 1.32× faster at 128K and 1.39× faster at 256K. |
+| GLM-5.2 | ≈744B MoE | FP8 | 8× H200 prefill campaign | Benchmark evidence · Experimental | SGLang 0.5.18 uses DP8 attention with TP8 MoE in the recorded long-context comparisons: 1.32× faster at 128K and 1.39× faster at 256K. |
 | GPT-OSS-120B | 117B (≈5.1B active) | MXFP4 | H20 deployment guide | Documented deployment · Experimental | Functional path is documented; no comparable recent end-to-end advantage is claimed here. |
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
