@@ -262,14 +262,19 @@ install_flash_attention() {
         git checkout "$FLASH_ATTN_VERSION"
     else
         print_step "Cloning flash-attention repository..."
-        git clone --recursive https://github.com/Dao-AILab/flash-attention.git
+        # Hopper setup initializes its CUTLASS submodule itself. Clone the
+        # pinned tag directly so we do not download unrelated ROCm submodules
+        # from the repository's default branch first.
+        git clone --branch "$FLASH_ATTN_VERSION" --single-branch --depth 1 \
+            https://github.com/Dao-AILab/flash-attention.git
         cd flash-attention
-        git checkout "$FLASH_ATTN_VERSION"
     fi
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    FLASH_ATTENTION_DISABLE_SM80=TRUE \
+        pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }
