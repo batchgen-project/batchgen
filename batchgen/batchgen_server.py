@@ -526,6 +526,8 @@ class BatchGenServer:
 		self.skeleton_state_dict_file = file_path
 		self.skeleton_state_dict = None  # Don't keep tensors in memory
 		self.parameter_server_instance = ps
+		from batchgen.server.process_utils import hold_shm_objects
+		self._parameter_server_shm_fds = hold_shm_objects((shm_name, tensor_meta_shm_name))
 		self.model_info = {
 			"huggingface_ckpt_name": self.args.model,
 			"shm_name": shm_name,

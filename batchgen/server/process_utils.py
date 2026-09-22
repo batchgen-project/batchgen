@@ -87,6 +87,22 @@ def get_model_byte_size(model_name: str) -> int:
     return DEFAULT_MODEL_BYTE_SIZE
 
 
+def hold_shm_objects(names, shm_root: str = "/dev/shm") -> List[int]:
+    """Keep a read-only fd on each named shared-memory object for this process's life.
+
+    The local parameter server writes and closes its tensor-meta segment, so no
+    live process references it; holding it lets provenance-based residue cleanup
+    (clean-h200-servers claims) attribute it to this server after a crash.
+    """
+    fds = []
+    for name in names:
+        try:
+            fds.append(os.open(os.path.join(shm_root, name.lstrip("/")), os.O_RDONLY | os.O_CLOEXEC))
+        except FileNotFoundError:  # hugetlbfs-backed segments are not under shm_root
+            continue
+    return fds
+
+
 def get_hugepage_size() -> int:
     """Get system hugepage size in bytes from /proc/meminfo.
 
