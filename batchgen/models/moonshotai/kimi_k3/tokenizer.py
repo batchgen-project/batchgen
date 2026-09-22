@@ -1200,6 +1200,13 @@ class KimiK3Tokenizer(BaseTokenizer):
     )
     _RESPONSE_OPEN = OPEN_TOKEN + "response" + SEP_TOKEN
     _RESPONSE_CLOSE = CLOSE_TOKEN + "response" + SEP_TOKEN
+    # The final response channel closes with '<|close|>response' immediately
+    # before '<|end_of_msg|>'/EOS, where the trailing '<|sep|>' the renderer
+    # emits between segments is absent. Match the close with the separator
+    # optional so the last turn's structure is stripped, not leaked as content.
+    _RESPONSE_CLOSE_RE = re.compile(
+        re.escape(CLOSE_TOKEN + "response") + r"(?:" + re.escape(SEP_TOKEN) + r")?"
+    )
     _TOOLS_SECTION_RE = re.compile(
         r"<\|open\|>tools<\|sep\|>(?P<body>.*?)<\|close\|>tools<\|sep\|>", re.DOTALL)
     _CALL_RE = re.compile(
@@ -1254,15 +1261,15 @@ class KimiK3Tokenizer(BaseTokenizer):
             tail = rest[open_at + len(self._RESPONSE_OPEN):]
 
         while True:
-            close_at = tail.find(self._RESPONSE_CLOSE)
-            if close_at == -1:
+            close = self._RESPONSE_CLOSE_RE.search(tail)
+            if close is None:
                 # No closing tag: truncated generation (length cap, or a stop
                 # token mid-channel). Keep what there is rather than dropping it.
                 parts.append(tail)
                 tail = ""
                 break
-            parts.append(tail[:close_at])
-            tail = tail[close_at + len(self._RESPONSE_CLOSE):]
+            parts.append(tail[:close.start()])
+            tail = tail[close.end():]
             next_open = tail.find(self._RESPONSE_OPEN)
             if next_open == -1:
                 break

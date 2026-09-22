@@ -24,6 +24,9 @@ httpx==0.27.2
 huggingface-hub==0.36.0
 idna==3.11
 jinja2==3.1.6
+# UCX (>=1.14 for the UCP memory-handle API) for the core_engine distributed-weight
+# daemon. Portable manylinux wheel — ships headers + libs, no system UCX / source build.
+libucx-cu12>=1.15
 markupsafe==3.0.3
 mpmath==1.3.0
 multidict==6.7.0
