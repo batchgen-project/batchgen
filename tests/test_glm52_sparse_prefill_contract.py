@@ -147,7 +147,6 @@ def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
         "_fp8_linear_from_quantized",
         lambda *_args: projected,
     )
-    records = []
     indexer = types.SimpleNamespace(
         wk=types.SimpleNamespace(weight=types.SimpleNamespace(data=torch.empty(128, 4))),
         wk_scale=torch.ones(1),
@@ -158,9 +157,6 @@ def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
         ),
         index_head_dim=128,
         layer_idx=6,
-        record_prefill_rope_hadamard_path=lambda path, layer: records.append(
-            (path, layer)
-        ),
     )
     positions = torch.tensor([[0, 1, 2]], dtype=torch.int64)
 
@@ -180,7 +176,6 @@ def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
     assert calls["sin"].dtype == torch.float32
     assert calls["positions"].tolist() == [0, 1, 2]
     assert calls["scale"] == 128**-0.5
-    assert records == [("fused", 6)]
 
 
 def test_indexer_score_weights_match_deepgemm_contract(monkeypatch):
@@ -371,6 +366,59 @@ def test_glm52_sparse_prefill_path_audit_rejects_duplicate_compute():
 
     with pytest.raises(RuntimeError, match="coverage mismatch"):
         wrapper._finish_glm52_prefill_path_counts()
+
+
+def test_glm52_short_prefill_keeps_dense_fa3_route(monkeypatch):
+    from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
+    from batchgen.models.wrappers import AttnWrapperBase
+
+    sparse_calls = []
+    dense_calls = []
+    monkeypatch.setattr(
+        sparse_prefill,
+        "glm52_sparse_prefill_prepacked",
+        lambda **kwargs: sparse_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "retire_pending_prefill_offloads_before_layer",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        GLM5AttnWrapper,
+        "_offload_prepacked_kv",
+        lambda self, _kv: None,
+    )
+
+    class DenseModule:
+        config = types.SimpleNamespace(
+            model_type="glm_moe_dsa_5_2",
+            num_hidden_layers=1,
+            index_topk=2048,
+        )
+        indexer = None
+
+        def prefill_attn_w8a16_prepacked(self, hidden_states_2d, *_args):
+            dense_calls.append(tuple(hidden_states_2d.shape))
+            return torch.zeros_like(hidden_states_2d), torch.zeros(3, 576)
+
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
+    wrapper.prepack_mode = True
+    wrapper.position_ids = torch.arange(3, dtype=torch.int64)
+    wrapper.prepack_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    wrapper.prepack_max_seqlen = 2048
+    wrapper.prepack_num_sequences = 1
+    wrapper.prepack_seq_lengths = [3]
+    wrapper.cur_batch = ["sequence-0"]
+    wrapper.weight_dequant_scale = {}
+    wrapper.module = DenseModule()
+
+    attn_output, _, _ = wrapper._forward_prefill(torch.ones(1, 3, 4))
+
+    assert dense_calls == [(3, 4)]
+    assert sparse_calls == []
+    assert attn_output.shape == (1, 3, 4)
 
 
 def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):

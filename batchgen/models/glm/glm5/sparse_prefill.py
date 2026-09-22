@@ -262,7 +262,6 @@ def _compute_indexer_kv_from_quantized_hidden(
             position_ids.reshape(-1),
             scale=indexer.index_head_dim**-0.5,
         )
-        indexer.record_prefill_rope_hadamard_path("fused", indexer.layer_idx)
     return k.unsqueeze(0).unsqueeze(2)
 
 
