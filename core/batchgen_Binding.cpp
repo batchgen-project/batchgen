@@ -260,7 +260,7 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            "Batched variant: all (layer × seq) host-KV writes issued by "
            "one UVA kernel launch on the DtoH stream. Replaces the "
            "per-layer async_append_decode_kv_to_host loop of 78×bsz "
-           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs. Each "
+           "cudaMemcpyAsync with 1 kernel reading pinned pointer arrays. Each "
            "entry's layer_idx is a logical layer id for mapped worker views "
            "and is resolved before building destination pointers.")
         .def(
