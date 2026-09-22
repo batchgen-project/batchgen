@@ -360,7 +360,7 @@ install_batchgen() {
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install .
+        pip install . --no-build-isolation
         print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
@@ -389,7 +389,7 @@ try_download_wheels() {
     [[ $FROM_SOURCE -eq 1 ]] && return 0        # user forced a source build
     command -v curl &>/dev/null || { print_warning "curl not found; building from source."; return 0; }
 
-    local pytag api urls tmp w
+    local pytag api assets tmp w
     pytag="cp$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo cp311)"
     if [[ -n "$RELEASE_TAG" ]]; then
         api="https://api.github.com/repos/${BATCHGEN_REPO}/releases/tags/${RELEASE_TAG}"
@@ -398,8 +398,8 @@ try_download_wheels() {
     fi
     print_step "Looking for pre-built Hopper wheels on ${BATCHGEN_REPO} (${RELEASE_TAG:-latest}, ${pytag}/${BUILD_ARCH})..."
 
-    # Select matching asset download URLs (python-ABI + GPU-arch aware).
-    urls="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
+    # Select matching asset names and download URLs (python-ABI + GPU-arch aware).
+    assets="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
 import sys, os, json
 pytag = os.environ["PYTAG"]; arch = os.environ["WANT_ARCH"]
 try:
@@ -417,12 +417,12 @@ for a in assets:
         continue                                    # GPU-arch mismatch
     u = a.get("browser_download_url", "")
     if u:
-        print(u)
+        print(f"{n}\t{u}")
 ' || true)"
 
     # Require all four deps; otherwise fall back to a full source build.
     for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
-        if ! printf '%s\n' "$urls" | grep -q "/${w}"; then
+        if ! printf '%s\n' "$assets" | grep -q "^${w}.*\\.whl[[:space:]]"; then
             print_warning "no pre-built '${w}' wheel for this env (${pytag}/${BUILD_ARCH}) — building from source."
             return 0
         fi
@@ -430,8 +430,8 @@ for a in assets:
 
     tmp="$INSTALL_DIR/prebuilt_wheels"          # under INSTALL_DIR so cleanup() removes it
     rm -rf "$tmp"; mkdir -p "$tmp"
-    ( cd "$tmp" && printf '%s\n' "$urls" | while read -r u; do
-        [[ -n "$u" ]] && { curl -fsSL -O "$u" || print_warning "download failed: $u"; }
+    ( cd "$tmp" && printf '%s\n' "$assets" | while IFS=$'\t' read -r n u; do
+        [[ -n "$u" ]] && { curl -fsSL -o "$n" "$u" || print_warning "download failed: $u"; }
       done )
 
     # Accept only a COMPLETE set; a partial download falls back to source.
@@ -597,7 +597,13 @@ main() {
                 pip install --find-links "$WHEEL_DIR" --no-index \
                     flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
                     pip install "$WHEEL_DIR"/*.whl
-                print_success "Hopper dependencies installed from wheels"
+                # Validate the runtime interfaces rather than trusting wheel
+                # metadata. Each installer skips a dependency that imports and
+                # source-builds only a missing or incorrectly packaged one.
+                install_flash_attention
+                install_flashmla
+                install_deepgemm
+                print_success "Hopper dependencies installed and verified"
             else
                 install_flash_attention
                 install_flashmla
