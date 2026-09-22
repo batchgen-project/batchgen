@@ -27,6 +27,7 @@ from batchgen.server.process_utils import (
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
+    hold_shm_objects,
 )
 from batchgen.server.server_args import ServerArgs
 from batchgen.utils import config_torch_module_initializer
@@ -997,6 +998,7 @@ class WorkerManager:
         self.skeleton_state_dict_file = file_path
         self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = parameter_server
+        self._parameter_server_shm_fds = hold_shm_objects((shm_name, tensor_meta_shm_name))
         self.model_info = {
             "huggingface_ckpt_name": self.args.model,
             "shm_name": shm_name,
