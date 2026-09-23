@@ -18,6 +18,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 plan_wave_prefix_sharing = _MODULE.plan_wave_prefix_sharing
 validate_wave_prefix_plan = _MODULE.validate_wave_prefix_plan
+prefill_plan_work = _MODULE.prefill_plan_work
 
 B = 4  # block tokens, small for readable trees
 
@@ -142,6 +143,35 @@ def test_no_sharing_is_one_tail_per_prompt():
     result = plan(prompts)
     assert result.segments == ()
     assert result.computed_tokens == result.prompt_tokens == 11
+
+
+def test_plan_work_counts_pooled_prefix_and_tail_attention():
+    prompt = blk(1) + blk(2) + blk(3)
+    result = plan([prompt] * 3)
+    work = prefill_plan_work(result)
+    # Shared [0,8) runs once; each private [8,12) tail attends to its prefix.
+    assert work.computed_tokens == 8 + 3 * 4
+    assert work.full_attention_pairs == sum(range(1, 9)) + 3 * sum(range(9, 13))
+    assert work.item_rows == 4
+    assert work.chunks == len(result.chunks)
+
+
+def test_plan_work_no_sharing_counts_each_prompt_once():
+    result = plan([blk(1) + [1], blk(2) + [2], [7]])
+    work = prefill_plan_work(result)
+    assert work.computed_tokens == 11
+    assert work.full_attention_pairs == 2 * sum(range(1, 6)) + 1
+    assert work.item_rows == 3
+    assert work.chunks == 1
+
+
+def test_plan_work_chunking_changes_only_chunk_count():
+    wide = prefill_plan_work(plan(TREE))
+    split = prefill_plan_work(plan(TREE, chunk_tokens=10))
+    assert split.computed_tokens == wide.computed_tokens
+    assert split.full_attention_pairs == wide.full_attention_pairs
+    assert split.item_rows == wide.item_rows
+    assert split.chunks > wide.chunks
 
 
 def test_random_waves_satisfy_invariants():
