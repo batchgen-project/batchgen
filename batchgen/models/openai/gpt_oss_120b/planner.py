@@ -82,12 +82,12 @@ class GptOssPlanner(BasePlanner):
         self.config.Basic_Config.attn_mode = 3
 
         # In-wave prefix pool: everything past this workspace in prefill HBM.
-        # One 131,072-token prepacked forward peaked 12.22 GiB allocated above
-        # the loaded weights on H200 (b2v3_forest_kv600_off_a, wave 1), and a
-        # pool chunk of 130,344 tokens held 1.10 GiB reserved but unallocated
-        # when it ran out of a 12 GiB workspace (b3pool_forest_kv600_on_a).
-        # The worker charges the reserved peak plus device memory outside the
-        # allocator after every pool chunk and fails loudly past this value.
+        # Pool chunks of up to 131,072 tokens peaked at 11.54 GiB allocated
+        # over all 32 rank waves of the forest job on H200
+        # (b3pool_forest_kv600_on_b). A 12 GiB workspace ran out with 1.10 GiB
+        # of it reserved but unallocated (b3pool_forest_kv600_on_a); 16 GiB
+        # ran every chunk. The worker fails loudly if the allocated peak of a
+        # chunk passes this value.
         self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = 16 * 2**30
 
     def get_module_shapes(self) -> dict:

@@ -8861,7 +8861,7 @@ class BatchGenWorker:
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
-		allocated_peak = 0
+		reserved_peak = 0
 		base_alloc, base_reserved, base_other = self._prefill_pool_base
 		AttnWrapperBase.prefill_pool = wave.pool
 		try:
@@ -8901,20 +8901,18 @@ class BatchGenWorker:
 				del hidden_states
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
-				# The workspace is whatever device memory the pool left free, so
-				# charge the allocator's reserved peak (fragmentation included)
-				# plus any growth of device memory outside the allocator.
+				# Allocated bytes are what a chunk needs. The allocator's reserve
+				# grows into whatever the pool left free and drops cached blocks
+				# only when a cudaMalloc fails, so it is reported, not checked.
 				free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
 				reserved_now = torch.cuda.memory_reserved(self.local_rank)
-				peak = (
+				reserved_peak = max(
+					reserved_peak,
 					torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
-					+ (device_total - free_now - reserved_now) - base_other
+					+ (device_total - free_now - reserved_now) - base_other,
 				)
+				peak = torch.cuda.max_memory_allocated(self.local_rank) - base_alloc
 				workspace_peak = max(workspace_peak, peak)
-				allocated_peak = max(
-					allocated_peak,
-					torch.cuda.max_memory_allocated(self.local_rank) - base_alloc,
-				)
 				if peak > workspace:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
@@ -8954,7 +8952,7 @@ class BatchGenWorker:
 			"pool_pages": wave.pool.num_pages,
 			"peak_pool_pages": wave.plan.peak_pool_pages,
 			"workspace_peak_bytes": workspace_peak,
-			"allocated_peak_bytes": allocated_peak,
+			"reserved_peak_bytes": reserved_peak,
 			"prefill_s": prefill_s,
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
