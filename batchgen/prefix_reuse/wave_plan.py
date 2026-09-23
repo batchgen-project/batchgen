@@ -330,7 +330,8 @@ def plan_wave_prefix_sharing(
         raise ValueError("every prompt must be non-empty")
     lengths = [len(tokens) for tokens in prompts]
     tree = _build_tree(prompts, block_tokens)
-    for threshold in sorted({c for c in tree.count if c >= 2}):
+    # 2 means every shared segment; higher values only where counts exist.
+    for threshold in sorted({2} | {c for c in tree.count if c > 2}):
         plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, threshold)
         if plan is not None:
             return plan
