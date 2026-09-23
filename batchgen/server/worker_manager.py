@@ -145,6 +145,7 @@ class WorkerManager:
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
+        self._model_shm_init_unconfirmed = False
         self.host_kv_manager = None
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
@@ -360,6 +361,11 @@ class WorkerManager:
                 # model-weight region predates RuntimeIdentity and has its own
                 # UUID name.
                 if worker_teardown_safe:
+                    if getattr(self, "_model_shm_init_unconfirmed", False):
+                        raise RuntimeError(
+                            "Model SHM creation was attempted but ownership is "
+                            "unconfirmed; preserving runtime artifacts and locks"
+                        )
                     if self._runtime_namespace_owned:
                         cleanup_resources(
                             shm_prefix=(
@@ -1067,13 +1073,9 @@ class WorkerManager:
                 },
                 self.args.runtime_identity.runtime_dir,
             )
-            # A failed Init can already have created either region. Let startup
-            # rollback clean only these reserved, run-owned names.
-            self.parameter_server_instance = parameter_server
-            self.model_info = {
-                "shm_name": reserved_shm_names[0],
-                "tensor_meta_shm_name": reserved_shm_names[1],
-            }
+            # A reservation is not proof that C++ successfully created either
+            # region. Preserve the record if Init fails after creation begins.
+            self._model_shm_init_unconfirmed = True
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
                 KimiLinear_Parameter_Server,
@@ -1138,7 +1140,15 @@ class WorkerManager:
             print(f"[DIAG {_diag_time2.time():.3f}] {msg}", flush=True)
             _diag_sys2.stdout.flush()
         _diag2("    >>> parameter_server.Init()")
-        shm_name, tensor_meta_shm_name = parameter_server.Init()
+        try:
+            shm_name, tensor_meta_shm_name = parameter_server.Init()
+        except BaseException:
+            if (
+                reserved_shm_names is not None
+                and getattr(parameter_server, "shm_creation_attempted", None) is False
+            ):
+                self._model_shm_init_unconfirmed = False
+            raise
         _diag2("    <<< parameter_server.Init() returned")
         if (
             reserved_shm_names is not None
@@ -1149,6 +1159,13 @@ class WorkerManager:
                 f"recorded reservation {reserved_shm_names}: "
                 f"{(shm_name, tensor_meta_shm_name)}"
             )
+        if reserved_shm_names is not None:
+            self.parameter_server_instance = parameter_server
+            self.model_info = {
+                "shm_name": shm_name,
+                "tensor_meta_shm_name": tensor_meta_shm_name,
+            }
+            self._model_shm_init_unconfirmed = False
         ps_size = parameter_server.parameter_server.byte_size()
         _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 

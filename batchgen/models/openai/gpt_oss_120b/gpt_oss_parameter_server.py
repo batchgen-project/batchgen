@@ -86,6 +86,7 @@ class GptOss_Parameter_Server:
         self.enable_memfd = enable_memfd
         self.shm_name = None
         self.tensor_meta_shm_name = None
+        self.shm_creation_attempted = False
 
         # Use BatchGen's unified config system
         self.model_config = load_config(huggingface_ckpt_name)
@@ -159,6 +160,7 @@ class GptOss_Parameter_Server:
         # Convert checkpoint files to BatchGen format
         self._convert_checkpoint()
 
+        self.shm_creation_attempted = True
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
