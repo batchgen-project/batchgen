@@ -187,6 +187,7 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     server = server_type()
     server.shm_name = None
     server.tensor_meta_shm_name = None
+    server.shm_creation_attempted = False
     server.enable_hugetlbfs = False
     server.enable_memfd = False
     server.converted_ckpt_dir = "/tmp/converted"
@@ -201,7 +202,8 @@ def test_gpt_oss_reserve_shm_names_is_stable_and_used_by_init():
     cpp_init_calls = []
     server = _gpt_oss_parameter_server(
         lambda: converted_with.append(
-            (server.shm_name, server.tensor_meta_shm_name)
+            (server.shm_name, server.tensor_meta_shm_name,
+             server.shm_creation_attempted)
         ),
         cpp_init_calls,
     )
@@ -212,8 +214,9 @@ def test_gpt_oss_reserve_shm_names_is_stable_and_used_by_init():
 
     assert server.Init() == reserved
     # Names must already be fixed before the long checkpoint conversion.
-    assert converted_with == [reserved]
+    assert converted_with == [(*reserved, False)]
     assert cpp_init_calls[0][:2] == reserved
+    assert server.shm_creation_attempted
 
 
 def test_gpt_oss_init_still_self_generates_without_reservation():
@@ -247,6 +250,9 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
         },
     )
     manager = manager_type()
+    manager.parameter_server_instance = None
+    manager.model_info = {}
+    manager._model_shm_init_unconfirmed = False
     manager.args = SimpleNamespace(
         model=model,
         cache_dir=tmp_path / "cache",
@@ -257,7 +263,39 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
     return manager
 
 
-def test_local_gpt_oss_records_shm_names_before_init_failure(tmp_path, monkeypatch):
+def _stop_partial_local_manager(
+    manager, process_utils, shm_dir, *, namespace_owned=False
+):
+    stop_type = _worker_manager_method(
+        "stop",
+        {
+            "cleanup_model_shm_files": lambda info: process_utils[
+                "cleanup_model_shm_files"
+            ](info, shm_dir=shm_dir),
+            "logger": SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            ),
+        },
+    )
+    manager._stopping = False
+    manager.started = False
+    manager._runtime_dir_created = True
+    manager._runtime_namespace_owned = namespace_owned
+    manager._runtime_locks = None
+    manager._lane_lease = None
+    manager.worker_process = None
+    manager.distributed_weight_daemon = None
+    manager.skeleton_state_dict_file = None
+    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
+    manager._monitor_thread = None
+    manager._cleanup_skeleton_state_dict_file = lambda: None
+    return stop_type.stop(manager)
+
+
+def test_local_gpt_oss_preserves_unconfirmed_shm_after_init_failure(
+    tmp_path, monkeypatch
+):
     process_utils = _process_utils_namespace()
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
@@ -270,6 +308,7 @@ def test_local_gpt_oss_records_shm_names_before_init_failure(tmp_path, monkeypat
         def __init__(self, *args, **kwargs):
             self.shm_name = None
             self.tensor_meta_shm_name = None
+            self.shm_creation_attempted = False
 
         def reserve_shm_names(self):
             self.shm_name = "/shm_reserved_weights"
@@ -277,6 +316,7 @@ def test_local_gpt_oss_records_shm_names_before_init_failure(tmp_path, monkeypat
             return self.shm_name, self.tensor_meta_shm_name
 
         def Init(self):
+            self.shm_creation_attempted = True
             (shm_dir / self.shm_name.lstrip("/")).touch()
             (shm_dir / self.tensor_meta_shm_name.lstrip("/")).touch()
             raise RuntimeError("weight load crashed")
@@ -296,38 +336,97 @@ def test_local_gpt_oss_records_shm_names_before_init_failure(tmp_path, monkeypat
         (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
     )
     assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
-    assert manager.parameter_server_instance is not None
-    assert manager.model_info == {
-        "shm_name": "/shm_reserved_weights",
-        "tensor_meta_shm_name": "/shm_reserved_meta",
-    }
+    assert manager.parameter_server_instance is None
+    assert manager._model_shm_init_unconfirmed
 
-    stop_type = _worker_manager_method(
-        "stop",
-        {
-            "cleanup_model_shm_files": lambda info: process_utils[
-                "cleanup_model_shm_files"
-            ](info, shm_dir=shm_dir),
-            "logger": SimpleNamespace(
-                info=lambda *args, **kwargs: None,
-                error=lambda *args, **kwargs: None,
-            ),
-        },
+    with pytest.raises(RuntimeError, match="ownership is unconfirmed"):
+        _stop_partial_local_manager(
+            manager, process_utils, shm_dir, namespace_owned=True
+        )
+
+    assert (shm_dir / "shm_reserved_weights").exists()
+    assert (shm_dir / "shm_reserved_meta").exists()
+    assert neighbor.exists()
+    assert (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).exists()
+
+
+def test_local_gpt_oss_pre_creation_failure_closes_empty_run(tmp_path, monkeypatch):
+    process_utils = _process_utils_namespace()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+
+    class FakeGptOssParameterServer:
+        shm_creation_attempted = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def reserve_shm_names(self):
+            return "/shm_reserved_weights", "/shm_reserved_meta"
+
+        def Init(self):
+            raise ValueError("checkpoint absent")
+
+    module = ModuleType(GPT_OSS_PS_MODULE)
+    module.GptOss_Parameter_Server = FakeGptOssParameterServer
+    monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
+    manager = _local_load_manager(
+        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
     )
-    manager._stopping = False
-    manager.started = False
-    manager._runtime_dir_created = True
-    manager._runtime_namespace_owned = False
-    manager._runtime_locks = None
-    manager._lane_lease = None
-    manager.worker_process = None
-    manager.distributed_weight_daemon = None
-    manager.skeleton_state_dict_file = None
-    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
-    manager._monitor_thread = None
-    manager._cleanup_skeleton_state_dict_file = lambda: None
-    stop_type.stop(manager)
 
+    with pytest.raises(ValueError, match="checkpoint absent"):
+        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
+
+    assert not manager._model_shm_init_unconfirmed
+    _stop_partial_local_manager(manager, process_utils, shm_dir)
+    assert not runtime_dir.exists()
+    assert list(shm_dir.iterdir()) == []
+
+
+def test_local_gpt_oss_post_init_failure_cleans_only_owned_names(
+    tmp_path, monkeypatch
+):
+    process_utils = _process_utils_namespace()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    neighbor = shm_dir / "shm_neighbor"
+    neighbor.touch()
+
+    class FakeGptOssParameterServer:
+        shm_creation_attempted = False
+
+        def __init__(self, *args, **kwargs):
+            self.parameter_server = SimpleNamespace(byte_size=self._fail_size)
+
+        def _fail_size(self):
+            raise RuntimeError("size failed")
+
+        def reserve_shm_names(self):
+            return "/shm_reserved_weights", "/shm_reserved_meta"
+
+        def Init(self):
+            self.shm_creation_attempted = True
+            (shm_dir / "shm_reserved_weights").touch()
+            (shm_dir / "shm_reserved_meta").touch()
+            return self.reserve_shm_names()
+
+    module = ModuleType(GPT_OSS_PS_MODULE)
+    module.GptOss_Parameter_Server = FakeGptOssParameterServer
+    monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
+    manager = _local_load_manager(
+        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
+    )
+
+    with pytest.raises(RuntimeError, match="size failed"):
+        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
+
+    assert not manager._model_shm_init_unconfirmed
+    assert manager.parameter_server_instance is not None
+    _stop_partial_local_manager(manager, process_utils, shm_dir)
     assert not (shm_dir / "shm_reserved_weights").exists()
     assert not (shm_dir / "shm_reserved_meta").exists()
     assert neighbor.exists()
@@ -340,6 +439,8 @@ def test_local_gpt_oss_fails_closed_when_init_drifts_from_reservation(
     process_utils = _process_utils_namespace()
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
 
     class DriftingGptOssParameterServer:
         def __init__(self, *args, **kwargs):
@@ -366,6 +467,10 @@ def test_local_gpt_oss_fails_closed_when_init_drifts_from_reservation(
         (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
     )
     assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
+    assert manager._model_shm_init_unconfirmed
+    with pytest.raises(RuntimeError, match="ownership is unconfirmed"):
+        _stop_partial_local_manager(manager, process_utils, shm_dir)
+    assert runtime_dir.exists()
 
 
 def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypatch):
