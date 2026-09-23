@@ -94,6 +94,37 @@ class WavePrefixPlan:
 
 
 @dataclass(frozen=True)
+class PrefillPlanWork:
+    computed_tokens: int
+    full_attention_pairs: int
+    item_rows: int
+    chunks: int
+
+
+def prefill_plan_work(plan: WavePrefixPlan) -> PrefillPlanWork:
+    """Count executed tokens and causal attention pairs in one rank's plan.
+
+    A token at absolute position ``p`` attends to ``p + 1`` keys in a full
+    attention layer, including keys supplied by a pooled prefix. Each planned
+    item is computed once, so shared prefixes are counted only once here.
+    """
+    items = [item for chunk in plan.chunks for item in chunk.items]
+    pairs = sum(
+        (
+            item.token_end * (item.token_end + 1)
+            - item.token_start * (item.token_start + 1)
+        ) // 2
+        for item in items
+    )
+    return PrefillPlanWork(
+        computed_tokens=plan.computed_tokens,
+        full_attention_pairs=pairs,
+        item_rows=len(items),
+        chunks=len(plan.chunks),
+    )
+
+
+@dataclass(frozen=True)
 class _Tree:
     start_block: tuple[int, ...]
     end_block: tuple[int, ...]

@@ -6863,6 +6863,10 @@ class BatchGenWorker:
 				prefill_uuids = self._prepare_prefill_batch()
 				
 				if prefill_uuids:
+					pool_wave_start = (
+						time.perf_counter() if self._prefill_prefix_pool_enabled()
+						else None
+					)
 					if self.rank == 0:
 						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
 					for uuid in prefill_uuids:
@@ -7010,7 +7014,20 @@ class BatchGenWorker:
 						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
 							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					pool_rank_ready_s = (
+						time.perf_counter() - pool_wave_start
+						if pool_wave_start is not None else None
+					)
 					dist.barrier()
+					if pool_wave_start is not None:
+						logging.info("[METRICS] %s", json.dumps({
+							"component": "prefix_pool",
+							"phase": "wave",
+							"rank": self.rank,
+							"sequences": len(prefill_uuids),
+							"rank_ready_s": pool_rank_ready_s,
+							"wave_s": time.perf_counter() - pool_wave_start,
+						}, separators=(",", ":")))
 
 					# C4: a request whose whole budget is the prefill-sampled
 					# token is DONE here. Completing it now (instead of sending
@@ -8852,6 +8869,7 @@ class BatchGenWorker:
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
 		"""Prefill a planned wave: each pooled segment once, then every tail."""
 		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.wave_plan import prefill_plan_work
 
 		wave = self._prefill_pool_wave
 		index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
@@ -8945,6 +8963,7 @@ class BatchGenWorker:
 			AttnWrapperBase.prepack_num_sequences = None
 			AttnWrapperBase.prepack_seq_lengths = None
 			torch.cuda.empty_cache()
+		work = prefill_plan_work(wave.plan)
 		logging.info("[METRICS] " + json.dumps({
 			"component": "prefix_pool",
 			"phase": "prefill",
@@ -8952,6 +8971,8 @@ class BatchGenWorker:
 			"sequences": len(order),
 			"prompt_tokens": wave.plan.prompt_tokens,
 			"computed_tokens": executed,
+			"full_attention_pairs": work.full_attention_pairs,
+			"item_rows": work.item_rows,
 			"saved_tokens": wave.plan.prompt_tokens - executed,
 			"segments": len(wave.plan.segments),
 			"chunks": len(wave.plan.chunks),
