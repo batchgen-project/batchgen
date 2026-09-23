@@ -353,7 +353,7 @@ class WorkerManager:
                 try:
                     self._stop_workers()
                 finally:
-                    logging.info(
+                    logging.getLogger("uvicorn.error").info(
                         "[shutdown] worker processes elapsed=%.3fs",
                         time.monotonic() - shutdown_start,
                     )
@@ -393,7 +393,7 @@ class WorkerManager:
                             ),
                         )
                         self._model_shm_release_unverified = False
-                        logging.info(
+                        logging.getLogger("uvicorn.error").info(
                             "[shutdown] model SHM owner release elapsed=%.3fs",
                             time.monotonic() - model_release_start,
                         )
@@ -434,7 +434,7 @@ class WorkerManager:
                     logger.error(
                         "WorkerManager stop incomplete; admission locks remain held"
                     )
-                logging.info(
+                logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker manager elapsed=%.3fs clean=%s",
                     time.monotonic() - shutdown_start,
                     artifacts_cleaned,
@@ -472,7 +472,7 @@ class WorkerManager:
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
-                logging.info(
+                logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker SIGTERM grace elapsed=%.3fs remaining=%d",
                     time.monotonic() - stop_start,
                     len(remaining),
@@ -487,7 +487,7 @@ class WorkerManager:
                 deadline = time.monotonic() + 5
                 for proc, _ in remaining:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
-                logging.info(
+                logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
                     time.monotonic() - stop_start,
                     sum(proc.exitcode is None for proc in processes),
@@ -979,7 +979,9 @@ class WorkerManager:
         if self._stopping:
             return
         if self._worker_exit_state.set_failure(reason, exc):
-            logging.error("[shutdown] worker failure detected: %s", reason)
+            logging.getLogger("uvicorn.error").error(
+                "[shutdown] worker failure detected: %s", reason
+            )
             self._request_server_shutdown()
 
     @staticmethod
