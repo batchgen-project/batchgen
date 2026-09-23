@@ -6,6 +6,7 @@ import ast
 import copy
 import gc
 import json
+import logging
 import os
 import pickle
 import runpy
@@ -111,7 +112,7 @@ def _worker_manager_method(name: str, globals_=None):
         ],
         type_ignores=[],
     )
-    namespace = dict(globals_ or {})
+    namespace = {"logging": logging, "time": time, **(globals_ or {})}
     exec(
         compile(ast.fix_missing_locations(module), str(WORKER_MANAGER), "exec"),
         namespace,
