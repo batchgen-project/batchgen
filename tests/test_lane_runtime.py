@@ -745,6 +745,238 @@ def test_dead_lane_closeout_matches_only_exact_instance_shm(
     assert shm_object.exists()
 
 
+def _proc_locks(tmp_path, *lines):
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir(exist_ok=True)
+    (proc_root / "locks").write_text("".join(f"{line}\n" for line in lines))
+    return proc_root
+
+
+def _lock_entry(path, pid, kind="FLOCK", access="WRITE"):
+    metadata = path.stat()
+    return (
+        f"1: {kind}  ADVISORY  {access} {pid} "
+        f"{os.major(metadata.st_dev):02x}:"
+        f"{os.minor(metadata.st_dev):02x}:{metadata.st_ino} 0 EOF"
+    )
+
+
+def test_instance_lock_probe_observes_exact_owner_without_locking(tmp_path):
+    path = tmp_path / "instance-lane-0.lock"
+    missing_proc = _proc_locks(tmp_path)
+
+    assert not lane_runtime._instance_lock_is_held(path, 123, missing_proc)
+    assert not path.exists()
+
+    held = lane_runtime._open_lock(path, fcntl.LOCK_EX)
+    try:
+        assert lane_runtime._instance_lock_is_held(
+            path, 123, _proc_locks(tmp_path, _lock_entry(path, 123))
+        )
+        # A blocked waiter for the same file is not the holder.
+        assert not lane_runtime._instance_lock_is_held(
+            path,
+            123,
+            _proc_locks(tmp_path, "1: -> " + _lock_entry(path, 123)[3:]),
+        )
+        assert not lane_runtime._instance_lock_is_held(
+            path, 999, _proc_locks(tmp_path, _lock_entry(path, 123))
+        )
+        assert not lane_runtime._instance_lock_is_held(
+            path,
+            123,
+            _proc_locks(tmp_path, _lock_entry(path, 123, kind="POSIX")),
+        )
+        assert not lane_runtime._instance_lock_is_held(
+            path,
+            123,
+            _proc_locks(tmp_path, _lock_entry(path, 123, access="READ")),
+        )
+        other = tmp_path / "instance-lane-1.lock"
+        other.touch()
+        assert not lane_runtime._instance_lock_is_held(
+            path, 123, _proc_locks(tmp_path, _lock_entry(other, 123))
+        )
+        # Observing must not disturb the lock the server already holds.
+        with pytest.raises(BlockingIOError):
+            lane_runtime._open_lock(path, fcntl.LOCK_EX)
+    finally:
+        lane_runtime._close_fd(held)
+
+
+def test_instance_lock_probe_fails_closed_without_proc_locks(tmp_path):
+    path = tmp_path / "instance-lane-0.lock"
+    path.touch()
+
+    with pytest.raises(lane_runtime.LaneError, match="cannot observe"):
+        lane_runtime._instance_lock_is_held(path, 123, tmp_path / "absent")
+
+    directory = tmp_path / "instance-lane-1.lock"
+    directory.mkdir()
+    with pytest.raises(lane_runtime.LaneError, match="not a regular file"):
+        lane_runtime._instance_lock_is_held(
+            directory, 123, _proc_locks(tmp_path)
+        )
+
+
+def test_admission_wait_fails_closed_without_observed_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane_runtime, "HOST_LOCK_ROOT", tmp_path)
+    monkeypatch.setattr(
+        lane_runtime, "_instance_lock_is_held", lambda *args: False
+    )
+
+    with pytest.raises(lane_runtime.LaneError, match="before timeout"):
+        lane_runtime._wait_for_instance_lock(
+            "lane-0", SimpleNamespace(pid=123, poll=lambda: None), 0.2
+        )
+
+    with pytest.raises(lane_runtime.LaneError, match="exited before admission"):
+        lane_runtime._wait_for_instance_lock(
+            "lane-0",
+            SimpleNamespace(poll=lambda: 1, returncode=1),
+            0.2,
+        )
+
+    monkeypatch.setattr(
+        lane_runtime, "_instance_lock_is_held", lambda *args: True
+    )
+    lane_runtime._wait_for_instance_lock(
+        "lane-0", SimpleNamespace(pid=123, poll=lambda: None), 0.2
+    )
+
+
+def _provenance_stop_fixture(tmp_path, monkeypatch, payload):
+    temp_root = tmp_path / "lane-tmp"
+    runtime_dir = temp_root / f"batchgen_lane_{'a' * 32}"
+    runtime_dir.mkdir(parents=True)
+    if payload is not None:
+        (runtime_dir / lane_runtime._MODEL_SHM_PROVENANCE).write_text(payload)
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    state_root = tmp_path / "state"
+    manifest = _candidate("lane")
+    manifest.update(
+        {
+            "state": "admitted",
+            "process_group": 456,
+            "paths": {"temp": str(temp_root)},
+        }
+    )
+    lane_runtime._atomic_json(state_root / "lane.json", manifest)
+    real_path = Path
+    monkeypatch.setattr(
+        lane_runtime,
+        "Path",
+        lambda value: shm_dir if value == "/dev/shm" else real_path(value),
+    )
+    monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_process_group_exists", lambda value: False)
+    monkeypatch.setattr(lane_runtime, "_gpu_processes", lambda: [])
+    args = SimpleNamespace(state_root=state_root, instance_id="lane")
+    return shm_dir, runtime_dir, state_root / "lane.json", args
+
+
+def test_stop_records_provenanced_model_shm_and_ignores_unrecorded(
+    tmp_path, monkeypatch
+):
+    recorded_name = "shm_9f1c6b0e-3f1e-4a9b-9a1c-0d2e4f6a8b0c"
+    shm_dir, _, state_path, args = _provenance_stop_fixture(
+        tmp_path,
+        monkeypatch,
+        json.dumps({"version": 1, "shm_names": [recorded_name]}),
+    )
+    recorded = shm_dir / recorded_name
+    recorded.touch()
+    unrecorded = shm_dir / "shm_11111111-2222-3333-4444-555555555555"
+    unrecorded.touch()
+
+    with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
+        lane_runtime.stop_lane(args)
+
+    failed = lane_runtime._read_json(state_path)
+    assert failed["state"] == "failed"
+    assert failed["residual_shm"] == [str(recorded)]
+    assert recorded.exists()
+    assert unrecorded.exists()
+
+
+def test_stop_does_not_claim_provenanced_name_that_is_already_gone(
+    tmp_path, monkeypatch
+):
+    shm_dir, runtime_dir, state_path, args = _provenance_stop_fixture(
+        tmp_path,
+        monkeypatch,
+        json.dumps({"version": 1, "shm_names": ["shm_already-unlinked"]}),
+    )
+
+    with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
+        lane_runtime.stop_lane(args)
+
+    failed = lane_runtime._read_json(state_path)
+    assert failed["residual_shm"] == []
+    assert failed["residual_runtime_dirs"] == [str(runtime_dir)]
+    assert list(shm_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",
+        json.dumps({"version": 2, "shm_names": ["shm_a"]}),
+        json.dumps({"version": 1, "shm_names": []}),
+        json.dumps({"version": 1, "shm_names": ["../escape"]}),
+        json.dumps({"version": 1, "shm_names": [7]}),
+        json.dumps(["shm_a"]),
+    ],
+)
+def test_stop_fails_closed_on_malformed_provenance(tmp_path, monkeypatch, payload):
+    _, _, state_path, args = _provenance_stop_fixture(
+        tmp_path, monkeypatch, payload
+    )
+
+    with pytest.raises(lane_runtime.LaneError, match="model SHM provenance"):
+        lane_runtime.stop_lane(args)
+
+    assert lane_runtime._read_json(state_path)["state"] == "admitted"
+
+
+def test_stop_fails_closed_on_symlinked_provenance(tmp_path, monkeypatch):
+    _, runtime_dir, state_path, args = _provenance_stop_fixture(
+        tmp_path, monkeypatch, None
+    )
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(json.dumps({"version": 1, "shm_names": ["shm_a"]}))
+    (runtime_dir / lane_runtime._MODEL_SHM_PROVENANCE).symlink_to(foreign)
+
+    with pytest.raises(lane_runtime.LaneError, match="model SHM provenance"):
+        lane_runtime.stop_lane(args)
+
+    assert lane_runtime._read_json(state_path)["state"] == "admitted"
+
+
+def test_provenance_is_read_only_from_this_lane_exact_runtime_dirs(tmp_path):
+    payload = json.dumps({"version": 1, "shm_names": ["shm_a"]})
+    foreign = tmp_path / f"batchgen_lane_{'a' * 32}_b_{'b' * 32}"
+    foreign.mkdir()
+    (foreign / lane_runtime._MODEL_SHM_PROVENANCE).write_text("{not json")
+    mine = tmp_path / f"batchgen_lane_{'c' * 32}"
+    mine.mkdir()
+    (mine / lane_runtime._MODEL_SHM_PROVENANCE).write_text(payload)
+
+    assert lane_runtime._recorded_model_shm([foreign, mine], "lane") == ["shm_a"]
+    assert lane_runtime._recorded_model_shm([foreign], "lane") == []
+
+
+def test_provenance_rejects_symlinked_runtime_directory(tmp_path):
+    target = tmp_path / "foreign"
+    target.mkdir()
+    link = tmp_path / f"batchgen_lane_{'a' * 32}"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(lane_runtime.LaneError, match="symlink"):
+        lane_runtime._recorded_model_shm([link], "lane")
+
+
 def test_prepare_paths_pins_both_packages_to_one_worktree(tmp_path):
     worktree = tmp_path / "worktree"
     (worktree / "batchgen").mkdir(parents=True)
