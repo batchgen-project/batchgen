@@ -825,7 +825,8 @@ class BatchGenWorker:
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
-		self._prefill_pool_base_alloc = 0
+		# (allocated, reserved, device use outside the allocator) once the pool is up
+		self._prefill_pool_base = (0, 0, 0)
 		# Pseudo Host ids must not collide with entries a previous worker of
 		# this node left in the shared Host KV region (hot reload).
 		self._pool_sid_counter = time.time_ns() // 1000
@@ -8788,7 +8789,13 @@ class BatchGenWorker:
 			)
 			prefix_states[seq.global_idx] = state
 			self._prefix_sequence_states[seq.global_idx] = state
-		self._prefill_pool_base_alloc = torch.cuda.memory_allocated(self.local_rank)
+		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
+		reserved = torch.cuda.memory_reserved(self.local_rank)
+		self._prefill_pool_base = (
+			torch.cuda.memory_allocated(self.local_rank),
+			reserved,
+			device_total - free_after - reserved,
+		)
 		torch.cuda.reset_peak_memory_stats(self.local_rank)
 		logging.info(
 			"[PREFIX_POOL] Rank %s wave: %d prompts, %d segments, %d chunks, threshold %s, "
@@ -8854,6 +8861,8 @@ class BatchGenWorker:
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
+		allocated_peak = 0
+		base_alloc, base_reserved, base_other = self._prefill_pool_base
 		AttnWrapperBase.prefill_pool = wave.pool
 		try:
 			start = time.perf_counter()
@@ -8892,8 +8901,20 @@ class BatchGenWorker:
 				del hidden_states
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
-				peak = torch.cuda.max_memory_allocated(self.local_rank) - self._prefill_pool_base_alloc
+				# The workspace is whatever device memory the pool left free, so
+				# charge the allocator's reserved peak (fragmentation included)
+				# plus any growth of device memory outside the allocator.
+				free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
+				reserved_now = torch.cuda.memory_reserved(self.local_rank)
+				peak = (
+					torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
+					+ (device_total - free_now - reserved_now) - base_other
+				)
 				workspace_peak = max(workspace_peak, peak)
+				allocated_peak = max(
+					allocated_peak,
+					torch.cuda.max_memory_allocated(self.local_rank) - base_alloc,
+				)
 				if peak > workspace:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
@@ -8933,6 +8954,7 @@ class BatchGenWorker:
 			"pool_pages": wave.pool.num_pages,
 			"peak_pool_pages": wave.plan.peak_pool_pages,
 			"workspace_peak_bytes": workspace_peak,
+			"allocated_peak_bytes": allocated_peak,
 			"prefill_s": prefill_s,
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
