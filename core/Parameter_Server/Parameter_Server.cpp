@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <chrono>
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
 // #include <filesystem>
@@ -614,7 +615,13 @@ Parameter_Server::~Parameter_Server() {
         free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
     }
     if (weight_posix_shm_owned_) {
-        shm_unlink(this->shm_name.c_str());
+        const auto unlink_start = std::chrono::steady_clock::now();
+        const int unlink_result = shm_unlink(this->shm_name.c_str());
+        this->logger->info(
+            "weight shm_unlink={} elapsed={:.3f}s",
+            unlink_result,
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - unlink_start).count());
     }
     // Only the exact hugetlbfs path this process created with O_EXCL and
     // mapped successfully is removed; unmapping above already happened.

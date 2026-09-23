@@ -980,7 +980,9 @@ class WorkerManager:
             return
         if self._worker_exit_state.set_failure(reason, exc):
             logging.getLogger("uvicorn.error").error(
-                "[shutdown] worker failure detected: %s", reason
+                "[shutdown] worker failure detected epoch=%.6f: %s",
+                time.time(),
+                reason,
             )
             self._request_server_shutdown()
 
