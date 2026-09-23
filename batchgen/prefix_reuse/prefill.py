@@ -23,6 +23,9 @@ class PrefixCacheSequenceState:
     attached_tokens: int
     compute_cached_tokens: int
     commit_attachment_handles: tuple[int, ...] = ()
+    # In-wave prefix pool: the planner's chain of segment Host pages, used
+    # instead of a coordinator lookup result.
+    planned_shared_page_ids: tuple[int, ...] = ()
 
     @property
     def attachment_handle(self) -> int:
@@ -32,6 +35,8 @@ class PrefixCacheSequenceState:
     def shared_page_ids(self) -> tuple[int, ...]:
         if self.attached_tokens == 0:
             return ()
+        if self.lookup_result is None:
+            return self.planned_shared_page_ids
         spans = list(getattr(self.lookup_result, "materialization_spans", ()))
         if len(spans) != 1 or int(spans[0].group_id) != 0:
             raise RuntimeError(
