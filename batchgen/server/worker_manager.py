@@ -28,6 +28,7 @@ from batchgen.server.process_utils import (
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
+    record_model_shm_provenance,
 )
 from batchgen.server.runtime_locks import RuntimeLocks
 from batchgen.server.runtime_lease import LaneLease
@@ -1149,6 +1150,11 @@ class WorkerManager:
             "converted_ckpt_dir": converted_ckpt_dir,
             "parameter_server_size": ps_size,
         }
+        # Only this run owns these randomly named regions, so record them now;
+        # a supervisor cannot otherwise attribute them after an abrupt exit.
+        record_model_shm_provenance(
+            self.model_info, self.args.runtime_identity.runtime_dir
+        )
         logger.info("Local parameter server initialized: %s", self.model_info)
 
     def _load_model_from_remote_server(

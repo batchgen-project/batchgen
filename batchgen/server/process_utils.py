@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -24,6 +26,12 @@ BATCHGEN_SHM_PREFIXES = (
     "batchgen_skel_", # Temp skeleton files: batchgen_skel_*.pt
     "batchgen_",      # General BatchGen prefix
 )
+
+# Run-owned record of this run's exact model SHM names. Model weight and
+# tensor-metadata regions carry random names, so a supervisor can only tell
+# them apart from foreign objects through this private provenance file.
+MODEL_SHM_PROVENANCE_FILE = "model_shm.json"
+_RECORDED_SHM_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
 
 # Default hugepage size (2MB) used as fallback if detection fails
 DEFAULT_HUGEPAGE_SIZE = 2 * 1024 * 1024
@@ -233,20 +241,58 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
     return removed
 
 
+MODEL_SHM_KEYS = ("shm_name", "tensor_meta_shm_name")
+
+
+def _validated_shm_entry_name(name: str) -> str:
+    """Return the /dev/shm entry name for a model SHM name, or raise."""
+    entry_name = name[1:] if name.startswith("/") else name
+    if not entry_name or "/" in entry_name or entry_name in (".", ".."):
+        raise ValueError(f"Invalid model SHM name: {name!r}")
+    return entry_name
+
+
+def record_model_shm_provenance(
+    model_info: Dict[str, Any], runtime_dir: Path
+) -> Optional[Path]:
+    """Record this run's exact model SHM names inside its private runtime dir.
+
+    Written once, never overwritten: an existing record means another owner
+    claimed this runtime directory, which must fail closed.
+    """
+    names = []
+    for key in MODEL_SHM_KEYS:
+        if not model_info.get(key):
+            continue
+        entry_name = _validated_shm_entry_name(model_info[key])
+        if not _RECORDED_SHM_NAME_RE.fullmatch(entry_name):
+            raise ValueError(f"Invalid model SHM name: {model_info[key]!r}")
+        names.append(entry_name)
+    if not names:
+        return None
+    path = Path(runtime_dir) / MODEL_SHM_PROVENANCE_FILE
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        payload = json.dumps({"version": 1, "shm_names": names}, sort_keys=True)
+        os.write(fd, payload.encode() + b"\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path
+
+
 def cleanup_model_shm_files(
     model_info: Dict[str, Any], *, shm_dir: Path = Path("/dev/shm")
 ) -> int:
     """Unlink this model's exact weight and metadata SHM names after workers exit."""
-    keys = ("shm_name", "tensor_meta_shm_name")
+    keys = MODEL_SHM_KEYS
     paths = []
     for key in keys:
         name = model_info.get(key)
         if not name:
             continue
-        entry_name = name[1:] if name.startswith("/") else name
-        if not entry_name or "/" in entry_name or entry_name in (".", ".."):
-            raise ValueError(f"Invalid model SHM name: {name!r}")
-        paths.append(shm_dir / entry_name)
+        paths.append(shm_dir / _validated_shm_entry_name(name))
 
     if paths and not shm_dir.is_dir():
         raise RuntimeError(f"Model SHM directory is unavailable: {shm_dir}")
