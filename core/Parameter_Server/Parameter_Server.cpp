@@ -429,13 +429,15 @@ void Parameter_Server::Init(
     bool weight_posix_shm_owned = false;
     bool weight_hugetlbfs_owned = false;
     std::string weight_hugetlbfs_path;
+    int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
                                                this->enable_memfd_, -1, -1,
                                                &memfd_fd_out,
                                                &weight_posix_shm_owned,
                                                &weight_hugetlbfs_owned,
-                                               &weight_hugetlbfs_path);
+                                               &weight_hugetlbfs_path,
+                                               &mapped_size);
     this->shm_name = weight_shm_name;
     this->weight_posix_shm_owned_ = weight_posix_shm_owned;
     this->weight_hugetlbfs_owned_ = weight_hugetlbfs_owned;
@@ -444,6 +446,7 @@ void Parameter_Server::Init(
         this->weights_memfd_fd_ = memfd_fd_out;
     }
     this->byte_size_ = byte_size;
+    this->mapped_size_ = mapped_size;
     this->weight_ptr_ = weight_ptr;
 
     // Load weights from the model_weights_path
@@ -608,7 +611,7 @@ Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
 
 Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
-        free_shared_pinned_memory(this->weight_ptr_, this->byte_size_);
+        free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
     }
     if (weight_posix_shm_owned_) {
         shm_unlink(this->shm_name.c_str());

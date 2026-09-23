@@ -84,6 +84,7 @@ class Parameter_Server {
     std::string tensor_meta_shm_name;
     void* weight_ptr_ = nullptr;
     int64_t byte_size_ = 0;
+    int64_t mapped_size_ = 0;
     bool weight_posix_shm_owned_ = false;
     bool weight_hugetlbfs_owned_ = false;
     std::string weight_hugetlbfs_path_;

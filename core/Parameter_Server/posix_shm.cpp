@@ -282,13 +282,15 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int* out_memfd_fd,
                                     bool* out_posix_shm_owned,
                                     bool* out_hugetlbfs_owned,
-                                    std::string* out_hugetlbfs_path) {
+                                    std::string* out_hugetlbfs_path,
+                                    int64_t* out_mapped_size) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
     if (out_posix_shm_owned) *out_posix_shm_owned = false;
     if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
     if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
+    if (out_mapped_size) *out_mapped_size = 0;
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
@@ -588,6 +590,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
     logger->info("Memory allocation completed successfully using {} pages.",
                using_huge_pages ? "huge" : "regular");
+
+    if (out_mapped_size) *out_mapped_size = allocated_size;
 
     return ptr;
 }
