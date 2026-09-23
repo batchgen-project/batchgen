@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import os
 import pickle
+import runpy
 import signal
 import subprocess
+import sys
+import tempfile
 import time
+import uuid
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Optional
 import pytest
 
@@ -20,6 +25,17 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 WORKER_MANAGER = ROOT / "batchgen" / "server" / "worker_manager.py"
 HTTP_SERVER = ROOT / "batchgen" / "server" / "http_server.py"
+PROCESS_UTILS = ROOT / "batchgen" / "server" / "process_utils.py"
+GPT_OSS_PARAMETER_SERVER = (
+    ROOT
+    / "batchgen"
+    / "models"
+    / "openai"
+    / "gpt_oss_120b"
+    / "gpt_oss_parameter_server.py"
+)
+GPT_OSS_PS_MODULE = "batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server"
+MIXTRAL_PS_MODULE = "batchgen.models.mixtral.mixtral_parameter_server"
 
 
 def _top_level_function(path: Path, name: str):
@@ -100,6 +116,290 @@ def _worker_manager_method(name: str, globals_=None):
         namespace,
     )
     return namespace["IsolatedManager"]
+
+
+def _isolated_class(path: Path, class_name: str, method_names, globals_=None):
+    tree = ast.parse(path.read_text(), filename=str(path))
+    source_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    methods = [
+        copy.deepcopy(
+            next(
+                node
+                for node in source_class.body
+                if isinstance(node, ast.FunctionDef) and node.name == method_name
+            )
+        )
+        for method_name in method_names
+    ]
+    module = ast.Module(
+        body=[
+            ast.ClassDef(
+                name="Isolated",
+                bases=[],
+                keywords=[],
+                body=methods,
+                decorator_list=[],
+            )
+        ],
+        type_ignores=[],
+    )
+    namespace = dict(globals_ or {})
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["Isolated"]
+
+
+def _process_utils_namespace():
+    """Load process_utils standalone so the test needs no batchgen package import."""
+    return runpy.run_path(str(PROCESS_UTILS))
+
+
+def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
+    fake_cpp = SimpleNamespace(
+        Init=lambda *args: cpp_init_calls.append(args),
+        get_skeleton_state_dict=lambda: {"model.norm.weight": 1},
+    )
+    server_type = _isolated_class(
+        GPT_OSS_PARAMETER_SERVER,
+        "GptOss_Parameter_Server",
+        ("reserve_shm_names", "Init"),
+        {
+            "logging": SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                debug=lambda *args, **kwargs: None,
+                warning=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            ),
+            "os": os,
+            "shutil": SimpleNamespace(
+                disk_usage=lambda path: (0, 0, 200 * 1024**3)
+            ),
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(mem_get_info=lambda: (1 << 40, 1 << 40))
+            ),
+            "uuid": uuid,
+            "Parameter_Server": lambda *args: fake_cpp,
+        },
+    )
+    server = server_type()
+    server.shm_name = None
+    server.tensor_meta_shm_name = None
+    server.enable_hugetlbfs = False
+    server.enable_memfd = False
+    server.converted_ckpt_dir = "/tmp/converted"
+    server.state_dict_name_map = {}
+    server._parse_state_dict = lambda: None
+    server._convert_checkpoint = convert_hook
+    return server
+
+
+def test_gpt_oss_reserve_shm_names_is_stable_and_used_by_init():
+    converted_with = []
+    cpp_init_calls = []
+    server = _gpt_oss_parameter_server(
+        lambda: converted_with.append(
+            (server.shm_name, server.tensor_meta_shm_name)
+        ),
+        cpp_init_calls,
+    )
+
+    reserved = server.reserve_shm_names()
+    assert server.reserve_shm_names() == reserved
+    assert reserved[0].startswith("/shm_") and reserved[0] != reserved[1]
+
+    assert server.Init() == reserved
+    # Names must already be fixed before the long checkpoint conversion.
+    assert converted_with == [reserved]
+    assert cpp_init_calls[0][:2] == reserved
+
+
+def test_gpt_oss_init_still_self_generates_without_reservation():
+    cpp_init_calls = []
+    server = _gpt_oss_parameter_server(lambda: None, cpp_init_calls)
+
+    shm_name, tensor_meta_shm_name = server.Init()
+
+    assert shm_name.startswith("/shm_")
+    assert tensor_meta_shm_name.startswith("/shm_")
+    assert shm_name != tensor_meta_shm_name
+    assert cpp_init_calls[0][:2] == (shm_name, tensor_meta_shm_name)
+
+
+def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
+    manager_type = _worker_manager_method(
+        "_load_model_locally",
+        {
+            "record_model_shm_provenance": process_utils[
+                "record_model_shm_provenance"
+            ],
+            "logger": SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                warning=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            ),
+            "os": os,
+            "Path": Path,
+            "tempfile": tempfile,
+            "torch": SimpleNamespace(save=lambda obj, path: None),
+        },
+    )
+    manager = manager_type()
+    manager.args = SimpleNamespace(
+        model=model,
+        cache_dir=tmp_path / "cache",
+        enable_hugetlbfs=False,
+        fast_init=False,
+        runtime_identity=SimpleNamespace(runtime_dir=runtime_dir),
+    )
+    return manager
+
+
+def test_local_gpt_oss_records_shm_names_before_init_failure(tmp_path, monkeypatch):
+    process_utils = _process_utils_namespace()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    neighbor = shm_dir / "shm_neighbor"
+    neighbor.touch()
+
+    class FakeGptOssParameterServer:
+        def __init__(self, *args, **kwargs):
+            self.shm_name = None
+            self.tensor_meta_shm_name = None
+
+        def reserve_shm_names(self):
+            self.shm_name = "/shm_reserved_weights"
+            self.tensor_meta_shm_name = "/shm_reserved_meta"
+            return self.shm_name, self.tensor_meta_shm_name
+
+        def Init(self):
+            (shm_dir / self.shm_name.lstrip("/")).touch()
+            (shm_dir / self.tensor_meta_shm_name.lstrip("/")).touch()
+            raise RuntimeError("weight load crashed")
+
+    module = ModuleType(GPT_OSS_PS_MODULE)
+    module.GptOss_Parameter_Server = FakeGptOssParameterServer
+    monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
+
+    manager = _local_load_manager(
+        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
+    )
+
+    with pytest.raises(RuntimeError, match="weight load crashed"):
+        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
+
+    record = json.loads(
+        (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
+    )
+    assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
+    assert manager.parameter_server_instance is not None
+    assert manager.model_info == {
+        "shm_name": "/shm_reserved_weights",
+        "tensor_meta_shm_name": "/shm_reserved_meta",
+    }
+
+    stop_type = _worker_manager_method(
+        "stop",
+        {
+            "cleanup_model_shm_files": lambda info: process_utils[
+                "cleanup_model_shm_files"
+            ](info, shm_dir=shm_dir),
+            "logger": SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            ),
+        },
+    )
+    manager._stopping = False
+    manager.started = False
+    manager._runtime_dir_created = True
+    manager._runtime_namespace_owned = False
+    manager._runtime_locks = None
+    manager._lane_lease = None
+    manager.worker_process = None
+    manager.distributed_weight_daemon = None
+    manager.skeleton_state_dict_file = None
+    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
+    manager._monitor_thread = None
+    manager._cleanup_skeleton_state_dict_file = lambda: None
+    stop_type.stop(manager)
+
+    assert not (shm_dir / "shm_reserved_weights").exists()
+    assert not (shm_dir / "shm_reserved_meta").exists()
+    assert neighbor.exists()
+    assert not runtime_dir.exists()
+
+
+def test_local_gpt_oss_fails_closed_when_init_drifts_from_reservation(
+    tmp_path, monkeypatch
+):
+    process_utils = _process_utils_namespace()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+
+    class DriftingGptOssParameterServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def reserve_shm_names(self):
+            return "/shm_reserved_weights", "/shm_reserved_meta"
+
+        def Init(self):
+            return "/shm_other_weights", "/shm_reserved_meta"
+
+    module = ModuleType(GPT_OSS_PS_MODULE)
+    module.GptOss_Parameter_Server = DriftingGptOssParameterServer
+    monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
+
+    manager = _local_load_manager(
+        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
+    )
+
+    with pytest.raises(RuntimeError, match="differ from the recorded reservation"):
+        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
+
+    record = json.loads(
+        (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
+    )
+    assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
+
+
+def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypatch):
+    process_utils = _process_utils_namespace()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    record_path = runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]
+    recorded_during_init = []
+
+    class FakeMixtralParameterServer:
+        def __init__(self, *args, **kwargs):
+            self.parameter_server = SimpleNamespace(
+                byte_size=lambda: 1234,
+                get_skeleton_state_dict=lambda: {"model.norm.weight": 1},
+            )
+
+        def Init(self):
+            recorded_during_init.append(record_path.exists())
+            return "/shm_mixtral_weights", "/shm_mixtral_meta"
+
+    module = ModuleType(MIXTRAL_PS_MODULE)
+    module.Mixtral_Parameter_Server = FakeMixtralParameterServer
+    monkeypatch.setitem(sys.modules, MIXTRAL_PS_MODULE, module)
+
+    manager = _local_load_manager(
+        process_utils, runtime_dir, "mistralai/Mixtral-8x7B-Instruct-v0.1", tmp_path
+    )
+
+    manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
+
+    assert recorded_during_init == [False]
+    assert manager.model_info["shm_name"] == "/shm_mixtral_weights"
+    record = json.loads(record_path.read_text())
+    assert record["shm_names"] == ["shm_mixtral_weights", "shm_mixtral_meta"]
 
 
 def test_local_world_size_requires_exact_division_and_visibility():

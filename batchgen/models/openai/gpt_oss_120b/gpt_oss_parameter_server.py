@@ -84,6 +84,8 @@ class GptOss_Parameter_Server:
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
         self.enable_memfd = enable_memfd
+        self.shm_name = None
+        self.tensor_meta_shm_name = None
 
         # Use BatchGen's unified config system
         self.model_config = load_config(huggingface_ckpt_name)
@@ -108,6 +110,17 @@ class GptOss_Parameter_Server:
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"Python PM instantiation: GPU 0 free memory: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
+
+    def reserve_shm_names(self):
+        """Reserve this run's random model SHM names without creating anything.
+
+        A caller reserves before Init so the exact names can be persisted while
+        no shared memory exists yet; repeated calls return the same reservation.
+        """
+        if self.shm_name is None:
+            self.shm_name = "/shm_" + str(uuid.uuid4())
+            self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
+        return self.shm_name, self.tensor_meta_shm_name
 
     def Init(self):
         """Initialize parameter server and load weights."""
@@ -137,8 +150,8 @@ class GptOss_Parameter_Server:
                 "'sudo mount -o remount,size=<size>G /dev/shm'"
             )
 
-        self.shm_name = "/shm_" + str(uuid.uuid4())
-        self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
+        # Reuse the caller's reservation when present, otherwise self-generate.
+        self.reserve_shm_names()
         logging.info(f"Model parameters shared memory name: {self.shm_name}")
         logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
         logging.info(f"Byte size: {byte_size}")
