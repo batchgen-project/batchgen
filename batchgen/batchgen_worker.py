@@ -8721,6 +8721,18 @@ class BatchGenWorker:
 			initial_loads=loads,
 		)
 		for seq, rank in zip(seqs, ranks):
+			if current_wave and seq.assigned_rank == self.rank and rank != self.rank:
+				local_idx = release_local_query_slot(
+					seq.uuid,
+					uuid_to_local_map=self._uuid_to_local_map,
+					local_to_uuid_map=self._local_to_uuid_map,
+					query_book=self.query_book,
+					free_local_indices=self._free_local_indices,
+				)
+				if local_idx is None:
+					raise RuntimeError(
+						f"Rank {self.rank}: missing local slot for reassigned {seq.uuid}"
+					)
 			self.global_batch.assign_rank(seq.uuid, rank)
 		if self.rank == 0:
 			counts = [0] * self.world_size
