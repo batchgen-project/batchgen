@@ -8701,9 +8701,11 @@ class BatchGenWorker:
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
 		"""Plan this rank's in-wave sharing and allocate the prefill prefix pool.
 
-		None keeps the existing prefill path: nothing is shared, or a prompt
-		re-enters after eviction (v1 plans fresh prompts only). A cross-wave
-		lookup hit is released and planned in-wave instead.
+		A prompt re-entering after eviction is planned like any other: its
+		reconstructed tokens are its prompt. Cross-wave lookup hits are always
+		released and recomputed, in-wave or, when this returns None (nothing
+		shared, or no room past the scratch pages), by the existing path, so
+		that path never materializes a hit in a temporary GPU KV manager.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		from batchgen.prefix_reuse.executor import PoolChunkExecutor
@@ -8712,7 +8714,6 @@ class BatchGenWorker:
 			pool_pages_from_budget,
 			scratch_pages_bound,
 		)
-		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 		from batchgen.prefix_reuse.wave_plan import (
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
@@ -8720,9 +8721,6 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.wave_runtime import PoolWave
 
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
-		if any(seq.decoded_length or seq.total_decoded_before_eviction for seq in seqs):
-			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: evicted re-entry", self.rank)
-			return None
 		prompts = [seq.input_ids[0, :seq.prompt_length].tolist() for seq in seqs]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
@@ -8747,6 +8745,7 @@ class BatchGenWorker:
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
 				self.rank, total_pages, scratch,
 			)
+			self._replace_prefix_lookup_hits(seqs, prefix_states, [0] * len(seqs))
 			return None
 		plan = plan_wave_prefix_sharing(
 			prompts,
@@ -8757,6 +8756,7 @@ class BatchGenWorker:
 		validate_wave_prefix_plan(plan, prompts)
 		if not plan.segments:
 			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: nothing shared", self.rank)
+			self._replace_prefix_lookup_hits(seqs, prefix_states, [0] * len(seqs))
 			return None
 		pool = PrefillPrefixPool(
 			num_layers=geometry.num_layers,
@@ -8779,16 +8779,9 @@ class BatchGenWorker:
 			pool=pool,
 			executor=PoolChunkExecutor(plan, prompts, pool),
 		)
-		for index, seq in enumerate(seqs):
-			old = prefix_states[seq.global_idx]
-			if old.attachment_handle:
-				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
-			end = wave.chain_tokens(index)
-			state = PrefixCacheSequenceState(
-				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
-			)
-			prefix_states[seq.global_idx] = state
-			self._prefix_sequence_states[seq.global_idx] = state
+		self._replace_prefix_lookup_hits(
+			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
+		)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -8807,6 +8800,20 @@ class BatchGenWorker:
 			int(batching.prefill_prefix_pool_workspace_bytes),
 		)
 		return wave
+
+	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
+		"""Release each cross-wave lookup hit; a prompt starts at its chain end."""
+		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+
+		for seq, end in zip(seqs, chain_tokens):
+			old = prefix_states[seq.global_idx]
+			if old.attachment_handle:
+				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
+			state = PrefixCacheSequenceState(
+				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
+			)
+			prefix_states[seq.global_idx] = state
+			self._prefix_sequence_states[seq.global_idx] = state
 
 	def _prefill_pool_segment_host_pages(self) -> int:
 		wave = self._prefill_pool_wave
