@@ -6867,6 +6867,19 @@ class BatchGenWorker:
 						time.perf_counter() if self._prefill_prefix_pool_enabled()
 						else None
 					)
+					# One-node pure-DP Host admission is rank-independent. Place
+					# this selected wave once, before its local prefill setup.
+					# Evicted sequences keep the rank owning their Host KV.
+					if (
+						pool_wave_start is not None
+						and self._get_num_nodes() == 1
+						and not self._prefill_sequence_limits()
+						and all(
+							self.global_batch.get_sequence(uuid).status == SequenceStatus.QUEUEING
+							for uuid in prefill_uuids
+						)
+					):
+						self._assign_ranks_for_prefix_sharing(prefill_uuids, current_wave=True)
 					if self.rank == 0:
 						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
 					for uuid in prefill_uuids:
@@ -8686,16 +8699,19 @@ class BatchGenWorker:
 		self._pool_sid_counter += 1
 		return -(self.rank + 1 + self.world_size * self._pool_sid_counter)
 
-	def _assign_ranks_for_prefix_sharing(self, uuids: List[str]) -> None:
+	def _assign_ranks_for_prefix_sharing(
+		self, uuids: List[str], *, current_wave: bool = False
+	) -> None:
 		"""Keep prompts sharing a prefix on one DP rank: each rank has its own pool."""
 		from batchgen.prefix_reuse.wave_plan import assign_ranks_for_sharing
 
 		pending = set(uuids)
 		loads = [0] * self.world_size
-		for seq in self.global_batch:
-			if seq.uuid in pending or seq.assigned_rank is None:
-				continue
-			loads[seq.assigned_rank] += int(getattr(seq, "prompt_length", 0) or 0)
+		if not current_wave:
+			for seq in self.global_batch:
+				if seq.uuid in pending or seq.assigned_rank is None:
+					continue
+				loads[seq.assigned_rank] += int(getattr(seq, "prompt_length", 0) or 0)
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		seqs = [seq for seq in seqs if seq is not None]
 		ranks = assign_ranks_for_sharing(
@@ -8711,8 +8727,8 @@ class BatchGenWorker:
 			for rank in ranks:
 				counts[rank] += 1
 			logging.info(
-				"[PREFIX_POOL] sharing-aware rank assignment: %d sequences, per-rank %s",
-				len(seqs), counts,
+				"[PREFIX_POOL] %s rank assignment: %d sequences, per-rank %s",
+				"wave" if current_wave else "sharing-aware", len(seqs), counts,
 			)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
