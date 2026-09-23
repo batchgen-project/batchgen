@@ -826,7 +826,9 @@ class BatchGenWorker:
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
 		self._prefill_pool_base_alloc = 0
-		self._pool_sid_counter = 0
+		# Pseudo Host ids must not collide with entries a previous worker of
+		# this node left in the shared Host KV region (hot reload).
+		self._pool_sid_counter = time.time_ns() // 1000
 		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
 		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
 		if self.enable_prefix_cache:
@@ -8718,6 +8720,7 @@ class BatchGenWorker:
 
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		if any(seq.decoded_length or seq.total_decoded_before_eviction for seq in seqs):
+			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: evicted re-entry", self.rank)
 			return None
 		prompts = [seq.input_ids[0, :seq.prompt_length].tolist() for seq in seqs]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
@@ -8739,6 +8742,10 @@ class BatchGenWorker:
 			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts), page_tokens
 		)
 		if total_pages <= scratch:
+			logging.info(
+				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
+				self.rank, total_pages, scratch,
+			)
 			return None
 		plan = plan_wave_prefix_sharing(
 			prompts,
@@ -8748,6 +8755,7 @@ class BatchGenWorker:
 		)
 		validate_wave_prefix_plan(plan, prompts)
 		if not plan.segments:
+			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: nothing shared", self.rank)
 			return None
 		pool = PrefillPrefixPool(
 			num_layers=geometry.num_layers,
@@ -8821,6 +8829,11 @@ class BatchGenWorker:
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
+			# A segment's Host pages live until its last member releases.
+			sids = tuple(wave.segment_sids[seg] for seg in wave.chains[index])
+			self._pool_member_sids[global_id] = sids
+			for sid in sids:
+				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
 		"""Prefill a planned wave: each pooled segment once, then every tail."""
@@ -8842,66 +8855,70 @@ class BatchGenWorker:
 		executed = 0
 		workspace_peak = 0
 		AttnWrapperBase.prefill_pool = wave.pool
-		start = time.perf_counter()
-		for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
-			self.feed_watchdog()
-			rows = wave.executor.build(chunk)
-			host_ids, host_starts = wave.row_host_targets(rows)
-			AttnWrapperBase.prepack_mode = True
-			AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
-			AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
-			AttnWrapperBase.prepack_num_sequences = len(rows.items)
-			AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
-			AttnWrapperBase.position_ids = rows.position_ids
-			AttnWrapperBase.cur_batch = host_ids
-			AttnWrapperBase.prefill_pool_batch = rows
-			AttnWrapperBase.prefill_pool_row_starts = host_starts
-			hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
-			for decoder_layer in self.model.model.layers:
-				hidden_states = decoder_layer(
-					hidden_states,
-					attention_mask=None,
-					position_ids=None,
-					past_key_value=None,
-					output_attentions=False,
-					use_cache=False,
-				)[0]
-			if rows.tail_wave_indices:
-				last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
-				logits = torch.nn.functional.linear(last_hidden, lm_weight, lm_bias).float()
-				selected = self._select_tokens(
-					logits,
-					[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
-				)
-				for row, index in enumerate(rows.tail_wave_indices):
-					tokens_by_index[index] = selected[row]
-			del hidden_states
-			executed += int(rows.input_ids.numel())
-			wave.executor.finish(chunk)
-			peak = torch.cuda.max_memory_allocated(self.local_rank) - self._prefill_pool_base_alloc
-			workspace_peak = max(workspace_peak, peak)
-			if peak > workspace:
+		try:
+			start = time.perf_counter()
+			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
+				self.feed_watchdog()
+				rows = wave.executor.build(chunk)
+				host_ids, host_starts = wave.row_host_targets(rows)
+				AttnWrapperBase.prepack_mode = True
+				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
+				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
+				AttnWrapperBase.prepack_num_sequences = len(rows.items)
+				AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
+				AttnWrapperBase.position_ids = rows.position_ids
+				AttnWrapperBase.cur_batch = host_ids
+				AttnWrapperBase.prefill_pool_batch = rows
+				AttnWrapperBase.prefill_pool_row_starts = host_starts
+				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
+				for decoder_layer in self.model.model.layers:
+					hidden_states = decoder_layer(
+						hidden_states,
+						attention_mask=None,
+						position_ids=None,
+						past_key_value=None,
+						output_attentions=False,
+						use_cache=False,
+					)[0]
+				if rows.tail_wave_indices:
+					last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+					logits = torch.nn.functional.linear(last_hidden, lm_weight, lm_bias).float()
+					selected = self._select_tokens(
+						logits,
+						[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
+					)
+					for row, index in enumerate(rows.tail_wave_indices):
+						tokens_by_index[index] = selected[row]
+				del hidden_states
+				executed += int(rows.input_ids.numel())
+				wave.executor.finish(chunk)
+				peak = torch.cuda.max_memory_allocated(self.local_rank) - self._prefill_pool_base_alloc
+				workspace_peak = max(workspace_peak, peak)
+				if peak > workspace:
+					raise RuntimeError(
+						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
+						f"{workspace} B kept beside the prefix pool"
+					)
+			prefill_s = time.perf_counter() - start
+			if executed != wave.plan.computed_tokens:
 				raise RuntimeError(
-					f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
-					f"{workspace} B kept beside the prefix pool"
+					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
+					f"{wave.plan.computed_tokens}"
 				)
-		prefill_s = time.perf_counter() - start
-		if executed != wave.plan.computed_tokens:
-			raise RuntimeError(
-				f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
-				f"{wave.plan.computed_tokens}"
-			)
-		wave.executor.close()
-		wave.pool.release()
-		AttnWrapperBase.prefill_pool = None
-		AttnWrapperBase.prefill_pool_batch = None
-		AttnWrapperBase.prefill_pool_row_starts = None
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
-		torch.cuda.empty_cache()
+			wave.executor.close()
+		finally:
+			if wave.pool.free_pages != wave.pool.num_pages:
+				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
+			wave.pool.k = wave.pool.v = None
+			AttnWrapperBase.prefill_pool = None
+			AttnWrapperBase.prefill_pool_batch = None
+			AttnWrapperBase.prefill_pool_row_starts = None
+			AttnWrapperBase.prepack_mode = False
+			AttnWrapperBase.prepack_cu_seqlens = None
+			AttnWrapperBase.prepack_max_seqlen = None
+			AttnWrapperBase.prepack_num_sequences = None
+			AttnWrapperBase.prepack_seq_lengths = None
+			torch.cuda.empty_cache()
 		logging.info("[METRICS] " + json.dumps({
 			"component": "prefix_pool",
 			"phase": "prefill",
@@ -8956,10 +8973,6 @@ class BatchGenWorker:
 			self._prefix_sequence_states[global_id] = replace(
 				state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
 			)
-			sids = tuple(wave.segment_sids[seg] for seg in wave.chains[index])
-			self._pool_member_sids[global_id] = sids
-			for sid in sids:
-				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
 		"""A pool segment's Host pages outlive its last member, never longer."""
