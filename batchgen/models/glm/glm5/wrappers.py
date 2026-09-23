@@ -779,7 +779,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "GLM-5.2 sparse prefill path audit finished without being started"
             )
 
-        from .config import dsa_layer_skips_topk
+        from .dsa_schedule import dsa_layer_skips_topk
 
         config = self.module.config
         num_layers = config.num_hidden_layers
