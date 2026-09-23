@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 
 _module = None
 _qkv_wgmma_available: Optional[bool] = None
+_arch: Optional[str] = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ('sm90a' / 'sm100')."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels
+        _arch = batchgen_kernels.get_device_arch()
+    return _arch
 
 
 def _check_wgmma_support() -> bool:
@@ -66,6 +76,12 @@ def is_qkv_wgmma_available() -> bool:
         _qkv_wgmma_available = False
         return False
 
+    # On SM100 (Blackwell) the WGMMA .cu is not built; the fused QKV path is
+    # provided by the pure-Triton kernel (qkv_proj_rope), always available.
+    if _get_arch() == "sm100":
+        _qkv_wgmma_available = True
+        return True
+
     _qkv_wgmma_available = _get_module() is not None
     return _qkv_wgmma_available
 
@@ -102,6 +118,16 @@ def cuda_qkv_wgmma(
         (Q, K, V) as separate contiguous [M, *] BF16 tensors.
         When rope_cos/sin provided, Q and K have RoPE applied; V is unchanged.
     """
+    # SM100 (Blackwell): WGMMA .cu is not built — use the pure-Triton port.
+    if _get_arch() == "sm100":
+        from batchgen_kernels.triton.qkv_proj_rope import qkv_proj_rope
+        _bias = bias if (bias is not None and bias.numel() > 0) else None
+        _cos = rope_cos if (rope_cos is not None and rope_cos.numel() > 0) else None
+        _sin = rope_sin if (rope_sin is not None and rope_sin.numel() > 0) else None
+        return qkv_proj_rope(
+            input, weight, _bias, q_size, kv_size, head_dim, _cos, _sin,
+        )
+
     mod = _get_module()
     assert mod is not None, "QKV WGMMA module not available"
 
