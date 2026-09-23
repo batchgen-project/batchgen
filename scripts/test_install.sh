@@ -200,6 +200,9 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
     clean_deepgemm_wheels "$PWD"
     bash ./build_sgl_deep_gemm.sh
     DEEPGEMM_WHEEL="$(find_deepgemm_wheel "$PWD")" || exit 1
+    find "$WHEEL_DIR" -maxdepth 1 -type f \
+        \( -name 'sgl_deep_gemm-*.whl' -o -name 'apache_tvm_ffi-*.whl' \) \
+        -delete
     cp "$DEEPGEMM_WHEEL" "$WHEEL_DIR/"
     pip download --only-binary=:all: --no-deps \
         "apache-tvm-ffi==${TVM_FFI_VERSION}" \

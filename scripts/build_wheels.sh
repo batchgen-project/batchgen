@@ -194,6 +194,9 @@ if [[ $ONLY_KERNELS -eq 0 && $SKIP_DEEPGEMM -eq 0 ]]; then
     bash ./build_sgl_deep_gemm.sh
     DEEPGEMM_WHEEL="$(find_deepgemm_wheel "$DEPS_DIR/$DEEPGEMM_SRC_DIR")" \
         || fail "Could not locate the built DeepGEMM wheel"
+    find "$OUTPUT_DIR" -maxdepth 1 -type f \
+        \( -name 'sgl_deep_gemm-*.whl' -o -name 'apache_tvm_ffi-*.whl' \) \
+        -delete
     cp "$DEEPGEMM_WHEEL" "$OUTPUT_DIR/"
     pip download --only-binary=:all: --no-deps \
         "apache-tvm-ffi==${TVM_FFI_VERSION}" \
