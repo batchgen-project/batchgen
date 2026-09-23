@@ -87,8 +87,12 @@ of these accumulated-token loads:
 - 8 prompts × 1,048,575 tokens plus one generated token: one full-window
   sequence per rank.
 
-The two shapes also completed in that order on one pool-32 service. The second
-stage returned 8/8 valid, nonempty rows and kept all eight workers alive.
+An earlier source candidate completed the shapes in the order above. A newer
+source candidate with metadata-sized weight shared memory and bounded grouped
+MoE router/shared-expert workspaces completed them in the reverse order on one
+pool-32 service. Both runs returned valid, nonempty rows and kept all eight
+workers alive. Final release qualification repeats both shapes from the exact
+installed wheels.
 
 This qualification covers prefill and the first sampled token. It does not
 claim sustained decode performance from eight simultaneous 1M-token contexts.
@@ -97,11 +101,14 @@ count is not a general performance profile.
 
 ## Memory limits
 
-The same-service long-prefill qualification reached a minimum host
+One same-service long-prefill qualification reached a minimum host
 `MemAvailable` of about 1.02 GiB with `--host-kv-cache-size 860` and
-`--max-pool-size 32`. Treat that combination as a tight qualification point.
-Run it only on a dedicated, otherwise idle host with the same memory capacity,
-or reduce the Host KV/pool reservation.
+`--max-pool-size 32`; a newer source qualification on another 2 TiB host
+reached 0 KiB without an OOM or worker loss. Treat that combination as a
+zero-margin qualification point. Run it only on a dedicated, otherwise idle
+host with at least the same memory capacity. Prefer additional host-memory
+headroom in production. Reducing Host KV or admitted concurrency also reduces
+the maximum simultaneous full-window workload.
 
 Large admissions cross a deterministic per-rank text threshold and tokenize
 one rank at a time. Smaller jobs retain parallel tokenization. If a worker is
