@@ -335,11 +335,17 @@ def _server_worker_main_impl(
 	# blocked in NCCL operations when node 0 is killed.
 	def _worker_shutdown_callback():
 		"""Cleanup callback when worker receives termination signal."""
+		start = time.monotonic()
 		try:
 			if dist.is_available() and dist.is_initialized():
 				dist.destroy_process_group()
 		except Exception:
 			pass
+		finally:
+			logging.info(
+				"[shutdown] worker process-group teardown elapsed=%.3fs",
+				time.monotonic() - start,
+			)
 
 	install_worker_signal_handlers(_worker_shutdown_callback)
 
