@@ -66,7 +66,9 @@ RUN git clone --recursive https://github.com/deepseek-ai/FlashMLA.git \
 
 # Install DeepGEMM (sgl-project fork, supported build_sgl_deep_gemm.sh path).
 # The build needs apache-tvm-ffi first. Exactly one wheel must be produced; a
-# py3-none-any tag is normalised to the manylinux platform tag before install.
+# py3-none-any tag is normalised to a truthful Linux/x86_64 platform tag before
+# install. A manylinux tag would require a separate audit of the image's glibc
+# symbol floor.
 # The final check pins the distribution AND the fp8_mqa_logits signature.
 RUN git clone --recursive https://github.com/sgl-project/DeepGEMM.git \
     && cd DeepGEMM \
@@ -77,8 +79,9 @@ RUN git clone --recursive https://github.com/sgl-project/DeepGEMM.git \
     && DG_WHEEL="$(find ./dist -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)" \
     && [ "$(printf '%s\n' "$DG_WHEEL" | grep -c .)" = "1" ] \
     && if [[ "$DG_WHEEL" == *-py3-none-any.whl ]]; then \
-         python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$DG_WHEEL"; \
-         DG_WHEEL="${DG_WHEEL%-py3-none-any.whl}-py3-none-manylinux2014_x86_64.whl"; \
+         [ "$(uname -m)" = "x86_64" ]; \
+         python -m wheel tags --platform-tag linux_x86_64 --remove "$DG_WHEEL"; \
+         DG_WHEEL="${DG_WHEEL%-py3-none-any.whl}-py3-none-linux_x86_64.whl"; \
        fi \
     && uv pip install "$DG_WHEEL" \
     && python -c "import inspect; from importlib.metadata import version; import deep_gemm; assert version('sgl-deep-gemm') == '0.1.5.post3'; assert 'max_seqlen_k' in inspect.signature(deep_gemm.fp8_mqa_logits).parameters" \

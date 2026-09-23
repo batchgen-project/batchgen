@@ -95,6 +95,7 @@ DEEPGEMM_DIST="sgl-deep-gemm"
 DEEPGEMM_DIST_VERSION="0.1.5.post3"
 TVM_FFI_VERSION="0.1.11"
 WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # ── Build target arch (sm90a default / sm100 / all) ──
 # Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
@@ -107,7 +108,8 @@ fi
 
 # ── Helper: locate the wheel built by build_sgl_deep_gemm.sh ──
 # Exactly one must match, otherwise we fail instead of guessing. A py3-none-any
-# wheel is retagged to the manylinux platform tag before install/publication.
+# wheel is retagged as Linux/x86_64. A manylinux tag requires a separate ABI
+# audit against the claimed glibc baseline.
 find_deepgemm_wheel() {
     local repo="$1" found count whl
     found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
@@ -118,8 +120,12 @@ find_deepgemm_wheel() {
     fi
     whl="$found"
     if [[ "$whl" == *-py3-none-any.whl ]]; then
-        python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl" >&2
-        whl="${whl%-py3-none-any.whl}-py3-none-manylinux2014_x86_64.whl"
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo -e "${RED}[FAIL]${NC} DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
     fi
     printf '%s\n' "$whl"
 }
@@ -285,13 +291,8 @@ elif [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
 
     # Install from cached wheels (no network, no compilation)
     pip install --find-links "$WHEEL_DIR" --no-index \
-        flash-attn-hopper flash-mla sgl-deep-gemm \
-        "apache-tvm-ffi==${TVM_FFI_VERSION}" 2>&1 || {
-        # Wheel names may vary — try installing all .whl files
-        warn "Named install failed, installing all wheels from $WHEEL_DIR"
-        pip install --find-links "$WHEEL_DIR" --no-index \
-            "$WHEEL_DIR"/*.whl
-    }
+        flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
+        "apache-tvm-ffi==${TVM_FFI_VERSION}"
     ok "Hopper dependencies installed from wheels"
     verify_deepgemm
 
@@ -349,23 +350,28 @@ fi
 # Phase 4: Install batchgen_kernels (AOT CUDA extensions)
 # ============================================================================ #
 divider
-step "Phase 4: Installing batchgen_kernels (AOT compilation)"
+if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" && $SKIP_DEPS -eq 0 ]]; then
+    step "Phase 4: Verifying pre-built batchgen_kernels wheel"
+    python -c "import batchgen_kernels"
+    ok "batchgen_kernels pre-built wheel imports"
+else
+    step "Phase 4: Installing batchgen_kernels (AOT compilation)"
+    cd "$BATCHGEN_DIR/batchgen_kernels"
 
-cd "$BATCHGEN_DIR/batchgen_kernels"
+    T0=$SECONDS
+    pip install . --no-build-isolation 2>&1 | tee /tmp/batchgen_kernels_build.log | tail -20
+    T1=$SECONDS
 
-T0=$SECONDS
-pip install . --no-build-isolation 2>&1 | tee /tmp/batchgen_kernels_build.log | tail -20
-T1=$SECONDS
-
-# Check for build errors
-if grep -qiE "error|fatal|failed" /tmp/batchgen_kernels_build.log; then
-    if ! grep -q "Successfully installed" /tmp/batchgen_kernels_build.log; then
-        fail "batchgen_kernels build failed — check /tmp/batchgen_kernels_build.log"
-        exit 1
+    # Check for build errors
+    if grep -qiE "error|fatal|failed" /tmp/batchgen_kernels_build.log; then
+        if ! grep -q "Successfully installed" /tmp/batchgen_kernels_build.log; then
+            fail "batchgen_kernels build failed — check /tmp/batchgen_kernels_build.log"
+            exit 1
+        fi
     fi
-fi
 
-ok "batchgen_kernels installed in $(( T1 - T0 ))s"
+    ok "batchgen_kernels installed in $(( T1 - T0 ))s"
+fi
 
 # Verify it's in site-packages (not editable)
 KERNELS_LOC=$(python -c "import batchgen_kernels; print(batchgen_kernels.__file__)")

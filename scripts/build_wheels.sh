@@ -45,6 +45,7 @@ DEEPGEMM_SRC_DIR="DeepGEMM-sgl"
 DEEPGEMM_VERSION="v0.1.5.post3"
 TVM_FFI_VERSION="0.1.11"
 WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # ── Build target arch (sm90a default / sm100 / all) ──
 # Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
@@ -126,7 +127,8 @@ clone_or_update() {
 
 # ── Helper: locate the wheel built by build_sgl_deep_gemm.sh ──
 # Exactly one must match, otherwise we fail instead of guessing. A py3-none-any
-# wheel is retagged to the manylinux platform tag before it is published.
+# wheel is retagged as Linux/x86_64. A manylinux tag requires a separate ABI
+# audit against the claimed glibc baseline.
 find_deepgemm_wheel() {
     local repo="$1" found count whl
     found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
@@ -137,8 +139,12 @@ find_deepgemm_wheel() {
     fi
     whl="$found"
     if [[ "$whl" == *-py3-none-any.whl ]]; then
-        python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl" >&2
-        whl="${whl%-py3-none-any.whl}-py3-none-manylinux2014_x86_64.whl"
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo -e "${RED}[FAIL]${NC} DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
     fi
     printf '%s\n' "$whl"
 }

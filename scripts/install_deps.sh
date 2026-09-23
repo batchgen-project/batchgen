@@ -37,6 +37,7 @@ DEEPGEMM_DIST="sgl-deep-gemm"
 DEEPGEMM_DIST_VERSION="0.1.5.post3"
 TVM_FFI_VERSION="0.1.11"
 WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # Build target architecture for batchgen_kernels and FlashMLA.
 #   sm90a (default) -> Hopper; FlashMLA SM100 kernels are disabled.
@@ -338,8 +339,9 @@ PY
 
 # Locate the wheel produced by build_sgl_deep_gemm.sh under a DeepGEMM checkout.
 # Exactly one must match, otherwise the caller fails instead of guessing. A
-# py3-none-any wheel is retagged to the manylinux platform tag used by the
-# published release assets before it is installed or copied out.
+# py3-none-any wheel is retagged as Linux/x86_64 before installation. Do not
+# claim a manylinux baseline here: the actual glibc floor depends on the build
+# image and must be checked separately before publishing a manylinux tag.
 find_deepgemm_wheel() {
     local repo="$1" found count whl
     found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
@@ -350,8 +352,12 @@ find_deepgemm_wheel() {
     fi
     whl="$found"
     if [[ "$whl" == *-py3-none-any.whl ]]; then
-        python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl" >&2
-        whl="${whl%-py3-none-any.whl}-py3-none-manylinux2014_x86_64.whl"
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            print_error "DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
     fi
     printf '%s\n' "$whl"
 }
@@ -366,6 +372,14 @@ remove_upstream_deepgemm() {
     if python -c 'from importlib.metadata import version; version("deep-gemm")' &>/dev/null; then
         print_step "Removing incompatible upstream deep-gemm distribution..."
         pip uninstall -y deep-gemm
+        # Both distributions own the same import package. If a previous
+        # partial upgrade left both metadata records behind, uninstalling the
+        # upstream RECORD may remove files from the SGL package too. Remove its
+        # metadata as well so the following install cannot be skipped as
+        # already satisfied.
+        if python -c 'from importlib.metadata import version; version("sgl-deep-gemm")' &>/dev/null; then
+            pip uninstall -y sgl-deep-gemm
+        fi
     fi
 }
 
@@ -485,7 +499,7 @@ try:
     assets = json.load(sys.stdin).get("assets", [])
 except Exception:
     sys.exit(0)
-want = ("flash_attn", "flash_mla", "sgl_deep_gemm", "apache_tvm_ffi", "batchgen_kernels")
+want = ("flash_attn_3", "flash_mla", "sgl_deep_gemm", "apache_tvm_ffi", "batchgen_kernels")
 for a in assets:
     n = a.get("name", "")
     if not n.endswith(".whl") or not any(n.startswith(w) for w in want):
@@ -500,7 +514,7 @@ for a in assets:
 ' || true)"
 
     # Require all five wheels; otherwise fall back to a full source build.
-    for w in flash_attn flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
         if ! printf '%s\n' "$assets" | grep -q "^${w}.*\\.whl[[:space:]]"; then
             print_warning "no pre-built '${w}' wheel for this env (${pytag}/${BUILD_ARCH}) — building from source."
             return 0
@@ -514,7 +528,7 @@ for a in assets:
       done )
 
     # Accept only a COMPLETE set; a partial download falls back to source.
-    for w in flash_attn flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
         if ! ls "$tmp/${w}"*.whl &>/dev/null 2>&1; then
             print_warning "incomplete wheel set (missing ${w}); building from source."
             rm -rf "$tmp"
@@ -674,11 +688,11 @@ main() {
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
                 remove_upstream_deepgemm
-                pip install --find-links "$WHEEL_DIR" --no-index \
-                    flash-attn-hopper flash-mla sgl-deep-gemm \
-                    "apache-tvm-ffi==${TVM_FFI_VERSION}" 2>/dev/null || \
-                    pip install --find-links "$WHEEL_DIR" --no-index \
-                    "$WHEEL_DIR"/*.whl
+                if ! pip install --find-links "$WHEEL_DIR" --no-index \
+                    flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
+                    "apache-tvm-ffi==${TVM_FFI_VERSION}"; then
+                    print_warning "pre-built wheel installation failed; validating each dependency and source-building only what is missing"
+                fi
                 # Validate the runtime interfaces rather than trusting wheel
                 # metadata. Each installer skips a dependency that imports and
                 # source-builds only a missing or incorrectly packaged one.
@@ -699,6 +713,7 @@ main() {
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Blackwell dependencies from pre-built wheels: $WHEEL_DIR"
+                remove_upstream_deepgemm
                 for whl in "$WHEEL_DIR"/*.whl; do
                     [[ -f "$whl" ]] || continue
                     pip install "$whl" --no-deps \
@@ -707,6 +722,7 @@ main() {
                 # FA4 runtime deps (pure-Python, not in wheel cache)
                 pip install "nvidia-cutlass-dsl>=4.4.2" quack-kernels torch-c-dlpack-ext cuda-python \
                     --extra-index-url https://pypi.nvidia.com -q
+                install_deepgemm
                 print_success "Blackwell dependencies installed from wheels"
             else
                 install_flash_attention_4
