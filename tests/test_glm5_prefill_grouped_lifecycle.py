@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from batchgen.models.glm.glm5.model import Glm5DecoderLayer, Glm5MoE
+from batchgen.models.glm.glm5.model import (
+    Glm5DecoderLayer,
+    Glm5MoE,
+    _glm5_accumulate_shared_expert_chunked,
+)
 
 
 class _Event:
@@ -96,6 +100,31 @@ def _make_moe(experts, shared):
     moe.experts = experts
     moe.shared_experts = shared
     return moe
+
+
+def test_shared_expert_prefill_is_accumulated_in_bounded_chunks():
+    class _Shared:
+        def __init__(self):
+            self.rows = []
+
+        def _forward_impl(self, hidden_states):
+            self.rows.append(hidden_states.shape[0])
+            return hidden_states * 3
+
+    hidden = torch.arange(44, dtype=torch.float32).view(11, 4)
+    output = torch.ones_like(hidden)
+    shared = _Shared()
+
+    result = _glm5_accumulate_shared_expert_chunked(
+        output,
+        hidden,
+        shared,
+        chunk_rows=4,
+    )
+
+    assert result is output
+    assert shared.rows == [4, 4, 3]
+    torch.testing.assert_close(result, 1 + hidden * 3)
 
 
 @pytest.fixture(autouse=True)

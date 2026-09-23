@@ -1254,6 +1254,19 @@ def _glm5_moe_3d_blockwise_supported(
     )
 
 
+def _glm5_accumulate_shared_expert_chunked(
+    output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    shared_expert,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Add the shared-expert output without materializing a full-token result."""
+    for start in range(0, hidden_states.shape[0], chunk_rows):
+        end = min(start + chunk_rows, hidden_states.shape[0])
+        output[start:end].add_(shared_expert._forward_impl(hidden_states[start:end]))
+    return output
+
+
 class Glm5MoE(nn.Module):
     """GLM-5 MoE layer (unified prefill + EP decode).
 
@@ -2568,8 +2581,12 @@ class Glm5MoE(nn.Module):
                 output=output[start:end],
             )
 
-        shared = self.shared_experts
-        shared_output = shared._forward_impl(hidden_flat)
+        _glm5_accumulate_shared_expert_chunked(
+            output,
+            hidden_flat,
+            self.shared_experts,
+            buf.token_window,
+        )
         self._queue_prefill_grouped_releases()
 
         if not cls._prefill_grouped_logged:
@@ -2581,7 +2598,7 @@ class Glm5MoE(nn.Module):
                 buf.token_window,
                 (num_tokens + buf.token_window - 1) // buf.token_window,
             )
-        return (output + shared_output).view(*orig_shape)
+        return output.view(*orig_shape)
 
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill: per-expert loop (no EP).
