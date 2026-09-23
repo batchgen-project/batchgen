@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import batchgen.models.glm.glm5.model as glm5_model
+
 from batchgen.models.glm.glm5.model import (
     Glm5DecoderLayer,
     Glm5MoE,
@@ -167,6 +169,104 @@ def test_prefill_gate_routes_in_bounded_ordered_chunks():
     indices = torch.cat([indices for _, _, _, indices in chunks])
     assert indices.dtype == torch.int32
     torch.testing.assert_close(indices, expected_indices.to(torch.int32))
+
+
+def test_grouped_prefill_threads_each_gate_window_to_dispatch_and_reduce(
+    monkeypatch,
+):
+    calls = {"gate": [], "dispatch": [], "reduce": [], "shared": []}
+
+    class _Gate:
+        def __call__(self, hidden_states):
+            token_ids = hidden_states[:, 0].to(torch.int64)
+            calls["gate"].append(token_ids.tolist())
+            indices = torch.stack((token_ids % 3, (token_ids + 1) % 3), dim=1)
+            weights = torch.full(indices.shape, 0.5, dtype=torch.float32)
+            return weights, indices
+
+    class _Shared:
+        def _forward_impl(self, hidden_states):
+            calls["shared"].append(hidden_states.shape[0])
+            return torch.zeros_like(hidden_states)
+
+    class _ViewBuffer:
+        def view(self, *_args):
+            return self
+
+    topk_pos = torch.empty(8, dtype=torch.int32)
+    buf = SimpleNamespace(
+        token_window=4,
+        num_experts=3,
+        dispatched_x=object(),
+        expert_counts=object(),
+        expert_counters=object(),
+        cu_seqlens=object(),
+        topk_pos=topk_pos,
+        x_fp8=_ViewBuffer(),
+        x_scale=object(),
+        intermediate=object(),
+        s1_tma_desc=object(),
+        tiles=object(),
+        cu_tiles=object(),
+        inter_fp8=_ViewBuffer(),
+        inter_scale=object(),
+        expert_out=object(),
+        s3_tma_desc=object(),
+    )
+
+    def _dispatch(hidden_states, indices, *_args):
+        calls["dispatch"].append((hidden_states[:, 0].tolist(), indices.clone()))
+        return object(), object(), _args[-1]
+
+    def _reduce(
+        _expert_output,
+        positions,
+        indices,
+        weights,
+        num_tokens,
+        _hidden_size,
+        _topk,
+        *,
+        output,
+    ):
+        calls["reduce"].append(
+            (positions.numel(), indices.clone(), weights.clone(), num_tokens)
+        )
+        output.zero_()
+        return output
+
+    monkeypatch.setattr(glm5_model, "_glm5_dispatch_scatter_ragged", _dispatch)
+    monkeypatch.setattr(glm5_model, "_glm5_act_quant_ragged", lambda *_args: None)
+    monkeypatch.setattr(
+        glm5_model,
+        "grouped_fp8_blockwise_fused_s1_ptrs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        glm5_model,
+        "grouped_fp8_blockwise_s3_ptrs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(glm5_model, "_glm5_reduce_ordered", _reduce)
+
+    moe = _make_moe([], _Shared())
+    moe.num_experts_per_tok = 2
+    moe.gate = _Gate()
+    moe._prefill_prepared_keys = []
+    moe._prefill_weight_prototypes = (None,) * 6
+    moe._queue_prefill_grouped_releases = lambda: None
+    Glm5MoE._prefill_buf = buf
+    Glm5MoE._prefill_ptrs_dev = [None] * 6
+
+    hidden = torch.arange(44, dtype=torch.bfloat16).view(11, 4)
+    output = moe._forward_prefill_grouped_impl(hidden)
+
+    assert calls["gate"] == [[0, 4, 8, 12], [16, 20, 24, 28], [32, 36, 40]]
+    assert [len(rows) for rows, _ in calls["dispatch"]] == [4, 4, 3]
+    assert [entry[0] for entry in calls["reduce"]] == [8, 8, 6]
+    assert [entry[3] for entry in calls["reduce"]] == [4, 4, 3]
+    assert calls["shared"] == [4, 4, 3]
+    torch.testing.assert_close(output, torch.zeros_like(hidden))
 
 
 @pytest.fixture(autouse=True)
