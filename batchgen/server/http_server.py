@@ -148,11 +148,25 @@ def create_app(
             )
             yield
         finally:
+            shutdown_start = time.monotonic()
+            logging.info("[shutdown] scheduler stop begin")
             try:
                 if scheduler_started:
                     await scheduler.stop()
             finally:
-                worker.stop()
+                scheduler_stop_end = time.monotonic()
+                logging.info(
+                    "[shutdown] scheduler stop elapsed=%.3fs",
+                    scheduler_stop_end - shutdown_start,
+                )
+                try:
+                    worker.stop()
+                finally:
+                    logging.info(
+                        "[shutdown] worker stop elapsed=%.3fs total=%.3fs",
+                        time.monotonic() - scheduler_stop_end,
+                        time.monotonic() - shutdown_start,
+                    )
 
     app = FastAPI(title="BatchGen OpenAI-Compatible API", lifespan=lifespan)
     app.state.worker_exit_state = worker_exit_state
@@ -567,6 +581,7 @@ def launch_server(server_args: ServerArgs) -> None:
         nonlocal shutdown_requested
         sig_name = signal.Signals(signum).name
         logger.info(f"Received {sig_name}, initiating graceful shutdown...")
+        logging.info("[shutdown] server received %s", sig_name)
         shutdown_requested = True
         # Re-raise to let uvicorn handle shutdown
         raise KeyboardInterrupt()

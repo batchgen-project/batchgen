@@ -333,6 +333,7 @@ class WorkerManager:
         self._stopping = True
         worker_teardown_safe = self.worker_process is None
         artifacts_cleaned = False
+        shutdown_start = time.monotonic()
         try:
             self._monitor_stop_event.set()
             logger.info("Stopping WorkerManager...")
@@ -349,7 +350,13 @@ class WorkerManager:
                 self.distributed_weight_daemon.prepare_stop()
 
             if self.worker_process is not None:
-                self._stop_workers()
+                try:
+                    self._stop_workers()
+                finally:
+                    logging.info(
+                        "[shutdown] worker processes elapsed=%.3fs",
+                        time.monotonic() - shutdown_start,
+                    )
             worker_teardown_safe = True
 
             if self.distributed_weight_daemon is not None:
@@ -374,6 +381,7 @@ class WorkerManager:
                     if self._runtime_namespace_owned:
                         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:
+                        model_release_start = time.monotonic()
                         self._model_shm_release_unverified = True
                         self.parameter_server_instance = None
                         gc.collect()
@@ -385,6 +393,10 @@ class WorkerManager:
                             ),
                         )
                         self._model_shm_release_unverified = False
+                        logging.info(
+                            "[shutdown] model SHM owner release elapsed=%.3fs",
+                            time.monotonic() - model_release_start,
+                        )
                     else:
                         # Remote parameter servers and distributed stores own
                         # their names; this worker only borrowed them.
@@ -422,9 +434,15 @@ class WorkerManager:
                     logger.error(
                         "WorkerManager stop incomplete; admission locks remain held"
                     )
+                logging.info(
+                    "[shutdown] worker manager elapsed=%.3fs clean=%s",
+                    time.monotonic() - shutdown_start,
+                    artifacts_cleaned,
+                )
 
     def _stop_workers(self) -> None:
         """Signal only the original child processes, never a reused numeric PID."""
+        stop_start = time.monotonic()
         processes = self.worker_process.processes
         if not processes:
             raise RuntimeError("worker process context has no child processes")
@@ -454,6 +472,11 @@ class WorkerManager:
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
+                logging.info(
+                    "[shutdown] worker SIGTERM grace elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    len(remaining),
+                )
                 if remaining:
                     logger.warning("Workers did not exit gracefully, force-killing...")
                 for _, pidfd in remaining:
@@ -464,6 +487,11 @@ class WorkerManager:
                 deadline = time.monotonic() + 5
                 for proc, _ in remaining:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
+                logging.info(
+                    "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    sum(proc.exitcode is None for proc in processes),
+                )
 
                 surviving_pids = [
                     proc.pid for proc in processes if proc.exitcode is None
@@ -951,6 +979,7 @@ class WorkerManager:
         if self._stopping:
             return
         if self._worker_exit_state.set_failure(reason, exc):
+            logging.error("[shutdown] worker failure detected: %s", reason)
             self._request_server_shutdown()
 
     @staticmethod
