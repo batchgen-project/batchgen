@@ -339,6 +339,93 @@ def plan_wave_prefix_sharing(
     return plan
 
 
+def assign_ranks_for_sharing(
+    prompts: Sequence[Sequence[int]],
+    *,
+    world_size: int,
+    block_tokens: int,
+) -> tuple[int, ...]:
+    """Assign prompts to DP ranks so shared prefixes are computed on one rank.
+
+    Each rank has its own prefix pool, so prompts sharing a prefix only save
+    compute when they land on the same rank. Units start as the whole wave;
+    the heaviest unit is split (at its next branch, or in halves when its
+    prompts are identical) only while that lowers the busiest rank's load
+    under first-fit-decreasing placement. Load is the unit's computed tokens
+    with every shared segment pooled once.
+    """
+
+    if world_size <= 0 or block_tokens <= 0:
+        raise ValueError("world_size and block_tokens must be positive")
+    count = len(prompts)
+    if count == 0:
+        return ()
+
+    def cost(members: list[int]) -> int:
+        tree = _build_tree([prompts[i] for i in members], block_tokens)
+        saved = sum(
+            (c - 1) * (end - start)
+            for c, start, end in zip(tree.count, tree.start_block, tree.end_block)
+            if c >= 2
+        )
+        return sum(len(prompts[i]) for i in members) - saved * block_tokens
+
+    def split(members: list[int], depth: int) -> Optional[list[tuple[list[int], int]]]:
+        if len(members) == 1:
+            return None
+        while True:
+            groups: dict[tuple[int, ...], list[int]] = {}
+            ended: list[int] = []
+            for i in members:
+                if (len(prompts[i]) - 1) // block_tokens > depth:
+                    block = tuple(prompts[i][depth * block_tokens:(depth + 1) * block_tokens])
+                    groups.setdefault(block, []).append(i)
+                else:
+                    ended.append(i)
+            if not groups:  # identical shareable prefixes: halve the unit
+                half = len(members) // 2
+                return [(members[:half], depth), (members[half:], depth)]
+            if len(groups) == 1 and not ended:
+                depth += 1  # no branch at this block, look one block deeper
+                continue
+            parts = [list(g) for g in groups.values()]
+            # Prompts ending here share [0, depth) with every child; keep them
+            # with the largest child instead of recomputing that prefix alone.
+            max(parts, key=len).extend(ended)
+            if len(parts) == 1:  # only the ended prompts branched off
+                parts = [[i for i in members if i not in ended], ended]
+            return [(sorted(p), depth + 1) for p in parts]
+
+    def place(loads: list[int]) -> tuple[int, list[int]]:
+        rank_load = [0] * world_size
+        where = [0] * len(loads)
+        for unit in sorted(range(len(loads)), key=lambda k: (-loads[k], k)):
+            rank = min(range(world_size), key=lambda r: (rank_load[r], r))
+            where[unit] = rank
+            rank_load[rank] += loads[unit]
+        return max(rank_load), where
+
+    units: list[tuple[list[int], int]] = [(list(range(count)), 0)]
+    loads = [cost(units[0][0])]
+    span, where = place(loads)
+    while True:
+        heavy = max(range(len(units)), key=lambda k: (loads[k], -k))
+        parts = split(*units[heavy])
+        if parts is None:
+            break
+        trial_units = units[:heavy] + units[heavy + 1:] + parts
+        trial_loads = loads[:heavy] + loads[heavy + 1:] + [cost(m) for m, _ in parts]
+        trial_span, trial_where = place(trial_loads)
+        if trial_span >= span:
+            break
+        units, loads, span, where = trial_units, trial_loads, trial_span, trial_where
+    ranks = [0] * count
+    for unit, (members, _) in enumerate(units):
+        for i in members:
+            ranks[i] = where[unit]
+    return tuple(ranks)
+
+
 def validate_wave_prefix_plan(
     plan: WavePrefixPlan, prompts: Sequence[Sequence[int]]
 ) -> None:
