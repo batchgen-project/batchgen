@@ -182,3 +182,53 @@ def test_validator_rejects_missing_tail():
 def test_rejects_empty_prompt():
     with pytest.raises(ValueError):
         plan_wave_prefix_sharing([[]], block_tokens=B, pool_pages=1, chunk_tokens=1)
+
+
+assign_ranks_for_sharing = _MODULE.assign_ranks_for_sharing
+
+
+def _rank_loads(prompts, ranks, world):
+    loads = []
+    for r in range(world):
+        group = [p for p, k in zip(prompts, ranks) if k == r]
+        loads.append(plan(group).computed_tokens if group else 0)
+    return loads
+
+
+def test_sharing_assignment_keeps_subtrees_together():
+    ranks = assign_ranks_for_sharing(TREE, world_size=2, block_tokens=B)
+    # A-subtree (36 computed tokens) alone; B pair + unshared prompt (27).
+    assert ranks == (0, 0, 0, 0, 1, 1, 1)
+    assert _rank_loads(TREE, ranks, 2) == [36, 27]
+
+
+def test_sharing_assignment_splits_only_when_busiest_rank_improves():
+    ranks = assign_ranks_for_sharing(TREE, world_size=4, block_tokens=B)
+    loads = _rank_loads(TREE, ranks, 4)
+    # Splitting A at its A1/A2 branch lowers the busiest rank from 36 to 22.
+    assert max(loads) == 22
+    assert ranks[0] == ranks[1] and ranks[2] == ranks[3]
+
+
+def test_identical_prompts_are_halved_not_scattered():
+    prompt = blk(1) + blk(2) + blk(3)
+    ranks = assign_ranks_for_sharing([prompt] * 4, world_size=2, block_tokens=B)
+    assert ranks == (0, 0, 1, 1)
+
+
+def test_single_rank_assignment():
+    assert assign_ranks_for_sharing(TREE, world_size=1, block_tokens=B) == (0,) * 7
+
+
+def test_random_assignments_never_worse_than_one_rank():
+    rng = random.Random(1)
+    for _ in range(100):
+        vocab = [blk(n) for n in range(rng.randint(2, 5))]
+        prompts = [
+            [t for _ in range(rng.randint(0, 4)) for t in rng.choice(vocab)] + [rng.randint(0, 3)]
+            for _ in range(rng.randint(1, 10))
+        ]
+        world = rng.randint(1, 4)
+        ranks = assign_ranks_for_sharing(prompts, world_size=world, block_tokens=B)
+        assert len(ranks) == len(prompts) and all(0 <= r < world for r in ranks)
+        assert max(_rank_loads(prompts, ranks, world)) <= plan(prompts).computed_tokens
