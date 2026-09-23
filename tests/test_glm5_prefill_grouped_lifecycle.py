@@ -6,7 +6,9 @@ import torch
 from batchgen.models.glm.glm5.model import (
     Glm5DecoderLayer,
     Glm5MoE,
+    Glm5MoEGate,
     _glm5_accumulate_shared_expert_chunked,
+    _glm5_iter_prefill_gate_chunks,
 )
 
 
@@ -125,6 +127,46 @@ def test_shared_expert_prefill_is_accumulated_in_bounded_chunks():
     assert result is output
     assert shared.rows == [4, 4, 3]
     torch.testing.assert_close(result, 1 + hidden * 3)
+
+
+def test_prefill_gate_routes_in_bounded_ordered_chunks():
+    config = SimpleNamespace(
+        n_routed_experts=5,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.7,
+        hidden_size=3,
+    )
+    gate = Glm5MoEGate(config).to(torch.bfloat16)
+    with torch.no_grad():
+        gate.weight.copy_(torch.linspace(-0.7, 0.9, 15).view(5, 3))
+        gate.e_score_correction_bias.copy_(torch.linspace(-0.2, 0.2, 5))
+    hidden = torch.linspace(-1.0, 1.0, 33, dtype=torch.bfloat16).view(11, 3)
+    expected_weights, expected_indices = gate(hidden)
+
+    class _RecordingGate:
+        def __call__(self, hidden_states):
+            calls.append(hidden_states.shape[0])
+            return gate(hidden_states)
+
+    calls = []
+    chunks = list(
+        _glm5_iter_prefill_gate_chunks(_RecordingGate(), hidden, chunk_rows=4)
+    )
+
+    assert [(start, end) for start, end, _, _ in chunks] == [
+        (0, 4),
+        (4, 8),
+        (8, 11),
+    ]
+    assert calls == [4, 4, 3]
+    torch.testing.assert_close(
+        torch.cat([weights for _, _, weights, _ in chunks]),
+        expected_weights,
+    )
+    indices = torch.cat([indices for _, _, _, indices in chunks])
+    assert indices.dtype == torch.int32
+    torch.testing.assert_close(indices, expected_indices.to(torch.int32))
 
 
 @pytest.fixture(autouse=True)
