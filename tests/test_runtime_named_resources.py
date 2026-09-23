@@ -144,6 +144,7 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     assert "free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)" in destructor
     assert "if (tensor_meta_shm_owned_)" in destructor
     assert "if (create && errno == EEXIST)" in shm_source
+    assert "memfd creator requires an output fd" in shm_source
 
 
 @pytest.mark.skipif(

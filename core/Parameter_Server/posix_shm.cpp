@@ -287,6 +287,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
+    if (create && enable_memfd && out_memfd_fd == nullptr) {
+        throw std::runtime_error("memfd creator requires an output fd");
+    }
     if (out_posix_shm_owned) *out_posix_shm_owned = false;
     if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
     if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
