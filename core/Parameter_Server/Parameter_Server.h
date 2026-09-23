@@ -69,12 +69,6 @@ class Parameter_Server {
                                  std::unordered_map<std::string, std::string>>&
                   state_dict_name_map);
     std::unordered_map<std::string, torch::Tensor> get_skeleton_state_dict();
-    // Unmaps only this process's weight region. Shared-memory names, ownership
-    // flags, the weights memfd and the metadata region are left to the
-    // destructor, so nothing is unlinked here. Callers must not retain/read
-    // get_skeleton_state_dict() from_blob views after this method succeeds.
-    // Idempotent: a second call cannot munmap twice and returns false.
-    bool release_weight_mapping();
     int64_t byte_size();
     int weights_memfd_fd() const { return weights_memfd_fd_; }
     std::unordered_map<std::string,

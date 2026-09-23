@@ -627,7 +627,7 @@ void verify_numa_allocation(void* ptr, size_t size) {
 }
 
 
-bool free_shared_pinned_memory(void* ptr, int64_t size) {
+void free_shared_pinned_memory(void* ptr, int64_t size) {
     const auto start = std::chrono::steady_clock::now();
     const cudaError_t unregister_result = cudaHostUnregister(ptr);
     const auto unregister_done = std::chrono::steady_clock::now();
@@ -640,7 +640,6 @@ bool free_shared_pinned_memory(void* ptr, int64_t size) {
         std::chrono::duration<double>(unregister_done - start).count(),
         unmap_result,
         std::chrono::duration<double>(unmap_done - unregister_done).count());
-    return unmap_result == 0;
 }
 
 // -----------------------------------------------------------------------------

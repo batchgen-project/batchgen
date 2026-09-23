@@ -464,21 +464,8 @@ class WorkerManager:
                     self.request_queue.put(None)
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
+
                 deadline = time.monotonic() + 5
-
-                # Experimental: the weight munmap dominates owner release and
-                # does not need the children to be gone, so overlap it with
-                # their exit. Nothing is unlinked here and a failure must never
-                # skip the joins below.
-                try:
-                    self._release_weight_mapping_early()
-                except Exception:
-                    logger.warning(
-                        "Early weight unmap failed; leaving the mapping to the "
-                        "parameter server destructor",
-                        exc_info=True,
-                    )
-
                 for proc in processes:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
 
@@ -517,34 +504,6 @@ class WorkerManager:
             finally:
                 for _, pidfd in pidfds:
                     os.close(pidfd)
-
-    def _release_weight_mapping_early(self) -> None:
-        """Unmap only the locally owned model-weight region, before worker joins.
-
-        SHM names, ownership flags, the weights memfd, the recorded provenance
-        and the lane/admission locks stay untouched: the parameter server
-        destructor still releases every name after worker death is confirmed.
-        A build without the native method keeps the mapping for that destructor.
-        """
-        instance = getattr(self, "parameter_server_instance", None)
-        if instance is None:
-            # Remote parameter servers and distributed stores own the mapping.
-            return
-        native = getattr(instance, "parameter_server", None)
-        release = getattr(native, "release_weight_mapping", None)
-        if release is None:
-            logging.getLogger("uvicorn.error").warning(
-                "[shutdown] early weight unmap unavailable in native build; "
-                "owner destructor retains the full release"
-            )
-            return
-        unmap_start = time.monotonic()
-        released = release()
-        logging.getLogger("uvicorn.error").info(
-            "[shutdown] early weight unmap released=%s elapsed=%.3fs",
-            bool(released),
-            time.monotonic() - unmap_start,
-        )
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state

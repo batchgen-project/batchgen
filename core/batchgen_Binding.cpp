@@ -742,8 +742,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
-        .def("release_weight_mapping",
-             &Parameter_Server::release_weight_mapping)
         .def("byte_size", &Parameter_Server::byte_size)
         .def("module_weights_shm", &Parameter_Server::module_weights_shm)
         .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd);

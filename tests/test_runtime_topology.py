@@ -890,7 +890,6 @@ def test_worker_stop_signals_only_original_child_handles(exits_after_term):
     manager.worker_process = SimpleNamespace(processes=[child])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
-    manager._release_weight_mapping_early = lambda: None
 
     if exits_after_term:
         manager._stop_workers()
@@ -936,7 +935,6 @@ def test_worker_stop_real_child_pidfd():
     manager.worker_process = SimpleNamespace(processes=[Child()])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: None)
-    manager._release_weight_mapping_early = lambda: None
     try:
         manager._stop_workers()
         assert child_process.poll() is not None
@@ -944,138 +942,6 @@ def test_worker_stop_real_child_pidfd():
         if child_process.poll() is None:
             child_process.kill()
         child_process.wait()
-
-
-def _early_unmap_manager(events, parameter_server_instance):
-    """Isolated manager whose child exits on its first join."""
-
-    class Child:
-        pid = 123
-        exitcode = None
-
-        def join(self, timeout):
-            events.append("join")
-            self.exitcode = 0
-
-    manager_type = _isolated_class(
-        WORKER_MANAGER,
-        "WorkerManager",
-        ("_stop_workers", "_release_weight_mapping_early"),
-        {
-            "logger": SimpleNamespace(
-                warning=lambda *args, **kwargs: events.append("warn")
-            ),
-            "logging": SimpleNamespace(
-                getLogger=lambda name: SimpleNamespace(
-                    info=lambda *args, **kwargs: None,
-                    warning=lambda *args, **kwargs: None,
-                )
-            ),
-            "os": SimpleNamespace(
-                pidfd_open=lambda pid: 9,
-                close=lambda fd: None,
-            ),
-            "signal": SimpleNamespace(
-                SIGTERM=15,
-                SIGKILL=9,
-                pidfd_send_signal=lambda fd, sig: events.append(("signal", sig)),
-            ),
-            "time": time,
-        },
-    )
-    manager = manager_type()
-    manager.worker_process = SimpleNamespace(processes=[Child()])
-    manager._join_lock = nullcontext()
-    manager.request_queue = SimpleNamespace(
-        put=lambda value: events.append("poison")
-    )
-    manager.parameter_server_instance = parameter_server_instance
-    return manager
-
-
-def test_worker_stop_unmaps_weights_after_signals_before_joins():
-    events = []
-    native = SimpleNamespace(
-        release_weight_mapping=lambda: events.append("early-unmap") or True
-    )
-    manager = _early_unmap_manager(
-        events, SimpleNamespace(parameter_server=native)
-    )
-
-    manager._stop_workers()
-
-    assert events == [("signal", 15), "poison", "early-unmap", "join"]
-    # Ownership stays with the destructor that stop() triggers later.
-    assert manager.parameter_server_instance is not None
-
-
-def test_worker_stop_early_unmap_failure_still_joins_workers():
-    events = []
-
-    def boom():
-        events.append("early-unmap-raise")
-        raise RuntimeError("weight mapping release unavailable")
-
-    manager = _early_unmap_manager(
-        events,
-        SimpleNamespace(
-            parameter_server=SimpleNamespace(release_weight_mapping=boom)
-        ),
-    )
-
-    manager._stop_workers()
-
-    assert events == [
-        ("signal", 15),
-        "poison",
-        "early-unmap-raise",
-        "warn",
-        "join",
-    ]
-
-
-@pytest.mark.parametrize(
-    "instance",
-    [None, SimpleNamespace(parameter_server=SimpleNamespace())],
-    ids=["remote-or-distributed-store", "extension-without-method"],
-)
-def test_worker_stop_skips_early_unmap_without_local_native_release(instance):
-    events = []
-    manager = _early_unmap_manager(events, instance)
-
-    manager._stop_workers()
-
-    assert events == [("signal", 15), "poison", "join"]
-
-
-def test_early_weight_unmap_helper_touches_no_other_resource():
-    tree = ast.parse(WORKER_MANAGER.read_text(), filename=str(WORKER_MANAGER))
-    manager = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "WorkerManager"
-    )
-    helper = ast.unparse(
-        next(
-            node
-            for node in manager.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_release_weight_mapping_early"
-        )
-    )
-
-    assert "release_weight_mapping" in helper
-    for forbidden in (
-        "unlink",
-        "cleanup_shm_files",
-        "shm_name",
-        "record_model_shm_provenance",
-        "_lane_lease",
-        "_runtime_locks",
-        "rmtree",
-        "parameter_server_instance = None",
-    ):
-        assert forbidden not in helper
 
 
 def test_worker_monitor_does_not_invoke_context_auto_kill():

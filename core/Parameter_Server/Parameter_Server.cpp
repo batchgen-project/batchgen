@@ -610,25 +610,6 @@ Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
 //     this->logger->info("Parameter Server Initialized.");
 // };
 
-bool Parameter_Server::release_weight_mapping() {
-    if (this->weight_ptr_ == nullptr) {
-        return false;
-    }
-    if (!free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)) {
-        this->logger->warn("early weight unmap failed; destructor will retry");
-        return false;
-    }
-    // Clear the pointer only after a successful unmap, so a failed early
-    // attempt leaves the existing destructor path available.
-    this->weight_ptr_ = nullptr;
-    this->mapped_size_ = 0;
-    // These tensors are from_blob views over the mapping; the caller already
-    // persisted the skeleton it needs and must never read them after stop.
-    this->skeleton_state_dict_.clear();
-    this->logger->info("weight mapping released ahead of destruction.");
-    return true;
-};
-
 Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
         free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
