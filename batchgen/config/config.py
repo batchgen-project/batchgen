@@ -109,6 +109,9 @@ class ModuleBatchingConfig:
     # K3 DeepEP build + NVSHMEM env; planner-set, see batchgen/moe/deepep_ll.py).
     k3_deepep_ll: bool = False
     prepack_row_capacity: Optional[int] = None  # Token budget per packed row (None = no limit)
+    # In-wave prefix pool: prefill HBM kept for one prepacked forward; the
+    # rest of free prefill HBM becomes the pool (0 = pool off). Planner-set.
+    prefill_prefix_pool_workspace_bytes: int = 0
     # Sequence-count based prefill config (for non-prepack mode)
     attn_prefill_micro_batch_size: Optional[int] = 0
     MoE_prefill_micro_batch_size: Optional[int] = 0
