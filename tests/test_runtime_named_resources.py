@@ -136,7 +136,11 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     destructor = server_source.split("Parameter_Server::~Parameter_Server()", 1)[1]
     destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
     assert "if (weight_posix_shm_owned_)" in destructor
+    assert "if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty())" in destructor
+    assert "unlink(this->weight_hugetlbfs_path_.c_str())" in destructor
+    assert "close(this->weights_memfd_fd_)" in destructor
     assert "if (tensor_meta_shm_owned_)" in destructor
+    assert "if (create && errno == EEXIST)" in shm_source
 
 
 @pytest.mark.skipif(

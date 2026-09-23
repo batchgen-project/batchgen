@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import logging
 import os
 import pickle
@@ -24,11 +25,11 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
-    cleanup_model_shm_files,
-    cleanup_resources,
+    cleanup_shm_files,
     get_hugepage_size,
     get_model_byte_size,
     record_model_shm_provenance,
+    verify_model_shm_absent,
 )
 from batchgen.server.runtime_locks import RuntimeLocks
 from batchgen.server.runtime_lease import LaneLease
@@ -146,6 +147,7 @@ class WorkerManager:
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
         self._model_shm_init_unconfirmed = False
+        self._model_shm_release_unverified = False
         self.host_kv_manager = None
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
@@ -169,7 +171,6 @@ class WorkerManager:
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
-        self._hugepages_enabled = False  # Track if hugepages were configured
 
     def _cleanup_skeleton_state_dict_file(self) -> None:
         """Clean up temporary skeleton state dict file."""
@@ -250,7 +251,6 @@ class WorkerManager:
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
             self._config_hugepages(byte_size)
-            self._hugepages_enabled = True
 
         import sys as _diag_sys
         def _diag(msg):
@@ -366,16 +366,25 @@ class WorkerManager:
                             "Model SHM creation was attempted but ownership is "
                             "unconfirmed; preserving runtime artifacts and locks"
                         )
-                    if self._runtime_namespace_owned:
-                        cleanup_resources(
-                            shm_prefix=(
-                                self.args.runtime_identity.shm_prefix
-                            ),
-                            clean_hugepages=self._hugepages_enabled,
-                            kill_workers=False,  # Already handled above
+                    if getattr(self, "_model_shm_release_unverified", False):
+                        raise RuntimeError(
+                            "Model SHM owner release was not verified; "
+                            "preserving runtime artifacts and locks"
                         )
+                    if self._runtime_namespace_owned:
+                        cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:
-                        cleanup_model_shm_files(self.model_info)
+                        self._model_shm_release_unverified = True
+                        self.parameter_server_instance = None
+                        gc.collect()
+                        verify_model_shm_absent(
+                            self.model_info,
+                            hugepages_dir=(
+                                Path("/dev/hugepages")
+                                if self.args.enable_hugetlbfs else None
+                            ),
+                        )
+                        self._model_shm_release_unverified = False
                     else:
                         # Remote parameter servers and distributed stores own
                         # their names; this worker only borrowed them.

@@ -280,11 +280,15 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
                                     int* out_memfd_fd,
-                                    bool* out_posix_shm_owned) {
+                                    bool* out_posix_shm_owned,
+                                    bool* out_hugetlbfs_owned,
+                                    std::string* out_hugetlbfs_path) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
     if (out_posix_shm_owned) *out_posix_shm_owned = false;
+    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
+    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
@@ -365,6 +369,11 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (!using_huge_pages && create) {
                 logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
                 unlink(hugepage_path.c_str());
+            } else if (using_huge_pages && create) {
+                // O_EXCL create plus mapping both succeeded: this process owns
+                // exactly this hugetlbfs path and may unlink it on teardown.
+                if (out_hugetlbfs_owned) *out_hugetlbfs_owned = true;
+                if (out_hugetlbfs_path) *out_hugetlbfs_path = hugepage_path;
             }
         } else {
             if (create && errno == EEXIST) {
@@ -561,6 +570,11 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (create) {
                 if (using_huge_pages) {
                     unlink(hugepage_path.c_str());
+                    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
+                    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
+                } else if (enable_memfd && out_memfd_fd && *out_memfd_fd >= 0) {
+                    close(*out_memfd_fd);
+                    *out_memfd_fd = -1;
                 } else {
                     shm_unlink(shm_name.c_str());
                     if (out_posix_shm_owned) *out_posix_shm_owned = false;

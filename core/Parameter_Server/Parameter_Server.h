@@ -85,6 +85,8 @@ class Parameter_Server {
     void* weight_ptr_ = nullptr;
     int64_t byte_size_ = 0;
     bool weight_posix_shm_owned_ = false;
+    bool weight_hugetlbfs_owned_ = false;
+    std::string weight_hugetlbfs_path_;
     bool tensor_meta_shm_owned_ = false;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
