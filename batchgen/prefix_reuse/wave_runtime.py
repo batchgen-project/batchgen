@@ -120,9 +120,12 @@ def commit_pool_segments(
     publish_boundary_tokens: int,
     max_scan_nodes: int,
 ) -> list[int]:
-    """Publish every segment, parents first; returns the commits' handles.
+    """Publish every segment, parents first; returns handles pinning each chain.
 
-    The caller releases the returned handles once the members hold their own
+    A commit only protects the nodes it inserted, so right after each commit
+    the segment's whole chain is attached: a node another rank published
+    first cannot be evicted before a child commit or the member attach. The
+    caller releases the returned handles once the members hold their own
     attachments (attach_pool_members).
     """
 
@@ -135,38 +138,61 @@ def commit_pool_segments(
     )
 
     handles: list[int] = []
-    for seg in wave.plan.segments:
-        tokens = wave.prompts[seg.members[0]][:seg.token_end]
-        request = build_prefix_commit_request(
-            namespace_digest=namespace_digest,
-            token_ids=tokens,
-            publish_boundary_tokens=publish_boundary_tokens,
-            pages_by_group={0: wave.segment_prefix_pages(seg.segment_id)},
-        )
-        if request is None or request.commit_tokens != seg.token_end:
-            raise RuntimeError(
-                f"segment {seg.segment_id} ending at {seg.token_end} is not on "
-                f"the publish boundary {publish_boundary_tokens}"
+    try:
+        for seg in wave.plan.segments:
+            tokens = wave.prompts[seg.members[0]][:seg.token_end]
+            request = build_prefix_commit_request(
+                namespace_digest=namespace_digest,
+                token_ids=tokens,
+                publish_boundary_tokens=publish_boundary_tokens,
+                pages_by_group={0: wave.segment_prefix_pages(seg.segment_id)},
             )
-        outcome = commit_prefix_pages_with_capacity_retry(
-            request=request,
-            coordinator=coordinator,
-            worker_views_by_group={0: worker_view},
-            max_scan_nodes=max_scan_nodes,
-        )
-        result = outcome.commit_result
-        handle = int(result.active_attachment_handle)
-        if result.inserted_nodes and not handle:
-            raise RuntimeError("segment commit inserted pages without protection")
-        if handle:
-            handles.append(handle)
-        retain_inserted_prefix_pages(
-            commit_result=result,
-            request=request,
-            worker_views_by_group={0: worker_view},
-            sequence_id=wave.segment_sids[seg.segment_id],
-        )
+            if request is None or request.commit_tokens != seg.token_end:
+                raise RuntimeError(
+                    f"segment {seg.segment_id} ending at {seg.token_end} is not on "
+                    f"the publish boundary {publish_boundary_tokens}"
+                )
+            outcome = commit_prefix_pages_with_capacity_retry(
+                request=request,
+                coordinator=coordinator,
+                worker_views_by_group={0: worker_view},
+                max_scan_nodes=max_scan_nodes,
+            )
+            result = outcome.commit_result
+            commit_handle = int(result.active_attachment_handle)
+            if result.inserted_nodes and not commit_handle:
+                raise RuntimeError("segment commit inserted pages without protection")
+            try:
+                retain_inserted_prefix_pages(
+                    commit_result=result,
+                    request=request,
+                    worker_views_by_group={0: worker_view},
+                    sequence_id=wave.segment_sids[seg.segment_id],
+                )
+                handles.append(_attach_chain(coordinator, namespace_digest, tokens))
+            finally:
+                if commit_handle:
+                    coordinator.release_attachment(commit_handle)
+    except Exception:
+        for handle in handles:
+            coordinator.release_attachment(handle)
+        raise
     return handles
+
+
+def _attach_chain(coordinator: object, namespace_digest, tokens) -> int:
+    """Attach exactly ``tokens`` of resident prefix; raise if any is missing."""
+
+    result = coordinator.lookup_and_attach([int(v) for v in namespace_digest], list(tokens))
+    cached = int(result.common_cached_tokens)
+    handle = int(result.attachment_handle)
+    if cached != len(tokens) or not handle:
+        if handle:
+            coordinator.release_attachment(handle)
+        raise RuntimeError(
+            f"prefix chain of {len(tokens)} tokens has only {cached} resident"
+        )
+    return handle
 
 
 def attach_pool_members(
@@ -174,21 +200,16 @@ def attach_pool_members(
 ) -> dict[int, int]:
     """Attach every member to its resident chain; returns wave index -> handle."""
 
-    digest = [int(value) for value in namespace_digest]
     handles: dict[int, int] = {}
-    for index, chain in enumerate(wave.chains):
-        if not chain:
-            continue
-        end = wave.chain_tokens(index)
-        result = coordinator.lookup_and_attach(digest, wave.prompts[index][:end])
-        cached = int(result.common_cached_tokens)
-        handle = int(result.attachment_handle)
-        if cached != end or not handle:
-            if handle:
-                coordinator.release_attachment(handle)
-            raise RuntimeError(
-                f"pool member {wave.global_ids[index]} found {cached} of its "
-                f"{end} chain tokens resident right after the segment commit"
-            )
-        handles[index] = handle
+    try:
+        for index, chain in enumerate(wave.chains):
+            if chain:
+                end = wave.chain_tokens(index)
+                handles[index] = _attach_chain(
+                    coordinator, namespace_digest, wave.prompts[index][:end]
+                )
+    except Exception:
+        for handle in handles.values():
+            coordinator.release_attachment(handle)
+        raise
     return handles
