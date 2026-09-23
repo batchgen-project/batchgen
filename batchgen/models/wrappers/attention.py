@@ -246,6 +246,11 @@ class AttnWrapperBase(BaseModuleWrapper):
     prepack_compute_cached_tokens: ClassVar[Optional[List[int]]] = None
     prepack_attached_tokens: ClassVar[Optional[List[int]]] = None
     prefill_prefix_materialization: ClassVar[Optional[object]] = None
+    # In-wave prefix pool (batchgen/prefix_reuse): the pool, the plan chunk
+    # being run, and each row's Host destination start (row ids in cur_batch).
+    prefill_pool: ClassVar[Optional[object]] = None
+    prefill_pool_batch: ClassVar[Optional[object]] = None
+    prefill_pool_row_starts: ClassVar[Optional[List[int]]] = None
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None

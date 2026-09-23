@@ -34,6 +34,9 @@ class ChunkBatch:
     tail_rows: torch.Tensor  # int64, flat index of each tail's last token
     tail_wave_indices: tuple[int, ...]  # wave index per entry of tail_rows
     items: tuple["PlanItem", ...]
+    row_bounds: tuple[int, ...]  # cu_seqlens_q on the host
+    max_seqlen_q: int
+    max_cache_seqlen: int
 
 
 class PoolChunkExecutor:
@@ -103,6 +106,9 @@ class PoolChunkExecutor:
             tail_rows=torch.tensor(tail_rows, dtype=torch.long, device=device),
             tail_wave_indices=tuple(tail_waves),
             items=chunk.items,
+            row_bounds=tuple(cu_seqlens),
+            max_seqlen_q=max(item.tokens for item in chunk.items),
+            max_cache_seqlen=max(cache_seqlens),
         )
 
     def finish(self, chunk: "PlanChunk") -> None:
@@ -126,3 +132,41 @@ class PoolChunkExecutor:
                 f"{sorted(self.segment_pages)}, free={self.pool.free_pages} "
                 f"total={self.pool.num_pages}"
             )
+
+
+def pool_prefill_attention(
+    *,
+    pool: "PrefillPrefixPool",
+    layer_idx: int,
+    batch: ChunkBatch,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks,
+    softmax_scale: float,
+    sliding_window,
+):
+    """Write one layer of a chunk's K/V into the pool, then attend.
+
+    Every row reads its pooled ancestors plus its own tokens through its page
+    table, so the write must cover the whole chunk before attention runs.
+    """
+
+    from batchgen.attention.gqa import gqa_extend_fa
+
+    k_cache, v_cache = pool.k[layer_idx], pool.v[layer_idx]
+    heads, dim = k_cache.shape[-2:]
+    k_cache.view(-1, heads, dim).index_copy_(0, batch.slots, key)
+    v_cache.view(-1, heads, dim).index_copy_(0, batch.slots, value)
+    return gqa_extend_fa(
+        q=query,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=batch.cache_seqlens,
+        page_table=batch.page_table,
+        cu_seqlens_q=batch.cu_seqlens_q,
+        max_seqlen_q=batch.max_seqlen_q,
+        sinks=sinks,
+        softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+    )
