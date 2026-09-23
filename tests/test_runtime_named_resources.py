@@ -147,6 +147,64 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     assert "memfd creator requires an output fd" in shm_source
 
 
+def test_early_weight_release_unmaps_without_unlinking_or_disowning():
+    server_source = PARAMETER_SERVER.read_text()
+    binding_source = (ROOT / "core" / "batchgen_Binding.cpp").read_text()
+    release = server_source.split(
+        "bool Parameter_Server::release_weight_mapping() {", 1
+    )[1]
+    release = release.split("Parameter_Server::~Parameter_Server()", 1)[0]
+
+    # Idempotent after success, but a failed unmap preserves destructor retry.
+    assert "if (this->weight_ptr_ == nullptr) {\n        return false;" in release
+    assert release.index("if (!free_shared_pinned_memory(") < release.index(
+        "this->weight_ptr_ = nullptr;"
+    )
+    assert "this->skeleton_state_dict_.clear()" in release
+    # Names, ownership flags, the memfd and the metadata region stay untouched.
+    for forbidden in (
+        "unlink",
+        "shm_name",
+        "close(",
+        "weight_posix_shm_owned_",
+        "weight_hugetlbfs_owned_",
+        "tensor_meta_shm_owned_",
+        "weights_memfd_fd_",
+    ):
+        assert forbidden not in release
+    assert '.def("release_weight_mapping"' in binding_source
+    assert "&Parameter_Server::release_weight_mapping)" in binding_source
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not torch.cuda.is_available(),
+    reason="native early weight release check requires Linux CUDA",
+)
+def test_native_early_weight_release_is_idempotent_and_keeps_names(tmp_path):
+    from batchgen.models.engine_loader import core_engine
+
+    weight_name = f"/shm_{uuid.uuid4()}"
+    metadata_name = f"/shm_{uuid.uuid4()}"
+    parameter_server = core_engine.Parameter_Server(False, False)
+    parameter_server.Init(weight_name, metadata_name, 4096, str(tmp_path), {})
+    byte_size = parameter_server.byte_size()
+
+    assert parameter_server.release_weight_mapping() is True
+    assert weight_name[1:] not in Path("/proc/self/maps").read_text()
+    # No early unlink: both owned names still exist for the destructor.
+    assert (Path("/dev/shm") / weight_name[1:]).exists()
+    assert (Path("/dev/shm") / metadata_name[1:]).exists()
+    # A repeated stop attempt must not munmap the released mapping again.
+    assert parameter_server.release_weight_mapping() is False
+    assert parameter_server.byte_size() == byte_size
+
+    del parameter_server
+    gc.collect()
+
+    assert not (Path("/dev/shm") / weight_name[1:]).exists()
+    assert not (Path("/dev/shm") / metadata_name[1:]).exists()
+
+
 @pytest.mark.skipif(
     sys.platform != "linux" or not torch.cuda.is_available(),
     reason="native memfd lifetime check requires Linux CUDA",

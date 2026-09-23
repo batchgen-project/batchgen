@@ -33,7 +33,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     bool* out_hugetlbfs_owned = nullptr,
                                     std::string* out_hugetlbfs_path = nullptr,
                                     int64_t* out_mapped_size = nullptr);
-void free_shared_pinned_memory(void* ptr, int64_t size);
+bool free_shared_pinned_memory(void* ptr, int64_t size);
 void serialize_to_shared_memory(
     const std::unordered_map<std::string,
                              std::unordered_map<std::string, tensor_meta>>& map,
