@@ -85,7 +85,16 @@ step "BatchGen root: $BATCHGEN_DIR"
 # ── Pinned versions (must match install_deps.sh) ──
 FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-DEEPGEMM_VERSION="v2.1.1.post3"
+# DeepGEMM: sgl-project fork, built through its supported build_sgl_deep_gemm.sh
+# (needs apache-tvm-ffi first). Publishes the `sgl-deep-gemm` distribution while
+# still importing as `deep_gemm`.
+DEEPGEMM_REPO_URL="https://github.com/sgl-project/DeepGEMM.git"
+DEEPGEMM_SRC_DIR="DeepGEMM-sgl"
+DEEPGEMM_VERSION="v0.1.5.post3"
+DEEPGEMM_DIST="sgl-deep-gemm"
+DEEPGEMM_DIST_VERSION="0.1.5.post3"
+TVM_FFI_VERSION="0.1.11"
+WHEEL_VERSION="0.45.1"
 
 # ── Build target arch (sm90a default / sm100 / all) ──
 # Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
@@ -95,6 +104,50 @@ FLASH_MLA_ENV=()
 if [[ "$BUILD_ARCH" == "sm90a" ]]; then
     FLASH_MLA_ENV=(FLASH_MLA_DISABLE_SM100=1)
 fi
+
+# ── Helper: locate the wheel built by build_sgl_deep_gemm.sh ──
+# Exactly one must match, otherwise we fail instead of guessing. A py3-none-any
+# wheel is retagged to the manylinux platform tag before install/publication.
+find_deepgemm_wheel() {
+    local repo="$1" found count whl
+    found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
+    count="$(printf '%s' "$found" | grep -c . || true)"
+    if [[ "$count" != "1" ]]; then
+        echo -e "${RED}[FAIL]${NC} expected exactly 1 sgl_deep_gemm wheel under $repo, found $count" >&2
+        return 1
+    fi
+    whl="$found"
+    if [[ "$whl" == *-py3-none-any.whl ]]; then
+        python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-manylinux2014_x86_64.whl"
+    fi
+    printf '%s\n' "$whl"
+}
+
+clean_deepgemm_wheels() {
+    local repo="$1"
+    [[ -d "$repo/dist" ]] || return 0
+    find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' -delete
+}
+
+# ── Helper: DeepGEMM runtime contract (distribution + fp8_mqa_logits signature) ──
+verify_deepgemm() {
+    if ! DG_DIST="$DEEPGEMM_DIST" DG_VERSION="$DEEPGEMM_DIST_VERSION" python - <<'PY'
+import inspect
+import os
+from importlib.metadata import version
+
+import deep_gemm
+
+assert version(os.environ["DG_DIST"]) == os.environ["DG_VERSION"]
+assert "max_seqlen_k" in inspect.signature(deep_gemm.fp8_mqa_logits).parameters
+PY
+    then
+        fail "DeepGEMM runtime contract failed (expected ${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION} with fp8_mqa_logits(max_seqlen_k=...))"
+        exit 1
+    fi
+    ok "DeepGEMM contract verified (${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION})"
+}
 
 # ============================================================================ #
 # Build-wheels mode: build wheels from source repos, then exit
@@ -130,15 +183,22 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
     env "${FLASH_MLA_ENV[@]}" pip wheel . --no-build-isolation -w "$WHEEL_DIR"
     ok "FlashMLA wheel built"
 
-    # DeepGEMM
+    # DeepGEMM (sgl-project fork, supported build_sgl_deep_gemm.sh path)
     step "Building DeepGEMM wheel..."
     cd "$DEPS_DIR"
-    if [[ ! -d "DeepGEMM" ]]; then
-        git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
+    if [[ ! -d "$DEEPGEMM_SRC_DIR" ]]; then
+        git clone --recursive "$DEEPGEMM_REPO_URL" "$DEEPGEMM_SRC_DIR"
     fi
-    cd DeepGEMM && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
-    pip wheel . --no-build-isolation -w "$WHEEL_DIR"
-    ok "DeepGEMM wheel built"
+    cd "$DEEPGEMM_SRC_DIR" && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
+    pip install "apache-tvm-ffi==${TVM_FFI_VERSION}" "wheel==${WHEEL_VERSION}"
+    clean_deepgemm_wheels "$PWD"
+    bash ./build_sgl_deep_gemm.sh
+    DEEPGEMM_WHEEL="$(find_deepgemm_wheel "$PWD")" || exit 1
+    cp "$DEEPGEMM_WHEEL" "$WHEEL_DIR/"
+    pip download --only-binary=:all: --no-deps \
+        "apache-tvm-ffi==${TVM_FFI_VERSION}" \
+        --dest "$WHEEL_DIR"
+    ok "DeepGEMM wheel built: $(basename "$DEEPGEMM_WHEEL")"
 
     ok "All wheels built in $WHEEL_DIR:"
     ls -lh "$WHEEL_DIR"/*.whl
@@ -225,12 +285,15 @@ elif [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
 
     # Install from cached wheels (no network, no compilation)
     pip install --find-links "$WHEEL_DIR" --no-index \
-        flash-attn-hopper flash-mla deep-gemm 2>&1 || {
+        flash-attn-hopper flash-mla sgl-deep-gemm \
+        "apache-tvm-ffi==${TVM_FFI_VERSION}" 2>&1 || {
         # Wheel names may vary — try installing all .whl files
         warn "Named install failed, installing all wheels from $WHEEL_DIR"
-        pip install "$WHEEL_DIR"/*.whl
+        pip install --find-links "$WHEEL_DIR" --no-index \
+            "$WHEEL_DIR"/*.whl
     }
     ok "Hopper dependencies installed from wheels"
+    verify_deepgemm
 
     # Install remaining requirements
     cd "$BATCHGEN_DIR"
@@ -257,15 +320,20 @@ else
     env "${FLASH_MLA_ENV[@]}" pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
     ok "FlashMLA installed"
 
-    # DeepGEMM
+    # DeepGEMM (sgl-project fork, supported build_sgl_deep_gemm.sh path)
     step "Building DeepGEMM..."
     cd "$DEPS_DIR"
-    if [[ ! -d "DeepGEMM" ]]; then
-        git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
+    if [[ ! -d "$DEEPGEMM_SRC_DIR" ]]; then
+        git clone --recursive "$DEEPGEMM_REPO_URL" "$DEEPGEMM_SRC_DIR"
     fi
-    cd DeepGEMM && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
-    pip install . --no-build-isolation
+    cd "$DEEPGEMM_SRC_DIR" && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
+    pip install "apache-tvm-ffi==${TVM_FFI_VERSION}" "wheel==${WHEEL_VERSION}"
+    clean_deepgemm_wheels "$PWD"
+    bash ./build_sgl_deep_gemm.sh
+    DEEPGEMM_WHEEL="$(find_deepgemm_wheel "$PWD")" || exit 1
+    pip install "$DEEPGEMM_WHEEL"
     ok "DeepGEMM installed"
+    verify_deepgemm
 
     # Reinstall PyTorch (deps may have pulled wrong version)
     step "Reinstalling PyTorch to ensure correct version..."
