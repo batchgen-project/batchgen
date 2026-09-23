@@ -1010,6 +1010,7 @@ class WorkerManager:
         self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         model_lower = self.args.model.lower()
+        reserved_shm_names = None
         if "deepseek-v4" in model_lower:
             from batchgen.models.deepseek.deepseekv4_flash.deepseekv4_flash_parameter_server import (
                 DeepSeekV4Flash_Parameter_Server,
@@ -1055,6 +1056,24 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
+            # Reserve and record the exact random names before any SHM is
+            # created or the long checkpoint conversion runs: a crash in
+            # between would otherwise leave regions nobody can attribute.
+            reserved_shm_names = parameter_server.reserve_shm_names()
+            record_model_shm_provenance(
+                {
+                    "shm_name": reserved_shm_names[0],
+                    "tensor_meta_shm_name": reserved_shm_names[1],
+                },
+                self.args.runtime_identity.runtime_dir,
+            )
+            # A failed Init can already have created either region. Let startup
+            # rollback clean only these reserved, run-owned names.
+            self.parameter_server_instance = parameter_server
+            self.model_info = {
+                "shm_name": reserved_shm_names[0],
+                "tensor_meta_shm_name": reserved_shm_names[1],
+            }
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
                 KimiLinear_Parameter_Server,
@@ -1121,6 +1140,15 @@ class WorkerManager:
         _diag2("    >>> parameter_server.Init()")
         shm_name, tensor_meta_shm_name = parameter_server.Init()
         _diag2("    <<< parameter_server.Init() returned")
+        if (
+            reserved_shm_names is not None
+            and (shm_name, tensor_meta_shm_name) != reserved_shm_names
+        ):
+            raise RuntimeError(
+                "Parameter server used model SHM names that differ from the "
+                f"recorded reservation {reserved_shm_names}: "
+                f"{(shm_name, tensor_meta_shm_name)}"
+            )
         ps_size = parameter_server.parameter_server.byte_size()
         _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
@@ -1152,9 +1180,11 @@ class WorkerManager:
         }
         # Only this run owns these randomly named regions, so record them now;
         # a supervisor cannot otherwise attribute them after an abrupt exit.
-        record_model_shm_provenance(
-            self.model_info, self.args.runtime_identity.runtime_dir
-        )
+        # A reserved run already wrote the identical record before Init.
+        if reserved_shm_names is None:
+            record_model_shm_provenance(
+                self.model_info, self.args.runtime_identity.runtime_dir
+            )
         logger.info("Local parameter server initialized: %s", self.model_info)
 
     def _load_model_from_remote_server(
