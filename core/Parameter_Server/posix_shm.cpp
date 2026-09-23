@@ -628,8 +628,18 @@ void verify_numa_allocation(void* ptr, size_t size) {
 
 
 void free_shared_pinned_memory(void* ptr, int64_t size) {
-    cudaHostUnregister(ptr);
-    munmap(ptr, size);
+    const auto start = std::chrono::steady_clock::now();
+    const cudaError_t unregister_result = cudaHostUnregister(ptr);
+    const auto unregister_done = std::chrono::steady_clock::now();
+    const int unmap_result = munmap(ptr, size);
+    const auto unmap_done = std::chrono::steady_clock::now();
+    logger->info(
+        "shared memory release: cudaHostUnregister={} elapsed={:.3f}s, "
+        "munmap={} elapsed={:.3f}s",
+        static_cast<int>(unregister_result),
+        std::chrono::duration<double>(unregister_done - start).count(),
+        unmap_result,
+        std::chrono::duration<double>(unmap_done - unregister_done).count());
 }
 
 // -----------------------------------------------------------------------------
