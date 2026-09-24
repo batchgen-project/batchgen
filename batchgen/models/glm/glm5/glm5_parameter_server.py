@@ -14,7 +14,7 @@ Key differences from DeepSeek:
 - Indexer tensors (wk, wq_b, k_norm, weights_proj) — kept in skeleton (BF16/FP8 mixed)
 - e_score_correction_bias in MoE gate
 - MTP layer at index 78 (eh_proj, enorm, hnorm, shared_head.norm)
-- byte_size: ~760 GB (FP8 experts) or ~1400 GB (BF16 experts)
+- byte_size: derived from the converted checkpoint metadata (see shm_reservation)
 """
 
 import sys as _diag_sys
@@ -40,6 +40,7 @@ _diag("tqdm done")
 
 from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
+from .shm_reservation import converted_checkpoint_byte_size
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
 _diag("model_registry done")
 
@@ -86,12 +87,15 @@ class GLM5_Parameter_Server:
 
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
 
-        # GLM-5-FP8: FP8 experts (~675 GB) + FP8 attn + rest ≈ 700 GB
-        # GLM-5: BF16 experts (~1350 GB) + FP8 attn + rest ≈ 1380 GB
-        if "fp8" in self.huggingface_ckpt_name.lower():
-            byte_size = 760 * 1024 * 1024 * 1024
-        else:
-            byte_size = 1400 * 1024 * 1024 * 1024
+        # Convert checkpoint files
+        from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
+        converter = ckpt_converter()
+        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+
+        # Size the reservation from the converted metadata instead of a fixed
+        # per-dtype constant, and fail here rather than after the C++ side has
+        # already allocated the SHM segment.
+        byte_size = converted_checkpoint_byte_size(self.converted_ckpt_dir)
 
         total, used, free = shutil.disk_usage("/dev/shm")
         logging.info(f"Freespace in /dev/shm: {free / 1024**3:.1f} GB")
@@ -108,11 +112,6 @@ class GLM5_Parameter_Server:
         logging.info(f"Model parameters shared memory name: {self.shm_name}")
         logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
         logging.info(f"Byte size: {byte_size}")
-
-        # Convert checkpoint files
-        from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
         self.parameter_server.Init(
             self.shm_name,
