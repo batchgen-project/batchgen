@@ -108,3 +108,26 @@ def test_glm52_routes_to_dedicated_template_and_renders_reasoning_directive():
         "[gMASK]<sop><|system|>Reasoning Effort: Max"
         "<|user|>Hello<|assistant|><think>"
     )
+
+
+def test_glm53_parse_thinking_handles_template_primed_completion():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    tokenizer = object.__new__(tokenizer_module.GLM53Tokenizer)
+
+    reasoning, visible = tokenizer.parse_thinking(
+        "First reason.\n</think>\nThe answer is (C)."
+    )
+
+    assert reasoning == "First reason."
+    assert visible == "The answer is (C)."
+
+
+def test_glm5_parse_thinking_preserves_paired_and_plain_outputs():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    tokenizer = object.__new__(tokenizer_module.GLM5Tokenizer)
+
+    assert tokenizer.parse_thinking("<think>reason</think>answer") == (
+        "reason",
+        "answer",
+    )
+    assert tokenizer.parse_thinking("plain answer") == (None, "plain answer")

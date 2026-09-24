@@ -141,6 +141,7 @@ class GLM5Tokenizer(FastTokenizer):
     # ---- Output parsing ----
 
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _THINK_CLOSE = "</think>"
     _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
     _ARG_RE = re.compile(
         r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL
@@ -148,11 +149,23 @@ class GLM5Tokenizer(FastTokenizer):
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
         m = self._THINK_RE.search(text)
-        if not m:
-            return None, text
-        reasoning = m.group(1).strip()
-        visible = self._THINK_RE.sub("", text, count=1).strip()
-        return reasoning, visible
+        if m:
+            reasoning = m.group(1).strip()
+            visible = self._THINK_RE.sub("", text, count=1).strip()
+            return reasoning, visible
+
+        # GLM-5.3's chat template primes the assistant turn with ``<think>``.
+        # The generated completion therefore starts directly with reasoning and
+        # emits only the closing marker.  Treat that marker as the boundary so
+        # parse-thinking still fills reasoning_content and keeps the answer in
+        # message.content.
+        close = text.find(self._THINK_CLOSE)
+        if close >= 0:
+            reasoning = text[:close].strip()
+            visible = text[close + len(self._THINK_CLOSE):].strip()
+            return reasoning or None, visible
+
+        return None, text
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
         matches = self._TOOL_CALL_RE.findall(text)
