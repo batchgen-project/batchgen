@@ -170,6 +170,13 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
+        # GLM-5.2 long prompts run packed sparse absorbed FlashMLA prefill, which
+        # has no dense fallback. Prove the required runtime exists here, at
+        # configure time, instead of failing minutes into a long prefill.
+        if getattr(self.loaded_model_config, "model_type", None) == "glm_moe_dsa_5_2":
+            from .sparse_prefill import validate_glm52_sparse_prefill_runtime
+
+            validate_glm52_sparse_prefill_runtime()
         if self.is_fp8_experts:
             from batchgen.attention.fused_kernels import (
                 preload_fused_attention_kernels,
