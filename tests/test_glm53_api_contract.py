@@ -41,3 +41,14 @@ def test_reasoning_effort_rejects_unknown_values():
         assert "reasoning_effort" in str(exc)
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("unknown reasoning_effort must be rejected")
+
+
+def test_glm53_tokenizer_patterns_are_more_specific_than_glm5():
+    path = Path(__file__).resolve().parents[1] / "batchgen/config/tokenizer_registry.py"
+    spec = importlib.util.spec_from_file_location("batchgen.config.tokenizer_registry", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert module.TOKENIZER_NAME_PATTERNS["GLM-5.3-FP8"] == "glm_moe_dsa_5_3"
+    assert module.TOKENIZER_NAME_PATTERNS["GLM-5.3"] == "glm_moe_dsa_5_3"
