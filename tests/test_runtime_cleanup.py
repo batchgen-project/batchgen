@@ -19,7 +19,7 @@ PROCESS_UTILS = (
 )
 _NAMESPACE = runpy.run_path(str(PROCESS_UTILS))
 cleanup_shm_files = _NAMESPACE["cleanup_shm_files"]
-cleanup_model_shm_files = _NAMESPACE["cleanup_model_shm_files"]
+verify_model_shm_absent = _NAMESPACE["verify_model_shm_absent"]
 record_model_shm_provenance = _NAMESPACE["record_model_shm_provenance"]
 MODEL_SHM_PROVENANCE_FILE = _NAMESPACE["MODEL_SHM_PROVENANCE_FILE"]
 
@@ -45,7 +45,7 @@ def test_cleanup_removes_only_the_selected_run_prefix():
         second.unlink(missing_ok=True)
 
 
-def test_cleanup_model_shm_files_removes_both_exact_names(tmp_path):
+def test_verify_model_shm_absent_preserves_foreign_same_name(tmp_path):
     weight = tmp_path / f"shm_{uuid.uuid4()}"
     metadata = tmp_path / f"shm_{uuid.uuid4()}"
     neighbor = tmp_path / f"{weight.name}_neighbor"
@@ -56,15 +56,22 @@ def test_cleanup_model_shm_files_removes_both_exact_names(tmp_path):
         "tensor_meta_shm_name": f"/{metadata.name}",
     }
 
-    assert cleanup_model_shm_files(model_info, shm_dir=tmp_path) == 2
-    assert not weight.exists()
-    assert not metadata.exists()
+    with pytest.raises(RuntimeError, match="Model SHM remains after owner release"):
+        verify_model_shm_absent(model_info, shm_dir=tmp_path)
+    assert weight.exists()
+    assert metadata.exists()
     assert neighbor.exists()
+    assert "shm_name" in model_info
+    assert "tensor_meta_shm_name" in model_info
+
+    weight.unlink()
+    metadata.unlink()
+    verify_model_shm_absent(model_info, shm_dir=tmp_path)
     assert "shm_name" not in model_info
     assert "tensor_meta_shm_name" not in model_info
 
 
-def test_cleanup_model_shm_files_rejects_path_escape(tmp_path):
+def test_verify_model_shm_absent_rejects_path_escape(tmp_path):
     weight = tmp_path / f"shm_{uuid.uuid4()}"
     weight.touch()
     model_info = {
@@ -73,23 +80,55 @@ def test_cleanup_model_shm_files_rejects_path_escape(tmp_path):
     }
 
     with pytest.raises(ValueError, match="Invalid model SHM name"):
-        cleanup_model_shm_files(model_info, shm_dir=tmp_path)
+        verify_model_shm_absent(model_info, shm_dir=tmp_path)
     assert weight.exists()
     assert model_info["shm_name"] == f"/{weight.name}"
 
 
-def test_cleanup_model_shm_files_refuses_symlink(tmp_path):
+def test_verify_model_shm_absent_refuses_symlink(tmp_path):
     target = tmp_path / "neighbor"
     target.touch()
     link = tmp_path / f"shm_{uuid.uuid4()}"
     link.symlink_to(target)
     model_info = {"shm_name": f"/{link.name}"}
 
-    with pytest.raises(RuntimeError, match="Refusing non-file model SHM"):
-        cleanup_model_shm_files(model_info, shm_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="Model SHM remains after owner release"):
+        verify_model_shm_absent(model_info, shm_dir=tmp_path)
     assert link.is_symlink()
     assert target.exists()
     assert model_info["shm_name"] == f"/{link.name}"
+
+
+def test_verify_model_shm_absent_checks_hugetlbfs_weight(tmp_path):
+    shm_dir = tmp_path / "shm"
+    hugepages_dir = tmp_path / "hugepages"
+    shm_dir.mkdir()
+    hugepages_dir.mkdir()
+    weight = hugepages_dir / "shm_weight"
+    weight.touch()
+    info = {"shm_name": "/shm_weight"}
+
+    with pytest.raises(RuntimeError, match="Model SHM remains after owner release"):
+        verify_model_shm_absent(
+            info, shm_dir=shm_dir, hugepages_dir=hugepages_dir
+        )
+    assert weight.exists()
+    weight.unlink()
+    verify_model_shm_absent(
+        info, shm_dir=shm_dir, hugepages_dir=hugepages_dir
+    )
+    assert info == {}
+
+
+def test_verify_model_shm_absent_allows_missing_hugepages_mount(tmp_path):
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    info = {"shm_name": "/shm_fallback"}
+
+    verify_model_shm_absent(
+        info, shm_dir=shm_dir, hugepages_dir=tmp_path / "not-mounted"
+    )
+    assert info == {}
 
 
 def test_provenance_records_exact_names_privately(tmp_path):

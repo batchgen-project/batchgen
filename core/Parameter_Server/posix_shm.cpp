@@ -280,11 +280,20 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
                                     int* out_memfd_fd,
-                                    bool* out_posix_shm_owned) {
+                                    bool* out_posix_shm_owned,
+                                    bool* out_hugetlbfs_owned,
+                                    std::string* out_hugetlbfs_path,
+                                    int64_t* out_mapped_size) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
+    if (create && enable_memfd && out_memfd_fd == nullptr) {
+        throw std::runtime_error("memfd creator requires an output fd");
+    }
     if (out_posix_shm_owned) *out_posix_shm_owned = false;
+    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
+    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
+    if (out_mapped_size) *out_mapped_size = 0;
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
@@ -365,6 +374,11 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (!using_huge_pages && create) {
                 logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
                 unlink(hugepage_path.c_str());
+            } else if (using_huge_pages && create) {
+                // O_EXCL create plus mapping both succeeded: this process owns
+                // exactly this hugetlbfs path and may unlink it on teardown.
+                if (out_hugetlbfs_owned) *out_hugetlbfs_owned = true;
+                if (out_hugetlbfs_path) *out_hugetlbfs_path = hugepage_path;
             }
         } else {
             if (create && errno == EEXIST) {
@@ -561,6 +575,11 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (create) {
                 if (using_huge_pages) {
                     unlink(hugepage_path.c_str());
+                    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
+                    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
+                } else if (enable_memfd && out_memfd_fd && *out_memfd_fd >= 0) {
+                    close(*out_memfd_fd);
+                    *out_memfd_fd = -1;
                 } else {
                     shm_unlink(shm_name.c_str());
                     if (out_posix_shm_owned) *out_posix_shm_owned = false;
@@ -574,6 +593,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
     logger->info("Memory allocation completed successfully using {} pages.",
                using_huge_pages ? "huge" : "regular");
+
+    if (out_mapped_size) *out_mapped_size = allocated_size;
 
     return ptr;
 }
@@ -607,8 +628,18 @@ void verify_numa_allocation(void* ptr, size_t size) {
 
 
 void free_shared_pinned_memory(void* ptr, int64_t size) {
-    cudaHostUnregister(ptr);
-    munmap(ptr, size);
+    const auto start = std::chrono::steady_clock::now();
+    const cudaError_t unregister_result = cudaHostUnregister(ptr);
+    const auto unregister_done = std::chrono::steady_clock::now();
+    const int unmap_result = munmap(ptr, size);
+    const auto unmap_done = std::chrono::steady_clock::now();
+    logger->info(
+        "shared memory release: cudaHostUnregister={} elapsed={:.3f}s, "
+        "munmap={} elapsed={:.3f}s",
+        static_cast<int>(unregister_result),
+        std::chrono::duration<double>(unregister_done - start).count(),
+        unmap_result,
+        std::chrono::duration<double>(unmap_done - unregister_done).count());
 }
 
 // -----------------------------------------------------------------------------
