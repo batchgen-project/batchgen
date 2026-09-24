@@ -43,10 +43,12 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
-    # GPT-OSS reasoning effort control (low/medium/high)
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+    # GPT-OSS and GLM-5.3 reasoning effort control. GLM-5.3 uses low/high/max;
+    # medium remains accepted for GPT-OSS compatibility and is rejected by the
+    # GLM-5.3 scheduler path with a model-specific error.
+    reasoning_effort: Optional[Literal["low", "medium", "high", "max"]] = Field(
         default=None,
-        description="Reasoning effort level for GPT-OSS models (low, medium, high)",
+        description="Reasoning effort level (GPT-OSS: low/medium/high; GLM-5.3: low/high/max)",
     )
     tools: Optional[List[Dict[str, Any]]] = Field(
         default=None,
@@ -62,6 +64,10 @@ class ChatCompletionRequest(BaseModel):
             "Alternate name for `thinking` (GLM/SGLang convention). "
             "If both set, `enable_thinking` takes precedence."
         ),
+    )
+    clear_thinking: Optional[bool] = Field(
+        default=None,
+        description="GLM chat-template control for retaining prior assistant reasoning",
     )
     preserve_thinking: Optional[bool] = Field(
         default=None,

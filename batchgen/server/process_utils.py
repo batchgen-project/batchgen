@@ -61,6 +61,10 @@ MODEL_BYTE_SIZES = {
     # the BF16 "zai-org/GLM-5" 1400 GB entry first and over-reserve hugepages.
     "zai-org/GLM-5.2-FP8": 760 * 1024**3,
     "zai-org/GLM-5.2": 1400 * 1024**3,
+    # GLM-5.3 FP8 has the same released tensor total and host-weight envelope
+    # as GLM-5.2 FP8; keep exact entries ahead of the broad GLM-5 partial match.
+    "zai-org/GLM-5.3-FP8": 760 * 1024**3,
+    "zai-org/GLM-5.3": 1400 * 1024**3,
 }
 
 # Default byte_size when model not in lookup (700GB for backwards compatibility)

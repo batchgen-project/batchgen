@@ -90,10 +90,17 @@ class GLM5Tokenizer(FastTokenizer):
         # behavior — prevents extra whitespace tokens (e.g. token 8942 between
         # <sop> and <|system|>) that diverge from training.
         if self.chat_template:
-            from jinja2 import Template
-            self._jinja_template = Template(
-                self.chat_template, trim_blocks=True, lstrip_blocks=True
-            )
+            # GLM-5.3's official template uses ``{% break %}`` in its tool
+            # ordering guards. Enable loop controls for every GLM template;
+            # this is backwards-compatible with the older templates and keeps
+            # compilation behavior identical apart from the newly supported
+            # control tag.
+            from jinja2 import Environment
+            self._jinja_template = Environment(
+                extensions=["jinja2.ext.loopcontrols"],
+                trim_blocks=True,
+                lstrip_blocks=True,
+            ).from_string(self.chat_template)
         else:
             self._jinja_template = None
 
@@ -239,5 +246,27 @@ class GLM52Tokenizer(GLM5Tokenizer):
             raise FileNotFoundError(
                 f"GLM-5.2 chat template not found at {template_path}. "
                 f"Ensure chat_template_5_2.jinja is bundled with the GLM-5 package."
+            )
+        super().__init__()
+
+
+@register_tokenizer("glm_moe_dsa_5_3")
+class GLM53Tokenizer(GLM5Tokenizer):
+    """GLM-5.3 tokenizer with its released chat/tool template.
+
+    Vocab and stop-token assets are byte-identical to GLM-5.2, but the chat
+    template adds low/high/max reasoning effort and robust tool-result
+    ordering. Keep this as a distinct registry identity so a future template
+    change cannot silently alter GLM-5.2 behavior.
+    """
+
+    CHAT_TEMPLATE_FILENAME = "chat_template_5_3.jinja"
+
+    def __init__(self):
+        template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"GLM-5.3 chat template not found at {template_path}. "
+                "Ensure chat_template_5_3.jinja is bundled with the GLM-5 package."
             )
         super().__init__()
