@@ -1,6 +1,7 @@
 import torch
 import pytest
 
+import batchgen.models.glm.glm5.moe_cuda_graph_segments as glm5_moe_graph
 from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
     Glm5DecoderLayerGraphSegment,
     make_glm5_layer_graph_segment_name,
@@ -37,6 +38,34 @@ class _FakeInnerModel:
 
 class _FakeModel:
     model = _FakeInnerModel()
+
+
+def test_glm5_moe_graph_loads_fp8_ops_through_shared_loader_once(monkeypatch):
+    import batchgen_kernels
+
+    calls = []
+
+    class _FakeFp8Ops:
+        @staticmethod
+        def act_quant_3d(x, seqlens):
+            calls.append((x, seqlens))
+            return "quantized"
+
+    loads = []
+
+    def _load_extension(name):
+        loads.append(name)
+        return _FakeFp8Ops()
+
+    monkeypatch.setattr(batchgen_kernels, "load_extension", _load_extension)
+    monkeypatch.setattr(glm5_moe_graph, "_fp8_ops_module", None)
+    x = object()
+    seqlens = object()
+
+    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
+    assert glm5_moe_graph._act_quant_3d(x, seqlens) == "quantized"
+    assert loads == ["batchgen_kernels.moe._C_fp8_blockwise_ops"]
+    assert calls == [(x, seqlens), (x, seqlens)]
 
 
 def _make_segment(**kwargs):
@@ -99,6 +128,25 @@ def test_glm5_whole_model_segment_allocates_primary_and_aux_offload_buffers():
     assert segment._kv_buffers[0]["key"].shape == (4, 1, 1, 576)
     assert segment._aux_kv_buffers[0]["key"].shape == (4, 1, 1, 128)
     assert segment._no_v_cache
+
+
+def test_glm5_whole_model_segment_sets_up_children_for_each_bucket():
+    class _FakeLayerSegment:
+        def __init__(self):
+            self.setup_calls = []
+
+        def setup_static_buffers(self, bucket_size):
+            self.setup_calls.append(bucket_size)
+
+    layers = [_FakeLayerSegment(), _FakeLayerSegment()]
+    segment = _make_segment(max_bucket_size=4, layer_segments=layers)
+
+    segment.setup_static_buffers(bucket_size=1)
+    kv_buffer = segment._kv_key_buffer
+    segment.setup_static_buffers(bucket_size=2)
+
+    assert segment._kv_key_buffer is kv_buffer
+    assert [layer.setup_calls for layer in layers] == [[1, 2], [1, 2]]
 
 
 def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
@@ -318,6 +366,10 @@ class _FakeDsaSegment:
         self.release_calls.append(bucket_size)
 
 
+class _FakeReuseDsaSegment(_FakeDsaSegment):
+    aux_blocked_k = None
+
+
 def test_glm5_layer_graph_segment_static_contract_and_delegation():
     dsa = _FakeDsaSegment()
     segment = Glm5DecoderLayerGraphSegment(
@@ -358,6 +410,21 @@ def test_glm5_layer_graph_segment_static_contract_and_delegation():
     assert dsa.init_calls == [2]
     assert dsa.release_calls == [2]
     assert static_inputs["rank_token_counts"].tolist() == [1] * 16
+
+
+def test_glm52_reuse_layer_graph_segment_omits_indexer_output():
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=_FakeReuseDsaSegment(),
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+    )
+
+    outputs = segment.get_static_output_specs(bucket_size=2)
+
+    assert outputs["primary_k_tensor"].resolve_shape(2) == (2, 1, 1, 6)
+    assert "indexer_k_tensor" not in outputs
 
 
 def test_glm5_layer_graph_segment_empty_rank_capture_context():

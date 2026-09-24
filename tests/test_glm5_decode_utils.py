@@ -1031,6 +1031,11 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
         enable_cuda_graph=True,
         environ=env,
     )
+    assert glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
     assert not glm5_dsa_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
@@ -1048,6 +1053,11 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
     assert glm5_any_cuda_graph_requested_for_model(
         "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_any_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
@@ -2028,13 +2038,11 @@ def test_glm5_gpu_kv_config_uses_model_max_for_graph_page_table():
     assert updated.cuda_graph_max_slots == 64
 
 
-def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
+def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity():
     from batchgen.batchgen_worker import BatchGenWorker
 
     primary_page_table = torch.empty(2, 320, dtype=torch.int32)
     aux_page_table = torch.empty(2, 512, dtype=torch.int32)
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN", "8192")
-
     assert BatchGenWorker._glm5_dsa_graph_score_capacity_tokens(
         primary_page_table,
         64,
@@ -2497,6 +2505,43 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     )
 
 
+def test_glm5_whole_graph_keeps_replaying_beyond_8192_context(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        bucketing = BatchSizeBucketing([1, 2, 4])
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return True
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        disable_cuda_graphs=False,
+        enable_cuda_graph=True,
+    )
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = FakeManager()
+    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=131072)
+    worker._glm5_whole_model_graph = True
+    worker._glm5_whole_model_graph_failed_buckets = set()
+    worker._glm5_whole_model_graph_signature = ("same",)
+    worker._glm5_whole_model_graph_unavailable_reason = None
+    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_capture_signature",
+        lambda *args: ("same",),
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 9000, raising=False)
+
+    assert worker._glm5_whole_graph_path_state(1) == (
+        "graph",
+        1,
+        "captured",
+    )
+
+
 def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
@@ -2545,6 +2590,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     import batchgen.cuda_graph as cuda_graph_module
     import batchgen.models.glm.glm5.cuda_graph_segments as dsa_segments
     import batchgen.models.glm.glm5.layer_cuda_graph_segments as layer_segments_module
+    import batchgen.models.glm.glm5.reuse_topk_segment as reuse_segments
     import batchgen.models.glm.glm5.whole_model_cuda_graph_segments as whole_segments
 
     class FakeManager:
@@ -2583,7 +2629,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         def __init__(self):
             self.config = types.SimpleNamespace(page_size_tokens=64)
             self.storage = torch.empty(4, 8, dtype=torch.int32)
-            self.k_cache = torch.empty(1, 1, 64, 1, 4, dtype=torch.bfloat16)
+            self.k_cache = torch.empty(2, 1, 64, 1, 4, dtype=torch.bfloat16)
 
         def ensure_cuda_graph_page_table(self, _sequence_ids):
             return None
@@ -2602,21 +2648,25 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             return torch.empty(seq_len, 1), torch.empty(seq_len, 1)
 
     class FakeWrapper:
-        def __init__(self):
+        def __init__(self, *, has_indexer=True):
             self.module = types.SimpleNamespace(
-                indexer=FakeIndexer(),
+                indexer=FakeIndexer() if has_indexer else None,
                 num_heads=64,
             )
             self._fp8_absorb_weights = object()
-            self._fused_wqb_weights = object()
-            self._indexer_cuda_module = object()
+            self._fused_wqb_weights = object() if has_indexer else None
+            self._indexer_cuda_module = object() if has_indexer else None
+
+        def initialize_fused_kernels(self):
+            raise AssertionError("shared layer must not initialize indexer kernels")
 
     class FakeLayer:
-        def __init__(self):
-            self.self_attn = FakeWrapper()
+        def __init__(self, *, has_indexer=True):
+            self.self_attn = FakeWrapper(has_indexer=has_indexer)
             self.mlp = None
 
     bucket_inputs = []
+    reuse_segment_kwargs = []
     monkeypatch.setattr(cuda_graph_module, "CUDAGraphManager", FakeManager)
     monkeypatch.setattr(
         dsa_segments,
@@ -2627,6 +2677,11 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         layer_segments_module,
         "Glm5DecoderLayerGraphSegment",
         lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        reuse_segments,
+        "Glm5ReuseTopkAttnSegment",
+        lambda **kwargs: reuse_segment_kwargs.append(kwargs) or object(),
     )
     monkeypatch.setattr(whole_segments, "Glm5WholeModelSegment", FakeWholeSegment)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
@@ -2647,7 +2702,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker.torch_device = torch.device("cpu")
     worker._batchgen_debug = {}
     worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(layers=[FakeLayer()]),
+        model=types.SimpleNamespace(
+            layers=[FakeLayer(), FakeLayer(has_indexer=False)],
+        ),
         config=types.SimpleNamespace(vocab_size=16, hidden_size=4),
         vocab_size=16,
     )
@@ -2656,6 +2713,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker._current_decode_max_rank_batch_size = 2
     worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
     worker._cuda_graph_manager = None
+    worker._cuda_graph_adapter = None
     worker._whole_model_segment = None
     worker._whole_model_bucketing = None
     worker._whole_model_graph = False
@@ -2708,6 +2766,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
+    assert len(reuse_segment_kwargs) == 1
+    assert reuse_segment_kwargs[0]["wrapper"].module.indexer is None
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
 
@@ -3307,6 +3367,73 @@ def test_glm5_prefill_indexer_offload_requires_aux_host_view(monkeypatch):
         wrapper._offload_prepacked_indexer_kv(torch.zeros(2, 1, 128))
 
 
+def test_glm5_prefill_offloads_packed_primary_and_indexer_once(monkeypatch):
+    class DummyTask:
+        pass
+
+    class DummyView:
+        def __init__(self):
+            self.calls = []
+
+        def async_offload_packed_layer_kv_to_host(self, **kwargs):
+            self.calls.append(kwargs)
+            return DummyTask()
+
+    primary_view = DummyView()
+    auxiliary_view = DummyView()
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 7
+    wrapper.prepack_seq_lengths = [2, 1, 3]
+    wrapper.prepack_num_sequences = 3
+    wrapper.cur_batch = [101, 202, 303]
+    wrapper.core_engine = types.SimpleNamespace(
+        host_paged_kv_worker_view=primary_view
+    )
+
+    monkeypatch.setattr(
+        AttnWrapperBase, "host_paged_kv_worker_view_aux", auxiliary_view
+    )
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tasks", [])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tensors", [])
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_layer_idx", None
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Python producer event must not be created")
+        ),
+    )
+
+    wrapper._offload_prepacked_indexer_kv(torch.zeros(6, 1, 128))
+    wrapper._offload_prepacked_kv(torch.zeros(6, 576))
+
+    assert len(auxiliary_view.calls) == 1
+    assert len(primary_view.calls) == 1
+    assert auxiliary_view.calls[0]["sequence_ids"] == [101, 202, 303]
+    assert auxiliary_view.calls[0]["sequence_lengths"] == [2, 1, 3]
+    assert auxiliary_view.calls[0]["k_tensor"].shape == (6, 1, 128)
+    assert primary_view.calls[0]["sequence_ids"] == [101, 202, 303]
+    assert primary_view.calls[0]["sequence_lengths"] == [2, 1, 3]
+    assert primary_view.calls[0]["k_tensor"].shape == (6, 1, 576)
+    assert len(AttnWrapperBase.pending_prefill_offload_tasks) == 2
+    assert len(AttnWrapperBase.pending_prefill_offload_tensors) == 2
+
+
+def test_glm5_prefill_packed_offload_rejects_metadata_mismatch(monkeypatch):
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 7
+    wrapper.prepack_seq_lengths = [2, 1]
+    wrapper.cur_batch = [101, 202]
+    wrapper.core_engine = types.SimpleNamespace(
+        host_paged_kv_worker_view=object()
+    )
+
+    with pytest.raises(RuntimeError, match="primary KV token count mismatch"):
+        wrapper._offload_prepacked_kv(torch.zeros(4, 576))
+
+
 def test_prefill_offload_lifetime_retires_previous_layer(monkeypatch):
     class DummyTask:
         def __init__(self):
@@ -3331,6 +3458,33 @@ def test_prefill_offload_lifetime_retires_previous_layer(monkeypatch):
     assert AttnWrapperBase.pending_prefill_offload_tasks == []
     assert AttnWrapperBase.pending_prefill_offload_tensors == []
     assert AttnWrapperBase.pending_prefill_offload_layer_idx is None
+
+
+def test_prefill_offload_retirement_does_not_synchronize_device(monkeypatch):
+    class DummyTask:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("device-wide synchronization is redundant")
+        ),
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_tasks", [DummyTask()]
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_tensors", [torch.zeros(1)]
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase, "pending_prefill_offload_layer_idx", 3
+    )
+
+    assert AttnWrapperBase.retire_pending_prefill_offloads(
+        device=torch.device("cuda:0")
+    ) == 1
 
 
 def test_prefill_offload_lifetime_keeps_current_layer_refs(monkeypatch):

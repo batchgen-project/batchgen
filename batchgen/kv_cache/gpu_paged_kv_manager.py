@@ -924,6 +924,21 @@ class GPUPagedKVCacheManager:
 		# Clear active page pointer tables
 		self._clear_active_page_pointer_tables()
 
+	def reset_allocations(self) -> None:
+		"""Free every sequence and restore the fresh-allocator state in place.
+
+		Unlike ``destroy()``, the KV tensors and the CUDA-graph page-table
+		storage keep their addresses, so graphs captured against them stay
+		valid. The KV cache is zeroed to match a freshly initialized manager.
+		"""
+		self._ensure_initialized()
+		self._sequences = {}
+		self._free_pages = _TensorStack(self.config.num_pages)
+		self.clear_page_table()
+		self._k_cache.zero_()
+		if self._v_cache is not None:
+			self._v_cache.zero_()
+
 	def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
 		"""Rebuilds the GPU page table following ``sequence_ids`` order.
 

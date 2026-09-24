@@ -4,6 +4,8 @@
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <algorithm>
 
 #define WARP_SIZE 32
 
@@ -132,6 +134,218 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
     }
 
     return {expert_counts, topk_pos};
+}
+
+// ============================================================================
+// dispatch_scatter_ragged: Route tokens from flat [G, H] into compact ragged
+// rows. Local expert e owns rows [cu_seqlens[e], cu_seqlens[e + 1]) with
+// cu_seqlens[e + 1] - cu_seqlens[e] = align64(expert_counts[e]). Counts and
+// offsets stay on device; launch geometry depends only on host shapes
+// (N, K, E_local), so the call is CUDA-graph capturable.
+// ============================================================================
+#define RAGGED_ROW_ALIGN 64
+static constexpr int64_t kRaggedInt32Max = 2147483647;
+
+__global__ void count_tokens_ragged_kernel(
+    const int32_t* __restrict__ topk_indices,
+    int32_t* __restrict__ expert_counts,
+    int32_t* __restrict__ expert_counters,
+    int32_t* __restrict__ cu_seqlens,
+    int32_t* __restrict__ topk_pos,
+    int NK, int expert_start, int E_local
+) {
+    extern __shared__ int32_t s_counts[];
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    for (int i = tid; i < E_local; i += stride) s_counts[i] = 0;
+    __syncthreads();
+
+    for (int i = tid; i < NK; i += stride) {
+        topk_pos[i] = -1;
+        const int64_t local_id = (int64_t)topk_indices[i] - expert_start;
+        if (local_id >= 0 && local_id < E_local)
+            atomicAdd(&s_counts[local_id], 1);
+    }
+    __syncthreads();
+
+    for (int i = tid; i < E_local; i += stride) {
+        expert_counts[i] = s_counts[i];
+        expert_counters[i] = 0;
+    }
+
+    // Serial 64-aligned prefix sum on one thread (E_local is small). The host
+    // capacity check bounds the total below act_buffer rows <= INT32_MAX.
+    if (tid == 0) {
+        int64_t offset = 0;
+        for (int e = 0; e < E_local; e++) {
+            cu_seqlens[e] = (int32_t)offset;
+            offset += ((int64_t)s_counts[e] + RAGGED_ROW_ALIGN - 1) &
+                      ~(int64_t)(RAGGED_ROW_ALIGN - 1);
+        }
+        cu_seqlens[E_local] = (int32_t)offset;
+    }
+}
+
+__global__ void scatter_tokens_ragged_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const int32_t* __restrict__ topk_indices,
+    const int32_t* __restrict__ cu_seqlens,
+    int32_t* __restrict__ expert_counters,
+    __nv_bfloat16* __restrict__ act_buffer,
+    int32_t* __restrict__ topk_pos,
+    int NK, int H, int K,
+    int expert_start, int E_local
+) {
+    const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warp_id = global_tid / WARP_SIZE;
+    const int lane_id = global_tid % WARP_SIZE;
+
+    if (warp_id >= NK) return;
+
+    const int itopk = warp_id;
+    const int token_id = itopk / K;
+    const int64_t local_expert = (int64_t)topk_indices[itopk] - expert_start;
+
+    if (local_expert < 0 || local_expert >= E_local) return;
+
+    int write_pos;
+    if (lane_id == 0) {
+        const int relative_pos = atomicAdd(&expert_counters[local_expert], 1);
+        write_pos = (int)((int64_t)cu_seqlens[local_expert] + relative_pos);
+        topk_pos[itopk] = write_pos;
+    }
+    write_pos = __shfl_sync(0xffffffff, write_pos, 0);
+
+    if ((H & 7) == 0) {
+        const int vec_count = H / 8;
+        const float4* src = reinterpret_cast<const float4*>(x + (int64_t)token_id * H);
+        float4* dst = reinterpret_cast<float4*>(act_buffer + (int64_t)write_pos * H);
+        for (int v = lane_id; v < vec_count; v += WARP_SIZE)
+            dst[v] = src[v];
+    } else {
+        // A row stride that is not a multiple of 16 bytes makes float4 loads
+        // misaligned after the first row. Preserve arbitrary hidden sizes with
+        // a scalar tail path instead of vectorizing from an unaligned address.
+        const __nv_bfloat16* src = x + (int64_t)token_id * H;
+        __nv_bfloat16* dst = act_buffer + (int64_t)write_pos * H;
+        for (int h = lane_id; h < H; h += WARP_SIZE)
+            dst[h] = src[h];
+    }
+}
+
+// Worst-case rows needed by dispatch_scatter_ragged: every nonzero local
+// expert may add up to 63 pad rows, and the aligned total is a multiple of 64.
+static int64_t ragged_capacity_rows(
+    int64_t num_tokens, int64_t top_k, int64_t num_local_experts
+) {
+    TORCH_CHECK(num_tokens >= 0 && num_tokens <= kRaggedInt32Max,
+                "num_tokens out of range: ", num_tokens);
+    TORCH_CHECK(top_k > 0 && top_k <= kRaggedInt32Max, "top_k out of range: ", top_k);
+    TORCH_CHECK(num_local_experts > 0 && num_local_experts <= kRaggedInt32Max,
+                "num_local_experts out of range: ", num_local_experts);
+    const int64_t nk = num_tokens * top_k;
+    const int64_t rows = nk + (RAGGED_ROW_ALIGN - 1) * std::min(num_local_experts, nk);
+    return rows / RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+}
+
+static void check_ragged_cuda_tensor(
+    const torch::Tensor& t, const torch::Device& device, const char* name
+) {
+    TORCH_CHECK(t.defined() && t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.device() == device, name, " must be on ", device, ", got ", t.device());
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+std::vector<torch::Tensor> dispatch_scatter_ragged(
+    torch::Tensor x,
+    torch::Tensor topk_indices,
+    torch::Tensor act_buffer,
+    int64_t expert_start,
+    int64_t num_local_experts,
+    torch::Tensor expert_counts,
+    torch::Tensor expert_counters,
+    torch::Tensor topk_pos,
+    torch::Tensor cu_seqlens
+) {
+    TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
+    const auto device = x.device();
+    check_ragged_cuda_tensor(x, device, "x");
+    check_ragged_cuda_tensor(topk_indices, device, "topk_indices");
+    check_ragged_cuda_tensor(act_buffer, device, "act_buffer");
+    check_ragged_cuda_tensor(expert_counts, device, "expert_counts");
+    check_ragged_cuda_tensor(expert_counters, device, "expert_counters");
+    check_ragged_cuda_tensor(topk_pos, device, "topk_pos");
+    check_ragged_cuda_tensor(cu_seqlens, device, "cu_seqlens");
+
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kBFloat16,
+                "x must be BF16 [N, H]");
+    TORCH_CHECK(topk_indices.dim() == 2 && topk_indices.scalar_type() == at::kInt &&
+                topk_indices.size(0) == x.size(0),
+                "topk_indices must be int32 [N, K]");
+    TORCH_CHECK(act_buffer.dim() == 2 && act_buffer.scalar_type() == at::kBFloat16 &&
+                act_buffer.size(1) == x.size(1),
+                "act_buffer must be BF16 [rows, H]");
+
+    const int64_t N = x.size(0);
+    const int64_t H = x.size(1);
+    const int64_t K = topk_indices.size(1);
+    const int64_t E = num_local_experts;
+    TORCH_CHECK(H > 0 && H <= kRaggedInt32Max, "H out of range: ", H);
+    TORCH_CHECK(expert_start >= 0 && expert_start + E <= kRaggedInt32Max,
+                "expert_start out of range: ", expert_start);
+
+    const int64_t capacity = ragged_capacity_rows(N, K, E);
+    const int64_t NK = N * K;
+    TORCH_CHECK(NK * WARP_SIZE + 256 <= kRaggedInt32Max,
+                "N*K too large for scatter launch: ", NK);
+    TORCH_CHECK(act_buffer.size(0) >= capacity && act_buffer.size(0) <= kRaggedInt32Max,
+                "act_buffer rows (", act_buffer.size(0), ") must be in [", capacity,
+                ", INT32_MAX]");
+
+    TORCH_CHECK(expert_counts.dim() == 1 && expert_counts.scalar_type() == at::kInt &&
+                expert_counts.size(0) == E, "expert_counts must be int32 [E_local]");
+    TORCH_CHECK(expert_counters.dim() == 1 && expert_counters.scalar_type() == at::kInt &&
+                expert_counters.size(0) == E, "expert_counters must be int32 [E_local]");
+    TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.scalar_type() == at::kInt &&
+                cu_seqlens.size(0) == E + 1, "cu_seqlens must be int32 [E_local + 1]");
+    TORCH_CHECK(topk_pos.dim() == 1 && topk_pos.scalar_type() == at::kInt &&
+                topk_pos.size(0) == NK, "topk_pos must be int32 [N * K]");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    {
+        int threads = 256;
+        int blocks = 1;
+        int smem_bytes = static_cast<int>(E * sizeof(int32_t));
+        count_tokens_ragged_kernel<<<blocks, threads, smem_bytes, stream>>>(
+            topk_indices.data_ptr<int32_t>(),
+            expert_counts.data_ptr<int32_t>(),
+            expert_counters.data_ptr<int32_t>(),
+            cu_seqlens.data_ptr<int32_t>(),
+            topk_pos.data_ptr<int32_t>(),
+            static_cast<int>(NK), static_cast<int>(expert_start), static_cast<int>(E));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    if (NK > 0) {
+        const int64_t total_threads = NK * WARP_SIZE;
+        int threads_per_block = 256;
+        int blocks = static_cast<int>((total_threads + threads_per_block - 1) / threads_per_block);
+        scatter_tokens_ragged_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            topk_indices.data_ptr<int32_t>(),
+            cu_seqlens.data_ptr<int32_t>(),
+            expert_counters.data_ptr<int32_t>(),
+            reinterpret_cast<__nv_bfloat16*>(act_buffer.data_ptr()),
+            topk_pos.data_ptr<int32_t>(),
+            static_cast<int>(NK), static_cast<int>(H), static_cast<int>(K),
+            static_cast<int>(expert_start), static_cast<int>(E));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    return {expert_counts, cu_seqlens, topk_pos};
 }
 
 // ============================================================================
@@ -448,6 +662,8 @@ torch::Tensor reduce_weighted_scatter_bf16_ordered(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_scatter_3d", &dispatch_scatter_3d,
           "3D dispatch scatter for strided MoE buffer layout");
+    m.def("dispatch_scatter_ragged", &dispatch_scatter_ragged,
+          "Compact ragged dispatch scatter with 64-aligned device cu_seqlens");
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter,
           "Weighted reduce scatter from 3D to flat layout");
     m.def("reduce_weighted_scatter_fp32", &reduce_weighted_scatter_fp32,
