@@ -1,0 +1,28 @@
+name: README Update
+
+on:
+  pull_request:
+    paths:
+      - README.md
+      - scripts/check_readme_update.py
+      - docs/README_TEMPLATE.md
+      - docs/README_UPDATE_WORKFLOW.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readme:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base branch
+        if: github.event_name == 'pull_request'
+        run: git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+      - name: Check README history
+        run: >-
+          python3 scripts/check_readme_update.py
+          ${{ github.event_name == 'pull_request' && format('--base-ref origin/{0}', github.event.pull_request.base.ref) || '' }}
