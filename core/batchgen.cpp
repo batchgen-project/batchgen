@@ -20,6 +20,7 @@
 
 #include "spdlog/spdlog.h"
 #include <ATen/cuda/CachingHostAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #include <filesystem>
 #include <cstring>
 #include <memory>
@@ -288,6 +289,19 @@ std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights_pinned(
 void BatchGen::free_weights_buffer(const std::string& module_name) {
     /* Free the weights buffer. */
     this->gpu_weight_buffer_.releaseBuffer(module_name);
+};
+
+void BatchGen::free_weights_buffer_async(const std::string& module_name) {
+    this->free_weights_buffers_async({module_name});
+};
+
+void BatchGen::free_weights_buffers_async(
+    const std::vector<std::string>& module_names) {
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    const cudaStream_t consumer_stream = at::cuda::getCurrentCUDAStream(
+        this->engine_config_.basic_config.device).stream();
+    this->gpu_weight_buffer_.releaseBuffersAsync(
+        module_names, consumer_stream);
 };
 
 torch::Tensor BatchGen::attn(py::object torch_module, int64_t layer_idx,
