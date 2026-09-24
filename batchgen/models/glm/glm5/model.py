@@ -1254,6 +1254,31 @@ def _glm5_moe_3d_blockwise_supported(
     )
 
 
+def _glm5_accumulate_shared_expert_chunked(
+    output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    shared_expert,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Add the shared-expert output without materializing a full-token result."""
+    for start in range(0, hidden_states.shape[0], chunk_rows):
+        end = min(start + chunk_rows, hidden_states.shape[0])
+        output[start:end].add_(shared_expert._forward_impl(hidden_states[start:end]))
+    return output
+
+
+def _glm5_iter_prefill_gate_chunks(
+    gate,
+    hidden_states: torch.Tensor,
+    chunk_rows: int,
+):
+    """Route PREFILL tokens without materializing a full FP32 hidden copy."""
+    for start in range(0, hidden_states.shape[0], chunk_rows):
+        end = min(start + chunk_rows, hidden_states.shape[0])
+        topk_weights, topk_indices = gate(hidden_states[start:end])
+        yield start, end, topk_weights, topk_indices.to(torch.int32)
+
+
 class Glm5MoE(nn.Module):
     """GLM-5 MoE layer (unified prefill + EP decode).
 
@@ -2490,17 +2515,20 @@ class Glm5MoE(nn.Module):
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         num_tokens, hidden_size = hidden_flat.shape
         topk = self.num_experts_per_tok
-        topk_weights, topk_indices = self.gate(hidden_flat)
-        topk_indices_i32 = topk_indices.to(torch.int32)
         output = torch.empty_like(hidden_flat)
 
         gate_w, gate_scale, up_w, up_scale, down_w, down_scale = prototypes
-        for start in range(0, num_tokens, buf.token_window):
-            end = min(start + buf.token_window, num_tokens)
+        for start, end, topk_weights, topk_indices_i32 in (
+            _glm5_iter_prefill_gate_chunks(
+                self.gate,
+                hidden_flat,
+                buf.token_window,
+            )
+        ):
             window_tokens = end - start
             counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
                 hidden_flat[start:end],
-                topk_indices_i32[start:end],
+                topk_indices_i32,
                 buf.dispatched_x,
                 0,
                 buf.num_experts,
@@ -2560,28 +2588,33 @@ class Glm5MoE(nn.Module):
             _glm5_reduce_ordered(
                 buf.expert_out,
                 topk_pos,
-                topk_indices_i32[start:end],
-                topk_weights[start:end],
+                topk_indices_i32,
+                topk_weights,
                 window_tokens,
                 hidden_size,
                 topk,
                 output=output[start:end],
             )
 
-        shared = self.shared_experts
-        shared_output = shared._forward_impl(hidden_flat)
+        _glm5_accumulate_shared_expert_chunked(
+            output,
+            hidden_flat,
+            self.shared_experts,
+            buf.token_window,
+        )
         self._queue_prefill_grouped_releases()
 
         if not cls._prefill_grouped_logged:
             cls._prefill_grouped_logged = True
             logging.info(
                 "[GLM5_GROUPED_PREFILL] active: E=%d window=%d chunks=%d "
-                "pointer_table=device grouped_s1+s3 ordered_bf16_reduce",
+                "router=fp32_windowed pointer_table=device grouped_s1+s3 "
+                "ordered_bf16_reduce",
                 buf.num_experts,
                 buf.token_window,
                 (num_tokens + buf.token_window - 1) // buf.token_window,
             )
-        return (output + shared_output).view(*orig_shape)
+        return output.view(*orig_shape)
 
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill: per-expert loop (no EP).
