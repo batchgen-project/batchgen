@@ -94,6 +94,40 @@ def test_glm53_tokenizer_uses_dedicated_template_and_supports_loop_controls():
         assert rendered.endswith("<|assistant|><think>")
 
 
+def test_glm53_template_orders_tool_results_by_assistant_call_id():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    tokenizer = tokenizer_module.GLM53Tokenizer()
+
+    rendered = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "Use both tools."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "beta", "arguments": {}},
+                    },
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "alpha", "arguments": {}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        ],
+        tokenize=False,
+    )
+
+    assert rendered.index("<tool_response>B</tool_response>") < rendered.index(
+        "<tool_response>A</tool_response>"
+    )
+
+
 def test_glm52_routes_to_dedicated_template_and_renders_reasoning_directive():
     registry, tokenizer_module = _bootstrap_glm52_tokenizer()
 
