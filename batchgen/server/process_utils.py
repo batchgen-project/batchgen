@@ -56,6 +56,11 @@ MODEL_BYTE_SIZES = {
     # GLM-5.1 / GLM-5.1-FP8: same architecture + param count as GLM-5 (754B), same sizes.
     "zai-org/GLM-5.1-FP8": 760 * 1024**3,
     "zai-org/GLM-5.1": 1400 * 1024**3,
+    # GLM-5.2 / GLM-5.2-FP8: same architecture family + sizes as GLM-5.1.
+    # Exact entries are required: the partial match below would otherwise hit
+    # the BF16 "zai-org/GLM-5" 1400 GB entry first and over-reserve hugepages.
+    "zai-org/GLM-5.2-FP8": 760 * 1024**3,
+    "zai-org/GLM-5.2": 1400 * 1024**3,
 }
 
 # Default byte_size when model not in lookup (700GB for backwards compatibility)
