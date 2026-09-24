@@ -23,6 +23,10 @@
   source-qualified `8×1M` plus `32×256K` accumulated-token prefill. On the matched
   `8×1M` workload, BatchGen reached 20,648 prompt tok/s, **1.71× faster** than
   the best completed point in the recorded SGLang 0.5.18 tuning sweep.
+- **2026/09 — Kimi-K3** (2.8T-parameter, 896-expert MXFP4, top-16) support —
+  multi-node deployment on [2×8 H200](docs/deploy-kimi-k3-h200.md) or
+  [4×8 H20](docs/deploy-kimi-k3-h20.md).
+- **2026/01 — BatchGen v1.0** released with support for DeepSeek-R1/V3-671B.
 
 ## What is BatchGen?
 
