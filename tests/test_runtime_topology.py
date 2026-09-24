@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import gc
 import json
+import logging
 import os
 import pickle
 import runpy
@@ -38,7 +40,7 @@ GPT_OSS_PS_MODULE = "batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_serve
 MIXTRAL_PS_MODULE = "batchgen.models.mixtral.mixtral_parameter_server"
 
 
-def _top_level_function(path: Path, name: str):
+def _top_level_function(path: Path, name: str, globals_=None):
     tree = ast.parse(path.read_text(), filename=str(path))
     function = copy.deepcopy(
         next(
@@ -48,7 +50,7 @@ def _top_level_function(path: Path, name: str):
         )
     )
     module = ast.Module(body=[function], type_ignores=[])
-    namespace = {}
+    namespace = dict(globals_ or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
 
@@ -110,7 +112,12 @@ def _worker_manager_method(name: str, globals_=None):
         ],
         type_ignores=[],
     )
-    namespace = dict(globals_ or {})
+    namespace = {
+        "logging": logging,
+        "time": time,
+        "_WORKER_SENTINEL_GRACE_S": 20.0,
+        **(globals_ or {}),
+    }
     exec(
         compile(ast.fix_missing_locations(module), str(WORKER_MANAGER), "exec"),
         namespace,
@@ -269,9 +276,11 @@ def _stop_partial_local_manager(
     stop_type = _worker_manager_method(
         "stop",
         {
-            "cleanup_model_shm_files": lambda info: process_utils[
-                "cleanup_model_shm_files"
+            "verify_model_shm_absent": lambda info, **kwargs: process_utils[
+                "verify_model_shm_absent"
             ](info, shm_dir=shm_dir),
+            "gc": gc,
+            "Path": Path,
             "logger": SimpleNamespace(
                 info=lambda *args, **kwargs: None,
                 error=lambda *args, **kwargs: None,
@@ -401,6 +410,10 @@ def test_local_gpt_oss_post_init_failure_cleans_only_owned_names(
 
         def __init__(self, *args, **kwargs):
             self.parameter_server = SimpleNamespace(byte_size=self._fail_size)
+
+        def __del__(self):
+            (shm_dir / "shm_reserved_weights").unlink(missing_ok=True)
+            (shm_dir / "shm_reserved_meta").unlink(missing_ok=True)
 
         def _fail_size(self):
             raise RuntimeError("size failed")
@@ -559,6 +572,43 @@ def test_worker_rank_math_uses_configured_local_world_size():
     assert "NUM_GPUS_PER_NODE" not in migration_source
 
 
+def test_worker_runtime_shutdown_orders_engine_before_weights_storage():
+    shutdown = _top_level_function(
+        ROOT / "batchgen" / "server_worker_main_loop.py",
+        "_shutdown_worker_runtime",
+        {"gc": gc, "logging": logging, "time": time},
+    )
+    events = []
+
+    class Engine:
+        def terminate(self):
+            events.append("engine_terminate")
+
+    class Worker:
+        rank = 0
+        core_engine = Engine()
+        initializer = object()
+        weights_storage = object()
+        model = object()
+        parallel_manager = object()
+        _runtime_shutdown_complete = False
+
+        def __setattr__(self, name, value):
+            if name in {"initializer", "core_engine", "weights_storage"}:
+                if value is None:
+                    events.append(f"{name}_none")
+            object.__setattr__(self, name, value)
+
+    worker = Worker()
+    shutdown(worker)
+
+    assert events.index("engine_terminate") < events.index("core_engine_none")
+    assert events.index("core_engine_none") < events.index("weights_storage_none")
+    assert worker.weights_storage is None
+    shutdown(worker)
+    assert events.count("engine_terminate") == 1
+
+
 def test_http_shutdown_has_no_host_global_cleanup_fallback():
     http_source = HTTP_SERVER.read_text()
     manager_source = WORKER_MANAGER.read_text()
@@ -566,9 +616,10 @@ def test_http_shutdown_has_no_host_global_cleanup_fallback():
     assert "shm_prefix=None" not in http_source
     assert "clean_hugepages=True" not in http_source
     assert "if self._runtime_namespace_owned:" in manager_source
-    assert "shm_prefix=(" in manager_source
+    assert "cleanup_shm_files(self.args.runtime_identity.shm_prefix)" in manager_source
     assert "self.args.runtime_identity.shm_prefix" in manager_source
-    assert "kill_workers=False" in manager_source
+    assert "cleanup_resources" not in manager_source
+    assert "clean_hugepages" not in manager_source
     assert http_source.index("worker._acquire_runtime_admission()") < (
         http_source.index("StorageManager(server_args.storage_path)")
     )
@@ -609,7 +660,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     own.touch()
     neighbor.touch()
 
-    def cleanup_resources(*, shm_prefix, **kwargs):
+    def cleanup_shm_files(shm_prefix):
         for entry in tmp_path.iterdir():
             if entry.name.startswith(shm_prefix):
                 entry.unlink()
@@ -621,8 +672,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     manager_type = _worker_manager_method(
         "stop",
         {
-            "cleanup_resources": cleanup_resources,
-            "cleanup_model_shm_files": lambda model_info: None,
+            "cleanup_shm_files": cleanup_shm_files,
             "logger": fake_logger,
         },
     )
@@ -645,7 +695,6 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._hugepages_enabled = False
     manager._cleanup_skeleton_state_dict_file = lambda: None
 
     manager.stop()
@@ -655,17 +704,22 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
 
 
 @pytest.mark.parametrize("local_owner", [False, True])
-def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner):
+def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner):
     weight = tmp_path / "shm_weight"
     metadata = tmp_path / "shm_metadata"
     weight.touch()
     metadata.touch()
     cleaned = []
 
-    def cleanup_model_shm_files(model_info):
+    def verify_model_shm_absent(model_info, **kwargs):
         cleaned.append(True)
         for key in ("shm_name", "tensor_meta_shm_name"):
-            (tmp_path / model_info.pop(key).lstrip("/")).unlink()
+            assert not (tmp_path / model_info.pop(key).lstrip("/")).exists()
+
+    class Owner:
+        def __del__(self):
+            weight.unlink()
+            metadata.unlink()
 
     fake_logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
@@ -673,11 +727,17 @@ def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner)
     )
     manager_type = _worker_manager_method(
         "stop",
-        {"cleanup_model_shm_files": cleanup_model_shm_files, "logger": fake_logger},
+        {
+            "verify_model_shm_absent": verify_model_shm_absent,
+            "gc": gc,
+            "Path": Path,
+            "logger": fake_logger,
+        },
     )
     manager = manager_type()
     manager.args = SimpleNamespace(
-        runtime_identity=SimpleNamespace(runtime_dir=tmp_path / "unused")
+        runtime_identity=SimpleNamespace(runtime_dir=tmp_path / "unused"),
+        enable_hugetlbfs=False,
     )
     manager._stopping = False
     manager.started = True
@@ -687,7 +747,7 @@ def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner)
     manager._lane_lease = None
     manager.worker_process = None
     manager.distributed_weight_daemon = None
-    manager.parameter_server_instance = object() if local_owner else None
+    manager.parameter_server_instance = Owner() if local_owner else None
     manager.model_info = {
         "shm_name": f"/{weight.name}",
         "tensor_meta_shm_name": f"/{metadata.name}",
@@ -695,7 +755,6 @@ def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner)
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._hugepages_enabled = False
     manager._cleanup_skeleton_state_dict_file = lambda: None
 
     manager.stop()
@@ -705,6 +764,56 @@ def test_worker_stop_only_unlinks_locally_owned_model_shm(tmp_path, local_owner)
     assert metadata.exists() is not local_owner
     assert "shm_name" not in manager.model_info
     assert "tensor_meta_shm_name" not in manager.model_info
+
+
+def test_worker_stop_retries_preserve_unverified_owner_release(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    record = runtime_dir / "model_shm.json"
+    record.write_text("owned names")
+    events = []
+    manager_type = _worker_manager_method(
+        "stop",
+        {
+            "verify_model_shm_absent": lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("model residue")
+            ),
+            "gc": gc,
+            "Path": Path,
+            "logger": SimpleNamespace(
+                info=lambda *args: None, error=lambda *args: None
+            ),
+        },
+    )
+    manager = manager_type()
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(runtime_dir=runtime_dir),
+        enable_hugetlbfs=False,
+    )
+    manager._stopping = False
+    manager.started = True
+    manager._runtime_dir_created = True
+    manager._runtime_namespace_owned = False
+    manager._runtime_locks = SimpleNamespace(
+        close=lambda: events.append("lock-close")
+    )
+    manager._lane_lease = None
+    manager.worker_process = None
+    manager.distributed_weight_daemon = None
+    manager.parameter_server_instance = object()
+    manager.model_info = {"shm_name": "/shm_weight"}
+    manager.skeleton_state_dict_file = None
+    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
+    manager._monitor_thread = None
+    manager._cleanup_skeleton_state_dict_file = lambda: None
+
+    with pytest.raises(RuntimeError, match="model residue"):
+        manager.stop()
+    with pytest.raises(RuntimeError, match="owner release was not verified"):
+        manager.stop()
+    assert record.exists()
+    assert manager.model_info == {"shm_name": "/shm_weight"}
+    assert events == []
 
 
 def test_worker_start_rolls_back_partial_startup_before_reraising():
@@ -740,7 +849,7 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     manager_type = _worker_manager_method(
         "stop",
         {
-            "cleanup_resources": lambda **kwargs: events.append("cleanup"),
+            "cleanup_shm_files": lambda prefix: events.append("cleanup"),
             "logger": fake_logger,
         },
     )
@@ -773,7 +882,6 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
             runtime_dir=tmp_path / "runtime",
         )
     )
-    manager._hugepages_enabled = False
 
     with pytest.raises(RuntimeError, match="live owned PIDs"):
         manager.stop()
@@ -832,7 +940,53 @@ def test_worker_stop_signals_only_original_child_handles(exits_after_term):
         with pytest.raises(RuntimeError, match="live owned PIDs"):
             manager._stop_workers()
         assert ("signal", 9, 9) in events
-    assert events[0:2] == [("open", 123), ("signal", 9, 15)]
+    assert events[0] == ("open", 123)
+    assert events.index("poison") < events.index(("signal", 9, 15))
+    assert events[-1] == ("close", 9)
+
+
+def test_worker_stop_allows_idle_child_to_exit_from_sentinel():
+    events = []
+
+    class Child:
+        pid = 123
+        exitcode = None
+
+        def join(self, timeout):
+            events.append(("join", timeout))
+            if "poison" in events:
+                self.exitcode = 0
+
+    child = Child()
+    fake_os = SimpleNamespace(
+        pidfd_open=lambda pid: events.append(("open", pid)) or 9,
+        close=lambda fd: events.append(("close", fd)),
+    )
+    fake_signal = SimpleNamespace(
+        SIGTERM=15,
+        SIGKILL=9,
+        pidfd_send_signal=lambda fd, sig: events.append(("signal", fd, sig)),
+    )
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
+            "os": fake_os,
+            "signal": fake_signal,
+            "time": __import__("time"),
+        },
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(processes=[child])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
+
+    manager._stop_workers()
+
+    assert events[0] == ("open", 123)
+    assert "poison" in events
+    assert not any(event == ("signal", 9, 15) for event in events)
+    assert not any(event == ("signal", 9, 9) for event in events)
     assert events[-1] == ("close", 9)
 
 

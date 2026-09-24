@@ -7,10 +7,8 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -282,238 +280,28 @@ def record_model_shm_provenance(
     return path
 
 
-def cleanup_model_shm_files(
-    model_info: Dict[str, Any], *, shm_dir: Path = Path("/dev/shm")
-) -> int:
-    """Unlink this model's exact weight and metadata SHM names after workers exit."""
-    keys = MODEL_SHM_KEYS
+def verify_model_shm_absent(
+    model_info: Dict[str, Any], *, shm_dir: Path = Path("/dev/shm"),
+    hugepages_dir: Optional[Path] = None,
+) -> None:
+    """Verify the C++ owner released its model SHM; never unlink by name here."""
     paths = []
-    for key in keys:
+    for key in MODEL_SHM_KEYS:
         name = model_info.get(key)
-        if not name:
-            continue
-        paths.append(shm_dir / _validated_shm_entry_name(name))
+        if name:
+            entry = _validated_shm_entry_name(name)
+            paths.append(shm_dir / entry)
+            if key == "shm_name" and hugepages_dir is not None:
+                paths.append(hugepages_dir / entry)
 
     if paths and not shm_dir.is_dir():
         raise RuntimeError(f"Model SHM directory is unavailable: {shm_dir}")
-
-    removed = 0
     for path in paths:
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise RuntimeError(f"Refusing non-file model SHM: {path}")
-        if path.exists():
-            path.unlink()
-            removed += 1
         if path.exists() or path.is_symlink():
-            raise RuntimeError(f"Model SHM remains after cleanup: {path}")
+            raise RuntimeError(f"Model SHM remains after owner release: {path}")
 
-    for key in keys:
+    for key in MODEL_SHM_KEYS:
         model_info.pop(key, None)
-    return removed
-
-
-def cleanup_hugepages_files(prefix: Optional[str] = None) -> int:
-    """Clean up files in /dev/hugepages safely using Python.
-
-    This function only deletes files matching known BatchGen prefixes,
-    avoiding the unsafe 'rm -rf /dev/hugepages/*' pattern.
-
-    Args:
-        prefix: Specific prefix to match. If None, matches all
-               known BATCHGEN_SHM_PREFIXES.
-
-    Returns:
-        Number of files removed.
-    """
-    import shutil
-
-    hugepages_dir = Path("/dev/hugepages")
-    if not hugepages_dir.exists():
-        logger.debug("/dev/hugepages does not exist")
-        return 0
-
-    # Determine which prefixes to match
-    prefixes = (prefix,) if prefix else BATCHGEN_SHM_PREFIXES
-    removed = 0
-
-    try:
-        for entry in hugepages_dir.iterdir():
-            # Only delete entries matching our prefixes
-            if not any(entry.name.startswith(p) for p in prefixes):
-                continue
-
-            try:
-                if entry.is_file() or entry.is_symlink():
-                    entry.unlink()
-                elif entry.is_dir():
-                    shutil.rmtree(entry)
-                logger.debug(f"Removed /dev/hugepages/{entry.name}")
-                removed += 1
-            except PermissionError:
-                logger.warning(f"Permission denied: /dev/hugepages/{entry.name}")
-            except OSError as e:
-                logger.warning(f"Failed to remove /dev/hugepages/{entry.name}: {e}")
-
-    except (PermissionError, OSError) as e:
-        logger.warning(f"Error accessing /dev/hugepages: {e}")
-
-    if removed > 0:
-        logger.info(f"Cleaned up {removed} files from /dev/hugepages")
-
-    return removed
-
-
-def unmount_hugetlbfs() -> bool:
-    """Unmount all hugetlbfs filesystems.
-
-    Returns:
-        True if unmount was successful or no hugetlbfs mounted, False otherwise.
-    """
-    try:
-        # Check if hugetlbfs is mounted
-        result = subprocess.run(
-            ["mount"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if "hugetlbfs" not in result.stdout:
-            logger.debug("No hugetlbfs filesystems mounted")
-            return True
-
-        # Unmount all hugetlbfs mounts
-        max_attempts = 10
-        for attempt in range(max_attempts):
-            result = subprocess.run(
-                ["mount"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if "hugetlbfs" not in result.stdout:
-                logger.info("All hugetlbfs filesystems unmounted")
-                return True
-
-            # Try to unmount /dev/hugepages
-            umount_result = subprocess.run(
-                ["umount", "/dev/hugepages"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if umount_result.returncode != 0:
-                # umount failed, might need to wait for processes to release
-                if attempt < max_attempts - 1:
-                    logger.debug(
-                        f"Unmount attempt {attempt + 1} failed, retrying..."
-                    )
-                    time.sleep(0.5)
-                else:
-                    logger.warning(
-                        f"Failed to unmount hugetlbfs: {umount_result.stderr}"
-                    )
-                    return False
-
-        return True
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout while unmounting hugetlbfs")
-        return False
-    except Exception as e:
-        logger.warning(f"Error unmounting hugetlbfs: {e}")
-        return False
-
-
-def reset_hugepages_allocation() -> bool:
-    """Reset huge pages allocation to 0.
-
-    Runs both sysctl and direct /proc write for robustness.
-
-    Returns:
-        True if at least one method succeeded, False otherwise.
-    """
-    success = False
-
-    # Method 1: sysctl -w vm.nr_hugepages=0
-    try:
-        result = subprocess.run(
-            ["sysctl", "-w", "vm.nr_hugepages=0"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            logger.info("Reset vm.nr_hugepages to 0 via sysctl")
-            success = True
-        else:
-            logger.warning(f"sysctl failed: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout with sysctl")
-    except Exception as e:
-        logger.warning(f"sysctl error: {e}")
-
-    # Method 2: echo 0 > /proc/sys/vm/nr_hugepages
-    try:
-        with open("/proc/sys/vm/nr_hugepages", "w") as f:
-            f.write("0\n")
-        logger.info("Reset vm.nr_hugepages to 0 via /proc")
-        success = True
-    except PermissionError:
-        logger.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
-    except Exception as e:
-        logger.warning(f"Failed to reset hugepages via /proc: {e}")
-
-    return success
-
-
-def cleanup_resources(
-    shm_prefix: Optional[str] = "batchgen",
-    clean_hugepages: bool = True,
-    kill_workers: bool = True,
-    worker_pids: Optional[List[int]] = None,
-) -> None:
-    """Comprehensive resource cleanup for BatchGen.
-
-    This function should be called during server shutdown to clean up:
-    1. Worker processes (if kill_workers=True)
-    2. Shared memory files in /dev/shm
-    3. Files in /dev/hugepages
-    4. Unmount hugetlbfs and reset hugepages allocation
-
-    Args:
-        shm_prefix: Prefix for shared memory files to clean. None cleans all.
-        clean_hugepages: Whether to clean and unmount hugepages.
-        kill_workers: Whether to kill worker processes.
-        worker_pids: List of worker PIDs to kill. If None and kill_workers=True,
-                    kills all child processes.
-    """
-    logger.info("Starting resource cleanup...")
-
-    # Step 1: Kill worker processes
-    if kill_workers:
-        if worker_pids:
-            for pid in worker_pids:
-                try:
-                    proc = psutil.Process(pid)
-                    proc.kill()
-                    logger.debug(f"Killed worker process {pid}")
-                except psutil.NoSuchProcess:
-                    pass
-                except Exception as e:
-                    logger.warning(f"Failed to kill process {pid}: {e}")
-        else:
-            # Kill all child processes of current process
-            kill_process_tree(os.getpid(), include_parent=False)
-
-    # Step 2: Clean shared memory
-    cleanup_shm_files(shm_prefix)
-
-    # Step 3: Clean hugepages
-    if clean_hugepages:
-        cleanup_hugepages_files()
-        unmount_hugetlbfs()
-        reset_hugepages_allocation()
-
-    logger.info("Resource cleanup completed")
 
 
 def install_worker_signal_handlers(

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import gc
 import importlib
+import os
 import sys
 import types
 import uuid
@@ -136,7 +138,36 @@ def test_model_shm_creators_and_destructor_preserve_foreign_names():
     destructor = server_source.split("Parameter_Server::~Parameter_Server()", 1)[1]
     destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
     assert "if (weight_posix_shm_owned_)" in destructor
+    assert "if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty())" in destructor
+    assert "unlink(this->weight_hugetlbfs_path_.c_str())" in destructor
+    assert "close(this->weights_memfd_fd_)" in destructor
+    assert "free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)" in destructor
     assert "if (tensor_meta_shm_owned_)" in destructor
+    assert "if (create && errno == EEXIST)" in shm_source
+    assert "memfd creator requires an output fd" in shm_source
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not torch.cuda.is_available(),
+    reason="native memfd lifetime check requires Linux CUDA",
+)
+def test_native_parameter_server_releases_full_memfd_mapping(tmp_path):
+    from batchgen.models.engine_loader import core_engine
+
+    weight_name = f"/shm_{uuid.uuid4()}"
+    metadata_name = f"/shm_{uuid.uuid4()}"
+    parameter_server = core_engine.Parameter_Server(False, True)
+    parameter_server.Init(weight_name, metadata_name, 4096, str(tmp_path), {})
+    fd = parameter_server.weights_memfd_fd()
+    assert fd >= 0
+    assert "memfd:batchgen_weights" in os.readlink(f"/proc/self/fd/{fd}")
+    del parameter_server
+    gc.collect()
+
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    assert "memfd:batchgen_weights" not in Path("/proc/self/maps").read_text()
+    assert not (Path("/dev/shm") / metadata_name[1:]).exists()
 
 
 @pytest.mark.skipif(

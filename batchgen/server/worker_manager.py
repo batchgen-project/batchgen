@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import logging
 import os
 import pickle
@@ -24,11 +25,11 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
-    cleanup_model_shm_files,
-    cleanup_resources,
+    cleanup_shm_files,
     get_hugepage_size,
     get_model_byte_size,
     record_model_shm_provenance,
+    verify_model_shm_absent,
 )
 from batchgen.server.runtime_locks import RuntimeLocks
 from batchgen.server.runtime_lease import LaneLease
@@ -41,6 +42,11 @@ from batchgen.utils import config_torch_module_initializer
 logger = logging.getLogger(__name__)
 
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
+# A sentinel reaches the worker's ordered C++/Python teardown path.  That path
+# must be allowed to finish before the signal fallback can invoke os._exit and
+# skip the destructors it exists to run.  The bound still keeps a blocked
+# worker from holding server shutdown indefinitely.
+_WORKER_SENTINEL_GRACE_S = 20.0
 
 
 def _resolve_local_world_size(
@@ -146,6 +152,7 @@ class WorkerManager:
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
         self._model_shm_init_unconfirmed = False
+        self._model_shm_release_unverified = False
         self.host_kv_manager = None
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
@@ -169,7 +176,6 @@ class WorkerManager:
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
-        self._hugepages_enabled = False  # Track if hugepages were configured
 
     def _cleanup_skeleton_state_dict_file(self) -> None:
         """Clean up temporary skeleton state dict file."""
@@ -250,7 +256,6 @@ class WorkerManager:
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
             self._config_hugepages(byte_size)
-            self._hugepages_enabled = True
 
         import sys as _diag_sys
         def _diag(msg):
@@ -333,6 +338,7 @@ class WorkerManager:
         self._stopping = True
         worker_teardown_safe = self.worker_process is None
         artifacts_cleaned = False
+        shutdown_start = time.monotonic()
         try:
             self._monitor_stop_event.set()
             logger.info("Stopping WorkerManager...")
@@ -349,7 +355,13 @@ class WorkerManager:
                 self.distributed_weight_daemon.prepare_stop()
 
             if self.worker_process is not None:
-                self._stop_workers()
+                try:
+                    self._stop_workers()
+                finally:
+                    logging.getLogger("uvicorn.error").info(
+                        "[shutdown] worker processes elapsed=%.3fs",
+                        time.monotonic() - shutdown_start,
+                    )
             worker_teardown_safe = True
 
             if self.distributed_weight_daemon is not None:
@@ -366,16 +378,30 @@ class WorkerManager:
                             "Model SHM creation was attempted but ownership is "
                             "unconfirmed; preserving runtime artifacts and locks"
                         )
-                    if self._runtime_namespace_owned:
-                        cleanup_resources(
-                            shm_prefix=(
-                                self.args.runtime_identity.shm_prefix
-                            ),
-                            clean_hugepages=self._hugepages_enabled,
-                            kill_workers=False,  # Already handled above
+                    if getattr(self, "_model_shm_release_unverified", False):
+                        raise RuntimeError(
+                            "Model SHM owner release was not verified; "
+                            "preserving runtime artifacts and locks"
                         )
+                    if self._runtime_namespace_owned:
+                        cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:
-                        cleanup_model_shm_files(self.model_info)
+                        model_release_start = time.monotonic()
+                        self._model_shm_release_unverified = True
+                        self.parameter_server_instance = None
+                        gc.collect()
+                        verify_model_shm_absent(
+                            self.model_info,
+                            hugepages_dir=(
+                                Path("/dev/hugepages")
+                                if self.args.enable_hugetlbfs else None
+                            ),
+                        )
+                        self._model_shm_release_unverified = False
+                        logging.getLogger("uvicorn.error").info(
+                            "[shutdown] model SHM owner release elapsed=%.3fs",
+                            time.monotonic() - model_release_start,
+                        )
                     else:
                         # Remote parameter servers and distributed stores own
                         # their names; this worker only borrowed them.
@@ -413,9 +439,15 @@ class WorkerManager:
                     logger.error(
                         "WorkerManager stop incomplete; admission locks remain held"
                     )
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker manager elapsed=%.3fs clean=%s",
+                    time.monotonic() - shutdown_start,
+                    artifacts_cleaned,
+                )
 
     def _stop_workers(self) -> None:
         """Signal only the original child processes, never a reused numeric PID."""
+        stop_start = time.monotonic()
         processes = self.worker_process.processes
         if not processes:
             raise RuntimeError("worker process context has no child processes")
@@ -428,23 +460,50 @@ class WorkerManager:
                     if proc.exitcode is None:
                         pidfds.append((proc, os.pidfd_open(proc.pid)))
 
-                for _, pidfd in pidfds:
-                    try:
-                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                # Let an idle worker leave its main loop normally first.  This
+                # gives its C++ storage objects a chance to release CUDA
+                # registrations and mappings before the signal fallback uses
+                # os._exit().  Workers blocked in NCCL or otherwise unable to
+                # consume the sentinel still follow the existing pidfd path.
+                sentinel_sent = False
                 try:
                     self.request_queue.put(None)
+                    sentinel_sent = True
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + (
+                    _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
+                )
                 for proc in processes:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
 
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
+                for _, pidfd in remaining:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+                deadline = time.monotonic() + 5
+                for proc, _ in remaining:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                # A child may finish during the SIGTERM grace period. Reap
+                # only handles that are still live; sending SIGKILL to a
+                # child that already exited obscures the shutdown result and
+                # breaks fake-pidfd tests.
+                remaining = [
+                    (proc, fd) for proc, fd in remaining if proc.exitcode is None
+                ]
+
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker SIGTERM grace elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    len(remaining),
+                )
                 if remaining:
                     logger.warning("Workers did not exit gracefully, force-killing...")
                 for _, pidfd in remaining:
@@ -455,6 +514,11 @@ class WorkerManager:
                 deadline = time.monotonic() + 5
                 for proc, _ in remaining:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    sum(proc.exitcode is None for proc in processes),
+                )
 
                 surviving_pids = [
                     proc.pid for proc in processes if proc.exitcode is None
@@ -942,6 +1006,11 @@ class WorkerManager:
         if self._stopping:
             return
         if self._worker_exit_state.set_failure(reason, exc):
+            logging.getLogger("uvicorn.error").error(
+                "[shutdown] worker failure detected epoch=%.6f: %s",
+                time.time(),
+                reason,
+            )
             self._request_server_shutdown()
 
     @staticmethod
