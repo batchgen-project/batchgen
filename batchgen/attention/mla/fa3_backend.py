@@ -1165,6 +1165,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	import os as _os_gemm
 	_w8a16_dequant_path = _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
 	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
+	chunk_size = getattr(self, "single_sequence_prefill_chunk_size", 0)
+	if num_sequences == 1 and total_tokens > 262_144 and chunk_size:
+		return _mla_prefill_single_sequence_chunked(
+			self, hidden_states, position_ids, max_seqlen,
+			weight_scale, _gemm, chunk_size,
+		)
 
 	# Project Q
 	query_states = _gemm(
@@ -1258,3 +1264,92 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	)
 
 	return attn_output, offload_kv
+
+
+def _mla_prefill_single_sequence_chunked(
+	self,
+	hidden_states: torch.Tensor,
+	position_ids: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: dict,
+	gemm,
+	chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Keep one sequence's K/V resident while projecting and attending Q chunks."""
+	from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
+
+	total_tokens, hidden_dim = hidden_states.shape
+	key_states = hidden_states.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+	value_states = hidden_states.new_empty(total_tokens, self.num_heads, self.v_head_dim)
+	offload_kv = hidden_states.new_empty(total_tokens, self.kv_lora_rank + self.qk_rope_head_dim)
+	output = hidden_states.new_empty(total_tokens, hidden_dim)
+	cos, sin = self.rotary_emb(hidden_states, seq_len=max_seqlen)
+
+	# Project K/V into their final buffers without keeping the expanded [T,H,448]
+	# tensor alive. The compressed KV is also retained for Host-KV offload.
+	for start in range(0, total_tokens, chunk_size):
+		end = min(start + chunk_size, total_tokens)
+		compressed = gemm(
+			self.kv_a_proj_with_mqa.weight.data,
+			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+			hidden_states[start:end],
+		)
+		compressed_kv, k_pe = torch.split(
+			compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+		)
+		normed_kv = self.kv_a_layernorm(compressed_kv)
+		k_pe = rotary_pos_emb_interleaved_native(
+			k_pe.view(end - start, 1, self.qk_rope_head_dim).unsqueeze(0),
+			cos, sin, position_ids[start:end].unsqueeze(0), 2,
+		).squeeze(0)
+		offload_kv[start:end, :self.kv_lora_rank] = normed_kv
+		offload_kv[start:end, self.kv_lora_rank:] = k_pe.squeeze(1)
+		kv = gemm(
+			self.kv_b_proj.weight.data,
+			weight_scale["kv_b_proj.weight_scale_inv"],
+			normed_kv,
+		).view(end - start, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+		key_states[start:end, :, :self.qk_nope_head_dim] = kv[:, :, :self.qk_nope_head_dim]
+		key_states[start:end, :, self.qk_nope_head_dim:] = k_pe
+		value_states[start:end] = kv[:, :, self.qk_nope_head_dim:]
+		del compressed, compressed_kv, normed_kv, k_pe, kv
+
+	# FA3 aligns the causal mask to the bottom right when Q is shorter than K.
+	# For Q[start:end] against K[:end], that is the original absolute-position
+	# causal mask. Project each attention result before advancing to the next Q.
+	for start in range(0, total_tokens, chunk_size):
+		end = min(start + chunk_size, total_tokens)
+		q = gemm(
+			self.q_a_proj.weight.data,
+			weight_scale["q_a_proj.weight_scale_inv"],
+			hidden_states[start:end],
+		)
+		q = self.q_a_layernorm(q)
+		q = gemm(
+			self.q_b_proj.weight.data,
+			weight_scale["q_b_proj.weight_scale_inv"],
+			q,
+		).view(end - start, self.num_heads, self.q_head_dim)
+		q_pe = rotary_pos_emb_interleaved_native(
+			q[:, :, self.qk_nope_head_dim:].unsqueeze(0),
+			cos, sin, position_ids[start:end].unsqueeze(0), 2,
+		).squeeze(0)
+		q[:, :, self.qk_nope_head_dim:] = q_pe
+		cu_q = torch.tensor([0, end - start], dtype=torch.int32, device=q.device)
+		cu_k = torch.tensor([0, end], dtype=torch.int32, device=q.device)
+		attn = flash_attn_varlen_func(
+			q, key_states[:end], value_states[:end],
+			cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+			max_seqlen_q=end - start, max_seqlen_k=end,
+			softmax_scale=self.softmax_scale, causal=True,
+		)
+		if isinstance(attn, tuple):
+			attn = attn[0]
+		output[start:end] = gemm(
+			self.o_proj.weight.data,
+			weight_scale["o_proj.weight_scale_inv"],
+			attn.reshape(end - start, self.num_heads * self.v_head_dim),
+		)
+		del q, q_pe, attn
+
+	return output, offload_kv
