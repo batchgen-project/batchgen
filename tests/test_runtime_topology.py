@@ -40,7 +40,7 @@ GPT_OSS_PS_MODULE = "batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_serve
 MIXTRAL_PS_MODULE = "batchgen.models.mixtral.mixtral_parameter_server"
 
 
-def _top_level_function(path: Path, name: str):
+def _top_level_function(path: Path, name: str, globals_=None):
     tree = ast.parse(path.read_text(), filename=str(path))
     function = copy.deepcopy(
         next(
@@ -50,7 +50,7 @@ def _top_level_function(path: Path, name: str):
         )
     )
     module = ast.Module(body=[function], type_ignores=[])
-    namespace = {}
+    namespace = dict(globals_ or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
 
@@ -567,6 +567,43 @@ def test_worker_rank_math_uses_configured_local_world_size():
     assert "NUM_GPUS_PER_NODE" not in migration_source
 
 
+def test_worker_runtime_shutdown_orders_engine_before_weights_storage():
+    shutdown = _top_level_function(
+        ROOT / "batchgen" / "server_worker_main_loop.py",
+        "_shutdown_worker_runtime",
+        {"gc": gc, "logging": logging, "time": time},
+    )
+    events = []
+
+    class Engine:
+        def terminate(self):
+            events.append("engine_terminate")
+
+    class Worker:
+        rank = 0
+        core_engine = Engine()
+        initializer = object()
+        weights_storage = object()
+        model = object()
+        parallel_manager = object()
+        _runtime_shutdown_complete = False
+
+        def __setattr__(self, name, value):
+            if name in {"initializer", "core_engine", "weights_storage"}:
+                if value is None:
+                    events.append(f"{name}_none")
+            object.__setattr__(self, name, value)
+
+    worker = Worker()
+    shutdown(worker)
+
+    assert events.index("engine_terminate") < events.index("core_engine_none")
+    assert events.index("core_engine_none") < events.index("weights_storage_none")
+    assert worker.weights_storage is None
+    shutdown(worker)
+    assert events.count("engine_terminate") == 1
+
+
 def test_http_shutdown_has_no_host_global_cleanup_fallback():
     http_source = HTTP_SERVER.read_text()
     manager_source = WORKER_MANAGER.read_text()
@@ -898,7 +935,53 @@ def test_worker_stop_signals_only_original_child_handles(exits_after_term):
         with pytest.raises(RuntimeError, match="live owned PIDs"):
             manager._stop_workers()
         assert ("signal", 9, 9) in events
-    assert events[0:2] == [("open", 123), ("signal", 9, 15)]
+    assert events[0] == ("open", 123)
+    assert events.index("poison") < events.index(("signal", 9, 15))
+    assert events[-1] == ("close", 9)
+
+
+def test_worker_stop_allows_idle_child_to_exit_from_sentinel():
+    events = []
+
+    class Child:
+        pid = 123
+        exitcode = None
+
+        def join(self, timeout):
+            events.append(("join", timeout))
+            if "poison" in events:
+                self.exitcode = 0
+
+    child = Child()
+    fake_os = SimpleNamespace(
+        pidfd_open=lambda pid: events.append(("open", pid)) or 9,
+        close=lambda fd: events.append(("close", fd)),
+    )
+    fake_signal = SimpleNamespace(
+        SIGTERM=15,
+        SIGKILL=9,
+        pidfd_send_signal=lambda fd, sig: events.append(("signal", fd, sig)),
+    )
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
+            "os": fake_os,
+            "signal": fake_signal,
+            "time": __import__("time"),
+        },
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(processes=[child])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
+
+    manager._stop_workers()
+
+    assert events[0] == ("open", 123)
+    assert "poison" in events
+    assert not any(event == ("signal", 9, 15) for event in events)
+    assert not any(event == ("signal", 9, 9) for event in events)
     assert events[-1] == ("close", 9)
 
 

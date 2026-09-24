@@ -1,4 +1,5 @@
 import importlib
+import gc
 import json
 import logging
 import os
@@ -26,6 +27,75 @@ from batchgen.server.watchdog import Watchdog
 
 _WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
 _WORKER_FATAL_ACK_TIMEOUT_S = 5.0
+
+
+def _shutdown_worker_runtime(worker) -> None:
+	"""Release the engine before the worker-owned weight mapping.
+
+	``BatchGen`` keeps a non-owning C++ reference to ``Weights_Storage`` and
+	its H2D/D2H workers can still hold pointers into that mapping.  Python's
+	attribute destruction order is not an ownership contract, so the sentinel
+	path performs the order explicitly: stop the engine, drop every Python
+	owner that can retain it or a weight tensor, then release the storage last.
+	Signal-driven ``os._exit`` remains the fail-closed fallback when this path
+	cannot run (for example, a worker blocked in a native collective).
+	"""
+	if getattr(worker, "_runtime_shutdown_complete", False):
+		return
+	worker._runtime_shutdown_complete = True
+	start = time.monotonic()
+
+	engine = getattr(worker, "core_engine", None)
+	if engine is not None:
+		try:
+			engine.terminate()
+		except Exception:
+			logging.warning(
+				"Rank %s: core engine termination failed during worker shutdown",
+				getattr(worker, "rank", "unknown"),
+				exc_info=True,
+			)
+			# Do not release the mapping while a native engine may still own
+			# pointers into it.  Propagating reaches the worker supervisor's
+			# os._exit fail-closed path, where the kernel unmaps the process.
+			raise
+
+	# These objects may retain the BatchGen binding, model tensors, or CUDA
+	# graph references.  Drop them before the storage object below.
+	for attr in (
+		"model",
+		"parallel_manager",
+		"gpu_paged_kv_cache_manager",
+		"host_paged_kv_worker_view",
+		"host_paged_kv_worker_view_aux",
+		"_cuda_graph_adapter",
+		"_cuda_graph_manager",
+		"_glm5_moe_cuda_graph_manager",
+		"_glm5_layer_cuda_graph_manager",
+		"_whole_model_segment",
+		"_buffer_pool",
+		"_retired_buffer_pools",
+		"skeleton_state_dict",
+		"global_batch",
+	):
+		if hasattr(worker, attr):
+			setattr(worker, attr, None)
+
+	# The model-specific initializer retains the same C++ BatchGen object.
+	worker.initializer = None
+	worker.core_engine = None
+	engine = None
+	gc.collect()
+
+	# This is deliberately last: the C++ engine has a non-owning reference to
+	# it, and the destructor performs cudaHostUnregister/munmap/shm_unlink.
+	worker.weights_storage = None
+	gc.collect()
+	logging.info(
+		"Rank %s: ordered runtime shutdown completed in %.3fs",
+		getattr(worker, "rank", "unknown"),
+		time.monotonic() - start,
+	)
 
 
 def _format_worker_fatal(
@@ -705,5 +775,7 @@ def _server_worker_main_impl(
 					continue
 			response_queue.put(final_results)
 
-	# Cleanup
+	# Cleanup.  Keep the engine alive until its worker threads stop, then drop
+	# the storage mapping only after all non-owning references are gone.
+	_shutdown_worker_runtime(worker)
 	dist.destroy_process_group()

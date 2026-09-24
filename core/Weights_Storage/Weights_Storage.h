@@ -92,9 +92,15 @@ class Weights_Storage {
     std::shared_ptr<spdlog::logger> logger;
 
     std::string shm_name;
-    void* weight_ptr_;
-    int64_t byte_size_;
-    
+    // Only the ordinary Init() path owns this mapping; the distributed path
+    // leaves it null so the destructor cannot release a mapping it never made.
+    void* weight_ptr_ = nullptr;
+    int64_t byte_size_ = 0;
+    // Bytes actually mapped by allocate_shared_pinned_memory, which rounds up
+    // to a huge page. munmap on hugetlbfs rejects a non-aligned length, so the
+    // release must use this, not byte_size_.
+    int64_t mapped_size_ = 0;
+
     /* "attn_0" -> "o_proj" -> ptr */
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_buffer>>

@@ -455,23 +455,43 @@ class WorkerManager:
                     if proc.exitcode is None:
                         pidfds.append((proc, os.pidfd_open(proc.pid)))
 
-                for _, pidfd in pidfds:
-                    try:
-                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                # Let an idle worker leave its main loop normally first.  This
+                # gives its C++ storage objects a chance to release CUDA
+                # registrations and mappings before the signal fallback uses
+                # os._exit().  Workers blocked in NCCL or otherwise unable to
+                # consume the sentinel still follow the existing pidfd path.
+                sentinel_sent = False
                 try:
                     self.request_queue.put(None)
+                    sentinel_sent = True
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + (1.0 if sentinel_sent else 0.0)
                 for proc in processes:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
 
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
+                for _, pidfd in remaining:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+                deadline = time.monotonic() + 5
+                for proc, _ in remaining:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                # A child may finish during the SIGTERM grace period. Reap
+                # only handles that are still live; sending SIGKILL to a
+                # child that already exited obscures the shutdown result and
+                # breaks fake-pidfd tests.
+                remaining = [
+                    (proc, fd) for proc, fd in remaining if proc.exitcode is None
+                ]
+
                 logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker SIGTERM grace elapsed=%.3fs remaining=%d",
                     time.monotonic() - stop_start,
