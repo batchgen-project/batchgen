@@ -206,3 +206,38 @@ class GLM51Tokenizer(GLM5Tokenizer):
                 f"Ensure chat_template_5_1.jinja is bundled with the GLM-5 package."
             )
         super().__init__()
+
+
+@register_tokenizer("glm_moe_dsa_5_2")
+class GLM52Tokenizer(GLM5Tokenizer):
+    """GLM-5.2 tokenizer — shares the GLM-5 vocab and stop tokens but ships its
+    own Jinja chat template.
+
+    Verified against the released checkpoint (zai-org/GLM-5.2-FP8):
+    ``tokenizer.json`` is byte-identical to GLM-5's (md5 752f6cd2…) and
+    ``generation_config.json`` carries the same eos/pad ids
+    ([154820, 154827, 154829] / 154820), so only the template differs
+    (md5 42994f78… vs GLM-5's 361dc1be…).
+
+    The template difference is NOT cosmetic. GLM-5.2 prepends
+    ``<|system|>Reasoning Effort: Max`` whenever thinking is enabled — a
+    directive the model was trained with — and adds the tool_to_json macro
+    (filtering defer_loading/strict) plus a multi-modal reminder branch.
+    Until this class existed, the unregistered ``glm_moe_dsa_5_2`` type fell
+    through to GLM-5's template, so every GLM-5.2 prompt was rendered without
+    the reasoning-effort directive, i.e. off the distribution the model was
+    aligned on.
+    """
+
+    CHAT_TEMPLATE_FILENAME = "chat_template_5_2.jinja"
+
+    def __init__(self):
+        # Fail loud at boot rather than silently falling back to GLM-5's
+        # template, which is what this class exists to stop.
+        template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"GLM-5.2 chat template not found at {template_path}. "
+                f"Ensure chat_template_5_2.jinja is bundled with the GLM-5 package."
+            )
+        super().__init__()
