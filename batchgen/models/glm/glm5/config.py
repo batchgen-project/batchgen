@@ -503,6 +503,19 @@ class GLM52Config(GLM5Config):
         return cls(**kwargs)
 
 
+@register_config("glm_moe_dsa_5_3")
+@dataclass
+class GLM53Config(GLM52Config):
+    """GLM-5.3 FP8 configuration.
+
+    The released 5.3 config has the same model geometry and DSA schedule as
+    GLM-5.2. It keeps a distinct identity so routing and chat semantics cannot
+    silently fall through to an older GLM variant.
+    """
+
+    model_type: str = "glm_moe_dsa_5_3"
+
+
 # ---------------------------------------------------------------------------- #
 #  DSA indexer top-k reuse schedule                                            #
 # ---------------------------------------------------------------------------- #
@@ -549,5 +562,4 @@ def assert_indexer_schedule_consistent(config) -> None:
             f"(index_topk_freq={getattr(config, 'index_topk_freq', None)}, "
             f"index_skip_topk_offset={getattr(config, 'index_skip_topk_offset', None)})"
         )
-
 
