@@ -42,6 +42,11 @@ from batchgen.utils import config_torch_module_initializer
 logger = logging.getLogger(__name__)
 
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
+# A sentinel reaches the worker's ordered C++/Python teardown path.  That path
+# must be allowed to finish before the signal fallback can invoke os._exit and
+# skip the destructors it exists to run.  The bound still keeps a blocked
+# worker from holding server shutdown indefinitely.
+_WORKER_SENTINEL_GRACE_S = 20.0
 
 
 def _resolve_local_world_size(
@@ -467,7 +472,9 @@ class WorkerManager:
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-                deadline = time.monotonic() + (1.0 if sentinel_sent else 0.0)
+                deadline = time.monotonic() + (
+                    _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
+                )
                 for proc in processes:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
 
