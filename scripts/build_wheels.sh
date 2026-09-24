@@ -38,7 +38,14 @@ fail()    { echo -e "${RED}[FAIL]${NC} $1"; exit 1; }
 # ── Pinned versions (must match install_deps.sh / Dockerfile) ──
 FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-DEEPGEMM_VERSION="v2.1.1.post3"
+# DeepGEMM: sgl-project fork, built through its supported build_sgl_deep_gemm.sh
+# (needs apache-tvm-ffi first). Publishes the `sgl-deep-gemm` distribution.
+DEEPGEMM_REPO_URL="https://github.com/sgl-project/DeepGEMM.git"
+DEEPGEMM_SRC_DIR="DeepGEMM-sgl"
+DEEPGEMM_VERSION="v0.1.5.post3"
+TVM_FFI_VERSION="0.1.11"
+WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # ── Build target arch (sm90a default / sm100 / all) ──
 # Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
@@ -118,6 +125,36 @@ clone_or_update() {
     git submodule update --init --recursive 2>/dev/null || warn "Submodule update failed, may need manual fix"
 }
 
+# ── Helper: locate the wheel built by build_sgl_deep_gemm.sh ──
+# Exactly one must match, otherwise we fail instead of guessing. A py3-none-any
+# wheel is retagged as Linux/x86_64. A manylinux tag requires a separate ABI
+# audit against the claimed glibc baseline.
+find_deepgemm_wheel() {
+    local repo="$1" found count whl
+    found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
+    count="$(printf '%s' "$found" | grep -c . || true)"
+    if [[ "$count" != "1" ]]; then
+        echo -e "${RED}[FAIL]${NC} expected exactly 1 sgl_deep_gemm wheel under $repo, found $count" >&2
+        return 1
+    fi
+    whl="$found"
+    if [[ "$whl" == *-py3-none-any.whl ]]; then
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo -e "${RED}[FAIL]${NC} DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
+    fi
+    printf '%s\n' "$whl"
+}
+
+clean_deepgemm_wheels() {
+    local repo="$1"
+    [[ -d "$repo/dist" ]] || return 0
+    find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' -delete
+}
+
 # ── Build flash-attention 3 ──
 if [[ $ONLY_KERNELS -eq 0 && $SKIP_FLASH_ATTN -eq 0 ]]; then
     step "Building flash-attention 3 wheel ($FLASH_ATTN_VERSION)..."
@@ -148,12 +185,23 @@ fi
 # ── Build DeepGEMM ──
 if [[ $ONLY_KERNELS -eq 0 && $SKIP_DEEPGEMM -eq 0 ]]; then
     step "Building DeepGEMM wheel ($DEEPGEMM_VERSION)..."
-    clone_or_update "DeepGEMM" \
-        "https://github.com/deepseek-ai/DeepGEMM.git" \
+    clone_or_update "$DEEPGEMM_SRC_DIR" \
+        "$DEEPGEMM_REPO_URL" \
         "$DEEPGEMM_VERSION"
-    cd "$DEPS_DIR/DeepGEMM"
-    pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
-    ok "DeepGEMM wheel built"
+    cd "$DEPS_DIR/$DEEPGEMM_SRC_DIR"
+    pip install "apache-tvm-ffi==${TVM_FFI_VERSION}" "wheel==${WHEEL_VERSION}"
+    clean_deepgemm_wheels "$PWD"
+    bash ./build_sgl_deep_gemm.sh
+    DEEPGEMM_WHEEL="$(find_deepgemm_wheel "$DEPS_DIR/$DEEPGEMM_SRC_DIR")" \
+        || fail "Could not locate the built DeepGEMM wheel"
+    find "$OUTPUT_DIR" -maxdepth 1 -type f \
+        \( -name 'sgl_deep_gemm-*.whl' -o -name 'apache_tvm_ffi-*.whl' \) \
+        -delete
+    cp "$DEEPGEMM_WHEEL" "$OUTPUT_DIR/"
+    pip download --only-binary=:all: --no-deps \
+        "apache-tvm-ffi==${TVM_FFI_VERSION}" \
+        --dest "$OUTPUT_DIR"
+    ok "DeepGEMM wheel built: $(basename "$DEEPGEMM_WHEEL")"
 else
     warn "Skipping DeepGEMM"
 fi

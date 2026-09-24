@@ -26,7 +26,18 @@ NC='\033[0m' # No Color
 # Configuration - pinned versions for reproducibility
 FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-DEEPGEMM_VERSION="v2.1.1.post3"
+# DeepGEMM comes from the sgl-project fork, which ships the supported
+# build_sgl_deep_gemm.sh path and the fp8_mqa_logits(max_seqlen_k=...) runtime
+# contract BatchGen calls. It publishes the `sgl-deep-gemm` distribution while
+# still importing as `deep_gemm`. Its build needs apache-tvm-ffi present first.
+DEEPGEMM_REPO_URL="https://github.com/sgl-project/DeepGEMM.git"
+DEEPGEMM_SRC_DIR="DeepGEMM-sgl"
+DEEPGEMM_VERSION="v0.1.5.post3"
+DEEPGEMM_DIST="sgl-deep-gemm"
+DEEPGEMM_DIST_VERSION="0.1.5.post3"
+TVM_FFI_VERSION="0.1.11"
+WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # Build target architecture for batchgen_kernels and FlashMLA.
 #   sm90a (default) -> Hopper; FlashMLA SM100 kernels are disabled.
@@ -262,14 +273,19 @@ install_flash_attention() {
         git checkout "$FLASH_ATTN_VERSION"
     else
         print_step "Cloning flash-attention repository..."
-        git clone --recursive https://github.com/Dao-AILab/flash-attention.git
+        # Hopper setup initializes its CUTLASS submodule itself. Clone the
+        # pinned tag directly so we do not download unrelated ROCm submodules
+        # from the repository's default branch first.
+        git clone --branch "$FLASH_ATTN_VERSION" --single-branch --depth 1 \
+            https://github.com/Dao-AILab/flash-attention.git
         cd flash-attention
-        git checkout "$FLASH_ATTN_VERSION"
     fi
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    FLASH_ATTENTION_DISABLE_SM80=TRUE \
+        pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }
@@ -304,34 +320,110 @@ install_flashmla() {
     print_success "FlashMLA installed"
 }
 
-install_deepgemm() {
-    print_step "Installing DeepGEMM..."
+# The DeepGEMM runtime contract: the pinned `sgl-deep-gemm` distribution AND the
+# fp8_mqa_logits signature BatchGen calls. An `import deep_gemm` alone is not
+# enough — the upstream deepseek-ai package imports under the same name but has
+# no max_seqlen_k parameter, so it must not satisfy the skip gate.
+deepgemm_contract_ok() {
+    DG_DIST="$DEEPGEMM_DIST" DG_VERSION="$DEEPGEMM_DIST_VERSION" python - <<'PY' &> /dev/null
+import inspect
+import os
+from importlib.metadata import version
 
-    # Check if already installed
-    if python -c "import deep_gemm" &> /dev/null 2>&1; then
-        print_success "DeepGEMM already installed"
+import deep_gemm
+
+assert version(os.environ["DG_DIST"]) == os.environ["DG_VERSION"]
+assert "max_seqlen_k" in inspect.signature(deep_gemm.fp8_mqa_logits).parameters
+PY
+}
+
+# Locate the wheel produced by build_sgl_deep_gemm.sh under a DeepGEMM checkout.
+# Exactly one must match, otherwise the caller fails instead of guessing. A
+# py3-none-any wheel is retagged as Linux/x86_64 before installation. Do not
+# claim a manylinux baseline here: the actual glibc floor depends on the build
+# image and must be checked separately before publishing a manylinux tag.
+find_deepgemm_wheel() {
+    local repo="$1" found count whl
+    found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
+    count="$(printf '%s' "$found" | grep -c . || true)"
+    if [[ "$count" != "1" ]]; then
+        print_error "expected exactly 1 sgl_deep_gemm wheel under $repo, found $count" >&2
+        return 1
+    fi
+    whl="$found"
+    if [[ "$whl" == *-py3-none-any.whl ]]; then
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            print_error "DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
+    fi
+    printf '%s\n' "$whl"
+}
+
+clean_deepgemm_wheels() {
+    local repo="$1"
+    [[ -d "$repo/dist" ]] || return 0
+    find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' -delete
+}
+
+remove_upstream_deepgemm() {
+    if python -c 'from importlib.metadata import version; version("deep-gemm")' &>/dev/null; then
+        print_step "Removing incompatible upstream deep-gemm distribution..."
+        pip uninstall -y deep-gemm
+        # Both distributions own the same import package. If a previous
+        # partial upgrade left both metadata records behind, uninstalling the
+        # upstream RECORD may remove files from the SGL package too. Remove its
+        # metadata as well so the following install cannot be skipped as
+        # already satisfied.
+        if python -c 'from importlib.metadata import version; version("sgl-deep-gemm")' &>/dev/null; then
+            pip uninstall -y sgl-deep-gemm
+        fi
+    fi
+}
+
+install_deepgemm() {
+    print_step "Installing DeepGEMM (${DEEPGEMM_DIST} ${DEEPGEMM_VERSION})..."
+
+    # Check if already installed (distribution + runtime signature)
+    if deepgemm_contract_ok; then
+        print_success "DeepGEMM already installed (${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION})"
         return 0
     fi
 
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    if [[ -d "DeepGEMM" ]]; then
+    if [[ -d "$DEEPGEMM_SRC_DIR" ]]; then
         print_step "Updating existing DeepGEMM repository..."
-        cd DeepGEMM
-        git fetch origin
+        cd "$DEEPGEMM_SRC_DIR"
+        git fetch origin --tags
         git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     else
-        print_step "Cloning DeepGEMM repository..."
-        git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
-        cd DeepGEMM
+        print_step "Cloning DeepGEMM repository ($DEEPGEMM_REPO_URL)..."
+        git clone --recursive "$DEEPGEMM_REPO_URL" "$DEEPGEMM_SRC_DIR"
+        cd "$DEEPGEMM_SRC_DIR"
         git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     fi
 
     print_step "Building DeepGEMM (this may take 5-10 minutes)..."
-    pip install . --no-build-isolation
+    pip install "apache-tvm-ffi==${TVM_FFI_VERSION}" "wheel==${WHEEL_VERSION}"
+    clean_deepgemm_wheels "$PWD"
+    bash ./build_sgl_deep_gemm.sh
+
+    local dg_wheel
+    dg_wheel="$(find_deepgemm_wheel "$PWD")" || exit 1
+    remove_upstream_deepgemm
+    pip install "$dg_wheel"
+
+    if ! deepgemm_contract_ok; then
+        print_error "DeepGEMM installed but the runtime contract failed"
+        print_error "  (expected ${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION} with fp8_mqa_logits(max_seqlen_k=...))"
+        exit 1
+    fi
 
     print_success "DeepGEMM installed"
 }
@@ -360,7 +452,7 @@ install_batchgen() {
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install .
+        pip install . --no-build-isolation
         print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
@@ -382,14 +474,15 @@ cleanup() {
 # Hopper fast path: stage matching pre-built wheels (flash-attn 3, FlashMLA,
 # DeepGEMM, batchgen_kernels) from the public GitHub release into a local dir so
 # the caller installs them instead of compiling (~2 min vs ~40-60 min). All four
-# must be present for this Python/GPU-arch; otherwise WHEEL_DIR is left empty and
+# plus the apache-tvm-ffi runtime wheel must be present for this Python/GPU-arch;
+# otherwise WHEEL_DIR is left empty and
 # the caller falls back to building from source. Never fatal.
 try_download_wheels() {
     [[ -n "$WHEEL_DIR" ]] && return 0          # explicit local --wheel-dir wins
     [[ $FROM_SOURCE -eq 1 ]] && return 0        # user forced a source build
     command -v curl &>/dev/null || { print_warning "curl not found; building from source."; return 0; }
 
-    local pytag api urls tmp w
+    local pytag api assets tmp w
     pytag="cp$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo cp311)"
     if [[ -n "$RELEASE_TAG" ]]; then
         api="https://api.github.com/repos/${BATCHGEN_REPO}/releases/tags/${RELEASE_TAG}"
@@ -398,15 +491,15 @@ try_download_wheels() {
     fi
     print_step "Looking for pre-built Hopper wheels on ${BATCHGEN_REPO} (${RELEASE_TAG:-latest}, ${pytag}/${BUILD_ARCH})..."
 
-    # Select matching asset download URLs (python-ABI + GPU-arch aware).
-    urls="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
+    # Select matching asset names and download URLs (python-ABI + GPU-arch aware).
+    assets="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
 import sys, os, json
 pytag = os.environ["PYTAG"]; arch = os.environ["WANT_ARCH"]
 try:
     assets = json.load(sys.stdin).get("assets", [])
 except Exception:
     sys.exit(0)
-want = ("flash_attn", "flash_mla", "deep_gemm", "batchgen_kernels")
+want = ("flash_attn_3", "flash_mla", "sgl_deep_gemm", "apache_tvm_ffi", "batchgen_kernels")
 for a in assets:
     n = a.get("name", "")
     if not n.endswith(".whl") or not any(n.startswith(w) for w in want):
@@ -417,12 +510,12 @@ for a in assets:
         continue                                    # GPU-arch mismatch
     u = a.get("browser_download_url", "")
     if u:
-        print(u)
+        print(f"{n}\t{u}")
 ' || true)"
 
-    # Require all four deps; otherwise fall back to a full source build.
-    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
-        if ! printf '%s\n' "$urls" | grep -q "/${w}"; then
+    # Require all five wheels; otherwise fall back to a full source build.
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
+        if ! printf '%s\n' "$assets" | grep -q "^${w}.*\\.whl[[:space:]]"; then
             print_warning "no pre-built '${w}' wheel for this env (${pytag}/${BUILD_ARCH}) — building from source."
             return 0
         fi
@@ -430,12 +523,12 @@ for a in assets:
 
     tmp="$INSTALL_DIR/prebuilt_wheels"          # under INSTALL_DIR so cleanup() removes it
     rm -rf "$tmp"; mkdir -p "$tmp"
-    ( cd "$tmp" && printf '%s\n' "$urls" | while read -r u; do
-        [[ -n "$u" ]] && { curl -fsSL -O "$u" || print_warning "download failed: $u"; }
+    ( cd "$tmp" && printf '%s\n' "$assets" | while IFS=$'\t' read -r n u; do
+        [[ -n "$u" ]] && { curl -fsSL -o "$n" "$u" || print_warning "download failed: $u"; }
       done )
 
     # Accept only a COMPLETE set; a partial download falls back to source.
-    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
         if ! ls "$tmp/${w}"*.whl &>/dev/null 2>&1; then
             print_warning "incomplete wheel set (missing ${w}); building from source."
             rm -rf "$tmp"
@@ -594,10 +687,19 @@ main() {
             try_download_wheels   # populate WHEEL_DIR from the public release; else source-build below
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
-                pip install --find-links "$WHEEL_DIR" --no-index \
-                    flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
-                    pip install "$WHEEL_DIR"/*.whl
-                print_success "Hopper dependencies installed from wheels"
+                remove_upstream_deepgemm
+                if ! pip install --find-links "$WHEEL_DIR" --no-index \
+                    flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
+                    "apache-tvm-ffi==${TVM_FFI_VERSION}"; then
+                    print_warning "pre-built wheel installation failed; validating each dependency and source-building only what is missing"
+                fi
+                # Validate the runtime interfaces rather than trusting wheel
+                # metadata. Each installer skips a dependency that imports and
+                # source-builds only a missing or incorrectly packaged one.
+                install_flash_attention
+                install_flashmla
+                install_deepgemm
+                print_success "Hopper dependencies installed and verified"
             else
                 install_flash_attention
                 install_flashmla
@@ -611,6 +713,7 @@ main() {
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Blackwell dependencies from pre-built wheels: $WHEEL_DIR"
+                remove_upstream_deepgemm
                 for whl in "$WHEEL_DIR"/*.whl; do
                     [[ -f "$whl" ]] || continue
                     pip install "$whl" --no-deps \
@@ -619,6 +722,7 @@ main() {
                 # FA4 runtime deps (pure-Python, not in wheel cache)
                 pip install "nvidia-cutlass-dsl>=4.4.2" quack-kernels torch-c-dlpack-ext cuda-python \
                     --extra-index-url https://pypi.nvidia.com -q
+                install_deepgemm
                 print_success "Blackwell dependencies installed from wheels"
             else
                 install_flash_attention_4
