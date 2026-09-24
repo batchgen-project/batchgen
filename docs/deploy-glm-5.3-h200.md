@@ -21,16 +21,13 @@ filesystem during startup.
 ```bash
 huggingface-cli download zai-org/GLM-5.3 \
     --local-dir /persistent/models/GLM-5.3-FP8
-
-# The local destination must have enough space for the source and converted
-# checkpoint. Keep the .partial directory private to the current staging run.
-python -m batchgen.tools.validate_checkpoint \
-    --input-dir /persistent/models/GLM-5.3-FP8
 ```
 
 The downloaded directory must contain `config.json`, tokenizer files,
 `model.safetensors.index.json`, and all referenced shards. Do not substitute a
-GLM-5.3-Flash or BF16 checkpoint for this guide.
+GLM-5.3-Flash or BF16 checkpoint for this guide. The local destination must
+have enough space for the source and converted checkpoint; keep any `.partial`
+directory private to the current staging run.
 
 ## 2. Convert to BatchGen format
 
