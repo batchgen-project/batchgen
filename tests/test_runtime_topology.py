@@ -112,7 +112,12 @@ def _worker_manager_method(name: str, globals_=None):
         ],
         type_ignores=[],
     )
-    namespace = {"logging": logging, "time": time, **(globals_ or {})}
+    namespace = {
+        "logging": logging,
+        "time": time,
+        "_WORKER_SENTINEL_GRACE_S": 20.0,
+        **(globals_ or {}),
+    }
     exec(
         compile(ast.fix_missing_locations(module), str(WORKER_MANAGER), "exec"),
         namespace,
