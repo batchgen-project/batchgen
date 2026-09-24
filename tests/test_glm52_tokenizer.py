@@ -75,11 +75,13 @@ def test_glm53_chat_template_matches_released_bytes():
     )
 
 
-def test_glm53_routes_to_dedicated_template_and_supports_loop_controls():
-    registry, tokenizer_module = _bootstrap_glm52_tokenizer()
+def test_glm53_tokenizer_uses_dedicated_template_and_supports_loop_controls():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
 
-    tokenizer = registry.load_tokenizer("zai-org/GLM-5.3-FP8")
-    assert isinstance(tokenizer, tokenizer_module.GLM53Tokenizer)
+    # The shared identifier-to-tokenizer registry is tested in the core PR;
+    # this model-scoped test exercises the model implementation directly so
+    # the model PR remains independently valid against main.
+    tokenizer = tokenizer_module.GLM53Tokenizer()
     assert tokenizer.CHAT_TEMPLATE_FILENAME == "chat_template_5_3.jinja"
     for effort, label in (("low", "Low"), ("high", "High"), ("max", "Max")):
         rendered = tokenizer.apply_chat_template(
