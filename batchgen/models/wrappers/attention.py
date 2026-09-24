@@ -173,14 +173,6 @@ class AttnWrapperBase(BaseModuleWrapper):
         )
 
     @classmethod
-    def _prefill_offload_sync_device(cls, device: Optional[torch.device]) -> None:
-        if device is None or not torch.cuda.is_available():
-            return
-        sync_device = device if isinstance(device, torch.device) else torch.device(device)
-        if sync_device.type == "cuda":
-            torch.cuda.synchronize(sync_device)
-
-    @classmethod
     def retire_pending_prefill_offloads(
         cls,
         *,
@@ -197,7 +189,10 @@ class AttnWrapperBase(BaseModuleWrapper):
         for task in pending:
             task.wait()
         pending.clear()
-        cls._prefill_offload_sync_device(device)
+        # KVAsyncTask completes only after the dedicated D2H stream records and
+        # synchronizes its completion event.  Waiting every task therefore
+        # proves both producer ordering and copy completion; a device-wide
+        # synchronization here only drains unrelated work.
         pinned.clear()
 
         layer_idx = cls.pending_prefill_offload_layer_idx
