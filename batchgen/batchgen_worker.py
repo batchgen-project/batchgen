@@ -1,5 +1,6 @@
 import concurrent.futures
 import copy
+import ctypes
 import functools
 import json
 import psutil
@@ -39,6 +40,12 @@ from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
+_TOKENIZER_TRIM_TOKENS_PER_RANK = 1 << 20
+# Admissions assigning this many prompt characters to any rank tokenize one
+# rank at a time, so tokenizer host-memory peaks do not land simultaneously.
+# 4M chars/rank sits below the roughly 4.8M chars/rank measured in both the
+# 32x256K and 8x1M repro; it is not a universal character/token conversion.
+_TOKENIZER_SERIALIZE_CHARS_PER_RANK = 4_000_000
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
@@ -65,6 +72,32 @@ def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
 		if is_repeat:
 			return True
 	return False
+
+def _malloc_trim() -> None:
+	"""Return this process's freed heap arenas to the OS (glibc, best effort).
+
+	Platforms without glibc's malloc_trim silently no-op.
+	"""
+	try:
+		malloc_trim = ctypes.CDLL(None).malloc_trim
+		malloc_trim.argtypes = [ctypes.c_size_t]
+		malloc_trim.restype = ctypes.c_int
+		malloc_trim(0)
+	except (AttributeError, OSError, TypeError):
+		pass
+
+def _release_tokenizer_arenas(total_prompt_tokens: int, world_size: int) -> None:
+	"""Return the tokenizer's freed heap arenas to the OS (glibc, best effort).
+
+	A measured 1,048,576-token per-rank workload left about 480 MiB of
+	freed-but-resident RssAnon after one admission and 694 MiB after a second;
+	malloc_trim(0) returned about 619 MiB. Skip smaller admissions because
+	malloc_trim walks every process arena.
+	"""
+	if total_prompt_tokens < world_size * _TOKENIZER_TRIM_TOKENS_PER_RANK:
+		return
+	_malloc_trim()
+
 from tqdm import trange
 import gc
 import numpy as np
@@ -1407,6 +1440,18 @@ class BatchGenWorker:
 		# Step 2: Tokenize new sequences (all ranks, parallel)
 		self._tokenize_admitted_sequences(new_uuids)
 
+		# The tokenizer's temporary payloads are dead only once that call has
+		# returned, so trim here — before any later admission work grows RSS
+		# again on top of arenas this admission already freed.
+		_release_tokenizer_arenas(
+			total_prompt_tokens=sum(
+				seq.prompt_length
+				for uuid in new_uuids
+				if (seq := self.global_batch.get_sequence(uuid)) is not None
+			),
+			world_size=self.world_size,
+		)
+
 		# Step 2.5: Update max_input_length from admitted sequences
 		# This is critical — engine config uses max_input_length for attention mask shape
 		max_prompt = max(
@@ -1455,49 +1500,106 @@ class BatchGenWorker:
 		Optimization: uses padding=False to avoid creating a large padded 2D
 		tensor on CPU. The tokenizer returns List[List[int]] directly, which
 		is lighter than a [N, max_len] padded tensor + attention_mask.
+
+		Before the object collective, compact each prompt's ``List[int]`` into
+		a contiguous CPU int64 tensor. This bounds the gathered token payload by
+		the token count instead of replicating boxed Python integers on every rank.
+
+		Very large admissions tokenize one rank at a time and broadcast instead,
+		so only one rank per node holds a tokenizer host-memory peak at a time.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
 		all_texts = [seq.text for seq in sequences]
 		num_new = len(all_texts)
 
-		# Phase 1: Parallel tokenization across ranks (same as _tokenize_global_batch)
-		my_indices = list(range(self.rank, num_new, self.world_size))
-		my_texts = [all_texts[i] for i in my_indices]
-
-		if my_texts:
+		def tokenize_indices(indices):
+			"""Tokenize all_texts[indices] into compact CPU int64 payload items."""
+			if not indices:
+				return []
+			texts = [all_texts[i] for i in indices]
 			# padding=False + return_tensors=None: returns List[List[int]]
 			# directly — no padded 2D tensor, no attention_mask overhead.
 			# Must pass return_tensors=None explicitly because model-specific
 			# tokenizers (e.g., Kimi K2.5) default to "pt" which crashes on
 			# ragged lists.
-			my_batch_tokenized = self.tokenizer(
-				my_texts,
+			batch_tokenized = self.tokenizer(
+				texts,
 				return_tensors=None,
 				truncation=False,
 				padding=False,
 				return_attention_mask=False,
 			)
-			my_tokenized = [
-				{
-					"idx": my_indices[i],
-					"input_ids": my_batch_tokenized["input_ids"][i],
-					"length": len(my_batch_tokenized["input_ids"][i]),
-				}
-				for i in range(len(my_texts))
-			]
-		else:
-			my_tokenized = []
+			# Compact to contiguous CPU int64 tensors and drop each raw Python
+			# list as soon as it is copied, so the boxed-int representation is
+			# never alive alongside the gathered payload. `list(...)` takes our
+			# own pointer array so clearing entries cannot mutate a tokenizer
+			# container that only exposes an immutable sequence.
+			raw_input_ids = list(batch_tokenized["input_ids"])
+			del batch_tokenized
+			tokenized = []
+			for i in range(len(texts)):
+				token_ids = raw_input_ids[i]
+				raw_input_ids[i] = None
+				tokenized.append({
+					"idx": indices[i],
+					"input_ids": torch.tensor(
+						token_ids, dtype=torch.int64, device="cpu"
+					),
+					"length": len(token_ids),
+				})
+				del token_ids
+			del raw_input_ids
+			return tokenized
 
-		# Phase 1.5: Gather across ranks
-		all_tokenized_lists = [None] * self.world_size
-		dist.all_gather_object(all_tokenized_lists, my_tokenized)
-
+		# Phase 1: tokenize across ranks. all_texts is identical on every rank,
+		# so this gate picks the same path everywhere without an extra collective.
+		total_chars = sum(len(text) for text in all_texts)
+		max_rank_chars = max(
+			(
+				sum(len(all_texts[i]) for i in range(rank, num_new, self.world_size))
+				for rank in range(min(self.world_size, num_new))
+			),
+			default=0,
+		)
 		tokenized_by_idx = {}
-		for rank_results in all_tokenized_lists:
-			if rank_results:
-				for item in rank_results:
+
+		if max_rank_chars >= _TOKENIZER_SERIALIZE_CHARS_PER_RANK:
+			if self.rank == 0:
+				logging.info(
+					f"[ADMIT] Serialized tokenization: {num_new} sequences, "
+					f"{total_chars} total prompt chars, max rank assignment "
+					f"{max_rank_chars} >= {_TOKENIZER_SERIALIZE_CHARS_PER_RANK}"
+				)
+			# Ranks at or above num_new own no strided index, so stop there.
+			for source in range(min(self.world_size, num_new)):
+				payload = [
+					tokenize_indices(list(range(source, num_new, self.world_size)))
+					if self.rank == source
+					else None
+				]
+				if self.rank == source:
+					# Hand the arenas this rank just freed back to the OS before
+					# releasing this turn's broadcast barrier. The compact tensor
+					# payload remains live and is not affected by malloc_trim.
+					_malloc_trim()
+				dist.broadcast_object_list(payload, src=source)
+				for item in payload[0]:
 					tokenized_by_idx[item["idx"]] = item
-		del all_tokenized_lists
+				del payload
+		else:
+			my_tokenized = tokenize_indices(
+				list(range(self.rank, num_new, self.world_size))
+			)
+
+			# Phase 1.5: Gather across ranks
+			all_tokenized_lists = [None] * self.world_size
+			dist.all_gather_object(all_tokenized_lists, my_tokenized)
+
+			for rank_results in all_tokenized_lists:
+				if rank_results:
+					for item in rank_results:
+						tokenized_by_idx[item["idx"]] = item
+			del all_tokenized_lists
 
 		# Phase 2.5: Reject sequences exceeding context length
 		rejected_uuids = []
@@ -1534,7 +1636,7 @@ class BatchGenWorker:
 
 		# Phase 2.75: size the pool for what this admission actually needs.
 		# COLLECTIVE — every rank runs it with the same numbers: the admission
-		# message was broadcast and the tokenized lengths were all-gathered above.
+		# message was broadcast and the tokenized lengths were shared above.
 		required_input_width = 0
 		required_decode_width = 0
 		for i, seq in enumerate(sequences):
@@ -1568,7 +1670,7 @@ class BatchGenWorker:
 			if seq.uuid in rejected_uuids:
 				continue
 			item = tokenized_by_idx[i]
-			input_ids_list = item["input_ids"]
+			input_ids_tensor = item["input_ids"]
 			actual_prompt_len = item["length"]
 
 			seq_extended_size = min(
@@ -1579,7 +1681,9 @@ class BatchGenWorker:
 			slot = self._buffer_pool.allocate_slot()
 			try:
 				input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-				input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+				# Direct copy out of the gathered tensor — no intermediate
+				# per-sequence allocation.
+				input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)
 				seq.input_ids = input_ids_view
 				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			except Exception:
