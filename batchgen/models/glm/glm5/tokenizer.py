@@ -90,10 +90,17 @@ class GLM5Tokenizer(FastTokenizer):
         # behavior — prevents extra whitespace tokens (e.g. token 8942 between
         # <sop> and <|system|>) that diverge from training.
         if self.chat_template:
-            from jinja2 import Template
-            self._jinja_template = Template(
-                self.chat_template, trim_blocks=True, lstrip_blocks=True
-            )
+            # GLM-5.3's official template uses ``{% break %}`` in its tool
+            # ordering guards. Enable loop controls for every GLM template;
+            # this is backwards-compatible with the older templates and keeps
+            # compilation behavior identical apart from the newly supported
+            # control tag.
+            from jinja2 import Environment
+            self._jinja_template = Environment(
+                extensions=["jinja2.ext.loopcontrols"],
+                trim_blocks=True,
+                lstrip_blocks=True,
+            ).from_string(self.chat_template)
         else:
             self._jinja_template = None
 
@@ -134,6 +141,7 @@ class GLM5Tokenizer(FastTokenizer):
     # ---- Output parsing ----
 
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _THINK_CLOSE = "</think>"
     _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
     _ARG_RE = re.compile(
         r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL
@@ -141,11 +149,23 @@ class GLM5Tokenizer(FastTokenizer):
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
         m = self._THINK_RE.search(text)
-        if not m:
-            return None, text
-        reasoning = m.group(1).strip()
-        visible = self._THINK_RE.sub("", text, count=1).strip()
-        return reasoning, visible
+        if m:
+            reasoning = m.group(1).strip()
+            visible = self._THINK_RE.sub("", text, count=1).strip()
+            return reasoning, visible
+
+        # GLM-5.3's chat template primes the assistant turn with ``<think>``.
+        # The generated completion therefore starts directly with reasoning and
+        # emits only the closing marker.  Treat that marker as the boundary so
+        # parse-thinking still fills reasoning_content and keeps the answer in
+        # message.content.
+        close = text.find(self._THINK_CLOSE)
+        if close >= 0:
+            reasoning = text[:close].strip()
+            visible = text[close + len(self._THINK_CLOSE):].strip()
+            return reasoning or None, visible
+
+        return None, text
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
         matches = self._TOOL_CALL_RE.findall(text)
@@ -239,5 +259,27 @@ class GLM52Tokenizer(GLM5Tokenizer):
             raise FileNotFoundError(
                 f"GLM-5.2 chat template not found at {template_path}. "
                 f"Ensure chat_template_5_2.jinja is bundled with the GLM-5 package."
+            )
+        super().__init__()
+
+
+@register_tokenizer("glm_moe_dsa_5_3")
+class GLM53Tokenizer(GLM5Tokenizer):
+    """GLM-5.3 tokenizer with its released chat/tool template.
+
+    Vocab and stop-token assets are byte-identical to GLM-5.2, but the chat
+    template adds low/high/max reasoning effort and robust tool-result
+    ordering. Keep this as a distinct registry identity so a future template
+    change cannot silently alter GLM-5.2 behavior.
+    """
+
+    CHAT_TEMPLATE_FILENAME = "chat_template_5_3.jinja"
+
+    def __init__(self):
+        template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"GLM-5.3 chat template not found at {template_path}. "
+                "Ensure chat_template_5_3.jinja is bundled with the GLM-5 package."
             )
         super().__init__()

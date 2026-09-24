@@ -12,6 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GLM5_DIR = REPO_ROOT / "batchgen" / "models" / "glm" / "glm5"
 TEMPLATE_PATH = GLM5_DIR / "chat_template_5_2.jinja"
+GLM53_TEMPLATE_PATH = GLM5_DIR / "chat_template_5_3.jinja"
 
 
 def _namespace(name: str, path: Path | None = None):
@@ -68,6 +69,29 @@ def test_glm52_chat_template_matches_released_bytes():
     )
 
 
+def test_glm53_chat_template_matches_released_bytes():
+    assert hashlib.sha256(GLM53_TEMPLATE_PATH.read_bytes()).hexdigest() == (
+        "3740abcea51c45830cb3ca562084ad5fb2ef53589376f73332e9886f93ade41c"
+    )
+
+
+def test_glm53_routes_to_dedicated_template_and_supports_loop_controls():
+    registry, tokenizer_module = _bootstrap_glm52_tokenizer()
+
+    tokenizer = registry.load_tokenizer("zai-org/GLM-5.3-FP8")
+    assert isinstance(tokenizer, tokenizer_module.GLM53Tokenizer)
+    assert tokenizer.CHAT_TEMPLATE_FILENAME == "chat_template_5_3.jinja"
+    for effort, label in (("low", "Low"), ("high", "High"), ("max", "Max")):
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            tokenize=False,
+            add_generation_prompt=True,
+            reasoning_effort=effort,
+        )
+        assert f"<|system|>Reasoning Effort: {label}" in rendered
+        assert rendered.endswith("<|assistant|><think>")
+
+
 def test_glm52_routes_to_dedicated_template_and_renders_reasoning_directive():
     registry, tokenizer_module = _bootstrap_glm52_tokenizer()
 
@@ -84,3 +108,26 @@ def test_glm52_routes_to_dedicated_template_and_renders_reasoning_directive():
         "[gMASK]<sop><|system|>Reasoning Effort: Max"
         "<|user|>Hello<|assistant|><think>"
     )
+
+
+def test_glm53_parse_thinking_handles_template_primed_completion():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    tokenizer = object.__new__(tokenizer_module.GLM53Tokenizer)
+
+    reasoning, visible = tokenizer.parse_thinking(
+        "First reason.\n</think>\nThe answer is (C)."
+    )
+
+    assert reasoning == "First reason."
+    assert visible == "The answer is (C)."
+
+
+def test_glm5_parse_thinking_preserves_paired_and_plain_outputs():
+    _, tokenizer_module = _bootstrap_glm52_tokenizer()
+    tokenizer = object.__new__(tokenizer_module.GLM5Tokenizer)
+
+    assert tokenizer.parse_thinking("<think>reason</think>answer") == (
+        "reason",
+        "answer",
+    )
+    assert tokenizer.parse_thinking("plain answer") == (None, "plain answer")
