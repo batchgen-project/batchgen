@@ -57,36 +57,38 @@ Total: ~40-50 min on first install.
 
 Pre-built wheels for Hopper GPUs (CUDA 12.8, PyTorch 2.9, Python 3.11) are
 available on the [GitHub Releases](https://github.com/batchgen-project/batchgen/releases) page.
-The wheel set below is pinned to `v1.0.10.post2` — the most recent release that
-ships the full dependency wheel set (later releases only ship the batchgen
-wheels). While the repository is private, plain `pip install <URL>` returns
-404; download the wheels with an authenticated client first:
+Use a release that contains the complete validated wheel set: FlashAttention 3,
+FlashMLA, SGL DeepGEMM, Apache TVM FFI, `batchgen_kernels`, and BatchGen. While
+the repository is private, plain `pip install <URL>` returns 404; download the
+wheels with an authenticated client first:
 
 ```bash
-gh release download v1.0.10.post2 -R batchgen-project/batchgen -p '*.whl' -D ./wheels
+RELEASE_TAG="vX.Y.Z"  # replace with the release tag you want to install
+gh release download "$RELEASE_TAG" \
+  -R batchgen-project/batchgen \
+  -p '*.whl' \
+  -D ./wheels
 pip install ./wheels/*.whl
 ```
 
-Or, with direct URLs once the repository is public:
+The complete set must contain distributions named `flash-attn-3`, `flash-mla`,
+`sgl-deep-gemm==0.1.5.post3`, `apache-tvm-ffi==0.1.11`,
+`batchgen-kernels`, and `batchgen`. The installer validates these identities
+and falls back to source for a missing or incompatible component.
+
+To let the installer download and validate that set automatically:
 
 ```bash
-# 1. Create conda env + install PyTorch
 conda create -n batchgen python=3.11 -y
 conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-
-# 2. Install all wheels from the pinned release
-RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post2"
-pip install \
-  "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
-  "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen_kernels-0.3.2+sm90a-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-1.0.10.post2-py3-none-any.whl"
+./scripts/install_deps.sh --all --release-tag "$RELEASE_TAG"
 ```
 
-No source compilation needed — pip auto-installs all remaining Python dependencies
-(transformers, fastapi, etc.) from PyPI when installing the batchgen wheel.
+When the complete wheel set is present, no source compilation is needed. Pip
+installs the remaining pure-Python dependencies (transformers, fastapi, etc.)
+from PyPI with the BatchGen wheel. The automatic installer builds only a
+missing or incompatible native component from source.
 
 ### Building wheels yourself
 
@@ -198,6 +200,9 @@ for ext in exts:
     print(f'  {ext}: OK')
 print(f'{len(exts)} batchgen_kernels extensions verified.')
 import flash_attn_interface, flash_mla, deep_gemm
+from importlib.metadata import version
+assert version("sgl-deep-gemm") == "0.1.5.post3"
+assert version("apache-tvm-ffi") == "0.1.11"
 print('All dependencies verified.')
 "
 ```
@@ -208,7 +213,7 @@ print('All dependencies verified.')
 PyTorch 2.9.0+cu128
 ├── flash-attention 3  (--no-build-isolation)
 ├── FlashMLA           (--no-build-isolation)
-├── DeepGEMM           (--no-build-isolation)
+├── SGL DeepGEMM       (sgl-deep-gemm 0.1.5.post3 + apache-tvm-ffi 0.1.11)
 ├── batchgen_kernels   (--no-build-isolation, 23 CUDAExtensions)
 │   ├── SM90a: WGMMA kernels (MoE, QKV, routing)
 │   └── SM80+: fused ops (RMSNorm, RoPE, dequant, MGN)

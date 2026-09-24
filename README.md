@@ -17,6 +17,13 @@
 
 ---
 
+## News
+
+- **2026/09 — GLM-5.2-FP8 on 8×H200.** Added a one-node deployment guide and
+  source-qualified `8×1M` plus `32×256K` accumulated-token prefill. On the matched
+  `8×1M` workload, BatchGen reached 20,648 prompt tok/s, **1.71× faster** than
+  the best completed point in the recorded SGLang 0.5.18 tuning sweep.
+
 ## What is BatchGen?
 
 BatchGen is a batch-inference engine for large language models, with a focus on sparse mixture-of-experts (MoE) models and long-context workloads. It minimizes **batch completion time (BCT)**—the time to finish a batch of requests—by coordinating sequence-level scheduling, expert-level batching, and host/device KV-cache movement across GPU clusters.
@@ -41,18 +48,17 @@ The numbers below are workload-specific measurements, not a universal ranking. C
 | --- | --- | ---: | ---: | ---: |
 | Kimi-K3 (2.8T), 2×8 H200 | Exact 64K-token prefill | 116.7 s service wall | SGLang 0.5.18 · TP16/EP16: 166.3 s | **1.42× faster** |
 | Kimi-K2.5 (1.04T), 16× H20 | 255K-token prefill, 16 sequences | 748.9 s | SGLang 0.5.9 · DP8/TP16: 1,202.9 s | **1.61× faster** |
-| GLM-5.2-FP8 (≈744B), 8× H200 | 128K-token prefill | 33,588 prompt tok/s | SGLang 0.5.18 · DP8 attention: 25,539 prompt tok/s | **1.32× faster** |
-| GLM-5.2-FP8 (≈744B), 8× H200 | 256K-token prefill | 33,191 prompt tok/s | SGLang 0.5.18 · DP8 attention: 23,860 prompt tok/s | **1.39× faster** |
+| [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) (753B), 8× H200 | 8×1M accumulated-token prefill, pure DP8 | 20,648 prompt tok/s | SGLang 0.5.18 · DP8 attention / TP8 MoE, tuned CPU offload + chunk: 12,106 prompt tok/s | **1.71× faster** |
 
-These snapshots come from the latest gated campaigns available to this repository. The 64K GLM-5.2 point is intentionally omitted because that workload currently favors the reference system; this keeps the table focused on demonstrated strengths rather than cherry-picking a model-wide claim.
+These snapshots come from the latest gated campaigns available to this repository. The GLM-5.2 row is the exact eight-prompt, one-request-per-rank workload; it covers prefill and the first sampled token rather than sustained 1M-context decode.
 
-Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 uses the 2026-07-10 long-context campaign; GLM-5.2 uses the 2026-09-12 strict H200 prefill campaign. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
+Measurement provenance: Kimi-K3 uses the `ae374617` campaign cohort; Kimi-K2.5 uses the 2026-07-10 long-context campaign; GLM-5.2 uses source assembly `954b2bc6` and a bracketed SGLang 0.5.18 chunk/offload sweep from 2026-09-23. The GLM source result still requires final installed-wheel replay. Re-run with the exact topology and baseline versions before using these figures for capacity planning.
 
 The reference column reports the recorded configuration rather than claiming a global optimum. Future hardware-specific tuning campaigns should publish their search space and replace these rows only with directly comparable measurements.
 
 ## Supported models and hardware
 
-The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, and GLM-5.1; recent benchmark evidence also covers Kimi-K2.5 and GLM-5.2. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
+The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, GLM-5.1, and GLM-5.2; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
 
 ## Quick start
 
@@ -74,6 +80,7 @@ For a manual or component-by-component setup, see [INSTALL.md](docs/INSTALL.md).
 
 Choose the guide that matches your model and topology:
 
+- [GLM-5.2-FP8 on H200](docs/deploy-glm-5.2-h200.md)
 - [DeepSeek-R1 on H20](docs/deploy-deepseek-r1-h20.md)
 - [Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)
 - [Kimi-K3 on H20](docs/deploy-kimi-k3-h20.md)
@@ -84,19 +91,15 @@ Choose the guide that matches your model and topology:
 After the server is healthy, submit requests through the batch API:
 
 ```python
-import requests
+from batchgen.batchgen_client import BatchGenHttpClient
 
-batch = {
-    "model": "your-model",
-    "input": [
-        {"custom_id": "example-1", "prompt": "Summarize this document."},
-    ],
-    "sampling_params": {"max_tokens": 256, "temperature": 0.0},
-}
-
-response = requests.post("http://localhost:8000/v1/batches", json=batch)
-response.raise_for_status()
-print(response.json())
+client = BatchGenHttpClient("http://localhost:10900")
+batch = client.submit_batch(
+    input_file_path="input.jsonl",
+    output_file_path="output.jsonl",
+    max_decoding_length=256,
+)
+print(batch["status"])
 ```
 
 See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, retries, and result retrieval.
@@ -104,6 +107,7 @@ See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, ret
 ## Documentation
 
 - [Support matrix](docs/support-matrix.md) — models, hardware, maturity, and evidence level
+- [GLM-5.2-FP8 on H200](docs/deploy-glm-5.2-h200.md) — download, conversion, one-node launch, 1M-context qualification, and memory limits
 - [Installation](docs/INSTALL.md) — dependency and source-install details
 - [Batch API guide](docs/batch-api-guide.md) — request format and lifecycle
 - [Server flags](docs/server-flags.md) — runtime configuration

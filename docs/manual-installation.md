@@ -76,18 +76,27 @@ See https://github.com/deepseek-ai/FlashMLA for more details.
 
 ## Step 4: Install DeepGEMM (Hopper Only)
 
-DeepGEMM provides optimized FP8 GEMM kernels for Hopper GPUs.
+The SGL DeepGEMM fork provides the FP8 GEMM kernels and sparse-attention API
+used by BatchGen on Hopper GPUs.
 
 ```bash
-git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
-cd DeepGEMM && git checkout v2.1.1.post3 && git submodule update --init --recursive
-pip install . --no-build-isolation
+git clone --recursive https://github.com/sgl-project/DeepGEMM.git DeepGEMM-sgl
+cd DeepGEMM-sgl
+git checkout v0.1.5.post3
+git submodule update --init --recursive
+pip install apache-tvm-ffi==0.1.11 wheel==0.45.1
+bash ./build_sgl_deep_gemm.sh
+python -m wheel tags --platform-tag linux_x86_64 --remove \
+  dist/sgl_deep_gemm-0.1.5.post3-py3-none-any.whl
+pip uninstall -y deep-gemm sgl-deep-gemm
+pip install dist/sgl_deep_gemm-0.1.5.post3-py3-none-linux_x86_64.whl --no-deps
 ```
 
-> Check out `v2.1.1.post3` (the version `scripts/install_deps.sh` pins):
-> DeepGEMM HEAD is not guaranteed to build against this stack.
+> Use the `sgl-deep-gemm==0.1.5.post3` distribution. The similarly named
+> upstream `deep-gemm` distribution does not provide the
+> `fp8_mqa_logits(..., max_seqlen_k=...)` interface required by GLM-5.2.
 
-See https://github.com/deepseek-ai/DeepGEMM for more details.
+See https://github.com/sgl-project/DeepGEMM for more details.
 
 ---
 
