@@ -19,6 +19,10 @@
 
 ## News
 
+- **2026/09 — GLM-5.3-FP8 support.** Added the dedicated GLM-5.3 chat
+  template, reasoning parser, request controls, and an 8×H200 deployment
+  guide. H200 short correctness and structured `reasoning_content` checks pass;
+  the 2,048-sequence MMLU-Pro qualification is still running.
 - **2026/09 — GLM-5.2-FP8 on 8×H200.** Added a one-node deployment guide and
   source-qualified `8×1M` plus `32×256K` accumulated-token prefill. On the matched
   `8×1M` workload, BatchGen reached 20,648 prompt tok/s, **1.71× faster** than
@@ -62,7 +66,7 @@ The reference column reports the recorded configuration rather than claiming a g
 
 ## Supported models and hardware
 
-The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, GLM-5.1, and GLM-5.2; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
+The [support matrix](docs/support-matrix.md) separates a registered model path from a documented deployment and from a workload with repeatable performance evidence. In short, current deployment guides cover DeepSeek-R1, Kimi-K3, GPT-OSS-120B, GLM-5.1, GLM-5.2, and GLM-5.3; recent benchmark evidence also covers Kimi-K2.5. Experimental paths include MiniMax-M2.5, Kimi-Linear, and related MoE variants. H20 and H200 are the primary validated accelerators; exact model/hardware topology matters.
 
 ## Quick start
 
@@ -85,6 +89,7 @@ For a manual or component-by-component setup, see [INSTALL.md](docs/INSTALL.md).
 Choose the guide that matches your model and topology:
 
 - [GLM-5.2-FP8 on H200](docs/deploy-glm-5.2-h200.md)
+- [GLM-5.3-FP8 on H200](docs/deploy-glm-5.3-h200.md)
 - [DeepSeek-R1 on H20](docs/deploy-deepseek-r1-h20.md)
 - [Kimi-K3 on H200](docs/deploy-kimi-k3-h200.md)
 - [Kimi-K3 on H20](docs/deploy-kimi-k3-h20.md)
@@ -112,6 +117,7 @@ See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, ret
 
 - [Support matrix](docs/support-matrix.md) — models, hardware, maturity, and evidence level
 - [GLM-5.2-FP8 on H200](docs/deploy-glm-5.2-h200.md) — download, conversion, one-node launch, 1M-context qualification, and memory limits
+- [GLM-5.3-FP8 on H200](docs/deploy-glm-5.3-h200.md) — local-SSD staging, one-node launch, reasoning controls, and qualification status
 - [Installation](docs/INSTALL.md) — dependency and source-install details
 - [Batch API guide](docs/batch-api-guide.md) — request format and lifecycle
 - [Server flags](docs/server-flags.md) — runtime configuration
