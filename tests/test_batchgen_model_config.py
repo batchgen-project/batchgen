@@ -18,7 +18,7 @@ Coverage:
   * resolve() for GLM-5.2-FP8 reads the real checkpoint config.json and yields
     the correct dims + GLM-5.2-only indexer fields + nested rope_theta, with a
     distinct model_type.
-  * Pattern ordering: GLM-5.2 resolves to GLM52Config, not GLM5Config.
+  * Pattern ordering: GLM-5.2/5.3 resolve to their dedicated config classes.
 """
 
 import importlib.util
@@ -153,6 +153,15 @@ def test_glm52_pattern_resolves_to_glm52_config_not_glm5():
     assert BatchGenModelConfig._match_variant("GLM-5-FP8")[1] == "GLM5Config"
 
 
+def test_glm53_pattern_resolves_to_dedicated_config_not_broad_glm5():
+    target = BatchGenModelConfig._match_variant("zai-org/GLM-5.3-FP8")
+    assert target == ("batchgen.models.glm.glm5.config", "GLM53Config")
+    rich = BatchGenModelConfig.resolve("zai-org/GLM-5.3-FP8", checkpoint_path=None)
+    assert type(rich).__name__ == "GLM53Config"
+    assert rich.model_type == "glm_moe_dsa_5_3"
+    assert rich.max_position_embeddings == 1048576
+
+
 @pytest.mark.skipif(
     not (Path(_GLM52_CKPT) / "config.json").exists(),
     reason="GLM-5.2-FP8 checkpoint config.json not available",
@@ -196,13 +205,13 @@ def test_unlisted_variant_warns_and_falls_back(caplog):
     assert any("matched no supported variant" in r.message for r in caplog.records)
 
 
-def test_unlisted_glm5_minor_warns_before_falling_back_to_base(caplog):
-    """An unlisted GLM-5.x minor must warn loudly, not silently bind to base."""
+def test_newly_unlisted_glm5_minor_still_warns_before_falling_back_to_base(caplog):
+    """A future GLM-5.x minor must warn loudly, not silently bind to base."""
     import logging as _logging
     with caplog.at_level(_logging.WARNING):
-        rich = BatchGenModelConfig.resolve("zai/GLM-5.3", checkpoint_path=None)
+        rich = BatchGenModelConfig.resolve("zai/GLM-5.4", checkpoint_path=None)
     assert type(rich).__name__ == "GLM5Config"  # base fallback
-    assert any("unlisted GLM-5.3 variant" in r.message for r in caplog.records)
+    assert any("unlisted GLM-5.4 variant" in r.message for r in caplog.records)
 
 
 def test_glm5_superstring_warns(caplog):
