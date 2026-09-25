@@ -32,18 +32,23 @@ def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
             "zai-org/glm-5-fp8",
             "zai-org/glm-5.1-fp8",
             "zai-org/glm-5.2-fp8",
+            "zai-org/glm-5.3-fp8",
             "glm-5-fp8",
             "glm_5_fp8",
             "glm-5.1-fp8",
             "glm_5.1_fp8",
             "glm-5.2-fp8",
+            "glm-5.3-fp8",
             "glm_5.2_fp8",
+            "glm_5.3_fp8",
             "glm5-fp8",
             "glm5_fp8",
             "glm51-fp8",
             "glm51_fp8",
             "glm52-fp8",
+            "glm53-fp8",
             "glm52_fp8",
+            "glm53_fp8",
         )
     )
 

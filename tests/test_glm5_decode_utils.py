@@ -49,6 +49,15 @@ from batchgen.models.glm.glm5.wrappers import (
 from batchgen.models.wrappers import AttnWrapperBase
 
 
+def test_glm53_whole_model_graph_requires_explicit_enable():
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.3-FP8", enable_cuda_graph=False
+    )
+    assert glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.3-FP8", enable_cuda_graph=True
+    )
+
+
 def test_build_clamped_dense_token_indices_caps_each_row():
     cache_seqlens = torch.tensor([1, 65, 128], dtype=torch.int32)
 
