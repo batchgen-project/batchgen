@@ -520,7 +520,9 @@ install_batchgen() {
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install . --no-build-isolation
+        # Replace stale editable/direct-url installs from another worktree
+        # without allowing dependency resolution to change the verified ABI.
+        pip install . --no-build-isolation --no-deps --force-reinstall
         print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"

@@ -430,7 +430,7 @@ divider
 step "Phase 5: Installing BatchGen (non-editable)"
 
 cd "$BATCHGEN_DIR"
-pip install . 2>&1 | tail -10
+pip install . --no-build-isolation --no-deps --force-reinstall 2>&1 | tail -10
 
 # Verify it's in site-packages
 BG_LOC=$(python -c "import batchgen; print(batchgen.__file__)")
