@@ -35,6 +35,8 @@ _SHM_TRANSIENT_RESERVE_GIB = 16
 _HOST_PRIVATE_RESERVE_GIB = 64
 _MIN_SAFETY_RESERVE_GIB = 64
 _INSTANCE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
+_MODEL_SHM_PROVENANCE = "model_shm.json"
+_SHM_ENTRY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
 _O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 _O200K_BASE_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790"
 
@@ -653,19 +655,58 @@ def _server_command(
     return command
 
 
+def _instance_lock_is_held(
+    path: Path, pid: int, proc_root: Path = Path("/proc")
+) -> bool:
+    """Observe the server's flock read-only; never open or lock the file here.
+
+    Taking the lock to probe it races the server's own non-blocking
+    acquisition, so admission is proven from /proc/locks for the exact owner
+    PID and the exact lock-file device/inode instead.
+    """
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise LaneError(f"cannot inspect the instance lock {path}: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise LaneError(f"instance lock is not a regular file: {path}")
+    target = (
+        f"{os.major(metadata.st_dev):02x}:"
+        f"{os.minor(metadata.st_dev):02x}:{metadata.st_ino}"
+    )
+    try:
+        lines = (proc_root / "locks").read_text().splitlines()
+    except OSError as exc:
+        raise LaneError(f"cannot observe {proc_root}/locks: {exc}") from exc
+    for line in lines:
+        fields = line.split()
+        if fields[:1] and fields[0].endswith(":"):
+            fields = fields[1:]
+        if fields[:1] == ["->"]:  # a blocked waiter, not the holder
+            continue
+        # <type> <kind> <rw> <pid> <major>:<minor>:<inode> <start> <end>
+        if len(fields) != 7:
+            continue
+        if (
+            fields[0] == "FLOCK"
+            and fields[2] == "WRITE"
+            and fields[3] == str(pid)
+            and fields[4] == target
+        ):
+            return True
+    return False
+
+
 def _wait_for_instance_lock(instance_id: str, process: subprocess.Popen, timeout: float) -> None:
     path = HOST_LOCK_ROOT / f"instance-{instance_id}.lock"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise LaneError(f"server exited before admission, code={process.returncode}")
-        if path.exists():
-            try:
-                fd = _open_lock(path, fcntl.LOCK_EX)
-            except BlockingIOError:
-                return
-            else:
-                _close_fd(fd)
+        if _instance_lock_is_held(path, process.pid):
+            return
         time.sleep(0.1)
     raise LaneError("server did not acquire its instance lock before timeout")
 
@@ -811,6 +852,50 @@ def start_lane(args: argparse.Namespace) -> dict[str, Any]:
         _close_fd(admission_fd)
 
 
+def _recorded_model_shm(
+    runtime_dirs: Iterable[Path], instance_id: str
+) -> list[str]:
+    """Read only this lane's run-owned model SHM provenance, fail closed."""
+    exact = re.compile(rf"batchgen_{re.escape(instance_id)}_[0-9a-f]{{32}}\Z")
+    names: list[str] = []
+    for directory in runtime_dirs:
+        if not exact.fullmatch(directory.name):
+            continue
+        if directory.is_symlink():
+            raise LaneError(f"lane runtime directory is a symlink: {directory}")
+        path = directory / _MODEL_SHM_PROVENANCE
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise LaneError(
+                f"unreadable model SHM provenance {path}: {exc}"
+            ) from exc
+        try:
+            payload = json.loads(os.read(fd, 65536).decode())
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise LaneError(
+                f"malformed model SHM provenance {path}: {exc}"
+            ) from exc
+        finally:
+            os.close(fd)
+        entries = payload.get("shm_names") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or not isinstance(entries, list)
+            or not entries
+            or any(
+                not isinstance(entry, str) or not _SHM_ENTRY_RE.fullmatch(entry)
+                for entry in entries
+            )
+        ):
+            raise LaneError(f"malformed model SHM provenance {path}")
+        names.extend(entries)
+    return names
+
+
 def _lane_state_path(args: argparse.Namespace) -> Path:
     _validate_instance_id(args.instance_id)
     return args.state_root / f"{args.instance_id}.json"
@@ -875,14 +960,23 @@ def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
 
     temp_root = Path(manifest["paths"]["temp"])
     runtime_dirs = list(temp_root.glob(f"batchgen_{args.instance_id}_*"))
+    shm_root = Path("/dev/shm")
     shm_name = re.compile(
         rf"batchgen_{re.escape(args.instance_id)}_[0-9a-f]{{32}}\."
     )
     shm_objects = [
         path
-        for path in Path("/dev/shm").glob(f"batchgen_{args.instance_id}_*")
+        for path in shm_root.glob(f"batchgen_{args.instance_id}_*")
         if shm_name.match(path.name)
     ]
+    # Model weight/metadata regions carry random names, so only this run's own
+    # provenance can prove they belong to this lane.
+    for name in _recorded_model_shm(runtime_dirs, args.instance_id):
+        recorded = shm_root / name
+        if recorded not in shm_objects and (
+            recorded.is_symlink() or recorded.exists()
+        ):
+            shm_objects.append(recorded)
     gpu_processes = [
         (uuid, process_pid)
         for uuid, process_pid in _gpu_processes()
