@@ -259,8 +259,16 @@ class CompressedStateHostManager {
         auto producer_event = RecordProducerEvent();
 
         const std::size_t total = entries.size() * batch;
-        std::vector<uint8_t*> src_host(total);
-        std::vector<uint8_t*> dst_host(total);
+        // Pointer arrays the UVA kernel reads from pinned host memory,
+        // allocated here on the calling thread: a cudaMalloc/cudaFree or a
+        // pageable H2D copy on the task's background thread serializes with
+        // the compute stream and can hang decode with NCCL in flight.
+        auto pointer_slots = torch::empty(
+            {static_cast<std::int64_t>(2 * total)},
+            torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+        auto** src_host =
+            reinterpret_cast<uint8_t**>(pointer_slots.data_ptr<std::int64_t>());
+        auto** dst_host = src_host + total;
         std::vector<OverlapRollingUpdate> rolling_updates;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -298,8 +306,8 @@ class CompressedStateHostManager {
         }
 
         auto task = transformed_detail::MakeAsyncTask(
-            [this, src_host = std::move(src_host),
-             dst_host = std::move(dst_host), total,
+            [this, pointer_slots = std::move(pointer_slots), src_host,
+             dst_host, total,
              rolling_updates = std::move(rolling_updates),
              producer_event]() mutable {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
@@ -307,19 +315,8 @@ class CompressedStateHostManager {
                     CopyStream(CopyDirection::kDeviceToHost);
                 WaitForProducerEvent(cuda_stream, *producer_event);
 
-                worker_detail::DeviceBuffer<uint8_t*> src_buf(total);
-                worker_detail::DeviceBuffer<uint8_t*> dst_buf(total);
-                const std::size_t ptr_bytes = total * sizeof(uint8_t*);
-                EnqueueCopy(
-                    reinterpret_cast<const std::byte*>(src_host.data()),
-                    reinterpret_cast<std::byte*>(src_buf.get()), ptr_bytes,
-                    CopyDirection::kHostToDevice, cuda_stream);
-                EnqueueCopy(
-                    reinterpret_cast<const std::byte*>(dst_host.data()),
-                    reinterpret_cast<std::byte*>(dst_buf.get()), ptr_bytes,
-                    CopyDirection::kHostToDevice, cuda_stream);
                 worker_detail::LaunchUvaPageCopyKernel(
-                    src_buf.get(), dst_buf.get(), config_.state_token_bytes,
+                    src_host, dst_host, config_.state_token_bytes,
                     static_cast<int>(total), cuda_stream);
                 SynchronizeWithEvent(cuda_stream);
                 ApplyOverlapRollingUpdates(rolling_updates);
