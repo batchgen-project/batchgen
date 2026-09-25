@@ -399,6 +399,18 @@ class BatchScheduler:
         for request in requests:
             body = request.body
             if isinstance(body, ChatCompletionRequest):
+                model_lower = body.model.lower()
+                if "glm-5.3" in model_lower:
+                    if body.enable_thinking is False or body.thinking is False:
+                        raise ValueError(
+                            "GLM-5.3 does not support enable_thinking=false; "
+                            "use reasoning_effort=low/high/max with thinking enabled."
+                        )
+                    if body.reasoning_effort == "medium":
+                        raise ValueError(
+                            "GLM-5.3 reasoning_effort must be low, high, or max; "
+                            "medium is unsupported."
+                        )
                 # Inject reasoning_effort into system message for GPT-OSS models
                 messages = self._inject_reasoning_effort(
                     [m.dict(exclude_none=True) for m in body.messages],
@@ -421,6 +433,10 @@ class BatchScheduler:
                     template_kwargs["thinking"] = thinking_val
                 if body.tools is not None:
                     template_kwargs["tools"] = body.tools
+                if body.reasoning_effort is not None and "glm-5.3" in model_lower:
+                    template_kwargs["reasoning_effort"] = body.reasoning_effort
+                if body.clear_thinking is not None:
+                    template_kwargs["clear_thinking"] = body.clear_thinking
                 if body.preserve_thinking is not None:
                     template_kwargs["preserve_thinking"] = body.preserve_thinking
                 try:

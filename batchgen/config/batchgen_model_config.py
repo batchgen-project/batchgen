@@ -68,9 +68,11 @@ logger = logging.getLogger(__name__)
 # more-specific pattern must come before a broader one it would substring-match.
 #
 # GLM-5 / GLM-5.1 share the architecturally-identical glm_moe_dsa graph and use
-# GLM5Config. GLM-5.2 gets its OWN config identity (GLM52Config, model_type
-# "glm_moe_dsa_5_2"); the model *code* stays shared, only the config differs.
+# GLM5Config. GLM-5.2 and GLM-5.3 get OWN config identities; the model code
+# stays shared, while checkpoint geometry and chat contracts remain explicit.
 _SUPPORTED_VARIANTS: Dict[str, Tuple[str, str]] = {
+    "GLM-5.3-FP8": ("batchgen.models.glm.glm5.config", "GLM53Config"),
+    "GLM-5.3": ("batchgen.models.glm.glm5.config", "GLM53Config"),
     "GLM-5.2-FP8": ("batchgen.models.glm.glm5.config", "GLM52Config"),
     "GLM-5.2": ("batchgen.models.glm.glm5.config", "GLM52Config"),
     "GLM-5.1-FP8": ("batchgen.models.glm.glm5.config", "GLM5Config"),
