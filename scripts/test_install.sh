@@ -419,7 +419,8 @@ KERNELS_LOC=$(python -c "import batchgen_kernels; print(batchgen_kernels.__file_
 if [[ "$KERNELS_LOC" == *"site-packages"* ]]; then
     ok "batchgen_kernels location: $KERNELS_LOC (site-packages)"
 else
-    warn "batchgen_kernels location: $KERNELS_LOC (NOT in site-packages)"
+    fail "batchgen_kernels location: $KERNELS_LOC (editable/source shadow)"
+    exit 1
 fi
 
 # ============================================================================ #

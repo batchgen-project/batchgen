@@ -460,6 +460,25 @@ batchgen_kernels_contract_ok() {
     # later fails when it lazily imports the fused attention extension.
     python - <<'PY' &>/dev/null
 import importlib
+import os
+import site
+import sysconfig
+
+import batchgen_kernels
+
+module_path = getattr(batchgen_kernels, "__file__", None)
+site_roots = {
+    os.path.realpath(path)
+    for path in (*site.getsitepackages(), sysconfig.get_paths()["purelib"])
+}
+if not module_path or not any(
+    os.path.commonpath((os.path.realpath(module_path), root)) == root
+    for root in site_roots
+):
+    raise ImportError(
+        "batchgen_kernels resolves outside site-packages "
+        f"({module_path!r}); refusing an editable/source shadow"
+    )
 
 for module_name in (
     "batchgen_kernels.attention._C_fused_ops",
