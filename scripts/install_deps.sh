@@ -240,7 +240,28 @@ install_torch() {
 
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-        print_success "PyTorch $TORCH_VERSION already installed"
+        if python - "$torch_ver" <<'PY'
+import sys
+import torch
+
+expected = sys.argv[1]
+if torch.__version__ != expected:
+    raise SystemExit(
+        f"expected PyTorch {expected}, found {torch.__version__}"
+    )
+PY
+        then
+            print_success "PyTorch $TORCH_VERSION already installed (ABI/channel verified)"
+        else
+            print_warning "PyTorch $TORCH_VERSION does not match required ${torch_ver}; reinstalling"
+            pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
+            TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+            if [[ "$TORCH_VERSION" != "$torch_ver" ]]; then
+                print_error "PyTorch install produced $TORCH_VERSION, expected $torch_ver"
+                return 1
+            fi
+            print_success "PyTorch $TORCH_VERSION installed (ABI/channel verified)"
+        fi
 
         # Check CUDA availability
         CUDA_AVAILABLE=$(python -c "import torch; print(torch.cuda.is_available())")
