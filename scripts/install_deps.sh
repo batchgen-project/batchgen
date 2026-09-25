@@ -473,7 +473,7 @@ install_batchgen_kernels() {
         return 0
     fi
 
-    print_warning "batchgen_kernels is importable but its AOT runtime contract is incomplete; rebuilding"
+    print_warning "batchgen_kernels is missing or its AOT runtime contract is incomplete; rebuilding"
 
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
