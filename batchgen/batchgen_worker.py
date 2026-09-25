@@ -372,7 +372,9 @@ def allocate_node_shared_int64(
 			f"shared input_ids segment '{name}' is {shm.size} bytes, "
 			f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
 		)
-	buf = torch.frombuffer(shm.buf, dtype=torch.int64, count=rows * width).view(rows, width)
+	# Admissions can later mutate this persistent mapping outside InferenceMode.
+	with torch.inference_mode(False):
+		buf = torch.frombuffer(shm.buf, dtype=torch.int64, count=rows * width).view(rows, width)
 	# Nobody may unlink/close until every rank has mapped it.
 	barrier()
 	return buf, shm
@@ -407,7 +409,8 @@ class QueryBookBufferPool:
 		input_ids_shm: object = None,
 	):
 		if input_ids_buffer is None:
-			input_ids_buffer = torch.zeros((num_sequences, input_ids_width), dtype=torch.long)
+			with torch.inference_mode(False):
+				input_ids_buffer = torch.zeros((num_sequences, input_ids_width), dtype=torch.long)
 		elif tuple(input_ids_buffer.shape) != (num_sequences, input_ids_width):
 			raise QueryBookPoolCapacityError(
 				f"shared input_ids buffer has shape {tuple(input_ids_buffer.shape)}, "
@@ -415,7 +418,8 @@ class QueryBookBufferPool:
 			)
 		self.input_ids_buffer = input_ids_buffer
 		self.input_ids_shm = input_ids_shm
-		self.decoded_tokens_buffer = torch.full((num_sequences, max_decoding_length), pad_token_id, dtype=torch.int64)
+		with torch.inference_mode(False):
+			self.decoded_tokens_buffer = torch.full((num_sequences, max_decoding_length), pad_token_id, dtype=torch.int64)
 		self.pad_token_id = pad_token_id
 		self.num_sequences = num_sequences
 		self.input_ids_width = input_ids_width
