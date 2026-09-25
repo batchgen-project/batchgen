@@ -20,6 +20,7 @@
 
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
+#include "KV_Storage/host_prefix_cache_coordinator.h"
 #include "KV_Storage/compressed_state_host_manager.h"
 #include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
@@ -409,11 +410,57 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
 }
 
 template <typename WorkerView>
+void BindPrefixHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
+    cls.def("async_offload_layer_kv_range_to_host",
+            &WorkerView::AsyncOffloadLayerKVRangeToHost,
+            py::arg("layer_idx"), py::arg("sequence_ids"),
+            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+            py::arg("raw_start_positions"), py::arg("token_counts"),
+            "Offload one layer of KV into a raw token range in host pages.")
+        .def("attach_shared_prefix_pages",
+            &WorkerView::AttachSharedPrefixPages,
+            py::arg("sequence_id"), py::arg("page_ids"),
+            "Prepend shared prefix Host page ids to a registered sequence's "
+            "logical page table. Ownership remains with the prefix cache.")
+        .def("attach_shared_prefix_pages_for_sequences",
+             &WorkerView::AttachSharedPrefixPagesForSequences,
+             py::arg("sequence_ids"), py::arg("page_ids_by_sequence"),
+             "Prepend shared prefix Host pages for multiple registered "
+             "sequences.")
+        .def("retain_sequence_pages", &WorkerView::RetainSequencePages,
+             py::arg("sequence_id"), py::arg("page_ids"),
+             "Move exact sequence-owned pages into prefix-cache resident "
+             "ownership without changing the worker logical page table.")
+        .def("release_resident_pages", &WorkerView::ReleaseResidentPages,
+             py::arg("page_ids"),
+             "Release prefix-cache resident pages returned by coordinator "
+             "eviction.")
+        .def(
+            "async_load_prefix_pages_to_device",
+            [](WorkerView& self, torch::Tensor host_page_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadPrefixPagesToDevice(
+                    std::move(host_page_ids), std::move(active_page_counts),
+                    std::move(k_device_ptrs), std::move(v_device_ptrs));
+            },
+            py::arg("host_page_ids"), py::arg("active_page_counts"),
+            py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load prefix-cache Host page ids into pre-allocated GPU pages. "
+            "Unlike async_load_layer_paged_kv_to_device, this reads directly "
+            "from the provided physical Host page ids instead of resolving "
+            "pages through sequence ids.");
+}
+
+template <typename WorkerView>
 void BindHostPagedWorkerView(py::module& m, const char* name) {
     auto cls = py::class_<WorkerView>(m, name);
     cls.def(py::init<EngineConfig, ModelConfig>())
         .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"));
     BindCommonHostPagedWorkerViewMethods(cls);
+    BindPrefixHostPagedWorkerViewMethods(cls);
 }
 
 template <typename WorkerView>
@@ -649,6 +696,201 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
+
+    py::enum_<kv::HostKVGroupSemantic>(m, "HostKVGroupSemantic")
+        .value("FULL_KV", kv::HostKVGroupSemantic::kFullKV)
+        .value("MLA_COMPRESSED_KV",
+               kv::HostKVGroupSemantic::kMlaCompressedKV)
+        .value("SWA_KV", kv::HostKVGroupSemantic::kSwaKV)
+        .value("COMPRESSED_RATIO_KV",
+               kv::HostKVGroupSemantic::kCompressedRatioKV);
+
+    py::class_<kv::HostKVGroupSpec>(m, "HostKVGroupSpec")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::HostKVGroupSpec::group_id)
+        .def_readwrite("semantic", &kv::HostKVGroupSpec::semantic)
+        .def_readwrite("required_for_reuse",
+                       &kv::HostKVGroupSpec::required_for_reuse)
+        .def_readwrite("raw_page_tokens",
+                       &kv::HostKVGroupSpec::raw_page_tokens)
+        .def_readwrite("compression_ratio",
+                       &kv::HostKVGroupSpec::compression_ratio)
+        .def("__repr__", [](const kv::HostKVGroupSpec& self) {
+            return kv::ToString(self);
+        });
+
+    py::class_<kv::HostPageHandle>(m, "HostPageHandle")
+        .def(py::init<>())
+        .def_readwrite("page_id", &kv::HostPageHandle::page_id);
+
+    py::class_<kv::GroupCommitPages>(m, "GroupCommitPages")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::GroupCommitPages::group_id)
+        .def_readwrite("pages", &kv::GroupCommitPages::pages);
+
+    py::class_<kv::GroupPageRequirement>(m, "GroupPageRequirement")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::GroupPageRequirement::group_id)
+        .def_readwrite("min_pages", &kv::GroupPageRequirement::min_pages);
+
+    py::class_<kv::GroupMaterializationSpan>(
+        m, "GroupMaterializationSpan")
+        .def_readonly("group_id", &kv::GroupMaterializationSpan::group_id)
+        .def_readonly("raw_end_token",
+                      &kv::GroupMaterializationSpan::raw_end_token)
+        .def_readonly("pages", &kv::GroupMaterializationSpan::pages);
+
+    py::class_<kv::PrefixLookupResult>(m, "PrefixLookupResult")
+        .def_readonly("attachment_handle",
+                      &kv::PrefixLookupResult::attachment_handle)
+        .def_readonly("common_cached_tokens",
+                      &kv::PrefixLookupResult::common_cached_tokens)
+        .def_readonly("materialization_spans",
+                      &kv::PrefixLookupResult::materialization_spans)
+        .def_readonly("miss_reason_mask",
+                      &kv::PrefixLookupResult::miss_reason_mask);
+
+    py::class_<kv::PrefixCommitResult>(m, "PrefixCommitResult")
+        .def_readonly("committed_tokens",
+                      &kv::PrefixCommitResult::committed_tokens)
+        .def_readonly("inserted_nodes",
+                      &kv::PrefixCommitResult::inserted_nodes)
+        .def_readonly("existing_nodes",
+                      &kv::PrefixCommitResult::existing_nodes)
+        .def_readonly("active_attachment_handle",
+                      &kv::PrefixCommitResult::active_attachment_handle)
+        .def_readonly("inserted_group_pages",
+                      &kv::PrefixCommitResult::inserted_group_pages);
+
+    py::class_<kv::PrefixEvictionResult>(m, "PrefixEvictionResult")
+        .def_readonly("evicted_nodes",
+                      &kv::PrefixEvictionResult::evicted_nodes)
+        .def_readonly("protected_nodes",
+                      &kv::PrefixEvictionResult::protected_nodes)
+        .def_readonly("freed_group_entries",
+                      &kv::PrefixEvictionResult::freed_group_entries)
+        .def_readonly("freed_page_handles",
+                      &kv::PrefixEvictionResult::freed_page_handles)
+        .def_readonly("evicted_group_pages",
+                      &kv::PrefixEvictionResult::evicted_group_pages);
+
+    py::class_<kv::HostPrefixCacheStats>(m, "HostPrefixCacheStats")
+        .def(py::init<>())
+        .def_readwrite("resident_nodes",
+                       &kv::HostPrefixCacheStats::resident_nodes)
+        .def_readwrite("active_attachments",
+                       &kv::HostPrefixCacheStats::active_attachments)
+        .def_readwrite("pending_load_entries",
+                       &kv::HostPrefixCacheStats::pending_load_entries)
+        .def_readwrite("pending_load_refs",
+                       &kv::HostPrefixCacheStats::pending_load_refs)
+        .def_readwrite("used_group_entries",
+                       &kv::HostPrefixCacheStats::used_group_entries)
+        .def_readwrite("used_page_handles",
+                       &kv::HostPrefixCacheStats::used_page_handles)
+        .def_readwrite("lookup_hits", &kv::HostPrefixCacheStats::lookup_hits)
+        .def_readwrite("lookup_misses",
+                       &kv::HostPrefixCacheStats::lookup_misses)
+        .def_readwrite("evicted_nodes",
+                       &kv::HostPrefixCacheStats::evicted_nodes)
+        .def_readwrite("eviction_protected_skips",
+                       &kv::HostPrefixCacheStats::eviction_protected_skips)
+        .def("__repr__", [](const kv::HostPrefixCacheStats& self) {
+            return kv::ToString(self);
+        });
+
+    py::class_<kv::HostPrefixCacheConfig>(m, "HostPrefixCacheConfig")
+        .def(py::init<>())
+        .def_readwrite("shm_name", &kv::HostPrefixCacheConfig::shm_name)
+        .def_readwrite("group_specs",
+                       &kv::HostPrefixCacheConfig::group_specs)
+        .def_readwrite("hash_block_tokens",
+                       &kv::HostPrefixCacheConfig::hash_block_tokens)
+        .def_readwrite("max_nodes", &kv::HostPrefixCacheConfig::max_nodes)
+        .def_readwrite("max_group_entries",
+                       &kv::HostPrefixCacheConfig::max_group_entries)
+        .def_readwrite("max_page_handles",
+                       &kv::HostPrefixCacheConfig::max_page_handles)
+        .def_readwrite("max_attachments",
+                       &kv::HostPrefixCacheConfig::max_attachments);
+
+    py::class_<kv::HostPrefixCacheCoordinator>(
+        m, "HostPrefixCacheCoordinator")
+        .def(py::init<kv::HostPrefixCacheConfig>(), py::arg("config"))
+        .def("initialize", &kv::HostPrefixCacheCoordinator::Initialize,
+             py::arg("create_region"))
+        .def("commit_prefix_pages",
+             &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
+             py::arg("namespace_digest"), py::arg("token_ids"),
+             py::arg("commit_tokens"), py::arg("group_pages"),
+             py::arg("protect_active") = false)
+        .def(
+            "commit_prefix_page_ids",
+            [](kv::HostPrefixCacheCoordinator& self,
+               kv::PrefixDigest namespace_digest,
+               const std::vector<std::int64_t>& token_ids,
+               std::uint32_t commit_tokens,
+               const std::vector<
+                   std::pair<std::uint32_t, std::vector<std::uint32_t>>>&
+                   group_page_ids,
+               bool protect_active) {
+                std::vector<kv::GroupCommitPages> group_pages;
+                group_pages.reserve(group_page_ids.size());
+                for (const auto& [group_id, page_ids] : group_page_ids) {
+                    kv::GroupCommitPages group;
+                    group.group_id = group_id;
+                    group.pages.reserve(page_ids.size());
+                    for (std::uint32_t page_id : page_ids) {
+                        group.pages.push_back(kv::HostPageHandle{page_id});
+                    }
+                    group_pages.emplace_back(std::move(group));
+                }
+                return self.CommitPrefixPages(namespace_digest, token_ids,
+                                              commit_tokens, group_pages,
+                                              protect_active);
+            },
+            py::arg("namespace_digest"), py::arg("token_ids"),
+            py::arg("commit_tokens"), py::arg("group_page_ids"),
+            py::arg("protect_active") = false)
+        .def("lookup_and_attach",
+             &kv::HostPrefixCacheCoordinator::LookupAndAttach,
+             py::arg("namespace_digest"), py::arg("token_ids"))
+        .def("estimate_lookup",
+             &kv::HostPrefixCacheCoordinator::EstimateLookup,
+             py::arg("namespace_digest"), py::arg("token_ids"))
+        .def("release_attachment",
+             &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
+             py::arg("attachment_handle"))
+        .def("begin_attachment_load",
+             &kv::HostPrefixCacheCoordinator::BeginAttachmentLoad,
+             py::arg("attachment_handle"))
+        .def("end_attachment_load",
+             &kv::HostPrefixCacheCoordinator::EndAttachmentLoad,
+             py::arg("attachment_handle"))
+        .def("evict_until_free",
+             &kv::HostPrefixCacheCoordinator::EvictUntilFree,
+             py::arg("min_free_nodes"),
+             py::arg("min_free_group_entries"),
+             py::arg("min_free_page_handles"), py::arg("max_scan_nodes"))
+        .def("evict_until_releasable_pages",
+             &kv::HostPrefixCacheCoordinator::EvictUntilReleasablePages,
+             py::arg("requirements"), py::arg("max_scan_nodes"))
+        .def("clear_unprotected",
+             &kv::HostPrefixCacheCoordinator::ClearUnprotected)
+        .def("clear_namespace",
+             &kv::HostPrefixCacheCoordinator::ClearNamespace,
+             py::arg("namespace_digest"))
+        .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
+        .def_property_readonly(
+            "hash_block_tokens",
+            &kv::HostPrefixCacheCoordinator::hash_block_tokens)
+        .def_property_readonly(
+            "commit_boundary_tokens",
+            &kv::HostPrefixCacheCoordinator::commit_boundary_tokens);
+
+    m.def("build_prefix_hash_chain", &kv::BuildPrefixHashChain,
+          py::arg("namespace_digest"), py::arg("token_ids"),
+          py::arg("block_tokens"));
 
     py::class_<kv::CompressedStateHostStats>(m,
                                              "CompressedStateHostStats")

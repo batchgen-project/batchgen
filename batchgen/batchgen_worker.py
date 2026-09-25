@@ -583,6 +583,8 @@ class BatchGenWorkerArgs:
 	device: int
 	kv_dtype: str
 	gpu_arch: str
+	enable_prefix_cache: bool = False
+	prefix_cache_debug_stats: bool = False
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -840,6 +842,18 @@ class BatchGenWorker:
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
+		self.enable_prefix_cache = bool(args.enable_prefix_cache)
+		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self.prefix_cache_runtime_config = None
+		self.prefix_cache_coordinator = None
+		self._prefix_sequence_states = {}
+		self._active_prefix_materializations = []
+		if self.enable_prefix_cache:
+			from batchgen.prefix_reuse.config import (
+				require_prefix_cache_model_support,
+			)
+
+			require_prefix_cache_model_support(args.model_name)
 
 		# DSA models: create DualHostKVCoordinator with proportional budget split.
 		# Non-DSA models get a single-view worker below.
@@ -879,6 +893,28 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: Initializing Host KV view with cudaHostRegister (local_rank={self.local_rank}, fast_init={args.fast_init})")
 			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
+
+			if self.enable_prefix_cache:
+				from batchgen.prefix_reuse.config import (
+					build_prefix_cache_runtime_config,
+					create_host_prefix_cache_coordinator,
+				)
+
+				self.prefix_cache_runtime_config = (
+					build_prefix_cache_runtime_config(
+						model_name=args.model_name,
+						kv_dtype=args.kv_dtype,
+						host_kv_config=worker_kv_config,
+						debug_stats=self.prefix_cache_debug_stats,
+					)
+				)
+				self.prefix_cache_coordinator = (
+					create_host_prefix_cache_coordinator(
+						core_engine_module=core_engine,
+						runtime_config=self.prefix_cache_runtime_config,
+						create_region=False,
+					)
+				)
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -2274,7 +2310,7 @@ class BatchGenWorker:
 			)
 
 		free_pages = manager.get_stats().num_free_pages
-		if total_pages > free_pages:
+		if total_pages > free_pages and not self.enable_prefix_cache:
 			logging.error(
 				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
 				f"only {free_pages} free"
@@ -2282,7 +2318,21 @@ class BatchGenWorker:
 			# Don't set gpu_pages_allocated since we're failing
 			return False
 		
-		# Now safe to update tracking (allocation will succeed)
+		try:
+			self._allocate_gpu_pages_with_host_identity(
+				manager, global_ids, pages_per_seq
+			)
+		except RuntimeError as exc:
+			if "Insufficient free pages" not in str(exc):
+				raise
+			logging.error(
+				"Rank %s cannot allocate shared GPU KV pages: %s",
+				self.rank,
+				exc,
+			)
+			return False
+
+		# Now safe to update tracking.
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -2291,7 +2341,6 @@ class BatchGenWorker:
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
 		
-		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
 		manager.rebuild_page_table(global_ids)
 
 		if load_from_host:
@@ -3069,6 +3118,42 @@ class BatchGenWorker:
 			self._make_token_budget_request(), sequence_ids
 		)
 
+	def _allocate_gpu_pages_with_host_identity(
+		self,
+		manager,
+		global_sequence_ids: Sequence[int],
+		sequence_tokens: Sequence[int],
+	):
+		"""Share GPU pages when sequences reference the same Host page ids."""
+
+		if (
+			not self.enable_prefix_cache
+			or isinstance(manager, DualKVCacheCoordinator)
+		):
+			return manager.allocate_pages_for_sequences(
+				global_sequence_ids, sequence_tokens
+			)
+		worker_view = self.core_engine.host_paged_kv_worker_view
+		host_tables = worker_view.build_page_table(global_sequence_ids)
+		page_size = int(manager.config.page_size_tokens)
+		page_keys = []
+		for sequence_id, tokens, host_pages in zip(
+			global_sequence_ids, sequence_tokens, host_tables
+		):
+			required = math.ceil(int(tokens) / page_size)
+			if len(host_pages) < required:
+				raise RuntimeError(
+					"Host page table is shorter than GPU reservation: "
+					f"sequence={sequence_id}, host_pages={len(host_pages)}, "
+					f"required={required}"
+				)
+			page_keys.append([int(page) for page in host_pages[:required]])
+		return manager.allocate_pages_for_sequences_with_page_keys(
+			global_sequence_ids,
+			sequence_tokens,
+			page_keys,
+		)
+
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
 		"""Bind GPU KV manager to both worker and core_engine.
 
@@ -3276,7 +3361,9 @@ class BatchGenWorker:
 		)
 		
 		# allocate_pages_for_sequences implicitly registers the sequences
-		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
+		self._allocate_gpu_pages_with_host_identity(
+			manager, global_sequence_ids, sequence_tokens
+		)
 		manager.rebuild_page_table(global_sequence_ids)
 		self._load_host_kv_to_gpu(manager, global_sequence_ids)
 
@@ -4046,6 +4133,7 @@ class BatchGenWorker:
 			worker_view.release_sequence_pages([global_idx])
 			if aux_view is not None:
 				aux_view.release_sequence_pages([global_idx])
+			self._release_prefix_cache_attachments([global_idx])
 			# Also send query_book data (input_ids, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
@@ -5295,16 +5383,145 @@ class BatchGenWorker:
 		# additionally supplies a persistent KDA-state limit: unlike the token
 		# cap used later by prepack, a KDA slot remains occupied until the
 		# sequence completes or is evicted.
-		prefill_batch = PrefillScheduler.select_prefill_batch(
-			self._make_prefill_selection_request(
-				all_candidates,
-				per_node_host_free,
-				num_nodes,
-				chunk_size,
-				per_rank_sequence_free=per_rank_sequence_free,
-				per_node_sequence_free=per_node_sequence_free,
-			)
+		selection = self._make_prefill_selection_request(
+			all_candidates,
+			per_node_host_free,
+			num_nodes,
+			chunk_size,
+			per_rank_sequence_free=per_rank_sequence_free,
+			per_node_sequence_free=per_node_sequence_free,
 		)
+		prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+		if (
+			self.enable_prefix_cache and not prefill_batch
+			and per_rank_sequence_free is None
+			and per_node_sequence_free is None
+		):
+			# A cached prefix already occupies Host pages. Estimate on each node
+			# leader before reclaiming those pages; the actual lookup and attach
+			# still happen in _config_prefill_for_batch. EVICTED prompts are
+			# reconstructed there, so retain their existing full-page path.
+			from batchgen.prefix_reuse.prefill import (
+				estimate_prefix_cached_pages_for_prefill,
+			)
+			estimated_values = [0] * (len(selection.candidates) + 1)
+			if self.local_rank == 0:
+				try:
+					for index, candidate in enumerate(selection.candidates):
+						if candidate.node_id != report_node or candidate.is_evicted:
+							continue
+						seq = self.global_batch.get_sequence(candidate.uuid)
+						estimated_values[index] = estimate_prefix_cached_pages_for_prefill(
+							coordinator=self.prefix_cache_coordinator,
+							namespace_digest=(
+								self.prefix_cache_runtime_config.namespace_digest
+							),
+							prompt_token_ids=seq.input_ids[0, :seq.prompt_length].tolist(),
+							page_size_tokens=(
+								self.prefix_cache_runtime_config.group_specs[0]
+								.raw_page_tokens
+							),
+						)
+				except Exception:
+					logging.exception("[PREFIX_CACHE] admission estimate failed")
+					estimated_values[-1] = 1
+			estimated = torch.tensor(
+				estimated_values, dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_reduce(estimated, op=dist.ReduceOp.MAX)
+			if int(estimated[-1].item()):
+				raise RuntimeError("prefix cache admission estimate failed on a worker")
+			cached_pages = estimated[:-1].tolist()
+			if any(cached_pages):
+				estimated_selection = replace(
+					selection,
+					candidates=tuple(
+						replace(candidate, cached_prefix_pages=int(cached_pages[index]))
+						for index, candidate in enumerate(selection.candidates)
+					),
+				)
+				prefill_batch = PrefillScheduler.select_prefill_batch(
+					estimated_selection
+				)
+		if (
+			self.enable_prefix_cache and not prefill_batch
+			and per_rank_sequence_free is None
+			and per_node_sequence_free is None
+		):
+			# No candidate fits even after a non-mutating prefix estimate.
+			# Reclaim against the original full-page requirement so a later
+			# lookup miss cannot make the allocation unsafe.
+			failure = 0
+			has_fitting_candidate = 0
+			updated_local_free = -1
+			if self.local_rank == 0:
+				try:
+					worker_view = self.core_engine.host_paged_kv_worker_view
+					stats = worker_view.get_stats()
+					requirements = [
+						PrefillScheduler.required_host_pages(candidate, selection)
+						for candidate in selection.candidates
+						if candidate.node_id == report_node
+					]
+					fitting = [
+						pages for pages in requirements
+						if pages <= int(stats.num_total_pages)
+					]
+					updated_local_free = int(stats.num_free_pages)
+					if fitting:
+						has_fitting_candidate = 1
+						required = min(fitting)
+						from batchgen.prefix_reuse.eviction import (
+							reclaim_prefix_pages_for_host_admission,
+						)
+						released = reclaim_prefix_pages_for_host_admission(
+								core_engine_module=core_engine,
+								coordinator=self.prefix_cache_coordinator,
+								worker_views_by_group={0: worker_view},
+								group_id=0,
+								page_target=max(0, required - updated_local_free),
+								max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+							)
+						updated_local_free = self._get_host_kv_free_pages()
+						logging.info(
+							"[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
+							"(free=%s, target=%s)",
+							released, report_node, updated_local_free, required,
+						)
+				except Exception:
+					logging.exception("[PREFIX_CACHE] admission eviction failed")
+					failure = 1
+			live_sequences = (
+				self.global_batch.has_prefilled()
+				or self.global_batch.has_in_decode()
+				or self.global_batch.has_on_hold()
+			)
+			failed = torch.tensor(
+				[failure, has_fitting_candidate, int(live_sequences)],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+			if int(failed[0].item()) != 0:
+				raise RuntimeError("prefix cache admission eviction failed on a worker")
+			if int(failed[1].item()) == 0:
+				raise RuntimeError("no prefix-cache request fits the total Host KV pool")
+			updated = torch.tensor(
+				[report_node, updated_local_free],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
+			dist.all_gather(gathered, updated)
+			for item in gathered:
+				node, free = int(item[0].item()), int(item[1].item())
+				if free >= 0:
+					per_node_host_free[node] = free
+			selection = replace(selection, per_node_host_free=tuple(per_node_host_free))
+			prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+			if not prefill_batch:
+				if int(failed[2].item()) == 1:
+					return []
+				raise RuntimeError("prefix cache prefill admission made no progress after eviction")
 
 		if self.rank == 0:
 			n_evicted = sum(
@@ -5940,7 +6157,9 @@ class BatchGenWorker:
 			return
 		
 		# 1. Allocate GPU Pages
-		manager.allocate_pages_for_sequences(global_ids, tokens)
+		self._allocate_gpu_pages_with_host_identity(
+			manager, global_ids, tokens
+		)
 
 		# 2. Rebuild Page Table
 		manager.rebuild_page_table(global_ids)
@@ -6782,6 +7001,7 @@ class BatchGenWorker:
 								else:
 									self.prefill(local_prefill_indices)
 						finally:
+							self._close_active_prefix_materializations()
 							if _memprof:
 								logging.info(
 									f"[MEMPROF] Rank {self.rank}: "
@@ -6815,6 +7035,9 @@ class BatchGenWorker:
 						num_retired = _AWB.retire_pending_prefill_offloads(
 							device=self.torch_device,
 							reason="end of prefill",
+						)
+						self._commit_prefix_cache_for_prefill(
+							local_prefill_indices
 						)
 						if num_retired:
 							# Every rank logs: r28 showed node 1 entering the first
@@ -7725,7 +7948,55 @@ class BatchGenWorker:
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
+			prefix_states = {}
 			chunk_size = self._get_effective_chunk_size()
+			if self.enable_prefix_cache:
+				from batchgen.prefix_reuse.prefill import (
+					PrefixCacheSequenceState,
+					lookup_prefix_cache_for_prefill,
+					release_prefix_lookup_attachments,
+				)
+
+				prompt_token_ids = []
+				for uuid in my_prefill_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					prompt_token_ids.append(
+						seq.input_ids[0, :seq.prompt_length].tolist()
+					)
+				lookup = lookup_prefix_cache_for_prefill(
+					coordinator=self.prefix_cache_coordinator,
+					namespace_digest=(
+						self.prefix_cache_runtime_config.namespace_digest
+					),
+					prompt_token_ids=prompt_token_ids,
+					page_size_tokens=(
+						self.prefix_cache_runtime_config.group_specs[0]
+						.raw_page_tokens
+					),
+				)
+				try:
+					for uuid, result, attached, compute_cached in zip(
+						my_prefill_uuids,
+						lookup.lookup_results,
+						lookup.attached_tokens,
+						lookup.compute_cached_tokens,
+					):
+						seq = self.global_batch.get_sequence(uuid)
+						state = PrefixCacheSequenceState(
+							lookup_result=result,
+							attached_tokens=int(attached),
+							compute_cached_tokens=int(compute_cached),
+						)
+						prefix_states[seq.global_idx] = state
+						self._prefix_sequence_states[seq.global_idx] = state
+				except Exception:
+					for sequence_id in prefix_states:
+						self._prefix_sequence_states.pop(sequence_id, None)
+					release_prefix_lookup_attachments(
+						coordinator=self.prefix_cache_coordinator,
+						lookup=lookup,
+					)
+					raise
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
@@ -7745,11 +8016,71 @@ class BatchGenWorker:
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
 				sequence_tokens.append(seq.host_token_capacity)
 
+			private_sequence_ids = []
+			private_sequence_tokens = []
+			for global_id, total_tokens in zip(
+				global_sequence_ids, sequence_tokens
+			):
+				state = prefix_states.get(global_id)
+				attached = state.attached_tokens if state is not None else 0
+				page_size = int(
+					self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
+					if self.enable_prefix_cache
+					else self.PAGE_SIZE
+				)
+				total_pages = math.ceil(total_tokens / page_size)
+				attached_pages = attached // page_size
+				private_pages = total_pages - attached_pages
+				if private_pages < 0:
+					self._release_prefix_cache_attachments(
+						list(prefix_states)
+					)
+					raise RuntimeError(
+						"prefix attachment exceeds Host KV reservation: "
+						f"sequence={global_id}, attached_pages={attached_pages}, "
+						f"total_pages={total_pages}"
+					)
+				if private_pages:
+					private_sequence_ids.append(global_id)
+					private_sequence_tokens.append(private_pages * page_size)
+
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
 			# if it fires, there's another selection bug to investigate.
-			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
-			total_pages_needed = sum(math.ceil(t / seq.PAGE_SIZE) for t in sequence_tokens)
+			try:
+				kv_stats = (
+					self.core_engine.host_paged_kv_worker_view.get_stats()
+				)
+				total_pages_needed = sum(
+					math.ceil(tokens / self.PAGE_SIZE)
+					for tokens in private_sequence_tokens
+				)
+				page_deficit = max(
+					0, total_pages_needed - int(kv_stats.num_free_pages)
+				)
+				if page_deficit and self.enable_prefix_cache:
+					from batchgen.prefix_reuse.eviction import (
+						evict_prefix_pages_for_host_allocation,
+					)
+
+					evict_prefix_pages_for_host_allocation(
+						core_engine_module=core_engine,
+						coordinator=self.prefix_cache_coordinator,
+						worker_views_by_group={
+							0: self.core_engine.host_paged_kv_worker_view
+						},
+						group_id=0,
+						page_deficit=page_deficit,
+						max_scan_nodes=(
+							self.prefix_cache_runtime_config.max_nodes
+						),
+					)
+					kv_stats = (
+						self.core_engine.host_paged_kv_worker_view.get_stats()
+					)
+			except Exception:
+				self._release_prefix_cache_attachments(list(prefix_states))
+				raise
 			if total_pages_needed > kv_stats.num_free_pages:
 				# Log per-sequence breakdown to help diagnose the selection bug.
 				seq_details = []
@@ -7773,10 +8104,34 @@ class BatchGenWorker:
 				f"(chunk_size={chunk_size})"
 			)
 
-			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(global_sequence_ids, sequence_tokens))
-			)
+			worker_view = self.core_engine.host_paged_kv_worker_view
+			try:
+				worker_view.register_sequences(global_sequence_ids)
+				for global_id in global_sequence_ids:
+					state = prefix_states.get(global_id)
+					if state is not None and state.shared_page_ids:
+						worker_view.attach_shared_prefix_pages(
+							global_id, list(state.shared_page_ids)
+						)
+				if private_sequence_ids:
+					worker_view.allocate_pages_for_sequences(
+						list(zip(
+							private_sequence_ids,
+							private_sequence_tokens,
+						))
+					)
+			except Exception:
+				for global_id in global_sequence_ids:
+					try:
+						worker_view.release_sequence_pages([global_id])
+					except Exception:
+						pass
+					state = self._prefix_sequence_states.pop(global_id, None)
+					if state is not None and state.attachment_handle:
+						self.prefix_cache_coordinator.release_attachment(
+							state.attachment_handle
+						)
+				raise
 			# DSA: mirror registration on auxiliary host KV
 			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
@@ -8394,6 +8749,7 @@ class BatchGenWorker:
 			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
 				aux_view.release_sequence_pages(global_sequence_ids)
+			self._release_prefix_cache_attachments(global_sequence_ids)
 
 		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
 		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
@@ -8411,6 +8767,135 @@ class BatchGenWorker:
 				if remaining_global_ids:
 					remaining_global_ids.sort()
 					manager.rebuild_page_table(remaining_global_ids)
+
+	def _close_active_prefix_materializations(self) -> None:
+		"""Release temporary prefix-prefill GPU buffers after success or error."""
+
+		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+
+		_AWB.prefill_prefix_materialization = None
+		if not self._active_prefix_materializations:
+			return
+		try:
+			_AWB.retire_pending_prefill_offloads(
+				device=self.torch_device,
+				reason="prefix materialization cleanup",
+			)
+		except Exception:
+			logging.exception(
+				"Rank %s failed to retire prefix prefill offloads",
+				self.rank,
+			)
+		while self._active_prefix_materializations:
+			materialization = self._active_prefix_materializations.pop()
+			try:
+				materialization.close(empty_cuda_cache=True)
+			except Exception:
+				logging.exception(
+					"Rank %s failed to close prefix materialization",
+					self.rank,
+				)
+
+	def _release_prefix_cache_attachments(
+		self, global_sequence_ids: Sequence[int]
+	) -> None:
+		if not self.enable_prefix_cache:
+			return
+		for sequence_id in global_sequence_ids:
+			state = self._prefix_sequence_states.pop(int(sequence_id), None)
+			if state is None:
+				continue
+			for handle in (*state.commit_attachment_handles, state.attachment_handle):
+				if handle:
+					self.prefix_cache_coordinator.release_attachment(handle)
+
+	def _commit_prefix_cache_for_prefill(
+		self, local_sequence_ids: Sequence[int]
+	) -> None:
+		"""Publish completed prompt pages after every D2H offload retires."""
+
+		if not self.enable_prefix_cache or not local_sequence_ids:
+			return
+		from batchgen.prefix_reuse.commit import (
+			build_prefix_commit_request,
+			collect_group_pages_for_commit,
+			retain_inserted_prefix_pages,
+		)
+		from batchgen.prefix_reuse.eviction import (
+			commit_prefix_pages_with_capacity_retry,
+		)
+
+		worker_view = self.core_engine.host_paged_kv_worker_view
+		runtime = self.prefix_cache_runtime_config
+		page_size = int(runtime.group_specs[0].raw_page_tokens)
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			if not self._owns_host_kv(seq):
+				continue
+			token_ids = seq.input_ids[0, :seq.prompt_length].tolist()
+			commit_tokens = (
+				len(token_ids) // runtime.publish_boundary_tokens
+			) * runtime.publish_boundary_tokens
+			if commit_tokens == 0:
+				continue
+			pages = collect_group_pages_for_commit(
+				worker_views_by_group={0: worker_view},
+				sequence_id=seq.global_idx,
+				commit_tokens=commit_tokens,
+				raw_page_tokens_by_group={0: page_size},
+			)
+			request = build_prefix_commit_request(
+				namespace_digest=runtime.namespace_digest,
+				token_ids=token_ids,
+				publish_boundary_tokens=runtime.publish_boundary_tokens,
+				pages_by_group=pages,
+			)
+			if request is None:
+				continue
+
+			commit_outcome = commit_prefix_pages_with_capacity_retry(
+				request=request,
+				coordinator=self.prefix_cache_coordinator,
+				worker_views_by_group={0: worker_view},
+				max_scan_nodes=runtime.max_nodes,
+			)
+			result = commit_outcome.commit_result
+			commit_handle = int(result.active_attachment_handle)
+			if result.inserted_nodes and not commit_handle:
+				raise RuntimeError(
+					"prefix commit inserted pages without protecting the active sequence"
+				)
+			if commit_handle:
+				# Keep the new resident pages pinned until this sequence releases
+				# its Host page table, including during back-to-back prefill.
+				state = self._prefix_sequence_states.get(seq.global_idx)
+				if state is None:
+					self.prefix_cache_coordinator.release_attachment(commit_handle)
+					raise RuntimeError(
+						"prefix commit has no active sequence state"
+					)
+				self._prefix_sequence_states[seq.global_idx] = replace(
+					state,
+					commit_attachment_handles=(
+						*state.commit_attachment_handles, commit_handle
+					),
+				)
+			retained = retain_inserted_prefix_pages(
+				commit_result=result,
+				request=request,
+				worker_views_by_group={0: worker_view},
+				sequence_id=seq.global_idx,
+			)
+			logging.info(
+				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
+				"inserted_nodes=%s retained_pages=%s",
+				self.rank,
+				seq.global_idx,
+				result.committed_tokens,
+				result.inserted_nodes,
+				sum(len(value) for value in retained.values()),
+			)
 
 	# ============ Prefill and Decode ============
 
@@ -8574,6 +9059,10 @@ class BatchGenWorker:
 		input_ids_list = []
 		attention_mask_list = []
 		seq_lengths = []
+		full_seq_lengths = []
+		compute_cached_tokens = []
+		attached_tokens = []
+		prefix_lookup_results = []
 
 		for query_idx in batch:
 			uuid = self._local_to_uuid_map[query_idx]
@@ -8604,13 +9093,35 @@ class BatchGenWorker:
 				f"encoded prompt length {encoded.size(-1)} < seq.prompt_length {L} "
 				f"for query_idx={query_idx} uuid={uuid[:8]}"
 			)
-			input_ids = encoded[:, :L]
-			seq_lengths.append(L)
+			prefix_state = self._prefix_sequence_states.get(seq.global_idx)
+			compute_cached = (
+				prefix_state.compute_cached_tokens
+				if prefix_state is not None
+				else 0
+			)
+			attached = (
+				prefix_state.attached_tokens
+				if prefix_state is not None
+				else 0
+			)
+			input_ids = encoded[:, compute_cached:L]
+			query_len = L - compute_cached
+			if query_len <= 0:
+				raise RuntimeError(
+					"prefix prefill must compute at least one prompt token"
+				)
+			seq_lengths.append(query_len)
+			full_seq_lengths.append(L)
+			compute_cached_tokens.append(compute_cached)
+			attached_tokens.append(attached)
+			prefix_lookup_results.append(
+				prefix_state.lookup_result if prefix_state is not None else None
+			)
 
 			# Per-seq mask marks the L valid positions for the prepacker.
 			# Causal attention is enforced by FA varlen + cu_seqlens.
 			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
-			attention_mask[0, :L] = 1
+			attention_mask[0, :query_len] = 1
 
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
@@ -8650,8 +9161,13 @@ class BatchGenWorker:
 			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
 			packed_input_ids_flat.append(seq_input_ids)
 
-			# Position IDs are 0, 1, 2, ... for each sequence
-			packed_position_ids_flat.append(torch.arange(seq_len, device=self.torch_device))
+			# Prefix-hit suffixes retain their original absolute positions.
+			position_start = compute_cached_tokens[seq_idx]
+			packed_position_ids_flat.append(torch.arange(
+				position_start,
+				position_start + seq_len,
+				device=self.torch_device,
+			))
 
 		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
 		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
@@ -8730,6 +9246,10 @@ class BatchGenWorker:
 
 				# Get sequences for this micro-batch
 				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
+				batch_full_seq_lengths = full_seq_lengths[seq_start:seq_end]
+				batch_compute_cached = compute_cached_tokens[seq_start:seq_end]
+				batch_attached_tokens = attached_tokens[seq_start:seq_end]
+				batch_lookup_results = prefix_lookup_results[seq_start:seq_end]
 				batch_num_seqs = seq_end - seq_start
 
 				# Extract tokens for this micro-batch
@@ -8784,6 +9304,59 @@ class BatchGenWorker:
 					device=self.torch_device,
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
+				prefix_materialization = None
+				if any(tokens > 0 for tokens in batch_compute_cached):
+					if any(result is None for result in batch_lookup_results):
+						raise RuntimeError(
+							"prefix-hit microbatch is missing lookup results"
+						)
+					from batchgen.kv_cache.host_kv_mananger_config import (
+						build_gpu_kv_config,
+					)
+					from batchgen.prefix_reuse.materialization import (
+						materialize_gpt_oss_prefixes,
+					)
+
+					host_page_tokens = int(
+						self.prefix_cache_runtime_config.group_specs[0]
+						.raw_page_tokens
+					)
+					gpu_config = build_gpu_kv_config(
+						self.huggingface_ckpt_name,
+						batch_full_seq_lengths,
+					)
+					fa_page_tokens = max(256, int(gpu_config.page_size_tokens))
+					fa_page_tokens = math.ceil(fa_page_tokens / 256) * 256
+					gpu_config = replace(
+						gpu_config,
+						num_pages=sum(
+							math.ceil(max(1, int(tokens)) / fa_page_tokens)
+							for tokens in batch_full_seq_lengths
+						),
+						page_size_tokens=fa_page_tokens,
+					)
+					temporary_manager = GPUPagedKVCacheManager(
+						config=gpu_config,
+						device=self.local_rank,
+					)
+					temporary_manager.initialize()
+					prefix_materialization = materialize_gpt_oss_prefixes(
+						gpu_manager=temporary_manager,
+						host_worker_view=(
+							self.core_engine.host_paged_kv_worker_view
+						),
+						coordinator=self.prefix_cache_coordinator,
+						lookup_results=batch_lookup_results,
+						sequence_ids=(
+							prefill_sequence_spans_to_global_seq_ids(batch_spans)
+						),
+						prompt_lengths=batch_full_seq_lengths,
+						compute_cached_tokens=batch_compute_cached,
+						raw_page_tokens=host_page_tokens,
+					)
+					self._active_prefix_materializations.append(
+						prefix_materialization
+					)
 
 				# Set up Attn_Wrapper for this micro-batch.
 				# These class attrs are the per-step worker->model contract read
@@ -8805,6 +9378,24 @@ class BatchGenWorker:
 				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
 				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
 				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+				AttnWrapperBase.prepack_full_seq_lengths = (
+					batch_full_seq_lengths
+					if prefix_materialization is not None
+					else None
+				)
+				AttnWrapperBase.prepack_compute_cached_tokens = (
+					batch_compute_cached
+					if prefix_materialization is not None
+					else None
+				)
+				AttnWrapperBase.prepack_attached_tokens = (
+					batch_attached_tokens
+					if prefix_materialization is not None
+					else None
+				)
+				AttnWrapperBase.prefill_prefix_materialization = (
+					prefix_materialization
+				)
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
@@ -8961,6 +9552,17 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
+				if prefix_materialization is not None:
+					AttnWrapperBase.retire_pending_prefill_offloads(
+						device=self.torch_device,
+						reason="before releasing prefix materialization",
+					)
+					prefix_materialization.close(empty_cuda_cache=True)
+					self._active_prefix_materializations.remove(
+						prefix_materialization
+					)
+					AttnWrapperBase.prefill_prefix_materialization = None
+
 				# The FIRST generated token, straight out of prefill. A
 				# max_tokens=1 request is now completed right after prefill
 				# (PREFILL_PLAN C4, _finish_prefill_completed_sequences) and
@@ -9094,6 +9696,10 @@ class BatchGenWorker:
 		AttnWrapperBase.prepack_max_seqlen = None
 		AttnWrapperBase.prepack_num_sequences = None
 		AttnWrapperBase.prepack_seq_lengths = None
+		AttnWrapperBase.prepack_full_seq_lengths = None
+		AttnWrapperBase.prepack_compute_cached_tokens = None
+		AttnWrapperBase.prepack_attached_tokens = None
+		AttnWrapperBase.prefill_prefix_materialization = None
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
@@ -9663,6 +10269,9 @@ class BatchGenWorker:
 					if aux_view is not None:
 						aux_view.release_sequence_pages(evicted_global_ids)
 						aux_view.unregister_sequences(evicted_global_ids)
+					self._release_prefix_cache_attachments(
+						evicted_global_ids
+					)
 
 			# All-ranks: update scalar metadata deterministically. Compute
 			# new_reentry_len from already-synced prompt_length, decoded_length,
@@ -9881,7 +10490,9 @@ class BatchGenWorker:
 					new_load_global = filtered_global
 					tokens = filtered_tokens
 
-					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+					self._allocate_gpu_pages_with_host_identity(
+						gpu_manager, new_load_global, tokens
+					)
 					timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
 
 					t_launch = time.perf_counter()
@@ -13062,7 +13673,9 @@ class BatchGenWorker:
 			return None, new_uuids, [], []
 		
 		# Step 5: Allocate GPU pages
-		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
+		self._allocate_gpu_pages_with_host_identity(
+			gpu_manager, new_global_ids, tokens
+		)
 		
 		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
 
@@ -13219,7 +13832,9 @@ class BatchGenWorker:
 			return None, new_uuids, [], [], timing
 		
 		# ============ PHASE 6: Allocate GPU pages ============
-		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
+		self._allocate_gpu_pages_with_host_identity(
+			gpu_manager, new_global_ids, tokens
+		)
 		timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
 		
 		# ============ PHASE 7: Prepare for async load ============
@@ -14333,6 +14948,9 @@ class BatchGenWorker:
 							except Exception:
 								# Sequence was already released during decode - this is normal
 								pass
+						self._release_prefix_cache_attachments(
+							global_ids_to_release
+						)
 						logging.info(f"Rank {self.rank}: Released {released_count}/{len(global_ids_to_release)} sequences (others already released)")
 			except Exception as e:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup host KV: {e}")
@@ -14358,6 +14976,8 @@ class BatchGenWorker:
 		
 		# 7. Reset GPU KV tracking
 		self._sequences_with_gpu_kv = set()
+		self._prefix_sequence_states = {}
+		self._active_prefix_materializations = []
 		
 		# 8. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:

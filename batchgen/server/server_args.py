@@ -88,6 +88,8 @@ class ServerArgs:
     dist_init_addr: str = "localhost:12355"
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
+    enable_prefix_cache: bool = False
+    prefix_cache_debug_stats: bool = False
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -239,6 +241,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Host KV cache size (GB)",
+    )
+    parser.add_argument(
+        "--enable-prefix-cache",
+        action="store_true",
+        default=False,
+        help="Enable page-level Host prefix-cache reuse for qualified models",
+    )
+    parser.add_argument(
+        "--prefix-cache-debug-stats",
+        action="store_true",
+        default=False,
+        help="Log prefix-cache lifecycle statistics",
     )
     parser.add_argument(
         "--gpu-arch", type=str, default=None, help="GPU architecture hint"
@@ -524,6 +538,12 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_cache_size <= 0:
         raise ValueError("--host-kv-cache-size must be a positive number of GB")
+    if args.enable_prefix_cache:
+        from batchgen.prefix_reuse.config import (
+            require_prefix_cache_model_support,
+        )
+
+        require_prefix_cache_model_support(args.model)
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(
@@ -614,6 +634,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
+        enable_prefix_cache=parsed.enable_prefix_cache,
+        prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,

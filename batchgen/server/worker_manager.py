@@ -124,6 +124,8 @@ class WorkerManager:
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
         self._fatal_ack_event = self._mp_ctx.Event()
+        self.prefix_cache_runtime_config = None
+        self.prefix_cache_coordinator = None
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
@@ -188,6 +190,10 @@ class WorkerManager:
                     self.host_kv_manager = result
                     self.host_kv_aux_manager = None
             except Exception as exc:
+                if self.args.enable_prefix_cache:
+                    raise RuntimeError(
+                        "Host KV allocation is required for prefix cache reuse"
+                    ) from exc
                 logger.warning("Host KV cache allocation failed: %s", exc)
                 self.host_kv_manager = None
                 self.host_kv_aux_manager = None
@@ -201,20 +207,27 @@ class WorkerManager:
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
 
+        if self.args.enable_prefix_cache:
+            self._initialize_prefix_cache_owner()
+
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
         if self.distributed_weight_daemon is not None:
             _diag(">>> distributed_weight_daemon.wait_ready")
             self.distributed_weight_daemon.wait_ready(600.0)
             _diag("<<< distributed_weight_daemon.wait_ready")
-        self._spawn_workers()
-        _diag("<<< _spawn_workers")
-        _diag(">>> _start_worker_monitor")
-        self._start_worker_monitor()
-        _diag("<<< _start_worker_monitor")
-        _diag(">>> _wait_for_workers_ready")
-        self._wait_for_workers_ready()
-        _diag("<<< _wait_for_workers_ready")
+        try:
+            self._spawn_workers()
+            _diag("<<< _spawn_workers")
+            _diag(">>> _start_worker_monitor")
+            self._start_worker_monitor()
+            _diag("<<< _start_worker_monitor")
+            _diag(">>> _wait_for_workers_ready")
+            self._wait_for_workers_ready()
+            _diag("<<< _wait_for_workers_ready")
+        except Exception:
+            self._shutdown_prefix_cache_owner()
+            raise
         logger.info("[startup] Workers ready in %.2fs",
                     _time.monotonic() - spawn_start)
 
@@ -289,6 +302,8 @@ class WorkerManager:
         if self.distributed_weight_daemon is not None:
             self.distributed_weight_daemon.stop()
             self.distributed_weight_daemon = None
+
+        self._shutdown_prefix_cache_owner()
 
         # Get shm_name for cleanup if available
         shm_name = self.model_info.get("shm_name")
@@ -615,6 +630,8 @@ class WorkerManager:
                 "host_kv_cache_size_per_rank"
             ),
             global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
+            enable_prefix_cache=self.args.enable_prefix_cache,
+            prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,
@@ -1126,6 +1143,39 @@ class WorkerManager:
             host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
         host_paged_kv_manager.initialize(True)
         return host_paged_kv_manager
+
+    def _initialize_prefix_cache_owner(self) -> None:
+        from batchgen.prefix_reuse.config import (
+            build_prefix_cache_runtime_config,
+            create_host_prefix_cache_coordinator,
+        )
+
+        host_config = build_host_kv_config(
+            model_name=self.args.model,
+            host_kv_cache_size=int(self.args.host_kv_cache_size * (1024**3)),
+        )
+        self.prefix_cache_runtime_config = build_prefix_cache_runtime_config(
+            model_name=self.args.model,
+            kv_dtype=self.args.kv_dtype,
+            host_kv_config=host_config,
+            debug_stats=self.args.prefix_cache_debug_stats,
+        )
+        self.prefix_cache_coordinator = create_host_prefix_cache_coordinator(
+            core_engine_module=bg_lib,
+            runtime_config=self.prefix_cache_runtime_config,
+            create_region=True,
+        )
+
+    def _shutdown_prefix_cache_owner(self) -> None:
+        if self.prefix_cache_runtime_config is None:
+            return
+        from batchgen.prefix_reuse.config import (
+            unlink_prefix_cache_shared_memory,
+        )
+
+        self.prefix_cache_coordinator = None
+        unlink_prefix_cache_shared_memory(self.prefix_cache_runtime_config)
+        self.prefix_cache_runtime_config = None
 
     @staticmethod
     def _parse_parameter_server_endpoint(endpoint: str) -> tuple[str, int]:
