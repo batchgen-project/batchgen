@@ -48,3 +48,19 @@ def test_glm52_uses_glm5_primary_and_indexer_host_kv_profiles(monkeypatch):
             config._resolve_indexer_profile(model_name)
             is config._GLM5_INDEXER_PROFILE
         )
+
+
+def test_glm53_uses_glm5_primary_and_indexer_host_kv_profiles(monkeypatch):
+    config = _load_host_kv_config(monkeypatch)
+
+    for model_name in (
+        "zai-org/GLM-5.3-FP8",
+        "zai-org/GLM-5.3",
+        "GLM-5.3-FP8",
+        "GLM-5.3",
+    ):
+        assert config._resolve_profile(model_name) is config._GLM5_MLA_PROFILE
+        assert (
+            config._resolve_indexer_profile(model_name)
+            is config._GLM5_INDEXER_PROFILE
+        )
