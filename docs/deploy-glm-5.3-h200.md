@@ -97,11 +97,17 @@ numactl --interleave=all python -m batchgen.launch_http_server \
     --dist-init-addr 127.0.0.1:29504 \
     --host-kv-cache-size 280 \
     --kv-dtype bfloat16 \
-    --gpu-memory-frac 0.56 \
-    --disable-cuda-graphs \
+    --gpu-memory-frac 0.96 \
     --parse-thinking \
     --startup-timeout 3600
 ```
+
+Use the production H200 defaults above for performance measurements. A lower
+`--gpu-memory-frac` can leave no positive GPU-KV budget after the GLM-5.3
+weights are resident; BatchGen then falls back to a 1-GiB minimum pool, which
+is a configuration failure for throughput testing. Keep
+`--disable-cuda-graphs` only for an explicitly isolated compatibility
+diagnostic, not for a release performance run.
 
 `--parse-thinking` places the generated reasoning before the template-primed
 `</think>` boundary in `message.reasoning_content` and leaves the answer in
