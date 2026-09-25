@@ -38,7 +38,7 @@ def should_use_glm52_sparse_prefill(
     max_seqlen: int,
     index_topk: int,
 ) -> bool:
-    return model_type == "glm_moe_dsa_5_2" and max_seqlen > index_topk
+    return model_type in {"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"} and max_seqlen > index_topk
 
 
 def build_packed_causal_ranges(

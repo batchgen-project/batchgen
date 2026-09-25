@@ -173,7 +173,9 @@ class GLM5ParallelStrategyManager:
         # GLM-5.2 long prompts run packed sparse absorbed FlashMLA prefill, which
         # has no dense fallback. Prove the required runtime exists here, at
         # configure time, instead of failing minutes into a long prefill.
-        if getattr(self.loaded_model_config, "model_type", None) == "glm_moe_dsa_5_2":
+        if getattr(self.loaded_model_config, "model_type", None) in {
+            "glm_moe_dsa_5_2", "glm_moe_dsa_5_3"
+        }:
             from .sparse_prefill import validate_glm52_sparse_prefill_runtime
 
             validate_glm52_sparse_prefill_runtime()
