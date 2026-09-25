@@ -943,6 +943,8 @@ class BatchGenWorker:
 		# Request pool: admission queue and response queue for persistent loop
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
+		self._deferred_pool_cancellations: List[dict] = []
+		self._next_pool_global_idx = 0
 		# global_idx -> decoded text for sequences completed during PREFILL
 		# (C4). Captured before _report_completion pops the local maps; the
 		# legacy end-of-generate() gather merges it. Legacy mode only.
@@ -1345,18 +1347,45 @@ class BatchGenWorker:
 		"""Set the mp.Queue used to send per-request completion results."""
 		self._response_queue = queue
 
-	def _poll_admissions(self) -> bool:
+	def _handle_pool_message(
+		self, msg: dict, *, defer_cancellation: bool = False
+	) -> Optional[str]:
+		"""Apply one broadcast pool-control message on every rank."""
+		msg_type = msg.get("type")
+		if msg_type == "admit":
+			self._admit_sequences_from_message(msg)
+			return "admit"
+		if msg_type == "cancel":
+			batch_id = msg.get("batch_id")
+			if not isinstance(batch_id, str) or not batch_id:
+				raise ValueError("Pool cancel message requires a non-empty batch_id")
+			if defer_cancellation:
+				from batchgen.worker.cancellation import defer_batch_cancellation
+				defer_batch_cancellation(self, msg)
+				return "cancel_deferred"
+			from batchgen.worker.cancellation import cancel_batch_sequences
+			cancel_batch_sequences(self, batch_id)
+			return "cancel"
+		return None
+
+	def _apply_deferred_pool_cancellations(self) -> bool:
+		"""Apply cancellations saved while decode-local state was still live."""
+		from batchgen.worker.cancellation import apply_deferred_batch_cancellations
+		return apply_deferred_batch_cancellations(self)
+
+	def _poll_admissions(
+		self, *, defer_cancellation: bool = False
+	) -> Optional[str]:
 		"""Poll for new admission messages. Called at top of generate() outer loop.
 
 		Only rank 0 polls the queue; result is broadcast to all ranks.
 		New sequences are tokenized, assigned ranks, and added to global_batch as QUEUEING.
 
-		Returns:
-			True if new sequences were admitted.
+		Returns the handled control type, or ``None`` when the queue was empty.
 		"""
 		import queue as queue_mod
 
-		has_new = False
+		has_message = False
 		msg_data = None
 
 		if self.rank == 0 and self._admission_queue is not None:
@@ -1364,9 +1393,9 @@ class BatchGenWorker:
 				msg = self._admission_queue.get_nowait()
 				if msg is None:
 					self._shutdown_requested = True
-				elif isinstance(msg, dict) and msg.get("type") == "admit":
+				elif isinstance(msg, dict) and msg.get("type") in {"admit", "cancel"}:
 					msg_data = msg
-					has_new = True
+					has_message = True
 				elif isinstance(msg, dict) and "prompts" in msg:
 					# A legacy /v1/inference payload (worker_manager.infer builds
 					# exactly this shape). It matches no branch above, so it used
@@ -1383,20 +1412,23 @@ class BatchGenWorker:
 
 		# Broadcast status to all ranks
 		status = torch.tensor(
-			[1 if has_new else 0, 1 if self._shutdown_requested else 0],
+			[1 if has_message else 0, 1 if self._shutdown_requested else 0],
 			dtype=torch.int32, device=self.torch_device,
 		)
 		dist.broadcast(status, src=0)
-		has_new = status[0].item() == 1
+		has_message = status[0].item() == 1
 		self._shutdown_requested = status[1].item() == 1
 
-		if has_new:
+		action = None
+		if has_message:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
-			self._admit_sequences_from_message(msg_data)
+			action = self._handle_pool_message(
+				msg_data, defer_cancellation=defer_cancellation
+			)
 
-		return has_new
+		return action
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -1414,10 +1446,11 @@ class BatchGenWorker:
 			return
 
 		# Determine starting global_idx (continue from existing batch)
-		existing_max_idx = max(
+		existing_next_idx = max(
 			(seq.global_idx for seq in self.global_batch), default=-1
-		)
-		start_idx = existing_max_idx + 1
+		) + 1
+		start_idx = max(existing_next_idx, self._next_pool_global_idx)
+		self._next_pool_global_idx = start_idx + len(entries)
 
 		# Step 1: Create SequenceEntry objects
 		new_uuids = []
@@ -6542,8 +6575,8 @@ class BatchGenWorker:
 		while True:
 			# --- ADMISSION CHECK: Poll for new sequences from IntakePool ---
 			if self._admission_queue is not None:
-				admitted = self._poll_admissions()
-				if admitted and self.rank == 0:
+				action = self._poll_admissions()
+				if action == "admit" and self.rank == 0:
 					logging.info(f"[POOL] Admitted new sequences, total in batch: {len(self.global_batch)}")
 					self._timing_logged = False  # Reset for new batch group
 
@@ -6582,19 +6615,19 @@ class BatchGenWorker:
 							self._shutdown_requested = True
 							status = torch.tensor([0, 1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
-						elif isinstance(msg, dict) and msg.get("type") == "admit":
+						elif isinstance(msg, dict) and msg.get("type") in {"admit", "cancel"}:
 							# Broadcast that we got new work
 							status = torch.tensor([1, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							self._admit_sequences_from_message(msg)
-							# Reset per-batch-group timing so each admission cycle
-							# emits its own "Pool batch group completed" summary.
-							prefill_time = 0.0
-							decoding_time = 0.0
-							generation_start_time = time.perf_counter()
-							self._timing_logged = False
+							if self._handle_pool_message(msg) == "admit":
+								# Reset per-batch-group timing so each admission cycle
+								# emits its own "Pool batch group completed" summary.
+								prefill_time = 0.0
+								decoding_time = 0.0
+								generation_start_time = time.perf_counter()
+								self._timing_logged = False
 							# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and msg.get("command") == "reload":
 							# Hot-reload command — broadcast to all ranks then handle.
@@ -6632,12 +6665,12 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
-						self._admit_sequences_from_message(container[0])
-						# Reset per-batch-group timing (matches rank-0 branch).
-						prefill_time = 0.0
-						decoding_time = 0.0
-						generation_start_time = time.perf_counter()
-						self._timing_logged = False
+						if self._handle_pool_message(container[0]) == "admit":
+							# Reset per-batch-group timing (matches rank-0 branch).
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
 					elif is_reload:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
@@ -7125,8 +7158,12 @@ class BatchGenWorker:
 				# This ensures newly submitted batches are admitted to global_batch
 				# so has_queueing() can detect them and trigger prefill.
 				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
+					if self._apply_deferred_pool_cancellations():
+						continue
+					action = self._poll_admissions()
+					if action == "cancel":
+						continue
+					if action == "admit" and self.rank == 0:
 						logging.info(f"[DECODE] Mid-cycle admission, total in batch: {len(self.global_batch)}")
 
 				# Check if there are queued sequences waiting for prefill AND
@@ -11804,8 +11841,32 @@ class BatchGenWorker:
 				# New batches may have been submitted during decode — drain them
 				# and break for prefill if QUEUEING sequences arrive.
 				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
+					action = self._poll_admissions(defer_cancellation=True)
+					if action == "cancel_deferred":
+						# The boundary may have launched a new async Host->GPU load.
+						# Finalize it before leaving the decode-local state; the outer
+						# loop applies cancellation only after model cleanup + barrier.
+						from batchgen.worker.cancellation import (
+							pause_decode_for_cancellation,
+							settle_pending_decode_load,
+						)
+						decode_uuids, batch = settle_pending_decode_load(
+							self,
+							pending_async_task=pending_async_task,
+							pending_load_uuids=pending_load_uuids,
+							pending_load_local=pending_load_local,
+							pending_load_global=pending_load_global,
+							decode_uuids=decode_uuids,
+							batch=batch,
+							gpu_manager=gpu_manager,
+						)
+						pending_async_task = None
+						pending_load_uuids = []
+						pending_load_local = []
+						pending_load_global = []
+						pause_decode_for_cancellation(self, decode_uuids)
+						break
+					if action == "admit" and self.rank == 0:
 						logging.info(
 							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
 							f"total in batch: {len(self.global_batch)}"
@@ -11815,7 +11876,7 @@ class BatchGenWorker:
 						num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						logging.info(
 							f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
-							f"watermark={watermark_triggered} admitted={admitted}"
+							f"watermark={watermark_triggered} admitted={action == 'admit'}"
 						)
 					if has_q and watermark_triggered:
 						if self.rank == 0:

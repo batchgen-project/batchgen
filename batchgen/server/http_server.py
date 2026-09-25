@@ -398,6 +398,7 @@ def create_app(
     @app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
     async def cancel_batch(request: Request, batch_id: str):
         storage: StorageManager = request.app.state.storage
+        scheduler: BatchScheduler = request.app.state.scheduler
         batch = storage.load_batch(batch_id)
         if not batch:
             raise HTTPException(
@@ -412,12 +413,10 @@ def create_app(
                 f" Valid statuses: validating, in_progress",
             )
 
-        now = int(time.time())
-        storage.update_batch_status(
-            batch_id, BatchStatus.CANCELLED, cancelling_at=now, cancelled_at=now
-        )
-        updated = storage.load_batch(batch_id)
-        return updated
+        try:
+            return await scheduler.cancel_batch(batch_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/inference")
     async def run_inference():

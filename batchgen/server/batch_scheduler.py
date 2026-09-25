@@ -117,6 +117,7 @@ class BatchScheduler:
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._cancel_pending: Dict[str, set[str]] = {}
 
     async def start(self) -> None:
         if self._task:
@@ -163,6 +164,103 @@ class BatchScheduler:
 
     async def enqueue(self, batch_id: str) -> None:
         await self._queue.put(batch_id)
+
+    async def cancel_batch(self, batch_id: str):
+        """Cancel queued work and request collective-safe worker cleanup."""
+        batch = self.storage.load_batch(batch_id)
+        if batch is None:
+            raise KeyError(batch_id)
+        if batch.status not in {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS}:
+            raise ValueError(
+                f"Batch {batch_id} cannot be cancelled from status {batch.status.value}"
+            )
+        if not self._pool_mode and batch.status == BatchStatus.IN_PROGRESS:
+            raise RuntimeError(
+                "Active cancellation requires persistent pool mode "
+                "(--max-pool-size > 0)"
+            )
+
+        now = int(time.time())
+        self.storage.update_batch_status(
+            batch_id, BatchStatus.CANCELLING, cancelling_at=now
+        )
+        self._intake_pool.cancel_batch(batch_id)
+
+        request_ids = set(self._pool_request_meta.get(batch_id, {}))
+        active_ids = self._scheduling_pool.active_request_ids(request_ids)
+        if not active_ids:
+            self._finish_cancel(batch_id)
+            return self.storage.load_batch(batch_id)
+
+        self._cancel_pending[batch_id] = active_ids
+        self.worker.request_queue.put({"type": "cancel", "batch_id": batch_id})
+        return self.storage.load_batch(batch_id)
+
+    def _finish_cancel(self, batch_id: str) -> None:
+        self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
+        self._pool_request_meta.pop(batch_id, None)
+        self._cancel_pending.pop(batch_id, None)
+        now = int(time.time())
+        self.storage.update_batch_status(
+            batch_id,
+            BatchStatus.CANCELLED,
+            cancelled_at=now,
+        )
+
+    def _handle_batch_cancelled(self, result: Dict[str, Any]) -> None:
+        batch_id = result.get("batch_id")
+        if not batch_id:
+            logger.error("[POOL] Worker cancellation ACK missing batch_id")
+            return
+        batch = self.storage.load_batch(batch_id)
+        if batch and batch.status == BatchStatus.FAILED:
+            logger.error(
+                "[POOL] Ignoring cancellation ACK for failed batch %s", batch_id
+            )
+            return
+        pending = self._cancel_pending.get(batch_id)
+        if pending is None:
+            logger.warning("[POOL] Unexpected cancellation ACK for %s", batch_id)
+            return
+        for request_id in result.get("request_ids", []):
+            self._scheduling_pool.free_slot_if_allocated(request_id)
+            pending.discard(request_id)
+        if pending:
+            error = (
+                "Worker cancellation ACK omitted active requests: "
+                f"{sorted(pending)}"
+            )
+            logger.error("[POOL] Batch %s %s", batch_id, error)
+            tracker = self._scheduling_pool.get_batch_tracker(batch_id)
+            if tracker is not None:
+                tracker.error = error
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=error
+            )
+            return
+        self._finish_cancel(batch_id)
+
+    def _handle_pool_completion(self, result: Dict[str, Any]) -> None:
+        request_id = result.get("request_id")
+        batch_id = result.get("batch_id")
+        if request_id:
+            self._scheduling_pool.free_slot_if_allocated(request_id)
+        if batch_id in self._cancel_pending:
+            self._cancel_pending.get(batch_id, set()).discard(request_id)
+            logger.info(
+                "[POOL] Discarded completion for cancelling batch %s request %s",
+                batch_id,
+                request_id,
+            )
+            return
+        if batch_id and request_id:
+            self._write_pool_completion(batch_id, request_id, result)
+            batch_done = self._scheduling_pool.mark_request_completed(
+                request_id, batch_id
+            )
+            if batch_done:
+                logger.info("[POOL] Batch %s completed", batch_id)
 
     async def _run(self) -> None:
         while not self._stopped.is_set():
@@ -1004,8 +1102,12 @@ class BatchScheduler:
         batch_failed = False
 
         while True:
+            persisted = self.storage.load_batch(batch_id)
+            if persisted and persisted.status == BatchStatus.CANCELLED:
+                return
             tracker = self._scheduling_pool.get_batch_tracker(batch_id)
-            if tracker and tracker.is_complete:
+            if (tracker and tracker.is_complete and persisted
+                    and persisted.status != BatchStatus.CANCELLING):
                 break
             if tracker and getattr(tracker, 'error', None):
                 logger.error(f"[POOL] Batch {batch_id} failed: {tracker.error}")
@@ -1143,13 +1245,7 @@ class BatchScheduler:
             if isinstance(result, dict):
                 msg_type = result.get("type")
                 if msg_type == "completion":
-                    request_id = result.get("request_id")
-                    batch_id = result.get("batch_id")
-                    if request_id:
-                        try:
-                            self._scheduling_pool.free_slot(request_id)
-                        except KeyError:
-                            pass
+                    self._handle_pool_completion(result)
                     # DIAG: Periodic slot status after completions
                     if not hasattr(self, '_completion_count'):
                         self._completion_count = 0
@@ -1161,15 +1257,8 @@ class BatchScheduler:
                             f"free={self._scheduling_pool.num_free_slots()}, "
                             f"intake={self._intake_pool.size()}"
                         )
-                    # Write output JSONL line
-                    if batch_id and request_id:
-                        self._write_pool_completion(batch_id, request_id, result)
-                    if batch_id:
-                        batch_done = self._scheduling_pool.mark_request_completed(
-                            request_id, batch_id
-                        )
-                        if batch_done:
-                            logger.info(f"[POOL] Batch {batch_id} completed")
+                elif msg_type == "batch_cancelled":
+                    self._handle_batch_cancelled(result)
                 elif msg_type == "pool_shutdown":
                     error = result.get("error")
                     if error:
