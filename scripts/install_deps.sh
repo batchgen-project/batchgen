@@ -428,19 +428,42 @@ install_deepgemm() {
     print_success "DeepGEMM installed"
 }
 
+batchgen_kernels_contract_ok() {
+    # Importing the namespace package is not sufficient: a source checkout or an
+    # incomplete wheel can satisfy that check while the first GPT-OSS request
+    # later fails when it lazily imports the fused attention extension.
+    python - <<'PY' &>/dev/null
+import importlib
+
+for module_name in (
+    "batchgen_kernels.attention._C_fused_ops",
+    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
+):
+    importlib.import_module(module_name)
+PY
+}
+
 install_batchgen_kernels() {
-    # Already provided by a pre-built wheel (auto-download / --wheel-dir)? Skip the compile.
-    if python -c "import batchgen_kernels" &>/dev/null 2>&1; then
-        print_success "batchgen_kernels already installed (wheel); skipping compilation"
+    # A pre-built wheel is usable only when the runtime extensions needed by
+    # the model path are present.  If a partial/source-only package is visible,
+    # rebuild from the checked-out sources instead of silently skipping it.
+    if batchgen_kernels_contract_ok; then
+        print_success "batchgen_kernels AOT runtime contract satisfied; skipping compilation"
         return 0
     fi
+
+    print_warning "batchgen_kernels is importable but its AOT runtime contract is incomplete; rebuilding"
 
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
-        pip install . --no-build-isolation
-        print_success "batchgen_kernels installed"
+        pip install . --no-build-isolation --no-deps --force-reinstall
+        if ! batchgen_kernels_contract_ok; then
+            print_error "batchgen_kernels installed but the AOT runtime contract is still incomplete"
+            return 1
+        fi
+        print_success "batchgen_kernels installed and AOT runtime contract verified"
     else
         print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
     fi

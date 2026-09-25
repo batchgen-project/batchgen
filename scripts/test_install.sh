@@ -376,6 +376,24 @@ else
     ok "batchgen_kernels installed in $(( T1 - T0 ))s"
 fi
 
+# Importing the namespace alone can pass for a source-only or partial wheel.
+# Verify the extensions that are loaded lazily by the GPT-OSS runtime before
+# declaring the environment usable.
+if ! python - <<'PY'
+import importlib
+
+for module_name in (
+    "batchgen_kernels.attention._C_fused_ops",
+    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
+):
+    importlib.import_module(module_name)
+PY
+then
+    fail "batchgen_kernels AOT runtime contract is incomplete"
+    exit 1
+fi
+ok "batchgen_kernels AOT runtime contract verified"
+
 # Verify it's in site-packages (not editable)
 KERNELS_LOC=$(python -c "import batchgen_kernels; print(batchgen_kernels.__file__)")
 if [[ "$KERNELS_LOC" == *"site-packages"* ]]; then
