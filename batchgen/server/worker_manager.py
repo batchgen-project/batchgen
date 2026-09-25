@@ -111,6 +111,8 @@ class WorkerManager:
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
+        self.host_kv_manager = None
+        self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
         self.distributed_weight_config = None
         self.skeleton_state_dict = None
@@ -139,6 +141,10 @@ class WorkerManager:
             except Exception as e:
                 logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
 
+    def _prepare_runtime_dir(self) -> None:
+        runtime_dir = self.args.runtime_identity.runtime_dir
+        runtime_dir.mkdir(mode=0o700, exist_ok=False)
+
     # ---------------------- Public API ----------------------
     def start(self) -> None:
         import time as _time
@@ -152,6 +158,7 @@ class WorkerManager:
         self._monitor_stop_event.clear()
         self._ready_event.clear()
         self._fatal_ack_event.clear()
+        self._prepare_runtime_dir()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -175,21 +182,19 @@ class WorkerManager:
         _diag("<<< config_torch_module_initializer")
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
-            try:
-                _diag(">>> allocate_host_kv_cache")
-                result = self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size, self.args.model,
-                    enable_memfd=self.args.fast_init,
-                )
-                _diag("<<< allocate_host_kv_cache")
-                if isinstance(result, tuple):
-                    self.host_kv_manager, self.host_kv_aux_manager = result
-                else:
-                    self.host_kv_manager = result
-                    self.host_kv_aux_manager = None
-            except Exception as exc:
-                logger.warning("Host KV cache allocation failed: %s", exc)
-                self.host_kv_manager = None
+            _diag(">>> allocate_host_kv_cache")
+            result = self.allocate_host_kv_cache(
+                self.args.host_kv_cache_size,
+                self.args.model,
+                primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
+                aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+                enable_memfd=self.args.fast_init,
+            )
+            _diag("<<< allocate_host_kv_cache")
+            if isinstance(result, tuple):
+                self.host_kv_manager, self.host_kv_aux_manager = result
+            else:
+                self.host_kv_manager = result
                 self.host_kv_aux_manager = None
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
@@ -402,9 +407,9 @@ class WorkerManager:
         status file polling.
 
         Pool-mode workers (generate_persistent loop) read the reload command
-        from request_queue and write per-rank status to
-        /tmp/batchgen_reload_status/rank_<N>.json. This method polls those
-        files for up to `timeout` seconds, returning aggregated status.
+        from request_queue and write per-rank status below this run's private
+        runtime directory. This method polls those files for up to `timeout`
+        seconds, returning aggregated status.
 
         Why not response_queue: pool mode admission queue and response_queue
         are designed for batched async I/O (per-completion notifications via
@@ -416,7 +421,7 @@ class WorkerManager:
         import shutil
         import time as _time
 
-        status_dir = "/tmp/batchgen_reload_status"
+        status_dir = str(self.args.runtime_identity.reload_status_dir)
         # Clear stale status files from previous reloads
         if os.path.isdir(status_dir):
             try:
@@ -660,6 +665,14 @@ class WorkerManager:
                 str(self.args.distributed_weight_config)
                 if self.args.distributed_weight_config is not None
                 else None
+            ),
+            host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
+            host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+            query_book_shm_prefix=(
+                self.args.runtime_identity.query_book_shm_prefix
+            ),
+            reload_status_dir=str(
+                self.args.runtime_identity.reload_status_dir
             ),
         )
         from batchgen.server_worker_main_loop import server_worker_main
@@ -970,7 +983,11 @@ class WorkerManager:
         logger.info(f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)...")
 
         # Create temp file for skeleton state dict
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        fd, file_path = tempfile.mkstemp(
+            suffix='.pt',
+            prefix='skeleton_',
+            dir=self.args.runtime_identity.runtime_dir,
+        )
         os.close(fd)  # Close fd, torch.save will open its own handle
 
         torch.save(skeleton_state_dict, file_path)
@@ -1019,7 +1036,11 @@ class WorkerManager:
 
         # Save skeleton_state_dict to temp file to avoid passing tensors through mp.spawn
         logger.info(f"Saving skeleton state dict to temp file ({len(skeleton)} keys)...")
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        fd, file_path = tempfile.mkstemp(
+            suffix='.pt',
+            prefix='skeleton_',
+            dir=self.args.runtime_identity.runtime_dir,
+        )
         os.close(fd)  # Close fd, torch.save will open its own handle
 
         torch.save(skeleton, file_path)
@@ -1095,6 +1116,8 @@ class WorkerManager:
     @staticmethod
     def allocate_host_kv_cache(
         host_kv_cache_size_gb: int, model_name: str,
+        primary_shm_name: str,
+        aux_shm_name: str,
         enable_memfd: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
@@ -1104,6 +1127,8 @@ class WorkerManager:
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
             enable_memfd=enable_memfd,
+            primary_shm_name=primary_shm_name,
+            aux_shm_name=aux_shm_name,
         )
         if dual is not None:
             primary_mgr, aux_mgr = dual
@@ -1115,6 +1140,7 @@ class WorkerManager:
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
+            shm_name=primary_shm_name,
         )
         if enable_memfd:
             config.enable_memfd = True

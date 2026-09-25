@@ -154,6 +154,8 @@ class DualHostKVCoordinator:
 		memfd_creator_pid: int = -1,
 		memfd_fd: int = -1,
 		aux_memfd_fd: int = -1,
+		primary_shm_name: str | None = None,
+		aux_shm_name: str | None = None,
 	) -> Optional["DualHostKVCoordinator"]:
 		"""Factory: split budget proportionally, create both worker views.
 
@@ -165,15 +167,21 @@ class DualHostKVCoordinator:
 		if not is_dsa_model(model_name):
 			return None
 
+		if primary_shm_name is None:
+			primary_shm_name = HOST_KV_SHM_NAME
+		if aux_shm_name is None:
+			aux_shm_name = HOST_KV_AUX_SHM_NAME
+		if not primary_shm_name or not aux_shm_name:
+			raise ValueError("Host KV shared-memory names must be non-empty")
 		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
 			model_name, host_kv_cache_size,
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile, primary_shm_name, num_pages,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile, aux_shm_name, num_pages,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision
@@ -211,6 +219,8 @@ class DualHostKVCoordinator:
 		model_name: str,
 		host_kv_cache_size: int,
 		enable_memfd: bool = False,
+		primary_shm_name: str | None = None,
+		aux_shm_name: str | None = None,
 	) -> Optional[Tuple[Any, Any]]:
 		"""Server-side factory: create and initialize both host KV managers.
 
@@ -222,15 +232,21 @@ class DualHostKVCoordinator:
 		if not is_dsa_model(model_name):
 			return None
 
+		if primary_shm_name is None:
+			primary_shm_name = HOST_KV_SHM_NAME
+		if aux_shm_name is None:
+			aux_shm_name = HOST_KV_AUX_SHM_NAME
+		if not primary_shm_name or not aux_shm_name:
+			raise ValueError("Host KV shared-memory names must be non-empty")
 		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
 			model_name, host_kv_cache_size,
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile, primary_shm_name, num_pages,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile, aux_shm_name, num_pages,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision
