@@ -9164,6 +9164,7 @@ class BatchGenWorker:
 			seq_meta=seq_meta,
 			world_size=self.world_size,
 			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
 			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
 			attn_tp_size=self._decode_attn_tp_size(),
