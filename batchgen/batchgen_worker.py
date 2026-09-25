@@ -1437,6 +1437,7 @@ class BatchGenWorker:
 			seq.sampling_params = entry.get("sampling_params")
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
+		self._group_uuids.update(new_uuids)
 
 		# Step 2: Tokenize new sequences (all ranks, parallel)
 		self._tokenize_admitted_sequences(new_uuids)
@@ -6502,6 +6503,16 @@ class BatchGenWorker:
 		)
 		torch.cuda.synchronize(device)
 
+	def _group_token_totals(self):
+		"""(sequences, prompt tokens, decoded tokens) of the current batch group."""
+		group = [self.global_batch.get_sequence(u) for u in self._group_uuids]
+		group = [s for s in group if s is not None]  # rejected at admission
+		return (
+			len(group),
+			sum(s.prompt_length for s in group),
+			sum(s.decoded_length for s in group),
+		)
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -6515,6 +6526,10 @@ class BatchGenWorker:
 
 		# Initialize cumulative decode counters (persist across prefill/decode switches)
 		self._timing_logged = False  # Print timing once per batch group
+		# Sequences of the current batch group. global_batch keeps completed
+		# sequences across groups, so the summaries count only these to match
+		# the per-group timers.
+		self._group_uuids = {seq.uuid for seq in self.global_batch}
 		self._decode_group_idx = 0  # Track decode groups for diagnostic logging
 		self._cumulative_decode_iterations = 0
 		self._cumulative_decode_boundaries = 0
@@ -6553,9 +6568,7 @@ class BatchGenWorker:
 				# Print timing summary when all current work is done
 				if not self._timing_logged and self.rank == 0:
 					gen_time = time.perf_counter() - generation_start_time
-					total_prompt = sum(s.prompt_length for s in self.global_batch)
-					total_decoded = sum(s.decoded_length for s in self.global_batch)
-					num_seq = len(self.global_batch)
+					num_seq, total_prompt, total_decoded = self._group_token_totals()
 					pf_tp = total_prompt / prefill_time if prefill_time > 0 else 0
 					dc_tp = total_decoded / decoding_time if decoding_time > 0 else 0
 					ov_tp = (total_prompt + total_decoded) / gen_time if gen_time > 0 else 0
@@ -6588,6 +6601,7 @@ class BatchGenWorker:
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
+							self._group_uuids = set()
 							self._admit_sequences_from_message(msg)
 							# Reset per-batch-group timing so each admission cycle
 							# emits its own "Pool batch group completed" summary.
@@ -6632,6 +6646,7 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
+						self._group_uuids = set()
 						self._admit_sequences_from_message(container[0])
 						# Reset per-batch-group timing (matches rank-0 branch).
 						prefill_time = 0.0
@@ -7167,15 +7182,9 @@ class BatchGenWorker:
 		generation_time = time.perf_counter() - generation_start_time
 		phase_switching_time = config_prefill_time + config_decode_time
 
-		# Compute throughput metrics from all sequences
-		total_prompt_tokens = 0
-		total_decoded_tokens = 0
-		num_sequences = 0
-		if self.global_batch is not None:
-			for seq in self.global_batch:
-				total_prompt_tokens += seq.prompt_length
-				total_decoded_tokens += seq.decoded_length
-				num_sequences += 1
+		# Compute throughput metrics from the last batch group (the timers
+		# above restart with each pool admission group)
+		num_sequences, total_prompt_tokens, total_decoded_tokens = self._group_token_totals()
 
 		# Calculate throughput (tokens/second)
 		prefill_throughput = total_prompt_tokens / prefill_time if prefill_time > 0 else 0
