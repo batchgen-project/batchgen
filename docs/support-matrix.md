@@ -17,6 +17,7 @@ This page is the README-specific map of current model support. It is deliberatel
 | Kimi-K3 | 2.8T | MXFP4, 896 experts | 2×8 H200; 4×8 H20 guides | Documented deployment · Benchmark evidence | Exact-64K comparison uses SGLang 0.5.18 TP16/EP16: 1.42× faster in the recorded workload. |
 | GLM-5 / GLM-5.1 | 754B (≈40B active) | FP8 | H20 support note | Documented deployment | Deployment and validation instructions are available; performance coverage is workload-dependent. |
 | GLM-5.2 | 753B MoE | FP8 | 1×8 H200 guide and long-context prefill campaign | Documented deployment · Benchmark evidence | The pure-DP8 `8×1M` comparison uses the best completed SGLang 0.5.18 chunk/offload point: 1.71× faster in the recorded workload. Final installed-wheel replay remains required. |
+| GLM-5.3 | 753B MoE | FP8 | 1×8 H200 deployment guide; MMLU-Pro qualification in progress | Experimental | Complete weights, conversion, local-SSD startup, short correctness, and structured reasoning output are verified. The 2,048-sequence MMLU-Pro and long-context gates remain open. |
 | GPT-OSS-120B | 117B (≈5.1B active) | MXFP4 | H20 deployment guide | Documented deployment · Experimental | Functional path is documented; no comparable recent end-to-end advantage is claimed here. |
 | MiniMax-M2.5 | 230B (≈10B active) | FP8 | H20 testbed | Experimental | Registered and tested; broader deployment and performance coverage is still being expanded. |
 | Kimi-Linear-48B-A3B | 48B | BF16 | Development testbed | Experimental | Useful for integration testing; not a current headline performance target. |
@@ -34,4 +35,5 @@ For a production rollout, start from the deployment guide, confirm the checkpoin
 - [Kimi-K3 on H20](deploy-kimi-k3-h20.md)
 - [GPT-OSS-120B on H20](deploy-gpt-oss-h20.md)
 - [GLM-5.2-FP8 on H200](deploy-glm-5.2-h200.md)
+- [GLM-5.3-FP8 on H200](deploy-glm-5.3-h200.md)
 - [GLM-5.1 support notes](support-glm-5.1.md)
