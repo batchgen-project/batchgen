@@ -275,6 +275,10 @@ pip install ninja setuptools wheel packaging
 
 TORCH_VER=$(python -c "import torch; print(torch.__version__)")
 CUDA_VER=$(python -c "import torch; print(torch.version.cuda)")
+if [[ "$TORCH_VER" != "2.9.0+cu128" || "$CUDA_VER" != "12.8" ]]; then
+    fail "Unexpected Torch/CUDA ABI: $TORCH_VER / CUDA $CUDA_VER (expected 2.9.0+cu128 / CUDA 12.8)"
+    exit 1
+fi
 ok "PyTorch $TORCH_VER (CUDA $CUDA_VER)"
 
 # ============================================================================ #
@@ -347,6 +351,22 @@ else
     # Install remaining requirements
     cd "$BATCHGEN_DIR"
     pip install -r requirements.txt 2>&1 | tail -5
+fi
+
+if [[ $SKIP_DEPS -eq 0 ]]; then
+    # Hopper GPT-OSS requires FA3; FA2 is an optional fallback for other
+    # model families and is intentionally not required by this gate.
+    if ! python - <<'PY'
+import flash_attn_interface
+import flash_mla
+import libucx
+libucx.load_library()
+PY
+    then
+        fail "Hopper runtime dependency contract failed (FA3, FlashMLA, or UCX)"
+        exit 1
+    fi
+    ok "Hopper FA3/FlashMLA/UCX runtime contract verified"
 fi
 
 # ============================================================================ #
