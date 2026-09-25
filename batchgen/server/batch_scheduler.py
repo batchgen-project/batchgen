@@ -57,6 +57,7 @@ def parse_batch_file(
 
     requests: List[BatchRequestItem] = []
     model_name: Optional[str] = None
+    custom_id_lines: Dict[str, int] = {}
 
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
@@ -66,6 +67,16 @@ def parse_batch_file(
             request = BatchRequestItem(**payload)
         except Exception as exc:
             return False, f"Line {idx}: {exc}", []
+
+        # custom_id names the output line and, in pool mode, the in-flight
+        # request; an empty one gets a unique index-based fallback.
+        if request.custom_id:
+            first = custom_id_lines.setdefault(request.custom_id, idx)
+            if first != idx:
+                return False, (
+                    f"Line {idx}: duplicate custom_id {request.custom_id!r} "
+                    f"(first on line {first})"
+                ), []
 
         if isinstance(request.body, ChatCompletionRequest):
             current_model = request.body.model
@@ -116,6 +127,7 @@ class BatchScheduler:
         self._drain_task: Optional[asyncio.Task] = None
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
+        # where request_id is f"{custom_id}@{batch_id}"
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     async def start(self) -> None:
@@ -928,11 +940,21 @@ class BatchScheduler:
             ) if hasattr(self.storage, 'output_dir') else None,
         )
 
+        # custom_id is unique only within one Batch, but the scheduling pool,
+        # the worker's sequence uuids and completion routing span all batches:
+        # scope the internal request id by batch (custom_id first keeps the
+        # worker's truncated uuid logs readable).
+        custom_ids = [
+            req.custom_id or f"{batch_id}_req_{idx}"
+            for idx, req in enumerate(requests)
+        ]
+        request_ids = [f"{custom_id}@{batch_id}" for custom_id in custom_ids]
+
         # Build IntakeEntry objects and push to IntakePool
         entries = []
         for idx, req in enumerate(requests):
             entries.append(IntakeEntry(
-                request_id=req.custom_id or f"{batch_id}_req_{idx}",
+                request_id=request_ids[idx],
                 batch_id=batch_id,
                 raw_request={
                     "text": prompts[idx],
@@ -967,9 +989,8 @@ class BatchScheduler:
         # Store per-request metadata for output JSONL building
         self._pool_request_meta[batch_id] = {}
         for idx, req in enumerate(requests):
-            rid = req.custom_id or f"{batch_id}_req_{idx}"
-            self._pool_request_meta[batch_id][rid] = {
-                "custom_id": rid,
+            self._pool_request_meta[batch_id][request_ids[idx]] = {
+                "custom_id": custom_ids[idx],
                 "url": req.url.value,
                 "model": req.body.model,
                 "prompt_text": prompts[idx],
@@ -1029,7 +1050,24 @@ class BatchScheduler:
         self._finalize_batch_output(batch_id, requests, prompts)
 
     async def _drain_intake_to_worker(self) -> None:
-        """Background task: drain IntakePool → send admission messages to worker.
+        """Background task: run the intake drain; any failure is fatal.
+
+        Without a drain every queued and later request stays in_progress
+        forever, and entries already popped from the IntakePool or holding a
+        slot cannot be recovered: fail the active batches, then stop the server.
+        """
+        try:
+            await self._drain_intake_loop()
+        except Exception as exc:
+            reason = f"Server intake drain failed: {type(exc).__name__}: {exc}"
+            logger.exception("[POOL] %s", reason)
+            try:
+                self._fail_all_active_batches(reason)
+            finally:
+                self.worker.report_worker_fatal(reason)
+
+    async def _drain_intake_loop(self) -> None:
+        """Drain IntakePool → send admission messages to worker.
 
         On first drain, sends an "init" message to trigger worker initialization.
         Subsequent drains send "admit" messages with sequences.
