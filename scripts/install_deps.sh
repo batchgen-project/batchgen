@@ -230,6 +230,19 @@ else:
     esac
 }
 
+torch_contract_ok() {
+    python - "$1" "$2" <<'PY'
+import sys
+import torch
+
+expected, channel = sys.argv[1:]
+digits = channel[2:]
+expected_cuda = f"{digits[:-1]}.{digits[-1]}" if digits.isdigit() else ""
+if torch.__version__ != expected or torch.version.cuda != expected_cuda:
+    raise SystemExit(1)
+PY
+}
+
 install_torch() {
     print_step "Checking PyTorch installation..."
 
@@ -240,27 +253,19 @@ install_torch() {
 
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-        if python - "$torch_ver" <<'PY'
-import sys
-import torch
-
-expected = sys.argv[1]
-if torch.__version__ != expected:
-    raise SystemExit(
-        f"expected PyTorch {expected}, found {torch.__version__}"
-    )
-PY
+        if torch_contract_ok "$torch_ver" "$cuda_channel"
         then
-            print_success "PyTorch $TORCH_VERSION already installed (ABI/channel verified)"
+            print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
         else
             print_warning "PyTorch $TORCH_VERSION does not match required ${torch_ver}; reinstalling"
             pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
             TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-            if [[ "$TORCH_VERSION" != "$torch_ver" ]]; then
-                print_error "PyTorch install produced $TORCH_VERSION, expected $torch_ver"
+            if ! torch_contract_ok "$torch_ver" "$cuda_channel"
+            then
+                print_error "PyTorch install did not produce the required ${torch_ver}/${cuda_channel} ABI"
                 return 1
             fi
-            print_success "PyTorch $TORCH_VERSION installed (ABI/channel verified)"
+            print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
         fi
 
         # Check CUDA availability
