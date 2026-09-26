@@ -12,8 +12,8 @@ This launches the FastAPI server with:
 import logging
 import sys
 
-from batchgen.server.http_server import launch_server
 from batchgen.server.server_args import prepare_server_args
+from batchgen.runtime_preflight import RuntimePreflightError, run_runtime_preflight
 
 
 def main():
@@ -36,7 +36,15 @@ def main():
     logging.info(f"Watchdog timeout: {server_args.watchdog_timeout}s")
 
     try:
+        # Run before importing worker_manager/http_server so missing native
+        # dependencies fail before workers, SHM, ports, or model weights exist.
+        run_runtime_preflight(server_args)
+        from batchgen.server.http_server import launch_server
+
         launch_server(server_args)
+    except RuntimePreflightError as exc:
+        logging.error("Runtime preflight failed: %s", exc)
+        sys.exit(1)
     except KeyboardInterrupt:
         logging.info("Server shutdown requested")
     except RuntimeError as exc:

@@ -1,26 +1,27 @@
-import logging
-import os
-
-# Preload the pip libucx-cu12 UCX libraries (if installed) so core_engine's
-# distributed-weight daemon resolves libucp/libuct/libucs/libucm at load time,
-# independent of LD_LIBRARY_PATH. No-op if the wheel is absent (a system UCX or
-# the linker rpath baked at build time then satisfies the .so).
+# Preload the pip libucx-cu12 UCX libraries so core_engine's distributed-weight
+# daemon resolves libucp/libuct/libucs/libucm at load time.  A missing or broken
+# UCX runtime is a deployment error; do not silently continue and let a worker
+# discover it after startup.
 try:
     import libucx
 
     libucx.load_library()
-except Exception:
-    pass
+except Exception as exc:
+    raise RuntimeError(
+        "UCX runtime preflight failed; install and load libucx-cu12 before "
+        "starting BatchGen"
+    ) from exc
 
-from batchgen.op_builder.core_engine import CoreEngineBuilder
-
-use_jit = False
 try:
     from batchgen import core_engine
-except ImportError:
-    logging.debug("Do not detect pre-installed core engine, use JIT mode.")
-    use_jit = True
+except ImportError as exc:
+    raise RuntimeError(
+        "AOT batchgen.core_engine is unavailable; refusing implicit JIT "
+        "compilation during server startup"
+    ) from exc
 
-# print("run core engine importer")
-
-core_engine = CoreEngineBuilder().load() if use_jit else core_engine
+if not str(getattr(core_engine, "__file__", "")).endswith((".so", ".pyd", ".dylib")):
+    raise RuntimeError(
+        "batchgen.core_engine is not an AOT native module; refusing implicit JIT "
+        "compilation during server startup"
+    )

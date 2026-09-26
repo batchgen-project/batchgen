@@ -300,48 +300,48 @@ def _import_model_configs():
     """Import all model-specific config modules to register them."""
     try:
         from batchgen.models.openai.gpt_oss_120b import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for gpt_oss unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv4_flash import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v4 unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv3 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v3 unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv2 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v2 unavailable: %s", exc)
 
     try:
         from batchgen.models.mixtral import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for mixtral unavailable: %s", exc)
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for kimi_k25 unavailable: %s", exc)
 
     try:
         from batchgen.models.moonshotai.kimi_linear import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for kimi_linear unavailable: %s", exc)
 
     try:
         from batchgen.models.minimax.minimax_m25 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for minimax_m25 unavailable: %s", exc)
 
     try:
         from batchgen.models.glm.glm5 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for glm_moe_dsa unavailable: %s", exc)
 
 
 # Auto-import on module load

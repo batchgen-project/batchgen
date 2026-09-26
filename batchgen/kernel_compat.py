@@ -18,15 +18,17 @@ def check_kernels_version():
     """Check batchgen_kernels version compatibility. Called at import batchgen."""
     try:
         import batchgen_kernels
-    except ImportError:
-        return  # not installed; individual kernel loads will fail with clear errors
+    except ImportError as exc:
+        raise RuntimeError(
+            "batchgen_kernels is required; install the matching AOT wheel before "
+            "starting BatchGen"
+        ) from exc
 
     if not hasattr(batchgen_kernels, "version_info"):
-        logger.warning(
-            "batchgen_kernels is installed but has no version_info attribute. "
-            "Please upgrade: pip install -e batchgen_kernels/ --no-build-isolation"
+        raise RuntimeError(
+            "batchgen_kernels has no version_info attribute; refusing an "
+            "unverifiable/source-only kernel package"
         )
-        return
 
     installed = batchgen_kernels.version_info
     if installed < MIN_KERNELS_VERSION:

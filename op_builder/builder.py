@@ -750,6 +750,10 @@ class CUDAOpBuilder(OpBuilder):
             ]),
             libraries=self.strip_empty_entries(self.libraries_args()),
             extra_compile_args=compile_args,
+            # Same link line as jit_load(); without it the AOT .so misses
+            # -lnuma/-lucp/-lcufile and the UCX rpath and fails at import
+            # with `undefined symbol: numa_all_nodes_ptr`.
+            extra_link_args=self.strip_empty_entries(self.extra_ldflags()),
         )
 
         if self.is_rocm_pytorch():

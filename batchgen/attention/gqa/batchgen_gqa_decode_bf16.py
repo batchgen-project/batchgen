@@ -40,9 +40,9 @@ def _check_custom_kernel():
         print("[batchgen_decode] Custom WGMMA decode kernel loaded successfully", flush=True)
         return True
     except Exception as e:
-        print(f"[batchgen_decode] Failed to load custom kernel: {e}", flush=True)
-        print("[batchgen_decode] Falling back to FA3", flush=True)
-        return False
+        # The runtime preflight requires this kernel on H20; never silently
+        # switch a selected decode backend.
+        raise RuntimeError("H20 WGMMA decode kernel failed to load") from e
 
 
 def batchgen_gqa_decode_bf16(
