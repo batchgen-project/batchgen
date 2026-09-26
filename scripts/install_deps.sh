@@ -510,7 +510,8 @@ install_batchgen_kernels() {
         fi
         print_success "batchgen_kernels installed and AOT runtime contract verified"
     else
-        print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
+        print_error "batchgen_kernels/setup.py not found; refusing to continue without AOT kernels"
+        return 1
     fi
 }
 
