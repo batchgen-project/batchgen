@@ -11,12 +11,15 @@ Usage:
     pip install -e batchgen_kernels/ --no-build-isolation
 
 Environment variables:
-    MAX_JOBS        — parallel file compilation (default: cpu_count/2)
+    MAX_JOBS        — parallel file compilation within one extension (default: cpu_count/2)
+                      With `build_ext --parallel N`, N extensions build at once, each
+                      with up to MAX_JOBS ninja jobs; lower MAX_JOBS accordingly.
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
     BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
+import copy
 import os
 import shutil
 from setuptools import setup
@@ -407,6 +410,24 @@ else:
     print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
 _ext_modules.extend(_sm80_extensions)
 
+class IsolatedBuildExtension(BuildExtension):
+    """BuildExtension that is safe under `build_ext --parallel N`.
+
+    torch writes each extension's ninja manifest to `<build_temp>/build.ninja`.
+    setuptools builds parallel extensions on threads sharing one build_temp, so
+    concurrent extensions overwrite each other's manifest
+    (`build.ninja:38: expected '=', got newline`). Give every extension its own
+    build_temp; serial builds keep the shared directory unchanged.
+    """
+
+    def build_extension(self, ext):
+        if not self.parallel:
+            return super().build_extension(ext)
+        worker = copy.copy(self)
+        worker.build_temp = os.path.join(self.build_temp, ext.name)
+        return super(IsolatedBuildExtension, worker).build_extension(ext)
+
+
 setup(
     name="batchgen_kernels",
     version=_get_version(),
@@ -435,7 +456,7 @@ setup(
         ],
     },
     ext_modules=_ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": IsolatedBuildExtension},
     python_requires=">=3.11",
     # torch must be pre-installed (with correct CUDA variant, e.g. cu128).
     # Do NOT list it here — pip would pull the CPU-only version from PyPI.
