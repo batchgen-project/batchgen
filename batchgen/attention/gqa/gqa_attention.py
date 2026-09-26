@@ -46,7 +46,6 @@ import os
 from typing import Optional, Tuple
 
 import torch
-from batchgen.runtime_policy import selected_flash_backend
 import torch.nn.functional as F
 
 from ..sink import softmax_with_sinks
@@ -65,16 +64,14 @@ if os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1" or os.environ.get("BATCH
 _USE_FA3 = False
 _flash_attn_func = None
 
-_SELECTED_BACKEND = selected_flash_backend()
-if _SELECTED_BACKEND in (None, "fa3"):
-    try:
-        from flash_attn_interface import flash_attn_func as _fa3_func
-        _USE_FA3 = True
-        _flash_attn_func = _fa3_func
-    except ImportError:
-        pass
+try:
+    from flash_attn_interface import flash_attn_func as _fa3_func
+    _USE_FA3 = True
+    _flash_attn_func = _fa3_func
+except ImportError:
+    pass
 
-if _flash_attn_func is None and _SELECTED_BACKEND in (None, "fa2"):
+if _flash_attn_func is None:
     try:
         from flash_attn import flash_attn_func as _fa2_func
         _flash_attn_func = _fa2_func
@@ -165,10 +162,6 @@ def gqa_attention_prefill(
     # Vanilla PyTorch attention path
     # Used when: FlashAttention not available, OR (sinks present AND USE_VANILLA_FOR_SINKS=True)
     # This path uses correct inline softmax_with_sinks for accurate sink handling.
-    if _SELECTED_BACKEND is not None and _flash_attn_func is None:
-        raise RuntimeError(
-            f"selected FlashAttention backend {_SELECTED_BACKEND!r} could not be imported"
-        )
     if _flash_attn_func is None:
         import warnings
         warnings.warn(

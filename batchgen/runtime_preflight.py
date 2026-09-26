@@ -22,8 +22,6 @@ from typing import Iterable
 
 import torch
 
-from batchgen.runtime_policy import configure_runtime_policy
-
 logger = logging.getLogger(__name__)
 
 
@@ -87,7 +85,6 @@ class RuntimeContract:
     modules: tuple[str, ...] = ()
     extensions: tuple[str, ...] = ()
     require_deepgemm: bool = False
-    flash_backend: str = "fa3"
 
 
 _COMMON_EXTENSIONS = (
@@ -121,27 +118,22 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     "deepseek_v2": RuntimeContract(
         modules=("flash_attn", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa2",
     ),
     "deepseek_v3": RuntimeContract(
         modules=("flash_attn", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa2",
     ),
     "deepseek_v4": RuntimeContract(
         modules=("flash_attn", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa2",
     ),
     "mixtral": RuntimeContract(
         modules=("flash_attn", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa2",
     ),
     "minimax_m25": RuntimeContract(
         modules=("flash_attn_interface", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa3",
     ),
     "kimi_linear": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
@@ -154,7 +146,6 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     "kimi_k25": RuntimeContract(
         modules=("flash_attn", "libucx"),
         extensions=_COMMON_EXTENSIONS,
-        flash_backend="fa2",
     ),
 }
 
@@ -403,7 +394,7 @@ def run_runtime_preflight(server_args: object) -> str:
     if not model:
         raise RuntimePreflightError("server model is empty")
 
-    if os.environ.get("BATCHGEN_KERNELS_DEV") == "1":
+    if os.environ.get("BATCHGEN_KERNELS_DEV") == "1":  # noqa: hygiene - rejects dev JIT
         raise RuntimePreflightError(
             "BATCHGEN_KERNELS_DEV=1 enables runtime JIT compilation; unset it and "
             "build the kernels ahead of time"
@@ -415,10 +406,6 @@ def run_runtime_preflight(server_args: object) -> str:
         "wgmma"
         if torch.cuda.is_available() and "H20" in torch.cuda.get_device_name()
         else "fa3"
-    )
-    configure_runtime_policy(
-        flash_backend=contract.flash_backend,
-        decode_backend=decode_backend,
     )
     _check_tokenizer(model)
 
@@ -472,9 +459,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         model_type = run_runtime_preflight(args)
     except RuntimePreflightError as exc:
-        print(f"PREFLIGHT FAIL: {exc}", file=sys.stderr)
+        print(f"PREFLIGHT FAIL: {exc}", file=sys.stderr)  # noqa: hygiene - CLI output
         return 1
-    print(json.dumps(
+    print(json.dumps(  # noqa: hygiene - CLI output
         {"model_type": model_type, "root": str(_batchgen_root()), "modules": _manifest},
         indent=2,
         sort_keys=True,
