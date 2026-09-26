@@ -82,7 +82,7 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# System (OS) packages required to BUILD the JIT-compiled `core_engine` extension.
+# System (OS) packages required to BUILD the AOT `core_engine` extension.
 # The core_engine sources (core/Parameter_Server/posix_shm.cpp) `#include <numa.h>`
 # and link `-lnuma`, so the NUMA development headers must be present or the first
 # server launch fails with:
@@ -116,14 +116,15 @@ install_system_deps() {
     if [[ -f /usr/include/numa.h ]]; then
         print_success "NUMA dev headers installed (numa.h present)"
     else
-        print_warning "numa.h still missing — the core_engine JIT build will fail until installed."
+        print_error "numa.h still missing — the AOT core_engine build cannot proceed."
+        return 1
     fi
 }
 
 check_prerequisites() {
     print_step "Checking prerequisites..."
 
-    # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
+    # System headers needed by the core_engine AOT build (numa.h -> numactl-devel).
     # UCX (for the core_engine distributed-weight daemon's UCP memory-handle API) is
     # provided by the `libucx-cu12` pip wheel declared in requirements.txt (installed
     # with the batchgen package), so no system UCX or source build is needed here.
@@ -230,6 +231,45 @@ else:
     esac
 }
 
+torch_contract_ok() {
+    python - "$1" "$2" <<'PY'
+import sys
+import torch
+
+expected, channel = sys.argv[1:]
+digits = channel[2:]
+expected_cuda = f"{digits[:-1]}.{digits[-1]}" if digits.isdigit() else ""
+if torch.__version__ != expected or torch.version.cuda != expected_cuda:
+    raise SystemExit(1)
+PY
+}
+
+enforce_torch_contract() {
+    local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
+    local torch_ver="2.9.0+${cuda_channel}"
+
+    if torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+        print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
+        return 0
+    fi
+
+    if [[ "${REPAIR_TORCH:-0}" != "1" ]]; then
+        print_error "Existing PyTorch does not match ${torch_ver} / CUDA ${cuda_channel}"
+        print_error "Refusing to modify the environment; rerun with --repair to replace it"
+        return 1
+    fi
+
+    print_warning "PyTorch ABI mismatch; --repair requested, reinstalling ${torch_ver}"
+    pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
+    if ! torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        print_error "PyTorch repair did not produce the required ${torch_ver}/${cuda_channel} ABI"
+        return 1
+    fi
+    TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+    print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified after repair"
+}
+
 install_torch() {
     print_step "Checking PyTorch installation..."
 
@@ -240,7 +280,7 @@ install_torch() {
 
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-        print_success "PyTorch $TORCH_VERSION already installed"
+        enforce_torch_contract
 
         # Check CUDA availability
         CUDA_AVAILABLE=$(python -c "import torch; print(torch.cuda.is_available())")
@@ -250,7 +290,7 @@ install_torch() {
     else
         print_step "Installing PyTorch ${torch_ver} (cuda_channel=${cuda_channel})..."
         pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-        print_success "PyTorch installed"
+        enforce_torch_contract
     fi
 }
 
@@ -428,21 +468,64 @@ install_deepgemm() {
     print_success "DeepGEMM installed"
 }
 
+batchgen_kernels_contract_ok() {
+    # Importing the namespace package is not sufficient: a source checkout or an
+    # incomplete wheel can satisfy that check while the first GPT-OSS request
+    # later fails when it lazily imports the fused attention extension.
+    python - <<'PY' &>/dev/null
+import importlib
+import os
+import site
+import sysconfig
+
+import batchgen_kernels
+
+module_path = getattr(batchgen_kernels, "__file__", None)
+site_roots = {
+    os.path.realpath(path)
+    for path in (*site.getsitepackages(), sysconfig.get_paths()["purelib"])
+}
+if not module_path or not any(
+    os.path.commonpath((os.path.realpath(module_path), root)) == root
+    for root in site_roots
+):
+    raise ImportError(
+        "batchgen_kernels resolves outside site-packages "
+        f"({module_path!r}); refusing an editable/source shadow"
+    )
+
+for module_name in (
+    "batchgen_kernels.attention._C_fused_ops",
+    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
+):
+    importlib.import_module(module_name)
+PY
+}
+
 install_batchgen_kernels() {
-    # Already provided by a pre-built wheel (auto-download / --wheel-dir)? Skip the compile.
-    if python -c "import batchgen_kernels" &>/dev/null 2>&1; then
-        print_success "batchgen_kernels already installed (wheel); skipping compilation"
+    # A pre-built wheel is usable only when the runtime extensions needed by
+    # the model path are present.  If a partial/source-only package is visible,
+    # rebuild from the checked-out sources instead of silently skipping it.
+    if batchgen_kernels_contract_ok; then
+        print_success "batchgen_kernels AOT runtime contract satisfied; skipping compilation"
         return 0
     fi
+
+    print_warning "batchgen_kernels is missing or its AOT runtime contract is incomplete; rebuilding"
 
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
-        pip install . --no-build-isolation
-        print_success "batchgen_kernels installed"
+        pip install . --no-build-isolation --no-deps --force-reinstall
+        if ! batchgen_kernels_contract_ok; then
+            print_error "batchgen_kernels installed but the AOT runtime contract is still incomplete"
+            return 1
+        fi
+        print_success "batchgen_kernels installed and AOT runtime contract verified"
     else
-        print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
+        print_error "batchgen_kernels/setup.py not found; refusing to continue without AOT kernels"
+        return 1
     fi
 }
 
@@ -452,8 +535,28 @@ install_batchgen() {
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install . --no-build-isolation
-        print_success "BatchGen installed"
+        # Replace stale editable/direct-url installs from another worktree
+        # without allowing dependency resolution to change the verified ABI.
+        # BUILD_OPS=1 emits batchgen.core_engine as an AOT extension. Runtime
+        # startup is deliberately AOT-only and must never compile from source.
+        BUILD_OPS=1 pip install . --no-build-isolation --no-deps --force-reinstall
+        if ! (
+            cd /tmp
+            python - <<'PY'
+import importlib
+from pathlib import Path
+
+module = importlib.import_module("batchgen.core_engine")
+path = Path(module.__file__)
+if path.suffix not in {".so", ".pyd", ".dylib"}:
+    raise SystemExit(f"batchgen.core_engine is not AOT: {path}")
+print(f"batchgen.core_engine AOT: {path}")
+PY
+        ); then
+            print_error "BatchGen installed without an importable AOT core_engine"
+            return 1
+        fi
+        print_success "BatchGen installed with AOT core_engine"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
         print_error "Please run this script from the BatchGen/scripts directory"
@@ -553,6 +656,7 @@ show_help() {
     echo "  --wheel-dir DIR   Use pre-built wheels from a LOCAL dir (offline; auto-detects arch)"
     echo "  --release-tag TAG Fetch pre-built wheels from this GitHub release tag (default: latest)"
     echo "  --from-source     Force building all deps from source (skip the wheel fast path)"
+    echo "  --repair          Allow replacing an existing mismatched Torch installation"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -570,20 +674,6 @@ show_help() {
     echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
 }
 
-# Pre-build (warm) the core_engine JIT extension now, while the CUDA toolkit is on
-# hand from the source build, so the FIRST server launch does not require CUDA_HOME
-# / nvcc on PATH. The compile is CPU-only (no GPU needed). Non-fatal: on failure the
-# engine JIT-builds at first launch instead (which then needs CUDA_HOME set).
-warm_core_engine() {
-    python -c "import batchgen" &> /dev/null || return 0   # batchgen not installed; skip
-    print_step "Warming the core_engine JIT build (so the first server launch needs no CUDA toolkit)..."
-    if python -c "from batchgen.models.engine_loader import core_engine" > /tmp/batchgen_core_engine_warm.log 2>&1; then
-        print_success "core_engine JIT built and cached"
-    else
-        print_warning "core_engine warm build failed; it will JIT-build on first server launch (set CUDA_HOME then). Log: /tmp/batchgen_core_engine_warm.log"
-    fi
-}
-
 main() {
     echo "========================================"
     echo "  BatchGen Dependency Installer"
@@ -597,6 +687,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
+    REPAIR_TORCH=0
     WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
 
     while [[ $# -gt 0 ]]; do
@@ -631,6 +722,10 @@ main() {
                 ;;
             --from-source)
                 FROM_SOURCE=1
+                shift
+                ;;
+            --repair)
+                REPAIR_TORCH=1
                 shift
                 ;;
             --release-tag)
@@ -704,11 +799,9 @@ main() {
                 install_flash_attention
                 install_flashmla
                 install_deepgemm
-                # Reinstall PyTorch — building deps from source may downgrade torch or triton
-                print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-                local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
-                pip install "torch==2.9.0+${cuda_channel}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-                print_success "PyTorch reinstalled"
+                # Source builds may alter the environment; verify the pinned
+                # ABI and repair only when explicitly requested.
+                enforce_torch_contract
             fi
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
@@ -750,10 +843,6 @@ main() {
             install_batchgen
         fi
     fi
-
-    # Warm the core_engine JIT now (CUDA toolkit is available during install) so
-    # the first server launch needs no CUDA_HOME / nvcc on PATH.
-    warm_core_engine
 
     # Cleanup
     cleanup
