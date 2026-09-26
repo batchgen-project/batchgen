@@ -33,9 +33,11 @@ Usage:
     tokenizer = load_tokenizer("/path/to/model")
 """
 
-# Model configuration
+# Model configuration.  The registry imports every model package in order to
+# register config classes; several of those packages import native engines.
+# Keep that cost out of tokenizer-only imports and let the selected runtime
+# preflight report native dependency failures in a controlled order.
 from .model_config import BaseModelConfig
-from .model_registry import load_config, register_config, CONFIG_REGISTRY
 
 # Tokenizer abstraction
 from .base_tokenizer import BaseTokenizer
@@ -55,3 +57,16 @@ __all__ = [
     "register_tokenizer",
     "TOKENIZER_REGISTRY",
 ]
+
+
+_MODEL_REGISTRY_EXPORTS = {"load_config", "register_config", "CONFIG_REGISTRY"}
+
+
+def __getattr__(name):
+    if name in _MODEL_REGISTRY_EXPORTS:
+        from . import model_registry
+
+        value = getattr(model_registry, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
