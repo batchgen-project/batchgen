@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen — Kimi-Linear                                                        #
-#  copyright (c) EfficientMoE team 2025                                          #
+#  Copyright (c) 2025-2026 BatchGen Team                                         #
 #  Licensed under the Apache License, Version 2.0                                #
 # ---------------------------------------------------------------------------- #
 """M2a regression: A_log head-shard must survive the (1, 1, H, 1) checkpoint shape.

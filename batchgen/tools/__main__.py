@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------- #
 #  BatchGen Tools - Module Entry Point                                          #
-#  copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Enables: python -m batchgen.tools.convert_checkpoint                         #
 # ---------------------------------------------------------------------------- #

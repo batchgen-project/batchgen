@@ -1,4 +1,6 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Kernel
+// Adapted from Tencent/hpc-ops (https://github.com/Tencent/hpc-ops, MIT License,
+// Copyright (C) 2026 Tencent), with modifications by BatchGen Team. See NOTICE.
 // Persistent 3-WG CuTe kernel: 2 math WGs (TiledMma N-split) + 1 TMA loader WG.
 // Adaptive TileM (16/32/64), TileN=128, TileK=128, 8-stage TMA pipeline.
 // x_scale tiles are addressed per expert as cu_seqlens[e] / TileM, which covers

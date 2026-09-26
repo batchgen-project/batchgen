@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------- #
 #  BatchGen Checkpoint Converter CLI                                            #
-#  copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Convert HuggingFace model checkpoints to BatchGen format for optimized       #
 #  SSD read performance during inference.                                       #

@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                          #
+#  Copyright (c) 2025-2026 BatchGen Team                                         #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "License");              #
 #  you may not use this file except in compliance with the License.              #
