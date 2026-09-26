@@ -69,14 +69,16 @@ def _setup_ccache():
     """Detect and configure ccache/sccache for faster incremental builds.
 
     CC must stay a plain compiler: torch passes it to nvcc as `-ccbin`, and
-    nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC.
+    nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC and
+    tools/cache_nvcc.sh, which rewrites torch's dependency flags for ccache.
     For reuse across checkouts, callers set CCACHE_BASEDIR to the checkout.
     """
     for tool in ("sccache", "ccache"):
         if shutil.which(tool):
             os.environ.setdefault("CXX", f"{tool} g++")
             nvcc = os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")
-            os.environ.setdefault("PYTORCH_NVCC", f"{tool} {nvcc}")
+            wrapper = os.path.join(_this_dir, "tools", "cache_nvcc.sh")
+            os.environ.setdefault("PYTORCH_NVCC", f"{wrapper} {tool} {nvcc}")
             print(f"[batchgen_kernels] Using {tool} for compilation cache")
             return tool
     return None

@@ -67,7 +67,7 @@ if command -v ccache >/dev/null; then
     export CCACHE_BASEDIR="$ROOT"
     export CCACHE_NOHASHDIR=true
     export CXX="${CXX:-ccache g++}"
-    export PYTORCH_NVCC="${PYTORCH_NVCC:-ccache $(command -v nvcc)}"
+    export PYTORCH_NVCC="${PYTORCH_NVCC:-$ROOT/batchgen_kernels/tools/cache_nvcc.sh ccache $(command -v nvcc)}"
     log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default}"
 fi
 
