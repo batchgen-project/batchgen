@@ -26,9 +26,42 @@ from batchgen.runtime_policy import configure_runtime_policy
 logger = logging.getLogger(__name__)
 
 
-def _detect_model_type_from_identifier(model_identifier: str):
-    """Load registry detection only when preflight is actually running."""
+_KNOWN_IDENTIFIER_PATTERNS = (
+    ("DeepSeek-V4-Flash", "deepseek_v4"),
+    ("DeepSeek-V4-Pro", "deepseek_v4"),
+    ("MiniMax-M2.5", "minimax_m25"),
+    ("DeepSeek-R1", "deepseek_v3"),
+    ("DeepSeek-V3", "deepseek_v3"),
+    ("DeepSeek-V2-Lite", "deepseek_v2"),
+    ("DeepSeek-V2", "deepseek_v2"),
+    ("Mixtral-8x22B", "mixtral"),
+    ("Mixtral-8x7B", "mixtral"),
+    ("gpt-oss", "gpt_oss"),
+    ("GLM-5.3-FP8", "glm_moe_dsa_5_3"),
+    ("GLM-5.3", "glm_moe_dsa_5_3"),
+    ("GLM-5.2-FP8", "glm_moe_dsa_5_2"),
+    ("GLM-5.2", "glm_moe_dsa_5_2"),
+    ("GLM-5.1-FP8", "glm_moe_dsa"),
+    ("GLM-5.1", "glm_moe_dsa"),
+    ("GLM-5-FP8", "glm_moe_dsa"),
+    ("GLM-5", "glm_moe_dsa"),
+    ("Kimi-Linear-48B-A3B", "kimi_linear"),
+    ("Kimi-Linear", "kimi_linear"),
+    ("Kimi-K3", "kimi_k3"),
+)
 
+
+def _detect_model_type_from_identifier(model_identifier: str):
+    """Resolve common IDs without importing every model package.
+
+    The full registry eagerly imports model parameter servers.  That is too
+    broad for a startup gate: an unrelated model's native dependency must not
+    prevent the gate from reporting the selected model's own contract.
+    """
+
+    for pattern, model_type in _KNOWN_IDENTIFIER_PATTERNS:
+        if pattern.lower() in model_identifier.lower():
+            return model_type
     from batchgen.config.model_registry import _detect_model_type_from_identifier as detect
 
     return detect(model_identifier)
