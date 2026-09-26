@@ -60,6 +60,12 @@ and `batchgen_kernels` worktrees must be from the same release revision; a
 shared checkout that another model session moves can select incompatible
 kernels.
 
+The GLM-5.3 FA3 path also imports the SGLang-maintained `sgl-deep-gemm`
+distribution (`0.1.5.post3`). This is the DeepGEMM runtime package only; it
+does not install SGLang. Keep the license and attribution files from the
+dependency source checkout with any redistributable runtime bundle. The
+license inventory is recorded in [Third-party runtime licenses](third-party-licenses.md).
+
 ## 4. Prepare the host
 
 Use an otherwise idle 8×H200 host with sufficient RAM for the FP8 weights and
