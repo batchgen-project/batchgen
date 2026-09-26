@@ -83,17 +83,18 @@ preflight before importing the HTTP server. It checks:
 - Torch version and CUDA ABI;
 - the selected tokenizer, EOS IDs, and its chat-template rendering (or the
   model's explicit non-Jinja formatter);
-- the exact FlashAttention backend (FA3 or FA2) and FlashMLA where required;
+- the FlashAttention module the model declares (FA3 or FA2) and FlashMLA
+  where required;
 - the `libucx` runtime loader and DeepGEMM API where required;
-- AOT `batchgen_kernels` extensions and the selected H20 decode backend;
+- AOT `batchgen_kernels` extensions, plus the WGMMA decode kernel on H20;
 - a native (AOT) `batchgen.core_engine` module, not older than `core/` when
   running from a worktree;
 - the provenance rule above.
 
 An unknown model type has no implicit dependency contract and is rejected.
-The selected backend is inherited by worker processes. If that backend cannot
-be imported, startup fails; BatchGen does not silently switch to another
-backend or to a vanilla implementation.
+Workers run in the same environment the preflight checked, so they resolve the
+same modules. If a declared module cannot be imported, startup fails; on H20 a
+WGMMA decode kernel that fails to load is an error, not a switch to FA3.
 
 ## Interpreting common failures
 
