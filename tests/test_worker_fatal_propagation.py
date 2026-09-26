@@ -57,6 +57,7 @@ def _isolated_scheduler():
     namespace = {
         "asyncio": asyncio,
         "logger": logging.getLogger(__name__),
+        "BatchStatus": SimpleNamespace(FAILED="failed"),
     }
     exec(compile(ast.fix_missing_locations(module), str(SCHEDULER), "exec"), namespace)
     return namespace["IsolatedBatchScheduler"]
@@ -131,8 +132,8 @@ def test_pool_shutdown_error_fails_storage_before_acknowledgement():
         _batch_trackers={"batch-1": tracker},
     )
     scheduler.storage = SimpleNamespace(
-        update_batch=lambda batch_id, **kwargs: trace.append(
-            ("storage", batch_id, kwargs)
+        update_batch_status=lambda batch_id, status, **kwargs: trace.append(
+            ("storage", batch_id, {"status": status, **kwargs})
         ),
     )
 

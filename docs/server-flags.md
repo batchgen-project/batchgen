@@ -154,6 +154,7 @@ gpu_kv_cache = GPU_memory × gpu_memory_frac - model_instance_size
 | `--fast-init` | `false` | Use `memfd_create` + Transparent Huge Pages (THP) for fast memory registration. |
 
 **Note:** When `--enable-hugetlbfs` is enabled, BatchGen will automatically configure huge pages. This requires running the server with root privileges (sudo).
+At shutdown, BatchGen releases its own hugetlbfs weight file but does not sweep other files, unmount hugetlbfs, or reset the machine's hugepage reservation. Machine-level cleanup is an operator responsibility.
 
 **`--fast-init` details:**
 
