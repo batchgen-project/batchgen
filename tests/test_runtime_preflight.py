@@ -156,3 +156,68 @@ def test_installed_core_engine_skips_source_freshness(monkeypatch):
     _core_engine_at(monkeypatch, SITE / "batchgen/core_engine.so")
 
     preflight._check_core_engine()
+
+
+def test_missing_core_dir_fails_in_source_mode(worktrees, monkeypatch):
+    (worktrees.a / "core").rmdir()
+    so = worktrees.a / "batchgen/core_engine.so"
+    so.touch()
+    _core_engine_at(monkeypatch, so)
+
+    with pytest.raises(preflight.RuntimePreflightError, match="no core/ directory"):
+        preflight._check_core_engine()
+
+
+def test_non_source_files_do_not_mark_core_engine_stale(worktrees, monkeypatch):
+    so = worktrees.a / "batchgen/core_engine.so"
+    so.touch()
+    note = worktrees.a / "core/NOTES.md"
+    note.touch()
+    os.utime(so, (1000, 1000))
+    os.utime(note, (2000, 2000))
+    _core_engine_at(monkeypatch, so)
+
+    preflight._check_core_engine()
+
+
+def test_newer_external_header_marks_core_engine_stale(worktrees, monkeypatch):
+    so = worktrees.a / "batchgen/core_engine.so"
+    so.touch()
+    header = worktrees.a / "external/dep/api.h"
+    header.parent.mkdir(parents=True)
+    header.touch()
+    os.utime(so, (1000, 1000))
+    os.utime(header, (2000, 2000))
+    _core_engine_at(monkeypatch, so)
+
+    with pytest.raises(preflight.RuntimePreflightError, match="older than"):
+        preflight._check_core_engine()
+
+
+def test_kernels_dev_jit_is_rejected(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_KERNELS_DEV", "1")
+
+    with pytest.raises(preflight.RuntimePreflightError, match="BATCHGEN_KERNELS_DEV"):
+        preflight.run_runtime_preflight(SimpleNamespace(model="openai/gpt-oss-120b"))
+
+
+def test_batchgen_root_resolves_through_pyroot_symlink(worktrees, monkeypatch):
+    # Exercise the real _batchgen_root: batchgen imported via pyroot/batchgen.
+    monkeypatch.undo()
+    monkeypatch.setattr(preflight, "_site_roots", lambda: (SITE,))
+    fake = SimpleNamespace(__file__=str(worktrees.pyroot / "batchgen/__init__.py"))
+    monkeypatch.setitem(__import__("sys").modules, "batchgen", fake)
+
+    assert preflight._batchgen_root() == worktrees.a.resolve()
+    assert preflight._is_source_root(worktrees.a.resolve())
+
+
+def test_batchgen_root_in_site_packages_is_installed(tmp_path, monkeypatch):
+    site_dir = tmp_path / "site-packages"
+    (site_dir / "batchgen").mkdir(parents=True)
+    monkeypatch.setattr(preflight, "_site_roots", lambda: (site_dir.resolve(),))
+    fake = SimpleNamespace(__file__=str(site_dir / "batchgen/__init__.py"))
+    monkeypatch.setitem(__import__("sys").modules, "batchgen", fake)
+
+    assert preflight._batchgen_root() == site_dir.resolve()
+    assert not preflight._is_source_root(site_dir.resolve())

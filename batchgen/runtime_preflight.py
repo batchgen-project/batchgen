@@ -160,8 +160,14 @@ _CONTRACTS: dict[str, RuntimeContract] = {
 
 
 def _site_roots() -> tuple[Path, ...]:
-    roots = {*site.getsitepackages(), sysconfig.get_paths()["purelib"]}
-    return tuple(Path(root).resolve() for root in roots if root)
+    roots = {
+        *site.getsitepackages(),
+        site.getusersitepackages(),
+        sysconfig.get_paths()["purelib"],
+    }
+    # Deepest first, so a nested site dir wins deterministically.
+    resolved = {Path(root).resolve() for root in roots if root}
+    return tuple(sorted(resolved, key=lambda p: len(p.parts), reverse=True))
 
 
 def _module_path(module_name: str, module: object) -> Path:
@@ -241,6 +247,8 @@ def _import_required(module_name: str, *, origin: str | None = None) -> object:
 
 _manifest: dict[str, str] = {}
 
+_CORE_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
+
 
 def _check_core_engine() -> None:
     core_engine = _import_required("batchgen.core_engine", origin=_ORIGIN_BATCHGEN)
@@ -252,10 +260,22 @@ def _check_core_engine() -> None:
     root = _batchgen_root()
     if not _is_source_root(root):
         return
-    # Source worktree: the in-place build must be newer than every core/ file,
+    # Source worktree: the in-place build must be newer than every build input,
     # otherwise the server would silently run an old engine.
-    sources = [p for p in (root / "core").rglob("*") if p.is_file()]
-    newest = max(sources, key=lambda p: p.stat().st_mtime, default=None)
+    if not (root / "core").is_dir():
+        raise RuntimePreflightError(
+            f"source worktree {root} has no core/ directory; cannot verify "
+            "that batchgen.core_engine matches its sources"
+        )
+    inputs = [
+        p
+        for d in ("core", "external")
+        for p in (root / d).rglob("*")
+        if p.is_file() and p.suffix in _CORE_SOURCE_SUFFIXES
+    ]
+    inputs.append(root / "op_builder" / "core_engine.py")
+    inputs = [p for p in inputs if p.is_file()]
+    newest = max(inputs, key=lambda p: p.stat().st_mtime, default=None)
     if newest is not None and newest.stat().st_mtime > core_path.stat().st_mtime:
         raise RuntimePreflightError(
             f"batchgen.core_engine {core_path} is older than {newest}; rebuild "
@@ -383,6 +403,11 @@ def run_runtime_preflight(server_args: object) -> str:
     if not model:
         raise RuntimePreflightError("server model is empty")
 
+    if os.environ.get("BATCHGEN_KERNELS_DEV") == "1":
+        raise RuntimePreflightError(
+            "BATCHGEN_KERNELS_DEV=1 enables runtime JIT compilation; unset it and "
+            "build the kernels ahead of time"
+        )
     _check_torch()
     model_type = _resolve_model_type(model)
     contract = _CONTRACTS[model_type]
