@@ -157,18 +157,27 @@ def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
                 logger.info(f"Using registered tokenizer for type={tokenizer_type}")
                 # Tokenizer loads from its own package directory (no path argument)
                 return TOKENIZER_REGISTRY[tokenizer_type]()
-            # Falling through to a later, less specific pattern means serving
-            # this model with a DIFFERENT model's tokenizer. That is intended
-            # and documented for GLM-5.2 (identical vocab, see above); anywhere
-            # else it is the bug_log.md 2026-07-31 failure mode. Never silent.
-            logger.warning(
-                "Model %r matched pattern %r -> tokenizer type %r, which is not "
-                "registered. Falling through to a less specific pattern; the "
-                "tokenizer that ends up serving this model is NOT the one its "
-                "name selected. This is correct only when the two share a vocab "
-                "AND a chat template -- verify before relying on it.",
-                model_identifier, pattern, tokenizer_type,
-            )
+            module_path = _TOKENIZER_MODULES.get(tokenizer_type)
+            if module_path is None:
+                raise RuntimeError(
+                    f"model {model_identifier!r} selected tokenizer type "
+                    f"{tokenizer_type!r}, but no tokenizer module is declared"
+                )
+            try:
+                importlib.import_module(module_path)
+            except Exception as exc:  # noqa: BLE001 - preserve selected failure
+                raise RuntimeError(
+                    f"tokenizer module {module_path!r} for model "
+                    f"{model_identifier!r} failed to import: {exc}"
+                ) from exc
+            tokenizer_cls = TOKENIZER_REGISTRY.get(tokenizer_type)
+            if tokenizer_cls is None:
+                raise RuntimeError(
+                    f"tokenizer module {module_path!r} did not register "
+                    f"tokenizer type {tokenizer_type!r}"
+                )
+            logger.info("Using registered tokenizer for type=%s", tokenizer_type)
+            return tokenizer_cls()
 
     raise ValueError(
         f"No tokenizer registered for model: {model_identifier}. "
@@ -186,35 +195,37 @@ def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
     return TOKENIZER_REGISTRY.copy()
 
 
-# Import model-specific tokenizers to register them
-# These imports trigger the @register_tokenizer decorators
-def _import_tokenizers():
-    """Import all model-specific tokenizer modules to register them.
+_TOKENIZER_MODULES = {
+    "deepseek_v4": "batchgen.models.deepseek.deepseekv4_flash.tokenizer",
+    "deepseek_v3": "batchgen.models.deepseek.deepseekv3.tokenizer",
+    "deepseek_v2": "batchgen.models.deepseek.deepseekv2.tokenizer",
+    "gpt_oss": "batchgen.models.openai.gpt_oss_120b.tokenizer",
+    "mixtral": "batchgen.models.mixtral.tokenizer",
+    "kimi_k25": "batchgen.models.moonshotai.kimi_k25.tokenizer",
+    "kimi_linear": "batchgen.models.moonshotai.kimi_linear.tokenizer",
+    "kimi_k3": "batchgen.models.moonshotai.kimi_k3.tokenizer",
+    "glm_moe_dsa": "batchgen.models.glm.glm5.tokenizer",
+    "glm_moe_dsa_5_1": "batchgen.models.glm.glm5.tokenizer",
+    "glm_moe_dsa_5_2": "batchgen.models.glm.glm5.tokenizer",
+    "glm_moe_dsa_5_3": "batchgen.models.glm.glm5.tokenizer",
+    "minimax_m25": "batchgen.models.minimax.minimax_m25.tokenizer",
+}
 
-    A model package that cannot be imported (optional extra not installed, a
-    typo in a module, an asset missing from the wheel) is tolerated -- but it is
-    logged. Swallowing it silently turns a broken tokenizer into the misleading
-    "No tokenizer registered for model" further down.
-    """
-    for module_path in (
-        "batchgen.models.deepseek.deepseekv4_flash.tokenizer",
-        "batchgen.models.deepseek.deepseekv3.tokenizer",
-        "batchgen.models.deepseek.deepseekv2.tokenizer",
-        "batchgen.models.openai.gpt_oss_120b.tokenizer",
-        "batchgen.models.mixtral.tokenizer",
-        "batchgen.models.moonshotai.kimi_k25.tokenizer",
-        "batchgen.models.moonshotai.kimi_linear.tokenizer",
-        "batchgen.models.moonshotai.kimi_k3.tokenizer",
-        "batchgen.models.glm.glm5.tokenizer",
-        "batchgen.models.minimax.minimax_m25.tokenizer",
-    ):
+
+# Preserve the historical registry population for callers that inspect
+# TOKENIZER_REGISTRY directly, but isolate failures to the affected model.
+# `load_tokenizer()` still imports the selected module on demand and never
+# falls through to a different model's tokenizer.
+def _import_tokenizers():
+    for module_path in dict.fromkeys(_TOKENIZER_MODULES.values()):
         try:
             importlib.import_module(module_path)
-        except ImportError as exc:
-            logger.warning(
-                "Tokenizer module %s could not be imported (%s); any model "
-                "routed to it will fail to load a tokenizer.", module_path, exc)
+        except Exception as exc:  # noqa: BLE001 - report unrelated module failure
+            logger.error(
+                "Tokenizer module %s unavailable during registry warm-up: %s",
+                module_path,
+                exc,
+            )
 
 
-# Auto-import on module load
 _import_tokenizers()
