@@ -265,6 +265,23 @@ def _check_tokenizer(model: str) -> None:
         raise RuntimePreflightError(
             f"tokenizer contract for {model!r} does not define eos_token_ids"
         )
+    renderer = getattr(tokenizer, "apply_chat_template", None)
+    if callable(renderer):
+        try:
+            rendered = renderer(
+                [{"role": "user", "content": "runtime preflight"}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - template is a runtime contract
+            raise RuntimePreflightError(
+                f"chat-template contract failed for {model!r}: {exc}"
+            ) from exc
+        if not isinstance(rendered, str) or not rendered:
+            raise RuntimePreflightError(
+                f"chat-template contract for {model!r} returned no rendered text"
+            )
+        logger.info("[runtime-preflight] chat_template_chars=%d", len(rendered))
     logger.info(
         "[runtime-preflight] tokenizer=%s eos_token_ids=%s",
         type(tokenizer).__name__,
