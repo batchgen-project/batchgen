@@ -21,13 +21,25 @@ from typing import Iterable
 
 import torch
 
-from batchgen.config.model_registry import (
-    _detect_model_type_from_identifier,
-    load_config,
-)
 from batchgen.runtime_policy import configure_runtime_policy
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_model_type_from_identifier(model_identifier: str):
+    """Load registry detection only when preflight is actually running."""
+
+    from batchgen.config.model_registry import _detect_model_type_from_identifier as detect
+
+    return detect(model_identifier)
+
+
+def load_config(model_identifier: str):
+    """Load model config lazily so missing native deps are reported by preflight."""
+
+    from batchgen.config.model_registry import load_config as load
+
+    return load(model_identifier)
 
 
 class RuntimePreflightError(RuntimeError):
