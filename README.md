@@ -119,6 +119,8 @@ See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, ret
 - [GLM-5.2-FP8 on H200](docs/deploy-glm-5.2-h200.md) — download, conversion, one-node launch, 1M-context qualification, and memory limits
 - [GLM-5.3-FP8 on H200](docs/deploy-glm-5.3-h200.md) — local-SSD staging, one-node launch, reasoning controls, and qualification status
 - [Installation](docs/INSTALL.md) — dependency and source-install details
+- [Runtime dependency contract](docs/runtime-dependencies.md) — AOT install,
+  worktree isolation, startup preflight, and failure interpretation
 - [Batch API guide](docs/batch-api-guide.md) — request format and lifecycle
 - [Server flags](docs/server-flags.md) — runtime configuration
 - [Deployment guides](docs/) — model-specific startup and troubleshooting

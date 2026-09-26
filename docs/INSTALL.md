@@ -6,9 +6,9 @@
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
 - **System packages**: the NUMA dev headers (`numactl-devel` on RHEL/TencentOS,
-  `libnuma-dev` on Debian/Ubuntu) — required for the `core_engine` JIT build
+  `libnuma-dev` on Debian/Ubuntu) — required for the `core_engine` AOT build
   (`#include <numa.h>`). `install_deps.sh` installs these automatically; without them
-  the first server launch fails with `numa.h: No such file or directory`.
+  the installation fails with `numa.h: No such file or directory`.
 - **Model-specific (Kimi-K3 / Kimi-linear)**: `fla-core>=0.5.0` (flash-linear-attention) provides the `fla` Kimi-Delta-Attention kernels. It is listed in `requirements.txt`, so `pip install .` (and `install_deps.sh`) pull it automatically — no separate step.
 - **GitHub access**: the repository is currently **private** — anonymous
   `git clone` and raw release-asset URLs fail (404). Authenticate first
@@ -52,6 +52,12 @@ This installs (in order):
 6. **batchgen** — main package via `pip install .` (~1 min)
 
 Total: ~40-50 min on first install.
+
+The production runtime is AOT-only: `install_deps.sh` builds and verifies
+`batchgen.core_engine` during installation, and the server will not compile it
+on first launch. See [Runtime dependency contract](runtime-dependencies.md) for
+the Torch/ CUDA ABI, worktree-isolation, tokenizer, FA3/FA2, UCX, and
+fail-closed startup rules.
 
 ## Option C: Pre-built Wheels (Fastest, ~2 min)
 
