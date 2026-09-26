@@ -23,7 +23,8 @@ Usage: scripts/build_source_runtime.sh [options]
   -h, --help       Show this help.
 
 Environment: TORCH_CUDA_CHANNEL (default cu128), BUILD_ARCH (default sm90a),
-MAX_JOBS. Run inside the BatchGen environment (e.g. conda env `batchgen`).
+KERNELS_PARALLEL (extensions built at once, default 24), MAX_JOBS (ninja jobs
+per extension, default 8). Run inside the BatchGen environment.
 EOF
 }
 
@@ -74,7 +75,12 @@ if [[ $BUILD_CORE -eq 1 ]]; then
 fi
 if [[ $BUILD_KERNELS -eq 1 ]]; then
     log "building batchgen_kernels in $ROOT/batchgen_kernels"
-    (cd "$ROOT/batchgen_kernels" && python setup.py build_ext --inplace)
+    # Extensions are independent and mostly single-file, so build them
+    # concurrently (h200-instance-1, clean: 131 s vs 1142 s serial).
+    (cd "$ROOT/batchgen_kernels" \
+        && MAX_JOBS="${MAX_JOBS:-8}" python setup.py build_ext \
+            --inplace \
+            --parallel "${KERNELS_PARALLEL:-24}")
 fi
 
 # 3. pyroot: never repoint a pyroot that belongs to another worktree; a server
