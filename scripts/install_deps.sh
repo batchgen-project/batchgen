@@ -243,6 +243,32 @@ if torch.__version__ != expected or torch.version.cuda != expected_cuda:
 PY
 }
 
+enforce_torch_contract() {
+    local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
+    local torch_ver="2.9.0+${cuda_channel}"
+
+    if torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+        print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
+        return 0
+    fi
+
+    if [[ "${REPAIR_TORCH:-0}" != "1" ]]; then
+        print_error "Existing PyTorch does not match ${torch_ver} / CUDA ${cuda_channel}"
+        print_error "Refusing to modify the environment; rerun with --repair to replace it"
+        return 1
+    fi
+
+    print_warning "PyTorch ABI mismatch; --repair requested, reinstalling ${torch_ver}"
+    pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
+    if ! torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        print_error "PyTorch repair did not produce the required ${torch_ver}/${cuda_channel} ABI"
+        return 1
+    fi
+    TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+    print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified after repair"
+}
+
 install_torch() {
     print_step "Checking PyTorch installation..."
 
@@ -253,20 +279,7 @@ install_torch() {
 
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-        if torch_contract_ok "$torch_ver" "$cuda_channel"
-        then
-            print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
-        else
-            print_warning "PyTorch $TORCH_VERSION does not match required ${torch_ver}; reinstalling"
-            pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-            TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-            if ! torch_contract_ok "$torch_ver" "$cuda_channel"
-            then
-                print_error "PyTorch install did not produce the required ${torch_ver}/${cuda_channel} ABI"
-                return 1
-            fi
-            print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
-        fi
+        enforce_torch_contract
 
         # Check CUDA availability
         CUDA_AVAILABLE=$(python -c "import torch; print(torch.cuda.is_available())")
@@ -276,7 +289,7 @@ install_torch() {
     else
         print_step "Installing PyTorch ${torch_ver} (cuda_channel=${cuda_channel})..."
         pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-        print_success "PyTorch installed"
+        enforce_torch_contract
     fi
 }
 
@@ -624,6 +637,7 @@ show_help() {
     echo "  --wheel-dir DIR   Use pre-built wheels from a LOCAL dir (offline; auto-detects arch)"
     echo "  --release-tag TAG Fetch pre-built wheels from this GitHub release tag (default: latest)"
     echo "  --from-source     Force building all deps from source (skip the wheel fast path)"
+    echo "  --repair          Allow replacing an existing mismatched Torch installation"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -668,6 +682,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
+    REPAIR_TORCH=0
     WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
 
     while [[ $# -gt 0 ]]; do
@@ -702,6 +717,10 @@ main() {
                 ;;
             --from-source)
                 FROM_SOURCE=1
+                shift
+                ;;
+            --repair)
+                REPAIR_TORCH=1
                 shift
                 ;;
             --release-tag)
@@ -775,11 +794,9 @@ main() {
                 install_flash_attention
                 install_flashmla
                 install_deepgemm
-                # Reinstall PyTorch — building deps from source may downgrade torch or triton
-                print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-                local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
-                pip install "torch==2.9.0+${cuda_channel}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-                print_success "PyTorch reinstalled"
+                # Source builds may alter the environment; verify the pinned
+                # ABI and repair only when explicitly requested.
+                enforce_torch_contract
             fi
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
