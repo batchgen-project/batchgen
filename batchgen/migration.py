@@ -20,8 +20,6 @@ from batchgen.sequence import SequenceStatus
 
 logger = logging.getLogger(__name__)
 
-# Constants for migration
-NUM_GPUS_PER_NODE = 8  # TODO: Make configurable
 HOST_KV_WATERMARK_PERCENT = 70  # Trigger prefill when >70% free
 
 
@@ -106,6 +104,10 @@ class KVMigrationHelper:
         return self.worker.local_rank
 
     @property
+    def local_world_size(self) -> int:
+        return self.worker.local_world_size
+
+    @property
     def PAGE_SIZE(self) -> int:
         return self.worker.PAGE_SIZE
 
@@ -146,9 +148,12 @@ class KVMigrationHelper:
         stats = self.worker.host_paged_kv_worker_view.get_stats()
 
         # Count pages used by sequences with KV in host on THIS NODE
-        node_id = self.rank // NUM_GPUS_PER_NODE
-        node_rank_start = node_id * NUM_GPUS_PER_NODE
-        node_rank_end = min(node_rank_start + NUM_GPUS_PER_NODE, self.world_size)
+        node_id = self.rank // self.local_world_size
+        node_rank_start = node_id * self.local_world_size
+        node_rank_end = min(
+            node_rank_start + self.local_world_size,
+            self.world_size,
+        )
 
         valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
 
@@ -296,9 +301,9 @@ class KVMigrationHelper:
         for src_node_id, _ in overloaded:
             while used_by_node[src_node_id] > target_per_node and underutilized:
                 # Find sequences to migrate from src_node
-                src_rank_base = src_node_id * NUM_GPUS_PER_NODE
+                src_rank_base = src_node_id * self.local_world_size
                 candidate_sequences = []
-                for gpu_offset in range(NUM_GPUS_PER_NODE):
+                for gpu_offset in range(self.local_world_size):
                     src_rank = src_rank_base + gpu_offset
                     if src_rank >= self.world_size:
                         break
@@ -330,10 +335,15 @@ class KVMigrationHelper:
                 if dest_node_id not in self._dest_rank_counter:
                     self._dest_rank_counter[dest_node_id] = 0
 
-                dest_rank_offset = self._dest_rank_counter[dest_node_id] % NUM_GPUS_PER_NODE
-                dest_rank = dest_node_id * NUM_GPUS_PER_NODE + dest_rank_offset
+                dest_rank_offset = (
+                    self._dest_rank_counter[dest_node_id]
+                    % self.local_world_size
+                )
+                dest_rank = (
+                    dest_node_id * self.local_world_size + dest_rank_offset
+                )
                 if dest_rank >= self.world_size:
-                    dest_rank = dest_node_id * NUM_GPUS_PER_NODE
+                    dest_rank = dest_node_id * self.local_world_size
                 self._dest_rank_counter[dest_node_id] += 1
 
                 migrations.append(MigrationOp(

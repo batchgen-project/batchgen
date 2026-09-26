@@ -86,10 +86,15 @@ def test_runtime_identity_rejects_malformed_instance_ids(instance_id):
         runtime.RuntimeIdentity.create(instance_id)
 
 
-def test_shared_runtime_mode_remains_fail_loud():
+def test_runtime_identity_accepts_only_declared_modes():
     runtime = _load_runtime_identity_module()
-    with pytest.raises(ValueError, match="shared runtime mode is not available"):
-        runtime.RuntimeIdentity.create("lane-0", mode="shared")
+    identity = runtime.RuntimeIdentity.create(
+        "lane-0", mode="shared", run_id="0" * 32
+    )
+    assert identity.mode == "shared"
+
+    with pytest.raises(ValueError, match="runtime mode must be"):
+        runtime.RuntimeIdentity.create("lane-0", mode="invalid")
 
 
 @pytest.mark.parametrize("run_id", ["", "0" * 31, "G" * 32, 123])

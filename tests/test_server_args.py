@@ -30,6 +30,9 @@ def _load_server_args_module():
 server_args_module = _load_server_args_module()
 ServerArgs = server_args_module.ServerArgs
 validate_server_args = server_args_module.validate_server_args
+validate_shared_runtime_capability = (
+    server_args_module.validate_shared_runtime_capability
+)
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +54,7 @@ def _args(tmp_path, **overrides):
         "nnodes": 4,
         "node_rank": 0,
         "world_size": 32,
+        "host_kv_cache_size": 1,
         "storage_path": tmp_path / "storage",
     }
     values.update(overrides)
@@ -88,3 +92,101 @@ def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):
             world_size=24,
         )
     )
+
+
+def test_world_size_must_divide_evenly_across_nodes(tmp_path):
+    with pytest.raises(ValueError, match="world_size must be divisible"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=3,
+                world_size=8,
+            )
+        )
+
+
+def test_pynccl_range_must_be_positive_and_fit_port_space(tmp_path):
+    with pytest.raises(ValueError, match="pynccl_port_span must be positive"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=1,
+                pynccl_port_span=0,
+            )
+        )
+
+    with pytest.raises(ValueError, match="must end at or before 65535"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=1,
+                pynccl_port_base=65535,
+                pynccl_port_span=2,
+            )
+        )
+
+
+def _shared_args(tmp_path, **overrides):
+    values = {
+        "model": "openai/gpt-oss-120b",
+        "instance_id": "lane-0",
+        "runtime_mode": "shared",
+        "lane_lease_manifest_fd": 99,
+        "cache_dir": tmp_path / "checkpoint",
+        "converted_ckpt_dir": tmp_path / "converted",
+        "nnodes": 1,
+        "node_rank": 0,
+        "world_size": 1,
+        "host_kv_cache_size": 1,
+        "listen_port": 11000,
+        "dist_init_addr": "localhost:12000",
+        "pynccl_port_base": 21000,
+        "pynccl_port_span": 4,
+        "storage_path": tmp_path / "storage",
+    }
+    values.update(overrides)
+    return ServerArgs(**values)
+
+
+def test_shared_capability_accepts_only_qualified_shape(tmp_path):
+    validate_shared_runtime_capability(_shared_args(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"model": "other/model"}, "qualified only"),
+        ({"world_size": 3}, "world_size"),
+        ({"nnodes": 2}, "one node"),
+        ({"fast_init": True}, "rejects fast-init"),
+        ({"enable_hugetlbfs": True}, "rejects fast-init"),
+        ({"enable_deepep": True}, "rejects fast-init"),
+        ({"enable_ep_with_offloading": True}, "EP offloading"),
+        ({"enable_cuda_graph": True}, "CUDA graph"),
+        ({"lane_lease_manifest_fd": None}, "lease-manifest"),
+        ({"cache_dir": None}, "explicit cache_dir"),
+    ],
+)
+def test_shared_capability_rejects_unqualified_shapes(
+    tmp_path, override, message
+):
+    with pytest.raises(ValueError, match=message):
+        validate_shared_runtime_capability(
+            _shared_args(tmp_path, **override)
+        )
+
+
+def test_shared_capability_rejects_overlapping_ports(tmp_path):
+    with pytest.raises(ValueError, match="ports must differ"):
+        validate_shared_runtime_capability(
+            _shared_args(tmp_path, dist_init_addr="localhost:11000")
+        )
+    with pytest.raises(ValueError, match="allocations overlap"):
+        validate_shared_runtime_capability(
+            _shared_args(tmp_path, listen_port=21001, world_size=2)
+        )

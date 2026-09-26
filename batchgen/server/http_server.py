@@ -45,7 +45,10 @@ from batchgen.deprecation import (
     LEGACY_INFERENCE_MESSAGE,
 )
 from batchgen.server.health import ServerHealthState
-from batchgen.server.server_args import ServerArgs
+from batchgen.server.server_args import (
+    ServerArgs,
+    validate_shared_runtime_capability,
+)
 from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerExitState, WorkerManager
 
@@ -102,46 +105,54 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         e2e_start = time.monotonic()
-        storage = StorageManager(server_args.storage_path)
+        validate_shared_runtime_capability(server_args)
         worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
-        scheduler = BatchScheduler(storage, worker, server_args)
-
         app.state.server_args = server_args
-        app.state.storage = storage
         app.state.worker = worker
-        app.state.scheduler = scheduler
-
-        # Build model metadata object (cached for lifetime of server)
-        # Only use BatchGen-maintained registered configs — never fall back to HF config.json
-        detected_type = _detect_model_type_from_identifier(server_args.model)
-        if detected_type is None or detected_type not in CONFIG_REGISTRY:
-            raise ValueError(
-                f"Model '{server_args.model}' is not registered in BatchGen CONFIG_REGISTRY. "
-                f"Cannot serve /v1/models metadata. Registered types: {list(CONFIG_REGISTRY.keys())}"
-            )
-        model_config = CONFIG_REGISTRY[detected_type]()
-        model_id = Path(server_args.model).name
-        app.state.model_object = ModelObject(
-            id=model_id,
-            created=int(time.time()),
-            owned_by="batchgen",
-            max_context_length=model_config.max_position_embeddings,
-        )
-
-        worker.start()
-        await scheduler.start()
-        health_state.mark_startup_complete()
-        e2e_elapsed = time.monotonic() - e2e_start
-        logger.info(
-            "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
-        )
-        print(f"[startup] End-to-end server ready in {e2e_elapsed:.2f}s", flush=True)
-
+        scheduler = None
+        scheduler_started = False
         try:
+            worker._acquire_runtime_admission()
+            storage = StorageManager(server_args.storage_path)
+            scheduler = BatchScheduler(storage, worker, server_args)
+            app.state.storage = storage
+            app.state.scheduler = scheduler
+
+            # Build model metadata once for the server lifetime. Only use
+            # BatchGen-maintained configs; never fall back to HF config.json.
+            detected_type = _detect_model_type_from_identifier(
+                server_args.model
+            )
+            if detected_type is None or detected_type not in CONFIG_REGISTRY:
+                raise ValueError(
+                    f"Model '{server_args.model}' is not registered in "
+                    "BatchGen CONFIG_REGISTRY. Cannot serve /v1/models "
+                    f"metadata. Registered types: {list(CONFIG_REGISTRY.keys())}"
+                )
+            model_config = CONFIG_REGISTRY[detected_type]()
+            model_id = Path(server_args.model).name
+            app.state.model_object = ModelObject(
+                id=model_id,
+                created=int(time.time()),
+                owned_by="batchgen",
+                max_context_length=model_config.max_position_embeddings,
+            )
+
+            worker.start()
+            await scheduler.start()
+            scheduler_started = True
+            health_state.mark_startup_complete()
+            e2e_elapsed = time.monotonic() - e2e_start
+            logger.info(
+                "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
+            )
             yield
         finally:
-            await scheduler.stop()
-            worker.stop()
+            try:
+                if scheduler_started:
+                    await scheduler.stop()
+            finally:
+                worker.stop()
 
     app = FastAPI(title="BatchGen OpenAI-Compatible API", lifespan=lifespan)
     app.state.worker_exit_state = worker_exit_state
@@ -522,8 +533,6 @@ def launch_server(server_args: ServerArgs) -> None:
     import signal
     import threading
 
-    from batchgen.server.process_utils import cleanup_resources
-
     worker_exit_state = WorkerExitState()
     health_state = ServerHealthState()
     app = create_app(server_args, worker_exit_state, health_state)
@@ -589,15 +598,6 @@ def launch_server(server_args: ServerArgs) -> None:
         signal.signal(signal.SIGQUIT, original_sigquit)
 
         logger.info("HTTP server stopped.")
-
-        # Final cleanup in case lifespan cleanup was incomplete
-        # (e.g., if server was killed before lifespan could run, or watchdog triggered)
-        # Always clean hugepages on shutdown for complete resource release
-        cleanup_resources(
-            shm_prefix=None,  # Clean all shared memory files
-            clean_hugepages=True,  # Always clean hugepages on shutdown
-            kill_workers=True,  # Force kill any remaining workers
-        )
 
         if worker_exit_state.is_failed():
             reason = worker_exit_state.reason or "Worker process exited."
