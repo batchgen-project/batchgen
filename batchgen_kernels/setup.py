@@ -52,21 +52,6 @@ _nvcc_threads = os.getenv("NVCC_THREADS", "4")
 
 # ── ccache / sccache integration ──
 
-def _setup_ccache():
-    """Detect and configure ccache/sccache for faster incremental builds."""
-    for tool in ("sccache", "ccache"):
-        if shutil.which(tool):
-            os.environ.setdefault("CC", f"{tool} gcc")
-            os.environ.setdefault("CXX", f"{tool} g++")
-            if tool == "ccache":
-                os.environ.setdefault("CCACHE_NVCC", "1")
-            print(f"[batchgen_kernels] Using {tool} for compilation cache")
-            return tool
-    return None
-
-_cache_tool = _setup_ccache()
-
-
 # ── CUDA_HOME auto-detection (for external users) ──
 
 if not os.environ.get("CUDA_HOME"):
@@ -78,6 +63,25 @@ if not os.environ.get("CUDA_HOME"):
             "CUDA toolkit not found. Set CUDA_HOME or ensure nvcc is on PATH.\n"
             "Example: export CUDA_HOME=/usr/local/cuda-12.8"
         )
+
+
+def _setup_ccache():
+    """Detect and configure ccache/sccache for faster incremental builds.
+
+    CC must stay a plain compiler: torch passes it to nvcc as `-ccbin`, and
+    nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC.
+    For reuse across checkouts, callers set CCACHE_BASEDIR to the checkout.
+    """
+    for tool in ("sccache", "ccache"):
+        if shutil.which(tool):
+            os.environ.setdefault("CXX", f"{tool} g++")
+            nvcc = os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")
+            os.environ.setdefault("PYTORCH_NVCC", f"{tool} {nvcc}")
+            print(f"[batchgen_kernels] Using {tool} for compilation cache")
+            return tool
+    return None
+
+_cache_tool = _setup_ccache()
 
 
 # ── Architecture build gating ──

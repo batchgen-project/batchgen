@@ -61,6 +61,16 @@ if not torch.__version__.startswith("2.9.0") or torch.version.cuda != cuda:
     sys.exit(f"expected torch 2.9.0 with CUDA {cuda} ({channel})")
 PY
 
+# Optional compile cache: identical sources in another worktree hit the cache
+# because CCACHE_BASEDIR makes this checkout's absolute paths relative.
+if command -v ccache >/dev/null; then
+    export CCACHE_BASEDIR="$ROOT"
+    export CCACHE_NOHASHDIR=true
+    export CXX="${CXX:-ccache g++}"
+    export PYTORCH_NVCC="${PYTORCH_NVCC:-ccache $(command -v nvcc)}"
+    log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default}"
+fi
+
 # 2. In-place AOT builds. setuptools only recompiles extensions whose sources
 #    changed, so repeated runs during debugging are incremental.
 if [[ $BUILD_CORE -eq 1 ]]; then
