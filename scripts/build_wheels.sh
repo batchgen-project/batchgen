@@ -1,7 +1,7 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------- #
 #  BatchGen Wheel Builder                                                       #
-#  Copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Builds pre-compiled wheels for all CUDA dependencies + batchgen_kernels.     #
 #  Users can install these wheels with pip install *.whl — no compilation.      #

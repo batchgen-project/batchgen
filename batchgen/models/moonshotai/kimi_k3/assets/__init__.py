@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen — Kimi-K3 vendored checkpoint assets                                #
-#  copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 # ---------------------------------------------------------------------------- #
 """Kimi-K3 tokenizer assets, vendored verbatim from the served checkpoint.
 

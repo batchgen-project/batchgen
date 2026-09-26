@@ -1,4 +1,6 @@
 // BatchGen — FP8 Blockwise GEMM Utility Functions
+// Adapted from Tencent/hpc-ops (https://github.com/Tencent/hpc-ops, MIT License,
+// Copyright (C) 2026 Tencent), with modifications by BatchGen Team. See NOTICE.
 // TMA descriptor management, vectorized load/store, synchronization primitives.
 
 #ifndef BATCHGEN_FP8_BLOCKWISE_UTILS_CUH_

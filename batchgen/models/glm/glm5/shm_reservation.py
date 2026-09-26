@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 # ---------------------------------------------------------------------------- #
 
 """Size the GLM-5 weight shared memory from the converted checkpoint metadata.

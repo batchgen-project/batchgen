@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                          #
+#  Copyright (c) 2025-2026 BatchGen Team                                         #
 # ---------------------------------------------------------------------------- #
 
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (

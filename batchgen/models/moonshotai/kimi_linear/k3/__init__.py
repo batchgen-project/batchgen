@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen — Kimi-K3 divergences from the shared Kimi-Linear stack             #
-#  copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #  Licensed under the Apache License, Version 2.0                               #
 # ---------------------------------------------------------------------------- #
 """Kimi-K3 (2.8T) specifics, contained in one subpackage.

@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen Makefile                                                           #
-#  Copyright (c) EfficientMoE team 2025                                        #
+#  Copyright (c) 2025-2026 BatchGen Team                                       #
 # ---------------------------------------------------------------------------- #
 
 .PHONY: help install install-all install-deps install-hopper-deps install-kernels clean
