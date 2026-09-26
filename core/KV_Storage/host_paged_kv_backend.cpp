@@ -581,7 +581,7 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
         return;
     }
 
-    // ---- Original shm_open path (unchanged) ----
+    // ---- POSIX shm_open path ----
     auto resize_region = [&](std::size_t bytes) {
         if (ftruncate(shm_fd, static_cast<off_t>(bytes)) == -1) {
             const int err = errno;
@@ -592,20 +592,9 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
         }
     };
 
-    auto reset_region = [&]() {
-        if (ftruncate(shm_fd, 0) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "ftruncate reset failed");
-        }
-        resize_region(total_bytes);
-    };
-
     int flags = O_RDWR;
     if (create_region) {
-        flags |= O_CREAT;
+        flags |= O_CREAT | O_EXCL;
     }
 
     shm_fd = shm_open(config.shm_name.c_str(), flags, 0660);
@@ -615,22 +604,7 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     }
 
     if (create_region) {
-        struct stat stat_buffer {};
-        if (fstat(shm_fd, &stat_buffer) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "fstat failed");
-        }
-
-        const std::size_t current_size =
-            static_cast<std::size_t>(stat_buffer.st_size);
-        if (current_size == total_bytes && current_size != 0) {
-            reset_region();
-        } else {
-            resize_region(total_bytes);
-        }
+        resize_region(total_bytes);
         created_region = true;
     } else {
         struct stat stat_buffer {};

@@ -8,6 +8,7 @@ import string
 import time
 from concurrent.futures import ProcessPoolExecutor
 
+import pytest
 import torch
 from tqdm import tqdm
 
@@ -48,6 +49,70 @@ def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ig
     cfg.sequence_table_capacity = 10240
     cfg.alignment_bytes = 64
     return cfg
+
+
+def _make_tiny_mla_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore
+    cfg = bg.HostPagedKVConfig()
+    cfg.shm_name = shm_name
+    cfg.num_layers = 1
+    cfg.num_pages = 4
+    cfg.page_size_tokens = 4
+    cfg.num_k_heads = 1
+    cfg.k_head_dim = 8
+    cfg.num_v_heads = 0
+    cfg.v_head_dim = 0
+    cfg.k_element_size_bytes = 2
+    cfg.v_element_size_bytes = 0
+    cfg.sequence_table_capacity = 8
+    cfg.alignment_bytes = 64
+    return cfg
+
+
+def test_duplicate_creator_does_not_reset_live_region():
+    shm_name = _random_shm_name()
+    first = bg.MLAHostPagedKVManager(_make_tiny_mla_config(shm_name))
+    second = bg.MLAHostPagedKVManager(_make_tiny_mla_config(shm_name))
+    shm_path = f"/dev/shm/{shm_name.lstrip('/')}"
+
+    try:
+        first.initialize(True)
+        size_before = os.stat(shm_path).st_size
+        stats_before = first.get_stats()
+
+        with pytest.raises(RuntimeError, match="File exists"):
+            second.initialize(True)
+
+        assert os.stat(shm_path).st_size == size_before
+        stats_after = first.get_stats()
+        assert stats_after.num_total_pages == stats_before.num_total_pages
+        assert stats_after.num_free_pages == stats_before.num_free_pages
+    finally:
+        del second
+        del first
+        _shm_unlink(shm_name)
+
+
+def test_distinct_named_regions_coexist():
+    first_name = _random_shm_name()
+    second_name = _random_shm_name()
+    first = bg.MLAHostPagedKVManager(_make_tiny_mla_config(first_name))
+    second = bg.MLAHostPagedKVManager(_make_tiny_mla_config(second_name))
+
+    try:
+        first.initialize(True)
+        second.initialize(True)
+
+        first_stats = first.get_stats()
+        second_stats = second.get_stats()
+        assert first_stats.num_total_pages == 4
+        assert second_stats.num_total_pages == 4
+        assert first_stats.num_free_pages == 4
+        assert second_stats.num_free_pages == 4
+    finally:
+        del second
+        del first
+        _shm_unlink(second_name)
+        _shm_unlink(first_name)
 
 
 # 每个 worker 进程里做的事：attach shm + 分配自己的 sequences + 打印自己的 page table

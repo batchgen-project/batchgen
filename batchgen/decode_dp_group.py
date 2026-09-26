@@ -63,8 +63,8 @@ def rank_in_decode_group(
 def host_kv_owner_rank(decode_dp_group: int, group_size: int) -> int:
     """Canonical rank that owns the per-node SHARED host-KV entry for a group.
 
-    The host paged KV cache is ONE shared-memory region per node
-    (shm ``batchgen_host_kv_cache``) keyed by ``global_idx``, so a sequence's
+    The host paged KV cache is ONE run-namespaced shared-memory region per node
+    keyed by ``global_idx``, so a sequence's
     register / allocate / grow / release against it must happen EXACTLY once. Under
     Option 1 (G>1) all G ranks of a group replicate the sequence, so if every rank
     touched the shared region the first releaser would tombstone the entry and the

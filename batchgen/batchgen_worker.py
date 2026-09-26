@@ -357,12 +357,8 @@ def allocate_node_shared_int64(
 
 	nbytes = rows * width * 8
 	if is_creator:
-		try:
-			# A crashed predecessor can leave the name behind; reusing its
-			# (possibly smaller) segment would silently truncate.
-			shared_memory.SharedMemory(name=name).unlink()
-		except FileNotFoundError:
-			pass
+		# SharedMemory(create=True) uses exclusive creation. A collision must
+		# fail without unlinking or modifying the existing run's segment.
 		shm = shared_memory.SharedMemory(name=name, create=True, size=nbytes)
 	barrier()
 	if not is_creator:
@@ -633,6 +629,10 @@ class BatchGenWorkerArgs:
 	distributed_weight_config: Optional[str] = None
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Default enables pool mode. 0 = legacy batch-FIFO.
+	host_kv_shm_name: str = "batchgen_host_kv_cache"
+	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
+	query_book_shm_prefix: str = "batchgen_input_ids"
+	reload_status_dir: str = "/tmp/batchgen_reload_status"
 
 
 class BatchGenWorker:
@@ -852,6 +852,8 @@ class BatchGenWorker:
 			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
 			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
 			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
+			primary_shm_name=args.host_kv_shm_name,
+			aux_shm_name=args.host_kv_aux_shm_name,
 		)
 		if dual_host is not None:
 			self.host_paged_kv_worker_view = dual_host
@@ -862,6 +864,7 @@ class BatchGenWorker:
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
 				host_kv_cache_size=host_budget_bytes,
+				shm_name=args.host_kv_shm_name,
 			)
 			if args.fast_init:
 				worker_kv_config.enable_memfd = True
@@ -956,7 +959,8 @@ class BatchGenWorker:
 		# static config.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._buffer_pool_generation = 0
-		self._shared_buffer_tag: Optional[str] = None
+		self._query_book_shm_prefix = args.query_book_shm_prefix
+		self._reload_status_dir = args.reload_status_dir
 		# Superseded pools stay mapped for the process lifetime (see
 		# _retire_buffer_pool).
 		self._retired_buffer_pools: List[QueryBookBufferPool] = []
@@ -1783,8 +1787,8 @@ class BatchGenWorker:
 	def _owns_host_kv(self, seq) -> bool:
 		"""Which SINGLE rank drives the per-node SHARED host-KV region for a seq.
 
-		The host paged KV cache is ONE shm region per node
-		(``batchgen_host_kv_cache``) keyed by ``global_idx``, so register /
+		The host paged KV cache is ONE run-namespaced shm region per node,
+		keyed by ``global_idx``, so register /
 		allocate / grow / release must fire EXACTLY once per sequence. This is
 		NARROWER than ``_owns_local_sequence``: G>1 replicates a seq onto all G
 		ranks of its group (they each hold GPU KV + head-sharded KDA state), but
@@ -4696,14 +4700,6 @@ class BatchGenWorker:
 
 	# ============ QueryBook Buffer Pool ============
 
-	def _node_shared_tag(self) -> str:
-		"""Run-unique tag shared by every rank, for shared-memory segment names."""
-		if self._shared_buffer_tag is None:
-			tag = [os.urandom(6).hex() if self.rank == 0 else None]
-			dist.broadcast_object_list(tag, src=0)
-			self._shared_buffer_tag = tag[0]
-		return self._shared_buffer_tag
-
 	def _ensure_buffer_pool(
 		self,
 		required_rows: int,
@@ -4743,7 +4739,7 @@ class BatchGenWorker:
 		self._buffer_pool_generation += 1
 		node_id = self.rank // NUM_GPUS_PER_NODE
 		name = (
-			f"batchgen_input_ids_{self._node_shared_tag()}"
+			f"{self._query_book_shm_prefix}"
 			f"_n{node_id}_g{self._buffer_pool_generation}"
 		)
 		is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
@@ -6598,7 +6594,7 @@ class BatchGenWorker:
 							# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and msg.get("command") == "reload":
 							# Hot-reload command — broadcast to all ranks then handle.
-							# Result is written to /tmp/batchgen_reload_status/rank_<N>.json
+							# Result is written below this run's reload-status directory
 							# inside _handle_hot_reload (via _write_reload_status), NOT
 							# put on response_queue. Putting on response_queue would
 							# deadlock the FastAPI event loop because the sync HTTP
@@ -8363,7 +8359,7 @@ class BatchGenWorker:
 		
 		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
 
-		# Host KV is ONE per-node SHARED shm region (batchgen_host_kv_cache) keyed
+		# Host KV is ONE run-namespaced per-node SHARED shm region keyed
 		# by global_idx. Under Option 1 (G>1) all G ranks of a group hold the uuid
 		# in _uuid_to_local_map, so releasing on every rank double-frees the single
 		# shared entry -- the first releaser tombstones it and the rest raise
@@ -14161,7 +14157,7 @@ class BatchGenWorker:
 			return result
 
 	def _write_reload_status(self, result: dict) -> None:
-		"""Write reload status atomically to /tmp/batchgen_reload_status/rank_<N>.json.
+		"""Write reload status atomically to this run's status directory.
 
 		The HTTP server polls these files instead of waiting on a queue,
 		which avoids deadlocks when the FastAPI event loop is blocked.
@@ -14173,7 +14169,7 @@ class BatchGenWorker:
 		try:
 			result_with_time = dict(result)
 			result_with_time["timestamp"] = _time.time()
-			status_dir = "/tmp/batchgen_reload_status"
+			status_dir = self._reload_status_dir
 			os.makedirs(status_dir, exist_ok=True)
 			# Write to temp then atomic rename
 			fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")

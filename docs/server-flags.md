@@ -25,6 +25,7 @@ python -m batchgen.launch_http_server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--instance-id` | `default` | Logical instance name used in this run's mutable resource namespace. This does not enable shared-host operation. |
 | `--listen-ip` | `0.0.0.0` | IP address the server listens on |
 | `--listen-port` | `10900` | Port the server listens on |
 

@@ -3,7 +3,7 @@
 import argparse
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +11,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
+from batchgen.server.runtime_identity import RuntimeIdentity
 
 
 def is_port_available(port: int) -> bool:
@@ -73,6 +74,8 @@ class ServerArgs:
     """Server configuration."""
 
     model: str
+    instance_id: str = "default"
+    runtime_mode: str = "exclusive"
     listen_ip: str = "0.0.0.0"
     listen_port: int = 10900
     hf_cache_dir: Optional[Path] = None
@@ -143,8 +146,13 @@ class ServerArgs:
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
+    runtime_identity: RuntimeIdentity = field(init=False)
 
     def __post_init__(self):
+        self.runtime_identity = RuntimeIdentity.create(
+            self.instance_id,
+            mode=self.runtime_mode,
+        )
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
         # Default incremental output dir: {storage_path}/incremental/
@@ -171,6 +179,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BatchGen FastAPI server")
     parser.add_argument(
         "--model", type=str, required=True, help="HuggingFace model name"
+    )
+    parser.add_argument(
+        "--instance-id",
+        type=str,
+        default="default",
+        help=(
+            "Logical server instance identifier used to namespace mutable "
+            "runtime resources. Shared-host mode is not enabled by this flag."
+        ),
     )
     parser.add_argument(
         "--listen-ip", type=str, default="0.0.0.0", help="Server listen IP"
@@ -604,6 +621,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
 
     server_args = ServerArgs(
         model=parsed.model,
+        instance_id=parsed.instance_id,
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
