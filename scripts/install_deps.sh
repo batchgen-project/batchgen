@@ -82,7 +82,7 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# System (OS) packages required to BUILD the JIT-compiled `core_engine` extension.
+# System (OS) packages required to BUILD the AOT `core_engine` extension.
 # The core_engine sources (core/Parameter_Server/posix_shm.cpp) `#include <numa.h>`
 # and link `-lnuma`, so the NUMA development headers must be present or the first
 # server launch fails with:
@@ -116,14 +116,15 @@ install_system_deps() {
     if [[ -f /usr/include/numa.h ]]; then
         print_success "NUMA dev headers installed (numa.h present)"
     else
-        print_warning "numa.h still missing — the core_engine JIT build will fail until installed."
+        print_error "numa.h still missing — the AOT core_engine build cannot proceed."
+        return 1
     fi
 }
 
 check_prerequisites() {
     print_step "Checking prerequisites..."
 
-    # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
+    # System headers needed by the core_engine AOT build (numa.h -> numactl-devel).
     # UCX (for the core_engine distributed-weight daemon's UCP memory-handle API) is
     # provided by the `libucx-cu12` pip wheel declared in requirements.txt (installed
     # with the batchgen package), so no system UCX or source build is needed here.
@@ -536,8 +537,26 @@ install_batchgen() {
         cd "$BATCHGEN_DIR"
         # Replace stale editable/direct-url installs from another worktree
         # without allowing dependency resolution to change the verified ABI.
-        pip install . --no-build-isolation --no-deps --force-reinstall
-        print_success "BatchGen installed"
+        # BUILD_OPS=1 emits batchgen.core_engine as an AOT extension. Runtime
+        # startup is deliberately AOT-only and must never compile from source.
+        BUILD_OPS=1 pip install . --no-build-isolation --no-deps --force-reinstall
+        if ! (
+            cd /tmp
+            python - <<'PY'
+import importlib
+from pathlib import Path
+
+module = importlib.import_module("batchgen.core_engine")
+path = Path(module.__file__)
+if path.suffix not in {".so", ".pyd", ".dylib"}:
+    raise SystemExit(f"batchgen.core_engine is not AOT: {path}")
+print(f"batchgen.core_engine AOT: {path}")
+PY
+        ); then
+            print_error "BatchGen installed without an importable AOT core_engine"
+            return 1
+        fi
+        print_success "BatchGen installed with AOT core_engine"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
         print_error "Please run this script from the BatchGen/scripts directory"
@@ -653,20 +672,6 @@ show_help() {
     echo "  $0 --flash-attn                     # Install only flash-attention 3"
     echo "  $0 --wheel-dir /path/to/wheels      # Install deps from pre-built wheels"
     echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
-}
-
-# Pre-build (warm) the core_engine JIT extension now, while the CUDA toolkit is on
-# hand from the source build, so the FIRST server launch does not require CUDA_HOME
-# / nvcc on PATH. The compile is CPU-only (no GPU needed). Non-fatal: on failure the
-# engine JIT-builds at first launch instead (which then needs CUDA_HOME set).
-warm_core_engine() {
-    python -c "import batchgen" &> /dev/null || return 0   # batchgen not installed; skip
-    print_step "Warming the core_engine JIT build (so the first server launch needs no CUDA toolkit)..."
-    if python -c "from batchgen.models.engine_loader import core_engine" > /tmp/batchgen_core_engine_warm.log 2>&1; then
-        print_success "core_engine JIT built and cached"
-    else
-        print_warning "core_engine warm build failed; it will JIT-build on first server launch (set CUDA_HOME then). Log: /tmp/batchgen_core_engine_warm.log"
-    fi
 }
 
 main() {
@@ -838,10 +843,6 @@ main() {
             install_batchgen
         fi
     fi
-
-    # Warm the core_engine JIT now (CUDA toolkit is available during install) so
-    # the first server launch needs no CUDA_HOME / nvcc on PATH.
-    warm_core_engine
 
     # Cleanup
     cleanup

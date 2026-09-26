@@ -440,6 +440,24 @@ else
     warn "batchgen location: $BG_LOC (NOT in site-packages)"
 fi
 
+# The production server is AOT-only.  Check this outside the checkout so a
+# source tree cannot hide a missing installed extension.
+if ! (
+    cd /tmp
+    python - <<'PY'
+import importlib
+from pathlib import Path
+
+module = importlib.import_module("batchgen.core_engine")
+path = Path(module.__file__)
+if path.suffix not in {".so", ".pyd", ".dylib"}:
+    raise SystemExit(f"batchgen.core_engine is not AOT: {path}")
+print(f"batchgen.core_engine: {path}")
+PY
+); then
+    fail "batchgen.core_engine AOT extension is missing or not importable"
+fi
+
 # ============================================================================ #
 # Phase 6: Import smoke tests
 # ============================================================================ #
@@ -529,8 +547,9 @@ else:
 # Verify no JIT cache was created
 JIT_FILES=$(find "$TORCH_EXTENSIONS_DIR" -name "*.so" 2>/dev/null | wc -l)
 if [[ "$JIT_FILES" -gt 0 ]]; then
-    warn "JIT cache has $JIT_FILES .so files — some kernels may still use JIT"
+    fail "JIT cache has $JIT_FILES .so files — production runtime must use AOT extensions"
     find "$TORCH_EXTENSIONS_DIR" -name "*.so" -exec echo "  {}" \;
+    exit 1
 else
     ok "No JIT cache created — all kernels loaded from AOT-compiled site-packages"
 fi
