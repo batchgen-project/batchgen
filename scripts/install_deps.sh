@@ -1,7 +1,7 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------- #
 #  BatchGen Dependency Installation Script                                      #
-#  Copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Supports Hopper (SM90) and Blackwell (SM100/B200) GPUs:                      #
 #  Hopper:    flash-attention 3, FlashMLA, DeepGEMM                             #

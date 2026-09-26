@@ -132,7 +132,7 @@ See the [batch API guide](docs/batch-api-guide.md) for JSONL input, polling, ret
 
 ## Citation
 
-If BatchGen helps your research, please cite:
+We ask that any work, product, or publication that uses BatchGen or code derived from it cite the BatchGen repository and/or the BatchGen paper. GitHub's "Cite this repository" button exports the same metadata from [CITATION.cff](CITATION.cff).
 
 ```bibtex
 @inproceedings{xu2026batchgen,
@@ -152,7 +152,7 @@ Paper: [BatchGen: An Architecture for Scalable and Efficient Batch Inference](ht
 
 ## Acknowledgements
 
-BatchGen learns from and draws on the ecosystem work of [SGLang](https://github.com/sgl-project/sglang) and [vLLM](https://github.com/vllm-project/vllm), among other open-source projects.
+BatchGen learns from and draws on the ecosystem work of [SGLang](https://github.com/sgl-project/sglang) and [vLLM](https://github.com/vllm-project/vllm), among other open-source projects. Parts of our FP8 blockwise grouped GEMM and GQA decode kernels are adapted from Tencent's [hpc-ops](https://github.com/Tencent/hpc-ops); third-party components and their licenses are listed in [NOTICE](NOTICE).
 
 ## Contributing
 
@@ -160,4 +160,4 @@ We welcome model integrations, kernels, scheduler improvements, evaluation tooli
 
 ## License
 
-BatchGen is released under the [Apache 2.0 license](LICENSE).
+BatchGen is released under the [Apache 2.0 license](LICENSE). Redistributions must retain the [NOTICE](NOTICE) file, which includes the attribution and citation request above.

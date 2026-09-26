@@ -16,7 +16,7 @@ body:
       options:
         - label: I have read the [BatchGen documentation](https://BatchGen.github.io/).
           required: true
-        - label: I have searched the [Issue Tracker](https://github.com/EfficientMoE/BatchGen/issues) to ensure this hasn't been reported before.
+        - label: I have searched the [Issue Tracker](https://github.com/batchgen-project/batchgen/issues) to ensure this hasn't been reported before.
           required: true
 
   - type: textarea

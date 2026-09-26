@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen — Kimi-K3                                                          #
-#  copyright (c) EfficientMoE team 2025                                        #
+#  Copyright (c) 2025-2026 BatchGen Team                                       #
 #  Licensed under the Apache License, Version 2.0                              #
 # ---------------------------------------------------------------------------- #
 """fla chunk_kda: the batch-1 call is bit-identical to the varlen call for a

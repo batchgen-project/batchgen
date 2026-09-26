@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 # ---------------------------------------------------------------------------- #
 
 """GLM-5 basic config setup. Standalone — no cross-model imports."""

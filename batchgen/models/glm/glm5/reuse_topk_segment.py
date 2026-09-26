@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 # ---------------------------------------------------------------------------- #
 
 """Graph-capturable GLM-5.2 attention segment for skip_topk layers.

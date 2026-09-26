@@ -1,7 +1,7 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------- #
 #  BatchGen Fresh Install + Test Pipeline                                       #
-#  Copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Creates a fresh conda environment, installs everything from scratch with     #
 #  pip install . (non-editable, matching production/ray deployment), and runs   #
