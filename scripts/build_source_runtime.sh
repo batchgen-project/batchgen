@@ -67,7 +67,7 @@ if command -v ccache >/dev/null; then
     export CCACHE_BASEDIR="$ROOT"
     export CCACHE_NOHASHDIR=true
     export CXX="${CXX:-ccache g++}"
-    export PYTORCH_NVCC="${PYTORCH_NVCC:-$ROOT/batchgen_kernels/tools/cache_nvcc.sh ccache $(command -v nvcc)}"
+    export PYTORCH_NVCC="${PYTORCH_NVCC:-$ROOT/scripts/cache_nvcc.sh ccache $(command -v nvcc)}"
     log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default}"
 fi
 
@@ -86,7 +86,7 @@ fi
 if [[ $BUILD_KERNELS -eq 1 ]]; then
     log "building batchgen_kernels in $ROOT/batchgen_kernels"
     # Extensions are independent and mostly single-file, so build them
-    # concurrently (h200-instance-1, clean: 131 s vs 1142 s serial).
+    # concurrently instead of one nvcc at a time.
     (cd "$ROOT/batchgen_kernels" \
         && MAX_JOBS="${MAX_JOBS:-8}" python setup.py build_ext \
             --inplace \

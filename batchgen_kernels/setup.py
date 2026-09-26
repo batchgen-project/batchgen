@@ -70,16 +70,17 @@ def _setup_ccache():
 
     CC must stay a plain compiler: torch passes it to nvcc as `-ccbin`, and
     nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC and
-    tools/cache_nvcc.sh, which rewrites torch's dependency flags for ccache.
+    scripts/cache_nvcc.sh, which rewrites torch's dependency flags for ccache.
     For reuse across checkouts, callers set CCACHE_BASEDIR to the checkout.
     """
     for tool in ("sccache", "ccache"):
         if shutil.which(tool):
             os.environ.setdefault("CXX", f"{tool} g++")
             nvcc = os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")
-            wrapper = os.path.join(_this_dir, "tools", "cache_nvcc.sh")
-            os.environ.setdefault("PYTORCH_NVCC", f"{wrapper} {tool} {nvcc}")
-            print(f"[batchgen_kernels] Using {tool} for compilation cache")
+            wrapper = os.path.join(_this_dir, "..", "scripts", "cache_nvcc.sh")
+            if os.path.isfile(wrapper):  # absent when built outside the repo
+                os.environ.setdefault("PYTORCH_NVCC", f"{wrapper} {tool} {nvcc}")
+            print(f"[batchgen_kernels] Using {tool} for compilation cache")  # noqa: hygiene - build output
             return tool
     return None
 
