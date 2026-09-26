@@ -275,6 +275,10 @@ pip install ninja setuptools wheel packaging
 
 TORCH_VER=$(python -c "import torch; print(torch.__version__)")
 CUDA_VER=$(python -c "import torch; print(torch.version.cuda)")
+if [[ "$TORCH_VER" != "2.9.0+cu128" || "$CUDA_VER" != "12.8" ]]; then
+    fail "Unexpected Torch/CUDA ABI: $TORCH_VER / CUDA $CUDA_VER (expected 2.9.0+cu128 / CUDA 12.8)"
+    exit 1
+fi
 ok "PyTorch $TORCH_VER (CUDA $CUDA_VER)"
 
 # ============================================================================ #
@@ -349,6 +353,22 @@ else
     pip install -r requirements.txt 2>&1 | tail -5
 fi
 
+if [[ $SKIP_DEPS -eq 0 ]]; then
+    # Hopper GPT-OSS requires FA3; FA2 is an optional fallback for other
+    # model families and is intentionally not required by this gate.
+    if ! python - <<'PY'
+import flash_attn_interface
+import flash_mla
+import libucx
+libucx.load_library()
+PY
+    then
+        fail "Hopper runtime dependency contract failed (FA3, FlashMLA, or UCX)"
+        exit 1
+    fi
+    ok "Hopper FA3/FlashMLA/UCX runtime contract verified"
+fi
+
 # ============================================================================ #
 # Phase 4: Install batchgen_kernels (AOT CUDA extensions)
 # ============================================================================ #
@@ -376,12 +396,31 @@ else
     ok "batchgen_kernels installed in $(( T1 - T0 ))s"
 fi
 
+# Importing the namespace alone can pass for a source-only or partial wheel.
+# Verify the extensions that are loaded lazily by the GPT-OSS runtime before
+# declaring the environment usable.
+if ! python - <<'PY'
+import importlib
+
+for module_name in (
+    "batchgen_kernels.attention._C_fused_ops",
+    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
+):
+    importlib.import_module(module_name)
+PY
+then
+    fail "batchgen_kernels AOT runtime contract is incomplete"
+    exit 1
+fi
+ok "batchgen_kernels AOT runtime contract verified"
+
 # Verify it's in site-packages (not editable)
 KERNELS_LOC=$(python -c "import batchgen_kernels; print(batchgen_kernels.__file__)")
 if [[ "$KERNELS_LOC" == *"site-packages"* ]]; then
     ok "batchgen_kernels location: $KERNELS_LOC (site-packages)"
 else
-    warn "batchgen_kernels location: $KERNELS_LOC (NOT in site-packages)"
+    fail "batchgen_kernels location: $KERNELS_LOC (editable/source shadow)"
+    exit 1
 fi
 
 # ============================================================================ #
@@ -391,7 +430,7 @@ divider
 step "Phase 5: Installing BatchGen (non-editable)"
 
 cd "$BATCHGEN_DIR"
-pip install . 2>&1 | tail -10
+pip install . --no-build-isolation --no-deps --force-reinstall 2>&1 | tail -10
 
 # Verify it's in site-packages
 BG_LOC=$(python -c "import batchgen; print(batchgen.__file__)")
@@ -399,6 +438,24 @@ if [[ "$BG_LOC" == *"site-packages"* ]]; then
     ok "batchgen location: $BG_LOC (site-packages)"
 else
     warn "batchgen location: $BG_LOC (NOT in site-packages)"
+fi
+
+# The production server is AOT-only.  Check this outside the checkout so a
+# source tree cannot hide a missing installed extension.
+if ! (
+    cd /tmp
+    python - <<'PY'
+import importlib
+from pathlib import Path
+
+module = importlib.import_module("batchgen.core_engine")
+path = Path(module.__file__)
+if path.suffix not in {".so", ".pyd", ".dylib"}:
+    raise SystemExit(f"batchgen.core_engine is not AOT: {path}")
+print(f"batchgen.core_engine: {path}")
+PY
+); then
+    fail "batchgen.core_engine AOT extension is missing or not importable"
 fi
 
 # ============================================================================ #
@@ -490,8 +547,9 @@ else:
 # Verify no JIT cache was created
 JIT_FILES=$(find "$TORCH_EXTENSIONS_DIR" -name "*.so" 2>/dev/null | wc -l)
 if [[ "$JIT_FILES" -gt 0 ]]; then
-    warn "JIT cache has $JIT_FILES .so files — some kernels may still use JIT"
+    fail "JIT cache has $JIT_FILES .so files — production runtime must use AOT extensions"
     find "$TORCH_EXTENSIONS_DIR" -name "*.so" -exec echo "  {}" \;
+    exit 1
 else
     ok "No JIT cache created — all kernels loaded from AOT-compiled site-packages"
 fi
