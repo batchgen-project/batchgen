@@ -35,7 +35,7 @@ def test_preflight_checks_contract_before_core_engine(monkeypatch):
 
     assert preflight.run_runtime_preflight(SimpleNamespace(model="openai/gpt-oss-120b")) == "gpt_oss"
     assert calls[0] == "torch"
-    assert calls.index("ucx-load") < calls.index(("batchgen.core_engine", False))
+    assert calls.index("ucx-load") < calls.index(("batchgen.core_engine", True))
 
 
 def test_non_aot_core_engine_fails(monkeypatch):

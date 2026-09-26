@@ -209,6 +209,13 @@ def _check_tokenizer(model: str) -> None:
             f"tokenizer contract failed for {model!r}: {exc}"
         ) from exc
     eos_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_ids is None:
+        # Single-EOS tokenizers (including GPT-OSS) intentionally expose the
+        # singular HuggingFace-compatible attribute.  The worker normalizes it
+        # to a set; preflight must validate the same contract rather than
+        # rejecting a valid tokenizer for lacking an optional plural alias.
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        eos_ids = set() if eos_id is None else {eos_id}
     if not eos_ids:
         raise RuntimePreflightError(
             f"tokenizer contract for {model!r} does not define eos_token_ids"
@@ -279,7 +286,7 @@ def run_runtime_preflight(server_args: object) -> str:
                 "selected WGMMA decode backend has no attention_decode_bf16()"
             )
 
-    core_engine = _import_required("batchgen.core_engine", site_package=False)
+    core_engine = _import_required("batchgen.core_engine", site_package=True)
     core_path = getattr(core_engine, "__file__", "")
     if Path(core_path).suffix not in {".so", ".pyd", ".dylib"}:
         raise RuntimePreflightError(
