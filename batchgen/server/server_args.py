@@ -83,6 +83,7 @@ class ServerArgs:
     # EP models). Default off = NCCL all_gather + reduce_scatter; on requires the
     # DeepEP build and fails fast at startup if it is unavailable (no silent NCCL fallback).
     enable_deepep: bool = False
+    allow_runtime_fallback: bool = False
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
@@ -199,6 +200,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "build; fails fast at startup if it is unavailable (no silent NCCL "
             "fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 "
             "and the K3 DeepEP build."
+        ),
+    )
+    parser.add_argument(
+        "--allow-runtime-fallback",
+        action="store_true",
+        help=(
+            "Explicitly allow a declared attention/custom-kernel fallback. "
+            "Disabled by default; missing required dependencies still fail "
+            "the startup preflight."
         ),
     )
     parser.add_argument(
@@ -636,6 +646,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_deepep=parsed.enable_deepep,
+        allow_runtime_fallback=parsed.allow_runtime_fallback,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,

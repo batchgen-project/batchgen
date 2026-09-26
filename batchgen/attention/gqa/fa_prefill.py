@@ -13,6 +13,7 @@ Set BATCHGEN_VANILLA_SINKS=1 environment variable to enable vanilla path.
 import os
 import torch
 from typing import Optional, Tuple
+from batchgen.runtime_policy import selected_flash_backend
 
 # Note: We check env var at runtime in the function, not at import time,
 # because worker processes may import modules before env vars are set.
@@ -22,16 +23,18 @@ _USE_FA3 = False
 _flash_varlen_func = None
 _flash_attn_forward = None  # FA3 low-level API that returns LSE
 
-try:
-    from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
-    from flash_attn_interface import _flash_attn_forward as _fa3_forward
-    _USE_FA3 = True
-    _flash_varlen_func = _fa3_varlen_func
-    _flash_attn_forward = _fa3_forward
-except ImportError:
-    pass
+_SELECTED_BACKEND = selected_flash_backend()
+if _SELECTED_BACKEND in (None, "fa3"):
+    try:
+        from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
+        from flash_attn_interface import _flash_attn_forward as _fa3_forward
+        _USE_FA3 = True
+        _flash_varlen_func = _fa3_varlen_func
+        _flash_attn_forward = _fa3_forward
+    except ImportError:
+        pass
 
-if _flash_varlen_func is None:
+if _flash_varlen_func is None and _SELECTED_BACKEND in (None, "fa2"):
     try:
         from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
         _flash_varlen_func = _fa2_varlen_func
