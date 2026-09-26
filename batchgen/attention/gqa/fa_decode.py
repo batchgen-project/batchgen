@@ -15,6 +15,7 @@ Set BATCHGEN_VANILLA_SINKS=1 environment variable to enable vanilla path.
 import os
 import torch
 from typing import Optional, Tuple
+from batchgen.runtime_policy import selected_flash_backend
 
 # Note: We check env var at runtime in the function, not at import time,
 # because worker processes may import modules before env vars are set.
@@ -23,14 +24,16 @@ from typing import Optional, Tuple
 _USE_FA3 = False
 _flash_with_kvcache = None
 
-try:
-    from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
-    _USE_FA3 = True
-    _flash_with_kvcache = _fa3_with_kvcache
-except ImportError:
-    pass
+_SELECTED_BACKEND = selected_flash_backend()
+if _SELECTED_BACKEND in (None, "fa3"):
+    try:
+        from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
+        _USE_FA3 = True
+        _flash_with_kvcache = _fa3_with_kvcache
+    except ImportError:
+        pass
 
-if _flash_with_kvcache is None:
+if _flash_with_kvcache is None and _SELECTED_BACKEND in (None, "fa2"):
     try:
         from flash_attn import flash_attn_with_kvcache as _fa2_with_kvcache
         _flash_with_kvcache = _fa2_with_kvcache

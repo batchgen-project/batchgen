@@ -6,6 +6,7 @@ or if the custom kernel is unavailable.
 """
 
 import logging
+import os
 import torch
 from typing import Optional, Tuple
 
@@ -22,8 +23,13 @@ def _check_custom_kernel():
         return _custom_kernel is not None
     _custom_kernel_checked = True
 
+    selected_backend = os.environ.get("BATCHGEN_DECODE_BACKEND")
+    if selected_backend == "fa3":
+        return False
+
     if not torch.cuda.is_available():
-        print("[batchgen_decode] CUDA not available, using FA3 fallback", flush=True)
+        if selected_backend == "wgmma":
+            raise RuntimeError("WGMMA decode backend selected without CUDA")
         return False
 
     device_name = torch.cuda.get_device_name()
@@ -31,7 +37,10 @@ def _check_custom_kernel():
 
     # Custom WGMMA decode kernel is optimized for H20 only
     if "H20" not in device_name:
-        print(f"[batchgen_decode] Not H20 ({device_name}), using FA3 fallback", flush=True)
+        if selected_backend == "wgmma":
+            raise RuntimeError(
+                f"WGMMA decode backend selected on unsupported GPU {device_name}"
+            )
         return False
 
     try:
@@ -41,7 +50,10 @@ def _check_custom_kernel():
         return True
     except Exception as e:
         print(f"[batchgen_decode] Failed to load custom kernel: {e}", flush=True)
-        print("[batchgen_decode] Falling back to FA3", flush=True)
+        if selected_backend == "wgmma":
+            raise RuntimeError(
+                "selected WGMMA decode backend failed to load"
+            ) from e
         return False
 
 
@@ -79,6 +91,12 @@ def batchgen_gqa_decode_bf16(
     """
     global _backend_logged
 
+    if os.environ.get("BATCHGEN_DECODE_BACKEND") not in {"fa3", "wgmma"}:
+        raise RuntimeError(
+            "decode backend policy is unset; run the server runtime preflight "
+            "before using batchgen_gqa_decode_bf16"
+        )
+
     if _check_custom_kernel():
         if not _backend_logged:
             print(f"[batchgen_decode] Using custom WGMMA kernel "
@@ -113,9 +131,12 @@ def batchgen_gqa_decode_bf16(
 
         return output, lse
 
-    # Fallback to FA3/FA2
+    if os.environ.get("BATCHGEN_DECODE_BACKEND") == "wgmma":
+        raise RuntimeError("selected WGMMA decode backend was not available")
+
+    # The server preflight selected FA3 explicitly for this hardware.
     if not _backend_logged:
-        print(f"[batchgen_decode] Using FA3 fallback "
+        print(f"[batchgen_decode] Using selected FA3 backend "
               f"(q={list(q.shape)}, headdim={q.shape[-1]})", flush=True)
         _backend_logged = True
 
