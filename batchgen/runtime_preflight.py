@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import inspect
+import json
 import logging
 import os
 import site
@@ -163,35 +164,103 @@ def _site_roots() -> tuple[Path, ...]:
     return tuple(Path(root).resolve() for root in roots if root)
 
 
-def _require_site_package(module_name: str, module: object) -> None:
+def _module_path(module_name: str, module: object) -> Path:
     module_path = getattr(module, "__file__", None)
     if not module_path:
         raise RuntimePreflightError(
             f"{module_name} has no __file__; refusing unverifiable runtime module"
         )
-    resolved = Path(module_path).resolve()
-    if not any(root == resolved or root in resolved.parents for root in _site_roots()):
-        raise RuntimePreflightError(
-            f"{module_name} resolves outside site-packages: {resolved}; "
-            "editable/source worktree shadowing is not allowed"
-        )
+    return Path(module_path).resolve()
 
 
-def _import_required(module_name: str, *, site_package: bool = False) -> object:
+def _under(path: Path, roots: Iterable[Path]) -> bool:
+    return any(root == path or root in path.parents for root in roots)
+
+
+def _batchgen_root() -> Path:
+    """Root that owns the running ``batchgen`` package.
+
+    Installed mode: a site-packages directory.  Source mode (pyroot/PYTHONPATH):
+    the worktree that ``batchgen`` resolves to after following symlinks.
+    """
+
+    import batchgen
+
+    package_dir = _module_path("batchgen", batchgen).parent
+    for root in _site_roots():
+        if _under(package_dir, (root,)):
+            return root
+    return package_dir.parent
+
+
+def _is_source_root(root: Path) -> bool:
+    return root not in _site_roots()
+
+
+# Where each required module may come from:
+#   "site"     - third-party native package, must be installed in site-packages
+#   "batchgen" - BatchGen-owned native code, must share the batchgen root so a
+#                worktree never mixes its Python with another checkout's kernels
+_ORIGIN_SITE = "site"
+_ORIGIN_BATCHGEN = "batchgen"
+
+
+def _require_origin(module_name: str, module: object, origin: str) -> Path:
+    resolved = _module_path(module_name, module)
+    if origin == _ORIGIN_SITE:
+        if not _under(resolved, _site_roots()):
+            raise RuntimePreflightError(
+                f"{module_name} resolves outside site-packages: {resolved}; "
+                "third-party native packages must be installed, not shadowed"
+            )
+    elif origin == _ORIGIN_BATCHGEN:
+        root = _batchgen_root()
+        if not _under(resolved, (root,)):
+            raise RuntimePreflightError(
+                f"{module_name} resolves to {resolved}, but batchgen runs from "
+                f"{root}; batchgen, batchgen_kernels, and core_engine must come "
+                "from the same install or worktree"
+            )
+    return resolved
+
+
+def _import_required(module_name: str, *, origin: str | None = None) -> object:
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001 - preserve the native import cause
         raise RuntimePreflightError(
             f"required runtime module {module_name!r} failed to import: {exc}"
         ) from exc
-    if site_package:
-        _require_site_package(module_name, module)
-    logger.info(
-        "[runtime-preflight] %s=%s",
-        module_name,
-        getattr(module, "__file__", "<built-in>"),
-    )
+    if origin is not None:
+        _manifest[module_name] = str(_require_origin(module_name, module, origin))
+    else:
+        _manifest[module_name] = str(getattr(module, "__file__", "<built-in>"))
+    logger.info("[runtime-preflight] %s=%s", module_name, _manifest[module_name])
     return module
+
+
+_manifest: dict[str, str] = {}
+
+
+def _check_core_engine() -> None:
+    core_engine = _import_required("batchgen.core_engine", origin=_ORIGIN_BATCHGEN)
+    core_path = Path(getattr(core_engine, "__file__", ""))
+    if core_path.suffix not in {".so", ".pyd", ".dylib"}:
+        raise RuntimePreflightError(
+            f"batchgen.core_engine is not an AOT native module: {str(core_path)!r}"
+        )
+    root = _batchgen_root()
+    if not _is_source_root(root):
+        return
+    # Source worktree: the in-place build must be newer than every core/ file,
+    # otherwise the server would silently run an old engine.
+    sources = [p for p in (root / "core").rglob("*") if p.is_file()]
+    newest = max(sources, key=lambda p: p.stat().st_mtime, default=None)
+    if newest is not None and newest.stat().st_mtime > core_path.stat().st_mtime:
+        raise RuntimePreflightError(
+            f"batchgen.core_engine {core_path} is older than {newest}; rebuild "
+            "with `BUILD_OPS=1 python setup.py build_ext --inplace`"
+        )
 
 
 def _check_torch() -> None:
@@ -310,6 +379,7 @@ def run_runtime_preflight(server_args: object) -> str:
     """Validate the exact model runtime before server resources are allocated."""
 
     model = str(getattr(server_args, "model", ""))
+    _manifest.clear()
     if not model:
         raise RuntimePreflightError("server model is empty")
 
@@ -324,46 +394,71 @@ def run_runtime_preflight(server_args: object) -> str:
     configure_runtime_policy(
         flash_backend=contract.flash_backend,
         decode_backend=decode_backend,
-        allow_fallback=bool(getattr(server_args, "allow_runtime_fallback", False)),
     )
     _check_tokenizer(model)
 
     for module_name in contract.modules:
         module = _import_required(
             module_name,
-            site_package=module_name in {"flash_attn_interface", "flash_attn", "flash_mla"},
+            origin=_ORIGIN_SITE
+            if module_name in {"flash_attn_interface", "flash_attn", "flash_mla"}
+            else None,
         )
         if module_name == "libucx":
             _check_ucx(module)
 
     for extension_name in contract.extensions:
-        _import_required(extension_name, site_package=True)
+        _import_required(extension_name, origin=_ORIGIN_BATCHGEN)
 
     if decode_backend == "wgmma":
         decode_module = _import_required(
-            "batchgen_kernels.attention.decode", site_package=True
+            "batchgen_kernels.attention.decode", origin=_ORIGIN_BATCHGEN
         )
         if not callable(getattr(decode_module, "attention_decode_bf16", None)):
             raise RuntimePreflightError(
                 "selected WGMMA decode backend has no attention_decode_bf16()"
             )
 
-    core_engine = _import_required("batchgen.core_engine", site_package=True)
-    core_path = getattr(core_engine, "__file__", "")
-    if Path(core_path).suffix not in {".so", ".pyd", ".dylib"}:
-        raise RuntimePreflightError(
-            f"batchgen.core_engine is not an AOT native module: {core_path!r}"
-        )
+    _check_core_engine()
 
     if contract.require_deepgemm:
         _check_deepgemm()
 
     logger.info(
-        "[runtime-preflight] passed model=%s model_type=%s",
+        "[runtime-preflight] passed model=%s model_type=%s root=%s manifest=%s",
         model,
         model_type,
+        _batchgen_root(),
+        json.dumps(_manifest, sort_keys=True),
     )
     return model_type
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the startup gate without launching a server (agent/debug entry)."""
+
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--model", required=True)
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        model_type = run_runtime_preflight(args)
+    except RuntimePreflightError as exc:
+        print(f"PREFLIGHT FAIL: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(
+        {"model_type": model_type, "root": str(_batchgen_root()), "modules": _manifest},
+        indent=2,
+        sort_keys=True,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 __all__ = ["RuntimePreflightError", "RuntimeContract", "run_runtime_preflight"]
