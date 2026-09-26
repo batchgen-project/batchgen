@@ -23,7 +23,8 @@ Usage: scripts/build_source_runtime.sh [options]
   -h, --help       Show this help.
 
 Environment: TORCH_CUDA_CHANNEL (default cu128), BUILD_ARCH (default sm90a),
-MAX_JOBS. Run inside the BatchGen environment (e.g. conda env `batchgen`).
+KERNELS_PARALLEL (extensions built at once, default 24), MAX_JOBS (ninja jobs
+per extension, default 8). Run inside the BatchGen environment.
 EOF
 }
 
@@ -60,6 +61,16 @@ if not torch.__version__.startswith("2.9.0") or torch.version.cuda != cuda:
     sys.exit(f"expected torch 2.9.0 with CUDA {cuda} ({channel})")
 PY
 
+# Optional compile cache: identical sources in another worktree hit the cache
+# because CCACHE_BASEDIR makes this checkout's absolute paths relative.
+if command -v ccache >/dev/null; then
+    export CCACHE_BASEDIR="$ROOT"
+    export CCACHE_NOHASHDIR=true
+    export CXX="${CXX:-ccache g++}"
+    export PYTORCH_NVCC="${PYTORCH_NVCC:-$ROOT/scripts/cache_nvcc.sh ccache $(command -v nvcc)}"
+    log "ccache enabled: $(command -v ccache) dir=${CCACHE_DIR:-default}"
+fi
+
 # 2. In-place AOT builds. setuptools only recompiles extensions whose sources
 #    changed, so repeated runs during debugging are incremental.
 if [[ $BUILD_CORE -eq 1 ]]; then
@@ -74,7 +85,12 @@ if [[ $BUILD_CORE -eq 1 ]]; then
 fi
 if [[ $BUILD_KERNELS -eq 1 ]]; then
     log "building batchgen_kernels in $ROOT/batchgen_kernels"
-    (cd "$ROOT/batchgen_kernels" && python setup.py build_ext --inplace)
+    # Extensions are independent and mostly single-file, so build them
+    # concurrently instead of one nvcc at a time.
+    (cd "$ROOT/batchgen_kernels" \
+        && MAX_JOBS="${MAX_JOBS:-8}" python setup.py build_ext \
+            --inplace \
+            --parallel "${KERNELS_PARALLEL:-24}")
 fi
 
 # 3. pyroot: never repoint a pyroot that belongs to another worktree; a server
