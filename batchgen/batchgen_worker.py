@@ -9732,6 +9732,13 @@ class BatchGenWorker:
 		# host pages have been released so worker_view free pages match the
 		# growth-debt-aware plan computed on rank 0.
 		if decisions.growth_feasible and decisions.host_growth_uuids:
+			# The host pool is shared by every rank on a node, but each rank
+			# released only its own completed/evicted rows above. Rank 0's plan
+			# already counts all of those pages as free, so no rank may grow
+			# until every rank has finished releasing; otherwise a fast rank
+			# sees the pre-release free count and AcquirePages fails.
+			if self.world_size > 1:
+				dist.barrier()
 			host_grow_requests = []
 			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
 				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
