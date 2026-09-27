@@ -262,7 +262,7 @@ class BatchScheduler:
                     f"First missing: {missing_ids[:5]}"
                 )
                 logger.error(error_message)
-                self._update_batch_status(
+                self.storage.update_batch_status(
                     batch_id, BatchStatus.FAILED, error=error_message
                 )
                 return
@@ -952,9 +952,9 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
-                "code": "capacity_exceeded", "message": error_msg,
-            })
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=f"capacity_exceeded: {error_msg}"
+            )
             return
         # Store max_tokens for init message
         if not hasattr(self, '_pool_max_output_len'):
@@ -1111,9 +1111,9 @@ class BatchScheduler:
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
-                self.storage.update_batch_status(batch_id, BatchStatus.FAILED, error={
-                    "code": "worker_fatal", "message": error_msg,
-                })
+                self.storage.update_batch_status(
+                    batch_id, BatchStatus.FAILED, error=f"worker_fatal: {error_msg}"
+                )
                 logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
 
     async def _pool_completion_listener(self) -> None:
