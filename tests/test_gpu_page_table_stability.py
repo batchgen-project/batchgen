@@ -301,3 +301,20 @@ def test_cuda_graph_page_table_storage_accessor_does_not_rebuild_active_table(mo
     assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == (3, 2)
     with pytest.raises(RuntimeError, match="CUDA graph page table is not valid"):
         manager.get_cuda_graph_page_table()
+
+
+def test_reused_rebuild_refreshes_cuda_graph_page_table_after_extension():
+    manager = _make_manager()
+    manager.allocate_pages_for_sequences([10, 20], [12, 4])
+    manager.rebuild_page_table([10, 20])
+    assert manager.get_cuda_graph_page_table()[1, 1].item() == -1
+
+    # Same slots, same order, enough columns: the active table is reused in
+    # place. The graph-stable table must still receive the extended page.
+    assert manager.extend_pages_for_sequence(20, 8) == 1
+    active = manager.rebuild_page_table([10, 20])
+    graph = manager.get_cuda_graph_page_table()
+
+    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == active.data_ptr()
+    torch.testing.assert_close(graph[1, :2], manager._sequences[20].pages)
+    torch.testing.assert_close(graph[:2, : active.shape[1]], active)

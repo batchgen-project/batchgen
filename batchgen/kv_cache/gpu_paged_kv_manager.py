@@ -492,7 +492,10 @@ class _GPUPageTableManager:
 
 			if not reuse_existing:
 				self.gpu_table = table
-				self._update_cuda_graph_table(wanted_order, sequences, max_required)
+			# Refresh the graph-stable copy on every rebuild: a reused active
+			# table can still gain pages (decode extension), and a stale graph
+			# row would send KV writes to page -1.
+			self._update_cuda_graph_table(wanted_order, sequences, max_required)
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
