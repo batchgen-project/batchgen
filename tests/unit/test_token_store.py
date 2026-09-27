@@ -476,9 +476,13 @@ def test_decoded_append_batch_interleaves_with_append():
 
 
 def test_decoded_extend_rows_flushes_a_step_log():
-    store = token_store.DecodedTokenStore(chunk_size_tokens=2)
-    seq_ids = np.array([11, 12, 13, 14], dtype=np.int64)
-    # [steps, batch] step log, one column per sequence.
+    store = token_store.DecodedTokenStore(chunk_size_tokens=8)
+    slots = np.array([11, 12, 13, 14], dtype=np.int64)
+    # Start the columns at different chunk offsets so flushes cross chunks.
+    store.append(11, np.arange(6))
+    store.append(12, np.arange(8))
+    store.append(14, np.arange(3))
+    # [steps, batch] step log, one column per slot.
     log = np.array(
         [
             [1, 10, 100, 1000],
@@ -489,27 +493,29 @@ def test_decoded_extend_rows_flushes_a_step_log():
         ],
         dtype=np.int64,
     )
-    store.extend_rows(seq_ids, log, counts=np.array([5, 3, 0, 1]))
+    store.extend_rows(slots, log, counts=np.array([5, 3, 0, 1]))
 
     np.testing.assert_array_equal(
-        store.read(11), np.array([1, 2, 3, 4, 5], dtype=np.int32)
+        store.read(11), np.r_[np.arange(6), 1, 2, 3, 4, 5].astype(np.int32)
     )
     np.testing.assert_array_equal(
-        store.read(12), np.array([10, 20, 30], dtype=np.int32)
+        store.read(12), np.r_[np.arange(8), 10, 20, 30].astype(np.int32)
     )
     assert store.length(13) == 0
-    np.testing.assert_array_equal(store.read(14), np.array([1000], dtype=np.int32))
+    np.testing.assert_array_equal(
+        store.read(14), np.r_[np.arange(3), 1000].astype(np.int32)
+    )
 
     # A scalar count applies to every column; None means all steps.
-    store.extend_rows(seq_ids, log, counts=1)
+    store.extend_rows(slots, log, counts=1)
     assert store.length(13) == 1
-    assert store.length(11) == 6
+    assert store.length(11) == 12
     store.extend_rows(np.array([21]), log[:, :1])
-    assert store.length(21) == 5
+    np.testing.assert_array_equal(store.read(21), np.arange(1, 6, dtype=np.int32))
 
 
 def test_decoded_extend_rows_validates_shapes():
-    store = token_store.DecodedTokenStore(chunk_size_tokens=2)
+    store = token_store.DecodedTokenStore(chunk_size_tokens=4)
     log = np.zeros((3, 2), dtype=np.int64)
 
     with pytest.raises(ValueError, match=r"\[steps, batch\]"):
@@ -520,6 +526,48 @@ def test_decoded_extend_rows_validates_shapes():
         store.extend_rows(np.array([1, 2]), log, counts=np.array([1, 2, 3]))
     with pytest.raises(ValueError, match=r"outside \[0, 3\]"):
         store.extend_rows(np.array([1, 2]), log, counts=4)
+    with pytest.raises(ValueError, match="exceeds the 4-token chunk"):
+        store.extend_rows(np.array([1]), np.zeros((5, 1), dtype=np.int64))
+    with pytest.raises(ValueError, match="slot must be >= 0"):
+        store.append_batch(np.array([-1]), np.array([1]))
+
+
+def test_decoded_store_matches_a_list_model_under_random_operations():
+    """Append, batch append, partial flushes and frees against a reference."""
+    rng = np.random.default_rng(1234)
+    chunk = 8
+    store = token_store.DecodedTokenStore(chunk_size_tokens=chunk)
+    model = {}
+    slots = np.arange(40)
+    for _ in range(300):
+        op = rng.integers(0, 4)
+        if op == 0:
+            slot = int(rng.integers(0, 40))
+            tokens = rng.integers(0, 1000, size=int(rng.integers(0, 20)))
+            store.append(slot, tokens)
+            model.setdefault(slot, []).extend(tokens.tolist())
+        elif op == 1:
+            batch = rng.choice(slots, size=int(rng.integers(1, 40)), replace=False)
+            tokens = rng.integers(0, 1000, size=batch.size)
+            store.append_batch(batch, tokens)
+            for s_, t_ in zip(batch.tolist(), tokens.tolist()):
+                model.setdefault(s_, []).append(t_)
+        elif op == 2:
+            batch = rng.choice(slots, size=int(rng.integers(1, 40)), replace=False)
+            steps = int(rng.integers(1, chunk + 1))
+            log = rng.integers(0, 1000, size=(steps, batch.size))
+            counts = rng.integers(0, steps + 1, size=batch.size)
+            store.extend_rows(batch, log, counts)
+            for j, s_ in enumerate(batch.tolist()):
+                model.setdefault(s_, []).extend(log[: counts[j], j].tolist())
+        else:
+            slot = int(rng.integers(0, 40))
+            assert store.free(slot) == len(model.pop(slot, []))
+        for s_ in range(40):
+            expected = np.array(model.get(s_, []), dtype=np.int32)
+            assert store.length(s_) == expected.size
+            np.testing.assert_array_equal(store.read(s_), expected)
+    assert store.active_sequences == sum(1 for v in model.values() if v)
 
 
 def test_decoded_read_bounds_and_free():
@@ -606,3 +654,19 @@ def test_release_punches_only_whole_system_pages_inside_free_runs(make_arena):
     np.testing.assert_array_equal(
         arena.read(again), _tokens(60 * page_tokens, seed=4).astype(np.int32)
     )
+
+
+def test_decoded_store_capacity_is_enforced_and_chunks_are_reused():
+    store = token_store.DecodedTokenStore(chunk_size_tokens=4, capacity_tokens=8)
+    assert store.capacity_chunks == 2
+    store.append(0, np.arange(8))
+    assert store.free_chunks == 0
+    with pytest.raises(token_store.TokenStoreCapacityError, match="all 2 chunks"):
+        store.append(1, [1])
+    assert store.free(0) == 8
+    assert store.free_chunks == 2
+    store.append_batch(np.array([1, 2]), np.array([5, 6]))
+    np.testing.assert_array_equal(store.read(1), np.array([5], dtype=np.int32))
+    np.testing.assert_array_equal(store.read(2), np.array([6], dtype=np.int32))
+    with pytest.raises(ValueError, match="does not hold one"):
+        token_store.DecodedTokenStore(chunk_size_tokens=4, capacity_tokens=3)

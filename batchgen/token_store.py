@@ -35,6 +35,7 @@ import numpy as np
 
 
 __all__ = [
+	"DEFAULT_DECODED_CAPACITY_TOKENS",
 	"DEFAULT_DECODED_CHUNK_TOKENS",
 	"DEFAULT_PAGE_SIZE_TOKENS",
 	"DEFAULT_RELEASE_FREE_FRACTION",
@@ -52,6 +53,8 @@ __all__ = [
 # wastes well under a page.
 DEFAULT_PAGE_SIZE_TOKENS = 4096
 DEFAULT_DECODED_CHUNK_TOKENS = 1024
+# Per-rank decoded-token capacity (4 GiB of int32, virtual until written).
+DEFAULT_DECODED_CAPACITY_TOKENS = 1 << 30
 DEFAULT_RELEASE_FREE_FRACTION = 0.25
 
 END_OF_CHAIN = -1
@@ -618,37 +621,59 @@ class PromptTokenArena:
 			yield run_start, prev + 1
 
 
-class _SeqTokens:
-	"""One sequence's decoded chunks and its logical token count."""
-
-	__slots__ = ("chunks", "length")
-
-	def __init__(self):
-		self.chunks: List[np.ndarray] = []
-		self.length = 0
-
-
 class DecodedTokenStore:
-	"""Rank-private chunked store for generated token ids (int32).
+	"""Rank-private chunked store for generated token ids (int32), indexed by slot.
 
 	Only the owning rank writes a sequence's decoded tokens, so nothing here is
-	shared, named, or locked. A sequence holds a list of ``chunk_size_tokens``
-	int32 chunks: it costs one chunk until it decodes past it, and :meth:`free`
-	drops its chunks immediately. There is no rectangular
-	``[max_pool_size, max_decoding_length]`` preallocation to grow or leak.
+	shared, named, or locked. All tokens live in one ``[chunks, chunk_size]``
+	int32 pool backed by a fixed-capacity anonymous mapping: the kernel
+	allocates physical pages only when they are first written, so a large
+	capacity costs nothing up front and the pool never grows or copies. A slot
+	owns a list of chunk ids and returns them to a free list on :meth:`free`.
+	There is no rectangular ``[max_pool_size, max_decoding_length]``
+	preallocation to grow or leak.
 
-	Every sequence id starts empty — ``append*`` creates its record lazily, and
-	reading or freeing an id that was never written is not an error, which keeps
-	the decode hot path free of existence checks.
+	Per-slot length and current chunk are numpy arrays, so the decode-step
+	append and the step-log flush are single vectorized writes over the whole
+	batch; only a slot that crosses a chunk boundary takes the Python path that
+	allocates its next chunk. Slots are small non-negative integers (the worker's
+	buffer slots); the per-slot arrays grow to the largest slot seen. A slot
+	that was never written reads as empty, and freeing it is a no-op.
 	"""
 
-	def __init__(self, chunk_size_tokens: int = DEFAULT_DECODED_CHUNK_TOKENS):
+	def __init__(
+		self,
+		chunk_size_tokens: int = DEFAULT_DECODED_CHUNK_TOKENS,
+		capacity_tokens: int = DEFAULT_DECODED_CAPACITY_TOKENS,
+	):
 		if chunk_size_tokens <= 0:
 			raise ValueError(
 				f"chunk_size_tokens must be > 0, got {chunk_size_tokens}"
 			)
 		self._chunk_size = int(chunk_size_tokens)
-		self._seqs: Dict[int, _SeqTokens] = {}
+		num_chunks = int(capacity_tokens) // self._chunk_size
+		if num_chunks < 1:
+			raise ValueError(
+				f"capacity_tokens {capacity_tokens} does not hold one "
+				f"{self._chunk_size}-token chunk"
+			)
+		# Anonymous and lazily faulted: untouched chunks use no memory. One extra
+		# row past the allocatable chunks absorbs the padding of a step-log flush.
+		self._mapping = mmap.mmap(
+			-1, (num_chunks + 1) * self._chunk_size * _TOKEN_BYTES
+		)
+		self._pool = np.frombuffer(self._mapping, dtype=_TOKEN_DTYPE).reshape(
+			num_chunks + 1, self._chunk_size
+		)
+		self._num_chunks = num_chunks
+		self._trash = num_chunks * self._chunk_size
+		self._flat = self._pool.reshape(-1)
+		self._next_chunk = 0  # bump pointer over never-used pool rows
+		self._free_chunks: List[int] = []
+		self._length = np.zeros(0, dtype=np.int64)  # tokens per slot
+		self._current = np.zeros(0, dtype=np.int64)  # last chunk per slot
+		self._chunks: List[Optional[List[int]]] = []  # chunk ids per slot
+		self._active = 0
 
 	@property
 	def chunk_size_tokens(self) -> int:
@@ -656,10 +681,19 @@ class DecodedTokenStore:
 
 	@property
 	def active_sequences(self) -> int:
-		return len(self._seqs)
+		"""Slots currently holding at least one chunk."""
+		return self._active
 
-	def append(self, seq_id: int, tokens: np.ndarray | Sequence[int] | int) -> None:
-		"""Append one sequence's tokens.
+	@property
+	def capacity_chunks(self) -> int:
+		return self._num_chunks
+
+	@property
+	def free_chunks(self) -> int:
+		return self._num_chunks - self._next_chunk + len(self._free_chunks)
+
+	def append(self, slot: int, tokens: np.ndarray | Sequence[int] | int) -> None:
+		"""Append one slot's tokens (prefill output, re-entry, tests).
 
 		O(chunks touched) numpy copies, independent of the token count.
 		"""
@@ -670,128 +704,200 @@ class DecodedTokenStore:
 			raise ValueError(f"tokens must be 1-D, got shape {src.shape}")
 		if src.size == 0:
 			return
-		record = self._record(int(seq_id))
+		slot = self._check_slot(slot)
 		chunk_size = self._chunk_size
 		pos = 0
 		while pos < src.size:
-			offset = record.length % chunk_size
-			if offset == 0:
-				record.chunks.append(np.empty(chunk_size, dtype=_TOKEN_DTYPE))
+			offset = int(self._length[slot]) % chunk_size
+			chunk = self._alloc_chunk(slot) if offset == 0 else int(self._current[slot])
 			count = min(chunk_size - offset, int(src.size) - pos)
-			record.chunks[-1][offset : offset + count] = src[pos : pos + count]
-			record.length += count
+			self._pool[chunk, offset : offset + count] = src[pos : pos + count]
+			self._length[slot] += count
 			pos += count
 
-	def append_batch(self, seq_ids: np.ndarray, tokens: np.ndarray) -> None:
-		"""Append ONE token per sequence — the decode-step hot path.
+	def append_batch(self, slots: np.ndarray, tokens: np.ndarray) -> None:
+		"""Append ONE token per slot — the decode-step hot path.
 
-		Complexity is O(batch): one dict lookup and one int store per sequence,
-		with the numpy-to-Python conversion done once per array (``tolist``)
-		instead of once per element. A single vectorized scatter is not possible
-		because the destination chunks are per-sequence, but nothing in the loop
-		allocates unless a sequence crosses a chunk boundary.
+		One vectorized gather, scatter and add over the batch; Python work only
+		for slots that start a new chunk (one step in ``chunk_size`` per slot).
+		``slots`` must not repeat within a call.
 		"""
-		ids = np.ascontiguousarray(seq_ids).reshape(-1).tolist()
-		# Validate before the loop so a bad id cannot leave a half-appended chunk.
-		values = _as_token_ids(tokens).reshape(-1).tolist()
-		if len(ids) != len(values):
+		idx = np.asarray(slots, dtype=np.int64).reshape(-1)
+		values = _as_token_ids(tokens).reshape(-1)
+		if idx.size != values.size:
 			raise ValueError(
-				f"seq_ids has {len(ids)} entries, tokens has {len(values)}"
+				f"slots has {idx.size} entries, tokens has {values.size}"
 			)
-		chunk_size = self._chunk_size
-		seqs = self._seqs
-		for seq_id, token in zip(ids, values):
-			record = seqs.get(seq_id)
-			if record is None:
-				record = seqs[seq_id] = _SeqTokens()
-			offset = record.length % chunk_size
-			if offset == 0:
-				record.chunks.append(np.empty(chunk_size, dtype=_TOKEN_DTYPE))
-			record.chunks[-1][offset] = token
-			record.length += 1
+		if idx.size == 0:
+			return
+		self._ensure_slots(idx)
+		offset = self._length[idx] % self._chunk_size
+		for i in np.flatnonzero(offset == 0).tolist():
+			self._alloc_chunk(int(idx[i]))
+		self._pool[self._current[idx], offset] = values
+		self._length[idx] += 1
 
 	def extend_rows(
 		self,
-		seq_ids: np.ndarray,
+		slots: np.ndarray,
 		tokens: np.ndarray,
 		counts: np.ndarray | int | None = None,
 	) -> None:
-		"""Flush a ``[steps, batch]`` step log column-wise.
+		"""Flush a ``[steps, batch]`` step log column-wise in one scatter.
 
-		``tokens[:, j]`` holds the tokens generated for ``seq_ids[j]`` in step
-		order. ``counts`` is the valid step count — one int for every column, one
-		per column, or ``None`` for all ``steps`` rows. One numpy copy per column
-		(a column is strided, so the copy is unavoidable) and O(batch) Python
-		work.
+		``tokens[:, j]`` holds the tokens generated for ``slots[j]`` in step order.
+		``counts`` is the valid step count — one int for every column, one per
+		column, or ``None`` for all ``steps`` rows. ``steps`` may not exceed the
+		chunk size, so a column spans at most two chunks. ``slots`` must not
+		repeat within a call.
 		"""
 		log = _as_token_ids(tokens)
 		if log.ndim != 2:
 			raise ValueError(f"tokens must be [steps, batch], got shape {log.shape}")
 		steps, batch = log.shape
-		ids = np.ascontiguousarray(seq_ids).reshape(-1).tolist()
-		if len(ids) != batch:
+		chunk_size = self._chunk_size
+		if steps > chunk_size:
 			raise ValueError(
-				f"seq_ids has {len(ids)} entries, tokens has {batch} columns"
+				f"a step log of {steps} steps exceeds the {chunk_size}-token chunk"
+			)
+		idx = np.asarray(slots, dtype=np.int64).reshape(-1)
+		if idx.size != batch:
+			raise ValueError(
+				f"slots has {idx.size} entries, tokens has {batch} columns"
 			)
 		if counts is None:
-			per_column = [steps] * batch
+			count = np.full(batch, steps, dtype=np.int64)
 		elif np.ndim(counts) == 0:
-			per_column = [int(counts)] * batch
+			count = np.full(batch, int(counts), dtype=np.int64)
 		else:
-			per_column = np.ascontiguousarray(counts).reshape(-1).tolist()
-			if len(per_column) != batch:
+			count = np.asarray(counts, dtype=np.int64).reshape(-1)
+			if count.size != batch:
 				raise ValueError(
-					f"counts has {len(per_column)} entries, tokens has {batch} "
-					"columns"
+					f"counts has {count.size} entries, tokens has {batch} columns"
 				)
-		for column, seq_id in enumerate(ids):
-			count = int(per_column[column])
-			if not 0 <= count <= steps:
-				raise ValueError(
-					f"count {count} for column {column} is outside [0, {steps}]"
-				)
-			if count:
-				self.append(seq_id, log[:count, column])
+		bad = np.flatnonzero((count < 0) | (count > steps))
+		if bad.size:
+			column = int(bad[0])
+			raise ValueError(
+				f"count {int(count[column])} for column {column} is outside "
+				f"[0, {steps}]"
+			)
+		if batch == 0 or not count.any():
+			return
+		self._ensure_slots(idx)
+		start = self._length[idx] % chunk_size
+		first = self._current[idx].copy()
+		for i in np.flatnonzero((start == 0) & (count > 0)).tolist():
+			first[i] = self._alloc_chunk(int(idx[i]))
+		second = np.full(batch, -1, dtype=np.int64)
+		for i in np.flatnonzero(start + count > chunk_size).tolist():
+			second[i] = self._alloc_chunk(int(idx[i]))
 
-	def read(
-		self, seq_id: int, start: int = 0, end: Optional[int] = None
-	) -> np.ndarray:
-		"""Copy ``[start, end)`` of a sequence's decoded tokens into a new array."""
-		length = self.length(seq_id)
+		# Flat pool index of every element, one row per column so each run is
+		# written in order. A run continues from ``start`` in its first chunk;
+		# only the few columns that wrap get their tail moved to the second
+		# chunk, and steps past a column's count land in the trash row.
+		steps_ar = np.arange(steps, dtype=np.int64)
+		dest = (first * chunk_size + start)[:, None] + steps_ar[None, :]
+		wrap = np.flatnonzero(start + count > chunk_size)
+		if wrap.size:
+			shift = (second[wrap] - first[wrap] - 1) * chunk_size
+			tail = steps_ar[None, :] >= (chunk_size - start[wrap])[:, None]
+			dest[wrap] += np.where(tail, shift[:, None], 0)
+		short = np.flatnonzero(count < steps)
+		if short.size:
+			dest[short] = np.where(
+				steps_ar[None, :] < count[short][:, None], dest[short], self._trash
+			)
+		self._flat[dest] = np.ascontiguousarray(log.T)
+		self._length[idx] += count
+
+	def read(self, slot: int, start: int = 0, end: Optional[int] = None) -> np.ndarray:
+		"""Copy ``[start, end)`` of a slot's decoded tokens into a new array."""
+		length = self.length(slot)
 		start = int(start)
 		end = length if end is None else int(end)
 		if not 0 <= start <= end <= length:
 			raise ValueError(
-				f"sequence {seq_id}: [{start}, {end}) is outside its {length} "
+				f"slot {slot}: [{start}, {end}) is outside its {length} "
 				"decoded tokens"
 			)
 		out = np.empty(end - start, dtype=_TOKEN_DTYPE)
 		if out.size == 0:
 			return out
 		chunk_size = self._chunk_size
-		chunks = self._seqs[int(seq_id)].chunks
+		chunks = self._chunks[int(slot)]
 		index, offset = divmod(start, chunk_size)
 		pos = 0
 		while pos < out.size:
 			count = min(chunk_size - offset, int(out.size) - pos)
-			out[pos : pos + count] = chunks[index][offset : offset + count]
+			out[pos : pos + count] = self._pool[chunks[index], offset : offset + count]
 			pos += count
 			index += 1
 			offset = 0
 		return out
 
-	def length(self, seq_id: int) -> int:
-		"""Decoded tokens held for ``seq_id``; 0 if it was never written."""
-		record = self._seqs.get(int(seq_id))
-		return 0 if record is None else record.length
+	def length(self, slot: int) -> int:
+		"""Decoded tokens held for ``slot``; 0 if it was never written."""
+		slot = int(slot)
+		return int(self._length[slot]) if 0 <= slot < self._length.size else 0
 
-	def free(self, seq_id: int) -> int:
-		"""Drop a sequence's chunks; returns the tokens dropped (0 if unknown)."""
-		record = self._seqs.pop(int(seq_id), None)
-		return 0 if record is None else record.length
+	def free(self, slot: int) -> int:
+		"""Return a slot's chunks; returns the tokens dropped (0 if empty)."""
+		slot = int(slot)
+		if not 0 <= slot < len(self._chunks) or self._chunks[slot] is None:
+			return 0
+		dropped = int(self._length[slot])
+		self._free_chunks.extend(self._chunks[slot])
+		self._chunks[slot] = None
+		self._length[slot] = 0
+		self._current[slot] = -1
+		self._active -= 1
+		return dropped
 
-	def _record(self, seq_id: int) -> _SeqTokens:
-		record = self._seqs.get(seq_id)
-		if record is None:
-			record = self._seqs[seq_id] = _SeqTokens()
-		return record
+	def _check_slot(self, slot: int) -> int:
+		slot = int(slot)
+		if slot < 0:
+			raise ValueError(f"slot must be >= 0, got {slot}")
+		self._grow_slots(slot + 1)
+		return slot
+
+	def _ensure_slots(self, idx: np.ndarray) -> None:
+		low, high = int(idx.min()), int(idx.max())
+		if low < 0:
+			raise ValueError(f"slot must be >= 0, got {low}")
+		if high >= self._length.size:
+			self._grow_slots(high + 1)
+
+	def _grow_slots(self, needed: int) -> None:
+		size = self._length.size
+		if needed <= size:
+			return
+		new_size = max(needed, 2 * size, 64)
+		self._length = np.concatenate(
+			[self._length, np.zeros(new_size - size, dtype=np.int64)]
+		)
+		self._current = np.concatenate(
+			[self._current, np.full(new_size - size, -1, dtype=np.int64)]
+		)
+		self._chunks.extend([None] * (new_size - size))
+
+	def _alloc_chunk(self, slot: int) -> int:
+		"""Give ``slot`` a new last chunk and return its id."""
+		if self._free_chunks:
+			chunk = self._free_chunks.pop()
+		elif self._next_chunk < self._num_chunks:
+			chunk = self._next_chunk
+			self._next_chunk += 1
+		else:
+			raise TokenStoreCapacityError(
+				f"decoded store: all {self._num_chunks} chunks of "
+				f"{self._chunk_size} tokens are in use"
+			)
+		owned = self._chunks[slot]
+		if owned is None:
+			owned = self._chunks[slot] = []
+			self._active += 1
+		owned.append(chunk)
+		self._current[slot] = chunk
+		return chunk
