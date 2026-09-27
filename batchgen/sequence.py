@@ -187,6 +187,19 @@ class SequenceEntry:
         self._rep_count: int = 0
         self._rep_detected: bool = False
 
+    def clamp_decode_to_context(self, prompt_len: int, context_len: int) -> int:
+        """Fit the decode budget into the model context; return the KV token budget.
+
+        A request whose prompt + max_tokens exceeds the context decodes until
+        the context is full. Both decode-length fields shrink with the budget
+        so ``kv_token_budget == original_prompt_length + original_max_decode_length``
+        keeps holding on every rank.
+        """
+        max_decode = min(self.original_max_decode_length, context_len - prompt_len)
+        self.max_decode_length = max_decode
+        self.original_max_decode_length = max_decode
+        return prompt_len + max_decode
+
     def log_event(self, event: int, rank: int, detail: str = "") -> None:
         """Log a lifespan event. No-op when BATCHGEN_SEQ_LIFESPAN is not set."""
         import logging
