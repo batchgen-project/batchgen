@@ -139,6 +139,15 @@ class BoundaryHandler:
             m = seq_meta.get(uuid)
             return m.priority if m is not None else 0
 
+        def host_owned_pages(uuid: str) -> int:
+            """Pages releasing ``uuid`` returns to the Host pool (own chain only)."""
+            state = global_seq_state[uuid]
+            if 'host_owned_pages' not in state:
+                raise RuntimeError(
+                    f"sequence {uuid} has no host_owned_pages in boundary state"
+                )
+            return int(state['host_owned_pages'])
+
         # Identify completed sequences
         completed_uuids = []
         active_uuids = []
@@ -220,8 +229,7 @@ class BoundaryHandler:
                 free_pages = int(node_stats.get('num_free_pages', 0) or 0)
                 safety_margin = int(total_pages * 0.05)
                 completed_host_pages = sum(
-                    int(global_seq_state.get(uuid, {}).get('host_pages_allocated', 0) or 0)
-                    for uuid in node_completed_uuids
+                    host_owned_pages(uuid) for uuid in node_completed_uuids
                 )
                 eviction_candidates = []
                 if node_active_uuids and enable_host_kv_eviction:
@@ -230,7 +238,7 @@ class BoundaryHandler:
                         if state and uuid not in completed_set:
                             eviction_candidates.append((uuid, {
                                 'decoded_length': state['decoded_length'],
-                                'host_pages_allocated': state.get('host_pages_allocated', 0),
+                                'host_owned_pages': host_owned_pages(uuid),
                                 'global_idx': meta_global_idx(uuid),
                                 'priority': meta_priority(uuid),
                             }))
@@ -247,7 +255,7 @@ class BoundaryHandler:
                     watermark_percent=host_kv_eviction_watermark if enable_host_kv_eviction else 0,
                     safety_margin=safety_margin,
                     strategy=EvictionStrategy.SHORTEST_FIRST,
-                    page_key='host_pages_allocated',
+                    page_key='host_owned_pages',
                 )
                 host_evicted_uuids.extend(growth_plan.evicted_uuids)
                 for uuid in growth_plan.evicted_uuids:
