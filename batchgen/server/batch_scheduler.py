@@ -262,7 +262,7 @@ class BatchScheduler:
                     f"First missing: {missing_ids[:5]}"
                 )
                 logger.error(error_message)
-                self._update_batch_status(
+                self.storage.update_batch_status(
                     batch_id, BatchStatus.FAILED, error=error_message
                 )
                 return
