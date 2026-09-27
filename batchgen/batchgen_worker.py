@@ -4746,17 +4746,23 @@ class BatchGenWorker:
 			f"_n{node_id}_g{self._buffer_pool_generation}"
 		)
 		is_creator = (self.rank % self.local_world_size) == 0
-		shared_input_ids, shm = allocate_node_shared_int64(
-			name, rows, in_w, is_creator, dist.barrier
-		)
-		new_pool = QueryBookBufferPool(
-			num_sequences=rows,
-			input_ids_width=in_w,
-			max_decoding_length=dec_w,
-			pad_token_id=self.pad_token_id,
-			input_ids_buffer=shared_input_ids,
-			input_ids_shm=shm,
-		)
+		# Mid-decode admissions grow the pool inside the decode loop's
+		# inference_mode. Allocate OUTSIDE it so the pool tensors stay normal
+		# tensors; otherwise a later admission outside inference_mode (generate()
+		# after the decode interval) fails in allocate_slot with "Inplace update
+		# to inference tensor outside InferenceMode".
+		with torch.inference_mode(False):
+			shared_input_ids, shm = allocate_node_shared_int64(
+				name, rows, in_w, is_creator, dist.barrier
+			)
+			new_pool = QueryBookBufferPool(
+				num_sequences=rows,
+				input_ids_width=in_w,
+				max_decoding_length=dec_w,
+				pad_token_id=self.pad_token_id,
+				input_ids_buffer=shared_input_ids,
+				input_ids_shm=shm,
+			)
 		shared_gib = rows * in_w * 8 / 2**30
 		private_gib = rows * dec_w * 8 / 2**30
 		if old is None:
