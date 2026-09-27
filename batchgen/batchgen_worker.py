@@ -1682,9 +1682,8 @@ class BatchGenWorker:
 			input_ids_tensor = item["input_ids"]
 			actual_prompt_len = item["length"]
 
-			seq_extended_size = min(
-				actual_prompt_len + seq.max_decode_length,
-				self.model_context_length,
+			seq_extended_size = seq.clamp_decode_to_context(
+				actual_prompt_len, self.model_context_length
 			)
 
 			slot = self._buffer_pool.allocate_slot()
@@ -5024,9 +5023,8 @@ class BatchGenWorker:
 				)
 				actual_prompt_len = len(input_ids_list)
 
-			seq_extended_size = min(
-				actual_prompt_len + self.max_decoding_length,
-				self.model_context_length
+			seq_extended_size = seq.clamp_decode_to_context(
+				actual_prompt_len, self.model_context_length
 			)
 
 			slot = self._buffer_pool.allocate_slot()
