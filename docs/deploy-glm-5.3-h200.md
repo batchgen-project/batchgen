@@ -5,11 +5,11 @@ BatchGen serves the official `zai-org/GLM-5.3` FP8 checkpoint on one node with
 separate chat template and request contract. Use the GLM-5.3 identifier so the
 runtime selects its dedicated tokenizer and template.
 
-The model context window is 1,048,576 tokens. The current qualification uses
-pure DP prefill, dual KV caches, and the host KV cache. The guide covers
-checkpoint staging, conversion, installation, host preparation, launch, and
-request semantics. The full MMLU-Pro and long-context qualification remains a
-separate release gate until its recorded run is complete.
+The model context window is 1,048,576 tokens. The qualified configuration uses
+pure DP prefill, dual KV caches, the host KV cache, persistent phase instances,
+and whole-model decode CUDA graphs. The guide covers checkpoint staging,
+conversion, installation, host preparation, launch, request semantics, and the
+qualification record.
 
 ## 1. Download and stage the checkpoint
 
@@ -81,9 +81,18 @@ cat /sys/kernel/mm/transparent_hugepage/shmem_enabled
 echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
 ```
 
-The exact host KV size depends on available RAM and the request mix. Start with
-a conservative value, then increase it only after checking `MemAvailable` and
-the verifier's host-memory gate.
+The exact host KV size depends on available RAM and the request mix. Each
+token needs 109,824 bytes of KV across the 78 layers: 89,856 for the 576-wide
+MLA latent cache and 19,968 for the 128-wide sparse-indexer cache, both
+bfloat16. One 64-token page is 6.70 MiB, so a 1,048,575-token sequence needs
+16,384 pages (107.25 GiB) and eight of them need 858 GiB. Add the 703.7 GiB of
+shared weight memory when sizing the host.
+
+Start with a conservative value, then increase it only after checking
+`MemAvailable` and the verifier's host-memory gate. The container must be
+allowed to use that memory: a container without a memory reservation can be
+evicted under host memory pressure, which shows up as a lost container with no
+kernel OOM record.
 
 ## 5. Start the server
 
@@ -103,17 +112,25 @@ numactl --interleave=all python -m batchgen.launch_http_server \
     --dist-init-addr 127.0.0.1:29504 \
     --host-kv-cache-size 280 \
     --kv-dtype bfloat16 \
-    --gpu-memory-frac 0.96 \
+    --max-pool-size 512 \
+    --gpu-memory-frac 0.93 \
+    --persistent-phase-instances \
+    --enable-cuda-graph \
+    --cuda-graph-max-bucket-size 32 \
+    --cuda-graph-num-buckets 6 \
     --parse-thinking \
     --startup-timeout 3600
 ```
 
-Use the production H200 defaults above for performance measurements. A lower
-`--gpu-memory-frac` can leave no positive GPU-KV budget after the GLM-5.3
-weights are resident; BatchGen then falls back to a 1-GiB minimum pool, which
-is a configuration failure for throughput testing. Keep
-`--disable-cuda-graphs` only for an explicitly isolated compatibility
-diagnostic, not for a release performance run.
+This is the qualified configuration. With persistent phase instances, the
+weights and both phase instances leave little free GPU memory. `--gpu-memory-frac
+0.93` keeps enough headroom to capture the whole-model decode graphs for buckets
+1–32; at 0.96 the GPU KV cache takes that headroom and graph capture fails with
+a CUDA out-of-memory error on the first request. A much lower fraction leaves no
+positive GPU-KV budget and falls back to the minimum pool, which is valid for
+correctness but not for throughput measurements. Decode batches larger than the
+top bucket run eagerly. Keep `--disable-cuda-graphs` only for an explicitly
+isolated compatibility diagnostic.
 
 `--parse-thinking` places the generated reasoning before the template-primed
 `</think>` boundary in `message.reasoning_content` and leaves the answer in
@@ -155,12 +172,21 @@ answer. GLM-5.3 is a thinking-only model, so disabling thinking is unsupported.
 
 ## 7. Qualification status and troubleshooting
 
-The current H200 qualification has verified complete weights, contiguous
-checkpoint conversion, local-SSD startup, the dedicated 2,048-token prompt
-rendering, deterministic short answers, and structured reasoning output on the
-assigned host. The 2,048-sequence MMLU-Pro run is the remaining long-running
-correctness/lifecycle gate; its final accuracy and postflight record must be
-consulted before making a release performance claim.
+The H200 qualification verified complete weights, contiguous checkpoint
+conversion, local-SSD startup, the dedicated chat template, deterministic short
+answers, and structured reasoning output. With the configuration in section 5,
+an installed runtime passed the startup preflight, and a 2,048-request
+MMLU-Pro batch with thinking enabled and `--parse-thinking` completed every
+request without a worker error, including mid-decode admissions, host-KV
+reloads, and watermark interrupts. GLM-5.3 reasons at `reasoning_effort=max`
+by default, so a small completion cap truncates many reasoning traces; use a
+large `max_completion_tokens` when measuring accuracy. This qualifies
+correctness and lifecycle, not throughput.
+
+GLM-5.3 uses the GLM-5.2 architecture and execution path; long-context
+prefill is covered by the GLM-5.2 qualification in
+[the GLM-5.2 H200 guide](deploy-glm-5.2-h200.md), whose `8×1M` layout needs
+the host memory computed in section 4.
 
 If a worker exits, inspect the first Python traceback from the failing rank.
 When no Python exception exists, use `CUDA_LAUNCH_BLOCKING=1` and per-operation
