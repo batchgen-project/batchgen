@@ -196,15 +196,11 @@ class PageTableCapacityRequest:
 class TokenBudgetRequest:
     """Frozen snapshot for the per-sequence host-KV token-budget cache.
 
-    The handler memoizes the computed budget on
-    ``query_book[sequence_id].kv_token_budget``. That mutation is on the
-    entry object the worker passes in; worker state is not touched.
+    The budget is read from ``query_book[sequence_id].kv_token_budget``,
+    which admission sets.
     """
 
     query_book: Mapping[int, "QueryBookEntry"]
-    local_to_uuid: Mapping[int, str]
-    global_batch: "SequenceBatch"
-    max_decoding_length: int
 
 
 # ---------------------------------------------------------------------------
@@ -520,34 +516,23 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     @staticmethod
     def get_sequence_token_budget(req: TokenBudgetRequest, sequence_id: int) -> int:
-        """Return cached host-allocation tokens for a sequence, computing once.
+        """Return the host-allocation token budget recorded at admission.
 
-        Reads ``query_book[sequence_id]``; if ``kv_token_budget`` is set,
-        returns it. Otherwise computes ``prompt_length + max_decoding_length``
-        from sequence metadata and memoizes it on the entry.
+        Reads ``query_book[sequence_id].kv_token_budget``. Admission always
+        sets it (clamped to the model context), so a missing value is a bug.
 
         Raises ``RuntimeError`` if ``query_book`` is empty (means the worker
-        has not initialized it yet) or ``KeyError`` if the sequence is missing.
+        has not initialized it yet) or the entry has no budget, and
+        ``KeyError`` if the sequence is missing.
         """
         if not req.query_book:
             raise RuntimeError("query_book is not initialized before KV allocation")
         query_entry = req.query_book.get(sequence_id)
         if query_entry is None or query_entry.encoded is None:
             raise KeyError(f"Missing query entry for sequence {sequence_id}")
-        if query_entry.kv_token_budget is not None:
-            return query_entry.kv_token_budget
-        # Fallback: compute from sequence metadata (attention_mask removed)
-        uuid = req.local_to_uuid.get(sequence_id, "")
-        seq = req.global_batch.get_sequence(uuid) if uuid else None
-        if seq is None:
-            raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
-        # NO truncation: KV budget must cover the FULL prompt + decode budget.
-        # An earlier min(...) here silently undersized KV when max_input_length
-        # lagged behind the actual prompt length on multi-batch admits.
-        input_tokens = seq.prompt_length
-        total_tokens = input_tokens + req.max_decoding_length
-        query_entry.kv_token_budget = total_tokens
-        return total_tokens
+        if query_entry.kv_token_budget is None:
+            raise RuntimeError(f"Query entry for sequence {sequence_id} has no kv_token_budget")
+        return query_entry.kv_token_budget
 
     @staticmethod
     def compute_host_kv_sequence_tokens(

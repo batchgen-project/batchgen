@@ -3058,17 +3058,11 @@ class BatchGenWorker:
 
 	# Phase 5.3.2 (issue #175): dual-path gate for the KV token-budget cache.
 	# `_make_token_budget_request` constructs the frozen snapshot the handler
-	# consumes; cache state lives on `query_book[sequence_id].kv_token_budget`
-	# (passed by reference through the snapshot) so the handler can memoize
-	# without touching worker attributes.
+	# consumes; the budget lives on `query_book[sequence_id].kv_token_budget`,
+	# set at admission.
 	def _make_token_budget_request(self) -> TokenBudgetRequest:
 		query_book = self.query_book if getattr(self, "query_book", None) is not None else {}
-		return TokenBudgetRequest(
-			query_book=query_book,
-			local_to_uuid=self._local_to_uuid_map,
-			global_batch=self.global_batch,
-			max_decoding_length=self.max_decoding_length,
-		)
+		return TokenBudgetRequest(query_book=query_book)
 
 	def _get_sequence_token_budget(self, sequence_id: int) -> int:
 		return KVCacheManager.get_sequence_token_budget(
