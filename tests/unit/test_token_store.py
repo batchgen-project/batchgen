@@ -567,6 +567,9 @@ def test_decoded_store_matches_a_list_model_under_random_operations():
             expected = np.array(model.get(s_, []), dtype=np.int32)
             assert store.length(s_) == expected.size
             np.testing.assert_array_equal(store.read(s_), expected)
+        # No chunk is leaked or shared: used chunks match the live lengths.
+        used = store.capacity_chunks - store.free_chunks
+        assert used == sum(-(-len(v) // chunk) for v in model.values())
     assert store.active_sequences == sum(1 for v in model.values() if v)
 
 
@@ -661,7 +664,7 @@ def test_decoded_store_capacity_is_enforced_and_chunks_are_reused():
     assert store.capacity_chunks == 2
     store.append(0, np.arange(8))
     assert store.free_chunks == 0
-    with pytest.raises(token_store.TokenStoreCapacityError, match="all 2 chunks"):
+    with pytest.raises(token_store.TokenStoreCapacityError, match="1 new chunks"):
         store.append(1, [1])
     assert store.free(0) == 8
     assert store.free_chunks == 2
@@ -670,3 +673,26 @@ def test_decoded_store_capacity_is_enforced_and_chunks_are_reused():
     np.testing.assert_array_equal(store.read(2), np.array([6], dtype=np.int32))
     with pytest.raises(ValueError, match="does not hold one"):
         token_store.DecodedTokenStore(chunk_size_tokens=4, capacity_tokens=3)
+
+
+def test_decoded_batch_capacity_failure_leaves_no_partial_state():
+    store = token_store.DecodedTokenStore(chunk_size_tokens=4, capacity_tokens=12)
+    store.append(0, np.arange(2))  # slot 0 mid-chunk, 2 chunks left
+    with pytest.raises(token_store.TokenStoreCapacityError, match="3 new chunks"):
+        store.append_batch(np.array([1, 2, 3]), np.array([7, 8, 9]))
+    with pytest.raises(token_store.TokenStoreCapacityError):
+        # Two fresh slots plus slot 0 wrapping into a second chunk.
+        store.extend_rows(np.array([0, 1, 2]), np.ones((4, 3), dtype=np.int32))
+    assert store.free_chunks == 2
+    assert [store.length(s) for s in range(4)] == [2, 0, 0, 0]
+    # The store still works after the refused calls.
+    store.append_batch(np.array([1, 2]), np.array([7, 8]))
+    np.testing.assert_array_equal(store.read(0), np.arange(2, dtype=np.int32))
+    np.testing.assert_array_equal(store.read(2), np.array([8], dtype=np.int32))
+
+
+def test_decoded_extend_rows_refuses_repeated_slots():
+    store = token_store.DecodedTokenStore(chunk_size_tokens=4)
+    with pytest.raises(ValueError, match="slots repeat"):
+        store.extend_rows(np.array([3, 3]), np.ones((2, 2), dtype=np.int32))
+    assert store.length(3) == 0

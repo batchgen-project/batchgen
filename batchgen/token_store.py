@@ -98,6 +98,8 @@ def _as_token_ids(tokens) -> np.ndarray:
 		return np.empty(arr.shape, dtype=_TOKEN_DTYPE)
 	if arr.dtype.kind not in "iu":
 		raise TypeError(f"token ids must be integers, got dtype {arr.dtype}")
+	if np.can_cast(arr.dtype, _TOKEN_DTYPE, casting="safe"):
+		return np.ascontiguousarray(arr, dtype=_TOKEN_DTYPE)
 	low, high = int(arr.min()), int(arr.max())
 	if low < _INT32_MIN or high > _INT32_MAX:
 		raise ValueError(f"token ids [{low}, {high}] do not fit int32")
@@ -659,8 +661,12 @@ class DecodedTokenStore:
 			)
 		# Anonymous and lazily faulted: untouched chunks use no memory. One extra
 		# row past the allocatable chunks absorbs the padding of a step-log flush.
+		# MAP_PRIVATE: never shared with a forked child, and charged as the
+		# rank's anonymous memory rather than as Shmem.
 		self._mapping = mmap.mmap(
-			-1, (num_chunks + 1) * self._chunk_size * _TOKEN_BYTES
+			-1,
+			(num_chunks + 1) * self._chunk_size * _TOKEN_BYTES,
+			flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
 		)
 		self._pool = np.frombuffer(self._mapping, dtype=_TOKEN_DTYPE).reshape(
 			num_chunks + 1, self._chunk_size
@@ -706,6 +712,9 @@ class DecodedTokenStore:
 			return
 		slot = self._check_slot(slot)
 		chunk_size = self._chunk_size
+		held = int(self._length[slot])
+		chunks_after = -(-(held + int(src.size)) // chunk_size)
+		self._require_chunks(chunks_after - -(-held // chunk_size))
 		pos = 0
 		while pos < src.size:
 			offset = int(self._length[slot]) % chunk_size
@@ -732,7 +741,9 @@ class DecodedTokenStore:
 			return
 		self._ensure_slots(idx)
 		offset = self._length[idx] % self._chunk_size
-		for i in np.flatnonzero(offset == 0).tolist():
+		starting = np.flatnonzero(offset == 0)
+		self._require_chunks(int(starting.size))
+		for i in starting.tolist():
 			self._alloc_chunk(int(idx[i]))
 		self._pool[self._current[idx], offset] = values
 		self._length[idx] += 1
@@ -785,12 +796,19 @@ class DecodedTokenStore:
 		if batch == 0 or not count.any():
 			return
 		self._ensure_slots(idx)
+		if np.unique(idx).size != batch:
+			raise ValueError("slots repeat within one step-log flush")
 		start = self._length[idx] % chunk_size
 		first = self._current[idx].copy()
-		for i in np.flatnonzero((start == 0) & (count > 0)).tolist():
+		opening = np.flatnonzero((start == 0) & (count > 0))
+		wrapping = np.flatnonzero(start + count > chunk_size)
+		# Check capacity before allocating anything: a failure half way would
+		# leave chunks with no length behind them.
+		self._require_chunks(int(opening.size + wrapping.size))
+		for i in opening.tolist():
 			first[i] = self._alloc_chunk(int(idx[i]))
 		second = np.full(batch, -1, dtype=np.int64)
-		for i in np.flatnonzero(start + count > chunk_size).tolist():
+		for i in wrapping.tolist():
 			second[i] = self._alloc_chunk(int(idx[i]))
 
 		# Flat pool index of every element, one row per column so each run is
@@ -854,6 +872,13 @@ class DecodedTokenStore:
 		self._current[slot] = -1
 		self._active -= 1
 		return dropped
+
+	def _require_chunks(self, needed: int) -> None:
+		if needed > self.free_chunks:
+			raise TokenStoreCapacityError(
+				f"decoded store: {needed} new chunks of {self._chunk_size} tokens "
+				f"needed, {self.free_chunks} of {self._num_chunks} are free"
+			)
 
 	def _check_slot(self, slot: int) -> int:
 		slot = int(slot)
