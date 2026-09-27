@@ -29,8 +29,12 @@ def _check_custom_kernel():
     device_name = torch.cuda.get_device_name()
     print(f"[batchgen_decode] GPU: {device_name}", flush=True)
 
-    # Custom WGMMA decode kernel is optimized for H20 only
-    if "H20" not in device_name:
+    # Custom WGMMA decode kernel is optimized for H20 only. Identify H20 as
+    # sm_90 with 78 SMs; device names are not reliable across SKUs.
+    if (
+        torch.cuda.get_device_capability() != (9, 0)
+        or torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count != 78
+    ):
         print(f"[batchgen_decode] Not H20 ({device_name}), using FA3 fallback", flush=True)
         return False
 

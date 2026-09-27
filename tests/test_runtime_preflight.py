@@ -221,3 +221,38 @@ def test_batchgen_root_in_site_packages_is_installed(tmp_path, monkeypatch):
 
     assert preflight._batchgen_root() == site_dir.resolve()
     assert not preflight._is_source_root(site_dir.resolve())
+
+
+@pytest.mark.parametrize(
+    ("capability", "sm_count", "expect_wgmma"),
+    [((9, 0), 78, True), ((9, 0), 132, False), ((10, 0), 78, False)],
+)
+def test_wgmma_decode_selected_only_on_h20(monkeypatch, capability, sm_count, expect_wgmma):
+    imported = []
+
+    monkeypatch.setattr(preflight, "_check_torch", lambda: None)
+    monkeypatch.setattr(preflight, "_resolve_model_type", lambda _: "gpt_oss")
+    monkeypatch.setattr(preflight, "_check_tokenizer", lambda _: None)
+    monkeypatch.setattr(preflight, "_check_core_engine", lambda: None)
+    monkeypatch.setattr(preflight, "_check_deepgemm", lambda: None)
+    monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(preflight.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(preflight.torch.cuda, "get_device_capability", lambda *_: capability)
+    monkeypatch.setattr(
+        preflight.torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=sm_count),
+    )
+
+    def fake_import(name, *, origin=None):
+        imported.append(name)
+        if name == "libucx":
+            return SimpleNamespace(load_library=lambda: None)
+        if name == "batchgen_kernels.attention.decode":
+            return SimpleNamespace(attention_decode_bf16=lambda: None)
+        return SimpleNamespace(__file__=str(SITE / "module.py"))
+
+    monkeypatch.setattr(preflight, "_import_required", fake_import)
+
+    preflight.run_runtime_preflight(SimpleNamespace(model="openai/gpt-oss-120b"))
+    assert ("batchgen_kernels.attention.decode" in imported) == expect_wgmma

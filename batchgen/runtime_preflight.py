@@ -402,9 +402,12 @@ def run_runtime_preflight(server_args: object) -> str:
     _check_torch()
     model_type = _resolve_model_type(model)
     contract = _CONTRACTS[model_type]
+    # H20 = sm_90 with 78 SMs; device names are not reliable across SKUs.
     decode_backend = (
         "wgmma"
-        if torch.cuda.is_available() and "H20" in torch.cuda.get_device_name()
+        if torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (9, 0)
+        and torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count == 78
         else "fa3"
     )
     _check_tokenizer(model)
