@@ -542,6 +542,11 @@ install_batchgen() {
         cd "$BATCHGEN_DIR"
         # Replace stale editable/direct-url installs from another worktree
         # without allowing dependency resolution to change the verified ABI.
+        # --no-deps keeps pip from re-resolving Torch, so install the pinned
+        # runtime requirements explicitly (libucx-cu12 also ships the UCX
+        # headers the core_engine build needs) and re-verify the Torch ABI.
+        pip install -r requirements.txt
+        enforce_torch_contract || return 1
         # BUILD_OPS=1 emits batchgen.core_engine as an AOT extension. Runtime
         # startup is deliberately AOT-only and must never compile from source.
         BUILD_OPS=1 pip install . --no-build-isolation --no-deps --force-reinstall
