@@ -231,6 +231,11 @@ else:
     esac
 }
 
+# Import checks must see the installed packages, not a source checkout in the
+# current directory: e.g. a DeepGEMM clone's ./deep_gemm (without _C) shadows
+# the freshly installed wheel and fails the check.
+in_neutral_dir() { (cd / && "$@"); }
+
 torch_contract_ok() {
     python - "$1" "$2" <<'PY'
 import sys
@@ -298,7 +303,7 @@ install_flash_attention() {
     print_step "Installing flash-attention 3 (Hopper)..."
 
     # Check if already installed (hopper build exposes the `flash_attn_interface` module)
-    if python -c "import flash_attn_interface" &> /dev/null 2>&1; then
+    if in_neutral_dir python -c "import flash_attn_interface" &> /dev/null 2>&1; then
         print_success "flash-attention 3 already installed"
         return 0
     fi
@@ -333,7 +338,7 @@ install_flash_attention() {
 install_flash_attention_4() {
     print_step "Installing flash-attention 4 (Blackwell/CuTeDSL JIT)..."
 
-    if python -c "from flash_attn.cute import flash_attn_func" &>/dev/null 2>&1; then
+    if in_neutral_dir python -c "from flash_attn.cute import flash_attn_func" &>/dev/null 2>&1; then
         print_success "flash-attention 4 already installed"
         return 0
     fi
@@ -349,7 +354,7 @@ install_flashmla() {
     print_step "Installing FlashMLA..."
 
     # Check if already installed
-    if python -c "import flash_mla" &> /dev/null 2>&1; then
+    if in_neutral_dir python -c "import flash_mla" &> /dev/null 2>&1; then
         print_success "FlashMLA already installed"
         return 0
     fi
@@ -365,7 +370,7 @@ install_flashmla() {
 # enough — the upstream deepseek-ai package imports under the same name but has
 # no max_seqlen_k parameter, so it must not satisfy the skip gate.
 deepgemm_contract_ok() {
-    DG_DIST="$DEEPGEMM_DIST" DG_VERSION="$DEEPGEMM_DIST_VERSION" python - <<'PY' &> /dev/null
+    DG_DIST="$DEEPGEMM_DIST" DG_VERSION="$DEEPGEMM_DIST_VERSION" in_neutral_dir python - <<'PY' &> /dev/null
 import inspect
 import os
 from importlib.metadata import version
@@ -472,7 +477,7 @@ batchgen_kernels_contract_ok() {
     # Importing the namespace package is not sufficient: a source checkout or an
     # incomplete wheel can satisfy that check while the first GPT-OSS request
     # later fails when it lazily imports the fused attention extension.
-    python - <<'PY' &>/dev/null
+    in_neutral_dir python - <<'PY' &>/dev/null
 import importlib
 import os
 import site
