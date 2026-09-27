@@ -11,21 +11,22 @@ def _libucx_paths():
     The core_engine's distributed-weight daemon uses the UCP memory-handle API
     (``UCP_OP_ATTR_FIELD_MEMH``), which needs UCX >= 1.14. The ``libucx-cu12``
     wheel (declared in requirements.txt) ships a modern UCX (headers + libs) as
-    a portable manylinux package, so no system UCX / source build is required.
-    Returns ``(include_dir, lib_dir)`` or ``(None, None)`` if the wheel is absent
-    (then the build falls back to a system UCX via the plain ``-lucp`` flags).
+    a portable manylinux package, and the runtime loads UCX from that wheel.
+    Building against any other UCX is refused. Returns ``(include_dir, lib_dir)``.
     """
     try:
         import libucx
-
-        base = os.path.dirname(os.path.abspath(libucx.__file__))
-        inc = os.path.join(base, "include")
-        lib = os.path.join(base, "lib")
-        if os.path.isdir(inc) and os.path.isdir(lib):
-            return inc, lib
-    except Exception:
-        pass
-    return None, None
+    except ImportError as exc:
+        raise RuntimeError(
+            "core_engine needs the libucx-cu12 wheel; run "
+            "`pip install -r requirements.txt` before building"
+        ) from exc
+    base = os.path.dirname(os.path.abspath(libucx.__file__))
+    inc = os.path.join(base, "include")
+    lib = os.path.join(base, "lib")
+    if not (os.path.isdir(inc) and os.path.isdir(lib)):
+        raise RuntimeError(f"libucx wheel at {base} has no include/ and lib/ directories")
+    return inc, lib
 
 
 class CoreEngineBuilder(CUDAOpBuilder):
@@ -66,8 +67,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
     def include_paths(self):
         paths = ["core/", "external"]
         ucx_inc, _ = _libucx_paths()
-        if ucx_inc:
-            paths.append(ucx_inc)
+        paths.append(ucx_inc)
         return paths
 
     def cxx_args(self):
@@ -124,11 +124,10 @@ class CoreEngineBuilder(CUDAOpBuilder):
 
         # UCX from the pip libucx-cu12 wheel: link against it and bake an rpath so
         # the .so resolves libucp/libuct/libucs/libucm at runtime with no
-        # LD_LIBRARY_PATH. Falls back to a system UCX when the wheel is absent.
+        # LD_LIBRARY_PATH.
         _, ucx_lib = _libucx_paths()
-        if ucx_lib:
-            flags.append(f"-L{ucx_lib}")
-            flags.append(f"-Wl,-rpath,{ucx_lib}")
+        flags.append(f"-L{ucx_lib}")
+        flags.append(f"-Wl,-rpath,{ucx_lib}")
 
         flags += [
             '-lnuma',
