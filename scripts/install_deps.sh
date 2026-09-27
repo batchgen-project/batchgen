@@ -522,7 +522,18 @@ install_batchgen_kernels() {
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
-        pip install . --no-build-isolation --no-deps --force-reinstall
+        # pip builds extensions one at a time. They are independent, so build
+        # them concurrently (same defaults as build_source_runtime.sh) and
+        # package that build into the wheel pip installs. --skip-build stops
+        # bdist_wheel from running build_ext a second time, which would
+        # recompile everything because torch appends its flags again.
+        local dist_dir
+        dist_dir="$(mktemp -d)"
+        MAX_JOBS="${MAX_JOBS:-8}" python setup.py \
+            build --parallel "${KERNELS_PARALLEL:-24}" \
+            bdist_wheel --skip-build --dist-dir "$dist_dir"
+        pip install "$dist_dir"/batchgen_kernels-*.whl --no-deps --force-reinstall
+        rm -rf "$dist_dir"
         if ! batchgen_kernels_contract_ok; then
             print_error "batchgen_kernels installed but the AOT runtime contract is still incomplete"
             return 1
