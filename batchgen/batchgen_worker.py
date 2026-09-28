@@ -5508,7 +5508,7 @@ class BatchGenWorker:
 			self.Init(None, self.max_decoding_length, 0,
 				max_context_length=self.max_context_length)
 
-		# Initialize empty global batch (Init may have created one via _reset)
+		# Initialize empty global batch
 		self.global_batch = SequenceBatch()
 
 		# The buffer pool is NOT pre-allocated here. Both of its widths depend on

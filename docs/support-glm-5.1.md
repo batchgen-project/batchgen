@@ -37,7 +37,7 @@ satisfies.
 ## Running GLM-5.1-FP8
 
 ```bash
-python -m batchgen.batchgen_server \
+python -m batchgen.launch_http_server \
   --model zai-org/GLM-5.1-FP8 \
   ...
 ```

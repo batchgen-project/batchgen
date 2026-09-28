@@ -128,7 +128,7 @@ def test_main_loop_fails_loudly_on_an_unhandled_message():
 def test_scheduler_always_routes_to_the_pool_path():
     process_batch = ast.unparse(_function(SCHEDULER, "_process_batch"))
     assert "_process_batch_pool_mode" in process_batch
-    assert "_pool_mode" not in process_batch
+    assert "self._pool_mode" not in process_batch
     assert "self.worker.infer" not in process_batch
 
     scheduler_methods = _class_method_names(SCHEDULER, "BatchScheduler")

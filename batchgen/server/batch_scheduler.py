@@ -781,7 +781,7 @@ class BatchScheduler:
                     logger.error(f"[POOL] Worker error: {result}")
                     break
                 else:
-                    # Legacy result dict — should not happen in pool mode
+                    # Anything else is a protocol error from the worker
                     logger.warning(f"[POOL] Unexpected result: {type(result)}")
 
         logger.info("[POOL] Completion listener stopped")
