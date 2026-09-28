@@ -1447,6 +1447,9 @@ class BatchGenWorker:
 			seq.batchgen_debug = entry.get("batchgen_debug")
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
+			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
+			# this sequence done on an EOS or stop token.
+			seq.ignore_eos = bool(entry.get("ignore_eos", False))
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
 
@@ -2200,8 +2203,12 @@ class BatchGenWorker:
 			rank=self.rank,
 		)
 
-	def _should_stop_at_eos(self, token_id: int) -> bool:
-		return CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
+	def _should_stop_at_eos(self, token_id: int, seq) -> bool:
+		# A per-request ignore_eos keeps the EOS token from marking the sequence
+		# done at the source, so every reader of eos_reached agrees.
+		return CompletionHandler.should_stop_at_eos(
+			self._make_completion_context(), token_id, getattr(seq, "ignore_eos", False)
+		)
 
 	def _is_sequence_completed(self, seq) -> bool:
 		return CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
@@ -8551,7 +8558,7 @@ class BatchGenWorker:
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
+			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
 				seq.eos_reached = True
 
 		return new_tokens
@@ -9129,7 +9136,7 @@ class BatchGenWorker:
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
+			if self._should_stop_at_eos(new_tokens_cpu[i].item(), seq):
 				seq.eos_reached = True
 
 		return new_tokens
@@ -12672,7 +12679,7 @@ class BatchGenWorker:
 						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
 						f"decoded_len={seq.decoded_length} token={token_id}"
 					)
-				if self._should_stop_at_eos(token_id):
+				if self._should_stop_at_eos(token_id, seq):
 					seq.eos_reached = True
 
 				if seq.decoded_length >= seq.max_decode_length:
@@ -13617,7 +13624,7 @@ class BatchGenWorker:
 
 						# Only mark eos_reached if we should stop at EOS
 						token_id = new_tokens[i].item()
-						if self._should_stop_at_eos(token_id):
+						if self._should_stop_at_eos(token_id, seq):
 							seq.eos_reached = True
 
 						# Always check max length
@@ -13714,7 +13721,7 @@ class BatchGenWorker:
 
 						# Only mark eos_reached if we should stop at EOS
 						token_id = new_tokens[i].item()
-						if self._should_stop_at_eos(token_id):
+						if self._should_stop_at_eos(token_id, seq):
 							seq.eos_reached = True
 
 						# Always check max length

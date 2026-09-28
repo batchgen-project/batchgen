@@ -73,6 +73,12 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Preserve prior assistant reasoning_content in Kimi-style chat templates",
     )
+    # Vendor extension, as in vLLM/SGLang: pass via the OpenAI SDK `extra_body`
+    # (or as a top-level body key in a Batch JSONL line). Per request.
+    ignore_eos: bool = Field(
+        default=False,
+        description="If true, EOS and stop tokens do not end generation; max tokens and the context limit still do.",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:
@@ -100,6 +106,11 @@ class CompletionRequest(BaseModel):
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     user: Optional[str] = None
+    # Vendor extension (see ChatCompletionRequest.ignore_eos).
+    ignore_eos: bool = Field(
+        default=False,
+        description="If true, EOS and stop tokens do not end generation; max tokens and the context limit still do.",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:
