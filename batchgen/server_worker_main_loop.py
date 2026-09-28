@@ -20,6 +20,7 @@ from batchgen.batchgen_worker import (
 	BatchGenWorker,
 	BatchGenWorkerArgs,
 )
+from batchgen.deprecation import LegacyInferenceDeprecated
 from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
@@ -563,8 +564,7 @@ def _server_worker_main_impl(
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
-	world_size = args.world_size
-	
+
 	# NCCL timeout prevention strategy:
 	# The problem: NCCL watchdog times out if a collective operation doesn't complete within timeout.
 	# When Rank 0 is blocking on request_queue.get() while other ranks wait on broadcast, 
@@ -676,104 +676,16 @@ def _server_worker_main_impl(
 				response_queue.put({"type": "pool_shutdown"})
 			break
 
-		# --- STEP 4: Legacy inference with full global batch ---
-		local_results = []
-		inference_error = None
-		try:
-			global_prompts = task_data.get("prompts", [])
-			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len")
-			max_context_length = task_data.get("max_context_length", None)
-			ignore_eos = task_data.get("ignore_eos", False)
-			temperature = task_data.get("temperature", None)
-			top_p = task_data.get("top_p", None)
-			sampling_params = task_data.get("sampling_params", None)
-			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
-			batchgen_debug = task_data.get("batchgen_debug", None)
-			if global_rank == 0:
-				if sampling_params:
-					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
-				else:
-					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
-
-			incr_output_dir = task_data.get("incremental_output_dir")
-			incr_custom_ids = task_data.get("custom_id_map")
-			if global_rank == 0 and incr_output_dir and incr_custom_ids:
-				worker._incremental_writer_config = {
-					"output_dir": incr_output_dir,
-					"batch_id": task_data.get("batch_id", "unknown"),
-					"model_name": task_data.get("model_name", "unknown"),
-					"custom_id_map": incr_custom_ids,
-					"request_urls": task_data.get("request_url_map", {}),
-					"prompt_texts": task_data.get("prompt_text_map", {}),
-					"parse_thinking": task_data.get("parse_thinking", False),
-					"parse_tool_call": task_data.get("parse_tool_call", False),
-				}
-
-			if hasattr(worker, 'reset_runtime_state'):
-				worker.reset_runtime_state()
-
-			if len(global_prompts) > 0:
-				worker.Init(current_max_input, current_max_output, len(global_prompts),
-					max_context_length=max_context_length)
-				worker.set_ignore_eos(ignore_eos)
-				if sampling_params:
-					worker.set_per_sequence_sampling_params(sampling_params)
-				else:
-					worker.set_sampling_params(temperature=temperature, top_p=top_p)
-				worker.set_batchgen_debug(batchgen_debug)
-				local_results = worker.process_new_batch(
-					global_prompts,
-					per_sequence_max_tokens=per_sequence_max_tokens,
-				)
-			else:
-				local_results = []
-
-		except Exception as e:
-			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
-			inference_error = str(e)
-			local_results = []
-		finally:
-			if getattr(worker, '_incremental_writer', None) is not None:
-				worker._incremental_writer.close()
-				worker._incremental_writer = None
-			if hasattr(worker, '_incremental_writer_config'):
-				del worker._incremental_writer_config
-
-		# --- STEP 5: Synchronize and check for errors ---
-		try:
-			torch.cuda.synchronize()
-		except RuntimeError as e:
-			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
-			inference_error = str(e)
-
-		dist.barrier()
-
-		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
-		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
-		has_any_error = error_flag.item() > 0
-
-		if has_any_error:
-			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
-			dist.gather_object(inference_error, error_list, dst=0)
-			if global_rank == 0:
-				errors = [e for e in error_list if e is not None]
-				logging.error(f"Inference failed with errors from ranks: {errors}")
-				response_queue.put({"error": errors[0], "all_errors": errors})
-			continue
-
-		# --- STEP 6: Legacy Response (Rank 0 Only) ---
-		if global_rank == 0:
-			final_results = local_results if local_results else {}
-			if not final_results and len(task_data.get("prompts", [])) > 0:
-				rejected = getattr(worker, '_rejected_sequences', None)
-				if rejected:
-					logging.info(f"All {len(rejected)} sequences rejected (context length exceeded).")
-				else:
-					logging.error(f"Results are unexpectedly empty!")
-					response_queue.put({"error": "Results unexpectedly empty after inference"})
-					continue
-			response_queue.put(final_results)
+		# --- STEP 4: No other message shape is served ---
+		# The legacy non-pool inference path was removed; the batch API is the
+		# only way in. The message was broadcast above, so every rank reaches
+		# this line together and raises into the outer fatal boundary rather
+		# than leaving one rank behind in a collective.
+		if isinstance(task_data, dict) and "prompts" in task_data:
+			raise LegacyInferenceDeprecated()
+		raise RuntimeError(
+			f"Rank {global_rank}: unexpected worker message: {task_data!r}"
+		)
 
 	# Cleanup.  Keep the engine alive until its worker threads stop, then drop
 	# the storage mapping only after all non-owning references are gone.

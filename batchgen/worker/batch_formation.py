@@ -1,16 +1,14 @@
 """Rank-assignment planner for batch formation.
 
 Slice 4 of the worker decouple initiative (issue #174). Ports the greedy
-bin-packing rank-assignment algorithm previously inlined on
-``BatchGenWorker._assign_sequences_to_ranks`` into a pure planner that
-returns a typed plan; the worker remains the sole mutator of
-``global_batch``.
+bin-packing rank-assignment algorithm previously inlined on the worker
+into a pure planner that returns a typed plan; the worker remains the
+sole mutator of ``global_batch``.
 
-Out of scope for this slice: ``_tokenize_global_batch`` (229 LOC,
-cross-rank ``all_gather_object`` + heavy ``SequenceEntry`` mutation) and
-``_build_local_query_book`` (mutates 5 worker fields). Both belong in
-later sub-slices once the underlying ``global_batch`` mutation surface
-has stabilized.
+NOTE: its only caller was ``BatchGenWorker._assign_sequences_to_ranks``,
+which went away with the legacy non-pool path — pool mode assigns ranks
+per admission through ``_assign_admitted_sequences_to_ranks``. Nothing in
+the runtime calls this planner today.
 """
 
 from __future__ import annotations

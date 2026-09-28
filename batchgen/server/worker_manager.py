@@ -540,67 +540,12 @@ class WorkerManager:
         self._fatal_ack_event.set()
         self._handle_worker_failure(reason, None)
 
-    def infer(
-        self,
-        prompts: List[str],
-        max_input_len: Optional[int],
-        max_output_len: int,
-        ignore_eos: bool = False,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        # Incremental writer metadata
-        custom_id_map: Optional[Dict[int, str]] = None,
-        request_url_map: Optional[Dict[int, str]] = None,
-        prompt_text_map: Optional[Dict[int, str]] = None,
-        batch_id: Optional[str] = None,
-        model_name: Optional[str] = None,
-        incremental_output_dir: Optional[str] = None,
-        parse_thinking: bool = False,
-        parse_tool_call: bool = False,
-        max_context_length: Optional[int] = None,
-        sampling_params: Optional[List[Dict[str, Any]]] = None,
-        per_sequence_max_tokens: Optional[List[int]] = None,
-        batchgen_debug: Optional[Dict[str, Any]] = None,
-    ) -> List[Any]:
-        if not self.started:
-            raise RuntimeError("WorkerManager has not been started")
-        payload = {
-            "prompts": prompts,
-            "max_input_len": max_input_len,  # None = dynamically determined
-            "max_output_len": max_output_len,
-            "ignore_eos": ignore_eos,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_context_length": max_context_length,
-        }
-        # Per-request sampling parameters (list of dicts with temperature/top_p/top_k)
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        # Per-sequence max output token limits
-        if per_sequence_max_tokens is not None:
-            payload["per_sequence_max_tokens"] = per_sequence_max_tokens
-        if batchgen_debug:
-            payload["batchgen_debug"] = batchgen_debug
-        # Incremental writer metadata (only included when active)
-        if incremental_output_dir and custom_id_map:
-            payload["incremental_output_dir"] = incremental_output_dir
-            payload["custom_id_map"] = custom_id_map
-            payload["request_url_map"] = request_url_map or {}
-            payload["prompt_text_map"] = prompt_text_map or {}
-            payload["batch_id"] = batch_id
-            payload["model_name"] = model_name
-            payload["parse_thinking"] = parse_thinking
-            payload["parse_tool_call"] = parse_tool_call
-        with self._lock:
-            self.request_queue.put(payload)
-            result = self.response_queue.get()
-        return result
-
     def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
-        """Send hot-reload command to all worker ranks (legacy sync RPC path).
+        """Send hot-reload command via the main loop's sync RPC path.
 
-        Used by the non-pool-mode worker main loop (one request → one response
-        via request_queue/response_queue). For pool-mode workers, use
+        Used before the worker enters generate_persistent(), while the main
+        loop still answers one request with one response on
+        request_queue/response_queue. Once pool mode is running, use
         send_pool_reload() instead — pool mode never returns to the main loop.
         """
         import queue as _queue
