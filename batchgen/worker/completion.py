@@ -48,9 +48,12 @@ class CompletionHandler:
     """Namespace of stateless completion-detection predicates."""
 
     @staticmethod
-    def should_stop_at_eos(ctx: CompletionContext, token_id: int) -> bool:
-        """Return ``True`` iff this token is an EOS id and ``ignore_eos`` is off."""
-        if ctx.ignore_eos:
+    def should_stop_at_eos(
+        ctx: CompletionContext, token_id: int, seq_ignore_eos: bool = False
+    ) -> bool:
+        """Return ``True`` iff this token is an EOS id and neither the global nor
+        the sequence's own ``ignore_eos`` is set."""
+        if ctx.ignore_eos or seq_ignore_eos:
             return False
         return token_id in ctx.eos_token_ids
 
