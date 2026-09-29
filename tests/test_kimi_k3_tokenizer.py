@@ -788,9 +788,8 @@ class TestEncodeDecode:
         """It must NOT be wired to tiktoken's allowlist.
 
         Fails before/passes after: ``kimi_linear.encode`` maps
-        ``add_special_tokens`` onto ``allow_special_tokens``, and
-        ``batch_scheduler._count_tokens`` -- its only core caller -- passes
-        ``False``. That reports a rendered K3 prompt at 32 tokens where the
+        ``add_special_tokens`` onto ``allow_special_tokens``, and core callers
+        pass ``False``. That reports a rendered K3 prompt at 32 tokens where the
         worker really produces 12. K3 adds no BOS/EOS in either mode, so the
         flag is a genuine no-op and reported usage matches served usage.
         """
@@ -846,12 +845,13 @@ class TestEncodeDecode:
         assert '<|open|>message role="user"<|sep|>Hi' in tok.decode(
             ids, skip_special_tokens=True)
 
-    def test_decode_accepts_the_kwarg_core_actually_passes(self, tok):
-        """``batch_scheduler._decode_tokens`` passes
-        ``clean_up_tokenization_spaces=False``.
+    def test_decode_accepts_the_kwarg_hf_callers_pass(self, tok):
+        """``decode`` must tolerate ``clean_up_tokenization_spaces=False``.
 
-        Fails before/passes after: ``KimiLinearTokenizer.decode`` has no such
-        parameter and raises ``TypeError`` on that live call path.
+        Fails before/passes after: ``KimiLinearTokenizer.decode`` had no such
+        parameter and raised ``TypeError``. The server-side detokenizer that
+        passed it went away with the legacy inference path, but the kwarg is
+        part of the HuggingFace tokenizer contract callers still rely on.
         """
         assert tok.decode([18699], clean_up_tokenization_spaces=False) == "Hi"
         with pytest.raises(ValueError):
@@ -1372,7 +1372,7 @@ class TestHuggingFaceOracle:
     def test_decode_matches_huggingface(self, tok):
         """Both the plain path AND the one production uses.
 
-        ``batch_scheduler._decode_tokens`` and ``batchgen_worker`` both call
+        ``batchgen_worker._decode_tokens_to_string`` calls
         ``decode(skip_special_tokens=True)``. HuggingFace's default inserts
         spaces around added tokens, so the comparison pins
         ``spaces_between_special_tokens=False`` -- the form K3 implements and

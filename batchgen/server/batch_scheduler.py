@@ -10,26 +10,15 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from batchgen.server.io_struct import (
-    BatchEndpoint,
-    BatchError,
     BatchRequestItem,
-    BatchResponse,
-    BatchResponseBody,
-    BatchResultItem,
     BatchStatus,
-    ChatCompletionChoice,
-    ChatCompletionChoiceMessage,
     ChatCompletionRequest,
-    ChatCompletionResponse,
-    CompletionChoice,
     CompletionRequest,
-    CompletionResponse,
     FileObject,
     FilePurpose,
     FileStatus,
     ToolCall,
     ToolCallFunction,
-    Usage,
 )
 from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.scheduling_pool import SchedulingPool
@@ -103,14 +92,13 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
-        # Request pool state
-        self._pool_mode = server_args.max_pool_size > 0
+        # Request pool state. Pool mode is the only mode: --max-pool-size <= 0
+        # is rejected in validate_server_args. The flag is kept for /status.
+        self._pool_mode = True
         self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
         self._batch_timeout = 86400  # 24h default, matches completion_window
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
-        self._scheduling_pool = SchedulingPool(
-            capacity=server_args.max_pool_size if self._pool_mode else 1024
-        )
+        self._scheduling_pool = SchedulingPool(capacity=server_args.max_pool_size)
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -124,13 +112,12 @@ class BatchScheduler:
         self._stopped.clear()
         self._task = asyncio.create_task(self._run())
         # Start pool mode background tasks
-        if self._pool_mode:
-            self._completion_listener_task = asyncio.create_task(
-                self._pool_completion_listener()
-            )
-            self._drain_task = asyncio.create_task(
-                self._drain_intake_to_worker()
-            )
+        self._completion_listener_task = asyncio.create_task(
+            self._pool_completion_listener()
+        )
+        self._drain_task = asyncio.create_task(
+            self._drain_intake_to_worker()
+        )
 
     async def stop(self) -> None:
         if not self._task:
@@ -270,7 +257,6 @@ class BatchScheduler:
             mt if mt is not None else default_max
             for mt in per_request_max_tokens
         ]
-        max_tokens = max(per_request_max_tokens)
 
         # Log batch-level sampling param defaults
         if batch.temperature is not None or batch.top_p is not None or batch.top_k is not None:
@@ -280,100 +266,9 @@ class BatchScheduler:
                 f"serve as defaults only; per-request values take priority"
             )
 
-        # Build incremental writer metadata
-        incremental_output_dir = (
-            self.server_args.incremental_output_dir
-            if not self.server_args.no_incremental_save
-            else None
-        )
-        incremental_kwargs = {}
-        if incremental_output_dir:
-            incremental_kwargs = dict(
-                custom_id_map={idx: req.custom_id for idx, req in enumerate(requests)},
-                request_url_map={idx: req.url.value for idx, req in enumerate(requests)},
-                prompt_text_map={idx: prompts[idx] for idx in range(len(prompts))},
-                batch_id=batch_id,
-                model_name=requests[0].body.model if requests else "unknown",
-                incremental_output_dir=incremental_output_dir,
-                parse_thinking=self.server_args.parse_thinking,
-                parse_tool_call=self.server_args.parse_tool_call,
-            )
-
-        # --- Pool mode: send admission messages instead of blocking infer() ---
-        if self._pool_mode:
-            await self._process_batch_pool_mode(
-                batch_id, batch, requests, prompts,
-                per_request_max_tokens, sampling_params, incremental_kwargs,
-            )
-            return
-
-        # --- Legacy mode: blocking infer() ---
-        try:
-            results = await asyncio.to_thread(
-                self.worker.infer,
-                prompts,
-                None,  # max_input_len: dynamically determined from prompts
-                max_tokens,
-                False,  # ignore_eos
-                None,  # temperature: handled via per-request sampling_params
-                None,  # top_p: handled via per-request sampling_params
-                max_context_length=batch.max_context_length,
-                sampling_params=sampling_params,
-                per_sequence_max_tokens=per_request_max_tokens,
-                batchgen_debug=batch.batchgen_debug,
-                **incremental_kwargs,
-            )
-        except Exception as exc:
-            self.storage.update_batch_status(
-                batch_id, BatchStatus.FAILED, error=str(exc)
-            )
-            logger.exception("Batch %s inference failed", batch_id)
-            return
-
-        output_file_id = f"file-{uuid.uuid4().hex}"
-
-        # If incremental save was active, use the incremental JSONL as the output
-        incremental_path = None
-        if incremental_output_dir:
-            from pathlib import Path
-            import shutil
-            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
-
-        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
-            # Copy incremental file to storage for API access
-            api_path = self.storage.files_dir / output_file_id
-            shutil.copy2(incremental_path, api_path)
-            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
-            shutil.copy2(incremental_path, output_path)
-            logger.info(
-                f"Batch {batch_id}: using incremental output "
-                f"({incremental_path} -> {output_path})"
-            )
-        else:
-            # Fallback: build output the original way
-            output_items = self._build_output_items(requests, results, prompts)
-            output_path = self.storage.write_output_file(
-                output_file_id, output_items
-            )
-
-        output_meta = FileObject(
-            id=output_file_id,
-            bytes=output_path.stat().st_size,
-            created_at=int(time.time()),
-            filename=output_path.name,
-            purpose=FilePurpose.BATCH_OUTPUT.value,
-            status=FileStatus.PROCESSED.value,
-            status_details=None,
-            checksum=None,
-        )
-        self.storage.save_metadata(output_file_id, output_meta.dict())
-
-        completed_at = int(time.time())
-        self.storage.update_batch_status(
-            batch_id,
-            BatchStatus.COMPLETED,
-            completed_at=completed_at,
-            output_file_id=output_file_id,
+        await self._process_batch_pool_mode(
+            batch_id, batch, requests, prompts,
+            per_request_max_tokens, sampling_params,
         )
 
     def _convert_requests_to_worker_inputs(
@@ -531,85 +426,6 @@ class BatchScheduler:
             messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
 
-    def _build_output_items(
-        self,
-        requests: List[BatchRequestItem],
-        results: Any,
-        prompts: List[str],
-    ) -> List[BatchResultItem]:
-        output: List[BatchResultItem] = []
-        # Support both dict (new: {global_idx: str}) and list (legacy) results
-        if isinstance(results, dict):
-            normalized_results = results
-        else:
-            normalized_results = self._normalize_worker_results(
-                results, len(requests)
-            )
-        for idx, request in enumerate(requests):
-            if isinstance(normalized_results, dict):
-                result = normalized_results.get(idx)
-            else:
-                result = (
-                    normalized_results[idx]
-                    if idx < len(normalized_results)
-                    else None
-                )
-            response = None
-            error = None
-            if result is None:
-                error = BatchError(
-                    code="missing_result",
-                    message="No result returned for this request.",
-                )
-            else:
-                prompt_text = prompts[idx] if idx < len(prompts) else ""
-                # Handle both decoded strings and token IDs
-                if isinstance(result, str):
-                    # Worker returned decoded string (server-side detokenization)
-                    body = self._build_response_body_from_text(
-                        request, result, prompt_text
-                    )
-                    response = self._wrap_response(body)
-                else:
-                    # Worker returned token IDs (legacy behavior)
-                    token_ids = self._coerce_token_ids(result)
-                    if token_ids is None:
-                        error = BatchError(
-                            code="invalid_result",
-                            message=(
-                                "Unsupported result payload: " f"{type(result)}"
-                            ),
-                        )
-                    else:
-                        body = self._build_response_body(
-                            request, token_ids, prompt_text
-                        )
-                        response = self._wrap_response(body)
-
-            output.append(
-                BatchResultItem(
-                    id=f"batch_req_{uuid.uuid4().hex[:24]}",
-                    custom_id=request.custom_id,
-                    response=response,
-                    error=error,
-                )
-            )
-
-        if len(normalized_results) > len(requests):
-            logger.warning(
-                "Received more results (%d) than requests (%d)",
-                len(normalized_results),
-                len(requests),
-            )
-        return output
-
-    def _wrap_response(self, body: BatchResponseBody) -> BatchResponse:
-        return BatchResponse(
-            status_code=200,
-            request_id=f"req_{uuid.uuid4().hex}",
-            body=body,
-        )
-
     def _parse_output(
         self,
         model: str,
@@ -654,172 +470,6 @@ class BatchScheduler:
 
         return content, reasoning_content, tool_calls
 
-    def _build_response_body(
-        self,
-        request: BatchRequestItem,
-        token_ids: List[int],
-        prompt_text: str,
-    ) -> BatchResponseBody:
-        model = request.body.model
-        created_at = int(time.time())
-        decoded_text = self._decode_tokens(model, token_ids)
-        usage = self._build_usage(model, prompt_text, token_ids)
-        content, reasoning_content, tool_calls = self._parse_output(
-            model, decoded_text
-        )
-
-        if request.url == BatchEndpoint.CHAT_COMPLETIONS:
-            body: BatchResponseBody = ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex}",
-                created=created_at,
-                model=model,
-                choices=[
-                    ChatCompletionChoice(
-                        index=0,
-                        message=ChatCompletionChoiceMessage(
-                            content=content,
-                            reasoning_content=reasoning_content,
-                            tool_calls=tool_calls,
-                        ),
-                        logprobs=None,
-                        finish_reason=None,
-                    )
-                ],
-                usage=usage,
-            )
-        else:
-            body = CompletionResponse(
-                id=f"cmpl-{uuid.uuid4().hex}",
-                created=created_at,
-                model=model,
-                choices=[
-                    CompletionChoice(
-                        index=0,
-                        text=decoded_text,
-                        logprobs=None,
-                        finish_reason=None,
-                    )
-                ],
-                usage=usage,
-            )
-        return body
-
-    def _build_response_body_from_text(
-        self,
-        request: BatchRequestItem,
-        decoded_text: str,
-        prompt_text: str,
-    ) -> BatchResponseBody:
-        """Build response body from decoded text (server-side detokenization)."""
-        model = request.body.model
-        created_at = int(time.time())
-        usage = self._build_usage_from_text(model, prompt_text, decoded_text)
-        content, reasoning_content, tool_calls = self._parse_output(
-            model, decoded_text
-        )
-
-        if request.url == BatchEndpoint.CHAT_COMPLETIONS:
-            body: BatchResponseBody = ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex}",
-                created=created_at,
-                model=model,
-                choices=[
-                    ChatCompletionChoice(
-                        index=0,
-                        message=ChatCompletionChoiceMessage(
-                            content=content,
-                            reasoning_content=reasoning_content,
-                            tool_calls=tool_calls,
-                        ),
-                        logprobs=None,
-                        finish_reason=None,
-                    )
-                ],
-                usage=usage,
-            )
-        else:
-            body = CompletionResponse(
-                id=f"cmpl-{uuid.uuid4().hex}",
-                created=created_at,
-                model=model,
-                choices=[
-                    CompletionChoice(
-                        index=0,
-                        text=decoded_text,
-                        logprobs=None,
-                        finish_reason=None,
-                    )
-                ],
-                usage=usage,
-            )
-        return body
-
-    def _build_usage_from_text(
-        self, model: str, prompt_text: str, completion_text: str
-    ) -> Optional[Usage]:
-        """Build usage stats from text (for server-side detokenization)."""
-        tokenizer = self._get_tokenizer(model)
-        if tokenizer is None:
-            return None
-        prompt_tokens = self._count_tokens(tokenizer, prompt_text)
-        completion_tokens = self._count_tokens(tokenizer, completion_text)
-        return Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
-
-    def _build_usage(
-        self, model: str, prompt_text: str, token_ids: List[int]
-    ) -> Optional[Usage]:
-        tokenizer = self._get_tokenizer(model)
-        if tokenizer is None:
-            return None
-        prompt_tokens = self._count_tokens(tokenizer, prompt_text)
-        completion_tokens = len(token_ids)
-        return Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
-
-    def _count_tokens(self, tokenizer: Any, text: str) -> int:
-        if not text:
-            return 0
-        return len(tokenizer.encode(text, add_special_tokens=False))
-
-    def _decode_tokens(self, model: str, token_ids: List[int]) -> str:
-        if not token_ids:
-            return ""
-        tokenizer = self._get_tokenizer(model)
-        if tokenizer is None:
-            return " ".join(str(token) for token in token_ids)
-        trimmed = self._trim_tokens(token_ids, tokenizer)
-        include_special = getattr(self.server_args, "detokenization_include_special_tokens", False)
-        return tokenizer.decode(
-            trimmed,
-            skip_special_tokens=(not include_special),
-            clean_up_tokenization_spaces=False,
-        )
-
-    def _trim_tokens(self, token_ids: List[int], tokenizer: Any) -> List[int]:
-        eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
-        if eos_token_ids is None:
-            eos_token_id = getattr(tokenizer, "eos_token_id", None)
-            eos_token_ids = set() if eos_token_id is None else {eos_token_id}
-        else:
-            eos_token_ids = set(eos_token_ids)
-        pad_token_id = getattr(tokenizer, "pad_token_id", None)
-        trimmed = list(token_ids)
-        if eos_token_ids:
-            eos_positions = [idx for idx, token_id in enumerate(trimmed) if token_id in eos_token_ids]
-            if eos_positions:
-                trimmed = trimmed[: eos_positions[0]]
-        if pad_token_id is not None:
-            while trimmed and trimmed[-1] == pad_token_id:
-                trimmed.pop()
-        return trimmed
-
     def _get_tokenizer(self, model: str) -> Optional[Any]:
         """Load tokenizer for the given model.
 
@@ -846,60 +496,6 @@ class BatchScheduler:
         self._tokenizer_model = model
         return tokenizer
 
-    def _normalize_worker_results(
-        self, results: List[Any], expected: int
-    ) -> List[Any]:
-        normalized = [self._normalize_result_value(item) for item in results]
-        if len(normalized) == expected:
-            return normalized
-        if len(normalized) == 1:
-            single = normalized[0]
-            if (
-                isinstance(single, list)
-                and len(single) == expected
-                and all(isinstance(item, (list, tuple)) for item in single)
-            ):
-                return [list(item) for item in single]
-        return normalized
-
-    def _coerce_token_ids(self, value: Any) -> Optional[List[int]]:
-        normalized = self._normalize_result_value(value)
-        if isinstance(normalized, list):
-            if not normalized:
-                return []
-            if all(isinstance(item, (int, float)) for item in normalized):
-                return [int(item) for item in normalized]
-            if (
-                len(normalized) == 1
-                and isinstance(normalized[0], (list, tuple))
-                and all(
-                    isinstance(item, (int, float)) for item in normalized[0]
-                )
-            ):
-                return [int(item) for item in normalized[0]]
-        return None
-
-    def _normalize_result_value(self, value: Any) -> Any:
-        if (
-            hasattr(value, "detach")
-            and hasattr(value, "cpu")
-            and hasattr(value, "tolist")
-        ):
-            return value.detach().cpu().tolist()
-        if hasattr(value, "tolist"):
-            try:
-                return value.tolist()
-            except Exception:
-                pass
-        if isinstance(value, (list, tuple)):
-            return [self._normalize_result_value(item) for item in value]
-        if isinstance(value, dict):
-            return {
-                key: self._normalize_result_value(val)
-                for key, val in value.items()
-            }
-        return value
-
     # ============ Pool Mode ============
 
     async def _process_batch_pool_mode(
@@ -910,7 +506,6 @@ class BatchScheduler:
         prompts: List[str],
         per_request_max_tokens: List[int],
         sampling_params: List[Dict[str, Any]],
-        incremental_kwargs: Dict[str, Any],
     ) -> None:
         """Process a batch in pool mode: push to IntakePool for async processing.
 
@@ -1186,7 +781,7 @@ class BatchScheduler:
                     logger.error(f"[POOL] Worker error: {result}")
                     break
                 else:
-                    # Legacy result dict — should not happen in pool mode
+                    # Anything else is a protocol error from the worker
                     logger.warning(f"[POOL] Unexpected result: {type(result)}")
 
         logger.info("[POOL] Completion listener stopped")

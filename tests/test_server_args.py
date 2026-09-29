@@ -131,6 +131,29 @@ def test_pynccl_range_must_be_positive_and_fit_port_space(tmp_path):
         )
 
 
+@pytest.mark.parametrize("max_pool_size", [0, -1])
+def test_non_pool_mode_is_rejected(tmp_path, max_pool_size):
+    """--max-pool-size 0 used to select the removed non-pool path."""
+    with pytest.raises(ValueError, match="legacy non-pool mode was removed"):
+        validate_server_args(
+            _args(
+                tmp_path,
+                distributed_weight_config=None,
+                nnodes=1,
+                world_size=1,
+                max_pool_size=max_pool_size,
+            )
+        )
+
+
+def test_default_pool_size_is_accepted(tmp_path):
+    args = _args(
+        tmp_path, distributed_weight_config=None, nnodes=1, world_size=1
+    )
+    assert args.max_pool_size > 0
+    validate_server_args(args)
+
+
 def _shared_args(tmp_path, **overrides):
     values = {
         "model": "openai/gpt-oss-120b",

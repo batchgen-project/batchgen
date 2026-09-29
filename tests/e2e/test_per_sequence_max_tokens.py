@@ -1,7 +1,7 @@
 """Unit tests for per-sequence max_completion_tokens (T27).
 
 Tests the full data flow: parse_batch_file → _convert_requests_to_worker_inputs →
-process_new_batch → _is_sequence_completed → _check_and_handle_completions.
+sequence admission → _is_sequence_completed → _check_and_handle_completions.
 
 NOTE: These are pure unit tests that run without GPU or server.
 """
@@ -476,9 +476,9 @@ class TestFallbackLogic:
 class TestFalsyZeroEdgeCases:
     """Ensure zero values are not treated as None/falsy."""
 
-    def test_process_new_batch_zero_max_tokens(self):
+    def test_admission_zero_max_tokens(self):
         """per_sequence_max_tokens=[0] should set max_decode_length=0, not fallback."""
-        # Simulates the fixed logic in process_new_batch
+        # Simulates the fixed per-sequence budget logic at admission
         per_sequence_max_tokens = [0, 100, None]
         worker_default = 512
         results = []

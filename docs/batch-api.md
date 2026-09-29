@@ -268,9 +268,13 @@ Returns server health status.
 
 ---
 
-## Deprecated: /v1/inference
+## Removed: /v1/inference
 
-`POST /v1/inference` exists for legacy direct inference but is **no longer maintained**. Use the batch API (`/v1/files` + `/v1/batches`) for all production workloads.
+`POST /v1/inference` is **disabled**. It always returns `410 Gone` with
+`detail.code = "legacy_inference_deprecated"` and `detail.use_instead = "/v1/batches"`;
+the route is kept only so callers get that explanation instead of a 404. The worker-side
+path behind it has been deleted. Use the batch API (`/v1/files` + `/v1/batches`) for every
+workload.
 
 ---
 
