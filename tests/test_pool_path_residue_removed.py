@@ -167,6 +167,31 @@ def test_select_tokens_is_greedy_for_all_none_param_dicts():
     assert torch.equal(_select_tokens()(LOGITS, batch), ARGMAX)
 
 
+def test_select_tokens_still_samples_a_request_with_temperature(monkeypatch):
+    import batchgen.sampling as sampling
+
+    calls = []
+    monkeypatch.setattr(
+        sampling, "sample_tokens",
+        lambda logits, **kw: calls.append(kw) or torch.tensor([[2], [2]]),
+    )
+    select = _select_tokens()
+    tensors = (torch.tensor([0.7, 0.0]), torch.tensor([1.0, 1.0]), torch.tensor([0, 0]))
+    select.__self__._build_sampling_tensors = lambda seqs: tensors
+    batch = [SimpleNamespace(sampling_params={"temperature": 0.7}),
+             SimpleNamespace(sampling_params=None)]
+    assert torch.equal(select(LOGITS, batch), torch.tensor([[2], [2]]))
+    assert len(calls) == 1 and calls[0]["temperature"] is tensors[0]
+
+
+@pytest.mark.parametrize("attr", [
+    "_ignore_eos", "_temperature", "_top_p", "_logged_greedy",
+    "_per_sequence_sampling_params", "_batch_completed", "_prefill_completed_results",
+])
+def test_worker_has_no_global_fallback_state(attr):
+    assert f"self.{attr}" not in WORKER.read_text()
+
+
 # ------------------------------------------------- no global ignore_eos left
 
 

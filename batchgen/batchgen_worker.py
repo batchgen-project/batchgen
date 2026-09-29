@@ -12626,7 +12626,6 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Efficient completion sync at page boundaries using all_reduce.
-		FIXED: Correctly respects ignore_eos.
 		"""
 		if not decode_uuids:
 			return [], []
@@ -12803,7 +12802,6 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Synchronize completion status across all ranks using all-reduce.
-		FIXED: Respects ignore_eos flag.
 		"""
 		if not decode_uuids:
 			return [], []
