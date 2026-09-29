@@ -892,7 +892,8 @@ class BatchScheduler:
     ) -> None:
         """Finalize batch output after all requests complete.
 
-        In pool mode, the incremental writer handles per-request output.
+        Per-request output is written by _write_pool_completion as each request
+        completes.
         This method writes the batch status and output file metadata.
         """
         output_file_id = f"file-{uuid.uuid4().hex}"

@@ -16,10 +16,9 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-from batchgen.batchgen_client import BatchGenClient
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 from batchgen.kernel_compat import check_kernels_version as _check_kv
 
 _check_kv()
 
-__all__ = ["BatchGenClient", "ckpt_converter"]
+__all__ = ["ckpt_converter"]

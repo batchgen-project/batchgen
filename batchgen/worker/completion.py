@@ -6,15 +6,14 @@ pure-predicate completion-detection methods previously inlined on
 ``_get_finish_reason``) into a single sibling module.
 
 Design follows the Phase A/B/C cuda-graph adapter pattern: a frozen
-``CompletionContext`` snapshot carries the four worker-owned fields each
+``CompletionContext`` snapshot carries the worker-owned fields each
 call consumes, and ``CompletionHandler`` is a namespace of stateless
 static methods. The worker remains the canonical owner of the underlying
 configuration; ``CompletionContext`` is a typed view, not a state copy.
 
 Out of scope for this slice: ``_check_and_handle_completions`` (vectorized
 boundary-time decision + repetition-flag mutation) and the cross-rank
-``_sync_completion_status_*`` collectives — those land in later slices
-(BatchFormation / SyncCoordinator).
+``_sync_completion_status_*`` collectives, which remain on the worker.
 """
 
 from __future__ import annotations
@@ -33,12 +32,11 @@ if TYPE_CHECKING:
 class CompletionContext:
     """Frozen snapshot passed to each ``CompletionHandler`` call.
 
-    The worker constructs one from its canonical fields (``self._ignore_eos``,
-    ``self.eos_token_ids``, ``self.model_context_length``, ``self.rank``)
+    The worker constructs one from its canonical fields
+    (``self.eos_token_ids``, ``self.model_context_length``, ``self.rank``)
     per call site. Handler methods MUST NOT mutate any contents.
     """
 
-    ignore_eos: bool
     eos_token_ids: FrozenSet[int]
     model_context_length: int
     rank: int
@@ -51,27 +49,28 @@ class CompletionHandler:
     def should_stop_at_eos(
         ctx: CompletionContext, token_id: int, seq_ignore_eos: bool = False
     ) -> bool:
-        """Return ``True`` iff this token is an EOS id and neither the global nor
-        the sequence's own ``ignore_eos`` is set."""
-        if ctx.ignore_eos or seq_ignore_eos:
+        """Return ``True`` iff this token is an EOS id and the sequence's own
+        ``ignore_eos`` is not set."""
+        if seq_ignore_eos:
             return False
         return token_id in ctx.eos_token_ids
 
     @staticmethod
     def is_sequence_completed(ctx: CompletionContext, seq: "SequenceEntry") -> bool:
-        """Unified completion check that respects ``ignore_eos``.
+        """Unified completion check.
 
         A sequence is completed if:
         1. ``decoded_length >= max_decode_length`` (always checked), OR
         2. ``current_context_length >= model_context_length`` (context limit), OR
-        3. ``eos_reached and not ignore_eos`` (real EOS), OR
+        3. ``eos_reached`` (real EOS; a per-request ``ignore_eos`` keeps this
+           unset at the source), OR
         4. Repetition pattern was detected on this sequence.
         """
         if seq.decoded_length >= seq.max_decode_length:
             return True
         if seq.current_context_length >= ctx.model_context_length:
             return True
-        if seq.eos_reached and not ctx.ignore_eos:
+        if seq.eos_reached:
             return True
         if seq._rep_detected:
             return True
@@ -103,7 +102,7 @@ class CompletionHandler:
         elif seq.current_context_length >= ctx.model_context_length:
             finish = "length"
         # Real EOS only — the token at seq.decoded_length-1 matches an EOS id
-        elif seq.eos_reached and not ctx.ignore_eos:
+        elif seq.eos_reached:
             finish = "stop"
         else:
             finish = "length"

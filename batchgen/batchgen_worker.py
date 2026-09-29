@@ -684,12 +684,6 @@ class BatchGenWorker:
 		# Decode watchdog: per-decode-step timeout (separate from general watchdog)
 		self._decode_watchdog = None
 
-		# Incremental writer for crash-resilient result saving. Never created in
-		# pool mode: the batch API writes its own JSONL from the scheduler's
-		# completion listener, so these stay None.
-		self._incremental_writer = None
-		self._incremental_writer_config = None
-
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
 			logging.info(
@@ -914,18 +908,11 @@ class BatchGenWorker:
 		self.model_context_length = None  # Updated from model config during init
 		self.num_global_queries = 0
 		self.num_local_queries = 0
-		self._ignore_eos: bool = False
-		self._temperature: Optional[float] = None  # Sampling temperature (None = greedy)
-		self._top_p: Optional[float] = None  # Nucleus sampling threshold (None = disabled)
-		self._logged_greedy: bool = False  # Track if we've logged greedy mode this batch
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
-		# Per-request sampling parameters (list of dicts, one per prompt in batch order)
-		self._per_sequence_sampling_params: Optional[list] = None
 		self._batchgen_debug: Optional[dict] = None
 
 		# 9. Initialization Flags
 		self._core_initialized = False
-		self._batch_completed = False
 		self._nvshmem_initialized_this_run = False
 		
 		# 10. Distributed Communication Info
@@ -947,10 +934,6 @@ class BatchGenWorker:
 		# Request pool: admission queue and response queue for persistent loop
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
-		# global_idx -> decoded text for sequences completed during PREFILL (C4).
-		# Nothing fills it any more: the store belonged to the removed non-pool
-		# path. Kept because the end-of-generate() gather still reads it.
-		self._prefill_completed_results: Dict[int, str] = {}
 		self._shutdown_requested = False
 		self._max_pool_size = args.max_pool_size  # always > 0 (validate_server_args)
 
@@ -1939,7 +1922,7 @@ class BatchGenWorker:
 
 		Returns:
 			(temps, top_ps, top_ks) tensors on the model's device, or (None, None, None)
-			if using global scalar params.
+			if no sequence in the batch carries sampling params.
 		"""
 		if not batch_sequences:
 			return None, None, None
@@ -1948,18 +1931,11 @@ class BatchGenWorker:
 			getattr(seq, "sampling_params", None) is not None
 			for seq in batch_sequences
 		)
-		if self._per_sequence_sampling_params is None and not has_sequence_params:
+		if not has_sequence_params:
 			return None, None, None
 
 		device = next(self.model.parameters()).device
-		params = []
-		for seq in batch_sequences:
-			seq_params = getattr(seq, "sampling_params", None)
-			if seq_params is None and self._per_sequence_sampling_params is not None:
-				global_idx = getattr(seq, "global_idx", -1)
-				if 0 <= global_idx < len(self._per_sequence_sampling_params):
-					seq_params = self._per_sequence_sampling_params[global_idx]
-			params.append(seq_params or {})
+		params = [getattr(seq, "sampling_params", None) or {} for seq in batch_sequences]
 
 		temps = torch.tensor(
 			[p.get('temperature', 0.0) or 0.0 for p in params],
@@ -1983,10 +1959,6 @@ class BatchGenWorker:
 		"""
 		for seq in batch_sequences:
 			seq_params = getattr(seq, "sampling_params", None)
-			if seq_params is None and self._per_sequence_sampling_params is not None:
-				global_idx = getattr(seq, "global_idx", -1)
-				if 0 <= global_idx < len(self._per_sequence_sampling_params):
-					seq_params = self._per_sequence_sampling_params[global_idx]
 			if ((seq_params or {}).get('temperature', 0.0) or 0.0) > 0:
 				return False
 		return True
@@ -1994,27 +1966,25 @@ class BatchGenWorker:
 	def _select_tokens(self, logits: torch.Tensor, batch_sequences: Optional[list] = None) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
-		Supports both global params and per-sequence params.
+		Sampling parameters are per-sequence; a batch without any falls
+		through to greedy argmax.
 
 		Args:
 			logits: [batch_size, vocab_size] logits from model
+			batch_sequences: active decode-batch sequences, or None
 
 		Returns:
 			[batch_size, 1] selected token indices
 		"""
 		from batchgen.sampling import sample_tokens
 
-		# Per-sequence sampling path. In pool mode, sampling params are attached
-		# to SequenceEntry objects; in legacy mode, fall back to global_idx lookup
-		# in the original per-prompt list.
+		# Per-sequence sampling path: sampling params ride on the SequenceEntry
+		# objects of the active decode batch.
 		if (
-			self._per_sequence_sampling_params is not None
-			or (
-				batch_sequences is not None
-				and any(getattr(seq, "sampling_params", None) is not None for seq in batch_sequences)
-			)
+			batch_sequences is not None
+			and any(getattr(seq, "sampling_params", None) is not None for seq in batch_sequences)
 		):
-			active_sequences = batch_sequences or []
+			active_sequences = batch_sequences
 			# All-greedy fast path: if every sequence's effective temperature is
 			# <= 0, argmax directly (fp32, bit-identical to sample_tokens' greedy
 			# branch) instead of entering sample_tokens. This skips its two per-
@@ -2031,21 +2001,8 @@ class BatchGenWorker:
 			if temps is not None:
 				return sample_tokens(logits, temperature=temps, top_p=top_ps, top_k=top_ks)
 
-		# Global sampling path (legacy)
-		# Fast path: greedy decoding (default)
-		if self._temperature is None or self._temperature <= 0:
-			# Log once per batch (only rank 0, first decode step)
-			if not getattr(self, '_logged_greedy', False) and self.rank == 0:
-				logging.debug(f"Using GREEDY decoding (temperature={self._temperature})")
-				self._logged_greedy = True
-			return torch.argmax(logits, dim=-1, keepdim=True)
-
-		# Sampling with temperature/top_p
-		# Log once per batch (only rank 0, first decode step)
-		if not getattr(self, '_logged_sampling', False) and self.rank == 0:
-			logging.info(f"Using SAMPLING: temperature={self._temperature}, top_p={self._top_p}")
-			self._logged_sampling = True
-		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
+		# No sequence in the batch carries sampling params — greedy decoding.
+		return torch.argmax(logits, dim=-1, keepdim=True)
 
 	def _log_prefill_timing(self):
 		"""Log prefill timing stats if available (GPT-OSS specific)."""
@@ -2121,14 +2078,13 @@ class BatchGenWorker:
 			yield
 
 	# Thin delegations to `batchgen.worker.completion.CompletionHandler`.
-	# The worker owns the canonical config (`self._ignore_eos`,
-	# `self.eos_token_ids`, `self.model_context_length`, `self.rank`);
+	# The worker owns the canonical config (`self.eos_token_ids`,
+	# `self.model_context_length`, `self.rank`);
 	# `_make_completion_context` snapshots them into a frozen
 	# `CompletionContext` per call.
 
 	def _make_completion_context(self) -> CompletionContext:
 		return CompletionContext(
-			ignore_eos=self._ignore_eos,
 			eos_token_ids=frozenset(self.eos_token_ids),
 			model_context_length=self.model_context_length,
 			rank=self.rank,
@@ -5066,7 +5022,8 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[int], List[str]]:
 		"""
 		Check for completed sequences at page boundaries.
-		FIXED: Respects ignore_eos flag.
+		A per-request ignore_eos is already honoured at the source: it keeps
+		seq.eos_reached unset, so the EOS column below never fires for it.
 		"""
 		n = len(decode_uuids)
 		if n == 0:
@@ -5077,7 +5034,6 @@ class BatchGenWorker:
 		max_lens = torch.empty(n, dtype=torch.int64)
 		ctx_lens = torch.empty(n, dtype=torch.int64)
 		eos_flags = torch.empty(n, dtype=torch.bool)
-		ignore_eos = self._ignore_eos
 
 		seqs = []
 		for i, uuid in enumerate(decode_uuids):
@@ -5086,7 +5042,7 @@ class BatchGenWorker:
 			decoded_lens[i] = seq.decoded_length
 			max_lens[i] = seq.max_decode_length
 			ctx_lens[i] = seq.current_context_length
-			eos_flags[i] = seq.eos_reached and not ignore_eos
+			eos_flags[i] = seq.eos_reached
 
 		# Variable-length N-gram repetition detection at decision boundary
 		# Catches repeating patterns of length 2-100 tokens (32 repetitions required)
@@ -5125,8 +5081,7 @@ class BatchGenWorker:
 				seq = seqs[i]
 				logging.info(
 					f"Rank {self.rank}: Sequence {uuid} completed at token {new_token_idx} "
-					f"(decoded_length={seq.decoded_length}, eos_reached={seq.eos_reached}, "
-					f"ignore_eos={self._ignore_eos})"
+					f"(decoded_length={seq.decoded_length}, eos_reached={seq.eos_reached})"
 				)
 			else:
 				active_uuids.append(uuid)
@@ -5134,54 +5089,6 @@ class BatchGenWorker:
 					active_local_indices.append(self._uuid_to_local_map[uuid])
 
 		return active_uuids, active_local_indices, completed_uuids
-
-	def _submit_completed_to_incremental_writer(
-		self,
-		completed_uuids: List[str],
-	) -> None:
-		"""Gather completed sequence tokens from all ranks and submit to writer.
-
-		Sequences are distributed across ranks (each rank owns a subset).
-		Uses all_gather_object to collect decoded tokens from the owning
-		rank to rank 0 where the writer lives. All ranks must participate
-		in the collective.
-		"""
-		if not completed_uuids:
-			return
-
-		# Quick check: does rank 0 have a writer? Broadcast to all ranks.
-		writer = getattr(self, '_incremental_writer', None)
-		has_writer = torch.tensor(
-			[1 if writer is not None else 0],
-			dtype=torch.int32, device=self.torch_device
-		)
-		dist.all_reduce(has_writer, op=dist.ReduceOp.MAX)
-		if has_writer.item() == 0:
-			return
-
-		# Each rank collects tokens + finish_reason for its locally-owned completed sequences
-		my_completed_tokens = []
-		for uuid in completed_uuids:
-			if uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None and local_idx in self.query_book:
-					finish_reason = self._get_finish_reason(seq)
-					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length].clone(), finish_reason)
-					)
-
-		# All ranks participate in gather (NCCL collective requirement)
-		all_completed_tokens = [None] * self.world_size
-		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
-
-		# Rank 0 submits to writer
-		# Each global_idx is owned by exactly one rank, so no duplicates possible
-		if writer is not None:
-			for rank_tokens in all_completed_tokens:
-				if rank_tokens:
-					for global_idx, tokens, finish_reason in rank_tokens:
-						writer.submit(global_idx, tokens, finish_reason=finish_reason)
 
 	def _finish_prefill_completed_sequences(self, prefill_uuids: List[str]) -> List[str]:
 		"""Complete the sequences whose budget is satisfied by the prefill token.
@@ -5245,11 +5152,9 @@ class BatchGenWorker:
 			)
 
 		# Same order as the decode-phase completion handling in generate():
-		# writer -> gather text -> release KV -> scalar cleanup -> status ->
-		# report. _submit_completed_to_incremental_writer and
-		# _gather_completed_tokens are collectives; every rank calls them with
+		# gather text -> release KV -> scalar cleanup -> status -> report.
+		# _gather_completed_tokens is a collective; every rank calls it with
 		# the identical uuid list.
-		self._submit_completed_to_incremental_writer(completed_uuids)
 		gathered_texts = self._gather_completed_tokens(completed_uuids)
 
 		my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
@@ -5544,7 +5449,7 @@ class BatchGenWorker:
 		self.max_input_length = 0
 
 		# Enter the persistent generate loop
-		return self.generate()
+		self.generate()
 
 	def _nsys_prefill_profile_begin(
 		self,
@@ -6422,14 +6327,12 @@ class BatchGenWorker:
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
 				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
 
-				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
 					# Refresh rank-0's sequence replicas first: _report_completion
 					# reads prompt_length/decoded_length from the local entry,
 					# which is stale here for sequences owned by other ranks
 					# (only the completion BIT was all-reduced above).
 					self._sync_sequence_metadata(list(global_completed))
-					self._submit_completed_to_incremental_writer(list(global_completed))
 					# Gather decoded tokens from owning ranks before reporting
 					# (each rank only writes decoded tokens for its own sequences)
 					gathered_texts = self._gather_completed_tokens(list(global_completed))
@@ -6664,44 +6567,7 @@ class BatchGenWorker:
 
 			# Compute and log batch statistics
 			self._log_batch_statistics()
-
-		# ============ Gather Results in Original Order ============
-		# Detokenize locally on each rank to avoid gathering large token tensors.
-		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
-		# Gathering strings (~KB each) instead reduces memory by ~100x.
-		local_results = []
-		# Sequences completed during prefill (C4) were reported and popped from
-		# the local maps back then; their text was captured at that point.
-		local_results.extend(getattr(self, '_prefill_completed_results', {}).items())
-		for local_idx, uuid in self._local_to_uuid_map.items():
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
-				continue
-			global_idx = seq.global_idx
-			if local_idx not in self.query_book:
-				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
-				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
-			decoded_str = self._decode_tokens_to_string(decoded_tokens)
-			local_results.append((global_idx, decoded_str))
-
-		all_results = [None] * self.world_size
-		dist.all_gather_object(all_results, local_results)
-		all_results = [item for sublist in all_results for item in sublist]
-		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
-
-		if self.rank == 0:
-			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
 			self._log_decode_timing()
-
-		dist.barrier()
-		self._batch_completed = True
-
-		if self.rank == 0:
-			return result_dict
-		else:
-			return {}
 
 	def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
 		"""Decode token IDs to string, stopping at first EOS token.
@@ -8990,8 +8856,6 @@ class BatchGenWorker:
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-			# Incremental write: gather completed tokens to rank 0
-			self._submit_completed_to_incremental_writer(completed_uuids)
 			# Gather decoded tokens from owning ranks before reporting
 			gathered_texts = self._gather_completed_tokens(completed_uuids)
 
@@ -12762,7 +12626,6 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Efficient completion sync at page boundaries using all_reduce.
-		FIXED: Correctly respects ignore_eos.
 		"""
 		if not decode_uuids:
 			return [], []
@@ -12939,7 +12802,6 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Synchronize completion status across all ranks using all-reduce.
-		FIXED: Respects ignore_eos flag.
 		"""
 		if not decode_uuids:
 			return [], []
@@ -12994,8 +12856,6 @@ class BatchGenWorker:
 				
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-					# Incremental write: gather completed tokens to rank 0
-					self._submit_completed_to_incremental_writer(completed_uuids)
 					# Gather decoded tokens from owning ranks before reporting
 					gathered_texts = self._gather_completed_tokens(completed_uuids)
 					# ORDERING FIX: release GPU/host KV BEFORE _report_completion
