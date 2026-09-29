@@ -945,6 +945,56 @@ def test_worker_stop_signals_only_original_child_handles(exits_after_term):
     assert events[-1] == ("close", 9)
 
 
+@pytest.mark.parametrize("exits_after_term", [True, False])
+def test_worker_stop_without_pidfd_support_still_sends_sentinel_then_signals(
+    exits_after_term,
+):
+    """Python builds without os.pidfd_open (conda) must not skip the sentinel."""
+    events = []
+
+    class Child:
+        pid = 123
+        exitcode = None
+
+        def join(self, timeout):
+            events.append(("join", timeout))
+            if exits_after_term and "terminate" in events:
+                self.exitcode = 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    child = Child()
+    fake_os = SimpleNamespace(close=lambda fd: events.append(("close", fd)))
+    fake_signal = SimpleNamespace(SIGTERM=15, SIGKILL=9)
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
+            "os": fake_os,
+            "signal": fake_signal,
+            "time": __import__("time"),
+        },
+    )
+    manager = manager_type()
+    manager.worker_process = SimpleNamespace(processes=[child])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
+
+    if exits_after_term:
+        manager._stop_workers()
+        assert "kill" not in events
+    else:
+        with pytest.raises(RuntimeError, match="live owned PIDs"):
+            manager._stop_workers()
+        assert events.index("terminate") < events.index("kill")
+    assert events.index("poison") < events.index("terminate")
+    assert not any(isinstance(e, tuple) and e[0] == "close" for e in events)
+
+
 def test_worker_stop_allows_idle_child_to_exit_from_sentinel():
     events = []
 

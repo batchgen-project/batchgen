@@ -452,13 +452,30 @@ class WorkerManager:
         if not processes:
             raise RuntimeError("worker process context has no child processes")
         pidfds = []
+        # Some Python builds (e.g. conda's) lack the pidfd APIs. The workers are
+        # our own unreaped children, whose PIDs cannot be reused, and
+        # Process.terminate()/kill() signal only a child not yet reaped, so
+        # they are an equally safe fallback.
+        use_pidfd = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+
+        def send(proc, pidfd, sig):
+            if pidfd is None:
+                (proc.kill if sig == signal.SIGKILL else proc.terminate)()
+                return
+            try:
+                signal.pidfd_send_signal(pidfd, sig)
+            except ProcessLookupError:
+                pass
+
         with self._join_lock:
             try:
                 # An unjoined child cannot have its PID reused. Open handles
                 # before joining; the handles remain bound to these children.
                 for proc in processes:
                     if proc.exitcode is None:
-                        pidfds.append((proc, os.pidfd_open(proc.pid)))
+                        pidfds.append(
+                            (proc, os.pidfd_open(proc.pid) if use_pidfd else None)
+                        )
 
                 # Let an idle worker leave its main loop normally first.  This
                 # gives its C++ storage objects a chance to release CUDA
@@ -481,11 +498,8 @@ class WorkerManager:
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
-                for _, pidfd in remaining:
-                    try:
-                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                for proc, pidfd in remaining:
+                    send(proc, pidfd, signal.SIGTERM)
 
                 deadline = time.monotonic() + 5
                 for proc, _ in remaining:
@@ -506,11 +520,8 @@ class WorkerManager:
                 )
                 if remaining:
                     logger.warning("Workers did not exit gracefully, force-killing...")
-                for _, pidfd in remaining:
-                    try:
-                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                for proc, pidfd in remaining:
+                    send(proc, pidfd, signal.SIGKILL)
                 deadline = time.monotonic() + 5
                 for proc, _ in remaining:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
@@ -530,7 +541,8 @@ class WorkerManager:
                     )
             finally:
                 for _, pidfd in pidfds:
-                    os.close(pidfd)
+                    if pidfd is not None:
+                        os.close(pidfd)
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
