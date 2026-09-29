@@ -63,7 +63,7 @@ def test_pool_intake_entry_carries_each_request_flag():
 
 def test_eos_decision_respects_the_sequence_flag():
     ctx = CompletionContext(
-        ignore_eos=False, eos_token_ids=frozenset({2}), model_context_length=64, rank=0
+        eos_token_ids=frozenset({2}), model_context_length=64, rank=0
     )
     assert CompletionHandler.should_stop_at_eos(ctx, 2) is True
     assert CompletionHandler.should_stop_at_eos(ctx, 2, True) is False

@@ -1,10 +1,9 @@
 """The single place the /v1/inference deprecation is spelled out.
 
 Three modules must agree on this text and cannot import one another:
-`batchgen_client` (imported by `batchgen/__init__`, so it must carry no heavy
-dependencies), `server/http_server` (FastAPI + pydantic) and `batchgen_worker`
-(torch). A module that imports nothing at all is the only seam the three of
-them can share.
+`batchgen_client` (requests), `server/http_server` (FastAPI + pydantic) and
+`batchgen_worker` (torch). A module that imports nothing at all is the only
+seam the three of them can share.
 """
 
 LEGACY_INFERENCE_ERROR_CODE = "legacy_inference_deprecated"

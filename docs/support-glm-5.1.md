@@ -29,8 +29,7 @@ same `glm_moe_dsa` path as `GLM-5` / `GLM-5-FP8`:
 | `batchgen/server/process_utils.py` | `MODEL_BYTE_SIZES`: `"zai-org/GLM-5.1-FP8"` → 760 GB, `"zai-org/GLM-5.1"` → 1400 GB (same as GLM-5 — identical param count) |
 
 No changes were needed in `get_initializer.py`, `get_parallel_strategy_manager.py`,
-or the parameter-server dispatch in `batchgen_server.py` /
-`batchgen_server_dev.py` / `server/worker_manager.py` — those branches
+or the parameter-server dispatch in `server/worker_manager.py` — those branches
 already substring-match `"glm-5"` (case-insensitive), which `GLM-5.1-FP8`
 satisfies.
 
