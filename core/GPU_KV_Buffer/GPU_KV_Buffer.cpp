@@ -237,8 +237,9 @@ torch::Tensor GPU_KV_Buffer::get_v(int64_t layer_idx, int64_t micro_batch_idx,
 };
 
 GPU_KV_Buffer::~GPU_KV_Buffer() {
-    for (int64_t buffer_idx = 0;
-         buffer_idx < this->engine_config_.gpu_buffer_config.num_kv_buffer;
+    // Free exactly the buffers the constructor allocated; the config's
+    // combined-buffer count is never parsed from Python, so it is no bound.
+    for (size_t buffer_idx = 0; buffer_idx < this->k_buffers_.size();
          buffer_idx++) {
         CUDA_CHECK(cudaFree(this->k_buffers_[buffer_idx]));
         // v_buffer can be nullptr
