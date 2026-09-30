@@ -157,17 +157,19 @@ BatchGen::~BatchGen() { this->Terminate(); }
 // };
 
 void BatchGen::init_weight_storage(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size, bool enable_hugetlbfs)
+                    int64_t byte_size, bool enable_hugetlbfs,
+                    bool enable_thp, int memfd_creator_pid, int memfd_fd,
+                    int tensor_meta_memfd_fd)
 {
     this->logger->info("BatchGen Init Weight Storage.");
     this->logger->info("model type: {}", this->model_config_.model_type);
     this->shm_name_ = shm_name;
     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
-    // auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-    this->logger->info("weights_map deserialized.");
     this->logger->info("shm_name: {}", shm_name);
     this->logger->info("byte_size: {}", byte_size);
-    this->weights_storage_.Init(shm_name, byte_size, tensor_meta_shm_name, enable_hugetlbfs);
+    this->weights_storage_.Init(shm_name, byte_size, tensor_meta_shm_name,
+                                enable_hugetlbfs, enable_thp, memfd_creator_pid,
+                                memfd_fd, tensor_meta_memfd_fd);
     this->logger->info("weights_storage initialized.");
 }
 

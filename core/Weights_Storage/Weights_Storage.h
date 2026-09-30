@@ -72,10 +72,12 @@ class Weights_Storage {
     
     ~Weights_Storage();
     
+    // memfd_creator_pid owns both the weights and tensor-metadata memfds; with
+    // hugetlbfs the weights fd stays -1 and only the metadata fd is used.
     void Init(std::string& shm_name, int64_t byte_size,
                 std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
-                bool enable_memfd = false, int memfd_creator_pid = -1,
-                int memfd_fd = -1);
+                bool enable_thp = false, int memfd_creator_pid = -1,
+                int memfd_fd = -1, int tensor_meta_memfd_fd = -1);
 
     void InitDistributed(const std::string& config_path);
                   

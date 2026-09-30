@@ -27,9 +27,10 @@ BATCHGEN_SHM_PREFIXES = (
     "batchgen_",      # General BatchGen prefix
 )
 
-# Run-owned record of this run's exact model SHM names. Model weight and
-# tensor-metadata regions carry random names, so a supervisor can only tell
-# them apart from foreign objects through this private provenance file.
+# Run-owned record of the named model regions this run can create. Only the
+# hugetlbfs weights file carries a name, and it carries a random one, so a
+# supervisor can tell it apart from foreign files only through this private
+# provenance file.
 MODEL_SHM_PROVENANCE_FILE = "model_shm.json"
 _RECORDED_SHM_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
 
@@ -250,7 +251,11 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
     return removed
 
 
+# Labels carried in model_info for the model weight and tensor-metadata
+# regions. Both regions are anonymous memfds the kernel reclaims with their last
+# mapping; only MODEL_NAMED_SHM_KEYS can name a file, and only under hugetlbfs.
 MODEL_SHM_KEYS = ("shm_name", "tensor_meta_shm_name")
+MODEL_NAMED_SHM_KEYS = ("shm_name",)
 
 
 def _validated_shm_entry_name(name: str) -> str:
@@ -264,10 +269,11 @@ def _validated_shm_entry_name(name: str) -> str:
 def record_model_shm_provenance(
     model_info: Dict[str, Any], runtime_dir: Path
 ) -> Optional[Path]:
-    """Record this run's exact model SHM names inside its private runtime dir.
+    """Record this run's exact named model regions in its private runtime dir.
 
-    Written once, never overwritten: an existing record means another owner
-    claimed this runtime directory, which must fail closed.
+    Every label is validated, but only a name a file can be created under is
+    recorded. Written once, never overwritten: an existing record means another
+    owner claimed this runtime directory, which must fail closed.
     """
     names = []
     for key in MODEL_SHM_KEYS:
@@ -276,7 +282,8 @@ def record_model_shm_provenance(
         entry_name = _validated_shm_entry_name(model_info[key])
         if not _RECORDED_SHM_NAME_RE.fullmatch(entry_name):
             raise ValueError(f"Invalid model SHM name: {model_info[key]!r}")
-        names.append(entry_name)
+        if key in MODEL_NAMED_SHM_KEYS:
+            names.append(entry_name)
     if not names:
         return None
     path = Path(runtime_dir) / MODEL_SHM_PROVENANCE_FILE
@@ -292,21 +299,22 @@ def record_model_shm_provenance(
 
 
 def verify_model_shm_absent(
-    model_info: Dict[str, Any], *, shm_dir: Path = Path("/dev/shm"),
-    hugepages_dir: Optional[Path] = None,
+    model_info: Dict[str, Any], *, hugepages_dir: Optional[Path] = None,
 ) -> None:
-    """Verify the C++ owner released its model SHM; never unlink by name here."""
+    """Verify the C++ owner released its named model region; never unlink here.
+
+    The weight and tensor-metadata memfds are unnamed, so the kernel reclaims
+    them with their last mapping and there is nothing to verify for them. Only
+    the hugetlbfs weights file needs proof of release.
+    """
     paths = []
     for key in MODEL_SHM_KEYS:
         name = model_info.get(key)
         if name:
             entry = _validated_shm_entry_name(name)
-            paths.append(shm_dir / entry)
-            if key == "shm_name" and hugepages_dir is not None:
+            if key in MODEL_NAMED_SHM_KEYS and hugepages_dir is not None:
                 paths.append(hugepages_dir / entry)
 
-    if paths and not shm_dir.is_dir():
-        raise RuntimeError(f"Model SHM directory is unavailable: {shm_dir}")
     for path in paths:
         if path.exists() or path.is_symlink():
             raise RuntimeError(f"Model SHM remains after owner release: {path}")

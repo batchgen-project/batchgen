@@ -18,7 +18,6 @@
 
 import logging
 import os
-import shutil
 from multiprocessing import Process
 
 import torch
@@ -41,14 +40,14 @@ except ImportError:
 
 
 class Mixtral_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs=False, enable_memfd=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs=False, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
         self.model_config = load_config(huggingface_ckpt_name)
 
@@ -59,21 +58,13 @@ class Mixtral_Parameter_Server:
     def Init(self):
         self._save_safetensors_to_pt()
         self._parse_state_dict()
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
         if "8x7B" in self.huggingface_ckpt_name:
             byte_size = 48 * 1024 * 1024 * 1024 * 2
         elif "8x22B" in self.huggingface_ckpt_name:
             byte_size = 143 * 1024 * 1024 * 1024 * 2
         else:
             raise ValueError("Unknown huggingface model card")
-
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free/1024/1024/1024} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size is not enough. Required: {byte_size}, Available: {free}. \
-                Please clear /dev/shm or increase the size by running 'sudo mount -o remount,size=<size>G /dev/shm'"
-            )
 
         import uuid
 

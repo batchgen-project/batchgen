@@ -50,7 +50,9 @@ class BatchGen {
 
     void Init();
     void init_weight_storage(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size, bool enable_hugetlbfs);
+                    int64_t byte_size, bool enable_hugetlbfs,
+                    bool enable_thp = false, int memfd_creator_pid = -1,
+                    int memfd_fd = -1, int tensor_meta_memfd_fd = -1);
     void Terminate();
 
     /*

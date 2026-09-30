@@ -133,41 +133,59 @@ def test_query_book_duplicate_creator_cannot_unlink_existing_segment():
 def test_model_shm_creators_and_destructor_preserve_foreign_names():
     shm_source = POSIX_SHM.read_text()
     server_source = PARAMETER_SERVER.read_text()
-    assert shm_source.count("create ? O_CREAT | O_EXCL : 0") >= 2
-    assert "shm_open(shm_name.c_str(), O_RDWR | O_CREAT | O_EXCL" in shm_source
+    # Only the hugetlbfs file is still created by name, and only with O_EXCL.
+    assert shm_source.count("create ? O_CREAT | O_EXCL : 0") == 1
     destructor = server_source.split("Parameter_Server::~Parameter_Server()", 1)[1]
     destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
-    assert "if (weight_posix_shm_owned_)" in destructor
     assert "if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty())" in destructor
     assert "unlink(this->weight_hugetlbfs_path_.c_str())" in destructor
     assert "close(this->weights_memfd_fd_)" in destructor
+    assert "close(this->tensor_meta_memfd_fd_)" in destructor
     assert "free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)" in destructor
-    assert "if (tensor_meta_shm_owned_)" in destructor
     assert "if (create && errno == EEXIST)" in shm_source
     assert "memfd creator requires an output fd" in shm_source
+
+
+def _core_engine():
+    """Import the compiled extension or skip; source checks still have to run."""
+    try:
+        from batchgen.models.engine_loader import core_engine
+    except Exception as exc:
+        pytest.skip(f"compiled extension unavailable: {exc}")
+    return core_engine
 
 
 @pytest.mark.skipif(
     sys.platform != "linux" or not torch.cuda.is_available(),
     reason="native memfd lifetime check requires Linux CUDA",
 )
-def test_native_parameter_server_releases_full_memfd_mapping(tmp_path):
-    from batchgen.models.engine_loader import core_engine
+@pytest.mark.parametrize("enable_thp", [False, True])
+def test_native_parameter_server_releases_full_memfd_mapping(tmp_path, enable_thp):
+    """Both regions are anonymous memfds in every mode, THP or not."""
+    core_engine = _core_engine()
 
     weight_name = f"/shm_{uuid.uuid4()}"
     metadata_name = f"/shm_{uuid.uuid4()}"
-    parameter_server = core_engine.Parameter_Server(False, True)
+    parameter_server = core_engine.Parameter_Server(False, enable_thp)
     parameter_server.Init(weight_name, metadata_name, 4096, str(tmp_path), {})
     fd = parameter_server.weights_memfd_fd()
+    metadata_fd = parameter_server.tensor_meta_memfd_fd()
     assert fd >= 0
+    assert metadata_fd >= 0
     assert "memfd:batchgen_weights" in os.readlink(f"/proc/self/fd/{fd}")
+    assert "memfd:batchgen_tensor_meta" in os.readlink(
+        f"/proc/self/fd/{metadata_fd}"
+    )
+    assert not (Path("/dev/shm") / weight_name[1:]).exists()
+    assert not (Path("/dev/shm") / metadata_name[1:]).exists()
     del parameter_server
     gc.collect()
 
     with pytest.raises(OSError):
         os.fstat(fd)
+    with pytest.raises(OSError):
+        os.fstat(metadata_fd)
     assert "memfd:batchgen_weights" not in Path("/proc/self/maps").read_text()
-    assert not (Path("/dev/shm") / metadata_name[1:]).exists()
 
 
 @pytest.mark.skipif(
@@ -176,7 +194,7 @@ def test_native_parameter_server_releases_full_memfd_mapping(tmp_path):
 )
 def test_native_host_kv_manager_creates_no_named_shm_object():
     """Host KV names are labels; the region itself is an anonymous memfd."""
-    from batchgen.models.engine_loader import core_engine
+    core_engine = _core_engine()
 
     shm_name = f"batchgen_host_kv_{uuid.uuid4().hex}"
     config = core_engine.HostPagedKVConfig()
@@ -207,38 +225,34 @@ def test_native_host_kv_manager_creates_no_named_shm_object():
 
 @pytest.mark.skipif(
     sys.platform != "linux" or not torch.cuda.is_available(),
-    reason="native parameter-server collision check requires Linux CUDA",
+    reason="native parameter-server name check requires Linux CUDA",
 )
-@pytest.mark.parametrize("collision", ["weight", "metadata"])
-def test_native_model_shm_collision_preserves_existing_region(tmp_path, collision):
-    from batchgen.models.engine_loader import core_engine
+@pytest.mark.parametrize("shared_label", ["weight", "metadata"])
+def test_native_model_names_are_labels_only(tmp_path, shared_label):
+    """A foreign /dev/shm object with the same name is neither used nor touched."""
+    core_engine = _core_engine()
 
     weight_name = f"/shm_{uuid.uuid4()}"
     metadata_name = f"/shm_{uuid.uuid4()}"
-    collided_name = weight_name if collision == "weight" else metadata_name
-    owner = shared_memory.SharedMemory(
-        name=collided_name[1:], create=True, size=64
-    )
+    label = weight_name if shared_label == "weight" else metadata_name
+    owner = shared_memory.SharedMemory(name=label[1:], create=True, size=64)
     sentinel = b"lane-owner-alive"
     owner.buf[: len(sentinel)] = sentinel
     parameter_server = core_engine.Parameter_Server(False, False)
     try:
-        try:
-            with pytest.raises(RuntimeError, match="File exists"):
-                parameter_server.Init(
-                    weight_name, metadata_name, 4096, str(tmp_path), {}
-                )
-        finally:
-            del parameter_server
-        attached = shared_memory.SharedMemory(name=collided_name[1:])
+        parameter_server.Init(
+            weight_name, metadata_name, 4096, str(tmp_path), {}
+        )
+        assert parameter_server.weights_memfd_fd() >= 0
+        assert parameter_server.tensor_meta_memfd_fd() >= 0
+        del parameter_server
+
+        attached = shared_memory.SharedMemory(name=label[1:])
         try:
             assert attached.size == 64
             assert bytes(attached.buf[: len(sentinel)]) == sentinel
         finally:
             attached.close()
-        if collision == "metadata":
-            with pytest.raises(FileNotFoundError):
-                shared_memory.SharedMemory(name=weight_name[1:])
     finally:
         owner.close()
         owner.unlink()

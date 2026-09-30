@@ -30,7 +30,6 @@ BatchGen format:
 import gc
 import logging
 import os
-import shutil
 import uuid
 
 import torch
@@ -74,14 +73,14 @@ _FP8_EXPERT_TENSOR_NAMES = [
 class MiniMaxM25_Parameter_Server:
     """Parameter server for MiniMax-M2.5 with FP8 weight handling."""
 
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
 
         self.model_config = load_config(huggingface_ckpt_name)
         self.num_layers = self.model_config.num_hidden_layers        # 62
@@ -96,18 +95,10 @@ class MiniMaxM25_Parameter_Server:
         """Initialize parameter server and load weights."""
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
 
         # M2.5: ~211GB safetensors (FP8 experts + FP8 attn + skeleton), 250GB with buffer
         byte_size = 250 * 1024 * 1024 * 1024
-
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free/1024/1024/1024:.2f} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size is not enough. Required: {byte_size}, Available: {free}. "
-                "Please clear /dev/shm or increase the size."
-            )
 
         self.shm_name = "/shm_" + str(uuid.uuid4())
         self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())

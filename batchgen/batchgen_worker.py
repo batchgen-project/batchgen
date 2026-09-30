@@ -613,14 +613,17 @@ class BatchGenWorkerArgs:
 	adaptive_chunk_max: int = 65536
 	adaptive_chunk_ema_alpha: float = 0.1
 	adaptive_chunk_multiplier: float = 1.5
-	# --fast-init (THP + prefault). Host KV always uses memfd_create, so the
-	# creator pid and fds below are populated in every mode.
+	# --fast-init (THP + prefault). Host KV, model weights and tensor metadata
+	# always use memfd_create, so the creator pids and fds below are populated
+	# in every mode. weights_memfd_pid owns both weights and tensor metadata;
+	# with hugetlbfs the weights fd stays -1 and the weights come from a file.
 	fast_init: bool = False
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
 	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
 	weights_memfd_pid: int = -1
 	weights_memfd_fd: int = -1
+	tensor_meta_memfd_fd: int = -1
 	distributed_weight_config: Optional[str] = None
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Must be > 0; rejected at startup otherwise.
@@ -822,14 +825,18 @@ class BatchGenWorker:
 				f"with {len(self.skeleton_state_dict)} keys"
 			)
 		else:
+			# The server's weights and tensor metadata are anonymous memfds in
+			# every mode, so this attach always goes through
+			# /proc/<creator>/fd/<N>; --fast-init only adds THP.
 			self.weights_storage.Init(
 				self.shm_name,
 				self.weight_byte_size,
 				self.tensor_meta_shm_name,
 				self.enable_hugetlbfs,
-				args.fast_init,
-				args.weights_memfd_pid,
-				args.weights_memfd_fd,
+				enable_thp=args.fast_init,
+				memfd_creator_pid=args.weights_memfd_pid,
+				memfd_fd=args.weights_memfd_fd,
+				tensor_meta_memfd_fd=args.tensor_meta_memfd_fd,
 			)
 		logging.info(f"Rank {self.rank}: [startup] Weights storage init: {_time.monotonic() - _t0:.2f}s")
 

@@ -61,7 +61,7 @@ struct tensor_meta {
 
 class Parameter_Server {
    public:
-    Parameter_Server(bool enable_hugetlbfs, bool enable_memfd = false);
+    Parameter_Server(bool enable_hugetlbfs, bool enable_thp = false);
     ~Parameter_Server();
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
               int64_t byte_size, std::string& model_weights_path,
@@ -71,6 +71,7 @@ class Parameter_Server {
     std::unordered_map<std::string, torch::Tensor> get_skeleton_state_dict();
     int64_t byte_size();
     int weights_memfd_fd() const { return weights_memfd_fd_; }
+    int tensor_meta_memfd_fd() const { return tensor_meta_memfd_fd_; }
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
     module_weights_shm();
@@ -80,22 +81,23 @@ class Parameter_Server {
     std::shared_ptr<spdlog::logger> logger;
 
     /* "attn_0" -> "o_proj" -> ptr */
+    // Only the hugetlbfs path turns shm_name into a file; both names are
+    // otherwise labels, because the regions are anonymous memfds.
     std::string shm_name;
     std::string tensor_meta_shm_name;
     void* weight_ptr_ = nullptr;
     int64_t byte_size_ = 0;
     int64_t mapped_size_ = 0;
-    bool weight_posix_shm_owned_ = false;
     bool weight_hugetlbfs_owned_ = false;
     std::string weight_hugetlbfs_path_;
-    bool tensor_meta_shm_owned_ = false;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;
     std::unordered_map<std::string, torch::Tensor> skeleton_state_dict_;
     bool enable_hugetlbfs;
-    bool enable_memfd_ = false;
+    bool enable_thp_ = false;
     int weights_memfd_fd_ = -1;
+    int tensor_meta_memfd_fd_ = -1;
     void _load_cus_format_file_to_host_mem(
         const std::string& model_weights_path,
         void* weight_ptr,

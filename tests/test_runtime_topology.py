@@ -181,9 +181,6 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
                 error=lambda *args, **kwargs: None,
             ),
             "os": os,
-            "shutil": SimpleNamespace(
-                disk_usage=lambda path: (0, 0, 200 * 1024**3)
-            ),
             "torch": SimpleNamespace(
                 cuda=SimpleNamespace(mem_get_info=lambda: (1 << 40, 1 << 40))
             ),
@@ -196,7 +193,7 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     server.tensor_meta_shm_name = None
     server.shm_creation_attempted = False
     server.enable_hugetlbfs = False
-    server.enable_memfd = False
+    server.enable_thp = False
     server.converted_ckpt_dir = "/tmp/converted"
     server.state_dict_name_map = {}
     server._parse_state_dict = lambda: None
@@ -273,12 +270,14 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
 def _stop_partial_local_manager(
     manager, process_utils, shm_dir, *, namespace_owned=False
 ):
+    # The only named model region left is the hugetlbfs weights file, so the
+    # release path proves absence in that directory.
     stop_type = _worker_manager_method(
         "stop",
         {
             "verify_model_shm_absent": lambda info, **kwargs: process_utils[
                 "verify_model_shm_absent"
-            ](info, shm_dir=shm_dir),
+            ](info, hugepages_dir=shm_dir),
             "gc": gc,
             "Path": Path,
             "logger": SimpleNamespace(
@@ -344,7 +343,7 @@ def test_local_gpt_oss_preserves_unconfirmed_shm_after_init_failure(
     record = json.loads(
         (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
     )
-    assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
+    assert record["shm_names"] == ["shm_reserved_weights"]
     assert manager.parameter_server_instance is None
     assert manager._model_shm_init_unconfirmed
 
@@ -479,7 +478,7 @@ def test_local_gpt_oss_fails_closed_when_init_drifts_from_reservation(
     record = json.loads(
         (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
     )
-    assert record["shm_names"] == ["shm_reserved_weights", "shm_reserved_meta"]
+    assert record["shm_names"] == ["shm_reserved_weights"]
     assert manager._model_shm_init_unconfirmed
     with pytest.raises(RuntimeError, match="ownership is unconfirmed"):
         _stop_partial_local_manager(manager, process_utils, shm_dir)

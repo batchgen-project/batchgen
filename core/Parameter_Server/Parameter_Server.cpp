@@ -427,25 +427,20 @@ void Parameter_Server::Init(
     // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
     int memfd_fd_out = -1;
-    bool weight_posix_shm_owned = false;
     bool weight_hugetlbfs_owned = false;
     std::string weight_hugetlbfs_path;
     int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
-                                               this->enable_memfd_, -1, -1,
+                                               this->enable_thp_, -1, -1,
                                                &memfd_fd_out,
-                                               &weight_posix_shm_owned,
                                                &weight_hugetlbfs_owned,
                                                &weight_hugetlbfs_path,
                                                &mapped_size);
     this->shm_name = weight_shm_name;
-    this->weight_posix_shm_owned_ = weight_posix_shm_owned;
     this->weight_hugetlbfs_owned_ = weight_hugetlbfs_owned;
     this->weight_hugetlbfs_path_ = weight_hugetlbfs_path;
-    if (this->enable_memfd_ && memfd_fd_out >= 0) {
-        this->weights_memfd_fd_ = memfd_fd_out;
-    }
+    this->weights_memfd_fd_ = memfd_fd_out;
     this->byte_size_ = byte_size;
     this->mapped_size_ = mapped_size;
     this->weight_ptr_ = weight_ptr;
@@ -453,11 +448,12 @@ void Parameter_Server::Init(
     // Load weights from the model_weights_path
     _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, state_dict_name_map);
 
-    // Serialize the module weights storage to shared memory
-    serialize_to_shared_memory(this->module_weights_storage_, tensor_meta_shm_name);
+    // Serialize the module weights storage into an anonymous memfd. Workers
+    // read it once through /proc/<this pid>/fd/<tensor_meta_memfd_fd_>.
+    this->tensor_meta_memfd_fd_ =
+        serialize_to_memfd(this->module_weights_storage_);
     this->tensor_meta_shm_name = tensor_meta_shm_name;
-    this->tensor_meta_shm_owned_ = true;
-    
+
     std::cout << std::endl;
     this->logger->info("Parameter Server Initialized.");
 };
@@ -465,10 +461,10 @@ void Parameter_Server::Init(
 
 
 
-Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
+Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_thp) {
     this->logger = init_logger("info", "Parameter_Server");
     this->enable_hugetlbfs = enable_hugetlbfs;
-    this->enable_memfd_ = enable_memfd;
+    this->enable_thp_ = enable_thp;
 };
 // void Parameter_Server::Init(
 //     std::string& weight_shm_name, std::string& tensor_meta_shm_name,
@@ -614,26 +610,20 @@ Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
         free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
     }
-    if (weight_posix_shm_owned_) {
-        const auto unlink_start = std::chrono::steady_clock::now();
-        const int unlink_result = shm_unlink(this->shm_name.c_str());
-        this->logger->info(
-            "weight shm_unlink={} elapsed={:.3f}s",
-            unlink_result,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - unlink_start).count());
-    }
     // Only the exact hugetlbfs path this process created with O_EXCL and
     // mapped successfully is removed; unmapping above already happened.
     if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty()) {
         unlink(this->weight_hugetlbfs_path_.c_str());
     }
+    // Closing the memfds drops the last reference the kernel needs: no name
+    // survives this process, so nothing is left to unlink.
     if (this->weights_memfd_fd_ >= 0) {
         close(this->weights_memfd_fd_);
         this->weights_memfd_fd_ = -1;
     }
-    if (tensor_meta_shm_owned_) {
-        shm_unlink(this->tensor_meta_shm_name.c_str());
+    if (this->tensor_meta_memfd_fd_ >= 0) {
+        close(this->tensor_meta_memfd_fd_);
+        this->tensor_meta_memfd_fd_ = -1;
     }
     this->logger->info("Parameter Server Destroyed.");
 };

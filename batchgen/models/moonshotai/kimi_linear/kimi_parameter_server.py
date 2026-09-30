@@ -42,7 +42,6 @@ import gc
 import json
 import logging
 import os
-import shutil
 import uuid
 
 import torch
@@ -153,14 +152,14 @@ class KimiLinear_Parameter_Server:
     """Parameter server for Kimi-Linear (BF16) and Kimi-K3 (MXFP4 experts)."""
 
     def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir,
-                 enable_hugetlbfs, enable_memfd=False):
+                 enable_hugetlbfs, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
 
         self.family = _detect_kimi_family(huggingface_ckpt_name, cache_dir)
 
@@ -214,21 +213,9 @@ class KimiLinear_Parameter_Server:
     def Init(self):
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
 
         byte_size = self._shm_byte_size()
-
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free / 1024**3:.2f} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size is not enough for {self.family}. "
-                f"Required: {byte_size} ({byte_size / 1024**3:.2f} GiB), "
-                f"Available: {free}. Remount: mount -o remount,"
-                f"size={int(byte_size / 1024**3) + 64}G /dev/shm (and set "
-                "/sys/kernel/mm/transparent_hugepage/shmem_enabled to 'always' "
-                "first, or page tables cost ~26 GB across 8 workers)."
-            )
 
         self.shm_name = "/shm_" + str(uuid.uuid4())
         self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
