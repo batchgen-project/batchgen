@@ -839,6 +839,17 @@ class WorkerManager:
             pynccl_port_span=self.args.pynccl_port_span,
         )
         from batchgen.server_worker_main_loop import server_worker_main
+        # Each worker arms PR_SET_PDEATHSIG, which the kernel delivers when the
+        # THREAD that created it exits -- not when this process exits.  Spawning
+        # from a helper thread would therefore kill every worker as soon as that
+        # thread finished.
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "GPU workers must be spawned from the main thread: the worker "
+                "parent-death signal is tied to the spawning thread, so workers "
+                f"spawned from {threading.current_thread().name!r} would be "
+                "killed when that thread exits."
+            )
         self.worker_process = mp.spawn(
             server_worker_main,
             args=(
