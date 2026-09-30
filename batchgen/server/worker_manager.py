@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import atexit
 import gc
 import logging
 import os
 import pickle
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -158,7 +156,10 @@ class WorkerManager:
         self.distributed_weight_daemon = None
         self.distributed_weight_config = None
         self.skeleton_state_dict = None
+        # The skeleton state dict lives in an anonymous memfd this process
+        # holds open; workers read it back through /proc/<our pid>/fd/<N>.
         self.skeleton_state_dict_file = None
+        self.skeleton_memfd_fd = -1
         self._lock = threading.Lock()
         self._worker_exit_state = worker_exit_state or WorkerExitState()
         self._monitor_stop_event = threading.Event()
@@ -174,18 +175,46 @@ class WorkerManager:
         self._runtime_locks: Optional[RuntimeLocks] = None
         self._lane_lease: Optional[LaneLease] = None
 
-        # Register cleanup for skeleton state dict temp file
-        atexit.register(self._cleanup_skeleton_state_dict_file)
+    def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
+        """Serialize the skeleton state dict into an anonymous memfd.
 
-    def _cleanup_skeleton_state_dict_file(self) -> None:
-        """Clean up temporary skeleton state dict file."""
-        if self.skeleton_state_dict_file and os.path.exists(self.skeleton_state_dict_file):
+        A named file in the runtime dir survives a forced exit of the serving
+        processes; a memfd cannot — the kernel reclaims it with its last
+        reference however this process died. Workers ``torch.load`` it through
+        ``/proc/<our pid>/fd/<N>``, so the descriptor stays open for this
+        process's life, well past the point where the last worker has loaded
+        it. MFD_CLOEXEC keeps an exec'd child from holding it open instead.
+        """
+        self._close_skeleton_memfd()
+        fd = os.memfd_create("batchgen_skeleton", os.MFD_CLOEXEC)
+        try:
+            # dup so closing the wrapper does not close the descriptor the
+            # workers will reach through /proc.
+            with os.fdopen(os.dup(fd), "wb") as handle:
+                torch.save(skeleton_state_dict, handle)
+            size = os.fstat(fd).st_size
+        except BaseException:
+            os.close(fd)
+            raise
+        self.skeleton_memfd_fd = fd
+        self.skeleton_state_dict_file = f"/proc/{os.getpid()}/fd/{fd}"
+        logger.info(
+            "Skeleton state dict held in an anonymous memfd, readable at %s "
+            "(%d keys, %.2f MB)",
+            self.skeleton_state_dict_file,
+            len(skeleton_state_dict),
+            size / (1024**2),
+        )
+
+    def _close_skeleton_memfd(self) -> None:
+        """Release the skeleton memfd. Nothing is left behind to unlink."""
+        if self.skeleton_memfd_fd >= 0:
             try:
-                logging.debug(f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}")
-                os.remove(self.skeleton_state_dict_file)
-                self.skeleton_state_dict_file = None
-            except Exception as e:
-                logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
+                os.close(self.skeleton_memfd_fd)
+            except OSError as e:
+                logging.warning(f"Failed to close skeleton memfd: {e}")
+            self.skeleton_memfd_fd = -1
+        self.skeleton_state_dict_file = None
 
     def _prepare_runtime_dir(self) -> None:
         runtime_dir = self.args.runtime_identity.runtime_dir
@@ -408,7 +437,7 @@ class WorkerManager:
                         self.model_info.pop("shm_name", None)
                         self.model_info.pop("tensor_meta_shm_name", None)
 
-                    self._cleanup_skeleton_state_dict_file()
+                    self._close_skeleton_memfd()
                     runtime_dir = self.args.runtime_identity.runtime_dir
                     if self._runtime_dir_created and runtime_dir.is_dir():
                         import shutil
@@ -1043,7 +1072,7 @@ class WorkerManager:
         config = self.distributed_weight_config
         if config is None:
             raise RuntimeError("distributed weight config is not loaded")
-        self.skeleton_state_dict_file = None
+        self._close_skeleton_memfd()
         self.skeleton_state_dict = None
         self.parameter_server_instance = None
         self.model_info = {
@@ -1224,23 +1253,9 @@ class WorkerManager:
         ps_size = parameter_server.parameter_server.byte_size()
         _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
-        # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
+        # Stash skeleton_state_dict in a memfd to avoid passing tensors through mp.spawn
         skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)...")
-
-        # Create temp file for skeleton state dict
-        fd, file_path = tempfile.mkstemp(
-            suffix='.pt',
-            prefix='skeleton_',
-            dir=self.args.runtime_identity.runtime_dir,
-        )
-        os.close(fd)  # Close fd, torch.save will open its own handle
-
-        torch.save(skeleton_state_dict, file_path)
-        actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
-
-        self.skeleton_state_dict_file = file_path
+        self._store_skeleton_state_dict(skeleton_state_dict)
         self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = parameter_server
         self.model_info = {
@@ -1287,20 +1302,8 @@ class WorkerManager:
                 "Remote parameter server did not return a skeleton_state_dict"
             )
 
-        # Save skeleton_state_dict to temp file to avoid passing tensors through mp.spawn
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton)} keys)...")
-        fd, file_path = tempfile.mkstemp(
-            suffix='.pt',
-            prefix='skeleton_',
-            dir=self.args.runtime_identity.runtime_dir,
-        )
-        os.close(fd)  # Close fd, torch.save will open its own handle
-
-        torch.save(skeleton, file_path)
-        actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
-
-        self.skeleton_state_dict_file = file_path
+        # Stash skeleton_state_dict in a memfd to avoid passing tensors through mp.spawn
+        self._store_skeleton_state_dict(skeleton)
         self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = None
         self.model_info = {

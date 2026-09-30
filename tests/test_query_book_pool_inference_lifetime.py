@@ -1,8 +1,9 @@
 """Persistent QueryBook buffers must remain writable across inference phases."""
 
 import gc
-from uuid import uuid4
+import os
 
+import pytest
 import torch
 
 from batchgen.batchgen_worker import QueryBookBufferPool, allocate_node_shared_int64
@@ -23,11 +24,18 @@ def test_recycled_slot_after_pool_creation_in_inference_mode():
     assert not pool.input_ids_buffer.is_inference()
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "memfd_create"), reason="memfd_create requires Linux"
+)
 def test_shared_input_buffer_created_in_inference_mode_is_later_writable():
-    name = f"batchgen_querybook_test_{uuid4().hex}"
     with torch.inference_mode():
-        input_ids, shm = allocate_node_shared_int64(
-            name, rows=2, width=8, is_creator=True, barrier=lambda: None
+        input_ids, memfd = allocate_node_shared_int64(
+            "batchgen_querybook_test",
+            rows=2,
+            width=8,
+            is_creator=True,
+            exchange=lambda pid, fd: (pid, fd),
+            barrier=lambda: None,
         )
     try:
         input_ids[0, 0] = 7
@@ -36,5 +44,4 @@ def test_shared_input_buffer_created_in_inference_mode_is_later_writable():
     finally:
         del input_ids
         gc.collect()
-        shm.close()
-        shm.unlink()
+        memfd.release_fd()
