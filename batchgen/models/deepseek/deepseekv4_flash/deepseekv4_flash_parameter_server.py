@@ -18,7 +18,6 @@ from __future__ import annotations
 import gc
 import logging
 import os
-import shutil
 import uuid
 from pathlib import Path
 
@@ -45,7 +44,7 @@ class DeepSeekV4Flash_Parameter_Server:
         cache_dir,
         converted_ckpt_dir,
         enable_hugetlbfs,
-        enable_memfd=False,
+        enable_thp=False,
     ):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
@@ -53,26 +52,17 @@ class DeepSeekV4Flash_Parameter_Server:
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
         self.model_config = load_config(huggingface_ckpt_name)
 
     def Init(self):
         self._parse_state_dict()
         self.parameter_server = Parameter_Server(
             self.enable_hugetlbfs,
-            self.enable_memfd,
+            self.enable_thp,
         )
 
         byte_size = get_model_byte_size(self.huggingface_ckpt_name)
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info("Freespace in /dev/shm: %.2f GB", free / 1024**3)
-        if free < byte_size:
-            raise ValueError(
-                "Shared memory size is not enough. "
-                f"Required: {byte_size}, Available: {free}. "
-                "Please clear /dev/shm or increase the size."
-            )
-
         self.shm_name = "/shm_" + str(uuid.uuid4())
         self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
         logging.info("V4 parameter shared memory name: %s", self.shm_name)

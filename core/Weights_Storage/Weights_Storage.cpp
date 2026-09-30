@@ -629,14 +629,11 @@ void Weights_Storage::release_module(
     this->active_leases_.erase(found);
 }
 
-/*
-auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-
-*/
 void Weights_Storage::Init(
     std::string& shm_name, int64_t byte_size,
     std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
-    bool enable_memfd, int memfd_creator_pid, int memfd_fd_arg)
+    bool enable_thp, int memfd_creator_pid, int memfd_fd_arg,
+    int tensor_meta_memfd_fd)
 {
     this->logger->info(
         "Setting CUDA device to {} for Weights_Storage initialization.",
@@ -647,8 +644,10 @@ void Weights_Storage::Init(
     this->shm_name = shm_name;
     auto start_time = std::chrono::high_resolution_clock::now();
     this->byte_size_ = byte_size;
-    auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-    
+    // The tensor metadata is always an anonymous memfd owned by the server.
+    auto weights_map =
+        deserialize_from_memfd(memfd_creator_pid, tensor_meta_memfd_fd);
+
     this->logger->info(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);
@@ -657,8 +656,8 @@ void Weights_Storage::Init(
     int64_t mapped_size = 0;
     void* weight_ptr =
         allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true,
-                                      enable_memfd, memfd_creator_pid, memfd_fd_arg,
-                                      nullptr, nullptr, nullptr, nullptr, &mapped_size);
+                                      enable_thp, memfd_creator_pid, memfd_fd_arg,
+                                      nullptr, nullptr, nullptr, &mapped_size);
 
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {

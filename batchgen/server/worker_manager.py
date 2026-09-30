@@ -822,6 +822,7 @@ class WorkerManager:
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
+            tensor_meta_memfd_fd=self._get_tensor_meta_memfd_fd(),
             distributed_weight_config=(
                 str(self.args.distributed_weight_config)
                 if self.args.distributed_weight_config is not None
@@ -881,18 +882,31 @@ class WorkerManager:
             return self.host_kv_aux_manager.memfd_fd()
         return -1
 
+    # The local parameter server owns both the weights and the tensor-metadata
+    # memfd, so its pid and fds are published to the workers in every mode.
+    # With hugetlbfs the weights come from a file and only the metadata fd is
+    # published.
     def _get_weights_memfd_pid(self) -> int:
         ps = getattr(self, 'parameter_server_instance', None)
-        if self.args.fast_init and ps is not None:
-            fd = ps.parameter_server.weights_memfd_fd()
-            if fd >= 0:
-                return os.getpid()
+        if ps is None:
+            return -1
+        if (
+            ps.parameter_server.weights_memfd_fd() >= 0
+            or ps.parameter_server.tensor_meta_memfd_fd() >= 0
+        ):
+            return os.getpid()
         return -1
 
     def _get_weights_memfd_fd(self) -> int:
         ps = getattr(self, 'parameter_server_instance', None)
-        if self.args.fast_init and ps is not None:
+        if ps is not None:
             return ps.parameter_server.weights_memfd_fd()
+        return -1
+
+    def _get_tensor_meta_memfd_fd(self) -> int:
+        ps = getattr(self, 'parameter_server_instance', None)
+        if ps is not None:
+            return ps.parameter_server.tensor_meta_memfd_fd()
         return -1
 
     def _wait_for_workers_ready(self) -> None:
@@ -1067,7 +1081,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "deepseek" in model_lower:
             from batchgen.models.deepseek.deepseek_parameter_server import (
@@ -1079,7 +1093,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "mixtral" in self.args.model.lower():
             from batchgen.models.mixtral.mixtral_parameter_server import (
@@ -1088,7 +1102,7 @@ class WorkerManager:
 
             parameter_server = Mixtral_Parameter_Server(
                 self.args.model, self.args.cache_dir, converted_ckpt_dir,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "gpt-oss-120b" in self.args.model.lower():
             from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
@@ -1100,11 +1114,12 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
-            # Reserve and record the exact random names before any SHM is
-            # created or the long checkpoint conversion runs: a crash in
-            # between would otherwise leave regions nobody can attribute.
+            # Reserve and record the exact random names before the hugetlbfs
+            # weights file is created or the long checkpoint conversion runs: a
+            # crash in between would otherwise leave a file nobody can
+            # attribute.
             reserved_shm_names = parameter_server.reserve_shm_names()
             record_model_shm_provenance(
                 {
@@ -1113,8 +1128,8 @@ class WorkerManager:
                 },
                 self.args.runtime_identity.runtime_dir,
             )
-            # A reservation is not proof that C++ successfully created either
-            # region. Preserve the record if Init fails after creation begins.
+            # A reservation is not proof that C++ successfully created that
+            # file. Preserve the record if Init fails after creation begins.
             self._model_shm_init_unconfirmed = True
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
@@ -1126,7 +1141,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
@@ -1138,7 +1153,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "minimax" in self.args.model.lower():
             from batchgen.models.minimax.minimax_m25.minimax_m25_parameter_server import (
@@ -1150,7 +1165,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
             import sys as _diag_sys, time as _diag_time
@@ -1167,7 +1182,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
             _diag("    glm5: GLM5_Parameter_Server constructed")
         else:

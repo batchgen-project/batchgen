@@ -27,7 +27,6 @@ _diag("start")
 import gc
 import logging
 import os
-import shutil
 from multiprocessing import Process
 _diag("stdlib done")
 
@@ -55,14 +54,14 @@ except ImportError:
 
 
 class GLM5_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
         # Single resolved internal config (checkpoint-backed GLM5Config/GLM52Config).
         # Used both for metadata reads and to build the model graph — GLM-5 no
         # longer uses an HF transformers.PretrainedConfig.
@@ -85,7 +84,7 @@ class GLM5_Parameter_Server:
 
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
 
         # Convert checkpoint files
         from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
@@ -93,18 +92,8 @@ class GLM5_Parameter_Server:
         self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
         # Size the reservation from the converted metadata instead of a fixed
-        # per-dtype constant, and fail here rather than after the C++ side has
-        # already allocated the SHM segment.
+        # per-dtype constant.
         byte_size = converted_checkpoint_byte_size(self.converted_ckpt_dir)
-
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free / 1024**3:.1f} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size not enough. Required: {byte_size / 1024**3:.0f} GB, "
-                f"Available: {free / 1024**3:.0f} GB. "
-                f"Please clear /dev/shm or increase size."
-            )
 
         import uuid
         self.shm_name = "/shm_" + str(uuid.uuid4())

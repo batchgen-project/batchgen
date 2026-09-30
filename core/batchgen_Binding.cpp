@@ -567,7 +567,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_past_key_states",
                 &BatchGen::get_past_key_states,
                 "Get the past key states for the given query global indices and max sequence length.")
-           .def("init_weight_storage", &BatchGen::init_weight_storage)
+           .def("init_weight_storage", &BatchGen::init_weight_storage,
+                py::arg("shm_name"),
+                py::arg("tensor_meta_shm_name"),
+                py::arg("byte_size"),
+                py::arg("enable_hugetlbfs"),
+                py::arg("enable_thp") = false,
+                py::arg("memfd_creator_pid") = -1,
+                py::arg("memfd_fd") = -1,
+                py::arg("tensor_meta_memfd_fd") = -1)
            .def_property(
               "host_paged_kv_worker_view",
               &BatchGen::host_paged_kv_worker_view,
@@ -588,9 +596,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("byte_size"),
             py::arg("module_weights_shm"),
             py::arg("enable_hugetlbfs") = false,
-            py::arg("enable_memfd") = false,
+            py::arg("enable_thp") = false,
             py::arg("memfd_creator_pid") = -1,
-            py::arg("memfd_fd") = -1)
+            py::arg("memfd_fd") = -1,
+            py::arg("tensor_meta_memfd_fd") = -1)
         .def("InitDistributed", &Weights_Storage::InitDistributed,
             py::arg("config_path"))
         .def("get_tensor", &Weights_Storage::get_tensor,
@@ -762,13 +771,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
-             py::arg("enable_memfd") = false)
+             py::arg("enable_thp") = false)
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
         .def("byte_size", &Parameter_Server::byte_size)
         .def("module_weights_shm", &Parameter_Server::module_weights_shm)
-        .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd);
+        .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd)
+        .def("tensor_meta_memfd_fd", &Parameter_Server::tensor_meta_memfd_fd);
 
     m.def(
         "set_data",
