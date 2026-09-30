@@ -74,7 +74,12 @@ to the host's `MemTotal` and verifies the resulting capacity before allowing a
 server launch. Run the family-specific identity gate, clean step, and verifier
 for the exact assigned host before starting the server.
 
-Transparent huge pages should be enabled for shared-memory initialization:
+Start the server with `--fast-init`. It allocates the shared FP8 weights and the
+host KV cache as unnamed memory backed by shared-memory transparent huge pages,
+so they are not named files in `/dev/shm` and are released by the kernel even
+if the server is stopped forcibly. Before allocating, it drops the page cache
+and compacts memory host-wide, so use it on a dedicated host. It needs
+shared-memory transparent huge pages enabled:
 
 ```bash
 cat /sys/kernel/mm/transparent_hugepage/shmem_enabled
@@ -114,6 +119,7 @@ numactl --interleave=all python -m batchgen.launch_http_server \
     --kv-dtype bfloat16 \
     --max-pool-size 512 \
     --gpu-memory-frac 0.93 \
+    --fast-init \
     --persistent-phase-instances \
     --enable-cuda-graph \
     --cuda-graph-max-bucket-size 32 \
