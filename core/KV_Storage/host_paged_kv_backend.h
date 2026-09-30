@@ -36,7 +36,10 @@ struct HostPagedKVConfig {
     std::size_t v_element_size_bytes = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t alignment_bytes = 64;
-    bool enable_memfd = false;
+    // Transparent huge pages for the region (--fast-init). Purely a paging
+    // hint: it changes neither the layout nor the lifetime of the region, so
+    // it is deliberately absent from HashHostKVConfig().
+    bool enable_thp = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
     LayerMapping logical_to_physical_layer;
@@ -202,9 +205,10 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.v_element_size_bytes);
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
-    seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
     // logical_to_physical_layer is view-level routing. It does not change the
     // physical shared-memory layout, so it is intentionally excluded here.
+    // enable_thp is likewise excluded: the creator and an attacher must agree
+    // on the layout, not on their paging hints.
     return seed;
 }
 

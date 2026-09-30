@@ -314,6 +314,9 @@ def _host_transfer_worker(spec: dict) -> dict:
     host_cfg = _make_deepseek_r1_host_config(
         shm_name, k_element_size_bytes=host_k_element_size_bytes
     )
+    # The host region is an anonymous memfd; attach through the creator's /proc.
+    host_cfg.memfd_creator_pid = spec["memfd_creator_pid"]
+    host_cfg.memfd_fd = spec["memfd_fd"]
     capacity_tokens = host_cfg.page_size_tokens * page_num_per_seq
     if any(length > capacity_tokens for length in sequence_lengths):
         raise ValueError("sequence length exceeds allocated capacity in worker")
@@ -569,6 +572,8 @@ def test_host_transfer_layer(shm_name):
         worker_specs.append(
             {
                 "shm_name": shm_name,
+                "memfd_creator_pid": os.getpid(),
+                "memfd_fd": host_manager.memfd_fd(),
                 "device_index": device_index,
                 "sequence_ids": sequence_ids,
                 "page_num_per_seq": page_num_per_seq,
@@ -677,6 +682,8 @@ def test_host_transfer_layer_variable_lengths(shm_name):
         worker_specs.append(
             {
                 "shm_name": shm_name,
+                "memfd_creator_pid": os.getpid(),
+                "memfd_fd": host_manager.memfd_fd(),
                 "device_index": device_index,
                 "sequence_ids": sequence_ids,
                 "page_num_per_seq": page_num_per_seq,
@@ -761,6 +768,8 @@ def test_host_transfer_layer_byte_kv(shm_name):
         worker_specs.append(
             {
                 "shm_name": shm_name,
+                "memfd_creator_pid": os.getpid(),
+                "memfd_fd": host_manager.memfd_fd(),
                 "device_index": device_index,
                 "sequence_ids": sequence_ids,
                 "page_num_per_seq": page_num_per_seq,
@@ -861,6 +870,8 @@ def test_host_transfer_layer_variable_lengths_byte_kv(shm_name):
         worker_specs.append(
             {
                 "shm_name": shm_name,
+                "memfd_creator_pid": os.getpid(),
+                "memfd_fd": host_manager.memfd_fd(),
                 "device_index": device_index,
                 "sequence_ids": sequence_ids,
                 "page_num_per_seq": page_num_per_seq,

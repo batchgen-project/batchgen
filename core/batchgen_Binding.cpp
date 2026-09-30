@@ -623,7 +623,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVConfig::sequence_table_capacity)
         .def_readwrite("alignment_bytes",
                        &kv::HostPagedKVConfig::alignment_bytes)
-        .def_readwrite("enable_memfd", &kv::HostPagedKVConfig::enable_memfd)
+        .def_readwrite("enable_thp", &kv::HostPagedKVConfig::enable_thp)
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)

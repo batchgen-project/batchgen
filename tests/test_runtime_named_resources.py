@@ -171,6 +171,41 @@ def test_native_parameter_server_releases_full_memfd_mapping(tmp_path):
 
 
 @pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="native host KV memfd check requires Linux",
+)
+def test_native_host_kv_manager_creates_no_named_shm_object():
+    """Host KV names are labels; the region itself is an anonymous memfd."""
+    from batchgen.models.engine_loader import core_engine
+
+    shm_name = f"batchgen_host_kv_{uuid.uuid4().hex}"
+    config = core_engine.HostPagedKVConfig()
+    config.shm_name = shm_name
+    config.num_layers = 1
+    config.num_pages = 4
+    config.page_size_tokens = 4
+    config.num_k_heads = 1
+    config.k_head_dim = 8
+    config.num_v_heads = 0
+    config.k_element_size_bytes = 2
+    config.sequence_table_capacity = 8
+    config.alignment_bytes = 64
+
+    manager = core_engine.MLAHostPagedKVManager(config)
+    manager.initialize(True)
+    fd = manager.memfd_fd()
+    assert fd >= 0
+    assert "memfd:batchgen_kv" in os.readlink(f"/proc/self/fd/{fd}")
+    assert not (Path("/dev/shm") / shm_name).exists()
+
+    del manager
+    gc.collect()
+
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+@pytest.mark.skipif(
     sys.platform != "linux" or not torch.cuda.is_available(),
     reason="native parameter-server collision check requires Linux CUDA",
 )
