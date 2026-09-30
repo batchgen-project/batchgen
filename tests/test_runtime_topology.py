@@ -516,7 +516,8 @@ def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypa
     assert recorded_during_init == [False]
     assert manager.model_info["shm_name"] == "/shm_mixtral_weights"
     record = json.loads(record_path.read_text())
-    assert record["shm_names"] == ["shm_mixtral_weights", "shm_mixtral_meta"]
+    # Tensor metadata is an unnamed memfd; only the weights name is recorded.
+    assert record["shm_names"] == ["shm_mixtral_weights"]
 
 
 def test_local_world_size_requires_exact_division_and_visibility():
