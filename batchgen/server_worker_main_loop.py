@@ -21,7 +21,10 @@ from batchgen.batchgen_worker import (
 	BatchGenWorkerArgs,
 )
 from batchgen.deprecation import LegacyInferenceDeprecated
-from batchgen.server.process_utils import install_worker_signal_handlers
+from batchgen.server.process_utils import (
+	die_with_parent,
+	install_worker_signal_handlers,
+)
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
 
@@ -398,6 +401,12 @@ def _server_worker_main_impl(
 	Rank 0 acts as the coordinator, reading from the master process queue.
 	All ranks receive the full global batch for coordinated scheduling.
 	"""
+	# Before anything else, including logging: tie this worker's life to the
+	# server process.  SIGKILL is the only reliable parent-death signal here —
+	# a Python-level handler cannot run while this thread is inside a native
+	# collective, so the worker would survive as an orphan holding GPUs and SHM.
+	die_with_parent()
+
 	# Step 0: Configure logging for this worker process first
 	_setup_worker_logging(rank_idx)
 

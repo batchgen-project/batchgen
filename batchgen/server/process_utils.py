@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import multiprocessing
 import os
 import re
 import signal
@@ -340,3 +342,46 @@ def install_worker_signal_handlers(
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.debug("Worker signal handlers installed")
+
+
+# prctl(2) option number; identical on every Linux architecture.
+PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig() -> None:
+    """Arm the kernel parent-death signal (SIGKILL) for this process."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"prctl(PR_SET_PDEATHSIG) failed: {os.strerror(errno)}")
+
+
+def die_with_parent() -> None:
+    """Make the kernel SIGKILL this process when its parent process dies.
+
+    GPU workers must never outlive the server process that spawned them: an
+    orphaned worker keeps its CUDA context and shared memory alive.  The signal
+    is SIGKILL rather than a catchable one because a Python-level handler cannot
+    run while the worker's main thread is inside a native collective (NCCL), so
+    a handler-based death signal is not reliable.
+
+    The parent-death signal is delivered when the *thread* that created this
+    process exits, so the caller must be spawned from the parent's main thread.
+
+    No-op on platforms without PR_SET_PDEATHSIG.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    _set_pdeathsig()
+
+    # Close the race where the parent died before prctl ran: the kernel would
+    # then never deliver the death signal, leaving this process an orphan.
+    parent = multiprocessing.parent_process()
+    if parent is not None and os.getppid() != parent.pid:
+        logger.error(
+            "Parent process %s exited before the parent-death signal was armed; exiting",
+            parent.pid,
+        )
+        os._exit(1)
