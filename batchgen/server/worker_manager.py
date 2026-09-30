@@ -273,7 +273,7 @@ class WorkerManager:
                 self.args.model,
                 primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
                 aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
             _diag("<<< allocate_host_kv_cache")
             if isinstance(result, tuple):
@@ -853,18 +853,20 @@ class WorkerManager:
             daemon=True,
         )
 
+    # Host KV regions are always anonymous memfds owned by this process, so the
+    # creator pid and fds are published to the workers in every mode.
     def _get_kv_memfd_pid(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if getattr(self, 'host_kv_manager', None) is not None:
             return os.getpid()
         return -1
 
     def _get_kv_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if getattr(self, 'host_kv_manager', None) is not None:
             return self.host_kv_manager.memfd_fd()
         return -1
 
     def _get_kv_aux_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_aux_manager', None) is not None:
+        if getattr(self, 'host_kv_aux_manager', None) is not None:
             return self.host_kv_aux_manager.memfd_fd()
         return -1
 
@@ -1343,7 +1345,7 @@ class WorkerManager:
         host_kv_cache_size_gb: int, model_name: str,
         primary_shm_name: str,
         aux_shm_name: str,
-        enable_memfd: bool = False,
+        enable_thp: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 
@@ -1351,7 +1353,7 @@ class WorkerManager:
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
-            enable_memfd=enable_memfd,
+            enable_thp=enable_thp,
             primary_shm_name=primary_shm_name,
             aux_shm_name=aux_shm_name,
         )
@@ -1367,8 +1369,7 @@ class WorkerManager:
             model_name=model_name,
             shm_name=primary_shm_name,
         )
-        if enable_memfd:
-            config.enable_memfd = True
+        config.enable_thp = enable_thp
         # Select manager based on model's KV cache configuration
         # MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
         if config.num_v_heads == 0:

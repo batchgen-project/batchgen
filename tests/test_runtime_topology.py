@@ -536,6 +536,38 @@ def test_local_world_size_requires_exact_division_and_visibility():
         resolve(4, 2, 8, require_exact_visibility=True)
 
 
+def _host_kv_memfd_getters():
+    namespace = {"os": SimpleNamespace(getpid=lambda: 4242)}
+    return tuple(
+        _worker_manager_method(name, namespace)
+        for name in ("_get_kv_memfd_pid", "_get_kv_memfd_fd", "_get_kv_aux_memfd_fd")
+    )
+
+
+@pytest.mark.parametrize("fast_init", [False, True])
+def test_host_kv_memfd_identity_is_published_in_every_mode(fast_init):
+    """Workers attach through /proc, so the creator identity is never optional."""
+    pid_type, fd_type, aux_type = _host_kv_memfd_getters()
+    manager = pid_type()
+    manager.args = SimpleNamespace(fast_init=fast_init)
+    manager.host_kv_manager = SimpleNamespace(memfd_fd=lambda: 17)
+    manager.host_kv_aux_manager = SimpleNamespace(memfd_fd=lambda: 18)
+
+    assert pid_type._get_kv_memfd_pid(manager) == 4242
+    assert fd_type._get_kv_memfd_fd(manager) == 17
+    assert aux_type._get_kv_aux_memfd_fd(manager) == 18
+
+
+def test_host_kv_memfd_identity_is_absent_without_a_local_region():
+    pid_type, fd_type, aux_type = _host_kv_memfd_getters()
+    manager = pid_type()
+    manager.args = SimpleNamespace(fast_init=True)
+
+    assert pid_type._get_kv_memfd_pid(manager) == -1
+    assert fd_type._get_kv_memfd_fd(manager) == -1
+    assert aux_type._get_kv_aux_memfd_fd(manager) == -1
+
+
 def test_pynccl_search_never_leaves_assigned_range():
     calls = []
 

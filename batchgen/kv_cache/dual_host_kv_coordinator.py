@@ -150,7 +150,7 @@ class DualHostKVCoordinator:
 		model_name: str,
 		host_kv_cache_size: int,
 		core_engine_module,
-		enable_memfd: bool = False,
+		enable_thp: bool = False,
 		memfd_creator_pid: int = -1,
 		memfd_fd: int = -1,
 		aux_memfd_fd: int = -1,
@@ -188,13 +188,14 @@ class DualHostKVCoordinator:
 		_try_set_logger_name(primary_config, "HostPagedKVWorkerView")
 		_try_set_logger_name(aux_config, "HostPagedKVWorkerView_aux")
 
-		if enable_memfd:
-			primary_config.enable_memfd = True
-			primary_config.memfd_creator_pid = memfd_creator_pid
-			primary_config.memfd_fd = memfd_fd
-			aux_config.enable_memfd = True
-			aux_config.memfd_creator_pid = memfd_creator_pid
-			aux_config.memfd_fd = aux_memfd_fd
+		# Both regions are always anonymous memfds owned by the server process,
+		# so every attacher needs the creator pid and its two fds.
+		primary_config.enable_thp = enable_thp
+		primary_config.memfd_creator_pid = memfd_creator_pid
+		primary_config.memfd_fd = memfd_fd
+		aux_config.enable_thp = enable_thp
+		aux_config.memfd_creator_pid = memfd_creator_pid
+		aux_config.memfd_fd = aux_memfd_fd
 
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
 		try:
@@ -218,7 +219,7 @@ class DualHostKVCoordinator:
 		cls,
 		model_name: str,
 		host_kv_cache_size: int,
-		enable_memfd: bool = False,
+		enable_thp: bool = False,
 		primary_shm_name: str | None = None,
 		aux_shm_name: str | None = None,
 	) -> Optional[Tuple[Any, Any]]:
@@ -253,9 +254,8 @@ class DualHostKVCoordinator:
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
 		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
 
-		if enable_memfd:
-			primary_config.enable_memfd = True
-			aux_config.enable_memfd = True
+		primary_config.enable_thp = enable_thp
+		aux_config.enable_thp = enable_thp
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)

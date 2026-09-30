@@ -613,7 +613,8 @@ class BatchGenWorkerArgs:
 	adaptive_chunk_max: int = 65536
 	adaptive_chunk_ema_alpha: float = 0.1
 	adaptive_chunk_multiplier: float = 1.5
-	# --fast-init (memfd_create + THP)
+	# --fast-init (THP + prefault). Host KV always uses memfd_create, so the
+	# creator pid and fds below are populated in every mode.
 	fast_init: bool = False
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
@@ -843,10 +844,10 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=host_budget_bytes,
 			core_engine_module=core_engine,
-			enable_memfd=args.fast_init,
-			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
-			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
-			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
+			enable_thp=args.fast_init,
+			memfd_creator_pid=args.kv_memfd_pid,
+			memfd_fd=args.kv_memfd_fd,
+			aux_memfd_fd=args.kv_aux_memfd_fd,
 			primary_shm_name=args.host_kv_shm_name,
 			aux_shm_name=args.host_kv_aux_shm_name,
 		)
@@ -861,10 +862,11 @@ class BatchGenWorker:
 				host_kv_cache_size=host_budget_bytes,
 				shm_name=args.host_kv_shm_name,
 			)
-			if args.fast_init:
-				worker_kv_config.enable_memfd = True
-				worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
-				worker_kv_config.memfd_fd = args.kv_memfd_fd
+			# The server's host KV region is an anonymous memfd in every mode;
+			# this view always attaches through /proc/<creator>/fd/<N>.
+			worker_kv_config.enable_thp = args.fast_init
+			worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
+			worker_kv_config.memfd_fd = args.kv_memfd_fd
 
 			# K3 keeps 93 logical engine-layer ids over 24 dense physical MLA
 			# rows, so the worker view must honor the profile's layer map.
