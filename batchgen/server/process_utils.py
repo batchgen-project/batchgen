@@ -352,6 +352,28 @@ def install_worker_signal_handlers(
     logger.debug("Worker signal handlers installed")
 
 
+# memfd_create(2) flag; identical on every Linux architecture.
+_MFD_CLOEXEC = 1
+
+
+def create_memfd(name: str) -> int:
+    """Create an anonymous, close-on-exec memfd and return its descriptor.
+
+    Some Python builds (e.g. conda's) lack ``os.memfd_create`` although the
+    kernel and glibc provide it, so fall back to glibc through ctypes.
+    """
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    libc.memfd_create.restype = ctypes.c_int
+    fd = libc.memfd_create(name.encode(), _MFD_CLOEXEC)
+    if fd < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"memfd_create({name}) failed: {os.strerror(errno)}")
+    return fd
+
+
 # prctl(2) option number; identical on every Linux architecture.
 PR_SET_PDEATHSIG = 1
 

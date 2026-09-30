@@ -384,7 +384,9 @@ def allocate_node_shared_int64(
 	nbytes = rows * width * 8
 	fd = -1
 	if is_creator:
-		fd = os.memfd_create(label, os.MFD_CLOEXEC)
+		from batchgen.server.process_utils import create_memfd
+
+		fd = create_memfd(label)
 		os.ftruncate(fd, nbytes)
 	creator_pid, creator_fd = exchange(os.getpid(), fd)
 	if not is_creator:

@@ -14,7 +14,9 @@ import copy
 import gc
 import logging
 import multiprocessing as mp
+import fcntl
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Tuple
 from uuid import uuid4
@@ -30,7 +32,7 @@ WORKER_MANAGER = ROOT / "batchgen" / "server" / "worker_manager.py"
 HELPERS = ("NodeSharedMemfd", "allocate_node_shared_int64")
 
 requires_memfd = pytest.mark.skipif(
-    not hasattr(os, "memfd_create"), reason="memfd_create requires Linux"
+    not sys.platform.startswith("linux"), reason="memfd_create requires Linux"
 )
 
 
@@ -116,7 +118,7 @@ def test_worker_never_names_the_input_ids_region():
 
     assert "shared_memory" not in source
     assert "shm_open" not in source
-    assert "os.memfd_create(label, os.MFD_CLOEXEC)" in source
+    assert "create_memfd(label)" in source
     # Attachers reach the creator's descriptor, and their handle must not
     # survive an exec either.
     assert 'f"/proc/{creator_pid}/fd/{creator_fd}", os.O_RDWR | os.O_CLOEXEC' in source
@@ -128,8 +130,8 @@ def test_allocator_creates_no_name_and_unlinks_nothing():
 
     assert "unlink" not in dump
     assert "SharedMemory" not in dump
+    assert "create_memfd" in dump
     assert set(_calls_to(allocate, "os")) == {
-        "memfd_create",
         "ftruncate",
         "getpid",
         "open",
@@ -192,7 +194,7 @@ def test_pool_allocation_passes_the_exchange_and_the_barrier():
 def test_skeleton_is_written_into_a_memfd_not_the_runtime_dir():
     source = WORKER_MANAGER.read_text()
 
-    assert 'os.memfd_create("batchgen_skeleton", os.MFD_CLOEXEC)' in source
+    assert 'create_memfd("batchgen_skeleton")' in source
     assert 'f"/proc/{os.getpid()}/fd/{fd}"' in source
     # The named temp file, its deletion and the atexit hook that existed only
     # to delete it are all gone.
@@ -381,7 +383,7 @@ def test_growth_keeps_the_superseded_mapping_valid():
 @requires_memfd
 def test_undersized_region_is_rejected_rather_than_truncated():
     allocate = _allocator()
-    fd = os.memfd_create("batchgen_input_ids_small", os.MFD_CLOEXEC)
+    fd = _create_memfd()("batchgen_input_ids_small")
     os.ftruncate(fd, 8)
     try:
         with pytest.raises(RuntimeError, match="need 64"):
@@ -410,3 +412,29 @@ def test_attacher_refuses_an_unpublished_creator():
             lambda pid, fd: (-1, -1),
             lambda: None,
         )
+
+
+def _create_memfd():
+    """Load create_memfd from process_utils without importing batchgen.server."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "batchgen" / "server" / "process_utils.py"
+    spec = importlib.util.spec_from_file_location("_process_utils_memfd", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.create_memfd
+
+
+@requires_memfd
+def test_create_memfd_falls_back_to_glibc_without_os_memfd_create(monkeypatch):
+    """Conda's Python lacks os.memfd_create; the ctypes path must still work."""
+    create_memfd = _create_memfd()
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    fd = create_memfd("batchgen_fallback_probe")
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+        assert target.startswith("/memfd:batchgen_fallback_probe")
+        assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        assert not any(p.name.startswith("batchgen_fallback_probe") for p in Path("/dev/shm").iterdir())
+    finally:
+        os.close(fd)

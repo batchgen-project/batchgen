@@ -24,6 +24,7 @@ from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
     cleanup_shm_files,
+    create_memfd,
     get_hugepage_size,
     get_model_byte_size,
     record_model_shm_provenance,
@@ -186,7 +187,7 @@ class WorkerManager:
         it. MFD_CLOEXEC keeps an exec'd child from holding it open instead.
         """
         self._close_skeleton_memfd()
-        fd = os.memfd_create("batchgen_skeleton", os.MFD_CLOEXEC)
+        fd = create_memfd("batchgen_skeleton")
         try:
             # dup so closing the wrapper does not close the descriptor the
             # workers will reach through /proc.

@@ -257,6 +257,7 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
     manager.parameter_server_instance = None
     manager.model_info = {}
     manager._model_shm_init_unconfirmed = False
+    manager._store_skeleton_state_dict = lambda skeleton_state_dict: None
     manager.args = SimpleNamespace(
         model=model,
         cache_dir=tmp_path / "cache",
