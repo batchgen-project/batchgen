@@ -250,7 +250,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fast-init",
         action="store_true",
-        help="Use memfd_create + THP for fast memory registration. "
+        help="Back the shared weights and host KV cache with transparent huge "
+             "pages (THP) for faster memory registration. The regions are "
+             "unnamed memfds in every mode; this flag only adds THP. "
              "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
              "(2) root access (for pre-allocation memory compaction). "
              "Automatically runs drop_caches + compact_memory before allocation "

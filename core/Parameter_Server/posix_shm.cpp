@@ -42,6 +42,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <filesystem>
@@ -871,7 +872,13 @@ int serialize_to_memfd(
     }
 
     // Write the data.
-    serialize_map_to_buffer(map, static_cast<char*>(addr), total_size);
+    try {
+        serialize_map_to_buffer(map, static_cast<char*>(addr), total_size);
+    } catch (...) {
+        munmap(addr, total_size);
+        close(fd);
+        throw;
+    }
 
     // Clean up; the fd is the caller's to keep and close.
     munmap(addr, total_size);
