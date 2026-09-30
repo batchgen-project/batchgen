@@ -135,17 +135,20 @@ static int create_anonymous_memfd(const char* name) {
     return static_cast<int>(syscall(SYS_memfd_create, name, MFD_CLOEXEC));
 }
 
-// Transparent huge pages are opt-in (--fast-init). Without that opt-in the
-// mapping is pinned to the base page size explicitly, so a host whose
-// /sys/kernel/mm/transparent_hugepage/shmem_enabled is "always" cannot silently
-// promote the region behind our back. A failed hint is not fatal.
+// --fast-init requests transparent huge pages explicitly. Without it the
+// mapping is not advised at all, so its page size follows the host's
+// /sys/kernel/mm/transparent_hugepage/shmem_enabled policy. A failed hint is
+// not fatal.
 static void advise_transparent_huge_pages(void* ptr, int64_t size,
                                           bool enable_thp) {
-    if (madvise(ptr, size, enable_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0) {
+    if (!enable_thp) {
+        return;
+    }
+    if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
         logger->warn(
-            "madvise({}) failed: {}; weights page size follows the system THP "
-            "setting",
-            enable_thp ? "MADV_HUGEPAGE" : "MADV_NOHUGEPAGE", strerror(errno));
+            "madvise(MADV_HUGEPAGE) failed: {}; weights page size follows the "
+            "system THP setting",
+            strerror(errno));
     }
 }
 

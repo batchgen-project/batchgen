@@ -109,12 +109,13 @@ def test_weight_allocation_failures_never_blame_fast_init():
             assert "touch" in line, line
 
 
-def test_weights_pin_base_page_size_unless_thp_is_requested():
+def test_weights_follow_system_page_size_unless_thp_is_requested():
     source = POSIX_SHM.read_text()
 
-    assert "enable_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE" in source
-    # Creator and attacher both advise, so one side cannot promote the mapping
-    # while the other keeps it at the base page size.
+    # Without --fast-init nothing is advised: the host's shmem_enabled decides.
+    assert "MADV_NOHUGEPAGE" not in source
+    assert "if (!enable_thp) {" in source
+    # Creator and attacher advise identically.
     assert (
         source.count("advise_transparent_huge_pages(ptr, allocated_size, enable_thp)")
         == 2
