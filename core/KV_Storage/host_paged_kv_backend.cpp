@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -132,7 +133,13 @@ int memfd_create_wrapper(const char* name, unsigned int flags) {
 // /sys/kernel/mm/transparent_hugepage/shmem_enabled is "always" cannot silently
 // promote the region behind our back.
 void AdviseTransparentHugePages(void* ptr, std::size_t size, bool enable_thp) {
-    madvise(ptr, size, enable_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+    if (madvise(ptr, size, enable_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0) {
+        std::fprintf(stderr,
+                     "[HostPagedKV] warning: madvise(%s) failed: %s; host KV page "
+                     "size follows the system THP setting\n",
+                     enable_thp ? "MADV_HUGEPAGE" : "MADV_NOHUGEPAGE",
+                     std::strerror(errno));
+    }
 }
 
 void TouchPagesMultiThreaded(void* ptr, std::size_t size, std::size_t stride) {
@@ -504,7 +511,9 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     // however that process died. Attachers reach it through
     // /proc/<creator_pid>/fd/<creator_fd>.
     if (create_region) {
-        int fd = memfd_create_wrapper("batchgen_kv", 0);
+        // Close-on-exec: an exec'd child must not keep the region alive;
+        // attachers open it through /proc, not by inheritance.
+        int fd = memfd_create_wrapper("batchgen_kv", MFD_CLOEXEC);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(),
                                     "memfd_create(batchgen_kv) failed");
@@ -553,7 +562,7 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     const std::string proc_path = "/proc/" +
                                   std::to_string(config.memfd_creator_pid) +
                                   "/fd/" + std::to_string(config.memfd_fd);
-    int fd = open(proc_path.c_str(), O_RDWR);
+    int fd = open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         throw std::runtime_error("Host KV attach cannot open " + proc_path +
                                  ": " + strerror(errno));

@@ -195,6 +195,7 @@ def _worker_proc_alloc(creator_pid, memfd_fd, device_index, requests):
     print(f"[worker {device_index}] page_table: {page_table}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_parallel_worker_allocate_sequences():
     shm_name = _random_shm_name()
     cfg = _make_deepseek_r1_config(shm_name)
@@ -355,6 +356,7 @@ def _worker_proc_copy_decode(creator_pid, memfd_fd, device_index, requests):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_kv_copy_prefill_d2h():
     PAGE_NUM_PER_SEQ = 200
     NUM_WORKERS = 8
@@ -457,6 +459,7 @@ def test_kv_copy_prefill_d2h():
             del manager
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_kv_copy_decode_d2h():
     PAGE_NUM_PER_SEQ = 10
     NUM_WORKERS = 8

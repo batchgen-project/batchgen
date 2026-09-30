@@ -171,8 +171,8 @@ def test_native_parameter_server_releases_full_memfd_mapping(tmp_path):
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux" or not torch.cuda.is_available(),
-    reason="native host KV memfd check requires Linux CUDA",
+    sys.platform != "linux",
+    reason="native host KV memfd check requires Linux",
 )
 def test_native_host_kv_manager_creates_no_named_shm_object():
     """Host KV names are labels; the region itself is an anonymous memfd."""

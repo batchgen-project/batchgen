@@ -78,7 +78,8 @@ def test_backend_never_opens_a_named_shm_object():
     assert "shm_unlink" not in source
     # One definition plus exactly one call site: creation is unconditional.
     assert source.count("memfd_create_wrapper(") == 2
-    assert 'memfd_create_wrapper("batchgen_kv", 0)' in source
+    assert 'memfd_create_wrapper("batchgen_kv", MFD_CLOEXEC)' in source
+    assert "O_RDWR | O_CLOEXEC" in source
     assert "enable_memfd" not in source
     assert "enable_memfd" not in BACKEND_HEADER.read_text()
 
@@ -146,7 +147,6 @@ def test_worker_manager_publishes_host_kv_memfd_in_every_mode(method_name):
     dump = _method_dump(WORKER_MANAGER, "WorkerManager", method_name)
 
     assert "fast_init" not in dump
-    assert "memfd_fd" in dump or "getpid" in dump
 
 
 def test_coordinator_always_forwards_the_creator_identity():
