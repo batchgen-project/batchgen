@@ -87,12 +87,14 @@ launcher owns its schema and admission checks.
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 0 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 
 # Node 1
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 1 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 ```
 
@@ -145,9 +147,10 @@ QueryBook table and weight skeleton are anonymous shared memory created with
 `memfd_create`. Workers attach to them through `/proc/<pid>/fd/<n>`; nothing is
 created by name in `/dev/shm` or a hugetlbfs mount. The kernel frees each region
 when the last process using it exits, however the processes stop, and workers
-are killed when their server process dies. After an abnormal exit only the
-per-run runtime directory under the temp directory (and Python's `sem.mp-*`
-semaphores if the whole process group was killed at once) can remain. The next
+are killed when their server process dies. After an abnormal exit, the only
+BatchGen objects that can remain are the per-run runtime directory under the
+temp directory and, if the whole process group was killed at once, Python's
+`sem.mp-*` semaphores. The next
 start of the same instance removes a previous run's runtime directory once its
 run lock proves every process of that run has exited, and refuses to start while
 one is still alive. The temp directory must be local to each node.
@@ -161,7 +164,7 @@ does not advise the shared regions, so their page size follows the host's
 Requests THP (2MB pages instead of 4KB) for the weights and host KV cache, which
 makes `cudaHostRegister` substantially faster. Before allocation it runs Linux
 memory compaction (`drop_caches` + `compact_memory`) to defragment physical
-memory, and it prefaults the weights. `--fast-init` is an explicit flag because
+memory, and it prefaults the weights and the host KV cache. `--fast-init` is an explicit flag because
 it needs the host setup below; the deployment recipes include it.
 
 **Requirements:**
@@ -177,7 +180,9 @@ echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
 model and allocates the weights with `memfd_create(MFD_HUGETLB)`; no hugetlbfs
 mount is needed. If the pool cannot satisfy the request, it falls back to a
 regular memfd with a warning. The `vm.nr_hugepages` reservation is host
-configuration: BatchGen does not reset it at shutdown.
+configuration: BatchGen does not reset it at shutdown. Setting it, like the
+`--fast-init` compaction, needs a writable `/proc/sys`; in a container that
+usually means `--privileged`.
 
 **Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit huge pages > THP). The host KV cache never uses hugetlbfs.
 
@@ -347,6 +352,7 @@ Completed sequences are written incrementally to a JSONL file on disk as they fi
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --incremental-output-dir /data/incremental_results
 ```
 
@@ -355,6 +361,7 @@ To disable:
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --no-incremental-save
 ```
 

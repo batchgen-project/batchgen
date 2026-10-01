@@ -154,12 +154,13 @@ Run on each node with the appropriate `--node-rank`. The container provides an i
 
 #### Option A: With `--cap-add=SYS_ADMIN` (Recommended)
 
-This option is required for `--enable-hugetlbfs`, which reserves the host's huge page pool:
+This option is required for `--enable-hugetlbfs`, which reserves the host's huge page pool. Setting that reservation also needs a writable `/proc/sys`, which in Docker usually means `--privileged`:
 
 ```bash
 # Node 0 (Master)
 docker run -it \
     --cap-add=SYS_ADMIN \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -170,6 +171,7 @@ docker run -it \
 # Node 1
 docker run -it \
     --cap-add=SYS_ADMIN \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -180,16 +182,18 @@ docker run -it \
 
 BatchGen's model weights and host KV cache are anonymous shared memory charged to
 host memory, not files in `/dev/shm`, so `/dev/shm` does not need to be remounted to
-the host memory size.
+the host memory size. NCCL and Python still use `/dev/shm`, and Docker's default is
+too small for them: start the container with `--ipc=host` or a `--shm-size` such as
+`64g`.
 
 #### Option B: With `--shm-size` (No SYS_ADMIN)
 
 If you cannot use `--cap-add=SYS_ADMIN`, start the container with a `--shm-size` for NCCL and Python's own shared memory:
 
 ```bash
-# Node 0 (Master) - Example with 2TB host memory
+# Node 0 (Master)
 docker run -it \
-    --shm-size=2048g \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -199,7 +203,7 @@ docker run -it \
 
 # Node 1
 docker run -it \
-    --shm-size=2048g \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -379,7 +383,7 @@ Key arguments for multi-node deployment:
 | `--nnodes` | 1 | Number of nodes in the cluster |
 | `--node-rank` | 0 | Rank of this node (0 = master) |
 | `--dist-init-addr` | localhost:12355 | Address for distributed init (`master-ip:port`) |
-| `--host-kv-cache-size` | None | Host KV cache size in GB (critical for throughput) |
+| `--host-kv-cache-size` | Required | Host KV cache size in GB (critical for throughput) |
 | `--storage-path` | batchgen/storage/ | Directory for files and batches |
 | `--save-result` | false | Save inference results to `{storage_path}/outputs/` |
 

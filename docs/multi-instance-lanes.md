@@ -60,8 +60,10 @@ admissions; it is not evidence that no process was created.
 A `stopped` record still blocks admission if its boot ID, PID start time, and
 process group identify a live owner, even when its recorded command is wrong.
 
-For the qualified GPT-OSS model, each SHM reservation must cover the model
-weight region, Host-KV allocation, and transient SHM headroom. The host-memory
+For the qualified GPT-OSS model, each SHM reservation (`--shm-gb`) must cover
+the model weight region, Host-KV allocation, and transient headroom. These are
+memfds charged to host memory, so the reservation is accounted inside the
+host-memory reservation rather than against a filesystem. The host-memory
 reservation must additionally cover private runtime headroom. Underreported
 lane budgets are rejected before launch. The host safety reserve is at least
 64 GiB; admitting a later lane preserves the largest active-lane reserve.
@@ -94,8 +96,8 @@ leftover runtime directory of the lane's instance is reclaimed only when taking
 its `run.lock` exclusively proves that every process of that run has exited;
 stop then removes that run's own `/dev/shm` files and the directory and records
 the run under `reclaimed` in the manifest. Any directory whose death cannot be
-proven, any other run-owned SHM, and any lane GPU process still fail the stop
-and stay in place. There is no TTL or time-based takeover.
+proven, any other run-prefixed `/dev/shm` object (normally none), and any lane
+GPU process still fail the stop and stay in place. There is no TTL or time-based takeover.
 `stop` also refuses an incomplete spawn intent with no verified process group.
 Inspect processes, GPU UUIDs, ports, lock holders, and SHM before any manual
 recovery; do not discard the manifest on the assumption that spawn failed.
