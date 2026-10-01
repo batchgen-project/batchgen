@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -22,6 +23,7 @@ from typing import Any, Iterable
 HOST_LOCK_ROOT = Path("/tmp/batchgen-runtime-locks")
 LANE_LOCK_ROOT = Path("/tmp/batchgen-lane-leases")
 STATE_ROOT = Path("/tmp/batchgen-lanes")
+SHM_ROOT = Path("/dev/shm")
 _CACHE_DIRS = {
     "temp": "tmp",
     "torch_extensions": "torch-extensions",
@@ -30,13 +32,17 @@ _CACHE_DIRS = {
     "cuda": "cuda-cache",
 }
 _GIB = 1024**3
+# The shared weight and host-KV regions are memfds charged to host memory
+# (Shmem), not files under /dev/shm, so the reservation sizes shared host
+# memory and is covered by the host-memory budget rather than a filesystem.
 _GPTOSS_WEIGHT_SHM_GIB = 70
 _SHM_TRANSIENT_RESERVE_GIB = 16
 _HOST_PRIVATE_RESERVE_GIB = 64
 _MIN_SAFETY_RESERVE_GIB = 64
 _INSTANCE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
-_MODEL_SHM_PROVENANCE = "model_shm.json"
-_SHM_ENTRY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
+# Every process of a run holds this file LOCK_SH for its whole life, so taking
+# it LOCK_EX proves that run is dead (batchgen/server/runtime_locks.py).
+_RUN_LOCK_NAME = "run.lock"
 _O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 _O200K_BASE_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790"
 
@@ -381,8 +387,13 @@ def _check_memory(
     active: Iterable[dict[str, Any]],
     *,
     meminfo_path: Path = Path("/proc/meminfo"),
-    shm_path: Path = Path("/dev/shm"),
 ) -> None:
+    """Admit a lane against host memory alone.
+
+    The shared regions are memfds charged to Shmem, so the lane's shared
+    reservation is already part of its host-memory reservation and of the
+    non-reclaimable host use measured here; no filesystem bounds it.
+    """
     active = list(active)
     meminfo = _parse_meminfo(meminfo_path)
     safety_reserve = candidate["safety_reserve_bytes"]
@@ -395,15 +406,6 @@ def _check_memory(
         raise LaneError("host-memory reservations exceed the admission limit")
     if _nonreclaimable_bytes(meminfo) + requested > memory_limit:
         raise LaneError("current host use plus the lane reservation is unsafe")
-
-    shm = os.statvfs(shm_path)
-    shm_free = shm.f_bavail * shm.f_frsize
-    shm_total = shm.f_blocks * shm.f_frsize
-    shm_reserved = sum(item.get("shm_reservation_bytes", 0) for item in active)
-    if shm_reserved + candidate["shm_reservation_bytes"] > shm_total:
-        raise LaneError("lane SHM reservations exceed /dev/shm capacity")
-    if candidate["shm_reservation_bytes"] > shm_free:
-        raise LaneError("lane SHM reservation exceeds current /dev/shm free space")
 
 
 def _check_ports_free(ports: Iterable[int]) -> None:
@@ -852,48 +854,95 @@ def start_lane(args: argparse.Namespace) -> dict[str, Any]:
         _close_fd(admission_fd)
 
 
-def _recorded_model_shm(
-    runtime_dirs: Iterable[Path], instance_id: str
-) -> list[str]:
-    """Read only this lane's run-owned model SHM provenance, fail closed."""
+def _notice(message: str) -> None:
+    print(f"lane-runtime: {message}", file=sys.stderr)
+
+
+def _open_dead_run_lock(directory: Path) -> int | None:
+    """Prove a leftover run is dead by taking its liveness lock exclusively.
+
+    A successful LOCK_EX means the kernel has already dropped every descriptor
+    of that run, so nothing of it is alive.  Anything that cannot be proven —
+    a symlink, a foreign owner, a missing or unreadable lock file, or a lock a
+    live process still holds — leaves the directory untouched.
+    """
+    try:
+        metadata = os.lstat(directory)
+    except OSError:
+        return None
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+    ):
+        return None
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(directory / _RUN_LOCK_NAME, flags)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _unlink_run_shm(shm_root: Path, prefix: str) -> list[str]:
+    """Unlink one proven-dead run's own /dev/shm objects, regular files only."""
+    removed: list[str] = []
+    if not shm_root.is_dir():
+        return removed
+    for entry in sorted(shm_root.iterdir()):
+        if not entry.name.startswith(prefix) or entry.is_symlink():
+            continue
+        if not entry.is_file():
+            continue
+        entry.unlink()
+        removed.append(str(entry))
+    return removed
+
+
+def _reclaim_dead_runs(
+    runtime_dirs: Iterable[Path], instance_id: str, shm_root: Path
+) -> tuple[list[str], list[Path]]:
+    """Remove the leftovers of this instance's runs that are provably dead.
+
+    Only exact `batchgen_<instance>_<run id>` directories are in scope; every
+    other leftover, and every run whose death cannot be proven, is returned as
+    a residual and preserved exactly as before.
+    """
     exact = re.compile(rf"batchgen_{re.escape(instance_id)}_[0-9a-f]{{32}}\Z")
-    names: list[str] = []
-    for directory in runtime_dirs:
-        if not exact.fullmatch(directory.name):
+    reclaimed: list[str] = []
+    residual: list[Path] = []
+    for directory in sorted(runtime_dirs):
+        fd = None
+        if exact.fullmatch(directory.name):
+            fd = _open_dead_run_lock(directory)
+        if fd is None:
+            residual.append(directory)
             continue
-        if directory.is_symlink():
-            raise LaneError(f"lane runtime directory is a symlink: {directory}")
-        path = directory / _MODEL_SHM_PROVENANCE
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise LaneError(
-                f"unreadable model SHM provenance {path}: {exc}"
-            ) from exc
-        try:
-            payload = json.loads(os.read(fd, 65536).decode())
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise LaneError(
-                f"malformed model SHM provenance {path}: {exc}"
-            ) from exc
+            removed = _unlink_run_shm(shm_root, f"{directory.name}.")
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                # Name what is already gone before failing closed.
+                _notice(
+                    f"dead run {directory.name}: removed "
+                    f"{', '.join(removed) or 'no shm objects'} but could not "
+                    f"remove {directory}"
+                )
+                raise
         finally:
             os.close(fd)
-        entries = payload.get("shm_names") if isinstance(payload, dict) else None
-        if (
-            not isinstance(payload, dict)
-            or payload.get("version") != 1
-            or not isinstance(entries, list)
-            or not entries
-            or any(
-                not isinstance(entry, str) or not _SHM_ENTRY_RE.fullmatch(entry)
-                for entry in entries
-            )
-        ):
-            raise LaneError(f"malformed model SHM provenance {path}")
-        names.extend(entries)
-    return names
+        reclaimed.append(directory.name)
+        _notice(
+            f"reclaimed dead run {directory.name}; every process of that run "
+            f"had exited. Removed: {', '.join([str(directory), *removed])}"
+        )
+    return reclaimed, residual
 
 
 def _lane_state_path(args: argparse.Namespace) -> Path:
@@ -959,8 +1008,14 @@ def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
         raise LaneError("refusing to signal an unverified lane owner")
 
     temp_root = Path(manifest["paths"]["temp"])
-    runtime_dirs = list(temp_root.glob(f"batchgen_{args.instance_id}_*"))
-    shm_root = Path("/dev/shm")
+    shm_root = SHM_ROOT
+    reclaimed, runtime_dirs = _reclaim_dead_runs(
+        temp_root.glob(f"batchgen_{args.instance_id}_*"),
+        args.instance_id,
+        shm_root,
+    )
+    if reclaimed:
+        manifest["reclaimed"] = reclaimed
     shm_name = re.compile(
         rf"batchgen_{re.escape(args.instance_id)}_[0-9a-f]{{32}}\."
     )
@@ -969,14 +1024,6 @@ def _stop_lane_under_admission_lock(args: argparse.Namespace) -> dict[str, Any]:
         for path in shm_root.glob(f"batchgen_{args.instance_id}_*")
         if shm_name.match(path.name)
     ]
-    # Model weight/metadata regions carry random names, so only this run's own
-    # provenance can prove they belong to this lane.
-    for name in _recorded_model_shm(runtime_dirs, args.instance_id):
-        recorded = shm_root / name
-        if recorded not in shm_objects and (
-            recorded.is_symlink() or recorded.exists()
-        ):
-            shm_objects.append(recorded)
     gpu_processes = [
         (uuid, process_pid)
         for uuid, process_pid in _gpu_processes()
