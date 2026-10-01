@@ -1510,6 +1510,16 @@ class BatchGenWorker:
 
 		def store_prompt(uuid: str, token_ids: torch.Tensor) -> torch.Tensor:
 			arr = token_ids.detach().to(dtype=torch.int32, device="cpu").contiguous().numpy()
+			needed_pages = (len(arr) + self._prompt_arena.page_size - 1) // self._prompt_arena.page_size
+			if self._prompt_arena.free_pages() < needed_pages:
+				old_arena = self._prompt_arena
+				new_capacity = max(old_arena.capacity_tokens * 2, old_arena.capacity_tokens + len(arr) * 2)
+				self._prompt_arena = PromptTokenArena(capacity_tokens=new_capacity)
+				for old_uuid, old_tensor in self._prompt_tensors.items():
+					self._prompt_handles[old_uuid] = self._prompt_arena.write(
+						old_tensor.view(-1).numpy()
+					)
+				old_arena.close()
 			handle = self._prompt_arena.write(arr)
 			self._prompt_handles[uuid] = handle
 			out = torch.empty((1, len(arr)), dtype=torch.int32)
