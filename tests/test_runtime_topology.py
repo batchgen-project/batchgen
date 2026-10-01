@@ -975,7 +975,8 @@ def test_stop_workers_names_what_an_abnormal_exit_leaves_behind():
     abnormal = [w for w in warnings if _ABNORMAL_EXIT_WARNING in w]
     assert len(abnormal) == 1
     assert leftover_shm in abnormal[0]
-    assert leftover_dir in abnormal[0]
+    # stop() removes the runtime dir after this warning, so it is not a leftover.
+    assert leftover_dir not in abnormal[0]
 
 
 def test_stop_workers_abnormal_exit_warning_states_when_nothing_remains():

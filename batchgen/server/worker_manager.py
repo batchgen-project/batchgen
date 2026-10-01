@@ -565,14 +565,22 @@ class WorkerManager:
 
                 if signal_fallback_used:
                     identity = self.args.runtime_identity
-                    leftovers = list_run_named_objects(
-                        identity.shm_prefix, identity.runtime_dir
-                    )
+                    # The runtime dir is still ours here; stop() removes it once
+                    # teardown is confirmed, so only name it as a leftover when
+                    # something else of this run also survives.
+                    leftovers = [
+                        name
+                        for name in list_run_named_objects(
+                            identity.shm_prefix, identity.runtime_dir
+                        )
+                        if name != str(identity.runtime_dir)
+                    ]
                     if leftovers:
                         remains = "Left behind for this run: " + ", ".join(leftovers)
                     else:
                         remains = (
-                            "Nothing named remains for this run; the model and KV "
+                            "Nothing named remains for this run beyond its runtime "
+                            "directory, which stop() removes; the model and KV "
                             "regions are anonymous memfds the kernel reclaims."
                         )
                     logger.warning(
