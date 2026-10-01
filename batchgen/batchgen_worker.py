@@ -1463,19 +1463,9 @@ class BatchGenWorker:
 				logging.info(f"[ADMIT] Updated max_input_length to {self.max_input_length}")
 			self._update_config_after_tokenization()
 
-		# Step 3: Assign ranks (round-robin, continuing from existing)
-		self._assign_admitted_sequences_to_ranks(new_uuids)
-
-		# Step 3b (Option 1, CORE): assign the serve-group at ADMISSION. Under
-		# unified resident TP (G>1) a sequence binds to ALL G ranks of its
-		# decode_dp_group from PREFILL onward (head-sharded KDA state + o_proj
-		# all_reduce need the group replicated at prefill, not reshuffled at the
-		# decode transition). No-op for G==1 (the validated pure-DP path never
-		# carries a group id). _config_prefill_for_batch re-runs this idempotently
-		# so evicted re-entries (whose group was cleared) re-group before binding.
-		self._assign_decode_dp_groups(new_uuids)
-
-		# Step 4: Build local query book entries for new sequences
+		# Step 3: Build local query book entries for new sequences. Ownership and
+		# decode groups were assigned during tokenization, before arena views were
+		# materialized.
 		self._build_local_query_book_for_admitted(new_uuids)
 
 		if self.rank == 0:
@@ -1541,6 +1531,13 @@ class BatchGenWorker:
 		self._prompt_handles = handles
 
 		for seq, tensor in valid:
+			owns_sequence = (
+				self._owns_local_sequence(seq)
+				if hasattr(self, "_owns_local_sequence")
+				else True
+			)
+			if not owns_sequence:
+				continue
 			handle = self._prompt_handles[seq.uuid]
 			out = torch.empty((1, int(tensor.numel())), dtype=torch.int32)
 			self._prompt_arena.read_into(handle, out.view(-1).numpy())
@@ -1715,6 +1712,20 @@ class BatchGenWorker:
 				})
 			self.global_batch.remove_sequence(uuid)
 
+		# Token lengths are now known, so assign ownership before materializing
+		# prompt tensors. The arena remains node-shared, but only ranks that will
+		# run a sequence need a local CPU view.
+		valid_uuids = []
+		for i, seq in enumerate(sequences):
+			if seq.uuid in rejected_uuids:
+				continue
+			seq.prompt_length = tokenized_by_idx[i]["length"]
+			valid_uuids.append(seq.uuid)
+		if hasattr(self, "_assign_admitted_sequences_to_ranks"):
+			self._assign_admitted_sequences_to_ranks(valid_uuids)
+		if hasattr(self, "_assign_decode_dp_groups"):
+			self._assign_decode_dp_groups(valid_uuids)
+
 		# The local-rank zero process is the sole writer for this host's arena.
 		# Other ranks attach to its anonymous memfd after the endpoint/handle map
 		# has crossed the process group. This keeps one canonical prompt copy per
@@ -1759,9 +1770,10 @@ class BatchGenWorker:
 			if seq.uuid in rejected_uuids:
 				continue
 			item = tokenized_by_idx[i]
+			has_prompt_arena = hasattr(self, "_publish_prompt_arena")
 			input_ids_tensor = (
-				self._prompt_tensors[seq.uuid]
-				if hasattr(self, "_prompt_tensors") and seq.uuid in self._prompt_tensors
+				self._prompt_tensors.get(seq.uuid)
+				if has_prompt_arena and hasattr(self, "_prompt_tensors")
 				else item["input_ids"]
 			)
 			actual_prompt_len = item["length"]
@@ -1778,8 +1790,9 @@ class BatchGenWorker:
 
 			slot = self._buffer_pool.allocate_slot()
 			try:
-				if hasattr(self, "_publish_prompt_arena"):
-					seq.input_ids = input_ids_tensor
+				if has_prompt_arena:
+					if input_ids_tensor is not None:
+						seq.input_ids = input_ids_tensor
 				else:
 					input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
 					input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)

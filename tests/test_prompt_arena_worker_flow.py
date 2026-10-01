@@ -82,6 +82,7 @@ def test_leader_publishes_int32_handles_and_reader_attaches():
             _prompt_handles={},
             _prompt_tensors={},
         )
+        reader._owns_local_sequence = lambda seq: seq.uuid == "a"
 
         def gather_reader(outputs, payload):
             outputs[:] = [(endpoint, handles), None]
@@ -89,7 +90,8 @@ def test_leader_publishes_int32_handles_and_reader_attaches():
         DIST.all_gather_object = gather_reader
         PUBLISH(reader, sequences, tokenized, set())
         assert not reader._prompt_arena.is_creator
-        assert reader._prompt_tensors["b"].tolist() == [[7, 8]]
+        assert reader._prompt_tensors["a"].tolist() == [[1, 2, 3]]
+        assert "b" not in reader._prompt_tensors
     finally:
         if getattr(reader, "_prompt_arena", None) is not None:
             reader._prompt_arena.close()
