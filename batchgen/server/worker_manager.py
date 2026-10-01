@@ -27,8 +27,6 @@ from batchgen.server.process_utils import (
     cleanup_shm_files,
     get_hugepage_size,
     get_model_byte_size,
-    record_model_shm_provenance,
-    verify_model_shm_absent,
 )
 from batchgen.server.runtime_locks import RuntimeLocks
 from batchgen.server.runtime_lease import LaneLease
@@ -150,8 +148,6 @@ class WorkerManager:
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
-        self._model_shm_init_unconfirmed = False
-        self._model_shm_release_unverified = False
         self.host_kv_manager = None
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
@@ -399,44 +395,25 @@ class WorkerManager:
                 self.distributed_weight_daemon = None
         finally:
             try:
-                # Clean only resources owned by this immutable run. The
-                # model-weight region predates RuntimeIdentity and has its own
-                # UUID name.
+                # Clean only resources owned by this immutable run. The model
+                # regions are outside this run's SHM namespace, so they are
+                # released through their C++ owner instead.
                 if worker_teardown_safe:
-                    if getattr(self, "_model_shm_init_unconfirmed", False):
-                        raise RuntimeError(
-                            "Model SHM creation was attempted but ownership is "
-                            "unconfirmed; preserving runtime artifacts and locks"
-                        )
-                    if getattr(self, "_model_shm_release_unverified", False):
-                        raise RuntimeError(
-                            "Model SHM owner release was not verified; "
-                            "preserving runtime artifacts and locks"
-                        )
                     if self._runtime_namespace_owned:
                         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:
                         model_release_start = time.monotonic()
-                        self._model_shm_release_unverified = True
                         self.parameter_server_instance = None
                         gc.collect()
-                        verify_model_shm_absent(
-                            self.model_info,
-                            hugepages_dir=(
-                                Path("/dev/hugepages")
-                                if self.args.enable_hugetlbfs else None
-                            ),
-                        )
-                        self._model_shm_release_unverified = False
                         logging.getLogger("uvicorn.error").info(
                             "[shutdown] model SHM owner release elapsed=%.3fs",
                             time.monotonic() - model_release_start,
                         )
-                    else:
-                        # Remote parameter servers and distributed stores own
-                        # their names; this worker only borrowed them.
-                        self.model_info.pop("shm_name", None)
-                        self.model_info.pop("tensor_meta_shm_name", None)
+                    # Both model regions are anonymous memfds in every mode, so
+                    # dropping the owner above is the whole release: the labels
+                    # name no object a supervisor could find afterwards.
+                    self.model_info.pop("shm_name", None)
+                    self.model_info.pop("tensor_meta_shm_name", None)
 
                     self._close_skeleton_memfd()
                     runtime_dir = self.args.runtime_identity.runtime_dir
@@ -682,7 +659,10 @@ class WorkerManager:
             logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
 
     def _config_hugepages(self, byte_size: int = None) -> None:
-        """Configure hugepages for shared memory.
+        """Reserve the host huge page pool the weights memfd draws from.
+
+        MFD_HUGETLB needs no hugetlbfs mount, only the reservation, so this
+        configures the pool size and nothing else.
 
         Args:
             byte_size: Model size in bytes. If None, uses default 700GB.
@@ -702,18 +682,13 @@ class WorkerManager:
             f"{hugepage_size / (1024**2):.0f} MB pages)"
         )
 
-        commands = [
-            ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"],
-            ["mkdir", "-p", "/dev/hugepages"],
-            ["mount", "-t", "hugetlbfs", "none", "/dev/hugepages"],
-        ]
-        for cmd in commands:
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:
-                logger.warning(
-                    "Hugepages configuration failed (%s): %s", cmd, exc
-                )
+        cmd = ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except Exception as exc:
+            logger.warning(
+                "Hugepages configuration failed (%s): %s", cmd, exc
+            )
 
     def _load_model_resources(self) -> None:
         import sys as _diag_sys, time as _diag_time
@@ -913,9 +888,8 @@ class WorkerManager:
         return -1
 
     # The local parameter server owns both the weights and the tensor-metadata
-    # memfd, so its pid and fds are published to the workers in every mode.
-    # With hugetlbfs the weights come from a file and only the metadata fd is
-    # published.
+    # memfd, so its pid and fds are published to the workers in every mode,
+    # hugetlbfs included: that mode only changes the memfd's page size.
     def _get_weights_memfd_pid(self) -> int:
         ps = getattr(self, 'parameter_server_instance', None)
         if ps is None:
@@ -1100,7 +1074,6 @@ class WorkerManager:
         self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         model_lower = self.args.model.lower()
-        reserved_shm_names = None
         if "deepseek-v4" in model_lower:
             from batchgen.models.deepseek.deepseekv4_flash.deepseekv4_flash_parameter_server import (
                 DeepSeekV4Flash_Parameter_Server,
@@ -1146,21 +1119,6 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_thp=self.args.fast_init,
             )
-            # Reserve and record the exact random names before the hugetlbfs
-            # weights file is created or the long checkpoint conversion runs: a
-            # crash in between would otherwise leave a file nobody can
-            # attribute.
-            reserved_shm_names = parameter_server.reserve_shm_names()
-            record_model_shm_provenance(
-                {
-                    "shm_name": reserved_shm_names[0],
-                    "tensor_meta_shm_name": reserved_shm_names[1],
-                },
-                self.args.runtime_identity.runtime_dir,
-            )
-            # A reservation is not proof that C++ successfully created that
-            # file. Preserve the record if Init fails after creation begins.
-            self._model_shm_init_unconfirmed = True
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
                 KimiLinear_Parameter_Server,
@@ -1225,32 +1183,11 @@ class WorkerManager:
             print(f"[DIAG {_diag_time2.time():.3f}] {msg}", flush=True)
             _diag_sys2.stdout.flush()
         _diag2("    >>> parameter_server.Init()")
-        try:
-            shm_name, tensor_meta_shm_name = parameter_server.Init()
-        except BaseException:
-            if (
-                reserved_shm_names is not None
-                and getattr(parameter_server, "shm_creation_attempted", None) is False
-            ):
-                self._model_shm_init_unconfirmed = False
-            raise
+        shm_name, tensor_meta_shm_name = parameter_server.Init()
         _diag2("    <<< parameter_server.Init() returned")
-        if (
-            reserved_shm_names is not None
-            and (shm_name, tensor_meta_shm_name) != reserved_shm_names
-        ):
-            raise RuntimeError(
-                "Parameter server used model SHM names that differ from the "
-                f"recorded reservation {reserved_shm_names}: "
-                f"{(shm_name, tensor_meta_shm_name)}"
-            )
-        if reserved_shm_names is not None:
-            self.parameter_server_instance = parameter_server
-            self.model_info = {
-                "shm_name": shm_name,
-                "tensor_meta_shm_name": tensor_meta_shm_name,
-            }
-            self._model_shm_init_unconfirmed = False
+        # Publish the owner before anything else can fail: a startup rollback
+        # has to be able to release the regions Init just created.
+        self.parameter_server_instance = parameter_server
         ps_size = parameter_server.parameter_server.byte_size()
         _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
@@ -1258,7 +1195,6 @@ class WorkerManager:
         skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
         self._store_skeleton_state_dict(skeleton_state_dict)
         self.skeleton_state_dict = None  # Don't keep tensors in memory
-        self.parameter_server_instance = parameter_server
         self.model_info = {
             "huggingface_ckpt_name": self.args.model,
             "shm_name": shm_name,
@@ -1266,13 +1202,6 @@ class WorkerManager:
             "converted_ckpt_dir": converted_ckpt_dir,
             "parameter_server_size": ps_size,
         }
-        # Only this run owns these randomly named regions, so record them now;
-        # a supervisor cannot otherwise attribute them after an abrupt exit.
-        # A reserved run already wrote the identical record before Init.
-        if reserved_shm_names is None:
-            record_model_shm_provenance(
-                self.model_info, self.args.runtime_identity.runtime_dir
-            )
         logger.info("Local parameter server initialized: %s", self.model_info)
 
     def _load_model_from_remote_server(

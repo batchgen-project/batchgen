@@ -427,19 +427,13 @@ void Parameter_Server::Init(
     // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
     int memfd_fd_out = -1;
-    bool weight_hugetlbfs_owned = false;
-    std::string weight_hugetlbfs_path;
     int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
                                                this->enable_thp_, -1, -1,
                                                &memfd_fd_out,
-                                               &weight_hugetlbfs_owned,
-                                               &weight_hugetlbfs_path,
                                                &mapped_size);
     this->shm_name = weight_shm_name;
-    this->weight_hugetlbfs_owned_ = weight_hugetlbfs_owned;
-    this->weight_hugetlbfs_path_ = weight_hugetlbfs_path;
     this->weights_memfd_fd_ = memfd_fd_out;
     this->byte_size_ = byte_size;
     this->mapped_size_ = mapped_size;
@@ -610,13 +604,9 @@ Parameter_Server::~Parameter_Server() {
     if (this->weight_ptr_ != nullptr) {
         free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
     }
-    // Only the exact hugetlbfs path this process created with O_EXCL and
-    // mapped successfully is removed; unmapping above already happened.
-    if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty()) {
-        unlink(this->weight_hugetlbfs_path_.c_str());
-    }
     // Closing the memfds drops the last reference the kernel needs: no name
-    // survives this process, so nothing is left to unlink.
+    // survives this process in any mode, hugetlbfs included, so nothing is left
+    // to unlink.
     if (this->weights_memfd_fd_ >= 0) {
         close(this->weights_memfd_fd_);
         this->weights_memfd_fd_ = -1;

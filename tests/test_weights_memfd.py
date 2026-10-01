@@ -1,14 +1,17 @@
-"""Model weights and tensor metadata must never be named /dev/shm objects.
+"""Model weights and tensor metadata must never be named objects.
 
 A named region outlives the processes that mapped it, so a crashed server can
 leave the whole model weight budget pinned until something unlinks the name.
-Both regions are therefore anonymous memfds whenever hugetlbfs is not requested,
-and `--fast-init` only adds transparent huge pages and prefaulting on top.
+Both regions are therefore anonymous memfds in every mode: `--enable-hugetlbfs`
+only takes the weights memfd from the host's huge page pool instead of base
+pages, and `--fast-init` only adds transparent huge pages and prefaulting.
 """
 
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -87,6 +90,10 @@ def test_parameter_server_sources_never_open_a_named_shm_object():
     assert "shm_unlink" not in source
     assert "shm_open" not in PARAMETER_SERVER.read_text()
     assert "shm_unlink" not in PARAMETER_SERVER.read_text()
+    # The hugetlbfs mode used to open /dev/hugepages/<name>, which survived a
+    # crash until the destructor ran.
+    assert "/dev/hugepages" not in source
+    assert "unlink" not in source
     # One definition plus exactly two call sites: the weights region and the
     # tensor-metadata region, both created unconditionally.
     assert source.count("create_anonymous_memfd(") == 3
@@ -115,11 +122,13 @@ def test_weights_follow_system_page_size_unless_thp_is_requested():
     # Without --fast-init nothing is advised: the host's shmem_enabled decides.
     assert "MADV_NOHUGEPAGE" not in source
     assert "if (!enable_thp) {" in source
-    # Creator and attacher advise identically.
+    # Creator and attacher advise identically, except that THP cannot apply to
+    # a mapping whose pages already come from the huge page pool.
     assert (
         source.count("advise_transparent_huge_pages(ptr, allocated_size, enable_thp)")
-        == 2
+        == 1
     )
+    assert "enable_thp && !fd_is_hugetlb);" in source
 
     # The 2 MiB prefault stays behind the THP opt-in; without it the mapping
     # keeps the base-page-stride touch.
@@ -142,7 +151,7 @@ def test_allocator_signature_drops_named_shm_ownership():
     assert "deserialize_from_shared_memory" not in header
 
 
-def test_parameter_server_owns_both_memfds_and_unlinks_only_hugetlbfs():
+def test_parameter_server_owns_both_memfds_and_unlinks_nothing():
     header = PARAMETER_SERVER_HEADER.read_text()
     source = PARAMETER_SERVER.read_text()
 
@@ -150,13 +159,48 @@ def test_parameter_server_owns_both_memfds_and_unlinks_only_hugetlbfs():
     assert "int tensor_meta_memfd_fd() const" in header
     assert "weight_posix_shm_owned_" not in header
     assert "tensor_meta_shm_owned_" not in header
+    # Nothing names the hugetlbfs region any more, so no path is tracked for it.
+    assert "weight_hugetlbfs_owned_" not in header
+    assert "weight_hugetlbfs_path_" not in header
 
     assert "serialize_to_memfd(this->module_weights_storage_)" in source
     destructor = source.split("Parameter_Server::~Parameter_Server()", 1)[1]
     destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
     assert "close(this->weights_memfd_fd_)" in destructor
     assert "close(this->tensor_meta_memfd_fd_)" in destructor
-    assert "unlink(this->weight_hugetlbfs_path_.c_str())" in destructor
+    assert "unlink(" not in destructor
+
+
+def test_hugetlbfs_weights_are_an_unnamed_huge_page_memfd():
+    source = POSIX_SHM.read_text()
+    header = POSIX_SHM_HEADER.read_text()
+
+    assert "syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_HUGETLB)" in source
+    assert 'create_huge_anonymous_memfd("batchgen_weights")' in source
+    # The huge page size is the host's default, so the region is rounded and
+    # mapped to exactly that, not to a hardcoded 2 MB.
+    assert "default_huge_page_size()" in source
+    assert "ftruncate64(fd, hugetlb_size)" in source
+    # Only the creator allocates; an attacher cannot name a memfd, so it takes
+    # the same /proc path in both modes.
+    assert "if (enable_hugetlbfs && create) {" in source
+    # The ownership bookkeeping a named file needed is gone from the signature.
+    for dead in ("out_hugetlbfs_owned", "out_hugetlbfs_path", "hugepage_path"):
+        assert dead not in source, dead
+        assert dead not in header, dead
+
+
+def test_hugepage_setup_reserves_the_pool_without_mounting_hugetlbfs():
+    source = WORKER_MANAGER.read_text()
+    config = source.split("def _config_hugepages(", 1)[1]
+    config = config.split("\n    def ", 1)[0]
+
+    # memfd needs the reservation, which stays host/operator configuration.
+    assert '["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]' in config
+    # It needs no mount point, so the server no longer creates or mounts one.
+    assert '"mount"' not in config
+    assert '"mkdir"' not in config
+    assert "/dev/hugepages" not in source
 
 
 def test_worker_side_attaches_both_regions_through_the_creator_fds():
@@ -230,13 +274,82 @@ def test_model_parameter_servers_forward_thp_and_drop_the_shm_check(path):
     assert 'disk_usage("/dev/shm")' not in source
 
 
-def test_release_path_verifies_only_the_hugetlbfs_weight_name():
-    source = PROCESS_UTILS.read_text()
+def test_release_path_has_no_named_model_region_left_to_verify():
+    process_utils = PROCESS_UTILS.read_text()
+    manager = WORKER_MANAGER.read_text()
 
-    assert 'MODEL_NAMED_SHM_KEYS = ("shm_name",)' in source
-    verify = source.split("def verify_model_shm_absent(", 1)[1]
-    verify = verify.split("\ndef ", 1)[0]
-    assert "shm_dir" not in verify
-    assert "hugepages_dir" in verify
-    # The label is still validated even when no path is built from it.
-    assert "_validated_shm_entry_name(name)" in verify
+    # No mode leaves a model region on disk, so there is nothing to record and
+    # nothing whose absence could be proven.
+    for dead in (
+        "MODEL_SHM_KEYS",
+        "MODEL_NAMED_SHM_KEYS",
+        "MODEL_SHM_PROVENANCE_FILE",
+        "model_shm.json",
+        "record_model_shm_provenance",
+        "verify_model_shm_absent",
+        "hugepages_dir",
+    ):
+        assert dead not in process_utils, dead
+        assert dead not in manager, dead
+
+    # The owner still has to be dropped, which is what closes the memfds.
+    assert "self.parameter_server_instance = None" in manager
+    assert 'self.model_info.pop("shm_name", None)' in manager
+    assert 'self.model_info.pop("tensor_meta_shm_name", None)' in manager
+
+
+_HUGE_MEMFD_PROGRAM = """
+import ctypes
+import mmap
+import os
+import sys
+
+MFD_CLOEXEC = 0x0001
+MFD_HUGETLB = 0x0004
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+fd = libc.memfd_create(b"batchgen_weights", MFD_CLOEXEC | MFD_HUGETLB)
+if fd < 0:
+    sys.exit(f"memfd_create(MFD_HUGETLB) failed: {os.strerror(ctypes.get_errno())}")
+size = int(sys.argv[1])
+os.ftruncate(fd, size)
+region = mmap.mmap(fd, size, flags=mmap.MAP_SHARED)
+region[0] = 7
+# The region is unnamed: only the creator's fd reaches it.
+assert "memfd:batchgen_weights" in os.readlink(f"/proc/self/fd/{fd}")
+assert not os.path.exists("/dev/hugepages/batchgen_weights")
+region.close()
+os.close(fd)
+"""
+
+
+def _free_huge_pages() -> tuple[int, int]:
+    """Return (free huge pages, huge page size in bytes) from /proc/meminfo."""
+    free, size = 0, 0
+    with open("/proc/meminfo") as meminfo:
+        for line in meminfo:
+            if line.startswith("HugePages_Free:"):
+                free = int(line.split()[1])
+            elif line.startswith("Hugepagesize:"):
+                size = int(line.split()[1]) * 1024
+    return free, size
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="MFD_HUGETLB requires Linux"
+)
+def test_native_huge_page_memfd_carries_no_name():
+    """The real syscall, when the host actually has huge pages reserved."""
+    free, huge_page_size = _free_huge_pages()
+    if huge_page_size == 0 or free < 4:
+        pytest.skip(f"host has {free} free huge pages; need 4")
+
+    # A child process keeps the huge page mapping out of this process.
+    result = subprocess.run(
+        [sys.executable, "-c", _HUGE_MEMFD_PROGRAM, str(2 * huge_page_size)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

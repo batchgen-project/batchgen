@@ -81,15 +81,13 @@ class Parameter_Server {
     std::shared_ptr<spdlog::logger> logger;
 
     /* "attn_0" -> "o_proj" -> ptr */
-    // Only the hugetlbfs path turns shm_name into a file; both names are
-    // otherwise labels, because the regions are anonymous memfds.
+    // Both names are labels in every mode, including hugetlbfs: the regions are
+    // anonymous memfds, so no filesystem object carries them.
     std::string shm_name;
     std::string tensor_meta_shm_name;
     void* weight_ptr_ = nullptr;
     int64_t byte_size_ = 0;
     int64_t mapped_size_ = 0;
-    bool weight_hugetlbfs_owned_ = false;
-    std::string weight_hugetlbfs_path_;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;

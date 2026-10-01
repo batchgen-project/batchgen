@@ -72,8 +72,8 @@ class Weights_Storage {
     
     ~Weights_Storage();
     
-    // memfd_creator_pid owns both the weights and tensor-metadata memfds; with
-    // hugetlbfs the weights fd stays -1 and only the metadata fd is used.
+    // memfd_creator_pid owns both the weights and tensor-metadata memfds in
+    // every mode, hugetlbfs included, so both fds are always used.
     void Init(std::string& shm_name, int64_t byte_size,
                 std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
                 bool enable_thp = false, int memfd_creator_pid = -1,
@@ -99,8 +99,8 @@ class Weights_Storage {
     void* weight_ptr_ = nullptr;
     int64_t byte_size_ = 0;
     // Bytes actually mapped by allocate_shared_pinned_memory, which rounds up
-    // to a huge page. munmap on hugetlbfs rejects a non-aligned length, so the
-    // release must use this, not byte_size_.
+    // to a huge page. munmap on a huge page mapping rejects a non-aligned
+    // length, so the release must use this, not byte_size_.
     int64_t mapped_size_ = 0;
 
     /* "attn_0" -> "o_proj" -> ptr */
