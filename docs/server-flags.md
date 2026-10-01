@@ -104,12 +104,12 @@ python -m batchgen.launch_http_server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-cache-size` | Auto | Host KV cache size in GB. Critical for throughput. |
+| `--host-kv-cache-size` | Required | Host KV cache size in GB. Critical for throughput. |
 | `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`). Values are not validated at parse time — typos are accepted silently. |
 
-**Auto-detection formula** (when `--host-kv-cache-size` is not specified):
+**Sizing guideline:**
 ```
-host_kv_cache_size = host_mem × 0.9 - model_size
+host_kv_cache_size ≈ host_mem × 0.9 - model_size
 ```
 
 For DeepSeek-R1 (~700GB model) on a 1.5TB memory node:
