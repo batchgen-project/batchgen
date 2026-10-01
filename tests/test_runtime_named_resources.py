@@ -110,7 +110,7 @@ def test_runtime_identity_rejects_malformed_run_ids(run_id):
 
 
 @pytest.mark.skipif(
-    not hasattr(os, "memfd_create"), reason="memfd_create requires Linux"
+    not sys.platform.startswith("linux"), reason="memfd_create requires Linux"
 )
 def test_query_book_creator_cannot_touch_a_same_named_segment():
     """The QueryBook label is a memfd tag, so it can never collide on a name."""

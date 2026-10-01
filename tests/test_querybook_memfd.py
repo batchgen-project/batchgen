@@ -103,6 +103,7 @@ def _allocator():
         "Tuple": Tuple,
         "os": os,
         "torch": torch,
+        "create_memfd": _create_memfd(),
     }
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
     return namespace["allocate_node_shared_int64"]
@@ -252,6 +253,7 @@ def _skeleton_holder():
         "logging": logging,
         "os": os,
         "torch": torch,
+        "create_memfd": _create_memfd(),
     }
     exec(
         compile(ast.fix_missing_locations(module), str(WORKER_MANAGER), "exec"),

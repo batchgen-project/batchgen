@@ -2,6 +2,7 @@
 
 import gc
 import os
+import sys
 
 import pytest
 import torch
@@ -25,7 +26,7 @@ def test_recycled_slot_after_pool_creation_in_inference_mode():
 
 
 @pytest.mark.skipif(
-    not hasattr(os, "memfd_create"), reason="memfd_create requires Linux"
+    not sys.platform.startswith("linux"), reason="memfd_create requires Linux"
 )
 def test_shared_input_buffer_created_in_inference_mode_is_later_writable():
     with torch.inference_mode():
