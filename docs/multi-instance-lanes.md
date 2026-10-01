@@ -10,7 +10,9 @@ The initial qualification is deliberately narrow:
 - model `openai/gpt-oss-120b`;
 - one node;
 - 1, 2, 4, or 8 physical GPU UUIDs per lane;
-- explicit host-memory and `/dev/shm` reservations; and
+- explicit host-memory reservations, which include the lane's shared weight
+  and host KV regions (anonymous memfds charged to host memory, not
+  `/dev/shm` files); and
 - explicit, non-overlapping HTTP, distributed-init, and bounded PyNccl ports.
 
 Before any remote `start`, `stop`, `verify`, or `exclusive-run`, operators and
@@ -87,8 +89,13 @@ after the lock holder finishes. `stop` opens a PIDFD, revalidates the owner,
 and sends TERM only through that descriptor. If graceful stop times out, it
 sends KILL only to that same owner descriptor while its identity still matches;
 it never signals a numeric PID or process group. If the owner exits while its
-process group remains, or run-owned SHM/runtime directories remain, stop fails
-closed and leaves evidence in place. There is no TTL or stale-state takeover.
+process group remains, stop fails closed and leaves evidence in place. A
+leftover runtime directory of the lane's instance is reclaimed only when taking
+its `run.lock` exclusively proves that every process of that run has exited;
+stop then removes that run's own `/dev/shm` files and the directory and records
+the run under `reclaimed` in the manifest. Any directory whose death cannot be
+proven, any other run-owned SHM, and any lane GPU process still fail the stop
+and stay in place. There is no TTL or time-based takeover.
 `stop` also refuses an incomplete spawn intent with no verified process group.
 Inspect processes, GPU UUIDs, ports, lock holders, and SHM before any manual
 recovery; do not discard the manifest on the assumption that spawn failed.
@@ -101,8 +108,9 @@ clean and strict-verify procedure; those machine-access scripts are not
 distributed in this repository. Never substitute a lane `stop` or `verify`
 for exclusive whole-node maintenance.
 
-The clean command fails immediately while any shared lane (including an orphaned
-worker that inherited the host lock) is alive. The strict zero-GPU, clean-SHM,
+The clean command fails immediately while any shared lane is alive. Workers
+are killed when their server process dies, so a lane cannot leave orphaned
+workers behind. The strict zero-GPU, clean-SHM,
 and host-memory verifier must pass before a new fleet starts.
 
 ## Qualification boundary

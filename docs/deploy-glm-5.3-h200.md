@@ -69,15 +69,15 @@ license inventory is recorded in [Third-party runtime licenses](third-party-lice
 ## 4. Prepare the host
 
 Use an otherwise idle 8×H200 host with sufficient RAM for the FP8 weights and
-host KV cache. The standard H200 pre-launch clean step now remounts `/dev/shm`
-to the host's `MemTotal` and verifies the resulting capacity before allowing a
-server launch. Run the family-specific identity gate, clean step, and verifier
-for the exact assigned host before starting the server.
+host KV cache. The weights and host KV cache are anonymous shared memory charged
+to host memory, not `/dev/shm` files, so `/dev/shm` needs no remount. Run the
+family-specific identity gate, clean step, and verifier for the exact assigned
+host before starting the server.
 
-Start the server with `--fast-init`. It allocates the shared FP8 weights and the
-host KV cache as unnamed memory backed by shared-memory transparent huge pages,
-so they are not named files in `/dev/shm` and are released by the kernel even
-if the server is stopped forcibly. Before allocating, it drops the page cache
+Start the server with `--fast-init`. In every mode the shared FP8 weights and
+the host KV cache are unnamed memory that the kernel releases even if the server
+is stopped forcibly; `--fast-init` backs them with shared-memory transparent huge
+pages for faster registration. Before allocating, it drops the page cache
 and compacts memory host-wide, so use it on a dedicated host. It needs
 shared-memory transparent huge pages enabled:
 

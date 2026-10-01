@@ -94,12 +94,9 @@ docker run -it \
     batchgen:latest
 ```
 
-Inside the container, remount `/dev/shm` with all available host memory:
-
-```bash
-# Recommended: mount all available host memory
-mount -o remount,size=2048G /dev/shm
-```
+BatchGen's model weights and host KV cache are anonymous shared memory charged to
+host memory, not files in `/dev/shm`, so `/dev/shm` does not need to be remounted to
+the host memory size.
 
 ---
 
