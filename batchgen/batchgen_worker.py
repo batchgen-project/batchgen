@@ -1484,6 +1484,67 @@ class BatchGenWorker:
 				f"global_batch now has {len(self.global_batch)} sequences"
 			)
 
+	def _publish_prompt_arena(
+		self,
+		sequences: Sequence,
+		tokenized_by_idx: Dict[int, Dict[str, object]],
+		rejected_uuids: Set[str],
+	) -> None:
+		"""Publish prompt handles from the node leader and attach local readers."""
+		valid = [
+			(seq, tokenized_by_idx[i]["input_ids"])
+			for i, seq in enumerate(sequences)
+			if seq.uuid not in rejected_uuids and i in tokenized_by_idx
+		]
+		leader = self.local_rank == 0
+		if leader:
+			if self._prompt_arena is None:
+				capacity = max(1 << 20, sum(int(t.numel()) for _, t in valid) * 2)
+				self._prompt_arena = PromptTokenArena.create(
+					f"{self._query_book_shm_prefix}_prompt_n{self.rank // self.local_world_size}",
+					capacity_bytes=capacity * 4,
+				)
+			needed = sum(
+				self._prompt_arena.pages_for(int(t.numel())) for _, t in valid
+			)
+			if needed > self._prompt_arena.free_pages:
+				old_arena = self._prompt_arena
+				new_capacity = max(
+					old_arena.capacity_tokens * 2,
+					old_arena.capacity_tokens + needed * old_arena.page_size_tokens * 2,
+				)
+				self._prompt_arena = PromptTokenArena.create(
+					f"{self._query_book_shm_prefix}_prompt_n{self.rank // self.local_world_size}",
+					capacity_bytes=new_capacity * 4,
+				)
+				for old_uuid, old_tensor in self._prompt_tensors.items():
+					self._prompt_handles[old_uuid] = self._prompt_arena.write(
+						old_tensor.view(-1).numpy()
+					)
+				old_arena.close()
+			for seq, tensor in valid:
+				arr = tensor.detach().to(dtype=torch.int32, device="cpu").contiguous().numpy()
+				self._prompt_handles[seq.uuid] = self._prompt_arena.write(arr)
+			payload = (self._prompt_arena.endpoint, dict(self._prompt_handles))
+		else:
+			payload = None
+
+		all_payloads = [None] * self.world_size
+		dist.all_gather_object(all_payloads, payload)
+		leader_rank = (self.rank // self.local_world_size) * self.local_world_size
+		endpoint, handles = all_payloads[leader_rank]
+		if not leader:
+			if self._prompt_arena is not None:
+				self._prompt_arena.close()
+			self._prompt_arena = PromptTokenArena.attach(endpoint)
+		self._prompt_handles = handles
+
+		for seq, tensor in valid:
+			handle = self._prompt_handles[seq.uuid]
+			out = torch.empty((1, int(tensor.numel())), dtype=torch.int32)
+			self._prompt_arena.read_into(handle, out.view(-1).numpy())
+			self._prompt_tensors[seq.uuid] = out
+
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
 		"""Tokenize newly admitted sequences and assign buffer pool slots.
 
@@ -1505,27 +1566,6 @@ class BatchGenWorker:
 		so only one rank per node holds a tokenizer host-memory peak at a time.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
-		if self._prompt_arena is None:
-			self._prompt_arena = PromptTokenArena(capacity_tokens=max(1 << 20, sum(len(s.text) for s in sequences) * 2))
-
-		def store_prompt(uuid: str, token_ids: torch.Tensor) -> torch.Tensor:
-			arr = token_ids.detach().to(dtype=torch.int32, device="cpu").contiguous().numpy()
-			needed_pages = (len(arr) + self._prompt_arena.page_size - 1) // self._prompt_arena.page_size
-			if self._prompt_arena.free_pages() < needed_pages:
-				old_arena = self._prompt_arena
-				new_capacity = max(old_arena.capacity_tokens * 2, old_arena.capacity_tokens + len(arr) * 2)
-				self._prompt_arena = PromptTokenArena(capacity_tokens=new_capacity)
-				for old_uuid, old_tensor in self._prompt_tensors.items():
-					self._prompt_handles[old_uuid] = self._prompt_arena.write(
-						old_tensor.view(-1).numpy()
-					)
-				old_arena.close()
-			handle = self._prompt_arena.write(arr)
-			self._prompt_handles[uuid] = handle
-			out = torch.empty((1, len(arr)), dtype=torch.int32)
-			self._prompt_arena.read_into(handle, out.view(-1).numpy())
-			self._prompt_tensors[uuid] = out
-			return out
 		all_texts = [seq.text for seq in sequences]
 		num_new = len(all_texts)
 
@@ -1651,6 +1691,16 @@ class BatchGenWorker:
 				})
 			self.global_batch.remove_sequence(uuid)
 
+		# The local-rank zero process is the sole writer for this host's arena.
+		# Other ranks attach to its anonymous memfd after the endpoint/handle map
+		# has crossed the process group. This keeps one canonical prompt copy per
+		# node while preserving the existing per-rank tensor interface.
+		self._publish_prompt_arena(
+			sequences,
+			tokenized_by_idx,
+			set(rejected_uuids),
+		)
+
 		# Phase 2.75: size the pool for what this admission actually needs.
 		# COLLECTIVE — every rank runs it with the same numbers: the admission
 		# message was broadcast and the tokenized lengths were shared above.
@@ -1684,7 +1734,7 @@ class BatchGenWorker:
 			if seq.uuid in rejected_uuids:
 				continue
 			item = tokenized_by_idx[i]
-			input_ids_tensor = item["input_ids"]
+			input_ids_tensor = self._prompt_tensors[seq.uuid]
 			actual_prompt_len = item["length"]
 
 			seq_extended_size = seq.clamp_decode_to_context(
@@ -1911,7 +1961,7 @@ class BatchGenWorker:
 				# for this seq must not free a slot now owned by another seq.
 				seq._buffer_slot = -1
 		handle = self._prompt_handles.pop(uuid, None)
-		if handle is not None and self._prompt_arena is not None:
+		if handle is not None and self._prompt_arena is not None and self._prompt_arena.is_creator:
 			self._prompt_arena.free(handle)
 		self._prompt_tensors.pop(uuid, None)
 
