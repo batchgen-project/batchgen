@@ -87,12 +87,14 @@ launcher owns its schema and admission checks.
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 0 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 
 # Node 1
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 1 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 ```
 
@@ -104,35 +106,22 @@ python -m batchgen.launch_http_server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-cache-size` | Auto | Host KV cache size in GB. Critical for throughput. |
+| `--host-kv-cache-size` | Required | Host KV cache size in GB. Critical for throughput. |
 | `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`). Values are not validated at parse time — typos are accepted silently. |
 
-**Auto-detection formula** (when `--host-kv-cache-size` is not specified):
+**Sizing guideline:**
 ```
-host_kv_cache_size = min(host_mem × 0.9 - model_size, /dev/shm_free_space)
+host_kv_cache_size ≈ host_mem × 0.9 - model_size
 ```
-
-If `/dev/shm` free space is smaller than the calculated budget, a warning will be logged recommending to increase `/dev/shm` size.
 
 For DeepSeek-R1 (~700GB model) on a 1.5TB memory node:
 ```bash
 --host-kv-cache-size 650  # (1500 * 0.9) - 700 ≈ 650 GB
 ```
 
-**Important: /dev/shm size requirement**
-
-Host KV cache uses shared memory (`/dev/shm`). If the cache size exceeds available `/dev/shm` space, you must increase it first:
-
-```bash
-# Check current size
-df -h /dev/shm
-
-# Increase temporarily (replace 1500G with your host memory size)
-sudo mount -o remount,size=1500G /dev/shm
-
-# Or make permanent by adding to /etc/fstab:
-# tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
-```
+The host KV cache, like the model weights, lives in anonymous shared memory
+(`memfd_create`) that is charged to host memory. It is not a file in `/dev/shm`,
+so the size of the `/dev/shm` mount does not limit it and no remount is needed.
 
 ### GPU Memory
 
@@ -150,25 +139,52 @@ gpu_kv_cache = GPU_memory × gpu_memory_frac - model_instance_size
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-hugetlbfs` | `false` | Enable hugeTLBFS for shared memory. Requires root privileges (sudo). |
-| `--fast-init` | `false` | Use `memfd_create` + Transparent Huge Pages (THP) for fast memory registration. |
+| `--enable-hugetlbfs` | `false` | Back the model weights with pages from the host's reserved huge page pool. Requires root privileges (sudo). |
+| `--fast-init` | `false` | Request Transparent Huge Pages (THP) for the shared weights and host KV cache, with memory compaction and prefault, for faster memory registration. Recommended. |
 
-**Note:** When `--enable-hugetlbfs` is enabled, BatchGen will automatically configure huge pages. This requires running the server with root privileges (sudo).
-At shutdown, BatchGen releases its own hugetlbfs weight file but does not sweep other files, unmount hugetlbfs, or reset the machine's hugepage reservation. Machine-level cleanup is an operator responsibility.
+**Lifetime in every mode:** the model weights, tensor metadata, host KV cache,
+QueryBook table and weight skeleton are anonymous shared memory created with
+`memfd_create`. Workers attach to them through `/proc/<pid>/fd/<n>`; nothing is
+created by name in `/dev/shm` or a hugetlbfs mount. The kernel frees each region
+when the last process using it exits, however the processes stop, and workers
+are killed when their server process dies. After an abnormal exit, the only
+BatchGen objects that can remain are the per-run runtime directory under the
+temp directory and, if the whole process group was killed at once, Python's
+`sem.mp-*` semaphores. The next
+start of the same instance removes a previous run's runtime directory once its
+run lock proves every process of that run has exited, and refuses to start while
+one is still alive. The temp directory must be local to each node.
+
+**Default page size:** without `--fast-init` or `--enable-hugetlbfs`, BatchGen
+does not advise the shared regions, so their page size follows the host's
+`/sys/kernel/mm/transparent_hugepage/shmem_enabled` policy.
 
 **`--fast-init` details:**
 
-Replaces `shm_open` with `memfd_create` for both KV cache and weights allocation, enabling THP (2MB pages instead of 4KB). This reduces `cudaHostRegister` time by ~9x (e.g., 27s → 3s for 100GB). Before allocation, automatically runs Linux memory compaction (`drop_caches` + `compact_memory`) to defragment physical memory for stable THP allocation.
+Requests THP (2MB pages instead of 4KB) for the weights and host KV cache, which
+makes `cudaHostRegister` substantially faster. Before allocation it runs Linux
+memory compaction (`drop_caches` + `compact_memory`) to defragment physical
+memory, and it prefaults the weights and the host KV cache. `--fast-init` is an explicit flag because
+it needs the host setup below; the deployment recipes include it.
 
 **Requirements:**
 ```bash
-# Enable THP for shared memory (required, set once per boot)
+# Enable THP for shared memory (required, set once per boot); the server refuses
+# --fast-init unless shmem_enabled is "always" or "within_size"
 echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
 
 # Root access (for memory compaction; runs inside docker as root)
 ```
 
-**Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit 2MB pages > THP). For KV cache, `--fast-init` memfd is always used (hugetlbfs was never supported for KV).
+**`--enable-hugetlbfs` details:** the server sets `vm.nr_hugepages` to cover the
+model and allocates the weights with `memfd_create(MFD_HUGETLB)`; no hugetlbfs
+mount is needed. If the pool cannot satisfy the request, it falls back to a
+regular memfd with a warning. The `vm.nr_hugepages` reservation is host
+configuration: BatchGen does not reset it at shutdown. Setting it, like the
+`--fast-init` compaction, needs a writable `/proc/sys`; in a container that
+usually means `--privileged`.
+
+**Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit huge pages > THP). The host KV cache never uses hugetlbfs.
 
 ---
 
@@ -336,6 +352,7 @@ Completed sequences are written incrementally to a JSONL file on disk as they fi
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --incremental-output-dir /data/incremental_results
 ```
 
@@ -344,6 +361,7 @@ To disable:
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --no-incremental-save
 ```
 

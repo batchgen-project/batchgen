@@ -154,12 +154,13 @@ Run on each node with the appropriate `--node-rank`. The container provides an i
 
 #### Option A: With `--cap-add=SYS_ADMIN` (Recommended)
 
-This option allows you to remount `/dev/shm` inside the container for maximum flexibility:
+This option is required for `--enable-hugetlbfs`, which reserves the host's huge page pool. Setting that reservation also needs a writable `/proc/sys`, which in Docker usually means `--privileged`:
 
 ```bash
 # Node 0 (Master)
 docker run -it \
     --cap-add=SYS_ADMIN \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -170,6 +171,7 @@ docker run -it \
 # Node 1
 docker run -it \
     --cap-add=SYS_ADMIN \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -178,21 +180,20 @@ docker run -it \
     batchgen:latest
 ```
 
-Once inside the container, remount `/dev/shm` with sufficient size before starting the server:
-
-```bash
-# Inside container: remount /dev/shm with host memory size (e.g., 2048G)
-mount -o remount,size=2048G /dev/shm
-```
+BatchGen's model weights and host KV cache are anonymous shared memory charged to
+host memory, not files in `/dev/shm`, so `/dev/shm` does not need to be remounted to
+the host memory size. NCCL and Python still use `/dev/shm`, and Docker's default is
+too small for them: start the container with `--ipc=host` or a `--shm-size` such as
+`64g`.
 
 #### Option B: With `--shm-size` (No SYS_ADMIN)
 
-If you cannot use `--cap-add=SYS_ADMIN`, pre-configure `/dev/shm` size at container start. Set `--shm-size` to your total host memory size:
+If you cannot use `--cap-add=SYS_ADMIN`, start the container with a `--shm-size` for NCCL and Python's own shared memory:
 
 ```bash
-# Node 0 (Master) - Example with 2TB host memory
+# Node 0 (Master)
 docker run -it \
-    --shm-size=2048g \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -202,7 +203,7 @@ docker run -it \
 
 # Node 1
 docker run -it \
-    --shm-size=2048g \
+    --shm-size=64g \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -215,8 +216,8 @@ docker run -it \
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--cap-add=SYS_ADMIN` | Conditional | **Required for `--enable-hugetlbfs`**. Also allows remounting `/dev/shm` inside container |
-| `--shm-size=<size>` | Conditional | Pre-set `/dev/shm` size. **Required if not using `--cap-add=SYS_ADMIN`**. Recommend setting to total host memory (e.g., `2048g`) |
+| `--cap-add=SYS_ADMIN` | Conditional | **Required for `--enable-hugetlbfs`** |
+| `--shm-size=<size>` | Conditional | `/dev/shm` size for NCCL and Python. BatchGen's weights and host KV cache do not use `/dev/shm` |
 | `--runtime=nvidia` | Yes | Enable NVIDIA GPU access |
 | `--gpus all` | Yes | Expose all GPUs to container |
 | `--network=host` | Yes | Required for multi-node distributed communication |
@@ -295,20 +296,11 @@ with open("requests.jsonl", "w") as f:
 
 ## 5. Start BatchGen Server
 
-### Prerequisites: Mount Shared Memory
+### Shared Memory
 
-BatchGen uses `/dev/shm` for host KV cache. Before starting the server, ensure `/dev/shm` is mounted with sufficient size (should match your host memory):
-
-```bash
-# Check current size
-df -h /dev/shm
-
-# Mount with full host memory size (replace 1500G with your host memory)
-sudo mount -o remount,size=1500G /dev/shm
-
-# To make permanent, add to /etc/fstab:
-# tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
-```
+BatchGen's model weights and host KV cache are anonymous shared memory charged to
+host memory, not files in `/dev/shm`, so `/dev/shm` does not need to be remounted to
+the host memory size.
 
 ### Set NCCL Environment Variables
 
@@ -391,7 +383,7 @@ Key arguments for multi-node deployment:
 | `--nnodes` | 1 | Number of nodes in the cluster |
 | `--node-rank` | 0 | Rank of this node (0 = master) |
 | `--dist-init-addr` | localhost:12355 | Address for distributed init (`master-ip:port`) |
-| `--host-kv-cache-size` | None | Host KV cache size in GB (critical for throughput) |
+| `--host-kv-cache-size` | Required | Host KV cache size in GB (critical for throughput) |
 | `--storage-path` | batchgen/storage/ | Directory for files and batches |
 | `--save-result` | false | Save inference results to `{storage_path}/outputs/` |
 
