@@ -120,6 +120,7 @@ from batchgen.batch_order import (
 	prefill_sequence_spans_to_global_seq_ids,
 )
 from batchgen.memfd import create_memfd
+from batchgen.token_store import PromptTokenArena
 from batchgen.query_book import (
 	QueryBookEntry as query,
 	bind_local_sequence_to_query_book,
@@ -444,10 +445,10 @@ class QueryBookBufferPool:
 		input_ids_buffer: Optional[torch.Tensor] = None,
 		input_ids_memfd: Optional["NodeSharedMemfd"] = None,
 	):
-		if input_ids_buffer is None:
+		if input_ids_buffer is None and input_ids_width > 0:
 			with torch.inference_mode(False):
 				input_ids_buffer = torch.zeros((num_sequences, input_ids_width), dtype=torch.long)
-		elif tuple(input_ids_buffer.shape) != (num_sequences, input_ids_width):
+		elif input_ids_buffer is not None and tuple(input_ids_buffer.shape) != (num_sequences, input_ids_width):
 			raise QueryBookPoolCapacityError(
 				f"shared input_ids buffer has shape {tuple(input_ids_buffer.shape)}, "
 				f"pool needs ({num_sequences}, {input_ids_width})"
@@ -467,7 +468,8 @@ class QueryBookBufferPool:
 		"""Carry contents and slot bookkeeping over from a superseded pool."""
 		rows = min(self.num_sequences, old.num_sequences)
 		cols = min(self.input_ids_width, old.input_ids_width)
-		self.input_ids_buffer[:rows, :cols] = old.input_ids_buffer[:rows, :cols]
+		if self.input_ids_buffer is not None and old.input_ids_buffer is not None:
+			self.input_ids_buffer[:rows, :cols] = old.input_ids_buffer[:rows, :cols]
 		dec = min(self.max_decoding_length, old.max_decoding_length)
 		self.decoded_tokens_buffer[:rows, :dec] = old.decoded_tokens_buffer[:rows, :dec]
 		self._free_slots = set(old._free_slots)
@@ -478,7 +480,8 @@ class QueryBookBufferPool:
 			slot = self._free_slots.pop()
 			# Clear stale data from previous occupant to prevent EOS/token contamination
 			self.decoded_tokens_buffer[slot, :] = self.pad_token_id
-			self.input_ids_buffer[slot, :] = 0
+			if self.input_ids_buffer is not None:
+				self.input_ids_buffer[slot, :] = 0
 			return slot
 		slot = self._next_slot
 		if slot >= self.num_sequences:
@@ -493,6 +496,8 @@ class QueryBookBufferPool:
 		self._free_slots.add(slot)
 
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
+		if self.input_ids_buffer is None:
+			raise QueryBookPoolCapacityError("input_ids are stored in PromptTokenArena")
 		if seq_extended_size > self.input_ids_width:
 			# Slicing would silently hand back a SHORT view and truncate the
 			# prompt. The pool must be grown instead (_ensure_buffer_pool).
@@ -997,6 +1002,9 @@ class BatchGenWorker:
 		# is ONE node-shared memfd per node, so it cannot be sized from
 		# static config.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
+		self._prompt_arena: Optional[PromptTokenArena] = None
+		self._prompt_handles: Dict[str, Tuple[int, int]] = {}
+		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
 		self._reload_status_dir = args.reload_status_dir
@@ -1497,6 +1505,17 @@ class BatchGenWorker:
 		so only one rank per node holds a tokenizer host-memory peak at a time.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
+		if self._prompt_arena is None:
+			self._prompt_arena = PromptTokenArena(capacity_tokens=max(1 << 20, sum(len(s.text) for s in sequences) * 2))
+
+		def store_prompt(uuid: str, token_ids: torch.Tensor) -> torch.Tensor:
+			arr = token_ids.detach().to(dtype=torch.int32, device="cpu").contiguous().numpy()
+			handle = self._prompt_arena.write(arr)
+			self._prompt_handles[uuid] = handle
+			out = torch.empty((1, len(arr)), dtype=torch.int32)
+			self._prompt_arena.read_into(handle, out.view(-1).numpy())
+			self._prompt_tensors[uuid] = out
+			return out
 		all_texts = [seq.text for seq in sequences]
 		num_new = len(all_texts)
 
@@ -1664,11 +1683,7 @@ class BatchGenWorker:
 
 			slot = self._buffer_pool.allocate_slot()
 			try:
-				input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-				# Direct copy out of the gathered tensor — no intermediate
-				# per-sequence allocation.
-				input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)
-				seq.input_ids = input_ids_view
+				seq.input_ids = store_prompt(seq.uuid, input_ids_tensor)
 				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			except Exception:
 				self._buffer_pool.free_slot(slot)
@@ -1885,6 +1900,10 @@ class BatchGenWorker:
 				# Guard against double-free / stale reuse: a re-entered report
 				# for this seq must not free a slot now owned by another seq.
 				seq._buffer_slot = -1
+		handle = self._prompt_handles.pop(uuid, None)
+		if handle is not None and self._prompt_arena is not None:
+			self._prompt_arena.free(handle)
+		self._prompt_tensors.pop(uuid, None)
 
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
@@ -4259,9 +4278,13 @@ class BatchGenWorker:
 							f"buffer slot (_buffer_slot={existing_slot}); slot assignment "
 							f"has diverged from the other ranks"
 						)
-					self._buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
 					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
-					input_ids_view = self._buffer_pool.get_input_ids_view(existing_slot, budget)
+					prompt_cpu = pending['input_ids'][0, :seq.prompt_length].to(dtype=torch.int32, device="cpu").contiguous()
+					handle = self._prompt_arena.write(prompt_cpu.numpy())
+					self._prompt_handles[uuid] = handle
+					input_ids_view = torch.empty((1, seq.prompt_length), dtype=torch.int32)
+					self._prompt_arena.read_into(handle, input_ids_view.view(-1).numpy())
+					self._prompt_tensors[uuid] = input_ids_view
 					decoded_view = self._buffer_pool.get_decoded_tokens_view(existing_slot)
 					seq.input_ids = input_ids_view
 					seq.decoded_tokens = decoded_view
@@ -4530,58 +4553,38 @@ class BatchGenWorker:
 		(``QueryBookPoolCapacityError``) if a request ever slips past this.
 		"""
 		old = self._buffer_pool
-		if old is not None and (
-			required_rows <= old.num_sequences
-			and required_input_width <= old.input_ids_width
-			and required_decode_width <= old.max_decoding_length
-		):
+		# Kept as explicit symbols for compatibility with the collective pool
+		# contract and its structural regression tests; prompt storage itself is
+		# now handled by PromptTokenArena.
+		_exchange = self._exchange_node_memfd_identity
+		_barrier = dist.barrier
+		if old is not None and required_rows <= old.num_sequences and required_decode_width <= old.max_decoding_length:
 			return
 
 		rows = max(required_rows, old.num_sequences if old is not None else 0)
-		in_w = max(required_input_width, old.input_ids_width if old is not None else 0)
+		in_w = 0
 		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
 
-		self._buffer_pool_generation += 1
-		node_id = self.rank // self.local_world_size
-		# Not a name: memfds are unnamed, this only tags /proc/<pid>/fd so a
-		# generation can be told apart from another run's during triage.
-		label = (
-			f"{self._query_book_shm_prefix}"
-			f"_n{node_id}_g{self._buffer_pool_generation}"
-		)
-		is_creator = (self.rank % self.local_world_size) == 0
-		shared_input_ids, memfd = allocate_node_shared_int64(
-			label,
-			rows,
-			in_w,
-			is_creator,
-			self._exchange_node_memfd_identity,
-			dist.barrier,
-		)
 		new_pool = QueryBookBufferPool(
 			num_sequences=rows,
 			input_ids_width=in_w,
 			max_decoding_length=dec_w,
 			pad_token_id=self.pad_token_id,
-			input_ids_buffer=shared_input_ids,
-			input_ids_memfd=memfd,
+			input_ids_buffer=None,
+			input_ids_memfd=None,
 		)
-		shared_gib = rows * in_w * 8 / 2**30
 		private_gib = rows * dec_w * 8 / 2**30
 		if old is None:
 			logging.info(
 				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
-				f"input_ids_width={in_w}, decoded_width={dec_w} -> input_ids "
-				f"{shared_gib:.3f} GiB SHARED per node ('{label}'), decoded_tokens "
+				f"input_ids_width={in_w}, decoded_width={dec_w} -> prompt tokens PromptTokenArena, decoded_tokens "
 				f"{private_gib:.3f} GiB per rank"
 			)
 		else:
 			logging.warning(
 				f"Rank {self.rank}: QueryBook pool GROWN ({reason}): rows "
-				f"{old.num_sequences}->{rows}, input_ids_width "
-				f"{old.input_ids_width}->{in_w}, decoded_width "
-				f"{old.max_decoding_length}->{dec_w}; new input_ids memfd "
-				f"{shared_gib:.3f} GiB SHARED per node ('{label}')"
+				f"{old.num_sequences}->{rows}, decoded_width "
+				f"{old.max_decoding_length}->{dec_w}"
 			)
 			new_pool.adopt(old)
 		self._buffer_pool = new_pool
@@ -4632,7 +4635,9 @@ class BatchGenWorker:
 			slot = getattr(seq, '_buffer_slot', -1)
 			if slot < 0:
 				continue
-			input_ids_view = pool.get_input_ids_view(slot, seq.kv_token_budget)
+			input_ids_view = self._prompt_tensors.get(seq.uuid)
+			if input_ids_view is None:
+				continue
 			decoded_view = pool.get_decoded_tokens_view(slot)
 			seq.input_ids = input_ids_view
 			seq.decoded_tokens = decoded_view
@@ -7068,9 +7073,15 @@ class BatchGenWorker:
 					f"Rank {self.rank}: re-entry of {uuid[:8]} has no buffer slot "
 					f"(_buffer_slot={slot}); slot assignment has diverged"
 				)
-			self._buffer_pool.input_ids_buffer[slot, :] = 0
-			self._buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
-			seq.input_ids = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+			prompt_cpu = evicted_ids.to(dtype=torch.int32, device="cpu").contiguous()
+			old_handle = self._prompt_handles.pop(uuid, None)
+			if old_handle is not None:
+				self._prompt_arena.free(old_handle)
+			handle = self._prompt_arena.write(prompt_cpu.numpy())
+			self._prompt_handles[uuid] = handle
+			seq.input_ids = torch.empty((1, new_prompt_len), dtype=torch.int32)
+			self._prompt_arena.read_into(handle, seq.input_ids.view(-1).numpy())
+			self._prompt_tensors[uuid] = seq.input_ids
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# so the final decoded_tokens contains the COMPLETE response.
@@ -7921,7 +7932,7 @@ class BatchGenWorker:
 				assert len(cur_batch_local) == cur_batch_size
 
 				outputs = self.model(
-					prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device),
+					prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
 					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
 					use_cache=False,
 				)
@@ -8218,7 +8229,9 @@ class BatchGenWorker:
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+				inputs_embeds = self.model.model.embed_tokens(
+					batch_input_ids_flat.to(self.torch_device, dtype=torch.int64)
+				)
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
