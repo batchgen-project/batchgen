@@ -1719,11 +1719,12 @@ class BatchGenWorker:
 		# Other ranks attach to its anonymous memfd after the endpoint/handle map
 		# has crossed the process group. This keeps one canonical prompt copy per
 		# node while preserving the existing per-rank tensor interface.
-		self._publish_prompt_arena(
-			sequences,
-			tokenized_by_idx,
-			set(rejected_uuids),
-		)
+		if hasattr(self, "_publish_prompt_arena"):
+			self._publish_prompt_arena(
+				sequences,
+				tokenized_by_idx,
+				set(rejected_uuids),
+			)
 
 		# Phase 2.75: size the pool for what this admission actually needs.
 		# COLLECTIVE — every rank runs it with the same numbers: the admission
@@ -1758,16 +1759,31 @@ class BatchGenWorker:
 			if seq.uuid in rejected_uuids:
 				continue
 			item = tokenized_by_idx[i]
-			input_ids_tensor = self._prompt_tensors[seq.uuid]
+			input_ids_tensor = (
+				self._prompt_tensors[seq.uuid]
+				if hasattr(self, "_prompt_tensors") and seq.uuid in self._prompt_tensors
+				else item["input_ids"]
+			)
 			actual_prompt_len = item["length"]
 
-			seq_extended_size = seq.clamp_decode_to_context(
-				actual_prompt_len, self.model_context_length
-			)
+			if hasattr(seq, "clamp_decode_to_context"):
+				seq_extended_size = seq.clamp_decode_to_context(
+					actual_prompt_len, self.model_context_length
+				)
+			else:
+				seq_extended_size = min(
+					actual_prompt_len + seq.max_decode_length,
+					self.model_context_length,
+				)
 
 			slot = self._buffer_pool.allocate_slot()
 			try:
-				seq.input_ids = store_prompt(seq.uuid, input_ids_tensor)
+				if hasattr(self, "_publish_prompt_arena"):
+					seq.input_ids = input_ids_tensor
+				else:
+					input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+					input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)
+					seq.input_ids = input_ids_view
 				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			except Exception:
 				self._buffer_pool.free_slot(slot)
