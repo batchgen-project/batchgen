@@ -6,6 +6,7 @@ import ast
 import copy
 import gc
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -39,6 +40,15 @@ def _load_runtime_identity_module():
             sys.modules[package_name] = previous
 
 
+def _create_memfd():
+    """Load create_memfd from batchgen/memfd.py without importing batchgen."""
+    path = Path(__file__).resolve().parents[1] / "batchgen" / "memfd.py"
+    spec = importlib.util.spec_from_file_location("_batchgen_memfd", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.create_memfd
+
+
 def _isolated_worker_namespace(*names: str) -> dict:
     """Exec the named top-level worker definitions without importing the worker."""
     tree = ast.parse(WORKER.read_text())
@@ -53,6 +63,7 @@ def _isolated_worker_namespace(*names: str) -> dict:
         "QueryBookPoolCapacityError": RuntimeError,
         "Tuple": Tuple,
         "os": os,
+        "create_memfd": _create_memfd(),
         "torch": torch,
     }
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)

@@ -119,6 +119,7 @@ from batchgen.batch_order import (
 	prefill_sequence_spans_to_cu_seqlens,
 	prefill_sequence_spans_to_global_seq_ids,
 )
+from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBookEntry as query,
 	bind_local_sequence_to_query_book,
@@ -384,8 +385,6 @@ def allocate_node_shared_int64(
 	nbytes = rows * width * 8
 	fd = -1
 	if is_creator:
-		from batchgen.server.process_utils import create_memfd
-
 		fd = create_memfd(label)
 		os.ftruncate(fd, nbytes)
 	creator_pid, creator_fd = exchange(os.getpid(), fd)
@@ -398,13 +397,17 @@ def allocate_node_shared_int64(
 		fd = os.open(
 			f"/proc/{creator_pid}/fd/{creator_fd}", os.O_RDWR | os.O_CLOEXEC
 		)
-	size = os.fstat(fd).st_size
-	if size < nbytes:
-		raise QueryBookPoolCapacityError(
-			f"shared input_ids memfd '{label}' is {size} bytes, "
-			f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
-		)
-	mapping = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+	try:
+		size = os.fstat(fd).st_size
+		if size < nbytes:
+			raise QueryBookPoolCapacityError(
+				f"shared input_ids memfd '{label}' is {size} bytes, "
+				f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
+			)
+		mapping = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+	except BaseException:
+		os.close(fd)
+		raise
 	# Admissions can later mutate this persistent mapping outside InferenceMode.
 	with torch.inference_mode(False):
 		buf = torch.frombuffer(mapping, dtype=torch.int64, count=rows * width).view(rows, width)
@@ -991,7 +994,7 @@ class BatchGenWorker:
 
 		# QueryBook buffer pool. Allocated lazily by _ensure_buffer_pool() once
 		# the first batch's tokenized lengths are known — its input_ids buffer
-		# is ONE shared-memory segment per node, so it cannot be sized from
+		# is ONE node-shared memfd per node, so it cannot be sized from
 		# static config.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._buffer_pool_generation = 0

@@ -22,9 +22,9 @@ from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
+from batchgen.memfd import create_memfd
 from batchgen.server.process_utils import (
     cleanup_shm_files,
-    create_memfd,
     get_hugepage_size,
     get_model_byte_size,
     record_model_shm_provenance,

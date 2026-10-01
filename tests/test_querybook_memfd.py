@@ -133,6 +133,7 @@ def test_allocator_creates_no_name_and_unlinks_nothing():
     assert "SharedMemory" not in dump
     assert "create_memfd" in dump
     assert set(_calls_to(allocate, "os")) == {
+        "close",
         "ftruncate",
         "getpid",
         "open",
@@ -417,11 +418,11 @@ def test_attacher_refuses_an_unpublished_creator():
 
 
 def _create_memfd():
-    """Load create_memfd from process_utils without importing batchgen.server."""
+    """Load create_memfd from batchgen/memfd.py without importing batchgen."""
     import importlib.util
 
-    path = Path(__file__).resolve().parents[1] / "batchgen" / "server" / "process_utils.py"
-    spec = importlib.util.spec_from_file_location("_process_utils_memfd", path)
+    path = Path(__file__).resolve().parents[1] / "batchgen" / "memfd.py"
+    spec = importlib.util.spec_from_file_location("_batchgen_memfd", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.create_memfd
