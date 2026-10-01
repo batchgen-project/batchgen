@@ -1,9 +1,33 @@
 import torch
 from torch.utils.cpp_extension import load
 import os
+import sysconfig
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _csrc_dir = os.path.join(_current_dir, "csrc")
+
+
+def _cuda_dependency_include_paths():
+	"""Return bundled CUDA dependency headers when the system CUDA tree is incomplete.
+
+	PyTorch wheels ship cuBLAS/cuSolver/cuSparse headers under ``nvidia/*``.
+	Some serving images expose ``nvcc`` through ``/usr/local/cuda`` but omit
+	those headers there, which makes the first GLM-5 prefill fail while JIT
+	compiling the binding.  Keep the system include path and add only the
+	installed wheel directories that actually exist.
+	"""
+	site_packages = sysconfig.get_paths().get("purelib", "")
+	nvidia_root = os.path.join(site_packages, "nvidia")
+	paths = [_csrc_dir]
+	if os.path.isdir(nvidia_root):
+		for package in sorted(os.listdir(nvidia_root)):
+			include = os.path.join(nvidia_root, package, "include")
+			if os.path.isdir(include):
+				paths.append(include)
+	return paths
+
+
+_include_paths = _cuda_dependency_include_paths()
 
 _cuda_flags = [
     '-O3',
@@ -25,7 +49,7 @@ _hadamard_cuda = load(
     ],
     extra_cflags=['-O3', '-std=c++17'],
     extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
+	 extra_include_paths=_include_paths,
     verbose=False,
 )
 
@@ -37,7 +61,7 @@ _fused_rope_hadamard_cuda = load(
     ],
     extra_cflags=['-O3', '-std=c++17'],
     extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
+	 extra_include_paths=_include_paths,
     verbose=False,
 )
 
