@@ -159,16 +159,16 @@ def test_query_book_creator_cannot_touch_a_same_named_segment():
 def test_model_shm_creators_and_destructor_preserve_foreign_names():
     shm_source = POSIX_SHM.read_text()
     server_source = PARAMETER_SERVER.read_text()
-    # Only the hugetlbfs file is still created by name, and only with O_EXCL.
-    assert shm_source.count("create ? O_CREAT | O_EXCL : 0") == 1
+    # No model region is created by name any more, in any mode, so no name of a
+    # foreign object can be opened, truncated or removed by mistake.
+    assert "O_CREAT" not in shm_source
+    assert "/dev/hugepages" not in shm_source
     destructor = server_source.split("Parameter_Server::~Parameter_Server()", 1)[1]
     destructor = destructor.split("Parameter_Server::get_skeleton_state_dict", 1)[0]
-    assert "if (weight_hugetlbfs_owned_ && !this->weight_hugetlbfs_path_.empty())" in destructor
-    assert "unlink(this->weight_hugetlbfs_path_.c_str())" in destructor
+    assert "unlink(" not in destructor
     assert "close(this->weights_memfd_fd_)" in destructor
     assert "close(this->tensor_meta_memfd_fd_)" in destructor
     assert "free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_)" in destructor
-    assert "if (create && errno == EEXIST)" in shm_source
     assert "memfd creator requires an output fd" in shm_source
 
 

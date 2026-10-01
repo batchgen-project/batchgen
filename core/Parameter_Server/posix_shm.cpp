@@ -36,6 +36,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include "../numa_compat.h"
@@ -44,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #include <filesystem>
 
@@ -56,7 +58,13 @@
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 #endif
-namespace fs = std::filesystem; 
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
+namespace fs = std::filesystem;
 
 std::shared_ptr<spdlog::logger> logger = init_logger("info", "Server");
 
@@ -133,6 +141,32 @@ void segv_handler(int sig, siginfo_t* info, void* context) {
 // through /proc/<creator_pid>/fd/<N>, not by inheritance.
 static int create_anonymous_memfd(const char* name) {
     return static_cast<int>(syscall(SYS_memfd_create, name, MFD_CLOEXEC));
+}
+
+// Same unnamed object, but backed by the host's preallocated huge page pool
+// instead of base pages. No hugetlbfs mount and no path are involved, so the
+// kernel returns the pages to the pool with the last mapping.
+static int create_huge_anonymous_memfd(const char* name) {
+    return static_cast<int>(
+        syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_HUGETLB));
+}
+
+// MFD_HUGETLB without a size flag uses the host's default huge page size, so
+// the region must be rounded and mapped to exactly that size.
+static size_t default_huge_page_size() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        if (line.find("Hugepagesize:") == 0) {
+            std::istringstream iss(line);
+            std::string key, value;
+            iss >> key >> value;
+            return static_cast<size_t>(std::stol(value)) * 1024;
+        }
+    }
+    logger->warn(
+        "Hugepagesize missing from /proc/meminfo; assuming 2MB huge pages");
+    return 2 * 1024 * 1024;
 }
 
 // --fast-init requests transparent huge pages explicitly. Without it the
@@ -282,17 +316,19 @@ void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, siz
 
 /**
  * @brief Allocates shared memory optionally pinned for CUDA operations.
- * * This function supports two allocation strategies:
- * 1.  Hugetlbfs: Uses large 2MB pages for potentially better performance, but requires
- * root privileges and proper system configuration. Controlled by enable_hugetlbfs.
- * 2.  Anonymous memfd: the only other strategy. The region has no name, so the
- * kernel reclaims it with the last mapping, however the owners died.
+ * * This function supports two allocation strategies, and neither gives the
+ * region a name: the kernel reclaims it with the last mapping, however the
+ * owners died.
+ * 1.  Huge page memfd: MFD_HUGETLB takes the region from the host's huge page
+ * pool, which needs that pool reserved. Controlled by enable_hugetlbfs.
+ * 2.  Base page memfd: the only other strategy, and the fallback when the huge
+ * page pool cannot satisfy the request.
  * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM.
  * If pin_for_cuda is true, memory is also registered with cudaHostRegister for DMA.
- * * @param shm_name The name of the hugetlbfs file; a label otherwise.
+ * * @param shm_name A label for logging; no filesystem object carries it.
  * @param size The desired size of the allocation in bytes.
  * @param create True if the caller is the server (creates the segment), false for workers.
- * @param enable_hugetlbfs If true, attempts to use hugetlbfs for allocation.
+ * @param enable_hugetlbfs If true, attempts a huge page memfd for allocation.
  * @param pin_for_cuda If true, register memory with cudaHostRegister for GPU DMA access.
  *                     Server should pass false (no GPU access needed), workers pass true.
  * @param enable_thp If true, hint transparent huge pages and prefault them.
@@ -310,8 +346,6 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
                                     int* out_memfd_fd,
-                                    bool* out_hugetlbfs_owned,
-                                    std::string* out_hugetlbfs_path,
                                     int64_t* out_mapped_size) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
@@ -319,8 +353,6 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     if (create && out_memfd_fd == nullptr) {
         throw std::runtime_error("memfd creator requires an output fd");
     }
-    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
-    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
     if (out_mapped_size) *out_mapped_size = 0;
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
@@ -333,95 +365,62 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     void* ptr = nullptr;
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
-    // std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    std::string hugepage_path = "/dev/hugepages/" +
-        (shm_name[0] == '/' ? shm_name.substr(1) : shm_name);
 
-    // STAGE 1: Attempt allocation using hugetlbfs if enabled
-    if (enable_hugetlbfs) {
-        logger->info("Attempting hugepage allocation...");
-        int flags = O_RDWR | (create ? O_CREAT | O_EXCL : 0);
-        int fd = open(hugepage_path.c_str(), flags, 0666);
+    // STAGE 1: Attempt a huge page memfd if enabled. Only the creator runs
+    // this: an attacher cannot tell a huge page memfd from a base page one by
+    // name, because neither has a name, so it always takes the attach path in
+    // STAGE 2 and discovers the page size from the fd itself.
+    if (enable_hugetlbfs && create) {
+        const size_t hugetlb_page_size = default_huge_page_size();
+        const int64_t hugetlb_size =
+            ((size + hugetlb_page_size - 1) / hugetlb_page_size) *
+            hugetlb_page_size;
+        logger->info("Attempting hugepage allocation ({}MB pages)...",
+                     hugetlb_page_size / (1024 * 1024));
 
-        if (fd >= 0) {
-            if (create) {
-                int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-                if (ftruncate64(fd, huge_aligned_size) == 0) {
-                    // Use mmap_aligned to ensure 2MB alignment (or system page size if larger)
-                    size_t alignment = std::max(huge_page_size, page_size);
-                    ptr = mmap_aligned(huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-                    if (ptr != MAP_FAILED) {
-                        allocated_size = huge_aligned_size;
-                        if (touch_pages(ptr, size, huge_page_size, true)) {
-                            using_huge_pages = true;
-                            logger->info("Hugepage multi-threaded initialization succeeded");
-                        } else {
-                            logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
-                            munmap(ptr, allocated_size);
-                            ptr = nullptr; // Signal failure to fallback
-                        }
-                    } else {
-                        logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
-                        ptr = nullptr; // Ensure ptr is null for fallback
-                    }
-                } else {
-                    logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
-                }
-            } else { // Worker logic: wait for file to be sized by server
-                struct stat sb;
-                int64_t file_size = 0;
-                for (int retry = 0; retry < 20; ++retry) { // Retry for up to 2 seconds
-                    if (fstat(fd, &sb) == -1) {
-                        close(fd);
-                        throw std::runtime_error("fstat on hugepage file failed: " + std::string(strerror(errno)));
-                    }
-                    if (sb.st_size > 0) {
-                        file_size = sb.st_size;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-
-                if (file_size > 0) {
-                    // Use mmap_aligned for workers too
-                    size_t alignment = std::max(huge_page_size, page_size);
-                    ptr = mmap_aligned(file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-                    if (ptr != MAP_FAILED) {
-                        allocated_size = file_size;
-                        using_huge_pages = true;
-                    } else {
-                        logger->warn("hugetlbfs mmap failed for worker: {}", strerror(errno));
-                        ptr = nullptr;
-                    }
-                } else {
-                    logger->error("Timed out waiting for server to create hugepage file.");
-                }
-            }
+        int fd = create_huge_anonymous_memfd("batchgen_weights");
+        if (fd < 0) {
+            logger->warn("memfd_create(MFD_HUGETLB) failed: {}",
+                         strerror(errno));
+        } else if (ftruncate64(fd, hugetlb_size) != 0) {
+            logger->warn("hugepage memfd ftruncate failed: {}",
+                         strerror(errno));
             close(fd);
-
-            if (!using_huge_pages && create) {
-                logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
-                unlink(hugepage_path.c_str());
-            } else if (using_huge_pages && create) {
-                // O_EXCL create plus mapping both succeeded: this process owns
-                // exactly this hugetlbfs path and may unlink it on teardown.
-                if (out_hugetlbfs_owned) *out_hugetlbfs_owned = true;
-                if (out_hugetlbfs_path) *out_hugetlbfs_path = hugepage_path;
-            }
         } else {
-            if (create && errno == EEXIST) {
-                throw std::runtime_error("hugetlbfs path already exists: " + hugepage_path);
+            size_t alignment = std::max(hugetlb_page_size, page_size);
+            ptr = mmap_aligned(hugetlb_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                               fd, 0, alignment);
+            if (ptr == MAP_FAILED) {
+                // The pool is reserved by the host, so this is where an
+                // insufficient reservation surfaces.
+                logger->warn("hugepage memfd mmap failed: {}", strerror(errno));
+                ptr = nullptr;
+                close(fd);
+            } else if (!touch_pages(ptr, size, hugetlb_page_size, true)) {
+                logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
+                munmap(ptr, hugetlb_size);
+                ptr = nullptr;
+                close(fd);
+            } else {
+                allocated_size = hugetlb_size;
+                using_huge_pages = true;
+                *out_memfd_fd = fd;
+                logger->info(
+                    "Weights allocated via memfd_create(MFD_HUGETLB) "
+                    "({:.1f} GB, {}MB pages)",
+                    allocated_size / (1024.0 * 1024.0 * 1024.0),
+                    hugetlb_page_size / (1024 * 1024));
             }
-            logger->warn("Could not open hugetlbfs path '{}': {}. Check permissions and mount.", hugepage_path, strerror(errno));
         }
     }
 
-    // STAGE 2: Anonymous memfd. This is the only path when hugetlbfs is not
-    // requested, and the fallback when it was requested but unusable, so the
-    // weights never become a named object the kernel keeps after a crash.
+    // STAGE 2: Base page memfd. This is the only path when hugetlbfs is not
+    // requested, and the fallback when it was requested but the huge page pool
+    // could not satisfy it. It is also the attach path in every mode, since an
+    // attacher reaches the creator's fd through /proc either way.
     if (!ptr) {
-        if (enable_hugetlbfs) {
-             logger->info("Falling back to an anonymous memfd allocation...");
+        if (enable_hugetlbfs && create) {
+             logger->info("Falling back to a base page memfd allocation...");
         }
 
         size_t alignment = std::max(huge_page_size, page_size);
@@ -504,6 +503,15 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 throw std::runtime_error(
                     "weights memfd too small or fstat failed");
             }
+            // A huge page memfd only accepts a mapping aligned to its own page
+            // size, which the base page alignment above does not guarantee.
+            struct statfs sfs;
+            const bool fd_is_hugetlb =
+                fstatfs(fd, &sfs) == 0 &&
+                static_cast<unsigned long>(sfs.f_type) == HUGETLBFS_MAGIC;
+            if (fd_is_hugetlb) {
+                alignment = std::max(default_huge_page_size(), page_size);
+            }
             ptr = mmap_aligned(sb.st_size, PROT_READ | PROT_WRITE,
                                MAP_SHARED, fd, 0, alignment);
             if (ptr == MAP_FAILED) {
@@ -515,12 +523,16 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                     std::string(strerror(err)));
             }
             allocated_size = sb.st_size;
+            using_huge_pages = fd_is_hugetlb;
             // Both sides advise, so one cannot promote the mapping while the
-            // other keeps it at the base page size.
-            advise_transparent_huge_pages(ptr, allocated_size, enable_thp);
+            // other keeps it at the base page size. Huge pages are already the
+            // mapping's page size, and THP cannot apply to them.
+            advise_transparent_huge_pages(ptr, allocated_size,
+                                          enable_thp && !fd_is_hugetlb);
             close(fd);
-            logger->info("Weights attached via memfd ({:.1f} GB)",
-                         allocated_size / (1024.0 * 1024.0 * 1024.0));
+            logger->info("Weights attached via memfd ({:.1f} GB, {} pages)",
+                         allocated_size / (1024.0 * 1024.0 * 1024.0),
+                         fd_is_hugetlb ? "huge" : "base");
         }
     }
 
@@ -542,17 +554,12 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
             logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
         } catch (const std::exception& e) {
-            // Clean up memory and rethrow if CUDA registration fails
+            // Clean up memory and rethrow if CUDA registration fails. Closing
+            // the creator's fd is the whole release in both modes.
             munmap(ptr, allocated_size);
-            if (create) {
-                if (using_huge_pages) {
-                    unlink(hugepage_path.c_str());
-                    if (out_hugetlbfs_owned) *out_hugetlbfs_owned = false;
-                    if (out_hugetlbfs_path) out_hugetlbfs_path->clear();
-                } else if (*out_memfd_fd >= 0) {
-                    close(*out_memfd_fd);
-                    *out_memfd_fd = -1;
-                }
+            if (create && *out_memfd_fd >= 0) {
+                close(*out_memfd_fd);
+                *out_memfd_fd = -1;
             }
             throw;
         }

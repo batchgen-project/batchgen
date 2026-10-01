@@ -5,11 +5,9 @@ from __future__ import annotations
 import ast
 import copy
 import gc
-import json
 import logging
 import os
 import pickle
-import runpy
 import signal
 import subprocess
 import sys
@@ -27,7 +25,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
 WORKER_MANAGER = ROOT / "batchgen" / "server" / "worker_manager.py"
 HTTP_SERVER = ROOT / "batchgen" / "server" / "http_server.py"
-PROCESS_UTILS = ROOT / "batchgen" / "server" / "process_utils.py"
 GPT_OSS_PARAMETER_SERVER = (
     ROOT
     / "batchgen"
@@ -159,11 +156,6 @@ def _isolated_class(path: Path, class_name: str, method_names, globals_=None):
     return namespace["Isolated"]
 
 
-def _process_utils_namespace():
-    """Load process_utils standalone so the test needs no batchgen package import."""
-    return runpy.run_path(str(PROCESS_UTILS))
-
-
 def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     fake_cpp = SimpleNamespace(
         Init=lambda *args: cpp_init_calls.append(args),
@@ -235,13 +227,10 @@ def test_gpt_oss_init_still_self_generates_without_reservation():
     assert cpp_init_calls[0][:2] == (shm_name, tensor_meta_shm_name)
 
 
-def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
+def _local_load_manager(runtime_dir, model, tmp_path):
     manager_type = _worker_manager_method(
         "_load_model_locally",
         {
-            "record_model_shm_provenance": process_utils[
-                "record_model_shm_provenance"
-            ],
             "logger": SimpleNamespace(
                 info=lambda *args, **kwargs: None,
                 warning=lambda *args, **kwargs: None,
@@ -256,7 +245,6 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
     manager = manager_type()
     manager.parameter_server_instance = None
     manager.model_info = {}
-    manager._model_shm_init_unconfirmed = False
     manager._store_skeleton_state_dict = lambda skeleton_state_dict: None
     manager.args = SimpleNamespace(
         model=model,
@@ -268,17 +256,12 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
     return manager
 
 
-def _stop_partial_local_manager(
-    manager, process_utils, shm_dir, *, namespace_owned=False
-):
-    # The only named model region left is the hugetlbfs weights file, so the
-    # release path proves absence in that directory.
+def _stop_partial_local_manager(manager):
+    # No model region is named in any mode, so the release path only has to
+    # drop the C++ owner; there is nothing left whose absence it could prove.
     stop_type = _worker_manager_method(
         "stop",
         {
-            "verify_model_shm_absent": lambda info, **kwargs: process_utils[
-                "verify_model_shm_absent"
-            ](info, hugepages_dir=shm_dir),
             "gc": gc,
             "Path": Path,
             "logger": SimpleNamespace(
@@ -290,7 +273,7 @@ def _stop_partial_local_manager(
     manager._stopping = False
     manager.started = False
     manager._runtime_dir_created = True
-    manager._runtime_namespace_owned = namespace_owned
+    manager._runtime_namespace_owned = False
     manager._runtime_locks = None
     manager._lane_lease = None
     manager.worker_process = None
@@ -302,78 +285,43 @@ def _stop_partial_local_manager(
     return stop_type.stop(manager)
 
 
-def test_local_gpt_oss_preserves_unconfirmed_shm_after_init_failure(
-    tmp_path, monkeypatch
-):
-    process_utils = _process_utils_namespace()
+def test_local_gpt_oss_load_needs_no_name_reservation(tmp_path, monkeypatch):
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    shm_dir = tmp_path / "shm"
-    shm_dir.mkdir()
-    neighbor = shm_dir / "shm_neighbor"
-    neighbor.touch()
 
     class FakeGptOssParameterServer:
         def __init__(self, *args, **kwargs):
-            self.shm_name = None
-            self.tensor_meta_shm_name = None
-            self.shm_creation_attempted = False
+            self.parameter_server = SimpleNamespace(
+                byte_size=lambda: 1234,
+                get_skeleton_state_dict=lambda: {"model.norm.weight": 1},
+            )
 
         def reserve_shm_names(self):
-            self.shm_name = "/shm_reserved_weights"
-            self.tensor_meta_shm_name = "/shm_reserved_meta"
-            return self.shm_name, self.tensor_meta_shm_name
+            raise AssertionError("no name needs reserving for a memfd")
 
         def Init(self):
-            self.shm_creation_attempted = True
-            (shm_dir / self.shm_name.lstrip("/")).touch()
-            (shm_dir / self.tensor_meta_shm_name.lstrip("/")).touch()
-            raise RuntimeError("weight load crashed")
+            return "/shm_weights", "/shm_meta"
 
     module = ModuleType(GPT_OSS_PS_MODULE)
     module.GptOss_Parameter_Server = FakeGptOssParameterServer
     monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
 
-    manager = _local_load_manager(
-        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
-    )
+    manager = _local_load_manager(runtime_dir, "openai/gpt-oss-120b", tmp_path)
+    manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
 
-    with pytest.raises(RuntimeError, match="weight load crashed"):
-        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
-
-    record = json.loads(
-        (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
-    )
-    assert record["shm_names"] == ["shm_reserved_weights"]
-    assert manager.parameter_server_instance is None
-    assert manager._model_shm_init_unconfirmed
-
-    with pytest.raises(RuntimeError, match="ownership is unconfirmed"):
-        _stop_partial_local_manager(
-            manager, process_utils, shm_dir, namespace_owned=True
-        )
-
-    assert (shm_dir / "shm_reserved_weights").exists()
-    assert (shm_dir / "shm_reserved_meta").exists()
-    assert neighbor.exists()
-    assert (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).exists()
+    assert manager.model_info["shm_name"] == "/shm_weights"
+    assert manager.parameter_server_instance is not None
+    # The labels name nothing on disk, so the run writes no provenance record.
+    assert list(runtime_dir.iterdir()) == []
 
 
-def test_local_gpt_oss_pre_creation_failure_closes_empty_run(tmp_path, monkeypatch):
-    process_utils = _process_utils_namespace()
+def test_local_gpt_oss_init_failure_closes_an_empty_run(tmp_path, monkeypatch):
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    shm_dir = tmp_path / "shm"
-    shm_dir.mkdir()
 
     class FakeGptOssParameterServer:
-        shm_creation_attempted = False
-
         def __init__(self, *args, **kwargs):
             pass
-
-        def reserve_shm_names(self):
-            return "/shm_reserved_weights", "/shm_reserved_meta"
 
         def Init(self):
             raise ValueError("checkpoint absent")
@@ -381,117 +329,55 @@ def test_local_gpt_oss_pre_creation_failure_closes_empty_run(tmp_path, monkeypat
     module = ModuleType(GPT_OSS_PS_MODULE)
     module.GptOss_Parameter_Server = FakeGptOssParameterServer
     monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
-    manager = _local_load_manager(
-        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
-    )
+    manager = _local_load_manager(runtime_dir, "openai/gpt-oss-120b", tmp_path)
 
     with pytest.raises(ValueError, match="checkpoint absent"):
         manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
 
-    assert not manager._model_shm_init_unconfirmed
-    _stop_partial_local_manager(manager, process_utils, shm_dir)
+    assert manager.parameter_server_instance is None
+    _stop_partial_local_manager(manager)
     assert not runtime_dir.exists()
-    assert list(shm_dir.iterdir()) == []
 
 
-def test_local_gpt_oss_post_init_failure_cleans_only_owned_names(
+def test_local_gpt_oss_post_init_failure_still_releases_the_owner(
     tmp_path, monkeypatch
 ):
-    process_utils = _process_utils_namespace()
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    shm_dir = tmp_path / "shm"
-    shm_dir.mkdir()
-    neighbor = shm_dir / "shm_neighbor"
-    neighbor.touch()
+    released = []
 
     class FakeGptOssParameterServer:
-        shm_creation_attempted = False
-
         def __init__(self, *args, **kwargs):
             self.parameter_server = SimpleNamespace(byte_size=self._fail_size)
 
         def __del__(self):
-            (shm_dir / "shm_reserved_weights").unlink(missing_ok=True)
-            (shm_dir / "shm_reserved_meta").unlink(missing_ok=True)
+            released.append(True)
 
         def _fail_size(self):
             raise RuntimeError("size failed")
 
-        def reserve_shm_names(self):
-            return "/shm_reserved_weights", "/shm_reserved_meta"
-
         def Init(self):
-            self.shm_creation_attempted = True
-            (shm_dir / "shm_reserved_weights").touch()
-            (shm_dir / "shm_reserved_meta").touch()
-            return self.reserve_shm_names()
+            return "/shm_weights", "/shm_meta"
 
     module = ModuleType(GPT_OSS_PS_MODULE)
     module.GptOss_Parameter_Server = FakeGptOssParameterServer
     monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
-    manager = _local_load_manager(
-        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
-    )
+    manager = _local_load_manager(runtime_dir, "openai/gpt-oss-120b", tmp_path)
 
     with pytest.raises(RuntimeError, match="size failed"):
         manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
 
-    assert not manager._model_shm_init_unconfirmed
+    # Init already created the regions, so the owner must be reachable for the
+    # rollback that follows.
     assert manager.parameter_server_instance is not None
-    _stop_partial_local_manager(manager, process_utils, shm_dir)
-    assert not (shm_dir / "shm_reserved_weights").exists()
-    assert not (shm_dir / "shm_reserved_meta").exists()
-    assert neighbor.exists()
+    _stop_partial_local_manager(manager)
+    assert released == [True]
     assert not runtime_dir.exists()
 
 
-def test_local_gpt_oss_fails_closed_when_init_drifts_from_reservation(
-    tmp_path, monkeypatch
-):
-    process_utils = _process_utils_namespace()
+def test_local_other_model_writes_no_shm_provenance(tmp_path, monkeypatch):
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    shm_dir = tmp_path / "shm"
-    shm_dir.mkdir()
-
-    class DriftingGptOssParameterServer:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def reserve_shm_names(self):
-            return "/shm_reserved_weights", "/shm_reserved_meta"
-
-        def Init(self):
-            return "/shm_other_weights", "/shm_reserved_meta"
-
-    module = ModuleType(GPT_OSS_PS_MODULE)
-    module.GptOss_Parameter_Server = DriftingGptOssParameterServer
-    monkeypatch.setitem(sys.modules, GPT_OSS_PS_MODULE, module)
-
-    manager = _local_load_manager(
-        process_utils, runtime_dir, "openai/gpt-oss-120b", tmp_path
-    )
-
-    with pytest.raises(RuntimeError, match="differ from the recorded reservation"):
-        manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
-
-    record = json.loads(
-        (runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]).read_text()
-    )
-    assert record["shm_names"] == ["shm_reserved_weights"]
-    assert manager._model_shm_init_unconfirmed
-    with pytest.raises(RuntimeError, match="ownership is unconfirmed"):
-        _stop_partial_local_manager(manager, process_utils, shm_dir)
-    assert runtime_dir.exists()
-
-
-def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypatch):
-    process_utils = _process_utils_namespace()
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    record_path = runtime_dir / process_utils["MODEL_SHM_PROVENANCE_FILE"]
-    recorded_during_init = []
 
     class FakeMixtralParameterServer:
         def __init__(self, *args, **kwargs):
@@ -501,7 +387,6 @@ def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypa
             )
 
         def Init(self):
-            recorded_during_init.append(record_path.exists())
             return "/shm_mixtral_weights", "/shm_mixtral_meta"
 
     module = ModuleType(MIXTRAL_PS_MODULE)
@@ -509,16 +394,14 @@ def test_local_other_model_still_records_shm_names_after_init(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, MIXTRAL_PS_MODULE, module)
 
     manager = _local_load_manager(
-        process_utils, runtime_dir, "mistralai/Mixtral-8x7B-Instruct-v0.1", tmp_path
+        runtime_dir, "mistralai/Mixtral-8x7B-Instruct-v0.1", tmp_path
     )
 
     manager._load_model_locally(tmp_path / "hf", tmp_path / "converted")
 
-    assert recorded_during_init == [False]
     assert manager.model_info["shm_name"] == "/shm_mixtral_weights"
-    record = json.loads(record_path.read_text())
-    # Tensor metadata is an unnamed memfd; only the weights name is recorded.
-    assert record["shm_names"] == ["shm_mixtral_weights"]
+    assert manager.model_info["tensor_meta_shm_name"] == "/shm_mixtral_meta"
+    assert list(runtime_dir.iterdir()) == []
 
 
 def test_local_world_size_requires_exact_division_and_visibility():
@@ -738,21 +621,12 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
 
 @pytest.mark.parametrize("local_owner", [False, True])
 def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner):
-    weight = tmp_path / "shm_weight"
-    metadata = tmp_path / "shm_metadata"
-    weight.touch()
-    metadata.touch()
-    cleaned = []
-
-    def verify_model_shm_absent(model_info, **kwargs):
-        cleaned.append(True)
-        for key in ("shm_name", "tensor_meta_shm_name"):
-            assert not (tmp_path / model_info.pop(key).lstrip("/")).exists()
+    """Dropping the C++ owner is the whole release; nothing is unlinked here."""
+    released = []
 
     class Owner:
         def __del__(self):
-            weight.unlink()
-            metadata.unlink()
+            released.append(True)
 
     fake_logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
@@ -761,7 +635,6 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
     manager_type = _worker_manager_method(
         "stop",
         {
-            "verify_model_shm_absent": verify_model_shm_absent,
             "gc": gc,
             "Path": Path,
             "logger": fake_logger,
@@ -782,8 +655,8 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
     manager.distributed_weight_daemon = None
     manager.parameter_server_instance = Owner() if local_owner else None
     manager.model_info = {
-        "shm_name": f"/{weight.name}",
-        "tensor_meta_shm_name": f"/{metadata.name}",
+        "shm_name": "/shm_weight",
+        "tensor_meta_shm_name": "/shm_metadata",
     }
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
@@ -792,61 +665,11 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
 
     manager.stop()
 
-    assert cleaned == ([True] if local_owner else [])
-    assert weight.exists() is not local_owner
-    assert metadata.exists() is not local_owner
+    # A borrowed region (remote parameter server, distributed store) is never
+    # released here; only the label is dropped.
+    assert released == ([True] if local_owner else [])
     assert "shm_name" not in manager.model_info
     assert "tensor_meta_shm_name" not in manager.model_info
-
-
-def test_worker_stop_retries_preserve_unverified_owner_release(tmp_path):
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    record = runtime_dir / "model_shm.json"
-    record.write_text("owned names")
-    events = []
-    manager_type = _worker_manager_method(
-        "stop",
-        {
-            "verify_model_shm_absent": lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("model residue")
-            ),
-            "gc": gc,
-            "Path": Path,
-            "logger": SimpleNamespace(
-                info=lambda *args: None, error=lambda *args: None
-            ),
-        },
-    )
-    manager = manager_type()
-    manager.args = SimpleNamespace(
-        runtime_identity=SimpleNamespace(runtime_dir=runtime_dir),
-        enable_hugetlbfs=False,
-    )
-    manager._stopping = False
-    manager.started = True
-    manager._runtime_dir_created = True
-    manager._runtime_namespace_owned = False
-    manager._runtime_locks = SimpleNamespace(
-        close=lambda: events.append("lock-close")
-    )
-    manager._lane_lease = None
-    manager.worker_process = None
-    manager.distributed_weight_daemon = None
-    manager.parameter_server_instance = object()
-    manager.model_info = {"shm_name": "/shm_weight"}
-    manager.skeleton_state_dict_file = None
-    manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
-    manager._monitor_thread = None
-    manager._close_skeleton_memfd = lambda: None
-
-    with pytest.raises(RuntimeError, match="model residue"):
-        manager.stop()
-    with pytest.raises(RuntimeError, match="owner release was not verified"):
-        manager.stop()
-    assert record.exists()
-    assert manager.model_info == {"shm_name": "/shm_weight"}
-    assert events == []
 
 
 def test_worker_start_rolls_back_partial_startup_before_reraising():

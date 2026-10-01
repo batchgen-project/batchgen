@@ -657,7 +657,7 @@ void Weights_Storage::Init(
     void* weight_ptr =
         allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true,
                                       enable_thp, memfd_creator_pid, memfd_fd_arg,
-                                      nullptr, nullptr, nullptr, &mapped_size);
+                                      nullptr, &mapped_size);
 
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {

@@ -660,7 +660,7 @@ class BatchGenWorkerArgs:
 	# --fast-init (THP + prefault). Host KV, model weights and tensor metadata
 	# always use memfd_create, so the creator pids and fds below are populated
 	# in every mode. weights_memfd_pid owns both weights and tensor metadata;
-	# with hugetlbfs the weights fd stays -1 and the weights come from a file.
+	# --enable-hugetlbfs only changes the weights memfd's page size.
 	fast_init: bool = False
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
