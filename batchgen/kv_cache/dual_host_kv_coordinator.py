@@ -254,8 +254,16 @@ class DualHostKVCoordinator:
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
 		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
 
-		primary_config.enable_thp = enable_thp
-		aux_config.enable_thp = enable_thp
+		# Older prebuilt core_engine wheels do not expose the optional THP
+		# attribute. Keep the default (disabled) path compatible while still
+		# failing explicitly if fast-init was requested without a matching ABI.
+		if hasattr(primary_config, "enable_thp"):
+			primary_config.enable_thp = enable_thp
+			aux_config.enable_thp = enable_thp
+		elif enable_thp:
+			raise RuntimeError(
+				"fast-init requires a core_engine build with HostPagedKVConfig.enable_thp"
+			)
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)
