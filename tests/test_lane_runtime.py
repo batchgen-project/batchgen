@@ -725,12 +725,7 @@ def test_dead_lane_closeout_matches_only_exact_instance_shm(
         }
     )
     lane_runtime._atomic_json(state_root / "lane.json", manifest)
-    real_path = Path
-    monkeypatch.setattr(
-        lane_runtime,
-        "Path",
-        lambda value: shm_dir if value == "/dev/shm" else real_path(value),
-    )
+    monkeypatch.setattr(lane_runtime, "SHM_ROOT", shm_dir)
     monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
     monkeypatch.setattr(lane_runtime, "_process_group_exists", lambda value: False)
     monkeypatch.setattr(lane_runtime, "_gpu_processes", lambda: [])
@@ -845,12 +840,21 @@ def test_admission_wait_fails_closed_without_observed_lock(tmp_path, monkeypatch
     )
 
 
-def _provenance_stop_fixture(tmp_path, monkeypatch, payload):
+# Hold the run lock LOCK_SH exactly as every process of a live run does.
+_HOLD_RUN_LOCK = (
+    "import fcntl, os, sys, time;"
+    "fd = os.open(sys.argv[1], os.O_RDWR);"
+    "fcntl.flock(fd, fcntl.LOCK_SH);"
+    "sys.stdout.write('held\\n');"
+    "sys.stdout.flush();"
+    "time.sleep(60)"
+)
+
+
+def _dead_lane_stop_fixture(tmp_path, monkeypatch):
+    """A lane whose owner and process group are already gone."""
     temp_root = tmp_path / "lane-tmp"
-    runtime_dir = temp_root / f"batchgen_lane_{'a' * 32}"
-    runtime_dir.mkdir(parents=True)
-    if payload is not None:
-        (runtime_dir / lane_runtime._MODEL_SHM_PROVENANCE).write_text(payload)
+    temp_root.mkdir()
     shm_dir = tmp_path / "shm"
     shm_dir.mkdir()
     state_root = tmp_path / "state"
@@ -863,118 +867,151 @@ def _provenance_stop_fixture(tmp_path, monkeypatch, payload):
         }
     )
     lane_runtime._atomic_json(state_root / "lane.json", manifest)
-    real_path = Path
-    monkeypatch.setattr(
-        lane_runtime,
-        "Path",
-        lambda value: shm_dir if value == "/dev/shm" else real_path(value),
-    )
+    monkeypatch.setattr(lane_runtime, "SHM_ROOT", shm_dir)
     monkeypatch.setattr(lane_runtime, "_pid_identity_matches", lambda value: False)
     monkeypatch.setattr(lane_runtime, "_process_group_exists", lambda value: False)
     monkeypatch.setattr(lane_runtime, "_gpu_processes", lambda: [])
-    args = SimpleNamespace(state_root=state_root, instance_id="lane")
-    return shm_dir, runtime_dir, state_root / "lane.json", args
+    return SimpleNamespace(
+        temp_root=temp_root,
+        shm_dir=shm_dir,
+        state_path=state_root / "lane.json",
+        args=SimpleNamespace(state_root=state_root, instance_id="lane"),
+    )
 
 
-def test_stop_records_provenanced_model_shm_and_ignores_unrecorded(
+def _run_dir(temp_root, name, *, run_lock=True):
+    directory = temp_root / name
+    directory.mkdir()
+    if run_lock:
+        (directory / lane_runtime._RUN_LOCK_NAME).touch()
+    return directory
+
+
+def test_stop_reclaims_a_dead_run_and_leaves_other_instances_alone(
     tmp_path, monkeypatch
 ):
-    recorded_name = "shm_9f1c6b0e-3f1e-4a9b-9a1c-0d2e4f6a8b0c"
-    shm_dir, _, state_path, args = _provenance_stop_fixture(
-        tmp_path,
-        monkeypatch,
-        json.dumps({"version": 1, "shm_names": [recorded_name]}),
-    )
-    recorded = shm_dir / recorded_name
-    recorded.touch()
-    unrecorded = shm_dir / "shm_11111111-2222-3333-4444-555555555555"
-    unrecorded.touch()
+    fixture = _dead_lane_stop_fixture(tmp_path, monkeypatch)
+    dead = _run_dir(fixture.temp_root, f"batchgen_lane_{'a' * 32}")
+    dead_shm = fixture.shm_dir / f"{dead.name}.host_kv"
+    dead_shm.touch()
+    other = _run_dir(fixture.temp_root, f"batchgen_lane_b_{'a' * 32}")
+    other_shm = fixture.shm_dir / f"{other.name}.host_kv"
+    other_shm.touch()
 
+    # The other instance's leftovers are not this lane's to reclaim, so they
+    # stay residual exactly as before.
     with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
-        lane_runtime.stop_lane(args)
+        lane_runtime.stop_lane(fixture.args)
 
-    failed = lane_runtime._read_json(state_path)
+    failed = lane_runtime._read_json(fixture.state_path)
     assert failed["state"] == "failed"
-    assert failed["residual_shm"] == [str(recorded)]
-    assert recorded.exists()
-    assert unrecorded.exists()
+    assert failed["reclaimed"] == [dead.name]
+    assert failed["residual_runtime_dirs"] == [str(other)]
+    assert failed["residual_shm"] == []
+    assert not dead.exists()
+    assert not dead_shm.exists()
+    assert (other / lane_runtime._RUN_LOCK_NAME).exists()
+    assert other_shm.exists()
 
 
-def test_stop_does_not_claim_provenanced_name_that_is_already_gone(
-    tmp_path, monkeypatch
-):
-    shm_dir, runtime_dir, state_path, args = _provenance_stop_fixture(
-        tmp_path,
-        monkeypatch,
-        json.dumps({"version": 1, "shm_names": ["shm_already-unlinked"]}),
+def test_stop_reclaims_the_last_dead_run_and_completes(tmp_path, monkeypatch):
+    fixture = _dead_lane_stop_fixture(tmp_path, monkeypatch)
+    dead = _run_dir(fixture.temp_root, f"batchgen_lane_{'a' * 32}")
+    dead_shm = fixture.shm_dir / f"{dead.name}.host_kv"
+    dead_shm.touch()
+    unrelated = fixture.shm_dir / "nccl-abcdef"
+    unrelated.touch()
+
+    result = lane_runtime.stop_lane(fixture.args)
+
+    assert result["state"] == "stopped"
+    assert result["reclaimed"] == [dead.name]
+    assert lane_runtime._read_json(fixture.state_path)["state"] == "stopped"
+    assert list(fixture.temp_root.iterdir()) == []
+    assert not dead_shm.exists()
+    assert unrelated.exists()
+
+
+def test_stop_keeps_a_run_whose_lock_a_live_process_holds(tmp_path, monkeypatch):
+    fixture = _dead_lane_stop_fixture(tmp_path, monkeypatch)
+    live = _run_dir(fixture.temp_root, f"batchgen_lane_{'a' * 32}")
+    live_shm = fixture.shm_dir / f"{live.name}.host_kv"
+    live_shm.touch()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _HOLD_RUN_LOCK,
+            str(live / lane_runtime._RUN_LOCK_NAME),
+        ],
+        stdout=subprocess.PIPE,
     )
+    try:
+        assert holder.stdout.readline() == b"held\n"
+        with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
+            lane_runtime.stop_lane(fixture.args)
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+        holder.stdout.close()
+
+    failed = lane_runtime._read_json(fixture.state_path)
+    assert failed["state"] == "failed"
+    assert "reclaimed" not in failed
+    assert failed["residual_runtime_dirs"] == [str(live)]
+    assert failed["residual_shm"] == [str(live_shm)]
+    assert (live / lane_runtime._RUN_LOCK_NAME).exists()
+    assert live_shm.exists()
+
+
+@pytest.mark.parametrize("flaw", ["no_run_lock", "symlink"])
+def test_stop_keeps_a_runtime_dir_whose_death_cannot_be_proven(
+    tmp_path, monkeypatch, flaw
+):
+    fixture = _dead_lane_stop_fixture(tmp_path, monkeypatch)
+    name = f"batchgen_lane_{'a' * 32}"
+    if flaw == "no_run_lock":
+        residual = _run_dir(fixture.temp_root, name, run_lock=False)
+    else:
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (target / lane_runtime._RUN_LOCK_NAME).touch()
+        residual = fixture.temp_root / name
+        residual.symlink_to(target, target_is_directory=True)
+    residual_shm = fixture.shm_dir / f"{name}.host_kv"
+    residual_shm.touch()
 
     with pytest.raises(lane_runtime.LaneError, match="residual lane resources"):
-        lane_runtime.stop_lane(args)
+        lane_runtime.stop_lane(fixture.args)
 
-    failed = lane_runtime._read_json(state_path)
-    assert failed["residual_shm"] == []
-    assert failed["residual_runtime_dirs"] == [str(runtime_dir)]
-    assert list(shm_dir.iterdir()) == []
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "{not json",
-        json.dumps({"version": 2, "shm_names": ["shm_a"]}),
-        json.dumps({"version": 1, "shm_names": []}),
-        json.dumps({"version": 1, "shm_names": ["../escape"]}),
-        json.dumps({"version": 1, "shm_names": [7]}),
-        json.dumps(["shm_a"]),
-    ],
-)
-def test_stop_fails_closed_on_malformed_provenance(tmp_path, monkeypatch, payload):
-    _, _, state_path, args = _provenance_stop_fixture(
-        tmp_path, monkeypatch, payload
-    )
-
-    with pytest.raises(lane_runtime.LaneError, match="model SHM provenance"):
-        lane_runtime.stop_lane(args)
-
-    assert lane_runtime._read_json(state_path)["state"] == "admitted"
+    failed = lane_runtime._read_json(fixture.state_path)
+    assert failed["state"] == "failed"
+    assert "reclaimed" not in failed
+    assert failed["residual_runtime_dirs"] == [str(residual)]
+    assert failed["residual_shm"] == [str(residual_shm)]
+    assert residual.is_dir()
+    assert residual.is_symlink() == (flaw == "symlink")
+    assert residual_shm.exists()
 
 
-def test_stop_fails_closed_on_symlinked_provenance(tmp_path, monkeypatch):
-    _, runtime_dir, state_path, args = _provenance_stop_fixture(
-        tmp_path, monkeypatch, None
-    )
-    foreign = tmp_path / "foreign.json"
-    foreign.write_text(json.dumps({"version": 1, "shm_names": ["shm_a"]}))
-    (runtime_dir / lane_runtime._MODEL_SHM_PROVENANCE).symlink_to(foreign)
+def test_run_shm_removal_touches_only_this_run_regular_files(tmp_path):
+    shm_dir = tmp_path / "shm"
+    shm_dir.mkdir()
+    prefix = f"batchgen_lane_{'a' * 32}."
+    regular = shm_dir / f"{prefix}host_kv"
+    regular.touch()
+    nested = shm_dir / f"{prefix}dir"
+    nested.mkdir()
+    link = shm_dir / f"{prefix}link"
+    link.symlink_to(tmp_path / "outside")
+    other = shm_dir / f"batchgen_lane_{'b' * 32}.host_kv"
+    other.touch()
 
-    with pytest.raises(lane_runtime.LaneError, match="model SHM provenance"):
-        lane_runtime.stop_lane(args)
-
-    assert lane_runtime._read_json(state_path)["state"] == "admitted"
-
-
-def test_provenance_is_read_only_from_this_lane_exact_runtime_dirs(tmp_path):
-    payload = json.dumps({"version": 1, "shm_names": ["shm_a"]})
-    foreign = tmp_path / f"batchgen_lane_{'a' * 32}_b_{'b' * 32}"
-    foreign.mkdir()
-    (foreign / lane_runtime._MODEL_SHM_PROVENANCE).write_text("{not json")
-    mine = tmp_path / f"batchgen_lane_{'c' * 32}"
-    mine.mkdir()
-    (mine / lane_runtime._MODEL_SHM_PROVENANCE).write_text(payload)
-
-    assert lane_runtime._recorded_model_shm([foreign, mine], "lane") == ["shm_a"]
-    assert lane_runtime._recorded_model_shm([foreign], "lane") == []
-
-
-def test_provenance_rejects_symlinked_runtime_directory(tmp_path):
-    target = tmp_path / "foreign"
-    target.mkdir()
-    link = tmp_path / f"batchgen_lane_{'a' * 32}"
-    link.symlink_to(target, target_is_directory=True)
-
-    with pytest.raises(lane_runtime.LaneError, match="symlink"):
-        lane_runtime._recorded_model_shm([link], "lane")
+    assert lane_runtime._unlink_run_shm(shm_dir, prefix) == [str(regular)]
+    assert not regular.exists()
+    assert nested.is_dir()
+    assert link.is_symlink()
+    assert other.exists()
 
 
 def test_prepare_paths_pins_both_packages_to_one_worktree(tmp_path):
@@ -1237,10 +1274,12 @@ def test_memory_admission_keeps_active_lane_safety_reserve(monkeypatch):
             "SReclaimable": 0,
         },
     )
+    # The shared regions are memfds charged to host memory, so no filesystem
+    # capacity may gate admission.
     monkeypatch.setattr(
         lane_runtime.os,
         "statvfs",
-        lambda path: SimpleNamespace(f_bavail=400, f_blocks=400, f_frsize=gib),
+        lambda path: pytest.fail("lane admission must not consult a filesystem"),
     )
     lane_runtime._check_memory(
         {
