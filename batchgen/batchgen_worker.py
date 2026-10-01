@@ -1003,6 +1003,7 @@ class BatchGenWorker:
 		# static config.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._prompt_arena: Optional[PromptTokenArena] = None
+		self._prompt_private_arena: Optional[PromptTokenArena] = None
 		self._prompt_handles: Dict[str, Tuple[int, int]] = {}
 		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
@@ -1545,6 +1546,29 @@ class BatchGenWorker:
 			self._prompt_arena.read_into(handle, out.view(-1).numpy())
 			self._prompt_tensors[seq.uuid] = out
 
+	def _write_local_prompt(self, uuid: str, tokens: torch.Tensor) -> torch.Tensor:
+		"""Write a prompt for a local re-entry/migration path.
+
+		Admission uses the node leader arena. These paths are owner-local and may
+		run without a process-group rendezvous, so an attached reader uses a small
+		private arena rather than attempting an unsafe cross-process allocation.
+		"""
+		arena = self._prompt_arena
+		if arena is None or not arena.is_creator:
+			if self._prompt_private_arena is None:
+				self._prompt_private_arena = PromptTokenArena.create(
+					f"{self._query_book_shm_prefix}_prompt_private_{os.getpid()}",
+					capacity_bytes=max(1 << 20, int(tokens.numel()) * 8),
+				)
+			arena = self._prompt_private_arena
+		arr = tokens.detach().to(dtype=torch.int32, device="cpu").contiguous()
+		handle = arena.write(arr.numpy())
+		self._prompt_handles[uuid] = handle
+		out = torch.empty((1, arr.numel()), dtype=torch.int32)
+		arena.read_into(handle, out.view(-1).numpy())
+		self._prompt_tensors[uuid] = out
+		return out
+
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
 		"""Tokenize newly admitted sequences and assign buffer pool slots.
 
@@ -1963,6 +1987,11 @@ class BatchGenWorker:
 		handle = self._prompt_handles.pop(uuid, None)
 		if handle is not None and self._prompt_arena is not None and self._prompt_arena.is_creator:
 			self._prompt_arena.free(handle)
+		elif handle is not None and self._prompt_private_arena is not None:
+			try:
+				self._prompt_private_arena.free(handle)
+			except ValueError:
+				pass
 		self._prompt_tensors.pop(uuid, None)
 
 		# Free local index mapping.
@@ -4339,12 +4368,9 @@ class BatchGenWorker:
 							f"has diverged from the other ranks"
 						)
 					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
-					prompt_cpu = pending['input_ids'][0, :seq.prompt_length].to(dtype=torch.int32, device="cpu").contiguous()
-					handle = self._prompt_arena.write(prompt_cpu.numpy())
-					self._prompt_handles[uuid] = handle
-					input_ids_view = torch.empty((1, seq.prompt_length), dtype=torch.int32)
-					self._prompt_arena.read_into(handle, input_ids_view.view(-1).numpy())
-					self._prompt_tensors[uuid] = input_ids_view
+					input_ids_view = self._write_local_prompt(
+						uuid, pending['input_ids'][0, :seq.prompt_length]
+					)
 					decoded_view = self._buffer_pool.get_decoded_tokens_view(existing_slot)
 					seq.input_ids = input_ids_view
 					seq.decoded_tokens = decoded_view
@@ -7133,15 +7159,10 @@ class BatchGenWorker:
 					f"Rank {self.rank}: re-entry of {uuid[:8]} has no buffer slot "
 					f"(_buffer_slot={slot}); slot assignment has diverged"
 				)
-			prompt_cpu = evicted_ids.to(dtype=torch.int32, device="cpu").contiguous()
 			old_handle = self._prompt_handles.pop(uuid, None)
-			if old_handle is not None:
+			if old_handle is not None and self._prompt_arena is not None and self._prompt_arena.is_creator:
 				self._prompt_arena.free(old_handle)
-			handle = self._prompt_arena.write(prompt_cpu.numpy())
-			self._prompt_handles[uuid] = handle
-			seq.input_ids = torch.empty((1, new_prompt_len), dtype=torch.int32)
-			self._prompt_arena.read_into(handle, seq.input_ids.view(-1).numpy())
-			self._prompt_tensors[uuid] = seq.input_ids
+			seq.input_ids = self._write_local_prompt(uuid, evicted_ids)
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# so the final decoded_tokens contains the COMPLETE response.
