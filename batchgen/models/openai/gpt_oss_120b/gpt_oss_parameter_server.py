@@ -85,7 +85,6 @@ class GptOss_Parameter_Server:
         self.enable_thp = enable_thp
         self.shm_name = None
         self.tensor_meta_shm_name = None
-        self.shm_creation_attempted = False
 
         # Use BatchGen's unified config system
         self.model_config = load_config(huggingface_ckpt_name)
@@ -111,17 +110,6 @@ class GptOss_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"Python PM instantiation: GPU 0 free memory: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
-    def reserve_shm_names(self):
-        """Reserve this run's random model SHM names without creating anything.
-
-        A caller reserves before Init so the exact names can be persisted while
-        no shared memory exists yet; repeated calls return the same reservation.
-        """
-        if self.shm_name is None:
-            self.shm_name = "/shm_" + str(uuid.uuid4())
-            self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
-        return self.shm_name, self.tensor_meta_shm_name
-
     def Init(self):
         """Initialize parameter server and load weights."""
         free_memory, total_memory = torch.cuda.mem_get_info()
@@ -141,8 +129,10 @@ class GptOss_Parameter_Server:
         # GPT-OSS-120B: ~65GB total (61GB MXFP4 experts + 4GB BF16 attn/embed)
         byte_size = 70 * 1024 * 1024 * 1024  # 70GB with buffer
 
-        # Reuse the caller's reservation when present, otherwise self-generate.
-        self.reserve_shm_names()
+        # Both regions are anonymous memfds; these names are only the labels the
+        # C++ parameter server reports for them.
+        self.shm_name = "/shm_" + str(uuid.uuid4())
+        self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
         logging.info(f"Model parameters shared memory name: {self.shm_name}")
         logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
         logging.info(f"Byte size: {byte_size}")
@@ -150,7 +140,6 @@ class GptOss_Parameter_Server:
         # Convert checkpoint files to BatchGen format
         self._convert_checkpoint()
 
-        self.shm_creation_attempted = True
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,

@@ -190,7 +190,10 @@ def kill_process_tree(
             pass
 
 
-def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
+def cleanup_shm_files(
+    shm_prefix: Optional[str] = "batchgen",
+    shm_dir: Optional[Path] = None,
+) -> int:
     """Clean up shared memory files in /dev/shm safely using Python.
 
     This function only deletes files matching known BatchGen prefixes,
@@ -200,13 +203,15 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
     Args:
         shm_prefix: Prefix to match shared memory files. If None, matches all
                    known BATCHGEN_SHM_PREFIXES. Default is 'batchgen'.
+        shm_dir: Directory holding the POSIX shared-memory objects. Defaults to
+                 /dev/shm; the dead-run reclaim tests inject a temporary dir.
 
     Returns:
         Number of files removed.
     """
-    shm_dir = Path("/dev/shm")
+    shm_dir = Path("/dev/shm") if shm_dir is None else Path(shm_dir)
     if not shm_dir.exists():
-        logger.debug("/dev/shm does not exist")
+        logger.debug("%s does not exist", shm_dir)
         return 0
 
     # Determine which prefixes to match
@@ -230,18 +235,18 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
 
             try:
                 entry.unlink()
-                logger.debug(f"Removed /dev/shm/{entry.name}")
+                logger.debug(f"Removed {entry}")
                 removed += 1
             except PermissionError:
-                logger.warning(f"Permission denied: /dev/shm/{entry.name}")
+                logger.warning(f"Permission denied: {entry}")
             except OSError as e:
-                logger.warning(f"Failed to remove /dev/shm/{entry.name}: {e}")
+                logger.warning(f"Failed to remove {entry}: {e}")
 
     except (PermissionError, OSError) as e:
-        logger.warning(f"Error accessing /dev/shm: {e}")
+        logger.warning(f"Error accessing {shm_dir}: {e}")
 
     if removed > 0:
-        logger.info(f"Cleaned up {removed} shared memory files from /dev/shm")
+        logger.info(f"Cleaned up {removed} shared memory files from {shm_dir}")
 
     return removed
 
