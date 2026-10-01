@@ -257,6 +257,7 @@ def _local_load_manager(process_utils, runtime_dir, model, tmp_path):
     manager.parameter_server_instance = None
     manager.model_info = {}
     manager._model_shm_init_unconfirmed = False
+    manager._store_skeleton_state_dict = lambda skeleton_state_dict: None
     manager.args = SimpleNamespace(
         model=model,
         cache_dir=tmp_path / "cache",
@@ -297,7 +298,7 @@ def _stop_partial_local_manager(
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._cleanup_skeleton_state_dict_file = lambda: None
+    manager._close_skeleton_memfd = lambda: None
     return stop_type.stop(manager)
 
 
@@ -727,7 +728,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._cleanup_skeleton_state_dict_file = lambda: None
+    manager._close_skeleton_memfd = lambda: None
 
     manager.stop()
 
@@ -787,7 +788,7 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._cleanup_skeleton_state_dict_file = lambda: None
+    manager._close_skeleton_memfd = lambda: None
 
     manager.stop()
 
@@ -837,7 +838,7 @@ def test_worker_stop_retries_preserve_unverified_owner_release(tmp_path):
     manager.skeleton_state_dict_file = None
     manager._monitor_stop_event = SimpleNamespace(set=lambda: None)
     manager._monitor_thread = None
-    manager._cleanup_skeleton_state_dict_file = lambda: None
+    manager._close_skeleton_memfd = lambda: None
 
     with pytest.raises(RuntimeError, match="model residue"):
         manager.stop()
@@ -907,7 +908,7 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     )
     manager.request_queue = SimpleNamespace(put=lambda value: None)
     manager._join_lock = nullcontext()
-    manager._cleanup_skeleton_state_dict_file = lambda: None
+    manager._close_skeleton_memfd = lambda: None
     manager.args = SimpleNamespace(
         runtime_identity=SimpleNamespace(
             shm_prefix="batchgen_lane-0_run.",

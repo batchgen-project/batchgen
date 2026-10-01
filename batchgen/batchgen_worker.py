@@ -119,6 +119,7 @@ from batchgen.batch_order import (
 	prefill_sequence_spans_to_cu_seqlens,
 	prefill_sequence_spans_to_global_seq_ids,
 )
+from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBookEntry as query,
 	bind_local_sequence_to_query_book,
@@ -321,13 +322,42 @@ class QueryBookPoolCapacityError(RuntimeError):
 	"""A QueryBook pool request exceeded the rows/width actually allocated."""
 
 
+class NodeSharedMemfd:
+	"""One node's anonymous memfd for the QueryBook ``input_ids`` table.
+
+	``fd`` is this rank's own descriptor onto the region: the creator's memfd
+	itself, or the handle an attacher got from ``/proc/<creator>/fd/<N>``. The
+	region carries no name anywhere in the filesystem, so the kernel reclaims
+	it with the last mapping however the processes died.
+
+	``release_fd`` drops only the descriptor. ``mapping`` deliberately stays
+	open: views handed out before a pool grow may still be live, and unmapping
+	under them would segfault. The mapping itself keeps the memfd alive, so a
+	released fd never shortens the region's life.
+	"""
+
+	def __init__(self, fd: int, mapping):
+		self.fd = fd
+		self.mapping = mapping
+
+	def release_fd(self) -> None:
+		if self.fd < 0:
+			return
+		try:
+			os.close(self.fd)
+		except OSError:
+			pass
+		self.fd = -1
+
+
 def allocate_node_shared_int64(
-	name: str,
+	label: str,
 	rows: int,
 	width: int,
 	is_creator: bool,
+	exchange,
 	barrier,
-) -> Tuple[torch.Tensor, object]:
+) -> Tuple[torch.Tensor, NodeSharedMemfd]:
 	"""Map ONE int64 ``[rows, width]`` CPU tensor per node into every worker.
 
 	The tokenized batch is identical on every rank (``_tokenize_admitted_sequences``
@@ -336,40 +366,54 @@ def allocate_node_shared_int64(
 	same bytes, which is what OOM-killed the node.
 
 	``is_creator`` must be true on exactly one rank per node. The creator makes
-	the segment (POSIX guarantees it is zero-filled, matching the ``torch.zeros``
-	it replaces), everyone waits on ``barrier``, then the rest attach. ``barrier``
-	is ``dist.barrier`` in the worker and an ``mp.Barrier`` in tests.
+	an UNNAMED memfd (``ftruncate`` guarantees it is zero-filled, matching the
+	``torch.zeros`` it replaces) and the rest open it through
+	``/proc/<creator_pid>/fd/<N>``. ``label`` never names an object: it is only
+	the ``memfd:`` tag that shows up in ``/proc/<pid>/fd`` and ``/proc/<pid>/maps``.
 
-	Returns ``(tensor, shm)``. The caller MUST keep ``shm`` alive for as long as
-	the tensor is reachable: the tensor points straight into the mapping.
+	``exchange(pid, fd) -> (creator_pid, creator_fd)`` publishes this rank's
+	identity and returns the node creator's. It must synchronize — the creator's
+	memfd only exists once it has entered — which is why it REPLACES the barrier
+	that used to sit here rather than adding to it. ``barrier`` still guards the
+	other end: no fd may be released until every rank has mapped the region.
 
-	Two operational notes: the segment lands in /dev/shm, so the container's
-	shm budget has to cover it; and CPython < 3.13 registers a segment with the
-	resource_tracker on attach as well as on create, so every non-creator rank
-	prints one "leaked shared_memory objects" warning at shutdown. That warning
-	is cosmetic — unlink only drops the name, never a live mapping.
+	Returns ``(tensor, memfd)``. The caller MUST keep ``memfd`` alive for as long
+	as the tensor is reachable: the tensor points straight into the mapping.
 	"""
-	from multiprocessing import shared_memory
+	import mmap
 
 	nbytes = rows * width * 8
+	fd = -1
 	if is_creator:
-		# SharedMemory(create=True) uses exclusive creation. A collision must
-		# fail without unlinking or modifying the existing run's segment.
-		shm = shared_memory.SharedMemory(name=name, create=True, size=nbytes)
-	barrier()
+		fd = create_memfd(label)
+		os.ftruncate(fd, nbytes)
+	creator_pid, creator_fd = exchange(os.getpid(), fd)
 	if not is_creator:
-		shm = shared_memory.SharedMemory(name=name)
-	if shm.size < nbytes:
-		raise QueryBookPoolCapacityError(
-			f"shared input_ids segment '{name}' is {shm.size} bytes, "
-			f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
+		if creator_pid < 0 or creator_fd < 0:
+			raise RuntimeError(
+				f"no rank published a memfd for the '{label}' input_ids region "
+				f"(got pid={creator_pid}, fd={creator_fd})"
+			)
+		fd = os.open(
+			f"/proc/{creator_pid}/fd/{creator_fd}", os.O_RDWR | os.O_CLOEXEC
 		)
+	try:
+		size = os.fstat(fd).st_size
+		if size < nbytes:
+			raise QueryBookPoolCapacityError(
+				f"shared input_ids memfd '{label}' is {size} bytes, "
+				f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
+			)
+		mapping = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+	except BaseException:
+		os.close(fd)
+		raise
 	# Admissions can later mutate this persistent mapping outside InferenceMode.
 	with torch.inference_mode(False):
-		buf = torch.frombuffer(shm.buf, dtype=torch.int64, count=rows * width).view(rows, width)
-	# Nobody may unlink/close until every rank has mapped it.
+		buf = torch.frombuffer(mapping, dtype=torch.int64, count=rows * width).view(rows, width)
+	# Nobody may release an fd until every rank has mapped it.
 	barrier()
-	return buf, shm
+	return buf, NodeSharedMemfd(fd, mapping)
 
 
 class QueryBookBufferPool:
@@ -398,7 +442,7 @@ class QueryBookBufferPool:
 		max_decoding_length: int,
 		pad_token_id: int = 0,
 		input_ids_buffer: Optional[torch.Tensor] = None,
-		input_ids_shm: object = None,
+		input_ids_memfd: Optional["NodeSharedMemfd"] = None,
 	):
 		if input_ids_buffer is None:
 			with torch.inference_mode(False):
@@ -409,7 +453,7 @@ class QueryBookBufferPool:
 				f"pool needs ({num_sequences}, {input_ids_width})"
 			)
 		self.input_ids_buffer = input_ids_buffer
-		self.input_ids_shm = input_ids_shm
+		self.input_ids_memfd = input_ids_memfd
 		with torch.inference_mode(False):
 			self.decoded_tokens_buffer = torch.full((num_sequences, max_decoding_length), pad_token_id, dtype=torch.int64)
 		self.pad_token_id = pad_token_id
@@ -781,7 +825,9 @@ class BatchGenWorker:
 		self.cache_dir = args.cache_dir
 		self.converted_ckpt_dir = args.converted_ckpt_dir
 
-		# Load skeleton_state_dict from temp file (avoids passing tensors through mp.spawn)
+		# Load skeleton_state_dict (avoids passing tensors through mp.spawn). The
+		# server holds it in an anonymous memfd, so this path is its
+		# /proc/<server pid>/fd/<N> — nothing named to leave behind on a crash.
 		if args.skeleton_state_dict_file:
 			logging.info(f"Rank {args.global_rank}: Loading skeleton state dict from {args.skeleton_state_dict_file}")
 			self.skeleton_state_dict = torch.load(args.skeleton_state_dict_file)
@@ -948,7 +994,7 @@ class BatchGenWorker:
 
 		# QueryBook buffer pool. Allocated lazily by _ensure_buffer_pool() once
 		# the first batch's tokenized lengths are known — its input_ids buffer
-		# is ONE shared-memory segment per node, so it cannot be sized from
+		# is ONE node-shared memfd per node, so it cannot be sized from
 		# static config.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._buffer_pool_generation = 0
@@ -4472,7 +4518,7 @@ class BatchGenWorker:
 		because both call sites derive the requirement from the tokenized batch,
 		which is all-gathered to every rank before this runs.
 
-		``input_ids_buffer`` is ONE shared-memory segment per node. Sizing is by
+		``input_ids_buffer`` is ONE anonymous memfd per node. Sizing is by
 		actual need: ``required_input_width`` is the widest ``seq_extended_size``
 		(prompt + that request's decode budget) the batch will ask for, capped at
 		the model context length — never the context length itself, and never the
@@ -4497,13 +4543,20 @@ class BatchGenWorker:
 
 		self._buffer_pool_generation += 1
 		node_id = self.rank // self.local_world_size
-		name = (
+		# Not a name: memfds are unnamed, this only tags /proc/<pid>/fd so a
+		# generation can be told apart from another run's during triage.
+		label = (
 			f"{self._query_book_shm_prefix}"
 			f"_n{node_id}_g{self._buffer_pool_generation}"
 		)
 		is_creator = (self.rank % self.local_world_size) == 0
-		shared_input_ids, shm = allocate_node_shared_int64(
-			name, rows, in_w, is_creator, dist.barrier
+		shared_input_ids, memfd = allocate_node_shared_int64(
+			label,
+			rows,
+			in_w,
+			is_creator,
+			self._exchange_node_memfd_identity,
+			dist.barrier,
 		)
 		new_pool = QueryBookBufferPool(
 			num_sequences=rows,
@@ -4511,7 +4564,7 @@ class BatchGenWorker:
 			max_decoding_length=dec_w,
 			pad_token_id=self.pad_token_id,
 			input_ids_buffer=shared_input_ids,
-			input_ids_shm=shm,
+			input_ids_memfd=memfd,
 		)
 		shared_gib = rows * in_w * 8 / 2**30
 		private_gib = rows * dec_w * 8 / 2**30
@@ -4519,7 +4572,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
 				f"input_ids_width={in_w}, decoded_width={dec_w} -> input_ids "
-				f"{shared_gib:.3f} GiB SHARED per node ('{name}'), decoded_tokens "
+				f"{shared_gib:.3f} GiB SHARED per node ('{label}'), decoded_tokens "
 				f"{private_gib:.3f} GiB per rank"
 			)
 		else:
@@ -4527,29 +4580,49 @@ class BatchGenWorker:
 				f"Rank {self.rank}: QueryBook pool GROWN ({reason}): rows "
 				f"{old.num_sequences}->{rows}, input_ids_width "
 				f"{old.input_ids_width}->{in_w}, decoded_width "
-				f"{old.max_decoding_length}->{dec_w}; new input_ids segment "
-				f"{shared_gib:.3f} GiB SHARED per node ('{name}')"
+				f"{old.max_decoding_length}->{dec_w}; new input_ids memfd "
+				f"{shared_gib:.3f} GiB SHARED per node ('{label}')"
 			)
 			new_pool.adopt(old)
 		self._buffer_pool = new_pool
 		if old is not None:
 			self._rebind_buffer_pool_views()
-			self._retire_buffer_pool(old, is_creator)
+			self._retire_buffer_pool(old)
 
-	def _retire_buffer_pool(self, old: QueryBookBufferPool, is_creator: bool) -> None:
-		"""Drop a superseded pool's NAME but keep its mapping alive.
+	def _exchange_node_memfd_identity(self, pid: int, fd: int) -> Tuple[int, int]:
+		"""Publish this rank's ``input_ids`` memfd identity, take its node's.
+
+		COLLECTIVE, one per pool generation, issued identically by every rank on
+		every path. It REPLACES the post-create barrier ``allocate_node_shared_int64``
+		used to run: an all_gather cannot deliver on any rank before every rank
+		has entered, so the creator's memfd is guaranteed to exist — and to be
+		sized — by the time an attacher reads its pid and fd. Non-creators
+		contribute ``fd=-1``, which is never selected.
+		"""
+		# Pool allocation can run inside InferenceMode (see the buffer creation
+		# in allocate_node_shared_int64); the collective writes into `gathered`.
+		with torch.inference_mode(False):
+			identity = torch.tensor(
+				[pid, fd], dtype=torch.int64, device=self.torch_device
+			)
+			gathered = [torch.zeros_like(identity) for _ in range(self.world_size)]
+			dist.all_gather(gathered, identity)
+			creator_rank = (self.rank // self.local_world_size) * self.local_world_size
+			creator = gathered[creator_rank]
+			return int(creator[0].item()), int(creator[1].item())
+
+	def _retire_buffer_pool(self, old: QueryBookBufferPool) -> None:
+		"""Drop a superseded generation's descriptor but keep its mapping alive.
 
 		Views handed out before the grow may still be referenced somewhere this
-		rebind does not reach; unmapping under them would segfault. Unlinking on
-		the node's creator keeps /dev/shm from accumulating one entry per grow —
-		POSIX frees the pages once the last mapping goes, i.e. at process exit.
+		rebind does not reach; unmapping under them would segfault. Closing the
+		fd keeps /proc/<pid>/fd from accumulating one entry per grow — the
+		kernel frees the pages once the last mapping goes, i.e. at process exit,
+		however that exit happens.
 		"""
 		self._retired_buffer_pools.append(old)
-		if is_creator and old.input_ids_shm is not None:
-			try:
-				old.input_ids_shm.unlink()
-			except FileNotFoundError:
-				pass
+		if old.input_ids_memfd is not None:
+			old.input_ids_memfd.release_fd()
 
 	def _rebind_buffer_pool_views(self) -> None:
 		"""Repoint every live sequence and query-book entry at the current pool."""

@@ -6,6 +6,7 @@ import ast
 import copy
 import gc
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -39,23 +40,34 @@ def _load_runtime_identity_module():
             sys.modules[package_name] = previous
 
 
-def _isolated_worker_function(name: str):
+def _create_memfd():
+    """Load create_memfd from batchgen/memfd.py without importing batchgen."""
+    path = Path(__file__).resolve().parents[1] / "batchgen" / "memfd.py"
+    spec = importlib.util.spec_from_file_location("_batchgen_memfd", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.create_memfd
+
+
+def _isolated_worker_namespace(*names: str) -> dict:
+    """Exec the named top-level worker definitions without importing the worker."""
     tree = ast.parse(WORKER.read_text())
-    function = copy.deepcopy(
-        next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        )
-    )
-    module = ast.Module(body=[function], type_ignores=[])
+    wanted = [
+        copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
+    ]
+    assert len(wanted) == len(names), [node.name for node in wanted]
+    module = ast.Module(body=wanted, type_ignores=[])
     namespace = {
         "QueryBookPoolCapacityError": RuntimeError,
         "Tuple": Tuple,
+        "os": os,
+        "create_memfd": _create_memfd(),
         "torch": torch,
     }
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
-    return namespace[name]
+    return namespace
 
 
 def test_runtime_identity_derives_disjoint_run_names():
@@ -108,18 +120,32 @@ def test_runtime_identity_rejects_malformed_run_ids(run_id):
         runtime.RuntimeIdentity.create("lane-0", run_id=run_id)
 
 
-def test_query_book_duplicate_creator_cannot_unlink_existing_segment():
-    allocate = _isolated_worker_function("allocate_node_shared_int64")
-    name = f"batchgen_query_book_collision_{uuid.uuid4().hex}"
-    owner = shared_memory.SharedMemory(name=name, create=True, size=64)
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="memfd_create requires Linux"
+)
+def test_query_book_creator_cannot_touch_a_same_named_segment():
+    """The QueryBook label is a memfd tag, so it can never collide on a name."""
+    namespace = _isolated_worker_namespace(
+        "NodeSharedMemfd", "allocate_node_shared_int64"
+    )
+    allocate = namespace["allocate_node_shared_int64"]
+    label = f"batchgen_query_book_collision_{uuid.uuid4().hex}"
+    owner = shared_memory.SharedMemory(name=label, create=True, size=64)
     try:
         sentinel = b"alive123"
         owner.buf[: len(sentinel)] = sentinel
 
-        with pytest.raises(FileExistsError):
-            allocate(name, 1, 1, True, lambda: None)
+        buf, memfd = allocate(label, 1, 1, True, lambda pid, fd: (pid, fd), lambda: None)
+        try:
+            # A fresh memfd is zero-filled; it did not adopt the foreign bytes.
+            assert buf[0, 0].item() == 0
+            assert "memfd:" in os.readlink(f"/proc/self/fd/{memfd.fd}")
+        finally:
+            del buf
+            gc.collect()
+            memfd.release_fd()
 
-        attached = shared_memory.SharedMemory(name=name)
+        attached = shared_memory.SharedMemory(name=label)
         try:
             assert attached.size == 64
             assert bytes(attached.buf[: len(sentinel)]) == sentinel
