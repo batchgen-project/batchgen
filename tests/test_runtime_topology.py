@@ -36,6 +36,16 @@ GPT_OSS_PARAMETER_SERVER = (
 GPT_OSS_PS_MODULE = "batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server"
 MIXTRAL_PS_MODULE = "batchgen.models.mixtral.mixtral_parameter_server"
 
+_RUN_PREFIX = "batchgen_lane-0_" + "0" * 32
+# What _stop_workers needs of args to name this run's leftovers.
+_FAKE_RUN_ARGS = SimpleNamespace(
+    runtime_identity=SimpleNamespace(
+        shm_prefix=f"{_RUN_PREFIX}.",
+        runtime_dir=Path(tempfile.gettempdir()) / _RUN_PREFIX,
+    )
+)
+_ABNORMAL_EXIT_WARNING = "Workers exited abnormally"
+
 
 def _top_level_function(path: Path, name: str, globals_=None):
     tree = ast.parse(path.read_text(), filename=str(path))
@@ -113,6 +123,7 @@ def _worker_manager_method(name: str, globals_=None):
         "logging": logging,
         "time": time,
         "_WORKER_SENTINEL_GRACE_S": 20.0,
+        "list_run_named_objects": lambda shm_prefix, runtime_dir: [],
         **(globals_ or {}),
     }
     exec(
@@ -164,7 +175,7 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     server_type = _isolated_class(
         GPT_OSS_PARAMETER_SERVER,
         "GptOss_Parameter_Server",
-        ("reserve_shm_names", "Init"),
+        ("Init",),
         {
             "logging": SimpleNamespace(
                 info=lambda *args, **kwargs: None,
@@ -183,7 +194,6 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     server = server_type()
     server.shm_name = None
     server.tensor_meta_shm_name = None
-    server.shm_creation_attempted = False
     server.enable_hugetlbfs = False
     server.enable_thp = False
     server.converted_ckpt_dir = "/tmp/converted"
@@ -193,38 +203,32 @@ def _gpt_oss_parameter_server(convert_hook, cpp_init_calls):
     return server
 
 
-def test_gpt_oss_reserve_shm_names_is_stable_and_used_by_init():
+def test_gpt_oss_init_generates_its_own_model_labels():
+    """Nothing reserves a name any more: both regions are anonymous memfds."""
     converted_with = []
     cpp_init_calls = []
     server = _gpt_oss_parameter_server(
         lambda: converted_with.append(
-            (server.shm_name, server.tensor_meta_shm_name,
-             server.shm_creation_attempted)
+            (server.shm_name, server.tensor_meta_shm_name)
         ),
         cpp_init_calls,
     )
-
-    reserved = server.reserve_shm_names()
-    assert server.reserve_shm_names() == reserved
-    assert reserved[0].startswith("/shm_") and reserved[0] != reserved[1]
-
-    assert server.Init() == reserved
-    # Names must already be fixed before the long checkpoint conversion.
-    assert converted_with == [(*reserved, False)]
-    assert cpp_init_calls[0][:2] == reserved
-    assert server.shm_creation_attempted
-
-
-def test_gpt_oss_init_still_self_generates_without_reservation():
-    cpp_init_calls = []
-    server = _gpt_oss_parameter_server(lambda: None, cpp_init_calls)
 
     shm_name, tensor_meta_shm_name = server.Init()
 
     assert shm_name.startswith("/shm_")
     assert tensor_meta_shm_name.startswith("/shm_")
     assert shm_name != tensor_meta_shm_name
+    # The labels are fixed before the long checkpoint conversion.
+    assert converted_with == [(shm_name, tensor_meta_shm_name)]
     assert cpp_init_calls[0][:2] == (shm_name, tensor_meta_shm_name)
+
+
+def test_gpt_oss_parameter_server_has_no_name_reservation_api():
+    source = GPT_OSS_PARAMETER_SERVER.read_text()
+
+    assert "reserve_shm_names" not in source
+    assert "shm_creation_attempted" not in source
 
 
 def _local_load_manager(runtime_dir, model, tmp_path):
@@ -264,6 +268,7 @@ def _stop_partial_local_manager(manager):
         {
             "gc": gc,
             "Path": Path,
+            "release_run_lock": lambda file_obj: None,
             "logger": SimpleNamespace(
                 info=lambda *args, **kwargs: None,
                 error=lambda *args, **kwargs: None,
@@ -276,6 +281,7 @@ def _stop_partial_local_manager(manager):
     manager._runtime_namespace_owned = False
     manager._runtime_locks = None
     manager._lane_lease = None
+    manager._run_lock = None
     manager.worker_process = None
     manager.distributed_weight_daemon = None
     manager.skeleton_state_dict_file = None
@@ -295,9 +301,6 @@ def test_local_gpt_oss_load_needs_no_name_reservation(tmp_path, monkeypatch):
                 byte_size=lambda: 1234,
                 get_skeleton_state_dict=lambda: {"model.norm.weight": 1},
             )
-
-        def reserve_shm_names(self):
-            raise AssertionError("no name needs reserving for a memfd")
 
         def Init(self):
             return "/shm_weights", "/shm_meta"
@@ -549,9 +552,15 @@ def test_runtime_namespace_preflight_does_not_claim_longer_instance_id(tmp_path)
     neighbor = shm_dir / f"{prefix}_b_{'b' * 32}_host_kv"
     neighbor.touch()
     runtime_dir = tmp_path / "runtime"
+    locked = []
     manager_type = _worker_manager_method(
         "_prepare_runtime_dir",
-        {"Path": lambda value: shm_dir if value == "/dev/shm" else Path(value)},
+        {
+            "Path": lambda value: shm_dir if value == "/dev/shm" else Path(value),
+            "hold_run_lock": lambda directory, *, create: locked.append(
+                (directory, create)
+            ),
+        },
     )
     manager = manager_type()
     manager.args = SimpleNamespace(
@@ -561,11 +570,14 @@ def test_runtime_namespace_preflight_does_not_claim_longer_instance_id(tmp_path)
     )
     manager._runtime_dir_created = False
     manager._runtime_namespace_owned = False
+    manager._run_lock = None
 
     manager._prepare_runtime_dir()
 
     assert manager._runtime_namespace_owned
     assert neighbor.exists()
+    # The run lock is created in the new runtime dir, by the server alone.
+    assert locked == [(runtime_dir, True)]
 
 
 def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
@@ -589,6 +601,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
         "stop",
         {
             "cleanup_shm_files": cleanup_shm_files,
+            "release_run_lock": lambda file_obj: None,
             "logger": fake_logger,
         },
     )
@@ -604,6 +617,7 @@ def test_worker_stop_does_not_clean_longer_instance_id(tmp_path):
     manager._runtime_namespace_owned = True
     manager._runtime_locks = None
     manager._lane_lease = None
+    manager._run_lock = None
     manager.worker_process = None
     manager.distributed_weight_daemon = None
     manager.parameter_server_instance = None
@@ -637,6 +651,7 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
         {
             "gc": gc,
             "Path": Path,
+            "release_run_lock": lambda file_obj: None,
             "logger": fake_logger,
         },
     )
@@ -651,6 +666,7 @@ def test_worker_stop_releases_only_locally_owned_model_shm(tmp_path, local_owner
     manager._runtime_namespace_owned = False
     manager._runtime_locks = None
     manager._lane_lease = None
+    manager._run_lock = None
     manager.worker_process = None
     manager.distributed_weight_daemon = None
     manager.parameter_server_instance = Owner() if local_owner else None
@@ -720,6 +736,9 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     manager._lane_lease = SimpleNamespace(
         close=lambda: events.append("lane-lease-close")
     )
+    manager._run_lock = SimpleNamespace(
+        close=lambda: events.append("run-lock-close")
+    )
     manager.worker_process = SimpleNamespace(processes=[SimpleNamespace(pid=123)])
     manager.distributed_weight_daemon = None
     manager.model_info = {}
@@ -745,10 +764,14 @@ def test_worker_stop_preserves_artifacts_and_locks_for_live_owned_pid(
     assert "cleanup" not in events
     assert "runtime-lock-close" not in events
     assert "lane-lease-close" not in events
+    # A surviving worker still holds the run lock; releasing this process's share
+    # would let the next run of this instance reclaim a live run's resources.
+    assert "run-lock-close" not in events
     assert manager._runtime_dir_created
     assert manager._runtime_namespace_owned
     assert manager._runtime_locks is not None
     assert manager._lane_lease is not None
+    assert manager._run_lock is not None
 
 
 @pytest.mark.parametrize("exits_after_term", [True, False])
@@ -785,6 +808,7 @@ def test_worker_stop_signals_only_original_child_handles(exits_after_term):
         },
     )
     manager = manager_type()
+    manager.args = _FAKE_RUN_ARGS
     manager.worker_process = SimpleNamespace(processes=[child])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
@@ -836,6 +860,7 @@ def test_worker_stop_without_pidfd_support_still_sends_sentinel_then_signals(
         },
     )
     manager = manager_type()
+    manager.args = _FAKE_RUN_ARGS
     manager.worker_process = SimpleNamespace(processes=[child])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
@@ -883,6 +908,7 @@ def test_worker_stop_allows_idle_child_to_exit_from_sentinel():
         },
     )
     manager = manager_type()
+    manager.args = _FAKE_RUN_ARGS
     manager.worker_process = SimpleNamespace(processes=[child])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: events.append("poison"))
@@ -894,6 +920,77 @@ def test_worker_stop_allows_idle_child_to_exit_from_sentinel():
     assert not any(event == ("signal", 9, 15) for event in events)
     assert not any(event == ("signal", 9, 9) for event in events)
     assert events[-1] == ("close", 9)
+
+
+def _stop_workers_warnings(*, exits_on_sentinel: bool, leftovers=()):
+    """Drive _stop_workers with fake children and capture its warnings."""
+    events = []
+    warnings = []
+
+    def record(message, *args, **kwargs):
+        warnings.append(message % args if args else message)
+
+    class Child:
+        pid = 123
+        exitcode = None
+
+        def join(self, timeout):
+            if exits_on_sentinel or "terminate" in events:
+                self.exitcode = 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    manager_type = _worker_manager_method(
+        "_stop_workers",
+        {
+            "logger": SimpleNamespace(warning=record),
+            "os": SimpleNamespace(close=lambda fd: None),
+            "signal": SimpleNamespace(SIGTERM=15, SIGKILL=9),
+            "list_run_named_objects": (
+                lambda shm_prefix, runtime_dir: list(leftovers)
+            ),
+        },
+    )
+    manager = manager_type()
+    manager.args = _FAKE_RUN_ARGS
+    manager.worker_process = SimpleNamespace(processes=[Child()])
+    manager._join_lock = nullcontext()
+    manager.request_queue = SimpleNamespace(put=lambda value: None)
+
+    manager._stop_workers()
+    return warnings
+
+
+def test_stop_workers_names_what_an_abnormal_exit_leaves_behind():
+    leftover_shm = f"/dev/shm/{_RUN_PREFIX}.host_kv"
+    leftover_dir = str(_FAKE_RUN_ARGS.runtime_identity.runtime_dir)
+    warnings = _stop_workers_warnings(
+        exits_on_sentinel=False, leftovers=(leftover_shm, leftover_dir)
+    )
+
+    abnormal = [w for w in warnings if _ABNORMAL_EXIT_WARNING in w]
+    assert len(abnormal) == 1
+    assert leftover_shm in abnormal[0]
+    assert leftover_dir in abnormal[0]
+
+
+def test_stop_workers_abnormal_exit_warning_states_when_nothing_remains():
+    warnings = _stop_workers_warnings(exits_on_sentinel=False)
+
+    abnormal = [w for w in warnings if _ABNORMAL_EXIT_WARNING in w]
+    assert len(abnormal) == 1
+    assert "Nothing named remains for this run" in abnormal[0]
+    assert "anonymous memfds" in abnormal[0]
+
+
+def test_stop_workers_ordered_exit_logs_no_abnormal_exit_warning():
+    warnings = _stop_workers_warnings(exits_on_sentinel=True)
+
+    assert not [w for w in warnings if _ABNORMAL_EXIT_WARNING in w]
 
 
 @pytest.mark.skipif(
@@ -926,6 +1023,7 @@ def test_worker_stop_real_child_pidfd():
         },
     )
     manager = manager_type()
+    manager.args = _FAKE_RUN_ARGS
     manager.worker_process = SimpleNamespace(processes=[Child()])
     manager._join_lock = nullcontext()
     manager.request_queue = SimpleNamespace(put=lambda value: None)

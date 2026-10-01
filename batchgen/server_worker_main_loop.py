@@ -25,12 +25,19 @@ from batchgen.server.process_utils import (
 	die_with_parent,
 	install_worker_signal_handlers,
 )
+from batchgen.server.runtime_locks import hold_run_lock
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
 
 
 _WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
 _WORKER_FATAL_ACK_TIMEOUT_S = 5.0
+
+# This worker's share of the run's liveness lock.  It is module state, not a
+# local, because it must outlive every function here: the kernel releases the
+# lock only when this process's last descriptor closes, which is what proves to
+# the next run of this instance that the run is dead.
+_run_lock_file = None
 
 
 def _shutdown_worker_runtime(worker) -> None:
@@ -406,6 +413,13 @@ def _server_worker_main_impl(
 	# a Python-level handler cannot run while this thread is inside a native
 	# collective, so the worker would survive as an orphan holding GPUs and SHM.
 	die_with_parent()
+
+	# Step 0.0: Join this run's liveness lock.  A spawned worker inherits no
+	# descriptor, so it opens the server-created file itself and never closes it;
+	# while any process of the run holds it LOCK_SH, a later run of this instance
+	# cannot take it LOCK_EX and so cannot reclaim this run's resources.
+	global _run_lock_file
+	_run_lock_file = hold_run_lock(os.path.dirname(args.reload_status_dir))
 
 	# Step 0: Configure logging for this worker process first
 	_setup_worker_logging(rank_idx)

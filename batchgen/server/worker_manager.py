@@ -28,7 +28,13 @@ from batchgen.server.process_utils import (
     get_hugepage_size,
     get_model_byte_size,
 )
-from batchgen.server.runtime_locks import RuntimeLocks
+from batchgen.server.runtime_locks import (
+    RuntimeLocks,
+    hold_run_lock,
+    list_run_named_objects,
+    reclaim_dead_runs,
+    release_run_lock,
+)
 from batchgen.server.runtime_lease import LaneLease
 from batchgen.server.server_args import (
     ServerArgs,
@@ -171,6 +177,8 @@ class WorkerManager:
         self._runtime_namespace_owned = False
         self._runtime_locks: Optional[RuntimeLocks] = None
         self._lane_lease: Optional[LaneLease] = None
+        # Held LOCK_SH for this process's whole life; see hold_run_lock.
+        self._run_lock = None
 
     def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
         """Serialize the skeleton state dict into an anonymous memfd.
@@ -217,6 +225,10 @@ class WorkerManager:
         runtime_dir = self.args.runtime_identity.runtime_dir
         runtime_dir.mkdir(mode=0o700, exist_ok=False)
         self._runtime_dir_created = True
+        # Create the run's liveness lock before anything else can use the
+        # directory: every worker opens this exact file, and only a run whose
+        # processes are all gone can be reclaimed by a later start.
+        self._run_lock = hold_run_lock(runtime_dir, create=True)
         shm_dir = Path("/dev/shm")
         prefix = self.args.runtime_identity.shm_prefix
         if shm_dir.is_dir() and any(
@@ -247,6 +259,10 @@ class WorkerManager:
         if self.args.runtime_mode == "shared":
             self._lane_lease = LaneLease.acquire(self.args)
         self._runtime_locks = RuntimeLocks.acquire(self.args.runtime_identity)
+        # The instance lock is held and this run has no runtime directory yet, so
+        # every other directory of this instance belongs to a previous run. Its
+        # run id is fresh random hex, so nothing but this scan can ever remove it.
+        reclaim_dead_runs(self.args.runtime_identity)
 
     def start(self) -> None:
         if self.started:
@@ -352,6 +368,7 @@ class WorkerManager:
                 self._runtime_namespace_owned,
                 self._runtime_locks is not None,
                 self._lane_lease is not None,
+                self._run_lock is not None,
                 self.worker_process is not None,
                 self.distributed_weight_daemon is not None,
                 bool(self.model_info.get("shm_name")),
@@ -417,6 +434,10 @@ class WorkerManager:
 
                     self._close_skeleton_memfd()
                     runtime_dir = self.args.runtime_identity.runtime_dir
+                    # Last holder of this run's liveness lock, and the lock file
+                    # lives in the directory removed next.
+                    release_run_lock(self._run_lock)
+                    self._run_lock = None
                     if self._runtime_dir_created and runtime_dir.is_dir():
                         import shutil
                         shutil.rmtree(runtime_dir)
@@ -505,6 +526,10 @@ class WorkerManager:
                 remaining = [
                     (proc, fd) for proc, fd in pidfds if proc.exitcode is None
                 ]
+                # Any worker that needs a signal did not run its ordered
+                # teardown, so this shutdown is abnormal and what it leaves
+                # behind has to be named in the log.
+                signal_fallback_used = bool(remaining)
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGTERM)
 
@@ -537,6 +562,24 @@ class WorkerManager:
                     time.monotonic() - stop_start,
                     sum(proc.exitcode is None for proc in processes),
                 )
+
+                if signal_fallback_used:
+                    identity = self.args.runtime_identity
+                    leftovers = list_run_named_objects(
+                        identity.shm_prefix, identity.runtime_dir
+                    )
+                    if leftovers:
+                        remains = "Left behind for this run: " + ", ".join(leftovers)
+                    else:
+                        remains = (
+                            "Nothing named remains for this run; the model and KV "
+                            "regions are anonymous memfds the kernel reclaims."
+                        )
+                    logger.warning(
+                        "Workers exited abnormally: the SIGTERM/SIGKILL fallback "
+                        "replaced their ordered teardown. %s",
+                        remains,
+                    )
 
                 surviving_pids = [
                     proc.pid for proc in processes if proc.exitcode is None

@@ -17,6 +17,7 @@ def _load_runtime_modules():
     package_name = "batchgen.server"
     module_names = (
         "batchgen.server.runtime_identity",
+        "batchgen.server.process_utils",
         "batchgen.server.runtime_locks",
     )
     previous_package = sys.modules.get(package_name)
@@ -28,7 +29,7 @@ def _load_runtime_modules():
     sys.modules[package_name] = package
     try:
         identity = importlib.import_module(module_names[0])
-        locks = importlib.import_module(module_names[1])
+        locks = importlib.import_module(module_names[-1])
         return identity, locks
     finally:
         for name in module_names:
