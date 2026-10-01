@@ -925,7 +925,16 @@ def _reclaim_dead_runs(
             continue
         try:
             removed = _unlink_run_shm(shm_root, f"{directory.name}.")
-            shutil.rmtree(directory)
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                # Name what is already gone before failing closed.
+                _notice(
+                    f"dead run {directory.name}: removed "
+                    f"{', '.join(removed) or 'no shm objects'} but could not "
+                    f"remove {directory}"
+                )
+                raise
         finally:
             os.close(fd)
         reclaimed.append(directory.name)
