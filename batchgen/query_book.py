@@ -6,6 +6,7 @@ never grows, relocates, or evicts pages while serving a sequence.
 """
 
 from dataclasses import dataclass
+import operator
 from typing import Dict, MutableMapping, Optional, Sequence, Set, Tuple
 
 import torch
@@ -39,10 +40,8 @@ class QueryBook:
     TOKEN_BYTES = 4
 
     def __init__(self, capacity_bytes: int, page_tokens: int = 4096) -> None:
-        if capacity_bytes <= 0:
-            raise ValueError(f"capacity_bytes must be > 0, got {capacity_bytes}")
-        if page_tokens <= 0:
-            raise ValueError(f"page_tokens must be > 0, got {page_tokens}")
+        capacity_bytes = self._positive_int(capacity_bytes, "capacity_bytes")
+        page_tokens = self._positive_int(page_tokens, "page_tokens")
         page_bytes = page_tokens * self.TOKEN_BYTES
         if capacity_bytes < page_bytes:
             raise ValueError(
@@ -53,9 +52,12 @@ class QueryBook:
         self.page_tokens = int(page_tokens)
         self.page_bytes = page_bytes
         self.page_count = capacity_bytes // page_bytes
-        self.storage = torch.empty(
-            (self.page_count, self.page_tokens), dtype=torch.int32, device="cpu"
-        )
+        # The server may construct the book under inference_mode while the
+        # scheduler later writes it from ordinary Python.
+        with torch.inference_mode(False):
+            self.storage = torch.empty(
+                (self.page_count, self.page_tokens), dtype=torch.int32, device="cpu"
+            )
         # The stack contains page ids only. It never grows after construction.
         self._free_pages = list(range(self.page_count - 1, -1, -1))
         self._records: Dict[int, QueryBookSlot] = {}
@@ -86,9 +88,8 @@ class QueryBook:
         return len(self._records)
 
     def pages_for(self, max_tokens: int) -> int:
-        if max_tokens <= 0:
-            raise ValueError(f"max_tokens must be > 0, got {max_tokens}")
-        return (int(max_tokens) + self.page_tokens - 1) // self.page_tokens
+        max_tokens = self._positive_int(max_tokens, "max_tokens")
+        return (max_tokens + self.page_tokens - 1) // self.page_tokens
 
     def can_reserve(self, max_tokens: int) -> bool:
         """Return whether admission can reserve a complete token chain."""
@@ -118,8 +119,11 @@ class QueryBook:
             )
         if len(set(sequence_ids)) != len(sequence_ids):
             raise ValueError("sequence_ids must be unique within a batch")
-        if any(not sequence_id for sequence_id in sequence_ids):
-            raise ValueError("sequence_id must be non-empty")
+        if any(
+            not isinstance(sequence_id, str) or not sequence_id
+            for sequence_id in sequence_ids
+        ):
+            raise ValueError("sequence_id must be a non-empty string")
         if any(sequence_id in self._seq_to_slot for sequence_id in sequence_ids):
             raise ValueError("sequence_id already bound")
         required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
@@ -138,11 +142,12 @@ class QueryBook:
     def bind(self, sequence_id: str, max_tokens: int) -> int:
         """Reserve the full page chain for one active sequence."""
 
-        if not sequence_id:
-            raise ValueError("sequence_id must be non-empty")
+        if not isinstance(sequence_id, str) or not sequence_id:
+            raise ValueError("sequence_id must be a non-empty string")
         if sequence_id in self._seq_to_slot:
             raise ValueError(f"sequence_id already bound: {sequence_id}")
 
+        max_tokens = self._positive_int(max_tokens, "max_tokens")
         page_count = self.pages_for(max_tokens)
         if page_count > self.free_page_count:
             raise QueryBookCapacityError(
@@ -161,7 +166,7 @@ class QueryBook:
         self._page_chains[slot] = pages
         self._tail_pages[slot] = pages[0]
         self._tail_offsets[slot] = 0
-        self._records[slot] = QueryBookSlot(slot, 0, 0, 0, int(max_tokens))
+        self._records[slot] = QueryBookSlot(slot, 0, 0, 0, max_tokens)
         return slot
 
     def release(self, slot: int) -> None:
@@ -190,7 +195,7 @@ class QueryBook:
         """Copy one prompt into the reserved pages and reset decode length."""
 
         self._check_active_slot(slot)
-        tokens = prompt_tokens.reshape(-1)
+        tokens = self._prepare_tokens(prompt_tokens)
         self._check_length(slot, int(tokens.numel()))
         self._write_span(slot, 0, tokens)
         record = self._records[slot]
@@ -208,8 +213,22 @@ class QueryBook:
             raise ValueError(
                 f"slots/prompts length mismatch: {len(slots)} != {len(prompts)}"
             )
+        if len(set(slots)) != len(slots):
+            raise ValueError("slots must be unique within a batch")
+        prepared = []
         for slot, prompt in zip(slots, prompts):
-            self.write_prompt(slot, prompt)
+            self._check_active_slot(slot)
+            tokens = self._prepare_tokens(prompt)
+            self._check_length(slot, int(tokens.numel()))
+            prepared.append(tokens)
+        for slot, tokens in zip(slots, prepared):
+            self._write_span(slot, 0, tokens)
+            record = self._records[slot]
+            prompt_length = int(tokens.numel())
+            self._records[slot] = QueryBookSlot(
+                slot, prompt_length, prompt_length, 0, record.max_tokens
+            )
+            self._update_tail(slot, prompt_length)
 
     def append_token(self, slot: int, token_id: int) -> int:
         """Append one generated token and return its logical token index."""
@@ -240,8 +259,16 @@ class QueryBook:
             raise ValueError(
                 f"slots/token_ids length mismatch: {len(slots)} != {len(token_ids)}"
             )
+        if len(set(slots)) != len(slots):
+            raise ValueError("slots must be unique within a batch")
+        prepared = []
         for slot, token_id in zip(slots, token_ids):
-            self.append_token(slot, int(token_id))
+            self._check_active_slot(slot)
+            record = self._records[slot]
+            self._check_length(slot, record.token_length + 1)
+            prepared.append(int(token_id))
+        for slot, token_id in zip(slots, prepared):
+            self.append_token(slot, token_id)
 
     def tokens(self, slot: int, length: Optional[int] = None) -> torch.Tensor:
         """Materialize a contiguous CPU tensor for a valid token span."""
@@ -250,6 +277,8 @@ class QueryBook:
         valid_length = self._records[slot].token_length
         if length is None:
             length = valid_length
+        else:
+            length = self._nonnegative_int(length, "length")
         if length < 0 or length > valid_length:
             raise QueryBookCapacityError(
                 f"requested length={length}, valid length={valid_length}"
@@ -270,16 +299,25 @@ class QueryBook:
 
         self._check_active_slot(slot)
         valid_length = self._records[slot].token_length
+        start = self._nonnegative_int(start, "start")
         if length is None:
             length = valid_length - start
+        else:
+            length = self._nonnegative_int(length, "length")
         if start < 0 or length < 0 or start + length > valid_length:
             raise QueryBookCapacityError(
                 f"requested span [{start}, {start + length}) exceeds valid length={valid_length}"
             )
-        if output.numel() < length or output.dtype != torch.int32 or output.device.type != "cpu":
+        if (
+            output.numel() < length
+            or output.dtype != torch.int32
+            or output.device.type != "cpu"
+            or not output.is_contiguous()
+        ):
             raise ValueError("output must be a sufficiently large CPU int32 tensor")
-        self._copy_span_to(slot, start, length, output.reshape(-1))
-        return output.reshape(-1)[:length]
+        flat_output = output.reshape(-1)
+        self._copy_span_to(slot, start, length, flat_output)
+        return flat_output[:length]
 
     def copy_to(
         self,
@@ -296,6 +334,8 @@ class QueryBook:
         valid_length = self._records[slot].token_length
         if length is None:
             length = valid_length
+        else:
+            length = self._nonnegative_int(length, "length")
         if length < 0 or length > valid_length:
             raise QueryBookCapacityError(
                 f"requested length={length}, valid length={valid_length}"
@@ -304,17 +344,53 @@ class QueryBook:
         source = torch.empty(length, dtype=torch.int32)
         self._copy_span_to(slot, 0, length, source)
         if out is not None:
-            if out.numel() < length or out.dtype != dtype or out.device != target_device:
+            if (
+                out.numel() < length
+                or out.dtype != dtype
+                or out.device != target_device
+                or not out.is_contiguous()
+            ):
                 raise ValueError("out has incompatible shape, dtype, or device")
             # copy_ performs the dtype conversion and device transfer in one
             # operation; do not create a temporary GPU int64 tensor here.
-            out.reshape(-1)[:length].copy_(source)
-            return out.reshape(-1)[:length]
+            flat_out = out.reshape(-1)
+            flat_out[:length].copy_(source)
+            return flat_out[:length]
         return source.to(device=target_device, dtype=dtype)
 
     def _check_active_slot(self, slot: int) -> None:
         if not isinstance(slot, int) or slot not in self._records:
             raise QueryBookCapacityError(f"slot is not active: {slot}")
+
+    @staticmethod
+    def _nonnegative_int(value: int, name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        try:
+            value = operator.index(value)
+        except TypeError as exc:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+        return value
+
+    @staticmethod
+    def _positive_int(value: int, name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        try:
+            value = operator.index(value)
+        except TypeError as exc:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0, got {value}")
+        return value
+
+    @staticmethod
+    def _prepare_tokens(tokens: torch.Tensor) -> torch.Tensor:
+        if not isinstance(tokens, torch.Tensor):
+            raise TypeError("tokens must be a torch.Tensor")
+        return tokens.reshape(-1).to(dtype=torch.int32, device="cpu")
 
     def _check_length(self, slot: int, length: int) -> None:
         max_tokens = self._records[slot].max_tokens

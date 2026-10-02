@@ -20,6 +20,17 @@ def test_query_book_allocates_fixed_page_store():
     assert book.free_page_count == 1
 
 
+def test_query_book_rejects_non_integral_reservation_sizes():
+    with pytest.raises(ValueError):
+        QueryBook(capacity_bytes=16.0, page_tokens=4)
+
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    with pytest.raises(ValueError):
+        book.bind("fractional", max_tokens=0.5)
+    assert book.active_count == 0
+    assert book.free_page_count == 4
+
+
 def test_query_book_reserves_variable_full_lengths_without_growth():
     book = QueryBook(capacity_bytes=5 * 4 * 4, page_tokens=4)
     assert book.can_reserve(8)
@@ -123,6 +134,32 @@ def test_query_book_copy_to_int64_and_reuse_output():
     assert reused.data_ptr() == output.data_ptr()
     assert torch.equal(reused, copied)
 
+    with pytest.raises(ValueError):
+        book.copy_span_to(slot, torch.empty((2, 2), dtype=torch.int32).t())
+    with pytest.raises(ValueError):
+        book.copy_to(
+            slot,
+            device="cpu",
+            dtype=torch.int64,
+            out=torch.empty((2, 2), dtype=torch.int64).t(),
+        )
+
+
+def test_query_book_batch_updates_validate_before_mutation():
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    slots = book.bind_batch(["q-0", "q-1"], [4, 4])
+    book.write_prompts(slots, [torch.arange(4), torch.arange(1)])
+
+    with pytest.raises(QueryBookCapacityError):
+        book.append_tokens(slots, [10, 11])
+    assert torch.equal(book.tokens(slots[0]), torch.arange(4, dtype=torch.int32))
+    assert torch.equal(book.tokens(slots[1]), torch.arange(1, dtype=torch.int32))
+
+    with pytest.raises(QueryBookCapacityError):
+        book.write_prompts(slots, [torch.arange(5), torch.tensor([3])])
+    assert torch.equal(book.tokens(slots[0]), torch.arange(4, dtype=torch.int32))
+    assert torch.equal(book.tokens(slots[1]), torch.arange(1, dtype=torch.int32))
+
 
 def test_query_book_release_returns_all_reserved_pages():
     book = QueryBook(capacity_bytes=3 * 4 * 4, page_tokens=4)
@@ -148,3 +185,12 @@ def test_query_book_lifecycle_and_length_guards():
     book.release(slot)
     with pytest.raises(QueryBookCapacityError):
         book.tokens(slot)
+
+
+def test_query_book_writes_after_inference_mode_construction():
+    with torch.inference_mode():
+        book = QueryBook(capacity_bytes=2 * 4 * 4, page_tokens=4)
+    slot = book.bind("request-1", max_tokens=4)
+    book.write_prompt(slot, torch.tensor([1, 2]))
+    book.append_token(slot, 3)
+    assert torch.equal(book.tokens(slot), torch.tensor([1, 2, 3], dtype=torch.int32))
