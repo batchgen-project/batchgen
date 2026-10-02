@@ -31,10 +31,11 @@ class QueryBook:
     """Fixed-byte-budget paged token book.
 
     The token store is one int32 CPU tensor of pages. ``bind`` reserves all
-    pages for a sequence's ``max_tokens`` immediately, so a request either
-    receives its complete reservation or remains queued. Appending a token
-    uses the sequence's cached tail page and offset; the hot append path does
-    not perform a page-table lookup.
+    pages for a sequence's ``max_tokens`` immediately. Callers should pass the
+    full trajectory limit (prompt tokens plus the maximum generated suffix),
+    so a request either receives its complete reservation or remains queued.
+    Appending a token uses the sequence's cached tail page and offset; the hot
+    append path does not perform a page-table lookup.
     """
 
     TOKEN_BYTES = 4
@@ -74,6 +75,12 @@ class QueryBook:
         """Bytes occupied by the fixed token tensor."""
 
         return int(self.storage.numel() * self.storage.element_size())
+
+    @property
+    def capacity_tokens(self) -> int:
+        """Logical token slots in the allocated pages."""
+
+        return self.page_count * self.page_tokens
 
     @property
     def free_page_count(self) -> int:
