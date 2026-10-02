@@ -95,6 +95,46 @@ class QueryBook:
 
         return self.pages_for(max_tokens) <= self.free_page_count
 
+    def can_reserve_batch(self, max_tokens: Sequence[int]) -> bool:
+        """Return whether a whole candidate batch fits in the free pages."""
+
+        required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
+        return required_pages <= self.free_page_count
+
+    def bind_batch(
+        self, sequence_ids: Sequence[str], max_tokens: Sequence[int]
+    ) -> list[int]:
+        """Atomically reserve complete page chains for a candidate batch.
+
+        Admission must check the aggregate reservation before mutating the book.
+        This prevents a too-large batch from binding a prefix of its sequences
+        and leaving the scheduler with a partially admitted batch.
+        """
+
+        if len(sequence_ids) != len(max_tokens):
+            raise ValueError(
+                "sequence_ids/max_tokens length mismatch: "
+                f"{len(sequence_ids)} != {len(max_tokens)}"
+            )
+        if len(set(sequence_ids)) != len(sequence_ids):
+            raise ValueError("sequence_ids must be unique within a batch")
+        if any(not sequence_id for sequence_id in sequence_ids):
+            raise ValueError("sequence_id must be non-empty")
+        if any(sequence_id in self._seq_to_slot for sequence_id in sequence_ids):
+            raise ValueError("sequence_id already bound")
+        required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
+        if required_pages > self.free_page_count:
+            raise QueryBookCapacityError(
+                "QueryBook token budget exhausted for batch: "
+                f"need={required_pages * self.page_bytes} bytes, "
+                f"free={self.free_bytes} bytes"
+            )
+
+        return [
+            self.bind(sequence_id, tokens)
+            for sequence_id, tokens in zip(sequence_ids, max_tokens)
+        ]
+
     def bind(self, sequence_id: str, max_tokens: int) -> int:
         """Reserve the full page chain for one active sequence."""
 

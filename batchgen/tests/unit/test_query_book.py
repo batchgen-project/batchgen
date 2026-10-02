@@ -43,6 +43,25 @@ def test_query_book_admission_checks_pages_before_binding():
     assert book.free_page_count == 3
 
 
+def test_query_book_batch_admission_is_aggregate_and_atomic():
+    book = QueryBook(capacity_bytes=3 * 4 * 4, page_tokens=4)
+
+    assert book.can_reserve_batch([5, 4])
+    assert not book.can_reserve_batch([5, 5])
+    with pytest.raises(QueryBookCapacityError):
+        book.bind_batch(["q-0", "q-1"], [5, 5])
+
+    assert book.active_count == 0
+    assert book.free_page_count == 3
+    with pytest.raises(ValueError):
+        book.bind_batch(["q-0", ""], [4, 4])
+    assert book.active_count == 0
+    assert book.free_page_count == 3
+    slots = book.bind_batch(["q-0", "q-1"], [5, 4])
+    assert slots == [0, 1]
+    assert book.free_page_count == 0
+
+
 def test_query_book_prompt_and_decode_share_reserved_pages():
     book = QueryBook(capacity_bytes=3 * 4 * 4, page_tokens=4)
     slot = book.bind("request-1", max_tokens=10)
