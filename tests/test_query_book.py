@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from batchgen.query_book import QueryBook, QueryBookCapacityError
+from batchgen.query_book import QueryBook, QueryBookCapacityError, QueryBookTurn
 
 
 def test_query_book_allocates_fixed_page_store():
@@ -223,3 +223,87 @@ def test_query_book_restore_preserves_trajectory_and_lengths():
     assert metadata.decoded_length == 2
     book.append_token(slot, 9)
     assert torch.equal(book.tokens(slot), torch.arange(10, dtype=torch.int32))
+
+
+def test_query_book_multi_turn_appends_prompt_and_tracks_generated_spans():
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    slot = book.bind("conversation", max_tokens=16)
+    book.write_prompt(slot, torch.tensor([1, 2]))
+    book.append_token(slot, 10)
+    book.append_prompt(slot, torch.tensor([20, 21]))
+    book.append_token(slot, 30)
+
+    assert torch.equal(
+        book.tokens(slot), torch.tensor([1, 2, 10, 20, 21, 30], dtype=torch.int32)
+    )
+    assert torch.equal(
+        book.generated_tokens(slot), torch.tensor([10, 30], dtype=torch.int32)
+    )
+    turns = book.turns(slot)
+    assert [(t.prompt_start, t.prompt_length, t.generated_start, t.generated_length) for t in turns] == [
+        (0, 2, 2, 1),
+        (3, 2, 5, 1),
+    ]
+    assert book.metadata(slot).prompt_length == 5
+    assert book.metadata(slot).decoded_length == 2
+
+
+def test_query_book_reentry_turn_replays_prefix_without_double_counting():
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    slot = book.bind("reentry", max_tokens=16)
+    book.write_prompt(slot, torch.tensor([1, 2]))
+    book.append_tokens([slot], [10])
+    book.append_tokens([slot], [11])
+
+    first = book.begin_reentry_turn(slot, prompt_length=4)
+    second = book.begin_reentry_turn(slot, prompt_length=4)
+    assert first == second
+    book.append_token(slot, 12)
+
+    assert book.metadata(slot).prompt_length == 4
+    assert book.metadata(slot).decoded_length == 3
+    assert torch.equal(
+        book.generated_tokens(slot), torch.tensor([10, 11, 12], dtype=torch.int32)
+    )
+    assert book.turns(slot)[-1].generated_start == 4
+    assert book.turns(slot)[-1].generated_length == 1
+
+
+def test_query_book_restore_round_trips_turn_ledger():
+    source = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    source_slot = source.bind("conversation", max_tokens=16)
+    source.write_prompt(source_slot, torch.tensor([1, 2]))
+    source.append_token(source_slot, 10)
+    source.append_prompt(source_slot, torch.tensor([20]))
+    source.append_token(source_slot, 30)
+
+    destination = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    destination_slot = destination.bind("conversation", max_tokens=16)
+    destination.restore(
+        destination_slot,
+        source.tokens(source_slot),
+        prompt_length=source.metadata(source_slot).prompt_length,
+        decoded_length=source.metadata(source_slot).decoded_length,
+        turns=QueryBook.turns_from_payload(source.turns_payload(source_slot)),
+    )
+
+    assert torch.equal(destination.tokens(destination_slot), source.tokens(source_slot))
+    assert destination.turns(destination_slot) == source.turns(source_slot)
+    assert torch.equal(
+        destination.generated_tokens(destination_slot),
+        torch.tensor([10, 30], dtype=torch.int32),
+    )
+
+
+def test_query_book_restore_rejects_inconsistent_turn_metadata():
+    book = QueryBook(capacity_bytes=2 * 4 * 4, page_tokens=4)
+    slot = book.bind("bad", max_tokens=8)
+    with pytest.raises(ValueError, match="does not match decoded_length"):
+        book.restore(
+            slot,
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            prompt_length=2,
+            decoded_length=2,
+            turns=[QueryBookTurn(0, 0, 2, 2, 1)],
+        )
+    assert book.metadata(slot).token_length == 0

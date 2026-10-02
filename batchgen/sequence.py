@@ -197,9 +197,10 @@ class SequenceEntry:
         so ``kv_token_budget == original_prompt_length + original_max_decode_length``
         keeps holding on every rank.
         """
-        max_decode = min(self.original_max_decode_length, context_len - prompt_len)
+        max_decode = max(0, min(self.original_max_decode_length, context_len - prompt_len))
         self.max_decode_length = max_decode
         self.original_max_decode_length = max_decode
+        self.kv_token_budget = prompt_len + max_decode
         return prompt_len + max_decode
 
     def log_event(self, event: int, rank: int, detail: str = "") -> None:

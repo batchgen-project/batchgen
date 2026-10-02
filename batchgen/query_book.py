@@ -27,6 +27,31 @@ class QueryBookSlot:
     max_tokens: int
 
 
+@dataclass(frozen=True)
+class QueryBookTurn:
+    """Logical prompt/generated spans for one trajectory turn.
+
+    ``prompt_start`` and ``generated_start`` index the immutable logical
+    trajectory, while ``generated_length`` counts only newly sampled tokens.
+    A KV re-entry turn can therefore replay an existing prompt prefix without
+    making the cumulative generated count look larger.
+    """
+
+    turn_id: int
+    prompt_start: int
+    prompt_length: int
+    generated_start: int
+    generated_length: int
+
+    @property
+    def prompt_end(self) -> int:
+        return self.prompt_start + self.prompt_length
+
+    @property
+    def generated_end(self) -> int:
+        return self.generated_start + self.generated_length
+
+
 class QueryBook:
     """Fixed-byte-budget paged token book.
 
@@ -85,6 +110,7 @@ class QueryBook:
         # to the byte budget.
         self._free_extents: list[tuple[int, int]] = [(0, self.page_count)]
         self._records: Dict[int, QueryBookSlot] = {}
+        self._turns: Dict[int, list[QueryBookTurn]] = {}
         self._page_ranges: Dict[int, tuple[int, int]] = {}
         self._tail_pages: Dict[int, int] = {}
         self._tail_offsets: Dict[int, int] = {}
@@ -114,6 +140,12 @@ class QueryBook:
         return self.free_page_count * self.page_bytes
 
     @property
+    def largest_free_extent_pages(self) -> int:
+        """Largest contiguous reservation currently available."""
+
+        return max((count for _, count in self._free_extents), default=0)
+
+    @property
     def active_count(self) -> int:
         return len(self._records)
 
@@ -124,18 +156,40 @@ class QueryBook:
     def can_reserve(self, max_tokens: int) -> bool:
         """Return whether admission can reserve a complete token chain."""
 
-        return self.pages_for(max_tokens) <= self.free_page_count
+        return self.pages_for(max_tokens) <= self.largest_free_extent_pages
 
     def can_reserve_batch(self, max_tokens: Sequence[int]) -> bool:
-        """Return whether a whole candidate batch fits in the free pages."""
+        """Return whether a whole candidate batch fits in free extents.
 
-        required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
-        return required_pages <= self.free_page_count
+        The check mirrors the first-fit allocator without mutating it. An
+        aggregate free-page check is insufficient after releases fragment the
+        pool: every sequence needs one contiguous chain of pages.
+        """
+
+        extents = list(self._free_extents)
+        for tokens in max_tokens:
+            pages = self.pages_for(tokens)
+            for index, (start, count) in enumerate(extents):
+                if count < pages:
+                    continue
+                if count == pages:
+                    extents.pop(index)
+                else:
+                    extents[index] = (start + pages, count - pages)
+                break
+            else:
+                return False
+        return True
 
     def reservation_capacity(self, max_tokens: int) -> int:
         """Return the maximum number of equal-size reservations that fit."""
 
-        return self.free_page_count // self.pages_for(max_tokens)
+        pages = self.pages_for(max_tokens)
+        # Production reservations are all model-context-sized and therefore
+        # remain whole extents after release. Counting each extent separately
+        # also keeps the published scheduler capacity correct if a caller uses
+        # the book with variable-size reservations in a test or migration.
+        return sum(count // pages for _, count in self._free_extents)
 
     def bind_batch(
         self, sequence_ids: Sequence[str], max_tokens: Sequence[int]
@@ -162,17 +216,17 @@ class QueryBook:
         if any(sequence_id in self._seq_to_slot for sequence_id in sequence_ids):
             raise ValueError("sequence_id already bound")
         required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
-        if required_pages > self.free_page_count:
+        if not self.can_reserve_batch(max_tokens):
             raise QueryBookCapacityError(
                 "QueryBook token budget exhausted for batch: "
                 f"need={required_pages * self.page_bytes} bytes, "
                 f"free={self.free_bytes} bytes"
             )
 
-        # ``free_page_count`` is an aggregate check, but an extent allocator
-        # can still fail after a partial bind if the free pages are fragmented.
         # Reserve each chain first and publish metadata only after every extent
-        # has been found, so admission remains atomic under fragmentation.
+        # has been found. The preflight above mirrors first-fit allocation, and
+        # this rollback keeps the operation atomic if state changes between
+        # validation and reservation.
         reservations: list[tuple[str, int, int, int]] = []
         try:
             for sequence_id, tokens in zip(sequence_ids, max_tokens):
@@ -200,6 +254,7 @@ class QueryBook:
             self._records[slot] = QueryBookSlot(
                 slot, 0, 0, 0, max_tokens_int
             )
+            self._turns[slot] = []
             slots.append(slot)
         return slots
 
@@ -231,6 +286,7 @@ class QueryBook:
         self._tail_pages[slot] = page_start
         self._tail_offsets[slot] = 0
         self._records[slot] = QueryBookSlot(slot, 0, 0, 0, max_tokens)
+        self._turns[slot] = []
         return slot
 
     def release(self, slot: int) -> None:
@@ -244,6 +300,7 @@ class QueryBook:
         del self._tail_pages[slot]
         del self._tail_offsets[slot]
         del self._records[slot]
+        del self._turns[slot]
         self._free_slots.append(slot)
 
     def slot_for(self, sequence_id: str) -> int:
@@ -261,6 +318,17 @@ class QueryBook:
 
         return isinstance(slot, int) and slot in self._records
 
+    def has_sequence(self, sequence_id: str) -> bool:
+        """Return whether a sequence owns a reservation in this local book."""
+
+        return sequence_id in self._seq_to_slot
+
+    def turns(self, slot: int) -> tuple[QueryBookTurn, ...]:
+        """Return an immutable snapshot of the slot's turn ledger."""
+
+        self._check_active_slot(slot)
+        return tuple(self._turns[slot])
+
     def write_prompt(self, slot: int, prompt_tokens: torch.Tensor) -> None:
         """Copy one prompt into the reserved pages and reset decode length."""
 
@@ -273,6 +341,106 @@ class QueryBook:
             slot, int(tokens.numel()), int(tokens.numel()), 0, record.max_tokens
         )
         self._update_tail(slot, int(tokens.numel()))
+        self._turns[slot] = [
+            QueryBookTurn(
+                turn_id=0,
+                prompt_start=0,
+                prompt_length=int(tokens.numel()),
+                generated_start=int(tokens.numel()),
+                generated_length=0,
+            )
+        ]
+
+    def append_prompt(self, slot: int, prompt_tokens: torch.Tensor) -> QueryBookTurn:
+        """Append a later user prompt to an existing trajectory.
+
+        Unlike ``write_prompt`` this never rewinds the tail. It creates a new
+        turn whose generated span starts after the appended prompt.
+        """
+
+        self._check_active_slot(slot)
+        tokens = self._prepare_tokens(prompt_tokens)
+        record = self._records[slot]
+        prompt_start = record.token_length
+        new_length = prompt_start + int(tokens.numel())
+        self._check_length(slot, new_length)
+        self._write_span(slot, prompt_start, tokens)
+        self._records[slot] = QueryBookSlot(
+            slot,
+            new_length,
+            new_length,
+            record.decoded_length,
+            record.max_tokens,
+        )
+        self._update_tail(slot, new_length)
+        turn = QueryBookTurn(
+            turn_id=len(self._turns[slot]),
+            prompt_start=prompt_start,
+            prompt_length=int(tokens.numel()),
+            generated_start=new_length,
+            generated_length=0,
+        )
+        self._turns[slot].append(turn)
+        return turn
+
+    def begin_reentry_turn(self, slot: int, prompt_length: int) -> QueryBookTurn:
+        """Record a KV re-entry prompt without copying or appending tokens.
+
+        The effective prompt is an existing trajectory prefix. This method is
+        idempotent when the same re-entry boundary is observed twice.
+        """
+
+        self._check_active_slot(slot)
+        prompt_length = self._nonnegative_int(prompt_length, "prompt_length")
+        record = self._records[slot]
+        if prompt_length > record.token_length:
+            raise QueryBookCapacityError(
+                f"re-entry prompt_length={prompt_length} exceeds token_length={record.token_length}"
+            )
+        turns = self._turns[slot]
+        if turns:
+            last = turns[-1]
+            if (
+                last.prompt_start == 0
+                and last.prompt_length == prompt_length
+                and last.generated_length == 0
+                and last.generated_start == record.token_length
+            ):
+                return last
+        turn = QueryBookTurn(
+            turn_id=len(turns),
+            prompt_start=0,
+            prompt_length=prompt_length,
+            generated_start=record.token_length,
+            generated_length=0,
+        )
+        turns.append(turn)
+        self._records[slot] = QueryBookSlot(
+            slot,
+            prompt_length,
+            record.token_length,
+            record.decoded_length,
+            record.max_tokens,
+        )
+        return turn
+
+    def set_prompt_length(self, slot: int, prompt_length: int) -> None:
+        """Update the effective prefill prompt boundary without copying data."""
+
+        self._check_active_slot(slot)
+        prompt_length = self._nonnegative_int(prompt_length, "prompt_length")
+        record = self._records[slot]
+        if prompt_length > record.token_length:
+            raise QueryBookCapacityError(
+                f"prompt_length={prompt_length} exceeds token_length={record.token_length}"
+            )
+        self._records[slot] = QueryBookSlot(
+            slot,
+            prompt_length,
+            record.token_length,
+            record.decoded_length,
+            record.max_tokens,
+        )
 
     def write_prompts(
         self, slots: Sequence[int], prompts: Sequence[torch.Tensor]
@@ -299,6 +467,15 @@ class QueryBook:
                 slot, prompt_length, prompt_length, 0, record.max_tokens
             )
             self._update_tail(slot, prompt_length)
+            self._turns[slot] = [
+                QueryBookTurn(
+                    turn_id=0,
+                    prompt_start=0,
+                    prompt_length=prompt_length,
+                    generated_start=prompt_length,
+                    generated_length=0,
+                )
+            ]
 
     def restore(
         self,
@@ -307,6 +484,7 @@ class QueryBook:
         *,
         prompt_length: int,
         decoded_length: int,
+        turns: Optional[Sequence[QueryBookTurn]] = None,
     ) -> None:
         """Restore an existing trajectory after rank/node migration.
 
@@ -327,12 +505,19 @@ class QueryBook:
                 f"prompt_length={prompt_length} exceeds token_length={token_length}"
             )
         self._check_length(slot, token_length)
+        validated_turns = self._validate_turns(
+            turns,
+            token_length=token_length,
+            prompt_length=prompt_length,
+            decoded_length=decoded_length,
+        )
         self._write_span(slot, 0, prepared)
         record = self._records[slot]
         self._records[slot] = QueryBookSlot(
             slot, prompt_length, token_length, decoded_length, record.max_tokens
         )
         self._update_tail(slot, token_length)
+        self._turns[slot] = validated_turns
 
     def append_token(self, slot: int, token_id: int) -> int:
         """Append one generated token and return its logical token index."""
@@ -352,6 +537,7 @@ class QueryBook:
             record.max_tokens,
         )
         self._update_tail(slot, index + 1)
+        self._increment_last_turn(slot, index + 1)
         return index
 
     def append_tokens(
@@ -390,6 +576,78 @@ class QueryBook:
         output = torch.empty(length, dtype=torch.int32)
         self.copy_span_to(slot, output, length=length)
         return output
+
+    def generated_tokens(self, slot: int) -> torch.Tensor:
+        """Materialize only generated spans, excluding later user prompts."""
+
+        self._check_active_slot(slot)
+        spans = [
+            (turn.generated_start, turn.generated_length)
+            for turn in self._turns[slot]
+            if turn.generated_length
+        ]
+        if not spans:
+            return torch.empty(0, dtype=torch.int32)
+        output = torch.empty(sum(length for _, length in spans), dtype=torch.int32)
+        offset = 0
+        for start, length in spans:
+            self._copy_span_to(slot, start, length, output[offset:offset + length])
+            offset += length
+        return output
+
+    def turns_payload(self, slot: int) -> torch.Tensor:
+        """Encode the turn ledger for a CPU migration payload."""
+
+        turns = self.turns(slot)
+        if not turns:
+            return torch.empty((0, 6), dtype=torch.int64)
+        return torch.tensor(
+            [
+                [
+                    turn.turn_id,
+                    turn.prompt_start,
+                    turn.prompt_length,
+                    turn.generated_start,
+                    turn.generated_length,
+                    turn.generated_end,
+                ]
+                for turn in turns
+            ],
+            dtype=torch.int64,
+        )
+
+    @staticmethod
+    def turns_from_payload(payload: torch.Tensor) -> list[QueryBookTurn]:
+        """Decode and validate the fixed-width migration turn payload."""
+
+        if not isinstance(payload, torch.Tensor):
+            raise ValueError("turn payload must be a tensor")
+        if payload.dtype != torch.int64 or payload.device.type != "cpu":
+            raise ValueError("turn payload must be a CPU int64 tensor")
+        if payload.ndim != 2 or payload.shape[1] != 6:
+            raise ValueError("turn payload must have shape [turns, 6]")
+        turns = []
+        for row in payload.tolist():
+            (
+                turn_id,
+                prompt_start,
+                prompt_length,
+                generated_start,
+                generated_length,
+                generated_end,
+            ) = row
+            if generated_end != generated_start + generated_length:
+                raise ValueError("turn payload generated_end is inconsistent")
+            turns.append(
+                QueryBookTurn(
+                    turn_id=int(turn_id),
+                    prompt_start=int(prompt_start),
+                    prompt_length=int(prompt_length),
+                    generated_start=int(generated_start),
+                    generated_length=int(generated_length),
+                )
+            )
+        return turns
 
     def copy_span_to(
         self,
@@ -504,6 +762,78 @@ class QueryBook:
             raise QueryBookCapacityError(
                 f"token length {length} exceeds reserved max_tokens={max_tokens}"
             )
+
+    def _increment_last_turn(self, slot: int, token_end: int) -> None:
+        turns = self._turns[slot]
+        if not turns:
+            record = self._records[slot]
+            turns.append(
+                QueryBookTurn(
+                    turn_id=0,
+                    prompt_start=0,
+                    prompt_length=record.prompt_length,
+                    generated_start=token_end - 1,
+                    generated_length=0,
+                )
+            )
+        last = turns[-1]
+        turns[-1] = QueryBookTurn(
+            turn_id=last.turn_id,
+            prompt_start=last.prompt_start,
+            prompt_length=last.prompt_length,
+            generated_start=last.generated_start,
+            generated_length=last.generated_length + 1,
+        )
+
+    @staticmethod
+    def _validate_turns(
+        turns: Optional[Sequence[QueryBookTurn]],
+        *,
+        token_length: int,
+        prompt_length: int,
+        decoded_length: int,
+    ) -> list[QueryBookTurn]:
+        if turns is None:
+            generated_length = max(0, token_length - prompt_length)
+            if generated_length != decoded_length:
+                raise ValueError(
+                    "migration restore requires turn metadata when cumulative "
+                    "decoded length differs from the current prompt suffix"
+                )
+            fallback = QueryBookTurn(
+                turn_id=0,
+                prompt_start=0,
+                prompt_length=prompt_length,
+                generated_start=prompt_length,
+                generated_length=generated_length,
+            )
+            return [fallback]
+        validated = list(turns)
+        generated_total = 0
+        for expected_id, turn in enumerate(validated):
+            if not isinstance(turn, QueryBookTurn):
+                raise ValueError("turn ledger entries must be QueryBookTurn")
+            if turn.turn_id != expected_id:
+                raise ValueError("turn ids must be contiguous from zero")
+            if min(
+                turn.prompt_start,
+                turn.prompt_length,
+                turn.generated_start,
+                turn.generated_length,
+            ) < 0:
+                raise ValueError("turn spans must be non-negative")
+            if turn.prompt_end > token_length or turn.generated_end > token_length:
+                raise ValueError("turn span exceeds restored trajectory length")
+            if turn.prompt_end > turn.generated_start:
+                raise ValueError("generated span overlaps its prompt span")
+            generated_total += turn.generated_length
+        if not validated and (token_length or decoded_length):
+            raise ValueError("non-empty trajectory requires at least one turn")
+        if generated_total != decoded_length:
+            raise ValueError(
+                f"turn generated total={generated_total} does not match decoded_length={decoded_length}"
+            )
+        return validated
 
     def _update_tail(self, slot: int, logical_length: int) -> None:
         page_index, offset = divmod(logical_length, self.page_tokens)
