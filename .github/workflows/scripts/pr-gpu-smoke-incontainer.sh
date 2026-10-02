@@ -3,11 +3,16 @@
 #
 # Assumes:
 #   - Running inside tairan's long-running container (tairan-batchgen on
-#     node0, batchgen on node1), entered via docker exec.
-#   - Conda env `batchgen` already has the runtime install. The PR's source
-#     overrides import resolution via PYTHONPATH=$WORKTREE_PATH so we test
-#     the PR's batchgen package without `pip install -e` (which would
-#     mutate POIS's interactive env).
+#     node0, batchgen on node1), entered via docker exec with conda env
+#     `batchgen` already activated. The PR is tested by creating a per-
+#     worktree venv with --system-site-packages (inheriting torch + CUDA
+#     deps from the conda env) and `pip install -e . --no-deps
+#     --no-build-isolation` into it. PYTHONPATH overrides do NOT work
+#     here: batchgen ships compiled C++/CUDA extensions, so any drift
+#     between the conda env's installed copy and the PR source produces
+#     silent worker crashes on module import. The venv approach forces
+#     extensions to be rebuilt against the PR source while keeping the
+#     conda env (POIS's interactive shell) untouched.
 #   - cwd is the worktree (set by pr-gpu-smoke.sh after `git worktree add`).
 #
 # Env (set by the outer host script via docker exec -e):
@@ -27,15 +32,27 @@ HEALTH_TIMEOUT=1800   # 30 min for distributed init + model load
 HEALTH_INTERVAL=10
 PORT=10900
 
-# Conda env is expected to be active when we get here (the outer host
-# script's docker exec runs `conda activate batchgen` first).
-echo "[in-container] node_rank=$NODE_RANK dist=$DIST_INIT_ADDR python=$(which python)"
+# Conda env `batchgen` is expected to be active when we get here (the
+# outer host script's docker exec runs `conda activate batchgen` first).
+echo "[in-container] node_rank=$NODE_RANK dist=$DIST_INIT_ADDR conda_python=$(which python)"
 cd "$WORKTREE_PATH"
 
-# Make the PR's batchgen the one Python imports, without mutating the
-# conda env. This way POIS's interactive shell still sees the conda
-# install after CI exits.
-export PYTHONPATH="$WORKTREE_PATH:${PYTHONPATH:-}"
+# Create a per-worktree venv inheriting torch + CUDA deps from the
+# conda env, then install the PR's batchgen into it. This rebuilds
+# the C++/CUDA extensions against the PR source while keeping the
+# conda env's batchgen install (POIS's interactive shell) untouched.
+VENV_DIR="$WORKTREE_PATH/.venv-ci"
+PIP_LOG="$WORKTREE_PATH/pip-install-rank${NODE_RANK}.log"
+echo "--- creating venv at $VENV_DIR (system-site-packages) ---"
+python -m venv "$VENV_DIR" --system-site-packages
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+echo "[in-container] venv_python=$(which python)"
+
+echo "--- pip install -e . --no-deps --no-build-isolation (logs: $PIP_LOG) ---"
+BUILD_OPS=1 pip install -e . --no-deps --no-build-isolation -v > "$PIP_LOG" 2>&1
+echo "pip install complete; tail of log:"
+tail -8 "$PIP_LOG"
 
 echo "--- launching batchgen.launch_http_server (rank $NODE_RANK) ---"
 python -m batchgen.launch_http_server \
