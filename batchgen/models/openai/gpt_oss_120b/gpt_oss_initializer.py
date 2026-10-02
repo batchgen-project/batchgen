@@ -274,6 +274,13 @@ class GptOssInitializer:
         logging.info("Parameter server initialized")
         return parameter_server
 
+    def get_runtime_behavior_adapter(self):
+        """Per-model runtime behaviors (M2). See batchgen/contracts/runtime_adapter.py."""
+        from batchgen.models.openai.gpt_oss_120b.runtime_adapter import (
+            GptOssRuntimeAdapter,
+        )
+        return GptOssRuntimeAdapter(self.model_config)
+
     def Init(self, weights_storage=None) -> Tuple:
         """Initialize the core engine and load weights.
 
