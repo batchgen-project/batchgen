@@ -555,8 +555,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def validate_server_args(args: ServerArgs) -> None:
     """Validate parsed arguments."""
-    if args.max_pool_size < 0:
-        raise ValueError("--max-pool-size must be >= 0")
+    if args.max_pool_size <= 0:
+        raise ValueError("legacy non-pool mode was removed; --max-pool-size must be positive")
     if args.input_ids_pool_size_gb <= 0:
         raise ValueError("--input-ids-pool-size-gb must be positive")
     _validate_port_range("listen port", args.listen_port)
