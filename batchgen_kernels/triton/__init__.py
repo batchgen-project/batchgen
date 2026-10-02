@@ -33,3 +33,4 @@ from batchgen_kernels.triton.fused_rmsnorm_rope import (
 from batchgen_kernels.triton.fused_dequant_gemm import fused_fp8_bf16_gemm
 from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
 from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape
+from batchgen_kernels.triton.fused_router_gemm import router_gemm_bias
