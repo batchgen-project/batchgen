@@ -1817,6 +1817,7 @@ class BatchGenWorker:
 				if slot in self._trajectory_book._records:
 					self._trajectory_book.release(slot)
 			raise
+		self._publish_trajectory_pool_capacity()
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
@@ -2103,6 +2104,7 @@ class BatchGenWorker:
 		# only token-storage release point; multi-turn re-entry keeps the slot.
 		if trajectory_slot is not None:
 			self._trajectory_book.release(trajectory_slot)
+		self._publish_trajectory_pool_capacity()
 		seq._buffer_slot = -1
 
 		# Free local index mapping.
@@ -3217,13 +3219,21 @@ class BatchGenWorker:
 		"""Publish derived scheduling capacity once rank zero has a response queue."""
 		if self.rank != 0 or self._response_queue is None or self._trajectory_book is None:
 			return
-		if getattr(self, "_trajectory_pool_capacity_published", False):
+		signature = (
+			self._trajectory_book.reservation_capacity(self.model_context_length),
+			self._trajectory_book.free_page_count,
+			self._trajectory_book.active_count,
+			self._trajectory_book.largest_free_extent_pages,
+		)
+		if getattr(self, "_trajectory_pool_capacity_signature", None) == signature:
 			return
-		self._trajectory_pool_capacity_published = True
+		self._trajectory_pool_capacity_signature = signature
 		self._response_queue.put({
 			"type": "trajectory_pool_capacity",
-			"capacity": self._trajectory_book.reservation_capacity(self.model_context_length),
+			"capacity": signature[0],
 			"free_pages": self._trajectory_book.free_page_count,
+			"active_count": self._trajectory_book.active_count,
+			"largest_free_extent_pages": signature[3],
 			"page_tokens": self._trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
 			"capacity_bytes": self._trajectory_book.memory_bytes,
@@ -4284,13 +4294,15 @@ class BatchGenWorker:
 			t_send = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_read)*1000:.1f}ms")
-			# Free host KV pages on source (mirror aux for DSA)
-			worker_view.release_sequence_pages([global_idx])
-			if aux_view is not None:
-				aux_view.release_sequence_pages([global_idx])
 			dist.send(tensor=header, dst=to_rank, group=gloo_group)
 			dist.send(tensor=trajectory, dst=to_rank, group=gloo_group)
 			dist.send(tensor=turn_payload, dst=to_rank, group=gloo_group)
+			# Free host KV pages only after the complete source payload is sent.
+			# The destination restores the trajectory before the migration barrier
+			# permits source-slot release.
+			worker_view.release_sequence_pages([global_idx])
+			if aux_view is not None:
+				aux_view.release_sequence_pages([global_idx])
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(
 					f"MIGRATION: Rank {self.rank}: Sent trajectory for {uuid[:8]} "
@@ -4458,6 +4470,7 @@ class BatchGenWorker:
 				and self._trajectory_book.has_sequence(mig.uuid)
 			):
 				self._trajectory_book.release(self._trajectory_book.slot_for(mig.uuid))
+				self._publish_trajectory_pool_capacity()
 		if self.rank == 0:
 			logging.info(
 				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
@@ -13076,16 +13089,13 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
-			pos = max(0, seq.decoded_length - 1)
 			if self._trajectory_book is None:
 				continue
-			# ``pos`` is the previous generated-token index. The unified book keeps
-			# the original prompt boundary stable even when KV eviction makes a
-			# later turn's effective prompt include historical generated tokens.
-			token = self._trajectory_tokens(
-				seq, start=seq.original_prompt_length + pos, length=1,
-				dtype=torch.int64,
-			).view(1, 1)
+			# Use the turn ledger: later user prompts make the latest generated
+			# token non-contiguous with the original prompt boundary.
+			token = self._trajectory_book.last_generated_token(
+				self._trajectory_slot(seq)
+			).to(dtype=torch.int64).view(1, 1)
 			tokens.append(token)
 
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
@@ -13193,12 +13203,12 @@ class BatchGenWorker:
 				with torch.inference_mode():
 					Attn_Wrapper.cur_batch = [batch]
 					# Build attention mask on-the-fly from sequence metadata
-					max_len = self.max_input_length + new_token_idx
 					cache_seqlens = []
 					for query_idx in batch:
 						uuid = self._local_to_uuid_map[query_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						cache_seqlens.append(seq.current_context_length)
+					max_len = max(cache_seqlens, default=0)
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64)
 					positions = torch.arange(max_len)
 					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
@@ -13265,17 +13275,22 @@ class BatchGenWorker:
 					for micro_batch_idx in range(num_micro_batches)
 				]
 				Attn_Wrapper.cur_batch = micro_batches
+				cache_seqlens = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[query_idx]).current_context_length
+					for query_idx in batch
+				]
+				max_cache_len = max(cache_seqlens, default=0)
 				
 				if (new_token_idx - 1) % 32 == 0:
 					for idx in range(new_token_idx - 1, new_token_idx + 31):
 						if "deepseek" in self.model_config.model_type:
 							past_kv_byte_size = (
-								(self.max_input_length + idx + 1)
+								(max(self.max_input_length + idx + 1, max_cache_len))
 								* self.model_config.compressed_kv_dim
 							)
 						elif "mixtral" in self.model_config.model_type:
 							past_kv_byte_size = (
-								(self.max_input_length + idx)
+								(max(self.max_input_length + idx, max_cache_len))
 								* self.model_config.num_key_value_heads
 								* self.model_config.head_dim
 								* 2
@@ -13292,12 +13307,7 @@ class BatchGenWorker:
 
 				with torch.inference_mode():
 					# Build attention mask on-the-fly from sequence metadata
-					max_len = self.max_input_length + new_token_idx
-					cache_seqlens = []
-					for query_idx in batch:
-						uuid = self._local_to_uuid_map[query_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						cache_seqlens.append(seq.current_context_length)
+					max_len = max_cache_len
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
 					positions = torch.arange(max_len, device=self.torch_device)
 					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)

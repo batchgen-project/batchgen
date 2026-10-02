@@ -268,7 +268,7 @@ class QueryBook:
 
         max_tokens = self._positive_int(max_tokens, "max_tokens")
         page_count = self.pages_for(max_tokens)
-        if page_count > self.free_page_count:
+        if page_count > self.largest_free_extent_pages:
             raise QueryBookCapacityError(
                 f"QueryBook token budget exhausted: need={page_count * self.page_bytes} "
                 f"bytes, free={self.free_bytes} bytes"
@@ -595,6 +595,30 @@ class QueryBook:
             offset += length
         return output
 
+    def last_generated_token(self, slot: int) -> torch.Tensor:
+        """Materialize the latest generated token without assuming one suffix.
+
+        A later prompt can sit between two generated spans, so callers must
+        use the turn ledger instead of deriving the position from the original
+        prompt length and cumulative decode count.
+        """
+
+        self._check_active_slot(slot)
+        turns = self._turns[slot]
+        for turn in reversed(turns):
+            if turn.generated_length:
+                output = torch.empty(1, dtype=torch.int32)
+                self._copy_span_to(
+                    slot, turn.generated_end - 1, 1, output
+                )
+                return output
+        record = self._records[slot]
+        if record.prompt_length <= 0:
+            raise QueryBookCapacityError("sequence has no token to feed to decode")
+        output = torch.empty(1, dtype=torch.int32)
+        self._copy_span_to(slot, record.prompt_length - 1, 1, output)
+        return output
+
     def turns_payload(self, slot: int) -> torch.Tensor:
         """Encode the turn ledger for a CPU migration payload."""
 
@@ -810,6 +834,7 @@ class QueryBook:
             return [fallback]
         validated = list(turns)
         generated_total = 0
+        previous_generated_end = 0
         for expected_id, turn in enumerate(validated):
             if not isinstance(turn, QueryBookTurn):
                 raise ValueError("turn ledger entries must be QueryBookTurn")
@@ -826,7 +851,10 @@ class QueryBook:
                 raise ValueError("turn span exceeds restored trajectory length")
             if turn.prompt_end > turn.generated_start:
                 raise ValueError("generated span overlaps its prompt span")
+            if turn.generated_start < previous_generated_end:
+                raise ValueError("generated spans must be monotonic and non-overlapping")
             generated_total += turn.generated_length
+            previous_generated_end = turn.generated_end
         if not validated and (token_length or decoded_length):
             raise ValueError("non-empty trajectory requires at least one turn")
         if generated_total != decoded_length:

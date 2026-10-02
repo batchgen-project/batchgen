@@ -515,15 +515,9 @@ class KVMigrationHelper:
         # Move to CPU for Gloo transfer
         k_cpu = k_gpu.cpu().contiguous()
 
-        # Send via Gloo
-        dist.send(tensor=k_cpu, dst=mig.to_rank, group=gloo_group)
-
-        # Free GPU and host pages
-        manager.free_pages_for_sequences([global_idx])
-        worker_view.release_sequence_pages([global_idx])
-
-        # Send the complete int32 trajectory and turn ledger; the destination
-        # restores it before the migration round acknowledges completion.
+        # Snapshot the token trajectory before releasing any source KV. If the
+        # source reservation is missing, fail before mutating host/GPU state;
+        # the destination needs this payload to restore bookkeeping.
         trajectory = self.worker._trajectory_tokens(seq, dtype=torch.int32).contiguous()
         book = getattr(self.worker, "_trajectory_book", None)
         if book is None or not book.has_sequence(mig.uuid):
@@ -534,9 +528,20 @@ class KVMigrationHelper:
             [1, trajectory.numel(), seq.prompt_length, seq.decoded_length, turns.shape[0]],
             dtype=torch.int64,
         )
+
+        # Send via Gloo
+        dist.send(tensor=k_cpu, dst=mig.to_rank, group=gloo_group)
+
+        # Send the complete int32 trajectory and turn ledger before releasing
+        # source KV resources. The destination restores it before the
+        # migration round acknowledges completion.
         dist.send(tensor=header, dst=mig.to_rank, group=gloo_group)
         dist.send(tensor=trajectory, dst=mig.to_rank, group=gloo_group)
         dist.send(tensor=turns, dst=mig.to_rank, group=gloo_group)
+
+        # Free GPU and host pages after the complete source payload is sent.
+        manager.free_pages_for_sequences([global_idx])
+        worker_view.release_sequence_pages([global_idx])
 
         if self.debug:
             logger.debug(f"MIGRATION: Rank {self.rank}: Sent {mig.uuid[:8]}... in {(time.perf_counter()-t0)*1000:.1f}ms")

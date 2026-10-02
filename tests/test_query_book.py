@@ -239,6 +239,9 @@ def test_query_book_multi_turn_appends_prompt_and_tracks_generated_spans():
     assert torch.equal(
         book.generated_tokens(slot), torch.tensor([10, 30], dtype=torch.int32)
     )
+    assert torch.equal(
+        book.last_generated_token(slot), torch.tensor([30], dtype=torch.int32)
+    )
     turns = book.turns(slot)
     assert [(t.prompt_start, t.prompt_length, t.generated_start, t.generated_length) for t in turns] == [
         (0, 2, 2, 1),
@@ -267,6 +270,15 @@ def test_query_book_reentry_turn_replays_prefix_without_double_counting():
     )
     assert book.turns(slot)[-1].generated_start == 4
     assert book.turns(slot)[-1].generated_length == 1
+
+
+def test_query_book_last_token_falls_back_to_prompt_boundary():
+    book = QueryBook(capacity_bytes=2 * 4 * 4, page_tokens=4)
+    slot = book.bind("prompt-only", max_tokens=8)
+    book.write_prompt(slot, torch.tensor([1, 2, 3], dtype=torch.int32))
+    assert torch.equal(
+        book.last_generated_token(slot), torch.tensor([3], dtype=torch.int32)
+    )
 
 
 def test_query_book_restore_round_trips_turn_ledger():
@@ -307,3 +319,20 @@ def test_query_book_restore_rejects_inconsistent_turn_metadata():
             turns=[QueryBookTurn(0, 0, 2, 2, 1)],
         )
     assert book.metadata(slot).token_length == 0
+
+
+def test_query_book_restore_rejects_overlapping_generated_spans():
+    book = QueryBook(capacity_bytes=2 * 4 * 4, page_tokens=4)
+    slot = book.bind("overlap", max_tokens=8)
+    turns = [
+        QueryBookTurn(0, 0, 2, 2, 1),
+        QueryBookTurn(1, 0, 2, 2, 1),
+    ]
+    with pytest.raises(ValueError, match="monotonic"):
+        book.restore(
+            slot,
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            prompt_length=2,
+            decoded_length=2,
+            turns=turns,
+        )
