@@ -341,6 +341,8 @@ class QueryBook:
                 f"requested length={length}, valid length={valid_length}"
             )
         target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None:
+            target_device = torch.device("cuda", torch.cuda.current_device())
         source = torch.empty(length, dtype=torch.int32)
         self._copy_span_to(slot, 0, length, source)
         if out is not None:
