@@ -190,6 +190,7 @@ def make_worker(
             capacity_bytes=max(1, len(texts) * ((model_context_length + 63) // 64) * 64 * 4),
             page_tokens=64,
         ),
+        _publish_trajectory_pool_capacity=lambda: None,
         _ensure_buffer_pool=lambda **kwargs: None,
     )
     uuids = [seq.uuid for seq in sequences]

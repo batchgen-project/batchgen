@@ -400,13 +400,25 @@ class QueryBook:
         turns = self._turns[slot]
         if turns:
             last = turns[-1]
-            if (
-                last.prompt_start == 0
-                and last.prompt_length == prompt_length
-                and last.generated_length == 0
-                and last.generated_start == record.token_length
-            ):
-                return last
+            if last.generated_length == 0 and last.generated_start == record.token_length:
+                # Repeated eviction/re-entry bookkeeping before the next
+                # generated token does not need one Python object per retry.
+                updated = QueryBookTurn(
+                    turn_id=last.turn_id,
+                    prompt_start=0,
+                    prompt_length=prompt_length,
+                    generated_start=record.token_length,
+                    generated_length=0,
+                )
+                turns[-1] = updated
+                self._records[slot] = QueryBookSlot(
+                    slot,
+                    prompt_length,
+                    record.token_length,
+                    record.decoded_length,
+                    record.max_tokens,
+                )
+                return updated
         turn = QueryBookTurn(
             turn_id=len(turns),
             prompt_start=0,
