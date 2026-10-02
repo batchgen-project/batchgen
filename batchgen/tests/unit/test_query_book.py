@@ -32,7 +32,7 @@ def test_query_book_rejects_non_integral_reservation_sizes():
 
 
 def test_query_book_reserves_variable_full_lengths_without_growth():
-    book = QueryBook(capacity_bytes=5 * 4 * 4, page_tokens=4)
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
     assert book.can_reserve(8)
     first = book.bind("first", max_tokens=5)
     second = book.bind("second", max_tokens=8)
