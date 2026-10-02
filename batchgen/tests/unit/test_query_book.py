@@ -194,3 +194,32 @@ def test_query_book_writes_after_inference_mode_construction():
     book.write_prompt(slot, torch.tensor([1, 2]))
     book.append_token(slot, 3)
     assert torch.equal(book.tokens(slot), torch.tensor([1, 2, 3], dtype=torch.int32))
+
+
+def test_query_book_batch_bind_is_atomic_when_free_pages_are_fragmented():
+    book = QueryBook(capacity_bytes=8 * 4 * 4, page_tokens=4)
+    slots = book.bind_batch(["a", "b", "c"], [8, 8, 8])
+    book.release(slots[1])
+    # Four pages are free in aggregate, but no contiguous three-page extent
+    # exists because the first/last reservations still fence the hole.
+    with pytest.raises(QueryBookCapacityError):
+        book.bind_batch(["d", "e"], [12, 4])
+    assert book.active_count == 2
+    assert book.free_page_count == 4
+    assert book.slot_for("a") == slots[0]
+    assert book.slot_for("c") == slots[2]
+
+
+def test_query_book_restore_preserves_trajectory_and_lengths():
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    slot = book.bind("request-1", max_tokens=12)
+    trajectory = torch.arange(9, dtype=torch.int32)
+    book.restore(slot, trajectory, prompt_length=7, decoded_length=2)
+
+    assert torch.equal(book.tokens(slot), trajectory)
+    metadata = book.metadata(slot)
+    assert metadata.prompt_length == 7
+    assert metadata.token_length == 9
+    assert metadata.decoded_length == 2
+    book.append_token(slot, 9)
+    assert torch.equal(book.tokens(slot), torch.arange(10, dtype=torch.int32))

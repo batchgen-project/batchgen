@@ -206,6 +206,7 @@ def create_app(
             "scheduling_pool_active": spool.num_active_slots(),
             "scheduling_pool_free": spool.num_free_slots(),
             "scheduling_pool_capacity": spool.capacity,
+            "trajectory_pool": scheduler._trajectory_pool_info,
             "active_batches": active_batches,
             "pool_mode": scheduler._pool_mode,
         }

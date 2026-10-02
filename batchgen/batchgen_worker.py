@@ -122,6 +122,7 @@ from batchgen.batch_order import (
 from batchgen.memfd import create_memfd
 from batchgen.token_store import PromptTokenArena
 from batchgen.query_book import (
+	QueryBook,
 	QueryBookEntry as query,
 	bind_local_sequence_to_query_book,
 	make_query_book_entry,
@@ -417,6 +418,57 @@ def allocate_node_shared_int64(
 	return buf, NodeSharedMemfd(fd, mapping)
 
 
+def allocate_node_shared_tensor(
+	label: str,
+	rows: int,
+	width: int,
+	dtype: torch.dtype,
+	is_creator: bool,
+	exchange,
+	barrier,
+) -> Tuple[torch.Tensor, NodeSharedMemfd]:
+	"""Map one anonymous node-shared CPU tensor into every local worker.
+
+	The creator publishes its memfd identity through ``exchange``. All ranks
+	then map the same fixed-size region and wait at ``barrier`` before any
+	caller can release its descriptor. This is the int32 counterpart of the
+	legacy int64 input table helper and is used by the unified trajectory book.
+	"""
+	import mmap
+	if dtype not in (torch.int32, torch.int64):
+		raise ValueError(f"unsupported shared tensor dtype: {dtype}")
+	if rows <= 0 or width <= 0:
+		raise ValueError(f"shared tensor shape must be positive, got ({rows}, {width})")
+	element_bytes = torch.empty((), dtype=dtype).element_size()
+	nbytes = rows * width * element_bytes
+	fd = -1
+	if is_creator:
+		fd = create_memfd(label)
+		os.ftruncate(fd, nbytes)
+	creator_pid, creator_fd = exchange(os.getpid(), fd)
+	if not is_creator:
+		if creator_pid < 0 or creator_fd < 0:
+			raise RuntimeError(
+				f"no rank published a memfd for '{label}' "
+				f"(got pid={creator_pid}, fd={creator_fd})"
+			)
+		fd = os.open(f"/proc/{creator_pid}/fd/{creator_fd}", os.O_RDWR | os.O_CLOEXEC)
+	try:
+		size = os.fstat(fd).st_size
+		if size < nbytes:
+			raise QueryBookPoolCapacityError(
+				f"shared memfd '{label}' is {size} bytes, need {nbytes}"
+			)
+		mapping = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+		with torch.inference_mode(False):
+			buf = torch.frombuffer(mapping, dtype=dtype, count=rows * width).view(rows, width)
+	except BaseException:
+		os.close(fd)
+		raise
+	barrier()
+	return buf, NodeSharedMemfd(fd, mapping)
+
+
 class QueryBookBufferPool:
 	"""Pre-allocated contiguous buffers for query book tensors.
 
@@ -675,7 +727,8 @@ class BatchGenWorkerArgs:
 	tensor_meta_memfd_fd: int = -1
 	distributed_weight_config: Optional[str] = None
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
-	max_pool_size: int = 10240  # Must be > 0; rejected at startup otherwise.
+	max_pool_size: int = 10240  # Deprecated compatibility field.
+	input_ids_pool_size_gb: float = 50.0  # Fixed node-shared int32 token budget.
 	host_kv_shm_name: str = "batchgen_host_kv_cache"
 	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
 	query_book_shm_prefix: str = "batchgen_input_ids"
@@ -995,13 +1048,14 @@ class BatchGenWorker:
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
 		self._shutdown_requested = False
-		self._max_pool_size = args.max_pool_size  # always > 0 (validate_server_args)
+		self._max_pool_size = args.max_pool_size  # Deprecated; no capacity semantics.
+		self._input_ids_pool_size_gb = float(args.input_ids_pool_size_gb)
 
-		# QueryBook buffer pool. Allocated lazily by _ensure_buffer_pool() once
-		# the first batch's tokenized lengths are known — its input_ids buffer
-		# is ONE node-shared memfd per node, so it cannot be sized from
-		# static config.
+		# Legacy pool fields remain only for checkpoint/object compatibility; the
+		# production path uses the fixed trajectory book initialized with the model.
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
+		self._trajectory_book = None
+		self._trajectory_memfd: Optional[NodeSharedMemfd] = None
 		self._prompt_arena: Optional[PromptTokenArena] = None
 		self._prompt_private_arena: Optional[PromptTokenArena] = None
 		self._prompt_handles: Dict[str, Tuple[int, int]] = {}
@@ -1481,7 +1535,9 @@ class BatchGenWorker:
 		tokenized_by_idx: Dict[int, Dict[str, object]],
 		rejected_uuids: Set[str],
 	) -> None:
-		"""Publish prompt handles from the node leader and attach local readers."""
+		"""Retired compatibility hook; prompts live in the trajectory book."""
+		raise RuntimeError("PromptTokenArena is retired; use the unified trajectory book")
+		# Kept below only for source compatibility with old checkpoints.
 		valid = [
 			(seq, tokenized_by_idx[i]["input_ids"])
 			for i, seq in enumerate(sequences)
@@ -1544,12 +1600,14 @@ class BatchGenWorker:
 			self._prompt_tensors[seq.uuid] = out
 
 	def _write_local_prompt(self, uuid: str, tokens: torch.Tensor) -> torch.Tensor:
-		"""Write a prompt for a local re-entry/migration path.
+		"""Retired compatibility hook; re-entry/migration use QueryBook.restore.
 
 		Admission uses the node leader arena. These paths are owner-local and may
 		run without a process-group rendezvous, so an attached reader uses a small
 		private arena rather than attempting an unsafe cross-process allocation.
 		"""
+		raise RuntimeError("PromptTokenArena is retired; use the unified trajectory book")
+		# Kept below only for source compatibility with old checkpoints.
 		arena = self._prompt_arena
 		if arena is None or not arena.is_creator:
 			if self._prompt_private_arena is None:
@@ -1567,13 +1625,11 @@ class BatchGenWorker:
 		return out
 
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
-		"""Tokenize newly admitted sequences and assign buffer pool slots.
+		"""Tokenize newly admitted sequences and bind trajectory reservations.
 
-		Tokenizes in parallel across ranks, then fills the buffer pool:
-		- Allocates the buffer pool on the first admission and grows it when a
-		  later admission is wider (the pool cannot be pre-sized: its widths
-		  come from the requests, not from static config)
-		- Only processes the new sequences, not the full global_batch
+		Tokenizes in parallel across ranks, then writes each prompt into the
+		fixed unified token pool. Only the new sequences are processed; the pool
+		reservation is never resized or copied during a later admission.
 
 		Optimization: uses padding=False to avoid creating a large padded 2D
 		tensor on CPU. The tokenizer returns List[List[int]] directly, which
@@ -1726,87 +1782,41 @@ class BatchGenWorker:
 		if hasattr(self, "_assign_decode_dp_groups"):
 			self._assign_decode_dp_groups(valid_uuids)
 
-		# The local-rank zero process is the sole writer for this host's arena.
-		# Other ranks attach to its anonymous memfd after the endpoint/handle map
-		# has crossed the process group. This keeps one canonical prompt copy per
-		# node while preserving the existing per-rank tensor interface.
-		if hasattr(self, "_publish_prompt_arena"):
-			self._publish_prompt_arena(
-				sequences,
-				tokenized_by_idx,
-				set(rejected_uuids),
-			)
-
-		# Phase 2.75: size the pool for what this admission actually needs.
-		# COLLECTIVE — every rank runs it with the same numbers: the admission
-		# message was broadcast and the tokenized lengths were shared above.
-		required_input_width = 0
-		required_decode_width = 0
-		for i, seq in enumerate(sequences):
-			if seq.uuid in rejected_uuids:
-				continue
-			prompt_len = tokenized_by_idx[i]["length"]
-			required_input_width = max(
-				required_input_width,
-				min(prompt_len + seq.max_decode_length, self.model_context_length),
-			)
-			required_decode_width = max(
-				required_decode_width,
-				min(seq.max_decode_length, self.model_context_length),
-			)
-		if required_input_width > 0:
-			# Rows keep their --max-pool-size meaning: the pool is NOT widened to
-			# fit an over-subscribed batch, allocate_slot() still hard-fails.
-			self._ensure_buffer_pool(
-				required_rows=self._max_pool_size,
-				required_input_width=required_input_width,
-				required_decode_width=required_decode_width,
-				reason=f"admission of {len(sequences)} sequences",
-			)
-
-		# Phase 3: Assign buffer pool slots and fill token data — allocate slot
-		# from the existing buffer pool, write tokens directly into the view.
-		for i, seq in enumerate(sequences):
-			if seq.uuid in rejected_uuids:
-				continue
-			item = tokenized_by_idx[i]
-			has_prompt_arena = hasattr(self, "_publish_prompt_arena")
-			input_ids_tensor = (
-				self._prompt_tensors.get(seq.uuid)
-				if has_prompt_arena and hasattr(self, "_prompt_tensors")
-				else item["input_ids"]
-			)
-			actual_prompt_len = item["length"]
-
-			if hasattr(seq, "clamp_decode_to_context"):
-				seq_extended_size = seq.clamp_decode_to_context(
-					actual_prompt_len, self.model_context_length
-				)
-			else:
-				seq_extended_size = min(
+		# Phase 2.75/3: reserve the complete fixed model-context page chain and
+		# copy the prompt into the same store that will receive decode tokens.
+		# Every rank executes this deterministically so local metadata and the
+		# node-shared storage have identical slot assignments.
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		valid = [
+			(seq, tokenized_by_idx[i])
+			for i, seq in enumerate(sequences)
+			if seq.uuid not in rejected_uuids
+		]
+		sequence_ids = [seq.uuid for seq, _ in valid]
+		reserved_tokens = [self.model_context_length] * len(valid)
+		reserved_slots = self._trajectory_book.bind_batch(sequence_ids, reserved_tokens)
+		try:
+			for (seq, item), slot in zip(valid, reserved_slots):
+				actual_prompt_len = int(item["length"])
+				self._trajectory_book.write_prompt(slot, item["input_ids"])
+				seq._buffer_slot = slot
+				# Token storage is now accessed through QueryBook; these fields are
+				# intentionally empty so no stale dense view can escape the book.
+				seq.input_ids = None
+				seq.decoded_tokens = None
+				seq.prompt_length = actual_prompt_len
+				seq.original_prompt_length = actual_prompt_len
+				seq.current_context_length = actual_prompt_len
+				seq.kv_token_budget = min(
 					actual_prompt_len + seq.max_decode_length,
 					self.model_context_length,
 				)
-
-			slot = self._buffer_pool.allocate_slot()
-			try:
-				if has_prompt_arena:
-					if input_ids_tensor is not None:
-						seq.input_ids = input_ids_tensor
-				else:
-					input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-					input_ids_view[0, :actual_prompt_len].copy_(input_ids_tensor)
-					seq.input_ids = input_ids_view
-				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
-			except Exception:
-				self._buffer_pool.free_slot(slot)
-				raise
-			seq._buffer_slot = slot
-
-			seq.prompt_length = actual_prompt_len
-			seq.original_prompt_length = actual_prompt_len
-			seq.current_context_length = actual_prompt_len
-			seq.kv_token_budget = seq_extended_size
+		except Exception:
+			for slot in reserved_slots:
+				if slot in self._trajectory_book._records:
+					self._trajectory_book.release(slot)
+			raise
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
@@ -1991,6 +2001,67 @@ class BatchGenWorker:
 				continue
 			self._bind_local_sequence_to_query_book(uuid)
 
+	def _trajectory_slot(self, seq: SequenceEntry) -> int:
+		if self._trajectory_book is None or seq._buffer_slot < 0:
+			raise RuntimeError(f"sequence {seq.uuid} has no active trajectory slot")
+		return seq._buffer_slot
+
+	def _trajectory_tokens(
+		self,
+		seq: SequenceEntry,
+		*,
+		start: int = 0,
+		length: Optional[int] = None,
+		dtype: torch.dtype = torch.int32,
+	) -> torch.Tensor:
+		"""Materialize a trajectory span; no persistent storage view escapes."""
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		if dtype not in (torch.int32, torch.int64):
+			raise ValueError(f"unsupported trajectory dtype: {dtype}")
+		valid = self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+		if length is None:
+			length = valid - start
+		out = torch.empty(int(length), dtype=torch.int32)
+		self._trajectory_book.copy_span_to(
+			self._trajectory_slot(seq), out, start=int(start), length=int(length)
+		)
+		return out if dtype == torch.int32 else out.to(dtype=torch.int64)
+
+	def _trajectory_model_input(self, seq: SequenceEntry) -> torch.Tensor:
+		"""Materialize the current trajectory as model-required int64 CPU ids."""
+		return self._trajectory_tokens(seq, dtype=torch.int64)
+
+	def _trajectory_decoded_tokens(self, seq: SequenceEntry) -> torch.Tensor:
+		"""Materialize generated tokens for output and repetition checks."""
+		start = int(seq.original_prompt_length)
+		length = int(seq.decoded_length)
+		return self._trajectory_tokens(seq, start=start, length=length)
+
+	def _append_trajectory_token(self, seq: SequenceEntry, token_id: int) -> int:
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		return self._trajectory_book.append_token(self._trajectory_slot(seq), int(token_id))
+
+	def _append_trajectory_batch(
+		self, batch: Sequence[int], token_ids: torch.Tensor
+	) -> None:
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		if token_ids.numel() != len(batch):
+			raise ValueError(
+				f"trajectory append batch mismatch: {len(batch)} != {token_ids.numel()}"
+			)
+		slots = []
+		values = token_ids.reshape(-1).to(device="cpu").tolist()
+		for local_idx in batch:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise KeyError(f"missing sequence for local_idx={local_idx}")
+			slots.append(self._trajectory_slot(seq))
+		self._trajectory_book.append_tokens(slots, values)
+
 	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
 		"""Report a single sequence completion to the response queue.
 
@@ -2005,23 +2076,29 @@ class BatchGenWorker:
 		seq = self.global_batch.get_sequence(uuid)
 		if seq is None:
 			return
-
-		# Free buffer slot (all ranks do this to keep state consistent)
-		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
-			if seq._buffer_slot >= 0:
-				self._buffer_pool.free_slot(seq._buffer_slot)
-				# Guard against double-free / stale reuse: a re-entered report
-				# for this seq must not free a slot now owned by another seq.
-				seq._buffer_slot = -1
-		handle = self._prompt_handles.pop(uuid, None)
-		if handle is not None and self._prompt_arena is not None and self._prompt_arena.is_creator:
-			self._prompt_arena.free(handle)
-		elif handle is not None and self._prompt_private_arena is not None:
+		fallback_text = ""
+		if (
+			self.rank == 0
+			and gathered_text is None
+			and seq.decoded_length > 0
+			and self._trajectory_book is not None
+			and self._trajectory_book.has_slot(seq._buffer_slot)
+		):
 			try:
-				self._prompt_private_arena.free(handle)
-			except ValueError:
-				pass
-		self._prompt_tensors.pop(uuid, None)
+				fallback_text = self._decode_tokens_to_string(
+					self._trajectory_decoded_tokens(seq)
+				)
+			except Exception:
+				fallback_text = ""
+
+		# Free the complete trajectory reservation on every rank. This is the
+		# only token-storage release point; multi-turn re-entry keeps the slot.
+		if (
+			self._trajectory_book is not None
+			and self._trajectory_book.has_slot(seq._buffer_slot)
+		):
+			self._trajectory_book.release(seq._buffer_slot)
+		seq._buffer_slot = -1
 
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
@@ -2045,14 +2122,7 @@ class BatchGenWorker:
 			return
 
 		# Use gathered text if provided, otherwise read from local buffer
-		text = gathered_text if gathered_text is not None else ""
-		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
-			try:
-				text = self._decode_tokens_to_string(
-					seq.decoded_tokens[:, :seq.decoded_length]
-				)
-			except Exception:
-				text = ""
+		text = gathered_text if gathered_text is not None else fallback_text
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
@@ -2087,9 +2157,7 @@ class BatchGenWorker:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					decoded_tokens = self.query_book[local_idx].decoded_tokens[
-						:, :seq.decoded_length
-					]
+					decoded_tokens = self._trajectory_decoded_tokens(seq)
 					try:
 						text = self._decode_tokens_to_string(decoded_tokens)
 					except Exception:
@@ -3088,11 +3156,73 @@ class BatchGenWorker:
 			self.world_size
 		)
 
+		# The token pool is fixed for the lifetime of the worker. Its byte budget
+		# is explicit, while the number of admitted trajectories is derived from
+		# the model context and the canonical 64-token page size.
+		self._initialize_trajectory_book()
+
 		# NOTE: GPU KV cache size is calculated in generate() via _init_gpu_kv_with_actual_size()
 		# after _load_decode_model() loads model weights to GPU. At this point (init),
 		# only the model skeleton exists and weights haven't been loaded yet.
 
 		logging.info(f"Rank {self.rank}: One-time core initialization completed")
+
+	def _initialize_trajectory_book(self) -> None:
+		"""Create or attach the node-shared fixed input-id trajectory pool."""
+		if self._trajectory_book is not None:
+			return
+		if self.model_context_length is None:
+			raise RuntimeError("model context must be known before creating QueryBook")
+		page_tokens = SequenceEntry.PAGE_SIZE
+		capacity_bytes = int(self._input_ids_pool_size_gb * (1024 ** 3))
+		page_bytes = page_tokens * QueryBook.TOKEN_BYTES
+		page_count = capacity_bytes // page_bytes
+		if page_count <= 0:
+			raise ValueError(
+				f"input_ids pool budget {capacity_bytes} bytes cannot hold one "
+				f"{page_tokens}-token page"
+			)
+		storage, memfd = allocate_node_shared_tensor(
+			label=f"{self._query_book_shm_prefix}trajectory_n{self.rank // self.local_world_size}",
+			rows=page_count,
+			width=page_tokens,
+			dtype=torch.int32,
+			is_creator=self.local_rank == 0,
+			exchange=self._exchange_node_memfd_identity,
+			barrier=dist.barrier,
+		)
+		self._trajectory_memfd = memfd
+		self._trajectory_book = QueryBook(
+			capacity_bytes=page_count * page_bytes,
+			page_tokens=page_tokens,
+			storage=storage,
+		)
+		logging.info(
+			"Rank %s: unified trajectory pool ready: budget=%.3f GiB "
+			"pages=%s page_tokens=%s max_context=%s sequence_capacity=%s",
+			self.rank,
+			self._trajectory_book.memory_bytes / (1024 ** 3),
+			self._trajectory_book.page_count,
+			page_tokens,
+			self.model_context_length,
+			self._trajectory_book.reservation_capacity(self.model_context_length),
+		)
+
+	def _publish_trajectory_pool_capacity(self) -> None:
+		"""Publish derived scheduling capacity once rank zero has a response queue."""
+		if self.rank != 0 or self._response_queue is None or self._trajectory_book is None:
+			return
+		if getattr(self, "_trajectory_pool_capacity_published", False):
+			return
+		self._trajectory_pool_capacity_published = True
+		self._response_queue.put({
+			"type": "trajectory_pool_capacity",
+			"capacity": self._trajectory_book.reservation_capacity(self.model_context_length),
+			"free_pages": self._trajectory_book.free_page_count,
+			"page_tokens": self._trajectory_book.page_tokens,
+			"model_context_length": self.model_context_length,
+			"capacity_bytes": self._trajectory_book.memory_bytes,
+		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
 		"""
@@ -4137,28 +4267,25 @@ class BatchGenWorker:
 			worker_view.release_sequence_pages([global_idx])
 			if aux_view is not None:
 				aux_view.release_sequence_pages([global_idx])
-			# Also send query_book data (input_ids, decoded_tokens)
-			local_idx = self._uuid_to_local_map.get(uuid)
-			if local_idx is not None and local_idx in self.query_book:
-				qb = self.query_book[local_idx]
-				# Send tensors via Gloo — must use .clone() because buffer pool views
-				# are already contiguous (.contiguous() returns same tensor, not a copy)
-				dist.send(tensor=qb.encoded["input_ids"].clone(), dst=to_rank, group=gloo_group)
-				dist.send(tensor=qb.decoded_tokens.clone(), dst=to_rank, group=gloo_group)
-				# The buffer slot is NOT freed here. slot -> row is GLOBAL
-				# state: every rank allocates the same slot for the same
-				# sequence at tokenization and frees it in _report_completion,
-				# and the destination below reuses this very slot index.
-				# Freeing it only on the source made this rank's pool disagree
-				# with every other rank's -- it could hand row S to a new
-				# admission while everyone else still reads S as this sequence,
-				# and it left _buffer_slot = -1, so an eviction re-entry wrote
-				# into row -1 (the LAST row). Now that input_ids is one
-				# node-shared segment that divergence is data corruption.
-				if BATCHGEN_CB_DEBUG:
-					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
-			else:
-				logging.warning(f"MIGRATION: Rank {self.rank}: No query_book entry for {uuid[:8]}... (local_idx={local_idx})")
+			# Send the complete int32 trajectory. The destination already reserved
+			# the sequence's pages during admission; it only restores bytes and
+			# scalar lengths. No dense prompt/decoded views cross the wire.
+			if self._trajectory_book is None or not self._trajectory_book.has_slot(seq._buffer_slot):
+				raise QueryBookPoolCapacityError(
+					f"Rank {self.rank}: migration source has no trajectory slot for {uuid[:8]}"
+				)
+			trajectory = self._trajectory_tokens(seq, dtype=torch.int32).contiguous()
+			header = torch.tensor(
+				[trajectory.numel(), seq.prompt_length, seq.decoded_length],
+				dtype=torch.int64,
+			)
+			dist.send(tensor=header, dst=to_rank, group=gloo_group)
+			dist.send(tensor=trajectory, dst=to_rank, group=gloo_group)
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"MIGRATION: Rank {self.rank}: Sent trajectory for {uuid[:8]} "
+					f"({trajectory.numel()} tokens)"
+				)
 
 			t_total = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
@@ -4205,13 +4332,12 @@ class BatchGenWorker:
 				f"in {(time.perf_counter()-t0)*1000:.1f}ms"
 			)
 
-			# Receive query_book data (input_ids, decoded_tokens)
-			input_ids_shape = seq.input_ids.shape
-			decoded_tokens_shape = seq.decoded_tokens.shape
-			input_ids_recv = torch.empty(input_ids_shape, dtype=seq.input_ids.dtype, device="cpu")
-			decoded_tokens_recv = torch.empty(decoded_tokens_shape, dtype=seq.decoded_tokens.dtype, device="cpu")
-			dist.recv(tensor=input_ids_recv, src=from_rank, group=gloo_group)
-			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
+			# Receive and restore the complete trajectory into the destination
+			# node's already-reserved slot.
+			header = torch.empty(3, dtype=torch.int64)
+			dist.recv(tensor=header, src=from_rank, group=gloo_group)
+			trajectory_recv = torch.empty(int(header[0].item()), dtype=torch.int32)
+			dist.recv(tensor=trajectory_recv, src=from_rank, group=gloo_group)
 
 			if not hasattr(self, '_pending_migrated_query_book'):
 				self._pending_migrated_query_book = {}
@@ -4220,8 +4346,9 @@ class BatchGenWorker:
 			self._migrated_sequences.add(uuid)
 			self._pending_migrated_query_book[uuid] = {
 				'text': seq.text,
-				'input_ids': input_ids_recv,
-				'decoded_tokens': decoded_tokens_recv,
+				'trajectory': trajectory_recv,
+				'prompt_length': int(header[1].item()),
+				'decoded_length': int(header[2].item()),
 				'kv_token_budget': seq.kv_token_budget,
 			}
 
@@ -4272,6 +4399,22 @@ class BatchGenWorker:
 		migration_start = time.perf_counter()
 		self._execute_kv_migrations_parallel(migrations)
 		migration_end = time.perf_counter()
+		# Each node has its own trajectory allocator metadata. Once the bytes are
+		# safely restored on the destination node, release the source-node copy on
+		# every local rank; the destination reservation remains owned by the same
+		# sequence until completion/eviction release.
+		for mig in migrations:
+			if self._get_node_for_rank(mig.from_rank) == self._get_node_for_rank(mig.to_rank):
+				continue
+			if self._get_node_for_rank(self.rank) != self._get_node_for_rank(mig.from_rank):
+				continue
+			seq = self.global_batch.get_sequence(mig.uuid)
+			if (
+				seq is not None
+				and self._trajectory_book is not None
+				and self._trajectory_book.has_slot(seq._buffer_slot)
+			):
+				self._trajectory_book.release(seq._buffer_slot)
 		if self.rank == 0:
 			logging.info(
 				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
@@ -4370,45 +4513,35 @@ class BatchGenWorker:
 				self._local_to_uuid_map[new_local_idx] = uuid
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
-				# Create query_book entry from pending migrated data, copying into buffer pool
+				# Restore trajectory bytes into the destination node's reserved slot.
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
-					budget = pending['kv_token_budget']
 					# Reuse existing buffer slot — Phase 3 already allocated a slot for every
 					# sequence in global_batch, so seq._buffer_slot is valid
 					seq = self.global_batch.get_sequence(uuid)
 					existing_slot = seq._buffer_slot
 					logging.info(
 						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
-						f"reusing existing_slot={existing_slot}, budget={budget}"
+						f"restoring existing_slot={existing_slot}, "
+						f"tokens={pending['trajectory'].numel()}"
 					)
-					if existing_slot < 0:
-						# Was: allocate a fresh slot here. That is a rank-LOCAL
-						# allocation of a globally-agreed index, so this rank would
-						# then write the sequence into a row every other rank reads
-						# as somebody else's -- silent corruption of the shared
-						# input_ids segment. The slot is allocated on every rank at
-						# tokenization and released on every rank in
-						# _report_completion, so reaching here means that invariant
-						# is already broken.
+					if self._trajectory_book is None or not self._trajectory_book.has_slot(existing_slot):
 						raise QueryBookPoolCapacityError(
-							f"Rank {self.rank}: migration receive of {uuid[:8]} found no "
-							f"buffer slot (_buffer_slot={existing_slot}); slot assignment "
-							f"has diverged from the other ranks"
+							f"Rank {self.rank}: migration receive of {uuid[:8]} has no "
+							f"destination trajectory slot ({existing_slot})"
 						)
-					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
-					input_ids_view = self._write_local_prompt(
-						uuid, pending['input_ids'][0, :seq.prompt_length]
+					self._trajectory_book.restore(
+						existing_slot,
+						pending['trajectory'],
+						prompt_length=pending['prompt_length'],
+						decoded_length=pending['decoded_length'],
 					)
-					decoded_view = self._buffer_pool.get_decoded_tokens_view(existing_slot)
-					seq.input_ids = input_ids_view
-					seq.decoded_tokens = decoded_view
-					self.query_book[new_local_idx] = query(
-						text=pending['text'],
-						encoded={"input_ids": input_ids_view},
-						decoded_tokens=decoded_view,
-						kv_token_budget=budget,
+					seq.prompt_length = pending['prompt_length']
+					seq.decoded_length = pending['decoded_length']
+					seq.current_context_length = (
+						seq.original_prompt_length + seq.decoded_length
 					)
+					self.query_book[new_local_idx] = make_query_book_entry(seq)
 					logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
 				else:
 					logging.error(f"Rank {self.rank}: No pending query_book data for migrated {uuid[:8]}...")
@@ -4650,7 +4783,7 @@ class BatchGenWorker:
 		required_decode_width: int,
 		reason: str,
 	) -> None:
-		"""Allocate — or grow — the QueryBook buffer pool.
+		"""Retired compatibility hook; the trajectory pool is fixed at init.
 
 		COLLECTIVE: every rank must call this with identical arguments. They do,
 		because both call sites derive the requirement from the tokenized batch,
@@ -4667,6 +4800,8 @@ class BatchGenWorker:
 		rebinds every view. ``get_input_ids_view`` hard-fails
 		(``QueryBookPoolCapacityError``) if a request ever slips past this.
 		"""
+		raise RuntimeError("dynamic QueryBookBufferPool growth is retired")
+		# Kept below only for source compatibility with old checkpoints.
 		old = self._buffer_pool
 		# Kept as explicit symbols for compatibility with the collective pool
 		# contract and its structural regression tests; prompt storage itself is
@@ -5256,7 +5391,7 @@ class BatchGenWorker:
 					local_idx = self._uuid_to_local_map.get(uuid)
 					if local_idx is not None and local_idx in self.query_book:
 						dl = seq.decoded_length
-						tokens = self.query_book[local_idx].decoded_tokens[0]
+						tokens = self._trajectory_decoded_tokens(seq)
 						if _check_repeating_pattern(tokens, dl):
 							seq._rep_detected = True
 							seq.eos_reached = True
@@ -5296,9 +5431,9 @@ class BatchGenWorker:
 		"""Complete the sequences whose budget is satisfied by the prefill token.
 
 		Prefill already samples the first token and appends it through the
-		normal decode write path (``query_book[..].decoded_tokens`` at
-		``seq.decoded_length``, then ``decoded_length += 1``; see the writeback
-		loop at the end of ``prefill``/``prefill_prepacked``). For a
+		unified trajectory book at the current tail (then increments
+		``decoded_length``; see the writeback loop at the end of
+		``prefill``/``prefill_prepacked``). For a
 		``max_tokens=1`` request that token IS the whole completion, so the
 		sequence is finished before decode starts. Previously every prefilled
 		sequence was handed to the decode phase unconditionally, which
@@ -5618,17 +5753,13 @@ class BatchGenWorker:
 		# Initialize empty global batch
 		self.global_batch = SequenceBatch()
 
-		# The buffer pool is NOT pre-allocated here. Both of its widths depend on
-		# the requests: input_ids needs prompt + that request's decode budget,
-		# decoded_tokens needs that request's max_completion_tokens — and neither
-		# is known until the first admission is tokenized. Sizing them at
-		# model_context_length "just in case" is what allocated 2 x 80 GiB per
-		# worker at K3's 1,048,576-token context. _tokenize_admitted_sequences
-		# allocates on first admission and grows if a later one needs more.
+		# The unified trajectory pool was allocated once during core init. It is
+		# fixed for the worker lifetime and derives scheduling capacity from its
+		# free reservations; no per-admission dense buffer growth is allowed.
 		self._buffer_pool = None
 		logging.info(
-			f"Rank {self.rank}: Buffer pool deferred to first admission "
-			f"(rows={self._max_pool_size}, widths sized per batch)"
+			f"Rank {self.rank}: unified trajectory pool active "
+			f"(capacity={self._trajectory_book.reservation_capacity(self.model_context_length)})"
 		)
 
 		# Initialize index maps
@@ -7098,8 +7229,7 @@ class BatchGenWorker:
 		#   (a) All-ranks scalar metadata update (runs on every rank using
 		#       fields already synchronized via Phase 4.C of the eviction
 		#       boundary and via _sync_sequence_metadata).
-		#   (b) Owner-only tensor buffer setup (only the owning rank has
-		#       the QueryBookBufferPool slot for this sequence).
+		#   (b) Validate the retained trajectory and clear the legacy marker.
 		#
 		# The previous single-loop version ran both steps gated on
 		# evicted_token_ids — which is an owner-only tensor — so non-owning
@@ -7151,79 +7281,35 @@ class BatchGenWorker:
 			if hasattr(seq, '_rep_detected'):
 				seq._rep_detected = False
 
-		# (b) Owner-only tensor buffer setup. Also clears seq.evicted_token_ids.
+		# (b) The trajectory is already the source of truth. Host-KV eviction
+		# releases only KV pages; it must not reconstruct or copy a second token
+		# buffer. Validate the retained trajectory and clear the legacy handoff
+		# marker so old callers cannot accidentally reintroduce dense storage.
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			# Gate on evicted_token_ids (owner-only tensor); non-owners fall
-			# through here because their copy is always None.
-			if seq.evicted_token_ids is None:
+			if seq.total_decoded_before_eviction == 0:
 				continue
-
-			evicted_ids = seq.evicted_token_ids  # 1D tensor
-			new_prompt_len = len(evicted_ids)
 			prev_decoded = seq.total_decoded_before_eviction
 			seq.log_event(SeqEvent.REENTRY_START, self.rank,
-				f"new_prompt_len={new_prompt_len}, prev_decoded={prev_decoded}")
-
-			# Sanity: owner-side new_prompt_len must match scalar math done
-			# in loop (a). Mismatches indicate a drift between the tensor
-			# built by Phase 4.C and the scalar accounting.
-			if new_prompt_len != seq.prompt_length:
-				logging.error(
-					f"Rank {self.rank}: re-entry prep length mismatch for "
-					f"{uuid[:8]}: tensor={new_prompt_len}, scalar="
-					f"{seq.prompt_length}. Trusting tensor."
-				)
-				seq.prompt_length = new_prompt_len
-				seq.current_context_length = new_prompt_len
-
-			# Rebuild input_ids with new prompt — reuse buffer pool slot
-			seq_extended_size = seq.kv_token_budget
-			slot = seq._buffer_slot
-			if slot < 0:
-				# A negative index silently rewrites the LAST row of the pool,
-				# which is another sequence's prompt (and, now that input_ids is
-				# node-shared, every rank's copy of it).
+				f"new_prompt_len={seq.prompt_length}, prev_decoded={prev_decoded}")
+			if self._trajectory_book is None or not self._trajectory_book.has_slot(seq._buffer_slot):
 				raise QueryBookPoolCapacityError(
-					f"Rank {self.rank}: re-entry of {uuid[:8]} has no buffer slot "
-					f"(_buffer_slot={slot}); slot assignment has diverged"
+					f"Rank {self.rank}: re-entry of {uuid[:8]} has no trajectory slot"
 				)
-			old_handle = self._prompt_handles.pop(uuid, None)
-			if old_handle is not None and self._prompt_arena is not None and self._prompt_arena.is_creator:
-				self._prompt_arena.free(old_handle)
-			seq.input_ids = self._write_local_prompt(uuid, evicted_ids)
-
-			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
-			# so the final decoded_tokens contains the COMPLETE response.
-			self._buffer_pool.decoded_tokens_buffer[slot, :] = self._buffer_pool.pad_token_id
-			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
-			if prev_decoded > 0:
-				old_decoded = evicted_ids[seq.original_prompt_length:]
-				n_old = min(len(old_decoded), self.max_decoding_length)
-				seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
-				# decoded_length and reentry_decoded_baseline are already set
-				# by loop (a); setting them here is redundant but harmless and
-				# acts as a local invariant check.
-				if seq.decoded_length != n_old:
-					logging.error(
-						f"Rank {self.rank}: re-entry decoded_length mismatch for "
-						f"{uuid[:8]}: tensor_n_old={n_old}, scalar="
-						f"{seq.decoded_length}. Trusting tensor."
-					)
-					seq.decoded_length = n_old
-					seq.reentry_decoded_baseline = n_old
-
-			# Clear eviction state
+			trajectory_length = self._trajectory_book.metadata(
+				seq._buffer_slot
+			).token_length
+			if trajectory_length < seq.prompt_length:
+				raise RuntimeError(
+					f"Rank {self.rank}: trajectory for {uuid[:8]} is shorter than "
+					f"re-entry prompt ({trajectory_length} < {seq.prompt_length})"
+				)
+			# Clear the legacy owner-only tensor marker. No token copy occurs.
 			seq.evicted_token_ids = None
-
-			# Recreate query_book entry for this rank's evicted sequences (Q4)
-			if seq.assigned_rank == self.rank and uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
-				self.query_book[local_idx] = make_query_book_entry(seq)
 
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
-				f"new_prompt={new_prompt_len}, prev_decoded={prev_decoded}, "
+				f"new_prompt={seq.prompt_length}, prev_decoded={prev_decoded}, "
 				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
 			)
 
@@ -7432,9 +7518,9 @@ class BatchGenWorker:
 		"""True when --persistent-phase-instances keeps both phase instances."""
 		if not getattr(self.args, "persistent_phase_instances", False):
 			return False
-		if self._max_pool_size <= 0:
+		if self._trajectory_book is None:
 			raise RuntimeError(
-				"--persistent-phase-instances requires pool mode (--max-pool-size > 0)"
+				"--persistent-phase-instances requires the unified trajectory pool"
 			)
 		pm = self.parallel_manager
 		if not hasattr(pm, "activate_decoding"):
@@ -7967,20 +8053,23 @@ class BatchGenWorker:
 
 		# Dynamic padding: find max length within THIS batch, not global max
 		# This is critical for long-tailed distributions
-		batch_seq_lengths = [
-			self.query_book[query_idx].encoded["input_ids"].shape[1]
-			for query_idx in batch
-		]
+		batch_seq_lengths = []
+		for query_idx in batch:
+			uuid = self._local_to_uuid_map[query_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			batch_seq_lengths.append(int(seq.prompt_length))
 		batch_max_len = max(batch_seq_lengths)
 
 		# Pad each sequence to batch_max_len and construct attention masks on-the-fly
 		padded_input_ids = []
 		padded_attention_masks = []
 		for query_idx in batch:
-			seq_input_ids = self.query_book[query_idx].encoded["input_ids"]
 			uuid = self._local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			prompt_len = seq.prompt_length
+			seq_input_ids = self._trajectory_tokens(
+				seq, length=prompt_len, dtype=torch.int64
+			).view(1, -1)
 			seq_len = seq_input_ids.shape[1]
 
 			# Construct attention mask from prompt_length (1s for valid tokens, 0s for padding)
@@ -8059,13 +8148,11 @@ class BatchGenWorker:
 		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
 		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
 		new_tokens_cpu = new_tokens.cpu()
+		self._append_trajectory_batch(batch, new_tokens_cpu)
 		for i, local_idx in enumerate(batch):
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			# Write token at correct offset (handles both fresh and re-entered sequences)
-			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
-			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
-			seq.decoded_length = token_pos + 1
+			seq.decoded_length += 1
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
@@ -8108,21 +8195,6 @@ class BatchGenWorker:
 		for query_idx in batch:
 			uuid = self._local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			query_entry = self.query_book[query_idx]
-			encoded = query_entry.encoded["input_ids"]
-			if encoded.data_ptr() != seq.input_ids.data_ptr():
-				raise RuntimeError(
-					f"Rank {self.rank}: stale query_book input_ids binding for "
-					f"local_idx={query_idx} uuid={uuid[:8]} "
-					f"(query_book_ptr={encoded.data_ptr():#x}, seq_ptr={seq.input_ids.data_ptr():#x})"
-				)
-			if query_entry.decoded_tokens.data_ptr() != seq.decoded_tokens.data_ptr():
-				raise RuntimeError(
-					f"Rank {self.rank}: stale query_book decoded_tokens binding for "
-					f"local_idx={query_idx} uuid={uuid[:8]} "
-					f"(query_book_ptr={query_entry.decoded_tokens.data_ptr():#x}, "
-					f"seq_ptr={seq.decoded_tokens.data_ptr():#x})"
-				)
 			# NO truncation: every prompt is tokenized to its OWN length.
 			# An earlier `[:, :self.max_input_length]` slice silently dropped
 			# the tail of long LongBench prompts when max_input_length was
@@ -8130,11 +8202,9 @@ class BatchGenWorker:
 			# model to "continue" mid-sentence instead of answering. Bind
 			# everything to seq.prompt_length directly.
 			L = seq.prompt_length
-			assert encoded.size(-1) >= L, (
-				f"encoded prompt length {encoded.size(-1)} < seq.prompt_length {L} "
-				f"for query_idx={query_idx} uuid={uuid[:8]}"
-			)
-			input_ids = encoded[:, :L]
+			input_ids = self._trajectory_tokens(
+				seq, length=L, dtype=torch.int64
+			).view(1, -1)
 			seq_lengths.append(L)
 
 			# Per-seq mask marks the L valid positions for the prepacker.
@@ -8643,8 +8713,7 @@ class BatchGenWorker:
 		for i, local_idx in enumerate(batch):
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
-			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+			self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
 			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
@@ -9119,10 +9188,9 @@ class BatchGenWorker:
 		# B. Host KV eviction
 		#
 		# SYNC MODEL: Mutations here must keep every rank consistent without
-		# requiring a follow-up _sync_sequence_metadata call. The only pieces
-		# that can only live on the owning rank are the actual token tensors
-		# (evicted_token_ids, input_ids view, decoded_tokens buffer). All
-		# scalar metadata — prompt_length, current_context_length,
+		# requiring a follow-up _sync_sequence_metadata call. The trajectory book
+		# is the token source of truth and remains resident across KV eviction;
+		# only scalar metadata — prompt_length, current_context_length,
 		# total_decoded_before_eviction, host/gpu page counters, status — is
 		# updated on ALL ranks deterministically, using values already
 		# synchronized in Phase 1/2 of this same boundary call.
@@ -9132,20 +9200,8 @@ class BatchGenWorker:
 		# across ranks because Phase 2 synced them from the owner.
 		host_evicted_uuids = decisions.host_evicted_uuids
 		if host_evicted_uuids:
-			# Owner-only: build and stash the evicted_token_ids tensor and
-			# release on-device resources (GPU KV pages, host KV worker view).
-			#
-			# CASCADING RE-ENTRY FIX: only append decoded tokens BEYOND the
-			# re-entry baseline. For a fresh sequence the baseline is 0 (all
-			# decoded tokens are genuinely new). For a sequence that has
-			# already been re-entered, decoded_tokens[0:reentry_decoded_baseline]
-			# contains the historical output copied in at the last re-entry
-			# prep — those tokens ALSO live inside the current reconstructed
-			# prompt (input_ids[original_prompt_length:prompt_length]), so
-			# re-appending them here would double-count them and the next
-			# re-entry cycle would receive a prompt that grew by prev_decoded
-			# instead of by new_decoded_count, producing the geometric
-			# doubling seen in multi-eviction runs.
+			# Release on-device/host KV resources. The unified trajectory stays
+			# bound to the sequence, so no prompt or decoded-token copy is made.
 			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
 			if my_evicted:
 				# Host-eviction usually targets seqs already in DECODE (so they
@@ -9154,24 +9210,14 @@ class BatchGenWorker:
 				gpu_allocated = [u for u in my_evicted if u in self._sequences_with_gpu_kv]
 				if gpu_allocated:
 					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-				for uuid in my_evicted:
-					seq = self.global_batch.get_sequence(uuid)
-					prompt_tokens = seq.input_ids[0, :seq.prompt_length]
-					baseline = seq.reentry_decoded_baseline
-					if (
-						seq.decoded_tokens is not None
-						and seq.decoded_length > baseline
-					):
-						new_decoded = seq.decoded_tokens[0, baseline:seq.decoded_length]
-						seq.evicted_token_ids = torch.cat([prompt_tokens, new_decoded])
-					else:
-						seq.evicted_token_ids = prompt_tokens.clone()
-					if BATCHGEN_CB_DEBUG:
+				if BATCHGEN_CB_DEBUG:
+					for uuid in my_evicted:
+						seq = self.global_batch.get_sequence(uuid)
 						logging.debug(
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
 							f"decoded={seq.decoded_length} "
 							f"host_pages={seq.host_pages_allocated} "
-							f"tokens_saved={len(seq.evicted_token_ids)}"
+							f"trajectory_tokens={self._trajectory_book.metadata(seq._buffer_slot).token_length}"
 						)
 				# Host KV is ONE per-node SHARED shm region keyed by global_idx, so
 				# release/unregister must fire EXACTLY once per sequence. Under G>1
@@ -9194,15 +9240,10 @@ class BatchGenWorker:
 						aux_view.release_sequence_pages(evicted_global_ids)
 						aux_view.unregister_sequences(evicted_global_ids)
 
-			# All-ranks: update scalar metadata deterministically. Compute
-			# new_reentry_len from already-synced prompt_length, decoded_length,
-			# and reentry_decoded_baseline so every rank arrives at the same
-			# value without needing the owner's evicted_token_ids tensor.
-			#
-			# Matches the owner's tensor computation exactly:
-			#   len(evicted_token_ids)
-			#   = len(prompt_tokens[:prompt_length]) + len(decoded_tokens[baseline:decoded_length])
-			#   = prompt_length + max(0, decoded_length - baseline)
+			# All-ranks: update scalar metadata deterministically. The retained
+			# trajectory length is original_prompt_length + decoded_length; the
+			# effective prompt for the next prefill is the previous effective prompt
+			# plus only the newly generated suffix from this KV residency cycle.
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				baseline = seq.reentry_decoded_baseline
@@ -12166,17 +12207,7 @@ class BatchGenWorker:
 				if self._is_sequence_completed(seq):
 					continue
 
-				decode_pos = seq.decoded_length
-				if BATCHGEN_CB_DEBUG:
-					qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
-					seq_ptr = seq.decoded_tokens.data_ptr()
-					if qb_ptr != seq_ptr:
-						logging.error(
-							f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
-							f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
-							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
-						)
-				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
+				self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
 
 				seq.decoded_length += 1
 				seq.current_context_length += 1
@@ -12217,7 +12248,7 @@ class BatchGenWorker:
 					# Variable-length N-gram pattern check (every 64 tokens)
 					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
 						_dl = seq.decoded_length
-						_tokens = self.query_book[local_idx].decoded_tokens[0]
+						_tokens = self._trajectory_decoded_tokens(seq)
 						if _check_repeating_pattern(_tokens, _dl):
 							seq._rep_detected = True
 							seq.eos_reached = True
@@ -12983,10 +13014,15 @@ class BatchGenWorker:
 			if seq is None:
 				continue
 			pos = max(0, seq.decoded_length - 1)
-			query_entry = self.query_book.get(local_idx)
-			if query_entry is None:
+			if self._trajectory_book is None:
 				continue
-			token = query_entry.decoded_tokens[:, pos:pos+1]
+			# ``pos`` is the previous generated-token index. The unified book keeps
+			# the original prompt boundary stable even when KV eviction makes a
+			# later turn's effective prompt include historical generated tokens.
+			token = self._trajectory_tokens(
+				seq, start=seq.original_prompt_length + pos, length=1,
+				dtype=torch.int64,
+			).view(1, 1)
 			tokens.append(token)
 
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
@@ -13272,7 +13308,9 @@ class BatchGenWorker:
 	):
 		new_tokens = new_tokens.to("cpu")
 		for idx, q_idx in enumerate(query_idx):
-			self.query_book[q_idx].decoded_tokens[:, new_token_idx] = new_tokens[idx]
+			uuid = self._local_to_uuid_map[q_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			self._append_trajectory_token(seq, int(new_tokens[idx].item()))
 
 	def init_nvshmem(self):
 		"""Initialize NVSHMEM only once per batch, not per decode iteration."""

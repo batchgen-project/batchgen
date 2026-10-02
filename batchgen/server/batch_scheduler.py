@@ -92,13 +92,14 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
-        # Request pool state. Pool mode is the only mode: --max-pool-size <= 0
-        # is rejected in validate_server_args. The flag is kept for /status.
+        # The worker publishes the fixed token-pool-derived capacity after the
+        # model context is known. Keep no independent row cap here.
         self._pool_mode = True
         self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
         self._batch_timeout = 86400  # 24h default, matches completion_window
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
-        self._scheduling_pool = SchedulingPool(capacity=server_args.max_pool_size)
+        self._scheduling_pool = SchedulingPool(capacity=0)
+        self._trajectory_pool_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -777,6 +778,17 @@ class BatchScheduler:
                     else:
                         logger.info("[POOL] Worker shutdown signal received")
                     break
+                elif msg_type == "trajectory_pool_capacity":
+                    capacity = int(result.get("capacity", 0))
+                    self._scheduling_pool.set_capacity(capacity)
+                    self._trajectory_pool_info = dict(result)
+                    logger.info(
+                        "[POOL] Token pool capacity published: sequences=%s "
+                        "free_pages=%s page_tokens=%s",
+                        capacity,
+                        result.get("free_pages"),
+                        result.get("page_tokens"),
+                    )
                 elif "error" in result:
                     logger.error(f"[POOL] Worker error: {result}")
                     break

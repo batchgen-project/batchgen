@@ -511,12 +511,15 @@ class KVMigrationHelper:
         manager.free_pages_for_sequences([global_idx])
         worker_view.release_sequence_pages([global_idx])
 
-        # Send query_book data
-        local_idx = self.worker._uuid_to_local_map.get(mig.uuid)
-        if local_idx is not None and local_idx in self.worker.query_book:
-            qb = self.worker.query_book[local_idx]
-            dist.send(tensor=qb.encoded["input_ids"].clone(), dst=mig.to_rank, group=gloo_group)
-            dist.send(tensor=qb.decoded_tokens.clone(), dst=mig.to_rank, group=gloo_group)
+        # Send the complete int32 trajectory; the destination restores it into
+        # its pre-reserved QueryBook slot.
+        trajectory = self.worker._trajectory_tokens(seq, dtype=torch.int32).contiguous()
+        header = torch.tensor(
+            [trajectory.numel(), seq.prompt_length, seq.decoded_length],
+            dtype=torch.int64,
+        )
+        dist.send(tensor=header, dst=mig.to_rank, group=gloo_group)
+        dist.send(tensor=trajectory, dst=mig.to_rank, group=gloo_group)
 
         if self.debug:
             logger.debug(f"MIGRATION: Rank {self.rank}: Sent {mig.uuid[:8]}... in {(time.perf_counter()-t0)*1000:.1f}ms")
@@ -563,18 +566,18 @@ class KVMigrationHelper:
 
         torch.cuda.synchronize(self.worker.torch_device)
 
-        # Receive query_book data
-        input_ids_recv = torch.empty(seq.input_ids.shape, dtype=seq.input_ids.dtype, device="cpu")
-        decoded_tokens_recv = torch.empty(seq.decoded_tokens.shape, dtype=seq.decoded_tokens.dtype, device="cpu")
-
-        dist.recv(tensor=input_ids_recv, src=mig.from_rank, group=gloo_group)
-        dist.recv(tensor=decoded_tokens_recv, src=mig.from_rank, group=gloo_group)
+        # Receive the complete trajectory.
+        header = torch.empty(3, dtype=torch.int64)
+        dist.recv(tensor=header, src=mig.from_rank, group=gloo_group)
+        trajectory_recv = torch.empty(int(header[0].item()), dtype=torch.int32)
+        dist.recv(tensor=trajectory_recv, src=mig.from_rank, group=gloo_group)
 
         # Store pending data
         self._pending_migrated_query_book[mig.uuid] = {
             'text': seq.text,
-            'input_ids': input_ids_recv,
-            'decoded_tokens': decoded_tokens_recv,
+            'trajectory': trajectory_recv,
+            'prompt_length': int(header[1].item()),
+            'decoded_length': int(header[2].item()),
             'kv_token_budget': seq.kv_token_budget,
         }
         self._migrated_sequences.add(mig.uuid)

@@ -40,7 +40,12 @@ class QueryBook:
 
     TOKEN_BYTES = 4
 
-    def __init__(self, capacity_bytes: int, page_tokens: int = 4096) -> None:
+    def __init__(
+        self,
+        capacity_bytes: int,
+        page_tokens: int = 4096,
+        storage: Optional[torch.Tensor] = None,
+    ) -> None:
         capacity_bytes = self._positive_int(capacity_bytes, "capacity_bytes")
         page_tokens = self._positive_int(page_tokens, "page_tokens")
         page_bytes = page_tokens * self.TOKEN_BYTES
@@ -53,16 +58,34 @@ class QueryBook:
         self.page_tokens = int(page_tokens)
         self.page_bytes = page_bytes
         self.page_count = capacity_bytes // page_bytes
-        # The server may construct the book under inference_mode while the
-        # scheduler later writes it from ordinary Python.
-        with torch.inference_mode(False):
-            self.storage = torch.empty(
-                (self.page_count, self.page_tokens), dtype=torch.int32, device="cpu"
+        if storage is None:
+            # The server may construct the book under inference_mode while the
+            # scheduler later writes it from ordinary Python.
+            with torch.inference_mode(False):
+                storage = torch.empty(
+                    (self.page_count, self.page_tokens),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+        if (
+            not isinstance(storage, torch.Tensor)
+            or storage.dtype != torch.int32
+            or storage.device.type != "cpu"
+            or not storage.is_contiguous()
+            or tuple(storage.shape) != (self.page_count, self.page_tokens)
+        ):
+            raise ValueError(
+                "storage must be a contiguous CPU int32 tensor with shape "
+                f"({self.page_count}, {self.page_tokens})"
             )
-        # The stack contains page ids only. It never grows after construction.
-        self._free_pages = list(range(self.page_count - 1, -1, -1))
+        self.storage = storage
+        # Store free page ranges instead of one Python integer per page. A
+        # 50-GiB pool with 64-token pages has over 200 million pages; the
+        # allocator metadata must remain proportional to fragmentation, not
+        # to the byte budget.
+        self._free_extents: list[tuple[int, int]] = [(0, self.page_count)]
         self._records: Dict[int, QueryBookSlot] = {}
-        self._page_chains: Dict[int, list[int]] = {}
+        self._page_ranges: Dict[int, tuple[int, int]] = {}
         self._tail_pages: Dict[int, int] = {}
         self._tail_offsets: Dict[int, int] = {}
         self._seq_to_slot: Dict[str, int] = {}
@@ -84,7 +107,7 @@ class QueryBook:
 
     @property
     def free_page_count(self) -> int:
-        return len(self._free_pages)
+        return sum(count for _, count in self._free_extents)
 
     @property
     def free_bytes(self) -> int:
@@ -108,6 +131,11 @@ class QueryBook:
 
         required_pages = sum(self.pages_for(tokens) for tokens in max_tokens)
         return required_pages <= self.free_page_count
+
+    def reservation_capacity(self, max_tokens: int) -> int:
+        """Return the maximum number of equal-size reservations that fit."""
+
+        return self.free_page_count // self.pages_for(max_tokens)
 
     def bind_batch(
         self, sequence_ids: Sequence[str], max_tokens: Sequence[int]
@@ -141,10 +169,39 @@ class QueryBook:
                 f"free={self.free_bytes} bytes"
             )
 
-        return [
-            self.bind(sequence_id, tokens)
-            for sequence_id, tokens in zip(sequence_ids, max_tokens)
-        ]
+        # ``free_page_count`` is an aggregate check, but an extent allocator
+        # can still fail after a partial bind if the free pages are fragmented.
+        # Reserve each chain first and publish metadata only after every extent
+        # has been found, so admission remains atomic under fragmentation.
+        reservations: list[tuple[str, int, int, int]] = []
+        try:
+            for sequence_id, tokens in zip(sequence_ids, max_tokens):
+                max_tokens_int = self._positive_int(tokens, "max_tokens")
+                page_count = self.pages_for(max_tokens_int)
+                page_start = self._take_extent(page_count)
+                reservations.append((sequence_id, page_start, page_count, max_tokens_int))
+        except BaseException:
+            for _, page_start, page_count, _ in reversed(reservations):
+                self._return_extent(page_start, page_count)
+            raise
+
+        slots = []
+        for sequence_id, page_start, page_count, max_tokens_int in reservations:
+            if self._free_slots:
+                slot = self._free_slots.pop()
+            else:
+                slot = self._next_slot
+                self._next_slot += 1
+            self._seq_to_slot[sequence_id] = slot
+            self._slot_to_seq[slot] = sequence_id
+            self._page_ranges[slot] = (page_start, page_count)
+            self._tail_pages[slot] = page_start
+            self._tail_offsets[slot] = 0
+            self._records[slot] = QueryBookSlot(
+                slot, 0, 0, 0, max_tokens_int
+            )
+            slots.append(slot)
+        return slots
 
     def bind(self, sequence_id: str, max_tokens: int) -> int:
         """Reserve the full page chain for one active sequence."""
@@ -162,16 +219,16 @@ class QueryBook:
                 f"bytes, free={self.free_bytes} bytes"
             )
 
+        page_start = self._take_extent(page_count)
         if self._free_slots:
             slot = self._free_slots.pop()
         else:
             slot = self._next_slot
             self._next_slot += 1
-        pages = [self._free_pages.pop() for _ in range(page_count)]
         self._seq_to_slot[sequence_id] = slot
         self._slot_to_seq[slot] = sequence_id
-        self._page_chains[slot] = pages
-        self._tail_pages[slot] = pages[0]
+        self._page_ranges[slot] = (page_start, page_count)
+        self._tail_pages[slot] = page_start
         self._tail_offsets[slot] = 0
         self._records[slot] = QueryBookSlot(slot, 0, 0, 0, max_tokens)
         return slot
@@ -182,7 +239,8 @@ class QueryBook:
         self._check_active_slot(slot)
         sequence_id = self._slot_to_seq.pop(slot)
         del self._seq_to_slot[sequence_id]
-        self._free_pages.extend(self._page_chains.pop(slot))
+        page_start, page_count = self._page_ranges.pop(slot)
+        self._return_extent(page_start, page_count)
         del self._tail_pages[slot]
         del self._tail_offsets[slot]
         del self._records[slot]
@@ -197,6 +255,11 @@ class QueryBook:
     def metadata(self, slot: int) -> QueryBookSlot:
         self._check_active_slot(slot)
         return self._records[slot]
+
+    def has_slot(self, slot: int) -> bool:
+        """Return whether ``slot`` is currently reserved."""
+
+        return isinstance(slot, int) and slot in self._records
 
     def write_prompt(self, slot: int, prompt_tokens: torch.Tensor) -> None:
         """Copy one prompt into the reserved pages and reset decode length."""
@@ -236,6 +299,40 @@ class QueryBook:
                 slot, prompt_length, prompt_length, 0, record.max_tokens
             )
             self._update_tail(slot, prompt_length)
+
+    def restore(
+        self,
+        slot: int,
+        tokens: torch.Tensor,
+        *,
+        prompt_length: int,
+        decoded_length: int,
+    ) -> None:
+        """Restore an existing trajectory after rank/node migration.
+
+        ``tokens`` contains the complete trajectory currently known to the
+        sequence. ``prompt_length`` is the effective prompt for the next
+        prefill turn; it may include earlier decoded tokens after KV eviction.
+        ``decoded_length`` is cumulative generated-token bookkeeping, so it is
+        intentionally independent of ``token_length - prompt_length``.
+        """
+
+        self._check_active_slot(slot)
+        prompt_length = self._nonnegative_int(prompt_length, "prompt_length")
+        decoded_length = self._nonnegative_int(decoded_length, "decoded_length")
+        prepared = self._prepare_tokens(tokens)
+        token_length = int(prepared.numel())
+        if prompt_length > token_length:
+            raise ValueError(
+                f"prompt_length={prompt_length} exceeds token_length={token_length}"
+            )
+        self._check_length(slot, token_length)
+        self._write_span(slot, 0, prepared)
+        record = self._records[slot]
+        self._records[slot] = QueryBookSlot(
+            slot, prompt_length, token_length, decoded_length, record.max_tokens
+        )
+        self._update_tail(slot, token_length)
 
     def append_token(self, slot: int, token_id: int) -> int:
         """Append one generated token and return its logical token index."""
@@ -410,11 +507,11 @@ class QueryBook:
 
     def _update_tail(self, slot: int, logical_length: int) -> None:
         page_index, offset = divmod(logical_length, self.page_tokens)
-        pages = self._page_chains[slot]
-        if page_index >= len(pages):
-            page_index = len(pages) - 1
+        page_start, page_count = self._page_ranges[slot]
+        if page_index >= page_count:
+            page_index = page_count - 1
             offset = self.page_tokens
-        self._tail_pages[slot] = pages[page_index]
+        self._tail_pages[slot] = page_start + page_index
         self._tail_offsets[slot] = offset
 
     def _write_span(self, slot: int, start: int, tokens: torch.Tensor) -> None:
@@ -425,7 +522,8 @@ class QueryBook:
         while remaining:
             page_index, page_offset = divmod(logical, self.page_tokens)
             count = min(remaining, self.page_tokens - page_offset)
-            page = self.storage[self._page_chains[slot][page_index]]
+            page_start, _ = self._page_ranges[slot]
+            page = self.storage[page_start + page_index]
             page[page_offset : page_offset + count].copy_(
                 source[source_offset : source_offset + count]
             )
@@ -442,13 +540,50 @@ class QueryBook:
         while remaining:
             page_index, page_offset = divmod(logical, self.page_tokens)
             count = min(remaining, self.page_tokens - page_offset)
-            page = self.storage[self._page_chains[slot][page_index]]
+            page_start, _ = self._page_ranges[slot]
+            page = self.storage[page_start + page_index]
             output[output_offset : output_offset + count].copy_(
                 page[page_offset : page_offset + count]
             )
             logical += count
             output_offset += count
             remaining -= count
+
+    def _take_extent(self, page_count: int) -> int:
+        """Take one contiguous free extent and return its first page."""
+
+        for index, (start, count) in enumerate(self._free_extents):
+            if count < page_count:
+                continue
+            if count == page_count:
+                self._free_extents.pop(index)
+            else:
+                self._free_extents[index] = (start + page_count, count - page_count)
+            return start
+        raise QueryBookCapacityError(
+            f"no contiguous extent of {page_count} pages; "
+            f"free_pages={self.free_page_count}"
+        )
+
+    def _return_extent(self, start: int, count: int) -> None:
+        """Return an extent and coalesce adjacent free ranges."""
+
+        if count <= 0:
+            return
+        self._free_extents.append((start, count))
+        self._free_extents.sort()
+        merged: list[tuple[int, int]] = []
+        for current_start, current_count in self._free_extents:
+            if not merged or merged[-1][0] + merged[-1][1] < current_start:
+                merged.append((current_start, current_count))
+                continue
+            previous_start, previous_count = merged[-1]
+            previous_end = previous_start + previous_count
+            merged[-1] = (
+                previous_start,
+                max(previous_end, current_start + current_count) - previous_start,
+            )
+        self._free_extents = merged
 
 
 @dataclass
