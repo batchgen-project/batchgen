@@ -4270,11 +4270,18 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
 			return
 
-		# Use the unwrapped primary view for migration. Aux (DSA indexer) KV is
-		# mirrored explicitly below — the coordinator does not implement
-		# read/write_sequence_kv_to_cpu, so go direct on primary and aux.
-		worker_view = self.core_engine.host_paged_kv_worker_view
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		# Migration reads/writes each cache directly because the coordinator only
+		# wraps lifecycle operations.  Registration, allocation, and release still
+		# go through that coordinator so DSA cannot split its two page tables.
+		lifecycle_view = getattr(self, "host_paged_kv_worker_view", None)
+		if lifecycle_view is None:
+			lifecycle_view = self.core_engine.host_paged_kv_worker_view
+		if isinstance(lifecycle_view, DualHostKVCoordinator):
+			worker_view = lifecycle_view.primary
+			aux_view = lifecycle_view.auxiliary
+		else:
+			worker_view = lifecycle_view
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
@@ -4324,9 +4331,7 @@ class BatchGenWorker:
 			# Free host KV pages only after the complete source payload is sent.
 			# The destination restores the trajectory before the migration barrier
 			# permits source-slot release.
-			worker_view.release_sequence_pages([global_idx])
-			if aux_view is not None:
-				aux_view.release_sequence_pages([global_idx])
+			lifecycle_view.release_sequence_pages([global_idx])
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(
 					f"MIGRATION: Rank {self.rank}: Sent trajectory for {uuid[:8]} "
@@ -4350,11 +4355,8 @@ class BatchGenWorker:
 
 			# Allocate host KV pages for the incoming sequence (mirror aux for DSA)
 			tokens_needed = pages_needed * SequenceEntry.PAGE_SIZE
-			worker_view.register_sequences([global_idx])
-			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
-			if aux_view is not None:
-				aux_view.register_sequences([global_idx])
-				aux_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
+			lifecycle_view.register_sequences([global_idx])
+			lifecycle_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 
 			# Read empty pages to get a tensor with correct shape/dtype for recv buffer.
 			# Both nodes have identical host KV config, so shape matches source's output.
