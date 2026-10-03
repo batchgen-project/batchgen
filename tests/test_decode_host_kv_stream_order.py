@@ -11,6 +11,8 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import math
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -100,39 +102,25 @@ def test_deferred_host_kv_launch_does_not_touch_cuda_from_python(monkeypatch):
     assert worker._deferred_kv_batch is None
 
 
-def test_decode_context_boundary_reserves_the_next_host_page():
-    """A 3456→3457 context transition must reserve before boundary validation.
+def test_effective_host_chunk_covers_one_decode_decision_interval():
+    """Host growth is planned before forward, never after a sample."""
+    source = _worker_method("_get_effective_chunk_size")
+    class _Entry:
+        PAGE_SIZE = 64
 
-    The forward pass writes the KV row at ``context - 1`` and increments the
-    metadata context after sampling. Without this post-sample reservation the
-    next boundary sees ``host_token_capacity=3456`` and
-    ``current_context_length=3457`` and aborts before the append path can grow.
-    """
-    source = _worker_method("_reserve_host_kv_capacity_for_decoded_context")
-    namespace = {"int": int}
+    namespace = {"math": math, "SequenceEntry": _Entry}
     exec(compile(source, str(WORKER), "exec"), namespace)
-
-    class _Sequence:
-        global_idx = 5
-        host_token_capacity = 3456
-        current_context_length = 3457
-
-    trace = []
     worker = SimpleNamespace(
-        _is_sequence_completed=lambda seq: False,
-        _ensure_host_kv_append_capacity=lambda ids, lengths: trace.append((ids, lengths)),
+        adaptive_chunk_sizer=None,
+        host_kv_chunk_size=64,
+        max_decoding_length=8192,
+        DECISION_INTERVAL=128,
     )
-    namespace["_reserve_host_kv_capacity_for_decoded_context"](
-        worker, [_Sequence()]
-    )
-    assert trace == [([5], [3456])]
+    assert namespace["_get_effective_chunk_size"](worker) == 128
 
-    # Once the page has been reserved, the same boundary must not request a
-    # duplicate growth operation.
-    seq = _Sequence()
-    seq.host_token_capacity = 3520
-    namespace["_reserve_host_kv_capacity_for_decoded_context"](worker, [seq])
-    assert trace == [([5], [3456])]
+    full_source = WORKER.read_text()
+    assert "_reserve_host_kv_capacity_for_decoded_context" not in full_source
+    assert "[HOST_KV_APPEND_GROW]" not in full_source
 
 
 def test_cpp_append_orders_copy_stream_after_producer_stream():

@@ -238,8 +238,20 @@ class SequenceEntry:
             f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
         )
 
-    def validate_metadata(self, context: str, require_owner_tensors: bool = True) -> None:
-        """Reject inconsistent per-sequence metadata at module boundaries."""
+    def validate_metadata(
+        self,
+        context: str,
+        require_owner_tensors: bool = True,
+        allow_terminal_capacity_gap: bool = False,
+    ) -> None:
+        """Reject inconsistent per-sequence metadata at module boundaries.
+
+        A sampled EOS/length-capped token can advance the logical context by
+        one after the last KV row has been written.  Boundary code releases
+        that sequence before another forward, so it may validate the scalar
+        state while allowing only this terminal host/GPU capacity gap.  All
+        structural invariants and positive allocation checks remain strict.
+        """
         prefix = f"{context}: sequence {self.uuid} gid={self.global_idx}"
 
         def require(condition: bool, message: str) -> None:
@@ -305,21 +317,27 @@ class SequenceEntry:
             SequenceStatus.IN_DECODE,
             SequenceStatus.ON_HOLD,
         }
+        terminal_capacity_gap = allow_terminal_capacity_gap and self.status in {
+            SequenceStatus.PREFILLED,
+            SequenceStatus.IN_DECODE,
+        }
         if self.status in host_required_statuses:
             require(self.assigned_rank is not None, f"{self.status.name} requires assigned_rank")
             require(self.host_pages_allocated > 0, f"{self.status.name} requires host_pages_allocated > 0")
-            require(
-                self.host_token_capacity >= self.current_context_length,
-                f"host_token_capacity={self.host_token_capacity} is smaller than current_context_length={self.current_context_length}",
-            )
+            if not terminal_capacity_gap:
+                require(
+                    self.host_token_capacity >= self.current_context_length,
+                    f"host_token_capacity={self.host_token_capacity} is smaller than current_context_length={self.current_context_length}",
+                )
 
         if self.status == SequenceStatus.IN_DECODE:
             require(self.gpu_pages_allocated > 0, "IN_DECODE requires gpu_pages_allocated > 0")
-            require(
-                self.gpu_pages_allocated * self.PAGE_SIZE >= self.current_context_length,
-                f"gpu allocation tokens={self.gpu_pages_allocated * self.PAGE_SIZE} "
-                f"is smaller than current_context_length={self.current_context_length}",
-            )
+            if not terminal_capacity_gap:
+                require(
+                    self.gpu_pages_allocated * self.PAGE_SIZE >= self.current_context_length,
+                    f"gpu allocation tokens={self.gpu_pages_allocated * self.PAGE_SIZE} "
+                    f"is smaller than current_context_length={self.current_context_length}",
+                )
         elif self.status == SequenceStatus.ON_HOLD:
             require(self.gpu_pages_allocated == 0, f"ON_HOLD requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
         elif self.status == SequenceStatus.EVICTED:
@@ -524,7 +542,10 @@ class SequenceEntry:
         """
         if self.host_token_capacity <= 0:
             return False
-        # Trigger growth when within one extension buffer of capacity
+        # Trigger growth when within one extension buffer of capacity.  The
+        # caller's effective chunk is also the decode-boundary lookahead, so
+        # the boundary planner reserves enough pages for the whole interval
+        # rather than relying on a post-sample emergency allocation.
         runway = self.host_token_capacity - self.current_context_length
         threshold = EXTENSION_GPU_PAGE_BUFFER * self.PAGE_SIZE
         return runway <= threshold

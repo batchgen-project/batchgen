@@ -2807,7 +2807,6 @@ class BatchGenWorker:
 			return
 		by_gid = {seq.global_idx: seq for seq in self.global_batch}
 		grow_requests = []
-		grow_metadata = []
 		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
 			seq = by_gid.get(int(global_idx))
 			if seq is None:
@@ -2836,57 +2835,20 @@ class BatchGenWorker:
 					(required_tokens - int(seq.host_token_capacity)) / seq.PAGE_SIZE
 				)
 				grow_requests.append((int(global_idx), growth_pages))
-				grow_metadata.append((seq, growth_pages, int(seq.host_token_capacity), required_tokens))
 
 		if not grow_requests:
 			return
 
-		worker_view = getattr(self, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			raise RuntimeError(
-				f"host KV append needs growth but no host KV worker is available: "
-				f"requests={grow_requests[:8]}"
-			)
-
-		waited = self._wait_pending_kv_append_tasks(defer_errors=False)
-		worker_view.grow_pages_for_sequences(grow_requests)
-		for seq, growth_pages, old_capacity, required_tokens in grow_metadata:
-			seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-			seq.host_pages_allocated += growth_pages
-			logging.warning(
-				f"Rank {self.rank}: [HOST_KV_APPEND_GROW] grew gid={seq.global_idx} "
-				f"old_cap={old_capacity} new_cap={seq.host_token_capacity} "
-				f"required={required_tokens} pages={growth_pages} waited_tasks={waited} "
-				f"ctx={seq.current_context_length} decoded={seq.decoded_length} "
-				f"status={seq.status.name}"
-			)
-
-	def _reserve_host_kv_capacity_for_decoded_context(self, batch_sequences) -> None:
-		"""Reserve host KV space for the context length just produced by decode.
-
-		The decode forward appends KV for the input token at
-		``current_context_length - 1`` and increments ``current_context_length``
-		once the sampled token is recorded. That leaves a one-token window where
-		the append itself fits but the metadata invariant
-		``host_token_capacity >= current_context_length`` does not. Grow the
-		page allocation immediately after the increment so the next boundary
-		validation observes the same reservation that the sequence metadata does.
-		Completed sequences are released at the next boundary and do not need a
-		new page.
-		"""
-		sequence_ids = []
-		sequence_lengths = []
-		for seq in batch_sequences:
-			if self._is_sequence_completed(seq):
-				continue
-			if int(seq.host_token_capacity) < int(seq.current_context_length):
-				sequence_ids.append(int(seq.global_idx))
-				# _ensure_host_kv_append_capacity takes a zero-based write position.
-				sequence_lengths.append(int(seq.current_context_length) - 1)
-		if sequence_ids:
-			self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
+		# Host pages are allocated only by the rank-0 boundary planner.  A
+		# deferred append is already inside a decode interval whose reservation
+		# was validated before forward; reaching this branch means the scheduler
+		# violated that invariant.  Growing here would bypass completion release,
+		# eviction, mirrored DSA allocation, and G>1 host ownership.
+		raise RuntimeError(
+			"host KV append reached without a boundary reservation: "
+			f"requests={grow_requests[:8]}; decode must enter the page-boundary "
+			"planner before issuing the forward"
+		)
 
 	def _append_decode_kv_to_host_async(
 		self,
@@ -2916,7 +2878,9 @@ class BatchGenWorker:
 		if not batch:
 			return
 		
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			return
 		
@@ -5057,9 +5021,44 @@ class BatchGenWorker:
 		# Cap by max_decoding_length — no point reserving more than max decode
 		if self.max_decoding_length > 0:
 			chunk = min(chunk, self.max_decoding_length)
+		# A boundary is the only place where host pages may be allocated.  Keep
+		# one complete decision interval of runway so the next boundary is
+		# reached while the metadata invariant still holds.  This removes the
+		# unsafe post-sample emergency growth path.
+		chunk = max(chunk, self.DECISION_INTERVAL)
 		# Round up to page boundary
 		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
 		return chunk
+
+	def _host_capacity_due_local(self, batch: List[int]) -> bool:
+		"""Whether a local decode row needs planning before its next forward."""
+		for local_idx in batch:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid is None:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or self._is_sequence_completed(seq):
+				continue
+			if int(seq.host_token_capacity) <= int(seq.current_context_length):
+				return True
+		return False
+
+	def _host_capacity_due_all_ranks(self, batch: List[int]) -> bool:
+		"""Collectively detect a re-entry row with no next-token runway.
+
+		Metadata is owner-local during decode, so a local check cannot decide
+		whether all ranks must enter the collective boundary planner.  This check
+		runs only at decode entry and immediately after a boundary, never once per
+		decode token.
+		"""
+		local_due = self._host_capacity_due_local(batch)
+		if self.world_size <= 1:
+			return local_due
+		flag = torch.tensor(
+			[1 if local_due else 0], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+		return bool(int(flag.item()))
 
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
@@ -7484,23 +7483,27 @@ class BatchGenWorker:
 			sequence_tokens = []
 			chunk_size = self._get_effective_chunk_size()
 
+			# Every local replica needs the same scalar reservation metadata, but
+			# the host-KV page table is shared per node.  Only its single owner
+			# performs register/allocate; G>1 replicas must never duplicate pages.
+			host_prefill_uuids = []
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				global_sequence_ids.append(seq.global_idx)
-				# Dynamic reservation: allocate prompt + chunk_size, not full budget.
-				# Must also cover the GPU initial load which needs
-				# ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages.
-				# The +1 accounts for the first decoded token produced during prefill
-				# (current_context_length = prompt_length + 1 after prefill).
+				# Dynamic reservation: allocate prompt + effective chunk, not the
+				# full budget.  The effective chunk includes one decode decision
+				# interval, so the next boundary can plan growth safely.
 				from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
-				post_prefill_length = seq.prompt_length + 1  # prefill produces 1 decode token
+				post_prefill_length = seq.prompt_length + 1
 				gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
 				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
-				sequence_tokens.append(seq.host_token_capacity)
+				if self._owns_host_kv(seq):
+					host_prefill_uuids.append(uuid)
+					global_sequence_ids.append(seq.global_idx)
+					sequence_tokens.append(seq.host_token_capacity)
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
@@ -7530,19 +7533,19 @@ class BatchGenWorker:
 				f"(chunk_size={chunk_size})"
 			)
 
-			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(global_sequence_ids, sequence_tokens))
-			)
-			# DSA: mirror registration on auxiliary host KV
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-			if aux_view is not None:
-				aux_view.register_sequences(global_sequence_ids)
-				aux_view.allocate_pages_for_sequences(
+			if host_prefill_uuids:
+				host_view = getattr(self, "host_paged_kv_worker_view", None)
+				if host_view is None:
+					host_view = self.core_engine.host_paged_kv_worker_view
+				host_view.register_sequences(global_sequence_ids)
+				host_view.allocate_pages_for_sequences(
 					list(zip(global_sequence_ids, sequence_tokens))
 				)
 
-			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
+			kv_stats = getattr(self, "host_paged_kv_worker_view", None)
+			if kv_stats is None:
+				kv_stats = self.core_engine.host_paged_kv_worker_view
+			kv_stats = kv_stats.get_stats()
 			if self.rank == 0:
 				logging.info(f"[PREFILL] Host KV allocated: {kv_stats.num_used_pages}/{kv_stats.num_total_pages} pages")
 
@@ -8143,14 +8146,9 @@ class BatchGenWorker:
 			# NOTE: GPU KV pages should already be released by caller
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
 
-			# Release host KV pages
-			# NOTE: release_sequence_pages already calls unregister_sequences internally,
-			# so we don't need to call unregister_sequences separately
+			# Release host KV pages through the mirrored coordinator when DSA is
+			# active.  It owns both primary and auxiliary page tables.
 			worker_view.release_sequence_pages(global_sequence_ids)
-			# DSA: release auxiliary host KV pages too
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-			if aux_view is not None:
-				aux_view.release_sequence_pages(global_sequence_ids)
 
 		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
 		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
@@ -9060,8 +9058,11 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
-				seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/decode_state")
 				is_completed = self._is_sequence_completed(seq)
+				seq.validate_metadata(
+					f"rank {self.rank} _page_boundary_fast/decode_state",
+					allow_terminal_capacity_gap=is_completed,
+				)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
@@ -9243,6 +9244,7 @@ class BatchGenWorker:
 					seq.validate_metadata(
 						f"rank {self.rank} _page_boundary_fast/gathered_state",
 						require_owner_tensors=False,
+						allow_terminal_capacity_gap=bool(state.get('completed', False)),
 					)
 			# The token pages are shared, but the QueryBook metadata is not.
 			# Repair every local mirror from the canonical owner state before
@@ -9254,7 +9256,12 @@ class BatchGenWorker:
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
 		# This eliminates desync from independent decision-making.
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		# The worker owns the mirrored coordinator for DSA.  Using the engine's
+		# primary view here would let a partial primary/aux growth split escape the
+		# coordinator's transaction guard.
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		per_node_host_stats = self._gather_host_kv_stats_by_node(worker_view)
 
 		if self.rank == 0:
@@ -9482,16 +9489,13 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
 				seq.host_pages_allocated += growth_pages
-				# Only do actual host page allocation on owner rank
-				if uuid in self._uuid_to_local_map:
+				# Host KV is one shared region per node.  G>1 ranks replicate
+				# GPU/KDA state, but only the host-KV owner may mutate its page table.
+				if self._owns_host_kv(seq):
 					host_grow_requests.append((seq.global_idx, growth_pages))
 
 			if host_grow_requests and worker_view is not None:
 				worker_view.grow_pages_for_sequences(host_grow_requests)
-				# DSA: mirror growth on auxiliary host KV
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-				if aux_view is not None:
-					aux_view.grow_pages_for_sequences(host_grow_requests)
 				if self.rank == 0:
 					logging.debug(
 						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
@@ -11449,6 +11453,10 @@ class BatchGenWorker:
 		local_iteration = 0
 		last_boundary = 0
 		global_batch_size = len(self.global_batch)
+		# Re-entry can be admitted with exactly enough host capacity for the
+		# current context.  Force one planner pass before the first forward so
+		# the next token never relies on an emergency append allocation.
+		force_host_boundary = self._host_capacity_due_all_ranks(batch)
 
 		# ========== INITIAL MOE BUFFER SYNC ==========
 		# Sync buffer size BEFORE first forward pass to prevent overflow.
@@ -11506,8 +11514,9 @@ class BatchGenWorker:
 				_hb_tokens = 0
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
-			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:
 				last_boundary = local_iteration
+				force_host_boundary = False
 
 				(decode_uuids, batch,
 				 pending_async_task, pending_load_uuids,
@@ -11660,8 +11669,17 @@ class BatchGenWorker:
 						pending_load_global = []
 						
 						if decode_uuids:
+							force_host_boundary = self._host_capacity_due_all_ranks(batch)
 							continue
 					break
+
+				# Newly loaded ON_HOLD/PREFILLED rows may have a reservation that
+				# ends exactly at their current context.  Run the planner once more
+				# before forward; the check is collective but boundary-rate, not
+				# token-rate.
+				force_host_boundary = self._host_capacity_due_all_ranks(batch)
+				if force_host_boundary:
+					continue
 				
 				new_tokens = self._rebuild_input_tokens(batch)
 				# DEBUG: Log tokens rebuild after boundary
@@ -12430,12 +12448,6 @@ class BatchGenWorker:
 								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
-
-			# The sampled token advances current_context_length after the
-			# deferred host-KV append was queued. Reserve a page immediately when
-			# that increment crosses the current capacity; otherwise the next page
-			# boundary validates a stale one-token-short reservation.
-			self._reserve_host_kv_capacity_for_decoded_context(batch_sequences)
 
 			_split_t4 = time.perf_counter()
 			self._cumulative_forward_ms += (_split_t4 - forward_start) * 1000

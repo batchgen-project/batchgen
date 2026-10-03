@@ -49,6 +49,27 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
     seq.validate_metadata("unit")
 
 
+def test_terminal_decode_boundary_allows_only_the_final_capacity_gap():
+    """EOS/length completion is released before another forward is issued."""
+    seq = SequenceEntry("seq", global_idx=25, prompt_length=100, max_decode_length=4000)
+    seq.status = SequenceStatus.IN_DECODE
+    seq.assigned_rank = 1
+    seq.decoded_length = 3257
+    seq.current_context_length = 3457
+    seq.host_pages_allocated = 54
+    seq.host_token_capacity = 3456
+    seq.gpu_pages_allocated = 54
+    seq.eos_reached = True
+
+    with pytest.raises(RuntimeError, match="host_token_capacity=3456"):
+        seq.validate_metadata("unit")
+    seq.validate_metadata("unit", allow_terminal_capacity_gap=True)
+
+    seq.eos_reached = False
+    with pytest.raises(RuntimeError, match="host_token_capacity=3456"):
+        seq.validate_metadata("unit", allow_terminal_capacity_gap=True)
+
+
 def test_unified_trajectory_eviction_does_not_require_legacy_token_tensor():
     seq = SequenceEntry("seq", global_idx=24, prompt_length=100, max_decode_length=900)
     seq.status = SequenceStatus.EVICTED
