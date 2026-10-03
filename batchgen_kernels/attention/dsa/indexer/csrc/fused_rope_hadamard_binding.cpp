@@ -3,7 +3,7 @@
  * Specialized for dim=128, bf16.
  ******************************************************************************/
 
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
