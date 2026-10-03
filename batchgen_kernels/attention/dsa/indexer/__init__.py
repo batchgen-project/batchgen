@@ -1,45 +1,32 @@
 import torch
-from torch.utils.cpp_extension import load
-import os
 
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_csrc_dir = os.path.join(_current_dir, "csrc")
+from batchgen_kernels import load_extension
 
-_cuda_flags = [
-    '-O3',
-    '-std=c++17',
-    '--use_fast_math',
-    '-U__CUDA_NO_HALF_OPERATORS__',
-    '-U__CUDA_NO_HALF_CONVERSIONS__',
-    '-U__CUDA_NO_HALF2_OPERATORS__',
-    '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-    '--expt-relaxed-constexpr',
-    '--expt-extended-lambda',
-]
 
-_hadamard_cuda = load(
-    name="fast_hadamard_transform_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fast_hadamard_transform_cuda.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
+_HADAMARD_MODULE = (
+    "batchgen_kernels.attention.dsa.indexer."
+    "batchgen_dsa_fast_hadamard_transform_cuda"
+)
+_FUSED_ROPE_HADAMARD_MODULE = (
+    "batchgen_kernels.attention.dsa.indexer."
+    "batchgen_dsa_fused_rope_hadamard_cuda"
 )
 
-_fused_rope_hadamard_cuda = load(
-    name="fused_rope_hadamard_cuda",
-    sources=[
-        os.path.join(_csrc_dir, "fused_rope_hadamard_binding.cpp"),
-        os.path.join(_csrc_dir, "fused_rope_hadamard.cu"),
-    ],
-    extra_cflags=['-O3', '-std=c++17'],
-    extra_cuda_cflags=_cuda_flags,
-    extra_include_paths=[_csrc_dir],
-    verbose=False,
-)
+
+def _load_required_extension(module_name: str):
+    try:
+        return load_extension(module_name, allow_dev_jit=False)
+    except ImportError as exc:
+        raise ImportError(
+            f"Failed to import required DSA Hadamard extension {module_name}. "
+            "Build batchgen_kernels AOT before serving GLM-5; production DSA "
+            "must not compile CUDA code at request time. "
+            f"Import error: {exc}"
+        ) from exc
+
+
+_hadamard_cuda = _load_required_extension(_HADAMARD_MODULE)
+_fused_rope_hadamard_cuda = _load_required_extension(_FUSED_ROPE_HADAMARD_MODULE)
 
 
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:

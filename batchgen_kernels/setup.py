@@ -22,6 +22,7 @@ Environment variables:
 import copy
 import os
 import shutil
+import sysconfig
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -123,6 +124,32 @@ else:
     )
 
 _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
+
+
+def _cuda_dependency_include_paths():
+    """Include CUDA headers shipped by the active PyTorch NVIDIA wheels."""
+
+    site_packages = sysconfig.get_paths().get("purelib", "")
+    nvidia_root = os.path.join(site_packages, "nvidia")
+    paths = []
+    if os.path.isdir(nvidia_root):
+        for package in sorted(os.listdir(nvidia_root)):
+            include = os.path.join(nvidia_root, package, "include")
+            if os.path.isdir(include):
+                paths.append(include)
+    return paths
+
+
+_dsa_indexer_csrc = os.path.join(_this_dir, "attention/dsa/indexer/csrc")
+_dsa_hadamard_nvcc_flags = [
+    "-O3", "-std=c++17", "--use_fast_math",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr", "--expt-extended-lambda",
+    "--threads", _nvcc_threads,
+] + _sm80_gencode
 
 # ── Build extension list ──
 
@@ -298,6 +325,39 @@ _sm90a_extensions = [
 
 _sm80_extensions = [
     # ── SM80+ universal kernels ──
+
+    # GLM-5 DSA Hadamard kernels are AOT extensions. Runtime JIT here is unsafe
+    # because every distributed rank imports the module concurrently.
+    CUDAExtension(
+        name=(
+            "batchgen_kernels.attention.dsa.indexer."
+            "batchgen_dsa_fast_hadamard_transform_cuda"
+        ),
+        sources=[
+            "attention/dsa/indexer/csrc/hadamard_binding.cpp",
+            "attention/dsa/indexer/csrc/fast_hadamard_transform_cuda.cu",
+        ],
+        include_dirs=[_dsa_indexer_csrc, *_cuda_dependency_include_paths()],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": _dsa_hadamard_nvcc_flags,
+        },
+    ),
+    CUDAExtension(
+        name=(
+            "batchgen_kernels.attention.dsa.indexer."
+            "batchgen_dsa_fused_rope_hadamard_cuda"
+        ),
+        sources=[
+            "attention/dsa/indexer/csrc/fused_rope_hadamard_binding.cpp",
+            "attention/dsa/indexer/csrc/fused_rope_hadamard.cu",
+        ],
+        include_dirs=[_dsa_indexer_csrc, *_cuda_dependency_include_paths()],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": _dsa_hadamard_nvcc_flags,
+        },
+    ),
 
     # Causal conv1d (KDA / mamba): varlen prefill + pooled-state decode update
     CUDAExtension(

@@ -1,4 +1,4 @@
-"""Prevent unrelated Torch JIT extensions from sharing one build directory."""
+"""Keep legacy JIT loaders separate from packaged DSA extensions."""
 
 from __future__ import annotations
 
@@ -37,6 +37,10 @@ def _load_names(path: Path) -> set[str]:
     return names
 
 
+def _source_text(path: Path) -> str:
+    return path.read_text()
+
+
 def test_hadamard_jit_extension_names_are_disjoint():
     legacy_names = _load_names(LEGACY_HADAMARD)
     kernels_names = _load_names(KERNELS_INDEXER)
@@ -45,8 +49,11 @@ def test_hadamard_jit_extension_names_are_disjoint():
         "batchgen_glm5_fast_hadamard_transform_cuda",
         "batchgen_glm5_fused_rope_hadamard_cuda",
     }
-    assert kernels_names == {
-        "fast_hadamard_transform_cuda",
-        "fused_rope_hadamard_cuda",
-    }
+    assert kernels_names == set()
     assert legacy_names.isdisjoint(kernels_names)
+
+    source = _source_text(KERNELS_INDEXER)
+    assert "torch.utils.cpp_extension" not in source
+    assert "batchgen_dsa_fast_hadamard_transform_cuda" in source
+    assert "batchgen_dsa_fused_rope_hadamard_cuda" in source
+    assert "allow_dev_jit=False" in source
