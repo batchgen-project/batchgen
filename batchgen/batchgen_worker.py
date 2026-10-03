@@ -8119,7 +8119,12 @@ class BatchGenWorker:
 		if not uuids:
 			return
 		
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		# Keep lifecycle mutations on the worker-owned view.  For DSA this is the
+		# DualHostKVCoordinator; the engine keeps only its primary view for the
+		# attention wrapper and must not be used to release a sequence by itself.
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			logging.warning("Host paged KV worker view is unavailable")
 			return
@@ -9406,13 +9411,12 @@ class BatchGenWorker:
 					if self._owns_host_kv(self.global_batch.get_sequence(u))
 				]
 				if worker_view is not None:
+					# The worker-owned view is a DualHostKVCoordinator for DSA and
+					# mirrors both page tables transactionally.  Calling the auxiliary
+					# view again here would double-release its pages and leave the two
+					# allocators out of sync.
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
-					# DSA: mirror release + unregister on auxiliary host KV
-					aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-					if aux_view is not None:
-						aux_view.release_sequence_pages(evicted_global_ids)
-						aux_view.unregister_sequences(evicted_global_ids)
 
 			# All-ranks: update scalar metadata deterministically. The retained
 			# trajectory length is original_prompt_length + decoded_length; the
