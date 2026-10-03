@@ -11,6 +11,7 @@ import pytest
 from batchgen.worker.decode import (
     DecodeBatchRequest,
     DecodeCandidate,
+    DecodeCapacityError,
     DecodeScheduler,
     estimate_max_decode_replica_batch,
 )
@@ -52,19 +53,41 @@ def test_single_candidate_fits():
     assert plan == ["a"]
 
 
-def test_candidate_too_big_for_watermark():
-    # capacity = 90; req 91 → excluded
+def test_candidate_over_watermark_is_admitted_as_singleton():
+    # capacity = 90; req 91 still fits in the physical 100-page pool. The
+    # watermark is a batching guard, so this candidate must make progress.
     plan = DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=91)], 100))
-    assert plan == []
+    assert plan == ["a"]
 
 
 def test_ninety_percent_watermark_boundary():
     # capacity = int(1000*0.9) = 900; exactly 900 fits
     plan = DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=900)], 1000))
     assert plan == ["a"]
-    # 901 does not
+    # 901 still fits physically and is admitted as the singleton.
     plan2 = DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=901)], 1000))
-    assert plan2 == []
+    assert plan2 == ["a"]
+
+
+def test_candidate_over_physical_capacity_is_refused():
+    with pytest.raises(DecodeCapacityError, match="more GPU KV pages"):
+        DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=101)], 100))
+
+
+def test_oversized_singleton_does_not_share_the_bucket():
+    # The first candidate crosses the soft watermark but consumes less than the
+    # physical pool. No second candidate is admitted in the same round.
+    cands = [
+        _cand("wide", gidx=0, req_pages=91),
+        _cand("small", gidx=1, req_pages=1),
+    ]
+    assert DecodeScheduler.select_decode_batch(_req(cands, 100)) == ["wide"]
+
+
+def test_zero_page_pool_keeps_empty_selection():
+    # A zero-page manager is an unsized/torn-down pool, not an oversized
+    # sequence; preserve the existing empty-selection behavior.
+    assert DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=1)], 0)) == []
 
 
 def test_global_idx_ordering():

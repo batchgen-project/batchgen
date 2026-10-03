@@ -35,6 +35,10 @@ from typing import List, Optional, Tuple
 _DECODE_CAPACITY_FRACTION = 0.9
 
 
+class DecodeCapacityError(RuntimeError):
+    """A candidate cannot fit in the physical GPU-KV capacity."""
+
+
 def estimate_max_decode_replica_batch(
     total_candidates: int, world_size: int, attn_tp_size: int
 ) -> int:
@@ -101,6 +105,26 @@ class DecodeScheduler:
                 f"attn_tp_size={group_size} must divide world_size={req.world_size}"
             )
         num_capacity_groups = req.world_size // group_size
+
+        # The 90% watermark is a batching guard, not the physical capacity.
+        # A long trajectory can legitimately need the remaining 10%.  Refusing
+        # it at the watermark makes it invisible to every later selection round
+        # and turns an ON_HOLD sequence into a permanent empty-batch livelock.
+        # Only a request larger than the whole replica is impossible; surface
+        # that as an explicit capacity error instead of silently skipping it.
+        if req.total_pages > 0:
+            unadmittable = [
+                c for c in candidates if c.req_pages > req.total_pages
+            ]
+            if unadmittable:
+                worst = max(unadmittable, key=lambda c: c.req_pages)
+                raise DecodeCapacityError(
+                    f"{len(unadmittable)} sequence(s) need more GPU KV pages "
+                    f"than a replica has: {worst.uuid[:8]} needs "
+                    f"{worst.req_pages} pages but the replica has "
+                    f"{req.total_pages} total"
+                )
+
         capacity_pages_used = [0] * num_capacity_groups
         capacity_seq_count = [0] * num_capacity_groups
         cap = req.max_rank_bsz  # <= 0 means unlimited
@@ -120,6 +144,25 @@ class DecodeScheduler:
             # capacity) — prevents overflow of the pre-reserved padded buffers.
             if cap > 0 and capacity_seq_count[r] >= cap:
                 continue
+
+            # Admit one oversized candidate when it fits the physical pool and
+            # this capacity bucket is otherwise empty.  Keep it singleton: the
+            # soft watermark exists to leave headroom for ordinary batching,
+            # and no second candidate can safely share this bucket once the
+            # watermark has been crossed.  If another candidate is already
+            # selected, leave the oversized one for a later round; the current
+            # round still makes progress and cannot livelock.
+            if c.req_pages > capacity_per_rank:
+                if (
+                    req.total_pages > 0
+                    and c.req_pages <= req.total_pages
+                    and capacity_pages_used[r] == 0
+                ):
+                    decode_batch.append(c.uuid)
+                    capacity_pages_used[r] += c.req_pages
+                    capacity_seq_count[r] += 1
+                continue
+
             if capacity_pages_used[r] + c.req_pages <= capacity_per_rank:
                 decode_batch.append(c.uuid)
                 capacity_pages_used[r] += c.req_pages
