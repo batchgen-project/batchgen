@@ -210,7 +210,7 @@ corresponding fragmentation and occupancy telemetry.
 | `--initial-gpu-page-buffer` | `32` | Pages to reserve when first loading sequence to GPU. Each page = 64 tokens. |
 | `--extension-gpu-page-buffer` | `4` | Pages to add at page boundaries during decode |
 | `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages). Must be <= `--extension-gpu-page-buffer`, otherwise the server fails at startup with a `ValueError`. |
-| `--host-kv-watermark` | `70` | Percentage threshold for prioritizing prefill over decode |
+| `--host-kv-watermark` | `70` | Prefill admission threshold: interrupt decode for queued work only when at least one node has more than this percentage of host-KV pages free. This controls prefill scheduling; it is separate from the eviction watermark. |
 | `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences (always on) |
 
 **GPU Page Buffer Design:**
@@ -229,7 +229,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 |------|---------|-------------|
 | `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length, is at least one decode decision interval, and is rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
 | `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is enabled exactly when the effective `--host-kv-chunk-size` is greater than zero; the parser rejects non-positive chunk sizes, and this flag cannot override that mode. Telemetry reports the derived effective state. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
-| `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
+| `--host-kv-eviction-watermark` | `10` | Host-KV growth-planner watermark (0-100). The planner preserves this free-page margin, after completed-row release and safety margin; if growth cannot fit, it evicts an active sequence for later re-entry. This does not control the prefill admission threshold above. |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
 | `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
