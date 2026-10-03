@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LEGACY_HADAMARD = (
     ROOT / "batchgen" / "other_kernels" / "hadamard_transform" / "__init__.py"
 )
+LEGACY_CSRC = ROOT / "batchgen" / "other_kernels" / "hadamard_transform" / "csrc"
 KERNELS_INDEXER = (
     ROOT
     / "batchgen_kernels"
@@ -54,6 +55,9 @@ def test_hadamard_jit_extension_names_are_disjoint():
     legacy_source = _source_text(LEGACY_HADAMARD)
     assert "torch.utils.cpp_extension" not in legacy_source
     assert "fused_rope_hadamard_out" in legacy_source
+    # The compatibility package must not retain a second kernel source tree;
+    # the packaged DSA AOT sources are the single source of truth.
+    assert not LEGACY_CSRC.exists()
 
     source = _source_text(KERNELS_INDEXER)
     assert "torch.utils.cpp_extension" not in source
