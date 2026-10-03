@@ -539,7 +539,7 @@ class QueryBookBufferPool:
 		if slot >= self.num_sequences:
 			raise QueryBookPoolCapacityError(
 				f"QueryBookBufferPool exhausted: {self.num_sequences} slots used "
-				f"(raise --max-pool-size)"
+				"(legacy buffer-pool mode is unavailable)"
 			)
 		self._next_slot += 1
 		return slot
@@ -3255,9 +3255,12 @@ class BatchGenWorker:
 		self._trajectory_pool_capacity_signature = signature
 		self._response_queue.put({
 			"type": "trajectory_pool_capacity",
+			# Reject pre-protocol snapshots: the legacy ``capacity`` field
+			# represented free reservations and cannot size the fixed scheduler.
+			"capacity_semantics_version": 1,
 			# ``total_capacity`` is immutable for the worker lifetime and sizes
-			# SchedulingPool.  ``capacity`` remains as a compatibility spelling
-			# with the same total-capacity meaning.
+			# SchedulingPool.  ``capacity`` remains a compatibility spelling for
+			# clients that only display the total.
 			"total_capacity": signature[0],
 			"capacity": signature[0],
 			"free_reservations": signature[1],
