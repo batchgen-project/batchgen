@@ -823,9 +823,21 @@ class BatchScheduler:
                     # sizes SchedulingPool.  ``free_reservations`` changes on
                     # bind/release and is status/admission telemetry only; it
                     # must never resize the scheduler's slot list.
-                    total_capacity = int(
-                        result.get("total_capacity", result.get("capacity", 0))
-                    )
+                    if (
+                        result.get("capacity_semantics_version") != 1
+                        or "total_capacity" not in result
+                    ):
+                        reason = (
+                            "Incompatible trajectory-pool capacity snapshot: "
+                            "worker must publish capacity_semantics_version=1 "
+                            "and total_capacity; refusing the legacy ambiguous "
+                            "capacity field"
+                        )
+                        logger.error("[POOL] %s", reason)
+                        self._fail_all_active_batches(reason)
+                        self.worker.report_worker_fatal(reason)
+                        break
+                    total_capacity = int(result["total_capacity"])
                     if total_capacity != self._scheduling_pool.capacity:
                         if self._scheduling_pool.num_active_slots():
                             logger.error(

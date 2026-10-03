@@ -60,6 +60,7 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
             self._results = iter([
                 {
                     "type": "trajectory_pool_capacity",
+                    "capacity_semantics_version": 1,
                     "total_capacity": 4,
                     # Keep the legacy field deliberately different: the
                     # listener must size from total_capacity, never free data.
@@ -77,6 +78,7 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
                 },
                 {
                     "type": "trajectory_pool_capacity",
+                    "capacity_semantics_version": 1,
                     "total_capacity": 4,
                     "capacity": 4,
                     "free_reservations": 4,
@@ -106,3 +108,32 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
     assert pool.get_batch_tracker("batch-1").is_complete
     assert scheduler._trajectory_pool_info["total_capacity"] == 4
     assert scheduler._trajectory_pool_info["free_reservations"] == 4
+
+
+def test_capacity_listener_rejects_legacy_ambiguous_snapshot():
+    """A pre-protocol free-count cannot silently resize the fixed pool."""
+    fatal = []
+
+    class ResponseQueue:
+        def get(self, timeout):
+            return {
+                "type": "trajectory_pool_capacity",
+                "capacity": 3,
+                "free_reservations": 3,
+            }
+
+    scheduler = object.__new__(BatchScheduler)
+    scheduler._stopped = SimpleNamespace(is_set=lambda: False)
+    scheduler.worker = SimpleNamespace(
+        response_queue=ResponseQueue(),
+        report_worker_fatal=lambda reason: fatal.append(reason),
+    )
+    scheduler._scheduling_pool = SchedulingPool(capacity=4)
+    scheduler._trajectory_pool_info = None
+    scheduler._fail_all_active_batches = lambda error: fatal.append(error)
+
+    asyncio.run(scheduler._pool_completion_listener())
+
+    assert scheduler._scheduling_pool.capacity == 4
+    assert len(fatal) == 2
+    assert "capacity_semantics_version=1" in fatal[0]

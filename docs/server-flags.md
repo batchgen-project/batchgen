@@ -199,9 +199,11 @@ capacity fields. `total_capacity` (also exposed as the compatibility field
 `capacity`) is the immutable number of full model-context reservations in the
 allocated QueryBook tensor and sizes the `SchedulingPool`. `free_reservations`
 is the current admission/allocator snapshot; it changes after bind and release
-and never resizes the scheduling pool. `free_pages`, `active_count`, and
-`largest_free_extent_pages` provide the corresponding fragmentation and
-occupancy telemetry.
+and never resizes the scheduling pool. Every snapshot carries
+`capacity_semantics_version=1`; the scheduler rejects older ambiguous snapshots
+instead of treating their dynamic `capacity` value as a fixed pool size.
+`free_pages`, `active_count`, and `largest_free_extent_pages` provide the
+corresponding fragmentation and occupancy telemetry.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -407,7 +409,7 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
 | `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
 | `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. |
-| `--max-pool-size` | `10240` | Max QueryBook pool capacity for persistent request scheduling. Must be > 0; the server refuses to start otherwise (`0` used to select the removed non-pool mode). |
+| `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
 
