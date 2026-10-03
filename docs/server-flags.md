@@ -194,6 +194,15 @@ usually means `--privileged`.
 
 Controls how BatchGen schedules sequences on GPU.
 
+The persistent worker publishes token-pool telemetry with two distinct
+capacity fields. `total_capacity` (also exposed as the compatibility field
+`capacity`) is the immutable number of full model-context reservations in the
+allocated QueryBook tensor and sizes the `SchedulingPool`. `free_reservations`
+is the current admission/allocator snapshot; it changes after bind and release
+and never resizes the scheduling pool. `free_pages`, `active_count`, and
+`largest_free_extent_pages` provide the corresponding fragmentation and
+occupancy telemetry.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--initial-gpu-page-buffer` | `32` | Pages to reserve when first loading sequence to GPU. Each page = 64 tokens. |

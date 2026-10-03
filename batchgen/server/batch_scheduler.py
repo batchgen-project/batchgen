@@ -819,29 +819,30 @@ class BatchScheduler:
                         logger.info("[POOL] Worker shutdown signal received")
                     break
                 elif msg_type == "trajectory_pool_capacity":
-                    capacity = int(result.get("capacity", 0))
-                    # Capacity is derived from the fixed token pool and is normally
-                    # constant for the worker lifetime.  Workers publish a fresh
-                    # snapshot after every bind/release so the HTTP status endpoint
-                    # sees free pages and active count.  Reinitializing the scheduler's
-                    # free-slot list for those snapshots would fail once any request is
-                    # active and would kill this listener task.
-                    if capacity != self._scheduling_pool.capacity:
+                    # ``total_capacity`` is immutable token-pool capacity and
+                    # sizes SchedulingPool.  ``free_reservations`` changes on
+                    # bind/release and is status/admission telemetry only; it
+                    # must never resize the scheduler's slot list.
+                    total_capacity = int(
+                        result.get("total_capacity", result.get("capacity", 0))
+                    )
+                    if total_capacity != self._scheduling_pool.capacity:
                         if self._scheduling_pool.num_active_slots():
                             logger.error(
-                                "[POOL] Ignoring capacity change while requests are active: "
+                                "[POOL] Ignoring total capacity change while requests are active: "
                                 "old=%s new=%s active=%s",
                                 self._scheduling_pool.capacity,
-                                capacity,
+                                total_capacity,
                                 self._scheduling_pool.num_active_slots(),
                             )
                         else:
-                            self._scheduling_pool.set_capacity(capacity)
+                            self._scheduling_pool.set_capacity(total_capacity)
                     self._trajectory_pool_info = dict(result)
                     logger.info(
-                        "[POOL] Token pool capacity published: sequences=%s "
-                        "free_pages=%s page_tokens=%s",
-                        capacity,
+                        "[POOL] Token pool capacity published: total_sequences=%s "
+                        "free_reservations=%s free_pages=%s page_tokens=%s",
+                        total_capacity,
+                        result.get("free_reservations"),
                         result.get("free_pages"),
                         result.get("page_tokens"),
                     )

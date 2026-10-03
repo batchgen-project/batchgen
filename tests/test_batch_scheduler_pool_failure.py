@@ -60,7 +60,11 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
             self._results = iter([
                 {
                     "type": "trajectory_pool_capacity",
+                    "total_capacity": 4,
+                    # Keep the legacy field deliberately different: the
+                    # listener must size from total_capacity, never free data.
                     "capacity": 3,
+                    "free_reservations": 3,
                     "free_pages": 255,
                     "active_count": 1,
                     "largest_free_extent_pages": 255,
@@ -70,6 +74,15 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
                     "request_id": "request-1",
                     "batch_id": "batch-1",
                     "text": "ok",
+                },
+                {
+                    "type": "trajectory_pool_capacity",
+                    "total_capacity": 4,
+                    "capacity": 4,
+                    "free_reservations": 4,
+                    "free_pages": 256,
+                    "active_count": 0,
+                    "largest_free_extent_pages": 256,
                 },
                 {"type": "pool_shutdown"},
             ])
@@ -91,4 +104,5 @@ def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
     assert pool.num_active_slots() == 0
     assert pool.num_free_slots() == 4
     assert pool.get_batch_tracker("batch-1").is_complete
-    assert scheduler._trajectory_pool_info["free_pages"] == 255
+    assert scheduler._trajectory_pool_info["total_capacity"] == 4
+    assert scheduler._trajectory_pool_info["free_reservations"] == 4

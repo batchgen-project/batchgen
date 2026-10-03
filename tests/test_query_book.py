@@ -11,6 +11,8 @@ def test_query_book_allocates_fixed_page_store():
     assert book.storage.dtype == torch.int32
     assert book.memory_bytes == 4 * 4 * 4
     assert book.free_page_count == 4
+    assert book.reservation_total_capacity(8) == 2
+    assert book.reservation_free_count(8) == 2
 
     first = book.bind("first", max_tokens=5)
     second = book.bind("second", max_tokens=4)
@@ -18,6 +20,24 @@ def test_query_book_allocates_fixed_page_store():
     assert second == 1
     assert book.active_count == 2
     assert book.free_page_count == 1
+    assert book.reservation_total_capacity(8) == 2
+    assert book.reservation_free_count(8) == 0
+
+
+def test_query_book_total_reservation_capacity_is_stable_across_lifecycle():
+    book = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4)
+    assert book.reservation_total_capacity(8) == 2
+    first = book.bind("first", max_tokens=8)
+    assert book.reservation_total_capacity(8) == 2
+    assert book.reservation_free_count(8) == 1
+
+    book.release(first)
+    assert book.reservation_total_capacity(8) == 2
+    assert book.reservation_free_count(8) == 2
+    # The compatibility name has the immutable-capacity meaning.  Free
+    # reservations must be requested explicitly so a scheduler cannot resize
+    # when admission or release changes allocator state.
+    assert book.reservation_capacity(8) == book.reservation_total_capacity(8)
 
 
 def test_query_book_rejects_non_integral_reservation_sizes():

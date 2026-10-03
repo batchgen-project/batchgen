@@ -3236,7 +3236,7 @@ class BatchGenWorker:
 			self._trajectory_book.page_count,
 			page_tokens,
 			self.model_context_length,
-			self._trajectory_book.reservation_capacity(self.model_context_length),
+			self._trajectory_book.reservation_total_capacity(self.model_context_length),
 		)
 
 	def _publish_trajectory_pool_capacity(self) -> None:
@@ -3244,7 +3244,8 @@ class BatchGenWorker:
 		if self.rank != 0 or self._response_queue is None or self._trajectory_book is None:
 			return
 		signature = (
-			self._trajectory_book.reservation_capacity(self.model_context_length),
+			self._trajectory_book.reservation_total_capacity(self.model_context_length),
+			self._trajectory_book.reservation_free_count(self.model_context_length),
 			self._trajectory_book.free_page_count,
 			self._trajectory_book.active_count,
 			self._trajectory_book.largest_free_extent_pages,
@@ -3254,10 +3255,15 @@ class BatchGenWorker:
 		self._trajectory_pool_capacity_signature = signature
 		self._response_queue.put({
 			"type": "trajectory_pool_capacity",
+			# ``total_capacity`` is immutable for the worker lifetime and sizes
+			# SchedulingPool.  ``capacity`` remains as a compatibility spelling
+			# with the same total-capacity meaning.
+			"total_capacity": signature[0],
 			"capacity": signature[0],
-			"free_pages": self._trajectory_book.free_page_count,
-			"active_count": self._trajectory_book.active_count,
-			"largest_free_extent_pages": signature[3],
+			"free_reservations": signature[1],
+			"free_pages": signature[2],
+			"active_count": signature[3],
+			"largest_free_extent_pages": signature[4],
 			"page_tokens": self._trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
 			"capacity_bytes": self._trajectory_book.memory_bytes,
@@ -5853,11 +5859,11 @@ class BatchGenWorker:
 
 		# The unified trajectory pool was allocated once during core init. It is
 		# fixed for the worker lifetime and derives scheduling capacity from its
-		# free reservations; no per-admission dense buffer growth is allowed.
+		# total reservation capacity; free reservations are telemetry only.
 		self._buffer_pool = None
 		logging.info(
 			f"Rank {self.rank}: unified trajectory pool active "
-			f"(capacity={self._trajectory_book.reservation_capacity(self.model_context_length)})"
+			f"(capacity={self._trajectory_book.reservation_total_capacity(self.model_context_length)})"
 		)
 
 		# Initialize index maps

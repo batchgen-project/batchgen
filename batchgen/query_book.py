@@ -181,15 +181,39 @@ class QueryBook:
                 return False
         return True
 
-    def reservation_capacity(self, max_tokens: int) -> int:
-        """Return the maximum number of equal-size reservations that fit."""
+    def reservation_total_capacity(self, max_tokens: int) -> int:
+        """Return the immutable number of equal-size reservations in the pool.
+
+        This is a property of the allocated token tensor and the reservation
+        size.  It does not change when sequences bind or release pages, so it
+        is the only QueryBook capacity that may size the server's
+        ``SchedulingPool``.
+        """
+
+        return self.page_count // self.pages_for(max_tokens)
+
+    def reservation_free_count(self, max_tokens: int) -> int:
+        """Return the currently available equal-size reservations.
+
+        The free count reflects allocator fragmentation and therefore changes
+        after every bind or release.  It is telemetry/admission information;
+        it is not the scheduler pool's total capacity.
+        """
 
         pages = self.pages_for(max_tokens)
-        # Production reservations are all model-context-sized and therefore
-        # remain whole extents after release. Counting each extent separately
-        # also keeps the published scheduler capacity correct if a caller uses
-        # the book with variable-size reservations in a test or migration.
         return sum(count // pages for _, count in self._free_extents)
+
+    def reservation_capacity(self, max_tokens: int) -> int:
+        """Compatibility alias for :meth:`reservation_total_capacity`.
+
+        New code must call ``reservation_total_capacity`` or
+        ``reservation_free_count`` explicitly.  Keeping this alias avoids
+        breaking older callers while making its historical ambiguity harmless:
+        ``reservation_capacity`` now has the conventional immutable-capacity
+        meaning and is never used for free-page telemetry.
+        """
+
+        return self.reservation_total_capacity(max_tokens)
 
     def bind_batch(
         self, sequence_ids: Sequence[str], max_tokens: Sequence[int]
