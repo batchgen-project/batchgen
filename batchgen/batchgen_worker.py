@@ -2863,6 +2863,31 @@ class BatchGenWorker:
 				f"status={seq.status.name}"
 			)
 
+	def _reserve_host_kv_capacity_for_decoded_context(self, batch_sequences) -> None:
+		"""Reserve host KV space for the context length just produced by decode.
+
+		The decode forward appends KV for the input token at
+		``current_context_length - 1`` and increments ``current_context_length``
+		once the sampled token is recorded. That leaves a one-token window where
+		the append itself fits but the metadata invariant
+		``host_token_capacity >= current_context_length`` does not. Grow the
+		page allocation immediately after the increment so the next boundary
+		validation observes the same reservation that the sequence metadata does.
+		Completed sequences are released at the next boundary and do not need a
+		new page.
+		"""
+		sequence_ids = []
+		sequence_lengths = []
+		for seq in batch_sequences:
+			if self._is_sequence_completed(seq):
+				continue
+			if int(seq.host_token_capacity) < int(seq.current_context_length):
+				sequence_ids.append(int(seq.global_idx))
+				# _ensure_host_kv_append_capacity takes a zero-based write position.
+				sequence_lengths.append(int(seq.current_context_length) - 1)
+		if sequence_ids:
+			self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
+
 	def _append_decode_kv_to_host_async(
 		self,
 		layer_idx: int,
@@ -12405,6 +12430,12 @@ class BatchGenWorker:
 								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
+
+			# The sampled token advances current_context_length after the
+			# deferred host-KV append was queued. Reserve a page immediately when
+			# that increment crosses the current capacity; otherwise the next page
+			# boundary validates a stale one-token-short reservation.
+			self._reserve_host_kv_capacity_for_decoded_context(batch_sequences)
 
 			_split_t4 = time.perf_counter()
 			self._cumulative_forward_ms += (_split_t4 - forward_start) * 1000
