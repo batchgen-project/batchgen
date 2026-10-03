@@ -317,10 +317,15 @@ class SequenceEntry:
             SequenceStatus.IN_DECODE,
             SequenceStatus.ON_HOLD,
         }
-        terminal_capacity_gap = allow_terminal_capacity_gap and self.status in {
-            SequenceStatus.PREFILLED,
-            SequenceStatus.IN_DECODE,
-        }
+        terminal_capacity_gap = (
+            allow_terminal_capacity_gap
+            and self.status in {SequenceStatus.PREFILLED, SequenceStatus.IN_DECODE}
+            and (
+                self.eos_reached
+                or self.decoded_length >= self.max_decode_length
+                or getattr(self, "_rep_detected", False)
+            )
+        )
         if self.status in host_required_statuses:
             require(self.assigned_rank is not None, f"{self.status.name} requires assigned_rank")
             require(self.host_pages_allocated > 0, f"{self.status.name} requires host_pages_allocated > 0")
