@@ -1,16 +1,53 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import importlib.util
+import sys
+from types import ModuleType, SimpleNamespace
+from pathlib import Path
 
 import pytest
 
-# Importing the BatchGen KV package loads the optional Triton GPU backends.
-# Keep this unit test collectable in the lightweight dev environment; the
-# project runtime environment exercises it with Triton and the native host-KV
-# bindings available.
-pytest.importorskip("triton")
 
-from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+def _load_coordinator_type():
+    """Load the pure coordinator wrapper without optional GPU backends."""
+    module_name = "batchgen.kv_cache.dual_host_kv_coordinator_test_module"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "batchgen"
+        / "kv_cache"
+        / "dual_host_kv_coordinator.py"
+    )
+    saved = {
+        name: sys.modules.get(name)
+        for name in (
+            "batchgen.kv_cache",
+            "batchgen.models",
+            "batchgen.models.engine_loader",
+        )
+    }
+    fake_kv = ModuleType("batchgen.kv_cache")
+    fake_kv.__path__ = []
+    fake_models = ModuleType("batchgen.models")
+    fake_models.__path__ = []
+    fake_loader = ModuleType("batchgen.models.engine_loader")
+    fake_loader.core_engine = SimpleNamespace()
+    sys.modules["batchgen.kv_cache"] = fake_kv
+    sys.modules["batchgen.models"] = fake_models
+    sys.modules["batchgen.models.engine_loader"] = fake_loader
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, source)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module.DualHostKVCoordinator
+    finally:
+        sys.modules.pop(module_name, None)
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
 
 class _View:
@@ -30,6 +67,7 @@ class _View:
 
 
 def test_dual_host_growth_poisoned_after_auxiliary_rejects() -> None:
+    DualHostKVCoordinator = _load_coordinator_type()
     primary = _View(free_pages=8)
     auxiliary = _View(free_pages=8, error=RuntimeError("aux allocator failed"))
     coordinator = DualHostKVCoordinator(primary, auxiliary)
@@ -49,6 +87,7 @@ def test_dual_host_growth_poisoned_after_auxiliary_rejects() -> None:
 
 
 def test_dual_host_growth_preflight_rejects_without_mutating_either_view() -> None:
+    DualHostKVCoordinator = _load_coordinator_type()
     primary = _View(free_pages=1)
     auxiliary = _View(free_pages=4)
     coordinator = DualHostKVCoordinator(primary, auxiliary)
