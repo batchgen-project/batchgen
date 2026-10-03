@@ -272,6 +272,37 @@ def test_query_book_reentry_turn_replays_prefix_without_double_counting():
     assert book.turns(slot)[-1].generated_length == 1
 
 
+def test_query_book_synchronize_metadata_repairs_shared_storage_mirror():
+    storage = torch.zeros((4, 4), dtype=torch.int32)
+    owner = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4, storage=storage)
+    mirror = QueryBook(capacity_bytes=4 * 4 * 4, page_tokens=4, storage=storage)
+    owner_slot = owner.bind("request", max_tokens=12)
+    mirror_slot = mirror.bind("request", max_tokens=12)
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
+    owner.write_prompt(owner_slot, prompt)
+    mirror.write_prompt(mirror_slot, prompt)
+
+    owner.append_tokens([owner_slot], [10])
+    owner.append_tokens([owner_slot], [11])
+    owner.append_tokens([owner_slot], [12])
+    owner_meta = owner.metadata(owner_slot)
+
+    mirror.synchronize_metadata(
+        mirror_slot,
+        prompt_length=owner_meta.prompt_length,
+        token_length=owner_meta.token_length,
+        decoded_length=owner_meta.decoded_length,
+    )
+    mirror.begin_reentry_turn(mirror_slot, prompt_length=owner_meta.token_length)
+
+    mirror_meta = mirror.metadata(mirror_slot)
+    assert mirror_meta.token_length == owner_meta.token_length
+    assert mirror_meta.decoded_length == owner_meta.decoded_length
+    assert mirror_meta.prompt_length == owner_meta.token_length
+    assert mirror.turns(mirror_slot)[0].generated_length == 3
+    assert torch.equal(mirror.tokens(mirror_slot), torch.tensor([1, 2, 3, 10, 11, 12]))
+
+
 def test_query_book_last_token_falls_back_to_prompt_boundary():
     book = QueryBook(capacity_bytes=2 * 4 * 4, page_tokens=4)
     slot = book.bind("prompt-only", max_tokens=8)

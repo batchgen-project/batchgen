@@ -2069,6 +2069,30 @@ class BatchGenWorker:
 			slots.append(self._trajectory_slot(seq))
 		self._trajectory_book.append_tokens(slots, values)
 
+	def _sync_trajectory_metadata(
+		self, seq: SequenceEntry, state: Dict[str, object]
+	) -> None:
+		"""Refresh a local QueryBook mirror from the owning rank's lengths.
+
+		The node-shared token pages are written by the sequence owner, while each
+		process keeps its QueryBook allocator metadata locally.  Boundary state
+		contains the owner's logical lengths so non-owning ranks can participate in
+		re-entry bookkeeping without copying the trajectory.
+		"""
+		if self._trajectory_book is None or not self._trajectory_book.has_sequence(seq.uuid):
+			return
+		token_length = state.get("trajectory_token_length")
+		if token_length is None:
+			return
+		self._trajectory_book.synchronize_metadata(
+			self._trajectory_slot(seq),
+			prompt_length=int(state["prompt_length"]),
+			token_length=int(token_length),
+			decoded_length=int(
+				state.get("trajectory_decoded_length", state["decoded_length"])
+			),
+		)
+
 	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
 		"""Report a single sequence completion to the response queue.
 
@@ -4740,6 +4764,21 @@ class BatchGenWorker:
 					'original_max_decode_length': seq.original_max_decode_length,
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
+					# QueryBook metadata is process-local even though its token
+					# pages are node-shared.  Publish the owner's lengths so
+					# non-owning ranks can repair their mirror before re-entry.
+					'trajectory_token_length': (
+						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._trajectory_book is not None
+						and self._trajectory_book.has_sequence(uuid)
+						else None
+					),
+					'trajectory_decoded_length': (
+						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._trajectory_book is not None
+						and self._trajectory_book.has_sequence(uuid)
+						else None
+					),
 					# total_decoded_before_eviction: needed so non-owning ranks
 					# sort eviction candidates consistently in _prepare_prefill_batch.
 					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
@@ -4799,6 +4838,11 @@ class BatchGenWorker:
 								f"rank {self.rank} _sync_sequence_metadata/recv",
 								require_owner_tensors=False,
 							)
+					# Keep the local QueryBook mirror aligned with the owner even
+					# when this rank also holds a replicated decode entry.
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is not None:
+						self._sync_trajectory_metadata(seq, state)
 
 	# Thin delegations to `batchgen.worker.sync.SyncCoordinator`. The worker
 	# owns the canonical state; `_make_sync_context` snapshots it into a
@@ -9012,6 +9056,21 @@ class BatchGenWorker:
 					'reentry_decoded_baseline': seq.reentry_decoded_baseline,
 					'max_decode_length': seq.max_decode_length,
 					'original_max_decode_length': seq.original_max_decode_length,
+					# QueryBook metadata is process-local even though its token
+					# pages are node-shared. Publish the owner's lengths so
+					# non-owning ranks can repair their mirror before re-entry.
+					'trajectory_token_length': (
+						self._trajectory_book.metadata(self._trajectory_slot(seq)).token_length
+						if self._trajectory_book is not None
+						and self._trajectory_book.has_sequence(uuid)
+						else None
+					),
+					'trajectory_decoded_length': (
+						self._trajectory_book.metadata(self._trajectory_slot(seq)).decoded_length
+						if self._trajectory_book is not None
+						and self._trajectory_book.has_sequence(uuid)
+						else None
+					),
 					# total_decoded_before_eviction: propagated here so the
 					# next _prepare_prefill_batch's eviction priority sort is
 					# consistent across ranks.
@@ -9151,6 +9210,12 @@ class BatchGenWorker:
 						f"rank {self.rank} _page_boundary_fast/gathered_state",
 						require_owner_tensors=False,
 					)
+			# The token pages are shared, but the QueryBook metadata is not.
+			# Repair every local mirror from the canonical owner state before
+			# Phase 4 can call begin_reentry_turn on all ranks.
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				self._sync_trajectory_metadata(seq, state)
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.

@@ -454,6 +454,81 @@ class QueryBook:
             record.max_tokens,
         )
 
+    def synchronize_metadata(
+        self,
+        slot: int,
+        *,
+        prompt_length: int,
+        token_length: int,
+        decoded_length: int,
+    ) -> None:
+        """Refresh process-local lengths for bytes written by another rank.
+
+        The token pages are node-shared, but allocator metadata is local to each
+        process.  A rank that did not run a sequence's decode step therefore
+        needs the owner's lengths before it can record the next re-entry turn.
+        This updates only metadata and the cached tail; it never copies token
+        bytes or allocates storage.
+        """
+
+        self._check_active_slot(slot)
+        prompt_length = self._nonnegative_int(prompt_length, "prompt_length")
+        token_length = self._nonnegative_int(token_length, "token_length")
+        decoded_length = self._nonnegative_int(decoded_length, "decoded_length")
+        if prompt_length > token_length:
+            raise QueryBookCapacityError(
+                f"prompt_length={prompt_length} exceeds token_length={token_length}"
+            )
+        self._check_length(slot, token_length)
+
+        record = self._records[slot]
+        turns = list(self._turns[slot])
+        if turns:
+            generated_before_last = sum(
+                turn.generated_length for turn in turns[:-1]
+            )
+            last_generated = decoded_length - generated_before_last
+            if last_generated < 0:
+                raise QueryBookCapacityError(
+                    "decoded_length is smaller than the committed turn ledger"
+                )
+            last = turns[-1]
+            turns[-1] = QueryBookTurn(
+                turn_id=last.turn_id,
+                prompt_start=last.prompt_start,
+                prompt_length=last.prompt_length,
+                generated_start=last.generated_start,
+                generated_length=last_generated,
+            )
+        elif token_length or decoded_length:
+            # This is only a defensive fallback for a restored mirror whose
+            # local turn list was empty.  Normal admission always creates the
+            # first turn in write_prompt().
+            generated_length = token_length - prompt_length
+            if generated_length < 0 or generated_length != decoded_length:
+                raise QueryBookCapacityError(
+                    "cannot reconstruct an empty turn ledger from lengths"
+                )
+            turns = [
+                QueryBookTurn(
+                    turn_id=0,
+                    prompt_start=0,
+                    prompt_length=prompt_length,
+                    generated_start=prompt_length,
+                    generated_length=generated_length,
+                )
+            ]
+
+        self._records[slot] = QueryBookSlot(
+            slot,
+            prompt_length,
+            token_length,
+            decoded_length,
+            record.max_tokens,
+        )
+        self._turns[slot] = turns
+        self._update_tail(slot, token_length)
+
     def write_prompts(
         self, slots: Sequence[int], prompts: Sequence[torch.Tensor]
     ) -> None:
