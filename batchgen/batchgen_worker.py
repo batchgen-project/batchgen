@@ -3237,7 +3237,6 @@ class BatchGenWorker:
 			"page_tokens": self._trajectory_book.page_tokens,
 			"model_context_length": self.model_context_length,
 			"capacity_bytes": self._trajectory_book.memory_bytes,
-			"largest_free_extent_pages": self._trajectory_book.largest_free_extent_pages,
 		})
 
 	def _update_batch_config(self, num_queries: int) -> None:
