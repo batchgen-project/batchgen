@@ -29,6 +29,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 
+def host_kv_eviction_enabled(host_kv_chunk_size: int) -> bool:
+	"""Return whether bounded chunked host-KV mode requires re-entry."""
+	return int(host_kv_chunk_size) > 0
+
+
 @dataclass(frozen=True)
 class PrefillCandidate:
     """A sequence eligible for prefill admission (EVICTED or QUEUEING).
