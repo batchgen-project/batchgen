@@ -79,6 +79,10 @@ class DecodeBatchRequest:
     # overflow (no runtime resize -> no OOM). 0 = unlimited (legacy / non-K2.5).
     max_rank_bsz: int = 0
     attn_tp_size: int = 1
+    # GPU pages already held by IN_DECODE rows in each DP/TP capacity group.
+    # The worker supplies this snapshot so an oversized singleton cannot be
+    # admitted beside an active row and overcommit the physical pool.
+    existing_pages: Tuple[int, ...] = ()
 
 
 class DecodeScheduler:
@@ -105,6 +109,11 @@ class DecodeScheduler:
                 f"attn_tp_size={group_size} must divide world_size={req.world_size}"
             )
         num_capacity_groups = req.world_size // group_size
+        if req.existing_pages and len(req.existing_pages) != num_capacity_groups:
+            raise ValueError(
+                f"existing_pages has {len(req.existing_pages)} groups; "
+                f"expected {num_capacity_groups}"
+            )
 
         # The 90% watermark is a batching guard, not the physical capacity.
         # A long trajectory can legitimately need the remaining 10%.  Refusing
@@ -125,7 +134,11 @@ class DecodeScheduler:
                     f"{req.total_pages} total"
                 )
 
-        capacity_pages_used = [0] * num_capacity_groups
+        capacity_pages_used = (
+            list(req.existing_pages)
+            if req.existing_pages
+            else [0] * num_capacity_groups
+        )
         capacity_seq_count = [0] * num_capacity_groups
         cap = req.max_rank_bsz  # <= 0 means unlimited
         decode_batch: List[str] = []

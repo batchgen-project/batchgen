@@ -5469,6 +5469,26 @@ class BatchGenWorker:
 		self, all_candidates: List[str], total_pages: int,
 	) -> DecodeBatchRequest:
 		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
+		attn_tp_size = self._decode_attn_tp_size()
+		num_capacity_groups = self.world_size // attn_tp_size
+		existing_pages = [0] * num_capacity_groups
+		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
+			seq = self.global_batch.get_sequence(uuid)
+			if attn_tp_size > 1:
+				r = seq.decode_dp_group
+				if r is None:
+					raise ValueError(
+						f"sequence {uuid[:8]} has no decode_dp_group for "
+						f"attn_tp_size={attn_tp_size}"
+					)
+			else:
+				r = seq.assigned_rank
+			if not 0 <= r < num_capacity_groups:
+				raise ValueError(
+					f"sequence {uuid[:8]} has invalid decode capacity group {r}"
+				)
+			existing_pages[r] += max(0, seq.gpu_pages_allocated)
+
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -5484,7 +5504,8 @@ class BatchGenWorker:
 			total_pages=total_pages,
 			world_size=self.world_size,
 			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
-			attn_tp_size=self._decode_attn_tp_size(),
+			attn_tp_size=attn_tp_size,
+			existing_pages=tuple(existing_pages),
 		)
 
 	def _check_and_handle_completions(

@@ -27,12 +27,19 @@ def _cand(uuid, *, rank=0, gidx=0, req_pages=10, decode_dp_group=None):
     )
 
 
-def _req(candidates, total_pages, world_size=8, attn_tp_size=1):
+def _req(
+    candidates,
+    total_pages,
+    world_size=8,
+    attn_tp_size=1,
+    existing_pages=(),
+):
     return DecodeBatchRequest(
         candidates=tuple(candidates),
         total_pages=total_pages,
         world_size=world_size,
         attn_tp_size=attn_tp_size,
+        existing_pages=tuple(existing_pages),
     )
 
 
@@ -82,6 +89,15 @@ def test_oversized_singleton_does_not_share_the_bucket():
         _cand("small", gidx=1, req_pages=1),
     ]
     assert DecodeScheduler.select_decode_batch(_req(cands, 100)) == ["wide"]
+
+
+def test_oversized_singleton_waits_behind_existing_decode_pages():
+    # An active row already owns pages in the capacity bucket. The singleton
+    # fallback must not overcommit the physical pool beside that row.
+    cands = [_cand("wide", req_pages=91)]
+    assert DecodeScheduler.select_decode_batch(
+        _req(cands, 100, existing_pages=(20, 0, 0, 0, 0, 0, 0, 0))
+    ) == []
 
 
 def test_zero_page_pool_keeps_empty_selection():
