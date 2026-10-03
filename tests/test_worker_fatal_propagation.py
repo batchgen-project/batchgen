@@ -145,10 +145,7 @@ def test_pool_shutdown_error_fails_storage_before_acknowledgement():
     assert storage_index < ack_index
     assert trace[storage_index][2] == {
         "status": "failed",
-        "error": {
-            "code": "worker_fatal",
-            "message": "rank 8\nTraceback",
-        },
+        "error": "worker_fatal: rank 8\nTraceback",
     }
 
 
