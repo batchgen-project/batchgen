@@ -216,7 +216,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
+| `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length and rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
 | `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
 | `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
@@ -228,10 +228,13 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 **How chunk-based reservation works:**
 
-1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
-2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
-3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
-4. If host pages are exhausted, shortest-decoded sequences are evicted first to free pages
+1. The first pool drain sends one worker `init` message. Its `max_output_len` is the maximum per-request output length in that first drain. The worker uses that value only to cap host-KV chunk sizing; it is not a server-wide output limit.
+2. At prefill, each sequence reserves pages for its prompt plus the effective chunk, capped by that sequence's full KV budget (`prompt + max_completion_tokens` or the applicable fallback).
+3. During decode, a sequence approaching its current host-KV capacity requests another chunk, capped by its own KV budget. Successful growth is not eviction and is not re-entry.
+4. Eviction occurs only when the host-KV page allocator cannot satisfy the required admission or growth under the watermark policy. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
+5. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA).
+
+The first-init rule matters when later admissions use a larger `max_completion_tokens`: the per-request decode budget remains authoritative, but the initial host-KV reservation may be smaller and grow during decode.
 
 **Example: High oversubscription with eviction**
 

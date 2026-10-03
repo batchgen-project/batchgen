@@ -486,7 +486,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host-kv-chunk-size",
         type=int,
         default=8192,
-        help="Host KV chunk size in tokens for dynamic reservation (default: 8192). Each sequence initially reserves prompt_length + chunk_size tokens instead of full max_decode_length.",
+        help=(
+            "Initial host-KV reservation chunk in tokens (default: 8192). "
+            "The first pool init caps the effective chunk with its max output "
+            "length; this sizes host-KV reservations only and does not override "
+            "per-request max_completion_tokens. Later larger requests grow their "
+            "own reservation up to their KV budget."
+        ),
     )
     parser.add_argument(
         "--host-kv-eviction-watermark",
