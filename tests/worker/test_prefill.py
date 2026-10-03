@@ -19,6 +19,7 @@ from batchgen.worker.prefill import (
     PrefillCandidate,
     PrefillScheduler,
     PrefillSelectionRequest,
+    host_kv_eviction_enabled,
 )
 
 _PAGE = 64
@@ -127,6 +128,13 @@ def test_evicted_admitted_before_queueing():
     e = _cand("e", evicted=True, gidx=1, decoded=50, prompt=100)
     plan = PrefillScheduler.select_prefill_batch(_req([q, e], [34]))
     assert plan == ["e"]  # evicted wins the single slot
+
+
+def test_chunked_host_kv_reentry_selects_evicted_without_cli_switch():
+    """Bounded chunking owns eviction; the deprecated switch is irrelevant."""
+    assert host_kv_eviction_enabled(8192)
+    e = _cand("e", evicted=True, gidx=1, decoded=50, prompt=100)
+    assert PrefillScheduler.select_prefill_batch(_req([e], [34])) == ["e"]
 
 
 def test_evicted_ordered_most_decoded_first():

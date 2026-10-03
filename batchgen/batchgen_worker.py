@@ -151,6 +151,7 @@ from batchgen.worker.prefill import (
 	PrefillCandidate,
 	PrefillScheduler,
 	PrefillSelectionRequest,
+	host_kv_eviction_enabled,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.boundary import (
@@ -761,8 +762,10 @@ class BatchGenWorker:
 		# Dynamic host KV reservation
 		self.host_kv_chunk_size = args.host_kv_chunk_size
 		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
-		# Eviction is always enabled — it's a correctness requirement for chunked host KV
-		self.enable_host_kv_eviction = True
+		# The deprecated CLI switch cannot disable re-entry. Any positive chunk
+		# creates bounded host-KV reservations, so eviction is part of that mode's
+		# correctness contract.
+		self.enable_host_kv_eviction = host_kv_eviction_enabled(self.host_kv_chunk_size)
 		if args.adaptive_chunk:
 			self.adaptive_chunk_sizer = AdaptiveChunkSizer(
 				initial_chunk=args.host_kv_chunk_size,
@@ -778,7 +781,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Dynamic Host KV Config: chunk_size={args.host_kv_chunk_size}, "
 				f"eviction_watermark={args.host_kv_eviction_watermark}%, "
-				f"eviction_enabled={args.enable_host_kv_eviction}, "
+				f"eviction_enabled={self.enable_host_kv_eviction}, "
 				f"adaptive_chunk={args.adaptive_chunk}"
 			)
 
