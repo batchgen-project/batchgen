@@ -231,7 +231,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 1. The first pool drain sends one worker `init` message. Its `max_output_len` is the maximum per-request output length in that first drain. The worker uses that value only to cap host-KV chunk sizing; it is not a server-wide output limit.
 2. At prefill, each sequence reserves pages for its prompt plus the effective chunk, capped by that sequence's full KV budget (`prompt + max_completion_tokens` or the applicable fallback).
 3. During decode, a sequence approaching its current host-KV capacity requests another chunk, capped by its own KV budget. Successful growth is not eviction and is not re-entry.
-4. Eviction occurs only when the host-KV page allocator cannot satisfy the required admission or growth under the watermark policy. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
+4. Eviction occurs when the host-KV growth planner determines that the active set cannot safely satisfy the required admission or growth while preserving the configured free-page watermark and safety margin. This can be proactive; it does not require a page allocation to fail first. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
 5. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA).
 
 The first-init rule matters when later admissions use a larger `max_completion_tokens`: the per-request decode budget remains authoritative, but the initial host-KV reservation may be smaller and grow during decode.
