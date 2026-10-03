@@ -2155,7 +2155,11 @@ class BatchGenWorker:
 			"decoded_length": seq.decoded_length,
 			"finish_reason": self._get_finish_reason(seq),
 		})
-		logging.info("[POOL_COMPLETION_SENT] uuid=%s", uuid)
+		try:
+			queue_depth = self._response_queue.qsize()
+		except (AttributeError, NotImplementedError, OSError):
+			queue_depth = "unknown"
+		logging.info("[POOL_COMPLETION_SENT] uuid=%s response_queue_depth=%s", uuid, queue_depth)
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
 		"""Gather decoded tokens from owning ranks for completed sequences.
