@@ -100,6 +100,41 @@ def test_deferred_host_kv_launch_does_not_touch_cuda_from_python(monkeypatch):
     assert worker._deferred_kv_batch is None
 
 
+def test_decode_context_boundary_reserves_the_next_host_page():
+    """A 3456→3457 context transition must reserve before boundary validation.
+
+    The forward pass writes the KV row at ``context - 1`` and increments the
+    metadata context after sampling. Without this post-sample reservation the
+    next boundary sees ``host_token_capacity=3456`` and
+    ``current_context_length=3457`` and aborts before the append path can grow.
+    """
+    source = _worker_method("_reserve_host_kv_capacity_for_decoded_context")
+    namespace = {"int": int}
+    exec(compile(source, str(WORKER), "exec"), namespace)
+
+    class _Sequence:
+        global_idx = 5
+        host_token_capacity = 3456
+        current_context_length = 3457
+
+    trace = []
+    worker = SimpleNamespace(
+        _is_sequence_completed=lambda seq: False,
+        _ensure_host_kv_append_capacity=lambda ids, lengths: trace.append((ids, lengths)),
+    )
+    namespace["_reserve_host_kv_capacity_for_decoded_context"](
+        worker, [_Sequence()]
+    )
+    assert trace == [([5], [3456])]
+
+    # Once the page has been reserved, the same boundary must not request a
+    # duplicate growth operation.
+    seq = _Sequence()
+    seq.host_token_capacity = 3520
+    namespace["_reserve_host_kv_capacity_for_decoded_context"](worker, [seq])
+    assert trace == [([5], [3456])]
+
+
 def test_cpp_append_orders_copy_stream_after_producer_stream():
     source = HOST_VIEW.read_text()
     start = source.index("    KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(")
