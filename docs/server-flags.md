@@ -228,7 +228,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length and rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
-| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is enabled exactly when the effective `--host-kv-chunk-size` is greater than zero; the parser rejects non-positive chunk sizes, and this flag cannot override that mode. Telemetry reports the derived effective state. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
 | `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
