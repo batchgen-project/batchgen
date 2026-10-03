@@ -780,7 +780,23 @@ class BatchScheduler:
                     break
                 elif msg_type == "trajectory_pool_capacity":
                     capacity = int(result.get("capacity", 0))
-                    self._scheduling_pool.set_capacity(capacity)
+                    # Capacity is derived from the fixed token pool and is normally
+                    # constant for the worker lifetime.  Workers publish a fresh
+                    # snapshot after every bind/release so the HTTP status endpoint
+                    # sees free pages and active count.  Reinitializing the scheduler's
+                    # free-slot list for those snapshots would fail once any request is
+                    # active and would kill this listener task.
+                    if capacity != self._scheduling_pool.capacity:
+                        if self._scheduling_pool.num_active_slots():
+                            logger.error(
+                                "[POOL] Ignoring capacity change while requests are active: "
+                                "old=%s new=%s active=%s",
+                                self._scheduling_pool.capacity,
+                                capacity,
+                                self._scheduling_pool.num_active_slots(),
+                            )
+                        else:
+                            self._scheduling_pool.set_capacity(capacity)
                     self._trajectory_pool_info = dict(result)
                     logger.info(
                         "[POOL] Token pool capacity published: sequences=%s "

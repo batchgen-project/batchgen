@@ -2126,22 +2126,10 @@ class BatchGenWorker:
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
-			logging.warning(
-				"[POOL_COMPLETION_SKIP] rank=%s uuid=%s response_queue=%s",
-				self.rank,
-				uuid[:8],
-				self._response_queue is not None,
-			)
 			return
 
 		# Use gathered text if provided, otherwise read from local buffer
 		text = gathered_text if gathered_text is not None else fallback_text
-		logging.info(
-			"[POOL_COMPLETION_SEND] uuid=%s batch_id=%s decoded=%s",
-			uuid,
-			getattr(seq, "batch_id", None),
-			seq.decoded_length,
-		)
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
@@ -2155,11 +2143,6 @@ class BatchGenWorker:
 			"decoded_length": seq.decoded_length,
 			"finish_reason": self._get_finish_reason(seq),
 		})
-		try:
-			queue_depth = self._response_queue.qsize()
-		except (AttributeError, NotImplementedError, OSError):
-			queue_depth = "unknown"
-		logging.info("[POOL_COMPLETION_SENT] uuid=%s response_queue_depth=%s", uuid, queue_depth)
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
 		"""Gather decoded tokens from owning ranks for completed sequences.
