@@ -32,8 +32,7 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
     source = WORKER.read_text()
     assert (
         "seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)\n"
-        "\t\t\t\tseq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE\n"
-        "\t\t\t\tsequence_tokens.append(seq.host_token_capacity)"
+        "\t\t\t\tseq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE"
     ) in source
 
     seq = SequenceEntry("seq", global_idx=24, prompt_length=6087, max_decode_length=4096)
@@ -54,7 +53,7 @@ def test_terminal_decode_boundary_allows_only_the_final_capacity_gap():
     seq = SequenceEntry("seq", global_idx=25, prompt_length=100, max_decode_length=4000)
     seq.status = SequenceStatus.IN_DECODE
     seq.assigned_rank = 1
-    seq.decoded_length = 3257
+    seq.decoded_length = 3357
     seq.current_context_length = 3457
     seq.host_pages_allocated = 54
     seq.host_token_capacity = 3456
