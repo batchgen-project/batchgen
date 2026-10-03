@@ -327,7 +327,15 @@ class SequenceEntry:
             require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
             require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
             if require_owner_tensors:
-                require(self.evicted_token_ids is not None, "EVICTED owner requires evicted_token_ids")
+                # Unified QueryBook keeps the trajectory in its fixed token
+                # pages and deliberately clears the legacy dense handoff tensor.
+                # Retain the old requirement for callers that still use the
+                # owner-local eviction tensor.
+                if self.evicted_token_ids is None:
+                    require(
+                        self._buffer_slot >= 0 and self.input_ids is None,
+                        "EVICTED owner requires evicted_token_ids or a unified trajectory slot",
+                    )
             else:
                 require(
                     self.evicted_token_ids is None,

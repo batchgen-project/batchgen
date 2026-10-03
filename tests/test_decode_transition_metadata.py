@@ -49,6 +49,21 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
     seq.validate_metadata("unit")
 
 
+def test_unified_trajectory_eviction_does_not_require_legacy_token_tensor():
+    seq = SequenceEntry("seq", global_idx=24, prompt_length=100, max_decode_length=900)
+    seq.status = SequenceStatus.EVICTED
+    seq.assigned_rank = 1
+    seq.prompt_length = 110
+    seq.original_prompt_length = 100
+    seq.decoded_length = 10
+    seq.current_context_length = 110
+    seq.total_decoded_before_eviction = 10
+    seq.reentry_decoded_baseline = 0
+    seq._buffer_slot = 3
+
+    seq.validate_metadata("unit")
+
+
 def test_synchronous_host_to_gpu_load_uses_dual_dsa_path():
     source = WORKER.read_text()
     start = source.index("\tdef _load_host_kv_to_gpu(")
