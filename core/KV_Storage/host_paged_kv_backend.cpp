@@ -700,13 +700,13 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequences(
         allocations[i].resize(required_pages[i]);
     }
 
-    // Hold the sequence lock while reserving from the free stack.  Existing
-    // single-sequence operations never hold both locks at once, so this lock
-    // order cannot deadlock with release or growth.  The aggregate free-page
-    // check is performed before any page is removed: a failed batch therefore
-    // cannot leave earlier sequences partially allocated.
-    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    // Match the allocation -> sequence order used by AcquirePages.  Release
+    // paths do not hold both locks at once, so this order cannot form a cycle
+    // with them.  The aggregate free-page check is performed before any page
+    // is removed: a failed batch therefore cannot leave earlier sequences
+    // partially allocated.
     ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
     const std::uint32_t old_top =
         header->free_stack_top.load(std::memory_order_relaxed);
     if (total_required > old_top) {
