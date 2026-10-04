@@ -9301,9 +9301,17 @@ class BatchGenWorker:
 				local_payload_error = (
 					f"load candidate {uuid}: {type(exc).__name__}: {exc}"
 				)
+				continue
+			try:
+				pages_needed = seq.get_gpu_pages_for_two_page_buffer()
+			except Exception as exc:
+				local_payload_error = (
+					f"load candidate {uuid} page count: {type(exc).__name__}: {exc}"
+				)
+				continue
 			# Report this as a potential load candidate
 			local_candidate_state[uuid] = {
-				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
+				'pages_needed': pages_needed,
 				'assigned_rank': seq.assigned_rank,
 				'decode_dp_group': seq.decode_dp_group,  # Option 1 group-ownership key
 				'status': seq.status.name,  # Include status for debugging
@@ -9401,6 +9409,7 @@ class BatchGenWorker:
 			)
 
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
+		post_gather_errors = []
 		for uuid, state in global_seq_state.items():
 			if uuid not in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
@@ -9435,17 +9444,40 @@ class BatchGenWorker:
 						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
 							f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
 						seq.current_context_length = expected_ctx
-					seq.validate_metadata(
-						f"rank {self.rank} _page_boundary_fast/gathered_state",
-						require_owner_tensors=False,
-						allow_terminal_capacity_gap=bool(state.get('completed', False)),
-					)
+					try:
+						seq.validate_metadata(
+							f"rank {self.rank} _page_boundary_fast/gathered_state",
+							require_owner_tensors=False,
+							allow_terminal_capacity_gap=bool(state.get('completed', False)),
+						)
+					except Exception as exc:
+						post_gather_errors.append(
+							f"gathered {uuid}: {type(exc).__name__}: {exc}"
+						)
 			# The token pages are shared, but the QueryBook metadata is not.
 			# Repair every local mirror from the canonical owner state before
 			# Phase 4 can call begin_reentry_turn on all ranks.
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is not None:
-				self._sync_trajectory_metadata(seq, state)
+				try:
+					self._sync_trajectory_metadata(seq, state)
+				except Exception as exc:
+					post_gather_errors.append(
+						f"trajectory {uuid}: {type(exc).__name__}: {exc}"
+					)
+
+		post_gather_reports = [None] * self.world_size
+		dist.all_gather_object(post_gather_reports, post_gather_errors)
+		post_gather_failures = [
+			f"rank {rank_idx}: {error}"
+			for rank_idx, errors in enumerate(post_gather_reports)
+			for error in (errors or [])
+		]
+		if post_gather_failures:
+			raise RuntimeError(
+				"[SCHED_INVARIANT] gathered boundary state validation failed: "
+				+ " | ".join(post_gather_failures)
+			)
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
