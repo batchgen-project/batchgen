@@ -9827,14 +9827,22 @@ class BatchGenWorker:
 		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
 		extension_preflight_ok = True
 		if remaining_needing_ext:
-			local_extension_pages = sum(
-				self.global_batch.get_sequence(uuid).get_additional_gpu_pages_needed()
-				for uuid in my_remaining_ext
-			)
-			local_extension_free = (
-				gpu_manager.get_stats().num_free_pages
-				if gpu_manager is not None and gpu_manager.is_initialized else 0
-			)
+			try:
+				local_extension_pages = sum(
+					self.global_batch.get_sequence(uuid).get_additional_gpu_pages_needed()
+					for uuid in my_remaining_ext
+				)
+				local_extension_free = (
+					gpu_manager.get_stats().num_free_pages
+					if gpu_manager is not None and gpu_manager.is_initialized else 0
+				)
+			except Exception as exc:
+				logging.exception("Rank %s: boundary extension snapshot failed", self.rank)
+				self._collective_gpu_kv_allocation_preflight(1, 0)
+				raise RuntimeError(
+					f"[SCHED_INVARIANT] boundary extension snapshot failed: "
+					f"{type(exc).__name__}: {exc}"
+				)
 			extension_preflight_ok = self._collective_gpu_kv_allocation_preflight(
 				local_extension_pages, local_extension_free
 			)
@@ -9911,16 +9919,26 @@ class BatchGenWorker:
 				u for u in new_load_uuids
 				if self._owns_local_sequence(self.global_batch.get_sequence(u))
 			]
-			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
-			local_load_pages = sum(
-				self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-				.get_gpu_pages_for_two_page_buffer()
-				for local_idx in new_load_local
-			)
-			local_load_free = (
-				gpu_manager.get_stats().num_free_pages
-				if gpu_manager is not None and gpu_manager.is_initialized else 0
-			)
+			try:
+				new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
+				local_load_pages = sum(
+					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+					.get_gpu_pages_for_two_page_buffer()
+					for local_idx in new_load_local
+				)
+				local_load_free = (
+					gpu_manager.get_stats().num_free_pages
+					if gpu_manager is not None and gpu_manager.is_initialized else 0
+				)
+			except Exception as exc:
+				logging.exception("Rank %s: boundary load snapshot failed", self.rank)
+				# The failed rank still joins the preflight so peers cannot
+				# advance into allocation while this rank raises.
+				self._collective_gpu_kv_allocation_preflight(1, 0)
+				raise RuntimeError(
+					f"[SCHED_INVARIANT] boundary load snapshot failed: "
+					f"{type(exc).__name__}: {exc}"
+				)
 			load_preflight_ok = self._collective_gpu_kv_allocation_preflight(
 				local_load_pages, local_load_free
 			)
