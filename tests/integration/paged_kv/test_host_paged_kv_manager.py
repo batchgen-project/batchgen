@@ -161,6 +161,30 @@ def test_second_process_attaches_through_proc():
         del manager
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
+def test_prefill_batch_allocation_is_atomic_on_capacity_failure():
+    """An over-capacity wave must not consume an earlier sequence's pages."""
+    worker = bg.MLAHostPagedKVWorkerView(_make_tiny_mla_config(_random_shm_name()))
+    try:
+        worker.initialize(0, True)
+        worker.register_sequences([101, 102])
+        with pytest.raises(RuntimeError, match="Insufficient free pages.*prefill batch"):
+            worker.allocate_pages_for_sequences([(101, 12), (102, 12)])
+
+        stats = worker.get_stats()
+        assert stats.num_free_pages == stats.num_total_pages == 4
+
+        # The failed two-row transaction left both sequence IDs reusable.
+        allocations = worker.allocate_pages_for_sequences([(101, 12)])
+        assert [len(pages) for pages in allocations] == [3]
+    finally:
+        try:
+            worker.release_sequence_pages([101])
+            worker.unregister_sequences([101, 102])
+        finally:
+            del worker
+
+
 def _make_attach_config(creator_pid, memfd_fd) -> bg.HostPagedKVConfig:  # type: ignore
     """Worker-side config: same layout, plus the creator's memfd identity."""
     cfg = _make_deepseek_r1_config(_random_shm_name())

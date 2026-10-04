@@ -58,3 +58,30 @@
   extension/load shortfalls, total-page mismatch, row-cap admission, UUID
   alignment, and pre-broadcast validation order; 31 tests pass. `py_compile`,
   PR hygiene, and `git diff --check` pass.
+
+## 2026-10-04 — Prefill admission could publish status before host allocation
+
+- **Symptom.** Prefill selection used a host-KV snapshot, then marked rows
+  `IN_PREFILL` and entered phase configuration before the shared host allocator
+  accepted the reservation. A stale snapshot or a concurrent allocator could
+  raise after partial registration, leaving status or per-sequence host-page
+  metadata advanced without a committed allocation.
+- **Root cause.** Host capacity was checked as a local selection hint rather
+  than a collective transaction. The native batch allocator also acquired each
+  sequence independently, so an over-capacity wave could consume earlier rows
+  before failing on a later row.
+- **Fix.** `e7aa3697` — the prefill path now builds one shared reservation formula, gathers a
+  fresh per-node free-page snapshot and owner demand across all ranks, and
+  commits host-page metadata only after collective allocator success. Failed
+  peers release pages and unregister tentative rows before the scheduler leaves
+  candidates in `QUEUEING`/`EVICTED`. Native `AcquirePagesForSequences` now
+  checks aggregate demand under the shared allocation lock and rolls back its
+  metadata/free-stack mutation on unexpected failure. The batch allocator uses
+  the existing allocation-to-sequence mutex order so it cannot deadlock with
+  single-sequence allocation.
+- **Validation.** Local lifecycle guards and Python compilation pass. On the
+  authorized H200, the AOT core build passed; the worker/admission suite passed
+  27 tests; the CUDA-gated atomic-allocation regression passed in isolation;
+  and the combined focused transaction set passed 4 tests. An unrelated legacy
+  multiprocessing test still fails in its child with Python's
+  `RuntimeError: cudaSetDevice failed with error 3 (initialization error)`.

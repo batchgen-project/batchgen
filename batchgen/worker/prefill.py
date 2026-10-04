@@ -34,6 +34,44 @@ def host_kv_eviction_enabled(host_kv_chunk_size: int) -> bool:
 	return int(host_kv_chunk_size) > 0
 
 
+def compute_prefill_host_reservation(
+    *,
+    prompt_length: int,
+    kv_token_budget: int,
+    page_size: int,
+    chunk_size: int,
+    initial_gpu_page_buffer: int,
+) -> Tuple[int, int]:
+	"""Return ``(pages, rounded_tokens)`` for one prefill reservation.
+
+	The selector and the worker allocator must use the same reservation
+	formula.  Keeping the arithmetic here makes the capacity snapshot and the
+	actual allocation one contract instead of two copies that can drift.
+	"""
+	if prompt_length < 0:
+		raise ValueError("prompt_length must be >= 0")
+	if kv_token_budget <= 0:
+		raise ValueError("kv_token_budget must be > 0")
+	if page_size <= 0:
+		raise ValueError("page_size must be > 0")
+	if chunk_size < 0:
+		raise ValueError("chunk_size must be >= 0")
+	if initial_gpu_page_buffer < 0:
+		raise ValueError("initial_gpu_page_buffer must be >= 0")
+
+	post_prefill_length = prompt_length + 1
+	gpu_initial_pages = (
+		math.ceil(post_prefill_length / page_size) + initial_gpu_page_buffer
+	)
+	gpu_initial_tokens = gpu_initial_pages * page_size
+	capacity = min(
+		max(prompt_length + chunk_size, gpu_initial_tokens),
+		kv_token_budget,
+	)
+	pages = math.ceil(capacity / page_size)
+	return pages, pages * page_size
+
+
 @dataclass(frozen=True)
 class PrefillCandidate:
     """A sequence eligible for prefill admission (EVICTED or QUEUEING).
@@ -172,18 +210,14 @@ class PrefillScheduler:
                     f"candidate {c.uuid} has invalid host_kv_replication_factor="
                     f"{c.host_kv_replication_factor}"
                 )
-            post_prefill_length = c.prompt_length + 1
-            gpu_initial_pages = (
-                math.ceil(post_prefill_length / c.page_size)
-                + req.initial_gpu_page_buffer
+            req_pages, _ = compute_prefill_host_reservation(
+                prompt_length=c.prompt_length,
+                kv_token_budget=c.kv_token_budget,
+                page_size=c.page_size,
+                chunk_size=req.chunk_size,
+                initial_gpu_page_buffer=req.initial_gpu_page_buffer,
             )
-            gpu_initial_tokens = gpu_initial_pages * c.page_size
-            initial_capacity = max(c.prompt_length + req.chunk_size, gpu_initial_tokens)
-            initial_capacity = min(initial_capacity, c.kv_token_budget)
-            req_pages = (
-                math.ceil(initial_capacity / c.page_size)
-                * c.host_kv_replication_factor
-            )
+            req_pages *= c.host_kv_replication_factor
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
