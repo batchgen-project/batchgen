@@ -9856,7 +9856,7 @@ class BatchGenWorker:
 				# Owner: release GPU pages
 				ext_failed_local = self._get_local_indices_for_uuids(my_remaining_ext)
 				ext_failed_global = self._local_indices_to_global_seq_ids(ext_failed_local)
-				if ext_failed_global:
+				if ext_failed_global and gpu_manager is not None:
 					gpu_manager.free_pages_for_sequences(ext_failed_global)
 				for uuid in my_remaining_ext:
 					self._sequences_with_gpu_kv.discard(uuid)
