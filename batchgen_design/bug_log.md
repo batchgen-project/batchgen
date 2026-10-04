@@ -47,7 +47,7 @@
   or the existing decode-row count, Phase E filtered selected loads independently on
   each rank, and legacy modes still used a local free-page loop. Rank 0 also had no
   broadcasted error path for planner validation failures.
-- **Fix.** `b22b2786` validates total/free capacity on every rank before rank-0
+- **Fix.** `b049a941` validates total/free capacity on every rank before rank-0
   planning, applies TP-tightest capacity and the persistent row cap to boundary
   selection, preflights every extension/load collectively before allocator mutation,
   and broadcasts rank-0 planner errors. The entry UUID guard runs before pending-load
