@@ -1,8 +1,10 @@
+import ast
 from pathlib import Path
 
 import pytest
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.worker.prefill import compute_prefill_host_reservation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,23 +31,44 @@ def test_prefill_to_decode_metadata_sync_brackets_status_transition():
 
 
 def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
-    source = WORKER.read_text()
-    assert (
-        "seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)\n"
-        "\t\t\t\tseq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE"
-    ) in source
-
     seq = SequenceEntry("seq", global_idx=24, prompt_length=6087, max_decode_length=4096)
+    pages, rounded_capacity = compute_prefill_host_reservation(
+        prompt_length=seq.prompt_length,
+        kv_token_budget=seq.kv_token_budget,
+        page_size=seq.PAGE_SIZE,
+        chunk_size=0,
+        initial_gpu_page_buffer=0,
+    )
+    assert (pages, rounded_capacity) == (96, 96 * seq.PAGE_SIZE)
+
     seq.status = SequenceStatus.PREFILLED
     seq.assigned_rank = 1
-    seq.host_pages_allocated = 96
+    seq.host_pages_allocated = pages
     seq.host_token_capacity = 6087
 
     with pytest.raises(RuntimeError, match="host_token_capacity=6087"):
         seq.validate_metadata("unit")
 
-    seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
+    seq.host_token_capacity = rounded_capacity
     seq.validate_metadata("unit")
+
+
+def test_worker_prefill_plan_delegates_page_rounding_to_shared_helper():
+    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
+    method = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        for node in node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_prefill_host_reservation_plan"
+    )
+    assert any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "compute_prefill_host_reservation"
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+    )
 
 
 def test_terminal_decode_boundary_allows_only_the_final_capacity_gap():
