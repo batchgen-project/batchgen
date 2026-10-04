@@ -70,13 +70,18 @@
   than a collective transaction. The native batch allocator also acquired each
   sequence independently, so an over-capacity wave could consume earlier rows
   before failing on a later row.
-- **Fix.** The prefill path now builds one shared reservation formula, gathers a
+- **Fix.** `e7aa3697` — the prefill path now builds one shared reservation formula, gathers a
   fresh per-node free-page snapshot and owner demand across all ranks, and
   commits host-page metadata only after collective allocator success. Failed
   peers release pages and unregister tentative rows before the scheduler leaves
   candidates in `QUEUEING`/`EVICTED`. Native `AcquirePagesForSequences` now
   checks aggregate demand under the shared allocation lock and rolls back its
-  metadata/free-stack mutation on unexpected failure.
-- **Validation.** Focused lifecycle guards pass; changed Python files compile;
-  the native integration regression is CUDA-gated and requires the Linux CUDA
-  extension environment.
+  metadata/free-stack mutation on unexpected failure. The batch allocator uses
+  the existing allocation-to-sequence mutex order so it cannot deadlock with
+  single-sequence allocation.
+- **Validation.** Local lifecycle guards and Python compilation pass. On the
+  authorized H200, the AOT core build passed; the worker/admission suite passed
+  27 tests; the CUDA-gated atomic-allocation regression passed in isolation;
+  and the combined focused transaction set passed 4 tests. An unrelated legacy
+  multiprocessing test still fails in its child with Python's
+  `RuntimeError: cudaSetDevice failed with error 3 (initialization error)`.
