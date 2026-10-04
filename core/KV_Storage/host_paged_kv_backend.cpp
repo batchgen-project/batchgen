@@ -216,6 +216,9 @@ struct HostPagedKVBackend::SharedState {
     void Initialize(bool create_region);
     std::vector<std::int32_t> AcquirePages(std::int64_t sequence_id,
                                            std::size_t num_pages);
+    std::vector<std::vector<std::int32_t>> AcquirePagesForSequences(
+        const std::vector<std::int64_t>& sequence_ids,
+        const std::vector<std::size_t>& num_tokens);
     void ReleaseSequence(std::int64_t sequence_id);
     std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
                                                  std::size_t num_pages);
@@ -649,6 +652,148 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
     return pages;
 }
 
+std::vector<std::vector<std::int32_t>>
+HostPagedKVBackend::SharedState::AcquirePagesForSequences(
+    const std::vector<std::int64_t>& sequence_ids,
+    const std::vector<std::size_t>& num_tokens) {
+    if (sequence_ids.size() != num_tokens.size()) {
+        throw std::invalid_argument(
+            "sequence_ids and num_tokens must have the same length");
+    }
+    if (sequence_ids.empty()) {
+        return {};
+    }
+
+    std::vector<std::size_t> required_pages;
+    required_pages.reserve(num_tokens.size());
+    std::size_t total_required = 0;
+    for (std::size_t i = 0; i < num_tokens.size(); ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (sequence_ids[j] == sequence_ids[i]) {
+                throw std::invalid_argument(
+                    "duplicate sequence id in prefill batch: " +
+                    std::to_string(sequence_ids[i]));
+            }
+        }
+        if (num_tokens[i] == 0) {
+            throw std::invalid_argument(
+                "num_tokens must be greater than zero for sequence " +
+                std::to_string(sequence_ids[i]));
+        }
+        const std::size_t pages =
+            (num_tokens[i] + config.page_size_tokens - 1) /
+            config.page_size_tokens;
+        if (total_required > std::numeric_limits<std::size_t>::max() - pages) {
+            throw std::overflow_error(
+                "host KV prefill page request exceeds size_t capacity");
+        }
+        required_pages.push_back(pages);
+        total_required += pages;
+    }
+    if (total_required > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error(
+            "host KV prefill page request exceeds shared counter capacity");
+    }
+
+    std::vector<std::vector<std::int32_t>> allocations(sequence_ids.size());
+    for (std::size_t i = 0; i < allocations.size(); ++i) {
+        allocations[i].resize(required_pages[i]);
+    }
+
+    // Hold the sequence lock while reserving from the free stack.  Existing
+    // single-sequence operations never hold both locks at once, so this lock
+    // order cannot deadlock with release or growth.  The aggregate free-page
+    // check is performed before any page is removed: a failed batch therefore
+    // cannot leave earlier sequences partially allocated.
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    const std::uint32_t old_top =
+        header->free_stack_top.load(std::memory_order_relaxed);
+    if (total_required > old_top) {
+        throw std::runtime_error(
+            "Insufficient free pages available for prefill batch "
+            "(requested=" + std::to_string(total_required) +
+            ", available=" + std::to_string(old_top) + ")");
+    }
+
+    std::size_t offset = 0;
+    const std::uint32_t new_top =
+        old_top - static_cast<std::uint32_t>(total_required);
+    for (std::size_t i = 0; i < allocations.size(); ++i) {
+        for (std::size_t j = 0; j < required_pages[i]; ++j) {
+            allocations[i][j] = free_stack[new_top + offset++];
+        }
+    }
+    header->free_stack_top.store(new_top, std::memory_order_relaxed);
+
+    std::vector<SequenceEntry*> entries;
+    std::vector<SequenceEntry> previous_entries;
+    std::vector<bool> newly_inserted;
+    std::vector<std::int32_t> previous_tail_links;
+    entries.reserve(sequence_ids.size());
+    previous_entries.reserve(sequence_ids.size());
+    newly_inserted.reserve(sequence_ids.size());
+    previous_tail_links.reserve(sequence_ids.size());
+    try {
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            bool is_new = false;
+            SequenceEntry* entry =
+                FindOrInsertSequenceEntryLocked(sequence_ids[i], &is_new);
+            entries.push_back(entry);
+            previous_entries.push_back(*entry);
+            newly_inserted.push_back(is_new);
+            previous_tail_links.push_back(
+                entry->tail_page == kInvalidPageIndex
+                    ? kInvalidPageIndex
+                    : page_links[entry->tail_page]);
+            for (std::int32_t page : allocations[i]) {
+                page_owners[page] = sequence_ids[i];
+                page_links[page] = kInvalidPageIndex;
+                if (entry->head_page == kInvalidPageIndex) {
+                    entry->head_page = page;
+                    entry->tail_page = page;
+                } else {
+                    page_links[entry->tail_page] = page;
+                    entry->tail_page = page;
+                }
+                ++entry->num_pages;
+            }
+            if (is_new) {
+                header->active_sequences.fetch_add(1,
+                                                   std::memory_order_relaxed);
+            }
+        }
+    } catch (...) {
+        // Restore sequence metadata and the free stack so a table-full or
+        // shared-memory error cannot strand a partially allocated wave.
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (newly_inserted[i]) {
+                entries[i]->sequence_id = kTombstoneSequenceId;
+                entries[i]->num_pages = 0;
+                entries[i]->head_page = kInvalidPageIndex;
+                entries[i]->tail_page = kInvalidPageIndex;
+                header->active_sequences.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+            } else {
+                if (previous_entries[i].tail_page != kInvalidPageIndex) {
+                    page_links[previous_entries[i].tail_page] =
+                        previous_tail_links[i];
+                }
+                *entries[i] = previous_entries[i];
+            }
+        }
+        for (const auto& pages : allocations) {
+            for (std::int32_t page : pages) {
+                page_owners[page] = kEmptySequenceId;
+                page_links[page] = kInvalidPageIndex;
+            }
+        }
+        header->free_stack_top.store(old_top, std::memory_order_relaxed);
+        throw;
+    }
+    return allocations;
+}
+
 void HostPagedKVBackend::SharedState::ReleaseSequence(
     std::int64_t sequence_id) {
     std::vector<std::int32_t> pages;
@@ -822,53 +967,7 @@ std::vector<std::vector<std::int32_t>>
 HostPagedKVBackend::AcquirePagesForSequences(
     const std::vector<std::int64_t>& sequence_ids,
     const std::vector<std::size_t>& num_tokens) {
-    if (sequence_ids.size() != num_tokens.size()) {
-        throw std::invalid_argument(
-            "sequence_ids and num_tokens must have the same length");
-    }
-    if (sequence_ids.empty()) {
-        return {};
-    }
-
-    auto allocate_one = [this](std::int64_t sequence_id,
-                               std::size_t num_tokens_value) {
-        if (num_tokens_value == 0) {
-            throw std::invalid_argument(
-                "num_tokens must be greater than zero for sequence " +
-                std::to_string(sequence_id));
-        }
-        const std::size_t required_pages =
-            (num_tokens_value + config_.page_size_tokens - 1) /
-            config_.page_size_tokens;
-        return state_->AcquirePages(sequence_id, required_pages);
-    };
-
-    if (sequence_ids.size() == 1 || SafeHardwareConcurrency() == 1) {
-        std::vector<std::vector<std::int32_t>> allocations;
-        allocations.reserve(sequence_ids.size());
-        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-            allocations.emplace_back(
-                allocate_one(sequence_ids[i], num_tokens[i]));
-        }
-        return allocations;
-    }
-
-    std::vector<std::future<std::vector<std::int32_t>>> futures;
-    futures.reserve(sequence_ids.size());
-    for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-        const std::int64_t sequence_id = sequence_ids[i];
-        const std::size_t tokens = num_tokens[i];
-        futures.emplace_back(std::async(std::launch::async, [=]() {
-            return allocate_one(sequence_id, tokens);
-        }));
-    }
-
-    std::vector<std::vector<std::int32_t>> allocations;
-    allocations.reserve(futures.size());
-    for (auto& future : futures) {
-        allocations.emplace_back(future.get());
-    }
-    return allocations;
+    return state_->AcquirePagesForSequences(sequence_ids, num_tokens);
 }
 
 void HostPagedKVBackend::ReleaseSequence(std::int64_t sequence_id) {

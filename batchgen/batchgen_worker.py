@@ -151,6 +151,7 @@ from batchgen.worker.prefill import (
 	PrefillCandidate,
 	PrefillScheduler,
 	PrefillSelectionRequest,
+	compute_prefill_host_reservation,
 	host_kv_eviction_enabled,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
@@ -5115,6 +5116,204 @@ class BatchGenWorker:
 		dist.all_reduce(flag, op=dist.ReduceOp.MAX)
 		return bool(int(flag.item()))
 
+	def _prefill_host_reservation_plan(
+		self, prefill_uuids: List[str]
+	) -> Tuple[Dict[str, Tuple[int, int]], List[Tuple[str, int]]]:
+		"""Build the immutable host reservation plan for a prefill wave.
+
+		The selector and allocator share this exact page formula.  The returned
+		owner list contains one entry per physical host-KV allocation: the host
+		pool is node-shared, so TP replicas must not allocate the same sequence
+		more than once.
+		"""
+		chunk_size = self._get_effective_chunk_size()
+		reservations: Dict[str, Tuple[int, int]] = {}
+		owner_requests: List[Tuple[str, int]] = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: prefill reservation references unknown {uuid}"
+				)
+			pages, tokens = compute_prefill_host_reservation(
+				prompt_length=seq.prompt_length,
+				kv_token_budget=seq.kv_token_budget,
+				page_size=seq.PAGE_SIZE,
+				chunk_size=chunk_size,
+				initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+			)
+			reservations[uuid] = (pages, tokens)
+			if self._owns_host_kv(seq):
+				owner_requests.append((uuid, tokens))
+		return reservations, owner_requests
+
+	def _collective_prefill_host_capacity_ok(
+		self, owner_requests: List[Tuple[str, int]]
+	) -> bool:
+		"""Check a fresh per-node host-KV snapshot before any mutation.
+
+		Every rank reports its owner demand.  Only the node leader reports the
+		shared allocator's free/total pages; summing demands across ranks and
+		comparing against that one live snapshot prevents one rank from making a
+		decision from stale local state.  The final MIN reduction makes the
+		decision explicit even when a rank's stats call fails.
+		"""
+		local_need = sum(
+			math.ceil(int(tokens) / self.PAGE_SIZE)
+			for _, tokens in owner_requests
+		)
+		node_id = self.rank // self.local_world_size
+		local_free = -1
+		local_total = -1
+		snapshot_error = 0
+		host_view = getattr(self, "host_paged_kv_worker_view", None)
+		if host_view is None:
+			host_view = getattr(
+				getattr(self, "core_engine", None),
+				"host_paged_kv_worker_view",
+				None,
+			)
+		if self.local_rank == 0:
+			try:
+				stats = host_view.get_stats()
+				local_free = int(stats.num_free_pages)
+				local_total = int(stats.num_total_pages)
+			except Exception:
+				snapshot_error = 1
+				logging.exception(
+					"Rank %s: host-KV prefill capacity snapshot failed", self.rank
+				)
+
+		report = torch.tensor(
+			[node_id, local_need, local_free, local_total, snapshot_error],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		if self.world_size == 1:
+			if snapshot_error:
+				return False
+			return 0 <= local_need <= local_free and local_need <= local_total
+		if not dist.is_initialized():
+			raise RuntimeError(
+				"distributed process group is required for host-KV prefill admission"
+			)
+		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
+		dist.all_gather(gathered, report)
+
+		node_needs: Dict[int, int] = {}
+		node_capacity: Dict[int, Tuple[int, int]] = {}
+		ok = True
+		for item in gathered:
+			reported_node = int(item[0].item())
+			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
+				item[1].item()
+			)
+			if int(item[4].item()) != 0:
+				ok = False
+			if int(item[2].item()) >= 0:
+				capacity = (int(item[2].item()), int(item[3].item()))
+				previous = node_capacity.get(reported_node)
+				if previous is not None and previous != capacity:
+					ok = False
+				node_capacity[reported_node] = capacity
+		for node, needed in node_needs.items():
+			free_total = node_capacity.get(node)
+			if free_total is None:
+				ok = False
+				continue
+			free_pages, total_pages = free_total
+			if needed < 0 or needed > free_pages or needed > total_pages:
+				ok = False
+
+		decision = torch.tensor(
+			[1 if ok else 0], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
+		return bool(int(decision.item()))
+
+	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
+		"""Atomically reserve host pages before IN_PREFILL is published.
+
+		Selection is only a snapshot.  This second, immediate snapshot catches a
+		capacity change before status, trajectory metadata, or local QueryBook
+		bindings are mutated.  Allocator exceptions are converted into a
+		collective failure and successful peers release their tentative pages.
+		"""
+		reservations, owner_requests = self._prefill_host_reservation_plan(
+			prefill_uuids
+		)
+		if not self._collective_prefill_host_capacity_ok(owner_requests):
+			if self.rank == 0:
+				logging.warning(
+					"[PREFILL] Host KV admission rejected by fresh capacity snapshot; "
+					"leaving candidates queueing/evicted"
+				)
+			return False
+
+		host_view = getattr(self, "host_paged_kv_worker_view", None)
+		if host_view is None:
+			host_view = getattr(
+				getattr(self, "core_engine", None),
+				"host_paged_kv_worker_view",
+				None,
+			)
+		global_ids = [
+			self.global_batch.get_sequence(uuid).global_idx
+			for uuid, _ in owner_requests
+		]
+		allocation_requests = [
+			(self.global_batch.get_sequence(uuid).global_idx, tokens)
+			for uuid, tokens in owner_requests
+		]
+		local_success = True
+		registered = bool(owner_requests)
+		try:
+			if owner_requests:
+				host_view.register_sequences(global_ids)
+				host_view.allocate_pages_for_sequences(allocation_requests)
+		except Exception:
+			local_success = False
+			logging.exception(
+				"Rank %s: host-KV prefill allocation failed after collective preflight",
+				self.rank,
+			)
+
+		if self.world_size > 1:
+			allocation = torch.tensor(
+				[1 if local_success else 0],
+				dtype=torch.int32,
+				device=self.torch_device,
+			)
+			dist.all_reduce(allocation, op=dist.ReduceOp.MIN)
+			all_success = bool(int(allocation.item()))
+		else:
+			all_success = local_success
+
+		if not all_success:
+			if registered:
+				try:
+					host_view.release_sequence_pages(global_ids)
+				except Exception:
+					logging.exception(
+						"Rank %s: failed to rollback host-KV prefill pages",
+						self.rank,
+					)
+				try:
+					host_view.unregister_sequences(global_ids)
+				except Exception:
+					logging.exception(
+						"Rank %s: failed to rollback host-KV prefill registrations",
+						self.rank,
+					)
+			return False
+
+		# Commit scalar reservation metadata only after every allocator agrees.
+		for uuid, (pages, tokens) in reservations.items():
+			seq = self.global_batch.get_sequence(uuid)
+			seq.host_pages_allocated = pages
+			seq.host_token_capacity = tokens
+		return True
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on HOST KV cache capacity.
@@ -6660,6 +6859,11 @@ class BatchGenWorker:
 						)
 
 				prefill_uuids = self._prepare_prefill_batch()
+				if prefill_uuids and not self._reserve_prefill_host_kv(prefill_uuids):
+					# The fresh capacity transaction rejected the snapshot.  Keep
+					# QUEUEING/EVICTED state untouched and retry on a later scheduler
+					# iteration after the live pool has changed.
+					prefill_uuids = []
 				
 				if prefill_uuids:
 					if self.rank == 0:
@@ -7576,12 +7780,9 @@ class BatchGenWorker:
 		# the group predicate below binds them on all G ranks. No-op for G==1.
 		self._assign_decode_dp_groups(prefill_uuids)
 
-		# STEP 4: Allocate host KV pages for sequences this rank serves.
-		# Ownership: G==1 -> the single assigned_rank; G>1 (Option 1) -> ALL G
-		# ranks of the sequence's serve-group, so the group holds the sequence's
-		# replicated MLA KV and head-sharded KDA state from prefill onward.
-		# Check by _owns_local_sequence, NOT _uuid_to_local_map (which may not
-		# have new sequences yet).
+		# STEP 4: Bind local rows for sequences this rank serves.  Host-KV pages
+		# were reserved and committed before IN_PREFILL was published, so this
+		# phase must not perform another allocator mutation.
 		my_prefill_uuids = []
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
@@ -7594,77 +7795,10 @@ class BatchGenWorker:
 						f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
 						f"(local_idx={new_local_idx})"
 					)
-
-		if my_prefill_uuids:
-			global_sequence_ids = []
-			sequence_tokens = []
-			chunk_size = self._get_effective_chunk_size()
-
-			# Every local replica needs the same scalar reservation metadata, but
-			# the host-KV page table is shared per node.  Only its single owner
-			# performs register/allocate; G>1 replicas must never duplicate pages.
-			host_prefill_uuids = []
-			for uuid in my_prefill_uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				# Dynamic reservation: allocate prompt + effective chunk, not the
-				# full budget.  The effective chunk includes one decode decision
-				# interval, so the next boundary can plan growth safely.
-				from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
-				post_prefill_length = seq.prompt_length + 1
-				gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-				initial_capacity = min(initial_capacity, seq.kv_token_budget)
-				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
-				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
-				if self._owns_host_kv(seq):
-					host_prefill_uuids.append(uuid)
-					global_sequence_ids.append(seq.global_idx)
-					sequence_tokens.append(seq.host_token_capacity)
-
-			# Safety assertion: log if selection over-admitted. This should not
-			# happen after the EVICTED-length fix in _prepare_prefill_batch —
-			# if it fires, there's another selection bug to investigate.
-			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
-			total_pages_needed = sum(math.ceil(t / seq.PAGE_SIZE) for t in sequence_tokens)
-			if total_pages_needed > kv_stats.num_free_pages:
-				# Log per-sequence breakdown to help diagnose the selection bug.
-				seq_details = []
-				for gid, tokens in list(zip(global_sequence_ids, sequence_tokens))[:10]:
-					s = self.global_batch.get_sequence(
-						next(u for u in my_prefill_uuids if self.global_batch.get_sequence(u).global_idx == gid)
-					)
-					seq_details.append(
-						f"gid={gid} prompt_len={s.prompt_length} "
-						f"was_evicted={s.total_decoded_before_eviction > 0} "
-						f"tokens={tokens}"
-					)
-				logging.error(
-					f"Rank {self.rank}: Host KV OVER-ADMISSION: need {total_pages_needed} pages, "
-					f"have {kv_stats.num_free_pages}. Selection should have prevented this. "
-					f"First 10 seqs: {seq_details}"
-				)
-
+		if self.rank == 0:
 			logging.debug(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
-				f"(chunk_size={chunk_size})"
+				"[PREFILL] Host KV reservation already committed before phase config"
 			)
-
-			if host_prefill_uuids:
-				host_view = getattr(self, "host_paged_kv_worker_view", None)
-				if host_view is None:
-					host_view = self.core_engine.host_paged_kv_worker_view
-				host_view.register_sequences(global_sequence_ids)
-				host_view.allocate_pages_for_sequences(
-					list(zip(global_sequence_ids, sequence_tokens))
-				)
-
-			kv_stats = getattr(self, "host_paged_kv_worker_view", None)
-			if kv_stats is None:
-				kv_stats = self.core_engine.host_paged_kv_worker_view
-			kv_stats = kv_stats.get_stats()
-			if self.rank == 0:
-				logging.info(f"[PREFILL] Host KV allocated: {kv_stats.num_used_pages}/{kv_stats.num_total_pages} pages")
 
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
