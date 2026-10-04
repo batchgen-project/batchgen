@@ -321,7 +321,7 @@ def test_loading_excludes_completed_and_onhold():
 
 def test_tp_loading_uses_group_capacity_and_not_assigned_rank():
     state = {
-        "active": _state(assigned_rank=1),
+        "active": _state(assigned_rank=1, decode_dp_group=0),
     }
     candidates = {
         # Both candidates are in group 0.  A rank-based planner would admit
