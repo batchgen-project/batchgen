@@ -219,8 +219,12 @@ def test_tp_new_load_rejects_one_rank_group_shortfall():
 
 def test_boundary_capacity_validation_precedes_rank0_broadcast():
     source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
-    snapshot_check = source.index("reduce_decode_capacity_snapshot(\n\t\t\ttuple(per_rank_total)")
-    rank0_planner = source.index("if self.rank == 0:\n\t\t\ttry:\n\t\t\t\tdecisions = self._compute_boundary_decisions")
+    boundary_source = source[source.index("def _page_boundary_fast"):]
+    uuid_guard = boundary_source.index("all_gather_object(all_decode_sets")
+    empty_return = boundary_source.index("if not decode_uuids:")
+    snapshot_check = boundary_source.index("reduce_decode_capacity_snapshot(\n\t\t\ttuple(per_rank_total)")
+    rank0_planner = boundary_source.index("if self.rank == 0:\n\t\t\ttry:\n\t\t\t\tdecisions = self._compute_boundary_decisions")
+    assert uuid_guard < empty_return
     assert snapshot_check < rank0_planner
 
 
