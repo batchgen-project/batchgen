@@ -163,6 +163,8 @@ from batchgen.worker.decode import (
 	DecodeBatchRequest,
 	DecodeCandidate,
 	DecodeScheduler,
+	DecodeCapacitySnapshot,
+	reduce_decode_capacity_snapshot,
 	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
@@ -2424,10 +2426,28 @@ class BatchGenWorker:
 			tokens.append(pages * self.PAGE_SIZE)
 		return tokens
 
+	def _collective_gpu_kv_allocation_preflight(
+		self, required_pages: int, free_pages: int
+	) -> bool:
+		"""Require every rank to approve a GPU-KV allocation before mutation."""
+		local_can_allocate = int(required_pages >= 0 and required_pages <= free_pages)
+		if self.world_size == 1:
+			return bool(local_can_allocate)
+		if not dist.is_initialized():
+			raise RuntimeError(
+				"distributed process group is required for GPU-KV allocation preflight"
+			)
+		can_allocate = torch.tensor(
+			[local_can_allocate], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(can_allocate, op=dist.ReduceOp.MIN)
+		return bool(int(can_allocate.item()))
+
 	def _allocate_gpu_kv_two_page_buffer(
 		self, 
 		local_sequence_ids: List[int],
-		load_from_host: bool = True
+		load_from_host: bool = True,
+		collective_preflight: bool = False,
 	) -> bool:
 		"""
 		Allocate GPU KV pages using two-page buffer strategy.
@@ -2435,12 +2455,21 @@ class BatchGenWorker:
 		Returns:
 			True if allocation succeeded, False otherwise.
 		"""
-		if not local_sequence_ids:
-			return True
-		
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
+			if collective_preflight:
+				return self._collective_gpu_kv_allocation_preflight(0, 0)
 			return False
+		if not manager.is_initialized:
+			if collective_preflight:
+				return self._collective_gpu_kv_allocation_preflight(0, 0)
+			return False
+		if not local_sequence_ids:
+			if collective_preflight:
+				return self._collective_gpu_kv_allocation_preflight(
+					0, manager.get_stats().num_free_pages
+				)
+			return True
 		
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
 		
@@ -2473,7 +2502,16 @@ class BatchGenWorker:
 			)
 
 		free_pages = manager.get_stats().num_free_pages
-		if total_pages > free_pages:
+		if collective_preflight:
+			if not self._collective_gpu_kv_allocation_preflight(
+				total_pages, free_pages
+			):
+				logging.warning(
+					f"Rank {self.rank}: collective GPU KV allocation preflight failed "
+					f"(need {total_pages}, local free {free_pages})"
+				)
+				return False
+		elif total_pages > free_pages:
 			logging.error(
 				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
 				f"only {free_pages} free"
@@ -5427,10 +5465,45 @@ class BatchGenWorker:
 		# Synchronize state across all ranks
 		dist.barrier()
 
+	def _snapshot_decode_capacity(self) -> DecodeCapacitySnapshot:
+		"""Collect the live GPU-KV capacity before decode admission.
+
+		Total pages are immutable after initialization and must match on every
+		rank.  Free pages are dynamic; the pure reducer takes the tightest rank
+		in each replicated attention group so the admission plan is safe for all
+		ranks that will allocate the selected sequence.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not manager.is_initialized:
+			raise RuntimeError(
+				"GPU KV manager must be initialized before taking a decode capacity snapshot"
+			)
+		stats = manager.get_stats()
+		local = torch.tensor(
+			[int(stats.num_total_pages), int(stats.num_free_pages)],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		if self.world_size == 1:
+			rank_stats = [local]
+		else:
+			if not dist.is_initialized():
+				raise RuntimeError(
+					"distributed process group is required for a multi-rank decode capacity snapshot"
+				)
+			rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
+			dist.all_gather(rank_stats, local)
+		return reduce_decode_capacity_snapshot(
+			tuple(int(item[0].item()) for item in rank_stats),
+			tuple(int(item[1].item()) for item in rank_stats),
+			world_size=self.world_size,
+			attn_tp_size=self._decode_attn_tp_size(),
+		)
+
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
 		Select sequences for decode phase from PREFILLED sequences.
-		Greedily fill GPU KV cache to ~90% capacity.
+		Greedily fill the current physical GPU-KV free capacity.
 		"""
 		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
@@ -5439,23 +5512,17 @@ class BatchGenWorker:
 		all_candidates = prefilled_uuids + onhold_uuids
 		all_candidates.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
 		
-  
+		# Get a collective live capacity snapshot.  The old implementation used
+		# only one rank's total_pages and a metadata-derived resident count, which
+		# could admit against stale state or strand a candidate at the 90% guard.
+		capacity = self._snapshot_decode_capacity()
 		if not all_candidates:
 			return []
-		
-		# Get GPU page capacity - GPU KV manager must be initialized before batch selection
-		# (model loading and GPU KV init happen in generate() BEFORE this call)
-		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
-			raise RuntimeError(
-				"GPU KV manager must be initialized before _prepare_decode_batch(). "
-				"Ensure _load_decode_model() and _init_gpu_kv_with_actual_size() are called first."
-			)
-		total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 
-		# Greedy per-rank 90%-watermark fill. The candidate enumeration above
-		# and the logging below stay here; the selection is delegated.
+		# Candidate enumeration and logging stay here; pure physical-capacity
+		# selection is delegated.
 		decode_batch = DecodeScheduler.select_decode_batch(
-			self._make_decode_batch_request(all_candidates, total_pages)
+			self._make_decode_batch_request(all_candidates, capacity)
 		)
 
 		if self.rank == 0:
@@ -5466,12 +5533,13 @@ class BatchGenWorker:
 		return decode_batch
 
 	def _make_decode_batch_request(
-		self, all_candidates: List[str], total_pages: int,
+		self, all_candidates: List[str], capacity: DecodeCapacitySnapshot,
 	) -> DecodeBatchRequest:
 		"""Snapshot the candidate metadata `select_decode_batch` consumes."""
 		attn_tp_size = self._decode_attn_tp_size()
 		num_capacity_groups = self.world_size // attn_tp_size
 		existing_pages = [0] * num_capacity_groups
+		existing_sequence_counts = [0] * num_capacity_groups
 		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
 			seq = self.global_batch.get_sequence(uuid)
 			if attn_tp_size > 1:
@@ -5488,6 +5556,7 @@ class BatchGenWorker:
 					f"sequence {uuid[:8]} has invalid decode capacity group {r}"
 				)
 			existing_pages[r] += max(0, seq.gpu_pages_allocated)
+			existing_sequence_counts[r] += 1
 
 		candidates = []
 		for uuid in all_candidates:
@@ -5501,11 +5570,13 @@ class BatchGenWorker:
 			))
 		return DecodeBatchRequest(
 			candidates=tuple(candidates),
-			total_pages=total_pages,
+			total_pages=capacity.total_pages,
 			world_size=self.world_size,
 			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
 			attn_tp_size=attn_tp_size,
 			existing_pages=tuple(existing_pages),
+			free_pages=capacity.free_pages,
+			existing_sequence_counts=tuple(existing_sequence_counts),
 		)
 
 	def _check_and_handle_completions(
@@ -7995,25 +8066,30 @@ class BatchGenWorker:
 		)
 
 		# Allocate GPU KV for sequences
-		if local_decode_indices:
-			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			if alloc_ok:
-				# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
-				# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
-				# Keep these for safety / idempotence.
-				for local_idx in local_decode_indices:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					# Mark initial reservation done
-					seq.mark_initial_gpu_reservation_done()
-					self._sequences_with_gpu_kv.add(uuid)
-			else:
-				raise RuntimeError(
-					f"Rank {self.rank}: GPU KV allocation failed for "
-					f"{len(local_decode_indices)} locally owned sequences; "
-					"decode admission exceeded the available replica capacity"
-				)
+		# Every rank participates, including ranks with no locally owned rows, so
+		# one rank cannot mutate its allocator after another rank reports failure.
+		alloc_ok = self._allocate_gpu_kv_two_page_buffer(
+			local_decode_indices,
+			load_from_host=True,
+			collective_preflight=True,
+		)
+		if alloc_ok:
+			# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
+			# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
+			# Keep these for safety / idempotence.
+			for local_idx in local_decode_indices:
+				uuid = self._local_to_uuid_map[local_idx]
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+				# Mark initial reservation done
+				seq.mark_initial_gpu_reservation_done()
+				self._sequences_with_gpu_kv.add(uuid)
+		else:
+			raise RuntimeError(
+				f"Rank {self.rank}: collective GPU KV allocation preflight failed for "
+				f"{len(local_decode_indices)} locally owned sequences; "
+				"decode admission exceeded the available replica capacity"
+			)
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
