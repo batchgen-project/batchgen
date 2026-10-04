@@ -5314,6 +5314,102 @@ class BatchGenWorker:
 			seq.host_token_capacity = tokens
 		return True
 
+	def _collective_host_kv_growth_capacity_ok(
+		self,
+		host_grow_requests: List[Tuple[int, int]],
+		worker_view: Optional[object] = None,
+	) -> bool:
+		"""Preflight one boundary's shared host-KV growth transaction.
+
+		The boundary planner runs from a gathered snapshot taken before completed
+		and evicted rows release their pages.  That snapshot is intentionally
+		pure, but it cannot prove that the shared allocator still has the pages
+		when Phase 4.C executes.  Every rank therefore reports its owner demand;
+		only one rank per node reports the node-shared allocator's fresh free/total
+		counts.  The all-rank MIN makes the decision identical before any view is
+		mutated.
+
+		The second all-rank consensus is performed by the caller after the local
+		allocator call.  A post-preflight allocator failure is fatal: the native
+		worker-view API has no page-level rollback for a successful peer, and
+		continuing would make scalar metadata and shared page tables disagree.
+		"""
+		local_need = sum(int(pages) for _, pages in host_grow_requests)
+		node_id = self.rank // self.local_world_size
+		local_free = -1
+		local_total = -1
+		snapshot_error = 0
+		if worker_view is None:
+			worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			worker_view = getattr(
+				getattr(self, "core_engine", None),
+				"host_paged_kv_worker_view",
+				None,
+			)
+		# The host region is shared by all ranks on a node.  Use the local
+		# representative for the snapshot, matching _gather_host_kv_stats_by_node
+		# and _collective_prefill_host_capacity_ok.
+		if self.local_rank == 0:
+			try:
+				if worker_view is None:
+					raise RuntimeError("host-KV worker view is unavailable")
+				stats = worker_view.get_stats()
+				local_free = int(stats.num_free_pages)
+				local_total = int(stats.num_total_pages)
+			except Exception:
+				snapshot_error = 1
+				logging.exception(
+					"Rank %s: host-KV boundary growth snapshot failed", self.rank
+				)
+
+		report = torch.tensor(
+			[node_id, local_need, local_free, local_total, snapshot_error],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		if self.world_size == 1:
+			if snapshot_error:
+				return False
+			return 0 <= local_need <= local_free and local_need <= local_total
+		if not dist.is_initialized():
+			raise RuntimeError(
+				"distributed process group is required for host-KV growth preflight"
+			)
+		gathered = [torch.zeros_like(report) for _ in range(self.world_size)]
+		dist.all_gather(gathered, report)
+
+		node_needs: Dict[int, int] = {}
+		node_capacity: Dict[int, Tuple[int, int]] = {}
+		ok = True
+		for item in gathered:
+			reported_node = int(item[0].item())
+			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
+				item[1].item()
+			)
+			if int(item[4].item()) != 0:
+				ok = False
+			if int(item[2].item()) >= 0:
+				capacity = (int(item[2].item()), int(item[3].item()))
+				previous = node_capacity.get(reported_node)
+				if previous is not None and previous != capacity:
+					ok = False
+				node_capacity[reported_node] = capacity
+		for node, needed in node_needs.items():
+			capacity = node_capacity.get(node)
+			if capacity is None:
+				ok = False
+				continue
+			free_pages, total_pages = capacity
+			if needed < 0 or needed > free_pages or needed > total_pages:
+				ok = False
+
+		decision = torch.tensor(
+			[1 if ok else 0], dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
+		return bool(int(decision.item()))
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on HOST KV cache capacity.
@@ -9879,20 +9975,64 @@ class BatchGenWorker:
 		# growth-debt-aware plan computed on rank 0.
 		if decisions.growth_feasible and decisions.host_growth_uuids:
 			host_grow_requests = []
+			growth_entries = []
 			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
-				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
-				# This keeps host_pages_allocated consistent across ranks, which is
-				# critical for deterministic migration planning in _plan_kv_migration().
 				seq = self.global_batch.get_sequence(uuid)
-				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-				seq.host_pages_allocated += growth_pages
+				growth_entries.append((uuid, growth_pages, seq))
 				# Host KV is one shared region per node.  G>1 ranks replicate
 				# GPU/KDA state, but only the host-KV owner may mutate its page table.
 				if self._owns_host_kv(seq):
 					host_grow_requests.append((seq.global_idx, growth_pages))
 
-			if host_grow_requests and worker_view is not None:
-				worker_view.grow_pages_for_sequences(host_grow_requests)
+			# The rank-0 planner's stats are an admission snapshot.  Recheck the
+			# node-shared allocator after all releases have completed and before any
+			# owner mutates it.  This mirrors GPU-KV admission and prevents one rank
+			# from consuming pages on a stale free-page estimate.
+			if not self._collective_host_kv_growth_capacity_ok(
+				host_grow_requests, worker_view
+			):
+				raise RuntimeError(
+					"[SCHED_INVARIANT] host-KV boundary growth rejected by fresh "
+					"collective capacity preflight"
+				)
+
+			local_growth_success = True
+			if host_grow_requests:
+				try:
+					if worker_view is None:
+						raise RuntimeError("host-KV worker view is unavailable")
+					worker_view.grow_pages_for_sequences(host_grow_requests)
+				except Exception:
+					local_growth_success = False
+					logging.exception(
+						"Rank %s: host-KV boundary growth failed after collective preflight",
+						self.rank,
+					)
+
+			if self.world_size > 1:
+				growth_success = torch.tensor(
+					[1 if local_growth_success else 0],
+					dtype=torch.int32,
+					device=self.torch_device,
+				)
+				dist.all_reduce(growth_success, op=dist.ReduceOp.MIN)
+				all_growth_success = bool(int(growth_success.item()))
+			else:
+				all_growth_success = local_growth_success
+			if not all_growth_success:
+				raise RuntimeError(
+					"[SCHED_INVARIANT] host-KV boundary growth failed on at least "
+					"one rank after collective preflight; worker state is not safe to continue"
+				)
+
+			# Commit scalar metadata only after every owner allocator call has
+			# succeeded.  A failed growth therefore cannot leave a sequence claiming
+			# pages that were never appended to its host chain.
+			for uuid, growth_pages, seq in growth_entries:
+				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+				seq.host_pages_allocated += growth_pages
+
+			if host_grow_requests:
 				if self.rank == 0:
 					logging.debug(
 						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "

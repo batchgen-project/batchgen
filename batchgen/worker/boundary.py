@@ -155,6 +155,37 @@ class BoundaryHandler:
         def node_for_rank(rank: int) -> int:
             return rank // gpn
 
+        def host_owner_rank(state: Mapping[str, object], uuid: str) -> Optional[int]:
+            """Return the rank whose node owns this sequence's host KV chain.
+
+            ``assigned_rank`` is the pure-DP row placement and is not a
+            physical host-KV ownership key once decode attention is replicated
+            across a TP group.  The host region is node-shared and is mutated
+            exactly once by ``host_kv_owner_rank(decode_dp_group, G)``.  Use
+            the same derivation in the rank-0 planner so growth, completion
+            release credits, and eviction candidates are charged to the pool
+            that the execution phase will actually mutate.
+
+            G==1 keeps the legacy assigned-rank contract.  Missing TP group
+            metadata is an invariant violation rather than a silent fallback:
+            charging that request to an arbitrary node can make the planner
+            report capacity that the owner cannot allocate from.
+            """
+            if group_size > 1:
+                group = state.get("decode_dp_group")
+                if not isinstance(group, int):
+                    raise ValueError(
+                        f"sequence {uuid} has no decode_dp_group for "
+                        f"attn_tp_size={group_size}"
+                    )
+                from batchgen.decode_dp_group import host_kv_owner_rank
+
+                return host_kv_owner_rank(group, group_size)
+            rank = state.get("assigned_rank")
+            if not isinstance(rank, int):
+                raise ValueError(f"sequence {uuid} has no assigned_rank")
+            return rank
+
         def meta_global_idx(uuid: str):
             m = seq_meta.get(uuid)
             return m.global_idx if m is not None else float("inf")
@@ -220,34 +251,31 @@ class BoundaryHandler:
             }
             completed_set = set(completed_uuids)
             active_nodes = {
-                node_for_rank(global_seq_state[uuid]['assigned_rank'])
+                node_for_rank(host_owner_rank(global_seq_state[uuid], uuid))
                 for uuid in active_uuids
-                if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+                if uuid in global_seq_state
             }
             completed_nodes = {
-                node_for_rank(global_seq_state[uuid]['assigned_rank'])
+                node_for_rank(host_owner_rank(global_seq_state[uuid], uuid))
                 for uuid in completed_uuids
-                if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+                if uuid in global_seq_state
             }
             for node in sorted(active_nodes | completed_nodes | set(host_stats_by_node.keys())):
                 node_stats = host_stats_by_node.get(node)
                 node_active_uuids = [
                     uuid for uuid in active_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 node_completed_uuids = [
                     uuid for uuid in completed_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 node_growth_uuids = [
                     uuid for uuid in host_growth_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 if not node_active_uuids and not node_completed_uuids and not node_growth_uuids:
                     continue
@@ -325,7 +353,7 @@ class BoundaryHandler:
                                 capacity - context_len,
                                 uuid,
                                 m.global_idx if m else None,
-                                state.get('assigned_rank'),
+                                host_owner_rank(state, uuid),
                                 context_len,
                                 capacity,
                                 int(state.get('host_pages_allocated', m.host_pages_allocated if m else 0) or 0),
@@ -422,10 +450,10 @@ class BoundaryHandler:
             remaining_growth_by_node = {}
             for uuid in host_growth_uuids:
                 state = global_seq_state.get(uuid, {})
-                assigned_rank = state.get('assigned_rank')
-                if assigned_rank is None:
+                owner = host_owner_rank(state, uuid)
+                if owner is None:
                     continue
-                node = node_for_rank(assigned_rank)
+                node = node_for_rank(owner)
                 remaining_growth_by_node[node] = (
                     remaining_growth_by_node.get(node, 0)
                     + remaining_growth_by_uuid[uuid]

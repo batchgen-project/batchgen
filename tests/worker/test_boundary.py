@@ -381,6 +381,41 @@ def test_tp_extension_uses_tightest_rank_in_group():
     assert plan.decode_uuids_final == []
 
 
+def test_tp_host_growth_uses_group_owner_node_not_assigned_rank():
+    """Host-KV planning must charge the node that owns the shared chain.
+
+    ``assigned_rank`` is deliberately placed on node 1 while the TP-8 group
+    is group 0.  The group leader (rank 0) owns node 0's host region, so a
+    growth request must use node 0's free pages.  Charging node 1 would
+    incorrectly reject the growth (and could evict rows from the wrong pool).
+    """
+    state = {
+        "a": _state(
+            assigned_rank=9,
+            decode_dp_group=0,
+            needs_host_growth=True,
+            host_growth_pages=2,
+        ),
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["a"],
+            global_seq_state=state,
+            per_rank_free=[100] * 16,
+            per_rank_total=[100] * 16,
+            world_size=16,
+            attn_tp_size=8,
+            per_node_host_stats=[
+                {"node_id": 0, "num_free_pages": 20, "num_total_pages": 100},
+                {"node_id": 1, "num_free_pages": 0, "num_total_pages": 100},
+            ],
+        )
+    )
+    assert plan.growth_feasible is True
+    assert plan.host_growth_uuids == ["a"]
+    assert plan.scheduler_error is None
+
+
 def test_request_and_meta_are_frozen():
     req = _req(decode_uuids=["a"], global_seq_state={"a": _state(assigned_rank=0)},
                per_rank_free=[1] * 8, world_size=8)

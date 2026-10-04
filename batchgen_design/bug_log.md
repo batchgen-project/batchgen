@@ -85,3 +85,24 @@
   and the combined focused transaction set passed 4 tests. An unrelated legacy
   multiprocessing test still fails in its child with Python's
   `RuntimeError: cudaSetDevice failed with error 3 (initialization error)`.
+
+## 2026-10-04 — Boundary host growth used the wrong node and lacked a fresh transaction gate
+
+- **Symptom.** A TP-group sequence could be planned against the node of its
+  stale `assigned_rank`, even though its shared host-KV chain is owned by the
+  `decode_dp_group` leader. Boundary growth also used the planner snapshot
+  directly, so a capacity change between release and growth could make one
+  rank mutate the host allocator while another rank failed.
+- **Root cause.** Host-KV ownership and decode-row placement are different
+  contracts for `attn_tp_size > 1`; the boundary planner had no owner-derived
+  node key. The execution path had no collective fresh host-page preflight or
+  post-allocation success consensus.
+- **Fix.** Boundary planning now derives the host node with
+  `host_kv_owner_rank(decode_dp_group, G)`. Before growth, all ranks report
+  owner demand and one live shared-pool snapshot per node; a MIN decision gates
+  mutation. Allocator success is then reduced across ranks before scalar page
+  metadata is committed. Any post-preflight failure fails closed because the
+  native worker view has no page-level rollback for a successful peer.
+- **Validation.** TP host-owner planning regression, focused boundary tests,
+  boundary payload validation, dual-host coordinator tests, `py_compile`, and
+  `git diff --check` passed (34 tests).
