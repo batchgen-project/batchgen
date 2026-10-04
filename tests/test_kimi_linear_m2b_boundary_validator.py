@@ -86,9 +86,9 @@ def test_boundary_payload_total_capacity_mismatch_fails():
 def test_boundary_payload_uuid_desync_fails_before_empty_return():
     payloads = [
         _pl({"a": {"assigned_rank": 0}}),
-        _pl({}),
+        _pl({"stale": {"assigned_rank": 1}}),
     ]
-    with pytest.raises(RuntimeError, match="missing from gathered"):
+    with pytest.raises(RuntimeError, match="absent from decode list"):
         validate_boundary_payload_alignment(["a"], payloads, group_size=1)
 
 

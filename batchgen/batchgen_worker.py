@@ -9200,8 +9200,23 @@ class BatchGenWorker:
 		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
 		t0 = time.perf_counter()
 		
-		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
-		local_total_pages = gpu_manager.get_stats().num_total_pages if gpu_manager and gpu_manager.is_initialized else 0
+		local_payload_error = None
+		try:
+			if gpu_manager is not None and gpu_manager.is_initialized:
+				gpu_stats = gpu_manager.get_stats()
+				local_free_pages = int(gpu_stats.num_free_pages)
+				local_total_pages = int(gpu_stats.num_total_pages)
+			else:
+				local_free_pages = 0
+				local_total_pages = 0
+		except Exception as exc:
+			# Carry allocator stats failures through the payload gather so
+			# peers do not block while this rank raises before all-gather.
+			local_free_pages = 0
+			local_total_pages = 0
+			local_payload_error = (
+				f"GPU-KV stats: {type(exc).__name__}: {exc}"
+			)
 		
 		# DEBUG: Log decode_uuids and which ones this rank owns
 		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
@@ -9212,14 +9227,19 @@ class BatchGenWorker:
 			)
 		
 		# Build local state for sequences owned by this rank
-		chunk_size = self._get_effective_chunk_size()
+		try:
+			chunk_size = self._get_effective_chunk_size()
+		except Exception as exc:
+			chunk_size = 0
+			local_payload_error = (
+				f"chunk size: {type(exc).__name__}: {exc}"
+			)
 		local_seq_state = {}
-		local_payload_error = None
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
-				is_completed = self._is_sequence_completed(seq)
 				try:
+					is_completed = self._is_sequence_completed(seq)
 					seq.validate_metadata(
 						f"rank {self.rank} _page_boundary_fast/decode_state",
 						allow_terminal_capacity_gap=is_completed,
@@ -9228,6 +9248,7 @@ class BatchGenWorker:
 					local_payload_error = (
 						f"decode {uuid}: {type(exc).__name__}: {exc}"
 					)
+					continue
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
@@ -9910,6 +9931,7 @@ class BatchGenWorker:
 					"boundary capacity changed before allocation"
 				)
 
+			local_load_success = True
 			if new_load_local:
 				new_load_global = self._local_indices_to_global_seq_ids(new_load_local)
 				tokens = [
@@ -9918,7 +9940,30 @@ class BatchGenWorker:
 					for local_idx in new_load_local
 				]
 
-				gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+				try:
+					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+				except Exception:
+					# Convert allocator failures into the same collective result
+					# before any rank launches an async host-KV copy.
+					logging.exception(
+						"Rank %s: GPU-KV load allocation raised after collective preflight",
+						self.rank,
+					)
+					local_load_success = False
+
+			load_success = self._collective_gpu_kv_allocation_preflight(
+				0 if local_load_success else 1,
+				1 if local_load_success else 0,
+			)
+			if not load_success:
+				if local_load_success and new_load_global and gpu_manager is not None:
+					gpu_manager.free_pages_for_sequences(new_load_global)
+				raise RuntimeError(
+					"[SCHED_INVARIANT] collective GPU-KV load allocation failed "
+					f"for {len(new_load_uuids)} globally selected sequences"
+				)
+
+			if new_load_local:
 				timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
 
 				t_launch = time.perf_counter()

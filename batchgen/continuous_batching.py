@@ -208,6 +208,12 @@ def validate_boundary_payload_alignment(
             "decode UUIDs missing from gathered seq_state: "
             f"count={len(missing_active)} first={missing_active[:8]}"
         )
+    unexpected_active = [uuid for uuid in active_reports if uuid not in decode_uuids]
+    if unexpected_active:
+        errors.append(
+            "gathered active UUIDs are absent from decode list: "
+            f"count={len(unexpected_active)} first={unexpected_active[:8]}"
+        )
 
     if G > 1:
         # Each active UUID must be reported by EXACTLY its group's G contiguous ranks.
