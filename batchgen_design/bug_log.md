@@ -36,3 +36,24 @@
 - **Validation.** Pure decode tests cover admission past the old batching watermark,
   stale metadata versus live free pages, resident sequence caps, TP reduction,
   total-page mismatch, `py_compile`, `compileall`, and `git diff --check`.
+
+## 2026-10-04 — Page-boundary loads could diverge after rank-local capacity checks
+
+- **Symptom.** A page boundary could select a replicated TP load or extension from
+  one rank's free-page view, then drop it locally on another rank. A rank entering
+  the boundary with a different UUID set could also take the pending-load/empty
+  return while peers entered the next collective.
+- **Root cause.** Boundary planning did not carry the immutable total-page snapshot
+  or the existing decode-row count, Phase E filtered selected loads independently on
+  each rank, and legacy modes still used a local free-page loop. Rank 0 also had no
+  broadcasted error path for planner validation failures.
+- **Fix.** `b22b2786` validates total/free capacity on every rank before rank-0
+  planning, applies TP-tightest capacity and the persistent row cap to boundary
+  selection, preflights every extension/load collectively before allocator mutation,
+  and broadcasts rank-0 planner errors. The entry UUID guard runs before pending-load
+  and empty handling. Legacy boundary admission delegates to the same decode selector
+  and collective allocator preflight; failed extensions release the full allocation
+  before moving sequences to `ON_HOLD`.
+- **Validation.** Pure tests cover one-rank TP extension/load shortfalls, total-page
+  mismatch, row-cap admission, UUID alignment, and pre-broadcast validation order;
+  `py_compile` and `git diff --check` pass. The local checkout has no `pytest` module.

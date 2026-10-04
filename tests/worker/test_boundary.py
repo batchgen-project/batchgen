@@ -14,6 +14,8 @@ phases: completion split, GPU extension/on-hold, loading, scheduler error.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from batchgen.worker.boundary import (
@@ -21,6 +23,7 @@ from batchgen.worker.boundary import (
     BoundaryHandler,
     BoundarySeqMeta,
 )
+from batchgen.worker.decode import reduce_decode_capacity_snapshot
 
 _GPN = 8
 
@@ -59,7 +62,8 @@ def _req(
     *, decode_uuids, global_seq_state, per_rank_free, world_size,
     global_candidate_info=None, per_node_host_stats=None, seq_meta=None,
     chunk_size=64, enable_host_kv_eviction=False, host_kv_eviction_watermark=10,
-    attn_tp_size=1,
+    attn_tp_size=1, per_rank_total=None, max_rank_bsz=0,
+    existing_sequence_counts=None,
 ):
     if seq_meta is None:
         seq_meta = {u: _meta(i) for i, u in enumerate(decode_uuids)}
@@ -68,6 +72,7 @@ def _req(
         global_seq_state=global_seq_state,
         global_candidate_info=global_candidate_info or {},
         per_rank_free=tuple(per_rank_free),
+        per_rank_total=(tuple(per_rank_total) if per_rank_total is not None else ()),
         chunk_size=chunk_size,
         per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
         seq_meta=seq_meta,
@@ -76,6 +81,11 @@ def _req(
         enable_host_kv_eviction=enable_host_kv_eviction,
         host_kv_eviction_watermark=host_kv_eviction_watermark,
         attn_tp_size=attn_tp_size,
+        max_rank_bsz=max_rank_bsz,
+        existing_sequence_counts=(
+            tuple(existing_sequence_counts)
+            if existing_sequence_counts is not None else ()
+        ),
     )
 
 
@@ -138,6 +148,100 @@ def test_gpu_extension_all_fit_no_onhold():
     assert set(plan.seqs_needing_extension) == {"a", "b"}
     assert plan.onhold_uuids == []
     assert set(plan.decode_uuids_final) == {"a", "b"}
+
+
+def test_boundary_rejects_divergent_total_page_capacity():
+    state = {"a": _state(assigned_rank=0)}
+    with pytest.raises(ValueError, match="total page count diverged"):
+        BoundaryHandler.compute_decisions(
+            _req(
+                decode_uuids=["a"],
+                global_seq_state=state,
+                per_rank_free=[10] * 8,
+                per_rank_total=[100, 99] + [100] * 6,
+                world_size=8,
+            )
+        )
+
+
+def test_capacity_snapshot_uses_one_rank_tp_extension_shortfall():
+    snapshot = reduce_decode_capacity_snapshot(
+        (100,) * 8,
+        (7,) + (100,) * 7,
+        world_size=8,
+        attn_tp_size=8,
+    )
+    # A replicated sequence must fit on the tightest rank, even when all
+    # peers report ample free pages.
+    assert snapshot.free_pages == (7,)
+    state = {
+        "a": _state(
+            assigned_rank=3, decode_dp_group=0,
+            additional_pages_needed=8,
+        ),
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["a"],
+            global_seq_state=state,
+            per_rank_free=[7] + [100] * 7,
+            per_rank_total=[100] * 8,
+            world_size=8,
+            attn_tp_size=8,
+        )
+    )
+    assert plan.onhold_uuids == ["a"]
+
+
+def test_tp_new_load_rejects_one_rank_group_shortfall():
+    candidates = {
+        "new": {
+            "decoded_length": 20,
+            "pages_needed": 8,
+            "assigned_rank": 3,
+            "decode_dp_group": 0,
+        },
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=[],
+            global_seq_state={},
+            global_candidate_info=candidates,
+            per_rank_free=[7] + [100] * 7,
+            per_rank_total=[100] * 8,
+            world_size=8,
+            attn_tp_size=8,
+            seq_meta={"new": _meta(0)},
+        )
+    )
+    assert plan.new_load_uuids == []
+
+
+def test_boundary_capacity_validation_precedes_rank0_broadcast():
+    source = (Path(__file__).parents[2] / "batchgen" / "batchgen_worker.py").read_text()
+    snapshot_check = source.index("reduce_decode_capacity_snapshot(\n\t\t\ttuple(per_rank_total)")
+    rank0_planner = source.index("if self.rank == 0:\n\t\t\ttry:\n\t\t\t\tdecisions = self._compute_boundary_decisions")
+    assert snapshot_check < rank0_planner
+
+
+def test_boundary_new_load_respects_existing_decode_row_cap():
+    state = {"a": _state(assigned_rank=0)}
+    candidates = {
+        "new": {"decoded_length": 20, "pages_needed": 1, "assigned_rank": 0}
+    }
+    counts = [1] + [0] * 7
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["a"],
+            global_seq_state=state,
+            global_candidate_info=candidates,
+            per_rank_free=[100] * 8,
+            world_size=8,
+            max_rank_bsz=1,
+            existing_sequence_counts=counts,
+        )
+    )
+    assert plan.new_load_uuids == []
 
 
 def test_gpu_onhold_when_rank_free_insufficient():

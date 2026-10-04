@@ -40,6 +40,7 @@ from batchgen.continuous_batching import (
     plan_host_kv_growth_evictions,
     select_sequences_for_loading,
 )
+from batchgen.worker.decode import reduce_decode_capacity_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,15 @@ class BoundaryDecisionRequest:
     # Decode attention TP size.  G==1 is pure DP; G>1 makes each sequence
     # resident on the contiguous G ranks of ``decode_dp_group``.
     attn_tp_size: int = 1
+    # The boundary must use the same live allocator contract as initial decode
+    # admission.  ``per_rank_total`` is optional for old pure callers, but the
+    # worker always supplies it so a divergent allocator is rejected before
+    # any boundary decision is made.
+    per_rank_total: Tuple[int, ...] = ()
+    # Existing rows and the pre-reserved decode buffer cap are needed when a
+    # boundary loads more rows into an already-running decode group.
+    max_rank_bsz: int = 0
+    existing_sequence_counts: Tuple[int, ...] = ()
 
 
 class BoundaryHandler:
@@ -123,10 +133,24 @@ class BoundaryHandler:
             return rank
 
         num_capacity_groups = world_size // group_size
-        capacity_free_pages = [
-            min(per_rank_free[g * group_size:(g + 1) * group_size])
-            for g in range(num_capacity_groups)
-        ]
+        if req.per_rank_total:
+            capacity_snapshot = reduce_decode_capacity_snapshot(
+                tuple(req.per_rank_total),
+                tuple(per_rank_free),
+                world_size=world_size,
+                attn_tp_size=group_size,
+            )
+            capacity_free_pages = list(capacity_snapshot.free_pages)
+        else:
+            if len(per_rank_free) != world_size:
+                raise ValueError(
+                    "boundary free-page snapshot length must equal world_size: "
+                    f"free={len(per_rank_free)}, world_size={world_size}"
+                )
+            capacity_free_pages = [
+                min(per_rank_free[g * group_size:(g + 1) * group_size])
+                for g in range(num_capacity_groups)
+            ]
 
         def node_for_rank(rank: int) -> int:
             return rank // gpn
@@ -148,6 +172,25 @@ class BoundaryHandler:
                 completed_uuids.append(uuid)
             else:
                 active_uuids.append(uuid)
+
+        if req.existing_sequence_counts:
+            if len(req.existing_sequence_counts) != num_capacity_groups:
+                raise ValueError(
+                    "existing_sequence_counts has "
+                    f"{len(req.existing_sequence_counts)} groups; expected "
+                    f"{num_capacity_groups}"
+                )
+            reported_counts = [0] * num_capacity_groups
+            for uuid in active_uuids:
+                state = global_seq_state.get(uuid)
+                if state is not None:
+                    reported_counts[capacity_group(state, uuid)] += 1
+            if tuple(reported_counts) != tuple(req.existing_sequence_counts):
+                raise ValueError(
+                    "boundary existing sequence counts disagree with gathered state: "
+                    f"computed={tuple(reported_counts)}, "
+                    f"reported={tuple(req.existing_sequence_counts)}"
+                )
 
         # Host KV growth + eviction decisions. Growth and eviction must be
         # planned together: if growth is needed, watermark-only eviction is not
@@ -416,6 +459,11 @@ class BoundaryHandler:
         decode_uuids_final = [u for u in decode_after_eviction if u not in onhold_set]
 
         new_load_uuids = []
+        existing_sequence_counts = [0] * num_capacity_groups
+        for uuid in decode_uuids_final:
+            state = global_seq_state.get(uuid)
+            if state is not None:
+                existing_sequence_counts[capacity_group(state, uuid)] += 1
         if global_candidate_info:
             # Compute adjusted free pages after extensions (arithmetic, no collective needed).
             adjusted_per_rank_free = [
@@ -430,6 +478,8 @@ class BoundaryHandler:
                 strategy=LoadingStrategy.LONGEST_FIRST,
                 get_global_idx_fn=meta_global_idx,
                 group_size=group_size,
+                max_sequence_count=req.max_rank_bsz,
+                existing_sequence_counts=tuple(existing_sequence_counts),
             )
 
         return BoundaryDecisions(

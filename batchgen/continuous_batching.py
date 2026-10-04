@@ -143,6 +143,8 @@ def validate_boundary_payload_alignment(
     active_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_bad_status: List[Tuple[str, int, Any]] = []
+    payload_totals: List[Optional[int]] = []
+    payload_free: List[Optional[int]] = []
 
     for rank_idx, payload in enumerate(all_payloads):
         if not isinstance(payload, dict):
@@ -151,6 +153,8 @@ def validate_boundary_payload_alignment(
 
         seq_state = payload.get("seq_state") or {}
         candidate_state = payload.get("candidate_state") or {}
+        payload_totals.append(payload.get("total_pages"))
+        payload_free.append(payload.get("free_pages"))
 
         for uuid, state in seq_state.items():
             active_reports.setdefault(uuid, []).append(rank_idx)
@@ -163,7 +167,9 @@ def validate_boundary_payload_alignment(
                     active_wrong_owner.append((uuid, rank_idx, group))
             else:
                 assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-                if assigned_rank is not None:
+                if assigned_rank is None:
+                    active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
                     try:
                         assigned_rank_int = int(assigned_rank)
                     except (TypeError, ValueError):
@@ -182,7 +188,9 @@ def validate_boundary_payload_alignment(
                     candidate_wrong_owner.append((uuid, rank_idx, group))
             else:
                 assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-                if assigned_rank is not None:
+                if assigned_rank is None:
+                    candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
                     try:
                         assigned_rank_int = int(assigned_rank)
                     except (TypeError, ValueError):
@@ -277,6 +285,33 @@ def validate_boundary_payload_alignment(
                 for uuid, rank, status in candidate_bad_status[:8]
             )
         )
+
+    # Modern workers include total/free allocator capacity in every payload.
+    # Keep old pure callers source-compatible, but validate the complete
+    # snapshot whenever the new fields are present so a rank cannot plan from
+    # a divergent page pool or an impossible free count.
+    if any(total is not None for total in payload_totals):
+        if any(total is None for total in payload_totals):
+            errors.append("boundary payloads disagree on total_pages presence")
+        elif any(free is None for free in payload_free):
+            errors.append("boundary payloads disagree on free_pages presence")
+        else:
+            totals = [int(total) for total in payload_totals]
+            frees = [int(free) for free in payload_free]
+            if any(total < 0 for total in totals):
+                errors.append(f"boundary payload has negative total_pages: {totals}")
+            if any(free < 0 for free in frees):
+                errors.append(f"boundary payload has negative free_pages: {frees}")
+            if any(free > total for free, total in zip(frees, totals)):
+                errors.append(
+                    "boundary payload free_pages exceed total_pages: "
+                    f"totals={totals}, free={frees}"
+                )
+            if len(set(totals)) != 1:
+                errors.append(
+                    "boundary payload total page count diverged across ranks: "
+                    f"{totals}"
+                )
 
     if errors:
         raise RuntimeError("[SCHED_INVARIANT] boundary gather misalignment: " + " | ".join(errors))
@@ -536,6 +571,8 @@ def select_sequences_for_loading(
     strategy: LoadingStrategy = LoadingStrategy.LONGEST_FIRST,
     get_global_idx_fn: Optional[callable] = None,
     group_size: int = 1,
+    max_sequence_count: int = 0,
+    existing_sequence_counts: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[List[str], Dict[int, int]]:
     """Select sequences to load from host to GPU.
 
@@ -556,6 +593,11 @@ def select_sequences_for_loading(
     ``decode_dp_group``; it therefore consumes one page bucket per group, with
     capacity equal to the tightest physical rank in that group.  The default
     keeps the validated pure-DP behavior unchanged.
+
+    ``existing_sequence_counts`` and ``max_sequence_count`` apply the same
+    per-capacity-group row limit used by initial decode admission. Boundary
+    loads happen while rows are already resident, so a page-only plan can
+    overflow a pre-reserved decode buffer even when pages remain available.
     """
     if not candidates:
         return [], {}
@@ -600,6 +642,21 @@ def select_sequences_for_loading(
 
     sorted_candidates = sorted(valid_candidates, key=sort_key)
 
+    if existing_sequence_counts is None:
+        capacity_seq_count = [0] * num_capacity_groups
+    else:
+        if len(existing_sequence_counts) != num_capacity_groups:
+            raise ValueError(
+                "existing_sequence_counts has "
+                f"{len(existing_sequence_counts)} groups; expected "
+                f"{num_capacity_groups}"
+            )
+        if any(int(count) < 0 for count in existing_sequence_counts):
+            raise ValueError(
+                f"existing_sequence_counts must be non-negative: {existing_sequence_counts}"
+            )
+        capacity_seq_count = [int(count) for count in existing_sequence_counts]
+
     load_uuids = []
     rank_pages_used: Dict[int, int] = {
         r: 0 for r in range(num_capacity_groups)
@@ -626,12 +683,16 @@ def select_sequences_for_loading(
             )
             continue
 
+        if max_sequence_count > 0 and capacity_seq_count[capacity_group] >= max_sequence_count:
+            continue
+
         if (
             rank_pages_used[capacity_group] + req_pages
             <= capacity_free_pages[capacity_group]
         ):
             load_uuids.append(uuid)
             rank_pages_used[capacity_group] += req_pages
+            capacity_seq_count[capacity_group] += 1
 
     return load_uuids, rank_pages_used
 

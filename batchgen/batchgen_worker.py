@@ -4008,10 +4008,18 @@ class BatchGenWorker:
 		report_total = 0
 		report_node = -1
 		if worker_view is not None and self.local_rank == 0:
-			stats = worker_view.get_stats()
-			report_node = self.rank // gpus_per_node
-			report_free = int(stats.num_free_pages)
-			report_total = int(stats.num_total_pages)
+			try:
+				stats = worker_view.get_stats()
+				report_node = self.rank // gpus_per_node
+				report_free = int(stats.num_free_pages)
+				report_total = int(stats.num_total_pages)
+			except Exception:
+				# Carry a rank-local stats failure through the collective so
+				# peers do not block while this rank raises before all-gather.
+				logging.exception("Rank %s: host-KV stats snapshot failed", self.rank)
+				report_node = -2
+				report_free = -1
+				report_total = -1
 
 		stats_tensor = torch.tensor(
 			[report_node, report_free, report_total],
@@ -4020,6 +4028,10 @@ class BatchGenWorker:
 		)
 		gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, stats_tensor)
+		if any(int(item[0].item()) == -2 for item in gathered):
+			raise RuntimeError(
+				"[SCHED_INVARIANT] host-KV stats snapshot failed on one or more ranks"
+			)
 
 		per_node_stats = []
 		reports_by_node = {}
@@ -5762,23 +5774,21 @@ class BatchGenWorker:
 		Load PREFILLED sequences from Host KV to GPU KV if space available.
 		Maintains deterministic ordering across all ranks.
 		"""
-		gpu_free_pages = self._get_gpu_kv_free_pages()
-		candidates = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		
-		# Sort for deterministic ordering across all ranks
-		candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
-		
-		new_uuids = []
-		pages_needed = 0
-		
-		for uuid in candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			req = seq.get_pages_required()
-			if pages_needed + req <= gpu_free_pages:
-				new_uuids.append(uuid)
-				pages_needed += req
-			else:
-				break
+		# Legacy attention modes still run on a live worker, so route their
+		# boundary admission through the same collective-capacity contract as
+		# mode 3.  The old local-free/pages-required loop could desynchronize
+		# ranks and bypass TP replication or the decode row cap.
+		# DecodeScheduler needs a TP group on every candidate, so stamp all
+		# PREFILLED/ON_HOLD candidates before taking its live capacity snapshot.
+		admission_candidates = (
+			self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+			+ self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+		)
+		self._assign_decode_dp_groups(admission_candidates)
+		new_uuids = [
+			uuid for uuid in self._prepare_decode_batch()
+			if uuid not in set(current_decode_uuids)
+		]
 		
 		if not new_uuids:
 			return current_decode_uuids, current_local_indices
@@ -5789,9 +5799,19 @@ class BatchGenWorker:
 		# M2b: assign the decode DP-group before the transition (no-op for G==1).
 		self._assign_decode_dp_groups(new_uuids)
 
-		if new_local_indices:
-			# Allocate and load (without final rebuild)
-			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
+		# Every rank participates, including ranks with no local rows, before any
+		# allocator mutation.  A failed preflight is global and leaves statuses
+		# untouched, so the next caller can retry safely.
+		alloc_ok = self._allocate_gpu_kv_two_page_buffer(
+			new_local_indices,
+			load_from_host=True,
+			collective_preflight=True,
+		)
+		if not alloc_ok:
+			raise RuntimeError(
+				f"Rank {self.rank}: collective GPU KV load preflight failed for "
+				f"{len(new_uuids)} legacy-mode sequences"
+			)
 
 		# Update status AFTER load completes
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
@@ -8979,6 +8999,7 @@ class BatchGenWorker:
 		global_seq_state: Dict[str, Dict],
 		global_candidate_info: Dict[str, Dict],
 		per_rank_free: List[int],
+		per_rank_total: List[int],
 		chunk_size: int,
 		per_node_host_stats: Optional[List[Dict[str, int]]],
 	) -> BoundaryDecisionRequest:
@@ -9008,6 +9029,7 @@ class BatchGenWorker:
 			global_seq_state=global_seq_state,
 			global_candidate_info=global_candidate_info,
 			per_rank_free=tuple(per_rank_free),
+			per_rank_total=tuple(per_rank_total),
 			chunk_size=chunk_size,
 			per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
 			seq_meta=seq_meta,
@@ -9016,7 +9038,41 @@ class BatchGenWorker:
 			enable_host_kv_eviction=self.enable_host_kv_eviction,
 			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
 			attn_tp_size=self._decode_attn_tp_size(),
+			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
+			existing_sequence_counts=tuple(
+				self._boundary_existing_sequence_counts(
+					decode_uuids, global_seq_state,
+				)
+			),
 		)
+
+	def _boundary_existing_sequence_counts(
+		self,
+		decode_uuids: List[str],
+		global_seq_state: Dict[str, Dict],
+	) -> List[int]:
+		"""Count active boundary rows in each physical decode capacity group."""
+		group_size = self._decode_attn_tp_size()
+		if group_size <= 0 or self.world_size % group_size:
+			raise ValueError(
+				f"attn_tp_size={group_size} must divide world_size={self.world_size}"
+			)
+		counts = [0] * (self.world_size // group_size)
+		for uuid in decode_uuids:
+			state = global_seq_state.get(uuid)
+			if not state or state.get("completed"):
+				continue
+			if group_size > 1:
+				capacity_group = state.get("decode_dp_group")
+			else:
+				capacity_group = state.get("assigned_rank")
+			if not isinstance(capacity_group, int) or not 0 <= capacity_group < len(counts):
+				raise ValueError(
+					f"sequence {uuid[:8]} has invalid boundary capacity group "
+					f"{capacity_group}"
+				)
+			counts[capacity_group] += 1
+		return counts
 
 	def _compute_boundary_decisions(
 		self,
@@ -9024,6 +9080,7 @@ class BatchGenWorker:
 		global_seq_state: Dict[str, Dict],
 		global_candidate_info: Dict[str, Dict],
 		per_rank_free: List[int],
+		per_rank_total: List[int],
 		chunk_size: int,
 		per_node_host_stats: Optional[List[Dict[str, int]]],
 	) -> 'BoundaryDecisions':
@@ -9036,7 +9093,7 @@ class BatchGenWorker:
 		return BoundaryHandler.compute_decisions(
 			self._make_boundary_decision_request(
 				decode_uuids, global_seq_state, global_candidate_info,
-				per_rank_free, chunk_size, per_node_host_stats,
+				per_rank_free, per_rank_total, chunk_size, per_node_host_stats,
 			)
 		)
 
@@ -9074,32 +9131,26 @@ class BatchGenWorker:
 		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
-		# decode_uuids sync: only run in debug mode for desync detection.
-		# In production, rank 0 makes all decisions so sync is unnecessary.
+		# Validate the entry UUID set before any conditional pending-load/empty
+		# return.  Otherwise one rank can return while another enters the Phase 1
+		# all-gather, deadlocking the process group.  This is deliberately a
+		# cheap object gather at the boundary; the normal non-empty path performs
+		# the full payload gather below as its next collective.
 		t_sync = time.perf_counter()
-		if BATCHGEN_CB_DEBUG:
-			local_decode_set = set(decode_uuids)
+		if self.world_size > 1:
+			local_decode_set = tuple(sorted(set(decode_uuids)))
 			all_decode_sets = [None] * self.world_size
 			dist.all_gather_object(all_decode_sets, local_decode_set)
 			all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
 			if not all_sets_equal:
-				for r, s in enumerate(all_decode_sets):
-					if s != local_decode_set:
-						diff_in_r = s - local_decode_set if s else set()
-						diff_in_local = local_decode_set - s if s else local_decode_set
-						logging.error(
-							f"Rank {self.rank}: decode_uuids DESYNC detected at boundary start! "
-							f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
-							f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
-						)
-				# Use RANK 0 as authoritative source
-				rank0_set = all_decode_sets[0] if all_decode_sets[0] is not None else set()
-				decode_uuids = sorted(
-					rank0_set,
-					key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+				logging.error(
+					f"Rank {self.rank}: decode_uuids DESYNC detected at boundary start: "
+					f"rank_sets={all_decode_sets}"
 				)
-				batch = self._get_local_indices_for_uuids(decode_uuids)
-				logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
+				raise RuntimeError(
+					"[SCHED_INVARIANT] decode UUID set diverged before boundary "
+					"pending-load/empty handling"
+				)
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
 		
 		# Integrate previous async load if any
@@ -9150,6 +9201,7 @@ class BatchGenWorker:
 		t0 = time.perf_counter()
 		
 		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+		local_total_pages = gpu_manager.get_stats().num_total_pages if gpu_manager and gpu_manager.is_initialized else 0
 		
 		# DEBUG: Log decode_uuids and which ones this rank owns
 		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
@@ -9162,14 +9214,20 @@ class BatchGenWorker:
 		# Build local state for sequences owned by this rank
 		chunk_size = self._get_effective_chunk_size()
 		local_seq_state = {}
+		local_payload_error = None
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				is_completed = self._is_sequence_completed(seq)
-				seq.validate_metadata(
-					f"rank {self.rank} _page_boundary_fast/decode_state",
-					allow_terminal_capacity_gap=is_completed,
-				)
+				try:
+					seq.validate_metadata(
+						f"rank {self.rank} _page_boundary_fast/decode_state",
+						allow_terminal_capacity_gap=is_completed,
+					)
+				except Exception as exc:
+					local_payload_error = (
+						f"decode {uuid}: {type(exc).__name__}: {exc}"
+					)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
@@ -9237,7 +9295,12 @@ class BatchGenWorker:
 				continue  # Don't load completed sequences
 			if seq.status not in valid_load_statuses:
 				continue  # Only load PREFILLED/ON_HOLD (not QUEUEING/IN_PREFILL)
-			seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/load_candidate")
+			try:
+				seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/load_candidate")
+			except Exception as exc:
+				local_payload_error = (
+					f"load candidate {uuid}: {type(exc).__name__}: {exc}"
+				)
 			# Report this as a potential load candidate
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
@@ -9250,12 +9313,24 @@ class BatchGenWorker:
 		# Pack everything into one dict for single all_gather
 		local_payload = {
 			'free_pages': local_free_pages,
+			'total_pages': local_total_pages,
+			'error': local_payload_error,
 			'seq_state': local_seq_state,
 			'candidate_state': local_candidate_state,
 		}
 		
 		all_payloads = [None] * self.world_size
 		dist.all_gather_object(all_payloads, local_payload)
+		payload_errors = [
+			f"rank {rank_idx}: {payload.get('error')}"
+			for rank_idx, payload in enumerate(all_payloads)
+			if isinstance(payload, dict) and payload.get('error')
+		]
+		if payload_errors:
+			raise RuntimeError(
+				"[SCHED_INVARIANT] boundary payload validation failed: "
+				+ " | ".join(payload_errors)
+			)
 		validate_boundary_payload_alignment(
 			decode_uuids, all_payloads, group_size=self._decode_attn_tp_size()
 		)
@@ -9265,8 +9340,20 @@ class BatchGenWorker:
 		# ========== PHASE 2: MERGE GATHERED DATA + RANK-0 DECISIONS ==========
 		t0 = time.perf_counter()
 
-		# Extract per-rank free pages
+		# Extract per-rank live capacity.  Total pages are immutable after GPU-KV
+		# initialization; rank 0 validates that invariant before planning any
+		# extension or load.
 		per_rank_free = [p['free_pages'] for p in all_payloads]
+		per_rank_total = [p['total_pages'] for p in all_payloads]
+		# Validate the live allocator snapshot on EVERY rank before rank 0
+		# computes or broadcasts decisions.  Keeping this check inside the
+		# rank-0 planner would strand peers in broadcast when one total differs.
+		reduce_decode_capacity_snapshot(
+			tuple(per_rank_total),
+			tuple(per_rank_free),
+			world_size=self.world_size,
+			attn_tp_size=self._decode_attn_tp_size(),
+		)
 
 		# Merge sequence state. G==1: each uuid appears exactly once (single owner).
 		# G>1 (Option 1): the uuid is reported by all G ranks of its group, so pin a
@@ -9372,10 +9459,27 @@ class BatchGenWorker:
 		per_node_host_stats = self._gather_host_kv_stats_by_node(worker_view)
 
 		if self.rank == 0:
-			decisions = self._compute_boundary_decisions(
-				decode_uuids, global_seq_state, global_candidate_info,
-				per_rank_free, chunk_size, per_node_host_stats,
-			)
+			try:
+				decisions = self._compute_boundary_decisions(
+					decode_uuids, global_seq_state, global_candidate_info,
+					per_rank_free, per_rank_total, chunk_size, per_node_host_stats,
+				)
+			except Exception as exc:
+				# Rank 0 owns the pure planner, but a malformed gathered state
+				# must become a broadcast scheduler error rather than strand peers
+				# waiting in the decision broadcast.
+				logging.exception("Rank 0 boundary planner failed")
+				decisions = BoundaryDecisions(
+					completed_uuids=[], active_uuids=[], host_growth_uuids=[],
+					host_growth_pages=[], growth_feasible=False,
+					host_evicted_uuids=[], onhold_uuids=[],
+					seqs_needing_extension=[], new_load_uuids=[],
+					decode_uuids_final=[],
+					scheduler_error=(
+						"[SCHED_INVARIANT] rank-0 boundary planner failed: "
+						f"{type(exc).__name__}: {exc}"
+					),
+				)
 		else:
 			decisions = None
 
@@ -9668,9 +9772,46 @@ class BatchGenWorker:
 		seqs_needing_extension = decisions.seqs_needing_extension
 		remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
 		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
-		if my_remaining_ext:
-			success = self._extend_gpu_kv_allocation(my_remaining_ext)
-			if not success:
+		extension_preflight_ok = True
+		if remaining_needing_ext:
+			local_extension_pages = sum(
+				self.global_batch.get_sequence(uuid).get_additional_gpu_pages_needed()
+				for uuid in my_remaining_ext
+			)
+			local_extension_free = (
+				gpu_manager.get_stats().num_free_pages
+				if gpu_manager is not None and gpu_manager.is_initialized else 0
+			)
+			extension_preflight_ok = self._collective_gpu_kv_allocation_preflight(
+				local_extension_pages, local_extension_free
+			)
+
+		local_extension_success = extension_preflight_ok
+		if extension_preflight_ok and my_remaining_ext:
+			try:
+				local_extension_success = self._extend_gpu_kv_allocation(my_remaining_ext)
+			except Exception:
+				# The stats preflight is only advisory if the allocator itself
+				# rejects a request. Convert that local failure into the second
+				# collective so peers can roll back without deadlocking here.
+				logging.exception(
+					"Rank %s: GPU-KV extension raised after collective preflight",
+					self.rank,
+				)
+				local_extension_success = False
+		if remaining_needing_ext and extension_preflight_ok:
+			# An allocator can still reject a request after the stats check. Make
+			# that failure global before any rank updates status or proceeds to
+			# loading.  Peers that extended successfully release the sequence's
+			# full allocation below; this rolls back both the old and new pages
+			# before the sequence is moved to ON_HOLD.
+			local_extension_success = self._collective_gpu_kv_allocation_preflight(
+				0 if local_extension_success else 1,
+				1 if local_extension_success else 0,
+			)
+
+		if remaining_needing_ext and not local_extension_success:
+			if my_remaining_ext:
 				# Extension failed — put failed sequences ON_HOLD to prevent
 				# cache_seqlens from exceeding gpu_pages_allocated × PAGE_SIZE,
 				# which would cause FlashAttention to read -1 sentinel page
@@ -9688,17 +9829,17 @@ class BatchGenWorker:
 				for uuid in my_remaining_ext:
 					self._sequences_with_gpu_kv.discard(uuid)
 
-				# All ranks: zero scalars and update status for ALL failed seqs
-				# (remaining_needing_ext is the globally-consistent list)
-				ext_failed_set = set(remaining_needing_ext)
-				for uuid in remaining_needing_ext:
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = 0
-					seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
-					self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			# All ranks: zero scalars and update status for ALL failed seqs
+			# (remaining_needing_ext is the globally-consistent list).
+			ext_failed_set = set(remaining_needing_ext)
+			for uuid in remaining_needing_ext:
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = 0
+				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
+				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
-				decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
-				batch = self._get_local_indices_for_uuids(decode_uuids)
+			decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
+			batch = self._get_local_indices_for_uuids(decode_uuids)
 
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
 
@@ -9718,74 +9859,64 @@ class BatchGenWorker:
 				if self._owns_local_sequence(self.global_batch.get_sequence(u))
 			]
 			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
+			local_load_pages = sum(
+				self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+				.get_gpu_pages_for_two_page_buffer()
+				for local_idx in new_load_local
+			)
+			local_load_free = (
+				gpu_manager.get_stats().num_free_pages
+				if gpu_manager is not None and gpu_manager.is_initialized else 0
+			)
+			load_preflight_ok = self._collective_gpu_kv_allocation_preflight(
+				local_load_pages, local_load_free
+			)
+			if not load_preflight_ok:
+				raise RuntimeError(
+					f"Rank {self.rank}: collective GPU KV load preflight failed for "
+					f"{len(new_load_uuids)} globally selected sequences; "
+					"boundary capacity changed before allocation"
+				)
 
 			if new_load_local:
-				actual_free = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+				new_load_global = self._local_indices_to_global_seq_ids(new_load_local)
+				tokens = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+					.get_gpu_pages_for_two_page_buffer() * self.PAGE_SIZE
+					for local_idx in new_load_local
+				]
 
-				filtered_local = []
-				filtered_global = []
-				filtered_tokens = []
-				pages_used = 0
+				gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+				timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
 
-				for local_idx in new_load_local:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					pages_needed = seq.get_gpu_pages_for_two_page_buffer()
-
-					if pages_used + pages_needed <= actual_free:
-						filtered_local.append(local_idx)
-						filtered_global.append(seq.global_idx)
-						filtered_tokens.append(pages_needed * self.PAGE_SIZE)
-						pages_used += pages_needed
-					else:
-						logging.warning(
-							f"Rank {self.rank}: Dropping {uuid[:8]} from load - "
-							f"need={pages_needed}, pages_used={pages_used}, actual_free={actual_free}"
+				t_launch = time.perf_counter()
+				if worker_view is not None:
+					existing_global_ids = self._local_indices_to_global_seq_ids(batch)
+					if isinstance(gpu_manager, DualKVCacheCoordinator):
+						pointers = self._prepare_dual_kv_load_pointers(
+							gpu_manager, new_load_global, existing_global_ids
 						)
-
-				if filtered_local:
-					new_load_local = filtered_local
-					new_load_global = filtered_global
-					tokens = filtered_tokens
-
-					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
-					timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
-
-					t_launch = time.perf_counter()
-					if worker_view is not None:
-						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
-						if isinstance(gpu_manager, DualKVCacheCoordinator):
-							pointers = self._prepare_dual_kv_load_pointers(
-								gpu_manager, new_load_global, existing_global_ids
-							)
-							new_async_task = self._launch_dual_host_kv_load(pointers)
-							self._async_load_tensors = pointers
-						else:
-							gpu_manager.rebuild_page_table(new_load_global)
-							k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
-							active_page_counts = gpu_manager.export_active_sequence_page_counts()
-							sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
-							new_async_task = worker_view.async_load_layer_paged_kv_to_device(
-								sequence_ids=sequence_tensor,
-								active_page_counts=active_page_counts,
-								k_device_ptrs=k_ptrs,
-								v_device_ptrs=v_ptrs,
-							)
-							if existing_global_ids:
-								gpu_manager.rebuild_page_table(existing_global_ids)
-							self._async_load_tensors = {
-								'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
-								'sequence_tensor': sequence_tensor,
-								'active_page_counts': active_page_counts,
-							}
+						new_async_task = self._launch_dual_host_kv_load(pointers)
+						self._async_load_tensors = pointers
+					else:
+						gpu_manager.rebuild_page_table(new_load_global)
+						k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+						active_page_counts = gpu_manager.export_active_sequence_page_counts()
+						sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
+						new_async_task = worker_view.async_load_layer_paged_kv_to_device(
+							sequence_ids=sequence_tensor,
+							active_page_counts=active_page_counts,
+							k_device_ptrs=k_ptrs,
+							v_device_ptrs=v_ptrs,
+						)
+						if existing_global_ids:
+							gpu_manager.rebuild_page_table(existing_global_ids)
+						self._async_load_tensors = {
+							'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
+							'sequence_tensor': sequence_tensor,
+							'active_page_counts': active_page_counts,
+						}
 					timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
-				else:
-					new_load_local = []
-					new_load_global = []
-					logging.warning(
-						f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
-						f"actual_free={actual_free}"
-					)
 		
 		timing.num_loaded = len(new_load_uuids)
 		
