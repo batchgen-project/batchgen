@@ -2816,20 +2816,11 @@ class BatchGenWorker:
 					if task is not None:
 						self._pending_kv_append_tasks.append(task)
 
-		# Complete this step's host appends before returning to the decode loop.
-		# Each task is a std::async thread that reads the worker view's page
-		# table on its own thread at execution time, with no lock. Letting up to
-		# 256 of them stay in flight across steps meant they could overlap the
-		# next admission wave's register/allocate on the main thread; a torn
-		# read then lands one token's KV in a page that now belongs to a freshly
-		# prefilled sequence. Measured on the 512x4096 K3 contract: every victim
-		# was in a wave after the first and collapsed at its 2nd or ~28th token,
-		# while the first wave (no page-table mutation in flight) was clean.
-		# The D2H is one token per sequence per MLA layer (~2.6 MB at 96
-		# sequences), sub-millisecond against a decode step.
-		if self._pending_kv_append_tasks:
-			self._wait_pending_kv_append_tasks(defer_errors=True)
-
+		# NOTE: this function only LAUNCHES the D2H copies. Draining the
+		# resulting tasks is the decode loop's job, so that the wait is
+		# attributed to its own step-split slot and can be moved between
+		# per-step and per-boundary placement; see the [KV_FLUSH_DRAIN]
+		# rationale at the drain site in ``decoding_continuous``.
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
 		self._deferred_kv_batch = None
@@ -12085,6 +12076,61 @@ class BatchGenWorker:
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
 
+		# True GPU time for the forward+sample segment, from reusable CUDA
+		# events. A fixed ring of slots keeps the steady-state step free of any
+		# host synchronization: a slot is harvested only once BOTH of its
+		# events report .query() True, and a step that finds no free slot
+		# simply skips recording rather than waiting for one.
+		# The record points straddle graph REPLAY only — this loop never
+		# captures a graph (see the whole-model bucket check below, which falls
+		# back to eager instead of capturing mid-decode), so no event is ever
+		# recorded into a capture.
+		_EVT_RING_SLOTS = 64
+		_evt_ring = [
+			(
+				torch.cuda.Event(enable_timing=True),
+				torch.cuda.Event(enable_timing=True),
+			)
+			for _ in range(_EVT_RING_SLOTS)
+		]
+		_evt_free = list(range(_EVT_RING_SLOTS))
+		_evt_pending: List[int] = []
+		_gpu_fwd_sum = 0.0
+		_gpu_fwd_cnt = 0
+		_gpu_fwd_max = 0.0
+
+		# Batch-level A/B for WHERE host-KV append tasks are drained. Resolved
+		# once per decode round (not per step) so a step never pays the dict
+		# merge, and so one round cannot change placement midway.
+		#   "step"     — drain after every step's token readback. Safe under
+		#                mid-decode admission, but each drain ends in a full
+		#                torch.cuda.synchronize inside
+		#                _wait_pending_kv_append_tasks, i.e. one whole device
+		#                sync of CPU wall per decode step.
+		#   "boundary" — no per-step drain; tasks are drained by the existing
+		#                boundary/exit/throttle waits only. Restores CPU/GPU
+		#                overlap. A/B diagnostic and candidate fix.
+		# Each append task is a std::async thread that reads the worker view's
+		# page table on its own thread, unlocked, at execution time. A task
+		# still in flight while the main thread mutates that page table
+		# (admission register/allocate/rebuild) can tear the read and land one
+		# token's KV in a page that now belongs to a freshly prefilled
+		# sequence. In "boundary" mode the barrier against that is the boundary
+		# planner's PHASE 0 drain, which runs unconditionally as the first
+		# statement of _page_boundary_fast, i.e. before every
+		# register/allocate/rebuild_page_table in the admission path.
+		_kv_drain_debug = self._active_batchgen_debug_for_sequences(
+			self._debug_sequences_for_decode_uuids(decode_uuids)
+		) or {}
+		_kv_flush_drain = _kv_drain_debug.get("kv_flush_drain") or "step"
+		if _kv_flush_drain not in ("step", "boundary"):
+			raise ValueError(
+				"batchgen_debug.kv_flush_drain must be 'step' or 'boundary', got "
+				f"{_kv_flush_drain!r}"
+			)
+		if self.rank == 0:
+			logging.info(f"[KV_FLUSH_DRAIN] mode={_kv_flush_drain}")
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -12107,10 +12153,19 @@ class BatchGenWorker:
 					_n = _split[0]
 					_split_txt = (
 						f" step_ms={_split[1] / _n:.1f} (setup {_split[2] / _n:.1f}, "
-						f"forward+sample {_split[3] / _n:.1f}, kv_flush {_split[4] / _n:.1f}, "
-						f"token_readback {_split[5] / _n:.1f}, bookkeeping {_split[6] / _n:.1f})"
+						f"fwd_launch {_split[3] / _n:.1f}, kv_launch {_split[4] / _n:.1f}, "
+						f"readback {_split[5] / _n:.1f}, kv_drain {_split[6] / _n:.1f}, "
+						f"bookkeeping {_split[7] / _n:.1f})"
 					)
-					self._decode_step_split = [0.0] * 7
+					self._decode_step_split = [0.0] * 8
+				if _gpu_fwd_cnt > 0:
+					_split_txt += (
+						f" gpu_fwd_ms={_gpu_fwd_sum / _gpu_fwd_cnt:.1f} "
+						f"gpu_fwd_max={_gpu_fwd_max:.1f} (n={_gpu_fwd_cnt})"
+					)
+					_gpu_fwd_sum = 0.0
+					_gpu_fwd_cnt = 0
+					_gpu_fwd_max = 0.0
 				logging.info(
 					f"[DECODE] step={self._cumulative_decode_iterations} "
 					f"active={len(decode_uuids)} finished={_hb_finished} "
@@ -12330,6 +12385,12 @@ class BatchGenWorker:
 						)
 
 			_split_t0 = time.perf_counter()
+			# Take a ring slot for this step's GPU forward timing; never wait.
+			_evt_slot = _evt_free.pop() if _evt_free else None
+			if _evt_slot is not None:
+				_evt_ring[_evt_slot][0].record(
+					torch.cuda.current_stream(self.torch_device)
+				)
 			with torch.inference_mode():
 				if batch:
 					# Collect context lengths with invariant validation
@@ -12979,6 +13040,11 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 			_split_t1 = time.perf_counter()
+			if _evt_slot is not None:
+				_evt_ring[_evt_slot][1].record(
+					torch.cuda.current_stream(self.torch_device)
+				)
+				_evt_pending.append(_evt_slot)
 
 			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
 			# exact token-readback boundary before launching host-KV copies on their
@@ -12996,6 +13062,16 @@ class BatchGenWorker:
 			_split_t2 = time.perf_counter()
 			_new_tokens_ready.synchronize()
 			_split_t3 = time.perf_counter()
+
+			# Drain this step's host-KV append tasks, placement per the
+			# [KV_FLUSH_DRAIN] mode resolved at round start. defer_errors=True
+			# keeps this a purely local wait: a guarded collective here would
+			# deadlock whenever only some ranks have pending tasks. Deferred
+			# errors surface at the next boundary PHASE 0 drain, which always
+			# uses sync_distributed_errors=True.
+			if _kv_flush_drain == "step" and self._pending_kv_append_tasks:
+				self._wait_pending_kv_append_tasks(defer_errors=True)
+			_split_t4 = time.perf_counter()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
@@ -13055,21 +13131,42 @@ class BatchGenWorker:
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 
-			_split_t4 = time.perf_counter()
-			self._cumulative_forward_ms += (_split_t4 - forward_start) * 1000
+			_split_t5 = time.perf_counter()
+			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
 			# Per-step wall split, averaged into the rank-0 heartbeat: where a
 			# decode step's time goes (host bookkeeping vs GPU wait), without
-			# adding any device sync of its own.
+			# adding any device sync of its own. These are CPU wall times; the
+			# companion gpu_fwd_ms is the real device time for the same
+			# forward segment, from the CUDA event ring.
 			_sp = getattr(self, "_decode_step_split", None)
 			if _sp is None:
-				_sp = self._decode_step_split = [0.0] * 7
+				_sp = self._decode_step_split = [0.0] * 8
 			_sp[0] += 1
-			_sp[1] += (_split_t4 - forward_start) * 1000
+			_sp[1] += (_split_t5 - forward_start) * 1000
 			_sp[2] += (_split_t0 - forward_start) * 1000
 			_sp[3] += (_split_t1 - _split_t0) * 1000
 			_sp[4] += (_split_t2 - _split_t1) * 1000
 			_sp[5] += (_split_t3 - _split_t2) * 1000
 			_sp[6] += (_split_t4 - _split_t3) * 1000
+			_sp[7] += (_split_t5 - _split_t4) * 1000
+
+			# Opportunistic, non-blocking harvest of finished event pairs.
+			# elapsed_time is only ever called on a pair both of whose events
+			# already reported .query() True, so this never blocks the host.
+			if _evt_pending:
+				_evt_still_pending = []
+				for _slot in _evt_pending:
+					_evt_start, _evt_end = _evt_ring[_slot]
+					if _evt_start.query() and _evt_end.query():
+						_evt_ms = _evt_start.elapsed_time(_evt_end)
+						_gpu_fwd_sum += _evt_ms
+						_gpu_fwd_cnt += 1
+						if _evt_ms > _gpu_fwd_max:
+							_gpu_fwd_max = _evt_ms
+						_evt_free.append(_slot)
+					else:
+						_evt_still_pending.append(_slot)
+				_evt_pending = _evt_still_pending
 
 			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
 			from batchgen.timing import get_decode_timer
@@ -13088,13 +13185,23 @@ class BatchGenWorker:
 		_split = getattr(self, "_decode_step_split", None)
 		if self.rank == 0 and _split and _split[0] > 0:
 			_n = _split[0]
+			_gpu_txt = ""
+			if _gpu_fwd_cnt > 0:
+				_gpu_txt = (
+					f" gpu_fwd_ms={_gpu_fwd_sum / _gpu_fwd_cnt:.1f} "
+					f"gpu_fwd_max={_gpu_fwd_max:.1f} (n={_gpu_fwd_cnt})"
+				)
 			logging.info(
 				f"[DECODE] interval end: steps={int(_n)} step_ms={_split[1] / _n:.1f} "
-				f"(setup {_split[2] / _n:.1f}, forward+sample {_split[3] / _n:.1f}, "
-				f"kv_flush {_split[4] / _n:.1f}, token_readback {_split[5] / _n:.1f}, "
-				f"bookkeeping {_split[6] / _n:.1f})"
+				f"(setup {_split[2] / _n:.1f}, fwd_launch {_split[3] / _n:.1f}, "
+				f"kv_launch {_split[4] / _n:.1f}, readback {_split[5] / _n:.1f}, "
+				f"kv_drain {_split[6] / _n:.1f}, bookkeeping {_split[7] / _n:.1f})"
+				f"{_gpu_txt}"
 			)
-			self._decode_step_split = [0.0] * 7
+			self._decode_step_split = [0.0] * 8
+			_gpu_fwd_sum = 0.0
+			_gpu_fwd_cnt = 0
+			_gpu_fwd_max = 0.0
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
