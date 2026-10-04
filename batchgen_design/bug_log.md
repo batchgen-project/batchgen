@@ -27,7 +27,7 @@
   predicate. Allocation then checked free
   pages locally, so rank capacity drift could be discovered only after other
   ranks had begun mutation.
-- **Fix.** `7d91a39e` — admission now consumes a collective snapshot whose TP
+- **Fix.** `8171b654` — admission now consumes a collective snapshot whose TP
   group free capacity is the minimum across ranks and whose immutable total
   page count must match. The selector uses live free pages as the physical
   invariant, counts resident decode rows against `max_rank_bsz`, and the
