@@ -12,11 +12,12 @@ width = the widest request in the batch) that are regrown whenever a wider reque
 arrives. The width is set by one outlier, every row pays for it, and the superseded
 matrices are leaked. This module stores tokens by the page instead:
 
-* ``PromptTokenArena`` — ONE int32 POSIX shared-memory arena per node, created
-  sparsely at a fixed capacity, handed out as chained 4096-token pages. The
-  tokenized batch is identical on every rank, so one copy per node replaces
-  ``world_size`` duplicates of the same bytes. A prompt costs
-  ``ceil(len / page_size)`` pages, not the batch's widest request.
+* ``PromptTokenArena`` — ONE int32 memfd-backed arena per node, created sparsely
+  at a fixed capacity, handed out as chained 4096-token pages. The tokenized
+  batch is identical on every rank, so one copy per node replaces ``world_size``
+  duplicates of the same bytes. A prompt costs ``ceil(len / page_size)`` pages,
+  not the batch's widest request. The arena carries no /dev/shm name, so a
+  killed creator leaves nothing behind to clean up or collide with.
 * ``DecodedTokenStore`` — process-local int32 chunks for generated tokens, which
   only the owning rank writes, and which are freed when the sequence finishes.
 
@@ -28,10 +29,13 @@ from __future__ import annotations
 
 import mmap
 import os
-from multiprocessing import shared_memory
+import sys
+import tempfile
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from batchgen.memfd import create_memfd
 
 
 __all__ = [
@@ -40,10 +44,12 @@ __all__ = [
 	"DEFAULT_PAGE_SIZE_TOKENS",
 	"DEFAULT_RELEASE_FREE_FRACTION",
 	"END_OF_CHAIN",
+	"PROMPT_ARENA_LABEL_SUFFIX",
 	"PROMPT_ARENA_SHM_SUFFIX",
 	"DecodedTokenStore",
 	"PromptTokenArena",
 	"TokenStoreCapacityError",
+	"prompt_arena_label",
 	"prompt_arena_shm_name",
 ]
 
@@ -58,7 +64,10 @@ DEFAULT_DECODED_CAPACITY_TOKENS = 1 << 30
 DEFAULT_RELEASE_FREE_FRACTION = 0.25
 
 END_OF_CHAIN = -1
-PROMPT_ARENA_SHM_SUFFIX = "prompt_tokens"
+PROMPT_ARENA_LABEL_SUFFIX = "prompt_tokens"
+# Compatibility names for callers that treated the old value as a label.  The
+# value no longer names a POSIX shm object.
+PROMPT_ARENA_SHM_SUFFIX = PROMPT_ARENA_LABEL_SUFFIX
 
 # Marks a page sitting on the writer's free list. Distinct from END_OF_CHAIN so
 # that a stale handle raises while its pages are still free. Once a later write
@@ -106,36 +115,56 @@ def _as_token_ids(tokens) -> np.ndarray:
 	return np.ascontiguousarray(arr, dtype=_TOKEN_DTYPE)
 
 
-def _check_shm_space(nbytes: int) -> None:
-	"""Refuse an arena larger than the free space of /dev/shm.
+def _anonymous_region(label: str, size: int) -> Tuple[int, str, Optional[str]]:
+	"""Create an unnamed ``size``-byte region; return ``(fd, endpoint, temp_path)``.
 
-	Creation is sparse, so an over-committed tmpfs would only fail at the first
-	write to an unbacked page — as SIGBUS, with no Python traceback. This check
-	covers creation; the host memory budget must also leave room for the tokens
-	actually written while other segments (host KV, weights) grow.
+	On Linux the region is a memfd. It has no filesystem name at all, so the
+	kernel reclaims it once the last mapping goes away — however the processes
+	died — and readers reach it through ``/proc/<creator pid>/fd/<N>``, which is
+	the ``endpoint``. ``label`` names nothing: it is only the ``memfd:`` tag that
+	shows up in ``/proc/<pid>/fd`` and ``/proc/<pid>/maps``.
+
+	Elsewhere (macOS, which has neither memfd nor ``/proc``) the creator uses a
+	temp file it removes on teardown: a path, but still not a persistent
+	/dev/shm object. That path is returned as ``temp_path`` so teardown can
+	unlink it.
+
+	``ftruncate`` keeps the region sparse: nothing is written or faulted here, so
+	a multi-GiB arena costs nothing at creation and reads as zero.
 	"""
+	temp_path: Optional[str] = None
+	if sys.platform.startswith("linux"):
+		fd = create_memfd(label)
+		endpoint = f"/proc/{os.getpid()}/fd/{fd}"
+	else:
+		fd, temp_path = tempfile.mkstemp(prefix=label)
+		endpoint = temp_path
 	try:
-		stat = os.statvfs("/dev/shm")
-	except OSError:
-		return  # no /dev/shm (e.g. macOS); POSIX shm is not tmpfs-backed there
-	available = stat.f_bavail * stat.f_frsize
-	if nbytes > available:
-		raise TokenStoreCapacityError(
-			f"prompt arena needs {nbytes} bytes of /dev/shm, only {available} "
-			"are free"
-		)
+		os.ftruncate(fd, size)
+	except BaseException:
+		os.close(fd)
+		if temp_path is not None:
+			os.unlink(temp_path)
+		raise
+	return fd, endpoint, temp_path
 
 
-def prompt_arena_shm_name(shm_prefix: str) -> str:
-	"""Name the node's prompt arena under a run's shm prefix.
+def prompt_arena_label(shm_prefix: str) -> str:
+	"""Label the node's prompt arena under a run's shm prefix.
 
-	The prefix comes from ``RuntimeIdentity.shm_prefix``, so the existing
-	prefix-based shm cleanup and the startup refusal on a stale prefix cover this
-	segment exactly as they cover ``host_kv`` and ``input_ids``.
+	The prefix comes from ``RuntimeIdentity.shm_prefix``, so a region shows up in
+	``/proc/<pid>/maps`` attributed to its run exactly as ``host_kv`` and
+	``input_ids`` do. It is a debugging tag only: the arena has no name to
+	collide with, to clean up, or to attach by.
 	"""
 	if not isinstance(shm_prefix, str) or not shm_prefix:
 		raise ValueError("shm_prefix must be a non-empty string")
-	return f"{shm_prefix}{PROMPT_ARENA_SHM_SUFFIX}"
+	return f"{shm_prefix}{PROMPT_ARENA_LABEL_SUFFIX}"
+
+
+def prompt_arena_shm_name(shm_prefix: str) -> str:
+	"""Compatibility alias returning the memfd debug label."""
+	return prompt_arena_label(shm_prefix)
 
 
 class TokenStoreCapacityError(RuntimeError):
@@ -153,16 +182,15 @@ class PromptTokenArena:
 		[data_offset, +num_pages*page_bytes)  the token pages
 
 	The chain array lives in a header region of the SAME mapping rather than in a
-	second segment: a reader has one name to open and can therefore never observe
-	tokens without the chain that indexes them, and the prefix-based cleanup has
-	one fewer name to chase. It costs ``num_pages * 4`` bytes — 0.024% of the
-	arena at the default page size — and stays sparse like the data region, since
-	nothing writes a chain entry until a chain is built.
+	second region: a reader has one descriptor to open and can therefore never
+	observe tokens without the chain that indexes them. It costs ``num_pages * 4``
+	bytes — 0.024% of the arena at the default page size — and stays sparse like
+	the data region, since nothing writes a chain entry until a chain is built.
 
-	Creation is sparse on purpose: the segment is ``ftruncate``'d to its full size
-	and never zero-filled or otherwise touched, so a multi-GiB arena costs nothing
-	at startup and resident memory tracks written pages only (POSIX guarantees the
-	untouched pages read as zero).
+	The region is an UNNAMED memfd (see :func:`_anonymous_region`), not a
+	``/dev/shm`` object: a SIGKILLed creator leaves no name to unlink, no stale
+	segment for the next run to adopt, and nothing for the prefix cleanup to
+	chase. The kernel frees the region when its last mapping goes away.
 
 	Exactly one process per node creates the arena and owns allocation; its free
 	list is process-local, so there is no cross-process lock. Everybody else
@@ -175,32 +203,38 @@ class PromptTokenArena:
 	  reads take no lock, so a concurrent free + write can tear or alias a read.
 	* Handles come only from :meth:`write`; they are not validated against the
 	  start of a chain.
-	* Attach after the creator has returned (a barrier), and only from
-	  multiprocessing descendants of the server that also spawned the creator:
-	  before Python 3.13 an attach registers the name with the resource tracker,
-	  and a process with its own tracker would unlink the name when it exits.
+	* A reader attaches by the creator's :attr:`endpoint`, so the creator must
+	  pass that string to the children it spawns (argv, env, or the spawn
+	  payload) and must keep the arena open while any of them may still attach:
+	  the endpoint resolves only while the creator holds the descriptor.
 	"""
 
 	def __init__(
 		self,
-		name: str,
+		target: str,
 		*,
 		create: bool,
 		capacity_bytes: Optional[int] = None,
 		page_size_tokens: int = DEFAULT_PAGE_SIZE_TOKENS,
 		release_free_fraction: float = DEFAULT_RELEASE_FREE_FRACTION,
 	):
-		"""Low-level constructor; prefer :meth:`create` / :meth:`attach`."""
-		self._name = name
+		"""Low-level constructor; prefer :meth:`create` / :meth:`attach`.
+
+		``target`` is the memfd label when creating, and the creator's
+		:attr:`endpoint` when attaching.
+		"""
+		self._name = target
 		self._is_creator = bool(create)
-		self._unlinked = False
 		self._release_free_fraction = float(release_free_fraction)
 		self._can_release = True
 		# Pages freed since the last release pass; each pass punches only these.
 		self._release_pending: List[int] = []
-		self._shm: Optional[shared_memory.SharedMemory] = None
-		# Kept after close() so the creator can still unlink the name.
-		self._shm_ref: Optional[shared_memory.SharedMemory] = None
+		self._fd = -1
+		self._size = 0
+		self._mapping: Optional[mmap.mmap] = None
+		self._endpoint = "" if self._is_creator else target
+		# Set only by the non-memfd fallback: the temp path teardown must remove.
+		self._temp_path: Optional[str] = None
 		self._next_page: Optional[np.ndarray] = None
 		self._data: Optional[np.ndarray] = None
 
@@ -239,19 +273,29 @@ class PromptTokenArena:
 				],
 				dtype=np.int64,
 			)
-			size = data_offset + num_pages * page_bytes
-			_check_shm_space(size)
-			# Exclusive creation (O_EXCL): a name collision must fail loudly
-			# rather than silently adopt another run's or a stale segment.
-			self._shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+			self._size = data_offset + num_pages * page_bytes
+			self._fd, self._endpoint, self._temp_path = _anonymous_region(
+				target, self._size
+			)
 		else:
-			self._shm = shared_memory.SharedMemory(name=name)
-		self._shm_ref = self._shm
+			# O_CLOEXEC: a reader's handle on the region must not survive an exec.
+			self._fd = os.open(target, os.O_RDWR | os.O_CLOEXEC)
+			self._size = os.fstat(self._fd).st_size
 		try:
+			self._mapping = mmap.mmap(
+				self._fd,
+				self._size,
+				flags=mmap.MAP_SHARED,
+				prot=mmap.PROT_READ | mmap.PROT_WRITE,
+			)
+			if not self._is_creator:
+				# The mapping alone keeps the region alive, so a reader needs no
+				# descriptor of its own; the creator keeps its fd so that the
+				# endpoint it published stays resolvable.
+				self._close_fd()
 			self._map_views(layout)
 		except BaseException:
-			# Never leave a mapping (or, for the creator, a name) behind on a
-			# rejected segment: the next attempt would inherit the debris.
+			# Never leave a mapping or descriptor behind on a rejected region.
 			self._unmap(destroy=self._is_creator)
 			raise
 
@@ -274,10 +318,12 @@ class PromptTokenArena:
 		"""Create the node's arena at a fixed token capacity in bytes.
 
 		The capacity sizes the TOKEN DATA; the header and chain array add about
-		0.024% on top. Raises ``FileExistsError`` if the name is already taken.
+		0.024% on top. ``shm_prefix`` only labels the region for debugging —
+		readers attach through :attr:`endpoint`, so two creators on the same
+		prefix get two independent arenas rather than a collision.
 		"""
 		return cls(
-			prompt_arena_shm_name(shm_prefix),
+			prompt_arena_label(shm_prefix),
 			create=True,
 			capacity_bytes=capacity_bytes,
 			page_size_tokens=page_size_tokens,
@@ -285,15 +331,33 @@ class PromptTokenArena:
 		)
 
 	@classmethod
-	def attach(cls, shm_prefix: str) -> "PromptTokenArena":
-		"""Attach to the node's existing arena for reading only."""
-		return cls(prompt_arena_shm_name(shm_prefix), create=False)
+	def attach(cls, endpoint: str) -> "PromptTokenArena":
+		"""Attach read-only to the arena published as ``endpoint``.
+
+		``endpoint`` is the creator's :attr:`endpoint`. It resolves only while the
+		creator holds the arena open; afterwards this raises ``FileNotFoundError``.
+		"""
+		return cls(endpoint, create=False)
 
 	# ---------------------------------------------------------------- geometry
 
 	@property
 	def name(self) -> str:
+		"""The creator's label (a reader reports the endpoint it attached by).
+
+		Diagnostics only: it names no shm object, so :meth:`attach` takes
+		:attr:`endpoint` instead.
+		"""
 		return self._name
+
+	@property
+	def endpoint(self) -> str:
+		"""The path a reader passes to :meth:`attach`.
+
+		``/proc/<creator pid>/fd/<N>`` for the memfd, or the creator's temp path
+		on a platform without memfd.
+		"""
+		return self._endpoint
 
 	@property
 	def is_creator(self) -> bool:
@@ -453,9 +517,7 @@ class PromptTokenArena:
 		"""
 		self._require_writer("release free memory")
 		pending, self._release_pending = self._release_pending, []
-		# SharedMemory exposes no mmap or fd, and madvise is an mmap method, so
-		# the private mapping is the only route to it — hence the getattr guard.
-		mapping = getattr(self._shm, "_mmap", None)
+		mapping = self._mapping
 		if (
 			not self._can_release
 			or mapping is None
@@ -481,11 +543,20 @@ class PromptTokenArena:
 		return released
 
 	def close(self) -> None:
-		"""Unmap this process's view. Idempotent; readers call only this."""
+		"""Unmap this process's view. Idempotent; readers call only this.
+
+		The creator keeps its descriptor, so its :attr:`endpoint` stays
+		resolvable and late readers can still attach until :meth:`unlink`.
+		"""
 		self._unmap(destroy=False)
 
 	def unlink(self) -> None:
-		"""Unmap and remove the segment's name. Only the creator may do this."""
+		"""Drop the creator's hold on the region. Only the creator may do this.
+
+		There is no name to remove: closing the creator's descriptor (after its
+		mapping) retires the endpoint, and the kernel frees the region once the
+		last reader has unmapped it. Idempotent.
+		"""
 		if not self._is_creator:
 			raise RuntimeError(
 				f"prompt arena '{self._name}' was attached, not created; only "
@@ -499,15 +570,15 @@ class PromptTokenArena:
 		"""Write or validate the header, then bind the chain and data views."""
 		header_bytes = _HEADER_SLOTS * 8
 		if layout is not None:
-			self._shm.buf[:header_bytes] = layout.tobytes()
+			self._mapping[:header_bytes] = layout.tobytes()
 		# Read the header as a COPY. A live numpy view of the mapping exports a
 		# buffer, and an export outstanding on any failure path below would make
 		# mmap.close() raise BufferError instead of unmapping.
-		header = np.frombuffer(bytes(self._shm.buf[:header_bytes]), dtype=np.int64)
+		header = np.frombuffer(self._mapping[:header_bytes], dtype=np.int64)
 		if layout is None:
 			if int(header[0]) != _HEADER_MAGIC:
 				raise ValueError(
-					f"shared segment '{self._name}' is not a prompt arena "
+					f"shared region '{self._name}' is not a prompt arena "
 					f"(magic {int(header[0]):#x})"
 				)
 			if int(header[1]) != _HEADER_VERSION:
@@ -531,50 +602,59 @@ class PromptTokenArena:
 		self._next_page_offset = int(header[4])
 		self._data_offset = int(header[5])
 		required = self._data_offset + self._num_pages * self._page_bytes
-		if self._shm.size < required:
+		if self._size < required:
 			raise TokenStoreCapacityError(
-				f"prompt arena '{self._name}' is {self._shm.size} bytes, its "
+				f"prompt arena '{self._name}' is {self._size} bytes, its "
 				f"header describes {required} ({self._num_pages} pages x "
 				f"{self._page_size_tokens} tokens x {_TOKEN_BYTES} B)"
 			)
 		self._next_page = np.frombuffer(
-			self._shm.buf,
+			self._mapping,
 			dtype=_TOKEN_DTYPE,
 			count=self._num_pages,
 			offset=self._next_page_offset,
 		)
 		self._data = np.frombuffer(
-			self._shm.buf,
+			self._mapping,
 			dtype=_TOKEN_DTYPE,
 			count=self._num_pages * self._page_size_tokens,
 			offset=self._data_offset,
 		)
 		if not self._is_creator:
-			# ``shared_memory`` has no read-only attach mode (it always opens
-			# O_RDWR), so the read-only contract is enforced on the numpy views
-			# and by _require_writer(), not by the page protection.
+			# Every mapping here is PROT_WRITE, so the read-only contract is
+			# enforced on the numpy views and by _require_writer(), not by the
+			# page protection.
 			self._next_page.flags.writeable = False
 			self._data.flags.writeable = False
 
 	def _unmap(self, *, destroy: bool) -> None:
-		"""Drop the views and the mapping; optionally unlink the name.
+		"""Drop the views and the mapping; with ``destroy``, the fd as well.
 
-		Unlinking does not depend on the mapping: a creator may close() first and
-		unlink() later. The name goes before the mapping so that a failing
-		close() cannot leave the segment behind.
+		A reader's descriptor is already closed after mapping, so only the
+		creator's teardown (``destroy``) retires one — which is what lets the
+		kernel reclaim the region once the readers unmap it.
 		"""
 		# The views must go first: they export buffers from the mapping, and
 		# nothing this class hands out is a view into it, so dropping our own
 		# references is enough to let mmap.close() through.
 		self._next_page = None
 		self._data = None
-		if destroy and not self._unlinked and self._shm_ref is not None:
-			self._shm_ref.unlink()
-			self._unlinked = True
-		shm = self._shm
-		self._shm = None
-		if shm is not None:
-			shm.close()
+		mapping, self._mapping = self._mapping, None
+		if mapping is not None:
+			mapping.close()
+		if destroy or not self._is_creator:
+			self._close_fd()
+		if destroy and self._temp_path is not None:
+			path, self._temp_path = self._temp_path, None
+			try:
+				os.unlink(path)  # non-memfd fallback only
+			except FileNotFoundError:
+				pass
+
+	def _close_fd(self) -> None:
+		fd, self._fd = self._fd, -1
+		if fd >= 0:
+			os.close(fd)
 
 	def _require_writer(self, action: str) -> None:
 		if not self._is_creator:

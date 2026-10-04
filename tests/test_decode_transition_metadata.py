@@ -1,8 +1,10 @@
+import ast
 from pathlib import Path
 
 import pytest
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.worker.prefill import compute_prefill_host_reservation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,23 +31,79 @@ def test_prefill_to_decode_metadata_sync_brackets_status_transition():
 
 
 def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
-    source = WORKER.read_text()
-    assert (
-        "seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)\n"
-        "\t\t\t\tseq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE\n"
-        "\t\t\t\tsequence_tokens.append(seq.host_token_capacity)"
-    ) in source
-
     seq = SequenceEntry("seq", global_idx=24, prompt_length=6087, max_decode_length=4096)
+    pages, rounded_capacity = compute_prefill_host_reservation(
+        prompt_length=seq.prompt_length,
+        kv_token_budget=seq.kv_token_budget,
+        page_size=seq.PAGE_SIZE,
+        chunk_size=0,
+        initial_gpu_page_buffer=0,
+    )
+    assert (pages, rounded_capacity) == (96, 96 * seq.PAGE_SIZE)
+
     seq.status = SequenceStatus.PREFILLED
     seq.assigned_rank = 1
-    seq.host_pages_allocated = 96
+    seq.host_pages_allocated = pages
     seq.host_token_capacity = 6087
 
     with pytest.raises(RuntimeError, match="host_token_capacity=6087"):
         seq.validate_metadata("unit")
 
-    seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
+    seq.host_token_capacity = rounded_capacity
+    seq.validate_metadata("unit")
+
+
+def test_worker_prefill_plan_delegates_page_rounding_to_shared_helper():
+    tree = ast.parse(WORKER.read_text(), filename=str(WORKER))
+    method = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+        for node in node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_prefill_host_reservation_plan"
+    )
+    assert any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "compute_prefill_host_reservation"
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+    )
+
+
+def test_terminal_decode_boundary_allows_only_the_final_capacity_gap():
+    """EOS/length completion is released before another forward is issued."""
+    seq = SequenceEntry("seq", global_idx=25, prompt_length=100, max_decode_length=4000)
+    seq.status = SequenceStatus.IN_DECODE
+    seq.assigned_rank = 1
+    seq.decoded_length = 3357
+    seq.current_context_length = 3457
+    seq.host_pages_allocated = 54
+    seq.host_token_capacity = 3456
+    seq.gpu_pages_allocated = 54
+    seq.eos_reached = True
+
+    with pytest.raises(RuntimeError, match="host_token_capacity=3456"):
+        seq.validate_metadata("unit")
+    seq.validate_metadata("unit", allow_terminal_capacity_gap=True)
+
+    seq.eos_reached = False
+    with pytest.raises(RuntimeError, match="host_token_capacity=3456"):
+        seq.validate_metadata("unit", allow_terminal_capacity_gap=True)
+
+
+def test_unified_trajectory_eviction_does_not_require_legacy_token_tensor():
+    seq = SequenceEntry("seq", global_idx=24, prompt_length=100, max_decode_length=900)
+    seq.status = SequenceStatus.EVICTED
+    seq.assigned_rank = 1
+    seq.prompt_length = 110
+    seq.original_prompt_length = 100
+    seq.decoded_length = 10
+    seq.current_context_length = 110
+    seq.total_decoded_before_eviction = 10
+    seq.reentry_decoded_baseline = 0
+    seq._buffer_slot = 3
+
     seq.validate_metadata("unit")
 
 

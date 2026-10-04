@@ -40,6 +40,7 @@ from batchgen.continuous_batching import (
     plan_host_kv_growth_evictions,
     select_sequences_for_loading,
 )
+from batchgen.worker.decode import reduce_decode_capacity_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,15 @@ class BoundaryDecisionRequest:
     # Decode attention TP size.  G==1 is pure DP; G>1 makes each sequence
     # resident on the contiguous G ranks of ``decode_dp_group``.
     attn_tp_size: int = 1
+    # The boundary must use the same live allocator contract as initial decode
+    # admission.  ``per_rank_total`` is optional for old pure callers, but the
+    # worker always supplies it so a divergent allocator is rejected before
+    # any boundary decision is made.
+    per_rank_total: Tuple[int, ...] = ()
+    # Existing rows and the pre-reserved decode buffer cap are needed when a
+    # boundary loads more rows into an already-running decode group.
+    max_rank_bsz: int = 0
+    existing_sequence_counts: Tuple[int, ...] = ()
 
 
 class BoundaryHandler:
@@ -123,13 +133,58 @@ class BoundaryHandler:
             return rank
 
         num_capacity_groups = world_size // group_size
-        capacity_free_pages = [
-            min(per_rank_free[g * group_size:(g + 1) * group_size])
-            for g in range(num_capacity_groups)
-        ]
+        if req.per_rank_total:
+            capacity_snapshot = reduce_decode_capacity_snapshot(
+                tuple(req.per_rank_total),
+                tuple(per_rank_free),
+                world_size=world_size,
+                attn_tp_size=group_size,
+            )
+            capacity_free_pages = list(capacity_snapshot.free_pages)
+        else:
+            if len(per_rank_free) != world_size:
+                raise ValueError(
+                    "boundary free-page snapshot length must equal world_size: "
+                    f"free={len(per_rank_free)}, world_size={world_size}"
+                )
+            capacity_free_pages = [
+                min(per_rank_free[g * group_size:(g + 1) * group_size])
+                for g in range(num_capacity_groups)
+            ]
 
         def node_for_rank(rank: int) -> int:
             return rank // gpn
+
+        def host_owner_rank(state: Mapping[str, object], uuid: str) -> Optional[int]:
+            """Return the rank whose node owns this sequence's host KV chain.
+
+            ``assigned_rank`` is the pure-DP row placement and is not a
+            physical host-KV ownership key once decode attention is replicated
+            across a TP group.  The host region is node-shared and is mutated
+            exactly once by ``host_kv_owner_rank(decode_dp_group, G)``.  Use
+            the same derivation in the rank-0 planner so growth, completion
+            release credits, and eviction candidates are charged to the pool
+            that the execution phase will actually mutate.
+
+            G==1 keeps the legacy assigned-rank contract.  Missing TP group
+            metadata is an invariant violation rather than a silent fallback:
+            charging that request to an arbitrary node can make the planner
+            report capacity that the owner cannot allocate from.
+            """
+            if group_size > 1:
+                group = state.get("decode_dp_group")
+                if not isinstance(group, int):
+                    raise ValueError(
+                        f"sequence {uuid} has no decode_dp_group for "
+                        f"attn_tp_size={group_size}"
+                    )
+                from batchgen.decode_dp_group import host_kv_owner_rank
+
+                return host_kv_owner_rank(group, group_size)
+            rank = state.get("assigned_rank")
+            if not isinstance(rank, int):
+                raise ValueError(f"sequence {uuid} has no assigned_rank")
+            return rank
 
         def meta_global_idx(uuid: str):
             m = seq_meta.get(uuid)
@@ -148,6 +203,25 @@ class BoundaryHandler:
                 completed_uuids.append(uuid)
             else:
                 active_uuids.append(uuid)
+
+        if req.existing_sequence_counts:
+            if len(req.existing_sequence_counts) != num_capacity_groups:
+                raise ValueError(
+                    "existing_sequence_counts has "
+                    f"{len(req.existing_sequence_counts)} groups; expected "
+                    f"{num_capacity_groups}"
+                )
+            reported_counts = [0] * num_capacity_groups
+            for uuid in active_uuids:
+                state = global_seq_state.get(uuid)
+                if state is not None:
+                    reported_counts[capacity_group(state, uuid)] += 1
+            if tuple(reported_counts) != tuple(req.existing_sequence_counts):
+                raise ValueError(
+                    "boundary existing sequence counts disagree with gathered state: "
+                    f"computed={tuple(reported_counts)}, "
+                    f"reported={tuple(req.existing_sequence_counts)}"
+                )
 
         # Host KV growth + eviction decisions. Growth and eviction must be
         # planned together: if growth is needed, watermark-only eviction is not
@@ -177,34 +251,31 @@ class BoundaryHandler:
             }
             completed_set = set(completed_uuids)
             active_nodes = {
-                node_for_rank(global_seq_state[uuid]['assigned_rank'])
+                node_for_rank(host_owner_rank(global_seq_state[uuid], uuid))
                 for uuid in active_uuids
-                if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+                if uuid in global_seq_state
             }
             completed_nodes = {
-                node_for_rank(global_seq_state[uuid]['assigned_rank'])
+                node_for_rank(host_owner_rank(global_seq_state[uuid], uuid))
                 for uuid in completed_uuids
-                if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+                if uuid in global_seq_state
             }
             for node in sorted(active_nodes | completed_nodes | set(host_stats_by_node.keys())):
                 node_stats = host_stats_by_node.get(node)
                 node_active_uuids = [
                     uuid for uuid in active_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 node_completed_uuids = [
                     uuid for uuid in completed_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 node_growth_uuids = [
                     uuid for uuid in host_growth_uuids
                     if uuid in global_seq_state
-                    and global_seq_state[uuid].get('assigned_rank') is not None
-                    and node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+                    and node_for_rank(host_owner_rank(global_seq_state[uuid], uuid)) == node
                 ]
                 if not node_active_uuids and not node_completed_uuids and not node_growth_uuids:
                     continue
@@ -282,7 +353,7 @@ class BoundaryHandler:
                                 capacity - context_len,
                                 uuid,
                                 m.global_idx if m else None,
-                                state.get('assigned_rank'),
+                                host_owner_rank(state, uuid),
                                 context_len,
                                 capacity,
                                 int(state.get('host_pages_allocated', m.host_pages_allocated if m else 0) or 0),
@@ -379,10 +450,10 @@ class BoundaryHandler:
             remaining_growth_by_node = {}
             for uuid in host_growth_uuids:
                 state = global_seq_state.get(uuid, {})
-                assigned_rank = state.get('assigned_rank')
-                if assigned_rank is None:
+                owner = host_owner_rank(state, uuid)
+                if owner is None:
                     continue
-                node = node_for_rank(assigned_rank)
+                node = node_for_rank(owner)
                 remaining_growth_by_node[node] = (
                     remaining_growth_by_node.get(node, 0)
                     + remaining_growth_by_uuid[uuid]
@@ -416,6 +487,11 @@ class BoundaryHandler:
         decode_uuids_final = [u for u in decode_after_eviction if u not in onhold_set]
 
         new_load_uuids = []
+        existing_sequence_counts = [0] * num_capacity_groups
+        for uuid in decode_uuids_final:
+            state = global_seq_state.get(uuid)
+            if state is not None:
+                existing_sequence_counts[capacity_group(state, uuid)] += 1
         if global_candidate_info:
             # Compute adjusted free pages after extensions (arithmetic, no collective needed).
             adjusted_per_rank_free = [
@@ -430,6 +506,8 @@ class BoundaryHandler:
                 strategy=LoadingStrategy.LONGEST_FIRST,
                 get_global_idx_fn=meta_global_idx,
                 group_size=group_size,
+                max_sequence_count=req.max_rank_bsz,
+                existing_sequence_counts=tuple(existing_sequence_counts),
             )
 
         return BoundaryDecisions(

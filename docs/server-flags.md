@@ -194,12 +194,23 @@ usually means `--privileged`.
 
 Controls how BatchGen schedules sequences on GPU.
 
+The persistent worker publishes token-pool telemetry with two distinct
+capacity fields. `total_capacity` (also exposed as the compatibility field
+`capacity`) is the immutable number of full model-context reservations in the
+allocated QueryBook tensor and sizes the `SchedulingPool`. `free_reservations`
+is the current admission/allocator snapshot; it changes after bind and release
+and never resizes the scheduling pool. Every snapshot carries
+`capacity_semantics_version=1`; the scheduler rejects older ambiguous snapshots
+instead of treating their dynamic `capacity` value as a fixed pool size.
+`free_pages`, `active_count`, and `largest_free_extent_pages` provide the
+corresponding fragmentation and occupancy telemetry.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--initial-gpu-page-buffer` | `32` | Pages to reserve when first loading sequence to GPU. Each page = 64 tokens. |
 | `--extension-gpu-page-buffer` | `4` | Pages to add at page boundaries during decode |
 | `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages). Must be <= `--extension-gpu-page-buffer`, otherwise the server fails at startup with a `ValueError`. |
-| `--host-kv-watermark` | `70` | Percentage threshold for prioritizing prefill over decode |
+| `--host-kv-watermark` | `70` | Prefill admission threshold: interrupt decode for queued work only when at least one node has more than this percentage of host-KV pages free. This controls prefill scheduling; it is separate from the eviction watermark. |
 | `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences (always on) |
 
 **GPU Page Buffer Design:**
@@ -216,9 +227,9 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
-| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
-| `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
+| `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length, is at least one decode decision interval, and is rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
+| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is enabled exactly when the effective `--host-kv-chunk-size` is greater than zero; the parser rejects non-positive chunk sizes, and this flag cannot override that mode. Telemetry reports the derived effective state. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--host-kv-eviction-watermark` | `10` | Host-KV growth-planner watermark (0-100). The planner preserves this free-page margin, after completed-row release and safety margin; if growth cannot fit, it evicts an active sequence for later re-entry. This does not control the prefill admission threshold above. |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
 | `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
@@ -228,10 +239,13 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 **How chunk-based reservation works:**
 
-1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
-2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
-3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
-4. If host pages are exhausted, shortest-decoded sequences are evicted first to free pages
+1. The first pool drain sends one worker `init` message. Its `max_output_len` is the maximum per-request output length in that first drain. The worker uses that value only to cap host-KV chunk sizing; it is not a server-wide output limit.
+2. At prefill, each sequence reserves pages for its prompt plus the effective chunk, capped by that sequence's full KV budget (`prompt + max_completion_tokens` or the applicable fallback).
+3. During decode, a sequence approaching its current host-KV capacity requests another chunk, capped by its own KV budget. Successful growth is not eviction and is not re-entry.
+4. Eviction occurs when the host-KV growth planner determines that the active set cannot safely satisfy the required admission or growth while preserving the configured free-page watermark and safety margin. This can be proactive; it does not require a page allocation to fail first. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
+5. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA).
+
+The first-init rule matters when later admissions use a larger `max_completion_tokens`: the per-request decode budget remains authoritative, but the initial host-KV reservation may be smaller and grow during decode.
 
 **Example: High oversubscription with eviction**
 
@@ -395,7 +409,7 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
 | `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
 | `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. |
-| `--max-pool-size` | `10240` | Max QueryBook pool capacity for persistent request scheduling. Must be > 0; the server refuses to start otherwise (`0` used to select the removed non-pool mode). |
+| `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
 

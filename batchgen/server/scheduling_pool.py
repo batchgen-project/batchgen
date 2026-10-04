@@ -87,6 +87,16 @@ class SchedulingPool:
         with self._lock:
             return len(self._free_slots) > 0
 
+    def set_capacity(self, capacity: int) -> None:
+        """Set the token-pool-derived capacity before admissions begin."""
+        if capacity < 0:
+            raise ValueError(f"capacity must be non-negative, got {capacity}")
+        with self._lock:
+            if self._active_slots:
+                raise RuntimeError("cannot change scheduling capacity with active slots")
+            self._capacity = int(capacity)
+            self._free_slots = list(range(self._capacity))
+
     # -------------------- Slot Management --------------------
 
     def allocate_slot(self, request_id: str) -> int:

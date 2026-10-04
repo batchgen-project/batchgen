@@ -25,12 +25,15 @@ import pytest
 from batchgen.continuous_batching import validate_boundary_payload_alignment
 
 
-def _pl(seq_state, candidate_state=None):
-    return {
-        "free_pages": 100,
+def _pl(seq_state, candidate_state=None, *, total_pages=None, free_pages=100):
+    payload = {
+        "free_pages": free_pages,
         "seq_state": seq_state,
         "candidate_state": candidate_state or {},
     }
+    if total_pages is not None:
+        payload["total_pages"] = total_pages
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +71,24 @@ def test_g1_wrong_owner_fails():
 def test_g1_missing_active_fails():
     payloads = [_pl({}), _pl({})]
     with pytest.raises(RuntimeError, match="missing from gathered"):
+        validate_boundary_payload_alignment(["a"], payloads, group_size=1)
+
+
+def test_boundary_payload_total_capacity_mismatch_fails():
+    payloads = [
+        _pl({"a": {"assigned_rank": 0}}, total_pages=100),
+        _pl({"b": {"assigned_rank": 1}}, total_pages=99),
+    ]
+    with pytest.raises(RuntimeError, match="total page count diverged"):
+        validate_boundary_payload_alignment(["a", "b"], payloads, group_size=1)
+
+
+def test_boundary_payload_uuid_desync_fails_before_empty_return():
+    payloads = [
+        _pl({"a": {"assigned_rank": 0}}),
+        _pl({"stale": {"assigned_rank": 1}}),
+    ]
+    with pytest.raises(RuntimeError, match="absent from decode list"):
         validate_boundary_payload_alignment(["a"], payloads, group_size=1)
 
 
