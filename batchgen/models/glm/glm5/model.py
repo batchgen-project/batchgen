@@ -2149,7 +2149,16 @@ class Glm5MoE(nn.Module):
             )
 
         # 3) 3D dispatch
-        buf.dispatched_x.zero_()
+        # No memset on the CUDA-ops path: the grouped GEMM rewrites per-expert
+        # TMA descriptors with extent = seqlens[e] (rows past the count are
+        # hardware-zero-filled on load and the Y store is extent-clipped), and
+        # act_quant_3d returns at token >= count. Only the Triton fallback
+        # quant reads the full [E*mtp] buffer and needs sane bf16 there.
+        if not _GLM5_HAS_FP8_OPS:
+            zero_rows = min(buf.max_tokens_padded, num_global + 128)
+            buf.dispatched_x.view(
+                self.experts_per_rank, buf.max_tokens_padded, hidden_size
+            )[:, :zero_rows].zero_()
         expert_counts, topk_pos = dispatch_scatter_3d(
             all_tokens, topk_idx.to(torch.int32),
             buf.dispatched_x,
@@ -2163,8 +2172,9 @@ class Glm5MoE(nn.Module):
         self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
         # 5) Weighted scatter reduce
+        # reduce_weighted_scatter writes every output element unconditionally
+        # (skips only pos<0 INPUT rows) — no pre-zero needed.
         result_buf = buf.result_buffer[:num_global]
-        result_buf.zero_()
         global_results = reduce_weighted_scatter(
             buf.expert_out, topk_pos, topk_weight,
             num_global, hidden_size, topk,
