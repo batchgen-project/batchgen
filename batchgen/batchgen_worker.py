@@ -679,6 +679,26 @@ class BatchGenWorkerArgs:
 	pynccl_port_span: int = 100
 
 
+def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
+	"""Per-decode-step DSA state reset for the eager (second) decode path.
+
+	Computes the dense short-circuit hint once per step (77 of 78 D2H syncs
+	saved on DSA models), and ALWAYS clears the previous step's reused top-k
+	indices before layer 0 runs. The clear must be unconditional: when the
+	model config carries ``index_topk`` (GLM-5.2 does), a clear nested under
+	the hint's else-branch never executes and shared reuse-topk layers can
+	consume a stale top-k from the previous step. The graph-config path
+	resets it separately.
+	"""
+	if index_topk is not None:
+		wrapper_cls._dsa_short_count = int(
+			(cache_seqlens <= int(index_topk)).sum().item()
+		)
+	else:
+		wrapper_cls._dsa_short_count = None
+	wrapper_cls._dsa_prev_topk_indices = None
+
+
 class BatchGenWorker:
 	"""
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
@@ -2048,7 +2068,12 @@ class BatchGenWorker:
 			# temp-0 batch. Host-side check (no device sync), recomputed each step
 			# so no membership-invalidation hazard.
 			if self._decode_batch_all_greedy(active_sequences):
-				return logits.float().argmax(dim=-1, keepdim=True)
+				# argmax directly on the lm_head dtype: an fp32 upcast preserves
+				# bf16 ordering exactly, and the .float() copy was a fresh
+				# [bs, vocab] fp32 allocation on every decode step — large
+				# enough to destabilize graph-enabled boots at high
+				# gpu-memory-frac.
+				return logits.argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -10393,7 +10418,7 @@ class BatchGenWorker:
 			from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
 				Glm5DecoderLayerGraphSegment,
 			)
-			from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+			from batchgen.models.glm.glm5.model import Glm5MoE, resolve_glm5_3d_mtp
 			from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
 				Glm5MoEGraphBufferPool,
 				Glm5MoEGraphSegment,
@@ -10510,7 +10535,12 @@ class BatchGenWorker:
 					intermediate_size=first_moe.config.moe_intermediate_size,
 					device=self.torch_device,
 					bucket_sizes=bucket_sizes,
-					base_mtp=_GLM5_3D_MTP,
+					# Graph decode fan-in is bounded by the largest captured
+					# bucket across all ranks; the pool still takes
+					# max(base_mtp, round_up(world_size x max_bucket)).
+					base_mtp=resolve_glm5_3d_mtp(
+						self.world_size * max(bucket_sizes)
+					),
 				)
 			shared_dsa_buffers = {}
 			shared_reuse_buffers = {}
@@ -10648,7 +10678,9 @@ class BatchGenWorker:
 			self._whole_model_segment = whole_seg
 			self._glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
-				for capture_bucket in capture_buckets:
+				# Largest-first: the big bucket primes the shared graph pool and
+				# smaller buckets reuse its blocks instead of growing the pool.
+				for capture_bucket in sorted(capture_buckets, reverse=True):
 					torch.cuda.synchronize(self.torch_device)
 					dist.barrier()
 					whole_seg.set_capture_inputs(
@@ -11425,19 +11457,11 @@ class BatchGenWorker:
 					# indexer scoring. Computing once here instead of inside
 					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
 					# per decode step on DSA models (GLM-5).
-					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
-					if _dsa_index_topk is not None:
-						GLM5AttnWrapper._dsa_short_count = int(
-							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
-						)
-					else:
-						GLM5AttnWrapper._dsa_short_count = None
-
-						# GLM-5.2 DSA indexer reuse: clear prev top-k once per decode
-						# step (before layer 0) so shared layers never reuse a stale
-						# value from the previous step. (Second decode path; the
-						# graph-config path resets it separately.)
-						GLM5AttnWrapper._dsa_prev_topk_indices = None
+					_reset_glm5_dsa_step_state(
+						GLM5AttnWrapper,
+						Attn_Wrapper.cache_seqlens,
+						getattr(self.model_config, "index_topk", None),
+					)
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)

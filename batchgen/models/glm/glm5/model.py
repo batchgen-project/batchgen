@@ -83,8 +83,32 @@ from .moe_ragged import (
     require_ragged_kernels as _glm5_require_ragged_kernels,
 )
 
-_GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
+_GLM5_3D_MTP_ENV = "BATCHGEN_GLM5_3D_MTP"
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
+
+
+def resolve_glm5_3d_mtp(min_rows: int) -> int:
+    """Per-expert padded row capacity (mtp) for the 3D MoE buffers.
+
+    In the worst case a single expert receives every routed token of the
+    step, so the capacity must cover the relevant global token count,
+    rounded up to the FP8 blockwise block. The buffers this sizes are
+    zeroed or scanned per MoE layer per decode step, so over-provisioning
+    is paid in per-step memset/scan traffic as well as resident memory.
+
+    ``BATCHGEN_GLM5_3D_MTP`` (the former fixed default of 4096) now acts as
+    an optional floor: unset resolves to exactly the computed requirement;
+    when set, the result is ``max(env, requirement)`` so an undersized
+    override can never cause an out-of-bounds dispatch write.
+    """
+    required = max(int(min_rows), 1)
+    required = (required + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK * _GLM5_MTP_BLOCK
+    env = os.environ.get(_GLM5_3D_MTP_ENV)
+    if env is None:
+        return required
+    return max(int(env), required)
+
+
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
@@ -1520,7 +1544,10 @@ class Glm5MoE(nn.Module):
                 topk=K,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_GLM5_3D_MTP,
+                # Worst-case single-expert fan-in for the eager path is the
+                # global token count; resize_if_needed regrows on later larger
+                # admissions, so the initial capacity need not over-provision.
+                max_tokens_padded=resolve_glm5_3d_mtp(global_num_tokens),
             )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
