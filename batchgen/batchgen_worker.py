@@ -10413,7 +10413,7 @@ class BatchGenWorker:
 			from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
 				Glm5DecoderLayerGraphSegment,
 			)
-			from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+			from batchgen.models.glm.glm5.model import Glm5MoE, resolve_glm5_3d_mtp
 			from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
 				Glm5MoEGraphBufferPool,
 				Glm5MoEGraphSegment,
@@ -10530,7 +10530,12 @@ class BatchGenWorker:
 					intermediate_size=first_moe.config.moe_intermediate_size,
 					device=self.torch_device,
 					bucket_sizes=bucket_sizes,
-					base_mtp=_GLM5_3D_MTP,
+					# Graph decode fan-in is bounded by the largest captured
+					# bucket across all ranks; the pool still takes
+					# max(base_mtp, round_up(world_size x max_bucket)).
+					base_mtp=resolve_glm5_3d_mtp(
+						self.world_size * max(bucket_sizes)
+					),
 				)
 			shared_dsa_buffers = {}
 			shared_reuse_buffers = {}
