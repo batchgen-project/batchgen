@@ -679,6 +679,26 @@ class BatchGenWorkerArgs:
 	pynccl_port_span: int = 100
 
 
+def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
+	"""Per-decode-step DSA state reset for the eager (second) decode path.
+
+	Computes the dense short-circuit hint once per step (77 of 78 D2H syncs
+	saved on DSA models), and ALWAYS clears the previous step's reused top-k
+	indices before layer 0 runs. The clear must be unconditional: when the
+	model config carries ``index_topk`` (GLM-5.2 does), a clear nested under
+	the hint's else-branch never executes and shared reuse-topk layers can
+	consume a stale top-k from the previous step. The graph-config path
+	resets it separately.
+	"""
+	if index_topk is not None:
+		wrapper_cls._dsa_short_count = int(
+			(cache_seqlens <= int(index_topk)).sum().item()
+		)
+	else:
+		wrapper_cls._dsa_short_count = None
+	wrapper_cls._dsa_prev_topk_indices = None
+
+
 class BatchGenWorker:
 	"""
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
@@ -11425,19 +11445,11 @@ class BatchGenWorker:
 					# indexer scoring. Computing once here instead of inside
 					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
 					# per decode step on DSA models (GLM-5).
-					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
-					if _dsa_index_topk is not None:
-						GLM5AttnWrapper._dsa_short_count = int(
-							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
-						)
-					else:
-						GLM5AttnWrapper._dsa_short_count = None
-
-						# GLM-5.2 DSA indexer reuse: clear prev top-k once per decode
-						# step (before layer 0) so shared layers never reuse a stale
-						# value from the previous step. (Second decode path; the
-						# graph-config path resets it separately.)
-						GLM5AttnWrapper._dsa_prev_topk_indices = None
+					_reset_glm5_dsa_step_state(
+						GLM5AttnWrapper,
+						Attn_Wrapper.cache_seqlens,
+						getattr(self.model_config, "index_topk", None),
+					)
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
