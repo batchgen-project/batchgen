@@ -2068,7 +2068,12 @@ class BatchGenWorker:
 			# temp-0 batch. Host-side check (no device sync), recomputed each step
 			# so no membership-invalidation hazard.
 			if self._decode_batch_all_greedy(active_sequences):
-				return logits.float().argmax(dim=-1, keepdim=True)
+				# argmax directly on the lm_head dtype: an fp32 upcast preserves
+				# bf16 ordering exactly, and the .float() copy was a fresh
+				# [bs, vocab] fp32 allocation on every decode step — large
+				# enough to destabilize graph-enabled boots at high
+				# gpu-memory-frac.
+				return logits.argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -10673,7 +10678,9 @@ class BatchGenWorker:
 			self._whole_model_segment = whole_seg
 			self._glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
-				for capture_bucket in capture_buckets:
+				# Largest-first: the big bucket primes the shared graph pool and
+				# smaller buckets reuse its blocks instead of growing the pool.
+				for capture_bucket in sorted(capture_buckets, reverse=True):
 					torch.cuda.synchronize(self.torch_device)
 					dist.barrier()
 					whole_seg.set_capture_inputs(
