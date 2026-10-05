@@ -540,32 +540,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
             attn.kv_b_proj.weight.data,
             weight_scale["kv_b_proj.weight_scale_inv"],
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
-        self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
-        self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
-
-        # SGLang-aligned absorb weights for BF16 BMM (matches
-        # deepseek_weight_loader.py:572-578 layout exactly).
-        #
-        #   self.w_kc — [H, qk_nope=192, kv_lora=512], BF16
-        #     `.transpose(1,2).contiguous().transpose(1,2)` is SGLang's stride
-        #     trick: physical memory laid out as [H, 512, 192] contiguous,
-        #     strides swapped on dim 1/2. Math-identical to [H, 192, 512] but
-        #     makes bmm/bmm_fp8 hit the same cuBLAS kernel SGLang triggers.
-        #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
-        #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
-        self.w_kc = self._cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-        # Mirror SGLang exactly: .contiguous() first, then .transpose — the
-        # final tensor is a non-contiguous view with physical [H, 256, 512]
-        # and logical [H, 512, 256]. Adding a trailing .contiguous() would
-        # re-lay it out and change which cuBLAS kernel bmm dispatches to.
-        self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
+        # BF16 absorb matrices, built as temporaries. When the FP8 WGMMA absorb
+        # path is available (the default), BOTH the eager (glm5_decode_selector)
+        # and CUDA-graph decode paths use the FP8 absorb weights for q_absorb and
+        # out_absorb — the BF16 matrices are never read. So we free them below to
+        # reclaim ~4.6 GB/GPU of HBM (78 layers) for the KV cache, keeping only the
+        # FP8 weights. The BF16 matrices are retained ONLY as a fallback when the
+        # FP8 absorb kernel is unavailable.
+        cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
+        cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
+        self._fp8_absorb_weights = None
         if _HAS_FP8_ABSORB:
             try:
                 self._fp8_absorb_weights = FP8AbsorbWeights(
-                    self._cached_q_absorb,   # [H, 192, 512]
-                    self._cached_out_absorb,  # [H, 256, 512]
+                    cached_q_absorb,   # [H, 192, 512]
+                    cached_out_absorb,  # [H, 256, 512]
                 )
                 logging.debug(
                     f"[layer {self.layer_idx}] FP8 absorb weights initialized"
@@ -575,6 +566,21 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
                 )
                 self._fp8_absorb_weights = None
+
+        if self._fp8_absorb_weights is not None:
+            # FP8 absorb is used for q_absorb + out_absorb; BF16 matrices are dead.
+            self._cached_q_absorb = None
+            self._cached_out_absorb = None
+            self.w_kc = None
+            self.w_vc = None
+        else:
+            # Fallback: keep BF16 absorb (SGLang-aligned layout) for the BF16 BMM
+            # path. w_kc: [H,192,512]; w_vc: [H,512,256] (stride-trick layouts that
+            # make bmm hit the same cuBLAS kernel SGLang triggers).
+            self._cached_q_absorb = cached_q_absorb
+            self._cached_out_absorb = cached_out_absorb
+            self.w_kc = cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
+            self.w_vc = cached_out_absorb.contiguous().transpose(1, 2)
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 
