@@ -238,12 +238,10 @@ void fused_gate_warmup(int64_t ctx_ptr, torch::Tensor base_buffer) {
     ctx->cached_input_rows = rows;
 }
 
-std::vector<torch::Tensor> fused_gate_forward(
+torch::Tensor fused_router_forward(
     int64_t ctx_ptr,
-    torch::Tensor hidden_states,     // [N, K_dim] BF16
-    torch::Tensor logits,            // [N, E] FP32 pre-allocated (optional)
-    torch::Tensor topk_indices,      // [N, topk] int32 pre-allocated (optional)
-    torch::Tensor topk_weights,      // [N, topk] FP32 pre-allocated (optional)
+    torch::Tensor hidden_states,
+    torch::Tensor logits,
     int64_t num_valid_tokens
 ) {
     auto* ctx = reinterpret_cast<FusedGateContext*>(ctx_ptr);
@@ -253,30 +251,16 @@ std::vector<torch::Tensor> fused_gate_forward(
     const int N = hidden_states.size(0);
     const int K_dim = ctx->K_dim;
     const int E = ctx->E;
-    const int topk = ctx->topk;
     auto device = hidden_states.device();
-
-    // Effective token count for CUDA graph compatibility
     const int N_eff = (num_valid_tokens > 0 && num_valid_tokens < N)
                       ? static_cast<int>(num_valid_tokens) : N;
 
-    // Allocate outputs if not pre-allocated (must be done BEFORE graph capture)
     if (!logits.defined() || logits.numel() == 0) {
         logits = torch::empty({N, E}, torch::dtype(torch::kFloat32).device(device));
     }
-    if (!topk_indices.defined() || topk_indices.numel() == 0) {
-        topk_indices = torch::empty({N, topk}, torch::dtype(torch::kInt32).device(device));
-    }
-    if (!topk_weights.defined() || topk_weights.numel() == 0) {
-        topk_weights = torch::empty({N, topk}, torch::dtype(torch::kFloat32).device(device));
-    }
 
-    // TMA descriptor for A (input):
-    // - Decode (CUDA graph): pre-cached via fused_gate_warmup() against fixed base buffer
-    // - Prefill (eager): auto-created when input pointer or size changes
-    // TMA OOB fill zeros handle partial M-tiles at boundary.
     void* input_ptr = hidden_states.data_ptr();
-    int input_rows = hidden_states.size(0);
+    const int input_rows = hidden_states.size(0);
     if (!ctx->has_cached_tma_a ||
         ctx->cached_input_ptr != input_ptr ||
         input_rows > ctx->cached_input_rows) {
@@ -287,31 +271,58 @@ std::vector<torch::Tensor> fused_gate_forward(
         ctx->cached_input_ptr = input_ptr;
         ctx->cached_input_rows = input_rows;
     }
-    CUtensorMap tma_a = ctx->tma_desc_a;
 
     const __nv_bfloat16* bias_ptr = ctx->has_bias
         ? reinterpret_cast<const __nv_bfloat16*>(ctx->router_bias.data_ptr())
         : nullptr;
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    // Set smem attribute once (lazy init, not per-call)
-    if (!ctx->smem_attr_set) {
-        cudaFuncSetAttribute(
-            wgmma_router_gemm_bias_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            ctx->smem_bytes);
-        ctx->smem_attr_set = true;
-    }
-
-    // Kernel A: WGMMA GEMM + bias (only process valid token tiles)
     const int num_m_tiles = (N_eff + BLOCK_M - 1) / BLOCK_M;
     const int num_n_tiles = (E + BLOCK_N - 1) / BLOCK_N;
 
-    wgmma_router_gemm_bias_kernel<<<dim3(num_m_tiles, num_n_tiles), TOTAL_THREADS, ctx->smem_bytes, stream>>>(
-        tma_a, ctx->tma_desc_b, bias_ptr,
-        logits.data_ptr<float>(),
-        N_eff, K_dim, E);
+    wgmma_router_gemm_bias_kernel<<<
+        dim3(num_m_tiles, num_n_tiles),
+        TOTAL_THREADS,
+        ctx->smem_bytes,
+        stream>>>(
+            ctx->tma_desc_a,
+            ctx->tma_desc_b,
+            bias_ptr,
+            logits.data_ptr<float>(),
+            N_eff,
+            K_dim,
+            E);
+    return logits;
+}
+
+std::vector<torch::Tensor> fused_gate_forward(
+    int64_t ctx_ptr,
+    torch::Tensor hidden_states,     // [N, K_dim] BF16
+    torch::Tensor logits,            // [N, E] FP32 pre-allocated (optional)
+    torch::Tensor topk_indices,      // [N, topk] int32 pre-allocated (optional)
+    torch::Tensor topk_weights,      // [N, topk] FP32 pre-allocated (optional)
+    int64_t num_valid_tokens
+) {
+    auto* ctx = reinterpret_cast<FusedGateContext*>(ctx_ptr);
+    const int N = hidden_states.size(0);
+    const int topk = ctx->topk;
+    auto device = hidden_states.device();
+
+    // Effective token count for CUDA graph compatibility
+    const int N_eff = (num_valid_tokens > 0 && num_valid_tokens < N)
+                      ? static_cast<int>(num_valid_tokens) : N;
+
+    if (!topk_indices.defined() || topk_indices.numel() == 0) {
+        topk_indices = torch::empty({N, topk}, torch::dtype(torch::kInt32).device(device));
+    }
+    if (!topk_weights.defined() || topk_weights.numel() == 0) {
+        topk_weights = torch::empty({N, topk}, torch::dtype(torch::kFloat32).device(device));
+    }
+
+    logits = fused_router_forward(
+        ctx_ptr,
+        hidden_states,
+        logits,
+        num_valid_tokens);
 
     // Kernel B: TopK + Softmax (reuse standalone gate kernel)
     {

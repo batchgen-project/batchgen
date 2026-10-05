@@ -3,6 +3,10 @@
  *
  * Computes BF16 hidden states x BF16 router weight^T into FP32 logits with a
  * per-row accumulation order that is independent of the captured bucket M.
+ * Grid is (E, ceil(N/ROWS_PER_BLOCK)): each block computes a tile of rows for
+ * one expert. Row tiling only partitions independent outputs — the K-order
+ * FMA chain per output element is unchanged, so results are bit-identical to
+ * the previous serial-row kernel while wall time stops scaling O(N).
  * Rank-major graph padding is masked by device-side rank_token_counts, so graph
  * replay can keep a fixed launch while changing valid rows without host sync.
  */
@@ -18,6 +22,7 @@ namespace {
 
 constexpr int ROUTER_THREADS = 256;
 constexpr int ROUTER_WARP_SIZE = 32;
+constexpr int ROUTER_ROWS_PER_BLOCK = 4;
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -42,6 +47,8 @@ __global__ void glm5_router_gemm_kernel(
     if (expert >= E) {
         return;
     }
+    const int row_begin = blockIdx.y * ROUTER_ROWS_PER_BLOCK;
+    const int row_end = min(row_begin + ROUTER_ROWS_PER_BLOCK, N);
 
     const int tid = threadIdx.x;
     const int lane = tid % ROUTER_WARP_SIZE;
@@ -51,7 +58,7 @@ __global__ void glm5_router_gemm_kernel(
 
     const __nv_bfloat16* w = router_weight + expert * H;
 
-    for (int row = 0; row < N; ++row) {
+    for (int row = row_begin; row < row_end; ++row) {
         bool valid = true;
         if (rank_token_counts != nullptr) {
             valid = false;
@@ -156,7 +163,7 @@ torch::Tensor glm5_router_gemm_cuda(
         return output;
     }
 
-    const dim3 grid(E);
+    const dim3 grid(E, (N + ROUTER_ROWS_PER_BLOCK - 1) / ROUTER_ROWS_PER_BLOCK);
     const dim3 block(ROUTER_THREADS);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     glm5_router_gemm_kernel<<<grid, block, 0, stream>>>(
