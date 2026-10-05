@@ -1188,6 +1188,11 @@ class BatchGenWorker:
 				num_v_heads=aux_profile.num_v_heads,
 				v_head_dim=aux_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(aux_profile.kv_dtype),
+				logical_to_physical_layer=(
+					list(aux_profile.logical_to_physical_layer)
+					if getattr(aux_profile, "logical_to_physical_layer", None) is not None
+					else None
+				),
 			)
 			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
 
@@ -2772,6 +2777,30 @@ class BatchGenWorker:
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
 			self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 
+	def _aux_layers_with_slots(self):
+		"""Logical layer ids that have a slot in the aux (indexer) KV pools.
+
+		None = no layer mapping (every engine layer has an aux slot). GLM-5.2
+		maps only its 21 indexer layers; skip layers' index-K is never read,
+		so decode appends for them are dropped at the queueing choke points —
+		the mapped host view hard-fails on unmapped layers by design.
+		"""
+		cached = getattr(self, "_aux_layers_with_slots_cache", False)
+		if cached is not False:
+			return cached
+		coord = getattr(self, "gpu_paged_kv_cache_manager", None)
+		aux_mgr = getattr(coord, "auxiliary", None)
+		if aux_mgr is None:
+			return None  # aux not initialized yet; do not cache
+		aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
+		result = None
+		if aux_map is not None:
+			result = frozenset(
+				l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
+			)
+		self._aux_layers_with_slots_cache = result
+		return result
+
 	def _append_decode_kv_to_host_aux_async(
 		self,
 		layer_idx: int,
@@ -2786,6 +2815,9 @@ class BatchGenWorker:
 		"""
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is None or not batch:
+			return
+		valid_layers = self._aux_layers_with_slots()
+		if valid_layers is not None and layer_idx not in valid_layers:
 			return
 
 		sequence_ids = []
@@ -10580,7 +10612,9 @@ class BatchGenWorker:
 						shared_buffers=shared_reuse_buffers,
 					)
 				else:
-					aux_blocked_k = aux_k_cache[layer_idx]
+					# The aux pool may hold only the indexer layers (GLM-5.2):
+					# resolve the physical slot instead of indexing by engine layer.
+					aux_blocked_k = aux_k_cache[aux_manager.resolve_physical_layer(layer_idx)]
 					dummy = torch.empty(
 						1,
 						1,
@@ -11596,6 +11630,9 @@ class BatchGenWorker:
 							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
 					else:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							valid_layers = self._aux_layers_with_slots()
+							if valid_layers is not None and layer_idx not in valid_layers:
+								return
 							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
