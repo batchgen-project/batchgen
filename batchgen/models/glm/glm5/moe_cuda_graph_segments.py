@@ -24,7 +24,7 @@ from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
 )
-from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
+from batchgen.moe.routing import FusedGateContext, gate_sigmoid_topk_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +246,11 @@ class Glm5MoEGraphSegment:
 
         self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
+        self.router_context = FusedGateContext(
+            self.gate_weight_bf16,
+            router_bias=None,
+            topk=self.num_experts_per_tok,
+        )
 
     def _validate_shared_expert_graph_safe(self) -> None:
         shared = getattr(self.moe, "shared_experts", None)
@@ -275,6 +280,7 @@ class Glm5MoEGraphSegment:
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
         self.pool.setup()
+        self.router_context.warmup(self.pool._base["all_tokens"])
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self.pool.release()
@@ -310,14 +316,25 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        glm5_router_gemm_cuda(
-            bufs.all_tokens,
-            self.gate_weight_bf16,
-            router_logits=bufs.router_logits,
-            rank_token_counts=rank_token_counts,
-            bucket_size=bucket_size,
-            world_size=self.world_size,
-        )
+        # global_rows is static per captured bucket, so this dispatch is
+        # resolved at capture time. Mid-size global batches hit the Triton
+        # small-M tensor-core router (block_m=16); everything else uses the
+        # WGMMA router, whose tile shape underutilizes at those sizes.
+        if 192 <= global_rows <= 512:
+            from batchgen_kernels.triton.glm5_router_gemm import (
+                glm5_router_gemm,
+            )
+
+            glm5_router_gemm(
+                bufs.all_tokens,
+                self.gate_weight_bf16,
+                bufs.router_logits,
+            )
+        else:
+            self.router_context.router_forward(
+                bufs.all_tokens,
+                logits=bufs.router_logits,
+            )
         gate_sigmoid_topk_cuda(
             bufs.router_logits,
             self.gate_bias_fp32,

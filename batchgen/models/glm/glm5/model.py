@@ -155,14 +155,16 @@ def _glm5_moe_debug_mode() -> Optional[str]:
 def _glm5_moe_router_mode() -> str:
     """Router GEMM implementation for eager GLM-5 MoE decode.
 
-    Default ``custom`` keeps graph/eager on the row-stable GLM router kernel.
-    ``cublas`` restores the historical eager router for trajectory A/B tests.
+    Default ``cublas`` runs FP32 cuBLAS against the init-cached FP32 gate
+    weight (fp32-grade logits, full top-k agreement with the custom kernel).
+    ``custom`` opts back into the row-stable serial GLM router kernel, kept
+    for CUDA-graph bucket-M-independence work and trajectory A/B tests.
     """
     value = _glm5_moe_debug_dict().get("glm5_moe_router_mode")
     if not isinstance(value, str):
         value = os.environ.get(_GLM5_MOE_ROUTER_MODE_ENV, "")
     mode = value.strip().lower()
-    return mode if mode in {"custom", "cublas"} else "custom"
+    return mode if mode in {"custom", "cublas"} else "cublas"
 
 
 def _record_glm5_moe_dispatch(
@@ -1362,6 +1364,7 @@ class Glm5MoE(nn.Module):
 
         self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
         self.num_tokens_per_rank = None
+        self._gate_w_fp32 = None
         self.enable_ep_offloading = False
         self.num_persistent_local_experts = self.experts_per_rank
 
@@ -2263,14 +2266,22 @@ class Glm5MoE(nn.Module):
         graph buckets include rank padding.
         """
         from batchgen.moe.routing import gate_sigmoid_topk_cuda
-        if _glm5_moe_router_mode() == "cublas":
-            router_logits = F.linear(x.float(), self.gate.weight.float())
-        else:
+        if _glm5_moe_router_mode() == "custom":
+            # Original fused kernel: one block per expert with a serial N-row
+            # loop, so wall time scales with the global batch. Kept only for
+            # CUDA-graph bucket-M-independence work.
             from batchgen.moe.routing import glm5_router_gemm_cuda
             router_logits = glm5_router_gemm_cuda(
                 x,
                 self.gate.weight,
             )
+        else:
+            # FP32 cuBLAS with the gate weight cast once and cached at first
+            # use: fp32-grade logits with full top-k agreement against the
+            # custom kernel, without re-casting the weight every step.
+            if self._gate_w_fp32 is None:
+                self._gate_w_fp32 = self.gate.weight.float()
+            router_logits = F.linear(x.float(), self._gate_w_fp32)
         return gate_sigmoid_topk_cuda(
             router_logits,
             self.gate.e_score_correction_bias.float(),
