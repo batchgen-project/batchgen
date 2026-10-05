@@ -360,3 +360,211 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     manager.drop_bucket(bucket_size)
     assert bucket_size not in shared_buffers
     assert bucket_size not in segment._outputs
+
+
+def _build_full_segment(monkeypatch, device, shared_buffers):
+    wrapper = _build_fake_wrapper(device)
+    attn = wrapper.module
+    kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+    _patch_full_dsa_dependencies(
+        monkeypatch,
+        bucket_size=4,
+        index_topk=attn.indexer.index_topk,
+        kv_dim=kv_dim,
+        v_dim=attn.v_head_dim,
+        device=device,
+    )
+    page_size = 4
+    primary_cache = torch.zeros(4, page_size, 1, kv_dim, dtype=torch.bfloat16, device=device)
+    aux_cache = torch.zeros(
+        4, page_size, 1, attn.indexer.index_head_dim, dtype=torch.bfloat16, device=device
+    )
+    primary_page_table = torch.tensor([[0, -1], [1, -1]], dtype=torch.int32, device=device)
+    aux_page_table = torch.tensor([[2, -1], [3, -1]], dtype=torch.int32, device=device)
+    cos = torch.ones(8, attn.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+    sin = torch.zeros_like(cos)
+    segment = Glm5FullDsaAttnSegment(
+        wrapper=wrapper,
+        primary_blocked_k=primary_cache,
+        aux_blocked_k=aux_cache,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        wq_b_weights=object(),
+        absorb_weights=object(),
+        cuda_module=object(),
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=8,
+        index_topk=attn.indexer.index_topk,
+        page_size=page_size,
+        aux_page_size=page_size,
+        shared_buffers=shared_buffers,
+    )
+    return segment, primary_cache, aux_cache
+
+
+def test_full_dsa_smaller_buckets_are_views_of_largest(monkeypatch):
+    device = torch.device("cuda")
+    shared_buffers = {}
+    segment, _, _ = _build_full_segment(monkeypatch, device, shared_buffers)
+
+    segment.setup_static_buffers(4)
+    segment.setup_static_buffers(2)
+    base, small = shared_buffers[4], shared_buffers[2]
+
+    for name in sorted(segments._GLM5_DSA_VIEW_FIELDS):
+        base_t, small_t = getattr(base, name), getattr(small, name)
+        assert small_t.data_ptr() == base_t.data_ptr(), name
+        assert small_t.shape[0] == 2, name
+    # Rebuilt fields: fresh scratch tensors, prepared recomputed ON the views.
+    assert small.q_x_fp8.data_ptr() != base.q_x_fp8.data_ptr()
+    assert small.indexer_k_x_fp8.data_ptr() != base.indexer_k_x_fp8.data_ptr()
+    assert small.prepared_flashmla is not base.prepared_flashmla
+    assert (
+        small.prepared_flashmla.query_states.data_ptr()
+        == base.query_states.data_ptr()
+    )
+    assert small.prepared_flashmla.query_states.shape[0] == 2
+    # Outputs follow the same slicing.
+    out_base, out_small = segment._outputs[4], segment._outputs[2]
+    assert out_small.attn_output.data_ptr() == out_base.attn_output.data_ptr()
+    assert out_small.primary_k_tensor.data_ptr() == out_base.primary_k_tensor.data_ptr()
+    assert out_small.attn_output.shape[0] == 2
+
+
+def test_full_dsa_smaller_first_order_stays_correct(monkeypatch):
+    # Not the production order (capture is largest-first): a smaller bucket
+    # arriving first must not break anything — the larger bucket allocates a
+    # fresh full set (with a warning), and later smaller buckets view the
+    # largest base.
+    device = torch.device("cuda")
+    shared_buffers = {}
+    segment, _, _ = _build_full_segment(monkeypatch, device, shared_buffers)
+    segment.setup_static_buffers(2)
+    segment.setup_static_buffers(4)
+    assert (
+        shared_buffers[4].q_a.data_ptr() != shared_buffers[2].q_a.data_ptr()
+    )
+    assert shared_buffers[4].q_a.shape[0] == 4
+    segment.setup_static_buffers(3)
+    assert shared_buffers[3].q_a.data_ptr() == shared_buffers[4].q_a.data_ptr()
+    assert shared_buffers[3].q_a.shape[0] == 3
+
+
+def test_reuse_segment_views_borrow_topk_and_placeholders(monkeypatch):
+    from batchgen.models.glm.glm5 import reuse_topk_segment as reuse_mod
+    from batchgen.models.glm.glm5.reuse_topk_segment import Glm5ReuseTopkAttnSegment
+
+    device = torch.device("cuda")
+    shared_full = {}
+    full_segment, primary_cache, _ = _build_full_segment(monkeypatch, device, shared_full)
+    # reuse_topk_segment bound these names at ITS import; patch them there too.
+    monkeypatch.setattr(
+        reuse_mod,
+        "prepare_sparse_flash_mla_decode_inputs",
+        segments.prepare_sparse_flash_mla_decode_inputs,
+    )
+    full_segment.setup_static_buffers(4)
+    full_segment.setup_static_buffers(2)
+
+    attn = full_segment.attn
+    shared_reuse = {}
+    reuse_segment = Glm5ReuseTopkAttnSegment(
+        wrapper=full_segment.wrapper,
+        primary_blocked_k=primary_cache,
+        primary_page_table=full_segment.primary_page_table,
+        absorb_weights=object(),
+        cos_table=full_segment.cos_table,
+        sin_table=full_segment.sin_table,
+        max_seqlen=8,
+        index_topk=attn.indexer.index_topk,
+        page_size=full_segment.page_size,
+        topk_source=full_segment,
+        shared_buffers=shared_reuse,
+    )
+    reuse_segment.setup_static_buffers(4)
+    reuse_segment.setup_static_buffers(2)
+    base, small = shared_reuse[4], shared_reuse[2]
+
+    for name in sorted(reuse_mod._GLM5_REUSE_VIEW_FIELDS):
+        base_t, small_t = getattr(base, name), getattr(small, name)
+        assert small_t.data_ptr() == base_t.data_ptr(), name
+        assert small_t.shape[0] == 2, name
+    for name in sorted(reuse_mod._GLM5_REUSE_PLACEHOLDER_FIELDS):
+        assert getattr(small, name) is getattr(base, name), name
+    # The borrowed top-k is the PRODUCER's per-bucket view (which itself
+    # aliases the producer's base buffer).
+    assert small.top_k_indices.data_ptr() == shared_full[4].top_k_indices.data_ptr()
+    assert small.top_k_indices.shape[0] == 2
+    assert small.prepared_flashmla.query_states.data_ptr() == base.query_states.data_ptr()
+    out_base, out_small = reuse_segment._outputs[4], reuse_segment._outputs[2]
+    assert out_small.attn_output.data_ptr() == out_base.attn_output.data_ptr()
+    assert out_small.indexer_k_tensor is out_base.indexer_k_tensor
+
+
+def test_full_dsa_two_bucket_replay_parity_with_aliased_buffers(monkeypatch):
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    shared_buffers = {}
+    segment, primary_cache, aux_cache = _build_full_segment(
+        monkeypatch, device, shared_buffers
+    )
+    attn = segment.attn
+
+    manager = CUDAGraphManager(BatchSizeBucketing([4, 2]), device=device)
+    manager.WARMUP_ITERATIONS = 1
+    name = make_glm5_full_dsa_graph_segment_name(0)
+    manager.register_segment(name, segment)
+    # Largest-first: bucket 4 allocates the base, bucket 2 captures on views.
+    manager.warmup_and_capture_buckets([4, 2])
+    assert shared_buffers[2].q_a.data_ptr() == shared_buffers[4].q_a.data_ptr()
+
+    metadata = torch.arange(4, dtype=torch.int32, device=device).view(1, 4)
+    num_splits = torch.ones(1, dtype=torch.int32, device=device)
+
+    def inputs_for(bsz, seed):
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        return {
+            "hidden_states": torch.randn(
+                bsz, 1, attn.hidden_size, generator=gen, dtype=torch.float32
+            ).to(torch.bfloat16).to(device),
+            "position_ids": torch.arange(1, bsz + 1, dtype=torch.int64, device=device).view(bsz, 1),
+            "cache_seqlens": torch.full((bsz,), 2, dtype=torch.int32, device=device),
+            "primary_slot_indices": torch.arange(bsz, dtype=torch.int32, device=device) % 2,
+            "aux_slot_indices": torch.arange(bsz, dtype=torch.int32, device=device) % 2,
+        }
+
+    def eager(bsz, seed):
+        inp = inputs_for(bsz, seed)
+        primary_cache.zero_()
+        aux_cache.zero_()
+        out = segment.forward(
+            num_valid_tokens=torch.tensor([bsz], dtype=torch.int32, device=device),
+            flashmla_tile_scheduler_metadata=metadata,
+            flashmla_num_splits=num_splits,
+            **inp,
+        )
+        torch.cuda.synchronize()
+        return {k: v.detach().clone() for k, v in out.items()}
+
+    def replay(bsz, seed):
+        inp = inputs_for(bsz, seed)
+        primary_cache.zero_()
+        aux_cache.zero_()
+        out = manager.replay(
+            name,
+            bsz,
+            flashmla_tile_scheduler_metadata=metadata,
+            flashmla_num_splits=num_splits,
+            **inp,
+        )
+        torch.cuda.synchronize()
+        return {k: v.detach().clone() for k, v in out.items()}
+
+    # Alternate buckets so each graph replays over buffer rows the other
+    # bucket's replay has just rewritten through the aliased base storage.
+    for bsz, seed in ((2, 11), (3, 12), (2, 13), (4, 14)):
+        expected = eager(bsz, seed)
+        got = replay(bsz, seed)
+        for key in expected:
+            assert torch.equal(got[key], expected[key]), (bsz, key)
