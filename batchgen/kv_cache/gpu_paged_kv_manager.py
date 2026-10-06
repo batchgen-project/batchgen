@@ -1660,13 +1660,17 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS" in os.environ
 			else None
 		)
+		# Decoupled from pool size (measure-once-cache contract): explicit
+		# capacities define the table SHAPE independent of the pool's page
+		# count, so captured graphs survive a pool resize. Stored values are
+		# runtime-bounded by the live pool.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_slots", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		candidates: List[int] = []
 		if self._engine_config is not None:
@@ -1682,7 +1686,7 @@ class GPUPagedKVCacheManager:
 					candidates.append(normalized)
 		if not candidates:
 			candidates.append(self.config.num_pages)
-		return max(1, min(max(candidates), self.config.num_pages))
+		return max(1, max(candidates))
 
 	def _resolve_page_table_max_pages_per_sequence(self) -> int:
 		env_value = _positive_or_none(
@@ -1690,13 +1694,14 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
 			else None
 		)
+		# Decoupled from pool size: see _resolve_page_table_max_slots.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_pages_per_sequence", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
 		if self._engine_config is not None:
@@ -1713,7 +1718,7 @@ class GPUPagedKVCacheManager:
 			if prepack_capacity is not None and prepack_capacity > 0:
 				token_capacity = max(token_capacity, int(prepack_capacity))
 		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
-		return max(1, min(page_capacity, self.config.num_pages))
+		return max(1, page_capacity)
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":
