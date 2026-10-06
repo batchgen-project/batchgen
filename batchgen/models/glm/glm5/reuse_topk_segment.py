@@ -28,6 +28,9 @@ out-absorb, o_proj. ``row_modes`` is recomputed exactly as the eager reuse
 branch does: ``cache_seqlens > index_topk``.
 """
 
+import logging
+
+from dataclasses import fields
 from typing import Dict, Optional
 
 import torch
@@ -46,6 +49,65 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
 )
+
+# Max-bucket view split for the SKIP-layer buffer set (see the full segment's
+# split in cuda_graph_segments.py). Indexer-only fields are 1-element
+# placeholders here and pass through from the base unsliced; top_k_indices is
+# borrowed per bucket from the producing full segment; prepared_flashmla is
+# rebuilt on the sliced views.
+_GLM5_REUSE_VIEW_FIELDS = frozenset({
+    "valid_mask",
+    "aux_valid_mask",
+    "row_indices",
+    "valid_rows_bf16",
+    "valid_rows_ones",
+    "valid_rows_zeros",
+    "safe_slot_zeros",
+    "skip_slot_neg_ones",
+    "safe_seqlen_zeros",
+    "kv_primary_slot_indices",
+    "kv_aux_slot_indices",
+    "safe_primary_slot_indices",
+    "safe_aux_slot_indices",
+    "safe_cache_seqlens",
+    "q_a",
+    "q_flat",
+    "q_nope",
+    "q_rope_4d",
+    "new_compressed_kv",
+    "selected_mla_kv",
+    "selected_lengths",
+    "row_modes",
+    "absorbed_q",
+    "query_states",
+    "attn_heads",
+})
+_GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
+    "indexer_k_raw",
+    "indexer_k_x_fp8",
+    "indexer_k_x_scale",
+    "indexer_k_tma_desc",
+    "q_x_fp8",
+    "q_x_scale",
+    "q_tma_desc",
+    "q_flat_indexer",
+    "q_index",
+    "head_gates",
+    "positions_expanded",
+    "agg_scores",
+})
+_GLM5_REUSE_SPECIAL_FIELDS = frozenset({"top_k_indices", "prepared_flashmla"})
+
+_split_delta = (
+    set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
+    ^ (_GLM5_REUSE_VIEW_FIELDS | _GLM5_REUSE_PLACEHOLDER_FIELDS
+       | _GLM5_REUSE_SPECIAL_FIELDS)
+)
+if _split_delta:
+    raise AssertionError(
+        f"_Glm5FullDsaSegmentBuffers fields not covered by (or extraneous in) "
+        f"the reuse-segment view split: {sorted(_split_delta)}"
+    )
 
 
 class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
@@ -121,6 +183,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         from batchgen.models.glm.glm5.cuda_graph_segments import (
             _Glm5FullDsaSegmentOutputs,
         )
+        if self._outputs and bucket_size < max(self._outputs):
+            base = self._outputs[max(self._outputs)]
+            self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+                primary_k_tensor=base.primary_k_tensor[:bucket_size],
+                # 1-element placeholder passes through unsliced.
+                indexer_k_tensor=base.indexer_k_tensor,
+                attn_output=base.attn_output[:bucket_size],
+            )
+            return
         device = self.primary_blocked_k.device
         attn = self.attn
         kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
@@ -136,10 +207,56 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             ),
         )
 
+    def _make_bucket_view_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
+        base_bucket = self._base_bucket()
+        source_buffers = self.topk_source._buffers.get(bucket_size)
+        if source_buffers is None:
+            raise RuntimeError(
+                "Glm5ReuseTopkAttnSegment: topk_source has no buffers for "
+                f"bucket {bucket_size}; producing indexer-layer segment must "
+                "be set up first"
+            )
+        base = self._buffers[base_bucket]
+        attn = self.attn
+        view_kwargs = {
+            name: getattr(base, name)[:bucket_size]
+            for name in _GLM5_REUSE_VIEW_FIELDS
+        }
+        placeholder_kwargs = {
+            name: getattr(base, name) for name in _GLM5_REUSE_PLACEHOLDER_FIELDS
+        }
+        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
+            view_kwargs["query_states"],
+            view_kwargs["selected_mla_kv"],
+            view_kwargs["selected_lengths"],
+            attn.num_heads,
+            float(attn.softmax_scale),
+            head_dim_v=attn.kv_lora_rank,
+            page_size=self.page_size,
+        )
+        return _Glm5FullDsaSegmentBuffers(
+            top_k_indices=source_buffers.top_k_indices,
+            prepared_flashmla=prepared_flashmla,
+            **view_kwargs,
+            **placeholder_kwargs,
+        )
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
+        if self._buffers and bucket_size < max(self._buffers):
+            self._buffers[bucket_size] = self._make_bucket_view_buffers(bucket_size)
+            self._setup_static_output_buffers(bucket_size)
+            return
+        if self._buffers:
+            logging.warning(
+                "GLM-5 reuse-topk statics: bucket %d requested after smaller "
+                "base %d; allocating a full set (largest-first capture "
+                "restores the max-bucket-view footprint)",
+                bucket_size,
+                max(self._buffers),
+            )
         device = self.primary_blocked_k.device
         attn = self.attn
         kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim

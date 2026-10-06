@@ -17,7 +17,9 @@ preconditions should fast-fail before replay rather than silently falling back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+
+from dataclasses import dataclass, fields
 from typing import Dict, Optional
 
 import torch
@@ -119,6 +121,74 @@ class _Glm5FullDsaSegmentOutputs:
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor
     attn_output: torch.Tensor
+
+
+# Static-buffer footprint: capture runs largest-first, so the full per-row
+# buffer set is allocated once for the largest bucket and every smaller bucket
+# is a leading-dim slice view of that base. Views are safe because exactly one
+# bucket's graph replays per step and every non-constant field is fully
+# rewritten (out=/copy_) for rows [0, bucket) before it is read within that
+# replay; constant fields are never written. Two field classes cannot be
+# views and are rebuilt per bucket:
+#   - FP8 activation scratch: its TMA descriptor bakes pointer + global rows;
+#   - prepared_flashmla: bakes shapes/metadata (rebuilt ON the sliced views,
+#     so its pointers still alias the base storage).
+_GLM5_DSA_REBUILT_FIELDS = frozenset({
+    "indexer_k_x_fp8",
+    "indexer_k_x_scale",
+    "indexer_k_tma_desc",
+    "q_x_fp8",
+    "q_x_scale",
+    "q_tma_desc",
+    "prepared_flashmla",
+})
+_GLM5_DSA_VIEW_FIELDS = frozenset({
+    "valid_mask",
+    "aux_valid_mask",
+    "row_indices",
+    "valid_rows_bf16",
+    "valid_rows_ones",
+    "valid_rows_zeros",
+    "safe_slot_zeros",
+    "skip_slot_neg_ones",
+    "safe_seqlen_zeros",
+    "kv_primary_slot_indices",
+    "kv_aux_slot_indices",
+    "safe_primary_slot_indices",
+    "safe_aux_slot_indices",
+    "safe_cache_seqlens",
+    "q_a",
+    "q_flat",
+    "q_nope",
+    "q_rope_4d",
+    "new_compressed_kv",
+    "indexer_k_raw",
+    "q_flat_indexer",
+    "q_index",
+    "head_gates",
+    "positions_expanded",
+    "agg_scores",
+    "top_k_indices",
+    "selected_mla_kv",
+    "selected_lengths",
+    "row_modes",
+    "absorbed_q",
+    "query_states",
+    "attn_heads",
+})
+
+# Fail loudly at import time if the dataclass gains a field this split does
+# not name: an unclassified field would silently become a stale full-size
+# allocation or, worse, a wrongly-shaped view.
+_split_delta = (
+    set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
+    ^ (_GLM5_DSA_VIEW_FIELDS | _GLM5_DSA_REBUILT_FIELDS)
+)
+if _split_delta:
+    raise AssertionError(
+        f"_Glm5FullDsaSegmentBuffers fields not covered by (or extraneous in) "
+        f"the view/rebuild split: {sorted(_split_delta)}"
+    )
 
 
 class Glm5DsaAttnSegment:
@@ -677,6 +747,27 @@ class Glm5FullDsaAttnSegment:
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
+        if self._buffers and bucket_size < max(self._buffers):
+            # A larger base set already exists (capture runs largest-first, so
+            # the first captured bucket allocated the full set): build this
+            # bucket as leading-dim slice views plus the per-bucket rebuilt
+            # fields.
+            self._buffers[bucket_size] = self._make_bucket_view_buffers(bucket_size)
+            self._setup_static_output_buffers(bucket_size)
+            return
+        if self._buffers:
+            # A bucket larger than the current base: allocate a fresh full set
+            # (already-captured graphs keep their baked pointers). Correct but
+            # forfeits the max-bucket-view footprint for the existing sets —
+            # the production capture path is largest-first, so reaching this
+            # means the capture order regressed.
+            logging.warning(
+                "GLM-5 DSA statics: bucket %d requested after smaller base %d; "
+                "allocating a full set (largest-first capture restores the "
+                "max-bucket-view footprint)",
+                bucket_size,
+                max(self._buffers),
+            )
         device = self.primary_blocked_k.device
         attn = self.attn
         indexer = attn.indexer
@@ -808,8 +899,62 @@ class Glm5FullDsaAttnSegment:
         )
         self._setup_static_output_buffers(bucket_size)
 
+    def _base_bucket(self) -> int:
+        return max(self._buffers)
+
+    def _make_bucket_view_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
+        base_bucket = self._base_bucket()
+        base = self._buffers[base_bucket]
+        attn = self.attn
+        view_kwargs = {
+            name: getattr(base, name)[:bucket_size] for name in _GLM5_DSA_VIEW_FIELDS
+        }
+        # FP8 activation scratch TMA descriptors bake pointer + global rows:
+        # re-encode per bucket (the scratch itself is tiny).
+        indexer_k_x_fp8, indexer_k_x_scale, indexer_k_tma_desc = make_fp8_activation_scratch(
+            bucket_size,
+            attn.hidden_size,
+            self.cuda_module,
+            device=self.primary_blocked_k.device,
+        )
+        q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
+            bucket_size,
+            attn.q_lora_rank,
+            self.cuda_module,
+            device=self.primary_blocked_k.device,
+        )
+        # prepared_flashmla bakes shapes/metadata; recompute it ON the sliced
+        # views so its pointers alias the base storage.
+        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
+            view_kwargs["query_states"],
+            view_kwargs["selected_mla_kv"],
+            view_kwargs["selected_lengths"],
+            attn.num_heads,
+            float(attn.softmax_scale),
+            head_dim_v=attn.kv_lora_rank,
+            page_size=self.page_size,
+        )
+        return _Glm5FullDsaSegmentBuffers(
+            indexer_k_x_fp8=indexer_k_x_fp8,
+            indexer_k_x_scale=indexer_k_x_scale,
+            indexer_k_tma_desc=indexer_k_tma_desc,
+            q_x_fp8=q_x_fp8,
+            q_x_scale=q_x_scale,
+            q_tma_desc=q_tma_desc,
+            prepared_flashmla=prepared_flashmla,
+            **view_kwargs,
+        )
+
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._outputs:
+            return
+        if self._outputs and bucket_size < max(self._outputs):
+            base = self._outputs[max(self._outputs)]
+            self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+                primary_k_tensor=base.primary_k_tensor[:bucket_size],
+                indexer_k_tensor=base.indexer_k_tensor[:bucket_size],
+                attn_output=base.attn_output[:bucket_size],
+            )
             return
         device = self.primary_blocked_k.device
         attn = self.attn
