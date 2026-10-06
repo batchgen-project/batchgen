@@ -91,6 +91,8 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	if getattr(profile, "logical_to_physical_layer", None) is not None:
+		config.logical_to_physical_layer = list(profile.logical_to_physical_layer)
 	return config
 
 
@@ -197,9 +199,15 @@ class DualHostKVCoordinator:
 		aux_config.memfd_creator_pid = memfd_creator_pid
 		aux_config.memfd_fd = aux_memfd_fd
 
-		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
+		# Select the mapped view when the config carries a logical->physical
+		# layer map (GLM-5.2 aux stores only its 21 indexer layers); the mapped
+		# view translates engine layer ids inside every API, so callers keep
+		# logical indexing.
+		from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_worker_view
+
+		primary_view = build_host_kv_worker_view(core_engine_module, primary_config)
 		try:
-			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
+			aux_view = build_host_kv_worker_view(core_engine_module, aux_config)
 		except RuntimeError as e:
 			raise RuntimeError(
 				"Cannot create auxiliary KV worker view for DSA model; "
