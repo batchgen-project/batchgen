@@ -1,4 +1,4 @@
-"""Compact ragged workspace helpers for GLM-5 grouped prefill."""
+"""Compact ragged workspace helpers for GLM-5 grouped prefill and MoE decode."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ from batchgen.moe.dispatch_scatter_3d import (
 ROW_ALIGN = 64
 QUANT_BLOCK = 128
 _CAPACITY_BLOCK = 128
+# Average-M tile hint handed to the grouped GEMM's persistent scheduler for the
+# compact decode layout (the 3D layout derived it from mtp/E).
+GEMM_TILEM_AVG = 64
 
 _ops_module = None
 
