@@ -20,7 +20,6 @@ from batchgen.attention.dsa.sparse_decode_mla import (
 )
 from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16
 from batchgen.attention.mla.fa3_backend import act_quant
-from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
 )
@@ -621,22 +620,12 @@ def _build_query_states(
     selected_mla_kv: torch.Tensor,
 ) -> torch.Tensor:
     attn = wrapper.module
-    weight_scale = wrapper.weight_dequant_scale
     bsz = q_nope.shape[0]
 
-    if wrapper._cached_q_absorb is not None:
-        q_absorb = wrapper._cached_q_absorb
-        out_absorb = wrapper._cached_out_absorb
-    else:
-        kv_b_proj = deepseek_v3_dequantization(
-            attn.kv_b_proj.weight.data,
-            weight_scale["kv_b_proj.weight_scale_inv"],
-        ).view(attn.num_heads, -1, attn.kv_lora_rank)
-        q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
-        out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
-        if wrapper.w_kc is None:
-            wrapper.w_kc = q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-            wrapper.w_vc = out_absorb.contiguous().transpose(1, 2)
+    # The retired BF16 BMM absorb path used to dequantize kv_b_proj HERE —
+    # per layer per decode step on the eager path once the FP8 wrappers
+    # stopped caching the BF16 matrices. Every consumer now uses the FP8
+    # absorb weights; their absence fails loud below.
 
     qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
     query_states = torch.empty(
