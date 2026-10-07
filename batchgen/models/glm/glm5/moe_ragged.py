@@ -12,9 +12,52 @@ from batchgen.moe.dispatch_scatter_3d import (
 ROW_ALIGN = 64
 QUANT_BLOCK = 128
 _CAPACITY_BLOCK = 128
-# Average-M tile hint handed to the grouped GEMM's persistent scheduler for the
-# compact decode layout (the 3D layout derived it from mtp/E).
-GEMM_TILEM_AVG = 64
+# Average-M tile hint handed to the grouped GEMM's persistent scheduler
+# (`num_seq_per_group_avg`, which the compiled dispatch maps to TileM
+# 16/32/64: <=16 -> 16, <=32 -> 32, else 64). The former pinned constant 64
+# came from the 3D layout's mtp // E_local and oversized the M-tile for
+# every compact-layout decode bucket; the real average rows per expert
+# segment is global_rows * topk / num_global_experts, which is static per
+# captured bucket (a host-side int at capture time, never a device
+# readback), so a per-bucket value stays CUDA-graph safe. ROW_ALIGN = 64 is
+# a multiple of every mapped TileM, so segment starts remain tile-aligned.
+def gemm_tilem_avg(global_rows: int, topk: int, num_global_experts: int) -> int:
+    """Average rows per expert segment for the grouped GEMM TileM selector."""
+    if num_global_experts <= 0:
+        raise ValueError("num_global_experts must be positive")
+    return max(1, (int(global_rows) * int(topk)) // int(num_global_experts))
+
+
+def _tilem_avg_override():
+    """Batch-level sweep override `batchgen_debug.glm5_moe_tilem_avg` (int).
+
+    Graphs are re-captured every decode round, so the override takes effect
+    on the next round's capture; the eager path reads it per call. Absent or
+    invalid means the per-bucket formula applies.
+    """
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return None
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    if not isinstance(debug, dict):
+        return None
+    try:
+        parsed = int(debug.get("glm5_moe_tilem_avg"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def gemm_tilem_avg_effective(
+    global_rows: int, topk: int, num_global_experts: int
+) -> int:
+    """The TileM average actually handed to the grouped GEMM: the batch-level
+    debug override when present, else the per-bucket formula."""
+    override = _tilem_avg_override()
+    if override is not None:
+        return override
+    return gemm_tilem_avg(global_rows, topk, num_global_experts)
 
 _ops_module = None
 

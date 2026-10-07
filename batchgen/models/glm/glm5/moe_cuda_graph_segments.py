@@ -32,7 +32,7 @@ from batchgen.moe.grouped_fp8_blockwise_moe import (
 from batchgen.moe.routing import FusedGateContext, gate_sigmoid_topk_cuda
 
 from .moe_ragged import (
-    GEMM_TILEM_AVG as _GLM5_MOE_GEMM_TILEM_AVG,
+    gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged,
     dispatch_scatter_ragged,
     make_quant_buffers,
@@ -514,7 +514,13 @@ class Glm5MoEGraphSegment:
         """
         e = self.num_local_experts
         seqlens = expert_counts[:e]
-        avg = _GLM5_MOE_GEMM_TILEM_AVG
+        # Static per captured bucket: routed_global_output is sized to the
+        # bucket's global rows, so this resolves to a host int at capture.
+        avg = _glm5_gemm_tilem_avg(
+            bufs.routed_global_output.shape[0],
+            self.num_experts_per_tok,
+            self.num_local_experts * self.world_size,
+        )
 
         act_quant_ragged(bufs.dispatched_x, seqlens, cu_seqlens, bufs.x_fp8, bufs.x_scale)
 

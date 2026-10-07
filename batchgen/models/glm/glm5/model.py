@@ -65,7 +65,7 @@ except ImportError:
     _GLM5_HAS_DISPATCH_3D = False
 
 from .moe_ragged import (
-    GEMM_TILEM_AVG as _GLM5_MOE_GEMM_TILEM_AVG,
+    gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged as _glm5_act_quant_ragged,
     dispatch_scatter_ragged as _glm5_dispatch_scatter_ragged,
     make_quant_buffers as _glm5_make_quant_buffers,
@@ -2226,7 +2226,9 @@ class Glm5MoE(nn.Module):
 
         E = self.experts_per_rank
         seqlens = expert_counts[:E]
-        avg = _GLM5_MOE_GEMM_TILEM_AVG
+        avg = _glm5_moe_tilem_avg_override() or _glm5_gemm_tilem_avg(
+            num_global, topk, self.experts_per_rank * self.world_size
+        )
 
         _glm5_act_quant_ragged(
             buf.dispatched_x, seqlens, cu_seqlens, buf.x_fp8, buf.x_scale)

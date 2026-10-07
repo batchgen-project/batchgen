@@ -377,3 +377,34 @@ def test_eager_buffers_are_compact_and_regrow_only_at_job_boundaries():
 # regrow does not exist on main: `Glm5MoE.set_num_tokens_per_rank` resizes
 # `padded` to the exact per-rank size (including shrink — NCCL all_gather sends
 # input.numel() per rank), which supersedes it.
+
+
+def test_gemm_tilem_avg_per_bucket_formula():
+    from batchgen.models.glm.glm5.moe_ragged import gemm_tilem_avg
+
+    # GLM-5.2 decode shapes: top-k 8, 256 global experts, 8 ranks. The
+    # compiled dispatch maps the value to TileM {<=16: 16, <=32: 32, else 64}.
+    assert gemm_tilem_avg(256, 8, 256) == 8
+    assert gemm_tilem_avg(512, 8, 256) == 16
+    assert gemm_tilem_avg(768, 8, 256) == 24
+    assert gemm_tilem_avg(1, 1, 256) == 1  # floor at 1
+    with pytest.raises(ValueError):
+        gemm_tilem_avg(256, 8, 0)
+
+
+def test_gemm_tilem_avg_debug_override(monkeypatch):
+    from batchgen.models.glm.glm5.moe_ragged import gemm_tilem_avg_effective
+    from batchgen.models.wrappers.attention import AttnWrapperBase
+
+    monkeypatch.setattr(
+        AttnWrapperBase, "batchgen_debug", {"glm5_moe_tilem_avg": 32},
+        raising=False,
+    )
+    assert gemm_tilem_avg_effective(256, 8, 256) == 32
+    monkeypatch.setattr(
+        AttnWrapperBase, "batchgen_debug", {"glm5_moe_tilem_avg": "junk"},
+        raising=False,
+    )
+    assert gemm_tilem_avg_effective(256, 8, 256) == 8
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", None, raising=False)
+    assert gemm_tilem_avg_effective(512, 8, 256) == 16
