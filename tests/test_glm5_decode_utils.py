@@ -540,8 +540,12 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
         "_dsa_cuda_graph_page_tables_match",
         lambda self, primary, aux: True,
     )
+    # The replay gate reads these off GLM5AttnWrapper; patching the base class
+    # leaves them at their subclass default and the test passes for the wrong
+    # reason ("missing per-forward graph state" instead of the worker's eager
+    # decision). No `raising=False`: if the attributes move again, fail loudly.
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_graph_forward_state",
         {
             "path": "eager",
@@ -550,13 +554,11 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
             "local_bsz": 2,
             "metadata_prepared": False,
         },
-        raising=False,
     )
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_flashmla_graph_metadata",
         None,
-        raising=False,
     )
 
     actual = wrapper._forward_decode_dsa(
