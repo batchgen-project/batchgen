@@ -383,6 +383,9 @@ class Glm5MoEGraphSegment:
             self.comm.disabled = False
         self.pool.setup()
         self.router_context.warmup(self.pool._base["all_tokens"])
+        # Create the shared-expert side stream BEFORE any capture touches
+        # this segment — stream creation inside capture is illegal.
+        type(self.moe)._get_shared_expert_stream(self.device)
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self.pool.release()
@@ -410,6 +413,14 @@ class Glm5MoEGraphSegment:
         bucket_size = padded.shape[0]
         bufs = self.pool.get(bucket_size)
         global_rows = self.world_size * bucket_size
+
+        # Shared expert on the side stream, overlapped with the whole routed
+        # pipeline (its only input is `padded`); joined before the final add.
+        main_stream = torch.cuda.current_stream(self.device)
+        shared_stream = type(self.moe)._get_shared_expert_stream(self.device)
+        shared_stream.wait_stream(main_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.moe.shared_expert_forward(padded)
 
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
@@ -498,7 +509,13 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+        main_stream.wait_stream(shared_stream)
+        if not torch.cuda.is_current_stream_capturing():
+            # shared_out is allocated on the side stream and consumed on the
+            # main stream (eager warmup / compare mode); inside capture the
+            # address is baked into the graph pool.
+            shared_out.record_stream(main_stream)
+        bufs.local_moe_output.add_(shared_out)
         return {"moe_output": bufs.local_moe_output}
 
     def _fp8_blockwise_gemm_3d(

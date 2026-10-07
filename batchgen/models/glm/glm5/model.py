@@ -1343,6 +1343,19 @@ class Glm5MoE(nn.Module):
     _warned_k25_path = False
     _warned_gemm_3d = False
     _warned_partial_3d_disabled = False
+
+    # Shared-expert side stream (one per process, all MoE layers). The shared
+    # expert only reads the layer input, so it overlaps with the whole routed
+    # pipeline (collectives included) and joins before the final add. Created
+    # eagerly before any CUDA-graph capture — stream creation inside capture
+    # is illegal.
+    _shared_expert_stream: Optional[torch.cuda.Stream] = None
+
+    @classmethod
+    def _get_shared_expert_stream(cls, device) -> torch.cuda.Stream:
+        if cls._shared_expert_stream is None:
+            cls._shared_expert_stream = torch.cuda.Stream(device=device)
+        return cls._shared_expert_stream
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
     # Pure-DP grouped prefill. The 512-slot core-engine ring owns two complete
@@ -2115,6 +2128,15 @@ class Glm5MoE(nn.Module):
         buf = Glm5MoE._3d_buf
         buf.resize_if_needed(num_global)
 
+        # Shared expert on the side stream, overlapped with the whole routed
+        # pipeline below (its only input is the layer input); joined before
+        # the final add.
+        main_stream = torch.cuda.current_stream(self.device)
+        shared_stream = type(self)._get_shared_expert_stream(self.device)
+        shared_stream.wait_stream(main_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.shared_expert_forward(identity)
+
         if not getattr(Glm5MoE, '_warned_k25_path', False):
             logging.warning(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_ragged + reduce_weighted_scatter "
@@ -2195,11 +2217,18 @@ class Glm5MoE(nn.Module):
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 7) Slice local + add shared expert
+        # 7) Join the shared-expert stream, slice local + add shared expert
+        main_stream.wait_stream(shared_stream)
+        if not torch.cuda.is_current_stream_capturing():
+            # shared_out is allocated on the side stream and consumed on the
+            # main stream: tell the caching allocator before its block can be
+            # recycled to a later side-stream writer. Inside capture the
+            # address is baked into the graph and no recycling happens.
+            shared_out.record_stream(main_stream)
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
         out = local_results[:num_tokens].to(hidden_states.dtype)
-        out = out + self.shared_expert_forward(identity)
+        out = out + shared_out
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts, cu_seqlens):
