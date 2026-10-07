@@ -107,11 +107,11 @@ def test_glm5_moe_graph_compare_defaults_to_layer3(monkeypatch):
     assert not _glm5_moe_graph_compare_layer_enabled(20)
 
 
-def test_glm5_moe_router_mode_defaults_to_custom(monkeypatch):
+def test_glm5_moe_router_mode_defaults_to_cublas(monkeypatch):
     monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", raising=False)
 
-    assert _glm5_moe_router_mode() == "custom"
+    assert _glm5_moe_router_mode() == "cublas"
 
 
 def test_glm5_moe_router_mode_batch_debug_overrides_env(monkeypatch):
@@ -133,9 +133,9 @@ def test_glm5_moe_router_mode_rejects_unknown_values(monkeypatch):
         {"glm5_moe_router_mode": "not-a-router"},
         raising=False,
     )
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", "cublas")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", "custom")
 
-    assert _glm5_moe_router_mode() == "custom"
+    assert _glm5_moe_router_mode() == "cublas"
 
 
 def test_glm5_moe_3d_blockwise_requires_all_persistent_experts():
@@ -255,8 +255,8 @@ def test_glm5_dsa_selector_preserves_dense_short_circuit():
         (),
         {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
     )()
-    old_short_count = AttnWrapperBase._dsa_short_count
-    AttnWrapperBase._dsa_short_count = None
+    old_short_count = GLM5AttnWrapper._dsa_short_count
+    GLM5AttnWrapper._dsa_short_count = None
     try:
         top_k, branch, row_modes = _select_glm5_dsa_indices(
             wrapper,
@@ -269,7 +269,7 @@ def test_glm5_dsa_selector_preserves_dense_short_circuit():
             aux_slot_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
         )
     finally:
-        AttnWrapperBase._dsa_short_count = old_short_count
+        GLM5AttnWrapper._dsa_short_count = old_short_count
 
     assert branch == "dense-short-circuit"
     assert row_modes.tolist() == [0, 0, 0]
@@ -343,8 +343,8 @@ def test_glm5_dsa_selector_scores_only_long_rows_in_mixed_batch():
         (),
         {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
     )()
-    old_short_count = AttnWrapperBase._dsa_short_count
-    AttnWrapperBase._dsa_short_count = 2
+    old_short_count = GLM5AttnWrapper._dsa_short_count
+    GLM5AttnWrapper._dsa_short_count = 2
     try:
         top_k, branch, row_modes = _select_glm5_dsa_indices(
             wrapper,
@@ -357,7 +357,7 @@ def test_glm5_dsa_selector_scores_only_long_rows_in_mixed_batch():
             aux_slot_indices=torch.tensor([3, 1, 2, 0], dtype=torch.int32),
         )
     finally:
-        AttnWrapperBase._dsa_short_count = old_short_count
+        GLM5AttnWrapper._dsa_short_count = old_short_count
 
     assert branch == "mixed"
     assert row_modes.tolist() == [0, 1, 0, 1]
@@ -448,7 +448,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     )()
     expected = torch.ones(2, 1, 16)
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_graph_forward_state",
         {
             "path": "graph",
@@ -460,7 +460,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        AttnWrapperBase,
+        GLM5AttnWrapper,
         "glm5_dsa_flashmla_graph_metadata",
         {
             "bucket_size": 2,
@@ -622,14 +622,14 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
 
     old_debug = AttnWrapperBase.batchgen_debug
     AttnWrapperBase.batchgen_debug = {"glm5_dsa_graph_compare": True}
-    AttnWrapperBase.glm5_dsa_graph_forward_state = {
+    GLM5AttnWrapper.glm5_dsa_graph_forward_state = {
         "path": "graph",
         "bucket": 2,
         "reason": "captured",
         "local_bsz": 2,
         "metadata_prepared": True,
     }
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
         "bucket_size": 2,
         "tile_scheduler_metadata": torch.empty(1, dtype=torch.int32),
         "num_splits": torch.empty(1, dtype=torch.int32),
@@ -645,8 +645,8 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
         )
     finally:
         AttnWrapperBase.batchgen_debug = old_debug
-        AttnWrapperBase.glm5_dsa_graph_forward_state = None
-        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+        GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 
     assert actual is expected
     assert calls == {"return_debug": True, "compare": True}
@@ -925,40 +925,11 @@ def test_glm5_dsa_cuda_graph_replay_gate_allows_short_rows_with_fixed_selected_k
     )
 
 
-def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
-    env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
-
-    assert glm5_dsa_cuda_graph_requested_for_model("zai-org/GLM-5-FP8", environ=env)
-    assert should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
-    )
-    assert not should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=True,
-        global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
-    )
-    assert not should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=True,
-        model_name="gpt-oss-120b",
-        environ=env,
-    )
-    assert should_warmup_cuda_graphs_before_decode(
-        graph_manager_is_initialized=False,
-        global_batch_has_queueing=False,
-        model_name="gpt-oss-120b",
-        environ={},
-    )
-
-
-def test_glm5_whole_model_graph_policy_is_env_or_cli_default_and_glm_only():
+def test_glm5_whole_model_graph_policy_is_cli_only_and_glm5_fp8_only():
     env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
 
-    assert glm5_whole_model_cuda_graph_requested_for_model(
+    # Phase C retired the env request path: --enable-cuda-graph is the only switch.
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8", environ=env
     )
     assert glm5_whole_model_cuda_graph_requested_for_model(
@@ -1003,27 +974,6 @@ def test_glm5_effective_decode_attn_mode_uses_continuous_path():
     assert glm5_effective_decode_attn_mode("glm_moe_dsa", 1) == 3
     assert glm5_effective_decode_attn_mode("zai-org/GLM-5-FP8", 0) == 3
     assert glm5_effective_decode_attn_mode("deepseek_v3", 1) == 1
-
-
-def test_glm5_graph_policy_tracks_segmented_and_any_requests():
-    dsa_env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
-    moe_env = {"BATCHGEN_GLM5_MOE_CUDA_GRAPH": "1"}
-    whole_env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
-    compare_env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
-    model_name = "zai-org/GLM-5-FP8"
-
-    assert glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_moe_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert not glm5_segmented_cuda_graph_requested_for_model(
-        model_name, environ=whole_env
-    )
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
-    assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 
 def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
@@ -1086,31 +1036,6 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
 
 
-def test_glm5_segmented_env_overrides_cli_whole_model_default():
-    env = {"BATCHGEN_SEGMENTED_GRAPH": "1"}
-
-    assert glm5_segmented_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert glm5_dsa_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert glm5_moe_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
-        "zai-org/GLM-5-FP8",
-        enable_cuda_graph=True,
-        environ=env,
-    )
-
-
 def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
     import batchgen.server.server_args as server_args_module
 
@@ -1128,6 +1053,8 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
         "--enable-cuda-graph",
         "--storage-path",
         str(tmp_path / "storage"),
+        "--host-kv-cache-size",
+        "64",
     ])
 
     assert args.enable_cuda_graph
@@ -1141,11 +1068,6 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
 def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
     import batchgen.server.server_args as server_args_module
 
-    monkeypatch.setenv("BATCHGEN_SEGMENTED_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
 
@@ -1157,15 +1079,13 @@ def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypat
         "--disable-cuda-graphs",
         "--storage-path",
         str(tmp_path / "storage"),
+        "--host-kv-cache-size",
+        "64",
     ])
 
     assert not args.enable_cuda_graph
     assert args.disable_cuda_graphs
-    assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "0"
-    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"] == "0"
+    # Phase C: mode env vars are no longer read, so only the compare env is pinned off.
     assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"] == "0"
 
 
@@ -1204,11 +1124,11 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         },
         raising=False,
     )
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", None, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", None, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", None, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
 
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
@@ -1218,8 +1138,8 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
     ]
 
     worker._configure_glm5_dispatch_trace(seqs)
-    assert AttnWrapperBase.glm5_dispatch_trace_enabled
-    assert AttnWrapperBase.glm5_dispatch_trace_context == {
+    assert GLM5AttnWrapper.glm5_dispatch_trace_enabled
+    assert GLM5AttnWrapper.glm5_dispatch_trace_context == {
         "rank": 0,
         "batch_ids": "batch-a",
         "global_ids": "3,7",
@@ -1251,24 +1171,24 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         reason="graph replay",
     )
 
-    assert AttnWrapperBase.glm5_dispatch_counts == {
+    assert GLM5AttnWrapper.glm5_dispatch_counts == {
         "dsa_eager": 2,
         "moe_graph": 1,
     }
 
     monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
     worker._configure_glm5_dispatch_trace(seqs)
-    assert not AttnWrapperBase.glm5_dispatch_trace_enabled
-    assert AttnWrapperBase.glm5_dispatch_counts == {}
+    assert not GLM5AttnWrapper.glm5_dispatch_trace_enabled
+    assert GLM5AttnWrapper.glm5_dispatch_counts == {}
 
 
 def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-dsa", raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", "unit-dsa", raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
 
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.layer_idx = 0
@@ -1318,9 +1238,9 @@ def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
         object(),
     )
     assert graph_out[0, 0, 0].item() == 11.0
-    assert AttnWrapperBase.glm5_dispatch_counts["dsa_graph"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["dsa_graph"] == 1
 
-    AttnWrapperBase.glm5_dispatch_counts = {}
+    GLM5AttnWrapper.glm5_dispatch_counts = {}
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1336,16 +1256,16 @@ def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
         object(),
     )
     assert eager_out[0, 0, 0].item() == 22.0
-    assert AttnWrapperBase.glm5_dispatch_counts["dsa_eager"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["dsa_eager"] == 1
 
 
 def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-moe", raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", "unit-moe", raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(GLM5AttnWrapper, "glm5_dispatch_seen", set(), raising=False)
     monkeypatch.setattr(glm5_model, "_GLM5_HAS_DISPATCH_3D", True)
     monkeypatch.setattr(Glm5MoE, "_3d_buf", object(), raising=False)
 
@@ -1376,9 +1296,9 @@ def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     )
     graph_out = moe._forward_decode(hidden)
     assert graph_out[0, 0].item() == 11.0
-    assert AttnWrapperBase.glm5_dispatch_counts["moe_graph"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["moe_graph"] == 1
 
-    AttnWrapperBase.glm5_dispatch_counts = {}
+    GLM5AttnWrapper.glm5_dispatch_counts = {}
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1387,7 +1307,7 @@ def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
     )
     eager_out = moe._forward_decode(hidden)
     assert eager_out[0, 0].item() == 22.0
-    assert AttnWrapperBase.glm5_dispatch_counts["moe_eager"] == 1
+    assert GLM5AttnWrapper.glm5_dispatch_counts["moe_eager"] == 1
 
 
 def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
@@ -1467,7 +1387,7 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
         "_project_dsa_attn_heads",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not project")),
     )
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
         "bucket_size": 4,
         "tile_scheduler_metadata": torch.ones(3, dtype=torch.int32),
         "num_splits": torch.ones(1, dtype=torch.int32),
@@ -1493,7 +1413,7 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
             object(),
         )
     finally:
-        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
         AttnWrapperBase.glm5_decode_primary_slot_indices = None
         AttnWrapperBase.glm5_decode_aux_slot_indices = None
         AttnWrapperBase.kv_append_callback = None
@@ -1832,7 +1752,6 @@ def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
                 logits=torch.zeros(input_ids.shape[0], 1, 4)
             )
 
-    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
     monkeypatch.setattr(
         AttnWrapperBase,
         "batchgen_debug",
@@ -1844,6 +1763,7 @@ def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
 
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
     worker.model = FakeModel()
 
@@ -1876,6 +1796,7 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
     worker._current_decode_max_rank_batch_size = 1
     manager = FakeManager()
@@ -1889,7 +1810,6 @@ def test_glm5_whole_graph_uses_eager_when_decode_exceeds_captured_seqlen(
     worker._glm5_whole_model_graph_state_change_after_capture_logged = False
     worker._glm5_whole_model_graph_signature = ("same",)
     worker._glm5_whole_model_graph_unavailable_reason = None
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -1962,6 +1882,7 @@ def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
     worker._current_decode_max_rank_batch_size = 3
     manager = FakeManager()
@@ -1974,7 +1895,6 @@ def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     worker._glm5_whole_model_graph_state_change_after_capture_logged = False
     worker._glm5_whole_model_graph_signature = ("same",)
     worker._glm5_whole_model_graph_unavailable_reason = None
-    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(
         worker,
         "_glm5_whole_model_graph_capture_signature",
@@ -2047,6 +1967,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         def get_kv_tensors(self):
             return self.k_cache, None
 
+        def resolve_physical_layer(self, layer_idx):
+            return layer_idx
+
     class FakeIndexer:
         rope_head_dim = 4
         index_topk = 8
@@ -2061,6 +1984,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
                 num_heads=64,
             )
             self._fp8_absorb_weights = object()
+            self._fp8_qkv_a_proj = object()
+            self._fp8_qkv_a_scale = object()
             self._fused_wqb_weights = object() if has_indexer else None
             self._indexer_cuda_module = object() if has_indexer else None
 
@@ -2202,6 +2127,7 @@ def test_glm5_release_whole_model_graph_state_preserves_capture_inputs():
     worker._glm5_whole_model_graph = True
     worker._glm5_whole_model_graph_signature = ("old",)
     worker._glm5_whole_model_capture_input_ids = capture_ids
+    worker._cuda_graph_adapter = None
 
     worker._release_glm5_whole_model_graph_state(empty_cuda_cache=False)
 
@@ -2252,6 +2178,7 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
         pass
 
     worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
     worker.model = FakeModel()
     worker.torch_device = torch.device("cpu")
     worker.parallel_manager = None
@@ -2359,19 +2286,32 @@ def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):
 
 
 def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
-    env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
-
     assert should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=False,
         global_batch_has_queueing=True,
         model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        enable_cuda_graph=True,
+        environ={},
     )
     assert not should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=True,
         global_batch_has_queueing=True,
         model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        enable_cuda_graph=True,
+        environ={},
+    )
+    assert not should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=True,
+        model_name="gpt-oss-120b",
+        enable_cuda_graph=True,
+        environ={},
+    )
+    assert should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=False,
+        model_name="gpt-oss-120b",
+        environ={},
     )
 
 
