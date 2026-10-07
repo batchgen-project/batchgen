@@ -533,8 +533,14 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
         calls["eager"] = True
         return expected
 
+    dispatch = []
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph_route)
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_eager", fake_eager)
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "record_glm5_dispatch",
+        lambda **kwargs: dispatch.append(kwargs),
+    )
     monkeypatch.setattr(
         GLM5AttnWrapper,
         "_dsa_cuda_graph_page_tables_match",
@@ -572,6 +578,13 @@ def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypa
 
     assert actual is expected
     assert calls == {"eager": True}
+    # The fallback must carry the worker's own reason. That token can only
+    # reach the dispatch record by way of the patched forward state, so this
+    # assertion is what keeps the test from passing on an inert patch.
+    assert len(dispatch) == 1
+    assert dispatch[0]["kind"] == "dsa"
+    assert dispatch[0]["path"] == "eager"
+    assert "primary_page_table_state_invalid" in dispatch[0]["reason"]
 
 
 def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch):
