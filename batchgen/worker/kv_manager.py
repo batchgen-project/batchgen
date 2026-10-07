@@ -208,42 +208,6 @@ class TokenBudgetRequest:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class GpuKvManagerRequest:
-    """Frozen snapshot for ``plan_gpu_kv_manager``.
-
-    ``current_num_pages`` is the page count of the manager the worker
-    currently holds (0 when none is bound). ``capacity`` carries the
-    page-table capacity inputs so the plan can populate the CUDA-graph
-    fields on the configs it returns.
-    """
-
-    model_name: str
-    sequence_tokens: Tuple[int, ...]
-    has_manager: bool
-    current_num_pages: int
-    capacity: PageTableCapacityRequest
-
-
-@dataclass(frozen=True)
-class GpuKvManagerPlan:
-    """What ``plan_gpu_kv_manager`` returns; the worker applies it.
-
-    * ``reuse`` — the existing manager already has enough pages; the
-      worker just re-initializes and binds it (no configs needed).
-    * ``destroy_existing`` — an existing manager must be torn down before
-      the new one is created (only set when ``reuse`` is False).
-    * ``primary_config`` / ``aux_config`` — sized configs for the new
-      managers. ``aux_config`` is non-None only for DSA models. Both are
-      ``None`` when ``reuse`` is True.
-    """
-
-    reuse: bool
-    destroy_existing: bool
-    primary_config: Optional["GPUPagedKVConfig"]
-    aux_config: Optional["GPUPagedKVConfig"]
-
-
 # ---------------------------------------------------------------------------
 # Host-KV watermark trigger (Phase 5.5): frozen request + plan
 # ---------------------------------------------------------------------------
@@ -494,17 +458,17 @@ class KVCacheManager:
         to construct the updated copy.
         """
         token_capacity = KVCacheManager.page_table_token_capacity(req)
+        # Decoupled from pool size (measure-once-cache contract): the page
+        # table's SHAPE comes from token/slot capacity only, so captured
+        # graphs never depend on the pool's page count and a pool resize
+        # cannot invalidate the baked table shape. Values stored in the table
+        # are page ids bounded by the live pool at runtime; a shape wider
+        # than the pool is unused columns (KB-MB scale), never an error.
         page_capacity = max(
             1,
-            min(
-                int(config.num_pages),
-                math.ceil(token_capacity / int(config.page_size_tokens)),
-            ),
+            math.ceil(token_capacity / int(config.page_size_tokens)),
         )
-        slot_capacity = max(
-            1,
-            min(int(config.num_pages), KVCacheManager.page_table_slot_capacity(req)),
-        )
+        slot_capacity = max(1, KVCacheManager.page_table_slot_capacity(req))
         return replace(
             config,
             cuda_graph_max_pages_per_sequence=page_capacity,
@@ -547,59 +511,38 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     # GPU-KV-manager allocation planning (Phase 5.4a)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Measure-once-cache pool sizing (pure helpers; the worker applies them)
+    # ------------------------------------------------------------------
     @staticmethod
-    def plan_gpu_kv_manager(req: GpuKvManagerRequest) -> GpuKvManagerPlan:
-        """Decide whether to reuse or recreate the GPU paged KV manager.
+    def compute_final_pool_gb(
+        total_gb: float,
+        gpu_memory_frac: float,
+        used_gb: float,
+        provisional_pool_gb: float,
+    ) -> float:
+        """Final pool size from the post-capture steady-state measurement.
 
-        Builds the primary (and, for DSA models, auxiliary) ``GPUPagedKVConfig``
-        sized for ``req.sequence_tokens`` with the CUDA-graph page-table
-        capacity applied. If the worker already holds a manager with at least
-        ``primary_config.num_pages`` pages, the plan says to reuse it; otherwise
-        the worker must (destroy the old manager and) create new ones.
-
-        Pure: calls the pure ``build_gpu_kv_config`` / ``build_gpu_kv_config_aux``
-        config builders and ``apply_page_table_capacity``. No GPU allocation, no
-        worker state — the worker applies the returned plan.
+        ``used_gb`` is sampled AFTER the full graph warmup/capture with the
+        provisional pool still allocated; subtracting the provisional pool
+        yields the steady residency (weights + graph pools + runtime), and the
+        final pool is everything the memory fraction allows above it. Pure and
+        deterministic: cached by the worker and reused for every later pool
+        (re)creation (measure-once-cache contract, POIS 2026-10-05).
         """
-        # Local import: the config builders pull torch + the model registry,
-        # which are heavy at module-load time and could cycle back here.
-        from batchgen.kv_cache.host_kv_mananger_config import (
-            build_gpu_kv_config,
-            build_gpu_kv_config_aux,
-        )
+        steady_used_gb = used_gb - provisional_pool_gb
+        return total_gb * gpu_memory_frac - steady_used_gb
 
-        primary_config = build_gpu_kv_config(
-            model_name=req.model_name,
-            sequence_tokens=req.sequence_tokens,
-        )
-        primary_config = KVCacheManager.apply_page_table_capacity(
-            req.capacity, primary_config
-        )
-        required_pages = primary_config.num_pages
+    @staticmethod
+    def pool_floor_pages(max_bucket_size: int, min_pages_per_sequence: int = 4) -> int:
+        """Fail-loud floor: the pool must at least hold one full decode bucket.
 
-        if req.has_manager and req.current_num_pages >= required_pages:
-            return GpuKvManagerPlan(
-                reuse=True,
-                destroy_existing=False,
-                primary_config=None,
-                aux_config=None,
-            )
-
-        aux_config = build_gpu_kv_config_aux(
-            model_name=req.model_name,
-            sequence_tokens=req.sequence_tokens,
-        )
-        if aux_config is not None:
-            aux_config = KVCacheManager.apply_page_table_capacity(
-                req.capacity, aux_config
-            )
-
-        return GpuKvManagerPlan(
-            reuse=False,
-            destroy_existing=req.has_manager,
-            primary_config=primary_config,
-            aux_config=aux_config,
-        )
+        Every active sequence needs pages; ``min_pages_per_sequence`` = 4 at
+        page size 64 gives each sequence 256 tokens of headroom — a
+        conservative minimum, documented as tunable. A computed pool below
+        this is a configuration error, never a silently accepted remainder.
+        """
+        return max(1, int(max_bucket_size)) * max(1, int(min_pages_per_sequence))
 
     # ------------------------------------------------------------------
     # Host-KV watermark trigger (Phase 5.5)

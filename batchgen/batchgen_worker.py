@@ -175,8 +175,6 @@ from batchgen.worker.decode import (
 	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
-	GpuKvManagerPlan,
-	GpuKvManagerRequest,
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
@@ -1014,6 +1012,11 @@ class BatchGenWorker:
 		# Store gpu_memory_frac, actual size calculated later right before GPU KV manager init
 		self.gpu_memory_frac = args.gpu_memory_frac
 		self.gpu_kv_cache_size_gb: Optional[float] = None  # Calculated in _calculate_gpu_kv_cache_size()
+		# Measure-once-cache sizing (semantic contract, POIS 2026-10-05): the
+		# pool size is measured once after the full graph warmup/capture and
+		# cached; every later pool (re)creation reuses the cached value.
+		self._gpu_kv_cached_pool_gb: Optional[float] = None
+		self._gpu_kv_sizing_provisional: bool = False
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -3188,120 +3191,6 @@ class BatchGenWorker:
 		return KVCacheManager.apply_page_table_capacity(
 			self._make_page_table_capacity_request(sequence_tokens), config
 		)
-
-	def _make_gpu_kv_manager_request(
-		self, sequence_tokens: Sequence[int]
-	) -> GpuKvManagerRequest:
-		"""Snapshot the worker state `plan_gpu_kv_manager` consumes."""
-		manager = self.gpu_paged_kv_cache_manager
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
-		return GpuKvManagerRequest(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=tuple(int(t) for t in sequence_tokens),
-			has_manager=manager is not None,
-			current_num_pages=int(current_pages),
-			capacity=self._make_page_table_capacity_request(sequence_tokens),
-		)
-
-	def _apply_gpu_kv_manager_plan(
-		self, plan: GpuKvManagerPlan
-	) -> GPUPagedKVCacheManager:
-		"""Apply a `GpuKvManagerPlan`: the GPU side effects live here only.
-
-		The worker is the sole mutator — create / destroy / initialize / bind.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-
-		if plan.reuse:
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-			return manager
-
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
-		if plan.destroy_existing and manager is not None:
-			manager.destroy()
-
-		logging.info(
-			"Rank %s creating GPUPagedKVCacheManager on %s: "
-			"current pages=%d, required pages=%d",
-			self.rank, self.local_rank, current_pages, plan.primary_config.num_pages
-		)
-
-		primary = GPUPagedKVCacheManager(
-			config=plan.primary_config,
-			device=self.local_rank,
-		)
-
-		# For DSA models, wrap primary + auxiliary (indexer) in a coordinator
-		if plan.aux_config is not None:
-			auxiliary = GPUPagedKVCacheManager(
-				config=plan.aux_config,
-				device=self.local_rank,
-			)
-			manager = DualKVCacheCoordinator(primary, auxiliary)
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized DualKVCacheCoordinator on %s: "
-				"primary=%d pages (dim=%d), auxiliary=%d pages (dim=%d)",
-				self.rank, self.local_rank,
-				plan.primary_config.num_pages, plan.primary_config.k_head_dim,
-				plan.aux_config.num_pages, plan.aux_config.k_head_dim,
-			)
-		else:
-			manager = primary
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized GPUPagedKVCacheManager on %s with %d pages",
-				self.rank, self.local_rank, plan.primary_config.num_pages,
-			)
-		return manager
-
-	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
-		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
-
-		For DSA models, returns a DualKVCacheCoordinator wrapping both primary
-		(MLA) and auxiliary (indexer) managers.
-
-		The reuse/recreate decision is delegated to
-		``KVCacheManager.plan_gpu_kv_manager``; ``_apply_gpu_kv_manager_plan``
-		performs the GPU side effects.
-		"""
-		plan = KVCacheManager.plan_gpu_kv_manager(
-			self._make_gpu_kv_manager_request(sequence_tokens)
-		)
-		return self._apply_gpu_kv_manager_plan(plan)
-
-	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
-		"""Allocate GPU KV pages and load host-resident KV for the batch."""
-		if not local_sequence_ids:
-			return
-		
-		# Convert local indices to global_idx (consistent with host KV registration)
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		
-		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
-		manager = self._ensure_gpu_paged_kv_manager(sequence_tokens)
-		
-		logging.info(
-			f"Rank {self.rank} Allocating GPU KV pages for global_idx: {global_sequence_ids}"
-		)
-		
-		# allocate_pages_for_sequences implicitly registers the sequences
-		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
-		manager.rebuild_page_table(global_sequence_ids)
-		self._load_host_kv_to_gpu(manager, global_sequence_ids)
 
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
 		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
@@ -7519,7 +7408,35 @@ class BatchGenWorker:
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
 			return
 
-		# First time: Calculate actual GPU KV size
+		# Measure-once-cache: once the post-capture steady state has been
+		# measured, every later pool (re)creation reuses the cached size —
+		# never a fresh measurement (contract invariant 1: the pool is
+		# identical across decode rounds of the same server).
+		if self._gpu_kv_cached_pool_gb is not None:
+			self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
+					"(measure-once-cache)"
+				)
+			# The previous pool's segments already returned to CUDA at destroy
+			# (dedicated MemPool, whole-segment free). This flushes the
+			# GENERAL cache's all-free segments (prefill transients) too, so
+			# the full-size cudaMalloc below sees the maximum free memory.
+			torch.cuda.synchronize(self.torch_device)
+			torch.cuda.empty_cache()
+			self._initialize_gpu_kv_manager_fixed_size()
+			if self.rank == 0:
+				stats = self.gpu_paged_kv_cache_manager.get_stats()
+				logging.info(
+					f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, "
+					f"{stats.num_total_pages} pages"
+				)
+			return
+
+		# First time: PROVISIONAL size from the post-weights measurement. The
+		# final size is fixed by _finalize_gpu_kv_pool_after_capture once the
+		# graph warmup has materialized every persistent allocation.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -7533,17 +7450,19 @@ class BatchGenWorker:
 		if new_gpu_kv_cache_size > 0:
 			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
 		else:
-			# Fallback to minimum
-			self.gpu_kv_cache_size_gb = 1.0
-			if self.rank == 0:
-				logging.warning(
-					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
-					f"Using minimum 1 GB."
-				)
+			# Fail-loud (contract invariant 3): a non-positive remainder is a
+			# configuration error, never a silently accepted minimum.
+			raise RuntimeError(
+				f"[GPU-KV] Calculated pool size non-positive "
+				f"({new_gpu_kv_cache_size:.2f} GB): total {total_mem_gb:.2f} GB "
+				f"x frac {self.gpu_memory_frac} - used {used_mem_gb:.2f} GB. "
+				"Lower resident memory or raise gpu_memory_frac."
+			)
+		self._gpu_kv_sizing_provisional = True
 
 		if self.rank == 0:
 			logging.info(
-				f"[GPU-KV] Actual size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
+				f"[GPU-KV] Provisional size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
 				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
 			)
 
@@ -9872,6 +9791,7 @@ class BatchGenWorker:
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
+		self._finalize_gpu_kv_pool_after_capture(gpu_manager)
 
 	@staticmethod
 	def _glm5_dsa_graph_score_capacity_tokens(
@@ -10357,6 +10277,77 @@ class BatchGenWorker:
 			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
 			"flashmla_num_splits": num_splits,
 		}
+
+	def _finalize_gpu_kv_pool_after_capture(self, gpu_manager) -> None:
+		"""Measure-once-cache finalization (semantic contract, POIS 2026-10-05).
+
+		Called once, right after the full graph warmup/capture, while the
+		PROVISIONAL pool is still allocated. The capture pass has materialized
+		every persistent allocation (graph pools, static buffers, NCCL
+		per-collective resources, JIT caches), so the steady residency is
+		``used - provisional_pool`` and the final pool is everything the memory
+		fraction allows above it. The result is CACHED; every later pool
+		(re)creation reuses it, making the pool identical across decode rounds
+		(invariant 1) and retiring the fresh-server round-1 protocol.
+
+		The current (first) round keeps the provisional pool — its sequences
+		already hold pages and captured graphs bake its addresses, and the
+		provisional size is never smaller than the final one (steady residency
+		only grows through capture). The cached size applies from the NEXT pool
+		creation (the per-round destroy/recreate that already exists), from
+		which point the page count is identical for every round.
+		"""
+		if not self._gpu_kv_sizing_provisional:
+			return
+		self._gpu_kv_sizing_provisional = False
+
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+		total_mem_gb = total_mem_bytes / (1024 ** 3)
+		used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
+
+		final_gb = KVCacheManager.compute_final_pool_gb(
+			total_mem_gb,
+			self.gpu_memory_frac,
+			used_mem_gb,
+			self.gpu_kv_cache_size_gb,
+		)
+
+		# Broadcast rank 0's decision so every rank resizes identically.
+		size_tensor = torch.tensor([final_gb], dtype=torch.float32, device=self.torch_device)
+		dist.broadcast(size_tensor, src=0)
+		final_gb = float(size_tensor.item())
+
+		# Fail-loud floor (contract invariant 3).
+		manager = self.gpu_paged_kv_cache_manager
+		stats = manager.get_stats()
+		bytes_per_page = (
+			self.gpu_kv_cache_size_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
+		)
+		final_pages = int(final_gb * (1024 ** 3) / bytes_per_page)
+		bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [1])
+		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
+		if final_gb <= 0 or final_pages < floor_pages:
+			raise RuntimeError(
+				f"[GPU-KV] Final pool below floor: {final_gb:.2f} GB "
+				f"(~{final_pages} pages) < {floor_pages} pages required for the "
+				f"largest decode bucket. Steady residency leaves no room under "
+				f"gpu_memory_frac={self.gpu_memory_frac}; fix the configuration."
+			)
+
+		# Cache only: the live round keeps the provisional pool (its sequences
+		# hold pages and the captured graphs bake its addresses); every later
+		# pool creation uses the cached final size.
+		self._gpu_kv_cached_pool_gb = final_gb
+		if self.rank == 0:
+			logging.info(
+				f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
+				f"(~{final_pages} pages; steady used "
+				f"{used_mem_gb - self.gpu_kv_cache_size_gb:.2f} GB; provisional "
+				f"{self.gpu_kv_cache_size_gb:.2f} GB stays for this round; cached "
+				"for every later pool creation)"
+			)
 
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
