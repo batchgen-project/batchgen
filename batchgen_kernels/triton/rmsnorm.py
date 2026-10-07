@@ -154,12 +154,12 @@ def fused_rmsnorm(
     assert x.is_cuda and weight.is_cuda, "Inputs must be on CUDA"
     orig_shape = x.shape
     hidden_size = orig_shape[-1]
-    x_2d = x.reshape(-1, hidden_size)
+    x_2d = x if x.dim() == 2 else x.reshape(-1, hidden_size)
     num_rows = x_2d.shape[0]
 
     if out is None:
         out = torch.empty_like(x)
-    out_2d = out.reshape(-1, hidden_size)
+    out_2d = out if out.dim() == 2 else out.reshape(-1, hidden_size)
 
     assert weight.shape == (hidden_size,), f"Weight shape mismatch: {weight.shape} vs ({hidden_size},)"
 
