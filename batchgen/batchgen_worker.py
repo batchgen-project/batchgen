@@ -73,6 +73,18 @@ def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
 			return True
 	return False
 
+def _repetition_check_enabled(seq) -> bool:
+	"""Per-request gate for the repetition breaker.
+
+	ignore_eos declares the content irrelevant and the length contract binding
+	(fixed-shape benchmark semantics): the breaker's premise — reclaiming
+	capacity from degenerate tokens the caller did not want — is void, so the
+	check is disabled for that sequence. Requests without ignore_eos keep the
+	breaker unchanged.
+	"""
+	return not seq.ignore_eos
+
+
 def _malloc_trim() -> None:
 	"""Return this process's freed heap arenas to the OS (glibc, best effort).
 
@@ -5188,7 +5200,8 @@ class BatchGenWorker:
 		if REP_DETECTION:
 			for i in range(n):
 				seq = seqs[i]
-				if seq.decoded_length >= 64 and not seq._rep_detected:
+				if (seq.decoded_length >= 64 and not seq._rep_detected
+						and _repetition_check_enabled(seq)):
 					uuid = decode_uuids[i]
 					local_idx = self._uuid_to_local_map.get(uuid)
 					if local_idx is not None and local_idx in self.query_book:
@@ -12135,7 +12148,7 @@ class BatchGenWorker:
 					seq.eos_reached = True
 
 				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected:
+				if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 					if token_id == seq._rep_last_token:
 						seq._rep_count += 1
 						if seq._rep_count >= 32:
@@ -13077,7 +13090,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 
 						# Repetition detection (BATCHGEN_REP_DETECTION=1)
-						if REP_DETECTION and not seq._rep_detected:
+						if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:
@@ -13174,7 +13187,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 
 						# Repetition detection (BATCHGEN_REP_DETECTION=1)
-						if REP_DETECTION and not seq._rep_detected:
+						if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:
