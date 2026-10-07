@@ -7406,12 +7406,10 @@ class BatchGenWorker:
 					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
 					"(measure-once-cache)"
 				)
-			# Return the previous round's freed segments (the old pool and
-			# prefill transients stay cached in the torch allocator) to CUDA
-			# before allocating the pool as one contiguous block; without this
-			# the reserved-but-unallocated segments fragment the free space
-			# and a full-size pool allocation OOMs even though the steady
-			# residency leaves room for it.
+			# The previous pool's segments already returned to CUDA at destroy
+			# (dedicated MemPool, whole-segment free). This flushes the
+			# GENERAL cache's all-free segments (prefill transients) too, so
+			# the full-size cudaMalloc below sees the maximum free memory.
 			torch.cuda.synchronize(self.torch_device)
 			torch.cuda.empty_cache()
 			self._initialize_gpu_kv_manager_fixed_size()
