@@ -7223,7 +7223,18 @@ class BatchGenWorker:
 		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
 		per-node cap when a TP-group model (every rank holds the same rows)
 		plans more slots than the guard — e.g. K3 H200 with sharded latent
-		projections plans 160 rows per node."""
+		projections plans 160 rows per node.
+
+		The legacy BATCHGEN_MAX_RANK_BSZ env name sizes the deepseek PSM
+		padding separately; silently diverging values corrupt the padded
+		buffer contract, so both names must agree when both are set."""
+		explicit = os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ")
+		legacy = os.environ.get("BATCHGEN_MAX_RANK_BSZ")
+		if explicit is not None and legacy is not None and explicit != legacy:
+			raise RuntimeError(
+				"BATCHGEN_MAX_DECODE_RANK_BSZ and BATCHGEN_MAX_RANK_BSZ "
+				"must match when both are set"
+			)
 		planned = int(getattr(
 			self.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
 		) or 0)
@@ -10524,6 +10535,14 @@ class BatchGenWorker:
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
+				if (
+					getattr(wrapper, "_fp8_qkv_a_proj", None) is None
+					or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
+				):
+					raise RuntimeError(
+						f"Layer {layer_idx}: GLM-5 whole-model graph requires "
+						"fused Q-A/KV-A weights"
+					)
 				if indexer is not None:
 					if getattr(wrapper, "_fused_wqb_weights", None) is None:
 						raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused WQB weights")
