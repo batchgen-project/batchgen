@@ -482,15 +482,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_o_proj = None
         self._fp8_qkv_a_proj = None
         self._fp8_qkv_a_scale = None
-        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
-        self._cached_q_absorb = None
-        self._cached_out_absorb = None
-        # SGLang-aligned BF16 BMM absorb weights (set by
-        # initialize_decode_absorb). w_kc: [H, 192, 512] BF16 with
-        # SGLang's stride trick; w_vc: [H, 512, 256] BF16 non-contig view.
-        self.w_kc = None
-        self.w_vc = None
-        # WP5: FP8 absorb weights (pre-quantized once at init)
+        # WP5: FP8 absorb weights (pre-quantized once at init). The retired
+        # BF16 BMM absorb cache (_cached_q_absorb / w_kc / w_vc) is gone:
+        # every decode consumer uses these FP8 weights and fails loud when
+        # they are missing.
         self._fp8_absorb_weights = None
         # WP2: Fused indexer KV proj (CUDA WGMMA)
         self._indexer_cuda_module = None
@@ -582,37 +577,29 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
-        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
-        self._fp8_absorb_weights = None
-        if _HAS_FP8_ABSORB:
-            try:
-                self._fp8_absorb_weights = FP8AbsorbWeights(
-                    cached_q_absorb,   # [H, 192, 512]
-                    cached_out_absorb,  # [H, 256, 512]
-                )
-                logging.debug(
-                    f"[layer {self.layer_idx}] FP8 absorb weights initialized"
-                )
-            except Exception as e:
-                logging.warning(
-                    f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
-                )
-                self._fp8_absorb_weights = None
-
-        if self._fp8_absorb_weights is not None:
-            # FP8 absorb is used for q_absorb + out_absorb; BF16 matrices are dead.
-            self._cached_q_absorb = None
-            self._cached_out_absorb = None
-            self.w_kc = None
-            self.w_vc = None
-        else:
-            # Fallback: keep BF16 absorb (SGLang-aligned layout) for the BF16 BMM
-            # path. w_kc: [H,192,512]; w_vc: [H,512,256] (stride-trick layouts that
-            # make bmm hit the same cuBLAS kernel SGLang triggers).
-            self._cached_q_absorb = cached_q_absorb
-            self._cached_out_absorb = cached_out_absorb
-            self.w_kc = cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-            self.w_vc = cached_out_absorb.contiguous().transpose(1, 2)
+        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel. Every decode
+        # consumer (eager selector and CUDA-graph path) requires them — the
+        # BF16 BMM fallback was retired, so a failed init must surface here,
+        # not as a mid-decode raise after a silently kept dead fallback.
+        if not _HAS_FP8_ABSORB:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 decode requires the WP5 FP8 "
+                "absorb kernel; rebuild batchgen_kernels with fp8_absorb"
+            )
+        try:
+            self._fp8_absorb_weights = FP8AbsorbWeights(
+                cached_q_absorb,   # [H, 192, 512]
+                cached_out_absorb,  # [H, 256, 512]
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
+            ) from e
+        logging.debug(
+            f"[layer {self.layer_idx}] FP8 absorb weights initialized"
+        )
+        # The BF16 temporaries above are quantizer input only and die here,
+        # reclaiming their HBM for the KV cache.
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 
