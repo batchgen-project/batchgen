@@ -40,6 +40,15 @@ try:
 except (ImportError, Exception):
     pass
 
+# Selected-token FA3 page-table transform (Triton)
+try:
+    from batchgen_kernels.attention.dsa.selected_page_table import (
+        transform_selected_positions_out,
+    )
+    __all__ += ["transform_selected_positions_out"]
+except (ImportError, Exception):
+    pass
+
 # WP2: Fused indexer KV proj (CUDA WGMMA)
 try:
     from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
