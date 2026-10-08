@@ -184,6 +184,13 @@ from batchgen.worker.kv_manager import (
 	TokenBudgetRequest,
 	WatermarkTriggerRequest,
 )
+from batchgen.worker.step_timing import (
+	FORWARD_EVENT_RING_SLOTS,
+	ForwardEventRing,
+	accumulate_decode_step_split,
+	format_decode_step_split,
+	new_decode_step_split,
+)
 import dataclasses as _dataclasses
 
 from batchgen.kv_cache.host_kv_mananger_config import (
@@ -2583,20 +2590,10 @@ class BatchGenWorker:
 					if task is not None:
 						self._pending_kv_append_tasks.append(task)
 
-		# Complete this step's host appends before returning to the decode loop.
-		# Each task is a std::async thread that reads the worker view's page
-		# table on its own thread at execution time, with no lock. Letting up to
-		# 256 of them stay in flight across steps meant they could overlap the
-		# next admission wave's register/allocate on the main thread; a torn
-		# read then lands one token's KV in a page that now belongs to a freshly
-		# prefilled sequence. Measured on the 512x4096 K3 contract: every victim
-		# was in a wave after the first and collapsed at its 2nd or ~28th token,
-		# while the first wave (no page-table mutation in flight) was clean.
-		# The D2H is one token per sequence per MLA layer (~2.6 MB at 96
-		# sequences), sub-millisecond against a decode step.
-		if self._pending_kv_append_tasks:
-			self._wait_pending_kv_append_tasks(defer_errors=True)
-
+		# This function only LAUNCHES the D2H append tasks. The decode loop
+		# drains them every step right after the sampled-token readback, in
+		# a step-split slot of its own; see [KV_APPEND_DRAIN] in
+		# ``decoding_continuous`` for why that drain must stay per step.
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
 		self._deferred_kv_batch = None
@@ -11224,6 +11221,23 @@ class BatchGenWorker:
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
 
+		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
+		# this decode round: a hot reload rebinds methods on the live worker,
+		# so an accumulator kept on ``self`` could outlive a slot-layout change.
+		_step_split = new_decode_step_split()
+		# Device-side time of the forward+sample segment from reusable timing
+		# events, so the heartbeat reports real GPU forward time next to the
+		# CPU split. The ring never makes the host wait (see
+		# batchgen.worker.step_timing). Its record points sit in this loop
+		# body, outside any graph capture: every capture site is a scoped
+		# ``torch.cuda.graph`` context that ends before its callee returns
+		# here, and this loop only replays graphs (a missing whole-model
+		# bucket falls back to eager below instead of capturing).
+		_fwd_ring = ForwardEventRing(
+			FORWARD_EVENT_RING_SLOTS,
+			lambda: torch.cuda.Event(enable_timing=True),
+		)
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -11240,16 +11254,11 @@ class BatchGenWorker:
 			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
 				_hb_elapsed = time.perf_counter() - _hb_last_time
 				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
-				_split = getattr(self, "_decode_step_split", None)
 				_split_txt = ""
-				if _split and _split[0] > 0:
-					_n = _split[0]
-					_split_txt = (
-						f" step_ms={_split[1] / _n:.1f} (setup {_split[2] / _n:.1f}, "
-						f"forward+sample {_split[3] / _n:.1f}, kv_flush {_split[4] / _n:.1f}, "
-						f"token_readback {_split[5] / _n:.1f}, bookkeeping {_split[6] / _n:.1f})"
-					)
-					self._decode_step_split = [0.0] * 7
+				if _step_split[0] > 0:
+					_split_txt = " " + format_decode_step_split(_step_split)
+					_step_split = new_decode_step_split()
+				_split_txt += _fwd_ring.take_summary()
 				logging.info(
 					f"[DECODE] step={self._cumulative_decode_iterations} "
 					f"active={len(decode_uuids)} finished={_hb_finished} "
@@ -11459,6 +11468,9 @@ class BatchGenWorker:
 						)
 
 			_split_t0 = time.perf_counter()
+			# Start marker of this step's device forward+sample time. Takes a
+			# free ring slot or skips timing this step; never waits.
+			_fwd_slot = _fwd_ring.begin(torch.cuda.current_stream(self.torch_device))
 			with torch.inference_mode():
 				if batch:
 					# Collect context lengths with invariant validation
@@ -11644,8 +11656,9 @@ class BatchGenWorker:
 
 				# DSA: auxiliary KV append callback for indexer host cache.
 				# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
-				# to _deferred_kv_entries_aux; a single event.synchronize in
-				# _flush_deferred_kv_to_host covers both primary and aux caches.
+				# to _deferred_kv_entries_aux; _flush_deferred_kv_to_host launches
+				# primary and aux appends together and the per-step
+				# [KV_APPEND_DRAIN] after the token readback completes both.
 				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 				if aux_view is not None:
 					if BATCHGEN_SYNC_KV:
@@ -12103,6 +12116,8 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 			_split_t1 = time.perf_counter()
+			# End marker, queued on the same stream ahead of the token copy below.
+			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device))
 
 			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
 			# exact token-readback boundary before launching host-KV copies on their
@@ -12113,13 +12128,35 @@ class BatchGenWorker:
 			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
 			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
 
-			# Host-KV offload orders its own stream with a device-side event. Wait
-			# only for the sampled-token readback required by exact EOS and output
-			# bookkeeping; do not drain host-KV copies or the whole CUDA device.
+			# Host-KV offload orders its own stream with a device-side event, so
+			# launching it needs no host wait. The host first waits for the
+			# sampled-token readback (needed for exact EOS and output bookkeeping),
+			# then drains the append tasks below.
 			self._flush_deferred_kv_to_host()
 			_split_t2 = time.perf_counter()
 			_new_tokens_ready.synchronize()
 			_split_t3 = time.perf_counter()
+
+			# [KV_APPEND_DRAIN] Complete this step's host appends before the
+			# next step. Each task is a std::async thread that reads the worker
+			# view's page table on its own thread at execution time, with no
+			# lock. Letting up to 256 of them stay in flight across steps meant
+			# they could overlap the next admission wave's register/allocate on
+			# the main thread; a torn read then lands one token's KV in a page
+			# that now belongs to a freshly prefilled sequence. Measured on the
+			# 512x4096 K3 contract: every victim was in a wave after the first
+			# and collapsed at its 2nd or ~28th token, while the first wave (no
+			# page-table mutation in flight) was clean. The drain sits after the
+			# token readback only so its wait (which ends in a full device sync)
+			# gets its own split slot instead of being charged to the copy
+			# launch; nothing between the launch above and here touches a page
+			# table. defer_errors=True keeps it a purely local wait (a guarded
+			# collective would deadlock when only some ranks have tasks); the
+			# deferred errors surface at the next boundary PHASE 0 or loop-exit
+			# drain, both of which sync errors across ranks.
+			if self._pending_kv_append_tasks:
+				self._wait_pending_kv_append_tasks(defer_errors=True)
+			_split_t4 = time.perf_counter()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
@@ -12187,21 +12224,17 @@ class BatchGenWorker:
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 
-			_split_t4 = time.perf_counter()
-			self._cumulative_forward_ms += (_split_t4 - forward_start) * 1000
-			# Per-step wall split, averaged into the rank-0 heartbeat: where a
-			# decode step's time goes (host bookkeeping vs GPU wait), without
-			# adding any device sync of its own.
-			_sp = getattr(self, "_decode_step_split", None)
-			if _sp is None:
-				_sp = self._decode_step_split = [0.0] * 7
-			_sp[0] += 1
-			_sp[1] += (_split_t4 - forward_start) * 1000
-			_sp[2] += (_split_t0 - forward_start) * 1000
-			_sp[3] += (_split_t1 - _split_t0) * 1000
-			_sp[4] += (_split_t2 - _split_t1) * 1000
-			_sp[5] += (_split_t3 - _split_t2) * 1000
-			_sp[6] += (_split_t4 - _split_t3) * 1000
+			_split_t5 = time.perf_counter()
+			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
+			# Per-step CPU wall split (setup, fwd_launch, kv_launch, readback,
+			# kv_drain, bookkeeping), without adding any device sync of its own.
+			accumulate_decode_step_split(
+				_step_split,
+				(forward_start, _split_t0, _split_t1, _split_t2, _split_t3, _split_t4, _split_t5),
+			)
+			# Non-blocking harvest of finished forward timing pairs; elapsed
+			# time is read only from pairs whose two events already completed.
+			_fwd_ring.harvest()
 
 			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
 			from batchgen.timing import get_decode_timer
@@ -12217,16 +12250,11 @@ class BatchGenWorker:
 			torch.cuda.synchronize(self.torch_device)
 		# Decode intervals shorter than the 30 s heartbeat (128-token probes,
 		# small admission waves) would otherwise never report their step split.
-		_split = getattr(self, "_decode_step_split", None)
-		if self.rank == 0 and _split and _split[0] > 0:
-			_n = _split[0]
+		if self.rank == 0 and _step_split[0] > 0:
 			logging.info(
-				f"[DECODE] interval end: steps={int(_n)} step_ms={_split[1] / _n:.1f} "
-				f"(setup {_split[2] / _n:.1f}, forward+sample {_split[3] / _n:.1f}, "
-				f"kv_flush {_split[4] / _n:.1f}, token_readback {_split[5] / _n:.1f}, "
-				f"bookkeeping {_split[6] / _n:.1f})"
+				f"[DECODE] interval end: steps={int(_step_split[0])} "
+				f"{format_decode_step_split(_step_split)}{_fwd_ring.take_summary()}"
 			)
-			self._decode_step_split = [0.0] * 7
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
