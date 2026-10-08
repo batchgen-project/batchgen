@@ -73,6 +73,18 @@ def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
 			return True
 	return False
 
+def _repetition_check_enabled(seq) -> bool:
+	"""Per-request gate for the repetition breaker.
+
+	ignore_eos declares the content irrelevant and the length contract binding
+	(fixed-shape benchmark semantics): the breaker's premise — reclaiming
+	capacity from degenerate tokens the caller did not want — is void, so the
+	check is disabled for that sequence. Requests without ignore_eos keep the
+	breaker unchanged.
+	"""
+	return not seq.ignore_eos
+
+
 def _malloc_trim() -> None:
 	"""Return this process's freed heap arenas to the OS (glibc, best effort).
 
@@ -169,8 +181,6 @@ from batchgen.worker.decode import (
 	estimate_max_decode_replica_batch,
 )
 from batchgen.worker.kv_manager import (
-	GpuKvManagerPlan,
-	GpuKvManagerRequest,
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
@@ -741,6 +751,26 @@ class BatchGenWorkerArgs:
 	pynccl_port_span: int = 100
 
 
+def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
+	"""Per-decode-step DSA state reset for the eager (second) decode path.
+
+	Computes the dense short-circuit hint once per step (77 of 78 D2H syncs
+	saved on DSA models), and ALWAYS clears the previous step's reused top-k
+	indices before layer 0 runs. The clear must be unconditional: when the
+	model config carries ``index_topk`` (GLM-5.2 does), a clear nested under
+	the hint's else-branch never executes and shared reuse-topk layers can
+	consume a stale top-k from the previous step. The graph-config path
+	resets it separately.
+	"""
+	if index_topk is not None:
+		wrapper_cls._dsa_short_count = int(
+			(cache_seqlens <= int(index_topk)).sum().item()
+		)
+	else:
+		wrapper_cls._dsa_short_count = None
+	wrapper_cls._dsa_prev_topk_indices = None
+
+
 class BatchGenWorker:
 	"""
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
@@ -1046,6 +1076,11 @@ class BatchGenWorker:
 		# Store gpu_memory_frac, actual size calculated later right before GPU KV manager init
 		self.gpu_memory_frac = args.gpu_memory_frac
 		self.gpu_kv_cache_size_gb: Optional[float] = None  # Calculated in _calculate_gpu_kv_cache_size()
+		# Measure-once-cache sizing (semantic contract, POIS 2026-10-05): the
+		# pool size is measured once after the full graph warmup/capture and
+		# cached; every later pool (re)creation reuses the cached value.
+		self._gpu_kv_cached_pool_gb: Optional[float] = None
+		self._gpu_kv_sizing_provisional: bool = False
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -1237,6 +1272,11 @@ class BatchGenWorker:
 				num_v_heads=aux_profile.num_v_heads,
 				v_head_dim=aux_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(aux_profile.kv_dtype),
+				logical_to_physical_layer=(
+					list(aux_profile.logical_to_physical_layer)
+					if getattr(aux_profile, "logical_to_physical_layer", None) is not None
+					else None
+				),
 			)
 			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
 
@@ -2290,7 +2330,12 @@ class BatchGenWorker:
 			# temp-0 batch. Host-side check (no device sync), recomputed each step
 			# so no membership-invalidation hazard.
 			if self._decode_batch_all_greedy(active_sequences):
-				return logits.float().argmax(dim=-1, keepdim=True)
+				# argmax directly on the lm_head dtype: an fp32 upcast preserves
+				# bf16 ordering exactly, and the .float() copy was a fresh
+				# [bs, vocab] fp32 allocation on every decode step — large
+				# enough to destabilize graph-enabled boots at high
+				# gpu-memory-frac.
+				return logits.argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -3014,6 +3059,30 @@ class BatchGenWorker:
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
 			self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 
+	def _aux_layers_with_slots(self):
+		"""Logical layer ids that have a slot in the aux (indexer) KV pools.
+
+		None = no layer mapping (every engine layer has an aux slot). GLM-5.2
+		maps only its 21 indexer layers; skip layers' index-K is never read,
+		so decode appends for them are dropped at the queueing choke points —
+		the mapped host view hard-fails on unmapped layers by design.
+		"""
+		cached = getattr(self, "_aux_layers_with_slots_cache", False)
+		if cached is not False:
+			return cached
+		coord = getattr(self, "gpu_paged_kv_cache_manager", None)
+		aux_mgr = getattr(coord, "auxiliary", None)
+		if aux_mgr is None:
+			return None  # aux not initialized yet; do not cache
+		aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
+		result = None
+		if aux_map is not None:
+			result = frozenset(
+				l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
+			)
+		self._aux_layers_with_slots_cache = result
+		return result
+
 	def _append_decode_kv_to_host_aux_async(
 		self,
 		layer_idx: int,
@@ -3028,6 +3097,9 @@ class BatchGenWorker:
 		"""
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is None or not batch:
+			return
+		valid_layers = self._aux_layers_with_slots()
+		if valid_layers is not None and layer_idx not in valid_layers:
 			return
 
 		sequence_ids = []
@@ -3465,120 +3537,6 @@ class BatchGenWorker:
 		return KVCacheManager.apply_page_table_capacity(
 			self._make_page_table_capacity_request(sequence_tokens), config
 		)
-
-	def _make_gpu_kv_manager_request(
-		self, sequence_tokens: Sequence[int]
-	) -> GpuKvManagerRequest:
-		"""Snapshot the worker state `plan_gpu_kv_manager` consumes."""
-		manager = self.gpu_paged_kv_cache_manager
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
-		return GpuKvManagerRequest(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=tuple(int(t) for t in sequence_tokens),
-			has_manager=manager is not None,
-			current_num_pages=int(current_pages),
-			capacity=self._make_page_table_capacity_request(sequence_tokens),
-		)
-
-	def _apply_gpu_kv_manager_plan(
-		self, plan: GpuKvManagerPlan
-	) -> GPUPagedKVCacheManager:
-		"""Apply a `GpuKvManagerPlan`: the GPU side effects live here only.
-
-		The worker is the sole mutator — create / destroy / initialize / bind.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-
-		if plan.reuse:
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-			return manager
-
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
-		if plan.destroy_existing and manager is not None:
-			manager.destroy()
-
-		logging.info(
-			"Rank %s creating GPUPagedKVCacheManager on %s: "
-			"current pages=%d, required pages=%d",
-			self.rank, self.local_rank, current_pages, plan.primary_config.num_pages
-		)
-
-		primary = GPUPagedKVCacheManager(
-			config=plan.primary_config,
-			device=self.local_rank,
-		)
-
-		# For DSA models, wrap primary + auxiliary (indexer) in a coordinator
-		if plan.aux_config is not None:
-			auxiliary = GPUPagedKVCacheManager(
-				config=plan.aux_config,
-				device=self.local_rank,
-			)
-			manager = DualKVCacheCoordinator(primary, auxiliary)
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized DualKVCacheCoordinator on %s: "
-				"primary=%d pages (dim=%d), auxiliary=%d pages (dim=%d)",
-				self.rank, self.local_rank,
-				plan.primary_config.num_pages, plan.primary_config.k_head_dim,
-				plan.aux_config.num_pages, plan.aux_config.k_head_dim,
-			)
-		else:
-			manager = primary
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized GPUPagedKVCacheManager on %s with %d pages",
-				self.rank, self.local_rank, plan.primary_config.num_pages,
-			)
-		return manager
-
-	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
-		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
-
-		For DSA models, returns a DualKVCacheCoordinator wrapping both primary
-		(MLA) and auxiliary (indexer) managers.
-
-		The reuse/recreate decision is delegated to
-		``KVCacheManager.plan_gpu_kv_manager``; ``_apply_gpu_kv_manager_plan``
-		performs the GPU side effects.
-		"""
-		plan = KVCacheManager.plan_gpu_kv_manager(
-			self._make_gpu_kv_manager_request(sequence_tokens)
-		)
-		return self._apply_gpu_kv_manager_plan(plan)
-
-	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
-		"""Allocate GPU KV pages and load host-resident KV for the batch."""
-		if not local_sequence_ids:
-			return
-		
-		# Convert local indices to global_idx (consistent with host KV registration)
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		
-		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
-		manager = self._ensure_gpu_paged_kv_manager(sequence_tokens)
-		
-		logging.info(
-			f"Rank {self.rank} Allocating GPU KV pages for global_idx: {global_sequence_ids}"
-		)
-		
-		# allocate_pages_for_sequences implicitly registers the sequences
-		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
-		manager.rebuild_page_table(global_sequence_ids)
-		self._load_host_kv_to_gpu(manager, global_sequence_ids)
 
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
 		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
@@ -5921,7 +5879,8 @@ class BatchGenWorker:
 		if REP_DETECTION:
 			for i in range(n):
 				seq = seqs[i]
-				if seq.decoded_length >= 64 and not seq._rep_detected:
+				if (seq.decoded_length >= 64 and not seq._rep_detected
+						and _repetition_check_enabled(seq)):
 					uuid = decode_uuids[i]
 					local_idx = self._uuid_to_local_map.get(uuid)
 					if local_idx is not None and local_idx in self.query_book:
@@ -7962,7 +7921,18 @@ class BatchGenWorker:
 		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
 		per-node cap when a TP-group model (every rank holds the same rows)
 		plans more slots than the guard — e.g. K3 H200 with sharded latent
-		projections plans 160 rows per node."""
+		projections plans 160 rows per node.
+
+		The legacy BATCHGEN_MAX_RANK_BSZ env name sizes the deepseek PSM
+		padding separately; silently diverging values corrupt the padded
+		buffer contract, so both names must agree when both are set."""
+		explicit = os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ")
+		legacy = os.environ.get("BATCHGEN_MAX_RANK_BSZ")
+		if explicit is not None and legacy is not None and explicit != legacy:
+			raise RuntimeError(
+				"BATCHGEN_MAX_DECODE_RANK_BSZ and BATCHGEN_MAX_RANK_BSZ "
+				"must match when both are set"
+			)
 		planned = int(getattr(
 			self.engine_config.Module_Batching_Config, "MoE_decoding_micro_batch_size", 0,
 		) or 0)
@@ -8147,7 +8117,35 @@ class BatchGenWorker:
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
 			return
 
-		# First time: Calculate actual GPU KV size
+		# Measure-once-cache: once the post-capture steady state has been
+		# measured, every later pool (re)creation reuses the cached size —
+		# never a fresh measurement (contract invariant 1: the pool is
+		# identical across decode rounds of the same server).
+		if self._gpu_kv_cached_pool_gb is not None:
+			self.gpu_kv_cache_size_gb = self._gpu_kv_cached_pool_gb
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Cached pool size: {self.gpu_kv_cache_size_gb:.2f} GB "
+					"(measure-once-cache)"
+				)
+			# The previous pool's segments already returned to CUDA at destroy
+			# (dedicated MemPool, whole-segment free). This flushes the
+			# GENERAL cache's all-free segments (prefill transients) too, so
+			# the full-size cudaMalloc below sees the maximum free memory.
+			torch.cuda.synchronize(self.torch_device)
+			torch.cuda.empty_cache()
+			self._initialize_gpu_kv_manager_fixed_size()
+			if self.rank == 0:
+				stats = self.gpu_paged_kv_cache_manager.get_stats()
+				logging.info(
+					f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, "
+					f"{stats.num_total_pages} pages"
+				)
+			return
+
+		# First time: PROVISIONAL size from the post-weights measurement. The
+		# final size is fixed by _finalize_gpu_kv_pool_after_capture once the
+		# graph warmup has materialized every persistent allocation.
 		torch.cuda.synchronize(self.torch_device)
 		torch.cuda.empty_cache()
 
@@ -8161,17 +8159,19 @@ class BatchGenWorker:
 		if new_gpu_kv_cache_size > 0:
 			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
 		else:
-			# Fallback to minimum
-			self.gpu_kv_cache_size_gb = 1.0
-			if self.rank == 0:
-				logging.warning(
-					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
-					f"Using minimum 1 GB."
-				)
+			# Fail-loud (contract invariant 3): a non-positive remainder is a
+			# configuration error, never a silently accepted minimum.
+			raise RuntimeError(
+				f"[GPU-KV] Calculated pool size non-positive "
+				f"({new_gpu_kv_cache_size:.2f} GB): total {total_mem_gb:.2f} GB "
+				f"x frac {self.gpu_memory_frac} - used {used_mem_gb:.2f} GB. "
+				"Lower resident memory or raise gpu_memory_frac."
+			)
+		self._gpu_kv_sizing_provisional = True
 
 		if self.rank == 0:
 			logging.info(
-				f"[GPU-KV] Actual size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
+				f"[GPU-KV] Provisional size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
 				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
 			)
 
@@ -10748,6 +10748,7 @@ class BatchGenWorker:
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
+		self._finalize_gpu_kv_pool_after_capture(gpu_manager)
 
 	@staticmethod
 	def _glm5_dsa_graph_score_capacity_tokens(
@@ -11234,6 +11235,77 @@ class BatchGenWorker:
 			"flashmla_num_splits": num_splits,
 		}
 
+	def _finalize_gpu_kv_pool_after_capture(self, gpu_manager) -> None:
+		"""Measure-once-cache finalization (semantic contract, POIS 2026-10-05).
+
+		Called once, right after the full graph warmup/capture, while the
+		PROVISIONAL pool is still allocated. The capture pass has materialized
+		every persistent allocation (graph pools, static buffers, NCCL
+		per-collective resources, JIT caches), so the steady residency is
+		``used - provisional_pool`` and the final pool is everything the memory
+		fraction allows above it. The result is CACHED; every later pool
+		(re)creation reuses it, making the pool identical across decode rounds
+		(invariant 1) and retiring the fresh-server round-1 protocol.
+
+		The current (first) round keeps the provisional pool — its sequences
+		already hold pages and captured graphs bake its addresses, and the
+		provisional size is never smaller than the final one (steady residency
+		only grows through capture). The cached size applies from the NEXT pool
+		creation (the per-round destroy/recreate that already exists), from
+		which point the page count is identical for every round.
+		"""
+		if not self._gpu_kv_sizing_provisional:
+			return
+		self._gpu_kv_sizing_provisional = False
+
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+		total_mem_gb = total_mem_bytes / (1024 ** 3)
+		used_mem_gb = total_mem_gb - free_mem_bytes / (1024 ** 3)
+
+		final_gb = KVCacheManager.compute_final_pool_gb(
+			total_mem_gb,
+			self.gpu_memory_frac,
+			used_mem_gb,
+			self.gpu_kv_cache_size_gb,
+		)
+
+		# Broadcast rank 0's decision so every rank resizes identically.
+		size_tensor = torch.tensor([final_gb], dtype=torch.float32, device=self.torch_device)
+		dist.broadcast(size_tensor, src=0)
+		final_gb = float(size_tensor.item())
+
+		# Fail-loud floor (contract invariant 3).
+		manager = self.gpu_paged_kv_cache_manager
+		stats = manager.get_stats()
+		bytes_per_page = (
+			self.gpu_kv_cache_size_gb * (1024 ** 3) / max(stats.num_total_pages, 1)
+		)
+		final_pages = int(final_gb * (1024 ** 3) / bytes_per_page)
+		bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [1])
+		floor_pages = KVCacheManager.pool_floor_pages(max(bucket_sizes))
+		if final_gb <= 0 or final_pages < floor_pages:
+			raise RuntimeError(
+				f"[GPU-KV] Final pool below floor: {final_gb:.2f} GB "
+				f"(~{final_pages} pages) < {floor_pages} pages required for the "
+				f"largest decode bucket. Steady residency leaves no room under "
+				f"gpu_memory_frac={self.gpu_memory_frac}; fix the configuration."
+			)
+
+		# Cache only: the live round keeps the provisional pool (its sequences
+		# hold pages and the captured graphs bake its addresses); every later
+		# pool creation uses the cached final size.
+		self._gpu_kv_cached_pool_gb = final_gb
+		if self.rank == 0:
+			logging.info(
+				f"[GPU-KV] Finalized pool size: {final_gb:.2f} GB "
+				f"(~{final_pages} pages; steady used "
+				f"{used_mem_gb - self.gpu_kv_cache_size_gb:.2f} GB; provisional "
+				f"{self.gpu_kv_cache_size_gb:.2f} GB stays for this round; cached "
+				"for every later pool creation)"
+			)
+
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
 
@@ -11339,7 +11411,7 @@ class BatchGenWorker:
 			from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
 				Glm5DecoderLayerGraphSegment,
 			)
-			from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+			from batchgen.models.glm.glm5.model import Glm5MoE, resolve_glm5_3d_mtp
 			from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
 				Glm5MoEGraphBufferPool,
 				Glm5MoEGraphSegment,
@@ -11409,6 +11481,14 @@ class BatchGenWorker:
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
+				if (
+					getattr(wrapper, "_fp8_qkv_a_proj", None) is None
+					or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
+				):
+					raise RuntimeError(
+						f"Layer {layer_idx}: GLM-5 whole-model graph requires "
+						"fused Q-A/KV-A weights"
+					)
 				if indexer is not None:
 					if getattr(wrapper, "_fused_wqb_weights", None) is None:
 						raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused WQB weights")
@@ -11456,7 +11536,12 @@ class BatchGenWorker:
 					intermediate_size=first_moe.config.moe_intermediate_size,
 					device=self.torch_device,
 					bucket_sizes=bucket_sizes,
-					base_mtp=_GLM5_3D_MTP,
+					# Graph decode fan-in is bounded by the largest captured
+					# bucket across all ranks; the pool still takes
+					# max(base_mtp, round_up(world_size x max_bucket)).
+					base_mtp=resolve_glm5_3d_mtp(
+						self.world_size * max(bucket_sizes)
+					),
 				)
 			shared_dsa_buffers = {}
 			shared_reuse_buffers = {}
@@ -11496,7 +11581,9 @@ class BatchGenWorker:
 						shared_buffers=shared_reuse_buffers,
 					)
 				else:
-					aux_blocked_k = aux_k_cache[layer_idx]
+					# The aux pool may hold only the indexer layers (GLM-5.2):
+					# resolve the physical slot instead of indexing by engine layer.
+					aux_blocked_k = aux_k_cache[aux_manager.resolve_physical_layer(layer_idx)]
 					dummy = torch.empty(
 						1,
 						1,
@@ -11594,7 +11681,9 @@ class BatchGenWorker:
 			self._whole_model_segment = whole_seg
 			self._glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
-				for capture_bucket in capture_buckets:
+				# Largest-first: the big bucket primes the shared graph pool and
+				# smaller buckets reuse its blocks instead of growing the pool.
+				for capture_bucket in sorted(capture_buckets, reverse=True):
 					torch.cuda.synchronize(self.torch_device)
 					dist.barrier()
 					whole_seg.set_capture_inputs(
@@ -12385,19 +12474,11 @@ class BatchGenWorker:
 					# indexer scoring. Computing once here instead of inside
 					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
 					# per decode step on DSA models (GLM-5).
-					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
-					if _dsa_index_topk is not None:
-						GLM5AttnWrapper._dsa_short_count = int(
-							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
-						)
-					else:
-						GLM5AttnWrapper._dsa_short_count = None
-
-						# GLM-5.2 DSA indexer reuse: clear prev top-k once per decode
-						# step (before layer 0) so shared layers never reuse a stale
-						# value from the previous step. (Second decode path; the
-						# graph-config path resets it separately.)
-						GLM5AttnWrapper._dsa_prev_topk_indices = None
+					_reset_glm5_dsa_step_state(
+						GLM5AttnWrapper,
+						Attn_Wrapper.cache_seqlens,
+						getattr(self.model_config, "index_topk", None),
+					)
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -12532,6 +12613,9 @@ class BatchGenWorker:
 							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
 					else:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							valid_layers = self._aux_layers_with_slots()
+							if valid_layers is not None and layer_idx not in valid_layers:
+								return
 							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
@@ -13026,7 +13110,7 @@ class BatchGenWorker:
 					seq.eos_reached = True
 
 				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected:
+				if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 					if token_id == seq._rep_last_token:
 						seq._rep_count += 1
 						if seq._rep_count >= 32:
@@ -13972,7 +14056,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 
 						# Repetition detection (BATCHGEN_REP_DETECTION=1)
-						if REP_DETECTION and not seq._rep_detected:
+						if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:
@@ -14071,7 +14155,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 
 						# Repetition detection (BATCHGEN_REP_DETECTION=1)
-						if REP_DETECTION and not seq._rep_detected:
+						if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:

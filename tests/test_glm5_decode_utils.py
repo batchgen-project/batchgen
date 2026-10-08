@@ -2771,7 +2771,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
 
     worker._setup_cuda_graphs(gpu_manager)
 
-    expected_buckets = [1, 2, 4, 8]
+    # Largest-first: the biggest bucket primes the shared graph pool and
+    # allocates the max-bucket DSA static base that smaller buckets view.
+    expected_buckets = [8, 4, 2, 1]
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
@@ -3520,3 +3522,22 @@ def test_prefill_offload_lifetime_keeps_current_layer_refs(monkeypatch):
     assert AttnWrapperBase.pending_prefill_offload_tasks == [task]
     assert AttnWrapperBase.pending_prefill_offload_tensors == [tensor]
     assert AttnWrapperBase.pending_prefill_offload_layer_idx == 4
+
+
+def test_max_decode_rank_bsz_env_name_mismatch_raises(monkeypatch):
+    worker_mod = pytest.importorskip("batchgen.batchgen_worker")
+    fake = types.SimpleNamespace(
+        engine_config=types.SimpleNamespace(
+            Module_Batching_Config=types.SimpleNamespace(
+                MoE_decoding_micro_batch_size=0
+            )
+        ),
+        _decode_attn_tp_size=lambda: 1,
+    )
+    monkeypatch.setenv("BATCHGEN_MAX_DECODE_RANK_BSZ", "128")
+    monkeypatch.setenv("BATCHGEN_MAX_RANK_BSZ", "160")
+    with pytest.raises(RuntimeError, match="must match"):
+        worker_mod.BatchGenWorker._max_decode_rank_bsz(fake)
+
+    monkeypatch.setenv("BATCHGEN_MAX_RANK_BSZ", "128")
+    assert worker_mod.BatchGenWorker._max_decode_rank_bsz(fake) > 0

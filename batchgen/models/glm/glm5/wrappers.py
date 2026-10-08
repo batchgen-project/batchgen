@@ -480,15 +480,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
-        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
-        self._cached_q_absorb = None
-        self._cached_out_absorb = None
-        # SGLang-aligned BF16 BMM absorb weights (set by
-        # initialize_decode_absorb). w_kc: [H, 192, 512] BF16 with
-        # SGLang's stride trick; w_vc: [H, 512, 256] BF16 non-contig view.
-        self.w_kc = None
-        self.w_vc = None
-        # WP5: FP8 absorb weights (pre-quantized once at init)
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
+        # WP5: FP8 absorb weights (pre-quantized once at init). The retired
+        # BF16 BMM absorb cache (_cached_q_absorb / w_kc / w_vc) is gone:
+        # every decode consumer uses these FP8 weights and fails loud when
+        # they are missing.
         self._fp8_absorb_weights = None
         # WP2: Fused indexer KV proj (CUDA WGMMA)
         self._indexer_cuda_module = None
@@ -511,6 +508,34 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
+        q_a_weight = self.module.q_a_proj.weight.data
+        kv_a_weight = self.module.kv_a_proj_with_mqa.weight.data
+        q_a_scale = self.weight_dequant_scale.get("q_a_proj.weight_scale_inv")
+        kv_a_scale = self.weight_dequant_scale.get(
+            "kv_a_proj_with_mqa.weight_scale_inv"
+        )
+        if q_a_scale is None or kv_a_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] fused Q-A/KV-A requires both FP8 scales"
+            )
+        self._fp8_qkv_a_proj = torch.cat(
+            (q_a_weight, kv_a_weight),
+            dim=0,
+        ).contiguous()
+        self._fp8_qkv_a_scale = torch.cat(
+            (q_a_scale, kv_a_scale),
+            dim=0,
+        ).contiguous()
+        q_rows = q_a_weight.shape[0]
+        q_scale_rows = q_a_scale.shape[0]
+        self.module.q_a_proj.weight.data = self._fp8_qkv_a_proj[:q_rows]
+        self.module.kv_a_proj_with_mqa.weight.data = self._fp8_qkv_a_proj[q_rows:]
+        self.weight_dequant_scale["q_a_proj.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[:q_scale_rows]
+        )
+        self.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[q_scale_rows:]
+        )
         self.fp8_q_a_proj = self.module.q_a_proj.weight.data
         self.fp8_q_b_proj = self.module.q_b_proj.weight.data
         self.fp8_kv_a_proj = self.module.kv_a_proj_with_mqa.weight.data
@@ -523,6 +548,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
 
     def initialize_decode_absorb(self):
         """Pre-compute absorbed projections from FP8 kv_b_proj weight.
@@ -540,41 +567,39 @@ class GLM5AttnWrapper(AttnWrapperBase):
             attn.kv_b_proj.weight.data,
             weight_scale["kv_b_proj.weight_scale_inv"],
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
-        self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
-        self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
+        # BF16 absorb matrices, built as temporaries. When the FP8 WGMMA absorb
+        # path is available (the default), BOTH the eager (glm5_decode_selector)
+        # and CUDA-graph decode paths use the FP8 absorb weights for q_absorb and
+        # out_absorb — the BF16 matrices are never read. So we free them below to
+        # reclaim ~4.6 GB/GPU of HBM (78 layers) for the KV cache, keeping only the
+        # FP8 weights. The BF16 matrices are retained ONLY as a fallback when the
+        # FP8 absorb kernel is unavailable.
+        cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
+        cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
-        # SGLang-aligned absorb weights for BF16 BMM (matches
-        # deepseek_weight_loader.py:572-578 layout exactly).
-        #
-        #   self.w_kc — [H, qk_nope=192, kv_lora=512], BF16
-        #     `.transpose(1,2).contiguous().transpose(1,2)` is SGLang's stride
-        #     trick: physical memory laid out as [H, 512, 192] contiguous,
-        #     strides swapped on dim 1/2. Math-identical to [H, 192, 512] but
-        #     makes bmm/bmm_fp8 hit the same cuBLAS kernel SGLang triggers.
-        #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
-        #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
-        self.w_kc = self._cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-        # Mirror SGLang exactly: .contiguous() first, then .transpose — the
-        # final tensor is a non-contiguous view with physical [H, 256, 512]
-        # and logical [H, 512, 256]. Adding a trailing .contiguous() would
-        # re-lay it out and change which cuBLAS kernel bmm dispatches to.
-        self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
-
-        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
-        if _HAS_FP8_ABSORB:
-            try:
-                self._fp8_absorb_weights = FP8AbsorbWeights(
-                    self._cached_q_absorb,   # [H, 192, 512]
-                    self._cached_out_absorb,  # [H, 256, 512]
-                )
-                logging.debug(
-                    f"[layer {self.layer_idx}] FP8 absorb weights initialized"
-                )
-            except Exception as e:
-                logging.warning(
-                    f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
-                )
-                self._fp8_absorb_weights = None
+        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel. Every decode
+        # consumer (eager selector and CUDA-graph path) requires them — the
+        # BF16 BMM fallback was retired, so a failed init must surface here,
+        # not as a mid-decode raise after a silently kept dead fallback.
+        if not _HAS_FP8_ABSORB:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 decode requires the WP5 FP8 "
+                "absorb kernel; rebuild batchgen_kernels with fp8_absorb"
+            )
+        try:
+            self._fp8_absorb_weights = FP8AbsorbWeights(
+                cached_q_absorb,   # [H, 192, 512]
+                cached_out_absorb,  # [H, 256, 512]
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
+            ) from e
+        logging.debug(
+            f"[layer {self.layer_idx}] FP8 absorb weights initialized"
+        )
+        # The BF16 temporaries above are quantizer input only and die here,
+        # reclaiming their HBM for the KV cache.
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 

@@ -18,8 +18,6 @@ from batchgen.migration import MigrationOp
 from batchgen.query_book import QueryBookEntry
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import (
-    GpuKvManagerPlan,
-    GpuKvManagerRequest,
     HostKVUtilization,
     KVCacheManager,
     KVStats,
@@ -436,18 +434,20 @@ def test_apply_capacity_normal_case():
     )
     config = _FakeCudaGraphConfig(num_pages=1000, page_size_tokens=64)
     out = KVCacheManager.apply_page_table_capacity(req, config)
-    # ceil(24000 / 64) = 375. min(1000, 375) = 375.
+    # ceil(24000 / 64) = 375 — from token capacity only.
     assert out.cuda_graph_max_pages_per_sequence == 375
-    # min(1000, 64) = 64.
     assert out.cuda_graph_max_slots == 64
 
 
-def test_apply_capacity_token_capacity_exceeds_num_pages():
-    """When ceil(tokens/page_size) > num_pages, clamped to num_pages."""
+def test_apply_capacity_decoupled_from_num_pages():
+    """Table SHAPE comes from token capacity only (measure-once-cache
+    contract): a pool smaller than the token capacity no longer clamps the
+    page-table width, so captured graphs never depend on the pool's page
+    count and a pool resize cannot invalidate the baked table shape."""
     req = _make_cap_req(model_max_position_embeddings=1_000_000)
     config = _FakeCudaGraphConfig(num_pages=100, page_size_tokens=64)
     out = KVCacheManager.apply_page_table_capacity(req, config)
-    assert out.cuda_graph_max_pages_per_sequence == 100
+    assert out.cuda_graph_max_pages_per_sequence == 15625  # ceil(1e6 / 64)
     assert out.cuda_graph_max_slots == 1  # no slot inputs → fallback 1
 
 
@@ -560,226 +560,6 @@ def test_token_budget_request_is_frozen():
     req = _make_token_budget_req(query_book={})
     with pytest.raises((AttributeError, Exception)):
         req.query_book = {}  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# GPU-KV-manager allocation planning (Phase 5.4a)
-# ---------------------------------------------------------------------------
-
-_CFG_MODULE = "batchgen.kv_cache.host_kv_mananger_config"
-
-
-@dataclass(frozen=True)
-class _FakeGpuConfig:
-    """Stand-in for GPUPagedKVConfig — only the fields the planner touches.
-
-    ``apply_page_table_capacity`` reads ``num_pages`` / ``page_size_tokens``
-    and ``dataclasses.replace``s the two cuda_graph fields, so this is
-    sufficient to exercise the plan without importing the real (JIT-backed)
-    config class.
-    """
-
-    num_pages: int
-    page_size_tokens: int = 64
-    cuda_graph_max_pages_per_sequence: "int | None" = None
-    cuda_graph_max_slots: "int | None" = None
-
-
-def _gpu_config(num_pages: int) -> _FakeGpuConfig:
-    return _FakeGpuConfig(num_pages=num_pages)
-
-
-def _cap_req_for_plan() -> PageTableCapacityRequest:
-    """Capacity request with everything off → apply_page_table_capacity
-    only sets cuda_graph fields, never touches num_pages."""
-    return PageTableCapacityRequest(
-        sequence_tokens=(),
-        max_input_length=0,
-        max_decoding_length=0,
-        engine_max_prompt=None,
-        engine_max_decode=None,
-        engine_module_global_batch_size=None,
-        engine_module_attn_decoding_micro_batch_size=None,
-        engine_basic_num_queries=None,
-        model_max_position_embeddings=None,
-        args_cuda_graph_max_bucket_size=None,
-    )
-
-
-def _patch_builders(monkeypatch, *, primary_pages: int, aux_pages=None):
-    """Inject a fake config module so the handler's local
-    ``from batchgen.kv_cache.host_kv_mananger_config import ...`` resolves to
-    controlled builders — without importing the real module (which JIT-builds
-    the core_engine op). Python's import machinery checks ``sys.modules``
-    first, so the fake wins.
-    """
-    fake_mod = types.ModuleType(_CFG_MODULE)
-    fake_mod.build_gpu_kv_config = (
-        lambda model_name, sequence_tokens: _gpu_config(primary_pages)
-    )
-    fake_mod.build_gpu_kv_config_aux = lambda model_name, sequence_tokens: (
-        None if aux_pages is None else _gpu_config(aux_pages)
-    )
-    monkeypatch.setitem(sys.modules, _CFG_MODULE, fake_mod)
-
-
-def _plan_req(*, has_manager: bool, current_num_pages: int) -> GpuKvManagerRequest:
-    return GpuKvManagerRequest(
-        model_name="fake-model",
-        sequence_tokens=(2048,),
-        has_manager=has_manager,
-        current_num_pages=current_num_pages,
-        capacity=_cap_req_for_plan(),
-    )
-
-
-def test_plan_gpu_kv_no_existing_manager_creates_new(monkeypatch):
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=False, current_num_pages=0)
-    )
-    assert plan.reuse is False
-    assert plan.destroy_existing is False  # nothing to destroy
-    assert plan.primary_config is not None and plan.primary_config.num_pages == 100
-    assert plan.aux_config is None  # non-DSA model
-
-
-def test_plan_gpu_kv_reuse_when_enough_pages(monkeypatch):
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=128)
-    )
-    assert plan.reuse is True
-    assert plan.destroy_existing is False
-    assert plan.primary_config is None  # reuse → no configs built
-    assert plan.aux_config is None
-
-
-def test_plan_gpu_kv_reuse_boundary_exact_pages(monkeypatch):
-    """current == required ⇒ reuse (the `>=` boundary)."""
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=100)
-    )
-    assert plan.reuse is True
-
-
-def test_plan_gpu_kv_recreate_when_too_few_pages(monkeypatch):
-    """Existing manager too small ⇒ recreate + destroy old."""
-    _patch_builders(monkeypatch, primary_pages=200)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=100)
-    )
-    assert plan.reuse is False
-    assert plan.destroy_existing is True
-    assert plan.primary_config.num_pages == 200
-
-
-def test_plan_gpu_kv_dsa_model_includes_aux(monkeypatch):
-    """DSA model (aux builder returns a config) ⇒ aux_config populated."""
-    _patch_builders(monkeypatch, primary_pages=200, aux_pages=50)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=False, current_num_pages=0)
-    )
-    assert plan.reuse is False
-    assert plan.primary_config.num_pages == 200
-    assert plan.aux_config is not None and plan.aux_config.num_pages == 50
-
-
-def test_plan_gpu_kv_reuse_skips_aux_build(monkeypatch):
-    """On reuse, neither config is built (aux stays None even for DSA)."""
-    _patch_builders(monkeypatch, primary_pages=100, aux_pages=50)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=128)
-    )
-    assert plan.reuse is True
-    assert plan.aux_config is None
-
-
-def test_plan_gpu_kv_applies_page_table_capacity(monkeypatch):
-    """The returned config carries CUDA-graph fields from the capacity req."""
-    _patch_builders(monkeypatch, primary_pages=100)
-    req = GpuKvManagerRequest(
-        model_name="fake-model",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=PageTableCapacityRequest(
-            sequence_tokens=(),
-            max_input_length=0,
-            max_decoding_length=0,
-            engine_max_prompt=None,
-            engine_max_decode=None,
-            engine_module_global_batch_size=32,  # → slot capacity 32
-            engine_module_attn_decoding_micro_batch_size=None,
-            engine_basic_num_queries=None,
-            model_max_position_embeddings=None,
-            args_cuda_graph_max_bucket_size=None,
-        ),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    # num_pages is untouched by capacity application; cuda_graph fields set.
-    assert plan.primary_config.num_pages == 100
-    assert plan.primary_config.cuda_graph_max_slots == 32
-    assert plan.primary_config.cuda_graph_max_pages_per_sequence is not None
-
-
-def test_plan_gpu_kv_request_and_plan_are_frozen():
-    req = _plan_req(has_manager=False, current_num_pages=0)
-    with pytest.raises((AttributeError, Exception)):
-        req.has_manager = True  # type: ignore[misc]
-    plan = GpuKvManagerPlan(
-        reuse=True, destroy_existing=False, primary_config=None, aux_config=None
-    )
-    with pytest.raises((AttributeError, Exception)):
-        plan.reuse = False  # type: ignore[misc]
-
-
-# --- Integration: real config builders for known models -------------------
-#
-# These exercise the REAL build_gpu_kv_config / _aux through the handler's
-# local import. That pulls batchgen.kv_cache, which JIT-builds the core_engine
-# op — unavailable on hosts without ninja (e.g. the dev laptop). Skip cleanly
-# there; they run where the op is built (remote / CI-with-GPU).
-
-
-def _require_real_config_module():
-    try:
-        import batchgen.kv_cache.host_kv_mananger_config  # noqa: F401
-    except Exception as exc:  # RuntimeError (ninja/JIT) or ImportError
-        pytest.skip(f"core_engine op unavailable on this host: {exc}")
-
-
-def test_plan_gpu_kv_real_glm5_is_dsa_with_aux():
-    """GLM-5-FP8 is a DSA model → real builder returns a non-None aux config."""
-    _require_real_config_module()
-    req = GpuKvManagerRequest(
-        model_name="glm-5-fp8",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=_cap_req_for_plan(),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    assert plan.reuse is False
-    assert plan.primary_config is not None and plan.primary_config.num_pages > 0
-    assert plan.aux_config is not None and plan.aux_config.num_pages > 0
-
-
-def test_plan_gpu_kv_real_gptoss_non_dsa_no_aux():
-    """GPT-OSS-120B is not a DSA model → real aux builder returns None."""
-    _require_real_config_module()
-    req = GpuKvManagerRequest(
-        model_name="gpt-oss-120b",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=_cap_req_for_plan(),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    assert plan.reuse is False
-    assert plan.primary_config is not None and plan.primary_config.num_pages > 0
-    assert plan.aux_config is None
 
 
 # ---------------------------------------------------------------------------
@@ -1062,3 +842,28 @@ def test_migration_request_and_candidate_are_frozen():
     c = _cand("a", 0, 0, 1, 1)
     with pytest.raises((AttributeError, Exception)):
         c.uuid = "b"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# measure-once-cache pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_compute_final_pool_gb_subtracts_provisional_pool():
+    final = KVCacheManager.compute_final_pool_gb(140.0, 0.93, 132.4, 19.1)
+    assert abs(final - (140.0 * 0.93 - (132.4 - 19.1))) < 1e-9
+
+
+def test_compute_final_pool_gb_is_deterministic_identity():
+    # Measuring again with the FINAL pool allocated returns the same value:
+    # used2 = steady + final, so total*frac - (used2 - final) = final.
+    total, frac, steady = 140.0, 0.93, 113.3
+    final = KVCacheManager.compute_final_pool_gb(total, frac, steady + 19.1, 19.1)
+    again = KVCacheManager.compute_final_pool_gb(total, frac, steady + final, final)
+    assert abs(final - again) < 1e-9
+
+
+def test_pool_floor_pages():
+    assert KVCacheManager.pool_floor_pages(128) == 512
+    assert KVCacheManager.pool_floor_pages(1) == 4
+    assert KVCacheManager.pool_floor_pages(0) == 4  # clamped bucket
