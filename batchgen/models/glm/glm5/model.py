@@ -2175,7 +2175,9 @@ class Glm5MoE(nn.Module):
         )
 
         # 4) FP8 blockwise GEMM on the compact buffer
-        self._fp8_blockwise_gemm_3d(buf, expert_counts, cu_seqlens)
+        self._fp8_blockwise_gemm_3d(
+            buf, expert_counts, cu_seqlens, num_global=num_global, topk=topk,
+        )
 
         # 5) Weighted scatter reduce
         # reduce_weighted_scatter writes every output element unconditionally
@@ -2202,7 +2204,7 @@ class Glm5MoE(nn.Module):
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
-    def _fp8_blockwise_gemm_3d(self, buf, expert_counts, cu_seqlens):
+    def _fp8_blockwise_gemm_3d(self, buf, expert_counts, cu_seqlens, *, num_global, topk):
         """FP8 blockwise grouped GEMM on the compact ragged buffer (in-place).
 
         Reads buf.dispatched_x, writes buf.expert_out. Every staging tensor is
@@ -2228,6 +2230,9 @@ class Glm5MoE(nn.Module):
         seqlens = expert_counts[:E]
         # gemm_tilem_avg_effective (imported as _glm5_gemm_tilem_avg) already
         # applies the batch-level glm5_moe_tilem_avg override internally.
+        # num_global and topk are threaded from _forward_decode_3d: the #443
+        # eager hunk referenced them from the wrong scope and this path never
+        # ran under graph-mode serving.
         avg = _glm5_gemm_tilem_avg(
             num_global, topk, self.experts_per_rank * self.world_size
         )
