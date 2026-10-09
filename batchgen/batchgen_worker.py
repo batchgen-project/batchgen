@@ -5028,7 +5028,7 @@ class BatchGenWorker:
 		# ranks, so this raises on every rank together (a clean failure)
 		# instead of one rank leaving the graph mid-collective.
 		if decode_batch and getattr(self, "_glm5_whole_model_all_short", False):
-			index_topk = int(getattr(self.model_config, "index_topk", 0) or 0)
+			index_topk = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
 			if index_topk:
 				over_budget = [
 					uuid for uuid in decode_batch
@@ -10088,6 +10088,7 @@ class BatchGenWorker:
 		self._cuda_graph_manager = None
 		self._whole_model_segment = None
 		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
 		self._whole_model_bucketing = None
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
@@ -10140,7 +10141,7 @@ class BatchGenWorker:
 		# An all_short capture never runs indexer scoring, so rows past
 		# index_topk must leave the graph; the eager path still selects
 		# top-k correctly for them.
-		index_topk_cfg = int(getattr(getattr(self, "model_config", None), "index_topk", 0) or 0)
+		index_topk_cfg = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
 		if (
 			getattr(self, "_glm5_whole_model_all_short", False)
 			and index_topk_cfg > 0
@@ -10523,13 +10524,25 @@ class BatchGenWorker:
 			# all_short lifetime: every admissible row's final length fits in
 			# index_topk, so the DSA segments attend densely to the resident
 			# page cache and skip indexer scoring/top-k for the graph lifetime.
+			# index_topk comes from the live indexer module — the value that
+			# actually drives scoring; a local-checkpoint model_config may not
+			# carry the field at all.
 			required_seqlen = self._glm5_dsa_graph_required_tokens(
 				active_sequence_ids,
 				page_size=primary_page_size,
 			)
-			index_topk_cfg = int(getattr(self.model_config, "index_topk", 0) or 0)
+			_first_indexer = next(
+				(
+					getattr(layer.self_attn.module, "indexer", None)
+					for layer in self.model.model.layers
+					if getattr(layer.self_attn.module, "indexer", None) is not None
+				),
+				None,
+			)
+			index_topk_cfg = int(getattr(_first_indexer, "index_topk", 0) or 0)
 			all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg
 			self._glm5_whole_model_all_short = all_short
+			self._glm5_whole_model_index_topk = index_topk_cfg
 			if self.rank == 0:
 				logging.info(
 					"Rank %s: GLM-5 whole-model graph attention span "
@@ -10793,6 +10806,7 @@ class BatchGenWorker:
 				self._cuda_graph_manager = None
 				self._whole_model_segment = None
 				self._glm5_whole_model_all_short = False
+				self._glm5_whole_model_index_topk = 0
 				self._whole_model_bucketing = None
 				self._glm5_whole_model_capture_input_ids = None
 				self._whole_model_graph = False
@@ -11767,9 +11781,9 @@ class BatchGenWorker:
 						# below with reason=all_short_exceeded.
 						_glm5_all_short_exceeded = bool(
 							getattr(self, "_glm5_whole_model_all_short", False)
-							and int(getattr(self.model_config, "index_topk", 0) or 0)
+							and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
 							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-							> int(self.model_config.index_topk)
+							> int(self._glm5_whole_model_index_topk)
 						)
 						_glm5_whole_graph_active = (
 							not _glm5_all_short_exceeded
@@ -13819,6 +13833,7 @@ class BatchGenWorker:
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_segment = None
 		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
 		self._whole_model_bucketing = None
 		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()

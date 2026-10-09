@@ -104,10 +104,12 @@ def test_build_block_derives_all_short_from_required_tokens():
     assert _kwargs(required_call) == {"page_size": "primary_page_size"}
 
     assert "required_seqlen = self._glm5_dsa_graph_required_tokens(" in src
-    assert (
-        "index_topk_cfg = int(getattr(self.model_config, 'index_topk', 0) or 0)"
-        in src
-    )
+    # index_topk must come from the live indexer module (the value the
+    # scoring kernels use), never from model_config: a local-checkpoint
+    # config may not carry the field.
+    assert "index_topk_cfg = int(getattr(_first_indexer, 'index_topk', 0) or 0)" in src
+    assert "self._glm5_whole_model_index_topk = index_topk_cfg" in src
+    assert "model_config, 'index_topk'" not in src
     assert (
         "all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg"
         in src
@@ -316,3 +318,15 @@ def test_admission_refuses_over_budget_rows_in_an_all_short_lifetime():
     assert "_glm5_whole_model_all_short" in window
     assert "kv_token_budget" in window
     assert "raise RuntimeError" in window
+
+
+def test_guards_read_the_stored_index_topk():
+    source = _WORKER_SRC.read_text()
+    assert source.count("_glm5_whole_model_index_topk", 0) >= 5
+    # No guard reads index_topk off model_config any more (the step-state
+    # hint helper at module level is a separate, pre-existing consumer).
+    gate = source[source.index("_glm5_whole_graph_active = bool("):]
+    gate = gate[: gate.index("_use_graph = (")]
+    assert "_glm5_whole_model_index_topk" in gate
+    admission = source[source.index("DecodeScheduler.select_decode_batch"):][:2500]
+    assert "_glm5_whole_model_index_topk" in admission
