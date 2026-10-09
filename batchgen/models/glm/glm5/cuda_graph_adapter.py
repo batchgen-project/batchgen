@@ -279,24 +279,11 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         captured graph is forward-only and warmup MUST NOT mutate the real
         KV cache, so the bound inputs have batch dim 0 (capture-time stub)
         except for `rank_token_counts` which is world-size-shaped.
-
-        TRANSITIONAL: the dead FlashMLA scheduler metadata is still built
-        here. `Glm5WholeModelSegment.set_capture_inputs` validates this dict
-        against `get_static_input_specs` and rejects BOTH unknown and
-        missing keys, so the capture dict must keep matching the two
-        transitional static inputs exactly. Both sides go in the core PR.
+        `Glm5WholeModelSegment.set_capture_inputs` validates this dict against
+        `get_static_input_specs` and rejects both unknown and missing keys.
         """
         self._require_ctx()
-        from batchgen.attention.dsa.sparse_decode_mla import (
-            prepare_sparse_flash_mla_decode_tensor_metadata,
-        )
-
         device = self._ctx.device
-        num_heads = self._ctx.num_heads
-        selected_lengths = torch.ones((int(bucket),), dtype=torch.int32, device=device)
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths, int(num_heads),
-        )
         return {
             "input_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
             "cache_seqlens": torch.empty((0,), dtype=torch.int32, device=device),
@@ -307,8 +294,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 (self.world_size,), dtype=torch.int64, device=device,
             ),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=device),
-            "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-            "flashmla_num_splits": num_splits,
         }
 
     # ---- Step-time ------------------------------------------------------
@@ -380,11 +365,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         the inline replay-arg construction at worker:12104-12124. Includes
         `input_ids` and `rank_token_counts` so the worker passes exactly
         this dict to `manager.replay`.
-
-        The FlashMLA scheduler metadata is NOT published any more: the DSA
-        segments run FA3 and never read it, and `manager.replay` only
-        rejects UNKNOWN keys, so omitting it leaves the (still declared,
-        still unread) static inputs untouched between replays.
         """
         self._require_ctx()
 

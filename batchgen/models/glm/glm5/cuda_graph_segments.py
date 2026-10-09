@@ -672,7 +672,6 @@ class Glm5FullDsaAttnSegment:
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
-        self._flashmla_metadata_specs: Dict[int, tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]] = {}
 
         if self.primary_blocked_k.ndim != 4 or self.primary_blocked_k.shape[2] != 1:
             raise ValueError(
@@ -762,39 +761,6 @@ class Glm5FullDsaAttnSegment:
             num_splits=0,
             return_softmax_lse=False,
         )
-
-    def _flashmla_tensor_metadata_specs(
-        self,
-        bucket_size: int,
-    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
-        """TRANSITIONAL: shapes for the now-dead FlashMLA graph metadata.
-
-        No stage of this segment reads the metadata any more. It survives
-        only so the whole-model segment can keep declaring the two static
-        inputs that the (not-yet-updated) worker still publishes at capture
-        and replay. Delete together with the worker's metadata prep.
-        """
-        cached = self._flashmla_metadata_specs.get(bucket_size)
-        if cached is not None:
-            return cached
-        lengths = torch.full(
-            (bucket_size,),
-            self._padding_selected_length(),
-            dtype=torch.int32,
-            device=self.primary_blocked_k.device,
-        )
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            lengths,
-            self.attn.num_heads,
-        )
-        spec = (
-            tuple(tile_scheduler_metadata.shape),
-            tile_scheduler_metadata.dtype,
-            tuple(num_splits.shape),
-            num_splits.dtype,
-        )
-        self._flashmla_metadata_specs[bucket_size] = spec
-        return spec
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -1074,15 +1040,7 @@ class Glm5FullDsaAttnSegment:
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
-        # TRANSITIONAL (accepted, never read): the FlashMLA scheduler
-        # metadata is dead on this path, but the enclosing decoder-layer
-        # segment and the worker still publish and thread it. Keep the two
-        # names so capture/replay work against an unmodified worker; they go
-        # away with the worker's metadata prep in the core PR.
-        flashmla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
-        flashmla_num_splits: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        del flashmla_tile_scheduler_metadata, flashmla_num_splits
         attn = self.attn
         indexer = attn.indexer
         batch_size = hidden_states.shape[0]
