@@ -245,22 +245,9 @@ class Glm5WholeModelSegment:
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
         }
         if self.layer_segments:
-            first_layer = self.layer_segments[0]
             specs["num_valid_tokens"] = TensorSpec(
                 (1,), torch.int32, fill_value=float(bucket_size)
             )
-            # TRANSITIONAL: the DSA segments run FA3 and no longer read the
-            # FlashMLA scheduler metadata, but the worker still publishes it
-            # at capture (`set_capture_inputs`, which rejects unknown keys)
-            # and at replay (`CUDAGraphManager.replay`, which raises KeyError
-            # for an input the captured graph never declared). The two static
-            # inputs therefore stay declared — and unread — until the core PR
-            # drops the worker's metadata prep.
-            tile_shape, tile_dtype, splits_shape, splits_dtype = (
-                first_layer._flashmla_tensor_metadata_specs(bucket_size)
-            )
-            specs["flashmla_tile_scheduler_metadata"] = TensorSpec(tile_shape, tile_dtype)
-            specs["flashmla_num_splits"] = TensorSpec(splits_shape, splits_dtype)
         return specs
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -325,17 +312,11 @@ class Glm5WholeModelSegment:
         aux_slot_indices: torch.Tensor | None = None,
         num_valid_tokens: torch.Tensor | None = None,
         rank_token_counts: torch.Tensor | None = None,
-        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
-        flashmla_num_splits: torch.Tensor | None = None,
         use_layer_segments: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         hidden_states = self.model.model.embed_tokens(input_ids)
         outputs: dict[str, torch.Tensor] = {}
         if self.layer_segments and use_layer_segments is not False:
-            # The FlashMLA scheduler metadata is NOT required any more: the
-            # DSA segments run FA3 and never read it. It is still threaded
-            # below because the enclosing decoder-layer segment keeps the two
-            # transitional parameters, but a None is legal.
             required = {
                 "cache_seqlens": cache_seqlens,
                 "primary_slot_indices": primary_slot_indices,
@@ -358,8 +339,6 @@ class Glm5WholeModelSegment:
                     aux_slot_indices=aux_slot_indices,
                     num_valid_tokens=num_valid_tokens,
                     rank_token_counts=rank_token_counts,
-                    flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                    flashmla_num_splits=flashmla_num_splits,
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
@@ -397,8 +376,6 @@ class Glm5WholeModelSegment:
         aux_slot_indices: torch.Tensor,
         rank_token_counts: torch.Tensor,
         num_valid_tokens: torch.Tensor | None = None,
-        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
-        flashmla_num_splits: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
         bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
@@ -428,8 +405,6 @@ class Glm5WholeModelSegment:
                 aux_slot_indices=aux_slot_indices,
                 num_valid_tokens=num_valid_tokens,
                 rank_token_counts=rank_token_counts,
-                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                flashmla_num_splits=flashmla_num_splits,
             )
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens

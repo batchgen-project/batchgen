@@ -5022,6 +5022,26 @@ class BatchGenWorker:
 			self._make_decode_batch_request(all_candidates, total_pages)
 		)
 
+		# An all_short whole-model capture never runs indexer scoring, so a
+		# sequence whose KV budget can outgrow index_topk must never join the
+		# decode batch of such a lifetime. Admission is deterministic across
+		# ranks, so this raises on every rank together (a clean failure)
+		# instead of one rank leaving the graph mid-collective.
+		if decode_batch and getattr(self, "_glm5_whole_model_all_short", False):
+			index_topk = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+			if index_topk:
+				over_budget = [
+					uuid for uuid in decode_batch
+					if int(self.global_batch.get_sequence(uuid).kv_token_budget) > index_topk
+				]
+				if over_budget:
+					raise RuntimeError(
+						"GLM-5 all_short whole-model graph lifetime cannot admit "
+						f"{len(over_budget)} sequence(s) with kv_token_budget > "
+						f"index_topk={index_topk} (first: {over_budget[0]}); "
+						"restart the server for workloads with longer budgets"
+					)
+
 		if self.rank == 0:
 			logging.info(
 				f"[DECODE] Prepared batch: {len(decode_batch)} sequences"
@@ -9822,6 +9842,44 @@ class BatchGenWorker:
 			)
 		return capacity
 
+	def _glm5_dsa_graph_required_tokens(
+		self,
+		active_sequence_ids: Sequence[int],
+		*,
+		page_size: int,
+	) -> int:
+		"""Smallest page-aligned decode length the current graph must cover.
+
+		Budget-based: ``kv_token_budget`` bounds every row's final length for
+		the whole graph lifetime, so a graph specialized on this value can never
+		be outgrown mid-lifetime.
+		"""
+		budgets = [
+			int(seq.kv_token_budget)
+			for seq in self.global_batch
+			if seq.status != SequenceStatus.COMPLETED
+		] if self.global_batch is not None else []
+		if not budgets and active_sequence_ids:
+			by_gid = {
+				int(seq.global_idx): seq
+				for seq in self.global_batch
+			} if self.global_batch is not None else {}
+			budgets = [
+				int(by_gid[seq_id].kv_token_budget)
+				for seq_id in active_sequence_ids
+				if int(seq_id) in by_gid
+			]
+		if budgets:
+			required = max(budgets)
+		else:
+			required = max(
+				1,
+				int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+				int(getattr(self, "max_input_length", 0) or 0)
+				+ int(getattr(self, "max_decoding_length", 0) or 0),
+			)
+		return math.ceil(required / int(page_size)) * int(page_size)
+
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
 			return value
@@ -10029,6 +10087,8 @@ class BatchGenWorker:
 					release(int(bucket))
 		self._cuda_graph_manager = None
 		self._whole_model_segment = None
+		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
 		self._whole_model_bucketing = None
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
@@ -10078,6 +10138,16 @@ class BatchGenWorker:
 			and current_max_seqlen > captured_max_seqlen
 		):
 			return "eager", bucket, "max_seqlen_exceeds_capture"
+		# An all_short capture never runs indexer scoring, so rows past
+		# index_topk must leave the graph; the eager path still selects
+		# top-k correctly for them.
+		index_topk_cfg = int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+		if (
+			getattr(self, "_glm5_whole_model_all_short", False)
+			and index_topk_cfg > 0
+			and current_max_seqlen > index_topk_cfg
+		):
+			return "eager", bucket, "all_short_exceeded"
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
 		if signature != getattr(self, "_glm5_whole_model_graph_signature", None):
 			return "eager", bucket, "page_table_storage_changed"
@@ -10126,37 +10196,6 @@ class BatchGenWorker:
 			cache_seqlens_i32 = torch.empty((0,), dtype=torch.int32, device=self.torch_device)
 			position_ids_i64 = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
-		layers = getattr(getattr(self.model, "model", None), "layers", None)
-		if not layers:
-			raise RuntimeError("GLM-5 layer graph replay requires decoder layers")
-		wrapper = layers[0].self_attn
-		index_topk = int(getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048))
-		num_heads = int(getattr(wrapper.module, "num_heads", 64))
-		graph_max_seqlen = int(
-			graph_max_seqlen_override
-			or getattr(self, "_glm5_layer_graph_max_seqlen", None)
-			or getattr(AttnWrapperBase, "max_seqlen", 0)
-			or index_topk
-		)
-		selected_lengths = torch.empty(
-			(bucket,),
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
-		if local_bsz > 0:
-			selected_lengths[:local_bsz].copy_(
-				torch.clamp(cache_seqlens_i32, max=index_topk),
-				non_blocking=True,
-			)
-		if local_bsz < bucket:
-			selected_lengths[local_bsz:].fill_(min(graph_max_seqlen, index_topk))
-		from batchgen.attention.dsa.sparse_decode_mla import (
-			prepare_sparse_flash_mla_decode_tensor_metadata,
-		)
-		tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-			selected_lengths,
-			num_heads,
-		)
 		num_valid_tokens = torch.empty((1,), dtype=torch.int32, device=self.torch_device)
 		num_valid_tokens.fill_(local_bsz)
 		return {
@@ -10165,8 +10204,6 @@ class BatchGenWorker:
 			"primary_slot_indices": _graph_slots(primary_manager),
 			"aux_slot_indices": _graph_slots(aux_manager),
 			"num_valid_tokens": num_valid_tokens,
-			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-			"flashmla_num_splits": num_splits,
 		}
 
 	def _log_glm5_graph_path_for_forward(
@@ -10260,20 +10297,6 @@ class BatchGenWorker:
 		bucket: int,
 		num_heads: int,
 	):
-		from batchgen.attention.dsa.sparse_decode_mla import (
-			prepare_sparse_flash_mla_decode_tensor_metadata,
-		)
-
-		bucket = int(bucket)
-		selected_lengths = torch.ones(
-			(bucket,),
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
-		tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-			selected_lengths,
-			int(num_heads),
-		)
 		return {
 			"input_ids": torch.empty((0, 1), dtype=torch.int64, device=self.torch_device),
 			"cache_seqlens": torch.empty((0,), dtype=torch.int32, device=self.torch_device),
@@ -10282,8 +10305,6 @@ class BatchGenWorker:
 			"aux_slot_indices": torch.empty((0,), dtype=torch.int32, device=self.torch_device),
 			"rank_token_counts": torch.zeros((self.world_size,), dtype=torch.int64, device=self.torch_device),
 			"num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=self.torch_device),
-			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-			"flashmla_num_splits": num_splits,
 		}
 
 	def _finalize_gpu_kv_pool_after_capture(self, gpu_manager) -> None:
@@ -10500,6 +10521,37 @@ class BatchGenWorker:
 					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "
 					f"exceeds model/KV capacity {graph_max_seqlen}"
 				)
+			# all_short lifetime: every admissible row's final length fits in
+			# index_topk, so the DSA segments attend densely to the resident
+			# page cache and skip indexer scoring/top-k for the graph lifetime.
+			# index_topk comes from the live indexer module — the value that
+			# actually drives scoring; a local-checkpoint model_config may not
+			# carry the field at all.
+			required_seqlen = self._glm5_dsa_graph_required_tokens(
+				active_sequence_ids,
+				page_size=primary_page_size,
+			)
+			_first_indexer = next(
+				(
+					getattr(layer.self_attn.module, "indexer", None)
+					for layer in self.model.model.layers
+					if getattr(layer.self_attn.module, "indexer", None) is not None
+				),
+				None,
+			)
+			index_topk_cfg = int(getattr(_first_indexer, "index_topk", 0) or 0)
+			all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg
+			self._glm5_whole_model_all_short = all_short
+			self._glm5_whole_model_index_topk = index_topk_cfg
+			if self.rank == 0:
+				logging.info(
+					"Rank %s: GLM-5 whole-model graph attention span "
+					"required_seqlen=%s index_topk=%s all_short=%s",
+					self.rank,
+					required_seqlen,
+					index_topk_cfg,
+					all_short,
+				)
 
 			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
@@ -10629,6 +10681,7 @@ class BatchGenWorker:
 						index_topk=last_index_topk,
 						page_size=primary_page_size,
 						topk_source=last_full_segment,
+						all_short=all_short,
 						shared_buffers=shared_reuse_buffers,
 					)
 				else:
@@ -10658,6 +10711,7 @@ class BatchGenWorker:
 						index_topk=indexer.index_topk,
 						page_size=primary_page_size,
 						aux_page_size=aux_page_size,
+						all_short=all_short,
 						shared_buffers=shared_dsa_buffers,
 					)
 					last_full_segment = dsa_segment
@@ -10751,6 +10805,8 @@ class BatchGenWorker:
 				self._glm5_whole_model_graph_failed_buckets.add(capture_bucket)
 				self._cuda_graph_manager = None
 				self._whole_model_segment = None
+				self._glm5_whole_model_all_short = False
+				self._glm5_whole_model_index_topk = 0
 				self._whole_model_bucketing = None
 				self._glm5_whole_model_capture_input_ids = None
 				self._whole_model_graph = False
@@ -11549,7 +11605,6 @@ class BatchGenWorker:
 					AttnWrapperBase.cur_batch = []
 					GLM5AttnWrapper._dsa_short_count = 0
 					GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-					GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 					self._decode_metadata_batch_key = None
 					self._decode_metadata_cpu_seqlens = None
 				
@@ -11692,8 +11747,8 @@ class BatchGenWorker:
 					decode_iter=self._cumulative_decode_iterations,
 				)
 				# Phase C: DSA-only graph metadata prep retired (DSA graph mode
-				# is no longer reachable). The whole-model graph builds its
-				# FlashMLA metadata in-line during prepare_replay_inputs.
+				# is no longer reachable). The whole-model graph's FA3 sparse
+				# decode needs no per-forward attention scheduler metadata.
 
 				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
 					local_iteration=local_iteration,
@@ -11718,8 +11773,21 @@ class BatchGenWorker:
 						_glm5_whole_graph_over_bucket = True
 						_glm5_whole_graph_active = False
 					else:
+						# An all_short capture never runs indexer scoring, so a
+						# step whose longest context exceeds index_topk must NOT
+						# replay it: top-k selection would be silently skipped.
+						# Leaving the graph here either falls back to eager
+						# (correct top-k) or, under a required graph, raises
+						# below with reason=all_short_exceeded.
+						_glm5_all_short_exceeded = bool(
+							getattr(self, "_glm5_whole_model_all_short", False)
+							and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+							> int(self._glm5_whole_model_index_topk)
+						)
 						_glm5_whole_graph_active = (
-							_glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
+							not _glm5_all_short_exceeded
+							and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
 							and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
 							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
 							and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
@@ -11901,8 +11969,6 @@ class BatchGenWorker:
 							aux_slot_indices=graph_inputs["aux_slot_indices"],
 							rank_token_counts=_all_rank_counts,
 							num_valid_tokens=graph_inputs["num_valid_tokens"],
-							flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
-							flashmla_num_splits=graph_inputs["flashmla_num_splits"],
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
@@ -12286,7 +12352,6 @@ class BatchGenWorker:
 		GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
 		GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 		GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-		GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
@@ -13767,6 +13832,8 @@ class BatchGenWorker:
 		self._glm5_moe_graph_capture_attempted_for_batch = False
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_segment = None
+		self._glm5_whole_model_all_short = False
+		self._glm5_whole_model_index_topk = 0
 		self._whole_model_bucketing = None
 		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()

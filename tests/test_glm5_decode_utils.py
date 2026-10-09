@@ -2014,11 +2014,12 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
 
     bucket_inputs = []
     reuse_segment_kwargs = []
+    full_segment_kwargs = []
     monkeypatch.setattr(cuda_graph_module, "CUDAGraphManager", FakeManager)
     monkeypatch.setattr(
         dsa_segments,
         "Glm5FullDsaAttnSegment",
-        lambda **_kwargs: object(),
+        lambda **kwargs: full_segment_kwargs.append(kwargs) or object(),
     )
     monkeypatch.setattr(
         layer_segments_module,
@@ -2045,7 +2046,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         cuda_graph_max_bucket_size=8,
         cuda_graph_num_buckets=4,
     )
-    worker.model_config = types.SimpleNamespace(max_position_embeddings=512)
+    worker.model_config = types.SimpleNamespace(max_position_embeddings=512, index_topk=8)
+    worker.global_batch = None
     worker.torch_device = torch.device("cpu")
     worker._batchgen_debug = {}
     worker.model = types.SimpleNamespace(
@@ -2092,8 +2094,6 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             "aux_slot_indices": torch.empty((0,), dtype=torch.int32),
             "rank_token_counts": torch.zeros((2,), dtype=torch.int64),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32),
-            "flashmla_tile_scheduler_metadata": torch.empty((1,), dtype=torch.int32),
-            "flashmla_num_splits": torch.empty((1,), dtype=torch.int32),
         }
 
     worker._make_glm5_whole_model_capture_inputs = fake_capture_inputs
@@ -2112,6 +2112,12 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
     assert len(reuse_segment_kwargs) == 1
     assert reuse_segment_kwargs[0]["wrapper"].module.indexer is None
+    # No budgets -> the AttnWrapperBase.max_seqlen fallback (128) exceeds
+    # index_topk (8), so neither segment family is specialized all_short.
+    assert len(full_segment_kwargs) == 1
+    assert full_segment_kwargs[0]["all_short"] is False
+    assert reuse_segment_kwargs[0]["all_short"] is False
+    assert worker._glm5_whole_model_all_short is False
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
 
@@ -2384,9 +2390,6 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         def release_static_buffers(self, bucket_size):
             self.release_bucket = bucket_size
 
-        def _flashmla_tensor_metadata_specs(self, bucket_size):
-            return (bucket_size, 2), torch.int32, (bucket_size,), torch.int32
-
         def forward(self, *, hidden_states, **kwargs):
             self.calls += 1
             rows = hidden_states.shape[0]
@@ -2429,7 +2432,7 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
 
     specs = segment.get_static_input_specs(2)
     assert "num_valid_tokens" in specs
-    assert "flashmla_tile_scheduler_metadata" in specs
+    assert not any("flashmla" in name for name in specs), sorted(specs)
 
     segment.setup_static_buffers(2)
     outputs = segment.forward(
@@ -2440,8 +2443,6 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32),
         rank_token_counts=torch.tensor([2, 2], dtype=torch.int64),
         num_valid_tokens=torch.tensor([2], dtype=torch.int32),
-        flashmla_tile_scheduler_metadata=torch.zeros(2, 2, dtype=torch.int32),
-        flashmla_num_splits=torch.zeros(2, dtype=torch.int32),
     )
 
     assert [layer_segment.calls for layer_segment in layer_segments] == [1, 1]

@@ -233,21 +233,16 @@ def test_full_dsa_initialize_static_inputs_no_longer_builds_metadata():
     "src,class_name",
     [(_SEGMENTS_SRC, "Glm5FullDsaAttnSegment"), (_REUSE_SRC, "Glm5ReuseTopkAttnSegment")],
 )
-def test_segment_forward_never_reads_flashmla_metadata(src, class_name):
-    """Both forwards still ACCEPT the two names (the enclosing decoder-layer
-    segment and the worker keep threading them during the transition) but
-    must delete them immediately and never pass them to a kernel."""
+def test_segment_forward_has_no_flashmla_metadata(src, class_name):
+    """The FlashMLA scheduler metadata is dead through the whole graph chain:
+    neither forward accepts it, and no FlashMLA kernel is called."""
     fwd = _method(_tree(src), class_name, "forward")
-    defaults = _param_defaults(fwd)
-    assert defaults.get("flashmla_tile_scheduler_metadata") == "None"
-    assert defaults.get("flashmla_num_splits") == "None"
-    deleted = {
-        ast.unparse(target)
-        for stmt in fwd.body
-        if isinstance(stmt, ast.Delete)
-        for target in stmt.targets
-    }
-    assert {"flashmla_tile_scheduler_metadata", "flashmla_num_splits"} <= deleted
+    params = {a.arg for a in fwd.args.args + fwd.args.kwonlyargs}
+    assert not {p for p in params if "flashmla" in p}, params
+    assert not any(isinstance(stmt, ast.Delete) for stmt in fwd.body)
+    # No transitional helper, cache, or comment survives on the class either.
+    cls_src = ast.get_source_segment(src.read_text(), _top_level(_tree(src), class_name))
+    assert "flashmla" not in cls_src.lower()
     calls = _call_names(fwd)
     for dropped in _DROPPED_FLASHMLA_CALLS:
         assert dropped not in calls, dropped
