@@ -23,9 +23,10 @@ becomes a static-tensor read: this segment consumes the per-bucket
 Relative to the full segment this variant drops every indexer stage
 (wk proj / k-norm / rope-hadamard / aux-KV write / head gates / wq_b proj /
 score+topk) and keeps the MLA spine: q_a/q_b + kv_a projections, fused
-rmsnorm-rope, primary-KV update, select-KV(with reused top-k), FlashMLA,
-out-absorb, o_proj. ``row_modes`` is recomputed exactly as the eager reuse
-branch does: ``cache_seqlens > index_topk``.
+rmsnorm-rope, primary-KV update, the selected-page-table transform over the
+BORROWED top-k, FA3, out-absorb, o_proj. It inherits the full segment's two
+attention branches, so an ``all_short`` graph skips the transform entirely
+and FA3 reads the resident cache.
 """
 
 import logging
@@ -39,13 +40,11 @@ from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
-    prepare_sparse_flash_mla_decode_inputs,
-    run_prepared_sparse_flash_mla_decode,
-    select_mla_kv_for_flashmla_bf16_out,
+    _fa3_with_kvcache,
     fp8_q_absorb_out,
     fp8_out_absorb_out,
-    pack_flashmla_query_out,
     run_paged_kv_token_update_fused,
+    transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
     fused_rmsnorm,
@@ -54,8 +53,7 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
 # Max-bucket view split for the SKIP-layer buffer set (see the full segment's
 # split in cuda_graph_segments.py). Indexer-only fields are 1-element
 # placeholders here and pass through from the base unsliced; top_k_indices is
-# borrowed per bucket from the producing full segment; prepared_flashmla is
-# rebuilt on the sliced views.
+# borrowed per bucket from the producing full segment.
 _GLM5_REUSE_VIEW_FIELDS = frozenset({
     "valid_mask",
     "aux_valid_mask",
@@ -78,11 +76,9 @@ _GLM5_REUSE_VIEW_FIELDS = frozenset({
     "q_nope",
     "q_rope_4d",
     "new_compressed_kv",
-    "selected_mla_kv",
+    "selected_token_ids",
     "selected_lengths",
-    "row_modes",
     "absorbed_q",
-    "query_states",
     "attn_heads",
 })
 _GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
@@ -99,7 +95,9 @@ _GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
     "positions_expanded",
     "agg_scores",
 })
-_GLM5_REUSE_SPECIAL_FIELDS = frozenset({"top_k_indices", "prepared_flashmla"})
+# Rebuilt per bucket: top_k_indices is borrowed from the producing full
+# segment's buffer set FOR THIS BUCKET, never sliced from our own base.
+_GLM5_REUSE_SPECIAL_FIELDS = frozenset({"top_k_indices"})
 
 _split_delta = (
     set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
@@ -129,6 +127,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         index_topk: int,
         page_size: int,
         topk_source: Glm5FullDsaAttnSegment,
+        all_short: bool = False,
         shared_buffers: Optional[dict] = None,
     ) -> None:
         # Deliberately do NOT call super().__init__ — it derefs indexer-only
@@ -144,7 +143,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         self.max_seqlen = int(max_seqlen)
         self.index_topk = int(index_topk)
         self.page_size = int(page_size)
+        # Same graph-lifetime specialization as the full segment: skip the
+        # transform and let FA3 read the resident page-size-N cache.
+        self.all_short = bool(all_short)
         self.topk_source = topk_source
+        if _fa3_with_kvcache is None:
+            raise RuntimeError(
+                "GLM-5 DSA graph requires flash_attn_interface "
+                "(FlashAttention-3): flash_attn_with_kvcache is unavailable"
+            )
         # NOTE: full segments share ONE _buffers dict across all indexer
         # layers (that is what the worker's shared_dsa_buffers is). Skip
         # segments share their OWN dict — passing the full segments' dict
@@ -220,7 +227,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 "be set up first"
             )
         base = self._buffers[base_bucket]
-        attn = self.attn
         view_kwargs = {
             name: getattr(base, name)[:bucket_size]
             for name in _GLM5_REUSE_VIEW_FIELDS
@@ -228,18 +234,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         placeholder_kwargs = {
             name: getattr(base, name) for name in _GLM5_REUSE_PLACEHOLDER_FIELDS
         }
-        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
-            view_kwargs["query_states"],
-            view_kwargs["selected_mla_kv"],
-            view_kwargs["selected_lengths"],
-            attn.num_heads,
-            float(attn.softmax_scale),
-            head_dim_v=attn.kv_lora_rank,
-            page_size=self.page_size,
-        )
         return _Glm5FullDsaSegmentBuffers(
             top_k_indices=source_buffers.top_k_indices,
-            prepared_flashmla=prepared_flashmla,
             **view_kwargs,
             **placeholder_kwargs,
         )
@@ -274,25 +270,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 "be set up first"
             )
 
-        selected_mla_kv = torch.empty(
-            bucket_size, self.index_topk, 1, kv_dim,
-            dtype=torch.bfloat16, device=device,
+        selected_token_ids = torch.empty(
+            bucket_size, self.index_topk,
+            dtype=torch.int32, device=device,
         )
         selected_lengths = torch.empty(bucket_size, dtype=torch.int32, device=device)
         selected_lengths.fill_(self._padding_selected_length())
-        query_states = torch.empty(
-            bucket_size, 1, attn.num_heads, kv_dim,
-            dtype=torch.bfloat16, device=device,
-        )
-        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
-            query_states,
-            selected_mla_kv,
-            selected_lengths,
-            attn.num_heads,
-            float(attn.softmax_scale),
-            head_dim_v=attn.kv_lora_rank,
-            page_size=self.page_size,
-        )
         one_i32 = torch.ones(1, dtype=torch.int32, device=device)
         one_bf16 = torch.ones(1, dtype=torch.bfloat16, device=device)
         qkv_a = torch.empty(
@@ -355,19 +338,16 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             agg_scores=one_bf16,
             # THE handoff: the producing full segment's static top-k buffer.
             top_k_indices=source_buffers.top_k_indices,
-            selected_mla_kv=selected_mla_kv,
+            selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
-            row_modes=torch.empty(bucket_size, dtype=torch.int32, device=device),
             absorbed_q=torch.empty(
                 bucket_size, attn.num_heads, attn.kv_lora_rank,
                 dtype=torch.bfloat16, device=device,
             ),
-            query_states=query_states,
             attn_heads=torch.empty(
                 bucket_size, 1, attn.num_heads, attn.v_head_dim,
                 dtype=torch.bfloat16, device=device,
             ),
-            prepared_flashmla=prepared_flashmla,
         )
         self._setup_static_output_buffers(bucket_size)
 
@@ -378,11 +358,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         position_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
+        # TRANSITIONAL (accepted, never read) — see the full segment's
+        # forward: the enclosing decoder-layer segment and the worker still
+        # thread the dead FlashMLA scheduler metadata.
+        flashmla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
+        flashmla_num_splits: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        del flashmla_tile_scheduler_metadata, flashmla_num_splits
         attn = self.attn
         batch_size = hidden_states.shape[0]
         buffers = self._buffers.get(batch_size)
@@ -479,41 +463,28 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             num_valid_tokens=num_valid_tokens,
         )
 
-        # Reuse branch semantics (glm5_decode_selector.py:446-448): row_modes
-        # = (cache_seqlens > index_topk), int32.
-        torch.gt(buffers.safe_cache_seqlens, self.index_topk, out=buffers.valid_mask)
-        buffers.row_modes.copy_(buffers.valid_mask.to(torch.int32))
-
-        select_mla_kv_for_flashmla_bf16_out(
-            self.primary_blocked_k,
-            self.primary_page_table,
-            buffers.safe_cache_seqlens,
-            buffers.top_k_indices,           # borrowed from the producer
-            self.page_size,
-            buffers.selected_mla_kv,
-            buffers.selected_lengths,
-            None,
-            buffers.row_modes,
-            index_topk=self.index_topk,
-            return_indices=False,
-            primary_slot_indices=buffers.safe_primary_slot_indices,
-            num_valid_tokens=num_valid_tokens,
-        )
-
         fp8_q_absorb_out(
             buffers.q_nope, self.absorb_weights, buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
-        pack_flashmla_query_out(
-            buffers.absorbed_q, buffers.q_rope_4d.squeeze(2), buffers.query_states,
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.query_states.mul_(valid_rows_bf16_4d)
-        attn_out = run_prepared_sparse_flash_mla_decode(
-            buffers.prepared_flashmla,
-            tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            num_splits=flashmla_num_splits,
-        )
+        if self.all_short:
+            attn_out = self._run_all_short_fa3(buffers)
+        else:
+            # The producer selected the top-k; this layer only re-runs the
+            # (cheap, B*index_topk int32 writes) logical->physical transform.
+            # Row mode (dense vs top-k) is decided inside the transform from
+            # ``cache_seqlens > index_topk``, so no row_modes buffer is needed.
+            transform_selected_positions_out(
+                self.primary_page_table,
+                buffers.safe_cache_seqlens,
+                buffers.top_k_indices,           # borrowed from the producer
+                buffers.selected_token_ids,
+                buffers.selected_lengths,
+                page_size=self.page_size,
+                primary_slot_indices=buffers.safe_primary_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            attn_out = self._run_selected_fa3(buffers)
         fp8_out_absorb_out(
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
