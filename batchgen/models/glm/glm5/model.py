@@ -2226,7 +2226,9 @@ class Glm5MoE(nn.Module):
 
         E = self.experts_per_rank
         seqlens = expert_counts[:E]
-        avg = _glm5_moe_tilem_avg_override() or _glm5_gemm_tilem_avg(
+        # gemm_tilem_avg_effective (imported as _glm5_gemm_tilem_avg) already
+        # applies the batch-level glm5_moe_tilem_avg override internally.
+        avg = _glm5_gemm_tilem_avg(
             num_global, topk, self.experts_per_rank * self.world_size
         )
 
