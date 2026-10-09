@@ -492,7 +492,10 @@ def build_glm5_dsa_flashmla_inputs(
                 type(wrapper)._dsa_prev_topk_indices = top_k_indices
 
     with (dt.timed("q_absorb", li) if dt else nullcontext()):
-        absorbed_q = _absorb_q_nope(wrapper, q_nope)
+        # One contiguous copy serves both the absorb kernel (which would
+        # otherwise make its own) and the debug dataclass field below.
+        q_nope_flat = q_nope.squeeze(2).contiguous()
+        absorbed_q = _absorb_q_nope(wrapper, q_nope_flat)
 
     mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
     mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
@@ -541,24 +544,25 @@ def build_glm5_dsa_flashmla_inputs(
                 cache_seqlens=safe_cache_seqlens,
             )
     else:
-        selected_token_ids = torch.empty(
-            bsz,
-            index_topk,
-            dtype=torch.int32,
-            device=mla_block_table.device,
-        )
-        selected_lengths = torch.empty(
-            bsz, dtype=torch.int32, device=mla_block_table.device,
-        )
-        transform_selected_positions_out(
-            mla_block_table,
-            safe_cache_seqlens,
-            top_k_indices,
-            selected_token_ids,
-            selected_lengths,
-            page_size=mla_page_size,
-            primary_slot_indices=primary_selector_slots,
-        )
+        with (dt.timed("sparse_select", li) if dt else nullcontext()):
+            selected_token_ids = torch.empty(
+                bsz,
+                index_topk,
+                dtype=torch.int32,
+                device=mla_block_table.device,
+            )
+            selected_lengths = torch.empty(
+                bsz, dtype=torch.int32, device=mla_block_table.device,
+            )
+            transform_selected_positions_out(
+                mla_block_table,
+                safe_cache_seqlens,
+                top_k_indices,
+                selected_token_ids,
+                selected_lengths,
+                page_size=mla_page_size,
+                primary_slot_indices=primary_selector_slots,
+            )
         if verify_indices and wrapper.layer_idx <= 4:
             _log_selected_token_bounds(
                 wrapper,
@@ -582,7 +586,7 @@ def build_glm5_dsa_flashmla_inputs(
 
     return Glm5DsaFlashMlaInputs(
         attn_out=attn_out,
-        q_nope=q_nope.squeeze(2).contiguous(),
+        q_nope=q_nope_flat,
         q_rope=q_pe.squeeze(2).contiguous(),
         selected_lengths=selected_lengths,
         selected_token_ids=(
@@ -597,8 +601,8 @@ def build_glm5_dsa_flashmla_inputs(
     )
 
 
-def _absorb_q_nope(wrapper, q_nope: torch.Tensor) -> torch.Tensor:
-    """FP8 WGMMA q absorb: ``[B, H, 1, qk_nope]`` → ``[B, H, kv_lora_rank]``.
+def _absorb_q_nope(wrapper, q_nope_flat: torch.Tensor) -> torch.Tensor:
+    """FP8 WGMMA q absorb: contiguous ``[B, H, qk_nope]`` → ``[B, H, kv_lora_rank]``.
 
     Lifted out of the retired `_build_query_states` pack: FA3 consumes the
     absorbed q as its separate ``qv`` input, so nothing concatenates it with
@@ -612,7 +616,7 @@ def _absorb_q_nope(wrapper, q_nope: torch.Tensor) -> torch.Tensor:
 
     from batchgen_kernels.attention.dsa.fp8_absorb import fp8_q_absorb
 
-    return fp8_q_absorb(q_nope.squeeze(2), wrapper._fp8_absorb_weights)
+    return fp8_q_absorb(q_nope_flat, wrapper._fp8_absorb_weights)
 
 
 def _require_fa3():
