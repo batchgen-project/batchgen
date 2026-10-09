@@ -11,8 +11,8 @@ its 2nd or ~28th token, while the first wave (no page-table mutation in
 flight) was clean.
 
 `_flush_deferred_kv_to_host` now only launches the appends; the decode loop
-drains them right after the sampled-token readback so the wait is timed in a
-step-split slot of its own. The drain must still run every step that
+drains them as the step's last host wait (after the previous step's token
+readback and bookkeeping) so the wait is timed in a step-split slot of its own. The drain must still run every step that
 launched appends, before anything that can mutate a page table.
 
 batchgen_worker imports the whole engine, so this is a static check on the
@@ -57,14 +57,22 @@ def test_flush_only_launches_appends():
 
 def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
     fn = _method("decoding_continuous")
-    loop = next(n for n in fn.body
+    # The loop sits in the try whose handler drains the in-flight decode token.
+    loop = next(n for n in ast.walk(fn)
                 if isinstance(n, ast.While) and ast.unparse(n.test) == "decode_uuids")
     body = loop.body
 
     flush = _single(body, lambda s: _stmt_calls(s, "self._flush_deferred_kv_to_host"),
                     "host-KV append launch")
-    readback = _single(body, lambda s: _stmt_calls(s, "_new_tokens_ready.synchronize"),
-                       "sampled-token readback")
+    # One-step token overlap: the readback waits for the PREVIOUS step's token.
+    readback = _single(
+        body,
+        lambda s: isinstance(s, ast.If) and any(
+            isinstance(b, ast.Expr)
+            and _stmt_calls(b, "_pending_decode_token.ready_event.synchronize")
+            for b in s.body),
+        "previous-step sampled-token readback",
+    )
     # The per-step drain is an `if` whose own body is the wait. The boundary
     # block's watermark wait is nested deeper and is a different drain.
     drain = _single(
@@ -75,11 +83,17 @@ def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
     )
     bookkeeping = _single(
         body,
-        lambda s: isinstance(s, ast.For)
-        and ast.unparse(s.iter) == "enumerate(zip(batch, batch_sequences))",
-        "per-sequence bookkeeping loop",
+        lambda s: _stmt_calls(s, "self._advance_decode_sequences_for_pending_token"),
+        "per-sequence bookkeeping (this step's advance)",
     )
-    assert flush < readback < drain < bookkeeping
+    # The bookkeeping runs before the drain so it overlaps this step's
+    # forward; the drain is still the step's last host wait, ahead of the
+    # next iteration's boundary / admission.
+    assert flush < readback < bookkeeping < drain
+    assert drain == max(
+        i for i, s in enumerate(body)
+        if any(_is_wait_call(n) for n in ast.walk(s))
+    )
 
     stmt = body[drain]
     # `if self._pending_kv_append_tasks:` -- a bare truthiness guard

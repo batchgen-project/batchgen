@@ -171,27 +171,31 @@ def test_decode_waits_only_for_token_event_after_host_kv_launch():
     tree = ast.parse(source)
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
 
+    # The copy lands in this step's readback ring slot; the slot's event is
+    # recorded right behind it.
     token_copy = next(
         node
         for node in calls
         if isinstance(node.func, ast.Attribute)
         and node.func.attr == "copy_"
-        and ast.unparse(node.func.value).startswith("_new_tokens_pinned[")
+        and ast.unparse(node.func.value) == "_tokens_cpu"
     )
     token_record = next(
         node
         for node in calls
-        if ast.unparse(node.func) == "_new_tokens_ready.record"
+        if ast.unparse(node.func) == "_token_ready_events[_token_slot].record"
     )
     kv_launch = next(
         node
         for node in calls
         if ast.unparse(node.func) == "self._flush_deferred_kv_to_host"
     )
+    # One-step overlap: the steady-path token wait is on the PREVIOUS step's
+    # event, issued after this step's forward, copy and host-KV launch.
     token_wait = next(
         node
         for node in calls
-        if ast.unparse(node.func) == "_new_tokens_ready.synchronize"
+        if ast.unparse(node.func) == "_pending_decode_token.ready_event.synchronize"
     )
 
     assert token_copy.lineno < token_record.lineno < kv_launch.lineno < token_wait.lineno

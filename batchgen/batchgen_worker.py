@@ -115,7 +115,7 @@ import gc
 import numpy as np
 from datetime import timedelta
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -333,6 +333,28 @@ class _DualKVLoadPointers:
 	aux_k_ptrs: torch.Tensor
 	aux_v_ptrs: Optional[torch.Tensor]
 	aux_page_counts: torch.Tensor
+
+
+@dataclass
+class _PendingDecodeTokenResult:
+	"""One decode step's sampled tokens whose CPU finalization is deferred.
+
+	The continuous-decode loop finalizes step N's token only after step N+1's
+	forward is launched (one step of pipelining). ``ready_event`` was recorded
+	right after the token D2H into readback ring slot ``slot``; ``tokens_cpu``
+	is that slot's pinned view. ``rows`` holds ``(token_row, local_idx, seq,
+	decode_pos)`` for every sequence whose length counters were already
+	advanced for this step. ``applied`` counts rows whose token-dependent
+	state is already applied, so a finalize retried after an exception resumes
+	instead of applying a row twice.
+	"""
+
+	ready_event: object
+	tokens_cpu: torch.Tensor
+	slot: int
+	local_iteration: int
+	rows: list = field(default_factory=list)
+	applied: int = 0
 
 
 class QueryBookPoolCapacityError(RuntimeError):
@@ -2111,6 +2133,118 @@ class BatchGenWorker:
 		# No sequence in the batch carries sampling params — greedy decoding.
 		return torch.argmax(logits, dim=-1, keepdim=True)
 
+	def _advance_decode_sequences_for_pending_token(
+		self,
+		batch: List[int],
+		batch_sequences: List[SequenceEntry],
+		rows: list,
+	) -> None:
+		"""Advance this step's length counters before its token reaches the CPU.
+
+		Every live sequence gains exactly one token per decode step, so
+		``decoded_length`` / ``current_context_length`` are known without the
+		token value; the next step's metadata (cache lengths, all_short gate,
+		host-KV write positions) reads only these counters. The token value and
+		everything derived from it (decoded token, EOS, length/repetition
+		completion) are applied later by ``_apply_pending_decode_token``.
+
+		The previous step's pending token MUST already be applied: completion
+		decided by it gates which rows advance here. Each advanced row is
+		appended to ``rows`` (the pending result's own list) as soon as it is
+		advanced, so an exception part-way still leaves every advanced row
+		recorded for the exception-path finalize.
+		"""
+		for token_row, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
+			if self._is_sequence_completed(seq):
+				continue
+			decode_pos = seq.decoded_length
+			seq.decoded_length += 1
+			seq.current_context_length += 1
+			rows.append((token_row, local_idx, seq, decode_pos))
+
+	def _finalize_pending_decode_token(
+		self,
+		pending: _PendingDecodeTokenResult,
+	) -> None:
+		"""Wait only for ``pending``'s token readback, then apply its CPU state."""
+		pending.ready_event.synchronize()
+		self._apply_pending_decode_token(pending)
+
+	def _apply_pending_decode_token(
+		self,
+		pending: _PendingDecodeTokenResult,
+	) -> None:
+		"""Apply a token result whose readback is already complete.
+
+		Resumes at ``pending.applied``: a row counts as applied only after all
+		of its updates ran, so a retry after an exception never applies a row
+		twice and never skips one that was not finished.
+		"""
+		new_tokens_cpu = pending.tokens_cpu
+		while pending.applied < len(pending.rows):
+			token_row, local_idx, seq, decode_pos = pending.rows[pending.applied]
+			if BATCHGEN_CB_DEBUG:
+				qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
+				seq_ptr = seq.decoded_tokens.data_ptr()
+				if qb_ptr != seq_ptr:
+					logging.error(
+						f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
+						f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
+						f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+					)
+			self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[token_row]
+
+			# Use the pinned CPU copy to avoid a GPU sync
+			token_id = new_tokens_cpu[token_row].item()
+
+			# DIAG: Log first 3 tokens for first 10 seqs in each decode group
+			if (
+				BATCHGEN_MULTI_BATCH_DIAG
+				and self.rank == 0
+				and pending.local_iteration <= 3
+				and token_row < 10
+			):
+				logging.info(
+					f"[MULTI_DIAG] iter={pending.local_iteration} seq={seq.uuid[:8]} "
+					f"decoded_len={seq.decoded_length} token={token_id}"
+				)
+			if self._should_stop_at_eos(token_id, seq):
+				seq.eos_reached = True
+
+			if seq.decoded_length >= seq.max_decode_length:
+				seq.eos_reached = True
+
+			# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
+			if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
+				if token_id == seq._rep_last_token:
+					seq._rep_count += 1
+					if seq._rep_count >= 32:
+						seq._rep_detected = True
+						seq.eos_reached = True
+						seq.log_event(SeqEvent.REPETITION, self.rank,
+							f"token={token_id}, count={seq._rep_count}")
+						lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+							seq._lifespan_log, "REPETITION")
+						logging.warning(
+							f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
+							f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+						)
+				else:
+					seq._rep_last_token = token_id
+					seq._rep_count = 1
+				# Variable-length N-gram pattern check (every 64 tokens)
+				if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
+					_dl = seq.decoded_length
+					_tokens = self.query_book[local_idx].decoded_tokens[0]
+					if _check_repeating_pattern(_tokens, _dl):
+						seq._rep_detected = True
+						seq.eos_reached = True
+						logging.warning(
+							f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
+							f"gid={seq.global_idx} at decoded_len={_dl}"
+						)
+			pending.applied += 1
+
 	def _log_prefill_timing(self):
 		"""Log prefill timing stats if available (GPT-OSS specific)."""
 		try:
@@ -2591,8 +2725,8 @@ class BatchGenWorker:
 						self._pending_kv_append_tasks.append(task)
 
 		# This function only LAUNCHES the D2H append tasks. The decode loop
-		# drains them every step right after the sampled-token readback, in
-		# a step-split slot of its own; see [KV_APPEND_DRAIN] in
+		# drains them every step as the step's last host wait, in a
+		# step-split slot of its own; see [KV_APPEND_DRAIN] in
 		# ``decoding_continuous`` for why that drain must stay per step.
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
@@ -11268,10 +11402,20 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate pinned memory and one reusable completion event for the
-		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
-		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
-		_new_tokens_ready = torch.cuda.Event()
+		# P0: Token readback ring for the only mandatory steady-state GPU→CPU
+		# dependency, the sampled token IDs. Step N's CPU finalization runs
+		# after step N+1's forward is launched (one step of pipelining), so
+		# step N+1's D2H must land in a different pinned slot than the one
+		# step N's finalization still reads: two slots, each with its own
+		# completion event, indexed by ``local_iteration & 1``.
+		_new_tokens_pinned = torch.empty(
+			2, max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True
+		)
+		_token_ready_events = [torch.cuda.Event(), torch.cuda.Event()]
+		# Step whose token is copied but not yet applied. Every consumer of
+		# token-dependent sequence state (page boundary, admission, input
+		# rebuild, loop exit) finalizes it first.
+		_pending_decode_token = None
 
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
@@ -11296,1018 +11440,1032 @@ class BatchGenWorker:
 
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
-		while decode_uuids:
-			local_iteration += 1
-			self._cumulative_decode_iterations += 1
+		try:
+			while decode_uuids:
+				local_iteration += 1
+				self._cumulative_decode_iterations += 1
 
-			# Feed watchdogs to prevent timeout during long decoding
-			self.feed_watchdog()
-			self.feed_decode_watchdog()
+				# Feed watchdogs to prevent timeout during long decoding
+				self.feed_watchdog()
+				self.feed_decode_watchdog()
 
-			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
-			# monitor sees liveness during long decode phases
-			_hb_tokens += len(decode_uuids)
-			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
-				_hb_elapsed = time.perf_counter() - _hb_last_time
-				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
-				_split_txt = ""
-				if _step_split[0] > 0:
-					_split_txt = " " + format_decode_step_split(_step_split)
-					_step_split = new_decode_step_split()
-				_split_txt += _fwd_ring.take_summary()
-				logging.info(
-					f"[DECODE] step={self._cumulative_decode_iterations} "
-					f"active={len(decode_uuids)} finished={_hb_finished} "
-					f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
-				)
-				_hb_last_time = time.perf_counter()
-				_hb_tokens = 0
-
-			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
-			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
-				last_boundary = local_iteration
-
-				(decode_uuids, batch,
-				 pending_async_task, pending_load_uuids,
-				 pending_load_local, pending_load_global,
-				 timing, watermark_triggered) = self._page_boundary_fast(
-					decode_uuids, batch, gpu_manager,
-					pending_async_task, pending_load_uuids,
-					pending_load_local, pending_load_global
-				)
-
-				self._cumulative_boundary_ms += timing.total_ms
-				self._cumulative_decode_boundaries += 1
-
-				# Batch may have changed - need to verify page table
-				_page_table_verified_this_batch = False
-
-				# Post-boundary: verify page table matches batch and fix if needed
-				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
-					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
-
-					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						# Fix: Rebuild page table to match batch
-						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-
-				# Page table is now verified for this batch
-				_page_table_verified_this_batch = True
-
-				# Check if watermark triggered - interrupt decode for prefill
-				if watermark_triggered:
-					# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
-					# Without this, KV data may not be fully written to host when sequences
-					# are later resumed, causing KV corruption and gibberish output.
-					num_waited = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
-					if num_waited > 0:
-						logging.info(
-							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
-							f"before putting sequences ON_HOLD"
-						)
-
+				# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
+				# monitor sees liveness during long decode phases
+				_hb_tokens += len(decode_uuids)
+				if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
+					_hb_elapsed = time.perf_counter() - _hb_last_time
+					_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+					_split_txt = ""
+					if _step_split[0] > 0:
+						_split_txt = " " + format_decode_step_split(_step_split)
+						_step_split = new_decode_step_split()
+					_split_txt += _fwd_ring.take_summary()
 					logging.info(
-						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
-						f"sequences ON_HOLD, will trigger prefill"
+						f"[DECODE] step={self._cumulative_decode_iterations} "
+						f"active={len(decode_uuids)} finished={_hb_finished} "
+						f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
 					)
-					# Put all remaining sequences ON_HOLD
-					self._put_sequences_on_hold(decode_uuids)
-					# Exit decode loop - will return to generate() which will trigger prefill
-					break
+					_hb_last_time = time.perf_counter()
+					_hb_tokens = 0
 
-				# Poll for new admissions at each page boundary.
-				# New batches may have been submitted during decode — drain them
-				# and break for prefill if QUEUEING sequences arrive.
-				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
+				# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
+				if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+					# The boundary reads completion state, rebuilds input tokens
+					# from the decoded-token book, admits new work and mutates page
+					# tables: resolve the one in-flight token first. The previous
+					# step's per-step host-KV drain already ran.
+					if _pending_decode_token is not None:
+						self._finalize_pending_decode_token(_pending_decode_token)
+						_pending_decode_token = None
+					last_boundary = local_iteration
+
+					(decode_uuids, batch,
+					 pending_async_task, pending_load_uuids,
+					 pending_load_local, pending_load_global,
+					 timing, watermark_triggered) = self._page_boundary_fast(
+						decode_uuids, batch, gpu_manager,
+						pending_async_task, pending_load_uuids,
+						pending_load_local, pending_load_global
+					)
+
+					self._cumulative_boundary_ms += timing.total_ms
+					self._cumulative_decode_boundaries += 1
+
+					# Batch may have changed - need to verify page table
+					_page_table_verified_this_batch = False
+
+					# Post-boundary: verify page table matches batch and fix if needed
+					if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
+						post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+						post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+
+						if post_boundary_slot_order != post_boundary_batch_global_ids:
+							# Fix: Rebuild page table to match batch
+							gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
+
+					# Page table is now verified for this batch
+					_page_table_verified_this_batch = True
+
+					# Check if watermark triggered - interrupt decode for prefill
+					if watermark_triggered:
+						# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
+						# Without this, KV data may not be fully written to host when sequences
+						# are later resumed, causing KV corruption and gibberish output.
+						num_waited = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+						if num_waited > 0:
+							logging.info(
+								f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
+								f"before putting sequences ON_HOLD"
+							)
+
 						logging.info(
-							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
-							f"total in batch: {len(self.global_batch)}"
+							f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
+							f"sequences ON_HOLD, will trigger prefill"
 						)
-					has_q = self.global_batch.has_queueing()
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
-						num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
-						logging.info(
-							f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
-							f"watermark={watermark_triggered} admitted={admitted}"
-						)
-					if has_q and watermark_triggered:
-						if self.rank == 0:
-							logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
+						# Put all remaining sequences ON_HOLD
+						self._put_sequences_on_hold(decode_uuids)
+						# Exit decode loop - will return to generate() which will trigger prefill
 						break
 
-				# Detailed logging at every boundary (only rank 0)
-				if self.rank == 0:
-					# Get status counts
-					# - in_decode: sequences currently in decode batch (IN_DECODE status)
-					# - onhold: sequences paused with host KV (ON_HOLD status)  
-					# - prefilled: sequences prefilled but not yet decoding (PREFILLED status)
-					# - host_kv_total: total sequences with host KV = prefilled + onhold + in_decode
-					num_in_decode = timing.total_active
-					num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
-					num_prefilled = timing.total_prefilled
-					num_completed_total = timing.total_completed_cumulative
-					num_host_kv_total = num_prefilled + num_onhold + num_in_decode
-					
-					# Get page stats if available
-					page_info = ""
-					if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
-						ps = self._host_kv_page_stats
-						page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
-
-					if BATCHGEN_CB_DEBUG:
-						# Detailed timing log when debug is enabled
-						logging.info(
-							f"[Decode Interval {self._cumulative_decode_boundaries}] "
-							f"iter={self._cumulative_decode_iterations}, "
-							f"total={timing.total_ms:.1f}ms | "
-							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
-							f"wait_async={timing.wait_async_load_ms:.1f}, "
-							f"finalize={timing.finalize_load_ms:.1f}, "
-							f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
-							f"gather={timing.gather_ms:.1f}, "
-							f"proc={timing.process_ms:.1f}, "
-							f"ext={timing.extension_ms:.1f}, "
-							f"load_sel={timing.load_select_ms:.1f}, "
-							f"load_alloc={timing.load_alloc_ms:.1f}, "
-							f"load_launch={timing.load_launch_ms:.1f}, "
-							f"rebuild={timing.rebuild_ms:.1f}, "
-							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
-							f"barrier={timing.barrier_ms:.1f}ms | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-					else:
-						# Minimal log without timing details
-						logging.info(
-							f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-				
-				if not decode_uuids:
-					# Check for pending loads
-					if pending_load_uuids:
-						if pending_async_task is not None:
-							pending_async_task.wait()
-							torch.cuda.synchronize(self.torch_device)
-						dist.barrier()
-						
-						decode_uuids, batch = self._finalize_async_load_minimal(
-							pending_async_task, pending_load_uuids,
-							pending_load_local, pending_load_global,
-							decode_uuids, batch, gpu_manager
-						)
-						self._rebuild_page_table_for_batch(batch, gpu_manager)
-						self._sync_decode_moe_rank_counts(
-							batch,
-							reason="post_pending_load_finalize",
-						)
-						
-						if batch:
-							new_tokens = self._rebuild_input_tokens(batch)
-						
-						pending_async_task = None
-						pending_load_uuids = []
-						pending_load_local = []
-						pending_load_global = []
-						
-						if decode_uuids:
-							continue
-					break
-				
-				new_tokens = self._rebuild_input_tokens(batch)
-				# DEBUG: Log tokens rebuild after boundary
-				if new_tokens.shape[0] != len(batch):
-					logging.error(
-						f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
-						f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
-					)
-			
-			# Forward pass
-			forward_start = time.perf_counter()
-
-			# Pre-compute batch_sequences for use in both forward setup and update loop
-			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
-			global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
-			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
-				global_decode_sequences
-			)
-			self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
-			self._configure_glm5_dispatch_trace(global_decode_sequences)
-
-			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
-
-			# Invariant check: cache_seqlens must not exceed allocated pages.
-			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
-			if BATCHGEN_DECODE_ASSERT and batch:
-				for seq in batch_sequences:
-					max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
-					if seq.current_context_length > max_tokens:
-						logging.error(
-							f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
-							f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
-							f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
-							f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
-							f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
-							f"status={seq.status})"
-						)
-						raise RuntimeError(
-							f"cache_seqlens overrun: ctx={seq.current_context_length} > "
-							f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
-							f"{max_tokens} for {seq.uuid[:8]}"
-						)
-
-			_split_t0 = time.perf_counter()
-			# Start marker of this step's device forward+sample time. Takes a
-			# free ring slot or skips timing this step; never waits.
-			_fwd_slot = _fwd_ring.begin(torch.cuda.current_stream(self.torch_device))
-			with torch.inference_mode():
-				if batch:
-					# Collect context lengths with invariant validation
-					# ALWAYS: current_context_length == original_prompt_length + decoded_length
-					cache_seqlens = []
-					for seq in batch_sequences:
-						ctx_len = seq.current_context_length
-						expected = seq.original_prompt_length + seq.decoded_length
-						if ctx_len != expected:
-							logging.error(
-								f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
-								f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
-								f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-							)
-							seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-								f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
-							seq.current_context_length = expected
-							ctx_len = expected
-						cache_seqlens.append(ctx_len)
-
-					max_ctx = max(cache_seqlens)
-
-					# DIAG: Log cache_seqlens at first iteration of each decode group
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
-						fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
-						resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
-						logging.info(
-							f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
-							f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
-							f"max_ctx={max_ctx}"
-						)
-						for uid, dl, ctx in fresh[:5]:
-							logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
-						for uid, dl, ctx, pg in resumed[:5]:
-							logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
-
-					Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
-					(
-						Attn_Wrapper.cache_seqlens,
-						Attn_Wrapper.position_ids,
-					) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
-					Attn_Wrapper.max_seqlen = max_ctx
-
-					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-					AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.max_seqlen = max_ctx
-
-					# Per-step DSA dispatch hint: count sequences whose cache is
-					# short enough to take the dense short-circuit instead of
-					# indexer scoring. Computing once here instead of inside
-					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
-					# per decode step on DSA models (GLM-5).
-					_reset_glm5_dsa_step_state(
-						GLM5AttnWrapper,
-						Attn_Wrapper.cache_seqlens,
-						getattr(self.model_config, "index_topk", None),
-					)
-
-					if new_tokens.shape[0] != len(batch):
-						new_tokens = self._rebuild_input_tokens(batch)
-				else:
-					Attn_Wrapper.attention_mask = None
-					Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
-					Attn_Wrapper.max_seqlen = 0
-					Attn_Wrapper.cur_batch = []
-					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					# Also bind empty state to AttnWrapperBase for GPT-OSS
-					AttnWrapperBase.attention_mask = None
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.max_seqlen = 0
-					AttnWrapperBase.cur_batch = []
-					GLM5AttnWrapper._dsa_short_count = 0
-					GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
-					self._decode_metadata_batch_key = None
-					self._decode_metadata_cpu_seqlens = None
-				
-				if batch:
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-					# OPTIMIZATION: Only check page table if not already verified this batch
-					# Between boundaries, batch doesn't change so page table stays valid
-					if not _page_table_verified_this_batch:
-						# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
-						# This is the root cause of KV corruption after resume - if they don't match,
-						# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
-						if gpu_manager and gpu_manager._gpu_page_table_manager:
-							slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-							batch_global_order = Attn_Wrapper.cur_batch
-							if slot_order != batch_global_order:
-								# Fix: Rebuild page table to match batch order
-								gpu_manager.rebuild_page_table(batch_global_order)
-								# Log page rebuild for affected sequences
-								for seq in batch_sequences:
-									seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
-										f"batch_size={len(batch)}")
-						_page_table_verified_this_batch = True
-				
-				# NOTE: Do NOT skip forward pass even with empty batch!
-				# MoE models have all-to-all collective operations that ALL ranks must participate in.
-				# Skipping would cause deadlock as other ranks wait for this rank.
-
-				# MoE buffer sync: only needed at decision boundaries (batch size changes).
-				# Between boundaries, batch size is constant — skip the all_reduce + .item()
-				# CPU-GPU sync that drains the GPU pipeline every step.
-				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				# Phase C: layer-graph mode retired; only whole-model needs the
-				# globally-synced rank-count reuse.
-				if (
-					getattr(self, '_whole_model_graph', False)
-					or self._glm5_whole_model_graph_requested_for_current_batch()
-				):
-					# Whole-model graph needs globally synced counts for NCCL bucket
-					# matching, but the count vector only changes at decode-entry,
-					# page-boundary, and async-load-finalize sync points. Reusing it
-					# avoids a per-token NCCL all_gather + D2H .item() sync.
-					_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
-					_cached_local_bsz = int(getattr(self, "_current_decode_local_batch_size", -1))
-					_max_bs = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-					if _all_rank_counts is None or _max_bs <= 0 or _cached_local_bsz != len(batch):
-						_max_bs = self._sync_decode_moe_rank_counts(
-							batch,
-							reason="decode_step_batch_change",
-						)
-						_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
-					_max_bs = max(int(_max_bs), 1)
-				else:
-					# Per-layer graph or eager: no NCCL in graph, use local batch size
-					_max_bs = max(len(batch), 1)
-					_all_rank_counts = None
-
-				# KV append callback — deferred: accumulate during forward, single sync after
-				current_batch = list(batch)
-				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-
-				if _kv_worker_view is not None:
-					_kv_seq_ids = []
-					_kv_seq_lengths = []
-					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
-					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
-					self._deferred_kv_entries = []
-					self._deferred_kv_entries_aux = []
-					self._deferred_kv_worker_view = _kv_worker_view
-					self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-
-				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
-					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
-					_sync_kv_seq_ids = _kv_seq_ids
-					_sync_kv_seq_lengths = _kv_seq_lengths
-					_sync_kv_worker_view = _kv_worker_view
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						if k_tensor.dim() == 3:
-							k_tensor = k_tensor.unsqueeze(2)
-						if v_tensor is not None and v_tensor.dim() == 3:
-							v_tensor = v_tensor.unsqueeze(2)
-						torch.cuda.synchronize(self.torch_device)
-						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
-							layer_idx=layer_idx,
-							sequence_ids=_sync_kv_seq_ids,
-							k_tensor=k_tensor,
-							v_tensor=v_tensor,
-							sequence_lengths=_sync_kv_seq_lengths,
-						)
-						if task is not None:
-							task.wait()
-				else:
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
-
-				Attn_Wrapper.kv_append_callback = kv_append_callback
-				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-				AttnWrapperBase.kv_append_callback = kv_append_callback
-
-				# DSA: auxiliary KV append callback for indexer host cache.
-				# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
-				# to _deferred_kv_entries_aux; _flush_deferred_kv_to_host launches
-				# primary and aux appends together and the per-step
-				# [KV_APPEND_DRAIN] after the token readback completes both.
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-				if aux_view is not None:
-					if BATCHGEN_SYNC_KV:
-						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
-					else:
-						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-							valid_layers = self._aux_layers_with_slots()
-							if valid_layers is not None and layer_idx not in valid_layers:
-								return
-							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
-					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
-				else:
-					AttnWrapperBase.kv_append_callback_aux = None
-
-				# Phase C: layer-graph mode retired; only the whole-model graph
-				# may need re-warmup here.
-				if self._glm5_whole_model_graph_current_bucket_missing():
-					logging.info(
-						f"Rank {self.rank}: GLM-5 whole-model CUDA graph was not captured "
-						"during decode configuration; using eager decode instead of "
-						"capturing in the decode loop"
-					)
-					self._glm5_whole_model_graph_capture_attempted_for_batch = True
-
-				self._log_glm5_graph_path_for_forward(
-					local_bsz=len(batch),
-					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
-					rank_counts=getattr(self, "_current_decode_rank_token_counts", None),
-					gpu_manager=gpu_manager,
-					decode_iter=self._cumulative_decode_iterations,
-				)
-				# Phase C: DSA-only graph metadata prep retired (DSA graph mode
-				# is no longer reachable). The whole-model graph's FA3 sparse
-				# decode needs no per-forward attention scheduler metadata.
-
-				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
-					local_iteration=local_iteration,
-					local_bsz=len(batch),
-					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
-				)
-
-				# Forward
-				# Phase C: layer-graph mode retired. The whole-model graph
-				# composes per-layer captures internally; no separate
-				# layer-graph dispatch is needed.
-
-				_glm5_whole_graph_active = bool(
-					getattr(self, "_glm5_whole_model_graph", False)
-					and self._cuda_graph_manager is not None
-				)
-				_glm5_whole_graph_over_bucket = False
-				if _glm5_whole_graph_active:
-					try:
-						_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
-					except ValueError:
-						_glm5_whole_graph_over_bucket = True
-						_glm5_whole_graph_active = False
-					else:
-						# An all_short capture never runs indexer scoring, so a
-						# step whose longest context exceeds index_topk must NOT
-						# replay it: top-k selection would be silently skipped.
-						# Leaving the graph here either falls back to eager
-						# (correct top-k) or, under a required graph, raises
-						# below with reason=all_short_exceeded.
-						_glm5_all_short_exceeded = bool(
-							getattr(self, "_glm5_whole_model_all_short", False)
-							and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
-							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-							> int(self._glm5_whole_model_index_topk)
-						)
-						_glm5_whole_graph_active = (
-							not _glm5_all_short_exceeded
-							and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
-							and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
-							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
-							and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
-						)
-				elif self._glm5_whole_model_graph_requested_for_current_batch():
-					try:
-						configured_max_bucket = int(self.args.cuda_graph_max_bucket_size)
-					except AttributeError:
-						pass
-					else:
-						_glm5_whole_graph_over_bucket = _max_bs > configured_max_bucket
-				if (
-					self._glm5_whole_model_graph_requested_for_current_batch()
-					and self._glm5_whole_model_graph_requested_for_current_batch()
-					and not _glm5_whole_graph_active
-					and not _glm5_whole_graph_over_bucket
-				):
-					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
-					raise RuntimeError(
-						"GLM-5 whole-model CUDA graph was required but no replayable "
-						"whole-model graph is available for this decode step "
-						f"(bucket={_required_bucket}, reason={_required_reason})"
-					)
-				_use_graph = (
-					getattr(self, '_whole_model_graph', False)
-					and self._cuda_graph_manager is not None
-					and _max_bs <= self._whole_model_bucketing._max_bucket
-					and (
-						not getattr(self, "_glm5_whole_model_graph", False)
-						or _glm5_whole_graph_active
-					)
-				)
-				if _use_graph:
-					_glm5_whole_compare = bool(
-						getattr(self, "_glm5_whole_model_graph", False)
-						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
-					)
-					_glm5_whole_timing = bool(
-						getattr(self, "_glm5_whole_model_graph", False)
-						and self._glm5_whole_model_graph_timing_requested_for_current_batch()
-					)
-					_glm5_whole_timing_items = {}
-					_glm5_skip_graph_kv_offload = False
-					# Whole-model CUDA graph replay.
-					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
-					# computation, NOT local len(batch). The graph has NCCL all_reduce
-					# baked inside — all ranks MUST replay the same bucket's graph,
-					# otherwise mismatched NCCL ops cause deadlock.
-					batch_size = len(batch)
-					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
-					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
-					# and an adapter is present, route replay through it. Legacy path
-					# (default) preserves today's behavior exactly.
-					# K2.5 always routes whole-model replay through the adapter
-					# (no legacy non-adapter K2.5 whole-model path exists).
-					_k25_whole_active = getattr(self, "_k25_whole_model_graph", False)
-					_adapter_dual_active = (
-						self._cuda_graph_adapter is not None
-						and (
-							_k25_whole_active
-							or (
-								self._cuda_graph_adapter_dual
-								and getattr(self, "_glm5_whole_model_graph", False)
-							)
-						)
-					)
-					_wm_seg_name = getattr(
-						self, "_whole_model_segment_name", "glm5_whole_model"
-					)
-					_adapter_decision = None
-					_adapter_batch_state = None
-					if _adapter_dual_active:
-						from batchgen.cuda_graph.adapter import BatchState as _BatchState
-						_adapter_batch_state = _BatchState(
-							local_bsz=batch_size,
-							max_rank_bsz=_max_bs,
-							rank_token_counts=_all_rank_counts,
-							cache_seqlens=AttnWrapperBase.cache_seqlens,
-							position_ids=AttnWrapperBase.position_ids,
-							max_seqlen=int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
-							cur_batch_sequence_ids=tuple(getattr(AttnWrapperBase, "cur_batch", None) or ()),
-							gpu_kv_manager=gpu_manager,
-							decode_iter=0,
-							input_ids=new_tokens,
-							device=self.torch_device,
-						)
-						_adapter_decision = self._cuda_graph_adapter.eligibility(_adapter_batch_state)
-						if _adapter_decision.mode.value != "whole_model":
+					# Poll for new admissions at each page boundary.
+					# New batches may have been submitted during decode — drain them
+					# and break for prefill if QUEUEING sequences arrive.
+					if self._admission_queue is not None:
+						admitted = self._poll_admissions()
+						if admitted and self.rank == 0:
 							logging.info(
-								"Phase B: adapter eligibility=%s/%s; using legacy path for parity",
-								_adapter_decision.mode.value, _adapter_decision.reason,
+								f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
+								f"total in batch: {len(self.global_batch)}"
 							)
-							_adapter_dual_active = False
-					if _adapter_dual_active:
-						# ADAPTER PATH (Phase B dual gate)
-						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
-							decision=_adapter_decision,
-							batch_state=_adapter_batch_state,
-							segment_name=_wm_seg_name,
+						has_q = self.global_batch.has_queueing()
+						if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
+							num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
+							logging.info(
+								f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
+								f"watermark={watermark_triggered} admitted={admitted}"
+							)
+						if has_q and watermark_triggered:
+							if self.rank == 0:
+								logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
+							break
+
+					# Detailed logging at every boundary (only rank 0)
+					if self.rank == 0:
+						# Get status counts
+						# - in_decode: sequences currently in decode batch (IN_DECODE status)
+						# - onhold: sequences paused with host KV (ON_HOLD status)  
+						# - prefilled: sequences prefilled but not yet decoding (PREFILLED status)
+						# - host_kv_total: total sequences with host KV = prefilled + onhold + in_decode
+						num_in_decode = timing.total_active
+						num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
+						num_prefilled = timing.total_prefilled
+						num_completed_total = timing.total_completed_cumulative
+						num_host_kv_total = num_prefilled + num_onhold + num_in_decode
+					
+						# Get page stats if available
+						page_info = ""
+						if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
+							ps = self._host_kv_page_stats
+							page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
+
+						if BATCHGEN_CB_DEBUG:
+							# Detailed timing log when debug is enabled
+							logging.info(
+								f"[Decode Interval {self._cumulative_decode_boundaries}] "
+								f"iter={self._cumulative_decode_iterations}, "
+								f"total={timing.total_ms:.1f}ms | "
+								f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
+								f"wait_async={timing.wait_async_load_ms:.1f}, "
+								f"finalize={timing.finalize_load_ms:.1f}, "
+								f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
+								f"gather={timing.gather_ms:.1f}, "
+								f"proc={timing.process_ms:.1f}, "
+								f"ext={timing.extension_ms:.1f}, "
+								f"load_sel={timing.load_select_ms:.1f}, "
+								f"load_alloc={timing.load_alloc_ms:.1f}, "
+								f"load_launch={timing.load_launch_ms:.1f}, "
+								f"rebuild={timing.rebuild_ms:.1f}, "
+								f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
+								f"barrier={timing.barrier_ms:.1f}ms | "
+								f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+								f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
+								f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+								f"{page_info}"
+							)
+						else:
+							# Minimal log without timing details
+							logging.info(
+								f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
+								f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+								f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
+								f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+								f"{page_info}"
+							)
+				
+					if not decode_uuids:
+						# Check for pending loads
+						if pending_load_uuids:
+							if pending_async_task is not None:
+								pending_async_task.wait()
+								torch.cuda.synchronize(self.torch_device)
+							dist.barrier()
+						
+							decode_uuids, batch = self._finalize_async_load_minimal(
+								pending_async_task, pending_load_uuids,
+								pending_load_local, pending_load_global,
+								decode_uuids, batch, gpu_manager
+							)
+							self._rebuild_page_table_for_batch(batch, gpu_manager)
+							self._sync_decode_moe_rank_counts(
+								batch,
+								reason="post_pending_load_finalize",
+							)
+						
+							if batch:
+								new_tokens = self._rebuild_input_tokens(batch)
+						
+							pending_async_task = None
+							pending_load_uuids = []
+							pending_load_local = []
+							pending_load_global = []
+						
+							if decode_uuids:
+								continue
+						break
+				
+					new_tokens = self._rebuild_input_tokens(batch)
+					# DEBUG: Log tokens rebuild after boundary
+					if new_tokens.shape[0] != len(batch):
+						logging.error(
+							f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
+							f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
 						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
-							_wm_seg_name, _max_bs, **replay_inputs,
-						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["replay_ms"] = (
-								time.perf_counter() - _glm5_replay_start
-							) * 1000.0
-						# K2.5 whole-model eager-vs-graph compare via the standard
-						# model-agnostic facility (observability-only; does NOT change
-						# token selection). GLM-5 keeps its own bespoke compare block
-						# below; this path serves any adapter that has no such block.
-						if _k25_whole_active:
-							_dbg = self._cuda_graph_adapter.debug_options(_adapter_batch_state)
-							if _dbg.compare_against_eager:
-								from batchgen.cuda_graph.compare import compare_decode_outputs
-								# graph_out has padded bucket rows; the eager reference
-								# produces local_bsz (=batch_size) rows. Slice to align.
-								# Graph probe keys are `probe_layer_<NNN>_hidden`; the
-								# eager reference uses `hidden_states_layer_<i>` — remap
-								# so the diff aligns by key.
-								_graph_cmp = {}
-								for _k, _v in graph_out.items():
-									_vs = _v[:batch_size]
-									if _k.startswith("probe_layer_") and _k.endswith("_hidden"):
-										_idx = int(_k[len("probe_layer_"):-len("_hidden")])
-										_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
-									else:
-										_graph_cmp[_k] = _vs
-								_report = compare_decode_outputs(
-									adapter=self._cuda_graph_adapter,
-									decision=_adapter_decision,
-									batch_state=_adapter_batch_state,
-									segment_name=_wm_seg_name,
-									captured_inputs=replay_inputs,
-									graph_outputs=_graph_cmp,
-									probe_layers=_dbg.probe_layers,
-									atol=_dbg.compare_atol,
-									rtol=_dbg.compare_rtol,
-									fail_on_mismatch=_dbg.fail_on_mismatch,
+			
+				# Forward pass
+				forward_start = time.perf_counter()
+
+				# Pre-compute batch_sequences for use in both forward setup and update loop
+				batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
+				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
+					global_decode_sequences
+				)
+				self._k3_decode_profile_step(AttnWrapperBase.batchgen_debug, len(batch))
+				self._configure_glm5_dispatch_trace(global_decode_sequences)
+
+				# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
+
+				# Invariant check: cache_seqlens must not exceed allocated pages.
+				# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
+				if BATCHGEN_DECODE_ASSERT and batch:
+					for seq in batch_sequences:
+						max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
+						if seq.current_context_length > max_tokens:
+							logging.error(
+								f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
+								f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
+								f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
+								f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
+								f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
+								f"status={seq.status})"
+							)
+							raise RuntimeError(
+								f"cache_seqlens overrun: ctx={seq.current_context_length} > "
+								f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
+								f"{max_tokens} for {seq.uuid[:8]}"
+							)
+
+				_split_t0 = time.perf_counter()
+				# Start marker of this step's device forward+sample time. Takes a
+				# free ring slot or skips timing this step; never waits.
+				_fwd_slot = _fwd_ring.begin(torch.cuda.current_stream(self.torch_device))
+				with torch.inference_mode():
+					if batch:
+						# Collect context lengths with invariant validation
+						# ALWAYS: current_context_length == original_prompt_length + decoded_length
+						cache_seqlens = []
+						for seq in batch_sequences:
+							ctx_len = seq.current_context_length
+							expected = seq.original_prompt_length + seq.decoded_length
+							if ctx_len != expected:
+								logging.error(
+									f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
+									f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
+									f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
 								)
-								_log = logging.info if _report.passed else logging.error
-								_log(
-									"[K25_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s "
-									"status=%s max_abs=%.6g max_rel=%.6g mismatched=%s "
-									"probes=%s",
-									self.rank, _adapter_decision.bucket, batch_size,
-									"OK" if _report.passed else "MISMATCH",
-									_report.max_abs, _report.max_rel,
-									_report.mismatched_keys, _report.probe_results,
-								)
-					elif getattr(self, "_glm5_whole_model_graph", False):
-						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-						aux_manager = getattr(
-							gpu_manager,
-							"auxiliary",
-							getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+								seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
+									f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
+								lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
+								seq.current_context_length = expected
+								ctx_len = expected
+							cache_seqlens.append(ctx_len)
+
+						max_ctx = max(cache_seqlens)
+
+						# DIAG: Log cache_seqlens at first iteration of each decode group
+						if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
+							fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
+							resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
+							logging.info(
+								f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
+								f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
+								f"max_ctx={max_ctx}"
+							)
+							for uid, dl, ctx in fresh[:5]:
+								logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
+							for uid, dl, ctx, pg in resumed[:5]:
+								logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
+
+						Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
+						(
+							Attn_Wrapper.cache_seqlens,
+							Attn_Wrapper.position_ids,
+						) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
+						Attn_Wrapper.max_seqlen = max_ctx
+
+						# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+						AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
+						AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+						AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+						AttnWrapperBase.max_seqlen = max_ctx
+
+						# Per-step DSA dispatch hint: count sequences whose cache is
+						# short enough to take the dense short-circuit instead of
+						# indexer scoring. Computing once here instead of inside
+						# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
+						# per decode step on DSA models (GLM-5).
+						_reset_glm5_dsa_step_state(
+							GLM5AttnWrapper,
+							Attn_Wrapper.cache_seqlens,
+							getattr(self.model_config, "index_topk", None),
 						)
-						if aux_manager is None:
-							raise RuntimeError("GLM-5 whole-model graph replay requires auxiliary GPU KV manager")
-						graph_inputs = self._prepare_glm5_layer_graph_inputs(
-							local_bsz=batch_size,
-							bucket=bucket,
-							gpu_manager=gpu_manager,
-							graph_max_seqlen_override=int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
-						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
-							"glm5_whole_model", _max_bs,
-							input_ids=new_tokens[:batch_size],
-							cache_seqlens=graph_inputs["cache_seqlens"],
-							position_ids=graph_inputs["position_ids"],
-							primary_slot_indices=graph_inputs["primary_slot_indices"],
-							aux_slot_indices=graph_inputs["aux_slot_indices"],
-							rank_token_counts=_all_rank_counts,
-							num_valid_tokens=graph_inputs["num_valid_tokens"],
-						)
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["replay_ms"] = (
-								time.perf_counter() - _glm5_replay_start
-							) * 1000.0
+
+						if new_tokens.shape[0] != len(batch):
+							# The rebuild reads the last decoded token from the book;
+							# the in-flight token must be written there first.
+							if _pending_decode_token is not None:
+								self._finalize_pending_decode_token(_pending_decode_token)
+								_pending_decode_token = None
+							new_tokens = self._rebuild_input_tokens(batch)
 					else:
-						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
-						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
-						if slot_indices_tensor is None:
-							# Rebuild may have cleared it; reconstruct as simple arange
-							slot_indices_tensor = torch.arange(
-								page_table_tensor.shape[0], dtype=torch.int32,
+						Attn_Wrapper.attention_mask = None
+						Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+						Attn_Wrapper.max_seqlen = 0
+						Attn_Wrapper.cur_batch = []
+						new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+						# Also bind empty state to AttnWrapperBase for GPT-OSS
+						AttnWrapperBase.attention_mask = None
+						AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+						AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+						AttnWrapperBase.max_seqlen = 0
+						AttnWrapperBase.cur_batch = []
+						GLM5AttnWrapper._dsa_short_count = 0
+						GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+						self._decode_metadata_batch_key = None
+						self._decode_metadata_cpu_seqlens = None
+				
+					if batch:
+						Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+						AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
+						# OPTIMIZATION: Only check page table if not already verified this batch
+						# Between boundaries, batch doesn't change so page table stays valid
+						if not _page_table_verified_this_batch:
+							# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
+							# This is the root cause of KV corruption after resume - if they don't match,
+							# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
+							if gpu_manager and gpu_manager._gpu_page_table_manager:
+								slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+								batch_global_order = Attn_Wrapper.cur_batch
+								if slot_order != batch_global_order:
+									# Fix: Rebuild page table to match batch order
+									gpu_manager.rebuild_page_table(batch_global_order)
+									# Log page rebuild for affected sequences
+									for seq in batch_sequences:
+										seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
+											f"batch_size={len(batch)}")
+							_page_table_verified_this_batch = True
+				
+					# NOTE: Do NOT skip forward pass even with empty batch!
+					# MoE models have all-to-all collective operations that ALL ranks must participate in.
+					# Skipping would cause deadlock as other ranks wait for this rank.
+
+					# MoE buffer sync: only needed at decision boundaries (batch size changes).
+					# Between boundaries, batch size is constant — skip the all_reduce + .item()
+					# CPU-GPU sync that drains the GPU pipeline every step.
+					# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
+					# Phase C: layer-graph mode retired; only whole-model needs the
+					# globally-synced rank-count reuse.
+					if (
+						getattr(self, '_whole_model_graph', False)
+						or self._glm5_whole_model_graph_requested_for_current_batch()
+					):
+						# Whole-model graph needs globally synced counts for NCCL bucket
+						# matching, but the count vector only changes at decode-entry,
+						# page-boundary, and async-load-finalize sync points. Reusing it
+						# avoids a per-token NCCL all_gather + D2H .item() sync.
+						_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
+						_cached_local_bsz = int(getattr(self, "_current_decode_local_batch_size", -1))
+						_max_bs = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+						if _all_rank_counts is None or _max_bs <= 0 or _cached_local_bsz != len(batch):
+							_max_bs = self._sync_decode_moe_rank_counts(
+								batch,
+								reason="decode_step_batch_change",
+							)
+							_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
+						_max_bs = max(int(_max_bs), 1)
+					else:
+						# Per-layer graph or eager: no NCCL in graph, use local batch size
+						_max_bs = max(len(batch), 1)
+						_all_rank_counts = None
+
+					# KV append callback — deferred: accumulate during forward, single sync after
+					current_batch = list(batch)
+					_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+
+					if _kv_worker_view is not None:
+						_kv_seq_ids = []
+						_kv_seq_lengths = []
+						for local_idx in current_batch:
+							uuid = self._local_to_uuid_map[local_idx]
+							seq = self.global_batch.get_sequence(uuid)
+							_kv_seq_ids.append(seq.global_idx)
+							_kv_seq_lengths.append(seq.current_context_length - 1)
+						self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
+						self._deferred_kv_entries = []
+						self._deferred_kv_entries_aux = []
+						self._deferred_kv_worker_view = _kv_worker_view
+						self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+
+					if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
+						# SYNC MODE: Immediately write each layer's KV to host (no deferral)
+						_sync_kv_seq_ids = _kv_seq_ids
+						_sync_kv_seq_lengths = _kv_seq_lengths
+						_sync_kv_worker_view = _kv_worker_view
+						def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							if k_tensor.dim() == 3:
+								k_tensor = k_tensor.unsqueeze(2)
+							if v_tensor is not None and v_tensor.dim() == 3:
+								v_tensor = v_tensor.unsqueeze(2)
+							torch.cuda.synchronize(self.torch_device)
+							task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+								layer_idx=layer_idx,
+								sequence_ids=_sync_kv_seq_ids,
+								k_tensor=k_tensor,
+								v_tensor=v_tensor,
+								sequence_lengths=_sync_kv_seq_lengths,
+							)
+							if task is not None:
+								task.wait()
+					else:
+						def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
+
+					Attn_Wrapper.kv_append_callback = kv_append_callback
+					# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+					AttnWrapperBase.kv_append_callback = kv_append_callback
+
+					# DSA: auxiliary KV append callback for indexer host cache.
+					# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
+					# to _deferred_kv_entries_aux; _flush_deferred_kv_to_host launches
+					# primary and aux appends together and the per-step
+					# [KV_APPEND_DRAIN] after the token readback completes both.
+					aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+					if aux_view is not None:
+						if BATCHGEN_SYNC_KV:
+							def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+								self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+						else:
+							def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+								valid_layers = self._aux_layers_with_slots()
+								if valid_layers is not None and layer_idx not in valid_layers:
+									return
+								self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
+						AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
+					else:
+						AttnWrapperBase.kv_append_callback_aux = None
+
+					# Phase C: layer-graph mode retired; only the whole-model graph
+					# may need re-warmup here.
+					if self._glm5_whole_model_graph_current_bucket_missing():
+						logging.info(
+							f"Rank {self.rank}: GLM-5 whole-model CUDA graph was not captured "
+							"during decode configuration; using eager decode instead of "
+							"capturing in the decode loop"
+						)
+						self._glm5_whole_model_graph_capture_attempted_for_batch = True
+
+					self._log_glm5_graph_path_for_forward(
+						local_bsz=len(batch),
+						max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+						rank_counts=getattr(self, "_current_decode_rank_token_counts", None),
+						gpu_manager=gpu_manager,
+						decode_iter=self._cumulative_decode_iterations,
+					)
+					# Phase C: DSA-only graph metadata prep retired (DSA graph mode
+					# is no longer reachable). The whole-model graph's FA3 sparse
+					# decode needs no per-forward attention scheduler metadata.
+
+					_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
+						local_iteration=local_iteration,
+						local_bsz=len(batch),
+						max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+					)
+
+					# Forward
+					# Phase C: layer-graph mode retired. The whole-model graph
+					# composes per-layer captures internally; no separate
+					# layer-graph dispatch is needed.
+
+					_glm5_whole_graph_active = bool(
+						getattr(self, "_glm5_whole_model_graph", False)
+						and self._cuda_graph_manager is not None
+					)
+					_glm5_whole_graph_over_bucket = False
+					if _glm5_whole_graph_active:
+						try:
+							_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+						except ValueError:
+							_glm5_whole_graph_over_bucket = True
+							_glm5_whole_graph_active = False
+						else:
+							# An all_short capture never runs indexer scoring, so a
+							# step whose longest context exceeds index_topk must NOT
+							# replay it: top-k selection would be silently skipped.
+							# Leaving the graph here either falls back to eager
+							# (correct top-k) or, under a required graph, raises
+							# below with reason=all_short_exceeded.
+							_glm5_all_short_exceeded = bool(
+								getattr(self, "_glm5_whole_model_all_short", False)
+								and int(getattr(self, "_glm5_whole_model_index_topk", 0) or 0)
+								and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+								> int(self._glm5_whole_model_index_topk)
+							)
+							_glm5_whole_graph_active = (
+								not _glm5_all_short_exceeded
+								and _glm5_whole_bucket not in getattr(self, "_glm5_whole_model_graph_failed_buckets", set())
+								and self._cuda_graph_manager.has_bucket_for_all_segments(_max_bs)
+								and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
+								and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
+							)
+					elif self._glm5_whole_model_graph_requested_for_current_batch():
+						try:
+							configured_max_bucket = int(self.args.cuda_graph_max_bucket_size)
+						except AttributeError:
+							pass
+						else:
+							_glm5_whole_graph_over_bucket = _max_bs > configured_max_bucket
+					if (
+						self._glm5_whole_model_graph_requested_for_current_batch()
+						and self._glm5_whole_model_graph_requested_for_current_batch()
+						and not _glm5_whole_graph_active
+						and not _glm5_whole_graph_over_bucket
+					):
+						_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
+						raise RuntimeError(
+							"GLM-5 whole-model CUDA graph was required but no replayable "
+							"whole-model graph is available for this decode step "
+							f"(bucket={_required_bucket}, reason={_required_reason})"
+						)
+					_use_graph = (
+						getattr(self, '_whole_model_graph', False)
+						and self._cuda_graph_manager is not None
+						and _max_bs <= self._whole_model_bucketing._max_bucket
+						and (
+							not getattr(self, "_glm5_whole_model_graph", False)
+							or _glm5_whole_graph_active
+						)
+					)
+					if _use_graph:
+						_glm5_whole_compare = bool(
+							getattr(self, "_glm5_whole_model_graph", False)
+							and self._glm5_whole_model_graph_compare_requested_for_current_batch()
+						)
+						_glm5_whole_timing = bool(
+							getattr(self, "_glm5_whole_model_graph", False)
+							and self._glm5_whole_model_graph_timing_requested_for_current_batch()
+						)
+						_glm5_whole_timing_items = {}
+						_glm5_skip_graph_kv_offload = False
+						# Whole-model CUDA graph replay.
+						# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
+						# computation, NOT local len(batch). The graph has NCCL all_reduce
+						# baked inside — all ranks MUST replay the same bucket's graph,
+						# otherwise mismatched NCCL ops cause deadlock.
+						batch_size = len(batch)
+						bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+						# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
+						# and an adapter is present, route replay through it. Legacy path
+						# (default) preserves today's behavior exactly.
+						# K2.5 always routes whole-model replay through the adapter
+						# (no legacy non-adapter K2.5 whole-model path exists).
+						_k25_whole_active = getattr(self, "_k25_whole_model_graph", False)
+						_adapter_dual_active = (
+							self._cuda_graph_adapter is not None
+							and (
+								_k25_whole_active
+								or (
+									self._cuda_graph_adapter_dual
+									and getattr(self, "_glm5_whole_model_graph", False)
+								)
+							)
+						)
+						_wm_seg_name = getattr(
+							self, "_whole_model_segment_name", "glm5_whole_model"
+						)
+						_adapter_decision = None
+						_adapter_batch_state = None
+						if _adapter_dual_active:
+							from batchgen.cuda_graph.adapter import BatchState as _BatchState
+							_adapter_batch_state = _BatchState(
+								local_bsz=batch_size,
+								max_rank_bsz=_max_bs,
+								rank_token_counts=_all_rank_counts,
+								cache_seqlens=AttnWrapperBase.cache_seqlens,
+								position_ids=AttnWrapperBase.position_ids,
+								max_seqlen=int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+								cur_batch_sequence_ids=tuple(getattr(AttnWrapperBase, "cur_batch", None) or ()),
+								gpu_kv_manager=gpu_manager,
+								decode_iter=0,
+								input_ids=new_tokens,
 								device=self.torch_device,
 							)
-						# Page table may have fewer columns than the static buffer
-						# (gpu_table gets rebuilt with varying max_pages_per_sequence).
-						# Pad to match the captured spec width.
-						wm_max_pages = self._whole_model_segment.max_pages_per_seq
-						pt_slice = page_table_tensor[:batch_size]
-						if pt_slice.shape[1] < wm_max_pages:
-							pt_slice = torch.nn.functional.pad(
-								pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+							_adapter_decision = self._cuda_graph_adapter.eligibility(_adapter_batch_state)
+							if _adapter_decision.mode.value != "whole_model":
+								logging.info(
+									"Phase B: adapter eligibility=%s/%s; using legacy path for parity",
+									_adapter_decision.mode.value, _adapter_decision.reason,
+								)
+								_adapter_dual_active = False
+						if _adapter_dual_active:
+							# ADAPTER PATH (Phase B dual gate)
+							replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
+								decision=_adapter_decision,
+								batch_state=_adapter_batch_state,
+								segment_name=_wm_seg_name,
 							)
-						elif pt_slice.shape[1] > wm_max_pages:
-							pt_slice = pt_slice[:, :wm_max_pages]
-						graph_out = self._cuda_graph_manager.replay(
-							"whole_model", bucket,
-							input_ids=new_tokens,
-							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-							page_table=pt_slice,
-							slot_indices=slot_indices_tensor[:batch_size],
-						)
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_replay_start = time.perf_counter()
+							graph_out = self._cuda_graph_manager.replay(
+								_wm_seg_name, _max_bs, **replay_inputs,
+							)
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_whole_timing_items["replay_ms"] = (
+									time.perf_counter() - _glm5_replay_start
+								) * 1000.0
+							# K2.5 whole-model eager-vs-graph compare via the standard
+							# model-agnostic facility (observability-only; does NOT change
+							# token selection). GLM-5 keeps its own bespoke compare block
+							# below; this path serves any adapter that has no such block.
+							if _k25_whole_active:
+								_dbg = self._cuda_graph_adapter.debug_options(_adapter_batch_state)
+								if _dbg.compare_against_eager:
+									from batchgen.cuda_graph.compare import compare_decode_outputs
+									# graph_out has padded bucket rows; the eager reference
+									# produces local_bsz (=batch_size) rows. Slice to align.
+									# Graph probe keys are `probe_layer_<NNN>_hidden`; the
+									# eager reference uses `hidden_states_layer_<i>` — remap
+									# so the diff aligns by key.
+									_graph_cmp = {}
+									for _k, _v in graph_out.items():
+										_vs = _v[:batch_size]
+										if _k.startswith("probe_layer_") and _k.endswith("_hidden"):
+											_idx = int(_k[len("probe_layer_"):-len("_hidden")])
+											_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
+										else:
+											_graph_cmp[_k] = _vs
+									_report = compare_decode_outputs(
+										adapter=self._cuda_graph_adapter,
+										decision=_adapter_decision,
+										batch_state=_adapter_batch_state,
+										segment_name=_wm_seg_name,
+										captured_inputs=replay_inputs,
+										graph_outputs=_graph_cmp,
+										probe_layers=_dbg.probe_layers,
+										atol=_dbg.compare_atol,
+										rtol=_dbg.compare_rtol,
+										fail_on_mismatch=_dbg.fail_on_mismatch,
+									)
+									_log = logging.info if _report.passed else logging.error
+									_log(
+										"[K25_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s "
+										"status=%s max_abs=%.6g max_rel=%.6g mismatched=%s "
+										"probes=%s",
+										self.rank, _adapter_decision.bucket, batch_size,
+										"OK" if _report.passed else "MISMATCH",
+										_report.max_abs, _report.max_rel,
+										_report.mismatched_keys, _report.probe_results,
+									)
+						elif getattr(self, "_glm5_whole_model_graph", False):
+							primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+							aux_manager = getattr(
+								gpu_manager,
+								"auxiliary",
+								getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+							)
+							if aux_manager is None:
+								raise RuntimeError("GLM-5 whole-model graph replay requires auxiliary GPU KV manager")
+							graph_inputs = self._prepare_glm5_layer_graph_inputs(
+								local_bsz=batch_size,
+								bucket=bucket,
+								gpu_manager=gpu_manager,
+								graph_max_seqlen_override=int(getattr(self._whole_model_segment, "max_seqlen", 0) or 0),
+							)
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_replay_start = time.perf_counter()
+							graph_out = self._cuda_graph_manager.replay(
+								"glm5_whole_model", _max_bs,
+								input_ids=new_tokens[:batch_size],
+								cache_seqlens=graph_inputs["cache_seqlens"],
+								position_ids=graph_inputs["position_ids"],
+								primary_slot_indices=graph_inputs["primary_slot_indices"],
+								aux_slot_indices=graph_inputs["aux_slot_indices"],
+								rank_token_counts=_all_rank_counts,
+								num_valid_tokens=graph_inputs["num_valid_tokens"],
+							)
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_whole_timing_items["replay_ms"] = (
+									time.perf_counter() - _glm5_replay_start
+								) * 1000.0
+						else:
+							page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
+							slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+							if slot_indices_tensor is None:
+								# Rebuild may have cleared it; reconstruct as simple arange
+								slot_indices_tensor = torch.arange(
+									page_table_tensor.shape[0], dtype=torch.int32,
+									device=self.torch_device,
+								)
+							# Page table may have fewer columns than the static buffer
+							# (gpu_table gets rebuilt with varying max_pages_per_sequence).
+							# Pad to match the captured spec width.
+							wm_max_pages = self._whole_model_segment.max_pages_per_seq
+							pt_slice = page_table_tensor[:batch_size]
+							if pt_slice.shape[1] < wm_max_pages:
+								pt_slice = torch.nn.functional.pad(
+									pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+								)
+							elif pt_slice.shape[1] > wm_max_pages:
+								pt_slice = pt_slice[:, :wm_max_pages]
+							graph_out = self._cuda_graph_manager.replay(
+								"whole_model", bucket,
+								input_ids=new_tokens,
+								cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+								page_table=pt_slice,
+								slot_indices=slot_indices_tensor[:batch_size],
+							)
 
-					logits = graph_out["logits"][:batch_size]
-					graph_hidden_states = graph_out.get("hidden_states")
-					if graph_hidden_states is not None:
-						graph_hidden_states = graph_hidden_states[:batch_size]
-					if _glm5_whole_compare:
-						graph_probe_hidden_states = {
-							key: value[:batch_size]
-							for key, value in graph_out.items()
-							if key.startswith("probe_layer_")
-						}
-						graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
+						logits = graph_out["logits"][:batch_size]
+						graph_hidden_states = graph_out.get("hidden_states")
+						if graph_hidden_states is not None:
+							graph_hidden_states = graph_hidden_states[:batch_size]
+						if _glm5_whole_compare:
+							graph_probe_hidden_states = {
+								key: value[:batch_size]
+								for key, value in graph_out.items()
+								if key.startswith("probe_layer_")
+							}
+							graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_eager_start = time.perf_counter()
+							with self._glm5_force_segmented_graph_eager():
+								if getattr(self._whole_model_segment, "compare_probe_layers", ()):
+									eager_probe_outputs = self._whole_model_segment.run_model_with_probes(
+										input_ids=new_tokens,
+										attention_mask=Attn_Wrapper.attention_mask,
+										position_ids=Attn_Wrapper.position_ids,
+										use_layer_segments=False,
+									)
+									eager_hidden_states = eager_probe_outputs["hidden_states"]
+									eager_logits = eager_probe_outputs["logits"]
+									eager_probe_hidden_states = {
+										key: value
+										for key, value in eager_probe_outputs.items()
+										if key.startswith("probe_layer_")
+									}
+								else:
+									eager_model_outputs = self.model.model(
+										input_ids=new_tokens,
+										attention_mask=Attn_Wrapper.attention_mask,
+										position_ids=Attn_Wrapper.position_ids,
+										use_cache=False,
+									)
+									eager_hidden_states = eager_model_outputs[0][:, -1, :]
+									eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
+									eager_probe_hidden_states = {}
+							if _glm5_whole_timing:
+								torch.cuda.synchronize(self.torch_device)
+								_glm5_whole_timing_items["eager_ms"] = (
+									time.perf_counter() - _glm5_eager_start
+								) * 1000.0
+							eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
+							new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
+							from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
+								compare_glm5_whole_model_graph_logits,
+							)
+							compare = compare_glm5_whole_model_graph_logits(
+								eager_logits=eager_logits,
+								graph_logits=logits,
+								eager_hidden_states=eager_hidden_states,
+								graph_hidden_states=graph_hidden_states,
+								eager_probe_hidden_states=eager_probe_hidden_states,
+								graph_probe_hidden_states=graph_probe_hidden_states,
+								eager_tokens=eager_tokens_for_compare,
+								graph_tokens=graph_tokens_for_compare,
+								atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
+								rtol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
+							)
+							_log = logging.info if compare["ok"] else logging.error
+							_log(
+								"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
+								"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
+								"hidden_mean_abs=%.6g probe_first_mismatch=%s "
+								"probe_max_abs=%.6g probe_mean_abs=%.6g "
+								"argmax_mismatch=%s token_mismatch=%s",
+								self.rank,
+								bucket,
+								batch_size,
+								"OK" if compare["ok"] else "MISMATCH",
+								compare["max_abs"],
+								compare["mean_abs"],
+								compare["hidden_max_abs"],
+								compare["hidden_mean_abs"],
+								compare["probe_first_mismatch"],
+								compare["probe_max_abs"],
+								compare["probe_mean_abs"],
+								compare["argmax_mismatch"],
+								compare["token_mismatch"],
+							)
+							if not compare["ok"] and self._glm5_whole_model_graph_compare_fail_on_mismatch():
+								raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
+							_glm5_skip_graph_kv_offload = True
+						else:
+							new_tokens_out = self._select_tokens(logits, batch_sequences)
+
+						if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
+							# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
+							# contiguous-only clone path; no per-layer fallback branch).
+							if _glm5_whole_timing:
+								_glm5_offload_start = time.perf_counter()
+							self._cuda_graph_adapter.stage_post_graph_kv(
+								decision=_adapter_decision,
+								batch_state=_adapter_batch_state,
+								graph_outputs=graph_out,
+							)
+							if _glm5_whole_timing:
+								_glm5_whole_timing_items["offload_callback_ms"] = (
+									time.perf_counter() - _glm5_offload_start
+								) * 1000.0
+						elif not _glm5_skip_graph_kv_offload:
+							if _glm5_whole_timing:
+								_glm5_offload_start = time.perf_counter()
+							# Fire KV host offload callbacks for all layers.
+							# KV buffers are static-address tensors written inside the graph.
+							# Stage primary and aux as two contiguous clones before async
+							# D2H; cloning per layer adds 156 small GPU copies per decode
+							# token on GLM-5 and dominates the whole-graph replay overhead.
+							kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+							wm_seg = getattr(self, '_whole_model_segment', None)
+							if (
+								batch_size > 0
+								and kv_cb is not None
+								and wm_seg is not None
+								and wm_seg._kv_buffers is not None
+							):
+								primary_stage = None
+								primary_key_buffer = getattr(wm_seg, "_kv_key_buffer", None)
+								if primary_key_buffer is not None:
+									primary_stage = primary_key_buffer[:, :batch_size].clone()
+								for layer_idx in range(wm_seg.num_layers):
+									kv_buf = wm_seg._kv_buffers[layer_idx]
+									# K2.5 MLA has no separate V cache — pass None for v_tensor
+									v_buf = kv_buf.get("value")
+									v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
+									k_tensor = (
+										primary_stage[layer_idx]
+										if primary_stage is not None
+										else kv_buf["key"][:batch_size].clone()
+									)
+									kv_cb(
+										layer_idx,
+										k_tensor,
+										v_clone,
+									)
+							aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
+							aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
+							if batch_size > 0 and aux_cb is not None and aux_buffers is not None:
+								aux_stage = None
+								aux_key_buffer = getattr(wm_seg, "_aux_kv_key_buffer", None)
+								if aux_key_buffer is not None:
+									aux_stage = aux_key_buffer[:, :batch_size].clone()
+								for layer_idx in range(wm_seg.num_layers):
+									aux_cb(
+										layer_idx,
+										aux_stage[layer_idx]
+										if aux_stage is not None
+										else aux_buffers[layer_idx]["key"][:batch_size].clone(),
+										None,
+									)
+							if _glm5_whole_timing:
+								_glm5_whole_timing_items["offload_callback_ms"] = (
+									time.perf_counter() - _glm5_offload_start
+								) * 1000.0
 						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_eager_start = time.perf_counter()
-						with self._glm5_force_segmented_graph_eager():
-							if getattr(self._whole_model_segment, "compare_probe_layers", ()):
-								eager_probe_outputs = self._whole_model_segment.run_model_with_probes(
-									input_ids=new_tokens,
-									attention_mask=Attn_Wrapper.attention_mask,
-									position_ids=Attn_Wrapper.position_ids,
-									use_layer_segments=False,
-								)
-								eager_hidden_states = eager_probe_outputs["hidden_states"]
-								eager_logits = eager_probe_outputs["logits"]
-								eager_probe_hidden_states = {
-									key: value
-									for key, value in eager_probe_outputs.items()
-									if key.startswith("probe_layer_")
-								}
-							else:
-								eager_model_outputs = self.model.model(
-									input_ids=new_tokens,
-									attention_mask=Attn_Wrapper.attention_mask,
-									position_ids=Attn_Wrapper.position_ids,
-									use_cache=False,
-								)
-								eager_hidden_states = eager_model_outputs[0][:, -1, :]
-								eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
-								eager_probe_hidden_states = {}
-						if _glm5_whole_timing:
-							torch.cuda.synchronize(self.torch_device)
-							_glm5_whole_timing_items["eager_ms"] = (
-								time.perf_counter() - _glm5_eager_start
-							) * 1000.0
-						eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
-						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
-						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
-							compare_glm5_whole_model_graph_logits,
-						)
-						compare = compare_glm5_whole_model_graph_logits(
-							eager_logits=eager_logits,
-							graph_logits=logits,
-							eager_hidden_states=eager_hidden_states,
-							graph_hidden_states=graph_hidden_states,
-							eager_probe_hidden_states=eager_probe_hidden_states,
-							graph_probe_hidden_states=graph_probe_hidden_states,
-							eager_tokens=eager_tokens_for_compare,
-							graph_tokens=graph_tokens_for_compare,
-							atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
-							rtol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
-						)
-						_log = logging.info if compare["ok"] else logging.error
-						_log(
-							"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
-							"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
-							"hidden_mean_abs=%.6g probe_first_mismatch=%s "
-							"probe_max_abs=%.6g probe_mean_abs=%.6g "
-							"argmax_mismatch=%s token_mismatch=%s",
-							self.rank,
-							bucket,
-							batch_size,
-							"OK" if compare["ok"] else "MISMATCH",
-							compare["max_abs"],
-							compare["mean_abs"],
-							compare["hidden_max_abs"],
-							compare["hidden_mean_abs"],
-							compare["probe_first_mismatch"],
-							compare["probe_max_abs"],
-							compare["probe_mean_abs"],
-							compare["argmax_mismatch"],
-							compare["token_mismatch"],
-						)
-						if not compare["ok"] and self._glm5_whole_model_graph_compare_fail_on_mismatch():
-							raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
-						_glm5_skip_graph_kv_offload = True
+							logging.info(
+								"[GLM5_WHOLE_GRAPH_TIMING] rank=%s bucket=%s batch=%s replay_ms=%.3f "
+								"eager_ms=%.3f offload_callback_ms=%.3f compare=%s",
+								self.rank,
+								bucket,
+								batch_size,
+								_glm5_whole_timing_items.get("replay_ms", -1.0),
+								_glm5_whole_timing_items.get("eager_ms", -1.0),
+								_glm5_whole_timing_items.get("offload_callback_ms", -1.0),
+								_glm5_whole_compare,
+							)
 					else:
-						new_tokens_out = self._select_tokens(logits, batch_sequences)
+						# Per-layer graph or eager forward
+						# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
+						# Without this, the model generates position_ids = [[0]] for all decode steps,
+						# causing RoPE to be applied at position 0 instead of the actual token position.
+						outputs = self._glm5_decode_model_forward(new_tokens)
+						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+					self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
-					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
-						# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
-						# contiguous-only clone path; no per-layer fallback branch).
-						if _glm5_whole_timing:
-							_glm5_offload_start = time.perf_counter()
-						self._cuda_graph_adapter.stage_post_graph_kv(
-							decision=_adapter_decision,
-							batch_state=_adapter_batch_state,
-							graph_outputs=graph_out,
-						)
-						if _glm5_whole_timing:
-							_glm5_whole_timing_items["offload_callback_ms"] = (
-								time.perf_counter() - _glm5_offload_start
-							) * 1000.0
-					elif not _glm5_skip_graph_kv_offload:
-						if _glm5_whole_timing:
-							_glm5_offload_start = time.perf_counter()
-						# Fire KV host offload callbacks for all layers.
-						# KV buffers are static-address tensors written inside the graph.
-						# Stage primary and aux as two contiguous clones before async
-						# D2H; cloning per layer adds 156 small GPU copies per decode
-						# token on GLM-5 and dominates the whole-graph replay overhead.
-						kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
-						wm_seg = getattr(self, '_whole_model_segment', None)
-						if (
-							batch_size > 0
-							and kv_cb is not None
-							and wm_seg is not None
-							and wm_seg._kv_buffers is not None
-						):
-							primary_stage = None
-							primary_key_buffer = getattr(wm_seg, "_kv_key_buffer", None)
-							if primary_key_buffer is not None:
-								primary_stage = primary_key_buffer[:, :batch_size].clone()
-							for layer_idx in range(wm_seg.num_layers):
-								kv_buf = wm_seg._kv_buffers[layer_idx]
-								# K2.5 MLA has no separate V cache — pass None for v_tensor
-								v_buf = kv_buf.get("value")
-								v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
-								k_tensor = (
-									primary_stage[layer_idx]
-									if primary_stage is not None
-									else kv_buf["key"][:batch_size].clone()
-								)
-								kv_cb(
-									layer_idx,
-									k_tensor,
-									v_clone,
-								)
-						aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
-						aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
-						if batch_size > 0 and aux_cb is not None and aux_buffers is not None:
-							aux_stage = None
-							aux_key_buffer = getattr(wm_seg, "_aux_kv_key_buffer", None)
-							if aux_key_buffer is not None:
-								aux_stage = aux_key_buffer[:, :batch_size].clone()
-							for layer_idx in range(wm_seg.num_layers):
-								aux_cb(
-									layer_idx,
-									aux_stage[layer_idx]
-									if aux_stage is not None
-									else aux_buffers[layer_idx]["key"][:batch_size].clone(),
-									None,
-								)
-						if _glm5_whole_timing:
-							_glm5_whole_timing_items["offload_callback_ms"] = (
-								time.perf_counter() - _glm5_offload_start
-							) * 1000.0
-					if _glm5_whole_timing:
-						logging.info(
-							"[GLM5_WHOLE_GRAPH_TIMING] rank=%s bucket=%s batch=%s replay_ms=%.3f "
-							"eager_ms=%.3f offload_callback_ms=%.3f compare=%s",
-							self.rank,
-							bucket,
-							batch_size,
-							_glm5_whole_timing_items.get("replay_ms", -1.0),
-							_glm5_whole_timing_items.get("eager_ms", -1.0),
-							_glm5_whole_timing_items.get("offload_callback_ms", -1.0),
-							_glm5_whole_compare,
-						)
-				else:
-					# Per-layer graph or eager forward
-					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
-					# Without this, the model generates position_ids = [[0]] for all decode steps,
-					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self._glm5_decode_model_forward(new_tokens)
-					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
-				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
+				new_tokens = new_tokens_out
+				_split_t1 = time.perf_counter()
+				# End marker, queued on the same stream ahead of the token copy below.
+				_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device))
 
-			new_tokens = new_tokens_out
-			_split_t1 = time.perf_counter()
-			# End marker, queued on the same stream ahead of the token copy below.
-			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device))
-
-			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
-			# exact token-readback boundary before launching host-KV copies on their
-			# independent D2H stream.
-			bs = new_tokens.shape[0]
-			if bs > _new_tokens_pinned.shape[0]:
-				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
-			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
-			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
-
-			# Host-KV offload orders its own stream with a device-side event, so
-			# launching it needs no host wait. The host first waits for the
-			# sampled-token readback (needed for exact EOS and output bookkeeping),
-			# then drains the append tasks below.
-			self._flush_deferred_kv_to_host()
-			_split_t2 = time.perf_counter()
-			_new_tokens_ready.synchronize()
-			_split_t3 = time.perf_counter()
-
-			# [KV_APPEND_DRAIN] Complete this step's host appends before the
-			# next step. Each task is a std::async thread that reads the worker
-			# view's page table on its own thread at execution time, with no
-			# lock. Letting up to 256 of them stay in flight across steps meant
-			# they could overlap the next admission wave's register/allocate on
-			# the main thread; a torn read then lands one token's KV in a page
-			# that now belongs to a freshly prefilled sequence. Measured on the
-			# 512x4096 K3 contract: every victim was in a wave after the first
-			# and collapsed at its 2nd or ~28th token, while the first wave (no
-			# page-table mutation in flight) was clean. The drain sits after the
-			# token readback only so its wait (which ends in a full device sync)
-			# gets its own split slot instead of being charged to the copy
-			# launch; nothing between the launch above and here touches a page
-			# table. defer_errors=True keeps it a purely local wait (a guarded
-			# collective would deadlock when only some ranks have tasks); the
-			# deferred errors surface at the next boundary PHASE 0 or loop-exit
-			# drain, both of which sync errors across ranks.
-			if self._pending_kv_append_tasks:
-				self._wait_pending_kv_append_tasks(defer_errors=True)
-			_split_t4 = time.perf_counter()
-			new_tokens_cpu = _new_tokens_pinned[:bs]
-
-			# Update sequences (reuse batch_sequences from forward pass setup)
-			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if self._is_sequence_completed(seq):
-					continue
-
-				decode_pos = seq.decoded_length
-				if BATCHGEN_CB_DEBUG:
-					qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
-					seq_ptr = seq.decoded_tokens.data_ptr()
-					if qb_ptr != seq_ptr:
-						logging.error(
-							f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
-							f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
-							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
-						)
-				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
-
-				seq.decoded_length += 1
-				seq.current_context_length += 1
-
-				# Use CPU tensor to avoid GPU sync
-				token_id = new_tokens_cpu[i].item()
-
-				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
-				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
-					logging.info(
-						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
-						f"decoded_len={seq.decoded_length} token={token_id}"
+				# P1: Non-blocking GPU→CPU token transfer into this step's readback
+				# ring slot. Record the exact token-readback boundary before
+				# launching host-KV copies on their independent D2H stream.
+				bs = new_tokens.shape[0]
+				if bs > _new_tokens_pinned.shape[1]:
+					# The in-flight token lives in the buffer being replaced;
+					# resolve it before swapping buffers.
+					if _pending_decode_token is not None:
+						self._finalize_pending_decode_token(_pending_decode_token)
+						_pending_decode_token = None
+					_new_tokens_pinned = torch.empty(
+						2, bs, 1, dtype=torch.long, pin_memory=True
 					)
-				if self._should_stop_at_eos(token_id, seq):
-					seq.eos_reached = True
+				_token_slot = local_iteration & 1
+				if _pending_decode_token is not None and _pending_decode_token.slot == _token_slot:
+					raise RuntimeError(
+						f"decode token readback ring overrun: step {local_iteration} would "
+						f"overwrite slot {_token_slot} still held by step "
+						f"{_pending_decode_token.local_iteration}"
+					)
+				_tokens_cpu = _new_tokens_pinned[_token_slot, :bs]
+				_tokens_cpu.copy_(new_tokens[:bs], non_blocking=True)
+				_token_ready_events[_token_slot].record(
+					torch.cuda.current_stream(self.torch_device)
+				)
 
-				if seq.decoded_length >= seq.max_decode_length:
-					seq.eos_reached = True
+				# Host-KV offload orders its own stream with a device-side event, so
+				# launching it needs no host wait.
+				self._flush_deferred_kv_to_host()
+				_split_t2 = time.perf_counter()
 
-				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
-					if token_id == seq._rep_last_token:
-						seq._rep_count += 1
-						if seq._rep_count >= 32:
-							seq._rep_detected = True
-							seq.eos_reached = True
-							seq.log_event(SeqEvent.REPETITION, self.rank,
-								f"token={token_id}, count={seq._rep_count}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-								seq._lifespan_log, "REPETITION")
-							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
-								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
-							)
-					else:
-						seq._rep_last_token = token_id
-						seq._rep_count = 1
-					# Variable-length N-gram pattern check (every 64 tokens)
-					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
-						_dl = seq.decoded_length
-						_tokens = self.query_book[local_idx].decoded_tokens[0]
-						if _check_repeating_pattern(_tokens, _dl):
-							seq._rep_detected = True
-							seq.eos_reached = True
-							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
-								f"gid={seq.global_idx} at decoded_len={_dl}"
-							)
+				# [DECODE_TOKEN_OVERLAP] readback: wait for the PREVIOUS step's
+				# token only. This step's forward, token copy and host-KV appends
+				# are already queued, so the previous step's CPU finalization below
+				# overlaps this step's device work. When the previous step launched
+				# host-KV appends, its drain ended in a device sync and this wait is
+				# already satisfied; otherwise it is the only host wait on the
+				# device before this step's drain.
+				if _pending_decode_token is not None:
+					_pending_decode_token.ready_event.synchronize()
+				_split_t3 = time.perf_counter()
 
-			_split_t5 = time.perf_counter()
-			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
-			# Per-step CPU wall split (setup, fwd_launch, kv_launch, readback,
-			# kv_drain, bookkeeping), without adding any device sync of its own.
-			accumulate_decode_step_split(
-				_step_split,
-				(forward_start, _split_t0, _split_t1, _split_t2, _split_t3, _split_t4, _split_t5),
-			)
-			# Non-blocking harvest of finished forward timing pairs; elapsed
-			# time is read only from pairs whose two events already completed.
-			_fwd_ring.harvest()
+				# bookkeeping: apply the previous step's token-dependent state
+				# (decoded token, EOS, length and repetition completion), then
+				# advance this step's length counters and defer its token. The
+				# advance reads the completion state the apply just decided.
+				if _pending_decode_token is not None:
+					self._apply_pending_decode_token(_pending_decode_token)
+				_pending_decode_token = _PendingDecodeTokenResult(
+					ready_event=_token_ready_events[_token_slot],
+					tokens_cpu=_tokens_cpu,
+					slot=_token_slot,
+					local_iteration=local_iteration,
+				)
+				self._advance_decode_sequences_for_pending_token(
+					batch, batch_sequences, _pending_decode_token.rows
+				)
+				_split_t4 = time.perf_counter()
 
-			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
-			from batchgen.timing import get_decode_timer
-			_dt = get_decode_timer()
-			if _dt and _dt.enabled:
-				_dt.log_summary()
-				_dt.reset()
+				# [KV_APPEND_DRAIN] Complete this step's host appends before the
+				# next step. Each task is a std::async thread that reads the worker
+				# view's page table on its own thread at execution time, with no
+				# lock. Letting up to 256 of them stay in flight across steps meant
+				# they could overlap the next admission wave's register/allocate on
+				# the main thread; a torn read then lands one token's KV in a page
+				# that now belongs to a freshly prefilled sequence. Measured on the
+				# 512x4096 K3 contract: every victim was in a wave after the first
+				# and collapsed at its 2nd or ~28th token, while the first wave (no
+				# page-table mutation in flight) was clean. The drain is the last
+				# host wait of the step so the bookkeeping above runs while this
+				# step's forward is still on the device; its wait (which ends in a
+				# full device sync) gets its own split slot. Nothing between the
+				# launch above and here touches a page table: the bookkeeping only
+				# writes the CPU decoded-token book and sequence counters, and every
+				# boundary / admission comes after this drain. defer_errors=True
+				# keeps it a purely local wait (a guarded collective would deadlock
+				# when only some ranks have tasks); the deferred errors surface at
+				# the next boundary PHASE 0 or loop-exit drain, both of which sync
+				# errors across ranks.
+				if self._pending_kv_append_tasks:
+					self._wait_pending_kv_append_tasks(defer_errors=True)
+				_split_t5 = time.perf_counter()
+				self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
+				# Per-step CPU wall split (setup, fwd_launch, kv_launch, readback,
+				# bookkeeping, kv_drain), without adding any device sync of its own.
+				accumulate_decode_step_split(
+					_step_split,
+					(forward_start, _split_t0, _split_t1, _split_t2, _split_t3, _split_t4, _split_t5),
+				)
+				# Non-blocking harvest of finished forward timing pairs; elapsed
+				# time is read only from pairs whose two events already completed.
+				_fwd_ring.harvest()
+
+				# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
+				from batchgen.timing import get_decode_timer
+				_dt = get_decode_timer()
+				if _dt and _dt.enabled:
+					_dt.log_summary()
+					_dt.reset()
+		except BaseException:
+			# Exception exit: keep sequence state equal to the sequential
+			# order, in which a step's token was applied before anything of
+			# the next step ran. Best effort only: a failure here (e.g. a
+			# sticky CUDA error in the event wait) is logged and must not
+			# replace the exception already propagating. The resumable apply
+			# never re-applies a row an interrupted apply already finished.
+			if _pending_decode_token is not None:
+				try:
+					self._finalize_pending_decode_token(_pending_decode_token)
+				except Exception:
+					logging.exception(
+						f"Rank {self.rank}: could not finalize the in-flight decode "
+						f"token of step {_pending_decode_token.local_iteration} "
+						"while unwinding the decode loop"
+					)
+				_pending_decode_token = None
+			raise
+
+		# Normal exit. The loop only ends through the page-boundary block, which
+		# finalizes the in-flight token first; this drain keeps every exit
+		# exact even if a future exit path skips the boundary.
+		if _pending_decode_token is not None:
+			self._finalize_pending_decode_token(_pending_decode_token)
+			_pending_decode_token = None
 
 		# Cleanup
 		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)

@@ -33,19 +33,25 @@ DECODE_STEP_SPLIT_SEGMENTS: Tuple[str, ...] = (
     "fwd_launch",
     # sampled-token D2H copy launch + host-KV D2H append-task launch
     "kv_launch",
-    # host wait for the sampled-token copy
+    # host wait for the PREVIOUS step's sampled-token copy (one-step
+    # token-finalization overlap; this step's forward is already queued)
     "readback",
-    # host wait for this step's host-KV append tasks
-    "kv_drain",
-    # per-sequence token / EOS / repetition updates
+    # previous step's per-sequence token / EOS / repetition updates, plus
+    # this step's length-counter advance; runs while this step's forward
+    # is still on the device
     "bookkeeping",
+    # host wait for this step's host-KV append tasks; the drain ends in a
+    # device sync whenever the step launched appends, so this slot also
+    # absorbs the remainder of this step's device time
+    "kv_drain",
 )
 DECODE_STEP_SPLIT_SLOTS = 2 + len(DECODE_STEP_SPLIT_SEGMENTS)
 
-# Reusable timing-event pairs per decode round. The decode loop harvests the
-# current step's pair after the sampled-token readback, so in steady state
-# at most one pair is outstanding; the slack only matters if a pair is still
-# incomplete when harvested.
+# Reusable timing-event pairs per decode round. The decode loop harvests at
+# the end of every step. With the one-step token overlap, a step that
+# launched no host-KV appends ends without waiting for its own forward, so up
+# to two pairs can be outstanding in steady state; the slack only matters if
+# pairs stay incomplete when harvested.
 FORWARD_EVENT_RING_SLOTS = 64
 
 

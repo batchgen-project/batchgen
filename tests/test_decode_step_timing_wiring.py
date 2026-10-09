@@ -26,8 +26,13 @@ def _decoding_continuous():
 
 
 def _decode_loop(fn):
+    # The loop sits directly in the method body or in the try whose handler
+    # drains the in-flight decode token on an exception exit.
+    candidates = list(fn.body) + [
+        stmt for node in fn.body if isinstance(node, ast.Try) for stmt in node.body
+    ]
     return next(
-        node for node in fn.body
+        node for node in candidates
         if isinstance(node, ast.While) and ast.unparse(node.test) == "decode_uuids"
     )
 
@@ -93,7 +98,7 @@ def test_forward_event_pair_brackets_forward_and_sample():
     )
     t1 = _index(body, _assigns("_split_t1"), "_split_t1")
     end = _index(body, _calls("_fwd_ring.end"), "_fwd_ring.end")
-    token_copy = _index(body, _calls("_new_tokens_pinned[:bs].copy_"), "token copy")
+    token_copy = _index(body, _calls("_tokens_cpu.copy_"), "token copy")
 
     assert begin == t0 + 1 and begin < forward < t1 < end < token_copy
     # The end marker is recorded on the stream that produced the tokens.
