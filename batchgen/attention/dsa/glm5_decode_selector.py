@@ -1,8 +1,16 @@
-"""GLM-5 DSA pre-FlashMLA decode input builder.
+"""GLM-5 DSA eager decode attention segment.
 
 This module owns the full eager selector segment for GLM-5 DSA decode:
 decode hidden states and metadata enter here, the GLM-5 DSA kernels are
-invoked, and the return value is ready for the raw FlashMLA call.
+invoked, sparse MLA attention runs on FlashAttention-3 directly over the
+resident paged KV, and the return value carries the attention output ready
+for out-absorb / o_proj.
+
+The eager path shares its attention backend with the GLM-5 whole-model graph
+(``Glm5FullDsaAttnSegment._run_selected_fa3`` / ``_run_all_short_fa3``): the
+selected KV is never gathered into a padded buffer. Instead the logical
+top-k positions are transformed into physical token IDs that act as an FA3
+page table over a page-size-1 view of the cache.
 """
 
 from __future__ import annotations
@@ -14,11 +22,11 @@ from dataclasses import dataclass
 
 import torch
 
-from batchgen.attention.dsa.sparse_decode_mla import (
-    PreparedSparseFlashMlaDecode,
-    prepare_sparse_flash_mla_decode_inputs,
-)
-from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16
+try:
+    from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
+except ImportError:  # pragma: no cover - resolved by the node's FA3 install
+    _fa3_with_kvcache = None
+
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -34,6 +42,9 @@ from batchgen.models.wrappers import AttnWrapperBase
 # (audit §A finding #8).
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 from batchgen.timing import get_decode_timer
+from batchgen_kernels.attention.dsa.selected_page_table import (
+    transform_selected_positions_out,
+)
 
 
 def _slot_indices_override(
@@ -59,15 +70,23 @@ def _slot_indices_override(
 
 @dataclass(frozen=True)
 class Glm5DsaFlashMlaInputs:
-    """Outputs of the GLM-5 DSA selector segment before FlashMLA invocation."""
+    """Outputs of the GLM-5 DSA eager attention segment.
 
-    flashmla: PreparedSparseFlashMlaDecode
-    query_states: torch.Tensor
+    ``attn_out`` is the FlashAttention-3 sparse MLA output, ``[B, 1, H,
+    kv_lora_rank]``, i.e. what the consumer feeds straight into out-absorb.
+    The gather-era fields are gone with the gather: there is no padded
+    ``selected_mla_kv`` slab, no packed FlashMLA ``query_states`` and no
+    ``PreparedSparseFlashMlaDecode``.
+    """
+
+    attn_out: torch.Tensor
     q_nope: torch.Tensor
     q_rope: torch.Tensor
-    selected_mla_kv: torch.Tensor
     selected_lengths: torch.Tensor
-    selected_indices: torch.Tensor | None
+    # Physical page-size-1 token IDs handed to FA3 as its ``page_table``,
+    # exposed for debug only. ``None`` on the all-short fast path, which
+    # attends over the real page table and therefore builds no selection.
+    selected_token_ids: torch.Tensor | None
     row_modes: torch.Tensor
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor | None
@@ -283,7 +302,7 @@ def build_glm5_dsa_flashmla_inputs(
     *,
     return_selected_indices: bool = False,
 ) -> Glm5DsaFlashMlaInputs:
-    """Build GLM-5 BF16 DSA inputs up to the FlashMLA invocation boundary."""
+    """Run the GLM-5 BF16 DSA eager decode segment through sparse attention."""
 
     weight_scale = wrapper.weight_dequant_scale
     attn = wrapper.module
@@ -446,6 +465,17 @@ def build_glm5_dsa_flashmla_inputs(
             row_modes = (cache_seqlens > index_topk).to(torch.int32)
             branch_label = "reuse-shared"
         else:
+            # `_dsa_prev_topk_indices` is the ONLY remaining consumer of the
+            # dense-short-circuit index build: with the gather gone, the
+            # all-short fast path below reads the real page table and never
+            # looks at logical top-k positions. So the dense build is skipped
+            # exactly when this layer does not have to carry top-k to a
+            # top-k-reusing layer. (The transform kernel does ignore carried
+            # indices for rows with `seqlen <= index_topk` and re-derives
+            # 0..len-1 itself, so an all-short carry is formally redundant —
+            # but the reuse layer also reads `top_k_indices.shape[-1]` for
+            # `index_topk`, and nothing else in the eager path guarantees the
+            # reuse family stays all-short, so the carry is still produced.)
             top_k_indices, branch_label, row_modes = _select_glm5_dsa_indices(
                 wrapper,
                 hidden_states,
@@ -455,69 +485,200 @@ def build_glm5_dsa_flashmla_inputs(
                 new_token_pos,
                 gpu_paged_kv_manager_aux,
                 aux_slot_indices,
+                need_dense_indices=bool(wrapper.module.next_skip_topk),
             )
             index_topk = wrapper.module.indexer.index_topk
             if wrapper.module.next_skip_topk:
                 type(wrapper)._dsa_prev_topk_indices = top_k_indices
 
-    with (dt.timed("sparse_gather", li) if dt else nullcontext()):
-        mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
-        primary_selector_slots = None
-        if slot_override_active:
-            primary_selector_slots = primary_slot_indices
-        else:
-            mla_block_table = reorder_block_table_to_batch_slots(
-                mla_block_table, primary_slot_indices,
-            )
-        mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+    with (dt.timed("q_absorb", li) if dt else nullcontext()):
+        absorbed_q = _absorb_q_nope(wrapper, q_nope)
+
+    mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+    mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+    # Slot semantics, identical to the retired gather: with an active slot
+    # override the storage-ordered table is indexed through
+    # `primary_slot_indices`; otherwise the table is reordered into batch
+    # order up front and no slot indirection remains.
+    primary_selector_slots = None
+    if slot_override_active:
+        primary_selector_slots = primary_slot_indices
+    else:
+        mla_block_table = reorder_block_table_to_batch_slots(
+            mla_block_table, primary_slot_indices,
+        )
+    safe_cache_seqlens = cache_seqlens.to(
+        dtype=torch.int32, device=mla_block_table.device,
+    )
+
+    if branch_label == "dense-short-circuit":
+        # Batch-level all-short fast path: every row's context fits inside
+        # index_topk, so attention is dense over the whole context. Read the
+        # resident page-`mla_page_size` cache directly — no transform, no
+        # selection table, no copy. This is the eager twin of
+        # `Glm5FullDsaAttnSegment._run_all_short_fa3`.
+        selected_token_ids = None
+        selected_lengths = safe_cache_seqlens
         if verify_indices and wrapper.layer_idx <= 4:
-            _log_gather_bounds(
+            _log_selected_token_bounds(
                 wrapper,
                 bsz,
-                top_k_indices,
+                None,
+                selected_lengths,
                 mla_block_table,
                 mla_blocked_k,
                 mla_page_size,
                 branch_label,
             )
-        selected_mla_kv, selected_lengths, selected_indices, row_modes = (
-            select_mla_kv_for_flashmla_bf16(
+        with (dt.timed("sparse_attn", li) if dt else nullcontext()):
+            attn_out = _run_all_short_fa3(
+                attn,
+                q_pe,
+                absorbed_q,
                 mla_blocked_k,
-                mla_block_table,
-                cache_seqlens,
-                top_k_indices,
-                index_topk=index_topk,
-                page_size=mla_page_size,
-                return_indices=verify_indices or return_selected_indices,
-                primary_slot_indices=primary_selector_slots,
+                page_table=mla_block_table,
+                cache_batch_idx=primary_selector_slots,
+                cache_seqlens=safe_cache_seqlens,
             )
+    else:
+        selected_token_ids = torch.empty(
+            bsz,
+            index_topk,
+            dtype=torch.int32,
+            device=mla_block_table.device,
         )
-
-    with (dt.timed("q_absorb", li) if dt else nullcontext()):
-        query_states = _build_query_states(wrapper, q_nope, q_pe, selected_mla_kv)
-
-    flashmla = prepare_sparse_flash_mla_decode_inputs(
-        query_states,
-        selected_mla_kv,
-        selected_lengths,
-        attn.num_heads,
-        attn.softmax_scale,
-        head_dim_v=attn.kv_lora_rank,
-        page_size=mla_page_size,
-    )
+        selected_lengths = torch.empty(
+            bsz, dtype=torch.int32, device=mla_block_table.device,
+        )
+        transform_selected_positions_out(
+            mla_block_table,
+            safe_cache_seqlens,
+            top_k_indices,
+            selected_token_ids,
+            selected_lengths,
+            page_size=mla_page_size,
+            primary_slot_indices=primary_selector_slots,
+        )
+        if verify_indices and wrapper.layer_idx <= 4:
+            _log_selected_token_bounds(
+                wrapper,
+                bsz,
+                selected_token_ids,
+                selected_lengths,
+                mla_block_table,
+                mla_blocked_k,
+                mla_page_size,
+                branch_label,
+            )
+        with (dt.timed("sparse_attn", li) if dt else nullcontext()):
+            attn_out = _run_selected_fa3(
+                attn,
+                q_pe,
+                absorbed_q,
+                mla_blocked_k,
+                selected_token_ids,
+                selected_lengths,
+            )
 
     return Glm5DsaFlashMlaInputs(
-        flashmla=flashmla,
-        query_states=query_states,
+        attn_out=attn_out,
         q_nope=q_nope.squeeze(2).contiguous(),
         q_rope=q_pe.squeeze(2).contiguous(),
-        selected_mla_kv=selected_mla_kv,
         selected_lengths=selected_lengths,
-        selected_indices=selected_indices,
+        selected_token_ids=(
+            selected_token_ids
+            if (verify_indices or return_selected_indices)
+            else None
+        ),
         row_modes=row_modes,
         primary_k_tensor=k_tensor,
         indexer_k_tensor=indexer_k_tensor,
         branch_label=branch_label,
+    )
+
+
+def _absorb_q_nope(wrapper, q_nope: torch.Tensor) -> torch.Tensor:
+    """FP8 WGMMA q absorb: ``[B, H, 1, qk_nope]`` → ``[B, H, kv_lora_rank]``.
+
+    Lifted out of the retired `_build_query_states` pack: FA3 consumes the
+    absorbed q as its separate ``qv`` input, so nothing concatenates it with
+    q_rope any more.
+    """
+    if wrapper._fp8_absorb_weights is None:
+        raise RuntimeError(
+            f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP5 FP8 "
+            "q_absorb; PyTorch/BF16 fallback is disabled"
+        )
+
+    from batchgen_kernels.attention.dsa.fp8_absorb import fp8_q_absorb
+
+    return fp8_q_absorb(q_nope.squeeze(2), wrapper._fp8_absorb_weights)
+
+
+def _require_fa3():
+    if _fa3_with_kvcache is None:
+        raise RuntimeError(
+            "GLM-5 DSA eager decode requires flash_attn_interface "
+            "(FlashAttention-3): flash_attn_with_kvcache is unavailable"
+        )
+    return _fa3_with_kvcache
+
+
+def _run_all_short_fa3(
+    attn,
+    q_pe: torch.Tensor,
+    absorbed_q: torch.Tensor,
+    mla_blocked_k: torch.Tensor,
+    *,
+    page_table: torch.Tensor,
+    cache_batch_idx: torch.Tensor | None,
+    cache_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Dense MLA decode straight over the resident page-`page_size` KV."""
+    fa3 = _require_fa3()
+    return fa3(
+        q=q_pe.squeeze(2).unsqueeze(1),
+        k_cache=mla_blocked_k[..., attn.kv_lora_rank :],
+        v_cache=mla_blocked_k[..., : attn.kv_lora_rank],
+        qv=absorbed_q.unsqueeze(1),
+        page_table=page_table,
+        cache_batch_idx=cache_batch_idx,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=float(attn.softmax_scale),
+        causal=True,
+        num_splits=0,
+        return_softmax_lse=False,
+    )
+
+
+def _run_selected_fa3(
+    attn,
+    q_pe: torch.Tensor,
+    absorbed_q: torch.Tensor,
+    mla_blocked_k: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse MLA decode over the selected PHYSICAL token IDs.
+
+    The KV cache is re-viewed at page size 1 so the per-row selected token
+    IDs act directly as the FA3 page table: the selected KV is never
+    materialized. ``cache_batch_idx`` is intentionally absent — the token IDs
+    are already absolute, so there is no slot indirection.
+    """
+    fa3 = _require_fa3()
+    flat_kv = mla_blocked_k.view(-1, 1, 1, mla_blocked_k.shape[-1])
+    return fa3(
+        q=q_pe.squeeze(2).unsqueeze(1),
+        k_cache=flat_kv[..., attn.kv_lora_rank :],
+        v_cache=flat_kv[..., : attn.kv_lora_rank],
+        qv=absorbed_q.unsqueeze(1),
+        page_table=selected_token_ids,
+        cache_seqlens=selected_lengths,
+        softmax_scale=float(attn.softmax_scale),
+        causal=True,
+        num_splits=0,
+        return_softmax_lse=False,
     )
 
 
@@ -530,7 +691,17 @@ def _select_glm5_dsa_indices(
     new_token_pos: torch.Tensor,
     gpu_paged_kv_manager_aux,
     aux_slot_indices: torch.Tensor,
-) -> tuple[torch.Tensor, str, torch.Tensor]:
+    *,
+    need_dense_indices: bool = True,
+) -> tuple[torch.Tensor | None, str, torch.Tensor]:
+    """Select DSA top-k positions for this decode step.
+
+    ``need_dense_indices=False`` lets the ``dense-short-circuit`` branch
+    return ``None`` instead of materializing dense token indices that nothing
+    consumes: the eager all-short FA3 fast path attends over the real page
+    table. The default stays ``True`` so legacy callers and unit tests keep
+    the historical return contract.
+    """
     indexer = wrapper.module.indexer
     index_topk = indexer.index_topk
     row_modes = (cache_seqlens > index_topk).to(torch.int32)
@@ -549,11 +720,13 @@ def _select_glm5_dsa_indices(
 
     if not any_long:
         # Historical eager short-circuit: short rows never run indexer scoring.
-        top_k_indices = build_clamped_dense_token_indices(
-            cache_seqlens,
-            index_topk,
-            device,
-        )
+        top_k_indices = None
+        if need_dense_indices:
+            top_k_indices = build_clamped_dense_token_indices(
+                cache_seqlens,
+                index_topk,
+                device,
+            )
         return top_k_indices, "dense-short-circuit", row_modes
 
     indexer_blocked_k, _, idx_block_table = (
@@ -613,48 +786,6 @@ def _select_glm5_dsa_indices(
     top_k_indices[long_mask] = long_top_k
     return top_k_indices, "mixed", row_modes
 
-def _build_query_states(
-    wrapper,
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    selected_mla_kv: torch.Tensor,
-) -> torch.Tensor:
-    attn = wrapper.module
-    bsz = q_nope.shape[0]
-
-    # The retired BF16 BMM absorb path used to dequantize kv_b_proj HERE —
-    # per layer per decode step on the eager path once the FP8 wrappers
-    # stopped caching the BF16 matrices. Every consumer now uses the FP8
-    # absorb weights; their absence fails loud below.
-
-    qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-    query_states = torch.empty(
-        bsz,
-        attn.num_heads,
-        1,
-        qk_head_dim,
-        dtype=selected_mla_kv.dtype,
-        device=selected_mla_kv.device,
-    )
-    q_nope_squeezed = q_nope.squeeze(2)
-
-    if wrapper._fp8_absorb_weights is not None:
-        from batchgen_kernels.attention.dsa.fp8_absorb import fp8_q_absorb
-
-        absorbed_q = fp8_q_absorb(q_nope_squeezed, wrapper._fp8_absorb_weights)
-        query_states[:, :, :, :attn.kv_lora_rank] = absorbed_q.view(
-            bsz, attn.num_heads, 1, attn.kv_lora_rank,
-        )
-    else:
-        raise RuntimeError(
-            f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP5 FP8 "
-            "q_absorb; PyTorch/BF16 fallback is disabled"
-        )
-
-    query_states[:, :, :, attn.kv_lora_rank:] = q_pe
-    return query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
-
-
 def _log_dsa_bounds(
     wrapper,
     bsz: int,
@@ -705,27 +836,62 @@ def _log_dsa_bounds(
         )
 
 
-def _log_gather_bounds(
+def _log_selected_token_bounds(
     wrapper,
     bsz: int,
-    top_k_indices: torch.Tensor,
+    selected_token_ids: torch.Tensor | None,
+    selected_lengths: torch.Tensor,
     mla_block_table: torch.Tensor,
     mla_blocked_k: torch.Tensor,
     mla_page_size: int,
     branch_label: str,
 ) -> None:
+    """Validate the FA3 page table that replaced the gather.
+
+    Successor of the retired `_log_gather_bounds`. On the transform path it
+    checks the PHYSICAL token IDs against the page-size-1 cache extent and
+    reports how many slots carry the ``-1`` padding sentinel; on the
+    all-short fast path there is no selection table, so it checks the page
+    table's extent against the longest context instead. Both run only under
+    ``BATCHGEN_GLM5_VERIFY_INDICES=1`` for the first few layers: the
+    reductions below synchronize.
+    """
     rk = AttnWrapperBase.get_rank_safe()
-    tk_shape = tuple(top_k_indices.shape)
     bt_shape = tuple(mla_block_table.shape)
     bk_shape = tuple(mla_blocked_k.shape)
-    num_pages_loaded = bk_shape[0]
-    max_flat_idx = num_pages_loaded * mla_page_size
-    expected_max_valid_tok = bt_shape[1] * mla_page_size
+    total_tokens = bk_shape[0] * mla_page_size
+    max_len = int(selected_lengths.max().item())
+    if selected_token_ids is None:
+        pages_needed = (max_len + mla_page_size - 1) // mla_page_size
+        logging.warning(
+            f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
+            f"branch={branch_label} all-short page-{mla_page_size} fast path | "
+            f"mla_block_table.shape={bt_shape} mla_blocked_k.shape={bk_shape} "
+            f"total_tokens={total_tokens} max_cache_seqlen={max_len} "
+            f"pages_needed={pages_needed} page_table_cols={bt_shape[1]}"
+        )
+        if pages_needed > bt_shape[1]:
+            logging.warning(
+                f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx}] "
+                f"max_cache_seqlen={max_len} needs {pages_needed} pages but the "
+                f"page table only has {bt_shape[1]} cols — FA3 will read past it"
+            )
+        return
+
+    padded = int((selected_token_ids < 0).sum().item())
+    max_id = int(selected_token_ids.max().item())
     logging.warning(
-        f"[VERIFY-GATHER rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
-        f"top_k_shape={tk_shape} | "
+        f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
+        f"branch={branch_label} "
+        f"selected_token_ids.shape={tuple(selected_token_ids.shape)} | "
         f"mla_block_table.shape={bt_shape} mla_blocked_k.shape={bk_shape} "
-        f"page_size={mla_page_size} max_flat_idx_if_clean={max_flat_idx} "
-        f"max_tok_pos_in_bt_cols={expected_max_valid_tok} | "
-        f"which branch: {branch_label}"
+        f"page_size={mla_page_size} total_tokens={total_tokens} "
+        f"max_physical_id={max_id} neg_one_slots={padded} "
+        f"max_selected_len={max_len}"
     )
+    if max_id >= total_tokens:
+        logging.warning(
+            f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx}] "
+            f"max_physical_id={max_id} >= total_tokens={total_tokens} — the "
+            "transform produced an out-of-range FA3 page-table entry"
+        )
