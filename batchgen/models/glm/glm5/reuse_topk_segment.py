@@ -162,14 +162,13 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             shared_buffers if shared_buffers is not None else {}
         )
         self._outputs: Dict[int, object] = {}
-        self._flashmla_metadata_specs: Dict[int, object] = {}
 
     # -- capture-plumbing overrides ------------------------------------------
     # No super() here: the parent's specs/output methods deref aux_blocked_k /
     # attn.indexer, which skip layers do not have.
     def get_static_input_specs(self, bucket_size: int):
-        # Parent body is deref-safe for skip layers (literals + attn dims +
-        # _flashmla_tensor_metadata_specs); only the aux slot input is dropped.
+        # Parent body is deref-safe for skip layers (literals + attn dims);
+        # only the aux slot input is dropped.
         specs = dict(Glm5FullDsaAttnSegment.get_static_input_specs(self, bucket_size))
         specs.pop("aux_slot_indices", None)
         return specs
@@ -360,13 +359,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         primary_slot_indices: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
-        # TRANSITIONAL (accepted, never read) — see the full segment's
-        # forward: the enclosing decoder-layer segment and the worker still
-        # thread the dead FlashMLA scheduler metadata.
-        flashmla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
-        flashmla_num_splits: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        del flashmla_tile_scheduler_metadata, flashmla_num_splits
         attn = self.attn
         batch_size = hidden_states.shape[0]
         buffers = self._buffers.get(batch_size)
