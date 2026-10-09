@@ -279,6 +279,12 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         captured graph is forward-only and warmup MUST NOT mutate the real
         KV cache, so the bound inputs have batch dim 0 (capture-time stub)
         except for `rank_token_counts` which is world-size-shaped.
+
+        TRANSITIONAL: the dead FlashMLA scheduler metadata is still built
+        here. `Glm5WholeModelSegment.set_capture_inputs` validates this dict
+        against `get_static_input_specs` and rejects BOTH unknown and
+        missing keys, so the capture dict must keep matching the two
+        transitional static inputs exactly. Both sides go in the core PR.
         """
         self._require_ctx()
         from batchgen.attention.dsa.sparse_decode_mla import (
@@ -374,11 +380,13 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         the inline replay-arg construction at worker:12104-12124. Includes
         `input_ids` and `rank_token_counts` so the worker passes exactly
         this dict to `manager.replay`.
+
+        The FlashMLA scheduler metadata is NOT published any more: the DSA
+        segments run FA3 and never read it, and `manager.replay` only
+        rejects UNKNOWN keys, so omitting it leaves the (still declared,
+        still unread) static inputs untouched between replays.
         """
         self._require_ctx()
-        from batchgen.attention.dsa.sparse_decode_mla import (
-            prepare_sparse_flash_mla_decode_tensor_metadata,
-        )
 
         device = self._ctx.device
         gpu_manager = batch_state.gpu_kv_manager or self._ctx.gpu_kv_manager
@@ -389,7 +397,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 "Glm5CudaGraphAdapter.prepare_replay_inputs requires auxiliary GPU KV manager"
             )
 
-        bucket = int(decision.bucket or 0)
         local_bsz = int(batch_state.local_bsz)
         active_sequence_ids = list(batch_state.cur_batch_sequence_ids or ())
 
@@ -417,25 +424,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             cache_seqlens_i32 = torch.empty((0,), dtype=torch.int32, device=device)
             position_ids_i64 = torch.empty((0, 1), dtype=torch.int64, device=device)
 
-        index_topk = int(self._ctx.index_topk)
-        num_heads = int(self._ctx.num_heads)
-        graph_max_seqlen = int(
-            self._ctx.max_seqlen_cap
-            or getattr(AttnWrapperBase, "max_seqlen", 0)
-            or index_topk
-        )
-        selected_lengths = torch.empty((bucket,), dtype=torch.int32, device=device)
-        if local_bsz > 0:
-            selected_lengths[:local_bsz].copy_(
-                torch.clamp(cache_seqlens_i32, max=index_topk),
-                non_blocking=True,
-            )
-        if local_bsz < bucket:
-            selected_lengths[local_bsz:].fill_(min(graph_max_seqlen, index_topk))
-
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths, num_heads,
-        )
         num_valid_tokens = torch.empty((1,), dtype=torch.int32, device=device)
         num_valid_tokens.fill_(local_bsz)
 
@@ -460,8 +448,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "aux_slot_indices": _graph_slots(aux_manager),
             "rank_token_counts": rank_token_counts,
             "num_valid_tokens": num_valid_tokens,
-            "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
-            "flashmla_num_splits": num_splits,
         }
 
     def stage_post_graph_kv(
@@ -539,10 +525,6 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 aux_slot_indices=captured_inputs.get("aux_slot_indices"),
                 num_valid_tokens=captured_inputs.get("num_valid_tokens"),
                 rank_token_counts=captured_inputs.get("rank_token_counts"),
-                flashmla_tile_scheduler_metadata=captured_inputs.get(
-                    "flashmla_tile_scheduler_metadata"
-                ),
-                flashmla_num_splits=captured_inputs.get("flashmla_num_splits"),
                 use_layer_segments=False,
             )
         out: Dict[str, torch.Tensor] = dict(outputs)
