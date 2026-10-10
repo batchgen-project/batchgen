@@ -46,6 +46,45 @@ def test_preflight_checks_contract_before_core_engine(monkeypatch):
     assert ("flash_attn_interface", "site") in calls
 
 
+def test_glm_contract_checks_aot_dsa_extensions_before_core_engine(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(preflight, "_check_torch", lambda: None)
+    monkeypatch.setattr(preflight, "_resolve_model_type", lambda _: "glm_moe_dsa_5_2")
+    monkeypatch.setattr(preflight, "_check_tokenizer", lambda _: None)
+    monkeypatch.setattr(preflight, "_check_core_engine", lambda: calls.append("core"))
+    monkeypatch.setattr(preflight, "_check_deepgemm", lambda: None)
+    monkeypatch.setattr(preflight, "_batchgen_root", lambda: SITE)
+    monkeypatch.setattr(preflight, "_site_roots", lambda: (SITE,))
+
+    def fake_import(name, *, origin=None):
+        calls.append((name, origin))
+        if name == "libucx":
+            return SimpleNamespace(load_library=lambda: None)
+        return SimpleNamespace(__file__=str(SITE / "module.py"))
+
+    monkeypatch.setattr(preflight, "_import_required", fake_import)
+    preflight.run_runtime_preflight(SimpleNamespace(model="zai-org/GLM-5.2-FP8"))
+
+    assert (
+        "batchgen_kernels.attention.dsa.indexer."
+        "batchgen_dsa_fast_hadamard_transform_cuda",
+        "batchgen",
+    ) in calls
+    assert (
+        "batchgen_kernels.attention.dsa.indexer."
+        "batchgen_dsa_fused_rope_hadamard_cuda",
+        "batchgen",
+    ) in calls
+    assert calls.index("core") > calls.index(
+        (
+            "batchgen_kernels.attention.dsa.indexer."
+            "batchgen_dsa_fused_rope_hadamard_cuda",
+            "batchgen",
+        )
+    )
+
+
 def test_non_aot_core_engine_fails(monkeypatch):
     monkeypatch.setattr(preflight, "_import_required", lambda name, *, origin=None: SimpleNamespace(
         __file__="/tmp/core_engine.py"
