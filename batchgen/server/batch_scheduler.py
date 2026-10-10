@@ -46,6 +46,7 @@ def parse_batch_file(
 
     requests: List[BatchRequestItem] = []
     model_name: Optional[str] = None
+    custom_id_lines: Dict[str, int] = {}
 
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
@@ -55,6 +56,17 @@ def parse_batch_file(
             request = BatchRequestItem(**payload)
         except Exception as exc:
             return False, f"Line {idx}: {exc}", []
+
+        # custom_id is unique within one OpenAI Batch.  It is also used as
+        # the public output key, so reject duplicates before they can alias
+        # the scheduler's internal request slot.
+        if request.custom_id:
+            first = custom_id_lines.setdefault(request.custom_id, idx)
+            if first != idx:
+                return False, (
+                    f"Line {idx}: duplicate custom_id {request.custom_id!r} "
+                    f"(first on line {first})"
+                ), []
 
         if isinstance(request.body, ChatCompletionRequest):
             current_model = request.body.model
@@ -92,18 +104,20 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
-        # Request pool state. Pool mode is the only mode: --max-pool-size <= 0
-        # is rejected in validate_server_args. The flag is kept for /status.
+        # The worker publishes the fixed token-pool-derived capacity after the
+        # model context is known. Keep no independent row cap here.
         self._pool_mode = True
         self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
         self._batch_timeout = 86400  # 24h default, matches completion_window
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
-        self._scheduling_pool = SchedulingPool(capacity=server_args.max_pool_size)
+        self._scheduling_pool = SchedulingPool(capacity=0)
+        self._trajectory_pool_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
+        # Internal request_id values are scoped by batch.
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     async def start(self) -> None:
@@ -523,11 +537,21 @@ class BatchScheduler:
             ) if hasattr(self.storage, 'output_dir') else None,
         )
 
+        # custom_id is only unique inside its input Batch, while scheduling
+        # slots and worker UUIDs span all concurrently queued Batches.  Keep
+        # the caller's custom_id in metadata, but use a batch-scoped internal
+        # request id for every in-flight lookup.
+        custom_ids = [
+            req.custom_id or f"{batch_id}_req_{idx}"
+            for idx, req in enumerate(requests)
+        ]
+        request_ids = [f"{custom_id}@{batch_id}" for custom_id in custom_ids]
+
         # Build IntakeEntry objects and push to IntakePool
         entries = []
         for idx, req in enumerate(requests):
             entries.append(IntakeEntry(
-                request_id=req.custom_id or f"{batch_id}_req_{idx}",
+                request_id=request_ids[idx],
                 batch_id=batch_id,
                 raw_request={
                     "text": prompts[idx],
@@ -564,9 +588,8 @@ class BatchScheduler:
         # Store per-request metadata for output JSONL building
         self._pool_request_meta[batch_id] = {}
         for idx, req in enumerate(requests):
-            rid = req.custom_id or f"{batch_id}_req_{idx}"
-            self._pool_request_meta[batch_id][rid] = {
-                "custom_id": rid,
+            self._pool_request_meta[batch_id][request_ids[idx]] = {
+                "custom_id": custom_ids[idx],
                 "url": req.url.value,
                 "model": req.body.model,
                 "prompt_text": prompts[idx],
@@ -626,7 +649,25 @@ class BatchScheduler:
         self._finalize_batch_output(batch_id, requests, prompts)
 
     async def _drain_intake_to_worker(self) -> None:
-        """Background task: drain IntakePool → send admission messages to worker.
+        """Run the intake drain and fail active Batches on a drain error.
+
+        A drain exception can occur after entries leave IntakePool or slots are
+        allocated.  Leaving this task dead strands those Batches in
+        ``in_progress`` forever, so surface the exact error and stop through
+        the worker-fatal path.  ``CancelledError`` intentionally propagates.
+        """
+        try:
+            await self._drain_intake_loop()
+        except Exception as exc:
+            reason = f"Server intake drain failed: {type(exc).__name__}: {exc}"
+            logger.exception("[POOL] %s", reason)
+            try:
+                self._fail_all_active_batches(reason)
+            finally:
+                self.worker.report_worker_fatal(reason)
+
+    async def _drain_intake_loop(self) -> None:
+        """Drain IntakePool → send admission messages to worker.
 
         On first drain, sends an "init" message to trigger worker initialization.
         Subsequent drains send "admit" messages with sequences.
@@ -777,6 +818,46 @@ class BatchScheduler:
                     else:
                         logger.info("[POOL] Worker shutdown signal received")
                     break
+                elif msg_type == "trajectory_pool_capacity":
+                    # ``total_capacity`` is immutable token-pool capacity and
+                    # sizes SchedulingPool.  ``free_reservations`` changes on
+                    # bind/release and is status/admission telemetry only; it
+                    # must never resize the scheduler's slot list.
+                    if (
+                        result.get("capacity_semantics_version") != 1
+                        or "total_capacity" not in result
+                    ):
+                        reason = (
+                            "Incompatible trajectory-pool capacity snapshot: "
+                            "worker must publish capacity_semantics_version=1 "
+                            "and total_capacity; refusing the legacy ambiguous "
+                            "capacity field"
+                        )
+                        logger.error("[POOL] %s", reason)
+                        self._fail_all_active_batches(reason)
+                        self.worker.report_worker_fatal(reason)
+                        break
+                    total_capacity = int(result["total_capacity"])
+                    if total_capacity != self._scheduling_pool.capacity:
+                        if self._scheduling_pool.num_active_slots():
+                            logger.error(
+                                "[POOL] Ignoring total capacity change while requests are active: "
+                                "old=%s new=%s active=%s",
+                                self._scheduling_pool.capacity,
+                                total_capacity,
+                                self._scheduling_pool.num_active_slots(),
+                            )
+                        else:
+                            self._scheduling_pool.set_capacity(total_capacity)
+                    self._trajectory_pool_info = dict(result)
+                    logger.info(
+                        "[POOL] Token pool capacity published: total_sequences=%s "
+                        "free_reservations=%s free_pages=%s page_tokens=%s",
+                        total_capacity,
+                        result.get("free_reservations"),
+                        result.get("free_pages"),
+                        result.get("page_tokens"),
+                    )
                 elif "error" in result:
                     logger.error(f"[POOL] Worker error: {result}")
                     break

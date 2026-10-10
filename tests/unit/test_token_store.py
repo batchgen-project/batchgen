@@ -1,12 +1,14 @@
 """Unit tests for batchgen/token_store.py — CPU only (numpy + stdlib).
 
 Covers the node-shared prompt arena (page chaining, capacity errors,
-cross-process read-only attach, lifecycle) and the rank-private decoded store.
+cross-process read-only attach through the creator's endpoint, lifecycle,
+absence of any named shm object) and the rank-private decoded store.
 
 The module is loaded by path: importing ``batchgen`` runs ``__init__`` which
 pulls in torch and the compiled batchgen_kernels, neither of which belongs in a
-CPU-only unit test. POSIX shm names are capped at 31 characters on macOS, so
-every test uses a SHORT unique prefix and unlinks it in teardown.
+CPU-only unit test. The prefix a test passes to ``create`` only labels the
+region, so it needs no cleanup of its own; the arena itself is released in
+teardown.
 """
 
 import importlib.util
@@ -15,6 +17,8 @@ import multiprocessing as mp
 import os
 import secrets
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +29,20 @@ _MODULE_PATH = Path(__file__).resolve().parents[2] / "batchgen" / "token_store.p
 
 
 def _load_module():
+    """Load token_store.py by path, with ``batchgen.memfd`` pre-seeded.
+
+    token_store imports ``batchgen.memfd``; importing the package itself would
+    pull in torch, so that leaf module is loaded by path and registered under
+    its real name. ONLY the leaf is seeded — a stub parent package would shadow
+    the real ``batchgen`` for every other test in the session.
+    """
+    if "batchgen.memfd" not in sys.modules:
+        memfd_spec = importlib.util.spec_from_file_location(
+            "batchgen.memfd", _MODULE_PATH.parent / "memfd.py"
+        )
+        memfd = importlib.util.module_from_spec(memfd_spec)
+        sys.modules[memfd_spec.name] = memfd
+        memfd_spec.loader.exec_module(memfd)
     spec = importlib.util.spec_from_file_location(
         "batchgen_token_store_under_test", _MODULE_PATH
     )
@@ -40,12 +58,16 @@ PAGE = token_store.DEFAULT_PAGE_SIZE_TOKENS
 
 
 def _unique_prefix() -> str:
-    """A short unique shm prefix (prefix + suffix must stay under 31 chars)."""
+    """A unique label prefix, one per arena, as a run's shm prefix would be."""
     return f"bgts{os.getpid() % 10000}{secrets.token_hex(3)}."
 
 
-def _prefix_of(arena) -> str:
-    return arena.name[: -len(token_store.PROMPT_ARENA_SHM_SUFFIX)]
+def _dev_shm_entries(prefix: str) -> list:
+    """Every /dev/shm entry a run with ``prefix`` could have left behind."""
+    shm = Path("/dev/shm")
+    if not shm.is_dir():
+        return []
+    return [p.name for p in shm.iterdir() if prefix in p.name]
 
 
 def _tokens(length: int, seed: int = 0) -> np.ndarray:
@@ -55,7 +77,7 @@ def _tokens(length: int, seed: int = 0) -> np.ndarray:
 
 @pytest.fixture
 def make_arena():
-    """Build arenas with unique names and unlink every one in teardown."""
+    """Build arenas under unique labels and release every one in teardown."""
     created = []
 
     def make(capacity_pages=64, page_size_tokens=PAGE, **kwargs):
@@ -88,7 +110,7 @@ def test_geometry_from_capacity(make_arena):
     assert arena.pages_for(1) == 1
     assert arena.pages_for(PAGE) == 1
     assert arena.pages_for(PAGE + 1) == 2
-    assert arena.name.endswith(token_store.PROMPT_ARENA_SHM_SUFFIX)
+    assert arena.name.endswith(token_store.PROMPT_ARENA_LABEL_SUFFIX)
 
 
 def test_capacity_must_hold_one_page():
@@ -282,7 +304,7 @@ def test_attached_arena_is_read_only(make_arena):
     tokens = _tokens(PAGE + 3)
     handle = arena.write(tokens)
 
-    reader = token_store.PromptTokenArena.attach(_prefix_of(arena))
+    reader = token_store.PromptTokenArena.attach(arena.endpoint)
     try:
         assert not reader.is_creator
         assert reader.num_pages == arena.num_pages
@@ -305,9 +327,9 @@ def test_attached_arena_is_read_only(make_arena):
         reader.close()  # idempotent
 
 
-def _reader_child(shm_prefix, handle, out_queue):
+def _reader_child(endpoint, handle, out_queue):
     """Attach in a spawned process and report what the handle holds."""
-    arena = token_store.PromptTokenArena.attach(shm_prefix)
+    arena = token_store.PromptTokenArena.attach(endpoint)
     try:
         out_queue.put(
             {
@@ -329,7 +351,7 @@ def test_spawned_reader_sees_identical_tokens(make_arena):
 
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    proc = ctx.Process(target=_reader_child, args=(_prefix_of(arena), handle, queue))
+    proc = ctx.Process(target=_reader_child, args=(arena.endpoint, handle, queue))
     proc.start()
     try:
         payload = queue.get(timeout=60)
@@ -345,39 +367,108 @@ def test_spawned_reader_sees_identical_tokens(make_arena):
     )
 
 
-def test_create_refuses_an_existing_name():
+def _creator_child(prefix, tokens, out_queue):
+    """Create an arena, publish its endpoint, then wait to be SIGKILLed."""
+    arena = token_store.PromptTokenArena.create(
+        prefix, capacity_bytes=16 * PAGE * 4
+    )
+    out_queue.put((arena.endpoint, arena.write(tokens)))
+    time.sleep(600)  # the parent kills this process; nothing is cleaned up
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="/proc and /dev/shm are Linux-only"
+)
+def test_killed_creator_leaves_no_dev_shm_residue():
+    """The arena is unnamed: a SIGKILLed creator leaves nothing to clean up."""
     prefix = _unique_prefix()
-    arena = token_store.PromptTokenArena.create(prefix, capacity_bytes=1 << 20)
+    tokens = _tokens(2 * PAGE + 5, seed=9)
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_creator_child, args=(prefix, tokens, queue), daemon=True)
+    proc.start()
+    reader = None
     try:
-        with pytest.raises(FileExistsError):
-            token_store.PromptTokenArena.create(prefix, capacity_bytes=1 << 20)
+        endpoint, handle = queue.get(timeout=60)
+        # The endpoint is the creator's descriptor, not a /dev/shm name.
+        assert endpoint.startswith(f"/proc/{proc.pid}/fd/")
+        assert _dev_shm_entries(prefix) == []
+        assert prefix in os.readlink(endpoint)  # memfd:<prefix>prompt_tokens
+
+        reader = token_store.PromptTokenArena.attach(endpoint)
+        np.testing.assert_array_equal(reader.read(handle), tokens.astype(np.int32))
+
+        proc.kill()
+        proc.join(timeout=60)
+        assert proc.exitcode != 0
+
+        # Nothing survives the kill but this reader's own mapping: no name to
+        # unlink, no stale segment for the next run to adopt.
+        assert _dev_shm_entries(prefix) == []
+        np.testing.assert_array_equal(reader.read(handle), tokens.astype(np.int32))
+        with pytest.raises(FileNotFoundError):
+            token_store.PromptTokenArena.attach(endpoint)
     finally:
-        arena.unlink()
+        if reader is not None:
+            reader.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=60)
+    # With the last mapping gone the kernel has reclaimed the region.
+    assert _dev_shm_entries(prefix) == []
 
 
-def test_unlink_removes_the_segment():
+def test_module_never_creates_a_named_shm_object():
+    source = _MODULE_PATH.read_text()
+
+    assert "shared_memory" not in source
+    assert "shm_open" not in source
+    assert "create_memfd" in source
+
+
+def test_one_prefix_can_back_two_independent_arenas():
+    """Labels do not collide: creation cannot adopt another run's region."""
+    prefix = _unique_prefix()
+    first = token_store.PromptTokenArena.create(prefix, capacity_bytes=1 << 20)
+    second = token_store.PromptTokenArena.create(prefix, capacity_bytes=1 << 20)
+    try:
+        assert first.name == second.name  # the same label ...
+        assert first.endpoint != second.endpoint  # ... two distinct regions
+        arenas = (first, second)
+        handles = [a.write(_tokens(8, seed=i)) for i, a in enumerate(arenas)]
+        # Both chains start at page 0, and neither sees the other's tokens.
+        assert handles[0] == handles[1]
+        for i, arena in enumerate(arenas):
+            np.testing.assert_array_equal(
+                arena.read(handles[i]), _tokens(8, seed=i).astype(np.int32)
+            )
+    finally:
+        first.unlink()
+        second.unlink()
+
+
+def test_unlink_retires_the_endpoint():
     prefix = _unique_prefix()
     arena = token_store.PromptTokenArena.create(prefix, capacity_bytes=1 << 20)
+    endpoint = arena.endpoint
     handle = arena.write(_tokens(8))
     np.testing.assert_array_equal(arena.read(handle), _tokens(8).astype(np.int32))
 
     arena.unlink()
     with pytest.raises(FileNotFoundError):
-        token_store.PromptTokenArena.attach(prefix)
+        token_store.PromptTokenArena.attach(endpoint)
+    assert _dev_shm_entries(prefix) == []
 
 
-def test_attach_refuses_a_foreign_segment():
-    from multiprocessing import shared_memory
-
-    prefix = _unique_prefix()
-    name = token_store.prompt_arena_shm_name(prefix)
-    shm = shared_memory.SharedMemory(name=name, create=True, size=1 << 16)
+def test_attach_refuses_a_foreign_region():
+    fd, path = tempfile.mkstemp(prefix="bgts-foreign")
     try:
+        os.ftruncate(fd, 1 << 16)
         with pytest.raises(ValueError, match="not a prompt arena"):
-            token_store.PromptTokenArena.attach(prefix)
+            token_store.PromptTokenArena.attach(path)
     finally:
-        shm.close()
-        shm.unlink()
+        os.close(fd)
+        os.unlink(path)
 
 
 def test_large_capacity_creation_is_sparse():
@@ -605,13 +696,18 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-def test_close_then_unlink_removes_the_segment():
+def test_close_keeps_the_endpoint_until_unlink():
     prefix = _unique_prefix()
     arena = token_store.PromptTokenArena.create(prefix, capacity_bytes=4 * PAGE * 4)
+    endpoint = arena.endpoint
     arena.close()
+    # close() drops only this process's view; a late reader can still attach.
+    reader = token_store.PromptTokenArena.attach(endpoint)
+    reader.close()
+
     arena.unlink()
     with pytest.raises(FileNotFoundError):
-        token_store.PromptTokenArena.attach(prefix)
+        token_store.PromptTokenArena.attach(endpoint)
     arena.unlink()  # idempotent
 
 
