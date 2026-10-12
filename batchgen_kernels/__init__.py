@@ -30,15 +30,21 @@ def load_extension(module_name: str, allow_dev_jit: bool = True):
     With BATCHGEN_KERNELS_DEV=1, falls back to JIT compilation from source
     if the AOT module import fails.
 
-    Pass ``allow_dev_jit=False`` to force AOT-only import even in dev mode, for
-    kernels whose DEV-JIT is known-doomed and would spawn a wasted compile on
-    every worker (e.g. the wgmma MoE kernels — their ``-arch=sm_90a`` shorthand
-    also emits a compute_90 PTX fallback image that ptxas rejects for wgmma).
+    Pass ``allow_dev_jit=False`` to forbid compilation in dev mode. A fresh
+    artifact already present in the torch extensions cache may still be loaded;
+    this lets a single-process pre-warm serve spawned workers without rebuilding.
     """
     try:
         return importlib.import_module(module_name)
     except ImportError:
-        if not _DEV_MODE or not allow_dev_jit:
+        if not _DEV_MODE:
+            raise
+
+        cached = _load_cached_jit(module_name)
+        if cached is not None:
+            return cached
+
+        if not allow_dev_jit:
             raise
 
     logger.warning(f"[DEV] AOT import failed for {module_name}, attempting JIT...")
@@ -64,28 +70,9 @@ def _jit_compile(module_name: str):
 
     short_name = module_name.rsplit(".", 1)[-1]
 
-    # Fast path: a single-process pre-warm already built the .so. Import it
-    # directly via torch's post-baton step, skipping torch's FileBaton spin-wait
-    # (file_baton.py wait()) that deadlocks when 8 workers JIT the same module on
-    # the shared FS. Guarded on the .so being at least as new as every listed
-    # source so a stale binary still rebuilds through jit_load() below. Private
-    # torch symbols are import-guarded; any failure falls back to jit_load().
-    try:
-        from torch.utils.cpp_extension import (
-            _get_build_directory,
-            _import_module_from_library,
-        )
-        build_dir = _get_build_directory(short_name, verbose=False)
-        so_path = os.path.join(build_dir, short_name + ".so")
-        if os.path.exists(so_path) and os.path.getmtime(so_path) >= max(
-            os.path.getmtime(s) for s in sources
-        ):
-            logger.warning(
-                "[DEV] importing prebuilt %s, bypassing JIT baton", short_name
-            )
-            return _import_module_from_library(short_name, build_dir, is_python_module=True)
-    except (ImportError, AttributeError, OSError):
-        pass
+    cached = _load_cached_jit(module_name)
+    if cached is not None:
+        return cached
 
     return jit_load(
         name=short_name,
@@ -95,6 +82,36 @@ def _jit_compile(module_name: str):
         extra_include_paths=include_dirs,
         verbose=True,
     )
+
+
+def _load_cached_jit(module_name: str):
+    """Load a fresh JIT artifact without compiling; return ``None`` on a miss."""
+    try:
+        from torch.utils.cpp_extension import (
+            _get_build_directory,
+            _import_module_from_library,
+        )
+        from batchgen_kernels._jit_registry import get_registry
+
+        cfg = get_registry().get(module_name)
+        if cfg is None:
+            return None
+
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        sources = [os.path.join(pkg_dir, source) for source in cfg["sources"]]
+        short_name = module_name.rsplit(".", 1)[-1]
+        build_dir = _get_build_directory(short_name, verbose=False)
+        so_path = os.path.join(build_dir, short_name + ".so")
+        if os.path.exists(so_path) and os.path.getmtime(so_path) >= max(
+            os.path.getmtime(s) for s in sources
+        ):
+            logger.warning(
+                "[DEV] importing prebuilt %s, bypassing JIT baton", short_name
+            )
+            return _import_module_from_library(short_name, build_dir, is_python_module=True)
+    except (ImportError, AttributeError, OSError, ValueError):
+        return None
+    return None
 
 
 def get_device_arch() -> str:

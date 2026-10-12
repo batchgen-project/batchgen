@@ -8,6 +8,12 @@
 #include <cstdint>
 #include <utility>
 
+// CUDA 13 retains the versioned driver-entry typedef but drops the legacy
+// unversioned alias used by CUDA 12.x headers.
+#if CUDA_VERSION >= 13000
+using PFN_cuTensorMapEncodeTiled = PFN_cuTensorMapEncodeTiled_v12000;
+#endif
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -747,4 +753,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int4_single_expert_stage2", &int4_single_expert_stage2,
           "INT4 Single Expert Stage 2 (down projection)");
 }
-
