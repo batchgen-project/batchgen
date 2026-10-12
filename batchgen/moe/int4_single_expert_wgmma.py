@@ -19,6 +19,16 @@ import logging
 import torch
 
 _single_expert_module = None
+_arch = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ('sm90a' / 'sm100')."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels
+        _arch = batchgen_kernels.get_device_arch()
+    return _arch
 
 
 def _get_single_expert_module():
@@ -56,6 +66,16 @@ def single_expert_int4_forward(
     Returns:
         output: [M, K=7168] bf16
     """
+    # SM100 (Blackwell): the WGMMA INT4 .cu is not built — use the Triton MLP.
+    if _get_arch() == "sm100":
+        from batchgen_kernels.triton.fused_int4_grouped_silu import int4_expert_mlp
+        gp = gate_packed.view(torch.uint8) if gate_packed.dtype == torch.int32 else gate_packed
+        upp = up_packed.view(torch.uint8) if up_packed.dtype == torch.int32 else up_packed
+        dp = down_packed.view(torch.uint8) if down_packed.dtype == torch.int32 else down_packed
+        return int4_expert_mlp(
+            hidden, gp, gate_scale, upp, up_scale, dp, down_scale, group_size=32,
+        )
+
     mod = _get_single_expert_module()
     empty_bias = torch.empty(0, dtype=torch.bfloat16, device=hidden.device)
 
