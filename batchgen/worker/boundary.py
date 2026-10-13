@@ -78,6 +78,10 @@ class BoundaryDecisionRequest:
     # Decode attention TP size.  G==1 is pure DP; G>1 makes each sequence
     # resident on the contiguous G ranks of ``decode_dp_group``.
     attn_tp_size: int = 1
+    # In-decode cap per capacity group: the batch the decode MoE buffers were
+    # padded for (``_decode_padding_bsz``). <= 0 means unlimited, as in
+    # ``DecodeBatchRequest``.
+    max_rank_bsz: int = 0
 
 
 class BoundaryHandler:
@@ -423,6 +427,14 @@ class BoundaryHandler:
                 - actual_extension_by_rank[r // group_size]
                 for r in range(world_size)
             ]
+            # Loads join the next decode step, so they may only fill the rows
+            # left under the padding cap the decode entry also enforces.
+            seq_slots = None
+            if req.max_rank_bsz > 0:
+                in_decode = [0] * num_capacity_groups
+                for uuid in decode_uuids_final:
+                    in_decode[capacity_group(global_seq_state.get(uuid, {}), uuid)] += 1
+                seq_slots = [max(0, req.max_rank_bsz - n) for n in in_decode]
             new_load_uuids, _ = select_sequences_for_loading(
                 candidates=global_candidate_info,
                 per_rank_free_pages=adjusted_per_rank_free,
@@ -430,6 +442,7 @@ class BoundaryHandler:
                 strategy=LoadingStrategy.LONGEST_FIRST,
                 get_global_idx_fn=meta_global_idx,
                 group_size=group_size,
+                per_group_seq_slots=seq_slots,
             )
 
         return BoundaryDecisions(
