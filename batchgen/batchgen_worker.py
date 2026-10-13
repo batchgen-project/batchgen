@@ -132,7 +132,6 @@ from batchgen.batch_order import (
 	prefill_sequence_spans_to_global_seq_ids,
 )
 from batchgen.memfd import create_memfd
-from batchgen.token_store import PromptTokenArena
 from batchgen.query_book import (
 	QueryBook,
 	QueryBookEntry as query,
@@ -570,7 +569,7 @@ class QueryBookBufferPool:
 
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
 		if self.input_ids_buffer is None:
-			raise QueryBookPoolCapacityError("input_ids are stored in PromptTokenArena")
+			raise QueryBookPoolCapacityError("input_ids are stored in the trajectory book")
 		if seq_extended_size > self.input_ids_width:
 			# Slicing would silently hand back a SHORT view and truncate the
 			# prompt. The pool must be grown instead (_ensure_buffer_pool).
@@ -1104,9 +1103,6 @@ class BatchGenWorker:
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._trajectory_book = None
 		self._trajectory_memfd: Optional[NodeSharedMemfd] = None
-		self._prompt_arena: Optional[PromptTokenArena] = None
-		self._prompt_private_arena: Optional[PromptTokenArena] = None
-		self._prompt_handles: Dict[str, Tuple[int, int]] = {}
 		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
@@ -1582,101 +1578,6 @@ class BatchGenWorker:
 				f"(global_idx {start_idx}-{start_idx + len(entries) - 1}), "
 				f"global_batch now has {len(self.global_batch)} sequences"
 			)
-
-	def _publish_prompt_arena(
-		self,
-		sequences: Sequence,
-		tokenized_by_idx: Dict[int, Dict[str, object]],
-		rejected_uuids: Set[str],
-	) -> None:
-		"""Retired compatibility hook; prompts live in the trajectory book."""
-		raise RuntimeError("PromptTokenArena is retired; use the unified trajectory book")
-		# Kept below only for source compatibility with old checkpoints.
-		valid = [
-			(seq, tokenized_by_idx[i]["input_ids"])
-			for i, seq in enumerate(sequences)
-			if seq.uuid not in rejected_uuids and i in tokenized_by_idx
-		]
-		leader = self.local_rank == 0
-		if leader:
-			if self._prompt_arena is None:
-				capacity = max(1 << 20, sum(int(t.numel()) for _, t in valid) * 2)
-				self._prompt_arena = PromptTokenArena.create(
-					f"{self._query_book_shm_prefix}_prompt_n{self.rank // self.local_world_size}",
-					capacity_bytes=capacity * 4,
-				)
-			needed = sum(
-				self._prompt_arena.pages_for(int(t.numel())) for _, t in valid
-			)
-			if needed > self._prompt_arena.free_pages:
-				old_arena = self._prompt_arena
-				new_capacity = max(
-					old_arena.capacity_tokens * 2,
-					old_arena.capacity_tokens + needed * old_arena.page_size_tokens * 2,
-				)
-				self._prompt_arena = PromptTokenArena.create(
-					f"{self._query_book_shm_prefix}_prompt_n{self.rank // self.local_world_size}",
-					capacity_bytes=new_capacity * 4,
-				)
-				for old_uuid, old_tensor in self._prompt_tensors.items():
-					self._prompt_handles[old_uuid] = self._prompt_arena.write(
-						old_tensor.view(-1).numpy()
-					)
-				old_arena.close()
-			for seq, tensor in valid:
-				arr = tensor.detach().to(dtype=torch.int32, device="cpu").contiguous().numpy()
-				self._prompt_handles[seq.uuid] = self._prompt_arena.write(arr)
-			payload = (self._prompt_arena.endpoint, dict(self._prompt_handles))
-		else:
-			payload = None
-
-		all_payloads = [None] * self.world_size
-		dist.all_gather_object(all_payloads, payload)
-		leader_rank = (self.rank // self.local_world_size) * self.local_world_size
-		endpoint, handles = all_payloads[leader_rank]
-		if not leader:
-			if self._prompt_arena is not None:
-				self._prompt_arena.close()
-			self._prompt_arena = PromptTokenArena.attach(endpoint)
-		self._prompt_handles = handles
-
-		for seq, tensor in valid:
-			owns_sequence = (
-				self._owns_local_sequence(seq)
-				if hasattr(self, "_owns_local_sequence")
-				else True
-			)
-			if not owns_sequence:
-				continue
-			handle = self._prompt_handles[seq.uuid]
-			out = torch.empty((1, int(tensor.numel())), dtype=torch.int32)
-			self._prompt_arena.read_into(handle, out.view(-1).numpy())
-			self._prompt_tensors[seq.uuid] = out
-
-	def _write_local_prompt(self, uuid: str, tokens: torch.Tensor) -> torch.Tensor:
-		"""Retired compatibility hook; re-entry/migration use QueryBook.restore.
-
-		Admission uses the node leader arena. These paths are owner-local and may
-		run without a process-group rendezvous, so an attached reader uses a small
-		private arena rather than attempting an unsafe cross-process allocation.
-		"""
-		raise RuntimeError("PromptTokenArena is retired; use the unified trajectory book")
-		# Kept below only for source compatibility with old checkpoints.
-		arena = self._prompt_arena
-		if arena is None or not arena.is_creator:
-			if self._prompt_private_arena is None:
-				self._prompt_private_arena = PromptTokenArena.create(
-					f"{self._query_book_shm_prefix}_prompt_private_{os.getpid()}",
-					capacity_bytes=max(1 << 20, int(tokens.numel()) * 8),
-				)
-			arena = self._prompt_private_arena
-		arr = tokens.detach().to(dtype=torch.int32, device="cpu").contiguous()
-		handle = arena.write(arr.numpy())
-		self._prompt_handles[uuid] = handle
-		out = torch.empty((1, arr.numel()), dtype=torch.int32)
-		arena.read_into(handle, out.view(-1).numpy())
-		self._prompt_tensors[uuid] = out
-		return out
 
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
 		"""Tokenize newly admitted sequences and bind trajectory reservations.
@@ -4913,7 +4814,7 @@ class BatchGenWorker:
 		old = self._buffer_pool
 		# Kept as explicit symbols for compatibility with the collective pool
 		# contract and its structural regression tests; prompt storage itself is
-		# now handled by PromptTokenArena.
+		# now handled by the trajectory book.
 		_exchange = self._exchange_node_memfd_identity
 		_barrier = dist.barrier
 		if old is not None and required_rows <= old.num_sequences and required_decode_width <= old.max_decoding_length:
@@ -4935,7 +4836,7 @@ class BatchGenWorker:
 		if old is None:
 			logging.info(
 				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
-				f"input_ids_width={in_w}, decoded_width={dec_w} -> prompt tokens PromptTokenArena, decoded_tokens "
+				f"input_ids_width={in_w}, decoded_width={dec_w} -> prompt tokens in the trajectory book, decoded_tokens "
 				f"{private_gib:.3f} GiB per rank"
 			)
 		else:
