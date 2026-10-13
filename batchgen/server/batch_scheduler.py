@@ -57,9 +57,8 @@ def parse_batch_file(
         except Exception as exc:
             return False, f"Line {idx}: {exc}", []
 
-        # custom_id is unique within one OpenAI Batch.  It is also used as
-        # the public output key, so reject duplicates before they can alias
-        # the scheduler's internal request slot.
+        # custom_id names the output line and, in pool mode, the in-flight
+        # request; an empty one gets a unique index-based fallback.
         if request.custom_id:
             first = custom_id_lines.setdefault(request.custom_id, idx)
             if first != idx:
@@ -117,7 +116,7 @@ class BatchScheduler:
         self._drain_task: Optional[asyncio.Task] = None
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
-        # Internal request_id values are scoped by batch.
+        # where request_id is f"{custom_id}@{batch_id}"
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     async def start(self) -> None:
@@ -537,10 +536,10 @@ class BatchScheduler:
             ) if hasattr(self.storage, 'output_dir') else None,
         )
 
-        # custom_id is only unique inside its input Batch, while scheduling
-        # slots and worker UUIDs span all concurrently queued Batches.  Keep
-        # the caller's custom_id in metadata, but use a batch-scoped internal
-        # request id for every in-flight lookup.
+        # custom_id is unique only within one Batch, but the scheduling pool,
+        # the worker's sequence uuids and completion routing span all batches:
+        # scope the internal request id by batch (custom_id first keeps the
+        # worker's truncated uuid logs readable).
         custom_ids = [
             req.custom_id or f"{batch_id}_req_{idx}"
             for idx, req in enumerate(requests)
@@ -649,12 +648,11 @@ class BatchScheduler:
         self._finalize_batch_output(batch_id, requests, prompts)
 
     async def _drain_intake_to_worker(self) -> None:
-        """Run the intake drain and fail active Batches on a drain error.
+        """Background task: run the intake drain; any failure is fatal.
 
-        A drain exception can occur after entries leave IntakePool or slots are
-        allocated.  Leaving this task dead strands those Batches in
-        ``in_progress`` forever, so surface the exact error and stop through
-        the worker-fatal path.  ``CancelledError`` intentionally propagates.
+        Without a drain every queued and later request stays in_progress
+        forever, and entries already popped from the IntakePool or holding a
+        slot cannot be recovered: fail the active batches, then stop the server.
         """
         try:
             await self._drain_intake_loop()

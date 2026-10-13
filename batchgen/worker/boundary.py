@@ -84,10 +84,10 @@ class BoundaryDecisionRequest:
     # worker always supplies it so a divergent allocator is rejected before
     # any boundary decision is made.
     per_rank_total: Tuple[int, ...] = ()
-    # Existing rows and the pre-reserved decode buffer cap are needed when a
-    # boundary loads more rows into an already-running decode group.
+    # In-decode cap per capacity group: the batch the decode MoE buffers were
+    # padded for (``_decode_padding_bsz``). <= 0 means unlimited, as in
+    # ``DecodeBatchRequest``.
     max_rank_bsz: int = 0
-    existing_sequence_counts: Tuple[int, ...] = ()
 
 
 class BoundaryHandler:
@@ -203,25 +203,6 @@ class BoundaryHandler:
                 completed_uuids.append(uuid)
             else:
                 active_uuids.append(uuid)
-
-        if req.existing_sequence_counts:
-            if len(req.existing_sequence_counts) != num_capacity_groups:
-                raise ValueError(
-                    "existing_sequence_counts has "
-                    f"{len(req.existing_sequence_counts)} groups; expected "
-                    f"{num_capacity_groups}"
-                )
-            reported_counts = [0] * num_capacity_groups
-            for uuid in active_uuids:
-                state = global_seq_state.get(uuid)
-                if state is not None:
-                    reported_counts[capacity_group(state, uuid)] += 1
-            if tuple(reported_counts) != tuple(req.existing_sequence_counts):
-                raise ValueError(
-                    "boundary existing sequence counts disagree with gathered state: "
-                    f"computed={tuple(reported_counts)}, "
-                    f"reported={tuple(req.existing_sequence_counts)}"
-                )
 
         # Host KV growth + eviction decisions. Growth and eviction must be
         # planned together: if growth is needed, watermark-only eviction is not
@@ -487,11 +468,6 @@ class BoundaryHandler:
         decode_uuids_final = [u for u in decode_after_eviction if u not in onhold_set]
 
         new_load_uuids = []
-        existing_sequence_counts = [0] * num_capacity_groups
-        for uuid in decode_uuids_final:
-            state = global_seq_state.get(uuid)
-            if state is not None:
-                existing_sequence_counts[capacity_group(state, uuid)] += 1
         if global_candidate_info:
             # Compute adjusted free pages after extensions (arithmetic, no collective needed).
             adjusted_per_rank_free = [
@@ -499,6 +475,14 @@ class BoundaryHandler:
                 - actual_extension_by_rank[r // group_size]
                 for r in range(world_size)
             ]
+            # Loads join the next decode step, so they may only fill the rows
+            # left under the padding cap the decode entry also enforces.
+            seq_slots = None
+            if req.max_rank_bsz > 0:
+                in_decode = [0] * num_capacity_groups
+                for uuid in decode_uuids_final:
+                    in_decode[capacity_group(global_seq_state.get(uuid, {}), uuid)] += 1
+                seq_slots = [max(0, req.max_rank_bsz - n) for n in in_decode]
             new_load_uuids, _ = select_sequences_for_loading(
                 candidates=global_candidate_info,
                 per_rank_free_pages=adjusted_per_rank_free,
@@ -506,8 +490,7 @@ class BoundaryHandler:
                 strategy=LoadingStrategy.LONGEST_FIRST,
                 get_global_idx_fn=meta_global_idx,
                 group_size=group_size,
-                max_sequence_count=req.max_rank_bsz,
-                existing_sequence_counts=tuple(existing_sequence_counts),
+                per_group_seq_slots=seq_slots,
             )
 
         return BoundaryDecisions(

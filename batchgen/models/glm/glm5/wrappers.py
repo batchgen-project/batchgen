@@ -1497,7 +1497,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
 
-            attn = self.module
             selector_inputs = eager_debug.get("selector_inputs")
             eager_attn_heads = eager_debug.get("attn_heads")
             checks = [
@@ -1537,31 +1536,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                             selector_inputs.selected_lengths,
                             exact=True,
                         ),
-                        self._compare_tensor_summary(
-                            "selected_indices",
-                            graph_outputs.get("top_k_indices"),
-                            selector_inputs.selected_indices,
-                            exact=True,
-                        ),
-                        self._compare_tensor_summary(
-                            "selected_mla_kv",
-                            graph_outputs.get("selected_mla_kv"),
-                            selector_inputs.selected_mla_kv,
-                            atol=0.0,
-                            rtol=0.0,
-                        ),
-                        self._compare_tensor_summary(
-                            "absorbed_q",
-                            graph_outputs.get("absorbed_q"),
-                            selector_inputs.query_states[:, 0, :, : attn.kv_lora_rank],
-                        ),
-                        self._compare_tensor_summary(
-                            "query_states",
-                            graph_outputs.get("query_states"),
-                            selector_inputs.query_states,
-                            atol=0.0,
-                            rtol=0.0,
-                        ),
+                        # The eager path now runs FA3 directly over the paged
+                        # KV, so it no longer produces logical
+                        # `selected_indices`, a padded `selected_mla_kv` slab
+                        # or a packed FlashMLA `query_states` to compare the
+                        # legacy standalone graph against. The four checks
+                        # built on them (selected_indices, selected_mla_kv,
+                        # absorbed_q, query_states) are dropped; final_o_proj
+                        # / attn_heads / raw_attn_out still catch a mismatch.
                         self._compare_tensor_summary(
                             "raw_attn_out",
                             graph_outputs.get("raw_attn_out"),
@@ -1770,15 +1752,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_flashmla_inputs,
         )
-        from batchgen.attention.dsa.sparse_decode_mla import (
-            run_prepared_sparse_flash_mla_decode,
-        )
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
 
         weight_scale = self.weight_dequant_scale
         dt = get_decode_timer()
+        # The builder runs sparse attention itself on FA3 over the resident
+        # paged KV and owns the "sparse_attn" timer; there is no padded
+        # gather and no FlashMLA call left on this path.
         selector_inputs = build_glm5_dsa_flashmla_inputs(
             self,
             hidden_states,
@@ -1789,8 +1771,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             gpu_paged_kv_manager_aux,
             return_selected_indices=return_debug,
         )
-        with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            attn_out = run_prepared_sparse_flash_mla_decode(selector_inputs.flashmla)
+        attn_out = selector_inputs.attn_out
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):

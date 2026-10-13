@@ -577,8 +577,7 @@ def select_sequences_for_loading(
     strategy: LoadingStrategy = LoadingStrategy.LONGEST_FIRST,
     get_global_idx_fn: Optional[callable] = None,
     group_size: int = 1,
-    max_sequence_count: int = 0,
-    existing_sequence_counts: Optional[Tuple[int, ...]] = None,
+    per_group_seq_slots: Optional[List[int]] = None,
 ) -> Tuple[List[str], Dict[int, int]]:
     """Select sequences to load from host to GPU.
 
@@ -590,6 +589,8 @@ def select_sequences_for_loading(
         exclude_uuids: UUIDs to exclude (completed, just evicted, etc.)
         strategy: Loading strategy to use
         get_global_idx_fn: Function to get global_idx for a uuid (for tie-breaking)
+        per_group_seq_slots: Optional max number of sequences to load per
+            capacity group (the decode rows left under the padding cap)
 
     Returns:
         (list of uuids to load, dict of capacity-group -> pages used)
@@ -599,11 +600,6 @@ def select_sequences_for_loading(
     ``decode_dp_group``; it therefore consumes one page bucket per group, with
     capacity equal to the tightest physical rank in that group.  The default
     keeps the validated pure-DP behavior unchanged.
-
-    ``existing_sequence_counts`` and ``max_sequence_count`` apply the same
-    per-capacity-group row limit used by initial decode admission. Boundary
-    loads happen while rows are already resident, so a page-only plan can
-    overflow a pre-reserved decode buffer even when pages remain available.
     """
     if not candidates:
         return [], {}
@@ -648,25 +644,11 @@ def select_sequences_for_loading(
 
     sorted_candidates = sorted(valid_candidates, key=sort_key)
 
-    if existing_sequence_counts is None:
-        capacity_seq_count = [0] * num_capacity_groups
-    else:
-        if len(existing_sequence_counts) != num_capacity_groups:
-            raise ValueError(
-                "existing_sequence_counts has "
-                f"{len(existing_sequence_counts)} groups; expected "
-                f"{num_capacity_groups}"
-            )
-        if any(int(count) < 0 for count in existing_sequence_counts):
-            raise ValueError(
-                f"existing_sequence_counts must be non-negative: {existing_sequence_counts}"
-            )
-        capacity_seq_count = [int(count) for count in existing_sequence_counts]
-
     load_uuids = []
     rank_pages_used: Dict[int, int] = {
         r: 0 for r in range(num_capacity_groups)
     }
+    loaded_per_group = [0] * num_capacity_groups
 
     for uuid, info in sorted_candidates:
         req_pages = info.get("pages_needed", 0)
@@ -689,7 +671,10 @@ def select_sequences_for_loading(
             )
             continue
 
-        if max_sequence_count > 0 and capacity_seq_count[capacity_group] >= max_sequence_count:
+        if (
+            per_group_seq_slots is not None
+            and loaded_per_group[capacity_group] >= per_group_seq_slots[capacity_group]
+        ):
             continue
 
         if (
@@ -698,7 +683,7 @@ def select_sequences_for_loading(
         ):
             load_uuids.append(uuid)
             rank_pages_used[capacity_group] += req_pages
-            capacity_seq_count[capacity_group] += 1
+            loaded_per_group[capacity_group] += 1
 
     return load_uuids, rank_pages_used
 
