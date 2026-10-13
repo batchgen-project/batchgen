@@ -91,6 +91,25 @@ def test_candidate_over_physical_capacity_is_refused():
         DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=101)], 100))
 
 
+def test_candidate_filling_the_whole_replica_is_admitted():
+    # Exactly the physical pool is admissible; only total + 1 is impossible.
+    plan = DecodeScheduler.select_decode_batch(_req([_cand("a", req_pages=100)], 100))
+    assert plan == ["a"]
+
+
+def test_the_refusal_names_every_unadmittable_sequence_and_the_worst():
+    cands = [
+        _cand("fits", gidx=0, req_pages=10),
+        _cand("huge-one", gidx=1, req_pages=500),
+        _cand("huge-two", gidx=2, req_pages=300),
+    ]
+    with pytest.raises(DecodeCapacityError) as excinfo:
+        DecodeScheduler.select_decode_batch(_req(cands, 100))
+    message = str(excinfo.value)
+    assert "2 sequence(s)" in message and "huge-one" in message
+    assert "500 pages" in message and "100 total" in message
+
+
 def test_candidates_share_bucket_when_both_fit_physical_capacity():
     # The old singleton rule was an artifact of the 90% target. Both rows fit
     # in the live physical pool and may share the round.
@@ -180,6 +199,8 @@ def test_global_idx_ordering():
         _cand("a", gidx=0, req_pages=40),
         _cand("b", gidx=1, req_pages=40),
     ]
+    # Contention alone never raises: c fits the replica and waits for a
+    # completion.
     plan = DecodeScheduler.select_decode_batch(_req(cands, 100))
     # sorted by global_idx → a(0), b(1) fit (80), c(2) would be 120 > 100
     assert plan == ["a", "b"]
