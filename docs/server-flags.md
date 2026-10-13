@@ -25,6 +25,9 @@ python -m batchgen.launch_http_server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--instance-id` | `default` | Logical instance name used in this run's mutable resource namespace. This does not enable shared-host operation. |
+| `--runtime-mode` | `exclusive` | Host admission mode. `shared` is accepted only for the qualified GPT-OSS topology with a valid inherited lane lease. |
+| `--lane-lease-manifest-fd` | None | Inherited lease-manifest descriptor supplied by the lane launcher; required for `shared`. |
 | `--listen-ip` | `0.0.0.0` | IP address the server listens on |
 | `--listen-port` | `10900` | Port the server listens on |
 
@@ -53,6 +56,29 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 | `--nnodes` | `1` | Number of nodes in the cluster |
 | `--node-rank` | `0` | Rank of this node (0-indexed, master node is 0) |
 | `--dist-init-addr` | `localhost:12355` | Address for torch.distributed initialization (`host:port`) |
+| `--pynccl-port-base` | `20003` | First port in this runtime's bounded PyNccl range |
+| `--pynccl-port-span` | `100` | Number of ports reserved for PyNccl initialization and recovery |
+
+`--world-size` must divide evenly by `--nnodes`. The derived local world size
+is passed explicitly to every worker; PyNccl initialization and recovery never
+scan outside `[pynccl-port-base, pynccl-port-base + pynccl-port-span)`.
+
+### Shared-host admission
+
+`--runtime-mode shared` is fail-closed and currently accepts only
+`openai/gpt-oss-120b`, one node, and world sizes 1, 2, 4, or 8. It rejects
+fast-init, hugetlbfs, DeepEP, EP offloading, CUDA graph capture, distributed
+host weights, default writable paths, and missing launcher leases.
+
+The lane launcher passes `--lane-lease-manifest-fd`. The inherited JSON
+manifest names the instance, ordered physical GPU UUIDs, communication ports,
+and exact storage, conversion, temporary, and compiler-cache paths. Its
+`resources` map contains a live inherited lock descriptor for every GPU, port
+allocation, and writable-path hash. BatchGen verifies the manifest against its
+arguments and environment, marks all lease descriptors close-on-exec, and
+holds them until owner-scoped resource teardown completes. Operators should
+not construct this internal descriptor bundle by hand; the versioned lane
+launcher owns its schema and admission checks.
 
 **Example: 2 Nodes x 8 GPUs**
 
@@ -61,12 +87,14 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 0 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 
 # Node 1
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --world-size 16 --nnodes 2 --node-rank 1 \
+    --host-kv-cache-size 650 \
     --dist-init-addr master-ip:12355
 ```
 
@@ -78,35 +106,22 @@ python -m batchgen.launch_http_server \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-cache-size` | Auto | Host KV cache size in GB. Critical for throughput. |
+| `--host-kv-cache-size` | Required | Host KV cache size in GB. Critical for throughput. |
 | `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`). Values are not validated at parse time — typos are accepted silently. |
 
-**Auto-detection formula** (when `--host-kv-cache-size` is not specified):
+**Sizing guideline:**
 ```
-host_kv_cache_size = min(host_mem × 0.9 - model_size, /dev/shm_free_space)
+host_kv_cache_size ≈ host_mem × 0.9 - model_size
 ```
-
-If `/dev/shm` free space is smaller than the calculated budget, a warning will be logged recommending to increase `/dev/shm` size.
 
 For DeepSeek-R1 (~700GB model) on a 1.5TB memory node:
 ```bash
 --host-kv-cache-size 650  # (1500 * 0.9) - 700 ≈ 650 GB
 ```
 
-**Important: /dev/shm size requirement**
-
-Host KV cache uses shared memory (`/dev/shm`). If the cache size exceeds available `/dev/shm` space, you must increase it first:
-
-```bash
-# Check current size
-df -h /dev/shm
-
-# Increase temporarily (replace 1500G with your host memory size)
-sudo mount -o remount,size=1500G /dev/shm
-
-# Or make permanent by adding to /etc/fstab:
-# tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
-```
+The host KV cache, like the model weights, lives in anonymous shared memory
+(`memfd_create`) that is charged to host memory. It is not a file in `/dev/shm`,
+so the size of the `/dev/shm` mount does not limit it and no remount is needed.
 
 ### GPU Memory
 
@@ -124,24 +139,52 @@ gpu_kv_cache = GPU_memory × gpu_memory_frac - model_instance_size
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-hugetlbfs` | `false` | Enable hugeTLBFS for shared memory. Requires root privileges (sudo). |
-| `--fast-init` | `false` | Use `memfd_create` + Transparent Huge Pages (THP) for fast memory registration. |
+| `--enable-hugetlbfs` | `false` | Back the model weights with pages from the host's reserved huge page pool. Requires root privileges (sudo). |
+| `--fast-init` | `false` | Request Transparent Huge Pages (THP) for the shared weights and host KV cache, with memory compaction and prefault, for faster memory registration. Recommended. |
 
-**Note:** When `--enable-hugetlbfs` is enabled, BatchGen will automatically configure huge pages. This requires running the server with root privileges (sudo).
+**Lifetime in every mode:** the model weights, tensor metadata, host KV cache,
+QueryBook table and weight skeleton are anonymous shared memory created with
+`memfd_create`. Workers attach to them through `/proc/<pid>/fd/<n>`; nothing is
+created by name in `/dev/shm` or a hugetlbfs mount. The kernel frees each region
+when the last process using it exits, however the processes stop, and workers
+are killed when their server process dies. After an abnormal exit, the only
+BatchGen objects that can remain are the per-run runtime directory under the
+temp directory and, if the whole process group was killed at once, Python's
+`sem.mp-*` semaphores. The next
+start of the same instance removes a previous run's runtime directory once its
+run lock proves every process of that run has exited, and refuses to start while
+one is still alive. The temp directory must be local to each node.
+
+**Default page size:** without `--fast-init` or `--enable-hugetlbfs`, BatchGen
+does not advise the shared regions, so their page size follows the host's
+`/sys/kernel/mm/transparent_hugepage/shmem_enabled` policy.
 
 **`--fast-init` details:**
 
-Replaces `shm_open` with `memfd_create` for both KV cache and weights allocation, enabling THP (2MB pages instead of 4KB). This reduces `cudaHostRegister` time by ~9x (e.g., 27s → 3s for 100GB). Before allocation, automatically runs Linux memory compaction (`drop_caches` + `compact_memory`) to defragment physical memory for stable THP allocation.
+Requests THP (2MB pages instead of 4KB) for the weights and host KV cache, which
+makes `cudaHostRegister` substantially faster. Before allocation it runs Linux
+memory compaction (`drop_caches` + `compact_memory`) to defragment physical
+memory, and it prefaults the weights and the host KV cache. `--fast-init` is an explicit flag because
+it needs the host setup below; the deployment recipes include it.
 
 **Requirements:**
 ```bash
-# Enable THP for shared memory (required, set once per boot)
+# Enable THP for shared memory (required, set once per boot); the server refuses
+# --fast-init unless shmem_enabled is "always" or "within_size"
 echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
 
 # Root access (for memory compaction; runs inside docker as root)
 ```
 
-**Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit 2MB pages > THP). For KV cache, `--fast-init` memfd is always used (hugetlbfs was never supported for KV).
+**`--enable-hugetlbfs` details:** the server sets `vm.nr_hugepages` to cover the
+model and allocates the weights with `memfd_create(MFD_HUGETLB)`; no hugetlbfs
+mount is needed. If the pool cannot satisfy the request, it falls back to a
+regular memfd with a warning. The `vm.nr_hugepages` reservation is host
+configuration: BatchGen does not reset it at shutdown. Setting it, like the
+`--fast-init` compaction, needs a writable `/proc/sys`; in a container that
+usually means `--privileged`.
+
+**Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit huge pages > THP). The host KV cache never uses hugetlbfs.
 
 ---
 
@@ -151,12 +194,23 @@ echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
 
 Controls how BatchGen schedules sequences on GPU.
 
+The persistent worker publishes token-pool telemetry with two distinct
+capacity fields. `total_capacity` (also exposed as the compatibility field
+`capacity`) is the immutable number of full model-context reservations in the
+allocated QueryBook tensor and sizes the `SchedulingPool`. `free_reservations`
+is the current admission/allocator snapshot; it changes after bind and release
+and never resizes the scheduling pool. Every snapshot carries
+`capacity_semantics_version=1`; the scheduler rejects older ambiguous snapshots
+instead of treating their dynamic `capacity` value as a fixed pool size.
+`free_pages`, `active_count`, and `largest_free_extent_pages` provide the
+corresponding fragmentation and occupancy telemetry.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--initial-gpu-page-buffer` | `32` | Pages to reserve when first loading sequence to GPU. Each page = 64 tokens. |
 | `--extension-gpu-page-buffer` | `4` | Pages to add at page boundaries during decode |
 | `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages). Must be <= `--extension-gpu-page-buffer`, otherwise the server fails at startup with a `ValueError`. |
-| `--host-kv-watermark` | `70` | Percentage threshold for prioritizing prefill over decode |
+| `--host-kv-watermark` | `70` | Prefill admission threshold: interrupt decode for queued work only when at least one node has more than this percentage of host-KV pages free. This controls prefill scheduling; it is separate from the eviction watermark. |
 | `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences (always on) |
 
 **GPU Page Buffer Design:**
@@ -173,9 +227,9 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
-| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
-| `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
+| `--host-kv-chunk-size` | `8192` | Initial host-KV reservation chunk in tokens. Each sequence initially reserves its prompt plus the effective chunk (subject to the GPU initial-page buffer), instead of its full per-request decode budget. The effective chunk is capped by the worker's first pool-init decode length, is at least one decode decision interval, and is rounded to 64-token pages. This flag does not override an explicit per-request `max_completion_tokens`; a later request with a larger budget grows its host reservation as needed. |
+| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is enabled exactly when the effective `--host-kv-chunk-size` is greater than zero; the parser rejects non-positive chunk sizes, and this flag cannot override that mode. Telemetry reports the derived effective state. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--host-kv-eviction-watermark` | `10` | Host-KV growth-planner watermark (0-100). The planner preserves this free-page margin, after completed-row release and safety margin; if growth cannot fit, it evicts an active sequence for later re-entry. This does not control the prefill admission threshold above. |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
 | `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
@@ -185,10 +239,13 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 
 **How chunk-based reservation works:**
 
-1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
-2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
-3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
-4. If host pages are exhausted, shortest-decoded sequences are evicted first to free pages
+1. The first pool drain sends one worker `init` message. Its `max_output_len` is the maximum per-request output length in that first drain. The worker uses that value only to cap host-KV chunk sizing; it is not a server-wide output limit.
+2. At prefill, each sequence reserves pages for its prompt plus the effective chunk, capped by that sequence's full KV budget (`prompt + max_completion_tokens` or the applicable fallback).
+3. During decode, a sequence approaching its current host-KV capacity requests another chunk, capped by its own KV budget. Successful growth is not eviction and is not re-entry.
+4. Eviction occurs when the host-KV growth planner determines that the active set cannot safely satisfy the required admission or growth while preserving the configured free-page watermark and safety margin. This can be proactive; it does not require a page allocation to fail first. The scheduler then releases a sequence's KV; that sequence becomes `EVICTED` and later re-enters through prefill/recompute before decoding again.
+5. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA).
+
+The first-init rule matters when later admissions use a larger `max_completion_tokens`: the per-request decode budget remains authoritative, but the initial host-KV reservation may be smaller and grow during decode.
 
 **Example: High oversubscription with eviction**
 
@@ -256,12 +313,17 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 | `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. Mutually exclusive with `--enable-cuda-graph`. |
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
+| `--persistent-phase-instances` | `false` | Keep supported prefill and decode model instances alive across phase switches. For GLM-5/5.1/5.2 this also retains decode graphs and swaps only the routed experts needed by the active phase. |
 
 **How it works:**
 - At startup, CUDA graphs are captured at multiple discrete batch sizes (buckets) from 1 to `--cuda-graph-max-bucket-size`
 - During decode, the actual batch size is rounded up to the nearest bucket and the pre-captured graph is replayed
 - If the batch size exceeds the max bucket on any rank, all ranks fall back to eager execution for that step
 - Use `BATCHGEN_SEGMENTED_GRAPH=1` to switch from whole-model graph to per-segment graph mode
+
+For GLM-5/5.1/5.2, graph context capacity is derived from the model and its
+primary and auxiliary KV page tables. `--cuda-graph-max-bucket-size` limits
+decode batch size per rank; it does not limit prompt or context length.
 
 ---
 
@@ -304,6 +366,7 @@ Completed sequences are written incrementally to a JSONL file on disk as they fi
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --incremental-output-dir /data/incremental_results
 ```
 
@@ -312,6 +375,7 @@ To disable:
 ```bash
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 650 \
     --no-incremental-save
 ```
 
@@ -345,7 +409,7 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
 | `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
 | `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. |
-| `--max-pool-size` | `10240` | Max QueryBook pool capacity for persistent request scheduling. |
+| `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
 

@@ -29,8 +29,12 @@ def _check_custom_kernel():
     device_name = torch.cuda.get_device_name()
     print(f"[batchgen_decode] GPU: {device_name}", flush=True)
 
-    # Custom WGMMA decode kernel is optimized for H20 only
-    if "H20" not in device_name:
+    # Custom WGMMA decode kernel is optimized for H20 only. Identify H20 as
+    # sm_90 with 78 SMs; device names are not reliable across SKUs.
+    if (
+        torch.cuda.get_device_capability() != (9, 0)
+        or torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count != 78
+    ):
         print(f"[batchgen_decode] Not H20 ({device_name}), using FA3 fallback", flush=True)
         return False
 
@@ -40,9 +44,9 @@ def _check_custom_kernel():
         print("[batchgen_decode] Custom WGMMA decode kernel loaded successfully", flush=True)
         return True
     except Exception as e:
-        print(f"[batchgen_decode] Failed to load custom kernel: {e}", flush=True)
-        print("[batchgen_decode] Falling back to FA3", flush=True)
-        return False
+        # The runtime preflight requires this kernel on H20; never silently
+        # switch a selected decode backend.
+        raise RuntimeError("H20 WGMMA decode kernel failed to load") from e
 
 
 def batchgen_gqa_decode_bf16(

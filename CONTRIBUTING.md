@@ -1,128 +1,91 @@
 # Contributing to BatchGen
 
-Thank you for considering contributing to BatchGen!
-We welcome contributions of all kinds from the community.
-Whether you're introducing new features, enhancing the infrastructure, fixing bugs, or writing documentation, we appreciate your enthusiasm and value your efforts.
+Thank you for helping improve BatchGen. We welcome model integrations, kernels, scheduler changes, evaluation tooling, deployment documentation, and bug fixes from both users and researchers.
 
-To help make your contributions as smooth as possible, we've put together this guide with helpful tips and best practices for contributing to the project.
+Please discuss a substantial change in an issue before implementing it. For a small documentation or bug-fix change, a focused pull request is usually enough.
 
-## Table of Contents
+## Before you start
 
-- [Contributing to BatchGen](#contributing-to-batchgen)
-  - [Table of Contents](#table-of-contents)
-  - [How to Contribute](#how-to-contribute)
-    - [Merge Policy](#merge-policy)
-    - [Roadmap and Tasks](#roadmap-and-tasks)
-    - [Development Environment](#development-environment)
-    - [Commit Message Guidelines](#commit-message-guidelines)
-      - [Commit Message Structure](#commit-message-structure)
+1. Search the [issue tracker](https://github.com/batchgen-project/batchgen/issues) and existing pull requests.
+2. Explain the problem, the intended behavior, and the affected model or hardware in an issue when the change is non-trivial.
+3. Fork the repository, create a feature branch, and keep unrelated formatting or refactoring out of the branch.
+4. Read the [PR Merge Policy Contract](PR_MERGE_POLICY.md). It is the binding source for file-scope allowlists, hygiene, review, CI, and merge authority.
 
+## Development setup
 
-## How to Contribute
+Use the same dependency family as the target deployment. For a complete development installation:
 
-- Check the [issue tracker](https://github.com/batchgen-project/batchgen/issues) for open issues, or open a new one to discuss your idea.
-- Follow the [Fork-and-Pull-Request](https://docs.github.com/en/get-started/quickstart/contributing-to-projects) workflow when opening your pull requests.
-- Ensure your code follows our style guidelines and passes all tests (see [Development Environment](#development-environment)).
-- Submit a pull request with a clear description of your changes.
-  - The pull request title should follow the [Commit Message Guidelines](#commit-message-guidelines).
-  - The description should follow the [Pull Request Template](https://github.com/batchgen-project/batchgen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
-  - Make sure to mention any related issues.
-
-Before your pull request can be merged, it must pass the formatting, linting, and testing checks (see [Development Environment](#development-environment)) **and satisfy the [PR Merge Policy Contract](PR_MERGE_POLICY.md)**.
-
-### Merge Policy
-
-> **The binding rules for what a PR's file changes must look like before merge — file
-> hygiene, diff scope, commit rules, the author checklist, the reviewer gate, CI
-> enforcement, and override authority — are in [`PR_MERGE_POLICY.md`](PR_MERGE_POLICY.md).
-> It applies identically to every contributor, agent or human. The summary below is the
-> governance part; the contract is authoritative.**
-
-To keep the `main` branch coherent and reviewed, only the project owner
-presses the **Merge** button on pull requests. Contributors with `Write`
-access — including members of the `batchgen-core` team — should:
-
-- Open pull requests targeting `main`.
-- Push commits to feature branches and PR branches as needed.
-- Review pull requests, leave comments, formally Approve / Request changes.
-- **Not press the Merge button** on any PR, including their own. Wait for
-  the owner to merge after approval.
-
-The owner is the only person whose merge lands on `main`. Pull requests
-must have at least one approving review (from a Code Owner where
-applicable, per `.github/CODEOWNERS`) and a green CI status before the
-owner merges. Direct pushes to `main` are reserved for the owner only.
-
-This policy is currently enforced socially. When the repository becomes
-public it will be enforced by GitHub branch protection.
-
-If you fix a bug:
-- Add a relevant unit test when possible. These can be found in the `test` directory.
-If you make an improvement:
-- Update any affected example console scripts in the `examples` directory and documentation in the `docs` directory.
-- Update unit tests when relevant.
-If you add a feature:
-- Include unit tests in the `test` directory.
-- Add a demo script in the `examples` directory.
-
-### Roadmap and Tasks
-
-For beginners, we recommend starting with issues labeled `good first issue` or `help wanted` in the [issue tracker](https://github.com/batchgen-project/batchgen/issues).
-Feel free to discuss any ideas before getting started!
-
-### Development Environment
-
-Ensure your development environment is set up with the following tools:
-
-- Format your code with pre-commit hooks:
 ```bash
+git clone https://github.com/batchgen-project/batchgen.git
+cd batchgen
+./scripts/install_deps.sh --all
 pip install -r requirements-lint.txt
-
-# add lint hooks to git commit
 pre-commit install --install-hooks
 ```
 
-This will automatically format your code before committing. However, you can also run the following commands manually:
+Run formatting and static hooks before opening a pull request:
+
 ```bash
-# format code
 pre-commit run -a
 ```
 
-- (Recommended) Sign off your commits:
-```bash
-git commit -s -m "feat: add new feature"
+Do not run performance-sensitive or GPU benchmarks on a development laptop. Run hardware-dependent validation on the matching registered remote machine and record the exact model, commit, GPU topology, workload, baseline version, and timing boundary.
+
+## What to include in a change
+
+### Bug fixes
+
+- Add a focused regression test when possible.
+- Describe the symptom, root cause, and validation in the pull request.
+- Update the relevant design or troubleshooting documentation when behavior changes.
+
+### Features, models, and kernels
+
+- Include tests and an example or deployment note where appropriate.
+- Keep model and kernel changes within the allowlists in `PR_MERGE_POLICY.md`; split a required core/scaffolding change into a separate pull request.
+- For a new model, document checkpoint format, precision, expected topology, known limitations, and accuracy status.
+- For a performance change, provide before/after measurements from the same workload. Report speedups as “1.5× faster”, not as a slowdown fraction, and do not generalize a single long-context or decode result into a universal ranking.
+
+### Documentation
+
+- Prefer short, runnable examples and link to the [support matrix](docs/support-matrix.md) instead of duplicating model status.
+- Check relative links and code blocks locally.
+- If a README or guide reports a number, identify whether it is a published paper result or a repository engineering measurement, and include hardware, workload, baseline, and date/commit when available.
+
+## Pull request workflow
+
+1. Rebase or merge the current `main` into your branch as appropriate and keep the diff focused.
+2. Run the applicable pre-commit hooks and tests. For docs-only changes, at minimum run the repository hygiene check and `git diff --check`.
+3. Fill out the [pull request template](.github/PULL_REQUEST_TEMPLATE.md), select exactly one change type, and explain validation and any known limitations.
+4. Request review from the relevant code owners. Respond to review comments with new commits or a clearly explained resolution.
+5. The project owner merges after the required approval and green CI. Contributors, including users with write access, should not press the Merge button.
+
+The merge contract is authoritative if this guide and the contract differ.
+
+## Commit messages
+
+Use the Angular-style format:
+
+```text
+<type>: <short summary>
+
+<optional body>
 ```
 
-### Commit Message Guidelines
-
-We follow the commit format rule based on the [Angular Commit Format](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#-commit-message-format). This format improves readability and helps generate changelogs automatically.
-
-#### Commit Message Structure
-
-Each commit message should consist of a **header** and a **body**:
-
-```
-<type>: <summary>
-<BLANK LINE>
-<body>(optional)
-<BLANK LINE>
-```
-- **Type**: Choose from `build`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `test`, `chore`.
-- **Summary**: A brief description of the change.
-- **Body**: Mandatory for all commits except those of type "docs". Must be at least 20 characters long.
-
+Use one of `build`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `test`, or `chore`. Keep the summary concise and explain the motivation in the body for non-trivial changes. A `docs` commit may omit the body; other commit types should include enough context for a reviewer to understand the change.
 
 Examples:
 
-```
-feat: add logging in sllm worker
-```
-
-```
-docs: add new example for serving vision model
-
-Vision mode: xxx
-Implemented xxx in `xxx.py`
+```text
+docs: clarify long-context support matrix
 ```
 
-For more details, read the [Angular Commit Format](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#-commit-message-format).
+```text
+fix: preserve host KV pages across rank growth
+
+Add a regression test for the cross-rank release and growth boundary.
+```
+
+## Questions and discussion
+
+Open an issue for design questions, use the pull request for implementation discussion, and include reproducible commands or logs when reporting a failure. For model or performance reports, start from the exact deployment guide and support matrix entry so that others can reproduce the same topology.

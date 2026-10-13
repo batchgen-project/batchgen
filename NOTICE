@@ -1,0 +1,90 @@
+BatchGen
+Copyright (c) 2025-2026 BatchGen Team
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+Source: https://github.com/batchgen-project/batchgen
+
+This NOTICE file must be retained in any redistribution of BatchGen or of a
+work derived from it, as required by Section 4(d) of the Apache License 2.0.
+
+Citation
+--------------------------------------------------------------------------------
+We ask that any work, product, or publication that uses BatchGen or code
+derived from it cite the BatchGen repository and/or the BatchGen paper:
+
+  Tairan Xu, Leyang Xue, Zhan Lu, Jinfu Deng, Hongyang Xiao, Yinsicheng Jiang,
+  Congjie He, Matej Sandor, Le Xu, and Luo Mai. "BatchGen: An Architecture for
+  Scalable and Efficient Batch Inference." In 20th USENIX Symposium on
+  Operating Systems Design and Implementation (OSDI 26), pages 1125-1141,
+  Seattle, WA, July 2026. USENIX Association.
+  https://www.usenix.org/conference/osdi26/presentation/xu-tairan
+
+Machine-readable citation metadata is provided in CITATION.cff.
+
+
+Third-party components
+================================================================================
+BatchGen includes or is derived from the following third-party software. Each
+component remains under its original license; the notices below and the
+copyright headers in the listed files are retained accordingly.
+
+--------------------------------------------------------------------------------
+hpc-ops (Tencent) -- MIT License
+https://github.com/Tencent/hpc-ops
+--------------------------------------------------------------------------------
+Used in:
+  batchgen_kernels/src/utils/{utils.h,utils.cc,utils.cuh,tma.cuh}  (verbatim)
+  batchgen_kernels/src/moe/fp8_blockwise/fp8_blockwise_gemm_config.h  (modified)
+  batchgen_kernels/src/moe/fp8_blockwise/fp8_blockwise_gemm_kernel.cuh  (modified)
+  batchgen_kernels/src/moe/fp8_blockwise/fp8_blockwise_utils.cuh  (modified)
+  batchgen_kernels/attention/_C_gqa_mha_decode_bf16*.so  (binary built from
+    modified hpc-ops attention decode kernels)
+
+Copyright (C) 2026 Tencent. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+Other components (license text retained in each file's header)
+--------------------------------------------------------------------------------
+CUTLASS -- NVIDIA, BSD-3-Clause
+  batchgen_kernels/3rd/cutlass/
+fast-hadamard-transform -- Tri Dao, BSD-3-Clause
+  batchgen/other_kernels/hadamard_transform/csrc/
+  batchgen_kernels/attention/dsa/indexer/csrc/
+vLLM -- The vLLM team, Apache-2.0
+  batchgen/distributed/utils.py
+SGLang -- SGLang Team, Apache-2.0
+  batchgen/models/moonshotai/kimi_linear/attn_residual_triton.py (adapted)
+DeepSpeed op_builder -- Microsoft Corporation, Apache-2.0
+  op_builder/
+Hugging Face Transformers / DeepSeek-AI modeling code -- Apache-2.0
+  batchgen/models/deepseek/deepseekv2/modeling_deepseek_v2.py
+  batchgen/models/deepseek/deepseekv3/modeling_deepseek_v3.py
+spdlog -- Gabi Melman & spdlog contributors, MIT
+  external/spdlog/
+{fmt} -- Victor Zverovich and fmt contributors, MIT
+  external/spdlog/fmt/bundled/ (see fmt.license.rst)
+nlohmann/json -- Niels Lohmann, MIT
+  external/nlohmann_json/
+tqdm.hpp -- Miguel Raggi, MIT
+  external/tqdm.hpp
+
+Model assets under batchgen/models/**/assets/ (tokenizers, configs, reference
+modeling code) are distributed under the licenses included in those
+directories.

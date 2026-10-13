@@ -1,4 +1,6 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Configuration
+// Adapted from Tencent/hpc-ops (https://github.com/Tencent/hpc-ops, MIT License,
+// Copyright (C) 2026 Tencent), with modifications by BatchGen Team. See NOTICE.
 // CuTe/CUTLASS-based tile configs, SMEM layouts, TiledMma dispatch.
 // SM90a (H20/H100/GH200) persistent 3-WG architecture.
 

@@ -165,6 +165,11 @@ class DualKVCacheCoordinator:
 
 	# -- Page freeing --
 
+	def reset_allocations(self) -> None:
+		self.primary.reset_allocations()
+		self.auxiliary.reset_allocations()
+		self.assert_mirrored_state("reset_allocations")
+
 	def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
 		self._assert_sequences_present(self.primary, sequence_ids, "free_pages_for_sequences")
 		self._assert_sequences_present(self.auxiliary, sequence_ids, "free_pages_for_sequences")

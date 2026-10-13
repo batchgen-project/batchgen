@@ -10,6 +10,12 @@ dispatch_scatter_3d:
     Two-stage: count tokens per expert, then scatter with atomic counters.
     topk_pos stores absolute strided positions for reduce.
 
+dispatch_scatter_ragged:
+    Routes tokens from flat [G, H] into compact ragged rows. Local expert e owns
+    rows [cu_seqlens[e], cu_seqlens[e+1]) with a 64-aligned span. Counts,
+    cu_seqlens, and topk_pos are written on device into caller-owned buffers;
+    launch geometry depends only on host shapes (CUDA-graph safe).
+
 reduce_weighted_scatter:
     Weighted sum from 3D output back to flat [G, H] using topk_pos indices.
     FP32 accumulation, BF16 output. Template-specialized for K=2,4,8.
@@ -17,6 +23,11 @@ reduce_weighted_scatter:
 reduce_weighted_scatter_fp32:
     K3 K=16 weighted sum into a preallocated FP32 [G, H] output.  This keeps
     the downcast after the EP reduce-scatter and is CUDA-graph safe.
+
+reduce_weighted_scatter_bf16_ordered:
+    Weighted sum in stable ascending expert-id order, rounding every product
+    and partial sum to BF16.  Bitwise independent of slot order when expert
+    ids are unique.
 """
 
 import logging
@@ -54,6 +65,14 @@ def _load_dispatch_reduce_module():
         return None
 
 
+def require_dispatch_scatter_3d_kernels():
+    """Resolve the dispatch/reduce extension once or fail closed."""
+    mod = _load_dispatch_reduce_module()
+    if mod is None:
+        raise RuntimeError("dispatch_scatter_3d kernels are unavailable")
+    return mod
+
+
 def dispatch_scatter_3d(
     x: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -87,6 +106,50 @@ def dispatch_scatter_3d(
         x, topk_indices, act_buffer,
         expert_start, num_local_experts, max_tokens_padded,
         expert_counts, expert_counters, topk_pos,
+    )
+
+
+def dispatch_scatter_ragged(
+    x: torch.Tensor,
+    topk_indices: torch.Tensor,
+    act_buffer: torch.Tensor,
+    expert_start: int,
+    num_local_experts: int,
+    expert_counts: torch.Tensor,
+    expert_counters: torch.Tensor,
+    topk_pos: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+):
+    """Route tokens from flat [G, H] into a compact ragged [rows, H] buffer.
+
+    Expert e owns rows ``[cu_seqlens[e], cu_seqlens[e+1])`` where
+    ``cu_seqlens[e+1] - cu_seqlens[e] == align64(expert_counts[e])``. Only the
+    first ``expert_counts[e]`` rows of each span are written; pad rows keep
+    their previous contents (``act_quant_ragged`` never reads them).
+
+    All tensors must be contiguous and on the same CUDA device. Device values
+    are never read on the host, so the call is CUDA-graph capturable.
+
+    Args:
+        x: Input tokens [G, H] BF16
+        topk_indices: Expert assignments [G, K] int32 (non-local ids skipped)
+        act_buffer: Pre-allocated [rows, H] BF16 large enough for all routed
+            rows plus up to 63 alignment rows per non-empty local expert
+        expert_start: Global index of first local expert
+        num_local_experts: Number of local experts (E_local)
+        expert_counts: Pre-allocated [E_local] int32 (overwritten)
+        expert_counters: Pre-allocated [E_local] int32 scratch (overwritten)
+        topk_pos: Pre-allocated [G*K] int32 (absolute row or -1 if non-local)
+        cu_seqlens: Pre-allocated [E_local + 1] int32 (64-aligned offsets)
+
+    Returns:
+        (expert_counts, cu_seqlens, topk_pos) — the caller-owned buffers.
+    """
+    mod = _load_dispatch_reduce_module()
+    return mod.dispatch_scatter_ragged(
+        x, topk_indices, act_buffer,
+        expert_start, num_local_experts,
+        expert_counts, expert_counters, topk_pos, cu_seqlens,
     )
 
 
@@ -139,4 +202,52 @@ def reduce_weighted_scatter_fp32(
     mod = _load_dispatch_reduce_module()
     return mod.reduce_weighted_scatter_fp32(
         expert_output, topk_pos, topk_weights, N, H, K, output,
+    )
+
+
+def reduce_weighted_scatter_bf16_ordered(
+    expert_output: torch.Tensor,
+    topk_pos: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    N: int,
+    H: int,
+    K: int,
+    output: torch.Tensor = None,
+) -> torch.Tensor:
+    """Expert-id-ordered weighted combine with BF16 rounding at every step.
+
+    For each token, valid slots (``topk_pos >= 0``) are visited in stable
+    ascending ``topk_indices`` order and accumulated as
+    ``acc = bf16(acc + bf16(x * bf16(w)))`` starting from +0.
+
+    Args:
+        expert_output: Strided buffer [rows, H] BF16, 16-byte aligned
+        topk_pos: Row per slot [N*K] or [N, K] int32 (-1 = not local, skipped)
+        topk_indices: Global expert id per slot [N, K] int32
+        topk_weights: Routing weights [N, K] FP32
+        N: Number of tokens
+        H: Hidden dimension (multiple of 8)
+        K: Top-k value (2, 4, or 8)
+        output: Pre-allocated output [N, H] BF16, 16-byte aligned (optional)
+
+    Returns:
+        output [N, H] BF16
+    """
+    mod = _load_dispatch_reduce_module()
+    if mod is None:
+        raise RuntimeError(
+            "batchgen_kernels.moe._C_dispatch_scatter_3d could not be loaded; "
+            "see the preceding loader warning"
+        )
+    kernel = getattr(mod, "reduce_weighted_scatter_bf16_ordered", None)
+    if kernel is None:
+        raise RuntimeError(
+            "batchgen_kernels.moe._C_dispatch_scatter_3d does not provide "
+            "reduce_weighted_scatter_bf16_ordered; rebuild batchgen_kernels"
+        )
+    if output is None:
+        output = torch.empty(N, H, dtype=torch.bfloat16, device=expert_output.device)
+    return kernel(
+        expert_output, topk_pos, topk_indices, topk_weights, N, H, K, output,
     )

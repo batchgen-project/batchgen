@@ -60,9 +60,14 @@ def test_k3_profile_matches_checkpoint_and_maps_mla_layers_densely():
 
 def test_k3_host_and_gpu_configs_share_the_same_24_physical_rows():
     module = _config_module()
-    host = module.build_host_kv_config(K3_MODEL_ID, 16 * GIB)
+    host = module.build_host_kv_config(
+        K3_MODEL_ID,
+        16 * GIB,
+        shm_name="batchgen_test_explicit_host_kv",
+    )
     gpu = module.build_gpu_kv_config_fixed_size(K3_MODEL_ID, 6.98)
 
+    assert host.shm_name == "batchgen_test_explicit_host_kv"
     assert host.num_layers == gpu.num_layers == 24
     assert tuple(host.logical_to_physical_layer) == tuple(
         gpu.logical_to_physical_layer

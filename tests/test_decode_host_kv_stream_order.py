@@ -11,6 +11,8 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import math
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -100,6 +102,27 @@ def test_deferred_host_kv_launch_does_not_touch_cuda_from_python(monkeypatch):
     assert worker._deferred_kv_batch is None
 
 
+def test_effective_host_chunk_covers_one_decode_decision_interval():
+    """Host growth is planned before forward, never after a sample."""
+    source = _worker_method("_get_effective_chunk_size")
+    class _Entry:
+        PAGE_SIZE = 64
+
+    namespace = {"math": math, "SequenceEntry": _Entry}
+    exec(compile(source, str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        adaptive_chunk_sizer=None,
+        host_kv_chunk_size=64,
+        max_decoding_length=8192,
+        DECISION_INTERVAL=128,
+    )
+    assert namespace["_get_effective_chunk_size"](worker) == 128
+
+    full_source = WORKER.read_text()
+    assert "_reserve_host_kv_capacity_for_decoded_context" not in full_source
+    assert "[HOST_KV_APPEND_GROW]" not in full_source
+
+
 def test_cpp_append_orders_copy_stream_after_producer_stream():
     source = HOST_VIEW.read_text()
     start = source.index("    KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(")
@@ -143,10 +166,27 @@ def test_cpp_every_async_copy_records_the_producer_on_the_issuing_thread():
         waits = source.count("WaitForProducerEvent(cuda_stream, *producer_event);")
         assert records == waits, (header.name, records, waits)
     view = HOST_VIEW.read_text()
-    # two h2d loads, the prefill offload, the per-layer append, the batched append
-    assert view.count("auto producer_event = RecordProducerEvent();") == 5
+    # two h2d loads, fixed-stride and packed prefill offloads, the per-layer
+    # append, and the batched append
+    assert view.count("auto producer_event = RecordProducerEvent();") == 6
     state = (ROOT / "core" / "KV_Storage" / "compressed_state_host_manager.h").read_text()
     assert state.count("auto producer_event = RecordProducerEvent();") == 3
+
+
+def test_cpp_packed_prefill_offload_orders_copy_after_producer():
+    source = HOST_VIEW.read_text()
+    start = source.index("    KVAsyncTask AsyncOffloadPackedLayerKVToHost(")
+    end = source.index("\n    KVAsyncTask AsyncAppendDecodeKVToHost(", start)
+    method = source[start:end]
+
+    record = method.index("auto producer_event = RecordProducerEvent();")
+    launch_task = method.index("return LaunchAsyncTask([", record)
+    wait = method.index(
+        "this->WaitForProducerEvent(cuda_stream, *producer_event);"
+    )
+    copy = method.index("EnqueueCopy(")
+    completion = method.index("this->SynchronizeWithEvent(cuda_stream);")
+    assert record < launch_task < wait < copy < completion
 
 
 def test_decode_waits_only_for_token_event_after_host_kv_launch():
@@ -181,3 +221,28 @@ def test_decode_waits_only_for_token_event_after_host_kv_launch():
     hot_path = "\n".join(source.splitlines()[token_copy.lineno - 1 : token_wait.end_lineno])
     assert "torch.cuda.synchronize" not in hot_path
     assert "current_stream(self.torch_device).synchronize" not in hot_path
+
+
+def test_cpp_host_kv_tasks_make_no_device_allocations_or_pageable_copies():
+    """Regression for the GPT-OSS H200 decode deadlock (2026-09-22): the task
+    lambdas run on std::async threads, and a per-call cudaMalloc/cudaFree plus
+    a pageable cudaMemcpyAsync of std::vector pointer arrays there serialized
+    with the compute stream and hung every rank at 1,400 concurrent requests.
+    The UVA kernel reads pinned pointer slots allocated on the issuing thread."""
+    state_header = ROOT / "core" / "KV_Storage" / "compressed_state_host_manager.h"
+    for header in (HOST_VIEW, state_header):
+        source = header.read_text()
+        assert "DeviceBuffer" not in source, header.name
+        assert "cudaMalloc(" not in source, header.name
+        assert "cudaFree(" not in source, header.name
+        assert "pinned_memory(true)" in source, header.name
+
+    view = HOST_VIEW.read_text()
+    # two h2d layer loads and the batched decode append
+    assert view.count("auto pointer_slots = PinnedPointerSlots(") == 3
+    assert view.count("pointer_slots = std::move(pointer_slots)") == 3
+    start = view.index("    KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(")
+    method = view[start:view.index("return LaunchAsyncTask([this", start) + 1]
+    assert "PinnedPointerSlots(" in method
+    state = state_header.read_text()
+    assert state.count("pointer_slots = std::move(pointer_slots)") == 1

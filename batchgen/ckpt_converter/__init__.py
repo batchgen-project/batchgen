@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen Checkpoint Converter                                                #
-#  copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Convert HuggingFace checkpoints to BatchGen format for optimized             #
 #  SSD read performance.                                                        #

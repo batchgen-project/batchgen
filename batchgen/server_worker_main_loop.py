@@ -1,4 +1,5 @@
 import importlib
+import gc
 import json
 import logging
 import os
@@ -19,13 +20,93 @@ from batchgen.batchgen_worker import (
 	BatchGenWorker,
 	BatchGenWorkerArgs,
 )
-from batchgen.server.process_utils import install_worker_signal_handlers
+from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.server.process_utils import (
+	die_with_parent,
+	install_worker_signal_handlers,
+)
+from batchgen.server.runtime_locks import hold_run_lock
 from batchgen.server.worker_readiness import _signal_local_worker_manager_ready
 from batchgen.server.watchdog import Watchdog
 
 
 _WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
 _WORKER_FATAL_ACK_TIMEOUT_S = 5.0
+
+# This worker's share of the run's liveness lock.  It is module state, not a
+# local, because it must outlive every function here: the kernel releases the
+# lock only when this process's last descriptor closes, which is what proves to
+# the next run of this instance that the run is dead.
+_run_lock_file = None
+
+
+def _shutdown_worker_runtime(worker) -> None:
+	"""Release the engine before the worker-owned weight mapping.
+
+	``BatchGen`` keeps a non-owning C++ reference to ``Weights_Storage`` and
+	its H2D/D2H workers can still hold pointers into that mapping.  Python's
+	attribute destruction order is not an ownership contract, so the sentinel
+	path performs the order explicitly: stop the engine, drop every Python
+	owner that can retain it or a weight tensor, then release the storage last.
+	Signal-driven ``os._exit`` remains the fail-closed fallback when this path
+	cannot run (for example, a worker blocked in a native collective).
+	"""
+	if getattr(worker, "_runtime_shutdown_complete", False):
+		return
+	worker._runtime_shutdown_complete = True
+	start = time.monotonic()
+
+	engine = getattr(worker, "core_engine", None)
+	if engine is not None:
+		try:
+			engine.terminate()
+		except Exception:
+			logging.warning(
+				"Rank %s: core engine termination failed during worker shutdown",
+				getattr(worker, "rank", "unknown"),
+				exc_info=True,
+			)
+			# Do not release the mapping while a native engine may still own
+			# pointers into it.  Propagating reaches the worker supervisor's
+			# os._exit fail-closed path, where the kernel unmaps the process.
+			raise
+
+	# These objects may retain the BatchGen binding, model tensors, or CUDA
+	# graph references.  Drop them before the storage object below.
+	for attr in (
+		"model",
+		"parallel_manager",
+		"gpu_paged_kv_cache_manager",
+		"host_paged_kv_worker_view",
+		"host_paged_kv_worker_view_aux",
+		"_cuda_graph_adapter",
+		"_cuda_graph_manager",
+		"_glm5_moe_cuda_graph_manager",
+		"_glm5_layer_cuda_graph_manager",
+		"_whole_model_segment",
+		"_buffer_pool",
+		"_retired_buffer_pools",
+		"skeleton_state_dict",
+		"global_batch",
+	):
+		if hasattr(worker, attr):
+			setattr(worker, attr, None)
+
+	# The model-specific initializer retains the same C++ BatchGen object.
+	worker.initializer = None
+	worker.core_engine = None
+	engine = None
+	gc.collect()
+
+	# This is deliberately last: the C++ engine has a non-owning reference to
+	# it, and the destructor performs cudaHostUnregister/munmap/shm_unlink.
+	worker.weights_storage = None
+	gc.collect()
+	logging.info(
+		"Rank %s: ordered runtime shutdown completed in %.3fs",
+		getattr(worker, "rank", "unknown"),
+		time.monotonic() - start,
+	)
 
 
 def _format_worker_fatal(
@@ -327,6 +408,19 @@ def _server_worker_main_impl(
 	Rank 0 acts as the coordinator, reading from the master process queue.
 	All ranks receive the full global batch for coordinated scheduling.
 	"""
+	# Before anything else, including logging: tie this worker's life to the
+	# server process.  SIGKILL is the only reliable parent-death signal here —
+	# a Python-level handler cannot run while this thread is inside a native
+	# collective, so the worker would survive as an orphan holding GPUs and SHM.
+	die_with_parent()
+
+	# Step 0.0: Join this run's liveness lock.  A spawned worker inherits no
+	# descriptor, so it opens the server-created file itself and never closes it;
+	# while any process of the run holds it LOCK_SH, a later run of this instance
+	# cannot take it LOCK_EX and so cannot reclaim this run's resources.
+	global _run_lock_file
+	_run_lock_file = hold_run_lock(os.path.dirname(args.reload_status_dir))
+
 	# Step 0: Configure logging for this worker process first
 	_setup_worker_logging(rank_idx)
 
@@ -335,11 +429,17 @@ def _server_worker_main_impl(
 	# blocked in NCCL operations when node 0 is killed.
 	def _worker_shutdown_callback():
 		"""Cleanup callback when worker receives termination signal."""
+		start = time.monotonic()
 		try:
 			if dist.is_available() and dist.is_initialized():
 				dist.destroy_process_group()
 		except Exception:
 			pass
+		finally:
+			logging.info(
+				"[shutdown] worker process-group teardown elapsed=%.3fs",
+				time.monotonic() - start,
+			)
 
 	install_worker_signal_handlers(_worker_shutdown_callback)
 
@@ -347,9 +447,14 @@ def _server_worker_main_impl(
 	_setup_nccl_env()
 	
 	# Step 1: Hydrate the rank of this process
-	num_gpus_per_node = torch.cuda.device_count()
+	visible_device_count = torch.cuda.device_count()
+	if visible_device_count < args.local_world_size:
+		raise RuntimeError(
+			f"local_world_size={args.local_world_size} exceeds visible GPU count "
+			f"{visible_device_count}"
+		)
 	args.local_rank = rank_idx
-	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
+	args.global_rank = args.local_world_size * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
 	# Reconfigure logging with actual global rank for clearer log output
@@ -482,8 +587,7 @@ def _server_worker_main_impl(
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
-	world_size = args.world_size
-	
+
 	# NCCL timeout prevention strategy:
 	# The problem: NCCL watchdog times out if a collective operation doesn't complete within timeout.
 	# When Rank 0 is blocking on request_queue.get() while other ranks wait on broadcast, 
@@ -573,6 +677,7 @@ def _server_worker_main_impl(
 				# Set admission and response queues for persistent generate()
 				worker.set_admission_queue(request_queue)
 				worker.set_response_queue(response_queue)
+				worker._publish_trajectory_pool_capacity()
 
 				if global_rank == 0:
 					logging.info(
@@ -595,104 +700,18 @@ def _server_worker_main_impl(
 				response_queue.put({"type": "pool_shutdown"})
 			break
 
-		# --- STEP 4: Legacy inference with full global batch ---
-		local_results = []
-		inference_error = None
-		try:
-			global_prompts = task_data.get("prompts", [])
-			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len")
-			max_context_length = task_data.get("max_context_length", None)
-			ignore_eos = task_data.get("ignore_eos", False)
-			temperature = task_data.get("temperature", None)
-			top_p = task_data.get("top_p", None)
-			sampling_params = task_data.get("sampling_params", None)
-			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
-			batchgen_debug = task_data.get("batchgen_debug", None)
-			if global_rank == 0:
-				if sampling_params:
-					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
-				else:
-					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
+		# --- STEP 4: No other message shape is served ---
+		# The legacy non-pool inference path was removed; the batch API is the
+		# only way in. The message was broadcast above, so every rank reaches
+		# this line together and raises into the outer fatal boundary rather
+		# than leaving one rank behind in a collective.
+		if isinstance(task_data, dict) and "prompts" in task_data:
+			raise LegacyInferenceDeprecated()
+		raise RuntimeError(
+			f"Rank {global_rank}: unexpected worker message: {task_data!r}"
+		)
 
-			incr_output_dir = task_data.get("incremental_output_dir")
-			incr_custom_ids = task_data.get("custom_id_map")
-			if global_rank == 0 and incr_output_dir and incr_custom_ids:
-				worker._incremental_writer_config = {
-					"output_dir": incr_output_dir,
-					"batch_id": task_data.get("batch_id", "unknown"),
-					"model_name": task_data.get("model_name", "unknown"),
-					"custom_id_map": incr_custom_ids,
-					"request_urls": task_data.get("request_url_map", {}),
-					"prompt_texts": task_data.get("prompt_text_map", {}),
-					"parse_thinking": task_data.get("parse_thinking", False),
-					"parse_tool_call": task_data.get("parse_tool_call", False),
-				}
-
-			if hasattr(worker, 'reset_runtime_state'):
-				worker.reset_runtime_state()
-
-			if len(global_prompts) > 0:
-				worker.Init(current_max_input, current_max_output, len(global_prompts),
-					max_context_length=max_context_length)
-				worker.set_ignore_eos(ignore_eos)
-				if sampling_params:
-					worker.set_per_sequence_sampling_params(sampling_params)
-				else:
-					worker.set_sampling_params(temperature=temperature, top_p=top_p)
-				worker.set_batchgen_debug(batchgen_debug)
-				local_results = worker.process_new_batch(
-					global_prompts,
-					per_sequence_max_tokens=per_sequence_max_tokens,
-				)
-			else:
-				local_results = []
-
-		except Exception as e:
-			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
-			inference_error = str(e)
-			local_results = []
-		finally:
-			if getattr(worker, '_incremental_writer', None) is not None:
-				worker._incremental_writer.close()
-				worker._incremental_writer = None
-			if hasattr(worker, '_incremental_writer_config'):
-				del worker._incremental_writer_config
-
-		# --- STEP 5: Synchronize and check for errors ---
-		try:
-			torch.cuda.synchronize()
-		except RuntimeError as e:
-			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
-			inference_error = str(e)
-
-		dist.barrier()
-
-		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
-		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
-		has_any_error = error_flag.item() > 0
-
-		if has_any_error:
-			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
-			dist.gather_object(inference_error, error_list, dst=0)
-			if global_rank == 0:
-				errors = [e for e in error_list if e is not None]
-				logging.error(f"Inference failed with errors from ranks: {errors}")
-				response_queue.put({"error": errors[0], "all_errors": errors})
-			continue
-
-		# --- STEP 6: Legacy Response (Rank 0 Only) ---
-		if global_rank == 0:
-			final_results = local_results if local_results else {}
-			if not final_results and len(task_data.get("prompts", [])) > 0:
-				rejected = getattr(worker, '_rejected_sequences', None)
-				if rejected:
-					logging.info(f"All {len(rejected)} sequences rejected (context length exceeded).")
-				else:
-					logging.error(f"Results are unexpectedly empty!")
-					response_queue.put({"error": "Results unexpectedly empty after inference"})
-					continue
-			response_queue.put(final_results)
-
-	# Cleanup
+	# Cleanup.  Keep the engine alive until its worker threads stop, then drop
+	# the storage mapping only after all non-owning references are gone.
+	_shutdown_worker_runtime(worker)
 	dist.destroy_process_group()

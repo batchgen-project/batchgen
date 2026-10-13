@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -20,6 +20,7 @@
 
 #include "spdlog/spdlog.h"
 #include <ATen/cuda/CachingHostAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #include <filesystem>
 #include <cstring>
 #include <memory>
@@ -156,17 +157,19 @@ BatchGen::~BatchGen() { this->Terminate(); }
 // };
 
 void BatchGen::init_weight_storage(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size, bool enable_hugetlbfs)
+                    int64_t byte_size, bool enable_hugetlbfs,
+                    bool enable_thp, int memfd_creator_pid, int memfd_fd,
+                    int tensor_meta_memfd_fd)
 {
     this->logger->info("BatchGen Init Weight Storage.");
     this->logger->info("model type: {}", this->model_config_.model_type);
     this->shm_name_ = shm_name;
     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
-    // auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-    this->logger->info("weights_map deserialized.");
     this->logger->info("shm_name: {}", shm_name);
     this->logger->info("byte_size: {}", byte_size);
-    this->weights_storage_.Init(shm_name, byte_size, tensor_meta_shm_name, enable_hugetlbfs);
+    this->weights_storage_.Init(shm_name, byte_size, tensor_meta_shm_name,
+                                enable_hugetlbfs, enable_thp, memfd_creator_pid,
+                                memfd_fd, tensor_meta_memfd_fd);
     this->logger->info("weights_storage initialized.");
 }
 
@@ -278,9 +281,29 @@ std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights(
     return this->gpu_weight_buffer_.get_weights(module_key, phase);  // blocking.
 };
 
+std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights_pinned(
+    const std::string& module_name) {
+    /* Get already-owned weights without evicting or releasing buffers. */
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    return this->gpu_weight_buffer_.get_weights_pinned(module_name);  // blocking.
+};
+
 void BatchGen::free_weights_buffer(const std::string& module_name) {
     /* Free the weights buffer. */
     this->gpu_weight_buffer_.releaseBuffer(module_name);
+};
+
+void BatchGen::free_weights_buffer_async(const std::string& module_name) {
+    this->free_weights_buffers_async({module_name});
+};
+
+void BatchGen::free_weights_buffers_async(
+    const std::vector<std::string>& module_names) {
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    const cudaStream_t consumer_stream = at::cuda::getCurrentCUDAStream(
+        this->engine_config_.basic_config.device).stream();
+    this->gpu_weight_buffer_.releaseBuffersAsync(
+        module_names, consumer_stream);
 };
 
 torch::Tensor BatchGen::attn(py::object torch_module, int64_t layer_idx,

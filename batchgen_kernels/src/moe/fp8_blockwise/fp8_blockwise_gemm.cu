@@ -13,6 +13,10 @@
 #include "src/moe/fp8_blockwise/fp8_blockwise_utils.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cstdint>
+#include <limits>
 #include <torch/all.h>
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
@@ -20,6 +24,10 @@ namespace py = pybind11;
 
 namespace batchgen {
 namespace moe {
+
+constexpr int kTmaGroupsPerThread = 8;
+constexpr int kTmaThreadsPerBlock = 32;
+constexpr int kMaxTmaGroups = kTmaGroupsPerThread * kTmaThreadsPerBlock;
 
 // ============================================================================
 // Launcher: configures TMA, dispatches kernel
@@ -41,8 +49,10 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
   int num_block_k = k / kTileK;
   int num_block_n = n / kTileN;
 
-  // mtp_tiles: uniform stride for x_scale indexing in our reserved buffer layout
-  int mtp_tiles = m_pad / (kTileM * num_group);
+  // x_scale tiles are addressed per expert as cu_seqlens[e] / kTileM (device
+  // side, alignment trapped in the kernel); the column space must tile evenly.
+  TORCH_CHECK(m_pad % kTileM == 0, "x_scale columns (m_pad=", m_pad,
+              ") must be a multiple of TileM=", kTileM);
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
@@ -71,13 +81,12 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
         *tma_y.get_tma_descriptor(),
     };
 
-    constexpr int kGroupPerThread = 8;
-    constexpr int kThreadPerBlock = 32;
     kernels::update_expert_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
-                                kGroupPerThread, kThreadPerBlock>
-        <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+                                kTmaGroupsPerThread, kTmaThreadsPerBlock>
+        <<<num_group + 1, kTmaThreadsPerBlock, 0, stream>>>(
             td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
             (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // Main kernel
@@ -88,7 +97,8 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
     dim3 block(384);
     dim3 grid(get_sm_count());
 
-    int shm_seq = sizeof(int) * (num_group + 1);
+    // shm_tiles [num_group + 1] followed by shm_xs_tile [num_group].
+    int shm_seq = sizeof(int) * (2 * num_group + 1);
     int shm_size = config.get_shm_size() + shm_seq;
 
     if (k <= 1024 || n <= 1024) {
@@ -97,23 +107,142 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
           kernels::fp8_blockwise_grouped_gemm_kernel<decltype(config), decltype(tma_x),
                                                       decltype(tma_w), decltype(tma_y),
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
       kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          mtp_tiles, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (int *)cu_seqlens_ptr,
+          (float *)xscale_ptr, (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+          num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       constexpr bool IsLoopH = false;
       auto kernel =
           kernels::fp8_blockwise_grouped_gemm_kernel<decltype(config), decltype(tma_x),
                                                       decltype(tma_w), decltype(tma_y),
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
       kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          mtp_tiles, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (int *)cu_seqlens_ptr,
+          (float *)xscale_ptr, (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+          num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+  }
+}
+
+// Streamed-offload variant: expert weights and scales live at independent ring
+// slot addresses. The prototype pointers are used only to construct base TMA
+// descriptors; update_expert_tma_ptrs patches every live address on device.
+template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage,
+          int kWarpgroupM, int kWarpgroupN, int kSwizzleX, int kSwizzleW,
+          int kSwizzleY>
+void launch_fp8_blockwise_gemm_ptrs(
+    void *y_ptr, const void *x_ptr, const void *w_prototype_ptr,
+    const void *weight_ptrs_ptr, const void *seqlens_ptr,
+    const void *cu_seqlens_ptr, const void *xscale_ptr,
+    const void *wscale_prototype_ptr, const void *wscale_ptrs_ptr,
+    void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+    int n, int k, int m_pad, int num_block_k_pad4, cudaStream_t stream) {
+  using namespace cute;  // NOLINT
+
+  using Tin = cute::float_e4m3_t;
+  using Tout = cute::bfloat16_t;
+  using TS = float;
+
+  int num_block_k = k / kTileK;
+  int num_block_n = n / kTileN;
+  TORCH_CHECK(m_pad % kTileM == 0, "x_scale columns (m_pad=", m_pad,
+              ") must be a multiple of TileM=", kTileM);
+
+  auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)),
+                       make_shape(m, k), make_stride(k, Int<1>{}));
+  auto W = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const Tin *>(w_prototype_ptr)),
+      make_shape(n, k, Int<1>{}), make_stride(k, Int<1>{}, n * k));
+  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
+                       make_shape(n, m), make_stride(Int<1>{}, n));
+  auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
+                        make_shape(num_block_k, m_pad),
+                        make_stride(m_pad, Int<1>{}));
+  auto WS = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const TS *>(wscale_prototype_ptr)),
+      make_shape(num_block_n, num_block_k_pad4, Int<1>{}),
+      make_stride(num_block_k_pad4, Int<1>{},
+                  num_block_n * num_block_k_pad4));
+
+  using Config = Fp8BlockwiseGemmConfig<
+      Tin, Tout, TS, kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
+      kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>;
+  Config config;
+  auto [tma_x, tma_w, tma_y, tma_xs, tma_ws] =
+      config.get_tma(X, W, Y, XS, WS);
+
+  auto *tma_xyww = static_cast<cute::TmaDescriptor *>(tmas_ptr);
+  vec_t<cute::TmaDescriptor, 4> td_xyww{
+      *tma_x.get_tma_descriptor(), *tma_y.get_tma_descriptor(),
+      *tma_w.get_tma_descriptor(), *tma_ws.get_tma_descriptor()};
+  constexpr int kGroupPerThread = 8;
+  constexpr int kThreadPerBlock = 32;
+  kernels::update_expert_tma_ptrs<
+      Tin, Tout, TS, decltype(tma_x), decltype(tma_y), decltype(tma_w),
+      decltype(tma_ws), kTileM, kGroupPerThread, kThreadPerBlock>
+      <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+          td_xyww, tma_xyww, reinterpret_cast<const Tin *>(x_ptr),
+          reinterpret_cast<const Tout *>(y_ptr),
+          reinterpret_cast<const int64_t *>(weight_ptrs_ptr),
+          reinterpret_cast<const int64_t *>(wscale_ptrs_ptr),
+          reinterpret_cast<const int *>(seqlens_ptr),
+          reinterpret_cast<const int *>(cu_seqlens_ptr),
+          reinterpret_cast<int *>(tiles_ptr),
+          reinterpret_cast<int *>(cu_tiles_ptr), num_group, m, n, k,
+          num_block_n, num_block_k_pad4);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  int num_tile_n = (n + kTileN - 1) / kTileN;
+  cutlass::FastDivmod flat_divider(num_tile_n);
+  dim3 block(384);
+  dim3 grid(get_sm_count());
+  // shm_tiles [num_group + 1] followed by shm_xs_tile [num_group].
+  int shm_seq = sizeof(int) * (2 * num_group + 1);
+  int shm_size = config.get_shm_size() + shm_seq;
+
+  if (k <= 1024 || n <= 1024) {
+    constexpr bool IsLoopH = true;
+    constexpr bool UsePointerWeights = true;
+    auto kernel = kernels::fp8_blockwise_grouped_gemm_kernel<
+        decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y),
+        decltype(tma_xs), decltype(tma_ws), IsLoopH, UsePointerWeights>;
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
+    kernel<<<grid, block, shm_size, stream>>>(
+        tma_w, tma_xs, tma_ws, tma_xyww,
+        reinterpret_cast<int *>(const_cast<void *>(seqlens_ptr)),
+        reinterpret_cast<const int *>(cu_seqlens_ptr),
+        reinterpret_cast<float *>(const_cast<void *>(xscale_ptr)),
+        reinterpret_cast<float *>(const_cast<void *>(wscale_prototype_ptr)),
+        reinterpret_cast<int *>(tiles_ptr), reinterpret_cast<int *>(cu_tiles_ptr),
+        num_group, m, n, k, m_pad, num_block_n, num_block_k,
+        num_block_k_pad4, flat_divider);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    constexpr bool IsLoopH = false;
+    constexpr bool UsePointerWeights = true;
+    auto kernel = kernels::fp8_blockwise_grouped_gemm_kernel<
+        decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y),
+        decltype(tma_xs), decltype(tma_ws), IsLoopH, UsePointerWeights>;
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
+    kernel<<<grid, block, shm_size, stream>>>(
+        tma_w, tma_xs, tma_ws, tma_xyww,
+        reinterpret_cast<int *>(const_cast<void *>(seqlens_ptr)),
+        reinterpret_cast<const int *>(cu_seqlens_ptr),
+        reinterpret_cast<float *>(const_cast<void *>(xscale_ptr)),
+        reinterpret_cast<float *>(const_cast<void *>(wscale_prototype_ptr)),
+        reinterpret_cast<int *>(tiles_ptr), reinterpret_cast<int *>(cu_tiles_ptr),
+        num_group, m, n, k, m_pad, num_block_n, num_block_k,
+        num_block_k_pad4, flat_divider);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
@@ -162,6 +291,251 @@ void fp8_blockwise_grouped_gemm_async(void *y_ptr, const void *x_ptr, const void
   }
 }
 
+void fp8_blockwise_grouped_gemm_ptrs_async(
+    void *y_ptr, const void *x_ptr, const void *w_prototype_ptr,
+    const void *weight_ptrs_ptr, const void *seqlens_ptr,
+    const void *cu_seqlens_ptr, const void *xscale_ptr,
+    const void *wscale_prototype_ptr, const void *wscale_ptrs_ptr,
+    void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+    int n, int k, int m_pad, int num_block_k_pad4,
+    int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileN = 128;
+  constexpr int kTileK = 128;
+  constexpr int kTileS = 64;
+  constexpr int kWarpgroupM = 2;
+  constexpr int kWarpgroupN = 1;
+  constexpr int kSwizzleX = 128;
+  constexpr int kSwizzleW = 128;
+  constexpr int kSwizzleY = 64;
+
+  if (num_seq_per_group_avg <= 16) {
+    launch_fp8_blockwise_gemm_ptrs<16, kTileN, kTileK, kTileS, 8,
+        kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_prototype_ptr, weight_ptrs_ptr, seqlens_ptr,
+        cu_seqlens_ptr, xscale_ptr, wscale_prototype_ptr, wscale_ptrs_ptr,
+        tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad,
+        num_block_k_pad4, stream);
+  } else if (num_seq_per_group_avg <= 32) {
+    launch_fp8_blockwise_gemm_ptrs<32, kTileN, kTileK, kTileS, 8,
+        kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_prototype_ptr, weight_ptrs_ptr, seqlens_ptr,
+        cu_seqlens_ptr, xscale_ptr, wscale_prototype_ptr, wscale_ptrs_ptr,
+        tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad,
+        num_block_k_pad4, stream);
+  } else {
+    launch_fp8_blockwise_gemm_ptrs<64, kTileN, kTileK, kTileS, 8,
+        kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_prototype_ptr, weight_ptrs_ptr, seqlens_ptr,
+        cu_seqlens_ptr, xscale_ptr, wscale_prototype_ptr, wscale_ptrs_ptr,
+        tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad,
+        num_block_k_pad4, stream);
+  }
+}
+
+// ============================================================================
+// Host boundary checks shared by the grouped GEMM and fused S1 entry points.
+// Only host metadata is inspected: device seqlens/cu_seqlens values are never
+// dereferenced here; their layout is validated inside the kernels.
+// ============================================================================
+namespace {
+
+constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
+constexpr int64_t kQuantBlock = 128;  // TileN == TileK == quantization block
+
+void check_cuda_tensor(const torch::Tensor &t, const torch::Device &device, const char *name) {
+  TORCH_CHECK(t.defined() && t.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(t.device() == device, name, " must be on ", device, ", got ", t.device());
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+struct GroupedGemmGeometry {
+  int m, n, k, m_pad, num_block_k_pad4, num_group;
+};
+
+GroupedGemmGeometry check_grouped_gemm_inputs(const torch::Tensor &x, const torch::Tensor &weight,
+                                              const torch::Tensor &seqlens,
+                                              const torch::Tensor &cu_seqlens,
+                                              const torch::Tensor &x_scale,
+                                              const torch::Tensor &w_scale,
+                                              const std::optional<torch::Tensor> &output) {
+  TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
+  const auto device = x.device();
+  check_cuda_tensor(x, device, "x");
+  check_cuda_tensor(weight, device, "weight");
+  check_cuda_tensor(seqlens, device, "seqlens");
+  check_cuda_tensor(cu_seqlens, device, "cu_seqlens");
+  check_cuda_tensor(x_scale, device, "x_scale");
+  check_cuda_tensor(w_scale, device, "w_scale");
+
+  TORCH_CHECK(x.dim() == 2 && x.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "x must be float8_e4m3fn [m, K]");
+  TORCH_CHECK(weight.dim() == 3 && weight.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "weight must be float8_e4m3fn [G, N, K]");
+  TORCH_CHECK(seqlens.dim() == 1 && seqlens.scalar_type() == torch::kInt32,
+              "seqlens must be int32 [G]");
+  TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.scalar_type() == torch::kInt32,
+              "cu_seqlens must be int32 [G + 1]");
+  TORCH_CHECK(x_scale.dim() == 2 && x_scale.scalar_type() == torch::kFloat32,
+              "x_scale must be float32 [K/128, m_pad]");
+  TORCH_CHECK(w_scale.dim() == 3 && w_scale.scalar_type() == torch::kFloat32,
+              "w_scale must be float32 [G, N/128, pad4(K/128)]");
+
+  const int64_t m = x.size(0);
+  const int64_t k = x.size(1);
+  const int64_t num_group = weight.size(0);
+  const int64_t n = weight.size(1);
+  TORCH_CHECK(num_group > 0 && num_group <= kMaxTmaGroups,
+              "num_group must be in [1, ", kMaxTmaGroups, "], got ", num_group);
+  TORCH_CHECK(weight.size(2) == k, "x and weight K mismatch");
+  TORCH_CHECK(k > 0 && k % kQuantBlock == 0 && n > 0 && n % kQuantBlock == 0,
+              "K (", k, ") and N (", n, ") must be positive multiples of 128");
+  TORCH_CHECK(seqlens.size(0) == num_group, "seqlens and weight num_group mismatch");
+  TORCH_CHECK(cu_seqlens.size(0) == num_group + 1,
+              "cu_seqlens must have num_group + 1 entries, got ", cu_seqlens.size(0));
+
+  const int64_t num_block_k = k / kQuantBlock;
+  const int64_t num_block_n = n / kQuantBlock;
+  const int64_t num_block_k_pad4 = (num_block_k + 3) / 4 * 4;
+  TORCH_CHECK(x_scale.size(0) == num_block_k, "x_scale must have K/128 = ", num_block_k,
+              " rows, got ", x_scale.size(0));
+  const int64_t m_pad = x_scale.size(1);
+  TORCH_CHECK(m > 0 && m_pad > 0 && m_pad <= m, "x_scale columns (m_pad=", m_pad,
+              ") must be in [1, x rows=", m, "]");
+  TORCH_CHECK(w_scale.size(0) == num_group && w_scale.size(1) == num_block_n &&
+                  w_scale.size(2) == num_block_k_pad4,
+              "w_scale must be [G, N/128, pad4(K/128)] = [", num_group, ", ", num_block_n, ", ",
+              num_block_k_pad4, "]");
+  // Values narrowed to int below: m, and the int strides n*k and
+  // num_block_n*num_block_k_pad4. Row offsets are computed in int64.
+  TORCH_CHECK(m <= kInt32Max && n * k <= kInt32Max &&
+                  num_block_n * num_block_k_pad4 <= kInt32Max,
+              "grouped GEMM shape products overflow int32");
+
+  if (output.has_value()) {
+    const auto &y = output.value();
+    check_cuda_tensor(y, device, "output");
+    TORCH_CHECK(y.dim() == 2 && y.scalar_type() == torch::kBFloat16 && y.size(0) == m &&
+                    y.size(1) == n,
+                "output must be BF16 [m, N] = [", m, ", ", n, "]");
+  }
+
+  return {static_cast<int>(m),     static_cast<int>(n),
+          static_cast<int>(k),     static_cast<int>(m_pad),
+          static_cast<int>(num_block_k_pad4), static_cast<int>(num_group)};
+}
+
+GroupedGemmGeometry check_grouped_gemm_ptr_inputs(
+    const torch::Tensor &x, const torch::Tensor &weight_prototype,
+    const torch::Tensor &weight_ptrs, const torch::Tensor &seqlens,
+    const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale,
+    const torch::Tensor &w_scale_prototype, const torch::Tensor &w_scale_ptrs,
+    const std::optional<torch::Tensor> &output) {
+  TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
+  const auto device = x.device();
+  check_cuda_tensor(x, device, "x");
+  check_cuda_tensor(weight_prototype, device, "weight_prototype");
+  check_cuda_tensor(weight_ptrs, device, "weight_ptrs");
+  check_cuda_tensor(seqlens, device, "seqlens");
+  check_cuda_tensor(cu_seqlens, device, "cu_seqlens");
+  check_cuda_tensor(x_scale, device, "x_scale");
+  check_cuda_tensor(w_scale_prototype, device, "w_scale_prototype");
+  check_cuda_tensor(w_scale_ptrs, device, "w_scale_ptrs");
+
+  TORCH_CHECK(x.dim() == 2 && x.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "x must be float8_e4m3fn [m, K]");
+  TORCH_CHECK(weight_prototype.dim() == 2 &&
+                  weight_prototype.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "weight_prototype must be float8_e4m3fn [N, K]");
+  TORCH_CHECK(weight_ptrs.dim() == 1 && weight_ptrs.scalar_type() == torch::kInt64,
+              "weight_ptrs must be int64 [G]");
+  TORCH_CHECK(seqlens.dim() == 1 && seqlens.scalar_type() == torch::kInt32,
+              "seqlens must be int32 [G]");
+  TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.scalar_type() == torch::kInt32,
+              "cu_seqlens must be int32 [G + 1]");
+  TORCH_CHECK(x_scale.dim() == 2 && x_scale.scalar_type() == torch::kFloat32,
+              "x_scale must be float32 [K/128, m_pad]");
+  TORCH_CHECK(w_scale_prototype.dim() == 2 &&
+                  w_scale_prototype.scalar_type() == torch::kFloat32,
+              "w_scale_prototype must be float32 [N/128, pad4(K/128)]");
+  TORCH_CHECK(w_scale_ptrs.dim() == 1 && w_scale_ptrs.scalar_type() == torch::kInt64,
+              "w_scale_ptrs must be int64 [G]");
+
+  const int64_t m = x.size(0);
+  const int64_t k = x.size(1);
+  const int64_t n = weight_prototype.size(0);
+  const int64_t num_group = seqlens.size(0);
+  TORCH_CHECK(num_group > 0 && num_group <= kMaxTmaGroups,
+              "num_group must be in [1, ", kMaxTmaGroups, "], got ", num_group);
+  TORCH_CHECK(weight_prototype.size(1) == k, "x and weight_prototype K mismatch");
+  TORCH_CHECK(k > 0 && k % kQuantBlock == 0 && n > 0 && n % kQuantBlock == 0,
+              "K (", k, ") and N (", n, ") must be positive multiples of 128");
+  TORCH_CHECK(weight_ptrs.numel() == num_group &&
+                  w_scale_ptrs.numel() == num_group,
+              "pointer arrays and seqlens num_group mismatch");
+  TORCH_CHECK(cu_seqlens.size(0) == num_group + 1,
+              "cu_seqlens must have num_group + 1 entries, got ", cu_seqlens.size(0));
+
+  const int64_t num_block_k = k / kQuantBlock;
+  const int64_t num_block_n = n / kQuantBlock;
+  const int64_t num_block_k_pad4 = (num_block_k + 3) / 4 * 4;
+  TORCH_CHECK(x_scale.size(0) == num_block_k, "x_scale must have K/128 = ",
+              num_block_k, " rows, got ", x_scale.size(0));
+  const int64_t m_pad = x_scale.size(1);
+  TORCH_CHECK(m > 0 && m_pad > 0 && m_pad <= m, "x_scale columns (m_pad=", m_pad,
+              ") must be in [1, x rows=", m, "]");
+  TORCH_CHECK(w_scale_prototype.size(0) == num_block_n &&
+                  w_scale_prototype.size(1) == num_block_k_pad4,
+              "w_scale_prototype must be [N/128, pad4(K/128)] = [",
+              num_block_n, ", ", num_block_k_pad4, "]");
+  TORCH_CHECK(m <= kInt32Max && n * k <= kInt32Max &&
+                  num_block_n * num_block_k_pad4 <= kInt32Max,
+              "grouped GEMM shape products overflow int32");
+
+  if (output.has_value()) {
+    const auto &y = output.value();
+    check_cuda_tensor(y, device, "output");
+    TORCH_CHECK(y.dim() == 2 && y.scalar_type() == torch::kBFloat16 &&
+                    y.size(0) == m && y.size(1) == n,
+                "output must be BF16 [m, N] = [", m, ", ", n, "]");
+  }
+
+  return {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+          static_cast<int>(m_pad), static_cast<int>(num_block_k_pad4),
+          static_cast<int>(num_group)};
+}
+
+torch::Tensor prepare_byte_workspace(
+    const std::optional<torch::Tensor> &workspace, const torch::Tensor &like,
+    int64_t rows, const char *name) {
+  if (!workspace.has_value()) {
+    return torch::empty({rows, 128}, like.options());
+  }
+  const auto &value = workspace.value();
+  check_cuda_tensor(value, like.device(), name);
+  TORCH_CHECK(value.dim() == 2 && value.element_size() == 1 &&
+                  value.size(0) >= rows && value.size(1) == 128,
+              name, " must be 1-byte [at least ", rows, ", 128] storage");
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>(value.data_ptr()) % 64 == 0,
+              name, " data pointer must be 64-byte aligned");
+  return value;
+}
+
+torch::Tensor prepare_int_workspace(
+    const std::optional<torch::Tensor> &workspace, const torch::Tensor &like,
+    int64_t size, const char *name) {
+  if (!workspace.has_value()) {
+    return torch::empty({size}, like.options().dtype(torch::kInt32));
+  }
+  const auto &value = workspace.value();
+  check_cuda_tensor(value, like.device(), name);
+  TORCH_CHECK(value.dim() == 1 && value.scalar_type() == torch::kInt32 &&
+                  value.numel() >= size,
+              name, " must be int32 [at least ", size, "]");
+  return value;
+}
+
+}  // namespace
+
 // ============================================================================
 // PyTorch entry point
 // ============================================================================
@@ -170,21 +544,27 @@ torch::Tensor fp8_blockwise_grouped_gemm(
     const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale, const torch::Tensor &w_scale,
     const int64_t num_seq_per_group_avg, std::optional<torch::Tensor> output,
     std::optional<torch::Tensor> tma_desc) {
-  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  TORCH_CHECK(x.device().is_cuda(), "x must be on CUDA");
-  TORCH_CHECK(weight.device().is_cuda(), "weight must be on CUDA");
-  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-  TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
-  TORCH_CHECK(seqlens.size(0) == weight.size(0), "seqlens and weight num_group mismatch");
-  TORCH_CHECK(x.size(1) == weight.size(2), "x and weight K mismatch");
-  TORCH_CHECK(w_scale.size(2) % 4 == 0, "w_scale K-dim must be multiple of 4");
+  const auto geom =
+      check_grouped_gemm_inputs(x, weight, seqlens, cu_seqlens, x_scale, w_scale, output);
+  const int m = geom.m;
+  const int k = geom.k;
+  const int n = geom.n;
+  const int m_pad = geom.m_pad;
+  const int num_block_k_pad4 = geom.num_block_k_pad4;
+  const int num_group = geom.num_group;
 
-  int m = x.size(0);
-  int k = x.size(1);
-  int n = weight.size(1);
-  int m_pad = x_scale.size(1);
-  int num_block_k_pad4 = w_scale.size(2);
-  int num_group = seqlens.size(0);
+  if (tma_desc.has_value()) {
+    const auto &td = tma_desc.value();
+    check_cuda_tensor(td, x.device(), "tma_desc");
+    TORCH_CHECK(td.dim() == 2 && td.element_size() == 1 && td.size(0) == 2 * num_group &&
+                    td.size(1) == 128,
+                "tma_desc must be a 1-byte [2 * num_group, 128] tensor");
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(td.data_ptr()) % 64 == 0,
+                "tma_desc data pointer must be 64-byte aligned");
+  }
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   auto options = x.options();
   torch::Tensor y;
@@ -195,10 +575,8 @@ torch::Tensor fp8_blockwise_grouped_gemm(
   }
 
   torch::Tensor tmas;
-  bool update_tma = true;
   if (tma_desc.has_value()) {
     tmas = tma_desc.value();
-    update_tma = false;
   } else {
     tmas = torch::empty({num_group * 2, 128}, options);
   }
@@ -212,8 +590,51 @@ torch::Tensor fp8_blockwise_grouped_gemm(
       x_scale.const_data_ptr(), w_scale.const_data_ptr(),
       tmas.mutable_data_ptr(), tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(),
       num_group, m, n, k, m_pad, num_block_k_pad4,
-      num_seq_per_group_avg, update_tma, stream);
+      num_seq_per_group_avg, true, stream);
 
+  return y;
+}
+
+torch::Tensor fp8_blockwise_grouped_gemm_ptrs(
+    const torch::Tensor &x, const torch::Tensor &weight_prototype,
+    const torch::Tensor &weight_ptrs, const torch::Tensor &seqlens,
+    const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale,
+    const torch::Tensor &w_scale_prototype, const torch::Tensor &w_scale_ptrs,
+    const int64_t num_seq_per_group_avg,
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> tma_desc,
+    std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace) {
+  const auto geom = check_grouped_gemm_ptr_inputs(
+      x, weight_prototype, weight_ptrs, seqlens, cu_seqlens, x_scale,
+      w_scale_prototype, w_scale_ptrs, output);
+  const int m = geom.m;
+  const int n = geom.n;
+  const int k = geom.k;
+  const int m_pad = geom.m_pad;
+  const int num_block_k_pad4 = geom.num_block_k_pad4;
+  const int num_group = geom.num_group;
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  torch::Tensor y = output.has_value()
+                        ? output.value()
+                        : torch::empty({m, n}, x.options().dtype(torch::kBFloat16));
+  torch::Tensor tmas =
+      prepare_byte_workspace(tma_desc, x, num_group * 4, "tma_desc");
+  torch::Tensor tiles =
+      prepare_int_workspace(tiles_workspace, x, num_group, "tiles");
+  torch::Tensor cu_tiles =
+      prepare_int_workspace(cu_tiles_workspace, x, num_group + 1, "cu_tiles");
+
+  fp8_blockwise_grouped_gemm_ptrs_async(
+      y.mutable_data_ptr(), x.const_data_ptr(),
+      weight_prototype.const_data_ptr(), weight_ptrs.const_data_ptr(),
+      seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
+      x_scale.const_data_ptr(), w_scale_prototype.const_data_ptr(),
+      w_scale_ptrs.const_data_ptr(), tmas.mutable_data_ptr(),
+      tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(), num_group, m, n, k,
+      m_pad, num_block_k_pad4, num_seq_per_group_avg, stream);
   return y;
 }
 
@@ -239,7 +660,10 @@ void launch_fp8_blockwise_fused_s1(
 
   int num_block_k = k / kTileK;
   int num_block_n = n / kTileN;
-  int mtp_tiles = m_pad / (kTileM * num_group);
+  TORCH_CHECK(m_pad % kTileM == 0, "x_scale columns (m_pad=", m_pad,
+              ") must be a multiple of TileM=", kTileM);
+  TORCH_CHECK(m_pad % kTileM == 0, "x_scale columns (m_pad=", m_pad,
+              ") must be a multiple of TileM=", kTileM);
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)),
                        make_shape(m, k), make_stride(k, Int<1>{}));
@@ -273,14 +697,13 @@ void launch_fp8_blockwise_fused_s1(
         *tma_x.get_tma_descriptor(),
         *tma_y.get_tma_descriptor(),
     };
-    constexpr int kGroupPerThread = 8;
-    constexpr int kThreadPerBlock = 32;
     kernels::update_expert_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
-                                kGroupPerThread, kThreadPerBlock>
-        <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+                                kTmaGroupsPerThread, kTmaThreadsPerBlock>
+        <<<num_group + 1, kTmaThreadsPerBlock, 0, stream>>>(
             td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr,
             (const int *)seqlens_ptr, (const int *)cu_seqlens_ptr,
             (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   {
@@ -288,7 +711,8 @@ void launch_fp8_blockwise_fused_s1(
     cutlass::FastDivmod flat_divider(num_tile_n);
     dim3 block(384);
     dim3 grid(get_sm_count());
-    int shm_seq = sizeof(int) * (num_group + 1);
+    // shm_tiles [num_group + 1] followed by shm_xs_tile [num_group].
+    int shm_seq = sizeof(int) * (2 * num_group + 1);
     int shm_size = config.get_shm_size() + shm_seq;
 
     if (k <= 1024 || n <= 1024) {
@@ -296,26 +720,157 @@ void launch_fp8_blockwise_fused_s1(
       auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
           decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
           decltype(tma_xs), decltype(tma_ws_gate), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
-          tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+          tma_xy, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (float *)xscale_ptr,
           (int *)tiles_ptr, (int *)cu_tiles_ptr,
-          num_group, m, n, k, m_pad, mtp_tiles,
+          num_group, m, n, k, m_pad,
           num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       constexpr bool IsLoopH = false;
       auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
           decltype(config), decltype(tma_x), decltype(tma_w_gate), decltype(tma_y),
           decltype(tma_xs), decltype(tma_ws_gate), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
-          tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+          tma_xy, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (float *)xscale_ptr,
           (int *)tiles_ptr, (int *)cu_tiles_ptr,
-          num_group, m, n, k, m_pad, mtp_tiles,
+          num_group, m, n, k, m_pad,
           num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+  }
+}
+
+template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage,
+          int kWarpgroupM, int kWarpgroupN, int kSwizzleX, int kSwizzleW,
+          int kSwizzleY>
+void launch_fp8_blockwise_fused_s1_ptrs(
+    void *y_ptr, const void *x_ptr, const void *gate_w_prototype_ptr,
+    const void *gate_weight_ptrs_ptr, const void *up_w_prototype_ptr,
+    const void *up_weight_ptrs_ptr, const void *seqlens_ptr,
+    const void *cu_seqlens_ptr, const void *xscale_ptr,
+    const void *gate_wscale_prototype_ptr, const void *gate_scale_ptrs_ptr,
+    const void *up_wscale_prototype_ptr, const void *up_scale_ptrs_ptr,
+    void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+    int n, int k, int m_pad, int num_block_k_pad4, cudaStream_t stream) {
+  using namespace cute;  // NOLINT
+  using Tin = cute::float_e4m3_t;
+  using Tout = cute::bfloat16_t;
+  using TS = float;
+
+  int num_block_k = k / kTileK;
+  int num_block_n = n / kTileN;
+  TORCH_CHECK(m_pad % kTileM == 0, "x_scale columns (m_pad=", m_pad,
+              ") must be a multiple of TileM=", kTileM);
+  auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)),
+                       make_shape(m, k), make_stride(k, Int<1>{}));
+  auto W_gate = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const Tin *>(gate_w_prototype_ptr)),
+      make_shape(n, k, Int<1>{}), make_stride(k, Int<1>{}, n * k));
+  auto W_up = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const Tin *>(up_w_prototype_ptr)),
+      make_shape(n, k, Int<1>{}), make_stride(k, Int<1>{}, n * k));
+  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
+                       make_shape(n, m), make_stride(Int<1>{}, n));
+  auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
+                        make_shape(num_block_k, m_pad),
+                        make_stride(m_pad, Int<1>{}));
+  auto WS_gate = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const TS *>(gate_wscale_prototype_ptr)),
+      make_shape(num_block_n, num_block_k_pad4, Int<1>{}),
+      make_stride(num_block_k_pad4, Int<1>{},
+                  num_block_n * num_block_k_pad4));
+  auto WS_up = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const TS *>(up_wscale_prototype_ptr)),
+      make_shape(num_block_n, num_block_k_pad4, Int<1>{}),
+      make_stride(num_block_k_pad4, Int<1>{},
+                  num_block_n * num_block_k_pad4));
+
+  using Config = Fp8BlockwiseGemmConfig<
+      Tin, Tout, TS, kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
+      kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>;
+  Config config;
+  auto [tma_x, tma_w_gate, tma_y, tma_xs, tma_ws_gate] =
+      config.get_tma(X, W_gate, Y, XS, WS_gate);
+  auto tma_w_up = make_tma_copy(SM90_TMA_LOAD{}, W_up,
+                                take<0, 2>(typename Config::SLayoutW{}));
+  auto tma_ws_up =
+      make_tma_copy(SM90_TMA_LOAD{}, WS_up, typename Config::CopyBoxWS{});
+
+  auto *tma_s1 = static_cast<cute::TmaDescriptor *>(tmas_ptr);
+  vec_t<cute::TmaDescriptor, 6> td_s1{
+      *tma_x.get_tma_descriptor(),       *tma_y.get_tma_descriptor(),
+      *tma_w_gate.get_tma_descriptor(),  *tma_ws_gate.get_tma_descriptor(),
+      *tma_w_up.get_tma_descriptor(),    *tma_ws_up.get_tma_descriptor()};
+  constexpr int kGroupPerThread = 8;
+  constexpr int kThreadPerBlock = 32;
+  kernels::update_expert_tma_s1_ptrs<
+      Tin, Tout, TS, decltype(tma_x), decltype(tma_y), decltype(tma_w_gate),
+      decltype(tma_ws_gate), kTileM, kGroupPerThread, kThreadPerBlock>
+      <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+          td_s1, tma_s1, reinterpret_cast<const Tin *>(x_ptr),
+          reinterpret_cast<const Tout *>(y_ptr),
+          reinterpret_cast<const int64_t *>(gate_weight_ptrs_ptr),
+          reinterpret_cast<const int64_t *>(gate_scale_ptrs_ptr),
+          reinterpret_cast<const int64_t *>(up_weight_ptrs_ptr),
+          reinterpret_cast<const int64_t *>(up_scale_ptrs_ptr),
+          reinterpret_cast<const int *>(seqlens_ptr),
+          reinterpret_cast<const int *>(cu_seqlens_ptr),
+          reinterpret_cast<int *>(tiles_ptr),
+          reinterpret_cast<int *>(cu_tiles_ptr), num_group, m, n, k,
+          num_block_n, num_block_k_pad4);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  int num_tile_n = (n + kTileN - 1) / kTileN;
+  cutlass::FastDivmod flat_divider(num_tile_n);
+  dim3 block(384);
+  dim3 grid(get_sm_count());
+  // shm_tiles [num_group + 1] followed by shm_xs_tile [num_group].
+  int shm_seq = sizeof(int) * (2 * num_group + 1);
+  int shm_size = config.get_shm_size() + shm_seq;
+
+  if (k <= 1024 || n <= 1024) {
+    constexpr bool IsLoopH = true;
+    constexpr bool UsePointerWeights = true;
+    auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
+        decltype(config), decltype(tma_x), decltype(tma_w_gate),
+        decltype(tma_y), decltype(tma_xs), decltype(tma_ws_gate), IsLoopH,
+        UsePointerWeights>;
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
+    kernel<<<grid, block, shm_size, stream>>>(
+        tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up, tma_s1,
+        reinterpret_cast<int *>(const_cast<void *>(seqlens_ptr)),
+        reinterpret_cast<const int *>(cu_seqlens_ptr),
+        reinterpret_cast<float *>(const_cast<void *>(xscale_ptr)),
+        reinterpret_cast<int *>(tiles_ptr), reinterpret_cast<int *>(cu_tiles_ptr),
+        num_group, m, n, k, m_pad, num_block_n, num_block_k,
+        num_block_k_pad4, flat_divider);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    constexpr bool IsLoopH = false;
+    constexpr bool UsePointerWeights = true;
+    auto kernel = kernels::fp8_blockwise_fused_s1_kernel<
+        decltype(config), decltype(tma_x), decltype(tma_w_gate),
+        decltype(tma_y), decltype(tma_xs), decltype(tma_ws_gate), IsLoopH,
+        UsePointerWeights>;
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size));
+    kernel<<<grid, block, shm_size, stream>>>(
+        tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up, tma_s1,
+        reinterpret_cast<int *>(const_cast<void *>(seqlens_ptr)),
+        reinterpret_cast<const int *>(cu_seqlens_ptr),
+        reinterpret_cast<float *>(const_cast<void *>(xscale_ptr)),
+        reinterpret_cast<int *>(tiles_ptr), reinterpret_cast<int *>(cu_tiles_ptr),
+        num_group, m, n, k, m_pad, num_block_n, num_block_k,
+        num_block_k_pad4, flat_divider);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
@@ -354,6 +909,37 @@ void fp8_blockwise_fused_s1_async(
   }
 }
 
+void fp8_blockwise_fused_s1_ptrs_async(
+    void *y_ptr, const void *x_ptr, const void *gate_w_prototype_ptr,
+    const void *gate_weight_ptrs_ptr, const void *up_w_prototype_ptr,
+    const void *up_weight_ptrs_ptr, const void *seqlens_ptr,
+    const void *cu_seqlens_ptr, const void *xscale_ptr,
+    const void *gate_wscale_prototype_ptr, const void *gate_scale_ptrs_ptr,
+    const void *up_wscale_prototype_ptr, const void *up_scale_ptrs_ptr,
+    void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+    int n, int k, int m_pad, int num_block_k_pad4,
+    int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileN = 128, kTileK = 128, kTileS = 64;
+  constexpr int kWarpgroupM = 2, kWarpgroupN = 1;
+  constexpr int kSwizzleX = 128, kSwizzleW = 128, kSwizzleY = 64;
+#define LAUNCH_PTR_S1(TM)                                                       \
+  launch_fp8_blockwise_fused_s1_ptrs<TM, kTileN, kTileK, kTileS, 8,            \
+      kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(              \
+      y_ptr, x_ptr, gate_w_prototype_ptr, gate_weight_ptrs_ptr,                 \
+      up_w_prototype_ptr, up_weight_ptrs_ptr, seqlens_ptr, cu_seqlens_ptr,      \
+      xscale_ptr, gate_wscale_prototype_ptr, gate_scale_ptrs_ptr,               \
+      up_wscale_prototype_ptr, up_scale_ptrs_ptr, tmas_ptr, tiles_ptr,          \
+      cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, stream)
+  if (num_seq_per_group_avg <= 16) {
+    LAUNCH_PTR_S1(16);
+  } else if (num_seq_per_group_avg <= 32) {
+    LAUNCH_PTR_S1(32);
+  } else {
+    LAUNCH_PTR_S1(64);
+  }
+#undef LAUNCH_PTR_S1
+}
+
 // ============================================================================
 // Fused S1 PyTorch entry point
 // ============================================================================
@@ -365,19 +951,26 @@ torch::Tensor fp8_blockwise_fused_s1(
     const torch::Tensor &gate_w_scale, const torch::Tensor &up_w_scale,
     const int64_t num_seq_per_group_avg,
     std::optional<torch::Tensor> output) {
-  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  TORCH_CHECK(x.device().is_cuda(), "x must be on CUDA");
-  TORCH_CHECK(gate_weight.is_contiguous() && up_weight.is_contiguous(),
-              "gate/up weights must be contiguous");
-  TORCH_CHECK(gate_weight.sizes() == up_weight.sizes(),
-              "gate and up weight shape mismatch");
+  const auto geom = check_grouped_gemm_inputs(x, gate_weight, seqlens, cu_seqlens, x_scale,
+                                              gate_w_scale, output);
+  check_cuda_tensor(up_weight, x.device(), "up_weight");
+  check_cuda_tensor(up_w_scale, x.device(), "up_w_scale");
+  TORCH_CHECK(up_weight.scalar_type() == gate_weight.scalar_type() &&
+                  up_weight.sizes() == gate_weight.sizes(),
+              "gate and up weight dtype/shape mismatch");
+  TORCH_CHECK(up_w_scale.scalar_type() == gate_w_scale.scalar_type() &&
+                  up_w_scale.sizes() == gate_w_scale.sizes(),
+              "gate and up weight scale dtype/shape mismatch");
 
-  int m = x.size(0);
-  int k = x.size(1);
-  int n = gate_weight.size(1);
-  int m_pad = x_scale.size(1);
-  int num_block_k_pad4 = gate_w_scale.size(2);
-  int num_group = seqlens.size(0);
+  const int m = geom.m;
+  const int k = geom.k;
+  const int n = geom.n;
+  const int m_pad = geom.m_pad;
+  const int num_block_k_pad4 = geom.num_block_k_pad4;
+  const int num_group = geom.num_group;
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   auto options = x.options();
   torch::Tensor y;
@@ -404,6 +997,64 @@ torch::Tensor fp8_blockwise_fused_s1(
   return y;
 }
 
+torch::Tensor fp8_blockwise_fused_s1_ptrs(
+    const torch::Tensor &x, const torch::Tensor &gate_weight_prototype,
+    const torch::Tensor &gate_weight_ptrs,
+    const torch::Tensor &up_weight_prototype,
+    const torch::Tensor &up_weight_ptrs, const torch::Tensor &seqlens,
+    const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale,
+    const torch::Tensor &gate_w_scale_prototype,
+    const torch::Tensor &gate_w_scale_ptrs,
+    const torch::Tensor &up_w_scale_prototype,
+    const torch::Tensor &up_w_scale_ptrs,
+    const int64_t num_seq_per_group_avg,
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> tma_desc,
+    std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace) {
+  const auto geom = check_grouped_gemm_ptr_inputs(
+      x, gate_weight_prototype, gate_weight_ptrs, seqlens, cu_seqlens,
+      x_scale, gate_w_scale_prototype, gate_w_scale_ptrs, output);
+  const auto up_geom = check_grouped_gemm_ptr_inputs(
+      x, up_weight_prototype, up_weight_ptrs, seqlens, cu_seqlens,
+      x_scale, up_w_scale_prototype, up_w_scale_ptrs, output);
+  TORCH_CHECK(up_geom.m == geom.m && up_geom.n == geom.n &&
+                  up_geom.k == geom.k && up_geom.m_pad == geom.m_pad &&
+                  up_geom.num_block_k_pad4 == geom.num_block_k_pad4 &&
+                  up_geom.num_group == geom.num_group,
+              "gate/up pointer geometry mismatch");
+
+  const int m = geom.m;
+  const int n = geom.n;
+  const int k = geom.k;
+  const int m_pad = geom.m_pad;
+  const int num_block_k_pad4 = geom.num_block_k_pad4;
+  const int num_group = geom.num_group;
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  torch::Tensor y = output.has_value()
+                        ? output.value()
+                        : torch::empty({m, n}, x.options().dtype(torch::kBFloat16));
+  torch::Tensor tmas =
+      prepare_byte_workspace(tma_desc, x, num_group * 6, "tma_desc");
+  torch::Tensor tiles =
+      prepare_int_workspace(tiles_workspace, x, num_group, "tiles");
+  torch::Tensor cu_tiles =
+      prepare_int_workspace(cu_tiles_workspace, x, num_group + 1, "cu_tiles");
+  fp8_blockwise_fused_s1_ptrs_async(
+      y.mutable_data_ptr(), x.const_data_ptr(),
+      gate_weight_prototype.const_data_ptr(), gate_weight_ptrs.const_data_ptr(),
+      up_weight_prototype.const_data_ptr(), up_weight_ptrs.const_data_ptr(),
+      seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
+      x_scale.const_data_ptr(), gate_w_scale_prototype.const_data_ptr(),
+      gate_w_scale_ptrs.const_data_ptr(), up_w_scale_prototype.const_data_ptr(),
+      up_w_scale_ptrs.const_data_ptr(), tmas.mutable_data_ptr(),
+      tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(), num_group, m, n, k,
+      m_pad, num_block_k_pad4, num_seq_per_group_avg, stream);
+  return y;
+}
+
 }  // close namespace moe
 }  // close namespace batchgen
 
@@ -414,6 +1065,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("weight"), py::arg("seqlens"), py::arg("cu_seqlens"),
         py::arg("x_scale"), py::arg("w_scale"), py::arg("num_seq_per_group_avg"),
         py::arg("output") = py::none(), py::arg("tma_desc") = py::none());
+  m.def("fp8_blockwise_grouped_gemm_ptrs",
+        &batchgen::moe::fp8_blockwise_grouped_gemm_ptrs,
+        "FP8 blockwise grouped GEMM over independent weight pointer arrays",
+        py::arg("x"), py::arg("weight_prototype"), py::arg("weight_ptrs"),
+        py::arg("seqlens"), py::arg("cu_seqlens"), py::arg("x_scale"),
+        py::arg("w_scale_prototype"), py::arg("w_scale_ptrs"),
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none(),
+        py::arg("tma_desc") = py::none(), py::arg("tiles") = py::none(),
+        py::arg("cu_tiles") = py::none());
   m.def("fp8_blockwise_fused_s1",
         &batchgen::moe::fp8_blockwise_fused_s1,
         "FP8 blockwise fused S1: gate+up+SiLU (CuTe persistent 3-WG, v19)",
@@ -421,4 +1081,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("seqlens"), py::arg("cu_seqlens"),
         py::arg("x_scale"), py::arg("gate_w_scale"), py::arg("up_w_scale"),
         py::arg("num_seq_per_group_avg"), py::arg("output") = py::none());
+  m.def("fp8_blockwise_fused_s1_ptrs",
+        &batchgen::moe::fp8_blockwise_fused_s1_ptrs,
+        "FP8 fused S1 over independent gate/up weight pointer arrays",
+        py::arg("x"), py::arg("gate_weight_prototype"),
+        py::arg("gate_weight_ptrs"), py::arg("up_weight_prototype"),
+        py::arg("up_weight_ptrs"), py::arg("seqlens"),
+        py::arg("cu_seqlens"), py::arg("x_scale"),
+        py::arg("gate_w_scale_prototype"), py::arg("gate_w_scale_ptrs"),
+        py::arg("up_w_scale_prototype"), py::arg("up_w_scale_ptrs"),
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none(),
+        py::arg("tma_desc") = py::none(), py::arg("tiles") = py::none(),
+        py::arg("cu_tiles") = py::none());
 }

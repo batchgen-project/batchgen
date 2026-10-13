@@ -2,7 +2,15 @@
 
 Provides S1 (gate+up+SiLU) and S3 (down) grouped GEMM functions for
 FP8 blockwise-scaled MoE layers. Uses pre-allocated reserved buffers
-with uniform mtp-stride layout [E * mtp, dim].
+[M, dim] where expert e owns rows starting at cu_seqlens[e]: either the
+uniform mtp-stride layout (cu_seqlens[e] = e * mtp) or a compact ragged
+layout with 64-aligned cu_seqlens (see dispatch_scatter_ragged and
+batchgen_kernels.moe._C_fp8_blockwise_ops.act_quant_ragged).
+
+x_scale tiles are addressed per expert as cu_seqlens[e] / TileM. The kernel
+traps on device if any cu_seqlens[e] is not TileM-aligned or an expert's
+tiled span exceeds x_scale's columns. Host checks reject mismatched devices,
+dtypes, ranks, non-contiguous tensors, and shapes before any launch.
 
 Architecture: persistent 3-WG CuTe kernel, adaptive TileM (16/32/64),
 TileN=128, TileK=128, 8-stage TMA pipeline, FastDivmod tile scheduling.
@@ -21,44 +29,106 @@ from typing import Optional
 
 logger = logging.getLogger("batchgen.moe.fp8_blockwise")
 
-_warned_import = False
+_MODULE_NAME = "batchgen_kernels.moe._C_fp8_blockwise_gemm"
+
+# Loaded once on first use; None after a failed import.
+_module = None
+_module_loaded = False
+_warned_gemm = False
 _warned_fused_s1 = False
+_warned_ptrs = False
+_warned_fused_s1_ptrs = False
+
+
+def _get_module():
+    """Load the compiled FP8 blockwise extension once (None if not built).
+
+    Only ImportError is treated as "not available"; JIT/build/runtime errors
+    propagate so they are not mistaken for a missing kernel.
+    """
+    global _module, _module_loaded
+    if not _module_loaded:
+        try:
+            import batchgen_kernels
+            _module = batchgen_kernels.load_extension(_MODULE_NAME)
+        except ImportError as e:
+            _module = None
+            logger.warning(
+                "FP8 blockwise kernel extension not available (%s): %s",
+                _MODULE_NAME, e,
+            )
+        _module_loaded = True
+    return _module
 
 
 def _get_kernel():
-    """Load the compiled FP8 blockwise GEMM kernel."""
-    global _warned_import
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_grouped_gemm,
+    """Return the compiled FP8 blockwise grouped GEMM kernel, or None."""
+    global _warned_gemm
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm", None)
+    if kernel is None and module is not None and not _warned_gemm:
+        _warned_gemm = True
+        logger.warning(
+            "FP8 blockwise grouped GEMM symbol missing from %s", _MODULE_NAME
         )
-        return fp8_blockwise_grouped_gemm
-    except ImportError:
-        if not _warned_import:
-            _warned_import = True
-            logger.warning(
-                "FP8 blockwise grouped GEMM kernel not available "
-                "(batchgen_kernels.moe._C_fp8_blockwise_gemm). "
-                "Falling back to Triton implementation."
-            )
-        return None
+    return kernel
 
 
 def _get_fused_s1_kernel():
-    """Load the compiled fused S1 kernel (gate+up+SiLU)."""
+    """Return the compiled fused S1 kernel (gate+up+SiLU), or None."""
     global _warned_fused_s1
-    try:
-        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
-            fp8_blockwise_fused_s1,
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_fused_s1", None)
+    if kernel is None and module is not None and not _warned_fused_s1:
+        _warned_fused_s1 = True
+        logger.warning(
+            "FP8 fused S1 symbol missing from %s", _MODULE_NAME
         )
-        return fp8_blockwise_fused_s1
-    except ImportError:
-        if not _warned_fused_s1:
-            _warned_fused_s1 = True
-            logger.warning(
-                "FP8 fused S1 kernel not available — falling back to 2× GEMM + SiLU"
-            )
-        return None
+    return kernel
+
+
+def _get_ptrs_kernel():
+    """Return grouped GEMM for independent expert weight addresses."""
+    global _warned_ptrs
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_grouped_gemm_ptrs", None)
+    if kernel is None and module is not None and not _warned_ptrs:
+        _warned_ptrs = True
+        logger.warning(
+            "FP8 pointer-array grouped GEMM symbol missing from %s",
+            _MODULE_NAME,
+        )
+    return kernel
+
+
+def _get_fused_s1_ptrs_kernel():
+    """Return fused S1 for independently allocated expert weights."""
+    global _warned_fused_s1_ptrs
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_fused_s1_ptrs", None)
+    if kernel is None and module is not None and not _warned_fused_s1_ptrs:
+        _warned_fused_s1_ptrs = True
+        logger.warning(
+            "FP8 pointer-array fused S1 symbol missing from %s", _MODULE_NAME
+        )
+    return kernel
+
+
+def require_grouped_fp8_blockwise_ptr_kernels():
+    """Load both pointer-array entry points or fail before serving."""
+    grouped = _get_ptrs_kernel()
+    fused_s1 = _get_fused_s1_ptrs_kernel()
+    if grouped is None or fused_s1 is None:
+        missing = []
+        if grouped is None:
+            missing.append("fp8_blockwise_grouped_gemm_ptrs")
+        if fused_s1 is None:
+            missing.append("fp8_blockwise_fused_s1_ptrs")
+        raise RuntimeError(
+            "FP8 pointer-array grouped kernels are incomplete: "
+            + ", ".join(missing)
+        )
+    return grouped, fused_s1
 
 
 def grouped_fp8_blockwise_gemm(
@@ -75,18 +145,22 @@ def grouped_fp8_blockwise_gemm(
     """Single FP8 blockwise grouped GEMM.
 
     Args:
-        x_fp8:      [E*mtp, K] fp8 — activations in reserved buffer
-        weight_3d:  [E, N, K] fp8 — pre-stacked expert weights
+        x_fp8:      [M, K] fp8 — activations in reserved buffer (K % 128 == 0)
+        weight_3d:  [E, N, K] fp8 — pre-stacked expert weights (N % 128 == 0)
         seqlens:    [E] int32 — actual tokens per expert
-        cu_seqlens: [E+1] int32 — [0, mtp, 2*mtp, ..., E*mtp]
-        x_scale:    [K/128, E*mtp] f32 — transposed, uniform mtp stride
+        cu_seqlens: [E+1] int32 — expert row offsets, each a multiple of the
+                    selected TileM: uniform [0, mtp, ..., E*mtp] or ragged
+                    64-aligned offsets
+        x_scale:    [K/128, M_pad] f32 — transposed; M_pad <= M and
+                    M_pad % TileM == 0
         w_scale_3d: [E, N/128, (K/128+3)//4*4] f32 — K-dim padded to 4
         num_seq_per_group_avg: int — controls TileM selection (16/32/64)
-        output:     [E*mtp, N] bf16 — pre-allocated output (optional)
-        tma_desc:   cached TMA descriptors (optional, for reuse)
+        output:     [M, N] bf16 — pre-allocated output (optional)
+        tma_desc:   caller-owned 64-byte-aligned TMA scratch [2*E, 128]
+                    (optional; descriptors are refreshed for current offsets)
 
     Returns:
-        [E*mtp, N] bf16 output
+        [M, N] bf16 output
     """
     kernel = _get_kernel()
     if kernel is None:
@@ -104,6 +178,53 @@ def grouped_fp8_blockwise_gemm(
         x_scale, w_scale_3d,
         num_seq_per_group_avg,
         output, tma_desc,
+    )
+
+
+def grouped_fp8_blockwise_gemm_ptrs(
+    x_fp8: Tensor,
+    weight_prototype: Tensor,
+    weight_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    x_scale: Tensor,
+    w_scale_prototype: Tensor,
+    w_scale_ptrs: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
+) -> Tensor:
+    """Grouped FP8 GEMM over independent core-engine weight allocations.
+
+    ``weight_prototype`` and ``w_scale_prototype`` provide only shape, stride,
+    dtype, and a valid descriptor seed. The CUDA preparation kernel replaces
+    their addresses with ``weight_ptrs[e]`` / ``w_scale_ptrs[e]`` for every
+    expert before launching the persistent grouped GEMM.
+    """
+    kernel = _get_ptrs_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 pointer-array grouped GEMM kernel not compiled. Rebuild "
+            "batchgen_kernels with SM90a support."
+        )
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+    return kernel(
+        x_fp8,
+        weight_prototype,
+        weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        w_scale_prototype,
+        w_scale_ptrs,
+        num_seq_per_group_avg,
+        output,
+        tma_desc,
+        tiles,
+        cu_tiles,
     )
 
 
@@ -173,7 +294,11 @@ def grouped_fp8_blockwise_fused_s1(
     Two-phase CuTe persistent kernel (v19). Gate result stays in SMEM,
     SiLU applied in the epilogue. 1.75× faster than 2× GEMM + SiLU at decode.
 
-    Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable.
+    Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable
+    and ``output`` is None; raises RuntimeError if ``output`` is supplied,
+    since the allocating fallback cannot honor the persistent output buffer.
+    Accepts the same uniform or ragged cu_seqlens / x_scale layouts as
+    :func:`grouped_fp8_blockwise_gemm` (E*mtp below reads as M / M_pad).
 
     Args:
         x_fp8:      [E*mtp, K] fp8 — quantized activations
@@ -199,11 +324,67 @@ def grouped_fp8_blockwise_fused_s1(
             num_seq_per_group_avg,
             output,
         )
+    if output is not None:
+        raise RuntimeError(
+            "FP8 fused S1 kernel (fp8_blockwise_fused_s1) not available in "
+            f"{_MODULE_NAME}, but a pre-allocated output buffer was supplied; "
+            "the 2× GEMM + SiLU fallback allocates a new tensor and cannot "
+            "write into it. Rebuild batchgen_kernels with the fused S1 kernel."
+        )
     # Fallback: 2× GEMM + SiLU
     return grouped_fp8_blockwise_s1_silu(
         x_fp8, x_scale, gate_w3d, up_w3d,
         gate_ws3d, up_ws3d, seqlens, cu_seqlens,
         num_seq_per_group_avg,
+    )
+
+
+def grouped_fp8_blockwise_fused_s1_ptrs(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    gate_w_prototype: Tensor,
+    gate_weight_ptrs: Tensor,
+    up_w_prototype: Tensor,
+    up_weight_ptrs: Tensor,
+    gate_ws_prototype: Tensor,
+    gate_scale_ptrs: Tensor,
+    up_ws_prototype: Tensor,
+    up_scale_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
+) -> Tensor:
+    """Fused gate+up+SiLU over streamed expert pointer arrays."""
+    kernel = _get_fused_s1_ptrs_kernel()
+    if kernel is None:
+        raise RuntimeError(
+            "FP8 pointer-array fused S1 kernel not compiled. Rebuild "
+            "batchgen_kernels with SM90a support."
+        )
+    if 33 <= num_seq_per_group_avg <= 48:
+        num_seq_per_group_avg = 64
+    return kernel(
+        x_fp8,
+        gate_w_prototype,
+        gate_weight_ptrs,
+        up_w_prototype,
+        up_weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        gate_ws_prototype,
+        gate_scale_ptrs,
+        up_ws_prototype,
+        up_scale_ptrs,
+        num_seq_per_group_avg,
+        output,
+        tma_desc,
+        tiles,
+        cu_tiles,
     )
 
 
@@ -238,4 +419,37 @@ def grouped_fp8_blockwise_s3(
         x_fp8, down_w3d, seqlens, cu_seqlens,
         x_scale, down_ws3d, num_seq_per_group_avg,
         output=output,
+    )
+
+
+def grouped_fp8_blockwise_s3_ptrs(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    down_w_prototype: Tensor,
+    down_weight_ptrs: Tensor,
+    down_ws_prototype: Tensor,
+    down_scale_ptrs: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+    tiles: Optional[Tensor] = None,
+    cu_tiles: Optional[Tensor] = None,
+) -> Tensor:
+    """S3 down projection for streamed, independently allocated experts."""
+    return grouped_fp8_blockwise_gemm_ptrs(
+        x_fp8,
+        down_w_prototype,
+        down_weight_ptrs,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        down_ws_prototype,
+        down_scale_ptrs,
+        num_seq_per_group_avg,
+        output=output,
+        tma_desc=tma_desc,
+        tiles=tiles,
+        cu_tiles=cu_tiles,
     )

@@ -132,7 +132,7 @@ modify it.** A `model` or `kernel` PR that touches any of it fails (§7).
   `prefill.py`, `prefill_task.py`, `sampling.py`, `sequence.py`, `migration.py`,
   `pd_orchestrator.py`, `query_book.py`, `query_manager.py`, `parameter_server.py`,
   `parameter_server_client.py`, `node_manager.py`, `inference_runtime.py`, `batch_inference.py`,
-  `batch_order.py`, `batchgen_server.py`, `batchgen_server_dev.py`, `batchgen_client.py`,
+  `batch_order.py`, `batchgen_client.py`,
   `client_optimized.py`, `launch_server.py`, `launch_http_server.py`, `entrypoint.py`,
   `lifespan.py`, `generate.py`, `model_instance.py`.
 - Subpackages: `batchgen/scheduler/`, `batchgen/server/`, `batchgen/kv_cache/`,

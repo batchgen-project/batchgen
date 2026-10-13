@@ -1,37 +1,41 @@
 import ctypes
-import errno
+import gc
 import math
 import multiprocessing as mp
 import os
 import random
 import string
+import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 import torch
 from tqdm import tqdm
 
-from batchgen.models.engine_loader import core_engine as bg
+if sys.platform != "linux":
+    pytest.skip(
+        "host paged KV backend is Linux-only", allow_module_level=True
+    )
 
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+try:
+    from batchgen.models.engine_loader import core_engine as bg
+except ImportError:  # compiled extension not built in this environment
+    pytest.skip("core_engine extension is unavailable", allow_module_level=True)
 
 
 def _random_shm_name() -> str:
+    """A diagnostic label only: the region itself is an anonymous memfd."""
     suffix = "".join(
         random.choices(string.ascii_lowercase + string.digits, k=10)
     )
     return f"/batchgen_kv_{suffix}"
 
 
-def _shm_unlink(name: str) -> None:
-    if not name:
-        return
-    res = _libc.shm_unlink(name.encode("utf-8"))
-    if res != 0:
-        err = ctypes.get_errno()
-        if err != errno.ENOENT:
-            raise OSError(err, f"shm_unlink({name}) failed")
+def _attach_identity(manager) -> tuple:
+    """(creator pid, memfd fd) another process needs to map the same region."""
+    fd = manager.memfd_fd()
+    assert fd >= 0
+    return os.getpid(), fd
 
 
 def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore
@@ -51,12 +55,149 @@ def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ig
     return cfg
 
 
-# 每个 worker 进程里做的事：attach shm + 分配自己的 sequences + 打印自己的 page table
-def _worker_proc_alloc(shm_name, device_index, requests):
-    # 每个进程里重新构造 cfg，shm_name 必须一致
-    cfg = _make_deepseek_r1_config(shm_name)
+def _make_tiny_mla_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore
+    cfg = bg.HostPagedKVConfig()
+    cfg.shm_name = shm_name
+    cfg.num_layers = 1
+    cfg.num_pages = 4
+    cfg.page_size_tokens = 4
+    cfg.num_k_heads = 1
+    cfg.k_head_dim = 8
+    cfg.num_v_heads = 0
+    cfg.v_head_dim = 0
+    cfg.k_element_size_bytes = 2
+    cfg.v_element_size_bytes = 0
+    cfg.sequence_table_capacity = 8
+    cfg.alignment_bytes = 64
+    return cfg
+
+
+def test_creator_leaves_no_named_shm_object():
+    shm_name = _random_shm_name()
+    manager = bg.MLAHostPagedKVManager(_make_tiny_mla_config(shm_name))
+    manager.initialize(True)
+    _, fd = _attach_identity(manager)
+
+    assert "memfd:batchgen_kv" in os.readlink(f"/proc/self/fd/{fd}")
+    assert not os.path.exists(f"/dev/shm/{shm_name.lstrip('/')}")
+
+    del manager
+    gc.collect()
+
+    # The kernel owns the lifetime: nothing survives the last mapping.
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_same_label_creators_get_independent_regions():
+    """The label no longer names anything, so two creators cannot collide."""
+    shm_name = _random_shm_name()
+    first = bg.MLAHostPagedKVManager(_make_tiny_mla_config(shm_name))
+    second = bg.MLAHostPagedKVManager(_make_tiny_mla_config(shm_name))
+
+    try:
+        first.initialize(True)
+        second.initialize(True)
+
+        assert first.memfd_fd() != second.memfd_fd()
+        first.allocate_pages(1, 4)
+
+        assert first.get_stats().num_free_pages == 3
+        assert second.get_stats().num_free_pages == 4
+    finally:
+        del second
+        del first
+
+
+def test_distinct_regions_coexist():
+    first = bg.MLAHostPagedKVManager(_make_tiny_mla_config(_random_shm_name()))
+    second = bg.MLAHostPagedKVManager(_make_tiny_mla_config(_random_shm_name()))
+
+    try:
+        first.initialize(True)
+        second.initialize(True)
+
+        first_stats = first.get_stats()
+        second_stats = second.get_stats()
+        assert first_stats.num_total_pages == 4
+        assert second_stats.num_total_pages == 4
+        assert first_stats.num_free_pages == 4
+        assert second_stats.num_free_pages == 4
+    finally:
+        del second
+        del first
+
+
+def _attach_and_report_stats(creator_pid, memfd_fd, result_queue):
+    cfg = _make_tiny_mla_config(_random_shm_name())
+    cfg.memfd_creator_pid = creator_pid
+    cfg.memfd_fd = memfd_fd
+    attached = bg.MLAHostPagedKVManager(cfg)
+    attached.initialize(False)
+    stats = attached.get_stats()
+    result_queue.put((stats.num_total_pages, stats.num_free_pages))
+
+
+def test_second_process_attaches_through_proc():
+    manager = bg.MLAHostPagedKVManager(_make_tiny_mla_config(_random_shm_name()))
+    try:
+        manager.initialize(True)
+        creator_pid, memfd_fd = _attach_identity(manager)
+        manager.allocate_pages(7, 4)
+
+        result_queue = mp.Queue()
+        child = mp.Process(
+            target=_attach_and_report_stats,
+            args=(creator_pid, memfd_fd, result_queue),
+        )
+        child.start()
+        total_pages, free_pages = result_queue.get(timeout=60)
+        child.join()
+
+        assert child.exitcode == 0
+        # The attacher sees the creator's allocation, not a fresh region.
+        assert (total_pages, free_pages) == (4, 3)
+    finally:
+        del manager
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
+def test_prefill_batch_allocation_is_atomic_on_capacity_failure():
+    """An over-capacity wave must not consume an earlier sequence's pages."""
+    worker = bg.MLAHostPagedKVWorkerView(_make_tiny_mla_config(_random_shm_name()))
+    try:
+        worker.initialize(0, True)
+        worker.register_sequences([101, 102])
+        with pytest.raises(RuntimeError, match="Insufficient free pages.*prefill batch"):
+            worker.allocate_pages_for_sequences([(101, 12), (102, 12)])
+
+        stats = worker.get_stats()
+        assert stats.num_free_pages == stats.num_total_pages == 4
+
+        # The failed two-row transaction left both sequence IDs reusable.
+        allocations = worker.allocate_pages_for_sequences([(101, 12)])
+        assert [len(pages) for pages in allocations] == [3]
+    finally:
+        try:
+            worker.release_sequence_pages([101])
+            worker.unregister_sequences([101, 102])
+        finally:
+            del worker
+
+
+def _make_attach_config(creator_pid, memfd_fd) -> bg.HostPagedKVConfig:  # type: ignore
+    """Worker-side config: same layout, plus the creator's memfd identity."""
+    cfg = _make_deepseek_r1_config(_random_shm_name())
+    cfg.memfd_creator_pid = creator_pid
+    cfg.memfd_fd = memfd_fd
+    return cfg
+
+
+# 每个 worker 进程里做的事：attach memfd + 分配自己的 sequences + 打印自己的 page table
+def _worker_proc_alloc(creator_pid, memfd_fd, device_index, requests):
+    cfg = _make_attach_config(creator_pid, memfd_fd)
     worker = bg.MLAHostPagedKVWorkerView(cfg)
-    worker.initialize(device_index, False)  # 只附着已有的 shared memory
+    worker.initialize(device_index, False)  # 只附着 creator 的 memfd
 
     seq_ids = [sid for (sid, _) in requests]
 
@@ -78,6 +219,7 @@ def _worker_proc_alloc(shm_name, device_index, requests):
     print(f"[worker {device_index}] page_table: {page_table}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_parallel_worker_allocate_sequences():
     shm_name = _random_shm_name()
     cfg = _make_deepseek_r1_config(shm_name)
@@ -101,13 +243,14 @@ def test_parallel_worker_allocate_sequences():
     try:
         # 1) 主进程创建并初始化共享内存区域（但不在主进程 allocate）
         manager.initialize(True)
+        creator_pid, memfd_fd = _attach_identity(manager)
 
         # 2) 启动多个 worker 进程，并发地在各自进程内 allocate pages
         procs = []
         for i in range(num_workers):
             p = mp.Process(
                 target=_worker_proc_alloc,
-                args=(shm_name, i, worker_requests[i]),
+                args=(creator_pid, memfd_fd, i, worker_requests[i]),
             )
             p.start()
             procs.append(p)
@@ -137,7 +280,7 @@ def test_parallel_worker_allocate_sequences():
             assert len(pages) == expected_page_count
 
     finally:
-        # 5) 清理：释放所有 sequence，删除 shm
+        # 5) 清理：释放所有 sequence，memfd 随最后一个映射一起消失
         try:
             manager.free_sequences(sequence_ids)
             stats_after_free = manager.get_stats()
@@ -146,7 +289,6 @@ def test_parallel_worker_allocate_sequences():
             assert stats_after_free.num_active_sequences == 0
         finally:
             del manager
-            _shm_unlink(shm_name)
 
 
 def test_worker_view_attaches_shared_prefix_pages_without_owning_them():
@@ -198,7 +340,6 @@ def test_worker_view_attaches_shared_prefix_pages_without_owning_them():
         except Exception:
             pass
         del worker
-        _shm_unlink(shm_name)
 
 
 def test_worker_view_retains_exact_prefix_pages_until_eviction_release():
@@ -250,14 +391,12 @@ def test_worker_view_retains_exact_prefix_pages_until_eviction_release():
         except Exception:
             pass
         del worker
-        _shm_unlink(shm_name)
 
 
-def _worker_proc_copy_prefill(shm_name, device_index, requests):
-    # 每个进程里重新构造 cfg，shm_name 必须一致
-    cfg = _make_deepseek_r1_config(shm_name)
+def _worker_proc_copy_prefill(creator_pid, memfd_fd, device_index, requests):
+    cfg = _make_attach_config(creator_pid, memfd_fd)
     worker = bg.MLAHostPagedKVWorkerView(cfg)
-    worker.initialize(device_index, False)  # 只附着已有的 shared memory
+    worker.initialize(device_index, False)  # 只附着 creator 的 memfd
 
     seq_ids = [sid for (sid, _) in requests]
 
@@ -298,8 +437,8 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
     )
 
 
-def _worker_proc_copy_decode(shm_name, device_index, requests):
-    cfg = _make_deepseek_r1_config(shm_name)
+def _worker_proc_copy_decode(creator_pid, memfd_fd, device_index, requests):
+    cfg = _make_attach_config(creator_pid, memfd_fd)
     worker = bg.MLAHostPagedKVWorkerView(cfg)
     worker.initialize(device_index, False)
 
@@ -343,6 +482,7 @@ def _worker_proc_copy_decode(shm_name, device_index, requests):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_kv_copy_prefill_d2h():
     PAGE_NUM_PER_SEQ = 200
     NUM_WORKERS = 8
@@ -365,13 +505,14 @@ def test_kv_copy_prefill_d2h():
     try:
         # 1) 主进程创建并初始化共享内存区域（但不在主进程 allocate）
         manager.initialize(True)
+        creator_pid, memfd_fd = _attach_identity(manager)
 
         # 2) 启动多个 worker 进程，并发地在各自进程内 allocate pages
         procs = []
         for i in range(num_workers):
             p = mp.Process(
                 target=_worker_proc_copy_prefill,
-                args=(shm_name, i, worker_requests[i]),
+                args=(creator_pid, memfd_fd, i, worker_requests[i]),
             )
             p.start()
             procs.append(p)
@@ -433,7 +574,7 @@ def test_kv_copy_prefill_d2h():
         print("All sequences verified successfully.")
 
     finally:
-        # 5) 清理：释放所有 sequence，删除 shm
+        # 5) 清理：释放所有 sequence，memfd 随最后一个映射一起消失
         try:
             manager.free_sequences(sequence_ids)
             stats_after_free = manager.get_stats()
@@ -442,9 +583,9 @@ def test_kv_copy_prefill_d2h():
             assert stats_after_free.num_active_sequences == 0
         finally:
             del manager
-            _shm_unlink(shm_name)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA devices")
 def test_kv_copy_decode_d2h():
     PAGE_NUM_PER_SEQ = 10
     NUM_WORKERS = 8
@@ -470,12 +611,18 @@ def test_kv_copy_decode_d2h():
 
     try:
         manager.initialize(True)
+        creator_pid, memfd_fd = _attach_identity(manager)
 
         procs = []
         for worker_idx in range(NUM_WORKERS):
             p = mp.Process(
                 target=_worker_proc_copy_decode,
-                args=(shm_name, worker_idx, worker_requests[worker_idx]),
+                args=(
+                    creator_pid,
+                    memfd_fd,
+                    worker_idx,
+                    worker_requests[worker_idx],
+                ),
             )
             p.start()
             procs.append(p)
@@ -514,7 +661,6 @@ def test_kv_copy_decode_d2h():
             manager.free_sequences(sequence_ids)
         finally:
             del manager
-            _shm_unlink(shm_name)
 
 
 if __name__ == "__main__":

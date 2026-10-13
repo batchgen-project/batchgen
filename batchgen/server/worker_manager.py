@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import atexit
+import gc
 import logging
 import os
+import pickle
 import signal
 import subprocess
-import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import psutil
 
 import torch
 import torch.multiprocessing as mp
@@ -23,17 +22,61 @@ from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
+from batchgen.memfd import create_memfd
 from batchgen.server.process_utils import (
-    cleanup_resources,
+    cleanup_shm_files,
     get_hugepage_size,
     get_model_byte_size,
 )
-from batchgen.server.server_args import ServerArgs
+from batchgen.server.runtime_locks import (
+    RuntimeLocks,
+    hold_run_lock,
+    list_run_named_objects,
+    reclaim_dead_runs,
+    release_run_lock,
+)
+from batchgen.server.runtime_lease import LaneLease
+from batchgen.server.server_args import (
+    ServerArgs,
+    validate_shared_runtime_capability,
+)
 from batchgen.utils import config_torch_module_initializer
 
 logger = logging.getLogger(__name__)
 
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
+# A sentinel reaches the worker's ordered C++/Python teardown path.  That path
+# must be allowed to finish before the signal fallback can invoke os._exit and
+# skip the destructors it exists to run.  The bound still keeps a blocked
+# worker from holding server shutdown indefinitely.
+_WORKER_SENTINEL_GRACE_S = 20.0
+
+
+def _resolve_local_world_size(
+    world_size: int,
+    nnodes: int,
+    visible_device_count: int,
+    *,
+    require_exact_visibility: bool = False,
+) -> int:
+    if nnodes <= 0 or world_size <= 0:
+        raise ValueError("world_size and nnodes must be positive")
+    if world_size % nnodes != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by nnodes ({nnodes})"
+        )
+    local_world_size = world_size // nnodes
+    if local_world_size > visible_device_count:
+        raise ValueError(
+            f"world_size ({world_size}) requires {local_world_size} GPUs per "
+            f"node, but only {visible_device_count} GPUs are visible"
+        )
+    if require_exact_visibility and local_world_size != visible_device_count:
+        raise ValueError(
+            f"shared mode requires exactly {local_world_size} visible GPUs, "
+            f"got {visible_device_count}"
+        )
+    return local_world_size
 
 
 def _validate_shmem_enabled() -> None:
@@ -111,10 +154,15 @@ class WorkerManager:
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
+        self.host_kv_manager = None
+        self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
         self.distributed_weight_config = None
         self.skeleton_state_dict = None
+        # The skeleton state dict lives in an anonymous memfd this process
+        # holds open; workers read it back through /proc/<our pid>/fd/<N>.
         self.skeleton_state_dict_file = None
+        self.skeleton_memfd_fd = -1
         self._lock = threading.Lock()
         self._worker_exit_state = worker_exit_state or WorkerExitState()
         self._monitor_stop_event = threading.Event()
@@ -126,34 +174,121 @@ class WorkerManager:
         self._fatal_ack_event = self._mp_ctx.Event()
         self.prefix_cache_runtime_config = None
         self.prefix_cache_coordinator = None
+        self._local_world_size: Optional[int] = None
+        self._runtime_dir_created = False
+        self._runtime_namespace_owned = False
+        self._runtime_locks: Optional[RuntimeLocks] = None
+        self._lane_lease: Optional[LaneLease] = None
+        # Held LOCK_SH for this process's whole life; see hold_run_lock.
+        self._run_lock = None
 
-        # Register cleanup for skeleton state dict temp file
-        atexit.register(self._cleanup_skeleton_state_dict_file)
-        self._hugepages_enabled = False  # Track if hugepages were configured
+    def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
+        """Serialize the skeleton state dict into an anonymous memfd.
 
-    def _cleanup_skeleton_state_dict_file(self) -> None:
-        """Clean up temporary skeleton state dict file."""
-        if self.skeleton_state_dict_file and os.path.exists(self.skeleton_state_dict_file):
+        A named file in the runtime dir survives a forced exit of the serving
+        processes; a memfd cannot — the kernel reclaims it with its last
+        reference however this process died. Workers ``torch.load`` it through
+        ``/proc/<our pid>/fd/<N>``, so the descriptor stays open for this
+        process's life, well past the point where the last worker has loaded
+        it. MFD_CLOEXEC keeps an exec'd child from holding it open instead.
+        """
+        self._close_skeleton_memfd()
+        fd = create_memfd("batchgen_skeleton")
+        try:
+            # dup so closing the wrapper does not close the descriptor the
+            # workers will reach through /proc.
+            with os.fdopen(os.dup(fd), "wb") as handle:
+                torch.save(skeleton_state_dict, handle)
+            size = os.fstat(fd).st_size
+        except BaseException:
+            os.close(fd)
+            raise
+        self.skeleton_memfd_fd = fd
+        self.skeleton_state_dict_file = f"/proc/{os.getpid()}/fd/{fd}"
+        logger.info(
+            "Skeleton state dict held in an anonymous memfd, readable at %s "
+            "(%d keys, %.2f MB)",
+            self.skeleton_state_dict_file,
+            len(skeleton_state_dict),
+            size / (1024**2),
+        )
+
+    def _close_skeleton_memfd(self) -> None:
+        """Release the skeleton memfd. Nothing is left behind to unlink."""
+        if self.skeleton_memfd_fd >= 0:
             try:
-                logging.debug(f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}")
-                os.remove(self.skeleton_state_dict_file)
-                self.skeleton_state_dict_file = None
-            except Exception as e:
-                logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
+                os.close(self.skeleton_memfd_fd)
+            except OSError as e:
+                logging.warning(f"Failed to close skeleton memfd: {e}")
+            self.skeleton_memfd_fd = -1
+        self.skeleton_state_dict_file = None
+
+    def _prepare_runtime_dir(self) -> None:
+        runtime_dir = self.args.runtime_identity.runtime_dir
+        runtime_dir.mkdir(mode=0o700, exist_ok=False)
+        self._runtime_dir_created = True
+        # Create the run's liveness lock before anything else can use the
+        # directory: every worker opens this exact file, and only a run whose
+        # processes are all gone can be reclaimed by a later start.
+        self._run_lock = hold_run_lock(runtime_dir, create=True)
+        shm_dir = Path("/dev/shm")
+        prefix = self.args.runtime_identity.shm_prefix
+        if shm_dir.is_dir() and any(
+            entry.name.startswith(prefix) for entry in shm_dir.iterdir()
+        ):
+            raise RuntimeError(
+                f"runtime namespace {prefix!r} already has shared-memory objects"
+            )
+        self._runtime_namespace_owned = True
 
     # ---------------------- Public API ----------------------
-    def start(self) -> None:
-        import time as _time
+    def _acquire_runtime_admission(self) -> None:
+        if self._runtime_locks is not None:
+            return
+        validate_shared_runtime_capability(self.args)
+        if (
+            self.args.runtime_mode == "shared"
+            and os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
+        ):
+            raise ValueError("shared mode rejects an external parameter server")
 
+        self._local_world_size = _resolve_local_world_size(
+            self.args.world_size,
+            self.args.nnodes,
+            torch.cuda.device_count(),
+            require_exact_visibility=self.args.runtime_mode == "shared",
+        )
+        if self.args.runtime_mode == "shared":
+            self._lane_lease = LaneLease.acquire(self.args)
+        self._runtime_locks = RuntimeLocks.acquire(self.args.runtime_identity)
+        # The instance lock is held and this run has no runtime directory yet, so
+        # every other directory of this instance belongs to a previous run. Its
+        # run id is fresh random hex, so nothing but this scan can ever remove it.
+        reclaim_dead_runs(self.args.runtime_identity)
+
+    def start(self) -> None:
         if self.started:
             return
+        try:
+            self._start_impl()
+        except BaseException:
+            try:
+                self.stop()
+            except BaseException:
+                logger.exception("Runtime rollback failed after startup error")
+            raise
+
+    def _start_impl(self) -> None:
+        import time as _time
 
         startup_start = _time.monotonic()
+        self._acquire_runtime_admission()
 
         self._stopping = False
         self._monitor_stop_event.clear()
         self._ready_event.clear()
         self._fatal_ack_event.clear()
+        self._prepare_runtime_dir()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -165,7 +300,6 @@ class WorkerManager:
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
             self._config_hugepages(byte_size)
-            self._hugepages_enabled = True
 
         import sys as _diag_sys
         def _diag(msg):
@@ -180,8 +314,11 @@ class WorkerManager:
             try:
                 _diag(">>> allocate_host_kv_cache")
                 result = self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size, self.args.model,
-                    enable_memfd=self.args.fast_init,
+                    self.args.host_kv_cache_size,
+                    self.args.model,
+                    primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
+                    aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+                    enable_thp=self.args.fast_init,
                 )
                 _diag("<<< allocate_host_kv_cache")
                 if isinstance(result, tuple):
@@ -191,6 +328,8 @@ class WorkerManager:
                     self.host_kv_aux_manager = None
             except Exception as exc:
                 if self.args.enable_prefix_cache:
+                    # Prefix reuse stores shared pages in Host KV; serving
+                    # without it would silently disable the feature.
                     raise RuntimeError(
                         "Host KV allocation is required for prefix cache reuse"
                     ) from exc
@@ -240,97 +379,251 @@ class WorkerManager:
         )
 
     def stop(self) -> None:
-        if not self.started:
+        if self._stopping:
+            return
+        has_partial_runtime = any(
+            (
+                self.started,
+                self._runtime_dir_created,
+                self._runtime_namespace_owned,
+                self._runtime_locks is not None,
+                self._lane_lease is not None,
+                self._run_lock is not None,
+                self.worker_process is not None,
+                self.distributed_weight_daemon is not None,
+                bool(self.model_info.get("shm_name")),
+                bool(self.model_info.get("tensor_meta_shm_name")),
+                self.skeleton_state_dict_file is not None,
+            )
+        )
+        if not has_partial_runtime:
             return
         self._stopping = True
-        self._monitor_stop_event.set()
-        logger.info("Stopping WorkerManager...")
-
-        # Stop the monitor thread
-        if self._monitor_thread is not None:
-            self._monitor_thread.join(timeout=5)
-
-        # Worker teardown closes the daemon control sockets. Mark the daemon as
-        # stopping first so those expected disconnects are not recorded as a
-        # transport failure; full daemon teardown still follows worker exit.
-        if self.distributed_weight_daemon is not None:
-            self.distributed_weight_daemon.prepare_stop()
-
-        # Collect worker PIDs before sending shutdown signal
-        worker_pids = self._get_worker_pids()
-
-        # Send SIGTERM to workers immediately for faster shutdown
-        # This is critical for Node 1 workers that may be blocked in NCCL
-        # waiting for Node 0 (which may already be shutting down)
-        if worker_pids:
-            logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
-            for pid in worker_pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass  # Process already exited
-
-        # Also send poison pill in case workers are not blocked in NCCL
+        worker_teardown_safe = self.worker_process is None
+        artifacts_cleaned = False
+        shutdown_start = time.monotonic()
         try:
-            self.request_queue.put(None)
-        except Exception:
-            logger.warning("Failed to signal worker shutdown", exc_info=True)
+            self._monitor_stop_event.set()
+            logger.info("Stopping WorkerManager...")
 
-        # Wait for workers to exit (reduced timeout for interactive use)
-        workers_joined = False
-        if self.worker_process is not None:
-            try:
-                with self._join_lock:
-                    self.worker_process.join(timeout=5)  # Reduced from 30s
-                workers_joined = True
-            except Exception:
-                logger.warning("Failed to join worker process", exc_info=True)
+            # Stop the monitor thread
+            if self._monitor_thread is not None:
+                self._monitor_thread.join(timeout=5)
+                self._monitor_thread = None
 
-        # Force-kill workers that didn't exit after SIGTERM
-        if not workers_joined and worker_pids:
-            logger.warning(
-                "Workers did not exit gracefully, force-killing..."
-            )
-            for pid in worker_pids:
+            # Worker teardown closes the daemon control sockets. Mark the daemon as
+            # stopping first so those expected disconnects are not recorded as a
+            # transport failure; full daemon teardown still follows worker exit.
+            if self.distributed_weight_daemon is not None:
+                self.distributed_weight_daemon.prepare_stop()
+
+            if self.worker_process is not None:
                 try:
-                    proc = psutil.Process(pid)
-                    proc.kill()
-                    logger.info(f"Force-killed worker process {pid}")
-                except Exception:
-                    pass
+                    self._stop_workers()
+                finally:
+                    logging.getLogger("uvicorn.error").info(
+                        "[shutdown] worker processes elapsed=%.3fs",
+                        time.monotonic() - shutdown_start,
+                    )
+            worker_teardown_safe = True
 
-        if self.distributed_weight_daemon is not None:
-            self.distributed_weight_daemon.stop()
-            self.distributed_weight_daemon = None
+            if self.distributed_weight_daemon is not None:
+                self.distributed_weight_daemon.stop()
+                self.distributed_weight_daemon = None
+        finally:
+            try:
+                # Clean only resources owned by this immutable run. The model
+                # regions are outside this run's SHM namespace, so they are
+                # released through their C++ owner instead.
+                if worker_teardown_safe:
+                    # The prefix-cache coordinator region lives in this run's
+                    # namespace; drop the owner before the namespace sweep.
+                    self._shutdown_prefix_cache_owner()
+                    if self._runtime_namespace_owned:
+                        cleanup_shm_files(self.args.runtime_identity.shm_prefix)
+                    if self.parameter_server_instance is not None:
+                        model_release_start = time.monotonic()
+                        self.parameter_server_instance = None
+                        gc.collect()
+                        logging.getLogger("uvicorn.error").info(
+                            "[shutdown] model SHM owner release elapsed=%.3fs",
+                            time.monotonic() - model_release_start,
+                        )
+                    # Both model regions are anonymous memfds in every mode, so
+                    # dropping the owner above is the whole release: the labels
+                    # name no object a supervisor could find afterwards.
+                    self.model_info.pop("shm_name", None)
+                    self.model_info.pop("tensor_meta_shm_name", None)
 
-        self._shutdown_prefix_cache_owner()
+                    self._close_skeleton_memfd()
+                    runtime_dir = self.args.runtime_identity.runtime_dir
+                    # Last holder of this run's liveness lock, and the lock file
+                    # lives in the directory removed next.
+                    release_run_lock(self._run_lock)
+                    self._run_lock = None
+                    if self._runtime_dir_created and runtime_dir.is_dir():
+                        import shutil
+                        shutil.rmtree(runtime_dir)
+                    artifacts_cleaned = True
+                else:
+                    logger.error(
+                        "Preserving runtime artifacts because owned worker "
+                        "termination was not confirmed"
+                    )
+            finally:
+                if artifacts_cleaned:
+                    self._runtime_dir_created = False
+                    self._runtime_namespace_owned = False
+                    self.worker_process = None
+                self.started = False
+                self._stopping = False
+                if artifacts_cleaned:
+                    if self._lane_lease is not None:
+                        self._lane_lease.close()
+                        self._lane_lease = None
+                    if self._runtime_locks is not None:
+                        self._runtime_locks.close()
+                        self._runtime_locks = None
+                if artifacts_cleaned:
+                    logger.info("WorkerManager stopped")
+                else:
+                    logger.error(
+                        "WorkerManager stop incomplete; admission locks remain held"
+                    )
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker manager elapsed=%.3fs clean=%s",
+                    time.monotonic() - shutdown_start,
+                    artifacts_cleaned,
+                )
 
-        # Get shm_name for cleanup if available
-        shm_name = self.model_info.get("shm_name")
-        shm_prefix = shm_name if shm_name else "batchgen"
-
-        # Cleanup resources (shared memory, hugepages, etc.)
-        cleanup_resources(
-            shm_prefix=shm_prefix,
-            clean_hugepages=self._hugepages_enabled,
-            kill_workers=False,  # Already handled above
-        )
-
-        self.started = False
-        logger.info("WorkerManager stopped")
-
-    def _get_worker_pids(self) -> List[int]:
-        """Get PIDs of all worker processes."""
-        pids = []
-        if self.worker_process is None:
-            return pids
-        processes = getattr(self.worker_process, "processes", None)
+    def _stop_workers(self) -> None:
+        """Signal only the original child processes, never a reused numeric PID."""
+        stop_start = time.monotonic()
+        processes = self.worker_process.processes
         if not processes:
-            return pids
-        for proc in processes:
-            if proc.pid is not None:
-                pids.append(proc.pid)
-        return pids
+            raise RuntimeError("worker process context has no child processes")
+        pidfds = []
+        # Some Python builds (e.g. conda's) lack the pidfd APIs. The workers are
+        # our own unreaped children, whose PIDs cannot be reused, and
+        # Process.terminate()/kill() signal only a child not yet reaped, so
+        # they are an equally safe fallback.
+        use_pidfd = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+
+        def send(proc, pidfd, sig):
+            if pidfd is None:
+                (proc.kill if sig == signal.SIGKILL else proc.terminate)()
+                return
+            try:
+                signal.pidfd_send_signal(pidfd, sig)
+            except ProcessLookupError:
+                pass
+
+        with self._join_lock:
+            try:
+                # An unjoined child cannot have its PID reused. Open handles
+                # before joining; the handles remain bound to these children.
+                for proc in processes:
+                    if proc.exitcode is None:
+                        pidfds.append(
+                            (proc, os.pidfd_open(proc.pid) if use_pidfd else None)
+                        )
+
+                # Let an idle worker leave its main loop normally first.  This
+                # gives its C++ storage objects a chance to release CUDA
+                # registrations and mappings before the signal fallback uses
+                # os._exit().  Workers blocked in NCCL or otherwise unable to
+                # consume the sentinel still follow the existing pidfd path.
+                sentinel_sent = False
+                try:
+                    self.request_queue.put(None)
+                    sentinel_sent = True
+                except Exception:
+                    logger.warning("Failed to signal worker shutdown", exc_info=True)
+
+                deadline = time.monotonic() + (
+                    _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
+                )
+                for proc in processes:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                remaining = [
+                    (proc, fd) for proc, fd in pidfds if proc.exitcode is None
+                ]
+                # Any worker that needs a signal did not run its ordered
+                # teardown, so this shutdown is abnormal and what it leaves
+                # behind has to be named in the log.
+                signal_fallback_used = bool(remaining)
+                for proc, pidfd in remaining:
+                    send(proc, pidfd, signal.SIGTERM)
+
+                deadline = time.monotonic() + 5
+                for proc, _ in remaining:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+
+                # A child may finish during the SIGTERM grace period. Reap
+                # only handles that are still live; sending SIGKILL to a
+                # child that already exited obscures the shutdown result and
+                # breaks fake-pidfd tests.
+                remaining = [
+                    (proc, fd) for proc, fd in remaining if proc.exitcode is None
+                ]
+
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker SIGTERM grace elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    len(remaining),
+                )
+                if remaining:
+                    logger.warning("Workers did not exit gracefully, force-killing...")
+                for proc, pidfd in remaining:
+                    send(proc, pidfd, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                for proc, _ in remaining:
+                    proc.join(timeout=max(0, deadline - time.monotonic()))
+                logging.getLogger("uvicorn.error").info(
+                    "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
+                    time.monotonic() - stop_start,
+                    sum(proc.exitcode is None for proc in processes),
+                )
+
+                if signal_fallback_used:
+                    identity = self.args.runtime_identity
+                    # The runtime dir is still ours here; stop() removes it once
+                    # teardown is confirmed, so only name it as a leftover when
+                    # something else of this run also survives.
+                    leftovers = [
+                        name
+                        for name in list_run_named_objects(
+                            identity.shm_prefix, identity.runtime_dir
+                        )
+                        if name != str(identity.runtime_dir)
+                    ]
+                    if leftovers:
+                        remains = "Left behind for this run: " + ", ".join(leftovers)
+                    else:
+                        remains = (
+                            "Nothing named remains for this run beyond its runtime "
+                            "directory, which stop() removes; the model and KV "
+                            "regions are anonymous memfds the kernel reclaims."
+                        )
+                    logger.warning(
+                        "Workers exited abnormally: the SIGTERM/SIGKILL fallback "
+                        "replaced their ordered teardown. %s",
+                        remains,
+                    )
+
+                surviving_pids = [
+                    proc.pid for proc in processes if proc.exitcode is None
+                ]
+                if surviving_pids:
+                    raise RuntimeError(
+                        "worker teardown left live owned PIDs; preserving runtime "
+                        f"artifacts for investigation: {surviving_pids}"
+                    )
+            finally:
+                for _, pidfd in pidfds:
+                    if pidfd is not None:
+                        os.close(pidfd)
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
@@ -340,67 +633,12 @@ class WorkerManager:
         self._fatal_ack_event.set()
         self._handle_worker_failure(reason, None)
 
-    def infer(
-        self,
-        prompts: List[str],
-        max_input_len: Optional[int],
-        max_output_len: int,
-        ignore_eos: bool = False,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        # Incremental writer metadata
-        custom_id_map: Optional[Dict[int, str]] = None,
-        request_url_map: Optional[Dict[int, str]] = None,
-        prompt_text_map: Optional[Dict[int, str]] = None,
-        batch_id: Optional[str] = None,
-        model_name: Optional[str] = None,
-        incremental_output_dir: Optional[str] = None,
-        parse_thinking: bool = False,
-        parse_tool_call: bool = False,
-        max_context_length: Optional[int] = None,
-        sampling_params: Optional[List[Dict[str, Any]]] = None,
-        per_sequence_max_tokens: Optional[List[int]] = None,
-        batchgen_debug: Optional[Dict[str, Any]] = None,
-    ) -> List[Any]:
-        if not self.started:
-            raise RuntimeError("WorkerManager has not been started")
-        payload = {
-            "prompts": prompts,
-            "max_input_len": max_input_len,  # None = dynamically determined
-            "max_output_len": max_output_len,
-            "ignore_eos": ignore_eos,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_context_length": max_context_length,
-        }
-        # Per-request sampling parameters (list of dicts with temperature/top_p/top_k)
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        # Per-sequence max output token limits
-        if per_sequence_max_tokens is not None:
-            payload["per_sequence_max_tokens"] = per_sequence_max_tokens
-        if batchgen_debug:
-            payload["batchgen_debug"] = batchgen_debug
-        # Incremental writer metadata (only included when active)
-        if incremental_output_dir and custom_id_map:
-            payload["incremental_output_dir"] = incremental_output_dir
-            payload["custom_id_map"] = custom_id_map
-            payload["request_url_map"] = request_url_map or {}
-            payload["prompt_text_map"] = prompt_text_map or {}
-            payload["batch_id"] = batch_id
-            payload["model_name"] = model_name
-            payload["parse_thinking"] = parse_thinking
-            payload["parse_tool_call"] = parse_tool_call
-        with self._lock:
-            self.request_queue.put(payload)
-            result = self.response_queue.get()
-        return result
-
     def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
-        """Send hot-reload command to all worker ranks (legacy sync RPC path).
+        """Send hot-reload command via the main loop's sync RPC path.
 
-        Used by the non-pool-mode worker main loop (one request → one response
-        via request_queue/response_queue). For pool-mode workers, use
+        Used before the worker enters generate_persistent(), while the main
+        loop still answers one request with one response on
+        request_queue/response_queue. Once pool mode is running, use
         send_pool_reload() instead — pool mode never returns to the main loop.
         """
         import queue as _queue
@@ -417,9 +655,9 @@ class WorkerManager:
         status file polling.
 
         Pool-mode workers (generate_persistent loop) read the reload command
-        from request_queue and write per-rank status to
-        /tmp/batchgen_reload_status/rank_<N>.json. This method polls those
-        files for up to `timeout` seconds, returning aggregated status.
+        from request_queue and write per-rank status below this run's private
+        runtime directory. This method polls those files for up to `timeout`
+        seconds, returning aggregated status.
 
         Why not response_queue: pool mode admission queue and response_queue
         are designed for batched async I/O (per-completion notifications via
@@ -431,7 +669,7 @@ class WorkerManager:
         import shutil
         import time as _time
 
-        status_dir = "/tmp/batchgen_reload_status"
+        status_dir = str(self.args.runtime_identity.reload_status_dir)
         # Clear stale status files from previous reloads
         if os.path.isdir(status_dir):
             try:
@@ -495,7 +733,10 @@ class WorkerManager:
             logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
 
     def _config_hugepages(self, byte_size: int = None) -> None:
-        """Configure hugepages for shared memory.
+        """Reserve the host huge page pool the weights memfd draws from.
+
+        MFD_HUGETLB needs no hugetlbfs mount, only the reservation, so this
+        configures the pool size and nothing else.
 
         Args:
             byte_size: Model size in bytes. If None, uses default 700GB.
@@ -515,18 +756,13 @@ class WorkerManager:
             f"{hugepage_size / (1024**2):.0f} MB pages)"
         )
 
-        commands = [
-            ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"],
-            ["mkdir", "-p", "/dev/hugepages"],
-            ["mount", "-t", "hugetlbfs", "none", "/dev/hugepages"],
-        ]
-        for cmd in commands:
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:
-                logger.warning(
-                    "Hugepages configuration failed (%s): %s", cmd, exc
-                )
+        cmd = ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except Exception as exc:
+            logger.warning(
+                "Hugepages configuration failed (%s): %s", cmd, exc
+            )
 
     def _load_model_resources(self) -> None:
         import sys as _diag_sys, time as _diag_time
@@ -592,16 +828,9 @@ class WorkerManager:
             # Auto-detect only if not explicitly specified
             world_size = local_device_count * self.args.nnodes
 
-        # Calculate local world size (workers per node)
-        local_world_size = world_size // self.args.nnodes
-
-        # Validate: can't spawn more workers than visible GPUs
-        if local_world_size > local_device_count:
-            raise ValueError(
-                f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
-                f"but only {local_device_count} GPUs are visible. "
-                f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
-            )
+        local_world_size = self._local_world_size
+        if local_world_size is None:
+            raise RuntimeError("runtime topology was not validated before startup")
 
         logger.info(
             "Spawning %d DDP workers (world_size=%d, nnodes=%d)",
@@ -619,6 +848,7 @@ class WorkerManager:
             kv_dtype=self.args.kv_dtype,
             dist_init_addr=self.args.dist_init_addr,
             world_size=world_size,
+            local_world_size=local_world_size,
             nnode_rank=self.args.node_rank,
             nnodes=self.args.nnodes,
             gpu_arch=gpu_arch,
@@ -656,6 +886,7 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            persistent_phase_instances=self.args.persistent_phase_instances,
             detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
             host_kv_chunk_size=self.args.host_kv_chunk_size,
             enable_host_kv_eviction=self.args.enable_host_kv_eviction,
@@ -667,18 +898,41 @@ class WorkerManager:
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
             max_pool_size=self.args.max_pool_size,
+            input_ids_pool_size_gb=self.args.input_ids_pool_size_gb,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
+            tensor_meta_memfd_fd=self._get_tensor_meta_memfd_fd(),
             distributed_weight_config=(
                 str(self.args.distributed_weight_config)
                 if self.args.distributed_weight_config is not None
                 else None
             ),
+            host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
+            host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+            query_book_shm_prefix=(
+                self.args.runtime_identity.query_book_shm_prefix
+            ),
+            reload_status_dir=str(
+                self.args.runtime_identity.reload_status_dir
+            ),
+            pynccl_port_base=self.args.pynccl_port_base,
+            pynccl_port_span=self.args.pynccl_port_span,
         )
         from batchgen.server_worker_main_loop import server_worker_main
+        # Each worker arms PR_SET_PDEATHSIG, which the kernel delivers when the
+        # THREAD that created it exits -- not when this process exits.  Spawning
+        # from a helper thread would therefore kill every worker as soon as that
+        # thread finished.
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "GPU workers must be spawned from the main thread: the worker "
+                "parent-death signal is tied to the spawning thread, so workers "
+                f"spawned from {threading.current_thread().name!r} would be "
+                "killed when that thread exits."
+            )
         self.worker_process = mp.spawn(
             server_worker_main,
             args=(
@@ -693,33 +947,47 @@ class WorkerManager:
             daemon=True,
         )
 
+    # Host KV regions are always anonymous memfds owned by this process, so the
+    # creator pid and fds are published to the workers in every mode.
     def _get_kv_memfd_pid(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if getattr(self, 'host_kv_manager', None) is not None:
             return os.getpid()
         return -1
 
     def _get_kv_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if getattr(self, 'host_kv_manager', None) is not None:
             return self.host_kv_manager.memfd_fd()
         return -1
 
     def _get_kv_aux_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_aux_manager', None) is not None:
+        if getattr(self, 'host_kv_aux_manager', None) is not None:
             return self.host_kv_aux_manager.memfd_fd()
         return -1
 
+    # The local parameter server owns both the weights and the tensor-metadata
+    # memfd, so its pid and fds are published to the workers in every mode,
+    # hugetlbfs included: that mode only changes the memfd's page size.
     def _get_weights_memfd_pid(self) -> int:
         ps = getattr(self, 'parameter_server_instance', None)
-        if self.args.fast_init and ps is not None:
-            fd = ps.parameter_server.weights_memfd_fd()
-            if fd >= 0:
-                return os.getpid()
+        if ps is None:
+            return -1
+        if (
+            ps.parameter_server.weights_memfd_fd() >= 0
+            or ps.parameter_server.tensor_meta_memfd_fd() >= 0
+        ):
+            return os.getpid()
         return -1
 
     def _get_weights_memfd_fd(self) -> int:
         ps = getattr(self, 'parameter_server_instance', None)
-        if self.args.fast_init and ps is not None:
+        if ps is not None:
             return ps.parameter_server.weights_memfd_fd()
+        return -1
+
+    def _get_tensor_meta_memfd_fd(self) -> int:
+        ps = getattr(self, 'parameter_server_instance', None)
+        if ps is not None:
+            return ps.parameter_server.tensor_meta_memfd_fd()
         return -1
 
     def _wait_for_workers_ready(self) -> None:
@@ -753,7 +1021,8 @@ class WorkerManager:
                 return
             try:
                 with self._join_lock:
-                    self.worker_process.join(timeout=self._monitor_interval_s)
+                    for proc in self.worker_process.processes:
+                        proc.join(timeout=0)
             except Exception as exc:
                 if self._stopping:
                     return
@@ -771,6 +1040,7 @@ class WorkerManager:
                 logger.error(exit_reason)
                 self._handle_worker_failure(exit_reason, None)
                 return
+            self._monitor_stop_event.wait(self._monitor_interval_s)
 
     def _collect_worker_exit_reason(self) -> Optional[str]:
         if self.worker_process is None:
@@ -779,10 +1049,19 @@ class WorkerManager:
         if not processes:
             return None
         exited = []
+        error_files = getattr(self.worker_process, "error_files", ())
         for idx, proc in enumerate(processes):
             if proc.exitcode is None:
                 continue
-            exited.append(f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}")
+            detail = f"idx={idx} pid={proc.pid} exitcode={proc.exitcode}"
+            if (
+                idx < len(error_files)
+                and error_files[idx]
+                and os.path.isfile(error_files[idx])
+            ):
+                with open(error_files[idx], "rb") as error_file:
+                    detail += " Python traceback:\n" + pickle.load(error_file)
+            exited.append(detail)
         if not exited:
             return None
         return "Detected worker process exit: " + ", ".join(exited)
@@ -793,6 +1072,11 @@ class WorkerManager:
         if self._stopping:
             return
         if self._worker_exit_state.set_failure(reason, exc):
+            logging.getLogger("uvicorn.error").error(
+                "[shutdown] worker failure detected epoch=%.6f: %s",
+                time.time(),
+                reason,
+            )
             self._request_server_shutdown()
 
     @staticmethod
@@ -840,7 +1124,7 @@ class WorkerManager:
         config = self.distributed_weight_config
         if config is None:
             raise RuntimeError("distributed weight config is not loaded")
-        self.skeleton_state_dict_file = None
+        self._close_skeleton_memfd()
         self.skeleton_state_dict = None
         self.parameter_server_instance = None
         self.model_info = {
@@ -877,7 +1161,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "deepseek" in model_lower:
             from batchgen.models.deepseek.deepseek_parameter_server import (
@@ -889,7 +1173,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "mixtral" in self.args.model.lower():
             from batchgen.models.mixtral.mixtral_parameter_server import (
@@ -898,7 +1182,7 @@ class WorkerManager:
 
             parameter_server = Mixtral_Parameter_Server(
                 self.args.model, self.args.cache_dir, converted_ckpt_dir,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "gpt-oss-120b" in self.args.model.lower():
             from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
@@ -910,7 +1194,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
@@ -922,7 +1206,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
@@ -934,7 +1218,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "minimax" in self.args.model.lower():
             from batchgen.models.minimax.minimax_m25.minimax_m25_parameter_server import (
@@ -946,7 +1230,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
         elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
             import sys as _diag_sys, time as _diag_time
@@ -963,7 +1247,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
-                enable_memfd=self.args.fast_init,
+                enable_thp=self.args.fast_init,
             )
             _diag("    glm5: GLM5_Parameter_Server constructed")
         else:
@@ -978,24 +1262,16 @@ class WorkerManager:
         _diag2("    >>> parameter_server.Init()")
         shm_name, tensor_meta_shm_name = parameter_server.Init()
         _diag2("    <<< parameter_server.Init() returned")
+        # Publish the owner before anything else can fail: a startup rollback
+        # has to be able to release the regions Init just created.
+        self.parameter_server_instance = parameter_server
         ps_size = parameter_server.parameter_server.byte_size()
         _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
-        # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
+        # Stash skeleton_state_dict in a memfd to avoid passing tensors through mp.spawn
         skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)...")
-
-        # Create temp file for skeleton state dict
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
-        os.close(fd)  # Close fd, torch.save will open its own handle
-
-        torch.save(skeleton_state_dict, file_path)
-        actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
-
-        self.skeleton_state_dict_file = file_path
+        self._store_skeleton_state_dict(skeleton_state_dict)
         self.skeleton_state_dict = None  # Don't keep tensors in memory
-        self.parameter_server_instance = parameter_server
         self.model_info = {
             "huggingface_ckpt_name": self.args.model,
             "shm_name": shm_name,
@@ -1033,16 +1309,8 @@ class WorkerManager:
                 "Remote parameter server did not return a skeleton_state_dict"
             )
 
-        # Save skeleton_state_dict to temp file to avoid passing tensors through mp.spawn
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton)} keys)...")
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
-        os.close(fd)  # Close fd, torch.save will open its own handle
-
-        torch.save(skeleton, file_path)
-        actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
-
-        self.skeleton_state_dict_file = file_path
+        # Stash skeleton_state_dict in a memfd to avoid passing tensors through mp.spawn
+        self._store_skeleton_state_dict(skeleton)
         self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = None
         self.model_info = {
@@ -1111,7 +1379,9 @@ class WorkerManager:
     @staticmethod
     def allocate_host_kv_cache(
         host_kv_cache_size_gb: int, model_name: str,
-        enable_memfd: bool = False,
+        primary_shm_name: str,
+        aux_shm_name: str,
+        enable_thp: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 
@@ -1119,7 +1389,9 @@ class WorkerManager:
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
-            enable_memfd=enable_memfd,
+            enable_thp=enable_thp,
+            primary_shm_name=primary_shm_name,
+            aux_shm_name=aux_shm_name,
         )
         if dual is not None:
             primary_mgr, aux_mgr = dual
@@ -1131,9 +1403,9 @@ class WorkerManager:
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
+            shm_name=primary_shm_name,
         )
-        if enable_memfd:
-            config.enable_memfd = True
+        config.enable_thp = enable_thp
         # Select manager based on model's KV cache configuration
         # MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
         if config.num_v_heads == 0:

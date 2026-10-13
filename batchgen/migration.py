@@ -17,11 +17,10 @@ import torch
 import torch.distributed as dist
 
 from batchgen.sequence import SequenceStatus
+from batchgen.query_book import QueryBook
 
 logger = logging.getLogger(__name__)
 
-# Constants for migration
-NUM_GPUS_PER_NODE = 8  # TODO: Make configurable
 HOST_KV_WATERMARK_PERCENT = 70  # Trigger prefill when >70% free
 
 
@@ -106,6 +105,10 @@ class KVMigrationHelper:
         return self.worker.local_rank
 
     @property
+    def local_world_size(self) -> int:
+        return self.worker.local_world_size
+
+    @property
     def PAGE_SIZE(self) -> int:
         return self.worker.PAGE_SIZE
 
@@ -146,9 +149,12 @@ class KVMigrationHelper:
         stats = self.worker.host_paged_kv_worker_view.get_stats()
 
         # Count pages used by sequences with KV in host on THIS NODE
-        node_id = self.rank // NUM_GPUS_PER_NODE
-        node_rank_start = node_id * NUM_GPUS_PER_NODE
-        node_rank_end = min(node_rank_start + NUM_GPUS_PER_NODE, self.world_size)
+        node_id = self.rank // self.local_world_size
+        node_rank_start = node_id * self.local_world_size
+        node_rank_end = min(
+            node_rank_start + self.local_world_size,
+            self.world_size,
+        )
 
         valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
 
@@ -296,9 +302,9 @@ class KVMigrationHelper:
         for src_node_id, _ in overloaded:
             while used_by_node[src_node_id] > target_per_node and underutilized:
                 # Find sequences to migrate from src_node
-                src_rank_base = src_node_id * NUM_GPUS_PER_NODE
+                src_rank_base = src_node_id * self.local_world_size
                 candidate_sequences = []
-                for gpu_offset in range(NUM_GPUS_PER_NODE):
+                for gpu_offset in range(self.local_world_size):
                     src_rank = src_rank_base + gpu_offset
                     if src_rank >= self.world_size:
                         break
@@ -330,10 +336,15 @@ class KVMigrationHelper:
                 if dest_node_id not in self._dest_rank_counter:
                     self._dest_rank_counter[dest_node_id] = 0
 
-                dest_rank_offset = self._dest_rank_counter[dest_node_id] % NUM_GPUS_PER_NODE
-                dest_rank = dest_node_id * NUM_GPUS_PER_NODE + dest_rank_offset
+                dest_rank_offset = (
+                    self._dest_rank_counter[dest_node_id]
+                    % self.local_world_size
+                )
+                dest_rank = (
+                    dest_node_id * self.local_world_size + dest_rank_offset
+                )
                 if dest_rank >= self.world_size:
-                    dest_rank = dest_node_id * NUM_GPUS_PER_NODE
+                    dest_rank = dest_node_id * self.local_world_size
                 self._dest_rank_counter[dest_node_id] += 1
 
                 migrations.append(MigrationOp(
@@ -423,6 +434,16 @@ class KVMigrationHelper:
 
             dist.barrier()
 
+            # The receiver restores the trajectory before the round barrier.
+            # Only then is it safe to return the source node's reservation.
+            for completed_migration in round_migrations:
+                if self.rank != completed_migration.from_rank:
+                    continue
+                uuid = completed_migration.uuid
+                book = getattr(self.worker, "_trajectory_book", None)
+                if book is not None and book.has_sequence(uuid):
+                    book.release(book.slot_for(uuid))
+
         if self.rank == 0:
             logger.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
 
@@ -494,19 +515,33 @@ class KVMigrationHelper:
         # Move to CPU for Gloo transfer
         k_cpu = k_gpu.cpu().contiguous()
 
+        # Snapshot the token trajectory before releasing any source KV. If the
+        # source reservation is missing, fail before mutating host/GPU state;
+        # the destination needs this payload to restore bookkeeping.
+        trajectory = self.worker._trajectory_tokens(seq, dtype=torch.int32).contiguous()
+        book = getattr(self.worker, "_trajectory_book", None)
+        if book is None or not book.has_sequence(mig.uuid):
+            raise RuntimeError(f"missing trajectory reservation for {mig.uuid}")
+        slot = book.slot_for(mig.uuid)
+        turns = book.turns_payload(slot).contiguous()
+        header = torch.tensor(
+            [1, trajectory.numel(), seq.prompt_length, seq.decoded_length, turns.shape[0]],
+            dtype=torch.int64,
+        )
+
         # Send via Gloo
         dist.send(tensor=k_cpu, dst=mig.to_rank, group=gloo_group)
 
-        # Free GPU and host pages
+        # Send the complete int32 trajectory and turn ledger before releasing
+        # source KV resources. The destination restores it before the
+        # migration round acknowledges completion.
+        dist.send(tensor=header, dst=mig.to_rank, group=gloo_group)
+        dist.send(tensor=trajectory, dst=mig.to_rank, group=gloo_group)
+        dist.send(tensor=turns, dst=mig.to_rank, group=gloo_group)
+
+        # Free GPU and host pages after the complete source payload is sent.
         manager.free_pages_for_sequences([global_idx])
         worker_view.release_sequence_pages([global_idx])
-
-        # Send query_book data
-        local_idx = self.worker._uuid_to_local_map.get(mig.uuid)
-        if local_idx is not None and local_idx in self.worker.query_book:
-            qb = self.worker.query_book[local_idx]
-            dist.send(tensor=qb.encoded["input_ids"].clone(), dst=mig.to_rank, group=gloo_group)
-            dist.send(tensor=qb.decoded_tokens.clone(), dst=mig.to_rank, group=gloo_group)
 
         if self.debug:
             logger.debug(f"MIGRATION: Rank {self.rank}: Sent {mig.uuid[:8]}... in {(time.perf_counter()-t0)*1000:.1f}ms")
@@ -553,18 +588,45 @@ class KVMigrationHelper:
 
         torch.cuda.synchronize(self.worker.torch_device)
 
-        # Receive query_book data
-        input_ids_recv = torch.empty(seq.input_ids.shape, dtype=seq.input_ids.dtype, device="cpu")
-        decoded_tokens_recv = torch.empty(seq.decoded_tokens.shape, dtype=seq.decoded_tokens.dtype, device="cpu")
+        # Receive the complete trajectory and its turn ledger.
+        header = torch.empty(5, dtype=torch.int64)
+        dist.recv(tensor=header, src=mig.from_rank, group=gloo_group)
+        version, trajectory_length, prompt_length, decoded_length, turn_count = [
+            int(value) for value in header.tolist()
+        ]
+        if version != 1 or trajectory_length < 0 or turn_count < 0:
+            raise RuntimeError(f"invalid trajectory migration header for {mig.uuid}")
+        trajectory_recv = torch.empty(trajectory_length, dtype=torch.int32)
+        dist.recv(tensor=trajectory_recv, src=mig.from_rank, group=gloo_group)
+        turn_payload = torch.empty((turn_count, 6), dtype=torch.int64)
+        dist.recv(tensor=turn_payload, src=mig.from_rank, group=gloo_group)
+        turns = QueryBook.turns_from_payload(turn_payload)
 
-        dist.recv(tensor=input_ids_recv, src=mig.from_rank, group=gloo_group)
-        dist.recv(tensor=decoded_tokens_recv, src=mig.from_rank, group=gloo_group)
+        book = getattr(self.worker, "_trajectory_book", None)
+        if book is None:
+            raise RuntimeError("trajectory book unavailable on migration destination")
+        if book.has_sequence(mig.uuid):
+            destination_slot = book.slot_for(mig.uuid)
+        else:
+            destination_slot = book.bind(mig.uuid, self.worker.model_context_length)
+        book.restore(
+            destination_slot,
+            trajectory_recv,
+            prompt_length=prompt_length,
+            decoded_length=decoded_length,
+            turns=turns,
+        )
+        seq._buffer_slot = destination_slot
 
         # Store pending data
         self._pending_migrated_query_book[mig.uuid] = {
             'text': seq.text,
-            'input_ids': input_ids_recv,
-            'decoded_tokens': decoded_tokens_recv,
+            'trajectory': trajectory_recv,
+            'prompt_length': prompt_length,
+            'decoded_length': decoded_length,
+            'turns': turns,
+            'restored': True,
+            'slot': destination_slot,
             'kv_token_budget': seq.kv_token_budget,
         }
         self._migrated_sequences.add(mig.uuid)

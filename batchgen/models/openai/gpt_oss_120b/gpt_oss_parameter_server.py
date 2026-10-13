@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
 #  you may not use this file except in compliance with the license.             #
@@ -48,7 +48,6 @@ BatchGen format (per expert):
 import gc
 import logging
 import os
-import shutil
 import uuid
 
 import torch
@@ -76,14 +75,16 @@ class GptOss_Parameter_Server:
     - Mapping checkpoint names to BatchGen format
     """
 
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
+        self.shm_name = None
+        self.tensor_meta_shm_name = None
 
         # Use BatchGen's unified config system
         self.model_config = load_config(huggingface_ckpt_name)
@@ -123,20 +124,13 @@ class GptOss_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
 
         # GPT-OSS-120B: ~65GB total (61GB MXFP4 experts + 4GB BF16 attn/embed)
         byte_size = 70 * 1024 * 1024 * 1024  # 70GB with buffer
 
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free/1024/1024/1024:.2f} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size is not enough. Required: {byte_size}, Available: {free}. "
-                "Please clear /dev/shm or increase the size by running "
-                "'sudo mount -o remount,size=<size>G /dev/shm'"
-            )
-
+        # Both regions are anonymous memfds; these names are only the labels the
+        # C++ parameter server reports for them.
         self.shm_name = "/shm_" + str(uuid.uuid4())
         self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
         logging.info(f"Model parameters shared memory name: {self.shm_name}")

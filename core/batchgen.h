@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -50,7 +50,9 @@ class BatchGen {
 
     void Init();
     void init_weight_storage(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size, bool enable_hugetlbfs);
+                    int64_t byte_size, bool enable_hugetlbfs,
+                    bool enable_thp = false, int memfd_creator_pid = -1,
+                    int memfd_fd = -1, int tensor_meta_memfd_fd = -1);
     void Terminate();
 
     /*
@@ -81,7 +83,12 @@ class BatchGen {
 
     std::unordered_map<std::string, torch::Tensor> get_weights(
         std::string module_key, std::string& phase);
+    std::unordered_map<std::string, torch::Tensor> get_weights_pinned(
+        const std::string& module_name);
     void free_weights_buffer(const std::string& module_name);
+    void free_weights_buffer_async(const std::string& module_name);
+    void free_weights_buffers_async(
+        const std::vector<std::string>& module_names);
 
     /* Attn */
     torch::Tensor attn(py::object torch_module, int64_t layer_idx,

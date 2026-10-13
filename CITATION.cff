@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use BatchGen or code derived from it, please cite it as below."
+title: BatchGen
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/batchgen-project/batchgen"
+authors:
+  - name: BatchGen Team
+preferred-citation:
+  type: conference-paper
+  title: "BatchGen: An Architecture for Scalable and Efficient Batch Inference"
+  authors:
+    - family-names: Xu
+      given-names: Tairan
+    - family-names: Xue
+      given-names: Leyang
+    - family-names: Lu
+      given-names: Zhan
+    - family-names: Deng
+      given-names: Jinfu
+    - family-names: Xiao
+      given-names: Hongyang
+    - family-names: Jiang
+      given-names: Yinsicheng
+    - family-names: He
+      given-names: Congjie
+    - family-names: Sandor
+      given-names: Matej
+    - family-names: Xu
+      given-names: Le
+    - family-names: Mai
+      given-names: Luo
+  collection-title: "20th USENIX Symposium on Operating Systems Design and Implementation (OSDI 26)"
+  publisher:
+    name: USENIX Association
+  conference:
+    name: "OSDI 26"
+    city: Seattle
+    region: WA
+  start: 1125
+  end: 1141
+  year: 2026
+  month: 7
+  url: "https://www.usenix.org/conference/osdi26/presentation/xu-tairan"

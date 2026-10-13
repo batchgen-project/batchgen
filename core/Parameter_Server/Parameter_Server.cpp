@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <chrono>
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
 // #include <filesystem>
@@ -413,8 +414,6 @@ void Parameter_Server::Init(
                        std::unordered_map<std::string, std::string>>&
         state_dict_name_map) {
     this->logger->info("Parameter Server Initializing...");
-    this->shm_name = weight_shm_name;
-    this->tensor_meta_shm_name = tensor_meta_shm_name;
 
     size_t free_memory = 0;
     size_t total_memory = 0;
@@ -428,22 +427,27 @@ void Parameter_Server::Init(
     // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
     int memfd_fd_out = -1;
+    int64_t mapped_size = 0;
     weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
                                                this->enable_hugetlbfs, false,
-                                               this->enable_memfd_, -1, -1,
-                                               &memfd_fd_out);
-    if (this->enable_memfd_ && memfd_fd_out >= 0) {
-        this->weights_memfd_fd_ = memfd_fd_out;
-    }
+                                               this->enable_thp_, -1, -1,
+                                               &memfd_fd_out,
+                                               &mapped_size);
+    this->shm_name = weight_shm_name;
+    this->weights_memfd_fd_ = memfd_fd_out;
     this->byte_size_ = byte_size;
+    this->mapped_size_ = mapped_size;
     this->weight_ptr_ = weight_ptr;
 
     // Load weights from the model_weights_path
     _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, state_dict_name_map);
 
-    // Serialize the module weights storage to shared memory
-    serialize_to_shared_memory(this->module_weights_storage_, tensor_meta_shm_name);
-    
+    // Serialize the module weights storage into an anonymous memfd. Workers
+    // read it once through /proc/<this pid>/fd/<tensor_meta_memfd_fd_>.
+    this->tensor_meta_memfd_fd_ =
+        serialize_to_memfd(this->module_weights_storage_);
+    this->tensor_meta_shm_name = tensor_meta_shm_name;
+
     std::cout << std::endl;
     this->logger->info("Parameter Server Initialized.");
 };
@@ -451,10 +455,10 @@ void Parameter_Server::Init(
 
 
 
-Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
+Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_thp) {
     this->logger = init_logger("info", "Parameter_Server");
     this->enable_hugetlbfs = enable_hugetlbfs;
-    this->enable_memfd_ = enable_memfd;
+    this->enable_thp_ = enable_thp;
 };
 // void Parameter_Server::Init(
 //     std::string& weight_shm_name, std::string& tensor_meta_shm_name,
@@ -597,10 +601,20 @@ Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
 // };
 
 Parameter_Server::~Parameter_Server() {
-    free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
-                              this->byte_size_, true);
-    shm_unlink(this->shm_name.c_str());
-    shm_unlink(this->tensor_meta_shm_name.c_str());
+    if (this->weight_ptr_ != nullptr) {
+        free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
+    }
+    // Closing the memfds drops the last reference the kernel needs: no name
+    // survives this process in any mode, hugetlbfs included, so nothing is left
+    // to unlink.
+    if (this->weights_memfd_fd_ >= 0) {
+        close(this->weights_memfd_fd_);
+        this->weights_memfd_fd_ = -1;
+    }
+    if (this->tensor_meta_memfd_fd_ >= 0) {
+        close(this->tensor_meta_memfd_fd_);
+        this->tensor_meta_memfd_fd_ = -1;
+    }
     this->logger->info("Parameter Server Destroyed.");
 };
 

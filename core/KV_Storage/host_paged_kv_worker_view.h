@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <iomanip>
 #include <limits>
@@ -45,58 +46,6 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
                          const std::shared_ptr<spdlog::logger>& logger);
 void UnregisterPinnedRange(void* base, int device_index,
                            const std::shared_ptr<spdlog::logger>& logger);
-
-template <typename T>
-class DeviceBuffer {
-   public:
-    DeviceBuffer() = default;
-    explicit DeviceBuffer(std::size_t count) { Allocate(count); }
-
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    DeviceBuffer(DeviceBuffer&& other) noexcept { Swap(other); }
-    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-        if (this != &other) {
-            Swap(other);
-        }
-        return *this;
-    }
-
-    ~DeviceBuffer() { Reset(); }
-
-    void Allocate(std::size_t count) {
-        Reset();
-        if (count == 0) {
-            return;
-        }
-        CUDA_CHECK(
-            cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)));
-        size_ = count;
-    }
-
-    void Reset() noexcept {
-        if (data_ == nullptr) {
-            return;
-        }
-        cudaFree(data_);
-        data_ = nullptr;
-        size_ = 0;
-    }
-
-    [[nodiscard]] T* get() const noexcept { return data_; }
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
-
-   private:
-    void Swap(DeviceBuffer& other) noexcept {
-        using std::swap;
-        swap(data_, other.data_);
-        swap(size_, other.size_);
-    }
-
-    T* data_ = nullptr;
-    std::size_t size_ = 0;
-};
 
 class ScopedCudaEvent final {
    public:
@@ -488,8 +437,12 @@ class HostPagedKVWorkerView : private LayerMapper {
             "Prepared AsyncLoadLayerKVToDevice (num_layers={}, total_pages={}, "
             "prep_time_ms={:.3f})",
             num_layers, total_pages, prep_ms);
+        auto pointer_slots = PinnedPointerSlots(
+            kHasVCache && batch.v_device_ptrs.has_value() ? 2 : 1,
+            copy_entries);
         auto producer_event = RecordProducerEvent();
         return LaunchAsyncTask([this, batch = std::move(batch),
+                                pointer_slots = std::move(pointer_slots),
                                 page_table = std::move(page_table),
                                 sequence_offsets = std::move(sequence_offsets),
                                 total_pages, num_layers, pointer_columns,
@@ -548,49 +501,15 @@ class HostPagedKVWorkerView : private LayerMapper {
                 }
             }
 
-            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
-
-            auto enqueue_plan =
-                [&](const PageCopyPlan& plan,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
-                    std::size_t page_bytes) {
-                    if (plan.host_sources.empty() || page_bytes == 0) {
-                        return;
-                    }
-                    const std::size_t ptr_bytes =
-                        plan.host_sources.size() * sizeof(uint8_t*);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.host_sources.data()),
-                        reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.device_dests.data()),
-                        reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    worker_detail::LaunchUvaPageCopyKernel(
-                        dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
-                        static_cast<int>(plan.host_sources.size()),
-                        cuda_stream);
-                };
-
-            enqueue_plan(k_plan, k_device_src_ptrs, k_device_dst_ptrs,
-                         k_page_bytes);
+            LaunchPlanFromPinned(k_plan, pointer_slots, 0, copy_entries,
+                                 k_page_bytes, cuda_stream);
 
             if constexpr (kHasVCache) {
                 if (v_plan.has_value()) {
                     const std::size_t v_page_bytes = layout_.VPageBytes();
-                    enqueue_plan(*v_plan, v_device_src_ptrs, v_device_dst_ptrs,
-                                 v_page_bytes);
+                    LaunchPlanFromPinned(*v_plan, pointer_slots, 1,
+                                         copy_entries, v_page_bytes,
+                                         cuda_stream);
                 }
             }
             this->logger_->debug(
@@ -954,6 +873,143 @@ class HostPagedKVWorkerView : private LayerMapper {
             std::move(token_counts), "AsyncOffloadLayerKVRangeToHost");
     }
 
+    KVAsyncTask AsyncOffloadPackedLayerKVToHost(
+        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
+        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
+        // K: [sum(sequence_lengths), H, D]
+        SequenceLengths sequence_lengths) {
+        constexpr std::string_view kOpName =
+            "AsyncOffloadPackedLayerKVToHost";
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kOpName);
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+        const std::size_t total_tokens = ValidatePackedKTensorShape(k_tensor);
+        ValidateSequenceLengthsInput(sequence_lengths, batch, kOpName);
+
+        torch::Tensor prepared_k = k_tensor;
+        std::optional<torch::Tensor> prepared_v;
+        if (v_tensor.has_value()) {
+            if constexpr (kHasVCache) {
+                ValidatePackedVTensorShape(*v_tensor, total_tokens);
+                prepared_v = *v_tensor;
+            } else {
+                throw std::invalid_argument(
+                    "V tensor provided but V cache is disabled");
+            }
+        }
+
+        std::vector<std::size_t> packed_lengths;
+        packed_lengths.reserve(batch);
+        std::size_t resolved_tokens = 0;
+        for (std::size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+            const std::size_t length = ResolveSequenceLength(
+                sequence_lengths, batch_idx, sequence_ids[batch_idx],
+                total_tokens, kOpName);
+            if (length > total_tokens - resolved_tokens) {
+                throw std::invalid_argument(
+                    "AsyncOffloadPackedLayerKVToHost: sequence lengths exceed "
+                    "the packed tensor token dimension");
+            }
+            resolved_tokens += length;
+            packed_lengths.push_back(length);
+        }
+        if (resolved_tokens != total_tokens) {
+            std::ostringstream oss;
+            oss << kOpName << ": sum(sequence_lengths) (" << resolved_tokens
+                << ") must equal packed tensor token dimension (" << total_tokens
+                << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (batch == 0) {
+            return LaunchAsyncTask([] {});
+        }
+
+        auto producer_event = RecordProducerEvent();
+
+        return LaunchAsyncTask([
+            this, physical_layer_idx,
+            sequence_ids = std::move(sequence_ids),
+            packed_lengths = std::move(packed_lengths), prepared_k, prepared_v,
+            producer_event]() {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
+
+            const auto* k_base =
+                static_cast<const std::byte*>(prepared_k.data_ptr());
+            const std::size_t k_token_bytes = geometry_.KTokenBytes();
+
+            const std::byte* v_base = nullptr;
+            std::size_t v_token_bytes = 0;
+            if (prepared_v.has_value()) {
+                if constexpr (kHasVCache) {
+                    v_base =
+                        static_cast<const std::byte*>(prepared_v->data_ptr());
+                    v_token_bytes =
+                        geometry_.template VTokenBytes<kHasVCache>();
+                }
+            }
+
+            std::byte* host_base = backend_.DataBase();
+            std::size_t packed_token_offset = 0;
+            for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
+                 ++batch_idx) {
+                const std::int64_t sequence_id = sequence_ids[batch_idx];
+                const std::size_t tokens_to_copy = packed_lengths[batch_idx];
+                if (tokens_to_copy == 0) {
+                    continue;
+                }
+                const auto pages = page_table_.Pages(sequence_id);
+                geometry_.ValidatePageCapacity(pages, tokens_to_copy, kOpName);
+                const auto* seq_k_src =
+                    k_base + packed_token_offset * k_token_bytes;
+
+                ForEachPageChunk(
+                    pages, 0, tokens_to_copy,
+                    [&](std::int32_t page_idx, std::size_t page_offset_tokens,
+                        std::size_t chunk_tokens,
+                        std::size_t relative_token_offset) {
+                        std::byte* dst = layout_.KPageAddress(
+                                             host_base, physical_layer_idx,
+                                             page_idx) +
+                                         page_offset_tokens * k_token_bytes;
+                        const std::byte* src =
+                            seq_k_src + relative_token_offset * k_token_bytes;
+                        EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                    });
+                if constexpr (kHasVCache) {
+                    if (v_base != nullptr) {
+                        const auto* seq_v_src =
+                            v_base + packed_token_offset * v_token_bytes;
+                        ForEachPageChunk(
+                            pages, 0, tokens_to_copy,
+                            [&](std::int32_t page_idx,
+                                std::size_t page_offset_tokens,
+                                std::size_t chunk_tokens,
+                                std::size_t relative_token_offset) {
+                                std::byte* dst =
+                                    layout_.template VPageAddress<>(
+                                        host_base, physical_layer_idx,
+                                        page_idx) +
+                                    page_offset_tokens * v_token_bytes;
+                                const std::byte* src =
+                                    seq_v_src +
+                                    relative_token_offset * v_token_bytes;
+                                EnqueueCopy(
+                                    src, dst, chunk_tokens * v_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                            });
+                    }
+                }
+                packed_token_offset += tokens_to_copy;
+            }
+
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
@@ -1077,7 +1133,7 @@ class HostPagedKVWorkerView : private LayerMapper {
      * pinned pages. GPU issues PCIe writes directly — no cudaMemcpyAsync
      * per copy pair. Replaces 78×batch_size cudaMemcpyAsync launches +
      * per-layer thread-pool task + per-task producer-stream wait with:
-     *   - 2 small HtoD of ptr arrays (~KiB each)
+     *   - pointer arrays in pinned host memory, read by the kernel over UVA
      *   - 1 UvaPageCopyKernel launch
      *   - 1 event record
      */
@@ -1152,10 +1208,14 @@ class HostPagedKVWorkerView : private LayerMapper {
         const std::size_t k_total = entries.size() * batch;
         const std::size_t v_total = has_v ? k_total : 0;
 
-        // Build src/dst ptr arrays on host (pinned unnecessary — staged
-        // HtoD is one-shot per cache per step, bandwidth insignificant).
-        std::vector<uint8_t*> k_src_host(k_total), k_dst_host(k_total);
-        std::vector<uint8_t*> v_src_host(v_total), v_dst_host(v_total);
+        // Pointer arrays the UVA kernel reads from pinned host memory (see
+        // PinnedPointerSlots): [k_src | v_src | k_dst | v_dst].
+        auto pointer_slots = PinnedPointerSlots(1, k_total + v_total).zero_();
+        auto** k_src_host = reinterpret_cast<uint8_t**>(
+            pointer_slots.data_ptr<std::int64_t>());
+        auto** k_dst_host = k_src_host + k_total + v_total;
+        auto** v_src_host = k_src_host + k_total;
+        auto** v_dst_host = k_dst_host + k_total;
 
         std::byte* host_base = backend_.DataBase();
         for (std::size_t li = 0; li < entries.size(); ++li) {
@@ -1187,51 +1247,22 @@ class HostPagedKVWorkerView : private LayerMapper {
             }
         }
 
-        return LaunchAsyncTask([this, k_src_host = std::move(k_src_host),
-                                 k_dst_host = std::move(k_dst_host),
-                                 v_src_host = std::move(v_src_host),
-                                 v_dst_host = std::move(v_dst_host),
-                                 k_token_bytes, v_token_bytes, k_total,
-                                 v_total, producer_event]() mutable {
+        return LaunchAsyncTask([this, pointer_slots = std::move(pointer_slots),
+                                 k_src_host, k_dst_host, v_src_host,
+                                 v_dst_host, k_token_bytes, v_token_bytes,
+                                 k_total, v_total, producer_event]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerEvent(cuda_stream, *producer_event);
 
-            worker_detail::DeviceBuffer<uint8_t*> k_src_buf(k_total);
-            worker_detail::DeviceBuffer<uint8_t*> k_dst_buf(k_total);
-
-            const std::size_t ptr_bytes_k = k_total * sizeof(uint8_t*);
-            EnqueueCopy(
-                reinterpret_cast<const std::byte*>(k_src_host.data()),
-                reinterpret_cast<std::byte*>(k_src_buf.get()),
-                ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
-            EnqueueCopy(
-                reinterpret_cast<const std::byte*>(k_dst_host.data()),
-                reinterpret_cast<std::byte*>(k_dst_buf.get()),
-                ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
-
             worker_detail::LaunchUvaPageCopyKernel(
-                k_src_buf.get(), k_dst_buf.get(),
-                k_token_bytes, static_cast<int>(k_total), cuda_stream);
+                k_src_host, k_dst_host, k_token_bytes,
+                static_cast<int>(k_total), cuda_stream);
 
             if constexpr (kHasVCache) {
                 if (v_total > 0) {
-                    worker_detail::DeviceBuffer<uint8_t*> v_src_buf(v_total);
-                    worker_detail::DeviceBuffer<uint8_t*> v_dst_buf(v_total);
-                    const std::size_t ptr_bytes_v = v_total * sizeof(uint8_t*);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(v_src_host.data()),
-                        reinterpret_cast<std::byte*>(
-                            v_src_buf.get()),
-                        ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(v_dst_host.data()),
-                        reinterpret_cast<std::byte*>(
-                            v_dst_buf.get()),
-                        ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
                     worker_detail::LaunchUvaPageCopyKernel(
-                        v_src_buf.get(),
-                        v_dst_buf.get(), v_token_bytes,
+                        v_src_host, v_dst_host, v_token_bytes,
                         static_cast<int>(v_total), cuda_stream);
                 }
             }
@@ -1389,6 +1420,44 @@ class HostPagedKVWorkerView : private LayerMapper {
         std::vector<uint8_t*> host_sources;
         std::vector<uint8_t*> device_dests;
     };
+
+    // The UVA page-copy kernel reads its src/dst pointer arrays straight from
+    // pinned host memory. Task lambdas run on background threads, where a
+    // cudaMalloc/cudaFree or a pageable H2D copy serializes with the compute
+    // stream: with an NCCL collective in flight there, every decode rank hung.
+    // So the slots are allocated on the calling thread, and a task only writes
+    // pointers into them and launches the kernel.
+    // Layout: `regions` blocks of [src (capacity) | dst (capacity)].
+    static torch::Tensor PinnedPointerSlots(std::size_t regions,
+                                            std::size_t capacity) {
+        return torch::empty(
+            {static_cast<std::int64_t>(2 * regions * capacity)},
+            torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+    }
+
+    static void LaunchPlanFromPinned(const PageCopyPlan& plan,
+                                     torch::Tensor& slots, std::size_t region,
+                                     std::size_t capacity,
+                                     std::size_t page_bytes,
+                                     cudaStream_t stream) {
+        const std::size_t n = plan.host_sources.size();
+        if (n == 0 || page_bytes == 0) {
+            return;
+        }
+        if (n > capacity || 2 * (region + 1) * capacity >
+                                static_cast<std::size_t>(slots.numel())) {
+            throw std::logic_error(
+                "page copy plan exceeds its pinned pointer slots");
+        }
+        auto** src = reinterpret_cast<uint8_t**>(
+                         slots.data_ptr<std::int64_t>()) +
+                     2 * region * capacity;
+        auto** dst = src + capacity;
+        std::memcpy(src, plan.host_sources.data(), n * sizeof(uint8_t*));
+        std::memcpy(dst, plan.device_dests.data(), n * sizeof(uint8_t*));
+        worker_detail::LaunchUvaPageCopyKernel(
+            src, dst, page_bytes, static_cast<int>(n), stream);
+    }
 
     struct CopyPointerPair {
         std::uintptr_t host = 0;
@@ -2132,8 +2201,17 @@ class HostPagedKVWorkerView : private LayerMapper {
             "Prepared {} (num_layers={}, total_pages={}, max_sequence_pages={}, prep_time_ms={:.3f})",
             op_name_text, num_layers, total_pages, max_sequence_pages, prep_ms);
 
+        // The UVA copy kernel reads its pointer arrays straight from pinned
+        // host memory; the slots and the producer event are created on the
+        // CALLING thread (a task thread must not cudaMalloc/cudaFree or issue
+        // a pageable H2D copy, and the event must capture work already queued
+        // by the caller).
+        auto pointer_slots = PinnedPointerSlots(
+            kHasVCache && flattened_v_ptrs.has_value() ? 2 : 1, copy_entries);
+        auto producer_event = RecordProducerEvent();
         return LaunchAsyncTask([
             this,
+            pointer_slots = std::move(pointer_slots),
             page_table = std::move(page_table),
             sequence_offsets = std::move(sequence_offsets),
             k_tensor = std::move(flattened_k_ptrs),
@@ -2141,11 +2219,13 @@ class HostPagedKVWorkerView : private LayerMapper {
             total_pages,
             num_layers,
             copy_entries,
-            op_name = op_name_text
+            op_name = op_name_text,
+            producer_event
         ]() mutable {
             const auto start = std::chrono::high_resolution_clock::now();
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            this->WaitForProducerEvent(cuda_stream, *producer_event);
             const std::size_t k_page_bytes = layout_.KPageBytes();
             if (k_page_bytes == 0) {
                 return;
@@ -2198,49 +2278,15 @@ class HostPagedKVWorkerView : private LayerMapper {
                 }
             }
 
-            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
-
-            auto enqueue_plan =
-                [&](const PageCopyPlan& plan,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
-                    std::size_t page_bytes) {
-                    if (plan.host_sources.empty() || page_bytes == 0) {
-                        return;
-                    }
-                    const std::size_t ptr_bytes =
-                        plan.host_sources.size() * sizeof(uint8_t*);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.host_sources.data()),
-                        reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.device_dests.data()),
-                        reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    worker_detail::LaunchUvaPageCopyKernel(
-                        dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
-                        static_cast<int>(plan.host_sources.size()),
-                        cuda_stream);
-                };
-
-            enqueue_plan(k_plan, k_device_src_ptrs, k_device_dst_ptrs,
-                         k_page_bytes);
+            LaunchPlanFromPinned(k_plan, pointer_slots, 0, copy_entries,
+                                 k_page_bytes, cuda_stream);
 
             if constexpr (kHasVCache) {
                 if (v_plan.has_value()) {
                     const std::size_t v_page_bytes = layout_.VPageBytes();
-                    enqueue_plan(*v_plan, v_device_src_ptrs,
-                                 v_device_dst_ptrs, v_page_bytes);
+                    LaunchPlanFromPinned(*v_plan, pointer_slots, 1,
+                                         copy_entries, v_page_bytes,
+                                         cuda_stream);
                 }
             }
 
@@ -2617,6 +2663,26 @@ class HostPagedKVWorkerView : private LayerMapper {
         return static_cast<std::size_t>(tensor.size(1));
     }
 
+    std::size_t ValidatePackedKTensorShape(const torch::Tensor& tensor) const {
+        ValidateCudaTensor(tensor);
+        EnsureContiguousTensor(tensor, "packed K tensor");
+        if (tensor.dim() != 3) {
+            throw std::invalid_argument(
+                "Expected packed K tensor with shape [T, H, D]");
+        }
+        if (tensor.size(1) != static_cast<long>(config_.num_k_heads) ||
+            tensor.size(2) != static_cast<long>(config_.k_head_dim)) {
+            throw std::invalid_argument(
+                "Packed K tensor head dimensions do not match configuration");
+        }
+        if (tensor.element_size() !=
+            static_cast<int64_t>(config_.k_element_size_bytes)) {
+            throw std::invalid_argument(
+                "Packed K tensor element size does not match configuration");
+        }
+        return static_cast<std::size_t>(tensor.size(0));
+    }
+
     template <bool Enabled = Layout::kHasVCache>
     std::enable_if_t<Enabled, void> ValidateVTensorShape(
         const torch::Tensor& tensor, std::size_t expected_batch,
@@ -2651,6 +2717,37 @@ class HostPagedKVWorkerView : private LayerMapper {
     std::enable_if_t<!Enabled, void> ValidateVTensorShape(const torch::Tensor&,
                                                           std::size_t,
                                                           std::size_t) const {
+        throw std::logic_error("V cache is disabled for this worker view");
+    }
+
+    template <bool Enabled = Layout::kHasVCache>
+    std::enable_if_t<Enabled, void> ValidatePackedVTensorShape(
+        const torch::Tensor& tensor, std::size_t expected_tokens) const {
+        ValidateCudaTensor(tensor);
+        EnsureContiguousTensor(tensor, "packed V tensor");
+        if (tensor.dim() != 3) {
+            throw std::invalid_argument(
+                "Expected packed V tensor with shape [T, H, D]");
+        }
+        if (static_cast<std::size_t>(tensor.size(0)) != expected_tokens) {
+            throw std::invalid_argument(
+                "Packed V tensor token dimension does not match K tensor");
+        }
+        if (tensor.size(1) != static_cast<long>(config_.num_v_heads) ||
+            tensor.size(2) != static_cast<long>(config_.v_head_dim)) {
+            throw std::invalid_argument(
+                "Packed V tensor head dimensions do not match configuration");
+        }
+        if (tensor.element_size() !=
+            static_cast<int64_t>(config_.v_element_size_bytes)) {
+            throw std::invalid_argument(
+                "Packed V tensor element size does not match configuration");
+        }
+    }
+
+    template <bool Enabled = Layout::kHasVCache>
+    std::enable_if_t<!Enabled, void> ValidatePackedVTensorShape(
+        const torch::Tensor&, std::size_t) const {
         throw std::logic_error("V cache is disabled for this worker view");
     }
 
@@ -2749,15 +2846,6 @@ class HostPagedKVWorkerView : private LayerMapper {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
-
-    // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
-    // pointer arrays (src + dst) uploaded once per batched call. Sized
-    // lazily (grow-only) on first use; typical steady-state usage is
-    // num_layers × max_batch_size entries per cache (~few KiB).
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_src_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_dst_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_src_buf_;
-    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_dst_buf_;
 
     inline static std::atomic<std::uint64_t> task_id_counter_{0};
 };

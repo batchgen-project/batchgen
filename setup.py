@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025-2026                                        #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
 #  you may not use this file except in compliance with the license.             #
@@ -184,7 +184,7 @@ setup(
     },
     include_package_data=True,
     install_requires=install_requires,
-    author="EfficientMoE Team",
+    author="BatchGen Team",
     description="High-throughput offline batch inference engine for MoE models",
     long_description=read_readme(),
     long_description_content_type="text/markdown",

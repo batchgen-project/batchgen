@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
 #  you may not use this file except in compliance with the license.             #
@@ -84,8 +84,11 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "gpt-oss": "gpt_oss",
     # GLM-5 / GLM-5.1 share an architecturally-identical glm_moe_dsa graph
     # (754B MoE + DSA, 78 layers, identical config.json apart from transformers_version).
-    # GLM-5.2 shares the model graph but gets its OWN config identity
-    # (glm_moe_dsa_5_2) — longer context, nested rope, extra DSA indexer knobs.
+    # GLM-5.2 and GLM-5.3 share the model graph but get OWN config identities
+    # (longer context, nested rope, extra DSA indexer knobs, and separate chat
+    # contracts). More-specific patterns must precede the broad GLM-5 entry.
+    "GLM-5.3-FP8": "glm_moe_dsa_5_3",
+    "GLM-5.3": "glm_moe_dsa_5_3",
     # More-specific patterns first so `GLM-5.2-FP8` doesn't get swallowed by
     # `GLM-5` (and `GLM-5.1-FP8` not by `GLM-5`).
     "GLM-5.2-FP8": "glm_moe_dsa_5_2",
@@ -297,48 +300,48 @@ def _import_model_configs():
     """Import all model-specific config modules to register them."""
     try:
         from batchgen.models.openai.gpt_oss_120b import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for gpt_oss unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv4_flash import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v4 unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv3 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v3 unavailable: %s", exc)
 
     try:
         from batchgen.models.deepseek.deepseekv2 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for deepseek_v2 unavailable: %s", exc)
 
     try:
         from batchgen.models.mixtral import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for mixtral unavailable: %s", exc)
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for kimi_k25 unavailable: %s", exc)
 
     try:
         from batchgen.models.moonshotai.kimi_linear import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for kimi_linear unavailable: %s", exc)
 
     try:
         from batchgen.models.minimax.minimax_m25 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for minimax_m25 unavailable: %s", exc)
 
     try:
         from batchgen.models.glm.glm5 import config as _  # noqa: F401
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.error("Model config module for glm_moe_dsa unavailable: %s", exc)
 
 
 # Auto-import on module load

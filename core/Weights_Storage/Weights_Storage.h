@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  * BatchGen                                                                      *
- * copyright (c) EfficientMoE team 2025                                             *
+ * Copyright (c) 2025-2026 BatchGen Team                                            *
  * *
  * licensed under the apache license, version 2.0 (the "license");              *
  * you may not use this file except in compliance with the license.             *
@@ -72,10 +72,12 @@ class Weights_Storage {
     
     ~Weights_Storage();
     
+    // memfd_creator_pid owns both the weights and tensor-metadata memfds in
+    // every mode, hugetlbfs included, so both fds are always used.
     void Init(std::string& shm_name, int64_t byte_size,
                 std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
-                bool enable_memfd = false, int memfd_creator_pid = -1,
-                int memfd_fd = -1);
+                bool enable_thp = false, int memfd_creator_pid = -1,
+                int memfd_fd = -1, int tensor_meta_memfd_fd = -1);
 
     void InitDistributed(const std::string& config_path);
                   
@@ -92,9 +94,15 @@ class Weights_Storage {
     std::shared_ptr<spdlog::logger> logger;
 
     std::string shm_name;
-    void* weight_ptr_;
-    int64_t byte_size_;
-    
+    // Only the ordinary Init() path owns this mapping; the distributed path
+    // leaves it null so the destructor cannot release a mapping it never made.
+    void* weight_ptr_ = nullptr;
+    int64_t byte_size_ = 0;
+    // Bytes actually mapped by allocate_shared_pinned_memory, which rounds up
+    // to a huge page. munmap on a huge page mapping rejects a non-aligned
+    // length, so the release must use this, not byte_size_.
+    int64_t mapped_size_ = 0;
+
     /* "attn_0" -> "o_proj" -> ptr */
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_buffer>>

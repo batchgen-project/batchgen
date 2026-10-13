@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 # ---------------------------------------------------------------------------- #
 
 """GLM-5 model configuration for BatchGen.
@@ -23,6 +23,8 @@ from typing import Dict, Any, List, Optional
 
 from batchgen.config.model_config import BaseModelConfig
 from batchgen.config.model_registry import register_config
+
+from .dsa_schedule import dsa_layer_skips_topk
 
 logger = logging.getLogger(__name__)
 
@@ -501,6 +503,19 @@ class GLM52Config(GLM5Config):
         return cls(**kwargs)
 
 
+@register_config("glm_moe_dsa_5_3")
+@dataclass
+class GLM53Config(GLM52Config):
+    """GLM-5.3 FP8 configuration.
+
+    The released 5.3 config has the same model geometry and DSA schedule as
+    GLM-5.2. It keeps a distinct identity so routing and chat semantics cannot
+    silently fall through to an older GLM variant.
+    """
+
+    model_type: str = "glm_moe_dsa_5_3"
+
+
 # ---------------------------------------------------------------------------- #
 #  DSA indexer top-k reuse schedule                                            #
 # ---------------------------------------------------------------------------- #
@@ -514,47 +529,6 @@ class GLM52Config(GLM5Config):
 # Ported from SGLang's ``dsa_layer_skips_topk`` (sglang/srt/configs/model_config.py):
 # the freq/offset formula is authoritative; the per-layer ``indexer_types`` list
 # shipped in the GLM-5.2 checkpoint is used only as a startup cross-check oracle.
-
-
-def dsa_layer_skips_topk(config, layer_id: int) -> bool:
-    """Whether ``layer_id`` reuses the previous full layer's DSA top-k indices.
-
-    Value-based (works on ANY config object — the rich :class:`GLM52Config` or
-    the base :class:`GLM5Config` used to build the model graph): the decision
-    keys off the presence of a positive ``index_topk_freq``. GLM-5 / GLM-5.1
-    configs have no such field (or it is ``None`` / 1), so every layer is a full
-    layer (uniform recompute) and this returns ``False`` — GLM-5 unchanged.
-
-    Authoritative formula (matches SGLang ``dsa_layer_skips_topk``):
-      - if ``index_topk_pattern`` is set: ``pattern[layer_id] == "S"``
-      - else with ``freq = index_topk_freq`` (>=1) and optional
-        ``offset = index_skip_topk_offset``:
-          ``max(layer_id - offset + 1, 0) % freq != 0``   (offset present)
-          ``max(layer_id - 1, 0) % freq != 0``            (offset absent)
-    """
-    pattern = getattr(config, "index_topk_pattern", None)
-    if pattern is not None:
-        return layer_id < len(pattern) and pattern[layer_id] == "S"
-
-    freq = getattr(config, "index_topk_freq", None)
-    if freq is None:
-        freq = 1
-    if freq <= 0:
-        raise ValueError(f"index_topk_freq must be positive, got {freq}")
-    if freq == 1:
-        # Uniform recompute (GLM-5): no layer is ever skipped.
-        return False
-
-    offset = getattr(config, "index_skip_topk_offset", None)
-    if offset is not None:
-        if offset <= 0:
-            raise ValueError(
-                "index_skip_topk_offset must be positive; offset <= 0 marks "
-                "layer 0 as skip_topk with no prior topk to reuse"
-            )
-        return max(layer_id - offset + 1, 0) % freq != 0
-
-    return max(layer_id - 1, 0) % freq != 0
 
 
 def assert_indexer_schedule_consistent(config) -> None:
@@ -588,6 +562,4 @@ def assert_indexer_schedule_consistent(config) -> None:
             f"(index_topk_freq={getattr(config, 'index_topk_freq', None)}, "
             f"index_skip_topk_offset={getattr(config, 'index_skip_topk_offset', None)})"
         )
-
-
 

@@ -134,33 +134,18 @@ Download file content.
 
 ---
 
-## Direct Inference API
-
-For synchronous inference without the batch workflow.
+## Removed: Direct Inference API
 
 ### submit_inference()
 
-Submit an inference request and get decoded string results.
+**Removed.** The method still exists so callers get an explanation instead of an
+`AttributeError`, but it raises `LegacyInferenceDeprecated` immediately, without any
+network call. The matching server route `POST /v1/inference` returns `410 Gone`, and the
+worker-side path behind it has been deleted.
 
-```python
-results = client.submit_inference(
-    prompts=["What is AI?", "Explain machine learning."],
-    max_input_len=None,
-    max_output_len=128,
-    ignore_eos=False,
-    temperature=None,
-    top_p=None,
-)
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `prompts` | list[str] | required | List of prompt strings |
-| `max_input_len` | int | None | Maximum input sequence length (None = dynamic from longest prompt) |
-| `max_output_len` | int | 128 | Maximum output/decoding length |
-| `ignore_eos` | bool | False | If True, ignore EOS tokens and decode to max_output_len (for benchmarking) |
-| `temperature` | float | None | Sampling temperature (None = greedy decoding) |
-| `top_p` | float | None | Nucleus sampling threshold (None = disabled) |
+Use `submit_batch()` (or `upload_file()` + `create_batch()` + `wait_for_batch()`) instead;
+per-request `temperature`, `top_p`, `top_k` and `max_completion_tokens` are set in each
+JSONL line's `body`.
 
 ---
 

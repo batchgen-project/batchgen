@@ -184,38 +184,36 @@ class Glm5WholeModelSegment:
             raise ValueError(
                 f"bucket_size {bucket_size} exceeds max_bucket_size {self.max_bucket_size}"
             )
-        if self._kv_buffers is not None and self._aux_kv_buffers is not None:
-            return
-
-        alloc_size = self.max_bucket_size
-        self._kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.primary_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._aux_kv_key_buffer = torch.zeros(
-            self.num_layers,
-            alloc_size,
-            1,
-            1,
-            self.aux_kv_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._kv_buffers = [
-            {"key": self._kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self._aux_kv_buffers = [
-            {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
-            for layer_idx in range(self.num_layers)
-        ]
-        self.primary_kv_offload_buffers = self._kv_buffers
-        self.aux_kv_offload_buffers = self._aux_kv_buffers
+        if self._kv_buffers is None or self._aux_kv_buffers is None:
+            alloc_size = self.max_bucket_size
+            self._kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.primary_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._aux_kv_key_buffer = torch.zeros(
+                self.num_layers,
+                alloc_size,
+                1,
+                1,
+                self.aux_kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._kv_buffers = [
+                {"key": self._kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self._aux_kv_buffers = [
+                {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
+                for layer_idx in range(self.num_layers)
+            ]
+            self.primary_kv_offload_buffers = self._kv_buffers
+            self.aux_kv_offload_buffers = self._aux_kv_buffers
         for layer_segment in self.layer_segments:
             setup = getattr(layer_segment, "setup_static_buffers", None)
             if setup is not None:
@@ -247,16 +245,8 @@ class Glm5WholeModelSegment:
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
         }
         if self.layer_segments:
-            first_layer = self.layer_segments[0]
-            tile_shape, tile_dtype, splits_shape, splits_dtype = (
-                first_layer._flashmla_tensor_metadata_specs(bucket_size)
-            )
-            specs.update(
-                {
-                    "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
-                    "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
-                    "flashmla_num_splits": TensorSpec(splits_shape, splits_dtype),
-                }
+            specs["num_valid_tokens"] = TensorSpec(
+                (1,), torch.int32, fill_value=float(bucket_size)
             )
         return specs
 
@@ -322,8 +312,6 @@ class Glm5WholeModelSegment:
         aux_slot_indices: torch.Tensor | None = None,
         num_valid_tokens: torch.Tensor | None = None,
         rank_token_counts: torch.Tensor | None = None,
-        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
-        flashmla_num_splits: torch.Tensor | None = None,
         use_layer_segments: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         hidden_states = self.model.model.embed_tokens(input_ids)
@@ -335,8 +323,6 @@ class Glm5WholeModelSegment:
                 "aux_slot_indices": aux_slot_indices,
                 "num_valid_tokens": num_valid_tokens,
                 "rank_token_counts": rank_token_counts,
-                "flashmla_tile_scheduler_metadata": flashmla_tile_scheduler_metadata,
-                "flashmla_num_splits": flashmla_num_splits,
             }
             missing = [name for name, value in required.items() if value is None]
             if missing:
@@ -353,12 +339,14 @@ class Glm5WholeModelSegment:
                     aux_slot_indices=aux_slot_indices,
                     num_valid_tokens=num_valid_tokens,
                     rank_token_counts=rank_token_counts,
-                    flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                    flashmla_num_splits=flashmla_num_splits,
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
-                self._copy_aux_kv(layer_idx, graph_out["indexer_k_tensor"], None)
+                # GLM-5.2 skip layers have no indexer KV (reuse-topk segments
+                # return no indexer_k_tensor).
+                _indexer_k = graph_out.get("indexer_k_tensor")
+                if _indexer_k is not None:
+                    self._copy_aux_kv(layer_idx, _indexer_k, None)
                 if layer_idx in self._compare_probe_layer_set:
                     outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
         else:
@@ -388,8 +376,6 @@ class Glm5WholeModelSegment:
         aux_slot_indices: torch.Tensor,
         rank_token_counts: torch.Tensor,
         num_valid_tokens: torch.Tensor | None = None,
-        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
-        flashmla_num_splits: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
         bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
@@ -419,8 +405,6 @@ class Glm5WholeModelSegment:
                 aux_slot_indices=aux_slot_indices,
                 num_valid_tokens=num_valid_tokens,
                 rank_token_counts=rank_token_counts,
-                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                flashmla_num_splits=flashmla_num_splits,
             )
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens

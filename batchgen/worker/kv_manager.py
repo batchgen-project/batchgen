@@ -196,56 +196,16 @@ class PageTableCapacityRequest:
 class TokenBudgetRequest:
     """Frozen snapshot for the per-sequence host-KV token-budget cache.
 
-    The handler memoizes the computed budget on
-    ``query_book[sequence_id].kv_token_budget``. That mutation is on the
-    entry object the worker passes in; worker state is not touched.
+    The budget is read from ``query_book[sequence_id].kv_token_budget``,
+    which admission sets.
     """
 
     query_book: Mapping[int, "QueryBookEntry"]
-    local_to_uuid: Mapping[int, str]
-    global_batch: "SequenceBatch"
-    max_decoding_length: int
 
 
 # ---------------------------------------------------------------------------
 # GPU-KV-manager allocation planning (Phase 5.4a): frozen request + plan
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class GpuKvManagerRequest:
-    """Frozen snapshot for ``plan_gpu_kv_manager``.
-
-    ``current_num_pages`` is the page count of the manager the worker
-    currently holds (0 when none is bound). ``capacity`` carries the
-    page-table capacity inputs so the plan can populate the CUDA-graph
-    fields on the configs it returns.
-    """
-
-    model_name: str
-    sequence_tokens: Tuple[int, ...]
-    has_manager: bool
-    current_num_pages: int
-    capacity: PageTableCapacityRequest
-
-
-@dataclass(frozen=True)
-class GpuKvManagerPlan:
-    """What ``plan_gpu_kv_manager`` returns; the worker applies it.
-
-    * ``reuse`` — the existing manager already has enough pages; the
-      worker just re-initializes and binds it (no configs needed).
-    * ``destroy_existing`` — an existing manager must be torn down before
-      the new one is created (only set when ``reuse`` is False).
-    * ``primary_config`` / ``aux_config`` — sized configs for the new
-      managers. ``aux_config`` is non-None only for DSA models. Both are
-      ``None`` when ``reuse`` is True.
-    """
-
-    reuse: bool
-    destroy_existing: bool
-    primary_config: Optional["GPUPagedKVConfig"]
-    aux_config: Optional["GPUPagedKVConfig"]
 
 
 # ---------------------------------------------------------------------------
@@ -498,17 +458,17 @@ class KVCacheManager:
         to construct the updated copy.
         """
         token_capacity = KVCacheManager.page_table_token_capacity(req)
+        # Decoupled from pool size (measure-once-cache contract): the page
+        # table's SHAPE comes from token/slot capacity only, so captured
+        # graphs never depend on the pool's page count and a pool resize
+        # cannot invalidate the baked table shape. Values stored in the table
+        # are page ids bounded by the live pool at runtime; a shape wider
+        # than the pool is unused columns (KB-MB scale), never an error.
         page_capacity = max(
             1,
-            min(
-                int(config.num_pages),
-                math.ceil(token_capacity / int(config.page_size_tokens)),
-            ),
+            math.ceil(token_capacity / int(config.page_size_tokens)),
         )
-        slot_capacity = max(
-            1,
-            min(int(config.num_pages), KVCacheManager.page_table_slot_capacity(req)),
-        )
+        slot_capacity = max(1, KVCacheManager.page_table_slot_capacity(req))
         return replace(
             config,
             cuda_graph_max_pages_per_sequence=page_capacity,
@@ -520,34 +480,23 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     @staticmethod
     def get_sequence_token_budget(req: TokenBudgetRequest, sequence_id: int) -> int:
-        """Return cached host-allocation tokens for a sequence, computing once.
+        """Return the host-allocation token budget recorded at admission.
 
-        Reads ``query_book[sequence_id]``; if ``kv_token_budget`` is set,
-        returns it. Otherwise computes ``prompt_length + max_decoding_length``
-        from sequence metadata and memoizes it on the entry.
+        Reads ``query_book[sequence_id].kv_token_budget``. Admission always
+        sets it (clamped to the model context), so a missing value is a bug.
 
         Raises ``RuntimeError`` if ``query_book`` is empty (means the worker
-        has not initialized it yet) or ``KeyError`` if the sequence is missing.
+        has not initialized it yet) or the entry has no budget, and
+        ``KeyError`` if the sequence is missing.
         """
         if not req.query_book:
             raise RuntimeError("query_book is not initialized before KV allocation")
         query_entry = req.query_book.get(sequence_id)
         if query_entry is None or query_entry.encoded is None:
             raise KeyError(f"Missing query entry for sequence {sequence_id}")
-        if query_entry.kv_token_budget is not None:
-            return query_entry.kv_token_budget
-        # Fallback: compute from sequence metadata (attention_mask removed)
-        uuid = req.local_to_uuid.get(sequence_id, "")
-        seq = req.global_batch.get_sequence(uuid) if uuid else None
-        if seq is None:
-            raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
-        # NO truncation: KV budget must cover the FULL prompt + decode budget.
-        # An earlier min(...) here silently undersized KV when max_input_length
-        # lagged behind the actual prompt length on multi-batch admits.
-        input_tokens = seq.prompt_length
-        total_tokens = input_tokens + req.max_decoding_length
-        query_entry.kv_token_budget = total_tokens
-        return total_tokens
+        if query_entry.kv_token_budget is None:
+            raise RuntimeError(f"Query entry for sequence {sequence_id} has no kv_token_budget")
+        return query_entry.kv_token_budget
 
     @staticmethod
     def compute_host_kv_sequence_tokens(
@@ -562,59 +511,38 @@ class KVCacheManager:
     # ------------------------------------------------------------------
     # GPU-KV-manager allocation planning (Phase 5.4a)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Measure-once-cache pool sizing (pure helpers; the worker applies them)
+    # ------------------------------------------------------------------
     @staticmethod
-    def plan_gpu_kv_manager(req: GpuKvManagerRequest) -> GpuKvManagerPlan:
-        """Decide whether to reuse or recreate the GPU paged KV manager.
+    def compute_final_pool_gb(
+        total_gb: float,
+        gpu_memory_frac: float,
+        used_gb: float,
+        provisional_pool_gb: float,
+    ) -> float:
+        """Final pool size from the post-capture steady-state measurement.
 
-        Builds the primary (and, for DSA models, auxiliary) ``GPUPagedKVConfig``
-        sized for ``req.sequence_tokens`` with the CUDA-graph page-table
-        capacity applied. If the worker already holds a manager with at least
-        ``primary_config.num_pages`` pages, the plan says to reuse it; otherwise
-        the worker must (destroy the old manager and) create new ones.
-
-        Pure: calls the pure ``build_gpu_kv_config`` / ``build_gpu_kv_config_aux``
-        config builders and ``apply_page_table_capacity``. No GPU allocation, no
-        worker state — the worker applies the returned plan.
+        ``used_gb`` is sampled AFTER the full graph warmup/capture with the
+        provisional pool still allocated; subtracting the provisional pool
+        yields the steady residency (weights + graph pools + runtime), and the
+        final pool is everything the memory fraction allows above it. Pure and
+        deterministic: cached by the worker and reused for every later pool
+        (re)creation (measure-once-cache contract, POIS 2026-10-05).
         """
-        # Local import: the config builders pull torch + the model registry,
-        # which are heavy at module-load time and could cycle back here.
-        from batchgen.kv_cache.host_kv_mananger_config import (
-            build_gpu_kv_config,
-            build_gpu_kv_config_aux,
-        )
+        steady_used_gb = used_gb - provisional_pool_gb
+        return total_gb * gpu_memory_frac - steady_used_gb
 
-        primary_config = build_gpu_kv_config(
-            model_name=req.model_name,
-            sequence_tokens=req.sequence_tokens,
-        )
-        primary_config = KVCacheManager.apply_page_table_capacity(
-            req.capacity, primary_config
-        )
-        required_pages = primary_config.num_pages
+    @staticmethod
+    def pool_floor_pages(max_bucket_size: int, min_pages_per_sequence: int = 4) -> int:
+        """Fail-loud floor: the pool must at least hold one full decode bucket.
 
-        if req.has_manager and req.current_num_pages >= required_pages:
-            return GpuKvManagerPlan(
-                reuse=True,
-                destroy_existing=False,
-                primary_config=None,
-                aux_config=None,
-            )
-
-        aux_config = build_gpu_kv_config_aux(
-            model_name=req.model_name,
-            sequence_tokens=req.sequence_tokens,
-        )
-        if aux_config is not None:
-            aux_config = KVCacheManager.apply_page_table_capacity(
-                req.capacity, aux_config
-            )
-
-        return GpuKvManagerPlan(
-            reuse=False,
-            destroy_existing=req.has_manager,
-            primary_config=primary_config,
-            aux_config=aux_config,
-        )
+        Every active sequence needs pages; ``min_pages_per_sequence`` = 4 at
+        page size 64 gives each sequence 256 tokens of headroom — a
+        conservative minimum, documented as tunable. A computed pool below
+        this is a configuration error, never a silently accepted remainder.
+        """
+        return max(1, int(max_bucket_size)) * max(1, int(min_pages_per_sequence))
 
     # ------------------------------------------------------------------
     # Host-KV watermark trigger (Phase 5.5)

@@ -40,20 +40,8 @@ def _make_seq(
 
 @pytest.fixture
 def ctx_strict() -> CompletionContext:
-    """Production-like context: ignore_eos=False, real model_context_length."""
+    """Production-like context with a real model_context_length."""
     return CompletionContext(
-        ignore_eos=False,
-        eos_token_ids=frozenset({0, 2, 1024}),
-        model_context_length=4096,
-        rank=0,
-    )
-
-
-@pytest.fixture
-def ctx_ignore_eos() -> CompletionContext:
-    """ignore_eos=True context for the override path."""
-    return CompletionContext(
-        ignore_eos=True,
         eos_token_ids=frozenset({0, 2, 1024}),
         model_context_length=4096,
         rank=0,
@@ -82,10 +70,10 @@ def test_should_stop_at_eos_miss(ctx_strict):
     assert CompletionHandler.should_stop_at_eos(ctx_strict, 42) is False
 
 
-def test_should_stop_at_eos_ignored_when_ignore_eos(ctx_ignore_eos):
-    # Even EOS tokens return False under ignore_eos
-    assert CompletionHandler.should_stop_at_eos(ctx_ignore_eos, 2) is False
-    assert CompletionHandler.should_stop_at_eos(ctx_ignore_eos, 1024) is False
+def test_should_stop_at_eos_ignored_when_the_sequence_sets_the_flag(ctx_strict):
+    # Even EOS tokens return False for a request that asked to ignore EOS
+    assert CompletionHandler.should_stop_at_eos(ctx_strict, 2, True) is False
+    assert CompletionHandler.should_stop_at_eos(ctx_strict, 1024, True) is False
 
 
 # ---------------------------------------------------------------------------
@@ -108,20 +96,9 @@ def test_is_sequence_completed_eos(ctx_strict):
     assert CompletionHandler.is_sequence_completed(ctx_strict, seq) is True
 
 
-def test_is_sequence_completed_eos_ignored_under_ignore_eos(ctx_ignore_eos):
-    seq = _make_seq(eos_reached=True, decoded_length=2)
-    assert CompletionHandler.is_sequence_completed(ctx_ignore_eos, seq) is False
-
-
 def test_is_sequence_completed_repetition(ctx_strict):
     seq = _make_seq(rep_detected=True, decoded_length=2)
     assert CompletionHandler.is_sequence_completed(ctx_strict, seq) is True
-
-
-def test_is_sequence_completed_repetition_overrides_ignore_eos(ctx_ignore_eos):
-    # ignore_eos doesn't suppress repetition detection
-    seq = _make_seq(rep_detected=True, decoded_length=2)
-    assert CompletionHandler.is_sequence_completed(ctx_ignore_eos, seq) is True
 
 
 def test_is_sequence_completed_active_sequence(ctx_strict):
@@ -151,13 +128,6 @@ def test_get_finish_reason_length_context_limit(ctx_strict):
 def test_get_finish_reason_stop(ctx_strict):
     seq = _make_seq(eos_reached=True, decoded_length=4)
     assert CompletionHandler.get_finish_reason(ctx_strict, seq) == "stop"
-
-
-def test_get_finish_reason_stop_becomes_length_under_ignore_eos(ctx_ignore_eos):
-    # Sequence's only completion signal is eos_reached; with ignore_eos=True
-    # the function falls through to the "length" branch.
-    seq = _make_seq(eos_reached=True, decoded_length=4, max_decode_length=16)
-    assert CompletionHandler.get_finish_reason(ctx_ignore_eos, seq) == "length"
 
 
 def test_get_finish_reason_precedence_repetition_beats_length(ctx_strict):

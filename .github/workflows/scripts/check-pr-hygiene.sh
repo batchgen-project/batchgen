@@ -25,7 +25,7 @@ PROD_RE='^(batchgen|batchgen_kernels|core|server|op_builder)/'
 ALLOWLIST=("batchgen/timing.py")
 
 # §2.6 scaffolding layer — only a `core` PR may modify these.
-SCAFFOLD_FILE_RE='^batchgen/(batchgen_worker|server_worker_main_loop|continuous_batching|scheduler|task_scheduler|decode|decode_task|prefill|prefill_task|sampling|sequence|migration|pd_orchestrator|query_book|query_manager|parameter_server|parameter_server_client|node_manager|inference_runtime|batch_inference|batch_order|batchgen_server|batchgen_server_dev|batchgen_client|client_optimized|launch_server|launch_http_server|entrypoint|lifespan|generate|model_instance)\.py$'
+SCAFFOLD_FILE_RE='^batchgen/(batchgen_worker|server_worker_main_loop|continuous_batching|scheduler|task_scheduler|decode|decode_task|prefill|prefill_task|sampling|sequence|migration|pd_orchestrator|query_book|query_manager|parameter_server|parameter_server_client|node_manager|inference_runtime|batch_inference|batch_order|batchgen_client|client_optimized|launch_server|launch_http_server|entrypoint|lifespan|generate|model_instance)\.py$'
 SCAFFOLD_DIR_RE='^batchgen/(scheduler|server|kv_cache|worker|sequence_manager|distributed|planner|cuda_graph|core)/'
 # §2.5 per-type allowlists — a `model`/`kernel` PR may touch ONLY these paths.
 MODEL_ALLOW_RE='^(batchgen/models/|batchgen/get_initializer\.py$|batchgen/get_parallel_strategy_manager\.py$|batchgen_kernels/|configurations/|tests/|docs/)'

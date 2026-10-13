@@ -300,6 +300,8 @@ def _fused_paged_score_with_slots_kernel(
     SEQLENS_ptr,       # [B] int32
     AGG_ptr,           # [B, max_seqlen] FP32
     max_seqlen,
+    topk: tl.constexpr,
+    skip_dense_prefix: tl.constexpr,
     B: tl.constexpr,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -329,6 +331,19 @@ def _fused_paged_score_with_slots_kernel(
     safe_slot = tl.maximum(slot, 0)
 
     seqlen = tl.load(SEQLENS_ptr + pid_b)
+    skip_score = (
+        (slot < 0)
+        | (skip_dense_prefix & (seqlen <= topk))
+        | (pid_s * BLOCK_S >= seqlen)
+    )
+    if skip_score:
+        tl.store(
+            AGG_ptr + pid_b * max_seqlen + s_offs,
+            float("-inf") + tl.zeros([BLOCK_S], dtype=tl.float32),
+            mask=s_offs < max_seqlen,
+        )
+        return
+
     s_mask = (s_offs < seqlen) & slot_valid
     page_in_range = s_offs < max_seqlen
 
@@ -354,7 +369,7 @@ def _fused_paged_score_with_slots_kernel(
     k_ptrs = K_ptr + (physical_page[:, None] * page_size + page_offset[:, None]) * head_dim + d_offs[None, :]
     k_tile = tl.load(
         k_ptrs,
-        mask=page_in_range[:, None] & (d_offs[None, :] < head_dim) & k_valid[:, None],
+        mask=s_mask[:, None] & (d_offs[None, :] < head_dim) & k_valid[:, None],
         other=0.0,
     ).to(tl.float32)
 
@@ -719,6 +734,8 @@ def fused_paged_score_and_topk_with_slots_out(
         cache_seqlens,
         agg,
         max_seqlen,
+        topk=topk,
+        skip_dense_prefix=topk == 2048 and top_k_indices.dtype == torch.int32,
         B=B,
         n_heads=n_heads,
         head_dim=head_dim,

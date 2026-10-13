@@ -41,7 +41,10 @@ class Glm5DecoderLayerGraphSegment:
         self.max_seqlen = int(getattr(dsa_segment, "max_seqlen"))
         self.index_topk = int(getattr(dsa_segment, "index_topk"))
         self.primary_kv_dim = int(dsa_segment.primary_blocked_k.shape[3])
-        self.aux_kv_dim = int(dsa_segment.aux_blocked_k.shape[3])
+        # Reuse-topk segments (GLM-5.2 skip layers) have no aux/indexer KV;
+        # aux_kv_dim=0 marks the layer as producing no indexer_k_tensor.
+        _aux_blocked_k = getattr(dsa_segment, "aux_blocked_k", None)
+        self.aux_kv_dim = int(_aux_blocked_k.shape[3]) if _aux_blocked_k is not None else 0
         self.capture_local_bsz: Optional[int] = None
         self.capture_rank_token_counts: Optional[torch.Tensor] = None
         self.set_capture_context(
@@ -70,16 +73,7 @@ class Glm5DecoderLayerGraphSegment:
             .clone()
         )
 
-    def _flashmla_tensor_metadata_specs(
-        self,
-        bucket_size: int,
-    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
-        return self.dsa_segment._flashmla_tensor_metadata_specs(bucket_size)
-
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
-            self._flashmla_tensor_metadata_specs(bucket_size)
-        )
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size),
@@ -99,12 +93,10 @@ class Glm5DecoderLayerGraphSegment:
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
-            "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
-            "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
+        specs = {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size),
                 torch.bfloat16,
@@ -113,11 +105,13 @@ class Glm5DecoderLayerGraphSegment:
                 ("batch_size", 1, 1, self.primary_kv_dim),
                 torch.bfloat16,
             ),
-            "indexer_k_tensor": TensorSpec(
+        }
+        if self.aux_kv_dim > 0:
+            specs["indexer_k_tensor"] = TensorSpec(
                 ("batch_size", 1, 1, self.aux_kv_dim),
                 torch.bfloat16,
-            ),
-        }
+            )
+        return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         self.dsa_segment.setup_static_buffers(bucket_size)
@@ -161,8 +155,6 @@ class Glm5DecoderLayerGraphSegment:
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: torch.Tensor,
         rank_token_counts: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
@@ -175,8 +167,6 @@ class Glm5DecoderLayerGraphSegment:
             primary_slot_indices=primary_slot_indices,
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
-            flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            flashmla_num_splits=flashmla_num_splits,
         )
         hidden_states, residual = cuda_add_rmsnorm(
             residual,
@@ -196,8 +186,10 @@ class Glm5DecoderLayerGraphSegment:
             )["moe_output"]
             mlp_output = moe_output.view(batch_size, 1, self.hidden_size)
 
-        return {
+        out = {
             "hidden_states": residual + mlp_output,
             "primary_k_tensor": dsa_out["primary_k_tensor"],
-            "indexer_k_tensor": dsa_out["indexer_k_tensor"],
         }
+        if "indexer_k_tensor" in dsa_out:
+            out["indexer_k_tensor"] = dsa_out["indexer_k_tensor"]
+        return out
