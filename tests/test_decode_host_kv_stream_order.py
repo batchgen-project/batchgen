@@ -11,6 +11,8 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import math
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "batchgen" / "batchgen_worker.py"
@@ -98,6 +100,27 @@ def test_deferred_host_kv_launch_does_not_touch_cuda_from_python(monkeypatch):
     assert worker._pending_kv_append_tensors == [tensor]
     assert worker._deferred_kv_entries == []
     assert worker._deferred_kv_batch is None
+
+
+def test_effective_host_chunk_covers_one_decode_decision_interval():
+    """Host growth is planned before forward, never after a sample."""
+    source = _worker_method("_get_effective_chunk_size")
+    class _Entry:
+        PAGE_SIZE = 64
+
+    namespace = {"math": math, "SequenceEntry": _Entry}
+    exec(compile(source, str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        adaptive_chunk_sizer=None,
+        host_kv_chunk_size=64,
+        max_decoding_length=8192,
+        DECISION_INTERVAL=128,
+    )
+    assert namespace["_get_effective_chunk_size"](worker) == 128
+
+    full_source = WORKER.read_text()
+    assert "_reserve_host_kv_capacity_for_decoded_context" not in full_source
+    assert "[HOST_KV_APPEND_GROW]" not in full_source
 
 
 def test_cpp_append_orders_copy_stream_after_producer_stream():

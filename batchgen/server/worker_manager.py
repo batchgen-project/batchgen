@@ -873,6 +873,7 @@ class WorkerManager:
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
             max_pool_size=self.args.max_pool_size,
+            input_ids_pool_size_gb=self.args.input_ids_pool_size_gb,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),

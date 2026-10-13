@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 
 from batchgen.server.batch_scheduler import BatchScheduler
+from batchgen.server.scheduling_pool import SchedulingPool
 from batchgen.server.io_struct import (
     BatchEndpoint,
     BatchObject,
@@ -46,3 +47,93 @@ def test_pool_worker_failure_writes_terminal_batch_status(tmp_path):
     assert persisted is not None
     assert persisted.status == BatchStatus.FAILED
     assert persisted.error == str(tracker.error)
+
+
+def test_capacity_snapshot_does_not_reset_active_scheduling_slots():
+    """Free-page snapshots must not reinitialize an active fixed-capacity pool."""
+    pool = SchedulingPool(capacity=4)
+    pool.allocate_slot("request-1")
+    pool.register_batch("batch-1", total_requests=1)
+
+    class ResponseQueue:
+        def __init__(self):
+            self._results = iter([
+                {
+                    "type": "trajectory_pool_capacity",
+                    "capacity_semantics_version": 1,
+                    "total_capacity": 4,
+                    # Keep the legacy field deliberately different: the
+                    # listener must size from total_capacity, never free data.
+                    "capacity": 3,
+                    "free_reservations": 3,
+                    "free_pages": 255,
+                    "active_count": 1,
+                    "largest_free_extent_pages": 255,
+                },
+                {
+                    "type": "completion",
+                    "request_id": "request-1",
+                    "batch_id": "batch-1",
+                    "text": "ok",
+                },
+                {
+                    "type": "trajectory_pool_capacity",
+                    "capacity_semantics_version": 1,
+                    "total_capacity": 4,
+                    "capacity": 4,
+                    "free_reservations": 4,
+                    "free_pages": 256,
+                    "active_count": 0,
+                    "largest_free_extent_pages": 256,
+                },
+                {"type": "pool_shutdown"},
+            ])
+
+        def get(self, timeout):
+            return next(self._results)
+
+    scheduler = object.__new__(BatchScheduler)
+    scheduler._stopped = SimpleNamespace(is_set=lambda: False)
+    scheduler.worker = SimpleNamespace(response_queue=ResponseQueue())
+    scheduler._scheduling_pool = pool
+    scheduler._trajectory_pool_info = None
+    scheduler.server_args = SimpleNamespace(incremental_output_dir=None)
+    scheduler._fail_all_active_batches = lambda error: None
+
+    asyncio.run(scheduler._pool_completion_listener())
+
+    assert pool.capacity == 4
+    assert pool.num_active_slots() == 0
+    assert pool.num_free_slots() == 4
+    assert pool.get_batch_tracker("batch-1").is_complete
+    assert scheduler._trajectory_pool_info["total_capacity"] == 4
+    assert scheduler._trajectory_pool_info["free_reservations"] == 4
+
+
+def test_capacity_listener_rejects_legacy_ambiguous_snapshot():
+    """A pre-protocol free-count cannot silently resize the fixed pool."""
+    fatal = []
+
+    class ResponseQueue:
+        def get(self, timeout):
+            return {
+                "type": "trajectory_pool_capacity",
+                "capacity": 3,
+                "free_reservations": 3,
+            }
+
+    scheduler = object.__new__(BatchScheduler)
+    scheduler._stopped = SimpleNamespace(is_set=lambda: False)
+    scheduler.worker = SimpleNamespace(
+        response_queue=ResponseQueue(),
+        report_worker_fatal=lambda reason: fatal.append(reason),
+    )
+    scheduler._scheduling_pool = SchedulingPool(capacity=4)
+    scheduler._trajectory_pool_info = None
+    scheduler._fail_all_active_batches = lambda error: fatal.append(error)
+
+    asyncio.run(scheduler._pool_completion_listener())
+
+    assert scheduler._scheduling_pool.capacity == 4
+    assert len(fatal) == 2
+    assert "capacity_semantics_version=1" in fatal[0]

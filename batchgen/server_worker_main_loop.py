@@ -677,6 +677,7 @@ def _server_worker_main_impl(
 				# Set admission and response queues for persistent generate()
 				worker.set_admission_queue(request_queue)
 				worker.set_response_queue(response_queue)
+				worker._publish_trajectory_pool_capacity()
 
 				if global_rank == 0:
 					logging.info(

@@ -145,6 +145,35 @@ class DualHostKVCoordinator:
 			raise RuntimeError("DualHostKVCoordinator requires auxiliary host KV for DSA")
 		self.primary = primary
 		self.auxiliary = auxiliary
+		# The native worker-view API has no page-level rollback operation.  If
+		# one side accepts a mirrored growth and the other side rejects it, the
+		# two shared-memory regions cannot be repaired safely in Python (releasing
+		# the sequence would discard its already-valid pages).  Poison the
+		# coordinator and fail every subsequent operation so the worker restarts
+		# instead of continuing with divergent primary/auxiliary metadata.
+		self._transaction_error: RuntimeError | None = None
+
+	def _ensure_transaction_healthy(self, operation: str) -> None:
+		if self._transaction_error is not None:
+			raise RuntimeError(
+				f"{operation}: dual host KV coordinator is poisoned after a partial "
+				"mirrored operation; restart the worker before reusing either view"
+			) from self._transaction_error
+
+	def _poison_after_partial_operation(
+		self, operation: str, error: BaseException
+	) -> RuntimeError:
+		if self._transaction_error is None:
+			self._transaction_error = RuntimeError(
+				f"{operation}: mirrored primary/auxiliary host KV operation was "
+				"partially applied; the worker must restart"
+			)
+		logger.critical(
+			"%s; refusing further host KV operations until worker restart",
+			self._transaction_error,
+			exc_info=error,
+		)
+		return self._transaction_error
 
 	@classmethod
 	def from_budget(
@@ -262,8 +291,16 @@ class DualHostKVCoordinator:
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
 		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
 
-		primary_config.enable_thp = enable_thp
-		aux_config.enable_thp = enable_thp
+		# Older prebuilt core_engine wheels do not expose the optional THP
+		# attribute. Keep the default (disabled) path compatible while still
+		# failing explicitly if fast-init was requested without a matching ABI.
+		if hasattr(primary_config, "enable_thp"):
+			primary_config.enable_thp = enable_thp
+			aux_config.enable_thp = enable_thp
+		elif enable_thp:
+			raise RuntimeError(
+				"fast-init requires a core_engine build with HostPagedKVConfig.enable_thp"
+			)
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)
@@ -327,6 +364,7 @@ class DualHostKVCoordinator:
 			raise
 
 	def grow_pages_for_sequences(self, seq_page_pairs) -> None:
+		self._ensure_transaction_healthy("grow_pages_for_sequences")
 		seq_page_pairs = list(seq_page_pairs)
 		needed = sum(int(pages) for _, pages in seq_page_pairs)
 		primary_stats = self.primary.get_stats()
@@ -339,7 +377,15 @@ class DualHostKVCoordinator:
 				f"aux_free={aux_stats.num_free_pages}"
 			)
 		self.primary.grow_pages_for_sequences(seq_page_pairs)
-		aux.grow_pages_for_sequences(seq_page_pairs)
+		try:
+			aux.grow_pages_for_sequences(seq_page_pairs)
+		except Exception as error:
+			# Native host views expose no safe page-level compensation.  Do not
+			# release the sequence (that would discard its existing pages); poison
+			# this coordinator and force a worker restart instead.
+			raise self._poison_after_partial_operation(
+				"grow_pages_for_sequences", error
+			) from error
 
 	def release_sequence_pages(self, sequence_ids) -> None:
 		self.primary.release_sequence_pages(sequence_ids)

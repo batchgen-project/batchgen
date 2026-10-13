@@ -180,14 +180,14 @@ def test_persistent_phase_worker_gate_rejects_invalid_flag_on_modes():
     enabled = _isolated_worker_method("_persistent_phase_enabled")
     worker = SimpleNamespace(
         args=SimpleNamespace(persistent_phase_instances=True),
-        _max_pool_size=0,
+        _trajectory_book=None,
         parallel_manager=SimpleNamespace(),
     )
 
-    with pytest.raises(RuntimeError, match="requires pool mode"):
+    with pytest.raises(RuntimeError, match="requires the unified trajectory pool"):
         enabled(worker)
 
-    worker._max_pool_size = 1
+    worker._trajectory_book = object()
     with pytest.raises(RuntimeError, match="is not supported"):
         enabled(worker)
 

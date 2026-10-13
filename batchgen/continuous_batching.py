@@ -143,6 +143,8 @@ def validate_boundary_payload_alignment(
     active_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_bad_status: List[Tuple[str, int, Any]] = []
+    payload_totals: List[Optional[int]] = []
+    payload_free: List[Optional[int]] = []
 
     for rank_idx, payload in enumerate(all_payloads):
         if not isinstance(payload, dict):
@@ -151,6 +153,8 @@ def validate_boundary_payload_alignment(
 
         seq_state = payload.get("seq_state") or {}
         candidate_state = payload.get("candidate_state") or {}
+        payload_totals.append(payload.get("total_pages"))
+        payload_free.append(payload.get("free_pages"))
 
         for uuid, state in seq_state.items():
             active_reports.setdefault(uuid, []).append(rank_idx)
@@ -163,7 +167,9 @@ def validate_boundary_payload_alignment(
                     active_wrong_owner.append((uuid, rank_idx, group))
             else:
                 assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-                if assigned_rank is not None:
+                if assigned_rank is None:
+                    active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
                     try:
                         assigned_rank_int = int(assigned_rank)
                     except (TypeError, ValueError):
@@ -182,7 +188,9 @@ def validate_boundary_payload_alignment(
                     candidate_wrong_owner.append((uuid, rank_idx, group))
             else:
                 assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-                if assigned_rank is not None:
+                if assigned_rank is None:
+                    candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
                     try:
                         assigned_rank_int = int(assigned_rank)
                     except (TypeError, ValueError):
@@ -199,6 +207,12 @@ def validate_boundary_payload_alignment(
         errors.append(
             "decode UUIDs missing from gathered seq_state: "
             f"count={len(missing_active)} first={missing_active[:8]}"
+        )
+    unexpected_active = [uuid for uuid in active_reports if uuid not in decode_uuids]
+    if unexpected_active:
+        errors.append(
+            "gathered active UUIDs are absent from decode list: "
+            f"count={len(unexpected_active)} first={unexpected_active[:8]}"
         )
 
     if G > 1:
@@ -277,6 +291,33 @@ def validate_boundary_payload_alignment(
                 for uuid, rank, status in candidate_bad_status[:8]
             )
         )
+
+    # Modern workers include total/free allocator capacity in every payload.
+    # Keep old pure callers source-compatible, but validate the complete
+    # snapshot whenever the new fields are present so a rank cannot plan from
+    # a divergent page pool or an impossible free count.
+    if any(total is not None for total in payload_totals):
+        if any(total is None for total in payload_totals):
+            errors.append("boundary payloads disagree on total_pages presence")
+        elif any(free is None for free in payload_free):
+            errors.append("boundary payloads disagree on free_pages presence")
+        else:
+            totals = [int(total) for total in payload_totals]
+            frees = [int(free) for free in payload_free]
+            if any(total < 0 for total in totals):
+                errors.append(f"boundary payload has negative total_pages: {totals}")
+            if any(free < 0 for free in frees):
+                errors.append(f"boundary payload has negative free_pages: {frees}")
+            if any(free > total for free, total in zip(frees, totals)):
+                errors.append(
+                    "boundary payload free_pages exceed total_pages: "
+                    f"totals={totals}, free={frees}"
+                )
+            if len(set(totals)) != 1:
+                errors.append(
+                    "boundary payload total page count diverged across ranks: "
+                    f"{totals}"
+                )
 
     if errors:
         raise RuntimeError("[SCHED_INVARIANT] boundary gather misalignment: " + " | ".join(errors))

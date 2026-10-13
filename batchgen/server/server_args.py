@@ -145,6 +145,10 @@ class ServerArgs:
     startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
     # Request pool: max QueryBook capacity. Must be > 0 (see validate_server_args).
     max_pool_size: int = 10240
+    # Fixed node-shared host token pool budget. Sequence capacity is derived
+    # from this budget and the model maximum context; max_pool_size is kept
+    # only as a deprecated CLI compatibility field.
+    input_ids_pool_size_gb: float = 50.0
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
@@ -347,8 +351,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-pool-size",
         type=int,
         default=10240,
-        help="Max QueryBook pool capacity for persistent request scheduling. "
-             "Must be > 0. Default: 10240.",
+        help="Deprecated compatibility value; scheduling capacity is derived "
+             "from --input-ids-pool-size-gb and model context. Default: 10240.",
+    )
+    parser.add_argument(
+        "--input-ids-pool-size-gb",
+        type=float,
+        default=50.0,
+        help="Fixed node-shared int32 input-id pool budget in GiB. "
+             "Sequence capacity is derived from this budget. Default: 50.",
     )
     parser.add_argument(
         "--max-intake-capacity",
@@ -475,7 +486,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host-kv-chunk-size",
         type=int,
         default=8192,
-        help="Host KV chunk size in tokens for dynamic reservation (default: 8192). Each sequence initially reserves prompt_length + chunk_size tokens instead of full max_decode_length.",
+        help=(
+            "Initial host-KV reservation chunk in tokens (default: 8192). "
+            "The first pool init caps the effective chunk with its max output "
+            "length; this sizes host-KV reservations only and does not override "
+            "per-request max_completion_tokens. Later larger requests grow their "
+            "own reservation up to their KV budget."
+        ),
     )
     parser.add_argument(
         "--host-kv-eviction-watermark",
@@ -545,10 +562,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def validate_server_args(args: ServerArgs) -> None:
     """Validate parsed arguments."""
     if args.max_pool_size <= 0:
-        raise ValueError(
-            "--max-pool-size must be positive; the legacy non-pool mode was "
-            "removed, use the batch API (POST /v1/files then POST /v1/batches)"
-        )
+        raise ValueError("legacy non-pool mode was removed; --max-pool-size must be positive")
+    if args.input_ids_pool_size_gb <= 0:
+        raise ValueError("--input-ids-pool-size-gb must be positive")
     _validate_port_range("listen port", args.listen_port)
     _ensure_local_port_free(args.listen_port, "Listen")
 
@@ -778,6 +794,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
         max_pool_size=parsed.max_pool_size,
+        input_ids_pool_size_gb=parsed.input_ids_pool_size_gb,
         max_intake_capacity=parsed.max_intake_capacity,
     )
     server_args.resolve_paths()
