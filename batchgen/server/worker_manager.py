@@ -899,6 +899,8 @@ class WorkerManager:
             fast_init=self.args.fast_init,
             max_pool_size=self.args.max_pool_size,
             input_ids_pool_size_gb=self.args.input_ids_pool_size_gb,
+            prefix_memfd_pid=self._get_prefix_memfd_pid(),
+            prefix_memfd_fd=self._get_prefix_memfd_fd(),
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
@@ -946,6 +948,18 @@ class WorkerManager:
             join=False,
             daemon=True,
         )
+
+    # The prefix-cache coordinator region is an anonymous memfd owned by this
+    # process, published to the workers like the host-KV regions below.
+    def _get_prefix_memfd_pid(self) -> int:
+        if getattr(self, 'prefix_cache_coordinator', None) is not None:
+            return os.getpid()
+        return -1
+
+    def _get_prefix_memfd_fd(self) -> int:
+        if getattr(self, 'prefix_cache_coordinator', None) is not None:
+            return self.prefix_cache_coordinator.memfd_fd()
+        return -1
 
     # Host KV regions are always anonymous memfds owned by this process, so the
     # creator pid and fds are published to the workers in every mode.
@@ -1440,12 +1454,11 @@ class WorkerManager:
     def _shutdown_prefix_cache_owner(self) -> None:
         if self.prefix_cache_runtime_config is None:
             return
-        from batchgen.prefix_reuse.config import (
-            unlink_prefix_cache_shared_memory,
-        )
-
+        # The region is an anonymous memfd: dropping the owner coordinator
+        # closes the last creator-side reference and the kernel reclaims the
+        # memory once the final worker mapping disappears. Nothing is named,
+        # so there is nothing to unlink.
         self.prefix_cache_coordinator = None
-        unlink_prefix_cache_shared_memory(self.prefix_cache_runtime_config)
         self.prefix_cache_runtime_config = None
 
     @staticmethod

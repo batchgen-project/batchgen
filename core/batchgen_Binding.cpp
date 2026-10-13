@@ -811,6 +811,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<kv::HostPrefixCacheConfig>(m, "HostPrefixCacheConfig")
         .def(py::init<>())
         .def_readwrite("shm_name", &kv::HostPrefixCacheConfig::shm_name)
+        .def_readwrite("memfd_creator_pid",
+                       &kv::HostPrefixCacheConfig::memfd_creator_pid)
+        .def_readwrite("memfd_fd", &kv::HostPrefixCacheConfig::memfd_fd)
         .def_readwrite("group_specs",
                        &kv::HostPrefixCacheConfig::group_specs)
         .def_readwrite("hash_block_tokens",
@@ -828,6 +831,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<kv::HostPrefixCacheConfig>(), py::arg("config"))
         .def("initialize", &kv::HostPrefixCacheCoordinator::Initialize,
              py::arg("create_region"))
+        .def("memfd_fd", &kv::HostPrefixCacheCoordinator::memfd_fd)
         .def("commit_prefix_pages",
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
              py::arg("namespace_digest"), py::arg("token_ids"),

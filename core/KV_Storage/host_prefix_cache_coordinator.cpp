@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -602,16 +603,17 @@ void HostPrefixCacheCoordinator::SharedState::ValidateSharedState() const {
 void HostPrefixCacheCoordinator::SharedState::Initialize(bool create_region) {
     const std::size_t page_size = SystemPageSize();
     total_bytes = AlignUp(total_bytes_unaligned, page_size);
-    int flags = O_RDWR;
     if (create_region) {
-        flags |= O_CREAT | O_EXCL;
-    }
-    shm_fd = shm_open(config.shm_name.c_str(), flags, 0660);
-    if (shm_fd == -1) {
-        throw std::system_error(errno, std::generic_category(),
-                                "host prefix cache shm_open failed");
-    }
-    if (create_region) {
+        // Anonymous region: the kernel reclaims it with the last mapping on
+        // ANY exit, so no named object can leak. Workers attach through
+        // /proc/<creator_pid>/fd/<fd>.
+        shm_fd = static_cast<int>(
+            syscall(SYS_memfd_create, "batchgen_prefix_cache", MFD_CLOEXEC));
+        if (shm_fd == -1) {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "host prefix cache memfd_create failed");
+        }
         if (ftruncate(shm_fd, static_cast<off_t>(total_bytes)) == -1) {
             const int err = errno;
             close(shm_fd);
@@ -620,6 +622,22 @@ void HostPrefixCacheCoordinator::SharedState::Initialize(bool create_region) {
                                     "host prefix cache ftruncate failed");
         }
     } else {
+        if (config.memfd_creator_pid <= 0 || config.memfd_fd < 0) {
+            throw std::runtime_error(
+                "host prefix cache attach requires a valid memfd_creator_pid "
+                "and memfd_fd (got pid=" +
+                std::to_string(config.memfd_creator_pid) +
+                ", fd=" + std::to_string(config.memfd_fd) + ")");
+        }
+        const std::string proc_path =
+            "/proc/" + std::to_string(config.memfd_creator_pid) + "/fd/" +
+            std::to_string(config.memfd_fd);
+        shm_fd = open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
+        if (shm_fd == -1) {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "host prefix cache memfd attach cannot open " + proc_path);
+        }
         struct stat stat_buffer{};
         if (fstat(shm_fd, &stat_buffer) == -1) {
             const int err = errno;
@@ -2102,6 +2120,8 @@ HostPrefixCacheCoordinator::~HostPrefixCacheCoordinator() {
 void HostPrefixCacheCoordinator::Initialize(bool create_region) {
     state_->Initialize(create_region);
 }
+
+int HostPrefixCacheCoordinator::memfd_fd() const { return state_->shm_fd; }
 
 PrefixCommitResult HostPrefixCacheCoordinator::CommitPrefixPages(
     PrefixDigest namespace_digest, const std::vector<std::int64_t>& token_ids,

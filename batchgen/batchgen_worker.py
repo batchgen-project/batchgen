@@ -741,6 +741,9 @@ class BatchGenWorkerArgs:
 	# in every mode. weights_memfd_pid owns both weights and tensor metadata;
 	# --enable-hugetlbfs only changes the weights memfd's page size.
 	fast_init: bool = False
+	# Prefix-cache coordinator region (anonymous memfd owned by the server).
+	prefix_memfd_pid: int = -1
+	prefix_memfd_fd: int = -1
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
 	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
@@ -1059,6 +1062,8 @@ class BatchGenWorker:
 						kv_dtype=args.kv_dtype,
 						host_kv_config=worker_kv_config,
 						debug_stats=self.prefix_cache_debug_stats,
+						memfd_creator_pid=args.prefix_memfd_pid,
+						memfd_fd=args.prefix_memfd_fd,
 					)
 				)
 				self.prefix_cache_coordinator = (

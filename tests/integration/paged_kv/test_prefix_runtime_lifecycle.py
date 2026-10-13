@@ -1,6 +1,6 @@
-import ctypes
 import os
 import uuid
+from dataclasses import replace
 
 from batchgen.models.engine_loader import core_engine as bg
 from batchgen.prefix_reuse.commit import (
@@ -12,15 +12,8 @@ from batchgen.prefix_reuse.commit import (
 from batchgen.prefix_reuse.config import (
     build_prefix_cache_runtime_config,
     create_host_prefix_cache_coordinator,
-    unlink_prefix_cache_shared_memory,
 )
 from batchgen.prefix_reuse.prefill import lookup_prefix_cache_for_prefill
-
-
-def _shm_unlink(name: str) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.shm_unlink(name.encode()) != 0 and ctypes.get_errno() != 2:
-        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
 
 
 def _host_config(shm_name: str):
@@ -47,7 +40,6 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
         kv_dtype="bfloat16",
         host_kv_config=host_config,
     )
-    unlink_prefix_cache_shared_memory(runtime)
     host = bg.DefaultHostPagedKVWorkerView(host_config)
     owner = None
     worker = None
@@ -58,9 +50,15 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
             runtime_config=runtime,
             create_region=True,
         )
+        # Attachers reach the owner's anonymous region through its memfd
+        # identity, exactly as a spawned worker does in serving.
         worker = create_host_prefix_cache_coordinator(
             core_engine_module=bg,
-            runtime_config=runtime,
+            runtime_config=replace(
+                runtime,
+                memfd_creator_pid=os.getpid(),
+                memfd_fd=owner.memfd_fd(),
+            ),
             create_region=False,
         )
 
@@ -150,5 +148,4 @@ def test_python_runtime_commit_attach_and_evict_round_trip():
         except Exception:
             pass
         del host
-        unlink_prefix_cache_shared_memory(runtime)
-        _shm_unlink(host_shm)
+        # Anonymous memfd regions: dropping the references is the cleanup.
