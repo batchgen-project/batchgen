@@ -168,6 +168,11 @@ class KimiLinearParallelStrategyManager:
         self._kda_pool_slots = int(getattr(
             engine_config.GPU_Buffer_Config, "kda_state_slots", 256
         ))
+        # Slots the planner added for pooled prefix segments (planner.py
+        # _K3_PREFIX_SEGMENT_STATE_SLOTS); never user capacity.
+        self._kda_segment_slots = int(getattr(
+            engine_config.GPU_Buffer_Config, "kda_prefix_segment_slots", 0
+        ))
         # M-PR-6: stream attn / kda_attn / shared_expert too (planner-set,
         # default False so the validated 48B path stays fully resident).
         self._stream_all_modules = bool(getattr(
@@ -525,7 +530,7 @@ class KimiLinearParallelStrategyManager:
         # told "193 free", selected 193 sequences for the node, and prefill died
         # with "Insufficient free KDA state items" because the scratch slot had
         # been consumed. Hold it back here, where capacity is reported.
-        available -= _KDA_GRAPH_SCRATCH_SLOTS
+        available -= _KDA_GRAPH_SCRATCH_SLOTS + self._kda_segment_slots
         available = max(0, int(available))
         if self._attn_tp_size > 1:
             return {"max_sequences_per_node": available}
@@ -1286,6 +1291,54 @@ class KimiLinearParallelStrategyManager:
         worker reads this (getattr, default 1) to size the decode MoE padding
         and to gate the decode DP-group assignment / KDA reshard (M2b)."""
         return self._attn_tp_size
+
+    @property
+    def attn_tp_group(self):
+        """This rank's attention (serve) TP process group; None for G == 1.
+
+        The worker reduces its prefill prefix-pool budget and checks its plan
+        digest over this group, so every rank of a serve group runs the same
+        wave."""
+        return self._attn_tp_group
+
+    def supports_group_pool_prefill(self):
+        """Whether the prefill prefix pool stays group-identical at G > 1.
+
+        A serve group replicates every sequence onto all G of its ranks and
+        prefills them in lockstep, so one plan per group suffices: each rank
+        pools its own head shard of the same segments and the per-layer
+        collectives still pair up chunk for chunk. True for the whole family:
+        the 48B at G > 1 runs the same resident head-parallel KDA (M2b) and the
+        same NoPE-MLA pool seams, and at G == 1 the worker never asks."""
+        return True
+
+    def prefill_pool_layout(self):
+        """K3's prefill prefix-pool geometry: the EXPANDED MLA K/V, not the latent.
+
+        Pool attention reads K of ``qk_nope + qk_rope`` and V of ``v_head_dim``
+        per LOCAL head (``_load_attn_modules`` already sharded them), while the
+        Host KV keeps one 576-wide latent per token, so the pool cannot be
+        sized from the Host geometry. ``layer_map`` maps an engine layer to its
+        dense pool row, the same way the Host and GPU pools are mapped.
+        """
+        cfg = self.loaded_model_config
+        mla_layers = [
+            layer_idx for layer_idx in range(cfg.num_hidden_layers)
+            if cfg.is_mla_layer(layer_idx)
+        ]
+        rows = {layer_idx: row for row, layer_idx in enumerate(mla_layers)}
+        attn = self.model.model.layers[mla_layers[0]].self_attn
+        attn = getattr(attn, "module", attn)
+        return {
+            "num_layers": len(mla_layers),
+            "layer_map": tuple(
+                rows.get(layer_idx, -1)
+                for layer_idx in range(cfg.num_hidden_layers)
+            ),
+            "num_kv_heads": int(attn.num_heads),
+            "k_head_dim": int(attn.qk_nope_head_dim + attn.qk_rope_head_dim),
+            "v_head_dim": int(attn.v_head_dim),
+        }
 
     @staticmethod
     def scatter_rows(x, group_size, group_rank):

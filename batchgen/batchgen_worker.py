@@ -1973,6 +1973,134 @@ class BatchGenWorker:
 			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
 		)
 
+	def _mirror_group_host_kv(self, uuids: List[str], prefix_states: dict) -> None:
+		"""Copy the serve-group leader's host-KV bookkeeping onto its followers.
+
+		G>1 replicates a sequence onto all G ranks of its group, but only the
+		leader (``_owns_host_kv``) registers / allocates it in the per-node
+		SHARED host region, so the other G-1 ranks come out of prefill config
+		with an empty worker-view page table and no ``_prefix_sequence_states``
+		entry for sequences they must still read. Both are rank-local views of
+		page ids the leader has already committed, so one object all-gather
+		reproduces them exactly: every follower installs ITS OWN leader's entry.
+
+		The payload is plain tuples and dicts — the coordinator attachment and
+		its lookup result belong to the leader alone — so a mirrored state
+		carries ``lookup_result=None`` plus the leader's page ids per KV group,
+		which is how ``shared_page_ids_for_group`` resolves a planned chain. A
+		prefill prefix-pool wave adds its segments' pseudo sequence ids and Host
+		pages, so every rank's segment row offloads land on the leader's pages.
+
+		No-op for G==1, where the host-KV owner is the only rank holding the
+		sequence. For G>1 every rank reaches the collective: the admission is
+		identical on all ranks while ``uuids`` is not, and the gather sits
+		outside the leader branch.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return
+		# The mirrored page ids index the leader's per-node host region, so a
+		# serve group must not straddle a node boundary.
+		if self.local_world_size % G:
+			raise RuntimeError(
+				f"attn_tp_size={G} must divide local_world_size="
+				f"{self.local_world_size}: a serve group spanning nodes would "
+				f"read another node's host-KV page ids"
+			)
+		from batchgen.decode_dp_group import host_kv_owner_rank
+		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+
+		host_views = self._host_views_by_group()
+		wave = getattr(self, "_prefill_pool_wave", None)
+		payload = None
+		if uuids and all(
+			self._owns_host_kv(self.global_batch.get_sequence(uuid))
+			for uuid in uuids
+		):
+			segments = None
+			if wave is not None:
+				from batchgen.prefix_reuse.wave_runtime import segment_mirror_payload
+
+				segments = segment_mirror_payload(wave)
+			global_ids = [
+				int(self.global_batch.get_sequence(uuid).global_idx)
+				for uuid in uuids
+			]
+			prefix = {}
+			for global_id in global_ids:
+				state = prefix_states.get(global_id)
+				if state is None:
+					continue
+				prefix[global_id] = (
+					int(state.attached_tokens),
+					int(state.compute_cached_tokens),
+					{
+						group_id: tuple(
+							int(page)
+							for page in state.shared_page_ids_for_group(group_id)
+						)
+						for group_id in host_views
+					},
+				)
+			payload = {
+				"global_ids": global_ids,
+				"page_tables": {
+					group_id: [
+						[int(page) for page in pages]
+						for pages in view.build_page_table(global_ids)
+					]
+					for group_id, view in host_views.items()
+				},
+				"prefix": prefix,
+				# A pooled segment's Host pages are the leader's too, but every
+				# rank of the group offloads the segment rows it computed, so the
+				# followers need the pages those rows must land on.
+				"segments": segments,
+			}
+
+		gathered = [None] * self.world_size
+		dist.all_gather_object(gathered, payload)
+
+		leader = host_kv_owner_rank(self.rank // G, G)
+		if leader == self.rank:
+			return
+		entry = gathered[leader]
+		if entry is None:
+			if uuids:
+				raise RuntimeError(
+					f"Rank {self.rank}: serve-group leader {leader} mirrored no "
+					f"host KV for the {len(uuids)} sequences this rank serves"
+				)
+			return
+		for group_id, view in host_views.items():
+			for global_id, pages in zip(
+				entry["global_ids"], entry["page_tables"][group_id]
+			):
+				view.set_sequence_pages(global_id, pages)
+		segments = entry.get("segments")
+		if (segments is None) != (wave is None):
+			raise RuntimeError(
+				f"Rank {self.rank}: serve-group leader {leader} planned "
+				f"{'a' if segments is not None else 'no'} prefix pool wave while "
+				f"this rank planned {'one' if wave is not None else 'none'}"
+			)
+		if segments is not None:
+			from batchgen.prefix_reuse.wave_runtime import install_mirrored_segments
+
+			install_mirrored_segments(wave, segments, host_views)
+		for global_id, (attached, cached, shared) in entry["prefix"].items():
+			state = PrefixCacheSequenceState(
+				lookup_result=None,
+				attached_tokens=attached,
+				compute_cached_tokens=cached,
+				planned_shared_page_ids={
+					int(group_id): tuple(pages)
+					for group_id, pages in shared.items()
+				},
+			)
+			prefix_states[global_id] = state
+			self._prefix_sequence_states[global_id] = state
+
 	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
 		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
 		BEFORE the group-predicate binding — not at the decode transition).
@@ -5250,8 +5378,12 @@ class BatchGenWorker:
 		# Members' demands exclude their shared chains, but the pooled
 		# segments themselves allocate one Host copy (mirrored per group, so
 		# one count). Leaving them out over-admits the wave and the
-		# allocation fails right after the preflight passed.
-		local_need += self._prefill_pool_segment_host_pages()
+		# allocation fails right after the preflight passed. Only the wave's
+		# host-KV LEADER allocates segments, so only a rank with owner demand
+		# reports them — at G>1 the followers reporting the same segments
+		# would multiply the node demand by G and falsely reject the wave.
+		if owner_requests:
+			local_need += self._prefill_pool_segment_host_pages()
 		node_id = self.rank // self.local_world_size
 		local_free = -1
 		local_total = -1
@@ -5335,62 +5467,73 @@ class BatchGenWorker:
 			lookup_prefix_cache_for_prefill,
 		)
 
-		owned = [
+		# Every rank that SERVES a sequence plans the wave (the G>1 plan is a
+		# group collective); only the host-KV LEADER looks up and attaches.
+		served = [
 			uuid for uuid in prefill_uuids
+			if self._owns_local_sequence(self.global_batch.get_sequence(uuid))
+		]
+		owned = [
+			uuid for uuid in served
 			if self._owns_host_kv(self.global_batch.get_sequence(uuid))
 		]
-		if not owned:
+		if not served:
 			return
-		prompt_token_ids = []
-		for uuid in owned:
-			seq = self.global_batch.get_sequence(uuid)
-			prompt_token_ids.append(
-				self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
-			)
-		lookup = lookup_prefix_cache_for_prefill(
-			coordinator=self.prefix_cache_coordinator,
-			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
-			prompt_token_ids=prompt_token_ids,
-			page_size_tokens=(
-				self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
-			),
-			num_groups=len(self.prefix_cache_runtime_config.group_specs),
-		)
 		prefix_states = {}
-		for uuid, result, attached, compute_cached in zip(
-			owned,
-			lookup.lookup_results,
-			lookup.attached_tokens,
-			lookup.compute_cached_tokens,
-		):
-			seq = self.global_batch.get_sequence(uuid)
-			state = PrefixCacheSequenceState(
-				lookup_result=result,
-				attached_tokens=int(attached),
-				compute_cached_tokens=int(compute_cached),
+		if owned:
+			prompt_token_ids = []
+			for uuid in owned:
+				seq = self.global_batch.get_sequence(uuid)
+				prompt_token_ids.append(
+					self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+				)
+			lookup = lookup_prefix_cache_for_prefill(
+				coordinator=self.prefix_cache_coordinator,
+				namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
+				prompt_token_ids=prompt_token_ids,
+				page_size_tokens=(
+					self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
+				),
+				num_groups=len(self.prefix_cache_runtime_config.group_specs),
 			)
-			self._prefix_sequence_states[seq.global_idx] = state
-			prefix_states[seq.global_idx] = state
+			for uuid, result, attached, compute_cached in zip(
+				owned,
+				lookup.lookup_results,
+				lookup.attached_tokens,
+				lookup.compute_cached_tokens,
+			):
+				seq = self.global_batch.get_sequence(uuid)
+				state = PrefixCacheSequenceState(
+					lookup_result=result,
+					attached_tokens=int(attached),
+					compute_cached_tokens=int(compute_cached),
+				)
+				self._prefix_sequence_states[seq.global_idx] = state
+				prefix_states[seq.global_idx] = state
 		# In-wave pool: plan this rank's shared segments from the same wave.
 		# The plan only reads tokens and states; Host pages for the segments
 		# are allocated inside the reservation transaction below.
 		self._prefill_pool_wave = None
 		if self._prefill_prefix_pool_enabled():
 			self._prefill_pool_wave = self._plan_prefill_pool_wave(
-				owned, prefix_states
+				served, prefix_states
 			)
-			if (
-				self._prefill_pool_wave is None
-				and len(self.prefix_cache_runtime_config.group_specs) > 1
-			):
-				# A multi-group (DSA) hit has no cross-wave materialization
-				# path (that path serves the single full-K/V group); a wave
-				# the pool declines recomputes, so its hits must not stay
-				# attached. Single-group waves keep theirs for attach+suffix.
-				seqs = [self.global_batch.get_sequence(uuid) for uuid in owned]
-				self._replace_prefix_lookup_hits(
-					seqs, prefix_states, [0] * len(seqs)
+			if self._prefill_pool_wave is None:
+				from batchgen.prefix_reuse.config import (
+					prefix_reuse_requires_prefill_pool,
+					require_prefix_cache_model_support,
 				)
+				if prefix_reuse_requires_prefill_pool(
+					require_prefix_cache_model_support(self.huggingface_ckpt_name)
+				):
+					# A pool-only model's hit (DSA dual-group, MLA-latent K3)
+					# has no cross-wave materialization path; a wave the pool
+					# declines recomputes, so its hits must not stay attached.
+					# Full-K/V waves keep theirs for attach+suffix.
+					seqs = [self.global_batch.get_sequence(uuid) for uuid in served]
+					self._replace_prefix_lookup_hits(
+						seqs, prefix_states, [0] * len(seqs)
+					)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -6044,6 +6187,12 @@ class BatchGenWorker:
 		"""Return the number of complete model forwards local prefill will run."""
 		if not batch:
 			return 0
+		if self._prefill_pool_wave is not None:
+			# A pool wave runs one forward per planned chunk, not one per
+			# micro-batch of whole prompts: a chunk packs pooled segments and
+			# tails. The plan is identical on every rank of the serve group, so
+			# the pass counts the transport padding aligns against agree.
+			return len(self._prefill_pool_wave.plan.chunks)
 		if not self.enable_prepack:
 			micro_batch_size = (
 				self.engine_config.Module_Batching_Config
@@ -6128,7 +6277,12 @@ class BatchGenWorker:
 				prompt_length=seq.prompt_length,
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
-				host_kv_replication_factor=G,
+				# G>1 no longer replicates the reservation: only the serve-group
+				# leader (_owns_host_kv) registers / allocates in the per-node
+				# shared host region and the other G-1 ranks mirror its page
+				# table (_mirror_group_host_kv), so one admitted sequence costs
+				# the node allocator exactly one copy of req_pages.
+				host_kv_replication_factor=1,
 				prefill_order=getattr(seq, "prefill_order", None),
 			))
 		return PrefillSelectionRequest(
@@ -8374,6 +8528,16 @@ class BatchGenWorker:
 			# Clear the legacy owner-only tensor marker. No token copy occurs.
 			seq.evicted_token_ids = None
 
+			# Recreate query_book entry for this rank's evicted sequences (Q4).
+			# G>1 binds the row on all G ranks of its serve group, and each of
+			# them decodes from its own query_book, so every holder must rebuild
+			# the entry — not just assigned_rank. The group id an evicted re-entry
+			# lost is already restored by the _assign_decode_dp_groups call at the
+			# top of this method. G==1: the same single rank as before.
+			if self._owns_local_sequence(seq) and uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				self.query_book[local_idx] = make_query_book_entry(seq)
+
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
 				f"new_prompt={seq.prompt_length}, prev_decoded={prev_decoded}, "
@@ -8405,6 +8569,12 @@ class BatchGenWorker:
 			logging.debug(
 				"[PREFILL] Host KV reservation already committed before phase config"
 			)
+
+		# Reached by EVERY rank — including ranks that serve no sequence this
+		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
+		# hands the leader's page tables, prefix metadata and pool segment
+		# pages to the rest of its serve group.
+		self._mirror_group_host_kv(my_prefill_uuids, self._prefix_sequence_states)
 
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
@@ -9057,7 +9227,47 @@ class BatchGenWorker:
 			# Release host KV pages through the mirrored coordinator when DSA is
 			# active.  It owns both primary and auxiliary page tables.
 			worker_view.release_sequence_pages(global_sequence_ids)
+			# A model with an aux region OUTSIDE the coordinator (K3 keeps its
+			# indexer keys there) releases it explicitly; the dual coordinator
+			# already mirrored its own aux above.
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+			if aux_view is not None and not isinstance(
+				worker_view, DualHostKVCoordinator
+			):
+				aux_view.release_sequence_pages(global_sequence_ids)
 			self._release_prefix_cache_attachments(global_sequence_ids)
+
+		# The G-1 followers of a serve group never touched the shared pages, but
+		# they do hold the leader's page table MIRRORED into their own view plus
+		# a mirrored prefix state. Drop those rank-local records too, or the next
+		# register of the same global_idx finds a stale row. unregister_sequences
+		# only edits the view's own HostKVPageTable; the pages themselves were
+		# freed exactly once, by the leader above. A mirrored prefix state has
+		# lookup_result=None (no attachment handle, so no coordinator call) and a
+		# follower owns no pool segment refs, so the shared release path inside
+		# _release_prefix_cache_attachments is a no-op here. G==1: the local-map
+		# owner IS the host-KV owner, so this list is always empty.
+		mirror_release_uuids = [
+			uuid for uuid in my_uuids
+			if not self._owns_host_kv(self.global_batch.get_sequence(uuid))
+		]
+		if mirror_release_uuids:
+			mirror_global_ids = [
+				self.global_batch.get_sequence(uuid).global_idx
+				for uuid in mirror_release_uuids
+			]
+			for view in self._host_views_by_group().values():
+				view.unregister_sequences(mirror_global_ids)
+			# An aux region OUTSIDE the prefix groups (K3 indexer keys) holds
+			# follower rows too; dropping only the group views would leave
+			# stale aux rows behind for the next use of the same global id.
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+			if aux_view is not None and not isinstance(
+				getattr(self, "host_paged_kv_worker_view", None),
+				DualHostKVCoordinator,
+			):
+				aux_view.unregister_sequences(mirror_global_ids)
+			self._release_prefix_cache_attachments(mirror_global_ids)
 
 		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
 		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
@@ -9169,24 +9379,72 @@ class BatchGenWorker:
 		workspace = self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
 		if not self.enable_prefix_cache:
 			return False
-		if len(self.prefix_cache_runtime_config.group_specs) > 1 and workspace <= 0:
-			# Only the pool path serves multi-group (DSA) prefix reuse; the
-			# cross-wave materialization path handles one full-K/V group.
+		from batchgen.prefix_reuse.config import PrefixKVGroupSemantic
+		if any(
+			spec.semantic is not PrefixKVGroupSemantic.FULL_KV
+			for spec in self.prefix_cache_runtime_config.group_specs
+		) and (workspace <= 0 or getattr(self, "_prefix_integrity", False)):
+			# Only the pool path serves MLA-latent prefix reuse (GLM DSA, Kimi-K3);
+			# the cross-wave materialization path handles one full-K/V group.
 			raise RuntimeError(
-				"DSA prefix reuse needs the prefill prefix pool, but this model's "
-				"planner sets no pool workspace"
+				"MLA-latent prefix reuse needs the prefill prefix pool, but this "
+				"model's planner sets no pool workspace or the integrity check is on"
 			)
 		if workspace <= 0 or getattr(self, "_prefix_integrity", False):
 			return False
-		if self._decode_attn_tp_size() != 1 or (
+		if (
 			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
 			and self.parallel_manager.prefill_uses_resident_ep()
+		) or (
+			self._decode_attn_tp_size() != 1
+			and not self._pool_prefill_group_safe()
 		):
 			raise RuntimeError(
 				"the prefill prefix pool runs per DP rank; this model's prefill "
 				"joins cross-rank collectives"
 			)
 		return True
+
+	def _pool_prefill_group_safe(self) -> bool:
+		"""Whether the PSM plans ONE identical pool wave per serve group (G>1).
+
+		At G>1 a sequence is replicated onto all G ranks of its serve group and
+		every one of them prefills it, so the pool is safe only when the whole
+		group runs the same chunks in the same order — the per-layer collectives
+		then still pair up. The PSM declares that; the resident-EP refusal above
+		stands either way, since those passes join EP-world collectives.
+		"""
+		declares = getattr(
+			self.parallel_manager, "supports_group_pool_prefill", None
+		)
+		return declares is not None and bool(declares())
+
+	def _prefill_pool_group(self):
+		"""The process group a pool wave must be identical over; None at G==1."""
+		if self._decode_attn_tp_size() <= 1:
+			return None
+		group = getattr(self.parallel_manager, "attn_tp_group", None)
+		if group is None:
+			raise RuntimeError(
+				"the prefill prefix pool at attn_tp_size>1 needs the attention "
+				"TP process group to plan one wave per serve group"
+			)
+		return group
+
+	def _prefill_pool_free_state_slots(self) -> int:
+		"""Free recurrent-state slots, or -1 when the model keeps no such state.
+
+		A pooled segment runs as a row of its own under a pseudo sequence id, so
+		it holds one slot for the whole wave on top of the wave's sequences.
+		"""
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+		except ImportError:
+			return -1
+		manager = KimiLinearKDAWrapper.state_manager
+		if KimiLinearKDAWrapper.slot_manager is None or manager is None:
+			return -1
+		return int(manager.get_stats().num_free_state_items)
 
 	def _next_pool_segment_sid(self) -> int:
 		"""Negative Host sequence ids, rank-strided so no two ranks collide."""
@@ -9431,20 +9689,27 @@ class BatchGenWorker:
 				)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
-		"""Plan this rank's in-wave sharing. CPU-only: the GPU pool is built in
+		"""Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
 		the prefill phase (`_construct_prefill_pool`), after configure_prefill
 		settles the device layout.
 
 		A prompt re-entering after eviction is planned like any other: its
 		reconstructed tokens are its prompt. A pooled member's cross-wave
 		lookup hit is released and its chain recomputed in-wave; when this
-		returns None the wave keeps its lookup hits and the existing
-		attach-and-suffix path materializes them.
+		returns None the wave keeps its lookup hits (the caller releases them
+		for a model whose reuse only the pool can serve).
 
 		The page budget is the prefill-phase free memory measured after the
 		previous configure_prefill — a deployment constant, so the first wave
 		after startup runs unpooled and seeds the measurement.
+
+		At G>1 every rank of the serve group runs this over the same sequences
+		and must come out with the same plan: the page and state-slot budgets
+		are reduced to the group MIN and the plan digest is compared inside the
+		group, so every early return and every chunk is group-identical.
 		"""
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
 			plan_wave_prefix_sharing,
@@ -9454,23 +9719,55 @@ class BatchGenWorker:
 
 		total_pages = self._prefill_pool_page_budget
 		if total_pages is None:
+			# Budget seeding is part of configure_prefill, which every rank of
+			# a wave runs in the same step, so an unmeasured budget is
+			# group-uniform. Declining before the group lookup also keeps the
+			# first wave off attn_tp_group, which the PSM publishes only once
+			# prefill has configured.
 			logging.info(
 				"[PREFIX_POOL] Rank %s first wave keeps the existing path: "
 				"prefill-phase pool budget not yet measured",
 				self.rank,
 			)
 			return None
+		group = self._prefill_pool_group()
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		prompts = [
 			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
 			for seq in seqs
 		]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
+		state_slots = self._prefill_pool_free_state_slots()
+		if group is not None:
+			# Reached by every rank of the group (uuids is the group's sequence
+			# set): the tightest rank's budget is the group's, so the identical
+			# prompts then give every rank the identical plan.
+			budget = torch.tensor(
+				[total_pages, state_slots],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)
+			total_pages = int(budget[0].item())
+			state_slots = int(budget[1].item())
+		if self._prefill_pool_psm_layout() is not None:
+			# The pool holds EVERY token of a chunk, tails as well as segments,
+			# so a chunk wider than the pool can never be planned; leave half the
+			# pages for the pooled segments those tails read.
+			pool_chunk_tokens = (
+				max(0, (total_pages - len(prompts)) // 2) * page_tokens
+			)
+			if pool_chunk_tokens < chunk_tokens:
+				logging.info(
+					"[PREFIX_POOL] Rank %s caps the pool chunk at %d tokens "
+					"(cap %d): %d pool pages hold every chunk token",
+					self.rank, pool_chunk_tokens, chunk_tokens, total_pages,
+				)
+				chunk_tokens = pool_chunk_tokens
 		scratch = scratch_pages_bound(
 			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts), page_tokens
 		)
@@ -9480,6 +9777,12 @@ class BatchGenWorker:
 				self.rank, total_pages, scratch,
 			)
 			return None
+		# A model that declares group-safe pool prefill (K3) writes a chunk's KV
+		# before attending over it AND runs its recurrent layers level by level,
+		# so a whole prefix tree finishes in one forward. Read from the PSM like
+		# the pool layout above; GPT-OSS and GLM declare neither.
+		declares = getattr(self.parallel_manager, "supports_group_pool_prefill", None)
+		level_wise = declares is not None and bool(declares())
 		plan = plan_wave_prefix_sharing(
 			prompts,
 			block_tokens=page_tokens,
@@ -9487,14 +9790,28 @@ class BatchGenWorker:
 			chunk_tokens=chunk_tokens,
 			# Every GLM prefill forward streams all experts, so a chunk is
 			# expensive; its attention writes the chunk's KV before reading it.
-			same_chunk_ancestors=not with_v,
+			same_chunk_ancestors=level_wise or not with_v,
 			# DSA pool attention gathers every row's prefix indexer keys (bf16
 			# plus an FP8 copy, ~384 B each); keep that inside the workspace.
 			chunk_keys=None if with_v else 8 * 1024 * 1024,
 		)
+		if level_wise:
+			# Rows grouped by level, so a recurrent layer runs one packed call
+			# per level, each after the level that left its parents' state.
+			plan = order_chunk_items_by_level(plan)
 		validate_wave_prefix_plan(plan, prompts)
-		if not plan.segments:
-			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: nothing shared", self.rank)
+		self._check_pool_plan_identical(plan, group)
+		# Nothing shared, or no room for the state: a pooled segment is a prefill
+		# row of its own, so on a model with per-sequence recurrent state it
+		# holds a slot of its own until the wave ends. The slot budget is the
+		# group MIN, so this decline is group-uniform like every other.
+		state_slots_needed = len(plan.segments) + len(prompts)
+		if not plan.segments or 0 <= state_slots < state_slots_needed:
+			logging.info(
+				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
+				"shared, %d state slots needed, %d free",
+				self.rank, len(plan.segments), state_slots_needed, state_slots,
+			)
 			return None
 		wave = PoolWave(
 			plan=plan,
@@ -9518,6 +9835,34 @@ class BatchGenWorker:
 		)
 		return wave
 
+	def _prefill_pool_psm_layout(self):
+		"""The PSM's pool-geometry override, or None to use the Host geometry.
+
+		A model whose pool holds the EXPANDED heads (K3: 192-wide K and
+		128-wide V per LOCAL head against one 576-wide latent) takes its pool
+		geometry from the PSM; the Host geometry is the pool's only while
+		prefill attention reads exactly what the Host stores.
+		"""
+		layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
+		return layout() if layout is not None else None
+
+	def _prefill_pool_page_dims(self, geometry) -> tuple:
+		"""(layers, heads, k_head_dim, v_head_dim) of one pool page row."""
+		layout = self._prefill_pool_psm_layout()
+		if layout:
+			return (
+				int(layout["num_layers"]),
+				int(layout["num_kv_heads"]),
+				int(layout["k_head_dim"]),
+				int(layout["v_head_dim"]),
+			)
+		return (
+			geometry.num_layers,
+			geometry.num_k_heads,
+			geometry.k_head_dim,
+			geometry.k_head_dim,
+		)
+
 	def _prefill_pool_page_bytes(self) -> int:
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
@@ -9525,9 +9870,10 @@ class BatchGenWorker:
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
 		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
+		layers, heads, k_head_dim, v_head_dim = self._prefill_pool_page_dims(geometry)
 		return (
-			(2 if with_v else 1) * geometry.num_layers * page_tokens
-			* geometry.num_k_heads * geometry.k_head_dim
+			layers * page_tokens * heads
+			* (k_head_dim + (v_head_dim if with_v else 0))
 			+ len(indexer_layers) * page_tokens * indexer_dim
 		) * element
 
@@ -9562,6 +9908,18 @@ class BatchGenWorker:
 
 		num_pages = wave.total_pages
 		budget = self._prefill_pool_page_budget
+		group = self._prefill_pool_group()
+		if group is not None:
+			# One pool size per serve group: a rank-local jitter shrink (or a
+			# rank-local failure) would leave the group's ranks in different
+			# chunk shapes mid-collective. The tightest rank decides.
+			reduced = torch.tensor(
+				[-1 if budget is None else int(budget)],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_reduce(reduced, op=dist.ReduceOp.MIN, group=group)
+			budget = None if int(reduced.item()) < 0 else int(reduced.item())
 		if budget is not None and budget < num_pages:
 			# Free-memory jitter of a few pages between measurements is not
 			# layout drift. The pool only ever needs the planned segment peak
@@ -9585,15 +9943,19 @@ class BatchGenWorker:
 		geometry_page_bytes = self._prefill_pool_page_bytes()
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
+		pool_layers, pool_heads, k_head_dim, v_head_dim = (
+			self._prefill_pool_page_dims(geometry)
+		)
 		pool = PrefillPrefixPool(
-			num_layers=geometry.num_layers,
+			num_layers=pool_layers,
 			num_pages=num_pages,
 			page_tokens=wave.page_tokens,
-			num_kv_heads=geometry.num_k_heads,
-			head_dim=geometry.k_head_dim,
+			num_kv_heads=pool_heads,
+			head_dim=k_head_dim,
 			dtype=geometry.kv_dtype,
 			device=self.torch_device,
 			with_v=with_v,
+			v_head_dim=v_head_dim,
 			indexer_layers=indexer_layers,
 			indexer_dim=indexer_dim,
 		)
@@ -9616,6 +9978,41 @@ class BatchGenWorker:
 			"[PREFIX_POOL] Rank %s pool up: %d pages (%d B each, %d segments)",
 			self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
 		)
+
+	def _check_pool_plan_identical(self, plan, group) -> None:
+		"""Raise unless every rank of the serve group planned the same wave.
+
+		Deterministic planning over replicated prompts and a group-MIN budget
+		gives one plan per group. A divergence would send two ranks through
+		different chunks of the per-layer collectives that pair them up, so it
+		is named here instead of deadlocking or corrupting a row later. No-op at
+		G==1, where the rank's plan is its own.
+		"""
+		if group is None:
+			return
+		hasher = hashlib.blake2b(digest_size=7)
+		for chunk in plan.chunks:
+			for item in chunk.items:
+				hasher.update(
+					f"{item.kind}:{item.ref}:{item.token_start}:"
+					f"{item.token_end}:{item.prefix_segments};".encode()
+				)
+			hasher.update(f"|{chunk.release_after}|".encode())
+		digest = torch.tensor(
+			[int.from_bytes(hasher.digest(), "little")],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		gathered = [
+			torch.zeros_like(digest) for _ in range(self._decode_attn_tp_size())
+		]
+		dist.all_gather(gathered, digest, group=group)
+		if len({int(item.item()) for item in gathered}) != 1:
+			raise RuntimeError(
+				f"Rank {self.rank}: the prefill prefix pool plan diverged inside "
+				f"the serve group ({len(plan.chunks)} chunks, "
+				f"{len(plan.segments)} segments, digest {int(digest.item())})"
+			)
 
 	def _prefill_pool_layout(self, geometry) -> tuple:
 		"""(with_v, indexer_layers, indexer_dim) of this model's prefill pool.
@@ -9654,12 +10051,18 @@ class BatchGenWorker:
 		return layout
 
 	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
-		"""Release each cross-wave lookup hit; a prompt starts at its chain end."""
+		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
+
+		A serve-group follower plans the same wave as its leader but holds no
+		lookup of its own — the leader owns every coordinator attachment and
+		mirrors the state afterwards — so a missing entry is its normal case and
+		leaves nothing to release.
+		"""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
 		for seq, end in zip(seqs, chain_tokens):
-			old = prefix_states[seq.global_idx]
-			if old.attachment_handle:
+			old = prefix_states.get(seq.global_idx)
+			if old is not None and old.attachment_handle:
 				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
 			state = PrefixCacheSequenceState(
 				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
@@ -9723,6 +10126,15 @@ class BatchGenWorker:
 		)
 		lm_weight = self.model.lm_head.weight
 		lm_bias = getattr(self.model.lm_head, "bias", None)
+		# The three model seams prefill_prepacked also goes through, duck-typed
+		# so they collapse to the plain path: K3 carries a per-layer block
+		# residual and ends on a depth mix, streamed-SP8 keeps only a row shard
+		# of the final hidden state, and its lm_head is vocab-parallel.
+		use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
+		gather_last_token_hidden = getattr(
+			self.parallel_manager, "gather_prefill_last_token_hidden", None
+		)
+		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -9733,6 +10145,16 @@ class BatchGenWorker:
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 		AttnWrapperBase.prefill_pool = wave.pool
+		# A recurrent layer forks a row's state from its parent segment's state
+		# slot, which is keyed by that segment's pseudo sequence id.
+		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
+		# The pool row of an engine layer comes from the model's own pool
+		# layout, never from a KV cache's layer mapping: a cache that keeps
+		# every layer resolves to itself and would index past the pool.
+		pool_layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
+		AttnWrapperBase.prefill_pool_layer_map = (
+			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
+		)
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
@@ -9749,18 +10171,56 @@ class BatchGenWorker:
 				AttnWrapperBase.prefill_pool_batch = rows
 				AttnWrapperBase.prefill_pool_row_starts = host_starts
 				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
+				block_residual = (
+					self.model.model._new_block_residual(hidden_states)
+					if use_attn_res else None
+				)
 				for decoder_layer in self.model.model.layers:
-					hidden_states = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
-					)[0]
+					if use_attn_res:
+						hidden_states, block_residual = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+							block_residual=block_residual,
+						)
+					else:
+						hidden_states = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)[0]
 				if rows.tail_wave_indices:
-					last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
-					logits = torch.nn.functional.linear(last_hidden, lm_weight, lm_bias).float()
+					if use_attn_res:
+						# Mix-then-norm over every row: the depth mix needs each
+						# row's own residual (kimi_linear/model.py:904-913).
+						hidden_dim = hidden_states.shape[2]
+						batch_sz, seq_sz = hidden_states.shape[:2]
+						hidden_states = self.model.model._apply_output_attn_res(
+							hidden_states.view(-1, hidden_dim), block_residual
+						).view(batch_sz, seq_sz, hidden_dim)
+					if gather_last_token_hidden is None:
+						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+					else:
+						# Streamed-SP8 holds only this rank's row shard, so the
+						# tail rows are reassembled over the group.
+						last_hidden = gather_last_token_hidden(
+							self.model.model.norm(hidden_states),
+							rows.tail_rows,
+							int(rows.input_ids.numel()),
+						)
+					logits = (
+						self.model.lm_head.forward(last_hidden).float()
+						if vocab_parallel_head
+						else torch.nn.functional.linear(
+							last_hidden, lm_weight, lm_bias
+						).float()
+					)
 					selected = self._select_tokens(
 						logits,
 						[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
@@ -9768,6 +10228,9 @@ class BatchGenWorker:
 					for row, index in enumerate(rows.tail_wave_indices):
 						tokens_by_index[index] = selected[row]
 				del hidden_states
+				# Dropped before the next chunk seeds its own buffer, so the two
+				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
+				block_residual = None
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
 				# Allocated bytes are what a chunk needs. The allocator's reserve
@@ -9797,10 +10260,16 @@ class BatchGenWorker:
 		finally:
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
+			# A segment's recurrent state is keyed by its pseudo sequence id and
+			# has to live across the chunks that continue it, so it is released
+			# here — the wave is over and no later batch carries those ids.
+			self._release_kda_state_slots(list(wave.segment_sids.values()))
 			wave.pool.k = wave.pool.v = wave.pool.indexer = None
 			AttnWrapperBase.prefill_pool = None
 			AttnWrapperBase.prefill_pool_batch = None
 			AttnWrapperBase.prefill_pool_row_starts = None
+			AttnWrapperBase.prefill_pool_segment_sids = None
+			AttnWrapperBase.prefill_pool_layer_map = None
 			AttnWrapperBase.prepack_mode = False
 			AttnWrapperBase.prepack_cu_seqlens = None
 			AttnWrapperBase.prepack_max_seqlen = None
@@ -9831,18 +10300,30 @@ class BatchGenWorker:
 		return self._write_prefill_tokens(batch, new_tokens)
 
 	def _finish_prefill_pool_wave(self) -> None:
-		"""After every D2H retired: publish the segments, pin members to them."""
+		"""After every D2H retired: publish the segments, pin members to them.
+
+		The Host pages and the prefix-cache nodes are the serve group's leader's,
+		so only the leader commits and attaches. A follower computed rows into
+		the leader's pages and has nothing to publish: it drops the page-table
+		record it mirrored for the pseudo sequences and keeps the mirrored prefix
+		state. The leader's member refcount is what keeps those pages alive.
+		"""
 		wave = self._prefill_pool_wave
 		if wave is None:
+			return
+		self._prefill_pool_wave = None
+		if not all(
+			self._owns_host_kv(self.global_batch.get_sequence(uuid))
+			for uuid in wave.uuids
+		):
+			for view in self._host_views_by_group().values():
+				view.unregister_sequences(list(wave.segment_sids.values()))
 			return
 		from batchgen.prefix_reuse.wave_runtime import (
 			attach_pool_members,
 			commit_pool_segments,
 		)
 
-		host_view = getattr(self, "host_paged_kv_worker_view", None)
-		if host_view is None:
-			host_view = self.core_engine.host_paged_kv_worker_view
 		runtime = self.prefix_cache_runtime_config
 		try:
 			segment_handles = commit_pool_segments(
@@ -9876,7 +10357,13 @@ class BatchGenWorker:
 			self._prefill_pool_wave = None
 
 	def _release_pool_segment_refs(self, global_id: int) -> None:
-		"""A pool segment's Host pages outlive its last member, never longer."""
+		"""A pool segment's Host pages outlive its last member, never longer.
+
+		Leader-only by construction: only ``_allocate_prefill_pool_host_pages``
+		fills these maps and only the serve group's host-KV owner runs it, so a
+		follower — which released its mirrored records at the end of the wave —
+		finds nothing here and must not free the leader's pages.
+		"""
 		for sid in self._pool_member_sids.pop(global_id, ()):
 			left = self._pool_sid_members[sid] - 1
 			if left:
@@ -11528,6 +12015,16 @@ class BatchGenWorker:
 					self.global_batch.get_sequence(u).global_idx for u in my_evicted
 					if self._owns_host_kv(self.global_batch.get_sequence(u))
 				]
+				# A follower of the group holds the leader's page table MIRRORED in
+				# its own view plus a mirrored prefix state, and the re-entry of
+				# this row registers the same global_idx again, so those rank-local
+				# records must go as well. unregister_sequences edits only the
+				# view's own HostKVPageTable — the shared pages are freed exactly
+				# once, by the leader above. Always empty at G==1.
+				mirrored_global_ids = [
+					self.global_batch.get_sequence(u).global_idx for u in my_evicted
+					if not self._owns_host_kv(self.global_batch.get_sequence(u))
+				]
 				if worker_view is not None:
 					# The worker-owned view is a DualHostKVCoordinator for DSA and
 					# mirrors both page tables transactionally.  Calling the auxiliary
@@ -11538,6 +12035,10 @@ class BatchGenWorker:
 					self._release_prefix_cache_attachments(
 						evicted_global_ids
 					)
+					if mirrored_global_ids:
+						for view in self._host_views_by_group().values():
+							view.unregister_sequences(mirrored_global_ids)
+						self._release_prefix_cache_attachments(mirrored_global_ids)
 
 			# All-ranks: update scalar metadata deterministically. The retained
 			# trajectory length is original_prompt_length + decoded_length; the
@@ -11686,6 +12187,18 @@ class BatchGenWorker:
 								f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
 								f"runway={runway} pages={growth_pages}"
 							)
+
+			# Every rank reads and writes host KV through its OWN worker-view
+			# page table, so a follower whose leader just extended the shared
+			# chain still holds the pre-growth table and would append the next
+			# token past its last known page. Re-mirror the grown rows (page
+			# tables only — the prefix attachment stays the leader's). Reached
+			# by every rank under the broadcast growth condition, so the
+			# gather inside stays aligned; no-op for G==1.
+			self._mirror_group_host_kv(
+				[u for u in decisions.host_growth_uuids if u in self._uuid_to_local_map],
+				{},
+			)
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
 

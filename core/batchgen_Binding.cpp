@@ -218,6 +218,12 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            py::arg("sequence_ids"))
        .def("register_sequences", &WorkerView::RegisterSequences,
            py::arg("sequence_ids"))
+       .def("set_sequence_pages", &WorkerView::SetSequencePages,
+           py::arg("sequence_id"), py::arg("page_ids"),
+           "Overwrite this view's LOCAL page table for one sequence without "
+           "touching the shared backend allocator. Used by the G>1 host-KV "
+           "mirror: the serve-group leader owns the shared region, the other "
+           "ranks of its group install the page table it produced.")
        .def("unregister_sequence", &WorkerView::UnregisterSequence,
            py::arg("sequence_id"))
        .def("unregister_sequences", &WorkerView::UnregisterSequences,

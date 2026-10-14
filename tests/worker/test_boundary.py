@@ -103,6 +103,74 @@ def test_completion_split():
     assert plan.scheduler_error is None
 
 
+
+def test_host_plan_follows_owning_rank_not_assigned_rank():
+    """G=8: the group leader's node holds the chain, assigned_rank does not.
+
+    Every row below reports a stale node-0 ``assigned_rank`` while its serve
+    group (1) is resident on node 1, so a node mapping keyed on assigned_rank
+    charges the growth to node 0's roomy pool and plans nothing on node 1 —
+    which then runs dry when the leader actually grows the shared chain.
+    """
+    state = {
+        # 17 pages of growth, owned by group 1's leader (rank 8, node 1).
+        "grow": {**_state(assigned_rank=3, decode_dp_group=1,
+                          needs_host_growth=True, host_growth_pages=17),
+                 "owning_rank": 8},
+        "victim": {**_state(assigned_rank=4, decode_dp_group=1,
+                            decoded_length=5, host_pages_allocated=40),
+                   "owning_rank": 8},
+        "keeper": {**_state(assigned_rank=5, decode_dp_group=1,
+                            decoded_length=500, host_pages_allocated=40),
+                   "owning_rank": 8},
+    }
+    plan = BoundaryHandler.compute_decisions(
+        _req(
+            decode_uuids=["grow", "victim", "keeper"],
+            global_seq_state=state,
+            per_rank_free=[100] * 16,
+            world_size=16,
+            attn_tp_size=8,
+            enable_host_kv_eviction=True,
+            per_node_host_stats=[
+                {"node_id": 0, "num_total_pages": 1000, "num_free_pages": 900},
+                {"node_id": 1, "num_total_pages": 455, "num_free_pages": 5},
+            ],
+        )
+    )
+
+    # Node 1 is the only planned node: 5 free + the victim's 40 released pages,
+    # against 17 growth + a 22-page safety margin. Node 0 is charged nothing.
+    assert plan.host_planned_free_pages == {1: 45}
+    assert plan.host_evicted_uuids == ["victim"]
+    assert plan.host_growth_uuids == ["grow"]
+    assert plan.growth_feasible is True
+    assert plan.scheduler_error is None
+
+
+def test_g1_owning_rank_matches_assigned_rank_and_changes_nothing():
+    """At G==1 the worker stamps owning_rank = the single reporting rank."""
+    base = {
+        "done": _state(assigned_rank=0, completed=True, host_pages_allocated=99),
+        "grow": _state(assigned_rank=2, needs_host_growth=True, host_growth_pages=17),
+    }
+    stamped = {
+        uuid: {**state, "owning_rank": state["assigned_rank"]}
+        for uuid, state in base.items()
+    }
+    stats = [{"node_id": 0, "num_total_pages": 455, "num_free_pages": 15}]
+    plans = [
+        BoundaryHandler.compute_decisions(
+            _req(decode_uuids=["done", "grow"], global_seq_state=seq_state,
+                 per_rank_free=[100] * 8, world_size=8,
+                 per_node_host_stats=stats)
+        )
+        for seq_state in (base, stamped)
+    ]
+    assert plans[0] == plans[1]
+    assert plans[0].host_planned_free_pages == {0: 114}
+
+
 def test_no_stats_no_growth_is_clean():
     state = {"a": _state(assigned_rank=0), "b": _state(assigned_rank=1)}
     plan = BoundaryHandler.compute_decisions(

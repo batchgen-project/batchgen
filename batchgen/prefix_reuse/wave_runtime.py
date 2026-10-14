@@ -139,6 +139,92 @@ def allocate_segment_host_pages(
     return total
 
 
+def segment_mirror_payload(wave: PoolWave) -> dict:
+    """The segments' pseudo sequence ids and Host pages as plain data.
+
+    Host pages belong to the serve group's owner, so only it allocates them -
+    but every rank of the group offloads the rows it computed, into the pages
+    the owner allocated. This payload is what the other ranks need, picklable
+    for one object gather.
+    """
+
+    missing = sorted(
+        seg.segment_id
+        for seg in wave.plan.segments
+        if seg.segment_id not in wave.segment_sids
+        or seg.segment_id not in wave.segment_host_pages
+    )
+    if missing:
+        raise RuntimeError(f"segments {missing} have no Host pages to mirror")
+    return {
+        "segment_sids": {
+            int(segment_id): int(sid)
+            for segment_id, sid in wave.segment_sids.items()
+        },
+        "segment_host_pages": {
+            int(segment_id): {
+                int(group_id): [int(page) for page in pages]
+                for group_id, pages in group_pages.items()
+            }
+            for segment_id, group_pages in wave.segment_host_pages.items()
+        },
+    }
+
+
+def install_mirrored_segments(
+    wave: PoolWave,
+    payload: Mapping,
+    worker_views_by_group: Mapping[int, object],
+) -> None:
+    """Point this rank's segment pseudo sequences at the owner's Host pages.
+
+    Registers the page table the owner already allocated, so this rank's row
+    offloads land on the owner's pages. Nothing is allocated here, and so
+    nothing may be released here either.
+    """
+
+    sids = {
+        int(segment_id): int(sid)
+        for segment_id, sid in payload["segment_sids"].items()
+    }
+    pages_by_segment = {
+        int(segment_id): {
+            int(group_id): [int(page) for page in pages]
+            for group_id, pages in group_pages.items()
+        }
+        for segment_id, group_pages in payload["segment_host_pages"].items()
+    }
+    # The GPU pool is not built until the prefill phase; the page geometry
+    # lives on the wave itself.
+    page_tokens = wave.page_tokens
+    for seg in wave.plan.segments:
+        sid = sids.get(seg.segment_id)
+        group_pages = pages_by_segment.get(seg.segment_id)
+        if sid is None or group_pages is None:
+            raise RuntimeError(
+                f"segment {seg.segment_id} is missing from the mirror payload"
+            )
+        if sid >= 0:
+            raise ValueError("pool segment pseudo sequence ids must be negative")
+        expected = seg.tokens // page_tokens
+        for group_id in worker_views_by_group:
+            pages = group_pages.get(int(group_id))
+            if pages is None or len(pages) != expected:
+                raise RuntimeError(
+                    f"segment {seg.segment_id} mirrors "
+                    f"{0 if pages is None else len(pages)} Host pages in group "
+                    f"{group_id} for {seg.tokens} tokens of {page_tokens}"
+                )
+    for group_id, worker_view in sorted(worker_views_by_group.items()):
+        for seg in wave.plan.segments:
+            worker_view.set_sequence_pages(
+                sids[seg.segment_id],
+                pages_by_segment[seg.segment_id][int(group_id)],
+            )
+    wave.segment_sids = sids
+    wave.segment_host_pages = pages_by_segment
+
+
 def commit_pool_segments(
     wave: PoolWave,
     *,

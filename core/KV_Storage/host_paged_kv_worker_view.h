@@ -771,6 +771,16 @@ class HostPagedKVWorkerView : private LayerMapper {
         }
     }
 
+    // Overwrite this view's LOCAL page table for a sequence without touching
+    // the shared backend allocator. The G>1 host-KV mirror needs it: only the
+    // serve-group leader registers / allocates in the per-node shared region,
+    // so the other ranks of its group install the resulting page table here to
+    // resolve their own reads of the same pages.
+    void SetSequencePages(std::int64_t sequence_id,
+                          std::vector<std::int32_t> page_ids) {
+        page_table_.RegisterOrUpdate(sequence_id, std::move(page_ids));
+    }
+
     void UnregisterSequence(std::int64_t sequence_id) {
         page_table_.Remove(sequence_id);
     }

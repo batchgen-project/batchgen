@@ -165,7 +165,8 @@ def mla_prefill_nope(self, hidden_states, attention_mask, position_ids):
 
 
 def mla_prefill_nope_prepacked(
-    self, hidden_states_2d, position_ids, cu_seqlens, max_seqlen, num_sequences
+    self, hidden_states_2d, position_ids, cu_seqlens, max_seqlen, num_sequences,
+    pool=None, pool_batch=None, pool_layer=None,
 ):
     """NoPE MLA prefill for PREPACKED (varlen) sequences.
 
@@ -179,10 +180,22 @@ def mla_prefill_nope_prepacked(
         cu_seqlens: (num_sequences + 1,) int32
         max_seqlen: int
         num_sequences: int
+        pool: the in-wave prefill prefix pool, with ``pool_batch`` the chunk
+            being prefilled and ``pool_layer`` this layer's dense pool row;
+            all three are None for the plain packed prefill.
 
     Returns:
         attn_output: (total_tokens, hidden)
         offload_kv: (total_tokens, kv_lora_rank + qk_rope_head_dim)
+
+    With a pool chunk the q/k/v math is unchanged — the pool holds the same
+    EXPANDED per-head K (192) and V (128) this attention builds — and only the
+    attention call differs: the chunk's K/V is written into the pool and every
+    row then attends its pooled ancestors plus its own tokens through its page
+    table. The write covers the whole chunk before the attention of THIS layer,
+    which is what lets a tail read a segment computed beside it in the same
+    chunk (``same_chunk_ancestors``). The 576-wide latent is returned either
+    way: the Host cache keeps the latent, never the expanded heads.
     """
     # FA3 (flash_attn_interface); FA2 `flash_attn` is not installed on the
     # H20 node. Same kwargs; the tuple return is normalized below.
@@ -225,19 +238,34 @@ def mla_prefill_nope_prepacked(
     key_states = key_states.contiguous()
     value_states = value_states.contiguous()
 
-    attn_output = flash_attn_varlen_func(
-        query_states,
-        key_states,
-        value_states,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=self.scaling,
-        causal=True,
-    )
-    if isinstance(attn_output, tuple):
-        attn_output = attn_output[0]
+    if pool_batch is None:
+        attn_output = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.scaling,
+            causal=True,
+        )
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
+    else:
+        from batchgen.prefix_reuse.executor import pool_prefill_attention
+
+        attn_output, _ = pool_prefill_attention(
+            pool=pool,
+            layer_idx=pool_layer,
+            batch=pool_batch,
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            sinks=None,
+            softmax_scale=self.scaling,
+            sliding_window=None,
+        )
 
     attn_output = attn_output.reshape(total_tokens, self.num_heads * self.v_head_dim).contiguous()
     if self.use_output_gate:
@@ -854,9 +882,62 @@ def _kda_prefill_conv(x, weight, bias, conv_pool, cu_seqlens, slot_ids,
     )
 
 
+def _kda_prefill_levels(self, chunk_kda_fn, kda_state, pool_levels, q, k, v, f,
+                        beta, conv_weights, kernel_kwargs, segment_tokens):
+    """Run one KDA layer over a prefill-prefix-pool chunk, level by level.
+
+    A full-attention layer serves the whole chunk in one call because it writes
+    every row's KV before attending; a recurrent layer cannot, since a row that
+    continues a pooled segment must start from the state that segment ended
+    with. The chunk's rows are grouped by level (``prefix_reuse/levels.py``) and
+    each level runs as one packed call, preceded by the FORK: the parent's
+    recurrent row and its three conv rows are copied into the child's slot, in
+    THIS layer's pools only. The parent's own slot is never written, so the
+    later levels of this chunk and the later chunks of the wave still read it.
+
+    Exact for the reason the segmented sweep is: a segment ends on a page
+    multiple and the page is ``_KDA_CHUNK_SIZE``, so a child resumes on the
+    chunk grid the unsegmented call would have used, with the fp32 recurrent
+    state and the raw conv rows crossing the cut unchanged.
+
+    ``chunk_kda_fn`` is passed in for the same reason ``_kda_chunk_segments``
+    takes it: fla is CUDA-only (tests/unit/test_k3_kda_pool_levels.py).
+    """
+    from einops import rearrange
+
+    (qw, qb), (kw, kb), (vw, vb) = conv_weights
+    num_heads, head_dim = self.num_heads, self.head_dim
+    o = torch.empty(1, q.shape[0], num_heads, head_dim,
+                    dtype=v.dtype, device=v.device)
+    for level in pool_levels:
+        if level.fork_children is not None:
+            for pool in (kda_state.recurrent_pool, kda_state.conv_q,
+                         kda_state.conv_k, kda_state.conv_v):
+                pool.index_copy_(
+                    0, level.fork_children,
+                    pool.index_select(0, level.fork_parents),
+                )
+        lo, hi = level.token_start, level.token_end
+        rows = (level.bounds, level.slots, level.has_initial_state)
+        q_l = _kda_prefill_conv(q[lo:hi], qw, qb, kda_state.conv_q, *rows)
+        k_l = _kda_prefill_conv(k[lo:hi], kw, kb, kda_state.conv_k, *rows)
+        v_l = _kda_prefill_conv(v[lo:hi], vw, vb, kda_state.conv_v, *rows)
+        o[:, lo:hi] = _kda_chunk_segments(
+            chunk_kda_fn,
+            rearrange(q_l, "l (h d) -> 1 l h d", h=num_heads),
+            rearrange(k_l, "l (h d) -> 1 l h d", h=num_heads),
+            rearrange(v_l, "l (h d) -> 1 l h d", h=num_heads),
+            f[lo:hi].unsqueeze(0), beta[lo:hi].unsqueeze(0),
+            level.bounds, level.slots, kda_state.recurrent_pool,
+            kernel_kwargs, segment_tokens,
+        )
+    return o
+
+
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
                         has_initial_state, kda_state,
-                        segment_tokens=KDA_PREFILL_SEGMENT_TOKENS):
+                        segment_tokens=KDA_PREFILL_SEGMENT_TOKENS,
+                        pool_levels=None):
     """KDA prefill for PREPACKED (varlen) sequences.
 
     Args:
@@ -867,6 +948,9 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         kda_state: KDALayerState (conv/recurrent pools; mutated in place).
         segment_tokens: token budget for one chunk_kda call; None or a value
             >= total_tokens reproduces the single-call path exactly.
+        pool_levels: the chunk's levels while a prefill prefix pool wave is
+            running (``prefix_reuse/levels.state_levels``); None is the plain
+            packed prefill, where no row continues a pooled segment.
 
     Returns:
         (total_tokens, hidden) attention output.
@@ -884,6 +968,10 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
       - chunk_kda's own scratch is 12x the token stream against the 6x that has
         to stay resident, so segmenting it alone takes a KDA layer from
         51.0 GiB to 18.0 + 4.5 GiB at S=131,072 / T=16,384.
+    With ``pool_levels`` the projections still run over the whole range — the
+    GEMM rule above is absolute — while the convs and the chunk sweep run once
+    per level (``_kda_prefill_levels``), which is a reordering of the same
+    per-sequence work, not a reshaping of it.
     """
     from einops import rearrange
     from fla.ops.kda import chunk_kda
@@ -911,41 +999,49 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     # for the unsegmented sweep it was measured against. Still worth having:
     # nothing else makes the segment slices contiguous, and it is free.
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
-    q = _kda_prefill_conv(
-        q, qw, qb, kda_state.conv_q, cu_seqlens, slot_ids, has_initial_state
-    )
     kw, kb = _conv_weights(self.k_conv1d, k.dtype)
-    k = _kda_prefill_conv(
-        k, kw, kb, kda_state.conv_k, cu_seqlens, slot_ids, has_initial_state
-    )
     vw, vb = _conv_weights(self.v_conv1d, v.dtype)
-    v = _kda_prefill_conv(
-        v, vw, vb, kda_state.conv_v, cu_seqlens, slot_ids, has_initial_state
+    kernel_kwargs = dict(
+        A_log=self.A_log, dt_bias=self.dt_bias,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        lower_bound=self.gate_lower_bound,
+        output_final_state=True,
     )
+    if pool_levels is not None:
+        # The convs and the chunk sweep interleave per level, so they share one
+        # span instead of reporting a conv phase this path does not have.
+        o = _kda_prefill_levels(
+            self, chunk_kda, kda_state, pool_levels, q, k, v, f, beta,
+            ((qw, qb), (kw, kb), (vw, vb)), kernel_kwargs, segment_tokens,
+        )
+        _end_streamed_sp8_profile(profiler, "kda_chunk", span)
+    else:
+        q = _kda_prefill_conv(
+            q, qw, qb, kda_state.conv_q, cu_seqlens, slot_ids, has_initial_state
+        )
+        k = _kda_prefill_conv(
+            k, kw, kb, kda_state.conv_k, cu_seqlens, slot_ids, has_initial_state
+        )
+        v = _kda_prefill_conv(
+            v, vw, vb, kda_state.conv_v, cu_seqlens, slot_ids, has_initial_state
+        )
 
-    _end_streamed_sp8_profile(profiler, "kda_conv", span)
-    span = profiler.begin_profile_span() if profiler is not None else None
+        _end_streamed_sp8_profile(profiler, "kda_conv", span)
+        span = profiler.begin_profile_span() if profiler is not None else None
 
-    q = rearrange(q, "l (h d) -> 1 l h d", h=num_heads)
-    k = rearrange(k, "l (h d) -> 1 l h d", h=num_heads)
-    v = rearrange(v, "l (h d) -> 1 l h d", h=num_heads)
-    f = f.unsqueeze(0)        # (1, total, H, K)
-    beta = beta.unsqueeze(0)  # (1, total, H)
+        q = rearrange(q, "l (h d) -> 1 l h d", h=num_heads)
+        k = rearrange(k, "l (h d) -> 1 l h d", h=num_heads)
+        v = rearrange(v, "l (h d) -> 1 l h d", h=num_heads)
+        f = f.unsqueeze(0)        # (1, total, H, K)
+        beta = beta.unsqueeze(0)  # (1, total, H)
 
-    o = _kda_chunk_segments(
-        chunk_kda, q, k, v, f, beta, cu_seqlens, slot_ids,
-        kda_state.recurrent_pool,
-        dict(
-            A_log=self.A_log, dt_bias=self.dt_bias,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            lower_bound=self.gate_lower_bound,
-            output_final_state=True,
-        ),
-        segment_tokens,
-    )
-    _end_streamed_sp8_profile(profiler, "kda_chunk", span)
+        o = _kda_chunk_segments(
+            chunk_kda, q, k, v, f, beta, cu_seqlens, slot_ids,
+            kda_state.recurrent_pool, kernel_kwargs, segment_tokens,
+        )
+        _end_streamed_sp8_profile(profiler, "kda_chunk", span)
     span = profiler.begin_profile_span() if profiler is not None else None
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
