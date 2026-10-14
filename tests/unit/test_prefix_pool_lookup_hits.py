@@ -1,7 +1,9 @@
-"""Pool mode releases every cross-wave hit, so no wave materializes one.
+"""Pooled members release their cross-wave hits; declined waves keep theirs.
 
-The existing path builds a temporary GPU KV manager for a lookup hit; with
-the prefix pool on, a wave that the pool declines must reach it hit-free.
+A pooled member's chain is recomputed in-wave, so its lookup hit is released
+and its state restarts at the chain end. A wave the pool declines (no budget
+yet, pool under the scratch bound, nothing shared) keeps every lookup hit:
+the merged attach-and-suffix path materializes hits natively.
 """
 
 import ast
@@ -58,7 +60,7 @@ def test_hits_are_released_and_prompts_start_at_their_chain_end():
     assert worker._prefix_sequence_states == states
 
 
-def test_every_declined_wave_releases_its_hits_first():
+def test_declined_waves_keep_their_hits_and_pooled_waves_release_them():
     plan = _method("_plan_prefill_pool_wave")
     declines = 0
     for block in ast.walk(plan):
@@ -69,10 +71,19 @@ def test_every_declined_wave_releases_its_hits_first():
             if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant) \
                     and stmt.value.value is None:
                 declines += 1
-                assert any(
+                assert not any(
                     _calls(prior, "_replace_prefix_lookup_hits") for prior in body[:index]
-                ), f"return None at line {stmt.lineno} keeps its lookup hits"
-    assert declines == 2
+                ), f"return None at line {stmt.lineno} must keep its lookup hits"
+    # no budget yet / pool under scratch bound / nothing shared
+    assert declines == 3
+    # The pooled return releases hits exactly once, per chain end.
+    assert len(_calls(plan, "_replace_prefix_lookup_hits")) == 1
+    # Planning is CPU-only: the GPU pool is built in the prefill phase.
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr in
+        ("mem_get_info", "empty_cache", "synchronize")
+        for node in ast.walk(plan)
+    )
     # Re-entries after eviction are planned, not sent to the existing path.
     assert not any(
         isinstance(node, ast.Attribute) and node.attr == "total_decoded_before_eviction"

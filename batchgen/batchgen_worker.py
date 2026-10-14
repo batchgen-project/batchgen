@@ -1001,6 +1001,9 @@ class BatchGenWorker:
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
+		# Prefill-phase pool page budget: measured after configure_prefill,
+		# None until the first prefill of this deployment.
+		self._prefill_pool_page_budget = None
 		# (allocated, reserved, device use outside the allocator) once the pool is up
 		self._prefill_pool_base = (0, 0, 0)
 		# Pseudo Host ids must not collide with entries a previous worker of
@@ -8190,6 +8193,11 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 			)
 
+		# Prefill-phase device layout is settled here: seed/refresh the pool
+		# page budget the NEXT wave's planner reads at reservation time.
+		if self._prefill_prefix_pool_enabled():
+			self._measure_prefill_pool_budget()
+
 		if not reuse_startup_prefill:
 			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
 
@@ -9128,47 +9136,43 @@ class BatchGenWorker:
 			)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
-		"""Plan this rank's in-wave sharing and allocate the prefill prefix pool.
+		"""Plan this rank's in-wave sharing. CPU-only: the GPU pool is built in
+		the prefill phase (`_construct_prefill_pool`), after configure_prefill
+		settles the device layout.
 
 		A prompt re-entering after eviction is planned like any other: its
-		reconstructed tokens are its prompt. Cross-wave lookup hits are always
-		released and recomputed, in-wave or, when this returns None (nothing
-		shared, or no room past the scratch pages), by the existing path, so
-		that path never materializes a hit in a temporary GPU KV manager.
+		reconstructed tokens are its prompt. A pooled member's cross-wave
+		lookup hit is released and its chain recomputed in-wave; when this
+		returns None the wave keeps its lookup hits and the existing
+		attach-and-suffix path materializes them.
+
+		The page budget is the prefill-phase free memory measured after the
+		previous configure_prefill — a deployment constant, so the first wave
+		after startup runs unpooled and seeds the measurement.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
-		from batchgen.prefix_reuse.executor import PoolChunkExecutor
-		from batchgen.prefix_reuse.pool import (
-			PrefillPrefixPool,
-			pool_pages_from_budget,
-			scratch_pages_bound,
-		)
+		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
 		)
 		from batchgen.prefix_reuse.wave_runtime import PoolWave
 
+		total_pages = self._prefill_pool_page_budget
+		if total_pages is None:
+			logging.info(
+				"[PREFIX_POOL] Rank %s first wave keeps the existing path: "
+				"prefill-phase pool budget not yet measured",
+				self.rank,
+			)
+			return None
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		prompts = [
 			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
 			for seq in seqs
 		]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
-		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
-		page_bytes = (
-			2 * geometry.num_layers * page_tokens * geometry.num_k_heads
-			* geometry.k_head_dim * element
-		)
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
-		torch.cuda.synchronize(self.torch_device)
-		torch.cuda.empty_cache()
-		free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
-		total_pages = pool_pages_from_budget(
-			free_bytes, int(batching.prefill_prefix_pool_workspace_bytes), page_bytes
-		)
 		scratch = scratch_pages_bound(
 			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts), page_tokens
 		)
@@ -9177,7 +9181,6 @@ class BatchGenWorker:
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
 				self.rank, total_pages, scratch,
 			)
-			self._replace_prefix_lookup_hits(seqs, prefix_states, [0] * len(seqs))
 			return None
 		plan = plan_wave_prefix_sharing(
 			prompts,
@@ -9188,32 +9191,96 @@ class BatchGenWorker:
 		validate_wave_prefix_plan(plan, prompts)
 		if not plan.segments:
 			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: nothing shared", self.rank)
-			self._replace_prefix_lookup_hits(seqs, prefix_states, [0] * len(seqs))
 			return None
-		pool = PrefillPrefixPool(
-			num_layers=geometry.num_layers,
-			num_pages=total_pages,
-			page_tokens=page_tokens,
-			num_kv_heads=geometry.num_k_heads,
-			head_dim=geometry.k_head_dim,
-			dtype=geometry.kv_dtype,
-			device=self.torch_device,
-		)
-		if pool.page_bytes != page_bytes:
-			raise RuntimeError(
-				f"prefix pool page is {pool.page_bytes} B, budget assumed {page_bytes} B"
-			)
 		wave = PoolWave(
 			plan=plan,
 			prompts=prompts,
 			uuids=list(uuids),
 			global_ids=[seq.global_idx for seq in seqs],
-			pool=pool,
-			executor=PoolChunkExecutor(plan, prompts, pool),
+			page_tokens=page_tokens,
+			total_pages=total_pages,
 		)
 		self._replace_prefix_lookup_hits(
 			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
 		)
+		logging.info(
+			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
+			"threshold %s, compute %d of %d prompt tokens, %d pool pages "
+			"(%d for segments, %d scratch)",
+			self.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
+			plan.computed_tokens, plan.prompt_tokens, total_pages,
+			total_pages - scratch, scratch,
+		)
+		return wave
+
+	def _prefill_pool_page_bytes(self) -> int:
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
+		return (
+			2 * geometry.num_layers * page_tokens * geometry.num_k_heads
+			* geometry.k_head_dim * element
+		)
+
+	def _measure_prefill_pool_budget(self) -> None:
+		"""Measure the prefill-phase pool page budget. Runs after every
+		configure_prefill while the pool gate is enabled; the device layout at
+		that point is a deployment constant, so the measurement is stable."""
+		from batchgen.prefix_reuse.pool import pool_pages_from_budget
+
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+		free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
+		batching = self.engine_config.Module_Batching_Config
+		budget = pool_pages_from_budget(
+			free_bytes, int(batching.prefill_prefix_pool_workspace_bytes),
+			self._prefill_pool_page_bytes(),
+		)
+		previous = self._prefill_pool_page_budget
+		self._prefill_pool_page_budget = budget
+		if previous is None or previous != budget:
+			logging.info(
+				"[PREFIX_POOL] Rank %s prefill-phase pool budget: %d pages "
+				"(%d B free, %d B workspace, was %s)",
+				self.rank, budget, free_bytes,
+				int(batching.prefill_prefix_pool_workspace_bytes), previous,
+			)
+
+	def _construct_prefill_pool(self, wave) -> None:
+		"""Build the planned wave's GPU pool and executor in the prefill phase."""
+		from batchgen.prefix_reuse.executor import PoolChunkExecutor
+		from batchgen.prefix_reuse.pool import PrefillPrefixPool
+
+		if self._prefill_pool_page_budget is not None and (
+			self._prefill_pool_page_budget < wave.total_pages
+		):
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill pool budget shrank to "
+				f"{self._prefill_pool_page_budget} pages below the planned "
+				f"{wave.total_pages}; the prefill-phase layout must be stable"
+			)
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+
+		geometry_page_bytes = self._prefill_pool_page_bytes()
+		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
+		pool = PrefillPrefixPool(
+			num_layers=geometry.num_layers,
+			num_pages=wave.total_pages,
+			page_tokens=wave.page_tokens,
+			num_kv_heads=geometry.num_k_heads,
+			head_dim=geometry.k_head_dim,
+			dtype=geometry.kv_dtype,
+			device=self.torch_device,
+		)
+		if pool.page_bytes != geometry_page_bytes:
+			raise RuntimeError(
+				f"prefix pool page is {pool.page_bytes} B, budget assumed "
+				f"{geometry_page_bytes} B"
+			)
+		wave.pool = pool
+		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -9223,15 +9290,9 @@ class BatchGenWorker:
 		)
 		torch.cuda.reset_peak_memory_stats(self.local_rank)
 		logging.info(
-			"[PREFIX_POOL] Rank %s wave: %d prompts, %d segments, %d chunks, threshold %s, "
-			"compute %d of %d prompt tokens, pool %d pages (%d B each, %d for segments, "
-			"%d scratch) from %d B free with %d B workspace",
-			self.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
-			plan.computed_tokens, plan.prompt_tokens, total_pages, page_bytes,
-			total_pages - scratch, scratch, free_bytes,
-			int(batching.prefill_prefix_pool_workspace_bytes),
+			"[PREFIX_POOL] Rank %s pool up: %d pages (%d B each, %d segments)",
+			self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
 		)
-		return wave
 
 	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end."""
@@ -9287,6 +9348,8 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.wave_plan import prefill_plan_work
 
 		wave = self._prefill_pool_wave
+		if wave.pool is None:
+			self._construct_prefill_pool(wave)
 		index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
 		order = [index_of[self._local_to_uuid_map[local_idx]] for local_idx in batch]
 		if sorted(order) != list(range(len(wave.uuids))):

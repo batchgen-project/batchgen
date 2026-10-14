@@ -108,7 +108,9 @@ def make_wave():
     pool = PrefillPrefixPool(num_layers=1, num_pages=200, page_tokens=B, num_kv_heads=1,
                              head_dim=2, dtype=torch.float32, device="cpu")
     wave = PoolWave(plan=plan, prompts=[list(p) for p in TREE], uuids=[f"u{i}" for i in range(len(TREE))],
-                    global_ids=list(range(len(TREE))), pool=pool, executor=PoolChunkExecutor(plan, TREE, pool))
+                    global_ids=list(range(len(TREE))), page_tokens=pool.page_tokens,
+                    total_pages=pool.num_pages, pool=pool,
+                    executor=PoolChunkExecutor(plan, TREE, pool))
     return wave
 
 

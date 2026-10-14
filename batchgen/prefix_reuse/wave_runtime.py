@@ -30,8 +30,13 @@ class PoolWave:
     prompts: list[list[int]]
     uuids: list[str]
     global_ids: list[int]
-    pool: PrefillPrefixPool
-    executor: PoolChunkExecutor
+    page_tokens: int
+    total_pages: int
+    # The GPU pool and its executor are constructed in the prefill phase,
+    # after configure_prefill settles the device layout; planning and Host
+    # segment allocation run earlier, inside the admission reservation.
+    pool: PrefillPrefixPool | None = None
+    executor: PoolChunkExecutor | None = None
     chains: list[tuple[int, ...]] = field(default_factory=list)
     segment_sids: dict[int, int] = field(default_factory=dict)
     segment_host_pages: dict[int, list[int]] = field(default_factory=dict)
@@ -88,7 +93,7 @@ def allocate_segment_host_pages(
     Returns the number of Host pages allocated.
     """
 
-    page_tokens = wave.pool.page_tokens
+    page_tokens = wave.page_tokens
     sids = [next_sid() for _ in wave.plan.segments]
     if any(sid >= 0 for sid in sids):
         raise ValueError("pool segment pseudo sequence ids must be negative")
