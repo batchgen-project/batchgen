@@ -1121,6 +1121,8 @@ class BatchGenWorker:
 		# Set by _release_prefill_weight_ring and consumed by the
 		# prefill->decode switch invariant.
 		self._prefill_ring_released_for_switch = False
+		self._phase = None
+		self._reused_decode_graph_present = False
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -8255,8 +8257,38 @@ class BatchGenWorker:
 					"bytes still mapped"
 				)
 			self._prefill_ring_released_for_switch = False
+			if self._decode_instance_is_reusable():
+				pm = self.parallel_manager
+				if not getattr(pm, "decode_experts_resident", False):
+					raise RuntimeError(
+						f"Rank {self.rank}: prefill->decode switch activated a "
+						"reused decode instance whose routed experts are not "
+						"mapped; a graph replay would read unmapped memory"
+					)
+				self._assert_kv_region_mapped("prefill->decode")
 			return
 		if direction == "decode_to_prefill":
+			if self._decode_instance_is_reusable():
+				# Inverted on the reuse path, deliberately: the decode graphs and
+				# the KV region are supposed to outlive this switch. Tearing either
+				# down is what would force the recapture this lifecycle exists to
+				# remove, and the KV region must stay mapped for #424 anyway.
+				if getattr(self, "_reused_decode_graph_present", False) and not (
+					self._decode_graph_state_present()
+				):
+					raise RuntimeError(
+						f"Rank {self.rank}: decode->prefill switch tore down the "
+						"captured decode graph state of a reused instance; it must "
+						"survive the prefill phase"
+					)
+				self._assert_kv_region_mapped("decode->prefill")
+				pm = self.parallel_manager
+				if getattr(pm, "decode_experts_resident", False):
+					raise RuntimeError(
+						f"Rank {self.rank}: decode->prefill switch left the decode "
+						"routed experts mapped; prefill needs that memory back"
+					)
+				return
 			leftovers = [
 				name
 				for name in (
@@ -8374,8 +8406,18 @@ class BatchGenWorker:
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
 		persistent = self._persistent_phase_enabled()
+		reuse = (not persistent) and self._decode_instance_is_reusable()
 		if persistent:
 			self._release_persistent_decode_instance()
+		elif reuse:
+			# Default lifecycle, second and later switches: the decode model,
+			# its CUDA graphs, its kernel/descriptor state and the KV pools all
+			# stay where they are. Only the routed experts give their physical
+			# memory back, at the same virtual addresses, so nothing a graph
+			# baked moves and nothing has to be rebuilt on the way back.
+			self._k3_startup_prefill_ready = False
+			self._release_reused_decode_instance()
+			self._assert_phase_switch_clean("decode_to_prefill")
 		elif reuse_startup_prefill:
 			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
 			# decode model has run yet, and this prefill phase — model,
@@ -8412,9 +8454,14 @@ class BatchGenWorker:
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
-		if not persistent:
+		# The KV region stays mapped across the switch on both reuse paths:
+		# the decode graphs bake its pointers, and PR #424 made decode
+		# admission read live all-rank capacity, so it may not vanish under a
+		# capacity decision. _release_reused_decode_instance already dropped
+		# every sequence through it.
+		if not persistent and not reuse:
 			self._destroy_gpu_paged_kv_cache()
-		if not persistent and k3_prefill_profile and torch.cuda.is_available():
+		if not persistent and not reuse and k3_prefill_profile and torch.cuda.is_available():
 			torch.cuda.reset_peak_memory_stats(self.local_rank)
 
 		if (
@@ -8464,7 +8511,11 @@ class BatchGenWorker:
 		# STEP 1: Configure model for prefill. The normal first K3 admission
 		# inherits the exact phase installed before readiness; do not re-enter
 		# configure_prefill or stop/restart its H2D pipeline lazily here.
-		if persistent and self.parallel_manager.prefill_instance is not None:
+		if (
+			(persistent or reuse)
+			and self.parallel_manager.prefill_instance is not None
+		):
+			# Built once per process; switching it in is the whole step.
 			self.model, self.weight_copy_task = self.parallel_manager.activate_prefill()
 			self.set_phase("prefill")
 		elif not reuse_startup_prefill:
@@ -8670,6 +8721,23 @@ class BatchGenWorker:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
 		self._prefill_ring_released_for_switch = True
+
+		if self._decode_instance_is_reusable():
+			# Second and later switches: map the routed experts back at their
+			# reserved addresses, refill them from the pinned host copy, and
+			# switch the instance in. No model construction, no weight reload
+			# beyond the experts, no kernel or descriptor re-init, no graph
+			# capture, no KV pool allocation.
+			self.model, self.weight_copy_task = (
+				self.parallel_manager.activate_decoding()
+			)
+			self._assert_phase_switch_clean("prefill_to_decode")
+			self.set_phase("decode")
+			self._install_decode_weight_copy_queue()
+			if self.rank == 0:
+				logging.info("[DECODE] Reused decode instance activated")
+			return
+
 		self.deep_free_model_memory()
 		_nv_t0 = time.perf_counter()
 		self.init_nvshmem()
@@ -8677,18 +8745,41 @@ class BatchGenWorker:
 		if _nv_dt > 1.0:
 			logging.info(f"[DECODE] Rank {self.rank}: init_nvshmem took {_nv_dt:.1f}s")
 
+		# Ask the strategy manager to keep this instance. It declines for a rank
+		# that streams part of its routed experts (no fixed-address stacks are
+		# possible there), leaving decode_instance None so the next switch
+		# rebuilds exactly as before.
+		reuse_requested = self._request_phase_instance_reuse()
+		# A reused instance and its padded MoE buffers are never rebuilt, so
+		# they are sized once for the largest batch admission can ever hand
+		# them, not for this batch. _max_decode_rank_bsz() is the cap the
+		# estimate above was already clamped to.
+		padding_bsz = self._max_decode_rank_bsz() if reuse_requested else max_num_seq
 		# Unified method handles all deployment scenarios
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
-			padding_bsz=max_num_seq, comm=comm
+			padding_bsz=padding_bsz, comm=comm
 		)
 		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
-		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
+		# in-decode at this value so the padded buffer (mtp = round_up(world_size*padding_bsz))
 		# never overflows.
-		self._decode_padding_bsz = max_num_seq
+		self._decode_padding_bsz = padding_bsz
 		self._assert_phase_switch_clean("prefill_to_decode")
 		self.set_phase("decode")
 
-		# Only start H2D worker if there are experts to offload
+		self._install_decode_weight_copy_queue()
+
+		if self.rank == 0:
+			logging.info(f"[DECODE] Model loaded for decoding phase")
+			self._log_decode_parameter_residency()
+
+	def _install_decode_weight_copy_queue(self) -> None:
+		"""Point the H2D copy engine at the decode weight-copy schedule.
+
+		Only a rank that offloads part of its routed experts has one. Shared by
+		the first decode build and by every later activation of a reused
+		instance, whose task is the one its build produced.
+		"""
+		# Only start the H2D worker if there are experts to offload.
 		if self.weight_copy_task.get("routed_expert"):
 			if self._streamed_sp8_h2d_installed:
 				raise RuntimeError(
@@ -8698,10 +8789,6 @@ class BatchGenWorker:
 				)
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-
-		if self.rank == 0:
-			logging.info(f"[DECODE] Model loaded for decoding phase")
-			self._log_decode_parameter_residency()
 
 	def _max_decode_rank_bsz(self) -> int:
 		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
@@ -8760,6 +8847,81 @@ class BatchGenWorker:
 			)
 		except Exception as e:  # informational only
 			logging.debug("parameter residency breakdown failed: %r", e)
+
+	def _assert_kv_region_mapped(self, context: str) -> None:
+		"""#424: the KV region may not vanish under a live capacity decision.
+
+		Decode admission reads live all-rank capacity, and the decode graphs bake
+		the pool pointers, so on the reuse lifecycle the region stays mapped
+		across both switch directions.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not manager.is_initialized:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV region "
+				"unmapped while phase instances are reused; decode admission "
+				"reads live capacity through it and the decode graphs bake its "
+				"pointers"
+			)
+
+	def _request_phase_instance_reuse(self) -> bool:
+		"""Ask the strategy manager to keep this process's phase instances.
+
+		Returns whether the request was made. The manager still decides whether
+		it can honour it: a rank that streams part of its routed experts has no
+		fixed-address stacks to unmap and remap, so it keeps its legacy loader and
+		leaves ``decode_instance`` None, and ``_decode_instance_is_reusable()``
+		stays False for the rest of the run — that rank rebuilds each phase
+		exactly as it did before.
+
+		This is not a mode and not a flag. Every deployment that alternates
+		prefill and decode runs through here; legacy non-pool serving, which never
+		alternated, was removed from the server.
+		``--persistent-phase-instances`` has its own gate and never reaches here.
+		"""
+		pm = self.parallel_manager
+		if not hasattr(pm, "reuse_phase_instances") or not hasattr(
+			pm, "activate_decoding"
+		):
+			return False
+		pm.reuse_phase_instances = True
+		return True
+
+	def _decode_instance_is_reusable(self) -> bool:
+		"""True when a built decode instance is waiting to be switched back in."""
+		pm = self.parallel_manager
+		return bool(
+			getattr(pm, "reuse_phase_instances", False)
+			and getattr(pm, "decode_instance", None) is not None
+		)
+
+	def _decode_graph_state_present(self) -> bool:
+		"""Whether any captured decode graph state is currently held."""
+		return any(
+			getattr(self, name, None) is not None
+			for name in (
+				"_cuda_graph_manager",
+				"_glm5_moe_cuda_graph_manager",
+				"_glm5_layer_cuda_graph_manager",
+				"_whole_model_segment",
+			)
+		)
+
+	def _release_reused_decode_instance(self) -> None:
+		"""D->P on the default lifecycle: give back only the routed experts.
+
+		Everything a decode graph baked stays put — the KV pools and their
+		page-table storage, the graph statics, the kernel and descriptor state,
+		the non-expert decode residents. Every sequence's GPU KV is dropped
+		through the pools rather than with them, and the routed experts hand back
+		their physical memory at reserved virtual addresses, which is the only
+		large class prefill actually needs back.
+		"""
+		pm = self.parallel_manager
+		self._reused_decode_graph_present = self._decode_graph_state_present()
+		self._destroy_gpu_paged_kv_cache(keep_buffers=True)
+		if getattr(pm, "decode_experts_resident", False):
+			pm.release_decode_routed_experts()
 
 	def _persistent_phase_enabled(self) -> bool:
 		"""True when --persistent-phase-instances keeps both phase instances."""
@@ -8902,6 +9064,22 @@ class BatchGenWorker:
 		# Skip if GPU KV manager is already initialized (subsequent decode iterations)
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
 			return
+
+		# The pool is sized from what is free once the decode model is in
+		# place, so sizing it while the prefill phase is still resident
+		# permanently charges that phase's bytes against decode capacity. On
+		# the reuse lifecycle the size is then kept for the whole process,
+		# which is exactly how an earlier startup-time sizing attempt ended up
+		# with roughly half the pages the per-batch path got. Sizing therefore
+		# only happens from the decode phase, after the prefill ring and the
+		# prefill model have been released.
+		if getattr(self, "_phase", None) != "decode":
+			raise RuntimeError(
+				f"Rank {self.rank}: GPU KV pool sizing attempted in phase "
+				f"{self._phase!r}; it must run from the decode phase so the "
+				"measurement cannot charge prefill-only residency against the "
+				"pool it then keeps"
+			)
 
 		# Measure-once-cache: once the post-capture steady state has been
 		# measured, every later pool (re)creation reuses the cached size —
@@ -16488,6 +16666,10 @@ class BatchGenWorker:
 
 	def set_phase(self, phase: str):
 		"""Control different behavior of the engine in different phases."""
+		# Kept on the worker too: the KV sizing guard needs to know which
+		# phase it is running in, and the wrapper class attributes below are
+		# model-side state.
+		self._phase = phase
 		torch.cuda.empty_cache()
 		self.core_engine.set_phase(phase)
 		Attn_Wrapper.phase = phase

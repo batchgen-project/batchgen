@@ -4428,6 +4428,12 @@ def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
     # A streamed decode task would reseed the same queue with a different
     # phase schedule.  Distributed streamed-SP8 therefore requires the
     # resident-EP decode path and fails before set_weight_copy_queue.
+    # The install moved into _install_decode_weight_copy_queue, which both the
+    # first decode build and every later activation of a reused instance call;
+    # its internal structure is unchanged.
+    function = _function(
+        worker_path, "BatchGenWorker", "_install_decode_weight_copy_queue"
+    )
     routed_task = next(
         node
         for node in ast.walk(function)
