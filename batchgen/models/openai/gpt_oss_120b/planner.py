@@ -81,6 +81,13 @@ class GptOssPlanner(BasePlanner):
         # (attn_mode=1 is legacy and doesn't support dynamic loading correctly)
         self.config.Basic_Config.attn_mode = 3
 
+        # In-wave prefix pool: the prefill HBM budget the pool planner may
+        # use for pooled chunks. Sized from the measured allocation peak of
+        # the largest supported pool chunk plus allocator reservation slack;
+        # the worker fails loudly if a chunk's allocated peak passes this
+        # value, so an undersized budget cannot corrupt a wave.
+        self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = 16 * 2**30
+
     def get_module_shapes(self) -> dict:
         """Return GPT-OSS-120B specific tensor shapes."""
         return {
