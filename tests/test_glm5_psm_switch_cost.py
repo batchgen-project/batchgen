@@ -478,7 +478,19 @@ def test_blockwise_init_adopts_preallocated_stacks_without_recopying():
     # The adopting branch must not allocate a stack or copy experts into one.
     assert "torch.empty" not in adopt
     assert ".copy_(" not in adopt
-    assert "self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d) = prealloc" in adopt
+    # Structural, not textual: ast.unparse parenthesises tuple targets on
+    # Python 3.9 but not on 3.11 (the CI interpreter).
+    adopts = [
+        node
+        for node in branch.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "prealloc"
+        and isinstance(node.targets[0], ast.Tuple)
+        and [ast.unparse(t) for t in node.targets[0].elts]
+        == ["self.fp8_gate_w3d", "self.fp8_up_w3d", "self.fp8_down_w3d"]
+    ]
+    assert len(adopts) == 1
     # The allocate-and-copy code remains, for the partially resident path.
     assert "torch.empty" in ast.unparse(branch.orelse)
 
