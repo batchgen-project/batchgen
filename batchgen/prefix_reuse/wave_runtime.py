@@ -32,6 +32,10 @@ class PoolWave:
     global_ids: list[int]
     page_tokens: int
     total_pages: int
+    # Exact transient bound the executor needs beside the planned segment
+    # peak; construction may shrink the pool to a re-measured budget as long
+    # as peak + scratch still fits.
+    scratch_pages: int = 0
     # The GPU pool and its executor are constructed in the prefill phase,
     # after configure_prefill settles the device layout; planning and Host
     # segment allocation run earlier, inside the admission reservation.

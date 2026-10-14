@@ -9199,6 +9199,7 @@ class BatchGenWorker:
 			global_ids=[seq.global_idx for seq in seqs],
 			page_tokens=page_tokens,
 			total_pages=total_pages,
+			scratch_pages=scratch,
 		)
 		self._replace_prefix_lookup_hits(
 			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
@@ -9253,21 +9254,33 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.executor import PoolChunkExecutor
 		from batchgen.prefix_reuse.pool import PrefillPrefixPool
 
-		if self._prefill_pool_page_budget is not None and (
-			self._prefill_pool_page_budget < wave.total_pages
-		):
-			raise RuntimeError(
-				f"Rank {self.rank}: prefill pool budget shrank to "
-				f"{self._prefill_pool_page_budget} pages below the planned "
-				f"{wave.total_pages}; the prefill-phase layout must be stable"
+		num_pages = wave.total_pages
+		budget = self._prefill_pool_page_budget
+		if budget is not None and budget < num_pages:
+			# Free-memory jitter of a few pages between measurements is not
+			# layout drift. The pool only ever needs the planned segment peak
+			# plus the executor's exact transient bound; shrink to the fresh
+			# budget when that still fits, fail loud when it cannot.
+			required = wave.plan.peak_pool_pages + wave.scratch_pages
+			if budget < required:
+				raise RuntimeError(
+					f"Rank {self.rank}: prefill pool budget shrank to {budget} "
+					f"pages below the required {required} (peak "
+					f"{wave.plan.peak_pool_pages} + scratch {wave.scratch_pages})"
+				)
+			logging.info(
+				"[PREFIX_POOL] Rank %s pool shrinks to the fresh budget: "
+				"%d pages (planned %d, required %d)",
+				self.rank, budget, num_pages, required,
 			)
+			num_pages = budget
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
 		geometry_page_bytes = self._prefill_pool_page_bytes()
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
 		pool = PrefillPrefixPool(
 			num_layers=geometry.num_layers,
-			num_pages=wave.total_pages,
+			num_pages=num_pages,
 			page_tokens=wave.page_tokens,
 			num_kv_heads=geometry.num_k_heads,
 			head_dim=geometry.k_head_dim,
