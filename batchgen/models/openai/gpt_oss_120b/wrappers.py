@@ -1700,7 +1700,12 @@ class GptOssAttnWrapper(AttnWrapperBase):
         attached_tokens = AttnWrapperBase.prepack_attached_tokens
         materialization = AttnWrapperBase.prefill_prefix_materialization
         prefix_reuse_mode = materialization is not None
-        if prefix_reuse_mode:
+        pool_batch = AttnWrapperBase.prefill_pool_batch
+        if pool_batch is not None:
+            if prefix_reuse_mode:
+                raise RuntimeError("prefix pool and materialization are exclusive")
+            rotary_seq_len = pool_batch.max_cache_seqlen
+        elif prefix_reuse_mode:
             if not (
                 full_seq_lengths is not None
                 and compute_cached_tokens is not None
@@ -1829,7 +1834,21 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 ], dim=-1)
 
         # q, k, v: [total_tokens, num_heads, head_dim]
-        if prefix_reuse_mode:
+        if pool_batch is not None:
+            from batchgen.prefix_reuse.executor import pool_prefill_attention
+
+            attn_output, lse = pool_prefill_attention(
+                pool=AttnWrapperBase.prefill_pool,
+                layer_idx=self.layer_idx,
+                batch=pool_batch,
+                query=query,
+                key=key,
+                value=value,
+                sinks=self.sinks,
+                softmax_scale=self.scale,
+                sliding_window=self.sliding_window,
+            )
+        elif prefix_reuse_mode:
             materialization.wait_for_layer(self.layer_idx)
             materialization.manager.append_layer_prefill_suffix_tokens(
                 k_tensor=key,
@@ -1916,6 +1935,12 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # For GQA, we store both K and V (unlike MLA which only stores K)
         # Split by cu_seqlens and offload each sequence
+        if pool_batch is not None:
+            self._offload_prefill_pool_rows(
+                key, value, global_sequence_ids, pool_batch.row_bounds,
+                AttnWrapperBase.prefill_pool_row_starts,
+            )
+            num_sequences = 0  # rows handled above
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens[seq_idx].item()
             end_idx = cu_seqlens[seq_idx + 1].item()
@@ -1987,6 +2012,30 @@ class GptOssAttnWrapper(AttnWrapperBase):
             attn_output = attn_output.unsqueeze(0)  # [1, total_tokens, hidden_size]
 
         return attn_output, None, None
+
+    def _offload_prefill_pool_rows(self, key, value, sequence_ids, bounds, starts):
+        """Offload each prefix-pool row from its own activations.
+
+        A pooled segment row goes to its segment's Host pages at 0, a tail row
+        to its prompt's Host pages at the tail start; the pool itself is never
+        the D2H source, so its pages can be reused right after the chunk.
+        """
+
+        worker_view = self.core_engine.host_paged_kv_worker_view
+        for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
+            row_key = key[start:end].unsqueeze(0)
+            row_value = value[start:end].unsqueeze(0)
+            task = worker_view.async_offload_layer_kv_range_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=[sequence_ids[row]],
+                k_tensor=row_key,
+                v_tensor=row_value,
+                raw_start_positions=[starts[row]],
+                token_counts=[end - start],
+            )
+            AttnWrapperBase.pin_prefill_offload_tensor(row_key, self.layer_idx)
+            AttnWrapperBase.pin_prefill_offload_tensor(row_value, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def forward(
         self,

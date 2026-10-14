@@ -1000,6 +1000,17 @@ class BatchGenWorker:
 		self.prefix_cache_coordinator = None
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
+		self._prefill_pool_wave = None
+		# Prefill-phase pool page budget: measured after configure_prefill,
+		# None until the first prefill of this deployment.
+		self._prefill_pool_page_budget = None
+		# (allocated, reserved, device use outside the allocator) once the pool is up
+		self._prefill_pool_base = (0, 0, 0)
+		# Pseudo Host ids must not collide with entries a previous worker of
+		# this node left in the shared Host KV region (hot reload).
+		self._pool_sid_counter = time.time_ns() // 1000
+		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
+		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -1764,19 +1775,15 @@ class BatchGenWorker:
 				})
 			self.global_batch.remove_sequence(uuid)
 
-		# Token lengths are now known, so assign ownership before materializing
-		# prompt tensors. The arena remains node-shared, but only ranks that will
-		# run a sequence need a local CPU view.
+		# Token lengths are now known. Ownership is assigned AFTER the
+		# trajectory-book write below: sharing-aware assignment reads prompts
+		# through the book, which is the only token store after admission.
 		valid_uuids = []
 		for i, seq in enumerate(sequences):
 			if seq.uuid in rejected_uuids:
 				continue
 			seq.prompt_length = tokenized_by_idx[i]["length"]
 			valid_uuids.append(seq.uuid)
-		if hasattr(self, "_assign_admitted_sequences_to_ranks"):
-			self._assign_admitted_sequences_to_ranks(valid_uuids)
-		if hasattr(self, "_assign_decode_dp_groups"):
-			self._assign_decode_dp_groups(valid_uuids)
 
 		# Phase 2.75/3: reserve the complete fixed model-context page chain and
 		# copy the prompt into the same store that will receive decode tokens.
@@ -1815,6 +1822,14 @@ class BatchGenWorker:
 			raise
 		self._publish_trajectory_pool_capacity()
 
+		# Ownership assignment runs identically on every rank; the book write
+		# above already materialized each prompt node-shared, so the
+		# sharing-aware assignment can read tokens through the book.
+		if hasattr(self, "_assign_admitted_sequences_to_ranks"):
+			self._assign_admitted_sequences_to_ranks(valid_uuids)
+		if hasattr(self, "_assign_decode_dp_groups"):
+			self._assign_decode_dp_groups(valid_uuids)
+
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
 
@@ -1826,6 +1841,9 @@ class BatchGenWorker:
 
 		Fallback (BATCHGEN_L2_BALANCE=0): least-count argmin (legacy).
 		"""
+		if self._prefill_prefix_pool_enabled():
+			self._assign_ranks_for_prefix_sharing(uuids)
+			return
 		import os as _os
 		use_l2 = _os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 
@@ -5297,6 +5315,7 @@ class BatchGenWorker:
 				self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
 			),
 		)
+		prefix_states = {}
 		for uuid, result, attached, compute_cached in zip(
 			owned,
 			lookup.lookup_results,
@@ -5304,10 +5323,20 @@ class BatchGenWorker:
 			lookup.compute_cached_tokens,
 		):
 			seq = self.global_batch.get_sequence(uuid)
-			self._prefix_sequence_states[seq.global_idx] = PrefixCacheSequenceState(
+			state = PrefixCacheSequenceState(
 				lookup_result=result,
 				attached_tokens=int(attached),
 				compute_cached_tokens=int(compute_cached),
+			)
+			self._prefix_sequence_states[seq.global_idx] = state
+			prefix_states[seq.global_idx] = state
+		# In-wave pool: plan this rank's shared segments from the same wave.
+		# The plan only reads tokens and states; Host pages for the segments
+		# are allocated inside the reservation transaction below.
+		self._prefill_pool_wave = None
+		if self._prefill_prefix_pool_enabled():
+			self._prefill_pool_wave = self._plan_prefill_pool_wave(
+				owned, prefix_states
 			)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
@@ -5318,6 +5347,7 @@ class BatchGenWorker:
 		bindings are mutated.  Allocator exceptions are converted into a
 		collective failure and successful peers release their tentative pages.
 		"""
+		self._prefill_pool_wave = None
 		wave_global_ids = [
 			seq.global_idx
 			for seq in (
@@ -5347,6 +5377,8 @@ class BatchGenWorker:
 			owner_requests, local_error=plan_error
 		)
 		if plan_error:
+			# A planned wave never allocated: dropping it frees its GPU pool.
+			self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
 			raise RuntimeError(
 				f"Rank {self.rank}: host-KV prefill plan failed; the wave was "
@@ -5359,7 +5391,9 @@ class BatchGenWorker:
 					"leaving candidates queueing/evicted"
 				)
 			# The rejected wave stays QUEUEING/EVICTED; its lookup attachments
-			# must not pin prefix pages past this decision.
+			# must not pin prefix pages past this decision, and the planned
+			# wave (GPU pool included) must not outlive the rejection.
+			self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
 			return False
 
@@ -5384,6 +5418,21 @@ class BatchGenWorker:
 		try:
 			if owner_requests:
 				host_view.register_sequences(global_ids)
+				if self._prefill_pool_wave is not None:
+					# One Host copy per pooled segment; members reference the
+					# segment chains. Segment pseudo-sids join this rollback.
+					self._allocate_prefill_pool_host_pages(
+						host_view,
+						{
+							self.global_batch.get_sequence(uuid).global_idx:
+							self._prefix_sequence_states[
+								self.global_batch.get_sequence(uuid).global_idx
+							]
+							for uuid, _ in owner_requests
+							if self.global_batch.get_sequence(uuid).global_idx
+							in self._prefix_sequence_states
+						},
+					)
 				if self.enable_prefix_cache:
 					# Shared prefix pages join the sequence's page table before
 					# private allocation so release_sequence_pages covers both.
@@ -5430,6 +5479,24 @@ class BatchGenWorker:
 						"Rank %s: failed to rollback host-KV prefill registrations",
 						self.rank,
 					)
+			if self._prefill_pool_wave is not None:
+				wave = self._prefill_pool_wave
+				# Members release first (their rows merely reference segment
+				# pages), then each pseudo-sid frees and unregisters. Pop only
+				# THIS wave's entries: earlier waves' members still hold refs.
+				for gid in wave.global_ids:
+					self._pool_member_sids.pop(gid, None)
+				for sid in set(wave.segment_sids.values()):
+					self._pool_sid_members.pop(sid, None)
+					try:
+						host_view.release_sequence_pages([sid])
+					except Exception:
+						pass
+					try:
+						host_view.unregister_sequences([sid])
+					except Exception:
+						pass
+				self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
 			return False
 
@@ -7282,6 +7349,26 @@ class BatchGenWorker:
 						)
 
 				prefill_uuids = self._prepare_prefill_batch()
+				pool_wave_start = (
+					time.perf_counter()
+					if prefill_uuids and self._prefill_prefix_pool_enabled()
+					else None
+				)
+				# One-node pure-DP Host admission is rank-independent. Place
+				# this selected wave once, BEFORE the reservation registers
+				# Host pages on an owner rank — reassigning afterwards would
+				# strand registered pages on the old owner. Evicted sequences
+				# keep the rank owning their Host KV.
+				if (
+					pool_wave_start is not None
+					and self._get_num_nodes() == 1
+					and not self._prefill_sequence_limits()
+					and all(
+						self.global_batch.get_sequence(uuid).status == SequenceStatus.QUEUEING
+						for uuid in prefill_uuids
+					)
+				):
+					self._assign_ranks_for_prefix_sharing(prefill_uuids, current_wave=True)
 				if prefill_uuids and not self._reserve_prefill_host_kv(prefill_uuids):
 					# The fresh capacity transaction rejected the snapshot.  Keep
 					# QUEUEING/EVICTED state untouched and retry on a later scheduler
@@ -7391,6 +7478,7 @@ class BatchGenWorker:
 							device=self.torch_device,
 							reason="end of prefill",
 						)
+						self._finish_prefill_pool_wave()
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
 						)
@@ -7442,7 +7530,20 @@ class BatchGenWorker:
 						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
 							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					pool_rank_ready_s = (
+						time.perf_counter() - pool_wave_start
+						if pool_wave_start is not None else None
+					)
 					dist.barrier()
+					if pool_wave_start is not None:
+						logging.info("[METRICS] %s", json.dumps({
+							"component": "prefix_pool",
+							"phase": "wave",
+							"rank": self.rank,
+							"sequences": len(prefill_uuids),
+							"rank_ready_s": pool_rank_ready_s,
+							"wave_s": time.perf_counter() - pool_wave_start,
+						}, separators=(",", ":")))
 
 					# C4: a request whose whole budget is the prefill-sampled
 					# token is DONE here. Completing it now (instead of sending
@@ -8091,6 +8192,11 @@ class BatchGenWorker:
 				f"[HBM] Rank {self.rank} AFTER configure_prefill: "
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 			)
+
+		# Prefill-phase device layout is settled here: seed/refresh the pool
+		# page budget the NEXT wave's planner reads at reservation time.
+		if self._prefill_prefix_pool_enabled():
+			self._measure_prefill_pool_budget()
 
 		if not reuse_startup_prefill:
 			self._install_prefill_weight_copy_pipeline(k3_prefill_profile)
@@ -8956,12 +9062,487 @@ class BatchGenWorker:
 					self.rank,
 				)
 
+	# ============ IN-WAVE PREFIX POOL (batchgen/prefix_reuse) ============
+
+	def _prefill_prefix_pool_enabled(self) -> bool:
+		"""In-wave prefix pool: prefix caching on, planner workspace set, pure DP prefill."""
+		workspace = self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+		if (
+			not self.enable_prefix_cache
+			or workspace <= 0
+			or getattr(self, "_prefix_integrity", False)
+		):
+			return False
+		if self._decode_attn_tp_size() != 1 or (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			raise RuntimeError(
+				"the prefill prefix pool runs per DP rank; this model's prefill "
+				"joins cross-rank collectives"
+			)
+		return True
+
+	def _next_pool_segment_sid(self) -> int:
+		"""Negative Host sequence ids, rank-strided so no two ranks collide."""
+		self._pool_sid_counter += 1
+		return -(self.rank + 1 + self.world_size * self._pool_sid_counter)
+
+	def _assign_ranks_for_prefix_sharing(
+		self, uuids: List[str], *, current_wave: bool = False
+	) -> None:
+		"""Keep prompts sharing a prefix on one DP rank: each rank has its own pool."""
+		from batchgen.prefix_reuse.wave_plan import assign_ranks_for_sharing
+
+		pending = set(uuids)
+		loads = [0] * self.world_size
+		if not current_wave:
+			for seq in self.global_batch:
+				if seq.uuid in pending or seq.assigned_rank is None:
+					continue
+				loads[seq.assigned_rank] += int(getattr(seq, "prompt_length", 0) or 0)
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		seqs = [seq for seq in seqs if seq is not None]
+		ranks = assign_ranks_for_sharing(
+			[
+				self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+				for seq in seqs
+			],
+			world_size=self.world_size,
+			block_tokens=int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens),
+			initial_loads=loads,
+		)
+		for seq, rank in zip(seqs, ranks):
+			if current_wave and seq.assigned_rank == self.rank and rank != self.rank:
+				local_idx = release_local_query_slot(
+					seq.uuid,
+					uuid_to_local_map=self._uuid_to_local_map,
+					local_to_uuid_map=self._local_to_uuid_map,
+					query_book=self.query_book,
+					free_local_indices=self._free_local_indices,
+				)
+				if local_idx is None:
+					raise RuntimeError(
+						f"Rank {self.rank}: missing local slot for reassigned {seq.uuid}"
+					)
+			self.global_batch.assign_rank(seq.uuid, rank)
+		if self.rank == 0:
+			counts = [0] * self.world_size
+			for rank in ranks:
+				counts[rank] += 1
+			logging.info(
+				"[PREFIX_POOL] %s rank assignment: %d sequences, per-rank %s",
+				"wave" if current_wave else "sharing-aware", len(seqs), counts,
+			)
+
+	def _plan_prefill_pool_wave(self, uuids, prefix_states):
+		"""Plan this rank's in-wave sharing. CPU-only: the GPU pool is built in
+		the prefill phase (`_construct_prefill_pool`), after configure_prefill
+		settles the device layout.
+
+		A prompt re-entering after eviction is planned like any other: its
+		reconstructed tokens are its prompt. A pooled member's cross-wave
+		lookup hit is released and its chain recomputed in-wave; when this
+		returns None the wave keeps its lookup hits and the existing
+		attach-and-suffix path materializes them.
+
+		The page budget is the prefill-phase free memory measured after the
+		previous configure_prefill — a deployment constant, so the first wave
+		after startup runs unpooled and seeds the measurement.
+		"""
+		from batchgen.prefix_reuse.pool import scratch_pages_bound
+		from batchgen.prefix_reuse.wave_plan import (
+			plan_wave_prefix_sharing,
+			validate_wave_prefix_plan,
+		)
+		from batchgen.prefix_reuse.wave_runtime import PoolWave
+
+		total_pages = self._prefill_pool_page_budget
+		if total_pages is None:
+			logging.info(
+				"[PREFIX_POOL] Rank %s first wave keeps the existing path: "
+				"prefill-phase pool budget not yet measured",
+				self.rank,
+			)
+			return None
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		prompts = [
+			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+			for seq in seqs
+		]
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		batching = self.engine_config.Module_Batching_Config
+		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
+		scratch = scratch_pages_bound(
+			chunk_tokens, max(len(prompt) for prompt in prompts), len(prompts), page_tokens
+		)
+		if total_pages <= scratch:
+			logging.info(
+				"[PREFIX_POOL] Rank %s wave keeps the existing path: pool %d pages <= scratch %d",
+				self.rank, total_pages, scratch,
+			)
+			return None
+		plan = plan_wave_prefix_sharing(
+			prompts,
+			block_tokens=page_tokens,
+			pool_pages=total_pages - scratch,
+			chunk_tokens=chunk_tokens,
+		)
+		validate_wave_prefix_plan(plan, prompts)
+		if not plan.segments:
+			logging.info("[PREFIX_POOL] Rank %s wave keeps the existing path: nothing shared", self.rank)
+			return None
+		wave = PoolWave(
+			plan=plan,
+			prompts=prompts,
+			uuids=list(uuids),
+			global_ids=[seq.global_idx for seq in seqs],
+			page_tokens=page_tokens,
+			total_pages=total_pages,
+			scratch_pages=scratch,
+		)
+		self._replace_prefix_lookup_hits(
+			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
+		)
+		logging.info(
+			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
+			"threshold %s, compute %d of %d prompt tokens, %d pool pages "
+			"(%d for segments, %d scratch)",
+			self.rank, len(prompts), len(plan.segments), len(plan.chunks), plan.threshold,
+			plan.computed_tokens, plan.prompt_tokens, total_pages,
+			total_pages - scratch, scratch,
+		)
+		return wave
+
+	def _prefill_pool_page_bytes(self) -> int:
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
+		return (
+			2 * geometry.num_layers * page_tokens * geometry.num_k_heads
+			* geometry.k_head_dim * element
+		)
+
+	def _measure_prefill_pool_budget(self) -> None:
+		"""Measure the prefill-phase pool page budget. Runs after every
+		configure_prefill while the pool gate is enabled; the device layout at
+		that point is a deployment constant, so the measurement is stable."""
+		from batchgen.prefix_reuse.pool import pool_pages_from_budget
+
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+		free_bytes, _ = torch.cuda.mem_get_info(self.local_rank)
+		batching = self.engine_config.Module_Batching_Config
+		budget = pool_pages_from_budget(
+			free_bytes, int(batching.prefill_prefix_pool_workspace_bytes),
+			self._prefill_pool_page_bytes(),
+		)
+		previous = self._prefill_pool_page_budget
+		self._prefill_pool_page_budget = budget
+		if previous is None or previous != budget:
+			logging.info(
+				"[PREFIX_POOL] Rank %s prefill-phase pool budget: %d pages "
+				"(%d B free, %d B workspace, was %s)",
+				self.rank, budget, free_bytes,
+				int(batching.prefill_prefix_pool_workspace_bytes), previous,
+			)
+
+	def _construct_prefill_pool(self, wave) -> None:
+		"""Build the planned wave's GPU pool and executor in the prefill phase."""
+		from batchgen.prefix_reuse.executor import PoolChunkExecutor
+		from batchgen.prefix_reuse.pool import PrefillPrefixPool
+
+		num_pages = wave.total_pages
+		budget = self._prefill_pool_page_budget
+		if budget is not None and budget < num_pages:
+			# Free-memory jitter of a few pages between measurements is not
+			# layout drift. The pool only ever needs the planned segment peak
+			# plus the executor's exact transient bound; shrink to the fresh
+			# budget when that still fits, fail loud when it cannot.
+			required = wave.plan.peak_pool_pages + wave.scratch_pages
+			if budget < required:
+				raise RuntimeError(
+					f"Rank {self.rank}: prefill pool budget shrank to {budget} "
+					f"pages below the required {required} (peak "
+					f"{wave.plan.peak_pool_pages} + scratch {wave.scratch_pages})"
+				)
+			logging.info(
+				"[PREFIX_POOL] Rank %s pool shrinks to the fresh budget: "
+				"%d pages (planned %d, required %d)",
+				self.rank, budget, num_pages, required,
+			)
+			num_pages = budget
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+
+		geometry_page_bytes = self._prefill_pool_page_bytes()
+		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
+		pool = PrefillPrefixPool(
+			num_layers=geometry.num_layers,
+			num_pages=num_pages,
+			page_tokens=wave.page_tokens,
+			num_kv_heads=geometry.num_k_heads,
+			head_dim=geometry.k_head_dim,
+			dtype=geometry.kv_dtype,
+			device=self.torch_device,
+		)
+		if pool.page_bytes != geometry_page_bytes:
+			raise RuntimeError(
+				f"prefix pool page is {pool.page_bytes} B, budget assumed "
+				f"{geometry_page_bytes} B"
+			)
+		wave.pool = pool
+		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
+		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
+		reserved = torch.cuda.memory_reserved(self.local_rank)
+		self._prefill_pool_base = (
+			torch.cuda.memory_allocated(self.local_rank),
+			reserved,
+			device_total - free_after - reserved,
+		)
+		torch.cuda.reset_peak_memory_stats(self.local_rank)
+		logging.info(
+			"[PREFIX_POOL] Rank %s pool up: %d pages (%d B each, %d segments)",
+			self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
+		)
+
+	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
+		"""Release each cross-wave lookup hit; a prompt starts at its chain end."""
+		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
+
+		for seq, end in zip(seqs, chain_tokens):
+			old = prefix_states[seq.global_idx]
+			if old.attachment_handle:
+				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
+			state = PrefixCacheSequenceState(
+				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
+			)
+			prefix_states[seq.global_idx] = state
+			self._prefix_sequence_states[seq.global_idx] = state
+
+	def _prefill_pool_segment_host_pages(self) -> int:
+		wave = self._prefill_pool_wave
+		if wave is None:
+			return 0
+		return sum(seg.tokens for seg in wave.plan.segments) // wave.page_tokens
+
+	def _allocate_prefill_pool_host_pages(self, worker_view, prefix_states) -> None:
+		"""One Host copy per pooled segment; members attach their chain of them."""
+		from batchgen.prefix_reuse.wave_runtime import allocate_segment_host_pages
+
+		wave = self._prefill_pool_wave
+		allocated = allocate_segment_host_pages(
+			wave, worker_view, self._next_pool_segment_sid
+		)
+		if allocated != self._prefill_pool_segment_host_pages():
+			raise RuntimeError(
+				f"pool segments got {allocated} Host pages, planned "
+				f"{self._prefill_pool_segment_host_pages()}"
+			)
+		for index, global_id in enumerate(wave.global_ids):
+			if not wave.chains[index]:
+				continue
+			state = replace(
+				prefix_states[global_id],
+				planned_shared_page_ids=tuple(wave.chain_host_pages(index)),
+			)
+			prefix_states[global_id] = state
+			self._prefix_sequence_states[global_id] = state
+			# A segment's Host pages live until its last member releases.
+			sids = tuple(wave.segment_sids[seg] for seg in wave.chains[index])
+			self._pool_member_sids[global_id] = sids
+			for sid in sids:
+				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
+
+	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
+		"""Prefill a planned wave: each pooled segment once, then every tail."""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.wave_plan import prefill_plan_work
+
+		wave = self._prefill_pool_wave
+		if wave.pool is None:
+			self._construct_prefill_pool(wave)
+		index_of = {uuid: index for index, uuid in enumerate(wave.uuids)}
+		order = [index_of[self._local_to_uuid_map[local_idx]] for local_idx in batch]
+		if sorted(order) != list(range(len(wave.uuids))):
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill batch does not match the planned wave"
+			)
+		workspace = int(
+			self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
+		)
+		lm_weight = self.model.lm_head.weight
+		lm_bias = getattr(self.model.lm_head, "bias", None)
+		tokens_by_index = {}
+		executed = 0
+		workspace_peak = 0
+		reserved_peak = 0
+		base_alloc, base_reserved, base_other = self._prefill_pool_base
+		AttnWrapperBase.prefill_pool = wave.pool
+		try:
+			start = time.perf_counter()
+			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
+				self.feed_watchdog()
+				rows = wave.executor.build(chunk)
+				host_ids, host_starts = wave.row_host_targets(rows)
+				AttnWrapperBase.prepack_mode = True
+				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
+				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
+				AttnWrapperBase.prepack_num_sequences = len(rows.items)
+				AttnWrapperBase.prepack_seq_lengths = [item.tokens for item in rows.items]
+				AttnWrapperBase.position_ids = rows.position_ids
+				AttnWrapperBase.cur_batch = host_ids
+				AttnWrapperBase.prefill_pool_batch = rows
+				AttnWrapperBase.prefill_pool_row_starts = host_starts
+				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
+				for decoder_layer in self.model.model.layers:
+					hidden_states = decoder_layer(
+						hidden_states,
+						attention_mask=None,
+						position_ids=None,
+						past_key_value=None,
+						output_attentions=False,
+						use_cache=False,
+					)[0]
+				if rows.tail_wave_indices:
+					last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+					logits = torch.nn.functional.linear(last_hidden, lm_weight, lm_bias).float()
+					selected = self._select_tokens(
+						logits,
+						[self.global_batch.get_sequence(wave.uuids[i]) for i in rows.tail_wave_indices],
+					)
+					for row, index in enumerate(rows.tail_wave_indices):
+						tokens_by_index[index] = selected[row]
+				del hidden_states
+				executed += int(rows.input_ids.numel())
+				wave.executor.finish(chunk)
+				# Allocated bytes are what a chunk needs. The allocator's reserve
+				# grows into whatever the pool left free and drops cached blocks
+				# only when a cudaMalloc fails, so it is reported, not checked.
+				free_now, device_total = torch.cuda.mem_get_info(self.local_rank)
+				reserved_now = torch.cuda.memory_reserved(self.local_rank)
+				reserved_peak = max(
+					reserved_peak,
+					torch.cuda.max_memory_reserved(self.local_rank) - base_reserved
+					+ (device_total - free_now - reserved_now) - base_other,
+				)
+				peak = torch.cuda.max_memory_allocated(self.local_rank) - base_alloc
+				workspace_peak = max(workspace_peak, peak)
+				if peak > workspace:
+					raise RuntimeError(
+						f"Rank {self.rank}: prefill workspace peaked at {peak} B, above the "
+						f"{workspace} B kept beside the prefix pool"
+					)
+			prefill_s = time.perf_counter() - start
+			if executed != wave.plan.computed_tokens:
+				raise RuntimeError(
+					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
+					f"{wave.plan.computed_tokens}"
+				)
+			wave.executor.close()
+		finally:
+			if wave.pool.free_pages != wave.pool.num_pages:
+				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
+			wave.pool.k = wave.pool.v = None
+			AttnWrapperBase.prefill_pool = None
+			AttnWrapperBase.prefill_pool_batch = None
+			AttnWrapperBase.prefill_pool_row_starts = None
+			AttnWrapperBase.prepack_mode = False
+			AttnWrapperBase.prepack_cu_seqlens = None
+			AttnWrapperBase.prepack_max_seqlen = None
+			AttnWrapperBase.prepack_num_sequences = None
+			AttnWrapperBase.prepack_seq_lengths = None
+			torch.cuda.empty_cache()
+		work = prefill_plan_work(wave.plan)
+		logging.info("[METRICS] " + json.dumps({
+			"component": "prefix_pool",
+			"phase": "prefill",
+			"rank": self.rank,
+			"sequences": len(order),
+			"prompt_tokens": wave.plan.prompt_tokens,
+			"computed_tokens": executed,
+			"full_attention_pairs": work.full_attention_pairs,
+			"item_rows": work.item_rows,
+			"saved_tokens": wave.plan.prompt_tokens - executed,
+			"segments": len(wave.plan.segments),
+			"chunks": len(wave.plan.chunks),
+			"threshold": wave.plan.threshold,
+			"pool_pages": wave.pool.num_pages,
+			"peak_pool_pages": wave.plan.peak_pool_pages,
+			"workspace_peak_bytes": workspace_peak,
+			"reserved_peak_bytes": reserved_peak,
+			"prefill_s": prefill_s,
+		}, separators=(",", ":")))
+		new_tokens = torch.stack([tokens_by_index[index] for index in order])
+		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _finish_prefill_pool_wave(self) -> None:
+		"""After every D2H retired: publish the segments, pin members to them."""
+		wave = self._prefill_pool_wave
+		if wave is None:
+			return
+		from batchgen.prefix_reuse.wave_runtime import (
+			attach_pool_members,
+			commit_pool_segments,
+		)
+
+		host_view = getattr(self, "host_paged_kv_worker_view", None)
+		if host_view is None:
+			host_view = self.core_engine.host_paged_kv_worker_view
+		runtime = self.prefix_cache_runtime_config
+		try:
+			segment_handles = commit_pool_segments(
+				wave,
+				coordinator=self.prefix_cache_coordinator,
+				worker_view=host_view,
+				namespace_digest=runtime.namespace_digest,
+				publish_boundary_tokens=runtime.publish_boundary_tokens,
+				max_scan_nodes=runtime.max_nodes,
+			)
+			try:
+				member_handles = attach_pool_members(
+					wave,
+					coordinator=self.prefix_cache_coordinator,
+					namespace_digest=runtime.namespace_digest,
+				)
+			finally:
+				for handle in segment_handles:
+					self.prefix_cache_coordinator.release_attachment(handle)
+			for index, handle in member_handles.items():
+				global_id = wave.global_ids[index]
+				state = self._prefix_sequence_states[global_id]
+				self._prefix_sequence_states[global_id] = replace(
+					state, commit_attachment_handles=(*state.commit_attachment_handles, handle)
+				)
+		finally:
+			# Success or failure, the wave object is done. Segment Host pages
+			# stay tracked in _pool_sid_members/_pool_member_sids, so after a
+			# failed commit/attach the per-member release lane still frees and
+			# unregisters every pseudo-sid.
+			self._prefill_pool_wave = None
+
+	def _release_pool_segment_refs(self, global_id: int) -> None:
+		"""A pool segment's Host pages outlive its last member, never longer."""
+		for sid in self._pool_member_sids.pop(global_id, ()):
+			left = self._pool_sid_members[sid] - 1
+			if left:
+				self._pool_sid_members[sid] = left
+			else:
+				del self._pool_sid_members[sid]
+				host_view = getattr(self, "host_paged_kv_worker_view", None)
+				if host_view is None:
+					host_view = self.core_engine.host_paged_kv_worker_view
+				host_view.release_sequence_pages([sid])
+				host_view.unregister_sequences([sid])
+
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
 	) -> None:
 		if not self.enable_prefix_cache:
 			return
 		for sequence_id in global_sequence_ids:
+			self._release_pool_segment_refs(int(sequence_id))
 			state = self._prefix_sequence_states.pop(int(sequence_id), None)
 			if state is None:
 				continue
@@ -9249,6 +9830,9 @@ class BatchGenWorker:
 		# the host aux cache instead of early-returning on a None view.
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+
+		if self._prefill_pool_wave is not None:
+			return self._prefill_prepacked_pool(batch)
 
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
@@ -9898,6 +10482,10 @@ class BatchGenWorker:
 		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
+		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _write_prefill_tokens(self, batch: list[int], new_tokens: torch.Tensor) -> torch.Tensor:
+		"""Store each sequence's first generated token (batch order)."""
 		if new_tokens.shape[0] != len(batch):
 			raise RuntimeError(
 				f"Rank {self.rank}: prefill writeback shape mismatch, "
