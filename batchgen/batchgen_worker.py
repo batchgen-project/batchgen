@@ -1772,19 +1772,15 @@ class BatchGenWorker:
 				})
 			self.global_batch.remove_sequence(uuid)
 
-		# Token lengths are now known, so assign ownership before materializing
-		# prompt tensors. The arena remains node-shared, but only ranks that will
-		# run a sequence need a local CPU view.
+		# Token lengths are now known. Ownership is assigned AFTER the
+		# trajectory-book write below: sharing-aware assignment reads prompts
+		# through the book, which is the only token store after admission.
 		valid_uuids = []
 		for i, seq in enumerate(sequences):
 			if seq.uuid in rejected_uuids:
 				continue
 			seq.prompt_length = tokenized_by_idx[i]["length"]
 			valid_uuids.append(seq.uuid)
-		if hasattr(self, "_assign_admitted_sequences_to_ranks"):
-			self._assign_admitted_sequences_to_ranks(valid_uuids)
-		if hasattr(self, "_assign_decode_dp_groups"):
-			self._assign_decode_dp_groups(valid_uuids)
 
 		# Phase 2.75/3: reserve the complete fixed model-context page chain and
 		# copy the prompt into the same store that will receive decode tokens.
@@ -1822,6 +1818,14 @@ class BatchGenWorker:
 					self._trajectory_book.release(slot)
 			raise
 		self._publish_trajectory_pool_capacity()
+
+		# Ownership assignment runs identically on every rank; the book write
+		# above already materialized each prompt node-shared, so the
+		# sharing-aware assignment can read tokens through the book.
+		if hasattr(self, "_assign_admitted_sequences_to_ranks"):
+			self._assign_admitted_sequences_to_ranks(valid_uuids)
+		if hasattr(self, "_assign_decode_dp_groups"):
+			self._assign_decode_dp_groups(valid_uuids)
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
