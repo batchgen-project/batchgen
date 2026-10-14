@@ -1088,6 +1088,9 @@ class BatchGenWorker:
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
+		# Set by _release_prefill_weight_ring and consumed by the
+		# prefill->decode switch invariant.
+		self._prefill_ring_released_for_switch = False
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -7987,6 +7990,57 @@ class BatchGenWorker:
 			fingerprint if streamed_sp8 else None
 		)
 
+	def _assert_phase_switch_clean(self, direction: str) -> None:
+		"""Fail loud when a phase switch left the other phase's state behind.
+
+		Checks worker-owned switch state only, which is what this module can
+		observe cheaply and deterministically:
+
+		* ``prefill_to_decode`` — the prefill routed-expert weight ring must
+		  have been released BEFORE the decode model was built. It used to stay
+		  mapped through the whole decode configure, so the switch ran at the
+		  tightest free-HBM point of the batch; that is a cleanup bug, not a
+		  design choice, so it fails the switch instead of degrading it.
+		* ``decode_to_prefill`` — the decode-only graph state must be gone.
+		  A stale manager or captured segment keeps Python references to the
+		  decode model and its static KV buffers alive, so they survive
+		  empty_cache() and the next prefill runs with that memory still held.
+
+		Raises RuntimeError; there is no degraded mode. A violated invariant
+		means the next phase runs with the previous phase's HBM still mapped,
+		which shows up later as an unrelated OOM or a silent capacity loss.
+		"""
+		if direction == "prefill_to_decode":
+			if not getattr(self, "_prefill_ring_released_for_switch", False):
+				raise RuntimeError(
+					f"Rank {self.rank}: prefill->decode switch did not release the "
+					"prefill routed-expert weight ring before building the decode "
+					"model; the decode configure would run with prefill-only GPU "
+					"bytes still mapped"
+				)
+			self._prefill_ring_released_for_switch = False
+			return
+		if direction == "decode_to_prefill":
+			leftovers = [
+				name
+				for name in (
+					"_cuda_graph_manager",
+					"_glm5_moe_cuda_graph_manager",
+					"_glm5_layer_cuda_graph_manager",
+					"_whole_model_segment",
+				)
+				if getattr(self, name, None) is not None
+			]
+			if leftovers:
+				raise RuntimeError(
+					f"Rank {self.rank}: decode->prefill switch left decode-only GPU "
+					f"state mapped: {', '.join(leftovers)} still set; their Python "
+					"references keep the decode model and captured static buffers "
+					"alive across the prefill phase"
+				)
+			return
+		raise ValueError(f"unknown phase-switch direction {direction!r}")
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
@@ -8117,6 +8171,7 @@ class BatchGenWorker:
 			self._k3_startup_prefill_ready = False
 			logging.info("Deep freeing model memory before prefill config...")
 			self.deep_free_model_memory()
+			self._assert_phase_switch_clean("decode_to_prefill")
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
@@ -8348,6 +8403,25 @@ class BatchGenWorker:
 		if self._persistent_phase_enabled():
 			self._activate_persistent_decode_instance(comm)
 			return
+		# Release the prefill phase's H2D ring and queues BEFORE building the
+		# decode model, not after it. The routed-expert weight ring installed
+		# for prefill used to stay mapped through the whole decode configure, so
+		# the expert upload and the grouped-GEMM init ran at the tightest
+		# free-HBM point of the batch and the allocator churned at its peak.
+		# This is the ordering _activate_persistent_decode_instance already
+		# uses.
+		#
+		# Resident decode does not stream routed experts. Keep the installed
+		# streamed-SP8 state through this transition: host-RDMA needs its daemon
+		# cursor, while hierarchical GDR resets its local queue/ring at the next
+		# prefill boundary. reset_decoding_buffer() must not resize those slots
+		# to the decode layout in either case.
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		if not self._streamed_sp8_h2d_installed:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+		self._prefill_ring_released_for_switch = True
 		self.deep_free_model_memory()
 		_nv_t0 = time.perf_counter()
 		self.init_nvshmem()
@@ -8363,17 +8437,8 @@ class BatchGenWorker:
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
 		# never overflows.
 		self._decode_padding_bsz = max_num_seq
+		self._assert_phase_switch_clean("prefill_to_decode")
 		self.set_phase("decode")
-		self.core_engine.stop_h2d_worker()
-		self.core_engine.clear_kv_copy_queue()
-		# Resident decode does not stream routed experts. Keep the installed
-		# streamed-SP8 state through this transition: host-RDMA needs its daemon
-		# cursor, while hierarchical GDR resets its local queue/ring at the next
-		# prefill boundary. reset_decoding_buffer() must not resize those slots to
-		# the decode layout in either case.
-		if not self._streamed_sp8_h2d_installed:
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 
 		# Only start H2D worker if there are experts to offload
 		if self.weight_copy_task.get("routed_expert"):
@@ -12735,13 +12800,24 @@ class BatchGenWorker:
 				None,
 			)
 			index_topk_cfg = int(getattr(_first_indexer, "index_topk", 0) or 0)
-			all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg
+			# ONE general graph lifetime (POIS 2026-10-13). The all_short lifetime
+			# is a second, narrower lifetime: it only serves rows whose final
+			# length fits in index_topk, so a batch that grows past that bound has
+			# to fall back to eager or force a recapture. That is why the default
+			# path recaptured every bucket on every phase switch, and why the
+			# persistent path rejected long rows outright. Pinning the selection to
+			# the general lifetime makes the decode graphs capture-once and
+			# length-agnostic (their span still comes from KV capacity via
+			# graph_max_seqlen above), at the cost of always scoring the indexer.
+			# The all_short capture code itself is left in place and never selected.
+			all_short = False
 			self._glm5_whole_model_all_short = all_short
 			self._glm5_whole_model_index_topk = index_topk_cfg
 			if self.rank == 0:
 				logging.info(
 					"Rank %s: GLM-5 whole-model graph attention span "
-					"required_seqlen=%s index_topk=%s all_short=%s",
+					"required_seqlen=%s index_topk=%s all_short=%s "
+					"(general lifetime pinned)",
 					self.rank,
 					required_seqlen,
 					index_topk_cfg,
@@ -16065,6 +16141,22 @@ class BatchGenWorker:
 			pm = self.parallel_manager
 			if hasattr(pm, "_release_streamed_sp8_prefill"):
 				pm._release_streamed_sp8_prefill()
+			# The worker is not the only owner of the model: the parallel strategy
+			# manager keeps its own reference from configure_prefill/
+			# configure_decoding. Leaving that reference set is what made this
+			# function a measured no-op on the decode->prefill switch (allocated
+			# bytes unchanged across the call): the decode model was really freed
+			# later, by the refcount drop when configure_prefill rebound pm.model,
+			# so it stayed resident through the KV destroy and the first part of the
+			# prefill configure. Dropping it here is what makes the function free
+			# what its name says it frees.
+			#
+			# --persistent-phase-instances never reaches this function (its switch
+			# goes through _release_persistent_decode_instance), and its instance
+			# tuples own the models; the guard keeps that explicit.
+			if not getattr(pm, "persistent_phase_instances", False):
+				if getattr(pm, "model", None) is not None:
+					pm.model = None
 			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
 				if hasattr(pm, attr):
 					delattr(pm, attr)
