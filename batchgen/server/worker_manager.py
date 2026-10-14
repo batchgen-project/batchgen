@@ -436,9 +436,11 @@ class WorkerManager:
                 # regions are outside this run's SHM namespace, so they are
                 # released through their C++ owner instead.
                 if worker_teardown_safe:
-                    # The prefix-cache coordinator region lives in this run's
-                    # namespace; drop the owner before the namespace sweep.
-                    self._shutdown_prefix_cache_owner()
+                    # Drop the prefix-cache owner (an anonymous memfd) before
+                    # the namespace sweep. Only a real owner has a runtime
+                    # config; isolated test managers have neither.
+                    if getattr(self, "prefix_cache_runtime_config", None) is not None:
+                        self._shutdown_prefix_cache_owner()
                     if self._runtime_namespace_owned:
                         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:

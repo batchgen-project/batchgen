@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import math
+import os
 import random
 import string
 
@@ -101,7 +102,10 @@ def test_async_load_prefix_pages_to_device_uses_host_page_ids(gpu_page_size):
 
     host_manager = bg.DefaultHostPagedKVManager(_host_config(shm_name))
     host_manager.initialize(True)
-    worker = bg.DefaultHostPagedKVWorkerView(_host_config(shm_name))
+    worker_config = _host_config(shm_name)
+    worker_config.memfd_creator_pid = os.getpid()
+    worker_config.memfd_fd = host_manager.memfd_fd()
+    worker = bg.DefaultHostPagedKVWorkerView(worker_config)
     worker.initialize(0, False)
 
     try:
@@ -197,7 +201,10 @@ def test_shared_gpu_prefix_page_survives_one_sequence_release():
 
     host_manager = bg.DefaultHostPagedKVManager(_host_config(shm_name))
     host_manager.initialize(True)
-    worker = bg.DefaultHostPagedKVWorkerView(_host_config(shm_name))
+    worker_config = _host_config(shm_name)
+    worker_config.memfd_creator_pid = os.getpid()
+    worker_config.memfd_fd = host_manager.memfd_fd()
+    worker = bg.DefaultHostPagedKVWorkerView(worker_config)
     worker.initialize(0, False)
     gpu_manager = None
     try:

@@ -1,3 +1,4 @@
+import os
 import random
 import string
 
@@ -374,8 +375,6 @@ def test_host_prefix_cache_attach_requires_memfd_identity():
     with pytest.raises(RuntimeError, match="memfd_creator_pid"):
         attacher.initialize(False)
 
-    import os
-
     config = _config(shm_name)
     config.memfd_creator_pid = os.getpid()
     config.memfd_fd = owner.memfd_fd()
@@ -520,7 +519,10 @@ def test_host_prefix_cache_is_shared_across_process_attachments():
             ],
         )
 
-        worker = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        worker_config = _config(shm_name)
+        worker_config.memfd_creator_pid = os.getpid()
+        worker_config.memfd_fd = owner.memfd_fd()
+        worker = bg.HostPrefixCacheCoordinator(worker_config)
         worker.initialize(False)
         attached = worker.lookup_and_attach(namespace, token_ids)
 
