@@ -262,3 +262,17 @@ def test_random_assignments_never_worse_than_one_rank():
         ranks = assign_ranks_for_sharing(prompts, world_size=world, block_tokens=B)
         assert len(ranks) == len(prompts) and all(0 <= r < world for r in ranks)
         assert max(_rank_loads(prompts, ranks, world)) <= plan(prompts).computed_tokens
+
+
+def test_same_chunk_reads_are_invalid_unless_the_plan_allows_them():
+    prompts = [blk(1) + blk(2) + [1], blk(1) + blk(2) + [2], blk(1) + blk(3) + [3]]
+    result = plan_wave_prefix_sharing(
+        prompts, block_tokens=B, pool_pages=1000, chunk_tokens=1000,
+        same_chunk_ancestors=True,
+    )
+    validate_wave_prefix_plan(result, prompts)
+    assert len(result.chunks) == 1
+    with pytest.raises(AssertionError, match="before it is computed"):
+        validate_wave_prefix_plan(
+            dataclasses.replace(result, same_chunk_ancestors=False), prompts
+        )

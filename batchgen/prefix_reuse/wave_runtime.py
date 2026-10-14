@@ -1,7 +1,9 @@
 """Host side of the in-wave prefix pool for one DP rank.
 
 A pooled segment is computed once, so its KV must land in Host memory once.
-Each segment gets its own Host pages under a negative pseudo sequence id;
+Each segment gets its own Host pages under a negative pseudo sequence id, one
+copy per prefix-cache KV group (a DSA model holds the MLA latent and the
+indexer keys of a segment under the same pseudo id in both Host-KV regions);
 every member prompt's Host page table starts with its chain of segment pages
 (attached, never owned), followed by its own private pages. At the end of the
 wave the segments are committed to the prefix coordinator parents first, so a
@@ -17,7 +19,7 @@ same tokens and they stayed with the pseudo sequence.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from batchgen.prefix_reuse.executor import ChunkBatch, PoolChunkExecutor
 from batchgen.prefix_reuse.pool import PrefillPrefixPool
@@ -43,7 +45,8 @@ class PoolWave:
     executor: PoolChunkExecutor | None = None
     chains: list[tuple[int, ...]] = field(default_factory=list)
     segment_sids: dict[int, int] = field(default_factory=dict)
-    segment_host_pages: dict[int, list[int]] = field(default_factory=dict)
+    # segment id -> KV group id -> that group's Host pages for the segment
+    segment_host_pages: dict[int, dict[int, list[int]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         chains: list[list[int]] = [[] for _ in self.prompts]
@@ -56,23 +59,26 @@ class PoolWave:
         chain = self.chains[index]
         return self.plan.segments[chain[-1]].token_end if chain else 0
 
-    def chain_host_pages(self, index: int) -> list[int]:
-        pages: list[int] = []
-        for seg in self.chains[index]:
-            pages.extend(self.segment_host_pages[seg])
-        return pages
+    def chain_host_pages(self, index: int) -> dict[int, list[int]]:
+        return self._group_pages(self.chains[index])
 
-    def segment_prefix_pages(self, segment_id: int) -> list[int]:
-        """Host pages of a segment's ancestors followed by its own."""
+    def segment_prefix_pages(self, segment_id: int) -> dict[int, list[int]]:
+        """Host pages of a segment's ancestors followed by its own, per group."""
 
         chain = []
         seg = segment_id
         while seg is not None:
             chain.append(seg)
             seg = self.plan.segments[seg].parent_id
-        pages: list[int] = []
-        for seg in reversed(chain):
-            pages.extend(self.segment_host_pages[seg])
+        return self._group_pages(reversed(chain))
+
+    def _group_pages(self, segments) -> dict[int, list[int]]:
+        """Concatenate the segments' Host pages inside each KV group."""
+
+        pages: dict[int, list[int]] = {}
+        for seg in segments:
+            for group_id, group_pages in self.segment_host_pages[seg].items():
+                pages.setdefault(group_id, []).extend(group_pages)
         return pages
 
     def row_host_targets(self, batch: ChunkBatch) -> tuple[list[int], list[int]]:
@@ -90,33 +96,46 @@ class PoolWave:
 
 
 def allocate_segment_host_pages(
-    wave: PoolWave, worker_view: object, next_sid: Callable[[], int]
+    wave: PoolWave,
+    worker_views_by_group: Mapping[int, object],
+    next_sid: Callable[[], int],
 ) -> int:
     """Register one pseudo sequence per segment and give it exact pages.
 
-    Returns the number of Host pages allocated.
+    The same pseudo id and page count is registered in every KV group, so a
+    member's chain stays in lockstep across the Host-KV regions.
+
+    Returns the number of Host pages allocated per group.
     """
 
     page_tokens = wave.page_tokens
     sids = [next_sid() for _ in wave.plan.segments]
     if any(sid >= 0 for sid in sids):
         raise ValueError("pool segment pseudo sequence ids must be negative")
-    worker_view.register_sequences(sids)
-    worker_view.allocate_pages_for_sequences(
-        [(sid, seg.tokens) for sid, seg in zip(sids, wave.plan.segments)]
-    )
-    tables = worker_view.build_page_table(sids)
-    total = 0
-    for sid, seg, table in zip(sids, wave.plan.segments, tables):
-        pages = [int(page) for page in table]
-        if len(pages) != seg.tokens // page_tokens:
-            raise RuntimeError(
-                f"segment {seg.segment_id} got {len(pages)} Host pages for "
-                f"{seg.tokens} tokens of {page_tokens}"
-            )
+    requests = [(sid, seg.tokens) for sid, seg in zip(sids, wave.plan.segments)]
+    # Published before the first group allocates: a group that runs out of pages
+    # half way leaves the caller every pseudo id it has to release.
+    for sid, seg in zip(sids, wave.plan.segments):
         wave.segment_sids[seg.segment_id] = sid
-        wave.segment_host_pages[seg.segment_id] = pages
-        total += len(pages)
+    tables_by_group: dict[int, list] = {}
+    for group_id, worker_view in sorted(worker_views_by_group.items()):
+        worker_view.register_sequences(sids)
+        worker_view.allocate_pages_for_sequences(requests)
+        tables_by_group[int(group_id)] = worker_view.build_page_table(sids)
+    total = 0
+    for index, seg in enumerate(wave.plan.segments):
+        expected = seg.tokens // page_tokens
+        group_pages: dict[int, list[int]] = {}
+        for group_id, tables in tables_by_group.items():
+            pages = [int(page) for page in tables[index]]
+            if len(pages) != expected:
+                raise RuntimeError(
+                    f"segment {seg.segment_id} got {len(pages)} Host pages in "
+                    f"group {group_id} for {seg.tokens} tokens of {page_tokens}"
+                )
+            group_pages[group_id] = pages
+        wave.segment_host_pages[seg.segment_id] = group_pages
+        total += expected
     return total
 
 
@@ -124,7 +143,7 @@ def commit_pool_segments(
     wave: PoolWave,
     *,
     coordinator: object,
-    worker_view: object,
+    worker_views_by_group: Mapping[int, object],
     namespace_digest: Sequence[int],
     publish_boundary_tokens: int,
     max_scan_nodes: int,
@@ -154,7 +173,7 @@ def commit_pool_segments(
                 namespace_digest=namespace_digest,
                 token_ids=tokens,
                 publish_boundary_tokens=publish_boundary_tokens,
-                pages_by_group={0: wave.segment_prefix_pages(seg.segment_id)},
+                pages_by_group=wave.segment_prefix_pages(seg.segment_id),
             )
             if request is None or request.commit_tokens != seg.token_end:
                 raise RuntimeError(
@@ -164,7 +183,7 @@ def commit_pool_segments(
             outcome = commit_prefix_pages_with_capacity_retry(
                 request=request,
                 coordinator=coordinator,
-                worker_views_by_group={0: worker_view},
+                worker_views_by_group=worker_views_by_group,
                 max_scan_nodes=max_scan_nodes,
             )
             result = outcome.commit_result
@@ -175,7 +194,7 @@ def commit_pool_segments(
                 retain_inserted_prefix_pages(
                     commit_result=result,
                     request=request,
-                    worker_views_by_group={0: worker_view},
+                    worker_views_by_group=worker_views_by_group,
                     sequence_id=wave.segment_sids[seg.segment_id],
                 )
                 handles.append(_attach_chain(coordinator, namespace_digest, tokens))

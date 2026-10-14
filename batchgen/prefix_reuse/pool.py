@@ -20,13 +20,14 @@ import torch
 def pool_pages_from_budget(
     free_bytes: int, workspace_bytes: int, page_bytes: int
 ) -> int:
-    """How many pool pages fit in the free memory the workspace leaves over."""
+    """How many pool pages fit in the free memory the workspace leaves over.
+
+    Zero when the workspace does not fit: the wave then takes the existing path.
+    """
 
     if page_bytes <= 0:
         raise ValueError("page_bytes must be positive")
-    if free_bytes < workspace_bytes:
-        raise ValueError("free_bytes must cover workspace_bytes")
-    return (free_bytes - workspace_bytes) // page_bytes
+    return max(0, free_bytes - workspace_bytes) // page_bytes
 
 
 def scratch_pages_bound(
@@ -44,7 +45,12 @@ def scratch_pages_bound(
 
 
 class PrefillPrefixPool:
-    """Pages of KV for the pooled segments and the in-flight tails."""
+    """Pages of KV for the pooled segments and the in-flight tails.
+
+    GQA keeps K and V. An MLA/DSA model keeps only ``k`` (the latent,
+    ``with_v=False``) plus, when ``indexer_layers`` is given, the indexer keys
+    of those layers in ``indexer[indexer_row[layer]]``.
+    """
 
     def __init__(
         self,
@@ -56,22 +62,33 @@ class PrefillPrefixPool:
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        with_v: bool = True,
+        indexer_layers: Sequence[int] = (),
+        indexer_dim: int = 0,
     ) -> None:
         self.page_tokens = page_tokens
         self.device = torch.device(device)
         shape = (num_layers, num_pages, page_tokens, num_kv_heads, head_dim)
         self.k = torch.empty(shape, dtype=dtype, device=self.device)
-        self.v = torch.empty(shape, dtype=dtype, device=self.device)
+        self.v = torch.empty(shape, dtype=dtype, device=self.device) if with_v else None
+        self.indexer_row = {layer: row for row, layer in enumerate(indexer_layers)}
+        self.indexer = (
+            torch.empty(
+                (len(self.indexer_row), num_pages, page_tokens, indexer_dim),
+                dtype=dtype, device=self.device,
+            )
+            if self.indexer_row else None
+        )
         self._num_pages = num_pages
         self._free = list(range(num_pages))  # kept ascending
         self._page_bytes = (
-            2 * num_layers * page_tokens * num_kv_heads * head_dim
-            * self.k.element_size()
-        )
+            (2 if with_v else 1) * num_layers * page_tokens * num_kv_heads * head_dim
+            + len(self.indexer_row) * page_tokens * indexer_dim
+        ) * self.k.element_size()
 
     @property
     def page_bytes(self) -> int:
-        """Bytes of K and V for one page across all layers."""
+        """Bytes of every buffer for one page across all layers."""
 
         return self._page_bytes
 
@@ -139,3 +156,4 @@ class PrefillPrefixPool:
             )
         self.k = None
         self.v = None
+        self.indexer = None

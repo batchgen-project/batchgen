@@ -33,6 +33,82 @@ class Glm52SparsePrefillResult:
     topk_indices: torch.Tensor
 
 
+@dataclass(frozen=True)
+class Glm52PoolPrefill:
+    """One prefix-pool chunk's addressing, shared by every layer.
+
+    ``key_slots`` lists each row's keys ``[0, cache_len)`` as pool slots, rows
+    concatenated; a query token's causal range is its row's span in that list
+    up to and including its own absolute position. Top-k indices over it are
+    mapped back to pool slots, so attention reads the pool directly.
+    """
+
+    slots: torch.Tensor  # int64 [T]: pool slot of each query token
+    key_slots: torch.Tensor  # int64 [K]
+    causal_starts: torch.Tensor  # int32 [T]
+    causal_ends: torch.Tensor  # int32 [T]
+    max_cache_seqlen: int
+
+
+def build_glm52_pool_prefill(
+    *,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    position_ids: torch.Tensor,
+    slots: torch.Tensor,
+    page_tokens: int,
+    max_cache_seqlen: int,
+) -> Glm52PoolPrefill:
+    """Address a pool chunk whose rows hold ancestor pages then their own.
+
+    Pooled segments and tails start on page boundaries, so a row's key at
+    absolute position ``t`` sits in slot ``t % page_tokens`` of its
+    ``t // page_tokens``-th page.
+    """
+
+    device = page_table.device
+    rows = cache_seqlens.numel()
+    cache = cache_seqlens.to(torch.int64)
+    key_offsets = torch.zeros(rows + 1, dtype=torch.int64, device=device)
+    key_offsets[1:] = torch.cumsum(cache, 0)
+    total_keys = int(key_offsets[-1])
+    key_rows = torch.repeat_interleave(
+        torch.arange(rows, device=device), cache, output_size=total_keys
+    )
+    t = torch.arange(total_keys, device=device) - key_offsets[:-1][key_rows]
+    key_slots = (
+        page_table.to(torch.int64)[key_rows, t // page_tokens] * page_tokens
+        + t % page_tokens
+    )
+    q_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
+    q_rows = torch.repeat_interleave(
+        torch.arange(rows, device=device), q_lengths,
+        output_size=position_ids.numel(),
+    )
+    starts = key_offsets[:-1][q_rows]
+    ends = starts + position_ids.to(torch.int64) + 1
+    return Glm52PoolPrefill(
+        slots=slots.to(torch.int64),
+        key_slots=key_slots.contiguous(),
+        causal_starts=starts.to(torch.int32).contiguous(),
+        causal_ends=ends.to(torch.int32).contiguous(),
+        max_cache_seqlen=int(max_cache_seqlen),
+    )
+
+
+def _map_topk_to_pool_slots_(
+    topk_indices: torch.Tensor, key_slots: torch.Tensor, rows_per_step: int = 8192
+) -> torch.Tensor:
+    """Replace key-list offsets by pool slots in place; -1 stays -1."""
+
+    for start in range(0, topk_indices.shape[0], rows_per_step):
+        view = topk_indices[start:start + rows_per_step]
+        mapped = key_slots[view.clamp(min=0).to(torch.int64)].to(torch.int32)
+        view.copy_(torch.where(view >= 0, mapped, view))
+    return topk_indices
+
+
 def should_use_glm52_sparse_prefill(
     model_type: str | None,
     max_seqlen: int,
@@ -630,8 +706,17 @@ def glm52_sparse_prefill_prepacked(
     reusable_topk_indices: torch.Tensor | None,
     causal_starts: torch.Tensor | None,
     causal_ends: torch.Tensor | None,
+    pool: Glm52PoolPrefill | None = None,
+    latent_pool: torch.Tensor | None = None,
+    indexer_pool: torch.Tensor | None = None,
 ) -> Glm52SparsePrefillResult:
-    """Execute one GLM-5.2 packed sparse-attention prefill layer."""
+    """Execute one GLM-5.2 packed sparse-attention prefill layer.
+
+    With ``pool`` the rows continue prefixes already in the prefill prefix
+    pool: this layer's latent and indexer keys are written to their pool slots
+    first, the indexer scores each row's pooled keys, and attention reads the
+    latent pool (``latent_pool``, this layer) through slot indices.
+    """
 
     try:
         from flash_mla import flash_mla_sparse_fwd
@@ -648,6 +733,11 @@ def glm52_sparse_prefill_prepacked(
     )
 
     total_tokens = hidden_states.shape[0]
+    if pool is not None and latent_pool is None:
+        raise RuntimeError("GLM-5.2 pool prefill needs this layer's latent pool")
+    # RoPE tables must cover absolute positions, which run past the query
+    # length when a row continues a pooled prefix.
+    rope_seqlen = max_seqlen if pool is None else pool.max_cache_seqlen
     from batchgen.timing import get_prefill_timer
 
     timer = get_prefill_timer()
@@ -689,7 +779,7 @@ def glm52_sparse_prefill_prepacked(
     k_pe = k_pe.view(total_tokens, 1, attn.qk_rope_head_dim)
 
     with timed("attn_rope"):
-        cos, sin = attn.rotary_emb(k_pe, seq_len=max_seqlen)
+        cos, sin = attn.rotary_emb(k_pe, seq_len=rope_seqlen)
         k_pe = rotary_pos_emb_interleaved_native(
             k_pe.unsqueeze(0),
             cos,
@@ -704,6 +794,9 @@ def glm52_sparse_prefill_prepacked(
             dim=-1,
         ).contiguous()
     del compressed_kv, normed_kv, k_pe
+    if pool is not None:
+        latent_flat = latent_pool.view(-1, primary_kv.shape[-1])
+        latent_flat[pool.slots] = primary_kv
 
     indexer_kv = None
     if indexer is not None:
@@ -716,22 +809,32 @@ def glm52_sparse_prefill_prepacked(
             hidden_fp8=hidden_fp8,
             hidden_scale=hidden_scale,
             position_ids=position_ids,
-            max_seqlen=max_seqlen,
+            max_seqlen=rope_seqlen,
             timed=timed,
         )
+        score_kv = indexer_kv
+        if pool is not None:
+            if indexer_pool is None:
+                raise RuntimeError("GLM-5.2 full pool-prefill layer needs its indexer pool")
+            indexer_flat = indexer_pool.view(-1, indexer_kv.shape[-1])
+            indexer_flat[pool.slots] = indexer_kv[0, :, 0, :]
+            score_kv = indexer_flat[pool.key_slots].unsqueeze(0).unsqueeze(2)
         with timed("indexer_prefill_score"):
             topk_indices = select_packed_glm52_topk(
                 indexer=indexer,
                 hidden_states=hidden_states,
                 q_a_fp8=q_a_fp8,
                 q_a_scale=q_a_scale,
-                indexer_kv=indexer_kv,
+                indexer_kv=score_kv,
                 position_ids=position_ids,
                 causal_starts=causal_starts,
                 causal_ends=causal_ends,
-                max_seqlen=max_seqlen,
+                max_seqlen=rope_seqlen,
                 output=reusable_topk_indices,
             )
+        del score_kv
+        if pool is not None:
+            _map_topk_to_pool_slots_(topk_indices, pool.key_slots)
     else:
         topk_indices = validate_carried_topk(
             carried_topk_indices,
@@ -751,7 +854,10 @@ def glm52_sparse_prefill_prepacked(
         )
     q_absorb = kv_b[:, : attn.qk_nope_head_dim, :]
     out_absorb = kv_b[:, attn.qk_nope_head_dim :, :].transpose(1, 2)
-    kv_sparse = primary_kv.unsqueeze(1)
+    kv_sparse = (
+        primary_kv.unsqueeze(1) if pool is None
+        else latent_pool.view(-1, 1, primary_kv.shape[-1])
+    )
     attn_output = torch.empty(
         total_tokens,
         attn.hidden_size,

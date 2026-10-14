@@ -9,12 +9,26 @@ from enum import Enum
 from typing import Any
 
 
-_GPT_OSS_CANONICAL_MODEL = "openai/gpt-oss-120b"
-_GPT_OSS_ALIASES = frozenset({_GPT_OSS_CANONICAL_MODEL, "gpt-oss-120b"})
+# Support follows the prefill compute path (model type), never a model-name list.
+# One Host-KV region holding full K/V:
+_FULL_KV_MODEL_TYPES = frozenset({"gpt_oss"})
+# GLM-5.2 sparse DSA prefill: MLA latent in the primary Host-KV region and the
+# indexer keys in the auxiliary one. GLM-5/5.1 (glm_moe_dsa) prefill is dense.
+_DSA_MODEL_TYPES = frozenset({"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"})
 
 
 class PrefixKVGroupSemantic(str, Enum):
     FULL_KV = "full_kv"
+    MLA_LATENT = "mla_latent"
+    DSA_INDEXER_KEYS = "dsa_indexer_keys"
+
+
+# The core coordinator only stores and cross-checks the semantic.
+_CORE_SEMANTIC = {
+    PrefixKVGroupSemantic.FULL_KV: "FULL_KV",
+    PrefixKVGroupSemantic.MLA_LATENT: "MLA_COMPRESSED_KV",
+    PrefixKVGroupSemantic.DSA_INDEXER_KEYS: "MLA_COMPRESSED_KV",
+}
 
 
 @dataclass(frozen=True)
@@ -62,37 +76,24 @@ class PrefixCacheRuntimeConfig:
 
 
 def require_prefix_cache_model_support(model_name: str) -> str:
-    """Return the canonical model name or fail before allocating resources."""
+    """Return the model type or fail before allocating resources."""
 
     if not isinstance(model_name, str):
         raise ValueError("prefix cache model name must be a string")
-    normalized = model_name.strip().lower()
-    if normalized not in _GPT_OSS_ALIASES:
+    from batchgen.config.model_registry import _detect_model_type_from_identifier
+
+    model_type = _detect_model_type_from_identifier(model_name.strip())
+    if model_type not in _FULL_KV_MODEL_TYPES | _DSA_MODEL_TYPES:
         raise ValueError(
-            "prefix cache reuse currently supports only "
-            f"{_GPT_OSS_CANONICAL_MODEL}; model {model_name!r} is unsupported"
+            "prefix cache reuse currently supports only GPT-OSS and models on "
+            f"the GLM-5.2 sparse DSA prefill path; model {model_name!r} "
+            f"(type {model_type!r}) is unsupported"
         )
-    return _GPT_OSS_CANONICAL_MODEL
+    return model_type
 
 
-def build_prefix_cache_runtime_config(
-    *,
-    model_name: str,
-    kv_dtype: str,
-    host_kv_config: Any,
-    debug_stats: bool = False,
-    memfd_creator_pid: int = -1,
-    memfd_fd: int = -1,
-) -> PrefixCacheRuntimeConfig:
-    """Derive the single-group GPT-OSS prefix-cache shared-memory layout."""
-
-    canonical_model = require_prefix_cache_model_support(model_name)
-    page_tokens = int(host_kv_config.page_size_tokens)
-    num_pages = int(host_kv_config.num_pages)
-    sequence_capacity = int(host_kv_config.sequence_table_capacity)
-    if page_tokens <= 0 or num_pages <= 0 or sequence_capacity <= 0:
-        raise ValueError("host KV configuration must have positive capacities")
-    host_page_bytes_all_layers = int(host_kv_config.num_layers) * page_tokens * (
+def _host_page_bytes_all_layers(host_kv_config: Any) -> int:
+    return int(host_kv_config.num_layers) * int(host_kv_config.page_size_tokens) * (
         int(host_kv_config.num_k_heads)
         * int(host_kv_config.k_head_dim)
         * int(host_kv_config.k_element_size_bytes)
@@ -100,30 +101,89 @@ def build_prefix_cache_runtime_config(
         * int(host_kv_config.v_head_dim)
         * int(host_kv_config.v_element_size_bytes)
     )
+
+
+def build_prefix_cache_runtime_config(
+    *,
+    model_name: str,
+    kv_dtype: str,
+    host_kv_config: Any,
+    shm_name: str | None = None,
+    aux_host_kv_config: Any = None,
+    debug_stats: bool = False,
+    memfd_creator_pid: int = -1,
+    memfd_fd: int = -1,
+) -> PrefixCacheRuntimeConfig:
+    """Derive the prefix-cache shared-memory layout, one group per Host-KV region.
+
+    GPT-OSS has one full-K/V group. A DSA model has two, sharing page size and
+    page count: group 0 the MLA latent (primary region), group 1 the indexer
+    keys (``aux_host_kv_config``). A prefix is reusable only when every group
+    holds it.
+    """
+
+    model_type = require_prefix_cache_model_support(model_name)
+    if not shm_name:
+        # Diagnostic label only: the region is an anonymous memfd reached
+        # through /proc/<pid>/fd/<fd>, so the name never hits /dev/shm.
+        shm_name = _derive_prefix_cache_shm_name(model_name)
+    if model_type in _DSA_MODEL_TYPES:
+        if aux_host_kv_config is None:
+            raise ValueError(
+                "DSA prefix reuse needs the indexer-key (aux) Host-KV config"
+            )
+        layouts = (
+            (PrefixKVGroupSemantic.MLA_LATENT, host_kv_config),
+            (PrefixKVGroupSemantic.DSA_INDEXER_KEYS, aux_host_kv_config),
+        )
+    else:
+        if aux_host_kv_config is not None:
+            raise ValueError(f"model type {model_type!r} has no aux Host-KV region")
+        layouts = ((PrefixKVGroupSemantic.FULL_KV, host_kv_config),)
+
+    page_tokens = int(host_kv_config.page_size_tokens)
+    num_pages = int(host_kv_config.num_pages)
+    sequence_capacity = int(host_kv_config.sequence_table_capacity)
+    if page_tokens <= 0 or num_pages <= 0 or sequence_capacity <= 0:
+        raise ValueError("host KV configuration must have positive capacities")
+    for _, layout in layouts:
+        if (
+            int(layout.page_size_tokens) != page_tokens
+            or int(layout.num_pages) != num_pages
+        ):
+            raise ValueError(
+                "every prefix-cache group must share page size and page count"
+            )
+    host_page_bytes_all_layers = sum(
+        _host_page_bytes_all_layers(layout) for _, layout in layouts
+    )
     if host_page_bytes_all_layers <= 0:
         raise ValueError("host KV page byte size must be positive")
 
-    group_specs = (
+    group_specs = tuple(
         PrefixKVGroupSpec(
-            group_id=0,
-            semantic=PrefixKVGroupSemantic.FULL_KV,
+            group_id=group_id,
+            semantic=semantic,
             required_for_reuse=True,
             raw_page_tokens=page_tokens,
-        ),
+        )
+        for group_id, (semantic, _) in enumerate(layouts)
     )
+    groups = len(group_specs)
     return PrefixCacheRuntimeConfig(
-        shm_name=_derive_prefix_cache_shm_name(canonical_model),
+        shm_name=shm_name,
         namespace_digest=_build_namespace_digest(
-            model_name=canonical_model,
+            model_type=model_type,
             kv_dtype=kv_dtype,
             page_tokens=page_tokens,
+            semantics=[spec.semantic for spec in group_specs],
         ),
         group_specs=group_specs,
         hash_block_tokens=page_tokens,
         publish_boundary_tokens=page_tokens,
         max_nodes=num_pages + 1,
-        max_group_entries=num_pages + 1,
-        max_page_handles=num_pages,
+        max_group_entries=groups * (num_pages + 1),
+        max_page_handles=groups * num_pages,
         max_attachments=max(1024, sequence_capacity),
         host_page_bytes_all_layers=host_page_bytes_all_layers,
         debug_stats=bool(debug_stats),
@@ -152,13 +212,15 @@ def _derive_prefix_cache_shm_name(model_name: str) -> str:
 
 
 def _build_namespace_digest(
-    *, model_name: str, kv_dtype: str, page_tokens: int
+    *, model_type: str, kv_dtype: str, page_tokens: int, semantics
 ) -> tuple[int, int, int, int]:
     hasher = hashlib.blake2b(digest_size=32)
-    hasher.update(model_name.encode("utf-8"))
+    hasher.update(model_type.encode("utf-8"))
     hasher.update(b"\0")
     hasher.update(kv_dtype.strip().lower().encode("utf-8"))
-    hasher.update(b"\0full_kv\0")
+    for semantic in semantics:
+        hasher.update(b"\0" + semantic.value.encode("utf-8"))
+    hasher.update(b"\0")
     hasher.update(int(page_tokens).to_bytes(4, "little"))
     digest = hasher.digest()
     return tuple(
@@ -170,7 +232,9 @@ def _build_namespace_digest(
 def _to_core_group_spec(core_engine_module: Any, spec: PrefixKVGroupSpec):
     core_spec = core_engine_module.HostKVGroupSpec()
     core_spec.group_id = int(spec.group_id)
-    core_spec.semantic = core_engine_module.HostKVGroupSemantic.FULL_KV
+    core_spec.semantic = getattr(
+        core_engine_module.HostKVGroupSemantic, _CORE_SEMANTIC[spec.semantic]
+    )
     core_spec.required_for_reuse = bool(spec.required_for_reuse)
     core_spec.raw_page_tokens = int(spec.raw_page_tokens)
     core_spec.compression_ratio = int(spec.compression_ratio)

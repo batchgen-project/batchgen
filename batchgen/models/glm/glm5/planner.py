@@ -68,6 +68,14 @@ class GLM5Planner(BasePlanner):
             self.config.GPU_Buffer_Config.num_prefill_module_buffer[
                 "shared_expert"
             ] = 2
+            # Device memory the prefill prefix pool leaves for the forward,
+            # sized from the measured reserved-memory growth of the largest
+            # supported no-pool prefill forward plus margin for the pool
+            # path's per-row indexer-key gather. Provisional until a pool
+            # run measures its chunk peak; the worker fails loudly above it.
+            self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
+                24 * 2**30
+            )
 
     def _compute_batch_configs(self):
         """Compute batch sizes with GLM-5 specific constants.

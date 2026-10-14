@@ -175,6 +175,39 @@ class DualHostKVCoordinator:
 		)
 		return self._transaction_error
 
+	@staticmethod
+	def build_host_configs(
+		model_name: str,
+		host_kv_cache_size: int,
+		primary_shm_name: str | None = None,
+		aux_shm_name: str | None = None,
+	) -> Optional[Tuple[Any, Any]]:
+		"""Primary and aux Host-KV configs for a DSA model, or None otherwise.
+
+		The single source of the proportional split: the server's managers, the
+		workers' views and both sides' prefix-cache config must see the same
+		page count.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		)
+		if not is_dsa_model(model_name):
+			return None
+
+		if primary_shm_name is None:
+			primary_shm_name = HOST_KV_SHM_NAME
+		if aux_shm_name is None:
+			aux_shm_name = HOST_KV_AUX_SHM_NAME
+		if not primary_shm_name or not aux_shm_name:
+			raise ValueError("Host KV shared-memory names must be non-empty")
+		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
+			model_name, host_kv_cache_size,
+		)
+		return (
+			_build_host_config_from_profile(primary_profile, primary_shm_name, num_pages),
+			_build_host_config_from_profile(aux_profile, aux_shm_name, num_pages),
+		)
+
 	@classmethod
 	def from_budget(
 		cls,
@@ -192,28 +225,12 @@ class DualHostKVCoordinator:
 
 		Returns DualHostKVCoordinator or None if not a DSA model.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		configs = cls.build_host_configs(
+			model_name, host_kv_cache_size, primary_shm_name, aux_shm_name,
 		)
-		if not is_dsa_model(model_name):
+		if configs is None:
 			return None
-
-		if primary_shm_name is None:
-			primary_shm_name = HOST_KV_SHM_NAME
-		if aux_shm_name is None:
-			aux_shm_name = HOST_KV_AUX_SHM_NAME
-		if not primary_shm_name or not aux_shm_name:
-			raise ValueError("Host KV shared-memory names must be non-empty")
-		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
-			model_name, host_kv_cache_size,
-		)
-
-		primary_config = _build_host_config_from_profile(
-			primary_profile, primary_shm_name, num_pages,
-		)
-		aux_config = _build_host_config_from_profile(
-			aux_profile, aux_shm_name, num_pages,
-		)
+		primary_config, aux_config = configs
 
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVWorkerView")
@@ -247,7 +264,7 @@ class DualHostKVCoordinator:
 		logger.info(
 			"DualHostKVCoordinator created: %d pages, "
 			"primary k_dim=%d, aux k_dim=%d",
-			num_pages, primary_profile.k_head_dim, aux_profile.k_head_dim,
+			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
 		)
 		return coordinator
 
@@ -264,28 +281,12 @@ class DualHostKVCoordinator:
 
 		Returns (primary_manager, aux_manager) or None if not DSA.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		configs = cls.build_host_configs(
+			model_name, host_kv_cache_size, primary_shm_name, aux_shm_name,
 		)
-		if not is_dsa_model(model_name):
+		if configs is None:
 			return None
-
-		if primary_shm_name is None:
-			primary_shm_name = HOST_KV_SHM_NAME
-		if aux_shm_name is None:
-			aux_shm_name = HOST_KV_AUX_SHM_NAME
-		if not primary_shm_name or not aux_shm_name:
-			raise ValueError("Host KV shared-memory names must be non-empty")
-		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
-			model_name, host_kv_cache_size,
-		)
-
-		primary_config = _build_host_config_from_profile(
-			primary_profile, primary_shm_name, num_pages,
-		)
-		aux_config = _build_host_config_from_profile(
-			aux_profile, aux_shm_name, num_pages,
-		)
+		primary_config, aux_config = configs
 
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
@@ -316,7 +317,7 @@ class DualHostKVCoordinator:
 		logger.info(
 			"DualHostKVCoordinator managers created: %d pages, "
 			"primary k_dim=%d, aux k_dim=%d",
-			num_pages, primary_profile.k_head_dim, aux_profile.k_head_dim,
+			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
 		)
 		return primary_mgr, aux_mgr
 
@@ -330,6 +331,15 @@ class DualHostKVCoordinator:
 		if self.auxiliary is None:
 			raise RuntimeError(f"{context}: auxiliary host KV is required for DSA")
 		return self.auxiliary
+
+	def views_by_group(self) -> dict:
+		"""The prefix-cache KV group of each region: 0 MLA latent, 1 indexer keys.
+
+		Same order as ``build_host_configs()``, which the prefix-cache group
+		specs are derived from, so a caller holding a group id can reach the
+		exact region that stores that group's pages.
+		"""
+		return {0: self.primary, 1: self.require_auxiliary("views_by_group")}
 
 	# -- Sequence management (mirrored) --
 
