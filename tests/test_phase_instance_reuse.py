@@ -13,7 +13,10 @@ process and switches it in:
 * decode -> prefill releases only the routed experts, at reserved addresses, and
   keeps the KV region and the captured graph state mapped;
 * prefill -> decode maps the experts back and activates, with no model
-  construction, no kernel re-init and no capture.
+  construction, no kernel re-init and no capture;
+* the end of every decode interval leaves a reused instance alone: the
+  rebuild path's unregister + deep-free there is what nulled the graph
+  manager and the fused attention pointers in the first measured lifetime.
 
 The switch invariants are inverted for this path on purpose, and that inversion
 is pinned here: on the reuse lifecycle a decode -> prefill switch that tore down
@@ -26,8 +29,10 @@ needed.
 
 import ast
 import copy
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -69,7 +74,8 @@ def _isolated(names, **globals_override):
         ],
         type_ignores=[],
     )
-    namespace = {}
+    # Seeded, not only patched afterwards: annotations evaluate at def time.
+    namespace = dict(globals_override)
     exec(compile(ast.fix_missing_locations(module), str(WORKER), "exec"), namespace)
     cls = namespace["Worker"]
     for name in names:
@@ -185,7 +191,6 @@ def _release_worker(*, experts_resident=True, graph=True):
     worker._glm5_moe_cuda_graph_manager = None
     worker._glm5_layer_cuda_graph_manager = None
     worker._whole_model_segment = object() if graph else None
-    worker._reused_decode_graph_present = False
     return worker, calls
 
 
@@ -198,8 +203,6 @@ def test_release_drops_sequences_through_the_pools_and_unmaps_experts():
         ("destroy_kv", (("keep_buffers", True),)),
         "release_experts",
     ]
-    # Recorded so the invariant can tell "torn down" from "never captured".
-    assert worker._reused_decode_graph_present is True
 
 
 def test_release_is_idempotent_when_the_experts_are_already_unmapped():
@@ -210,17 +213,39 @@ def test_release_is_idempotent_when_the_experts_are_already_unmapped():
     assert calls == [("destroy_kv", (("keep_buffers", True),))]
 
 
-def test_release_records_absent_graph_state_as_absent():
-    worker, _ = _release_worker(graph=False)
+def test_release_leaves_the_captured_graph_state_in_place():
+    worker, _ = _release_worker(graph=True)
+    manager = worker._cuda_graph_manager
+    segment = worker._whole_model_segment
 
     worker._release_reused_decode_instance()
 
-    assert worker._reused_decode_graph_present is False
+    assert worker._cuda_graph_manager is manager
+    assert worker._whole_model_segment is segment
 
 
 # ---------------------------------------------------------------------------
 # The switch invariants, inverted for the reuse path
 # ---------------------------------------------------------------------------
+
+
+def _attn(*, persistent=True, registered=True, glm5=True):
+    wrapper = SimpleNamespace(persistent=persistent)
+    if glm5:
+        wrapper._fp8_qkv_a_proj = object() if registered else None
+        wrapper._fp8_qkv_a_scale = object() if registered else None
+    return wrapper
+
+
+def _decode_model(*, registered=True, layers=4):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=_attn(registered=registered))
+                for _ in range(layers)
+            ]
+        )
+    )
 
 
 def _invariant_worker(
@@ -231,11 +256,14 @@ def _invariant_worker(
     kv_initialized=True,
     experts_resident=False,
     ring_released=True,
+    attn_registered=True,
 ):
     cls = _isolated(
         [
             "_assert_phase_switch_clean",
             "_assert_kv_region_mapped",
+            "_assert_decode_graph_state_kept",
+            "_assert_decode_attention_weights_registered",
             "_decode_instance_is_reusable",
             "_decode_graph_state_present",
         ]
@@ -251,7 +279,8 @@ def _invariant_worker(
     worker._glm5_moe_cuda_graph_manager = None
     worker._glm5_layer_cuda_graph_manager = None
     worker._whole_model_segment = None
-    worker._reused_decode_graph_present = graph_was_present
+    worker._decode_graph_captures = 1 if graph_was_present else 0
+    worker.model = _decode_model(registered=attn_registered)
     worker.gpu_paged_kv_cache_manager = (
         SimpleNamespace(is_initialized=True) if kv_initialized else None
     )
@@ -534,3 +563,318 @@ def test_every_invariant_call_site_passes_the_mode_explicitly():
             ):
                 kw = {k.arg for k in node.keywords}
                 assert "reused" in kw, f"{name}: call without reused="
+
+
+# ---------------------------------------------------------------------------
+# Capture once: the decode residents survive the prefill phase
+# ---------------------------------------------------------------------------
+#
+# The first measured lifetime on the reuse path activated correctly and then
+# died in graph capture with "Layer 0: GLM-5 whole-model graph requires fused
+# Q-A/KV-A weights". Neither switch was at fault: the end-of-interval cleanup
+# in generate() still ran the rebuild path's _unregister_fp8_weights() +
+# deep_free_model_memory() on the reused instance. That nulled the graph
+# manager (so the next decode re-entered capture) and every attention wrapper's
+# fused Q-A/KV-A pointers (which capture checks). The decode->prefill invariant
+# missed it because it compared against a graph-presence snapshot taken at
+# release time, i.e. after the damage.
+
+
+def test_reuse_prefill_to_decode_raises_when_graph_state_was_torn_down():
+    worker = _invariant_worker(
+        experts_resident=True, graph_present=False, graph_was_present=True
+    )
+
+    with pytest.raises(RuntimeError, match="tore down the captured decode graph"):
+        worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+
+def test_reuse_prefill_to_decode_raises_when_attention_weights_unregistered():
+    worker = _invariant_worker(experts_resident=True, attn_registered=False)
+
+    with pytest.raises(RuntimeError, match="fused Q-A/KV-A attention weights"):
+        worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+
+def test_attention_check_reads_only_resident_fused_wrappers():
+    """Streamed wrappers and other wrapper types carry no registered pointers."""
+    worker = _invariant_worker(experts_resident=True)
+    worker.model.model.layers.append(
+        SimpleNamespace(self_attn=_attn(persistent=False, registered=False))
+    )
+    worker.model.model.layers.append(
+        SimpleNamespace(self_attn=_attn(glm5=False))
+    )
+
+    worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+
+def test_the_building_switch_does_not_check_attention_registration():
+    """reused=False: the build itself registers them."""
+    worker = _invariant_worker(
+        experts_resident=True, attn_registered=False, graph_was_present=False
+    )
+    worker._assert_phase_switch_clean("prefill_to_decode", reused=False)
+
+
+def _interval_worker(*, persistent=False, reusable=True):
+    cls = _isolated(["_finish_decode_interval", "_decode_instance_is_reusable"])
+    worker = cls()
+    calls = []
+    worker.parallel_manager = SimpleNamespace(
+        reuse_phase_instances=reusable,
+        decode_instance=(object(), {}) if reusable else None,
+    )
+    worker._persistent_phase_enabled = lambda: persistent
+    worker._unregister_fp8_weights = lambda: calls.append("unregister")
+    worker.deep_free_model_memory = lambda: calls.append("deep_free")
+    return worker, calls
+
+
+def test_interval_cleanup_leaves_a_reused_instance_alone():
+    worker, calls = _interval_worker(reusable=True)
+    worker._finish_decode_interval()
+    assert calls == []
+
+
+def test_interval_cleanup_leaves_a_persistent_instance_alone():
+    worker, calls = _interval_worker(persistent=True, reusable=False)
+    worker._finish_decode_interval()
+    assert calls == []
+
+
+def test_interval_cleanup_still_frees_on_the_rebuild_path():
+    worker, calls = _interval_worker(reusable=False)
+    worker._finish_decode_interval()
+    assert calls == ["unregister", "deep_free"]
+
+
+def test_generate_routes_decode_cleanup_through_the_gated_helper():
+    method = _method_ast("generate")
+    names = _call_names(
+        method,
+        {"_finish_decode_interval", "deep_free_model_memory", "_unregister_fp8_weights"},
+    )
+    assert "_finish_decode_interval" in names
+    assert "deep_free_model_memory" not in names
+    # The remaining direct unregister is the prefill model's, after prefill.
+    assert names.count("_unregister_fp8_weights") == 1
+    assert names.index("_unregister_fp8_weights") < names.index("_finish_decode_interval")
+
+
+def _active_worker(*, reusable=True, resident=True, active=True):
+    cls = _isolated(["_decode_instance_is_active", "_decode_instance_is_reusable"])
+    worker = cls()
+    worker.rank = 1
+    model = object()
+    worker.parallel_manager = SimpleNamespace(
+        reuse_phase_instances=reusable,
+        decode_instance=(model, {}) if reusable else None,
+        decode_experts_resident=resident,
+    )
+    worker.model = model if active else object()
+    return worker
+
+
+def test_decode_to_decode_interval_is_recognised():
+    assert _active_worker()._decode_instance_is_active() is True
+    # After decode -> prefill the experts are unmapped: activation is due.
+    assert _active_worker(resident=False)._decode_instance_is_active() is False
+    # No reusable instance: the rebuild path decides.
+    assert _active_worker(reusable=False)._decode_instance_is_active() is False
+
+
+def test_mapped_experts_on_an_inactive_instance_fail_loud():
+    with pytest.raises(RuntimeError, match="not the active model"):
+        _active_worker(active=False)._decode_instance_is_active()
+
+
+def test_decode_to_decode_interval_returns_before_any_switch_work():
+    method = _method_ast("_load_decode_model")
+    early = next(
+        node
+        for node in method.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self._decode_instance_is_active()"
+    )
+    assert [type(n) for n in early.body] == [ast.Return]
+    first_switch_work = min(
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"stop_h2d_worker", "activate_decoding", "configure_decoding"}
+    )
+    assert early.lineno < first_switch_work
+
+
+def test_capture_guard_precedes_any_capture_state():
+    method = _method_ast("_setup_cuda_graphs")
+    guard = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "_decode_graph_captures" in ast.unparse(node.test)
+        and "_decode_instance_is_reusable" in ast.unparse(node.test)
+    )
+    assert any(isinstance(n, ast.Raise) for n in guard.body)
+    later = [
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "Glm5WholeModelSegment")
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                in {"_release_glm5_whole_model_graph_state", "ensure_cuda_graph_page_table"}
+            )
+        )
+    ]
+    assert later and guard.lineno < min(later)
+
+
+def test_capture_episodes_are_counted_after_the_signature_is_recorded():
+    src = ast.unparse(_method_ast("_setup_cuda_graphs"))
+    sig = src.index(
+        "self._glm5_whole_model_graph_signature = "
+        "self._glm5_whole_model_graph_capture_signature()"
+    )
+    count = src.index("self._decode_graph_captures = ")
+    assert sig < count
+
+
+def test_required_seqlen_is_log_only():
+    """The per-batch span never reaches the capture signature or a decision.
+
+    Verified for Phase C: `required_seqlen` is read in exactly one place, the
+    rank-0 log line. The graph span is `graph_max_seqlen`, derived from KV
+    capacity, and the signature is the page-table storage identity.
+    """
+    method = _method_ast("_setup_cuda_graphs")
+    loads = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Name)
+        and node.id == "required_seqlen"
+        and isinstance(node.ctx, ast.Load)
+    ]
+    assert len(loads) == 1
+    log_calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "info"
+    ]
+    assert any(loads[0] in list(ast.walk(call)) for call in log_calls)
+    sig = ast.unparse(_method_ast("_glm5_whole_model_graph_capture_signature"))
+    assert "required_seqlen" not in sig and "max_seqlen" not in sig
+
+
+class _FakeStorage:
+    def __init__(self, ptr, shape):
+        self._ptr = ptr
+        self.shape = shape
+        self.dtype = "torch.int32"
+        self.device = "cuda:0"
+
+    def data_ptr(self):
+        return self._ptr
+
+
+class _FakeKv:
+    """Fixed-address graph page table: storage never moves (PR #458)."""
+
+    def __init__(self, ptr):
+        self._storage = _FakeStorage(ptr, (128, 4096))
+        self.resets = 0
+
+    def get_cuda_graph_page_table_storage(self):
+        return self._storage
+
+    def reset_allocations(self):
+        self.resets += 1
+
+
+class _FakeBucketing:
+    bucket_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+
+    def get_padded_size(self, n):
+        return next(b for b in self.bucket_sizes if b >= n)
+
+
+class _FakeManager:
+    bucketing = _FakeBucketing()
+
+    def has_bucket_for_all_segments(self, n):
+        return True
+
+
+def _load_policy():
+    spec = importlib.util.spec_from_file_location(
+        "_cuda_graph_policy",
+        ROOT / "batchgen" / "models" / "glm" / "glm5" / "cuda_graph_policy.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_batches_with_different_spans_never_invalidate_the_capture():
+    """Two batches, different spans and sizes, one captured signature.
+
+    Per-batch variation rides the dynamic graph inputs and the max-sized
+    tables; the capture is keyed to KV capacity and page-table identity only.
+    Between the batches the reuse lifecycle drops every sequence through the
+    pools (decode -> prefill) and switches the instance back in.
+    """
+    attn = SimpleNamespace(max_seqlen=0)
+    cls = _isolated(
+        [
+            "_glm5_whole_model_graph_current_bucket_missing",
+            "_glm5_whole_graph_path_state",
+            "_glm5_whole_model_graph_capture_signature",
+        ],
+        AttnWrapperBase=attn,
+        Optional=Optional,
+        logging=SimpleNamespace(info=lambda *a, **k: None),
+    )
+    worker = cls()
+    worker.rank = 0
+    worker.model_name = "glm-5.2-fp8"
+    primary, aux = _FakeKv(0x7F0000000000), _FakeKv(0x7F1000000000)
+    gpu = SimpleNamespace(primary=primary, auxiliary=aux)
+    worker.core_engine = SimpleNamespace(gpu_paged_kv_manager_aux=aux)
+    worker._get_cuda_graph_gpu_manager = lambda: gpu
+    worker._glm5_whole_model_graph_requested_for_current_batch = lambda: True
+    worker._glm5_whole_model_graph_unavailable_reason = None
+    worker._glm5_whole_model_graph_failed_buckets = set()
+    worker._glm5_whole_model_all_short = False
+    worker._glm5_whole_model_index_topk = 2048
+    # One capture, at the building switch, spanning the KV capacity.
+    worker._cuda_graph_manager = _FakeManager()
+    worker._glm5_whole_model_graph = True
+    worker._whole_model_segment = SimpleNamespace(max_seqlen=200_000)
+    worker._glm5_whole_model_graph_capture_attempted_for_batch = True
+    worker._glm5_whole_model_graph_signature = (
+        worker._glm5_whole_model_graph_capture_signature()
+    )
+    policy = _load_policy()
+
+    invalidations = 0
+    for max_bsz, span in ((37, 3_648), (128, 131_072), (5, 913)):
+        primary.reset_allocations()  # decode -> prefill on the reuse path
+        aux.reset_allocations()
+        worker._current_decode_max_rank_batch_size = max_bsz
+        attn.max_seqlen = span
+        warm = policy.should_warmup_cuda_graphs_before_decode(
+            graph_manager_is_initialized=worker._cuda_graph_manager is not None,
+            global_batch_has_queueing=False,
+            model_name=worker.model_name,
+        ) or worker._glm5_whole_model_graph_current_bucket_missing()
+        path, _, reason = worker._glm5_whole_graph_path_state(max_bsz)
+        invalidations += int(warm)
+        assert (path, reason) == ("graph", "captured"), (max_bsz, span, reason)
+
+    assert invalidations == 0

@@ -1122,7 +1122,10 @@ class BatchGenWorker:
 		# prefill->decode switch invariant.
 		self._prefill_ring_released_for_switch = False
 		self._phase = None
-		self._reused_decode_graph_present = False
+		# Whole-model decode graph capture episodes completed by this process.
+		# On the reuse lifecycle it must stay at 1: the switch invariants and
+		# the capture-once guard in _setup_cuda_graphs read it.
+		self._decode_graph_captures = 0
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -8035,9 +8038,7 @@ class BatchGenWorker:
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
-				if not self._persistent_phase_enabled():
-					self._unregister_fp8_weights()
-					self.deep_free_model_memory()
+				self._finish_decode_interval()
 				dist.barrier()
 
 				# Poll for new admissions after each decode interval.
@@ -8268,6 +8269,8 @@ class BatchGenWorker:
 						"mapped; a graph replay would read unmapped memory"
 					)
 				self._assert_kv_region_mapped("prefill->decode")
+				self._assert_decode_graph_state_kept("prefill->decode")
+				self._assert_decode_attention_weights_registered()
 			return
 		if direction == "decode_to_prefill":
 			if reused:
@@ -8275,14 +8278,7 @@ class BatchGenWorker:
 				# the KV region are supposed to outlive this switch. Tearing either
 				# down is what would force the recapture this lifecycle exists to
 				# remove, and the KV region must stay mapped for #424 anyway.
-				if getattr(self, "_reused_decode_graph_present", False) and not (
-					self._decode_graph_state_present()
-				):
-					raise RuntimeError(
-						f"Rank {self.rank}: decode->prefill switch tore down the "
-						"captured decode graph state of a reused instance; it must "
-						"survive the prefill phase"
-					)
+				self._assert_decode_graph_state_kept("decode->prefill")
 				self._assert_kv_region_mapped("decode->prefill")
 				pm = self.parallel_manager
 				if getattr(pm, "decode_experts_resident", False):
@@ -8704,6 +8700,12 @@ class BatchGenWorker:
 		if self._persistent_phase_enabled():
 			self._activate_persistent_decode_instance(comm)
 			return
+		if self._decode_instance_is_active():
+			# decode -> decode interval: the reused instance is already switched
+			# in, its experts mapped and its graphs captured. Same early return
+			# as _activate_persistent_decode_instance; re-activating would map
+			# an arena that is already mapped.
+			return
 		# Release the prefill phase's H2D ring and queues BEFORE building the
 		# decode model, not after it. The routed-expert weight ring installed
 		# for prefill used to stay mapped through the whole decode configure, so
@@ -8923,10 +8925,83 @@ class BatchGenWorker:
 		large class prefill actually needs back.
 		"""
 		pm = self.parallel_manager
-		self._reused_decode_graph_present = self._decode_graph_state_present()
 		self._destroy_gpu_paged_kv_cache(keep_buffers=True)
 		if getattr(pm, "decode_experts_resident", False):
 			pm.release_decode_routed_experts()
+
+	def _decode_instance_is_active(self) -> bool:
+		"""True when the reused decode instance is the one switched in now.
+
+		Its routed experts are mapped exactly while it is active: the building
+		switch maps them, decode -> prefill unmaps them, and every activation
+		maps them back.
+		"""
+		if not self._decode_instance_is_reusable():
+			return False
+		pm = self.parallel_manager
+		if not getattr(pm, "decode_experts_resident", False):
+			return False
+		if self.model is not pm.decode_instance[0]:
+			raise RuntimeError(
+				f"Rank {self.rank}: the reused decode instance has its routed "
+				"experts mapped but is not the active model; they are only "
+				"mapped while that instance is switched in"
+			)
+		return True
+
+	def _finish_decode_interval(self) -> None:
+		"""End-of-interval cleanup for the decode model that just ran.
+
+		The rebuild path unregisters the model's FP8 weight pointers and
+		deep-frees it, because its next decode configure builds a new model.
+		Persistent and reused instances are never rebuilt; they are switched
+		back in and their captured graphs replayed. Running this cleanup on a
+		reused instance nulled the graph manager, so the next activation
+		re-entered capture, and nulled every attention wrapper's fused
+		Q-A/KV-A pointers, which that capture requires.
+		"""
+		if self._persistent_phase_enabled() or self._decode_instance_is_reusable():
+			return
+		self._unregister_fp8_weights()
+		self.deep_free_model_memory()
+
+	def _assert_decode_graph_state_kept(self, context: str) -> None:
+		"""A reused instance's captured graphs outlive every phase switch."""
+		if getattr(self, "_decode_graph_captures", 0) > 0 and not (
+			self._decode_graph_state_present()
+		):
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch tore down the captured "
+				"decode graph state of a reused instance; it is captured once "
+				"per process and must survive every phase switch"
+			)
+
+	def _assert_decode_attention_weights_registered(self) -> None:
+		"""A reused decode instance keeps its resident attention weights.
+
+		The build registers them once; its graphs were captured against them,
+		and an eager step or a capture reads the fused Q-A/KV-A pointers. Nothing
+		on the reuse lifecycle may unregister them.
+		"""
+		missing = []
+		for layer_idx, layer in enumerate(self.model.model.layers):
+			wrapper = layer.self_attn
+			if not getattr(wrapper, "persistent", False):
+				continue
+			if not hasattr(wrapper, "_fp8_qkv_a_proj"):
+				continue
+			if (
+				wrapper._fp8_qkv_a_proj is None
+				or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
+			):
+				missing.append(layer_idx)
+		if missing:
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill->decode switch activated a reused "
+				"decode instance whose fused Q-A/KV-A attention weights are "
+				f"unregistered on {len(missing)} layer(s) (first {missing[:5]}); "
+				"they must stay registered across the prefill phase"
+			)
 
 	def _persistent_phase_enabled(self) -> bool:
 		"""True when --persistent-phase-instances keeps both phase instances."""
@@ -13803,6 +13878,20 @@ class BatchGenWorker:
 						"configure-time capture; using eager decode instead of recapturing"
 					)
 					return
+			# Capture-once on the reuse lifecycle: the building switch captures a
+			# reused instance's graphs and every later activation replays them.
+			# Getting here again means their state was torn down; recapturing
+			# would hide that, and it needs model state (fused attention
+			# pointers, MoE pointer tables) a torn-down instance no longer has.
+			if (
+				getattr(self, "_decode_graph_captures", 0) > 0
+				and self._decode_instance_is_reusable()
+			):
+				raise RuntimeError(
+					f"Rank {self.rank}: decode graph capture requested again for a "
+					"reused decode instance; its graphs are captured once per "
+					"process and their state must survive every phase switch"
+				)
 
 			from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 				Glm5WholeModelSegment,
@@ -14160,6 +14249,7 @@ class BatchGenWorker:
 				)
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
+			self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
 			# Phase B: hand the just-captured segment to the adapter so its
 			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
 			# can run against the same captured graph the legacy path uses.
