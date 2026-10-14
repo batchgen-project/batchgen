@@ -81,6 +81,7 @@ class SequenceEntry:
         # Dynamic host KV reservation tracking
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
+        'host_owned_pages',      # Pages in this sequence's own Host chain (what release frees)
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -159,6 +160,7 @@ class SequenceEntry:
         # Dynamic host KV reservation: starts at 0, set by worker at prefill time
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
+        self.host_owned_pages: int = 0
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None
@@ -302,6 +304,10 @@ class SequenceEntry:
         )
 
         require(self.host_pages_allocated >= 0, f"host_pages_allocated must be non-negative, got {self.host_pages_allocated}")
+        require(
+            0 <= self.host_owned_pages <= self.host_pages_allocated,
+            f"host_owned_pages={self.host_owned_pages} must be within [0, host_pages_allocated={self.host_pages_allocated}]",
+        )
         require(self.host_token_capacity >= 0, f"host_token_capacity must be non-negative, got {self.host_token_capacity}")
         require(self.gpu_pages_allocated >= 0, f"gpu_pages_allocated must be non-negative, got {self.gpu_pages_allocated}")
         if self.host_pages_allocated:
@@ -349,6 +355,7 @@ class SequenceEntry:
             require(self.assigned_rank is not None, "EVICTED requires assigned_rank for deterministic re-entry")
             require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
             require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
+            require(self.host_owned_pages == 0, f"EVICTED requires host_owned_pages=0, got {self.host_owned_pages}")
             if require_owner_tensors:
                 # Unified QueryBook keeps the trajectory in its fixed token
                 # pages and deliberately clears the legacy dense handoff tensor.
