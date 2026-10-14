@@ -361,17 +361,27 @@ def test_host_prefix_cache_releases_shared_physical_page_after_last_ref():
         pass
 
 
-def test_host_prefix_cache_owner_creation_is_exclusive():
+def test_host_prefix_cache_attach_requires_memfd_identity():
+    # Anonymous regions have no name to collide on; identity is the
+    # creator's (pid, fd). An attach without it must fail loud, and the
+    # owner publishes a real fd for workers to open via /proc.
     shm_name = _random_shm_name()
-    try:
-        owner = bg.HostPrefixCacheCoordinator(_config(shm_name))
-        owner.initialize(True)
-        duplicate_owner = bg.HostPrefixCacheCoordinator(_config(shm_name))
-        with pytest.raises(RuntimeError, match="shm_open failed"):
-            duplicate_owner.initialize(True)
-    finally:
-        # Anonymous memfd region: nothing named exists to unlink.
-        pass
+    owner = bg.HostPrefixCacheCoordinator(_config(shm_name))
+    owner.initialize(True)
+    assert owner.memfd_fd() >= 0
+
+    attacher = bg.HostPrefixCacheCoordinator(_config(shm_name))
+    with pytest.raises(RuntimeError, match="memfd_creator_pid"):
+        attacher.initialize(False)
+
+    import os
+
+    config = _config(shm_name)
+    config.memfd_creator_pid = os.getpid()
+    config.memfd_fd = owner.memfd_fd()
+    worker = bg.HostPrefixCacheCoordinator(config)
+    worker.initialize(False)
+    assert worker.get_stats().resident_nodes == owner.get_stats().resident_nodes
 
 
 def test_host_prefix_cache_clear_skips_active_entries():

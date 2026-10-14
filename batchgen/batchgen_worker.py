@@ -5155,7 +5155,9 @@ class BatchGenWorker:
 		return reservations, owner_requests
 
 	def _collective_prefill_host_capacity_ok(
-		self, owner_requests: List[Tuple[str, int]]
+		self,
+		owner_requests: List[Tuple[str, int]],
+		local_error: bool = False,
 	) -> bool:
 		"""Check a fresh per-node host-KV snapshot before any mutation.
 
@@ -5172,7 +5174,7 @@ class BatchGenWorker:
 		node_id = self.rank // self.local_world_size
 		local_free = -1
 		local_total = -1
-		snapshot_error = 0
+		snapshot_error = 1 if local_error else 0
 		host_view = getattr(self, "host_paged_kv_worker_view", None)
 		if host_view is None:
 			host_view = getattr(
@@ -5293,16 +5295,41 @@ class BatchGenWorker:
 		bindings are mutated.  Allocator exceptions are converted into a
 		collective failure and successful peers release their tentative pages.
 		"""
-		if self.enable_prefix_cache and self.prefix_cache_coordinator is not None:
-			self._attach_prefix_cache_for_prefill(prefill_uuids)
 		wave_global_ids = [
-			self.global_batch.get_sequence(uuid).global_idx
-			for uuid in prefill_uuids
+			seq.global_idx
+			for seq in (
+				self.global_batch.get_sequence(uuid) for uuid in prefill_uuids
+			)
+			if seq is not None
 		]
-		reservations, owner_requests = self._prefill_host_reservation_plan(
-			prefill_uuids
+		reservations: Dict[str, Tuple[int, int]] = {}
+		owner_requests: List[Tuple[str, int]] = []
+		plan_error = False
+		try:
+			if self.enable_prefix_cache and self.prefix_cache_coordinator is not None:
+				self._attach_prefix_cache_for_prefill(prefill_uuids)
+			reservations, owner_requests = self._prefill_host_reservation_plan(
+				prefill_uuids
+			)
+		except Exception:
+			# Every rank must still reach the capacity collective below, or the
+			# peers wait in all_gather forever while this rank raises.
+			plan_error = True
+			logging.exception(
+				"Rank %s: prefix lookup or reservation plan failed before the "
+				"host-KV capacity collective",
+				self.rank,
+			)
+		capacity_ok = self._collective_prefill_host_capacity_ok(
+			owner_requests, local_error=plan_error
 		)
-		if not self._collective_prefill_host_capacity_ok(owner_requests):
+		if plan_error:
+			self._release_prefix_cache_attachments(wave_global_ids)
+			raise RuntimeError(
+				f"Rank {self.rank}: host-KV prefill plan failed; the wave was "
+				"rejected collectively before any allocator mutation"
+			)
+		if not capacity_ok:
 			if self.rank == 0:
 				logging.warning(
 					"[PREFILL] Host KV admission rejected by fresh capacity snapshot; "
