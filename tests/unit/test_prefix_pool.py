@@ -40,13 +40,14 @@ def make_pool(num_pages=8, num_layers=2):
 def test_budget_leaves_room_for_the_workspace():
     assert pool_pages_from_budget(1000, 200, 300) == 2
     assert pool_pages_from_budget(1000, 1000, 300) == 0
+    # Less free memory than the workspace: no pool, the wave keeps the
+    # existing path instead of failing.
+    assert pool_pages_from_budget(100, 200, 32) == 0
 
 
 def test_budget_rejects_bad_inputs():
     with pytest.raises(ValueError):
         pool_pages_from_budget(1000, 200, 0)
-    with pytest.raises(ValueError):
-        pool_pages_from_budget(100, 200, 32)
 
 
 def test_scratch_bound_covers_partial_pages_and_oversized_items():
@@ -103,3 +104,19 @@ def test_release_requires_every_page_back():
     pool.free(pages)
     pool.release()
     assert pool.k is None and pool.v is None
+
+
+def test_dsa_pool_keeps_latent_and_full_layer_indexer_keys_only():
+    pool = PrefillPrefixPool(
+        num_layers=6, num_pages=3, page_tokens=4, num_kv_heads=1, head_dim=8,
+        dtype=torch.bfloat16, device="cpu", with_v=False,
+        indexer_layers=(0, 1, 5), indexer_dim=2,
+    )
+
+    assert pool.v is None
+    assert pool.k.shape == (6, 3, 4, 1, 8)
+    assert pool.indexer.shape == (3, 3, 4, 2)
+    assert pool.indexer_row == {0: 0, 1: 1, 5: 2}
+    assert pool.page_bytes == (6 * 4 * 8 + 3 * 4 * 2) * 2
+    pool.release()
+    assert pool.k is None and pool.indexer is None

@@ -120,7 +120,8 @@ def sids():
 
 
 def commit_and_attach(wave, view, coord):
-    handles = commit_pool_segments(wave, coordinator=coord, worker_view=view, namespace_digest=DIGEST,
+    handles = commit_pool_segments(wave, coordinator=coord, worker_views_by_group={0: view},
+                                   namespace_digest=DIGEST,
                                    publish_boundary_tokens=B, max_scan_nodes=100)
     members = attach_pool_members(wave, coordinator=coord, namespace_digest=DIGEST)
     for handle in handles:
@@ -130,18 +131,18 @@ def commit_and_attach(wave, view, coord):
 
 def test_segments_get_exact_pages_and_members_their_chain():
     wave, view = make_wave(), FakeWorkerView()
-    allocated = allocate_segment_host_pages(wave, view, sids())
+    allocated = allocate_segment_host_pages(wave, {0: view}, sids())
     assert allocated == sum(s.tokens for s in wave.plan.segments) // B
-    a, a1 = wave.segment_host_pages[0], wave.segment_host_pages[1]
+    a, a1 = wave.segment_host_pages[0][0], wave.segment_host_pages[1][0]
     assert wave.chains[0] == (0, 1)
-    assert wave.chain_host_pages(0) == a + a1
-    assert wave.segment_prefix_pages(1) == a + a1
+    assert wave.chain_host_pages(0) == {0: a + a1}
+    assert wave.segment_prefix_pages(1) == {0: a + a1}
     assert wave.chains[6] == ()
 
 
 def test_commit_parents_first_retains_segment_pages_and_pins_members():
     wave, view, coord = make_wave(), FakeWorkerView(), FakeCoordinator()
-    allocate_segment_host_pages(wave, view, sids())
+    allocate_segment_host_pages(wave, {0: view}, sids())
     members = commit_and_attach(wave, view, coord)
     # parents first: a segment's parent segment was committed before it
     order = {commit: i for i, commit in enumerate(coord.commits)}
@@ -150,7 +151,8 @@ def test_commit_parents_first_retains_segment_pages_and_pins_members():
             parent = wave.plan.segments[seg.parent_id]
             prompt = TREE[seg.members[0]]
             assert order[tuple(prompt[:parent.token_end])] < order[tuple(prompt[:seg.token_end])]
-    assert all(view.owner[p] == "resident" for pages in wave.segment_host_pages.values() for p in pages)
+    assert all(view.owner[p] == "resident" for groups in wave.segment_host_pages.values()
+               for pages in groups.values() for p in pages)
     assert sorted(members) == [0, 1, 2, 3, 4, 5]  # every prompt with a chain
     assert coord.open == set(members.values())  # segment handles released, no leak
 
@@ -159,17 +161,18 @@ def test_segment_already_published_by_another_rank_stays_with_pseudo_id():
     wave, view, coord = make_wave(), FakeWorkerView(), FakeCoordinator()
     for block in range(len(A) // B):  # another rank published A with its own pages
         coord.nodes[tuple(A[:(block + 1) * B])] = 9000 + block
-    allocate_segment_host_pages(wave, view, sids())
+    allocate_segment_host_pages(wave, {0: view}, sids())
     commit_and_attach(wave, view, coord)
     a_sid = wave.segment_sids[0]
-    assert all(view.owner[p] == a_sid for p in wave.segment_host_pages[0])  # not retained
-    assert all(view.owner[p] == "resident" for p in wave.segment_host_pages[1])  # A1 inserted
+    assert all(view.owner[p] == a_sid for p in wave.segment_host_pages[0][0])  # not retained
+    assert all(view.owner[p] == "resident" for p in wave.segment_host_pages[1][0])  # A1 inserted
 
 
 def test_missing_chain_raises_without_leaking_handles():
     wave, view, coord = make_wave(), FakeWorkerView(), FakeCoordinator()
-    allocate_segment_host_pages(wave, view, sids())
-    handles = commit_pool_segments(wave, coordinator=coord, worker_view=view, namespace_digest=DIGEST,
+    allocate_segment_host_pages(wave, {0: view}, sids())
+    handles = commit_pool_segments(wave, coordinator=coord, worker_views_by_group={0: view},
+                                   namespace_digest=DIGEST,
                                    publish_boundary_tokens=B, max_scan_nodes=100)
     del coord.nodes[tuple(A + A1)]  # the A1 node vanished before the members attach
     with pytest.raises(RuntimeError, match="resident"):

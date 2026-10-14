@@ -916,6 +916,7 @@ class WorkerManager:
             ),
             host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
             host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+            prefix_cache_shm_name=self.args.runtime_identity.prefix_cache_shm_name,
             query_book_shm_prefix=(
                 self.args.runtime_identity.query_book_shm_prefix
             ),
@@ -1437,14 +1438,30 @@ class WorkerManager:
             create_host_prefix_cache_coordinator,
         )
 
-        host_config = build_host_kv_config(
-            model_name=self.args.model,
-            host_kv_cache_size=int(self.args.host_kv_cache_size * (1024**3)),
+        from batchgen.kv_cache.dual_host_kv_coordinator import (
+            DualHostKVCoordinator,
         )
+
+        # Size the index from the same Host-KV split the workers use.
+        host_budget = int(self.args.host_kv_cache_size * (1024**3))
+        identity = self.args.runtime_identity
+        configs = DualHostKVCoordinator.build_host_configs(
+            self.args.model, host_budget,
+            identity.host_kv_shm_name, identity.host_kv_aux_shm_name,
+        )
+        if configs is None:
+            host_config = build_host_kv_config(
+                model_name=self.args.model, host_kv_cache_size=host_budget,
+            )
+            aux_config = None
+        else:
+            host_config, aux_config = configs
         self.prefix_cache_runtime_config = build_prefix_cache_runtime_config(
             model_name=self.args.model,
             kv_dtype=self.args.kv_dtype,
             host_kv_config=host_config,
+            aux_host_kv_config=aux_config,
+            shm_name=self.args.runtime_identity.prefix_cache_shm_name,
             debug_stats=self.args.prefix_cache_debug_stats,
         )
         self.prefix_cache_coordinator = create_host_prefix_cache_coordinator(

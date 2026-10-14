@@ -67,6 +67,10 @@ class RuntimeIdentity:
         return f"{self.shm_prefix}host_kv_aux"
 
     @property
+    def prefix_cache_shm_name(self) -> str:
+        return f"{self.shm_prefix}prefix_cache"
+
+    @property
     def query_book_shm_prefix(self) -> str:
         return f"{self.shm_prefix}input_ids"
 

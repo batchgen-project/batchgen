@@ -777,6 +777,7 @@ class BatchGenWorkerArgs:
 	input_ids_pool_size_gb: float = 50.0  # Fixed node-shared int32 token budget.
 	host_kv_shm_name: str = "batchgen_host_kv_cache"
 	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
+	prefix_cache_shm_name: str = "batchgen_prefix_cache"
 	query_book_shm_prefix: str = "batchgen_input_ids"
 	reload_status_dir: str = "/tmp/batchgen_reload_status"
 	pynccl_port_base: int = 20003
@@ -1058,6 +1059,11 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: Initializing DualHostKVCoordinator with parallel cudaHostRegister (local_rank={self.local_rank})")
 			dual_host.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: DualHostKVCoordinator cudaHostRegister completed (local_rank={self.local_rank})")
+			# The same split the views were built from (MLA latent + indexer keys).
+			prefix_host_config, prefix_aux_config = DualHostKVCoordinator.build_host_configs(
+				args.model_name, host_budget_bytes,
+				args.host_kv_shm_name, args.host_kv_aux_shm_name,
+			)
 		else:
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
@@ -1081,30 +1087,33 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: Initializing Host KV view with cudaHostRegister (local_rank={self.local_rank}, fast_init={args.fast_init})")
 			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
+			prefix_host_config, prefix_aux_config = worker_kv_config, None
 
-			if self.enable_prefix_cache:
-				from batchgen.prefix_reuse.config import (
-					build_prefix_cache_runtime_config,
-					create_host_prefix_cache_coordinator,
-				)
+		if self.enable_prefix_cache:
+			from batchgen.prefix_reuse.config import (
+				build_prefix_cache_runtime_config,
+				create_host_prefix_cache_coordinator,
+			)
 
-				self.prefix_cache_runtime_config = (
-					build_prefix_cache_runtime_config(
-						model_name=args.model_name,
-						kv_dtype=args.kv_dtype,
-						host_kv_config=worker_kv_config,
-						debug_stats=self.prefix_cache_debug_stats,
-						memfd_creator_pid=args.prefix_memfd_pid,
-						memfd_fd=args.prefix_memfd_fd,
-					)
+			self.prefix_cache_runtime_config = (
+				build_prefix_cache_runtime_config(
+					model_name=args.model_name,
+					kv_dtype=args.kv_dtype,
+					host_kv_config=prefix_host_config,
+					aux_host_kv_config=prefix_aux_config,
+					shm_name=args.prefix_cache_shm_name,
+					debug_stats=self.prefix_cache_debug_stats,
+					memfd_creator_pid=args.prefix_memfd_pid,
+					memfd_fd=args.prefix_memfd_fd,
 				)
-				self.prefix_cache_coordinator = (
-					create_host_prefix_cache_coordinator(
-						core_engine_module=core_engine,
-						runtime_config=self.prefix_cache_runtime_config,
-						create_region=False,
-					)
+			)
+			self.prefix_cache_coordinator = (
+				create_host_prefix_cache_coordinator(
+					core_engine_module=core_engine,
+					runtime_config=self.prefix_cache_runtime_config,
+					create_region=False,
 				)
+			)
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -5238,6 +5247,11 @@ class BatchGenWorker:
 			math.ceil(int(tokens) / self.PAGE_SIZE)
 			for _, tokens in owner_requests
 		)
+		# Members' demands exclude their shared chains, but the pooled
+		# segments themselves allocate one Host copy (mirrored per group, so
+		# one count). Leaving them out over-admits the wave and the
+		# allocation fails right after the preflight passed.
+		local_need += self._prefill_pool_segment_host_pages()
 		node_id = self.rank // self.local_world_size
 		local_free = -1
 		local_total = -1
@@ -5340,6 +5354,7 @@ class BatchGenWorker:
 			page_size_tokens=(
 				self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens
 			),
+			num_groups=len(self.prefix_cache_runtime_config.group_specs),
 		)
 		prefix_states = {}
 		for uuid, result, attached, compute_cached in zip(
@@ -5364,6 +5379,18 @@ class BatchGenWorker:
 			self._prefill_pool_wave = self._plan_prefill_pool_wave(
 				owned, prefix_states
 			)
+			if (
+				self._prefill_pool_wave is None
+				and len(self.prefix_cache_runtime_config.group_specs) > 1
+			):
+				# A multi-group (DSA) hit has no cross-wave materialization
+				# path (that path serves the single full-K/V group); a wave
+				# the pool declines recomputes, so its hits must not stay
+				# attached. Single-group waves keep theirs for attach+suffix.
+				seqs = [self.global_batch.get_sequence(uuid) for uuid in owned]
+				self._replace_prefix_lookup_hits(
+					seqs, prefix_states, [0] * len(seqs)
+				)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -5445,10 +5472,11 @@ class BatchGenWorker:
 			if owner_requests:
 				host_view.register_sequences(global_ids)
 				if self._prefill_pool_wave is not None:
-					# One Host copy per pooled segment; members reference the
-					# segment chains. Segment pseudo-sids join this rollback.
+					# One Host copy per pooled segment and per KV group;
+					# members reference the segment chains. Segment
+					# pseudo-sids join this rollback.
 					self._allocate_prefill_pool_host_pages(
-						host_view,
+						self._host_views_by_group(),
 						{
 							self.global_batch.get_sequence(uuid).global_idx:
 							self._prefix_sequence_states[
@@ -5462,13 +5490,19 @@ class BatchGenWorker:
 				if self.enable_prefix_cache:
 					# Shared prefix pages join the sequence's page table before
 					# private allocation so release_sequence_pages covers both.
+					# A group's shared pages live in that group's own region.
+					host_views = self._host_views_by_group()
 					for uuid, _ in owner_requests:
 						seq = self.global_batch.get_sequence(uuid)
 						state = self._prefix_sequence_states.get(seq.global_idx)
-						if state is not None and state.shared_page_ids:
-							host_view.attach_shared_prefix_pages(
-								seq.global_idx, list(state.shared_page_ids)
-							)
+						if state is None:
+							continue
+						for group_id, view in sorted(host_views.items()):
+							shared = state.shared_page_ids_for_group(group_id)
+							if shared:
+								view.attach_shared_prefix_pages(
+									seq.global_idx, list(shared)
+								)
 				if allocation_requests:
 					host_view.allocate_pages_for_sequences(allocation_requests)
 		except Exception:
@@ -5886,7 +5920,7 @@ class BatchGenWorker:
 						released = reclaim_prefix_pages_for_host_admission(
 								core_engine_module=core_engine,
 								coordinator=self.prefix_cache_coordinator,
-								worker_views_by_group={0: worker_view},
+								worker_views_by_group=self._host_views_by_group(),
 								group_id=0,
 								page_target=page_target,
 								max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
@@ -9053,6 +9087,28 @@ class BatchGenWorker:
 			**fields,
 		)
 
+	def _host_views_by_group(self) -> dict:
+		"""One Host-KV worker view per prefix-cache KV group.
+
+		A DSA model keeps group 0 (MLA latent) in the primary region and group 1
+		(indexer keys) in the auxiliary one, so every prefix-cache Host page
+		operation has to run on both. Every other model has one region.
+		"""
+		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			views = self.host_paged_kv_worker_view.views_by_group()
+		else:
+			view = getattr(self, "host_paged_kv_worker_view", None)
+			if view is None:
+				view = self.core_engine.host_paged_kv_worker_view
+			views = {0: view}
+		runtime = self.prefix_cache_runtime_config
+		if runtime is not None and len(runtime.group_specs) != len(views):
+			raise RuntimeError(
+				"prefix cache groups do not match the Host KV regions: "
+				f"groups={len(runtime.group_specs)}, views={len(views)}"
+			)
+		return views
+
 	def _prefix_host_resource_fields(self) -> dict[str, int]:
 		from batchgen.prefix_reuse.metrics import host_resource_fields
 
@@ -9111,11 +9167,16 @@ class BatchGenWorker:
 	def _prefill_prefix_pool_enabled(self) -> bool:
 		"""In-wave prefix pool: prefix caching on, planner workspace set, pure DP prefill."""
 		workspace = self.engine_config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes
-		if (
-			not self.enable_prefix_cache
-			or workspace <= 0
-			or getattr(self, "_prefix_integrity", False)
-		):
+		if not self.enable_prefix_cache:
+			return False
+		if len(self.prefix_cache_runtime_config.group_specs) > 1 and workspace <= 0:
+			# Only the pool path serves multi-group (DSA) prefix reuse; the
+			# cross-wave materialization path handles one full-K/V group.
+			raise RuntimeError(
+				"DSA prefix reuse needs the prefill prefix pool, but this model's "
+				"planner sets no pool workspace"
+			)
+		if workspace <= 0 or getattr(self, "_prefix_integrity", False):
 			return False
 		if self._decode_attn_tp_size() != 1 or (
 			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
@@ -9405,6 +9466,9 @@ class BatchGenWorker:
 			for seq in seqs
 		]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
 		scratch = scratch_pages_bound(
@@ -9421,6 +9485,12 @@ class BatchGenWorker:
 			block_tokens=page_tokens,
 			pool_pages=total_pages - scratch,
 			chunk_tokens=chunk_tokens,
+			# Every GLM prefill forward streams all experts, so a chunk is
+			# expensive; its attention writes the chunk's KV before reading it.
+			same_chunk_ancestors=not with_v,
+			# DSA pool attention gathers every row's prefix indexer keys (bf16
+			# plus an FP8 copy, ~384 B each); keep that inside the workspace.
+			chunk_keys=None if with_v else 8 * 1024 * 1024,
 		)
 		validate_wave_prefix_plan(plan, prompts)
 		if not plan.segments:
@@ -9454,10 +9524,12 @@ class BatchGenWorker:
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
 		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
+		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		return (
-			2 * geometry.num_layers * page_tokens * geometry.num_k_heads
-			* geometry.k_head_dim * element
-		)
+			(2 if with_v else 1) * geometry.num_layers * page_tokens
+			* geometry.num_k_heads * geometry.k_head_dim
+			+ len(indexer_layers) * page_tokens * indexer_dim
+		) * element
 
 	def _measure_prefill_pool_budget(self) -> None:
 		"""Measure the prefill-phase pool page budget. Runs after every
@@ -9512,6 +9584,7 @@ class BatchGenWorker:
 
 		geometry_page_bytes = self._prefill_pool_page_bytes()
 		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
+		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		pool = PrefillPrefixPool(
 			num_layers=geometry.num_layers,
 			num_pages=num_pages,
@@ -9520,6 +9593,9 @@ class BatchGenWorker:
 			head_dim=geometry.k_head_dim,
 			dtype=geometry.kv_dtype,
 			device=self.torch_device,
+			with_v=with_v,
+			indexer_layers=indexer_layers,
+			indexer_dim=indexer_dim,
 		)
 		if pool.page_bytes != geometry_page_bytes:
 			raise RuntimeError(
@@ -9541,6 +9617,42 @@ class BatchGenWorker:
 			self.rank, pool.num_pages, pool.page_bytes, len(wave.plan.segments),
 		)
 
+	def _prefill_pool_layout(self, geometry) -> tuple:
+		"""(with_v, indexer_layers, indexer_dim) of this model's prefill pool.
+
+		A DSA model (dual Host KV) pools only the MLA latent plus the indexer
+		keys of its full (top-k computing) layers; every other model pools K/V.
+		"""
+		if not isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			return True, (), 0
+		if self.model is None:
+			# Wave planning runs at reservation time (decode phase), where the
+			# model object is not resident. The layout is a model constant and
+			# the budget gate guarantees a prefill measured it before any wave
+			# plans, so the cached copy is always available here.
+			cached = getattr(self, "_prefill_pool_layout_cache", None)
+			if cached is None:
+				raise RuntimeError(
+					"DSA prefill pool: layout requested before the first "
+					"prefill measured it"
+				)
+			return cached
+		# The layers' own indexers decide what prefill scores and offloads: a
+		# shared layer has none and reuses the previous full layer's top-k.
+		indexers = {}
+		for layer_idx, layer in enumerate(self.model.model.layers):
+			attn = getattr(layer.self_attn, "module", layer.self_attn)
+			if getattr(attn, "indexer", None) is not None:
+				indexers[layer_idx] = attn.indexer
+		if not indexers or len(self.model.model.layers) != geometry.num_layers:
+			raise RuntimeError("DSA prefill pool: indexer layers do not match the KV geometry")
+		dims = {int(indexer.index_head_dim) for indexer in indexers.values()}
+		if len(dims) != 1:
+			raise RuntimeError(f"DSA prefill pool: mixed indexer head dims {sorted(dims)}")
+		layout = (False, tuple(indexers), dims.pop())
+		self._prefill_pool_layout_cache = layout
+		return layout
+
 	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end."""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
@@ -9561,13 +9673,13 @@ class BatchGenWorker:
 			return 0
 		return sum(seg.tokens for seg in wave.plan.segments) // wave.page_tokens
 
-	def _allocate_prefill_pool_host_pages(self, worker_view, prefix_states) -> None:
+	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
 		"""One Host copy per pooled segment; members attach their chain of them."""
 		from batchgen.prefix_reuse.wave_runtime import allocate_segment_host_pages
 
 		wave = self._prefill_pool_wave
 		allocated = allocate_segment_host_pages(
-			wave, worker_view, self._next_pool_segment_sid
+			wave, host_views, self._next_pool_segment_sid
 		)
 		if allocated != self._prefill_pool_segment_host_pages():
 			raise RuntimeError(
@@ -9579,7 +9691,10 @@ class BatchGenWorker:
 				continue
 			state = replace(
 				prefix_states[global_id],
-				planned_shared_page_ids=tuple(wave.chain_host_pages(index)),
+				planned_shared_page_ids={
+					group_id: tuple(pages)
+					for group_id, pages in wave.chain_host_pages(index).items()
+				},
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
@@ -9613,6 +9728,10 @@ class BatchGenWorker:
 		workspace_peak = 0
 		reserved_peak = 0
 		base_alloc, base_reserved, base_other = self._prefill_pool_base
+		# As in prefill_prepacked: layers offload through these views, and a DSA
+		# model writes its indexer keys through the aux one.
+		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 		AttnWrapperBase.prefill_pool = wave.pool
 		try:
 			start = time.perf_counter()
@@ -9678,7 +9797,7 @@ class BatchGenWorker:
 		finally:
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
-			wave.pool.k = wave.pool.v = None
+			wave.pool.k = wave.pool.v = wave.pool.indexer = None
 			AttnWrapperBase.prefill_pool = None
 			AttnWrapperBase.prefill_pool_batch = None
 			AttnWrapperBase.prefill_pool_row_starts = None
@@ -9729,7 +9848,7 @@ class BatchGenWorker:
 			segment_handles = commit_pool_segments(
 				wave,
 				coordinator=self.prefix_cache_coordinator,
-				worker_view=host_view,
+				worker_views_by_group=self._host_views_by_group(),
 				namespace_digest=runtime.namespace_digest,
 				publish_boundary_tokens=runtime.publish_boundary_tokens,
 				max_scan_nodes=runtime.max_nodes,
@@ -9764,11 +9883,9 @@ class BatchGenWorker:
 				self._pool_sid_members[sid] = left
 			else:
 				del self._pool_sid_members[sid]
-				host_view = getattr(self, "host_paged_kv_worker_view", None)
-				if host_view is None:
-					host_view = self.core_engine.host_paged_kv_worker_view
-				host_view.release_sequence_pages([sid])
-				host_view.unregister_sequences([sid])
+				for view in self._host_views_by_group().values():
+					view.release_sequence_pages([sid])
+					view.unregister_sequences([sid])
 
 	def _release_prefix_cache_attachments(
 		self, global_sequence_ids: Sequence[int]
@@ -9800,9 +9917,13 @@ class BatchGenWorker:
 			commit_prefix_pages_with_capacity_retry,
 		)
 
-		worker_view = self.core_engine.host_paged_kv_worker_view
+		host_views = self._host_views_by_group()
 		runtime = self.prefix_cache_runtime_config
 		page_size = int(runtime.group_specs[0].raw_page_tokens)
+		page_tokens_by_group = {
+			int(spec.group_id): int(spec.raw_page_tokens)
+			for spec in runtime.group_specs
+		}
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -9817,10 +9938,10 @@ class BatchGenWorker:
 			if commit_tokens == 0:
 				continue
 			pages = collect_group_pages_for_commit(
-				worker_views_by_group={0: worker_view},
+				worker_views_by_group=host_views,
 				sequence_id=seq.global_idx,
 				commit_tokens=commit_tokens,
-				raw_page_tokens_by_group={0: page_size},
+				raw_page_tokens_by_group=page_tokens_by_group,
 			)
 			request = build_prefix_commit_request(
 				namespace_digest=runtime.namespace_digest,
@@ -9834,7 +9955,7 @@ class BatchGenWorker:
 			commit_outcome = commit_prefix_pages_with_capacity_retry(
 				request=request,
 				coordinator=self.prefix_cache_coordinator,
-				worker_views_by_group={0: worker_view},
+				worker_views_by_group=host_views,
 				max_scan_nodes=runtime.max_nodes,
 			)
 			result = commit_outcome.commit_result
@@ -9861,11 +9982,12 @@ class BatchGenWorker:
 			retained = retain_inserted_prefix_pages(
 				commit_result=result,
 				request=request,
-				worker_views_by_group={0: worker_view},
+				worker_views_by_group=host_views,
 				sequence_id=seq.global_idx,
 			)
-			# Retained pages left the sequence chain for prefix residency.
-			seq.host_owned_pages -= sum(len(value) for value in retained.values())
+			# Retained pages left the sequence chain for prefix residency. Every
+			# group retains the same page count; host_owned_pages counts one.
+			seq.host_owned_pages -= len(retained.get(0, ()))
 			logging.info(
 				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
 				"inserted_nodes=%s retained_pages=%s",
