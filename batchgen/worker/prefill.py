@@ -94,6 +94,9 @@ class PrefillCandidate:
     # rank in its serve group.  The node-level allocator therefore consumes
     # this many copies of ``req_pages`` for one admitted sequence.
     host_kv_replication_factor: int = 1
+    # Read-only prefix estimate used only when physical free pages cannot
+    # admit any candidate. Attached pages already occupy the Host pool.
+    cached_prefix_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,33 @@ class PrefillSelectionRequest:
 
 class PrefillScheduler:
     """Prefill admission decision — pure, deterministic across ranks."""
+
+    @staticmethod
+    def required_host_pages(
+        candidate: PrefillCandidate, req: PrefillSelectionRequest
+    ) -> int:
+        """Return the same initial Host-KV reservation used by admission.
+
+        Delegates to ``compute_prefill_host_reservation`` so the selector and
+        the worker allocator stay one formula, then discounts pages already
+        resident in the prefix cache and multiplies the node replication
+        factor.
+        """
+        pages_per_replica, _ = compute_prefill_host_reservation(
+            prompt_length=candidate.prompt_length,
+            kv_token_budget=candidate.kv_token_budget,
+            page_size=candidate.page_size,
+            chunk_size=req.chunk_size,
+            initial_gpu_page_buffer=req.initial_gpu_page_buffer,
+        )
+        if not 0 <= candidate.cached_prefix_pages <= pages_per_replica:
+            raise ValueError(
+                f"candidate {candidate.uuid} has invalid cached_prefix_pages="
+                f"{candidate.cached_prefix_pages} for reservation {pages_per_replica}"
+            )
+        return (
+            pages_per_replica - candidate.cached_prefix_pages
+        ) * candidate.host_kv_replication_factor
 
     @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:
@@ -210,14 +240,7 @@ class PrefillScheduler:
                     f"candidate {c.uuid} has invalid host_kv_replication_factor="
                     f"{c.host_kv_replication_factor}"
                 )
-            req_pages, _ = compute_prefill_host_reservation(
-                prompt_length=c.prompt_length,
-                kv_token_budget=c.kv_token_budget,
-                page_size=c.page_size,
-                chunk_size=req.chunk_size,
-                initial_gpu_page_buffer=req.initial_gpu_page_buffer,
-            )
-            req_pages *= c.host_kv_replication_factor
+            req_pages = PrefillScheduler.required_host_pages(c, req)
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)

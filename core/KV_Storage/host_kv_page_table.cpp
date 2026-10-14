@@ -32,6 +32,15 @@ void HostKVPageTable::AppendPages(
                         additional_pages.end());
 }
 
+void HostKVPageTable::PrependPages(
+    std::int64_t sequence_id,
+    const std::vector<std::int32_t>& prefix_pages) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    SequenceRecord& record = RequireRecordLocked(sequence_id, lock);
+    record.pages.insert(record.pages.begin(), prefix_pages.begin(),
+                        prefix_pages.end());
+}
+
 std::vector<std::int32_t> HostKVPageTable::PopPrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
     if (num_pages == 0) {
