@@ -9312,7 +9312,7 @@ class BatchGenWorker:
 		wave = self._prefill_pool_wave
 		if wave is None:
 			return 0
-		return sum(seg.tokens for seg in wave.plan.segments) // wave.pool.page_tokens
+		return sum(seg.tokens for seg in wave.plan.segments) // wave.page_tokens
 
 	def _allocate_prefill_pool_host_pages(self, worker_view, prefix_states) -> None:
 		"""One Host copy per pooled segment; members attach their chain of them."""
