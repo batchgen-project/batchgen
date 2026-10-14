@@ -114,7 +114,7 @@ def test_decode_configure_releases_the_ring_before_building_the_model():
             "reset_decoding_buffer",
             "configure_decoding",
             "_assert_phase_switch_clean",
-            "set_weight_copy_queue",
+            "_install_decode_weight_copy_queue",
         },
     )
 
@@ -126,10 +126,12 @@ def test_decode_configure_releases_the_ring_before_building_the_model():
         "reset_decoding_buffer",
     ):
         assert names.index(released) < configure, released
-    # The new queue can only be installed once configure_decoding has produced
-    # the decode weight-copy task.
-    assert configure < names.index("set_weight_copy_queue")
-    assert configure < names.index("_assert_phase_switch_clean")
+    # The method has two exits (activate a reused instance, or build one), so
+    # only the release-before-build ordering is asserted here; the activation
+    # path is covered in tests/test_phase_instance_reuse.py. Both exits install
+    # the decode weight-copy queue and assert their invariant.
+    assert names.count("_install_decode_weight_copy_queue") == 2
+    assert names.count("_assert_phase_switch_clean") == 2
 
 
 def test_ring_release_still_preserves_an_installed_streamed_sp8_pipeline():
@@ -182,9 +184,20 @@ def test_ring_release_marks_the_switch_for_the_invariant():
 # ---------------------------------------------------------------------------
 
 
+def _rebuild_path_worker(**attrs):
+    """A worker on the rebuild path: no reusable decode instance.
+
+    The lifecycle predicate is stubbed False so these cases exercise the
+    original invariant; the reuse inversion is covered in
+    tests/test_phase_instance_reuse.py.
+    """
+    attrs.setdefault("_decode_instance_is_reusable", lambda: False)
+    return SimpleNamespace(**attrs)
+
+
 def test_prefill_to_decode_invariant_raises_when_the_ring_was_not_released():
     check = _isolated_worker_method("_assert_phase_switch_clean")
-    worker = SimpleNamespace(rank=3, _prefill_ring_released_for_switch=False)
+    worker = _rebuild_path_worker(rank=3, _prefill_ring_released_for_switch=False)
 
     with pytest.raises(RuntimeError, match="weight ring"):
         check(worker, "prefill_to_decode")
@@ -192,7 +205,7 @@ def test_prefill_to_decode_invariant_raises_when_the_ring_was_not_released():
 
 def test_prefill_to_decode_invariant_consumes_the_flag():
     check = _isolated_worker_method("_assert_phase_switch_clean")
-    worker = SimpleNamespace(rank=0, _prefill_ring_released_for_switch=True)
+    worker = _rebuild_path_worker(rank=0, _prefill_ring_released_for_switch=True)
 
     check(worker, "prefill_to_decode")
 
@@ -212,7 +225,7 @@ def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
         _whole_model_segment=None,
     )
 
-    check(SimpleNamespace(**clean), "decode_to_prefill")
+    check(_rebuild_path_worker(**clean), "decode_to_prefill")
 
     for name in (
         "_cuda_graph_manager",
@@ -223,13 +236,13 @@ def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
         planted = dict(clean)
         planted[name] = object()
         with pytest.raises(RuntimeError, match=name):
-            check(SimpleNamespace(**planted), "decode_to_prefill")
+            check(_rebuild_path_worker(**planted), "decode_to_prefill")
 
 
 def test_unknown_switch_direction_is_a_programming_error():
     check = _isolated_worker_method("_assert_phase_switch_clean")
     with pytest.raises(ValueError, match="unknown phase-switch direction"):
-        check(SimpleNamespace(rank=0), "sideways")
+        check(_rebuild_path_worker(rank=0), "sideways")
 
 
 # ---------------------------------------------------------------------------
