@@ -80,7 +80,10 @@ def _isolated(names, **globals_override):
     exec(compile(ast.fix_missing_locations(module), str(PSM), "exec"), namespace)
     cls = namespace["Psm"]
     for name in names:
-        getattr(cls, name).__globals__.update(globals_override)
+        member = getattr(cls, name)
+        # A property's code object lives on its getter.
+        target = member.fget if isinstance(member, property) else member
+        target.__globals__.update(globals_override)
     return cls
 
 
@@ -478,3 +481,75 @@ def test_blockwise_init_adopts_preallocated_stacks_without_recopying():
     assert "self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d) = prealloc" in adopt
     # The allocate-and-copy code remains, for the partially resident path.
     assert "torch.empty" in ast.unparse(branch.orelse)
+
+
+# ---------------------------------------------------------------------------
+# Reuse capability bit
+# ---------------------------------------------------------------------------
+
+
+def _reuse_psm(*, flag=False, reuse=False, resident=4, experts_per_rank=4,
+               world_size=2):
+    cls = _isolated(
+        ["_instances_are_reused", "_local_routed_experts_fully_resident"],
+        torch=_TorchProxy(),
+        logging=_QUIET_LOGGING,
+    )
+    psm = cls()
+    psm.persistent_phase_instances = flag
+    psm.reuse_phase_instances = reuse
+    psm.NUM_TOTAL_EXPERTS = experts_per_rank * world_size
+    psm.world_size = world_size
+    if resident is not None:
+        psm.num_local_expert_per_layer = resident
+    return psm
+
+
+def test_reuse_is_off_by_default():
+    assert _reuse_psm()._instances_are_reused is False
+
+
+def test_cli_flag_still_turns_reuse_on_regardless_of_residency():
+    """--persistent-phase-instances keeps its own behaviour exactly.
+
+    It asks for reuse unconditionally; `configure_decoding` then raises from the
+    arena loader if the rank is not fully resident, which is what it did before.
+    """
+    assert _reuse_psm(flag=True, resident=2)._instances_are_reused is True
+    assert _reuse_psm(flag=True, resident=4)._instances_are_reused is True
+
+
+def test_default_lifecycle_reuses_only_a_fully_resident_rank():
+    assert _reuse_psm(reuse=True, resident=4)._instances_are_reused is True
+    # Streaming rank: no reusable instance, so the worker rebuilds as before
+    # instead of the arena loader raising at it.
+    assert _reuse_psm(reuse=True, resident=2)._instances_are_reused is False
+
+
+def test_residency_is_unknown_before_the_first_decode_configure():
+    """`num_local_expert_per_layer` is set inside configure_decoding.
+
+    Reported as not resident rather than guessed, so a prefill-first process
+    cannot cache an instance it has not proven it can reuse.
+    """
+    psm = _reuse_psm(reuse=True, resident=None)
+    assert psm._local_routed_experts_fully_resident() is False
+    assert psm._instances_are_reused is False
+
+
+def test_expert_loader_selection_keeps_the_flag_path_separate():
+    src = ast.unparse(_method("configure_decoding"))
+    # The flag reaches the arena loader with no residency condition in front of
+    # it, so its existing failure mode is untouched.
+    assert "if self.persistent_phase_instances:" in src
+    assert "self.reuse_phase_instances and self._local_routed_experts_fully_resident()" in src
+    # Three distinct destinations: arena, preallocated stacks, legacy loader.
+    assert src.count("_load_local_routed_experts_into_arena()") == 2
+    assert "self._load_local_routed_experts_prealloc()" in src
+    assert "self._load_local_routed_experts()" in src
+
+
+def test_instance_caching_follows_the_same_predicate():
+    for name in ("configure_prefill", "configure_decoding"):
+        src = ast.unparse(_method(name))
+        assert "if self._instances_are_reused:" in src, name

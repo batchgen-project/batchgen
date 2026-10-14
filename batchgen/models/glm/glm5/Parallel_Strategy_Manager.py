@@ -78,6 +78,15 @@ class GLM5ParallelStrategyManager:
         # --persistent-phase-instances: each phase's (model, weight_copy_task)
         # is built once and switched in by activate_prefill/activate_decoding.
         self.persistent_phase_instances = False
+        # The same build-once/activate machinery, requested by the worker's
+        # default phase-switch lifecycle instead of by the CLI flag. It is a
+        # capability condition, not a mode: the worker turns it on only for a
+        # rank that keeps every one of its local routed experts resident, which
+        # is already the hard precondition of the 3D grouped-GEMM decode path.
+        # A rank that streams part of its experts leaves it off, keeps the
+        # legacy per-expert loader and reports no reusable instance, so the
+        # worker rebuilds that phase exactly as before.
+        self.reuse_phase_instances = False
         self.prefill_instance = None
         self.decode_instance = None
         self._expert_arena = None
@@ -86,6 +95,25 @@ class GLM5ParallelStrategyManager:
         # change, so they are uploaded once per process in one bulk copy and
         # handed out as views; see _device_scale.
         self._device_scales = None
+
+    @property
+    def _instances_are_reused(self) -> bool:
+        """True when this process keeps its phase instances and switches them in.
+
+        Either the CLI flag or the worker's default lifecycle asks for it. The
+        arena-backed routed-expert stacks come with it: they are what lets the
+        experts' physical memory be released for prefill and remapped at the
+        same addresses afterwards.
+        """
+        if self.persistent_phase_instances:
+            return True
+        # The default lifecycle only gets reusable instances when the arena
+        # path is actually available for this rank. A streaming rank keeps
+        # decode_instance None, which is how the worker learns to rebuild.
+        return bool(
+            self.reuse_phase_instances
+            and self._local_routed_experts_fully_resident()
+        )
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
@@ -220,7 +248,7 @@ class GLM5ParallelStrategyManager:
                 f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
                 f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
             )
-        if self.persistent_phase_instances:
+        if self._instances_are_reused:
             self.prefill_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
@@ -312,6 +340,11 @@ class GLM5ParallelStrategyManager:
         self._extract_dequantize_scale()
         self._load_model_skeleton()
         if self.persistent_phase_instances:
+            # Unchanged: the flag requires full residency and says so loudly.
+            self._load_local_routed_experts_into_arena()
+        elif self.reuse_phase_instances and self._local_routed_experts_fully_resident():
+            # Default lifecycle: same fixed-address stacks, so the experts can
+            # be released for prefill and remapped at the same addresses.
             self._load_local_routed_experts_into_arena()
         elif self._local_routed_experts_fully_resident():
             self._load_local_routed_experts_prealloc()
@@ -343,7 +376,7 @@ class GLM5ParallelStrategyManager:
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
             self._init_ata_comms(effective_bsz)
 
-        if self.persistent_phase_instances:
+        if self._instances_are_reused:
             self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
@@ -589,10 +622,12 @@ class GLM5ParallelStrategyManager:
         stacks: a partially resident rank streams the rest through the H2D
         copy engine and cannot own a full stack row per expert.
         """
-        return (
-            self.num_local_expert_per_layer
-            == self.NUM_TOTAL_EXPERTS // self.world_size
-        )
+        resident = getattr(self, "num_local_expert_per_layer", None)
+        if resident is None:
+            # configure_decoding has not run yet, so the per-rank expert split
+            # is not known. Reported as not resident rather than guessed.
+            return False
+        return resident == self.NUM_TOTAL_EXPERTS // self.world_size
 
     def _bind_local_routed_expert_stacks(self, carve):
         """Point every local routed expert at a row of its layer's 3D stack.
