@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from threading import Lock
@@ -100,6 +102,52 @@ class StorageManager:
                 return batch
         return None
 
+    def acquire_storage_ownership(self) -> None:
+        """Take the storage path's exclusive cross-process lock for this
+        process's lifetime.
+
+        One live server owns one storage path: batch state is a plain JSON
+        tree with no multi-writer coordination, and startup recovery
+        (``fail_orphaned_batches``) assumes every active batch belongs to a
+        dead process. A second live server on the same path would corrupt
+        both, so it must fail at startup instead.
+        """
+        lock_path = Path(self.storage_root) / ".owner.lock"
+        handle = lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"storage path {self.storage_root} is owned by a live server process; "
+                "give each server its own --storage-path"
+            ) from exc
+        # Held (never released) for the process lifetime; the OS drops it on
+        # exit, however the process dies.
+        self._owner_lock_handle = handle
+        handle.truncate(0)
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+
+    def fail_orphaned_batches(self) -> List[str]:
+        """Fail batches a previous server process left active.
+
+        A new process holds no worker state for them, so they can never finish;
+        left active they also block resubmission of the same (deduplicated)
+        input file. Call once at startup, after acquire_storage_ownership and
+        before any batch is accepted.
+        """
+        active = {BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS, BatchStatus.CANCELLING}
+        failed = []
+        for batch in self.list_all_batches():
+            if batch.status in active:
+                self.update_batch_status(
+                    batch.id, BatchStatus.FAILED,
+                    error="server restarted while this batch was active",
+                )
+                failed.append(batch.id)
+        return failed
+
     def update_batch_status(
         self, batch_id: str, status: BatchStatus, **updates
     ) -> Optional[BatchObject]:
@@ -132,9 +180,15 @@ class StorageManager:
 
     # ---------------------- Helpers ----------------------
     def _write_json(self, path: Path, data: Dict) -> None:
+        # Full-file-then-rename keeps every reader seeing either the old or
+        # the new metadata, never a truncated file, however this process dies.
         with self._lock:
-            with path.open("w", encoding="utf-8") as handle:
+            tmp = path.with_name(path.name + ".tmp")
+            with tmp.open("w", encoding="utf-8") as handle:
                 json.dump(data, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp.replace(path)
 
     def _read_json(self, path: Path) -> Optional[Dict]:
         if not path.exists():

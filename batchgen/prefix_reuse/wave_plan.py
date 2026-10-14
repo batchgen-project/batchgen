@@ -375,7 +375,7 @@ def assign_ranks_for_sharing(
     *,
     world_size: int,
     block_tokens: int,
-    initial_loads: Optional[Sequence[int]] = None,
+    initial_loads: Optional[Sequence[float]] = None,
 ) -> tuple[int, ...]:
     """Assign prompts to DP ranks so shared prefixes are computed on one rank.
 
@@ -384,7 +384,7 @@ def assign_ranks_for_sharing(
     the heaviest unit is split (at its next branch, or in halves when its
     prompts are identical) only while that lowers the busiest rank's load
     under first-fit-decreasing placement. Load is the unit's computed tokens
-    with every shared segment pooled once; ``initial_loads`` is each rank's
+    with every shared segment pooled once. ``initial_loads`` is each rank's
     load from prompts assigned earlier.
     """
 
@@ -394,7 +394,7 @@ def assign_ranks_for_sharing(
     if count == 0:
         return ()
 
-    def cost(members: list[int]) -> int:
+    def cost(members: list[int]) -> float:
         tree = _build_tree([prompts[i] for i in members], block_tokens)
         saved = sum(
             (c - 1) * (end - start)
@@ -429,7 +429,7 @@ def assign_ranks_for_sharing(
                 parts = [[i for i in members if i not in ended], ended]
             return [(sorted(p), depth + 1) for p in parts]
 
-    def place(loads: list[int]) -> tuple[int, list[int]]:
+    def place(loads: list[float]) -> tuple[float, list[int]]:
         rank_load = list(initial_loads) if initial_loads is not None else [0] * world_size
         where = [0] * len(loads)
         for unit in sorted(range(len(loads)), key=lambda k: (-loads[k], k)):
