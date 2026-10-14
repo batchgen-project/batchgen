@@ -203,6 +203,7 @@ def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
     )
     manager = type("Manager", (), {})()
     manager._kda_pool_slots = 4
+    manager._kda_segment_slots = 0
     manager._attn_tp_size = 8
     fake_wrapper = type("KDAWrapper", (), {"state_manager": None})
     method = _isolated_method(

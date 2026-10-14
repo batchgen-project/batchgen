@@ -25,3 +25,16 @@ def test_prefill_sequence_limits_reserves_graph_scratch_slot():
         "from the reported capacity, or admission consumes it and prefill dies "
         "with 'Insufficient free KDA state items'"
     )
+
+
+def test_prefill_sequence_limits_reserves_prefix_segment_slots():
+    """Pooled prefix segments hold KDA slots the planner adds on top of the
+    sequence cap; admission must not see them, or a full wave leaves no slot
+    for a segment and the prefill prefix pool never engages."""
+    tree = ast.parse(PSM.read_text())
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "prefill_sequence_limits"
+    )
+    attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert "_kda_segment_slots" in attrs

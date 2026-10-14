@@ -133,6 +133,13 @@ class SWAHostPagedKVWorkerView {
         }
     }
 
+    void SetSequencePages(std::int64_t sequence_id,
+                          const std::vector<std::int32_t>& page_ids) {
+        base_view_.SetSequencePages(sequence_id, page_ids);
+        std::lock_guard<std::mutex> lock(mutex_);
+        sequence_states_.try_emplace(sequence_id);
+    }
+
     void UnregisterSequence(std::int64_t sequence_id) {
         base_view_.UnregisterSequence(sequence_id);
         std::lock_guard<std::mutex> lock(mutex_);

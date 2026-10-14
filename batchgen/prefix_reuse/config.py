@@ -15,6 +15,16 @@ _FULL_KV_MODEL_TYPES = frozenset({"gpt_oss"})
 # GLM-5.2 sparse DSA prefill: MLA latent in the primary Host-KV region and the
 # indexer keys in the auxiliary one. GLM-5/5.1 (glm_moe_dsa) prefill is dense.
 _DSA_MODEL_TYPES = frozenset({"glm_moe_dsa_5_2", "glm_moe_dsa_5_3"})
+# Kimi-K3 and Kimi-Linear-48B dense MLA prefill: one Host-KV region holding
+# the latent -- the kimi_k3_mla profile (24 physical layers of 1 head x 576
+# bf16, page 64) over 93 engine layers, or kimi_linear_mla over 27. No indexer,
+# so one group. Both are NoPE MLA of the same per-head widths, so they share
+# every pool seam.
+_MLA_LATENT_MODEL_TYPES = frozenset({"kimi_k3", "kimi_linear"})
+# Reuse for these types exists only on the in-wave prefill prefix pool: they
+# have no cross-wave materialization path, so prefix caching without a planner
+# pool workspace must be refused rather than silently served the other way.
+_POOL_ONLY_MODEL_TYPES = _DSA_MODEL_TYPES | _MLA_LATENT_MODEL_TYPES
 
 
 class PrefixKVGroupSemantic(str, Enum):
@@ -83,13 +93,22 @@ def require_prefix_cache_model_support(model_name: str) -> str:
     from batchgen.config.model_registry import _detect_model_type_from_identifier
 
     model_type = _detect_model_type_from_identifier(model_name.strip())
-    if model_type not in _FULL_KV_MODEL_TYPES | _DSA_MODEL_TYPES:
+    if (
+        model_type
+        not in _FULL_KV_MODEL_TYPES | _DSA_MODEL_TYPES | _MLA_LATENT_MODEL_TYPES
+    ):
         raise ValueError(
-            "prefix cache reuse currently supports only GPT-OSS and models on "
-            f"the GLM-5.2 sparse DSA prefill path; model {model_name!r} "
-            f"(type {model_type!r}) is unsupported"
+            "prefix cache reuse currently supports only GPT-OSS, Kimi-K3 and "
+            f"models on the GLM-5.2 sparse DSA prefill path; model "
+            f"{model_name!r} (type {model_type!r}) is unsupported"
         )
     return model_type
+
+
+def prefix_reuse_requires_prefill_pool(model_type: str) -> bool:
+    """True when only the in-wave prefix pool can serve this model's reuse."""
+
+    return model_type in _POOL_ONLY_MODEL_TYPES
 
 
 def _host_page_bytes_all_layers(host_kv_config: Any) -> int:
@@ -116,10 +135,10 @@ def build_prefix_cache_runtime_config(
 ) -> PrefixCacheRuntimeConfig:
     """Derive the prefix-cache shared-memory layout, one group per Host-KV region.
 
-    GPT-OSS has one full-K/V group. A DSA model has two, sharing page size and
-    page count: group 0 the MLA latent (primary region), group 1 the indexer
-    keys (``aux_host_kv_config``). A prefix is reusable only when every group
-    holds it.
+    GPT-OSS has one full-K/V group and Kimi-K3 one MLA-latent group. A DSA
+    model has two, sharing page size and page count: group 0 the MLA latent
+    (primary region), group 1 the indexer keys (``aux_host_kv_config``). A
+    prefix is reusable only when every group holds it.
     """
 
     model_type = require_prefix_cache_model_support(model_name)
@@ -139,7 +158,12 @@ def build_prefix_cache_runtime_config(
     else:
         if aux_host_kv_config is not None:
             raise ValueError(f"model type {model_type!r} has no aux Host-KV region")
-        layouts = ((PrefixKVGroupSemantic.FULL_KV, host_kv_config),)
+        layouts = ((
+            PrefixKVGroupSemantic.MLA_LATENT
+            if model_type in _MLA_LATENT_MODEL_TYPES
+            else PrefixKVGroupSemantic.FULL_KV,
+            host_kv_config,
+        ),)
 
     page_tokens = int(host_kv_config.page_size_tokens)
     num_pages = int(host_kv_config.num_pages)

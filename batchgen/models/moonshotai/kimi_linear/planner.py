@@ -33,6 +33,19 @@ _K3_H20_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 32_768
 _K3_H200_PREFILL_COLLECTIVE_STRIPE_THRESHOLD_ROWS = 524_288
 _K3_H20_PREFILL_GROUPED_CHUNK_ROWS = 2_048
 _K3_H200_PREFILL_GROUPED_CHUNK_ROWS = 32_768
+# Device memory the in-wave prefill prefix pool must leave free for the K3
+# prefill forward; the pool takes what is left of mem_get_info. Sized from the
+# measured chunk-sweep peaks of the segmented KDA layer (resident token stream
+# plus chunk_kda scratch at the largest supported chunk, see
+# kda_prefill_serving) and the streamed-SP8 grouped MoE's global FP32 output at
+# the expert-chunk row cap, plus margin; the KDA term scales with the chunk.
+# Provisional until a pool run measures its chunk peak, like the GLM budget.
+_K3_H200_PREFIX_POOL_WORKSPACE_BYTES = 40 * _GIB
+# KDA state slots held back from admission for pooled prefix segments: each
+# segment row holds one slot for its wave, and a wave that admits the full
+# sequence cap would otherwise leave none and decline the pool; a wave needing
+# more segments takes the unpooled path.
+_K3_PREFIX_SEGMENT_STATE_SLOTS = 16
 # Per-node decode admission cap on H200 (= KDA state slots). See
 # k3_kda_state_slots for the HBM budget behind this number.
 #
@@ -185,6 +198,27 @@ def k3_resident_prefill_token_cap(
     return 0
 
 
+def k3_prefill_prefix_pool_workspace_bytes(
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+) -> int:
+    """Return the forward's reserve under the in-wave prefill prefix pool.
+
+    0 leaves the pool off, which is the answer for every layout but the
+    H200-class TP8 one the reserve above was sized on; K3 prefix reuse has no
+    cross-wave materialization path, so it runs on the pool or not at all.
+    """
+    group_size = int(attention_group_size)
+    if group_size <= 0:
+        raise ValueError("attention_group_size must be positive")
+    if (
+        group_size == 8
+        and gpu_total_memory_bytes is not None
+        and int(gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
+    ):
+        return _K3_H200_PREFIX_POOL_WORKSPACE_BYTES
+    return 0
+
+
 def k3_prefill_micro_batch_token_cap(
     *, gpu_total_memory_bytes: int | None, attention_group_size: int
 ) -> int:
@@ -333,6 +367,24 @@ class KimiLinearPlanner(BasePlanner):
         # Modern paged-KV decode path (decoding_continuous), same as K2.5.
         self.config.Basic_Config.attn_mode = 3
 
+        # In-wave prefill prefix pool reserve; 0 leaves the pool off. Family
+        # wide: at G > 1 the 48B runs the same resident head-parallel KDA and
+        # NoPE-MLA seams as K3, with identical per-head widths (192 K, 128 V,
+        # 576 latent), so one reserve gates both. K3's figure bounds the 48B's
+        # strictly smaller temporaries, so reusing it only under-fills the pool.
+        self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
+            k3_prefill_prefix_pool_workspace_bytes(
+                gpu_total_memory_bytes=self.gpu_total_memory_bytes,
+                attention_group_size=self.attention_group_size,
+            )
+        )
+        pool_segment_slots = (
+            _K3_PREFIX_SEGMENT_STATE_SLOTS
+            if self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes > 0
+            else 0
+        )
+        self.config.GPU_Buffer_Config.kda_prefix_segment_slots = pool_segment_slots
+
         # Kimi-Linear context: model_max_length=1048576. The TP8 K3 path
         # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB).
         # The admission scheduler enforces that persistent sequence limit;
@@ -422,7 +474,7 @@ class KimiLinearPlanner(BasePlanner):
         # PSM pools can hold). Config-driven — replaces the retired
         # BATCHGEN_KDA_STATE_SLOTS env var (M1-C). One slot is reserved by the
         # Phase-A decode graph as the padding/warmup scratch slot.
-        self.config.GPU_Buffer_Config.kda_state_slots = 256
+        self.config.GPU_Buffer_Config.kda_state_slots = 256 + pool_segment_slots
 
         # M5.2 Phase-A CUDA-graph decode (per-layer attention spans; MoE stays
         # eager because its resident-EP forward runs NCCL collectives). Read by
@@ -493,7 +545,10 @@ class KimiLinearPlanner(BasePlanner):
             sharded_latent=shard_latent,
             sharded_vocab=shard_latent,
         )
-        self.config.GPU_Buffer_Config.kda_state_slots = sequence_slots + 1
+        self.config.GPU_Buffer_Config.kda_state_slots = (
+            sequence_slots + 1
+            + self.config.GPU_Buffer_Config.kda_prefix_segment_slots
+        )
 
         # This is a per-node sequence cap under TP8: every rank in the node
         # holds the same sequence set. Keep the graph top bucket equal to that

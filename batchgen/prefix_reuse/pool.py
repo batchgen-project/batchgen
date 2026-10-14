@@ -50,6 +50,10 @@ class PrefillPrefixPool:
     GQA keeps K and V. An MLA/DSA model keeps only ``k`` (the latent,
     ``with_v=False``) plus, when ``indexer_layers`` is given, the indexer keys
     of those layers in ``indexer[indexer_row[layer]]``.
+
+    ``v_head_dim`` defaults to ``head_dim``; an MLA model whose prefill
+    attention runs on the expanded heads holds a wider K than V (192 against
+    128 per head on Kimi-K3).
     """
 
     def __init__(
@@ -63,14 +67,22 @@ class PrefillPrefixPool:
         dtype: torch.dtype,
         device: torch.device | str,
         with_v: bool = True,
+        v_head_dim: int | None = None,
         indexer_layers: Sequence[int] = (),
         indexer_dim: int = 0,
     ) -> None:
         self.page_tokens = page_tokens
         self.device = torch.device(device)
+        v_dim = head_dim if v_head_dim is None else v_head_dim
         shape = (num_layers, num_pages, page_tokens, num_kv_heads, head_dim)
         self.k = torch.empty(shape, dtype=dtype, device=self.device)
-        self.v = torch.empty(shape, dtype=dtype, device=self.device) if with_v else None
+        self.v = (
+            torch.empty(
+                (num_layers, num_pages, page_tokens, num_kv_heads, v_dim),
+                dtype=dtype, device=self.device,
+            )
+            if with_v else None
+        )
         self.indexer_row = {layer: row for row, layer in enumerate(indexer_layers)}
         self.indexer = (
             torch.empty(
@@ -82,7 +94,8 @@ class PrefillPrefixPool:
         self._num_pages = num_pages
         self._free = list(range(num_pages))  # kept ascending
         self._page_bytes = (
-            (2 if with_v else 1) * num_layers * page_tokens * num_kv_heads * head_dim
+            num_layers * page_tokens * num_kv_heads
+            * (head_dim + (v_dim if with_v else 0))
             + len(self.indexer_row) * page_tokens * indexer_dim
         ) * self.k.element_size()
 

@@ -246,6 +246,12 @@ class AttnWrapperBase(BaseModuleWrapper):
     prefill_pool: ClassVar[Optional[object]] = None
     prefill_pool_batch: ClassVar[Optional[object]] = None
     prefill_pool_row_starts: ClassVar[Optional[List[int]]] = None
+    # Pseudo Host sequence id of each pooled segment, for KDA state forks.
+    prefill_pool_segment_sids: ClassVar[Optional[dict]] = None
+    # Engine layer -> dense pool row, -1 for a layer the pool does not hold.
+    # The pool holds one row per attention layer it caches, which is NOT the
+    # Host cache's physical layer unless that cache compresses the same axis.
+    prefill_pool_layer_map: ClassVar[Optional[tuple]] = None
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None
