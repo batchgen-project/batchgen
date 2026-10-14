@@ -313,8 +313,11 @@ def test_kv_offload_to_host():
     manager.initialize(True)  # Create shared memory
     print(f"\nHost KV Manager created (shm={shm_name})")
 
+    # The host KV region is an anonymous memfd: attach through /proc.
+    host_cfg.memfd_creator_pid = os.getpid()
+    host_cfg.memfd_fd = manager.memfd_fd()
     worker = bg.DefaultHostPagedKVWorkerView(host_cfg)
-    worker.initialize(device_idx, False)  # Attach to existing shm
+    worker.initialize(device_idx, False)
     print(f"Host KV Worker attached on device {device_idx}")
 
     # Create mock KV tensors on GPU

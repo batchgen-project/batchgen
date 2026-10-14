@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -25,15 +25,16 @@
 void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     bool create, bool enable_hugetlbfs,
                                     bool pin_for_cuda = true,
-                                    bool enable_memfd = false,
+                                    bool enable_thp = false,
                                     int memfd_creator_pid = -1,
                                     int memfd_fd = -1,
-                                    int* out_memfd_fd = nullptr);
-void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
-                               bool create);
-void serialize_to_shared_memory(
+                                    int* out_memfd_fd = nullptr,
+                                    int64_t* out_mapped_size = nullptr);
+void free_shared_pinned_memory(void* ptr, int64_t size);
+// Returns the creator's memfd, which must stay open for attachers to reach it
+// through /proc/<creator_pid>/fd/<N>.
+int serialize_to_memfd(
     const std::unordered_map<std::string,
-                             std::unordered_map<std::string, tensor_meta>>& map,
-    const std::string& shm_name);
+                             std::unordered_map<std::string, tensor_meta>>& map);
 std::unordered_map<std::string, std::unordered_map<std::string, tensor_meta>>
-deserialize_from_shared_memory(const std::string& shm_name);
+deserialize_from_memfd(int memfd_creator_pid, int memfd_fd);

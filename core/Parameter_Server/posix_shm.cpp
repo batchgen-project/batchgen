@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -36,13 +36,16 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include "../numa_compat.h"
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #include <filesystem>
 
@@ -55,7 +58,13 @@
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 #endif
-namespace fs = std::filesystem; 
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
+namespace fs = std::filesystem;
 
 std::shared_ptr<spdlog::logger> logger = init_logger("info", "Server");
 
@@ -124,6 +133,57 @@ void segv_handler(int sig, siginfo_t* info, void* context) {
     sa.sa_flags = 0;
     sigaction(sig, &sa, nullptr);
     raise(sig);
+}
+
+// Anonymous memfd: the region carries no /dev/shm name, so the kernel reclaims
+// it as soon as the last process mapping it is gone, however that process died.
+// MFD_CLOEXEC keeps an exec'd child from holding it alive; attachers reach it
+// through /proc/<creator_pid>/fd/<N>, not by inheritance.
+static int create_anonymous_memfd(const char* name) {
+    return static_cast<int>(syscall(SYS_memfd_create, name, MFD_CLOEXEC));
+}
+
+// Same unnamed object, but backed by the host's preallocated huge page pool
+// instead of base pages. No hugetlbfs mount and no path are involved, so the
+// kernel returns the pages to the pool with the last mapping.
+static int create_huge_anonymous_memfd(const char* name) {
+    return static_cast<int>(
+        syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_HUGETLB));
+}
+
+// MFD_HUGETLB without a size flag uses the host's default huge page size, so
+// the region must be rounded and mapped to exactly that size.
+static size_t default_huge_page_size() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        if (line.find("Hugepagesize:") == 0) {
+            std::istringstream iss(line);
+            std::string key, value;
+            iss >> key >> value;
+            return static_cast<size_t>(std::stol(value)) * 1024;
+        }
+    }
+    logger->warn(
+        "Hugepagesize missing from /proc/meminfo; assuming 2MB huge pages");
+    return 2 * 1024 * 1024;
+}
+
+// --fast-init requests transparent huge pages explicitly. Without it the
+// mapping is not advised at all, so its page size follows the host's
+// /sys/kernel/mm/transparent_hugepage/shmem_enabled policy. A failed hint is
+// not fatal.
+static void advise_transparent_huge_pages(void* ptr, int64_t size,
+                                          bool enable_thp) {
+    if (!enable_thp) {
+        return;
+    }
+    if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
+        logger->warn(
+            "madvise(MADV_HUGEPAGE) failed: {}; weights page size follows the "
+            "system THP setting",
+            strerror(errno));
+    }
 }
 
 // Helper function to execute system command
@@ -256,18 +316,24 @@ void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, siz
 
 /**
  * @brief Allocates shared memory optionally pinned for CUDA operations.
- * * This function supports two allocation strategies:
- * 1.  Hugetlbfs: Uses large 2MB pages for potentially better performance, but requires
- * root privileges and proper system configuration. Controlled by enable_hugetlbfs.
- * 2.  Regular Shared Memory: A fallback using standard 4KB pages via shm_open.
+ * * This function supports two allocation strategies, and neither gives the
+ * region a name: the kernel reclaims it with the last mapping, however the
+ * owners died.
+ * 1.  Huge page memfd: MFD_HUGETLB takes the region from the host's huge page
+ * pool, which needs that pool reserved. Controlled by enable_hugetlbfs.
+ * 2.  Base page memfd: the only other strategy, and the fallback when the huge
+ * page pool cannot satisfy the request.
  * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM.
  * If pin_for_cuda is true, memory is also registered with cudaHostRegister for DMA.
- * * @param shm_name The name for the shared memory segment.
+ * * @param shm_name A label for logging; no filesystem object carries it.
  * @param size The desired size of the allocation in bytes.
  * @param create True if the caller is the server (creates the segment), false for workers.
- * @param enable_hugetlbfs If true, attempts to use hugetlbfs for allocation.
+ * @param enable_hugetlbfs If true, attempts a huge page memfd for allocation.
  * @param pin_for_cuda If true, register memory with cudaHostRegister for GPU DMA access.
  *                     Server should pass false (no GPU access needed), workers pass true.
+ * @param enable_thp If true, hint transparent huge pages and prefault them.
+ * @param memfd_creator_pid Creator of the memfd a worker attaches to.
+ * @param memfd_fd_arg The creator's fd number for that memfd.
  * @return A void pointer to the allocated shared memory.
  * @throws std::runtime_error on failure.
  */
@@ -276,13 +342,18 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     bool create,
                                     bool enable_hugetlbfs,
                                     bool pin_for_cuda,
-                                    bool enable_memfd,
+                                    bool enable_thp,
                                     int memfd_creator_pid,
                                     int memfd_fd_arg,
-                                    int* out_memfd_fd) {
+                                    int* out_memfd_fd,
+                                    int64_t* out_mapped_size) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
+    if (create && out_memfd_fd == nullptr) {
+        throw std::runtime_error("memfd creator requires an output fd");
+    }
+    if (out_mapped_size) *out_mapped_size = 0;
 
     const size_t page_size = sysconf(_SC_PAGESIZE);
     const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
@@ -294,98 +365,79 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     void* ptr = nullptr;
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
-    // std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    std::string hugepage_path = "/dev/hugepages/" +
-        (shm_name[0] == '/' ? shm_name.substr(1) : shm_name);
 
-    // STAGE 1: Attempt allocation using hugetlbfs if enabled
-    if (enable_hugetlbfs) {
-        logger->info("Attempting hugepage allocation...");
-        int flags = O_RDWR | (create ? O_CREAT : 0);
-        int fd = open(hugepage_path.c_str(), flags, 0666);
+    // STAGE 1: Attempt a huge page memfd if enabled. Only the creator runs
+    // this: an attacher cannot tell a huge page memfd from a base page one by
+    // name, because neither has a name, so it always takes the attach path in
+    // STAGE 2 and discovers the page size from the fd itself.
+    if (enable_hugetlbfs && create) {
+        const size_t hugetlb_page_size = default_huge_page_size();
+        const int64_t hugetlb_size =
+            ((size + hugetlb_page_size - 1) / hugetlb_page_size) *
+            hugetlb_page_size;
+        logger->info("Attempting hugepage allocation ({}MB pages)...",
+                     hugetlb_page_size / (1024 * 1024));
 
-        if (fd >= 0) {
-            if (create) {
-                int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-                if (ftruncate64(fd, huge_aligned_size) == 0) {
-                    // Use mmap_aligned to ensure 2MB alignment (or system page size if larger)
-                    size_t alignment = std::max(huge_page_size, page_size);
-                    ptr = mmap_aligned(huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-                    if (ptr != MAP_FAILED) {
-                        allocated_size = huge_aligned_size;
-                        if (touch_pages(ptr, size, huge_page_size, true)) {
-                            using_huge_pages = true;
-                            logger->info("Hugepage multi-threaded initialization succeeded");
-                        } else {
-                            logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
-                            munmap(ptr, allocated_size);
-                            ptr = nullptr; // Signal failure to fallback
-                        }
-                    } else {
-                        logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
-                        ptr = nullptr; // Ensure ptr is null for fallback
-                    }
-                } else {
-                    logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
-                }
-            } else { // Worker logic: wait for file to be sized by server
-                struct stat sb;
-                int64_t file_size = 0;
-                for (int retry = 0; retry < 20; ++retry) { // Retry for up to 2 seconds
-                    if (fstat(fd, &sb) == -1) {
-                        close(fd);
-                        throw std::runtime_error("fstat on hugepage file failed: " + std::string(strerror(errno)));
-                    }
-                    if (sb.st_size > 0) {
-                        file_size = sb.st_size;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-
-                if (file_size > 0) {
-                    // Use mmap_aligned for workers too
-                    size_t alignment = std::max(huge_page_size, page_size);
-                    ptr = mmap_aligned(file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-                    if (ptr != MAP_FAILED) {
-                        allocated_size = file_size;
-                        using_huge_pages = true;
-                    } else {
-                        logger->warn("hugetlbfs mmap failed for worker: {}", strerror(errno));
-                        ptr = nullptr;
-                    }
-                } else {
-                    logger->error("Timed out waiting for server to create hugepage file.");
-                }
-            }
+        int fd = create_huge_anonymous_memfd("batchgen_weights");
+        if (fd < 0) {
+            logger->warn("memfd_create(MFD_HUGETLB) failed: {}",
+                         strerror(errno));
+        } else if (ftruncate64(fd, hugetlb_size) != 0) {
+            logger->warn("hugepage memfd ftruncate failed: {}",
+                         strerror(errno));
             close(fd);
-
-            if (!using_huge_pages && create) {
-                logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
-                unlink(hugepage_path.c_str());
-            }
         } else {
-            logger->warn("Could not open hugetlbfs path '{}': {}. Check permissions and mount.", hugepage_path, strerror(errno));
+            size_t alignment = std::max(hugetlb_page_size, page_size);
+            ptr = mmap_aligned(hugetlb_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                               fd, 0, alignment);
+            if (ptr == MAP_FAILED) {
+                // The pool is reserved by the host, so this is where an
+                // insufficient reservation surfaces.
+                logger->warn("hugepage memfd mmap failed: {}", strerror(errno));
+                ptr = nullptr;
+                close(fd);
+            } else if (!touch_pages(ptr, size, hugetlb_page_size, true)) {
+                logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
+                munmap(ptr, hugetlb_size);
+                ptr = nullptr;
+                close(fd);
+            } else {
+                allocated_size = hugetlb_size;
+                using_huge_pages = true;
+                *out_memfd_fd = fd;
+                logger->info(
+                    "Weights allocated via memfd_create(MFD_HUGETLB) "
+                    "({:.1f} GB, {}MB pages)",
+                    allocated_size / (1024.0 * 1024.0 * 1024.0),
+                    hugetlb_page_size / (1024 * 1024));
+            }
         }
     }
 
-    // STAGE 1.5: memfd_create + THP (--fast-init)
-    if (!ptr && enable_memfd) {
+    // STAGE 2: Base page memfd. This is the only path when hugetlbfs is not
+    // requested, and the fallback when it was requested but the huge page pool
+    // could not satisfy it. It is also the attach path in every mode, since an
+    // attacher reaches the creator's fd through /proc either way.
+    if (!ptr) {
+        if (enable_hugetlbfs && create) {
+             logger->info("Falling back to a base page memfd allocation...");
+        }
+
         size_t alignment = std::max(huge_page_size, page_size);
         int64_t aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
 
         if (create) {
-            int fd = static_cast<int>(syscall(SYS_memfd_create, "batchgen_weights", 0));
+            int fd = create_anonymous_memfd("batchgen_weights");
             if (fd < 0) {
                 throw std::runtime_error(
-                    "--fast-init: memfd_create for weights failed: " +
+                    "memfd_create for weights failed: " +
                     std::string(strerror(errno)));
             }
             if (ftruncate64(fd, aligned_size) != 0) {
                 int err = errno;
                 close(fd);
                 throw std::runtime_error(
-                    "--fast-init: ftruncate on weights memfd failed: " +
+                    "ftruncate on weights memfd failed: " +
                     std::string(strerror(err)));
             }
             ptr = mmap_aligned(aligned_size, PROT_READ | PROT_WRITE,
@@ -395,56 +447,70 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 close(fd);
                 ptr = nullptr;
                 throw std::runtime_error(
-                    "--fast-init: mmap on weights memfd failed: " +
+                    "mmap on weights memfd failed: " +
                     std::string(strerror(err)));
             }
             allocated_size = aligned_size;
-            madvise(ptr, allocated_size, MADV_HUGEPAGE);
-            // Pre-fault THP pages before weight loading to avoid
-            // non-deterministic compaction stalls during direct I/O.
-            if (const char* skip_touch =
-                    std::getenv("BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH");
-                skip_touch != nullptr && std::strcmp(skip_touch, "1") == 0) {
-                logger->warn(
-                    "--fast-init: Skipping weights page touching because "
-                    "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
-            } else {
-                auto touch_start = std::chrono::high_resolution_clock::now();
-                bool ok = touch_pages(ptr, allocated_size, huge_page_size, /*multi_threaded=*/true);
-                auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::high_resolution_clock::now() - touch_start).count();
-                if (ok) {
-                    logger->info("--fast-init: Weights page touching completed in {:.2f}s ({:.1f} GB)",
-                                 touch_ms / 1000.0, allocated_size / (1024.0 * 1024.0 * 1024.0));
+            advise_transparent_huge_pages(ptr, allocated_size, enable_thp);
+            if (enable_thp) {
+                // Pre-fault THP pages before weight loading to avoid
+                // non-deterministic compaction stalls during direct I/O.
+                if (const char* skip_touch =
+                        std::getenv("BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH");
+                    skip_touch != nullptr && std::strcmp(skip_touch, "1") == 0) {
+                    logger->warn(
+                        "--fast-init: Skipping weights page touching because "
+                        "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
                 } else {
-                    logger->warn("--fast-init: Weights page touching failed after {:.2f}s, proceeding anyway",
-                                 touch_ms / 1000.0);
+                    auto touch_start = std::chrono::high_resolution_clock::now();
+                    bool ok = touch_pages(ptr, allocated_size, huge_page_size, /*multi_threaded=*/true);
+                    auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - touch_start).count();
+                    if (ok) {
+                        logger->info("--fast-init: Weights page touching completed in {:.2f}s ({:.1f} GB)",
+                                     touch_ms / 1000.0, allocated_size / (1024.0 * 1024.0 * 1024.0));
+                    } else {
+                        logger->warn("--fast-init: Weights page touching failed after {:.2f}s, proceeding anyway",
+                                     touch_ms / 1000.0);
+                    }
                 }
+            } else if (!touch_pages(ptr, size, page_size, true)) {
+                logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
-            if (out_memfd_fd) {
-                *out_memfd_fd = fd;
-            }
-            logger->info("--fast-init: Weights allocated via memfd_create ({:.1f} GB, THP)",
-                         allocated_size / (1024.0 * 1024.0 * 1024.0));
+            *out_memfd_fd = fd;
+            logger->info("Weights allocated via memfd_create ({:.1f} GB, {} pages)",
+                         allocated_size / (1024.0 * 1024.0 * 1024.0),
+                         enable_thp ? "transparent huge" : "base");
         } else {
-            // Worker: open via /proc/<pid>/fd/<N>
+            // Worker: open the creator's memfd via /proc/<pid>/fd/<N>.
             if (memfd_creator_pid <= 0 || memfd_fd_arg < 0) {
                 throw std::runtime_error(
-                    "--fast-init worker: invalid weights memfd_creator_pid or memfd_fd");
+                    "weights attach requires a valid memfd_creator_pid and "
+                    "memfd_fd (got pid=" + std::to_string(memfd_creator_pid) +
+                    ", fd=" + std::to_string(memfd_fd_arg) + ")");
             }
             std::string proc_path = "/proc/" + std::to_string(memfd_creator_pid) +
                                     "/fd/" + std::to_string(memfd_fd_arg);
-            int fd = open(proc_path.c_str(), O_RDWR);
+            int fd = open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
             if (fd < 0) {
                 throw std::runtime_error(
-                    "--fast-init worker: cannot open " + proc_path + ": " +
+                    "weights attach cannot open " + proc_path + ": " +
                     strerror(errno));
             }
             struct stat sb;
             if (fstat(fd, &sb) == -1 || sb.st_size < aligned_size) {
                 close(fd);
                 throw std::runtime_error(
-                    "--fast-init worker: weights memfd too small or fstat failed");
+                    "weights memfd too small or fstat failed");
+            }
+            // A huge page memfd only accepts a mapping aligned to its own page
+            // size, which the base page alignment above does not guarantee.
+            struct statfs sfs;
+            const bool fd_is_hugetlb =
+                fstatfs(fd, &sfs) == 0 &&
+                static_cast<unsigned long>(sfs.f_type) == HUGETLBFS_MAGIC;
+            if (fd_is_hugetlb) {
+                alignment = std::max(default_huge_page_size(), page_size);
             }
             ptr = mmap_aligned(sb.st_size, PROT_READ | PROT_WRITE,
                                MAP_SHARED, fd, 0, alignment);
@@ -453,80 +519,20 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 close(fd);
                 ptr = nullptr;
                 throw std::runtime_error(
-                    "--fast-init worker: mmap on weights memfd failed: " +
+                    "mmap on weights memfd failed: " +
                     std::string(strerror(err)));
             }
             allocated_size = sb.st_size;
+            using_huge_pages = fd_is_hugetlb;
+            // Both sides advise, so one cannot promote the mapping while the
+            // other keeps it at the base page size. Huge pages are already the
+            // mapping's page size, and THP cannot apply to them.
+            advise_transparent_huge_pages(ptr, allocated_size,
+                                          enable_thp && !fd_is_hugetlb);
             close(fd);
-            logger->info("--fast-init worker: Weights attached via memfd ({:.1f} GB)",
-                         allocated_size / (1024.0 * 1024.0 * 1024.0));
-        }
-    }
-
-    // STAGE 2: Fallback to regular shared memory if hugepages were disabled or failed
-    if (!ptr) {
-        if (enable_hugetlbfs) {
-             logger->info("Falling back to regular shared memory...");
-        }
-
-        int flags = O_RDWR | (create ? O_CREAT : 0);
-        int fd = shm_open(shm_name.c_str(), flags, 0666);
-        if (fd < 0) {
-            throw std::runtime_error("shm_open failed for '" + shm_name + "': " + strerror(errno));
-        }
-
-        if (create) {
-            int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
-            if (ftruncate64(fd, aligned_size) == -1) {
-                close(fd);
-                shm_unlink(shm_name.c_str());
-                throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
-            }
-            // Use mmap_aligned with 2MB alignment (or system page size) even for regular shm
-            size_t alignment = std::max(huge_page_size, page_size);
-            ptr = mmap_aligned(aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-            allocated_size = aligned_size;
-        } else { // Worker logic
-            struct stat sb;
-            int64_t file_size = 0;
-            for (int retry = 0; retry < 20; ++retry) {
-                if (fstat(fd, &sb) == -1) {
-                    close(fd);
-                    throw std::runtime_error("fstat on shm file failed: " + std::string(strerror(errno)));
-                }
-                if (sb.st_size > 0) {
-                    file_size = sb.st_size;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            if (file_size > 0) {
-                // Use mmap_aligned for workers too
-                size_t alignment = std::max(huge_page_size, page_size);
-                ptr = mmap_aligned(file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
-                allocated_size = file_size;
-            } else {
-                 logger->error("Timed out waiting for server to create shm file.");
-            }
-        }
-        close(fd);
-
-        if (ptr == MAP_FAILED) {
-            if (create) shm_unlink(shm_name.c_str());
-            throw std::runtime_error("mmap for regular shm failed: " + std::string(strerror(errno)));
-        }
-        
-        logger->info("Allocated {:.3f}GB using regular pages",
-                   allocated_size / (1024.0 * 1024.0 * 1024.0));
-
-        if (madvise(ptr, allocated_size, MADV_HUGEPAGE) == 0) {
-            logger->debug("Successfully enabled transparent huge pages hint.");
-        }
-
-        if (create) {
-            if (!touch_pages(ptr, size, page_size, true)) {
-                logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
-            }
+            logger->info("Weights attached via memfd ({:.1f} GB, {} pages)",
+                         allocated_size / (1024.0 * 1024.0 * 1024.0),
+                         fd_is_hugetlb ? "huge" : "base");
         }
     }
 
@@ -548,14 +554,12 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
             logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
         } catch (const std::exception& e) {
-            // Clean up memory and rethrow if CUDA registration fails
+            // Clean up memory and rethrow if CUDA registration fails. Closing
+            // the creator's fd is the whole release in both modes.
             munmap(ptr, allocated_size);
-            if (create) {
-                if (using_huge_pages) {
-                    unlink(hugepage_path.c_str());
-                } else {
-                    shm_unlink(shm_name.c_str());
-                }
+            if (create && *out_memfd_fd >= 0) {
+                close(*out_memfd_fd);
+                *out_memfd_fd = -1;
             }
             throw;
         }
@@ -565,6 +569,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
     logger->info("Memory allocation completed successfully using {} pages.",
                using_huge_pages ? "huge" : "regular");
+
+    if (out_mapped_size) *out_mapped_size = allocated_size;
 
     return ptr;
 }
@@ -597,11 +603,19 @@ void verify_numa_allocation(void* ptr, size_t size) {
 }
 
 
-void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
-                               bool create) {
-    cudaHostUnregister(ptr);
-    munmap(ptr, size);
-    shm_unlink(shm_name.c_str());
+void free_shared_pinned_memory(void* ptr, int64_t size) {
+    const auto start = std::chrono::steady_clock::now();
+    const cudaError_t unregister_result = cudaHostUnregister(ptr);
+    const auto unregister_done = std::chrono::steady_clock::now();
+    const int unmap_result = munmap(ptr, size);
+    const auto unmap_done = std::chrono::steady_clock::now();
+    logger->info(
+        "shared memory release: cudaHostUnregister={} elapsed={:.3f}s, "
+        "munmap={} elapsed={:.3f}s",
+        static_cast<int>(unregister_result),
+        std::chrono::duration<double>(unregister_done - start).count(),
+        unmap_result,
+        std::chrono::duration<double>(unmap_done - unregister_done).count());
 }
 
 // -----------------------------------------------------------------------------
@@ -832,63 +846,80 @@ deserialize_map_from_buffer(const char* buffer, size_t buffer_size) {
 }
 
 // -----------------------------------------------------------------------------
-// API: Serialize the map into shared memory.
-// This function computes the required size, creates (or truncates) the shared
-// memory object, maps it, writes the serialized data, then unmaps/closes it.
+// API: Serialize the map into an anonymous memfd.
+// This function computes the required size, creates and sizes the memfd, maps
+// it, writes the serialized data, then unmaps it. The returned fd stays open so
+// workers can reach the region through /proc/<creator_pid>/fd/<N>.
 // -----------------------------------------------------------------------------
-void serialize_to_shared_memory(
+int serialize_to_memfd(
     const std::unordered_map<std::string,
-                             std::unordered_map<std::string, tensor_meta>>& map,
-    const std::string& shm_name) {
+                             std::unordered_map<std::string, tensor_meta>>& map) {
     // Compute the buffer size required.
     size_t total_size = compute_serialized_size(map);
 
-    // Open (or create) the shared memory region.
-    int fd = shm_open(shm_name.c_str(), O_RDWR | O_CREAT, 0666);
+    int fd = create_anonymous_memfd("batchgen_tensor_meta");
     if (fd == -1)
-        throw std::runtime_error("Failed to create shared memory: " + shm_name);
+        throw std::runtime_error(
+            "memfd_create for tensor metadata failed: " +
+            std::string(strerror(errno)));
 
     // Set the size.
     if (ftruncate(fd, total_size) == -1) {
+        int err = errno;
         close(fd);
-        shm_unlink(shm_name.c_str());
-        throw std::runtime_error("Failed to set shared memory size");
+        throw std::runtime_error("ftruncate on tensor metadata memfd failed: " +
+                                 std::string(strerror(err)));
     }
 
     // Map the memory.
     void* addr =
         mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
+        int err = errno;
         close(fd);
-        shm_unlink(shm_name.c_str());
-        throw std::runtime_error("Failed to map shared memory");
+        throw std::runtime_error("mmap on tensor metadata memfd failed: " +
+                                 std::string(strerror(err)));
     }
 
     // Write the data.
-    serialize_map_to_buffer(map, static_cast<char*>(addr), total_size);
+    try {
+        serialize_map_to_buffer(map, static_cast<char*>(addr), total_size);
+    } catch (...) {
+        munmap(addr, total_size);
+        close(fd);
+        throw;
+    }
 
-    // Clean up.
+    // Clean up; the fd is the caller's to keep and close.
     munmap(addr, total_size);
-    close(fd);
+    return fd;
 }
 
 // -----------------------------------------------------------------------------
-// API: Deserialize the map from shared memory.
-// This function opens the shared memory region, maps it, reads the data, then
-// unmaps/closes it.
+// API: Deserialize the map from the creator's anonymous memfd.
+// This function opens /proc/<creator_pid>/fd/<N>, maps it, reads the data, then
+// unmaps/closes it. The region is small and read exactly once per worker.
 // -----------------------------------------------------------------------------
 std::unordered_map<std::string, std::unordered_map<std::string, tensor_meta>>
-deserialize_from_shared_memory(const std::string& shm_name) {
-    // Open shared memory (read-only).
-    int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
+deserialize_from_memfd(int memfd_creator_pid, int memfd_fd) {
+    if (memfd_creator_pid <= 0 || memfd_fd < 0)
+        throw std::runtime_error(
+            "tensor metadata attach requires a valid memfd_creator_pid and "
+            "memfd_fd (got pid=" + std::to_string(memfd_creator_pid) +
+            ", fd=" + std::to_string(memfd_fd) + ")");
+
+    const std::string proc_path = "/proc/" + std::to_string(memfd_creator_pid) +
+                                  "/fd/" + std::to_string(memfd_fd);
+    int fd = open(proc_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1)
-        throw std::runtime_error("Cannot open shared memory: " + shm_name);
+        throw std::runtime_error("Cannot open tensor metadata memfd " +
+                                 proc_path + ": " + strerror(errno));
 
     // Get the size.
     struct stat sb;
     if (fstat(fd, &sb) == -1) {
         close(fd);
-        throw std::runtime_error("Failed to get shared memory size");
+        throw std::runtime_error("Failed to get tensor metadata memfd size");
     }
     size_t size = sb.st_size;
 
@@ -896,7 +927,7 @@ deserialize_from_shared_memory(const std::string& shm_name) {
     void* addr = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
         close(fd);
-        throw std::runtime_error("Failed to map shared memory");
+        throw std::runtime_error("Failed to map tensor metadata memfd");
     }
 
     // Deserialize the map.

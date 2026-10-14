@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -61,7 +61,7 @@ struct tensor_meta {
 
 class Parameter_Server {
    public:
-    Parameter_Server(bool enable_hugetlbfs, bool enable_memfd = false);
+    Parameter_Server(bool enable_hugetlbfs, bool enable_thp = false);
     ~Parameter_Server();
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
               int64_t byte_size, std::string& model_weights_path,
@@ -71,6 +71,7 @@ class Parameter_Server {
     std::unordered_map<std::string, torch::Tensor> get_skeleton_state_dict();
     int64_t byte_size();
     int weights_memfd_fd() const { return weights_memfd_fd_; }
+    int tensor_meta_memfd_fd() const { return tensor_meta_memfd_fd_; }
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
     module_weights_shm();
@@ -80,17 +81,21 @@ class Parameter_Server {
     std::shared_ptr<spdlog::logger> logger;
 
     /* "attn_0" -> "o_proj" -> ptr */
+    // Both names are labels in every mode, including hugetlbfs: the regions are
+    // anonymous memfds, so no filesystem object carries them.
     std::string shm_name;
     std::string tensor_meta_shm_name;
-    void* weight_ptr_;
-    int64_t byte_size_;
+    void* weight_ptr_ = nullptr;
+    int64_t byte_size_ = 0;
+    int64_t mapped_size_ = 0;
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;
     std::unordered_map<std::string, torch::Tensor> skeleton_state_dict_;
     bool enable_hugetlbfs;
-    bool enable_memfd_ = false;
+    bool enable_thp_ = false;
     int weights_memfd_fd_ = -1;
+    int tensor_meta_memfd_fd_ = -1;
     void _load_cus_format_file_to_host_mem(
         const std::string& model_weights_path,
         void* weight_ptr,

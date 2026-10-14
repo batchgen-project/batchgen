@@ -29,6 +29,7 @@ If it fixes an issue, link it (e.g., `close #123`).
 - [ ] I have read the [CONTRIBUTING](https://github.com/batchgen-project/batchgen/blob/main/CONTRIBUTING.md) guide and the [PR Merge Policy Contract](https://github.com/batchgen-project/batchgen/blob/main/PR_MERGE_POLICY.md).
 - [ ] I have updated the tests (if applicable).
 - [ ] I have updated the documentation (if applicable).
+- [ ] If `README.md` changed, I ran `python3 scripts/check_readme_update.py --base-ref origin/main` and preserved all News history.
 
 <!--
 Before marking "Ready for review", self-check your change against the author

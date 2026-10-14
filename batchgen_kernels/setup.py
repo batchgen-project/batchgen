@@ -11,12 +11,15 @@ Usage:
     pip install -e batchgen_kernels/ --no-build-isolation
 
 Environment variables:
-    MAX_JOBS        — parallel file compilation (default: cpu_count/2)
+    MAX_JOBS        — parallel file compilation within one extension (default: cpu_count/2)
+                      With `build_ext --parallel N`, N extensions build at once, each
+                      with up to MAX_JOBS ninja jobs; lower MAX_JOBS accordingly.
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
     BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
+import copy
 import os
 import shutil
 from setuptools import setup
@@ -49,21 +52,6 @@ _nvcc_threads = os.getenv("NVCC_THREADS", "4")
 
 # ── ccache / sccache integration ──
 
-def _setup_ccache():
-    """Detect and configure ccache/sccache for faster incremental builds."""
-    for tool in ("sccache", "ccache"):
-        if shutil.which(tool):
-            os.environ.setdefault("CC", f"{tool} gcc")
-            os.environ.setdefault("CXX", f"{tool} g++")
-            if tool == "ccache":
-                os.environ.setdefault("CCACHE_NVCC", "1")
-            print(f"[batchgen_kernels] Using {tool} for compilation cache")
-            return tool
-    return None
-
-_cache_tool = _setup_ccache()
-
-
 # ── CUDA_HOME auto-detection (for external users) ──
 
 if not os.environ.get("CUDA_HOME"):
@@ -75,6 +63,28 @@ if not os.environ.get("CUDA_HOME"):
             "CUDA toolkit not found. Set CUDA_HOME or ensure nvcc is on PATH.\n"
             "Example: export CUDA_HOME=/usr/local/cuda-12.8"
         )
+
+
+def _setup_ccache():
+    """Detect and configure ccache/sccache for faster incremental builds.
+
+    CC must stay a plain compiler: torch passes it to nvcc as `-ccbin`, and
+    nvcc cannot run "ccache gcc". nvcc itself is cached via PYTORCH_NVCC and
+    scripts/cache_nvcc.sh, which rewrites torch's dependency flags for ccache.
+    For reuse across checkouts, callers set CCACHE_BASEDIR to the checkout.
+    """
+    for tool in ("sccache", "ccache"):
+        if shutil.which(tool):
+            os.environ.setdefault("CXX", f"{tool} g++")
+            nvcc = os.path.join(os.environ["CUDA_HOME"], "bin", "nvcc")
+            wrapper = os.path.join(_this_dir, "..", "scripts", "cache_nvcc.sh")
+            if os.path.isfile(wrapper):  # absent when built outside the repo
+                os.environ.setdefault("PYTORCH_NVCC", f"{wrapper} {tool} {nvcc}")
+            print(f"[batchgen_kernels] Using {tool} for compilation cache")  # noqa: hygiene - build output
+            return tool
+    return None
+
+_cache_tool = _setup_ccache()
 
 
 # ── Architecture build gating ──
@@ -407,6 +417,24 @@ else:
     print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
 _ext_modules.extend(_sm80_extensions)
 
+class IsolatedBuildExtension(BuildExtension):
+    """BuildExtension that is safe under `build_ext --parallel N`.
+
+    torch writes each extension's ninja manifest to `<build_temp>/build.ninja`.
+    setuptools builds parallel extensions on threads sharing one build_temp, so
+    concurrent extensions overwrite each other's manifest
+    (`build.ninja:38: expected '=', got newline`). Give every extension its own
+    build_temp; serial builds keep the shared directory unchanged.
+    """
+
+    def build_extension(self, ext):
+        if not self.parallel:
+            return super().build_extension(ext)
+        worker = copy.copy(self)
+        worker.build_temp = os.path.join(self.build_temp, ext.name)
+        return super(IsolatedBuildExtension, worker).build_extension(ext)
+
+
 setup(
     name="batchgen_kernels",
     version=_get_version(),
@@ -435,7 +463,7 @@ setup(
         ],
     },
     ext_modules=_ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": IsolatedBuildExtension},
     python_requires=">=3.11",
     # torch must be pre-installed (with correct CUDA variant, e.g. cu128).
     # Do NOT list it here — pip would pull the CPU-only version from PyPI.

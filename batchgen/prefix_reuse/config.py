@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +28,8 @@ class PrefixKVGroupSpec:
 
 @dataclass(frozen=True)
 class PrefixCacheRuntimeConfig:
+    # Diagnostic label; the region is an anonymous memfd reached through
+    # /proc/<memfd_creator_pid>/fd/<memfd_fd> when attaching.
     shm_name: str
     namespace_digest: tuple[int, int, int, int]
     group_specs: tuple[PrefixKVGroupSpec, ...]
@@ -40,10 +41,14 @@ class PrefixCacheRuntimeConfig:
     max_attachments: int
     host_page_bytes_all_layers: int
     debug_stats: bool = False
+    memfd_creator_pid: int = -1
+    memfd_fd: int = -1
 
     def to_core_config(self, core_engine_module: Any):
         config = core_engine_module.HostPrefixCacheConfig()
         config.shm_name = self.shm_name
+        config.memfd_creator_pid = int(self.memfd_creator_pid)
+        config.memfd_fd = int(self.memfd_fd)
         config.hash_block_tokens = int(self.hash_block_tokens)
         config.max_nodes = int(self.max_nodes)
         config.max_group_entries = int(self.max_group_entries)
@@ -76,6 +81,8 @@ def build_prefix_cache_runtime_config(
     kv_dtype: str,
     host_kv_config: Any,
     debug_stats: bool = False,
+    memfd_creator_pid: int = -1,
+    memfd_fd: int = -1,
 ) -> PrefixCacheRuntimeConfig:
     """Derive the single-group GPT-OSS prefix-cache shared-memory layout."""
 
@@ -120,6 +127,8 @@ def build_prefix_cache_runtime_config(
         max_attachments=max(1024, sequence_capacity),
         host_page_bytes_all_layers=host_page_bytes_all_layers,
         debug_stats=bool(debug_stats),
+        memfd_creator_pid=int(memfd_creator_pid),
+        memfd_fd=int(memfd_fd),
     )
 
 
@@ -134,16 +143,6 @@ def create_host_prefix_cache_coordinator(
     )
     coordinator.initialize(bool(create_region))
     return coordinator
-
-
-def unlink_prefix_cache_shared_memory(runtime_config: PrefixCacheRuntimeConfig):
-    """Remove the exact POSIX SHM name after every worker has exited."""
-
-    path = f"/dev/shm/{runtime_config.shm_name.lstrip('/')}"
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
 
 
 def _derive_prefix_cache_shm_name(model_name: str) -> str:

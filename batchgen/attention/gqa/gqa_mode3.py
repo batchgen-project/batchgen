@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                          #
+#  Copyright (c) 2025-2026 BatchGen Team                                         #
 # ---------------------------------------------------------------------------- #
 
 """GQA Mode 3 attention: GPU paged KV cache decode.

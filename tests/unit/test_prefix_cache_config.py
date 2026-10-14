@@ -20,7 +20,6 @@ _SPEC.loader.exec_module(_CONFIG)
 PrefixKVGroupSemantic = _CONFIG.PrefixKVGroupSemantic
 build_prefix_cache_runtime_config = _CONFIG.build_prefix_cache_runtime_config
 require_prefix_cache_model_support = _CONFIG.require_prefix_cache_model_support
-unlink_prefix_cache_shared_memory = _CONFIG.unlink_prefix_cache_shared_memory
 
 
 def _host_config(**overrides):
@@ -102,18 +101,37 @@ def test_runtime_config_converts_to_core_types():
     assert converted.max_page_handles == 4096
 
 
-def test_unlink_targets_only_the_derived_prefix_region(monkeypatch):
+def test_memfd_identity_defaults_and_round_trip():
+    # Owner builds without identity; workers attach with the published one.
     runtime = build_prefix_cache_runtime_config(
         model_name="openai/gpt-oss-120b",
         kv_dtype="bfloat16",
         host_kv_config=_host_config(),
     )
-    removed = []
-    monkeypatch.setattr(_CONFIG.os, "unlink", removed.append)
+    assert runtime.memfd_creator_pid == -1
+    assert runtime.memfd_fd == -1
 
-    unlink_prefix_cache_shared_memory(runtime)
+    attached = build_prefix_cache_runtime_config(
+        model_name="openai/gpt-oss-120b",
+        kv_dtype="bfloat16",
+        host_kv_config=_host_config(),
+        memfd_creator_pid=4321,
+        memfd_fd=17,
+    )
+    class CoreConfig:
+        pass
 
-    assert removed == [f"/dev/shm/{runtime.shm_name}"]
+    class CoreGroupSpec:
+        pass
+
+    core = SimpleNamespace(
+        HostPrefixCacheConfig=CoreConfig,
+        HostKVGroupSpec=CoreGroupSpec,
+        HostKVGroupSemantic=SimpleNamespace(FULL_KV="full-kv-enum"),
+    )
+    converted = attached.to_core_config(core)
+    assert converted.memfd_creator_pid == 4321
+    assert converted.memfd_fd == 17
 
 
 def test_namespace_changes_with_kv_dtype_or_page_geometry():

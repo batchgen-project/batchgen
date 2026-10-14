@@ -18,8 +18,6 @@ from batchgen.migration import MigrationOp
 from batchgen.query_book import QueryBookEntry
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import (
-    GpuKvManagerPlan,
-    GpuKvManagerRequest,
     HostKVUtilization,
     KVCacheManager,
     KVStats,
@@ -436,18 +434,20 @@ def test_apply_capacity_normal_case():
     )
     config = _FakeCudaGraphConfig(num_pages=1000, page_size_tokens=64)
     out = KVCacheManager.apply_page_table_capacity(req, config)
-    # ceil(24000 / 64) = 375. min(1000, 375) = 375.
+    # ceil(24000 / 64) = 375 — from token capacity only.
     assert out.cuda_graph_max_pages_per_sequence == 375
-    # min(1000, 64) = 64.
     assert out.cuda_graph_max_slots == 64
 
 
-def test_apply_capacity_token_capacity_exceeds_num_pages():
-    """When ceil(tokens/page_size) > num_pages, clamped to num_pages."""
+def test_apply_capacity_decoupled_from_num_pages():
+    """Table SHAPE comes from token capacity only (measure-once-cache
+    contract): a pool smaller than the token capacity no longer clamps the
+    page-table width, so captured graphs never depend on the pool's page
+    count and a pool resize cannot invalidate the baked table shape."""
     req = _make_cap_req(model_max_position_embeddings=1_000_000)
     config = _FakeCudaGraphConfig(num_pages=100, page_size_tokens=64)
     out = KVCacheManager.apply_page_table_capacity(req, config)
-    assert out.cuda_graph_max_pages_per_sequence == 100
+    assert out.cuda_graph_max_pages_per_sequence == 15625  # ceil(1e6 / 64)
     assert out.cuda_graph_max_slots == 1  # no slot inputs → fallback 1
 
 
@@ -489,34 +489,8 @@ def test_capacity_request_is_frozen():
 # ---------------------------------------------------------------------------
 
 
-def _make_token_budget_req(
-    *,
-    query_book=None,
-    local_to_uuid=None,
-    sequences=(),
-    max_decoding_length: int = 16,
-) -> TokenBudgetRequest:
-    """Build a TokenBudgetRequest from explicit pieces.
-
-    ``sequences`` is an iterable of ``(uuid, prompt_length)`` pairs which is
-    materialized into a real ``SequenceBatch`` so the handler exercises the
-    same ``get_sequence`` path the worker uses.
-    """
-    batch = SequenceBatch()
-    for uuid, prompt_length in sequences:
-        seq = SequenceEntry(
-            uuid=uuid,
-            global_idx=0,
-            prompt_length=prompt_length,
-            max_decode_length=max_decoding_length,
-        )
-        batch.add_sequence(seq)
-    return TokenBudgetRequest(
-        query_book=query_book if query_book is not None else {},
-        local_to_uuid=local_to_uuid if local_to_uuid is not None else {},
-        global_batch=batch,
-        max_decoding_length=max_decoding_length,
-    )
+def _make_token_budget_req(*, query_book=None) -> TokenBudgetRequest:
+    return TokenBudgetRequest(query_book=query_book if query_book is not None else {})
 
 
 def _make_entry(*, kv_token_budget=None) -> QueryBookEntry:
@@ -528,42 +502,19 @@ def _make_entry(*, kv_token_budget=None) -> QueryBookEntry:
     )
 
 
-def test_token_budget_uses_cached_value_when_set():
-    """If the entry already has kv_token_budget, return it without recomputing."""
+def test_token_budget_returns_admission_value():
     entry = _make_entry(kv_token_budget=999)
     req = _make_token_budget_req(query_book={42: entry})
     assert KVCacheManager.get_sequence_token_budget(req, 42) == 999
 
 
-def test_token_budget_computes_and_memoizes_when_missing():
-    """When the entry has no budget, compute from sequence metadata and cache."""
+def test_token_budget_missing_value_raises():
+    """Admission always sets the budget; there is no recompute fallback."""
     entry = _make_entry(kv_token_budget=None)
-    req = _make_token_budget_req(
-        query_book={7: entry},
-        local_to_uuid={7: "uuid-7"},
-        sequences=[("uuid-7", 100)],
-        max_decoding_length=512,
-    )
-    budget = KVCacheManager.get_sequence_token_budget(req, 7)
-    assert budget == 100 + 512  # prompt_length + max_decoding_length
-    # Memoized on the entry the worker passed in
-    assert entry.kv_token_budget == 612
-
-
-def test_token_budget_second_call_returns_cache_hit():
-    """Second call must hit the just-memoized value (no re-read of metadata)."""
-    entry = _make_entry(kv_token_budget=None)
-    req = _make_token_budget_req(
-        query_book={3: entry},
-        local_to_uuid={3: "uuid-3"},
-        sequences=[("uuid-3", 50)],
-        max_decoding_length=16,
-    )
-    first = KVCacheManager.get_sequence_token_budget(req, 3)
-    # Drop the sequence from the batch — cache hit must not need it
-    req.global_batch.sequences.clear()
-    second = KVCacheManager.get_sequence_token_budget(req, 3)
-    assert first == second == 66
+    req = _make_token_budget_req(query_book={7: entry})
+    with pytest.raises(RuntimeError, match="sequence 7 has no kv_token_budget"):
+        KVCacheManager.get_sequence_token_budget(req, 7)
+    assert entry.kv_token_budget is None
 
 
 def test_token_budget_raises_runtime_error_when_query_book_empty():
@@ -589,64 +540,15 @@ def test_token_budget_raises_keyerror_for_entry_without_encoded():
         KVCacheManager.get_sequence_token_budget(req, 5)
 
 
-def test_token_budget_raises_keyerror_when_sequence_metadata_missing():
-    """Compute path needs sequence metadata; missing ⇒ KeyError (legacy parity)."""
-    entry = _make_entry(kv_token_budget=None)
-    req = _make_token_budget_req(
-        query_book={9: entry},
-        local_to_uuid={9: "uuid-9"},
-        sequences=[],  # No sequence with uuid-9
-    )
-    with pytest.raises(KeyError, match="No sequence metadata available for sequence 9"):
-        KVCacheManager.get_sequence_token_budget(req, 9)
-
-
-def test_token_budget_raises_keyerror_when_uuid_unknown():
-    """If local_to_uuid has no entry for the sequence_id, uuid="" → no metadata."""
-    entry = _make_entry(kv_token_budget=None)
-    req = _make_token_budget_req(
-        query_book={11: entry},
-        local_to_uuid={},  # 11 not present
-        sequences=[("anything", 100)],
-    )
-    with pytest.raises(KeyError, match="No sequence metadata available for sequence 11"):
-        KVCacheManager.get_sequence_token_budget(req, 11)
-
-
-def test_token_budget_no_truncation_against_max_input_length():
-    """Budget is prompt + max_decode regardless of any worker max_input_length.
-
-    Legacy had an earlier min(...) here which silently undersized KV when
-    max_input_length lagged behind the actual prompt length on multi-batch
-    admits. The handler must NOT re-introduce that.
-    """
-    entry = _make_entry(kv_token_budget=None)
-    # Prompt is 4096 but no max_input_length in the request — handler must
-    # not clamp against any external limit.
-    req = _make_token_budget_req(
-        query_book={1: entry},
-        local_to_uuid={1: "uuid-1"},
-        sequences=[("uuid-1", 4096)],
-        max_decoding_length=512,
-    )
-    assert KVCacheManager.get_sequence_token_budget(req, 1) == 4096 + 512
-
-
 def test_compute_host_kv_sequence_tokens_returns_list_in_order():
-    """Bulk variant preserves input ordering and reuses the cache."""
-    e1 = _make_entry(kv_token_budget=111)
-    e2 = _make_entry(kv_token_budget=222)
-    e3 = _make_entry(kv_token_budget=None)
     req = _make_token_budget_req(
-        query_book={1: e1, 2: e2, 3: e3},
-        local_to_uuid={3: "uuid-3"},
-        sequences=[("uuid-3", 60)],
-        max_decoding_length=40,
+        query_book={
+            1: _make_entry(kv_token_budget=111),
+            2: _make_entry(kv_token_budget=222),
+            3: _make_entry(kv_token_budget=100),
+        },
     )
-    out = KVCacheManager.compute_host_kv_sequence_tokens(req, [2, 1, 3])
-    assert out == [222, 111, 100]
-    # The miss path also memoized:
-    assert e3.kv_token_budget == 100
+    assert KVCacheManager.compute_host_kv_sequence_tokens(req, [2, 1, 3]) == [222, 111, 100]
 
 
 def test_compute_host_kv_sequence_tokens_empty_input():
@@ -657,227 +559,7 @@ def test_compute_host_kv_sequence_tokens_empty_input():
 def test_token_budget_request_is_frozen():
     req = _make_token_budget_req(query_book={})
     with pytest.raises((AttributeError, Exception)):
-        req.max_decoding_length = 99  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# GPU-KV-manager allocation planning (Phase 5.4a)
-# ---------------------------------------------------------------------------
-
-_CFG_MODULE = "batchgen.kv_cache.host_kv_mananger_config"
-
-
-@dataclass(frozen=True)
-class _FakeGpuConfig:
-    """Stand-in for GPUPagedKVConfig — only the fields the planner touches.
-
-    ``apply_page_table_capacity`` reads ``num_pages`` / ``page_size_tokens``
-    and ``dataclasses.replace``s the two cuda_graph fields, so this is
-    sufficient to exercise the plan without importing the real (JIT-backed)
-    config class.
-    """
-
-    num_pages: int
-    page_size_tokens: int = 64
-    cuda_graph_max_pages_per_sequence: "int | None" = None
-    cuda_graph_max_slots: "int | None" = None
-
-
-def _gpu_config(num_pages: int) -> _FakeGpuConfig:
-    return _FakeGpuConfig(num_pages=num_pages)
-
-
-def _cap_req_for_plan() -> PageTableCapacityRequest:
-    """Capacity request with everything off → apply_page_table_capacity
-    only sets cuda_graph fields, never touches num_pages."""
-    return PageTableCapacityRequest(
-        sequence_tokens=(),
-        max_input_length=0,
-        max_decoding_length=0,
-        engine_max_prompt=None,
-        engine_max_decode=None,
-        engine_module_global_batch_size=None,
-        engine_module_attn_decoding_micro_batch_size=None,
-        engine_basic_num_queries=None,
-        model_max_position_embeddings=None,
-        args_cuda_graph_max_bucket_size=None,
-    )
-
-
-def _patch_builders(monkeypatch, *, primary_pages: int, aux_pages=None):
-    """Inject a fake config module so the handler's local
-    ``from batchgen.kv_cache.host_kv_mananger_config import ...`` resolves to
-    controlled builders — without importing the real module (which JIT-builds
-    the core_engine op). Python's import machinery checks ``sys.modules``
-    first, so the fake wins.
-    """
-    fake_mod = types.ModuleType(_CFG_MODULE)
-    fake_mod.build_gpu_kv_config = (
-        lambda model_name, sequence_tokens: _gpu_config(primary_pages)
-    )
-    fake_mod.build_gpu_kv_config_aux = lambda model_name, sequence_tokens: (
-        None if aux_pages is None else _gpu_config(aux_pages)
-    )
-    monkeypatch.setitem(sys.modules, _CFG_MODULE, fake_mod)
-
-
-def _plan_req(*, has_manager: bool, current_num_pages: int) -> GpuKvManagerRequest:
-    return GpuKvManagerRequest(
-        model_name="fake-model",
-        sequence_tokens=(2048,),
-        has_manager=has_manager,
-        current_num_pages=current_num_pages,
-        capacity=_cap_req_for_plan(),
-    )
-
-
-def test_plan_gpu_kv_no_existing_manager_creates_new(monkeypatch):
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=False, current_num_pages=0)
-    )
-    assert plan.reuse is False
-    assert plan.destroy_existing is False  # nothing to destroy
-    assert plan.primary_config is not None and plan.primary_config.num_pages == 100
-    assert plan.aux_config is None  # non-DSA model
-
-
-def test_plan_gpu_kv_reuse_when_enough_pages(monkeypatch):
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=128)
-    )
-    assert plan.reuse is True
-    assert plan.destroy_existing is False
-    assert plan.primary_config is None  # reuse → no configs built
-    assert plan.aux_config is None
-
-
-def test_plan_gpu_kv_reuse_boundary_exact_pages(monkeypatch):
-    """current == required ⇒ reuse (the `>=` boundary)."""
-    _patch_builders(monkeypatch, primary_pages=100)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=100)
-    )
-    assert plan.reuse is True
-
-
-def test_plan_gpu_kv_recreate_when_too_few_pages(monkeypatch):
-    """Existing manager too small ⇒ recreate + destroy old."""
-    _patch_builders(monkeypatch, primary_pages=200)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=100)
-    )
-    assert plan.reuse is False
-    assert plan.destroy_existing is True
-    assert plan.primary_config.num_pages == 200
-
-
-def test_plan_gpu_kv_dsa_model_includes_aux(monkeypatch):
-    """DSA model (aux builder returns a config) ⇒ aux_config populated."""
-    _patch_builders(monkeypatch, primary_pages=200, aux_pages=50)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=False, current_num_pages=0)
-    )
-    assert plan.reuse is False
-    assert plan.primary_config.num_pages == 200
-    assert plan.aux_config is not None and plan.aux_config.num_pages == 50
-
-
-def test_plan_gpu_kv_reuse_skips_aux_build(monkeypatch):
-    """On reuse, neither config is built (aux stays None even for DSA)."""
-    _patch_builders(monkeypatch, primary_pages=100, aux_pages=50)
-    plan = KVCacheManager.plan_gpu_kv_manager(
-        _plan_req(has_manager=True, current_num_pages=128)
-    )
-    assert plan.reuse is True
-    assert plan.aux_config is None
-
-
-def test_plan_gpu_kv_applies_page_table_capacity(monkeypatch):
-    """The returned config carries CUDA-graph fields from the capacity req."""
-    _patch_builders(monkeypatch, primary_pages=100)
-    req = GpuKvManagerRequest(
-        model_name="fake-model",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=PageTableCapacityRequest(
-            sequence_tokens=(),
-            max_input_length=0,
-            max_decoding_length=0,
-            engine_max_prompt=None,
-            engine_max_decode=None,
-            engine_module_global_batch_size=32,  # → slot capacity 32
-            engine_module_attn_decoding_micro_batch_size=None,
-            engine_basic_num_queries=None,
-            model_max_position_embeddings=None,
-            args_cuda_graph_max_bucket_size=None,
-        ),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    # num_pages is untouched by capacity application; cuda_graph fields set.
-    assert plan.primary_config.num_pages == 100
-    assert plan.primary_config.cuda_graph_max_slots == 32
-    assert plan.primary_config.cuda_graph_max_pages_per_sequence is not None
-
-
-def test_plan_gpu_kv_request_and_plan_are_frozen():
-    req = _plan_req(has_manager=False, current_num_pages=0)
-    with pytest.raises((AttributeError, Exception)):
-        req.has_manager = True  # type: ignore[misc]
-    plan = GpuKvManagerPlan(
-        reuse=True, destroy_existing=False, primary_config=None, aux_config=None
-    )
-    with pytest.raises((AttributeError, Exception)):
-        plan.reuse = False  # type: ignore[misc]
-
-
-# --- Integration: real config builders for known models -------------------
-#
-# These exercise the REAL build_gpu_kv_config / _aux through the handler's
-# local import. That pulls batchgen.kv_cache, which JIT-builds the core_engine
-# op — unavailable on hosts without ninja (e.g. the dev laptop). Skip cleanly
-# there; they run where the op is built (remote / CI-with-GPU).
-
-
-def _require_real_config_module():
-    try:
-        import batchgen.kv_cache.host_kv_mananger_config  # noqa: F401
-    except Exception as exc:  # RuntimeError (ninja/JIT) or ImportError
-        pytest.skip(f"core_engine op unavailable on this host: {exc}")
-
-
-def test_plan_gpu_kv_real_glm5_is_dsa_with_aux():
-    """GLM-5-FP8 is a DSA model → real builder returns a non-None aux config."""
-    _require_real_config_module()
-    req = GpuKvManagerRequest(
-        model_name="glm-5-fp8",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=_cap_req_for_plan(),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    assert plan.reuse is False
-    assert plan.primary_config is not None and plan.primary_config.num_pages > 0
-    assert plan.aux_config is not None and plan.aux_config.num_pages > 0
-
-
-def test_plan_gpu_kv_real_gptoss_non_dsa_no_aux():
-    """GPT-OSS-120B is not a DSA model → real aux builder returns None."""
-    _require_real_config_module()
-    req = GpuKvManagerRequest(
-        model_name="gpt-oss-120b",
-        sequence_tokens=(2048,),
-        has_manager=False,
-        current_num_pages=0,
-        capacity=_cap_req_for_plan(),
-    )
-    plan = KVCacheManager.plan_gpu_kv_manager(req)
-    assert plan.reuse is False
-    assert plan.primary_config is not None and plan.primary_config.num_pages > 0
-    assert plan.aux_config is None
+        req.query_book = {}  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -1160,3 +842,28 @@ def test_migration_request_and_candidate_are_frozen():
     c = _cand("a", 0, 0, 1, 1)
     with pytest.raises((AttributeError, Exception)):
         c.uuid = "b"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# measure-once-cache pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_compute_final_pool_gb_subtracts_provisional_pool():
+    final = KVCacheManager.compute_final_pool_gb(140.0, 0.93, 132.4, 19.1)
+    assert abs(final - (140.0 * 0.93 - (132.4 - 19.1))) < 1e-9
+
+
+def test_compute_final_pool_gb_is_deterministic_identity():
+    # Measuring again with the FINAL pool allocated returns the same value:
+    # used2 = steady + final, so total*frac - (used2 - final) = final.
+    total, frac, steady = 140.0, 0.93, 113.3
+    final = KVCacheManager.compute_final_pool_gb(total, frac, steady + 19.1, 19.1)
+    again = KVCacheManager.compute_final_pool_gb(total, frac, steady + final, final)
+    assert abs(final - again) < 1e-9
+
+
+def test_pool_floor_pages():
+    assert KVCacheManager.pool_floor_pages(128) == 512
+    assert KVCacheManager.pool_floor_pages(1) == 4
+    assert KVCacheManager.pool_floor_pages(0) == 4  # clamped bucket

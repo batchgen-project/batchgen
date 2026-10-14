@@ -3,7 +3,7 @@
 import argparse
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +11,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
+from batchgen.server.runtime_identity import RuntimeIdentity
 
 
 def is_port_available(port: int) -> bool:
@@ -73,6 +74,9 @@ class ServerArgs:
     """Server configuration."""
 
     model: str
+    instance_id: str = "default"
+    runtime_mode: str = "exclusive"
+    lane_lease_manifest_fd: Optional[int] = None
     listen_ip: str = "0.0.0.0"
     listen_port: int = 10900
     hf_cache_dir: Optional[Path] = None
@@ -86,6 +90,8 @@ class ServerArgs:
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
+    pynccl_port_base: int = 20003
+    pynccl_port_span: int = 100
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
     enable_prefix_cache: bool = False
@@ -121,6 +127,7 @@ class ServerArgs:
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+    persistent_phase_instances: bool = False  # Keep prefill/decode model instances across phase switches
     detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
     # Dynamic host KV reservation settings
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
@@ -138,14 +145,22 @@ class ServerArgs:
     decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
     # Startup timeout
     startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
-    # Request pool: max QueryBook capacity. Default 10240 enables pool mode.
-    # Set to 0 to force legacy batch-FIFO mode.
+    # Request pool: max QueryBook capacity. Must be > 0 (see validate_server_args).
     max_pool_size: int = 10240
+    # Fixed node-shared host token pool budget. Sequence capacity is derived
+    # from this budget and the model maximum context; max_pool_size is kept
+    # only as a deprecated CLI compatibility field.
+    input_ids_pool_size_gb: float = 50.0
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
+    runtime_identity: RuntimeIdentity = field(init=False)
 
     def __post_init__(self):
+        self.runtime_identity = RuntimeIdentity.create(
+            self.instance_id,
+            mode=self.runtime_mode,
+        )
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
         # Default incremental output dir: {storage_path}/incremental/
@@ -172,6 +187,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BatchGen FastAPI server")
     parser.add_argument(
         "--model", type=str, required=True, help="HuggingFace model name"
+    )
+    parser.add_argument(
+        "--instance-id",
+        type=str,
+        default="default",
+        help=(
+            "Logical server instance identifier used to namespace mutable "
+            "runtime resources. Shared-host mode is not enabled by this flag."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("exclusive", "shared"),
+        default="exclusive",
+        help="Host admission mode (shared requires a launcher lease bundle)",
+    )
+    parser.add_argument(
+        "--lane-lease-manifest-fd",
+        type=int,
+        default=None,
+        help="Inherited descriptor for the shared-lane lease manifest",
     )
     parser.add_argument(
         "--listen-ip", type=str, default="0.0.0.0", help="Server listen IP"
@@ -220,7 +256,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fast-init",
         action="store_true",
-        help="Use memfd_create + THP for fast memory registration. "
+        help="Back the shared weights and host KV cache with transparent huge "
+             "pages (THP) for faster memory registration. The regions are "
+             "unnamed memfds in every mode; this flag only adds THP. "
              "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
              "(2) root access (for pre-allocation memory compaction). "
              "Automatically runs drop_caches + compact_memory before allocation "
@@ -231,6 +269,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="localhost:12355",
         help="torch.distributed init addr",
+    )
+    parser.add_argument(
+        "--pynccl-port-base",
+        type=int,
+        default=20003,
+        help="First port in this runtime's bounded PyNccl range",
+    )
+    parser.add_argument(
+        "--pynccl-port-span",
+        type=int,
+        default=100,
+        help="Number of ports reserved for PyNccl initialization and recovery",
     )
     parser.add_argument(
         "--kv-dtype", type=str, default="bfloat16", help="KV cache dtype"
@@ -315,8 +365,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-pool-size",
         type=int,
         default=10240,
-        help="Max QueryBook pool capacity for persistent request scheduling. "
-             "Default: 10240 (pool mode enabled). Set to 0 for legacy batch-FIFO mode.",
+        help="Deprecated compatibility value; scheduling capacity is derived "
+             "from --input-ids-pool-size-gb and model context. Default: 10240.",
+    )
+    parser.add_argument(
+        "--input-ids-pool-size-gb",
+        type=float,
+        default=50.0,
+        help="Fixed node-shared int32 input-id pool budget in GiB. "
+             "Sequence capacity is derived from this budget. Default: 50.",
     )
     parser.add_argument(
         "--max-intake-capacity",
@@ -425,6 +482,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of CUDA graph bucket sizes (default: 16). For GLM, use 7 with max bucket 64 for [1,2,4,8,16,32,64].",
     )
     parser.add_argument(
+        "--persistent-phase-instances",
+        action="store_true",
+        default=False,
+        help="Build the prefill and decode model instances once and keep them, with their "
+        "decode CUDA graphs, across phase switches; a switch only releases or refills the "
+        "decode routed experts (GLM-5 only).",
+    )
+    parser.add_argument(
         "--detokenization-include-special-tokens",
         action="store_true",
         default=False,
@@ -435,7 +500,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host-kv-chunk-size",
         type=int,
         default=8192,
-        help="Host KV chunk size in tokens for dynamic reservation (default: 8192). Each sequence initially reserves prompt_length + chunk_size tokens instead of full max_decode_length.",
+        help=(
+            "Initial host-KV reservation chunk in tokens (default: 8192). "
+            "The first pool init caps the effective chunk with its max output "
+            "length; this sizes host-KV reservations only and does not override "
+            "per-request max_completion_tokens. Later larger requests grow their "
+            "own reservation up to their KV budget."
+        ),
     )
     parser.add_argument(
         "--host-kv-eviction-watermark",
@@ -504,22 +575,34 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def validate_server_args(args: ServerArgs) -> None:
     """Validate parsed arguments."""
+    if args.max_pool_size <= 0:
+        raise ValueError("legacy non-pool mode was removed; --max-pool-size must be positive")
+    if args.input_ids_pool_size_gb <= 0:
+        raise ValueError("--input-ids-pool-size-gb must be positive")
     _validate_port_range("listen port", args.listen_port)
     _ensure_local_port_free(args.listen_port, "Listen")
 
     _, dist_port = parse_host_port(args.dist_init_addr)
     _validate_port_range("dist_init_addr port", dist_port)
 
+    _validate_port_range("PyNccl base port", args.pynccl_port_base)
+    if args.pynccl_port_span <= 0:
+        raise ValueError("pynccl_port_span must be positive")
+    pynccl_port_end = args.pynccl_port_base + args.pynccl_port_span
+    if pynccl_port_end > 65536:
+        raise ValueError("PyNccl port range must end at or before 65535")
+
     if args.nnodes > 1 and args.node_rank == 0:
         _ensure_local_port_free(dist_port, "dist_init_addr")
-        communicator_port = 20003
-        _validate_port_range("communicator port", communicator_port)
-        _ensure_local_port_free(communicator_port, "COMM")
+    if args.world_size > 1 and args.node_rank == 0:
+        _ensure_local_port_free(args.pynccl_port_base, "PyNccl")
 
     if args.nnodes <= 0:
         raise ValueError("nnodes must be positive")
     if args.world_size <= 0:
         raise ValueError("world_size must be positive")
+    if args.world_size % args.nnodes != 0:
+        raise ValueError("world_size must be divisible by nnodes")
     if args.node_rank < 0 or args.node_rank >= args.nnodes:
         raise ValueError("node_rank must be in [0, nnodes)")
     if args.host_kv_cache_size is None:
@@ -535,6 +618,7 @@ def validate_server_args(args: ServerArgs) -> None:
         )
 
         require_prefix_cache_model_support(args.model)
+    validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(
@@ -603,6 +687,65 @@ def validate_server_args(args: ServerArgs) -> None:
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
+def validate_shared_runtime_capability(args: ServerArgs) -> None:
+    """Reject any unqualified shared-host configuration before allocation."""
+    if args.runtime_mode == "exclusive":
+        if args.lane_lease_manifest_fd is not None:
+            raise ValueError(
+                "--lane-lease-manifest-fd requires --runtime-mode shared"
+            )
+        return
+    if args.runtime_mode != "shared":
+        raise ValueError("runtime_mode must be 'exclusive' or 'shared'")
+    if args.lane_lease_manifest_fd is None or args.lane_lease_manifest_fd < 0:
+        raise ValueError("shared mode requires --lane-lease-manifest-fd")
+    if args.model != "openai/gpt-oss-120b":
+        raise ValueError("shared mode is qualified only for openai/gpt-oss-120b")
+    if args.nnodes != 1 or args.node_rank != 0:
+        raise ValueError("shared mode requires one node with node_rank 0")
+    if args.world_size not in {1, 2, 4, 8}:
+        raise ValueError("shared mode world_size must be one of 1, 2, 4, or 8")
+    if args.fast_init or args.enable_hugetlbfs or args.enable_deepep:
+        raise ValueError(
+            "shared mode rejects fast-init, hugetlbfs, and DeepEP"
+        )
+    if args.enable_ep_with_offloading or args.enable_cuda_graph:
+        raise ValueError(
+            "shared mode rejects EP offloading and CUDA graph capture"
+        )
+    if args.watchdog_timeout is not None or args.decode_step_timeout is not None:
+        raise ValueError(
+            "shared mode rejects watchdogs that signal a parent PID"
+        )
+    if args.distributed_weight_config is not None:
+        raise ValueError("shared mode rejects distributed host weights")
+    if args.cache_dir is None or args.converted_ckpt_dir is None:
+        raise ValueError(
+            "shared mode requires explicit cache_dir and converted_ckpt_dir"
+        )
+    storage_path = Path(args.storage_path).expanduser().resolve()
+    if storage_path == _default_storage_path().resolve():
+        raise ValueError("shared mode requires an explicit storage_path")
+    _, dist_port = parse_host_port(args.dist_init_addr)
+    pynccl_ports = range(
+        args.pynccl_port_base,
+        args.pynccl_port_base + args.pynccl_port_span,
+    )
+    if args.listen_port == dist_port:
+        raise ValueError("shared mode listen and distributed ports must differ")
+    if args.world_size > 1 and (
+        args.listen_port in pynccl_ports or dist_port in pynccl_ports
+    ):
+        raise ValueError("shared mode communication port allocations overlap")
+    incremental = args.incremental_output_dir
+    if incremental is not None:
+        incremental_path = Path(incremental).expanduser().resolve()
+        if not incremental_path.is_relative_to(storage_path):
+            raise ValueError(
+                "shared mode incremental_output_dir must be within storage_path"
+            )
+
+
 def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     """Parse CLI arguments and return a validated ServerArgs."""
     parser = _build_parser()
@@ -615,6 +758,9 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
 
     server_args = ServerArgs(
         model=parsed.model,
+        instance_id=parsed.instance_id,
+        runtime_mode=parsed.runtime_mode,
+        lane_lease_manifest_fd=parsed.lane_lease_manifest_fd,
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
@@ -623,6 +769,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
+        pynccl_port_base=parsed.pynccl_port_base,
+        pynccl_port_span=parsed.pynccl_port_span,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
         enable_prefix_cache=parsed.enable_prefix_cache,
@@ -653,6 +801,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
+        persistent_phase_instances=parsed.persistent_phase_instances,
         detokenization_include_special_tokens=parsed.detokenization_include_special_tokens,
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
@@ -667,6 +816,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
         max_pool_size=parsed.max_pool_size,
+        input_ids_pool_size_gb=parsed.input_ids_pool_size_gb,
         max_intake_capacity=parsed.max_intake_capacity,
     )
     server_args.resolve_paths()

@@ -6,6 +6,7 @@
 // 1. act_quant_3d       — BF16→FP8 blockwise quantization (128-element blocks)
 // 2. silu_mul_3d        — SiLU(gate) × up (vectorized BF16)
 // 3. fused_silu_quant_3d — SiLU(gate) × up + FP8 quantization (fuses S1 epilogue + S3 input)
+// 4. act_quant_ragged   — act_quant_3d arithmetic on compact ragged [max_rows, K] rows
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -13,6 +14,8 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <pybind11/pybind11.h>
 
 #define FP8_MAX_VAL 448.0f
@@ -101,6 +104,95 @@ __global__ void act_quant_3d_kernel(
 
         if (lane_id == 0) {
             scale_row[kb] = s;
+        }
+    }
+}
+
+// ============================================================================
+// Kernel 1b: act_quant_ragged — compact ragged FP8 blockwise quantization
+// Grid: (max_rows,)   Block: 128 threads (4 warps)
+// Expert e owns rows [cu_seqlens[e], cu_seqlens[e] + align64(seqlens[e])).
+// Valid rows use the exact act_quant_3d arithmetic. Pad rows inside that span
+// are quantized as zero input (y = 0, finite eps scale), so stale buffer rows
+// never reach GEMM tiles. Rows outside every span are left untouched.
+// Scale layout is the grouped GEMM x_scale layout [num_k_blocks, max_rows].
+// ============================================================================
+#define RAGGED_ROW_ALIGN 64
+
+__global__ void act_quant_ragged_kernel(
+    const __nv_bfloat16* __restrict__ x,            // [max_rows, K]
+    uint8_t* __restrict__ y,                         // [max_rows, K] FP8
+    float* __restrict__ scale,                       // [num_k_blocks, max_rows]
+    const int32_t* __restrict__ seqlens,             // [E]
+    const int32_t* __restrict__ cu_seqlens,          // [E + 1]
+    int E, int max_rows, int K, int num_k_blocks
+) {
+    const int row = blockIdx.x;
+    if (row < cu_seqlens[0] || row >= cu_seqlens[E]) return;
+
+    // Rightmost expert whose span starts at or before this row; an empty
+    // expert shares its start with the next one, which then owns the row.
+    int lo = 0;
+    int hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (cu_seqlens[mid] <= row) lo = mid;
+        else hi = mid - 1;
+    }
+    const int64_t rel = (int64_t)row - cu_seqlens[lo];
+    const int64_t valid_tokens = seqlens[lo];
+    const int64_t span = (valid_tokens + RAGGED_ROW_ALIGN - 1) /
+                         RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+    if (rel >= span) return;
+    const bool is_valid = rel < valid_tokens;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = blockDim.x / 32;
+
+    const __nv_bfloat16* x_row = x + (int64_t)row * K;
+    uint8_t* y_row = y + (int64_t)row * K;
+
+    for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
+        int col_base = kb * BLOCK_SIZE_QUANT;
+
+        float vals[4];
+        float local_max = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (is_valid && col < K) {
+                vals[i] = __bfloat162float(x_row[col]);
+            } else {
+                vals[i] = 0.0f;
+            }
+            local_max = fmaxf(local_max, fabsf(vals[i]));
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset >= 1; offset >>= 1) {
+            float other = __shfl_xor_sync(0xffffffff, local_max, offset);
+            local_max = fmaxf(local_max, other);
+        }
+
+        // Same FP32 op sequence as act_quant_3d (byte-exact on valid rows).
+        constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
+        float s = fmaxf(local_max, QUANT_EPS) * FP8_MAX_VAL_INV;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                float scaled = vals[i] / s;
+                scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+            }
+        }
+
+        if (lane_id == 0) {
+            scale[(int64_t)kb * max_rows + row] = s;
         }
     }
 }
@@ -267,6 +359,73 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_3d(
     return std::make_tuple(y, scale);
 }
 
+static void check_ragged_cuda_tensor(
+    const torch::Tensor& t, const torch::Device& device, const char* name
+) {
+    TORCH_CHECK(t.defined() && t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.device() == device, name, " must be on ", device, ", got ", t.device());
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+// Quantizes caller-owned compact ragged rows in place of y/scale; no
+// allocations. Device seqlens/cu_seqlens values are never read on the host.
+std::tuple<torch::Tensor, torch::Tensor> act_quant_ragged(
+    torch::Tensor x,
+    torch::Tensor seqlens,
+    torch::Tensor cu_seqlens,
+    torch::Tensor y,
+    torch::Tensor scale
+) {
+    constexpr int64_t kInt32Max = 2147483647;
+    TORCH_CHECK(x.defined() && x.is_cuda(), "x must be a CUDA tensor");
+    const auto device = x.device();
+    check_ragged_cuda_tensor(x, device, "x");
+    check_ragged_cuda_tensor(seqlens, device, "seqlens");
+    check_ragged_cuda_tensor(cu_seqlens, device, "cu_seqlens");
+    check_ragged_cuda_tensor(y, device, "y");
+    check_ragged_cuda_tensor(scale, device, "scale");
+
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == torch::kBFloat16,
+                "x must be BF16 [max_rows, K]");
+    const int64_t max_rows = x.size(0);
+    const int64_t K = x.size(1);
+    TORCH_CHECK(K > 0 && K <= kInt32Max && max_rows <= kInt32Max,
+                "x shape out of range: [", max_rows, ", ", K, "]");
+    const int64_t num_k_blocks = (K + BLOCK_SIZE_QUANT - 1) / BLOCK_SIZE_QUANT;
+
+    TORCH_CHECK(seqlens.dim() == 1 && seqlens.scalar_type() == torch::kInt32,
+                "seqlens must be int32 [E]");
+    const int64_t E = seqlens.size(0);
+    TORCH_CHECK(E > 0 && E < kInt32Max, "seqlens must be non-empty");
+    TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.scalar_type() == torch::kInt32 &&
+                cu_seqlens.size(0) == E + 1, "cu_seqlens must be int32 [E + 1]");
+    TORCH_CHECK(y.dim() == 2 &&
+                (y.scalar_type() == torch::kUInt8 ||
+                 y.scalar_type() == c10::ScalarType::Float8_e4m3fn) &&
+                y.size(0) == max_rows && y.size(1) == K,
+                "y must be uint8/float8_e4m3fn [max_rows, K]");
+    TORCH_CHECK(scale.dim() == 2 && scale.scalar_type() == torch::kFloat32 &&
+                scale.size(0) == num_k_blocks && scale.size(1) == max_rows,
+                "scale must be float32 [ceil(K/128), max_rows]");
+
+    if (max_rows == 0) return std::make_tuple(y, scale);
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid(static_cast<unsigned int>(max_rows));
+    act_quant_ragged_kernel<<<grid, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<uint8_t*>(y.data_ptr()),
+        scale.data_ptr<float>(),
+        seqlens.data_ptr<int32_t>(),
+        cu_seqlens.data_ptr<int32_t>(),
+        static_cast<int>(E), static_cast<int>(max_rows),
+        static_cast<int>(K), static_cast<int>(num_k_blocks));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return std::make_tuple(y, scale);
+}
+
 torch::Tensor silu_mul_3d(
     torch::Tensor gate,
     torch::Tensor up,
@@ -324,6 +483,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("act_quant_3d", &act_quant_3d,
           "FP8 blockwise quantization on 3D [E, mtp, K] layout");
+    m.def("act_quant_ragged", &act_quant_ragged,
+          "FP8 blockwise quantization on compact ragged rows (caller-owned outputs)");
     m.def("silu_mul_3d", &silu_mul_3d,
           "SiLU(gate) * up on 3D [E, mtp, N] layout");
     m.def("fused_silu_quant_3d", &fused_silu_quant_3d,

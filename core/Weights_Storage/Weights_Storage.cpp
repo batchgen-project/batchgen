@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  * BatchGen                                                                      *
- * copyright (c) EfficientMoE team 2025                                             *
+ * Copyright (c) 2025-2026 BatchGen Team                                            *
  * *
  * licensed under the apache license, version 2.0 (the "license");              *
  * you may not use this file except in compliance with the license.             *
@@ -226,8 +226,14 @@ Weights_Storage::Weights_Storage(int device_id)
 };
 
 Weights_Storage::~Weights_Storage() {
-    // free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
-    //                           this->byte_size_, true);
+    // The ordinary Init() path registers and maps the whole weight SHM in this
+    // worker, so it has to release exactly that mapping once. weight_ptr_ is
+    // set only after a successful Init(), and the distributed path never sets
+    // it, so this cannot fire twice or on a hierarchical_gdr instance.
+    if (this->weight_ptr_ != nullptr) {
+        free_shared_pinned_memory(this->weight_ptr_, this->mapped_size_);
+        this->weight_ptr_ = nullptr;
+    }
     // Unregister exactly what was registered. A hierarchical_gdr worker pins a
     // few slot-local ranges instead of the whole mapping, and a failed
     // InitDistributed can leave any prefix of them behind.
@@ -623,14 +629,11 @@ void Weights_Storage::release_module(
     this->active_leases_.erase(found);
 }
 
-/*
-auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-
-*/
 void Weights_Storage::Init(
     std::string& shm_name, int64_t byte_size,
     std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
-    bool enable_memfd, int memfd_creator_pid, int memfd_fd_arg)
+    bool enable_thp, int memfd_creator_pid, int memfd_fd_arg,
+    int tensor_meta_memfd_fd)
 {
     this->logger->info(
         "Setting CUDA device to {} for Weights_Storage initialization.",
@@ -641,23 +644,30 @@ void Weights_Storage::Init(
     this->shm_name = shm_name;
     auto start_time = std::chrono::high_resolution_clock::now();
     this->byte_size_ = byte_size;
-    auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-    
+    // The tensor metadata is always an anonymous memfd owned by the server.
+    auto weights_map =
+        deserialize_from_memfd(memfd_creator_pid, tensor_meta_memfd_fd);
+
     this->logger->info(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);
 
     // Worker process: register with CUDA for DMA access (pin_for_cuda=true)
+    int64_t mapped_size = 0;
     void* weight_ptr =
         allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true,
-                                      enable_memfd, memfd_creator_pid, memfd_fd_arg);
-        
+                                      enable_thp, memfd_creator_pid, memfd_fd_arg,
+                                      nullptr, &mapped_size);
+
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {
         this->logger->error("Failed to allocate shared pinned memory.");
         throw std::runtime_error("Failed to allocate shared pinned memory.");
     }
-    
+
+    // Publish the mapping only once it is fully established: the destructor
+    // releases it based on weight_ptr_.
+    this->mapped_size_ = mapped_size;
     this->weight_ptr_ = weight_ptr;
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration =

@@ -83,7 +83,11 @@ struct HostPrefixCacheStats {
 };
 
 struct HostPrefixCacheConfig {
+    // Diagnostic label only; the region is an anonymous memfd. Attachers
+    // reach it through /proc/<memfd_creator_pid>/fd/<memfd_fd>.
     std::string shm_name;
+    int memfd_creator_pid = -1;
+    int memfd_fd = -1;
     std::vector<HostKVGroupSpec> group_specs;
     std::uint32_t hash_block_tokens = 0;
     std::uint32_t max_nodes = 0;
@@ -101,6 +105,8 @@ std::vector<std::pair<std::uint32_t, PrefixDigest>> BuildPrefixHashChain(
 class HostPrefixCacheCoordinator {
    public:
     explicit HostPrefixCacheCoordinator(HostPrefixCacheConfig config);
+    // The owner's anonymous region fd, published to attaching workers.
+    int memfd_fd() const;
     HostPrefixCacheCoordinator(const HostPrefixCacheCoordinator&) = delete;
     HostPrefixCacheCoordinator& operator=(const HostPrefixCacheCoordinator&) =
         delete;

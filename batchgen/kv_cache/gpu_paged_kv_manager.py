@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -522,7 +523,10 @@ class _GPUPageTableManager:
 
 			if not reuse_existing:
 				self.gpu_table = table
-				self._update_cuda_graph_table(wanted_order, sequences, max_required)
+			# Refresh the graph-stable copy on every rebuild: a reused active
+			# table can still gain pages (decode extension), and a stale graph
+			# row would send KV writes to page -1.
+			self._update_cuda_graph_table(wanted_order, sequences, max_required)
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
@@ -728,28 +732,40 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
-		# Initialize KV cache with zeros
-		self._k_cache = torch.zeros(
-			shape, dtype=self.config.kv_dtype, device=self.device
-		)
-		logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
-
-		if self.config.has_v_cache:
-			v_shape = (
-				self.config.num_layers,
-				self.config.num_pages,
-				self.config.page_size_tokens,
-				self.config.num_v_heads,
-				self.config.v_head_dim,
+		# The pool tensors live in a dedicated allocator pool: its segments
+		# never serve other allocations, so when destroy() drops the tensors
+		# the segments are whole-segment free and return to CUDA. Without the
+		# isolation, allocations made while the pool is down (prefill
+		# transients, the fresh page-table manager built inside destroy)
+		# land in the freed segments and pin them partially occupied, and a
+		# later same-size pool allocation OOMs against the fragmented cache.
+		mem_pool_ctx = contextlib.nullcontext()
+		if self.device.type == "cuda":
+			self._mem_pool = torch.cuda.MemPool()
+			mem_pool_ctx = torch.cuda.use_mem_pool(self._mem_pool, device=self.device)
+		with mem_pool_ctx:
+			# Initialize KV cache with zeros
+			self._k_cache = torch.zeros(
+				shape, dtype=self.config.kv_dtype, device=self.device
 			)
-			self._v_cache = torch.zeros(
-				v_shape, dtype=self.config.kv_dtype, device=self.device
-			)
-			logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
-		else:
-			self._v_cache = None
+			logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
 
-		self._refresh_page_pointer_tables()
+			if self.config.has_v_cache:
+				v_shape = (
+					self.config.num_layers,
+					self.config.num_pages,
+					self.config.page_size_tokens,
+					self.config.num_v_heads,
+					self.config.v_head_dim,
+				)
+				self._v_cache = torch.zeros(
+					v_shape, dtype=self.config.kv_dtype, device=self.device
+				)
+				logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
+			else:
+				self._v_cache = None
+
+			self._refresh_page_pointer_tables()
 
 		total_bytes = self._k_cache.element_size() * self._k_cache.numel() + (
 			self._v_cache.element_size() * self._v_cache.numel()
@@ -781,6 +797,11 @@ class GPUPagedKVCacheManager:
 				continue to rely on the caching allocator’s memory, so clearing the
 				cache is usually unnecessary.
 
+				When the manager allocated its tensors in a dedicated MemPool
+				(CUDA devices), the cache is cleared regardless of this flag:
+				the dead pool's segments cannot serve any other allocation, so
+				they are returned to CUDA here.
+
 		This is idempotent: calling destroy() twice in a row (e.g. back-to-back
 		prefill cycles in generate()) is a no-op on the second call because
 		_reset_runtime_state has already set _is_initialized=False and cleared
@@ -795,8 +816,14 @@ class GPUPagedKVCacheManager:
 			)
 			return
 
+		had_mem_pool = self._mem_pool is not None
 		self._reset_runtime_state()
-		if empty_cuda_cache:
+		# A dedicated pool's segments are invisible to other allocations
+		# (that is the point of the isolation), so unlike general cached
+		# segments they are useless while the pool is down: always return
+		# them to CUDA. Prefill then reuses the memory through cudaMalloc
+		# instead of through the allocator cache.
+		if empty_cuda_cache or had_mem_pool:
 			self._release_cached_cuda_memory()
 
 	def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
@@ -870,6 +897,58 @@ class GPUPagedKVCacheManager:
 		if any_changes:
 			self._clear_active_page_pointer_tables()
 		return allocations
+
+	def count_new_shared_pages(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		page_keys_by_sequence: Sequence[Sequence[int]],
+	) -> int:
+		"""Read-only preview of ``allocate_pages_for_sequences_with_page_keys``.
+
+		Returns the number of distinct physical pages the allocation would
+		take from the free pool: a key already mapped by a resident sequence
+		costs nothing, and a key shared between sequences of this batch is
+		counted once. Runs the same validation as the allocation so a request
+		the preview accepts cannot fail validation later; never mutates state.
+		"""
+
+		self._ensure_initialized()
+		if not (
+			len(sequence_ids)
+			== len(num_tokens)
+			== len(page_keys_by_sequence)
+		):
+			raise ValueError(
+				"shared GPU allocation inputs must have equal lengths"
+			)
+		if len(set(int(seq_id) for seq_id in sequence_ids)) != len(sequence_ids):
+			raise ValueError("shared GPU allocation sequence ids must be unique")
+
+		required_counts = self._geometry.required_pages(num_tokens).tolist()
+		new_keys: set[int] = set()
+		for seq_id, required, raw_keys in zip(
+			sequence_ids, required_counts, page_keys_by_sequence
+		):
+			if int(seq_id) in self._sequences:
+				raise ValueError(
+					"shared GPU allocation requires a new sequence: "
+					f"{seq_id}"
+				)
+			keys = [int(key) for key in raw_keys]
+			if len(keys) != int(required):
+				raise ValueError(
+					"Host page-key count does not match required GPU pages: "
+					f"sequence={seq_id}, keys={len(keys)}, required={required}"
+				)
+			if len(keys) != len(set(keys)):
+				raise ValueError(
+					f"sequence {seq_id} contains duplicate Host page keys"
+				)
+			new_keys.update(
+				key for key in keys if key not in self._shared_page_key_to_gpu_page
+			)
+		return len(new_keys)
 
 	def allocate_pages_for_sequences_with_page_keys(
 		self,
@@ -1208,6 +1287,21 @@ class GPUPagedKVCacheManager:
 		
 		# Clear active page pointer tables
 		self._clear_active_page_pointer_tables()
+
+	def reset_allocations(self) -> None:
+		"""Free every sequence and restore the fresh-allocator state in place.
+
+		Unlike ``destroy()``, the KV tensors and the CUDA-graph page-table
+		storage keep their addresses, so graphs captured against them stay
+		valid. The KV cache is zeroed to match a freshly initialized manager.
+		"""
+		self._ensure_initialized()
+		self._sequences = {}
+		self._free_pages = _TensorStack(self.config.num_pages)
+		self.clear_page_table()
+		self._k_cache.zero_()
+		if self._v_cache is not None:
+			self._v_cache.zero_()
 
 	def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
 		"""Rebuilds the GPU page table following ``sequence_ids`` order.
@@ -2031,6 +2125,9 @@ class GPUPagedKVCacheManager:
 		self._active_page_indices = None
 		self._k_active_page_ptr_table = None
 		self._v_active_page_ptr_table = None
+		# Dropped AFTER every tensor allocated under use_mem_pool: with all
+		# blocks freed, the dead pool's segments become releasable.
+		self._mem_pool = None
 		self._free_pages = _TensorStack(self.config.num_pages)
 		self._sequences: Dict[int, _SequenceState] = {}
 		self._gpu_page_refcounts: Dict[int, int] = {}
@@ -2051,13 +2148,17 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS" in os.environ
 			else None
 		)
+		# Decoupled from pool size (measure-once-cache contract): explicit
+		# capacities define the table SHAPE independent of the pool's page
+		# count, so captured graphs survive a pool resize. Stored values are
+		# runtime-bounded by the live pool.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_slots", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		candidates: List[int] = []
 		if self._engine_config is not None:
@@ -2073,7 +2174,7 @@ class GPUPagedKVCacheManager:
 					candidates.append(normalized)
 		if not candidates:
 			candidates.append(self.config.num_pages)
-		return max(1, min(max(candidates), self.config.num_pages))
+		return max(1, max(candidates))
 
 	def _resolve_page_table_max_pages_per_sequence(self) -> int:
 		env_value = _positive_or_none(
@@ -2081,13 +2182,14 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
 			else None
 		)
+		# Decoupled from pool size: see _resolve_page_table_max_slots.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_pages_per_sequence", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
 		if self._engine_config is not None:
@@ -2104,7 +2206,7 @@ class GPUPagedKVCacheManager:
 			if prepack_capacity is not None and prepack_capacity > 0:
 				token_capacity = max(token_capacity, int(prepack_capacity))
 		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
-		return max(1, min(page_capacity, self.config.num_pages))
+		return max(1, page_capacity)
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":

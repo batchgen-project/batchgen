@@ -1,7 +1,7 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------- #
 #  BatchGen Dependency Installation Script                                      #
-#  Copyright (c) EfficientMoE team 2025                                         #
+#  Copyright (c) 2025-2026 BatchGen Team                                        #
 #                                                                               #
 #  Supports Hopper (SM90) and Blackwell (SM100/B200) GPUs:                      #
 #  Hopper:    flash-attention 3, FlashMLA, DeepGEMM                             #
@@ -26,7 +26,18 @@ NC='\033[0m' # No Color
 # Configuration - pinned versions for reproducibility
 FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-DEEPGEMM_VERSION="v2.1.1.post3"
+# DeepGEMM comes from the sgl-project fork, which ships the supported
+# build_sgl_deep_gemm.sh path and the fp8_mqa_logits(max_seqlen_k=...) runtime
+# contract BatchGen calls. It publishes the `sgl-deep-gemm` distribution while
+# still importing as `deep_gemm`. Its build needs apache-tvm-ffi present first.
+DEEPGEMM_REPO_URL="https://github.com/sgl-project/DeepGEMM.git"
+DEEPGEMM_SRC_DIR="DeepGEMM-sgl"
+DEEPGEMM_VERSION="v0.1.5.post3"
+DEEPGEMM_DIST="sgl-deep-gemm"
+DEEPGEMM_DIST_VERSION="0.1.5.post3"
+TVM_FFI_VERSION="0.1.11"
+WHEEL_VERSION="0.45.1"
+DEEPGEMM_PLATFORM_TAG="linux_x86_64"
 
 # Build target architecture for batchgen_kernels and FlashMLA.
 #   sm90a (default) -> Hopper; FlashMLA SM100 kernels are disabled.
@@ -71,7 +82,7 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# System (OS) packages required to BUILD the JIT-compiled `core_engine` extension.
+# System (OS) packages required to BUILD the AOT `core_engine` extension.
 # The core_engine sources (core/Parameter_Server/posix_shm.cpp) `#include <numa.h>`
 # and link `-lnuma`, so the NUMA development headers must be present or the first
 # server launch fails with:
@@ -105,14 +116,15 @@ install_system_deps() {
     if [[ -f /usr/include/numa.h ]]; then
         print_success "NUMA dev headers installed (numa.h present)"
     else
-        print_warning "numa.h still missing — the core_engine JIT build will fail until installed."
+        print_error "numa.h still missing — the AOT core_engine build cannot proceed."
+        return 1
     fi
 }
 
 check_prerequisites() {
     print_step "Checking prerequisites..."
 
-    # System headers needed by the core_engine JIT build (numa.h -> numactl-devel).
+    # System headers needed by the core_engine AOT build (numa.h -> numactl-devel).
     # UCX (for the core_engine distributed-weight daemon's UCP memory-handle API) is
     # provided by the `libucx-cu12` pip wheel declared in requirements.txt (installed
     # with the batchgen package), so no system UCX or source build is needed here.
@@ -219,6 +231,50 @@ else:
     esac
 }
 
+# Import checks must see the installed packages, not a source checkout in the
+# current directory: e.g. a DeepGEMM clone's ./deep_gemm (without _C) shadows
+# the freshly installed wheel and fails the check.
+in_neutral_dir() { (cd / && "$@"); }
+
+torch_contract_ok() {
+    python - "$1" "$2" <<'PY'
+import sys
+import torch
+
+expected, channel = sys.argv[1:]
+digits = channel[2:]
+expected_cuda = f"{digits[:-1]}.{digits[-1]}" if digits.isdigit() else ""
+if torch.__version__ != expected or torch.version.cuda != expected_cuda:
+    raise SystemExit(1)
+PY
+}
+
+enforce_torch_contract() {
+    local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
+    local torch_ver="2.9.0+${cuda_channel}"
+
+    if torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+        print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified"
+        return 0
+    fi
+
+    if [[ "${REPAIR_TORCH:-0}" != "1" ]]; then
+        print_error "Existing PyTorch does not match ${torch_ver} / CUDA ${cuda_channel}"
+        print_error "Refusing to modify the environment; rerun with --repair to replace it"
+        return 1
+    fi
+
+    print_warning "PyTorch ABI mismatch; --repair requested, reinstalling ${torch_ver}"
+    pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
+    if ! torch_contract_ok "$torch_ver" "$cuda_channel"; then
+        print_error "PyTorch repair did not produce the required ${torch_ver}/${cuda_channel} ABI"
+        return 1
+    fi
+    TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+    print_success "PyTorch $TORCH_VERSION / CUDA ${cuda_channel} ABI verified after repair"
+}
+
 install_torch() {
     print_step "Checking PyTorch installation..."
 
@@ -229,7 +285,7 @@ install_torch() {
 
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
-        print_success "PyTorch $TORCH_VERSION already installed"
+        enforce_torch_contract
 
         # Check CUDA availability
         CUDA_AVAILABLE=$(python -c "import torch; print(torch.cuda.is_available())")
@@ -239,7 +295,7 @@ install_torch() {
     else
         print_step "Installing PyTorch ${torch_ver} (cuda_channel=${cuda_channel})..."
         pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-        print_success "PyTorch installed"
+        enforce_torch_contract
     fi
 }
 
@@ -247,7 +303,7 @@ install_flash_attention() {
     print_step "Installing flash-attention 3 (Hopper)..."
 
     # Check if already installed (hopper build exposes the `flash_attn_interface` module)
-    if python -c "import flash_attn_interface" &> /dev/null 2>&1; then
+    if in_neutral_dir python -c "import flash_attn_interface" &> /dev/null 2>&1; then
         print_success "flash-attention 3 already installed"
         return 0
     fi
@@ -262,14 +318,19 @@ install_flash_attention() {
         git checkout "$FLASH_ATTN_VERSION"
     else
         print_step "Cloning flash-attention repository..."
-        git clone --recursive https://github.com/Dao-AILab/flash-attention.git
+        # Hopper setup initializes its CUTLASS submodule itself. Clone the
+        # pinned tag directly so we do not download unrelated ROCm submodules
+        # from the repository's default branch first.
+        git clone --branch "$FLASH_ATTN_VERSION" --single-branch --depth 1 \
+            https://github.com/Dao-AILab/flash-attention.git
         cd flash-attention
-        git checkout "$FLASH_ATTN_VERSION"
     fi
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    FLASH_ATTENTION_DISABLE_SM80=TRUE \
+        pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }
@@ -277,7 +338,7 @@ install_flash_attention() {
 install_flash_attention_4() {
     print_step "Installing flash-attention 4 (Blackwell/CuTeDSL JIT)..."
 
-    if python -c "from flash_attn.cute import flash_attn_func" &>/dev/null 2>&1; then
+    if in_neutral_dir python -c "from flash_attn.cute import flash_attn_func" &>/dev/null 2>&1; then
         print_success "flash-attention 4 already installed"
         return 0
     fi
@@ -293,7 +354,7 @@ install_flashmla() {
     print_step "Installing FlashMLA..."
 
     # Check if already installed
-    if python -c "import flash_mla" &> /dev/null 2>&1; then
+    if in_neutral_dir python -c "import flash_mla" &> /dev/null 2>&1; then
         print_success "FlashMLA already installed"
         return 0
     fi
@@ -304,53 +365,183 @@ install_flashmla() {
     print_success "FlashMLA installed"
 }
 
-install_deepgemm() {
-    print_step "Installing DeepGEMM..."
+# The DeepGEMM runtime contract: the pinned `sgl-deep-gemm` distribution AND the
+# fp8_mqa_logits signature BatchGen calls. An `import deep_gemm` alone is not
+# enough — the upstream deepseek-ai package imports under the same name but has
+# no max_seqlen_k parameter, so it must not satisfy the skip gate.
+deepgemm_contract_ok() {
+    DG_DIST="$DEEPGEMM_DIST" DG_VERSION="$DEEPGEMM_DIST_VERSION" in_neutral_dir python - <<'PY' &> /dev/null
+import inspect
+import os
+from importlib.metadata import version
 
-    # Check if already installed
-    if python -c "import deep_gemm" &> /dev/null 2>&1; then
-        print_success "DeepGEMM already installed"
+import deep_gemm
+
+assert version(os.environ["DG_DIST"]) == os.environ["DG_VERSION"]
+assert "max_seqlen_k" in inspect.signature(deep_gemm.fp8_mqa_logits).parameters
+PY
+}
+
+# Locate the wheel produced by build_sgl_deep_gemm.sh under a DeepGEMM checkout.
+# Exactly one must match, otherwise the caller fails instead of guessing. A
+# py3-none-any wheel is retagged as Linux/x86_64 before installation. Do not
+# claim a manylinux baseline here: the actual glibc floor depends on the build
+# image and must be checked separately before publishing a manylinux tag.
+find_deepgemm_wheel() {
+    local repo="$1" found count whl
+    found="$(find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' | sort)"
+    count="$(printf '%s' "$found" | grep -c . || true)"
+    if [[ "$count" != "1" ]]; then
+        print_error "expected exactly 1 sgl_deep_gemm wheel under $repo, found $count" >&2
+        return 1
+    fi
+    whl="$found"
+    if [[ "$whl" == *-py3-none-any.whl ]]; then
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            print_error "DeepGEMM release wheel retagging requires an x86_64 build host" >&2
+            return 1
+        fi
+        python -m wheel tags --platform-tag "$DEEPGEMM_PLATFORM_TAG" --remove "$whl" >&2
+        whl="${whl%-py3-none-any.whl}-py3-none-${DEEPGEMM_PLATFORM_TAG}.whl"
+    fi
+    printf '%s\n' "$whl"
+}
+
+clean_deepgemm_wheels() {
+    local repo="$1"
+    [[ -d "$repo/dist" ]] || return 0
+    find "$repo/dist" -maxdepth 1 -type f -name 'sgl_deep_gemm-*.whl' -delete
+}
+
+remove_upstream_deepgemm() {
+    if python -c 'from importlib.metadata import version; version("deep-gemm")' &>/dev/null; then
+        print_step "Removing incompatible upstream deep-gemm distribution..."
+        pip uninstall -y deep-gemm
+        # Both distributions own the same import package. If a previous
+        # partial upgrade left both metadata records behind, uninstalling the
+        # upstream RECORD may remove files from the SGL package too. Remove its
+        # metadata as well so the following install cannot be skipped as
+        # already satisfied.
+        if python -c 'from importlib.metadata import version; version("sgl-deep-gemm")' &>/dev/null; then
+            pip uninstall -y sgl-deep-gemm
+        fi
+    fi
+}
+
+install_deepgemm() {
+    print_step "Installing DeepGEMM (${DEEPGEMM_DIST} ${DEEPGEMM_VERSION})..."
+
+    # Check if already installed (distribution + runtime signature)
+    if deepgemm_contract_ok; then
+        print_success "DeepGEMM already installed (${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION})"
         return 0
     fi
 
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    if [[ -d "DeepGEMM" ]]; then
+    if [[ -d "$DEEPGEMM_SRC_DIR" ]]; then
         print_step "Updating existing DeepGEMM repository..."
-        cd DeepGEMM
-        git fetch origin
+        cd "$DEEPGEMM_SRC_DIR"
+        git fetch origin --tags
         git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     else
-        print_step "Cloning DeepGEMM repository..."
-        git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
-        cd DeepGEMM
+        print_step "Cloning DeepGEMM repository ($DEEPGEMM_REPO_URL)..."
+        git clone --recursive "$DEEPGEMM_REPO_URL" "$DEEPGEMM_SRC_DIR"
+        cd "$DEEPGEMM_SRC_DIR"
         git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     fi
 
     print_step "Building DeepGEMM (this may take 5-10 minutes)..."
-    pip install . --no-build-isolation
+    pip install "apache-tvm-ffi==${TVM_FFI_VERSION}" "wheel==${WHEEL_VERSION}"
+    clean_deepgemm_wheels "$PWD"
+    bash ./build_sgl_deep_gemm.sh
+
+    local dg_wheel
+    dg_wheel="$(find_deepgemm_wheel "$PWD")" || exit 1
+    remove_upstream_deepgemm
+    pip install "$dg_wheel"
+
+    if ! deepgemm_contract_ok; then
+        print_error "DeepGEMM installed but the runtime contract failed"
+        print_error "  (expected ${DEEPGEMM_DIST}==${DEEPGEMM_DIST_VERSION} with fp8_mqa_logits(max_seqlen_k=...))"
+        exit 1
+    fi
 
     print_success "DeepGEMM installed"
 }
 
+batchgen_kernels_contract_ok() {
+    # Importing the namespace package is not sufficient: a source checkout or an
+    # incomplete wheel can satisfy that check while the first GPT-OSS request
+    # later fails when it lazily imports the fused attention extension.
+    in_neutral_dir python - <<'PY' &>/dev/null
+import importlib
+import os
+import site
+import sysconfig
+
+import batchgen_kernels
+
+module_path = getattr(batchgen_kernels, "__file__", None)
+site_roots = {
+    os.path.realpath(path)
+    for path in (*site.getsitepackages(), sysconfig.get_paths()["purelib"])
+}
+if not module_path or not any(
+    os.path.commonpath((os.path.realpath(module_path), root)) == root
+    for root in site_roots
+):
+    raise ImportError(
+        "batchgen_kernels resolves outside site-packages "
+        f"({module_path!r}); refusing an editable/source shadow"
+    )
+
+for module_name in (
+    "batchgen_kernels.attention._C_fused_ops",
+    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
+):
+    importlib.import_module(module_name)
+PY
+}
+
 install_batchgen_kernels() {
-    # Already provided by a pre-built wheel (auto-download / --wheel-dir)? Skip the compile.
-    if python -c "import batchgen_kernels" &>/dev/null 2>&1; then
-        print_success "batchgen_kernels already installed (wheel); skipping compilation"
+    # A pre-built wheel is usable only when the runtime extensions needed by
+    # the model path are present.  If a partial/source-only package is visible,
+    # rebuild from the checked-out sources instead of silently skipping it.
+    if batchgen_kernels_contract_ok; then
+        print_success "batchgen_kernels AOT runtime contract satisfied; skipping compilation"
         return 0
     fi
+
+    print_warning "batchgen_kernels is missing or its AOT runtime contract is incomplete; rebuilding"
 
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
-        pip install . --no-build-isolation
-        print_success "batchgen_kernels installed"
+        # pip builds extensions one at a time. They are independent, so build
+        # them concurrently (same defaults as build_source_runtime.sh) and
+        # package that build into the wheel pip installs. --skip-build stops
+        # bdist_wheel from running build_ext a second time, which would
+        # recompile everything because torch appends its flags again.
+        local dist_dir
+        dist_dir="$(mktemp -d)"
+        MAX_JOBS="${MAX_JOBS:-8}" python setup.py \
+            build --parallel "${KERNELS_PARALLEL:-24}" \
+            bdist_wheel --skip-build --dist-dir "$dist_dir"
+        pip install "$dist_dir"/batchgen_kernels-*.whl --no-deps --force-reinstall
+        rm -rf "$dist_dir"
+        if ! batchgen_kernels_contract_ok; then
+            print_error "batchgen_kernels installed but the AOT runtime contract is still incomplete"
+            return 1
+        fi
+        print_success "batchgen_kernels installed and AOT runtime contract verified"
     else
-        print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
+        print_error "batchgen_kernels/setup.py not found; refusing to continue without AOT kernels"
+        return 1
     fi
 }
 
@@ -360,8 +551,33 @@ install_batchgen() {
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install .
-        print_success "BatchGen installed"
+        # Replace stale editable/direct-url installs from another worktree
+        # without allowing dependency resolution to change the verified ABI.
+        # --no-deps keeps pip from re-resolving Torch, so install the pinned
+        # runtime requirements explicitly (libucx-cu12 also ships the UCX
+        # headers the core_engine build needs) and re-verify the Torch ABI.
+        pip install -r requirements.txt
+        enforce_torch_contract || return 1
+        # BUILD_OPS=1 emits batchgen.core_engine as an AOT extension. Runtime
+        # startup is deliberately AOT-only and must never compile from source.
+        BUILD_OPS=1 pip install . --no-build-isolation --no-deps --force-reinstall
+        if ! (
+            cd /tmp
+            python - <<'PY'
+import importlib
+from pathlib import Path
+
+module = importlib.import_module("batchgen.core_engine")
+path = Path(module.__file__)
+if path.suffix not in {".so", ".pyd", ".dylib"}:
+    raise SystemExit(f"batchgen.core_engine is not AOT: {path}")
+print(f"batchgen.core_engine AOT: {path}")
+PY
+        ); then
+            print_error "BatchGen installed without an importable AOT core_engine"
+            return 1
+        fi
+        print_success "BatchGen installed with AOT core_engine"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
         print_error "Please run this script from the BatchGen/scripts directory"
@@ -382,14 +598,15 @@ cleanup() {
 # Hopper fast path: stage matching pre-built wheels (flash-attn 3, FlashMLA,
 # DeepGEMM, batchgen_kernels) from the public GitHub release into a local dir so
 # the caller installs them instead of compiling (~2 min vs ~40-60 min). All four
-# must be present for this Python/GPU-arch; otherwise WHEEL_DIR is left empty and
+# plus the apache-tvm-ffi runtime wheel must be present for this Python/GPU-arch;
+# otherwise WHEEL_DIR is left empty and
 # the caller falls back to building from source. Never fatal.
 try_download_wheels() {
     [[ -n "$WHEEL_DIR" ]] && return 0          # explicit local --wheel-dir wins
     [[ $FROM_SOURCE -eq 1 ]] && return 0        # user forced a source build
     command -v curl &>/dev/null || { print_warning "curl not found; building from source."; return 0; }
 
-    local pytag api urls tmp w
+    local pytag api assets tmp w
     pytag="cp$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo cp311)"
     if [[ -n "$RELEASE_TAG" ]]; then
         api="https://api.github.com/repos/${BATCHGEN_REPO}/releases/tags/${RELEASE_TAG}"
@@ -398,15 +615,15 @@ try_download_wheels() {
     fi
     print_step "Looking for pre-built Hopper wheels on ${BATCHGEN_REPO} (${RELEASE_TAG:-latest}, ${pytag}/${BUILD_ARCH})..."
 
-    # Select matching asset download URLs (python-ABI + GPU-arch aware).
-    urls="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
+    # Select matching asset names and download URLs (python-ABI + GPU-arch aware).
+    assets="$(curl -fsSL "$api" 2>/dev/null | PYTAG="$pytag" WANT_ARCH="$BUILD_ARCH" python3 -c '
 import sys, os, json
 pytag = os.environ["PYTAG"]; arch = os.environ["WANT_ARCH"]
 try:
     assets = json.load(sys.stdin).get("assets", [])
 except Exception:
     sys.exit(0)
-want = ("flash_attn", "flash_mla", "deep_gemm", "batchgen_kernels")
+want = ("flash_attn_3", "flash_mla", "sgl_deep_gemm", "apache_tvm_ffi", "batchgen_kernels")
 for a in assets:
     n = a.get("name", "")
     if not n.endswith(".whl") or not any(n.startswith(w) for w in want):
@@ -417,12 +634,12 @@ for a in assets:
         continue                                    # GPU-arch mismatch
     u = a.get("browser_download_url", "")
     if u:
-        print(u)
+        print(f"{n}\t{u}")
 ' || true)"
 
-    # Require all four deps; otherwise fall back to a full source build.
-    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
-        if ! printf '%s\n' "$urls" | grep -q "/${w}"; then
+    # Require all five wheels; otherwise fall back to a full source build.
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
+        if ! printf '%s\n' "$assets" | grep -q "^${w}.*\\.whl[[:space:]]"; then
             print_warning "no pre-built '${w}' wheel for this env (${pytag}/${BUILD_ARCH}) — building from source."
             return 0
         fi
@@ -430,12 +647,12 @@ for a in assets:
 
     tmp="$INSTALL_DIR/prebuilt_wheels"          # under INSTALL_DIR so cleanup() removes it
     rm -rf "$tmp"; mkdir -p "$tmp"
-    ( cd "$tmp" && printf '%s\n' "$urls" | while read -r u; do
-        [[ -n "$u" ]] && { curl -fsSL -O "$u" || print_warning "download failed: $u"; }
+    ( cd "$tmp" && printf '%s\n' "$assets" | while IFS=$'\t' read -r n u; do
+        [[ -n "$u" ]] && { curl -fsSL -o "$n" "$u" || print_warning "download failed: $u"; }
       done )
 
     # Accept only a COMPLETE set; a partial download falls back to source.
-    for w in flash_attn flash_mla deep_gemm batchgen_kernels; do
+    for w in flash_attn_3 flash_mla sgl_deep_gemm apache_tvm_ffi batchgen_kernels; do
         if ! ls "$tmp/${w}"*.whl &>/dev/null 2>&1; then
             print_warning "incomplete wheel set (missing ${w}); building from source."
             rm -rf "$tmp"
@@ -460,6 +677,7 @@ show_help() {
     echo "  --wheel-dir DIR   Use pre-built wheels from a LOCAL dir (offline; auto-detects arch)"
     echo "  --release-tag TAG Fetch pre-built wheels from this GitHub release tag (default: latest)"
     echo "  --from-source     Force building all deps from source (skip the wheel fast path)"
+    echo "  --repair          Allow replacing an existing mismatched Torch installation"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -477,20 +695,6 @@ show_help() {
     echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
 }
 
-# Pre-build (warm) the core_engine JIT extension now, while the CUDA toolkit is on
-# hand from the source build, so the FIRST server launch does not require CUDA_HOME
-# / nvcc on PATH. The compile is CPU-only (no GPU needed). Non-fatal: on failure the
-# engine JIT-builds at first launch instead (which then needs CUDA_HOME set).
-warm_core_engine() {
-    python -c "import batchgen" &> /dev/null || return 0   # batchgen not installed; skip
-    print_step "Warming the core_engine JIT build (so the first server launch needs no CUDA toolkit)..."
-    if python -c "from batchgen.models.engine_loader import core_engine" > /tmp/batchgen_core_engine_warm.log 2>&1; then
-        print_success "core_engine JIT built and cached"
-    else
-        print_warning "core_engine warm build failed; it will JIT-build on first server launch (set CUDA_HOME then). Log: /tmp/batchgen_core_engine_warm.log"
-    fi
-}
-
 main() {
     echo "========================================"
     echo "  BatchGen Dependency Installer"
@@ -504,6 +708,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
+    REPAIR_TORCH=0
     WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
 
     while [[ $# -gt 0 ]]; do
@@ -538,6 +743,10 @@ main() {
                 ;;
             --from-source)
                 FROM_SOURCE=1
+                shift
+                ;;
+            --repair)
+                REPAIR_TORCH=1
                 shift
                 ;;
             --release-tag)
@@ -594,23 +803,31 @@ main() {
             try_download_wheels   # populate WHEEL_DIR from the public release; else source-build below
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
-                pip install --find-links "$WHEEL_DIR" --no-index \
-                    flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
-                    pip install "$WHEEL_DIR"/*.whl
-                print_success "Hopper dependencies installed from wheels"
+                remove_upstream_deepgemm
+                if ! pip install --find-links "$WHEEL_DIR" --no-index \
+                    flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
+                    "apache-tvm-ffi==${TVM_FFI_VERSION}"; then
+                    print_warning "pre-built wheel installation failed; validating each dependency and source-building only what is missing"
+                fi
+                # Validate the runtime interfaces rather than trusting wheel
+                # metadata. Each installer skips a dependency that imports and
+                # source-builds only a missing or incorrectly packaged one.
+                install_flash_attention
+                install_flashmla
+                install_deepgemm
+                print_success "Hopper dependencies installed and verified"
             else
                 install_flash_attention
                 install_flashmla
                 install_deepgemm
-                # Reinstall PyTorch — building deps from source may downgrade torch or triton
-                print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-                local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
-                pip install "torch==2.9.0+${cuda_channel}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
-                print_success "PyTorch reinstalled"
+                # Source builds may alter the environment; verify the pinned
+                # ABI and repair only when explicitly requested.
+                enforce_torch_contract
             fi
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Blackwell dependencies from pre-built wheels: $WHEEL_DIR"
+                remove_upstream_deepgemm
                 for whl in "$WHEEL_DIR"/*.whl; do
                     [[ -f "$whl" ]] || continue
                     pip install "$whl" --no-deps \
@@ -619,6 +836,7 @@ main() {
                 # FA4 runtime deps (pure-Python, not in wheel cache)
                 pip install "nvidia-cutlass-dsl>=4.4.2" quack-kernels torch-c-dlpack-ext cuda-python \
                     --extra-index-url https://pypi.nvidia.com -q
+                install_deepgemm
                 print_success "Blackwell dependencies installed from wheels"
             else
                 install_flash_attention_4
@@ -646,10 +864,6 @@ main() {
             install_batchgen
         fi
     fi
-
-    # Warm the core_engine JIT now (CUDA toolkit is available during install) so
-    # the first server launch needs no CUDA_HOME / nvcc on PATH.
-    warm_core_engine
 
     # Cleanup
     cleanup

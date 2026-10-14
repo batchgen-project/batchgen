@@ -676,6 +676,7 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     sin_ptr,
     position_ids_ptr,
     norm_weight_ptr,
+    input_batch_stride,
     bsz,
     num_heads,
     kv_lora_rank,
@@ -694,7 +695,7 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     """
     batch_idx = tl.program_id(0)
     total_dim = kv_lora_rank + qk_rope_head_dim
-    input_offset = batch_idx * total_dim
+    input_offset = batch_idx * input_batch_stride
     output_offset = batch_idx * total_dim
     pos_id = tl.load(position_ids_ptr + batch_idx)
 
@@ -833,7 +834,11 @@ def fused_rmsnorm_rope_with_q_native(
     num_heads = q_pe.shape[1]
     assert q_pe.shape == (bsz, num_heads, 1, qk_rope_head_dim)
 
-    processed_kv = torch.empty_like(new_compressed_kv)
+    processed_kv = torch.empty(
+        new_compressed_kv.shape,
+        dtype=new_compressed_kv.dtype,
+        device=new_compressed_kv.device,
+    )
     grid = (bsz,)
 
     fused_rmsnorm_rope_with_q_native_kernel[grid](
@@ -844,6 +849,7 @@ def fused_rmsnorm_rope_with_q_native(
         sin,
         position_ids,
         norm_weight,
+        new_compressed_kv.stride(0),
         bsz,
         num_heads,
         kv_lora_rank,

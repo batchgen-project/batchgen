@@ -29,6 +29,49 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 
+def host_kv_eviction_enabled(host_kv_chunk_size: int) -> bool:
+	"""Return whether bounded chunked host-KV mode requires re-entry."""
+	return int(host_kv_chunk_size) > 0
+
+
+def compute_prefill_host_reservation(
+    *,
+    prompt_length: int,
+    kv_token_budget: int,
+    page_size: int,
+    chunk_size: int,
+    initial_gpu_page_buffer: int,
+) -> Tuple[int, int]:
+	"""Return ``(pages, rounded_tokens)`` for one prefill reservation.
+
+	The selector and the worker allocator must use the same reservation
+	formula.  Keeping the arithmetic here makes the capacity snapshot and the
+	actual allocation one contract instead of two copies that can drift.
+	"""
+	if prompt_length < 0:
+		raise ValueError("prompt_length must be >= 0")
+	if kv_token_budget <= 0:
+		raise ValueError("kv_token_budget must be > 0")
+	if page_size <= 0:
+		raise ValueError("page_size must be > 0")
+	if chunk_size < 0:
+		raise ValueError("chunk_size must be >= 0")
+	if initial_gpu_page_buffer < 0:
+		raise ValueError("initial_gpu_page_buffer must be >= 0")
+
+	post_prefill_length = prompt_length + 1
+	gpu_initial_pages = (
+		math.ceil(post_prefill_length / page_size) + initial_gpu_page_buffer
+	)
+	gpu_initial_tokens = gpu_initial_pages * page_size
+	capacity = min(
+		max(prompt_length + chunk_size, gpu_initial_tokens),
+		kv_token_budget,
+	)
+	pages = math.ceil(capacity / page_size)
+	return pages, pages * page_size
+
+
 @dataclass(frozen=True)
 class PrefillCandidate:
     """A sequence eligible for prefill admission (EVICTED or QUEUEING).
@@ -86,18 +129,20 @@ class PrefillScheduler:
     def required_host_pages(
         candidate: PrefillCandidate, req: PrefillSelectionRequest
     ) -> int:
-        """Return the same initial Host-KV reservation used by admission."""
-        post_prefill_length = candidate.prompt_length + 1
-        gpu_initial_pages = (
-            math.ceil(post_prefill_length / candidate.page_size)
-            + req.initial_gpu_page_buffer
+        """Return the same initial Host-KV reservation used by admission.
+
+        Delegates to ``compute_prefill_host_reservation`` so the selector and
+        the worker allocator stay one formula, then discounts pages already
+        resident in the prefix cache and multiplies the node replication
+        factor.
+        """
+        pages_per_replica, _ = compute_prefill_host_reservation(
+            prompt_length=candidate.prompt_length,
+            kv_token_budget=candidate.kv_token_budget,
+            page_size=candidate.page_size,
+            chunk_size=req.chunk_size,
+            initial_gpu_page_buffer=req.initial_gpu_page_buffer,
         )
-        gpu_initial_tokens = gpu_initial_pages * candidate.page_size
-        initial_capacity = max(
-            candidate.prompt_length + req.chunk_size, gpu_initial_tokens
-        )
-        initial_capacity = min(initial_capacity, candidate.kv_token_budget)
-        pages_per_replica = math.ceil(initial_capacity / candidate.page_size)
         if not 0 <= candidate.cached_prefix_pages <= pages_per_replica:
             raise ValueError(
                 f"candidate {candidate.uuid} has invalid cached_prefix_pages="

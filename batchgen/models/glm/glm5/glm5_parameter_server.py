@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  Copyright (c) 2025-2026 BatchGen Team                                            #
 # ---------------------------------------------------------------------------- #
 
 """GLM-5 parameter server for BatchGen.
@@ -14,7 +14,7 @@ Key differences from DeepSeek:
 - Indexer tensors (wk, wq_b, k_norm, weights_proj) — kept in skeleton (BF16/FP8 mixed)
 - e_score_correction_bias in MoE gate
 - MTP layer at index 78 (eh_proj, enorm, hnorm, shared_head.norm)
-- byte_size: ~760 GB (FP8 experts) or ~1400 GB (BF16 experts)
+- byte_size: derived from the converted checkpoint metadata (see shm_reservation)
 """
 
 import sys as _diag_sys
@@ -27,7 +27,6 @@ _diag("start")
 import gc
 import logging
 import os
-import shutil
 from multiprocessing import Process
 _diag("stdlib done")
 
@@ -40,6 +39,7 @@ _diag("tqdm done")
 
 from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
+from .shm_reservation import converted_checkpoint_byte_size
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
 _diag("model_registry done")
 
@@ -54,14 +54,14 @@ except ImportError:
 
 
 class GLM5_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_thp=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        self.enable_memfd = enable_memfd
+        self.enable_thp = enable_thp
         # Single resolved internal config (checkpoint-backed GLM5Config/GLM52Config).
         # Used both for metadata reads and to build the model graph — GLM-5 no
         # longer uses an HF transformers.PretrainedConfig.
@@ -84,23 +84,16 @@ class GLM5_Parameter_Server:
 
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_thp)
 
-        # GLM-5-FP8: FP8 experts (~675 GB) + FP8 attn + rest ≈ 700 GB
-        # GLM-5: BF16 experts (~1350 GB) + FP8 attn + rest ≈ 1380 GB
-        if "fp8" in self.huggingface_ckpt_name.lower():
-            byte_size = 760 * 1024 * 1024 * 1024
-        else:
-            byte_size = 1400 * 1024 * 1024 * 1024
+        # Convert checkpoint files
+        from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
+        converter = ckpt_converter()
+        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
-        total, used, free = shutil.disk_usage("/dev/shm")
-        logging.info(f"Freespace in /dev/shm: {free / 1024**3:.1f} GB")
-        if free < byte_size:
-            raise ValueError(
-                f"Shared memory size not enough. Required: {byte_size / 1024**3:.0f} GB, "
-                f"Available: {free / 1024**3:.0f} GB. "
-                f"Please clear /dev/shm or increase size."
-            )
+        # Size the reservation from the converted metadata instead of a fixed
+        # per-dtype constant.
+        byte_size = converted_checkpoint_byte_size(self.converted_ckpt_dir)
 
         import uuid
         self.shm_name = "/shm_" + str(uuid.uuid4())
@@ -108,11 +101,6 @@ class GLM5_Parameter_Server:
         logging.info(f"Model parameters shared memory name: {self.shm_name}")
         logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
         logging.info(f"Byte size: {byte_size}")
-
-        # Convert checkpoint files
-        from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
         self.parameter_server.Init(
             self.shm_name,

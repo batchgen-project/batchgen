@@ -1,0 +1,200 @@
+# Deploy GLM-5.3-FP8 on 8 H200 GPUs
+
+BatchGen serves the official `zai-org/GLM-5.3` FP8 checkpoint on one node with
+**8 H200 GPUs**. GLM-5.3 shares the GLM-5.2 DSA execution geometry, but it has a
+separate chat template and request contract. Use the GLM-5.3 identifier so the
+runtime selects its dedicated tokenizer and template.
+
+The model context window is 1,048,576 tokens. The qualified configuration uses
+pure DP prefill, dual KV caches, the host KV cache, persistent phase instances,
+and whole-model decode CUDA graphs. The guide covers checkpoint staging,
+conversion, installation, host preparation, launch, request semantics, and the
+qualification record.
+
+## 1. Download and stage the checkpoint
+
+Download the complete checkpoint to persistent storage, then copy it to local
+XFS/NVMe storage on the assigned H200 node before starting the server. Local
+staging avoids repeatedly reading the 141-shard checkpoint over the persistent
+filesystem during startup.
+
+```bash
+huggingface-cli download zai-org/GLM-5.3 \
+    --local-dir /persistent/models/GLM-5.3-FP8
+```
+
+The downloaded directory must contain `config.json`, tokenizer files,
+`model.safetensors.index.json`, and all referenced shards. Do not substitute a
+GLM-5.3-Flash or BF16 checkpoint for this guide. The local destination must
+have enough space for the source and converted checkpoint; keep any `.partial`
+directory private to the current staging run.
+
+## 2. Convert to BatchGen format
+
+```bash
+python -m batchgen.tools.convert_checkpoint \
+    --input-dir /persistent/models/GLM-5.3-FP8
+
+python -m batchgen.tools.convert_checkpoint \
+    --input-dir /persistent/models/GLM-5.3-FP8 \
+    --validate-only
+```
+
+The default output is
+`/persistent/models/GLM-5.3-FP8/converted_ckpt`. Keep the converted directory
+beside the staged source so the two paths can be checked together.
+
+## 3. Install BatchGen
+
+Use a release containing the GLM-5.3 model and request support. A full Hopper
+installation is:
+
+```bash
+git clone https://github.com/batchgen-project/batchgen.git
+cd batchgen
+./scripts/install_deps.sh --all
+```
+
+Run the server from the supported `batchgen` environment. The model-specific
+and `batchgen_kernels` worktrees must be from the same release revision; a
+shared checkout that another model session moves can select incompatible
+kernels.
+
+The GLM-5.3 FA3 path also imports the SGLang-maintained `sgl-deep-gemm`
+distribution (`0.1.5.post3`). This is the DeepGEMM runtime package only; it
+does not install SGLang. Keep the license and attribution files from the
+dependency source checkout with any redistributable runtime bundle. The
+license inventory is recorded in [Third-party runtime licenses](third-party-licenses.md).
+
+## 4. Prepare the host
+
+Use an otherwise idle 8×H200 host with sufficient RAM for the FP8 weights and
+host KV cache. The weights and host KV cache are anonymous shared memory charged
+to host memory, not `/dev/shm` files, so `/dev/shm` needs no remount. Run the
+family-specific identity gate, clean step, and verifier for the exact assigned
+host before starting the server.
+
+Start the server with `--fast-init`. In every mode the shared FP8 weights and
+the host KV cache are unnamed memory that the kernel releases even if the server
+is stopped forcibly; `--fast-init` backs them with shared-memory transparent huge
+pages for faster registration. Before allocating, it drops the page cache
+and compacts memory host-wide, so use it on a dedicated host. It needs
+shared-memory transparent huge pages enabled:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/shmem_enabled
+echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+```
+
+The exact host KV size depends on available RAM and the request mix. Each
+token needs 109,824 bytes of KV across the 78 layers: 89,856 for the 576-wide
+MLA latent cache and 19,968 for the 128-wide sparse-indexer cache, both
+bfloat16. One 64-token page is 6.70 MiB, so a 1,048,575-token sequence needs
+16,384 pages (107.25 GiB) and eight of them need 858 GiB. Add the 703.7 GiB of
+shared weight memory when sizing the host.
+
+Start with a conservative value, then increase it only after checking
+`MemAvailable` and the verifier's host-memory gate. The container must be
+allowed to use that memory: a container without a memory reservation can be
+evicted under host memory pressure, which shows up as a lost container with no
+kernel OOM record.
+
+## 5. Start the server
+
+Replace the paths and choose unused HTTP and rendezvous ports:
+
+```bash
+source /path/to/env/activate_batchgen.sh
+
+numactl --interleave=all python -m batchgen.launch_http_server \
+    --model zai-org/GLM-5.3-FP8 \
+    --cache-dir /local/models/GLM-5.3-FP8 \
+    --converted-ckpt-dir /local/models/GLM-5.3-FP8/converted_ckpt \
+    --listen-port 10904 \
+    --world-size 8 \
+    --nnodes 1 \
+    --node-rank 0 \
+    --dist-init-addr 127.0.0.1:29504 \
+    --host-kv-cache-size 280 \
+    --kv-dtype bfloat16 \
+    --max-pool-size 512 \
+    --gpu-memory-frac 0.93 \
+    --fast-init \
+    --persistent-phase-instances \
+    --enable-cuda-graph \
+    --cuda-graph-max-bucket-size 32 \
+    --cuda-graph-num-buckets 6 \
+    --parse-thinking \
+    --startup-timeout 3600
+```
+
+This is the qualified configuration. With persistent phase instances, the
+weights and both phase instances leave little free GPU memory. `--gpu-memory-frac
+0.93` keeps enough headroom to capture the whole-model decode graphs for buckets
+1–32; at 0.96 the GPU KV cache takes that headroom and graph capture fails with
+a CUDA out-of-memory error on the first request. A much lower fraction leaves no
+positive GPU-KV budget and falls back to the minimum pool, which is valid for
+correctness but not for throughput measurements. Decode batches larger than the
+top bucket run eagerly. Keep `--disable-cuda-graphs` only for an explicitly
+isolated compatibility diagnostic.
+
+`--parse-thinking` places the generated reasoning before the template-primed
+`</think>` boundary in `message.reasoning_content` and leaves the answer in
+`message.content`. GLM-5.3 supports `reasoning_effort=low`, `high`, and `max`;
+`medium` and `enable_thinking=false` are rejected by the request path. There is
+no CUDA-graph context-length flag.
+
+Wait for readiness before submitting a batch:
+
+```bash
+curl --fail http://127.0.0.1:10904/health
+```
+
+## 6. Submit requests
+
+A request may select the reasoning effort explicitly:
+
+```json
+{"custom_id":"glm53-1","method":"POST","url":"/v1/chat/completions","body":{"model":"zai-org/GLM-5.3-FP8","messages":[{"role":"user","content":"Explain sparse attention."}],"reasoning_effort":"high","max_completion_tokens":256,"temperature":0.0}}
+```
+
+The batch API accepts the same JSONL upload and polling flow as other models:
+
+```python
+from batchgen.batchgen_client import BatchGenHttpClient
+
+client = BatchGenHttpClient("http://127.0.0.1:10904")
+batch = client.submit_batch(
+    input_file_path="input.jsonl",
+    output_file_path="output.jsonl",
+    max_context_length=1_048_576,
+)
+print(batch["status"])
+```
+
+When `--parse-thinking` is enabled, inspect both `message.reasoning_content` and
+`message.content`; do not search for a literal closing marker in the visible
+answer. GLM-5.3 is a thinking-only model, so disabling thinking is unsupported.
+
+## 7. Qualification status and troubleshooting
+
+The H200 qualification verified complete weights, contiguous checkpoint
+conversion, local-SSD startup, the dedicated chat template, deterministic short
+answers, and structured reasoning output. With the configuration in section 5,
+an installed runtime passed the startup preflight, and a 2,048-request
+MMLU-Pro batch with thinking enabled and `--parse-thinking` completed every
+request without a worker error, including mid-decode admissions, host-KV
+reloads, and watermark interrupts. GLM-5.3 reasons at `reasoning_effort=max`
+by default, so a small completion cap truncates many reasoning traces; use a
+large `max_completion_tokens` when measuring accuracy. This qualifies
+correctness and lifecycle, not throughput.
+
+GLM-5.3 uses the GLM-5.2 architecture and execution path; long-context
+prefill is covered by the GLM-5.2 qualification in
+[the GLM-5.2 H200 guide](deploy-glm-5.2-h200.md), whose `8×1M` layout needs
+the host memory computed in section 4.
+
+If a worker exits, inspect the first Python traceback from the failing rank.
+When no Python exception exists, use `CUDA_LAUNCH_BLOCKING=1` and per-operation
+logging to localize a CUDA-side failure. Do not attribute a later collective
+hang to the supervisor's exit code alone.

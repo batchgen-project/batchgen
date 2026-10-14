@@ -1,7 +1,7 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
  *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
+ *  Copyright (c) 2025-2026 BatchGen Team                                            *
  *                                                                               *
  *  licensed under the apache license, version 2.0 (the "license");              *
  *  you may not use this file except in compliance with the license.             *
@@ -72,6 +72,13 @@ struct HasGrowPagesForSequences<
            std::declval<const std::vector<std::int64_t>&>(),
            std::declval<const std::vector<std::size_t>&>()))>>
     : std::true_type {};
+
+template <typename T>
+struct IsDirectHostPagedKVWorkerView : std::false_type {};
+
+template <kv::HostKVMode Mode, typename Layout, typename LayerMapper>
+struct IsDirectHostPagedKVWorkerView<
+    kv::HostPagedKVWorkerView<Mode, Layout, LayerMapper>> : std::true_type {};
 
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
@@ -261,7 +268,7 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            "Batched variant: all (layer × seq) host-KV writes issued by "
            "one UVA kernel launch on the DtoH stream. Replaces the "
            "per-layer async_append_decode_kv_to_host loop of 78×bsz "
-           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs. Each "
+           "cudaMemcpyAsync with 1 kernel reading pinned pointer arrays. Each "
            "entry's layer_idx is a logical layer id for mapped worker views "
            "and is resolved before building destination pointers.")
         .def(
@@ -388,6 +395,17 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
     if constexpr (HasCompressionRatio<WorkerView>::value) {
         cls.def_property_readonly("compression_ratio",
                                   &WorkerView::compression_ratio);
+    }
+    if constexpr (IsDirectHostPagedKVWorkerView<WorkerView>::value) {
+        cls.def("async_offload_packed_layer_kv_to_host",
+                &WorkerView::AsyncOffloadPackedLayerKVToHost,
+                py::arg("layer_idx"), py::arg("sequence_ids"),
+                py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+                py::arg("sequence_lengths"),
+                "Offload one packed, variable-length prefill layer with one "
+                "async task. K/V tensors use [sum(sequence_lengths), H, D] "
+                "layout. For mapped worker views, layer_idx is resolved "
+                "before writing.");
     }
 }
 
@@ -550,7 +568,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // attention and MoE compute concurrently.
         .def("get_weights", &BatchGen::get_weights,
              py::call_guard<py::gil_scoped_release>())
+        .def("get_weights_pinned", &BatchGen::get_weights_pinned,
+             py::call_guard<py::gil_scoped_release>())
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
+        .def("free_weights_buffer_async",
+             &BatchGen::free_weights_buffer_async)
+        .def("free_weights_buffers_async",
+             &BatchGen::free_weights_buffers_async)
         .def("attn", &BatchGen::attn)
         .def("submit_to_KV_queue", &BatchGen::submit_to_KV_queue)
         .def("clear_expert_buffer", &BatchGen::clear_expert_buffer)
@@ -590,7 +614,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_past_key_states",
                 &BatchGen::get_past_key_states,
                 "Get the past key states for the given query global indices and max sequence length.")
-           .def("init_weight_storage", &BatchGen::init_weight_storage)
+           .def("init_weight_storage", &BatchGen::init_weight_storage,
+                py::arg("shm_name"),
+                py::arg("tensor_meta_shm_name"),
+                py::arg("byte_size"),
+                py::arg("enable_hugetlbfs"),
+                py::arg("enable_thp") = false,
+                py::arg("memfd_creator_pid") = -1,
+                py::arg("memfd_fd") = -1,
+                py::arg("tensor_meta_memfd_fd") = -1)
            .def_property(
               "host_paged_kv_worker_view",
               &BatchGen::host_paged_kv_worker_view,
@@ -611,9 +643,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("byte_size"),
             py::arg("module_weights_shm"),
             py::arg("enable_hugetlbfs") = false,
-            py::arg("enable_memfd") = false,
+            py::arg("enable_thp") = false,
             py::arg("memfd_creator_pid") = -1,
-            py::arg("memfd_fd") = -1)
+            py::arg("memfd_fd") = -1,
+            py::arg("tensor_meta_memfd_fd") = -1)
         .def("InitDistributed", &Weights_Storage::InitDistributed,
             py::arg("config_path"))
         .def("get_tensor", &Weights_Storage::get_tensor,
@@ -646,7 +679,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVConfig::sequence_table_capacity)
         .def_readwrite("alignment_bytes",
                        &kv::HostPagedKVConfig::alignment_bytes)
-        .def_readwrite("enable_memfd", &kv::HostPagedKVConfig::enable_memfd)
+        .def_readwrite("enable_thp", &kv::HostPagedKVConfig::enable_thp)
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
@@ -778,6 +811,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<kv::HostPrefixCacheConfig>(m, "HostPrefixCacheConfig")
         .def(py::init<>())
         .def_readwrite("shm_name", &kv::HostPrefixCacheConfig::shm_name)
+        .def_readwrite("memfd_creator_pid",
+                       &kv::HostPrefixCacheConfig::memfd_creator_pid)
+        .def_readwrite("memfd_fd", &kv::HostPrefixCacheConfig::memfd_fd)
         .def_readwrite("group_specs",
                        &kv::HostPrefixCacheConfig::group_specs)
         .def_readwrite("hash_block_tokens",
@@ -795,6 +831,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<kv::HostPrefixCacheConfig>(), py::arg("config"))
         .def("initialize", &kv::HostPrefixCacheCoordinator::Initialize,
              py::arg("create_region"))
+        .def("memfd_fd", &kv::HostPrefixCacheCoordinator::memfd_fd)
         .def("commit_prefix_pages",
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
              py::arg("namespace_digest"), py::arg("token_ids"),
@@ -980,13 +1017,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
-             py::arg("enable_memfd") = false)
+             py::arg("enable_thp") = false)
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
         .def("byte_size", &Parameter_Server::byte_size)
         .def("module_weights_shm", &Parameter_Server::module_weights_shm)
-        .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd);
+        .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd)
+        .def("tensor_meta_memfd_fd", &Parameter_Server::tensor_meta_memfd_fd);
 
     m.def(
         "set_data",

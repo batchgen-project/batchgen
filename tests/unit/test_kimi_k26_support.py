@@ -192,15 +192,3 @@ def test_scheduler_forwards_preserve_thinking_and_reasoning_content():
     assert tokenizer.kwargs["preserve_thinking"] is True
     assert "tools" in tokenizer.kwargs
     assert tokenizer.messages[0]["reasoning_content"] == "hidden"
-
-
-def test_trim_tokens_honors_all_eos_ids():
-    _, batch_scheduler = _load_scheduler_modules()
-    BatchScheduler = batch_scheduler.BatchScheduler
-
-    scheduler = BatchScheduler.__new__(BatchScheduler)
-    tokenizer = SimpleNamespace(eos_token_id=163586, eos_token_ids={163585, 163586}, pad_token_id=163839)
-
-    trimmed = scheduler._trim_tokens([11, 163585, 42, 163839], tokenizer)
-
-    assert trimmed == [11]

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -135,6 +136,21 @@ int memfd_create_wrapper(const char* name, unsigned int flags) {
     return static_cast<int>(syscall(SYS_memfd_create, name, flags));
 }
 
+// --fast-init requests transparent huge pages explicitly. Without it the
+// mapping is not advised at all, so its page size follows the host's
+// /sys/kernel/mm/transparent_hugepage/shmem_enabled policy.
+void AdviseTransparentHugePages(void* ptr, std::size_t size, bool enable_thp) {
+    if (!enable_thp) {
+        return;
+    }
+    if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
+        std::fprintf(stderr,
+                     "[HostPagedKV] warning: madvise(MADV_HUGEPAGE) failed: %s; "
+                     "host KV page size follows the system THP setting\n",
+                     std::strerror(errno));
+    }
+}
+
 void TouchPagesMultiThreaded(void* ptr, std::size_t size, std::size_t stride) {
     const int num_threads = std::min(16, static_cast<int>(std::thread::hardware_concurrency()));
     const std::size_t chunk_size = size / num_threads;
@@ -208,6 +224,9 @@ struct HostPagedKVBackend::SharedState {
     void Initialize(bool create_region);
     std::vector<std::int32_t> AcquirePages(std::int64_t sequence_id,
                                            std::size_t num_pages);
+    std::vector<std::vector<std::int32_t>> AcquirePagesForSequences(
+        const std::vector<std::int64_t>& sequence_ids,
+        const std::vector<std::size_t>& num_tokens);
     void ReleaseSequence(std::int64_t sequence_id);
     std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
                                                  std::size_t num_pages);
@@ -238,7 +257,6 @@ struct HostPagedKVBackend::SharedState {
     std::byte* data_base = nullptr;
 
     bool created_region = false;
-    bool using_memfd = false;
     int memfd_fd_value = -1;
 
     std::size_t header_offset = 0;
@@ -310,8 +328,8 @@ void HostPagedKVBackend::SharedState::MapPointers() {
 
 void HostPagedKVBackend::SharedState::ConstructSharedState() {
     // Always zero the entire mapping — historically we skipped the data
-    // region under --fast-init because memfd pages are kernel-zeroed on
-    // first fault. That was fine for clean startup, but page 0 gets
+    // region because memfd pages are kernel-zeroed on first fault. That was
+    // fine for clean startup, but page 0 gets
     // legitimately written by some sequence during a run, and if any
     // gather path later reads page 0 via a -1->0 clamp fallback (see
     // sparse_gather.py comment on invalid_mask), the reader picks up
@@ -504,187 +522,97 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
     const std::size_t alignment = std::max(kHugePageSize, page_size);
 
-    if (config.enable_memfd) {
-        // ---- memfd_create fast path (--fast-init) ----
-        if (create_region) {
-            int fd = memfd_create_wrapper("batchgen_kv", 0);
-            if (fd < 0) {
-                throw std::runtime_error(
-                    "--fast-init: memfd_create failed: " +
-                    std::string(strerror(errno)));
-            }
-            if (ftruncate(fd, static_cast<off_t>(total_bytes)) == -1) {
-                const int err = errno;
-                close(fd);
-                throw std::system_error(err, std::generic_category(),
-                                        "--fast-init: ftruncate on memfd failed");
-            }
+    // The region is always an anonymous memfd: it carries no /dev/shm name, so
+    // the kernel reclaims it as soon as the last process mapping it is gone,
+    // however that process died. Attachers reach it through
+    // /proc/<creator_pid>/fd/<creator_fd>.
+    if (create_region) {
+        // Close-on-exec: an exec'd child must not keep the region alive;
+        // attachers open it through /proc, not by inheritance.
+        int fd = memfd_create_wrapper("batchgen_kv", MFD_CLOEXEC);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "memfd_create(batchgen_kv) failed");
+        }
+        if (ftruncate(fd, static_cast<off_t>(total_bytes)) == -1) {
+            const int err = errno;
+            close(fd);
+            throw std::system_error(err, std::generic_category(),
+                                    "ftruncate on host KV memfd failed");
+        }
 
-            void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
-                                        MAP_SHARED, fd, 0, alignment);
-            if (mapped == MAP_FAILED) {
-                const int err = errno;
-                close(fd);
-                throw std::system_error(err, std::generic_category(),
-                                        "--fast-init: mmap on memfd failed");
-            }
+        void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, fd, 0, alignment);
+        if (mapped == MAP_FAILED) {
+            const int err = errno;
+            close(fd);
+            throw std::system_error(err, std::generic_category(),
+                                    "mmap on host KV memfd failed");
+        }
 
-            madvise(mapped, total_bytes, MADV_HUGEPAGE);
-
-            auto touch_start = std::chrono::high_resolution_clock::now();
+        AdviseTransparentHugePages(mapped, total_bytes, config.enable_thp);
+        if (config.enable_thp) {
             TouchPagesMultiThreaded(mapped, total_bytes, kHugePageSize);
-            auto touch_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::high_resolution_clock::now() - touch_start);
-
-            shm_fd = fd;
-            memfd_fd_value = fd;
-            using_memfd = true;
-            created_region = true;
-            mapping = static_cast<std::byte*>(mapped);
-            MapPointers();
-            header->init_state.store(
-                static_cast<std::uint32_t>(InitState::kInitializing),
-                std::memory_order_relaxed);
-            ConstructSharedState();
-        } else {
-            // Worker: open memfd via /proc/<pid>/fd/<N>
-            if (config.memfd_creator_pid <= 0 || config.memfd_fd < 0) {
-                throw std::runtime_error(
-                    "--fast-init worker: invalid memfd_creator_pid or memfd_fd");
-            }
-            std::string proc_path = "/proc/" +
-                                    std::to_string(config.memfd_creator_pid) +
-                                    "/fd/" + std::to_string(config.memfd_fd);
-            int fd = open(proc_path.c_str(), O_RDWR);
-            if (fd < 0) {
-                throw std::runtime_error(
-                    "--fast-init worker: cannot open " + proc_path + ": " +
-                    strerror(errno));
-            }
-            struct stat stat_buffer {};
-            if (fstat(fd, &stat_buffer) == -1) {
-                const int err = errno;
-                close(fd);
-                throw std::system_error(err, std::generic_category(),
-                                        "--fast-init worker: fstat failed");
-            }
-            if (static_cast<std::size_t>(stat_buffer.st_size) < total_bytes) {
-                close(fd);
-                throw std::runtime_error(
-                    "--fast-init worker: memfd too small");
-            }
-
-            void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
-                                        MAP_SHARED, fd, 0, alignment);
-            if (mapped == MAP_FAILED) {
-                const int err = errno;
-                close(fd);
-                throw std::system_error(err, std::generic_category(),
-                                        "--fast-init worker: mmap failed");
-            }
-
-            shm_fd = fd;
-            using_memfd = true;
-            mapping = static_cast<std::byte*>(mapped);
-            MapPointers();
-            WaitForInitialization();
-            ValidateSharedState();
-        }
-        return;
-    }
-
-    // ---- Original shm_open path (unchanged) ----
-    auto resize_region = [&](std::size_t bytes) {
-        if (ftruncate(shm_fd, static_cast<off_t>(bytes)) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "ftruncate failed");
-        }
-    };
-
-    auto reset_region = [&]() {
-        if (ftruncate(shm_fd, 0) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "ftruncate reset failed");
-        }
-        resize_region(total_bytes);
-    };
-
-    int flags = O_RDWR;
-    if (create_region) {
-        flags |= O_CREAT;
-    }
-
-    shm_fd = shm_open(config.shm_name.c_str(), flags, 0660);
-    if (shm_fd == -1) {
-        throw std::system_error(errno, std::generic_category(),
-                                "shm_open failed");
-    }
-
-    if (create_region) {
-        struct stat stat_buffer {};
-        if (fstat(shm_fd, &stat_buffer) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "fstat failed");
         }
 
-        const std::size_t current_size =
-            static_cast<std::size_t>(stat_buffer.st_size);
-        if (current_size == total_bytes && current_size != 0) {
-            reset_region();
-        } else {
-            resize_region(total_bytes);
-        }
+        shm_fd = fd;
+        memfd_fd_value = fd;
         created_region = true;
-    } else {
-        struct stat stat_buffer {};
-        if (fstat(shm_fd, &stat_buffer) == -1) {
-            const int err = errno;
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::system_error(err, std::generic_category(),
-                                    "fstat failed");
-        }
-        if (static_cast<std::size_t>(stat_buffer.st_size) < total_bytes) {
-            close(shm_fd);
-            shm_fd = -1;
-            throw std::runtime_error(
-                "Existing shared memory segment is too small");
-        }
-    }
-
-    void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, shm_fd, 0, alignment);
-
-    if (mapped == MAP_FAILED) {
-        const int err = errno;
-        close(shm_fd);
-        shm_fd = -1;
-        throw std::system_error(err, std::generic_category(), "mmap failed");
-    }
-
-    madvise(mapped, total_bytes, MADV_HUGEPAGE);
-
-    mapping = static_cast<std::byte*>(mapped);
-    MapPointers();
-
-    if (created_region) {
+        mapping = static_cast<std::byte*>(mapped);
+        MapPointers();
         header->init_state.store(
             static_cast<std::uint32_t>(InitState::kInitializing),
             std::memory_order_relaxed);
         ConstructSharedState();
-    } else {
-        WaitForInitialization();
-        ValidateSharedState();
+        return;
     }
+
+    // Attacher: open the creator's memfd via /proc/<pid>/fd/<N>.
+    if (config.memfd_creator_pid <= 0 || config.memfd_fd < 0) {
+        throw std::runtime_error(
+            "Host KV attach requires a valid memfd_creator_pid and memfd_fd "
+            "(got pid=" +
+            std::to_string(config.memfd_creator_pid) +
+            ", fd=" + std::to_string(config.memfd_fd) + ")");
+    }
+    const std::string proc_path = "/proc/" +
+                                  std::to_string(config.memfd_creator_pid) +
+                                  "/fd/" + std::to_string(config.memfd_fd);
+    int fd = open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        throw std::runtime_error("Host KV attach cannot open " + proc_path +
+                                 ": " + strerror(errno));
+    }
+    struct stat stat_buffer {};
+    if (fstat(fd, &stat_buffer) == -1) {
+        const int err = errno;
+        close(fd);
+        throw std::system_error(err, std::generic_category(),
+                                "fstat on host KV memfd failed");
+    }
+    if (static_cast<std::size_t>(stat_buffer.st_size) < total_bytes) {
+        close(fd);
+        throw std::runtime_error("Host KV memfd is too small (expected=" +
+                                 std::to_string(total_bytes) + ", found=" +
+                                 std::to_string(stat_buffer.st_size) + ")");
+    }
+
+    void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                fd, 0, alignment);
+    if (mapped == MAP_FAILED) {
+        const int err = errno;
+        close(fd);
+        throw std::system_error(err, std::generic_category(),
+                                "mmap on host KV memfd failed");
+    }
+
+    AdviseTransparentHugePages(mapped, total_bytes, config.enable_thp);
+
+    shm_fd = fd;
+    mapping = static_cast<std::byte*>(mapped);
+    MapPointers();
+    WaitForInitialization();
+    ValidateSharedState();
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
@@ -737,6 +665,148 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
         }
     }
     return pages;
+}
+
+std::vector<std::vector<std::int32_t>>
+HostPagedKVBackend::SharedState::AcquirePagesForSequences(
+    const std::vector<std::int64_t>& sequence_ids,
+    const std::vector<std::size_t>& num_tokens) {
+    if (sequence_ids.size() != num_tokens.size()) {
+        throw std::invalid_argument(
+            "sequence_ids and num_tokens must have the same length");
+    }
+    if (sequence_ids.empty()) {
+        return {};
+    }
+
+    std::vector<std::size_t> required_pages;
+    required_pages.reserve(num_tokens.size());
+    std::size_t total_required = 0;
+    for (std::size_t i = 0; i < num_tokens.size(); ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (sequence_ids[j] == sequence_ids[i]) {
+                throw std::invalid_argument(
+                    "duplicate sequence id in prefill batch: " +
+                    std::to_string(sequence_ids[i]));
+            }
+        }
+        if (num_tokens[i] == 0) {
+            throw std::invalid_argument(
+                "num_tokens must be greater than zero for sequence " +
+                std::to_string(sequence_ids[i]));
+        }
+        const std::size_t pages =
+            (num_tokens[i] + config.page_size_tokens - 1) /
+            config.page_size_tokens;
+        if (total_required > std::numeric_limits<std::size_t>::max() - pages) {
+            throw std::overflow_error(
+                "host KV prefill page request exceeds size_t capacity");
+        }
+        required_pages.push_back(pages);
+        total_required += pages;
+    }
+    if (total_required > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error(
+            "host KV prefill page request exceeds shared counter capacity");
+    }
+
+    std::vector<std::vector<std::int32_t>> allocations(sequence_ids.size());
+    for (std::size_t i = 0; i < allocations.size(); ++i) {
+        allocations[i].resize(required_pages[i]);
+    }
+
+    // Match the allocation -> sequence order used by AcquirePages.  Release
+    // paths do not hold both locks at once, so this order cannot form a cycle
+    // with them.  The aggregate free-page check is performed before any page
+    // is removed: a failed batch therefore cannot leave earlier sequences
+    // partially allocated.
+    ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    const std::uint32_t old_top =
+        header->free_stack_top.load(std::memory_order_relaxed);
+    if (total_required > old_top) {
+        throw std::runtime_error(
+            "Insufficient free pages available for prefill batch "
+            "(requested=" + std::to_string(total_required) +
+            ", available=" + std::to_string(old_top) + ")");
+    }
+
+    std::size_t offset = 0;
+    const std::uint32_t new_top =
+        old_top - static_cast<std::uint32_t>(total_required);
+    for (std::size_t i = 0; i < allocations.size(); ++i) {
+        for (std::size_t j = 0; j < required_pages[i]; ++j) {
+            allocations[i][j] = free_stack[new_top + offset++];
+        }
+    }
+    header->free_stack_top.store(new_top, std::memory_order_relaxed);
+
+    std::vector<SequenceEntry*> entries;
+    std::vector<SequenceEntry> previous_entries;
+    std::vector<bool> newly_inserted;
+    std::vector<std::int32_t> previous_tail_links;
+    entries.reserve(sequence_ids.size());
+    previous_entries.reserve(sequence_ids.size());
+    newly_inserted.reserve(sequence_ids.size());
+    previous_tail_links.reserve(sequence_ids.size());
+    try {
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            bool is_new = false;
+            SequenceEntry* entry =
+                FindOrInsertSequenceEntryLocked(sequence_ids[i], &is_new);
+            entries.push_back(entry);
+            previous_entries.push_back(*entry);
+            newly_inserted.push_back(is_new);
+            previous_tail_links.push_back(
+                entry->tail_page == kInvalidPageIndex
+                    ? kInvalidPageIndex
+                    : page_links[entry->tail_page]);
+            for (std::int32_t page : allocations[i]) {
+                page_owners[page] = sequence_ids[i];
+                page_links[page] = kInvalidPageIndex;
+                if (entry->head_page == kInvalidPageIndex) {
+                    entry->head_page = page;
+                    entry->tail_page = page;
+                } else {
+                    page_links[entry->tail_page] = page;
+                    entry->tail_page = page;
+                }
+                ++entry->num_pages;
+            }
+            if (is_new) {
+                header->active_sequences.fetch_add(1,
+                                                   std::memory_order_relaxed);
+            }
+        }
+    } catch (...) {
+        // Restore sequence metadata and the free stack so a table-full or
+        // shared-memory error cannot strand a partially allocated wave.
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (newly_inserted[i]) {
+                entries[i]->sequence_id = kTombstoneSequenceId;
+                entries[i]->num_pages = 0;
+                entries[i]->head_page = kInvalidPageIndex;
+                entries[i]->tail_page = kInvalidPageIndex;
+                header->active_sequences.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+            } else {
+                if (previous_entries[i].tail_page != kInvalidPageIndex) {
+                    page_links[previous_entries[i].tail_page] =
+                        previous_tail_links[i];
+                }
+                *entries[i] = previous_entries[i];
+            }
+        }
+        for (const auto& pages : allocations) {
+            for (std::int32_t page : pages) {
+                page_owners[page] = kEmptySequenceId;
+                page_links[page] = kInvalidPageIndex;
+            }
+        }
+        header->free_stack_top.store(old_top, std::memory_order_relaxed);
+        throw;
+    }
+    return allocations;
 }
 
 void HostPagedKVBackend::SharedState::ReleaseSequence(
@@ -1030,53 +1100,7 @@ std::vector<std::vector<std::int32_t>>
 HostPagedKVBackend::AcquirePagesForSequences(
     const std::vector<std::int64_t>& sequence_ids,
     const std::vector<std::size_t>& num_tokens) {
-    if (sequence_ids.size() != num_tokens.size()) {
-        throw std::invalid_argument(
-            "sequence_ids and num_tokens must have the same length");
-    }
-    if (sequence_ids.empty()) {
-        return {};
-    }
-
-    auto allocate_one = [this](std::int64_t sequence_id,
-                               std::size_t num_tokens_value) {
-        if (num_tokens_value == 0) {
-            throw std::invalid_argument(
-                "num_tokens must be greater than zero for sequence " +
-                std::to_string(sequence_id));
-        }
-        const std::size_t required_pages =
-            (num_tokens_value + config_.page_size_tokens - 1) /
-            config_.page_size_tokens;
-        return state_->AcquirePages(sequence_id, required_pages);
-    };
-
-    if (sequence_ids.size() == 1 || SafeHardwareConcurrency() == 1) {
-        std::vector<std::vector<std::int32_t>> allocations;
-        allocations.reserve(sequence_ids.size());
-        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-            allocations.emplace_back(
-                allocate_one(sequence_ids[i], num_tokens[i]));
-        }
-        return allocations;
-    }
-
-    std::vector<std::future<std::vector<std::int32_t>>> futures;
-    futures.reserve(sequence_ids.size());
-    for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-        const std::int64_t sequence_id = sequence_ids[i];
-        const std::size_t tokens = num_tokens[i];
-        futures.emplace_back(std::async(std::launch::async, [=]() {
-            return allocate_one(sequence_id, tokens);
-        }));
-    }
-
-    std::vector<std::vector<std::int32_t>> allocations;
-    allocations.reserve(futures.size());
-    for (auto& future : futures) {
-        allocations.emplace_back(future.get());
-    }
-    return allocations;
+    return state_->AcquirePagesForSequences(sequence_ids, num_tokens);
 }
 
 void HostPagedKVBackend::ReleaseSequence(std::int64_t sequence_id) {

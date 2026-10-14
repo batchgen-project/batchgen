@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import multiprocessing
 import os
 import signal
-import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import psutil
 
@@ -24,6 +24,10 @@ BATCHGEN_SHM_PREFIXES = (
     "batchgen_skel_", # Temp skeleton files: batchgen_skel_*.pt
     "batchgen_",      # General BatchGen prefix
 )
+
+# The model weight and tensor-metadata regions are anonymous memfds in every
+# mode, hugetlbfs included, so this run creates no named model region for a
+# supervisor to attribute and records no model SHM provenance.
 
 # Default hugepage size (2MB) used as fallback if detection fails
 DEFAULT_HUGEPAGE_SIZE = 2 * 1024 * 1024
@@ -56,6 +60,15 @@ MODEL_BYTE_SIZES = {
     # GLM-5.1 / GLM-5.1-FP8: same architecture + param count as GLM-5 (754B), same sizes.
     "zai-org/GLM-5.1-FP8": 760 * 1024**3,
     "zai-org/GLM-5.1": 1400 * 1024**3,
+    # GLM-5.2 / GLM-5.2-FP8: same architecture family + sizes as GLM-5.1.
+    # Exact entries are required: the partial match below would otherwise hit
+    # the BF16 "zai-org/GLM-5" 1400 GB entry first and over-reserve hugepages.
+    "zai-org/GLM-5.2-FP8": 760 * 1024**3,
+    "zai-org/GLM-5.2": 1400 * 1024**3,
+    # GLM-5.3 FP8 has the same released tensor total and host-weight envelope
+    # as GLM-5.2 FP8; keep exact entries ahead of the broad GLM-5 partial match.
+    "zai-org/GLM-5.3-FP8": 760 * 1024**3,
+    "zai-org/GLM-5.3": 1400 * 1024**3,
 }
 
 # Default byte_size when model not in lookup (700GB for backwards compatibility)
@@ -177,7 +190,10 @@ def kill_process_tree(
             pass
 
 
-def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
+def cleanup_shm_files(
+    shm_prefix: Optional[str] = "batchgen",
+    shm_dir: Optional[Path] = None,
+) -> int:
     """Clean up shared memory files in /dev/shm safely using Python.
 
     This function only deletes files matching known BatchGen prefixes,
@@ -187,13 +203,15 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
     Args:
         shm_prefix: Prefix to match shared memory files. If None, matches all
                    known BATCHGEN_SHM_PREFIXES. Default is 'batchgen'.
+        shm_dir: Directory holding the POSIX shared-memory objects. Defaults to
+                 /dev/shm; the dead-run reclaim tests inject a temporary dir.
 
     Returns:
         Number of files removed.
     """
-    shm_dir = Path("/dev/shm")
+    shm_dir = Path("/dev/shm") if shm_dir is None else Path(shm_dir)
     if not shm_dir.exists():
-        logger.debug("/dev/shm does not exist")
+        logger.debug("%s does not exist", shm_dir)
         return 0
 
     # Determine which prefixes to match
@@ -217,224 +235,20 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
 
             try:
                 entry.unlink()
-                logger.debug(f"Removed /dev/shm/{entry.name}")
+                logger.debug(f"Removed {entry}")
                 removed += 1
             except PermissionError:
-                logger.warning(f"Permission denied: /dev/shm/{entry.name}")
+                logger.warning(f"Permission denied: {entry}")
             except OSError as e:
-                logger.warning(f"Failed to remove /dev/shm/{entry.name}: {e}")
+                logger.warning(f"Failed to remove {entry}: {e}")
 
     except (PermissionError, OSError) as e:
-        logger.warning(f"Error accessing /dev/shm: {e}")
+        logger.warning(f"Error accessing {shm_dir}: {e}")
 
     if removed > 0:
-        logger.info(f"Cleaned up {removed} shared memory files from /dev/shm")
+        logger.info(f"Cleaned up {removed} shared memory files from {shm_dir}")
 
     return removed
-
-
-def cleanup_hugepages_files(prefix: Optional[str] = None) -> int:
-    """Clean up files in /dev/hugepages safely using Python.
-
-    This function only deletes files matching known BatchGen prefixes,
-    avoiding the unsafe 'rm -rf /dev/hugepages/*' pattern.
-
-    Args:
-        prefix: Specific prefix to match. If None, matches all
-               known BATCHGEN_SHM_PREFIXES.
-
-    Returns:
-        Number of files removed.
-    """
-    import shutil
-
-    hugepages_dir = Path("/dev/hugepages")
-    if not hugepages_dir.exists():
-        logger.debug("/dev/hugepages does not exist")
-        return 0
-
-    # Determine which prefixes to match
-    prefixes = (prefix,) if prefix else BATCHGEN_SHM_PREFIXES
-    removed = 0
-
-    try:
-        for entry in hugepages_dir.iterdir():
-            # Only delete entries matching our prefixes
-            if not any(entry.name.startswith(p) for p in prefixes):
-                continue
-
-            try:
-                if entry.is_file() or entry.is_symlink():
-                    entry.unlink()
-                elif entry.is_dir():
-                    shutil.rmtree(entry)
-                logger.debug(f"Removed /dev/hugepages/{entry.name}")
-                removed += 1
-            except PermissionError:
-                logger.warning(f"Permission denied: /dev/hugepages/{entry.name}")
-            except OSError as e:
-                logger.warning(f"Failed to remove /dev/hugepages/{entry.name}: {e}")
-
-    except (PermissionError, OSError) as e:
-        logger.warning(f"Error accessing /dev/hugepages: {e}")
-
-    if removed > 0:
-        logger.info(f"Cleaned up {removed} files from /dev/hugepages")
-
-    return removed
-
-
-def unmount_hugetlbfs() -> bool:
-    """Unmount all hugetlbfs filesystems.
-
-    Returns:
-        True if unmount was successful or no hugetlbfs mounted, False otherwise.
-    """
-    try:
-        # Check if hugetlbfs is mounted
-        result = subprocess.run(
-            ["mount"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if "hugetlbfs" not in result.stdout:
-            logger.debug("No hugetlbfs filesystems mounted")
-            return True
-
-        # Unmount all hugetlbfs mounts
-        max_attempts = 10
-        for attempt in range(max_attempts):
-            result = subprocess.run(
-                ["mount"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if "hugetlbfs" not in result.stdout:
-                logger.info("All hugetlbfs filesystems unmounted")
-                return True
-
-            # Try to unmount /dev/hugepages
-            umount_result = subprocess.run(
-                ["umount", "/dev/hugepages"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if umount_result.returncode != 0:
-                # umount failed, might need to wait for processes to release
-                if attempt < max_attempts - 1:
-                    logger.debug(
-                        f"Unmount attempt {attempt + 1} failed, retrying..."
-                    )
-                    time.sleep(0.5)
-                else:
-                    logger.warning(
-                        f"Failed to unmount hugetlbfs: {umount_result.stderr}"
-                    )
-                    return False
-
-        return True
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout while unmounting hugetlbfs")
-        return False
-    except Exception as e:
-        logger.warning(f"Error unmounting hugetlbfs: {e}")
-        return False
-
-
-def reset_hugepages_allocation() -> bool:
-    """Reset huge pages allocation to 0.
-
-    Runs both sysctl and direct /proc write for robustness.
-
-    Returns:
-        True if at least one method succeeded, False otherwise.
-    """
-    success = False
-
-    # Method 1: sysctl -w vm.nr_hugepages=0
-    try:
-        result = subprocess.run(
-            ["sysctl", "-w", "vm.nr_hugepages=0"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            logger.info("Reset vm.nr_hugepages to 0 via sysctl")
-            success = True
-        else:
-            logger.warning(f"sysctl failed: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout with sysctl")
-    except Exception as e:
-        logger.warning(f"sysctl error: {e}")
-
-    # Method 2: echo 0 > /proc/sys/vm/nr_hugepages
-    try:
-        with open("/proc/sys/vm/nr_hugepages", "w") as f:
-            f.write("0\n")
-        logger.info("Reset vm.nr_hugepages to 0 via /proc")
-        success = True
-    except PermissionError:
-        logger.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
-    except Exception as e:
-        logger.warning(f"Failed to reset hugepages via /proc: {e}")
-
-    return success
-
-
-def cleanup_resources(
-    shm_prefix: Optional[str] = "batchgen",
-    clean_hugepages: bool = True,
-    kill_workers: bool = True,
-    worker_pids: Optional[List[int]] = None,
-) -> None:
-    """Comprehensive resource cleanup for BatchGen.
-
-    This function should be called during server shutdown to clean up:
-    1. Worker processes (if kill_workers=True)
-    2. Shared memory files in /dev/shm
-    3. Files in /dev/hugepages
-    4. Unmount hugetlbfs and reset hugepages allocation
-
-    Args:
-        shm_prefix: Prefix for shared memory files to clean. None cleans all.
-        clean_hugepages: Whether to clean and unmount hugepages.
-        kill_workers: Whether to kill worker processes.
-        worker_pids: List of worker PIDs to kill. If None and kill_workers=True,
-                    kills all child processes.
-    """
-    logger.info("Starting resource cleanup...")
-
-    # Step 1: Kill worker processes
-    if kill_workers:
-        if worker_pids:
-            for pid in worker_pids:
-                try:
-                    proc = psutil.Process(pid)
-                    proc.kill()
-                    logger.debug(f"Killed worker process {pid}")
-                except psutil.NoSuchProcess:
-                    pass
-                except Exception as e:
-                    logger.warning(f"Failed to kill process {pid}: {e}")
-        else:
-            # Kill all child processes of current process
-            kill_process_tree(os.getpid(), include_parent=False)
-
-    # Step 2: Clean shared memory
-    cleanup_shm_files(shm_prefix)
-
-    # Step 3: Clean hugepages
-    if clean_hugepages:
-        cleanup_hugepages_files()
-        unmount_hugetlbfs()
-        reset_hugepages_allocation()
-
-    logger.info("Resource cleanup completed")
 
 
 def install_worker_signal_handlers(
@@ -464,3 +278,46 @@ def install_worker_signal_handlers(
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.debug("Worker signal handlers installed")
+
+
+# prctl(2) option number; identical on every Linux architecture.
+PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig() -> None:
+    """Arm the kernel parent-death signal (SIGKILL) for this process."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"prctl(PR_SET_PDEATHSIG) failed: {os.strerror(errno)}")
+
+
+def die_with_parent() -> None:
+    """Make the kernel SIGKILL this process when its parent process dies.
+
+    GPU workers must never outlive the server process that spawned them: an
+    orphaned worker keeps its CUDA context and shared memory alive.  The signal
+    is SIGKILL rather than a catchable one because a Python-level handler cannot
+    run while the worker's main thread is inside a native collective (NCCL), so
+    a handler-based death signal is not reliable.
+
+    The parent-death signal is delivered when the *thread* that created this
+    process exits, so the caller must be spawned from the parent's main thread.
+
+    No-op on platforms without PR_SET_PDEATHSIG.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    _set_pdeathsig()
+
+    # Close the race where the parent died before prctl ran: the kernel would
+    # then never deliver the death signal, leaving this process an orphan.
+    parent = multiprocessing.parent_process()
+    if parent is not None and os.getppid() != parent.pid:
+        logger.error(
+            "Parent process %s exited before the parent-death signal was armed; exiting",
+            parent.pid,
+        )
+        os._exit(1)
