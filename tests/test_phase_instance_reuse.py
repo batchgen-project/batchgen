@@ -260,50 +260,50 @@ def _invariant_worker(
 
 
 def test_reuse_decode_to_prefill_accepts_surviving_graphs_and_kv():
-    _invariant_worker()._assert_phase_switch_clean("decode_to_prefill")
+    _invariant_worker()._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
 def test_reuse_decode_to_prefill_raises_when_graph_state_was_torn_down():
     worker = _invariant_worker(graph_present=False, graph_was_present=True)
 
     with pytest.raises(RuntimeError, match="tore down the captured decode graph"):
-        worker._assert_phase_switch_clean("decode_to_prefill")
+        worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
 def test_reuse_decode_to_prefill_tolerates_a_lifetime_with_graphs_off():
     """Nothing to preserve when nothing was captured."""
     worker = _invariant_worker(graph_present=False, graph_was_present=False)
-    worker._assert_phase_switch_clean("decode_to_prefill")
+    worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
 def test_reuse_decode_to_prefill_raises_when_the_kv_region_went_away():
     worker = _invariant_worker(kv_initialized=False)
 
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
-        worker._assert_phase_switch_clean("decode_to_prefill")
+        worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
 def test_reuse_decode_to_prefill_raises_when_the_experts_stayed_mapped():
     worker = _invariant_worker(experts_resident=True)
 
     with pytest.raises(RuntimeError, match="left the decode routed experts"):
-        worker._assert_phase_switch_clean("decode_to_prefill")
+        worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
 def test_reuse_prefill_to_decode_requires_mapped_experts_and_kv():
     _invariant_worker(experts_resident=True)._assert_phase_switch_clean(
-        "prefill_to_decode"
+        "prefill_to_decode", reused=True
     )
 
     with pytest.raises(RuntimeError, match="routed experts are not"):
         _invariant_worker(experts_resident=False)._assert_phase_switch_clean(
-            "prefill_to_decode"
+            "prefill_to_decode", reused=True
         )
 
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
         _invariant_worker(
             experts_resident=True, kv_initialized=False
-        )._assert_phase_switch_clean("prefill_to_decode")
+        )._assert_phase_switch_clean("prefill_to_decode", reused=True)
 
 
 def test_rebuild_path_keeps_the_original_invariant():
@@ -311,17 +311,17 @@ def test_rebuild_path_keeps_the_original_invariant():
     worker = _invariant_worker(reusable=False, graph_present=True)
 
     with pytest.raises(RuntimeError, match="_cuda_graph_manager"):
-        worker._assert_phase_switch_clean("decode_to_prefill")
+        worker._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
     clean = _invariant_worker(reusable=False, graph_present=False)
-    clean._assert_phase_switch_clean("decode_to_prefill")
+    clean._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
 
 def test_prefill_to_decode_still_requires_the_ring_release():
     worker = _invariant_worker(ring_released=False, experts_resident=True)
 
     with pytest.raises(RuntimeError, match="weight ring"):
-        worker._assert_phase_switch_clean("prefill_to_decode")
+        worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ def test_decode_activation_skips_the_whole_build_chain():
     src = ast.unparse(reuse_branch.body)
 
     assert "activate_decoding()" in src
-    assert "_assert_phase_switch_clean('prefill_to_decode')" in src
+    assert "_assert_phase_switch_clean('prefill_to_decode', reused=True)" in src
     assert "_install_decode_weight_copy_queue()" in src
     # Everything the rebuild path does must be absent from this branch.
     for forbidden in (
@@ -491,3 +491,46 @@ def test_the_reuse_path_never_nulls_the_graph_manager():
     # cannot reuse its instances.
     assert "self.deep_free_model_memory()" in ast.unparse(decode)
     assert "self.deep_free_model_memory()" in ast.unparse(prefill)
+
+
+def test_the_building_switch_does_not_require_a_mapped_kv_region():
+    """Regression: the first prefill -> decode switch BUILDS the instance.
+
+    The KV pool is created after `_load_decode_model` returns, by
+    `_init_gpu_kv_with_actual_size()`. An earlier version of the invariant
+    re-derived "am I on the reuse path?" from `_decode_instance_is_reusable()`,
+    which flips to True the moment `configure_decoding` caches the instance —
+    i.e. during the very switch that builds it, before the pool exists. Every
+    rank then died on the first decode with "left the GPU KV region unmapped".
+    The mode is now passed explicitly by each call site.
+    """
+    worker = _invariant_worker(
+        reusable=True,             # the instance has just been cached
+        kv_initialized=False,      # ...but the pool does not exist yet
+        experts_resident=True,
+        ring_released=True,
+    )
+    worker.gpu_paged_kv_cache_manager = None
+
+    # The building switch asserts only the ring release.
+    worker._assert_phase_switch_clean("prefill_to_decode", reused=False)
+
+    # The activating switch still demands a mapped region.
+    worker._prefill_ring_released_for_switch = True
+    with pytest.raises(RuntimeError, match="left the GPU KV region"):
+        worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+
+def test_every_invariant_call_site_passes_the_mode_explicitly():
+    """The mode must never be re-derived inside the invariant."""
+    body = ast.unparse(_method_ast("_assert_phase_switch_clean"))
+    assert "_decode_instance_is_reusable" not in body
+    for name in ("_load_decode_model", "_config_prefill_for_batch"):
+        for node in ast.walk(_method_ast(name)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_assert_phase_switch_clean"
+            ):
+                kw = {k.arg for k in node.keywords}
+                assert "reused" in kw, f"{name}: call without reused="

@@ -200,19 +200,19 @@ def test_prefill_to_decode_invariant_raises_when_the_ring_was_not_released():
     worker = _rebuild_path_worker(rank=3, _prefill_ring_released_for_switch=False)
 
     with pytest.raises(RuntimeError, match="weight ring"):
-        check(worker, "prefill_to_decode")
+        check(worker, "prefill_to_decode", reused=False)
 
 
 def test_prefill_to_decode_invariant_consumes_the_flag():
     check = _isolated_worker_method("_assert_phase_switch_clean")
     worker = _rebuild_path_worker(rank=0, _prefill_ring_released_for_switch=True)
 
-    check(worker, "prefill_to_decode")
+    check(worker, "prefill_to_decode", reused=False)
 
     # One release per switch: the next switch must release it again.
     assert worker._prefill_ring_released_for_switch is False
     with pytest.raises(RuntimeError, match="weight ring"):
-        check(worker, "prefill_to_decode")
+        check(worker, "prefill_to_decode", reused=False)
 
 
 def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
@@ -225,7 +225,7 @@ def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
         _whole_model_segment=None,
     )
 
-    check(_rebuild_path_worker(**clean), "decode_to_prefill")
+    check(_rebuild_path_worker(**clean), "decode_to_prefill", reused=False)
 
     for name in (
         "_cuda_graph_manager",
@@ -236,13 +236,13 @@ def test_decode_to_prefill_invariant_raises_on_a_planted_leftover():
         planted = dict(clean)
         planted[name] = object()
         with pytest.raises(RuntimeError, match=name):
-            check(_rebuild_path_worker(**planted), "decode_to_prefill")
+            check(_rebuild_path_worker(**planted), "decode_to_prefill", reused=False)
 
 
 def test_unknown_switch_direction_is_a_programming_error():
     check = _isolated_worker_method("_assert_phase_switch_clean")
     with pytest.raises(ValueError, match="unknown phase-switch direction"):
-        check(_rebuild_path_worker(rank=0), "sideways")
+        check(_rebuild_path_worker(rank=0), "sideways", reused=False)
 
 
 # ---------------------------------------------------------------------------
