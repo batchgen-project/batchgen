@@ -8228,7 +8228,9 @@ class BatchGenWorker:
 			fingerprint if streamed_sp8 else None
 		)
 
-	def _assert_phase_switch_clean(self, direction: str) -> None:
+	def _assert_phase_switch_clean(
+		self, direction: str, *, reused: bool
+	) -> None:
 		"""Fail loud when a phase switch left the other phase's state behind.
 
 		Checks worker-owned switch state only, which is what this module can
@@ -8257,7 +8259,7 @@ class BatchGenWorker:
 					"bytes still mapped"
 				)
 			self._prefill_ring_released_for_switch = False
-			if self._decode_instance_is_reusable():
+			if reused:
 				pm = self.parallel_manager
 				if not getattr(pm, "decode_experts_resident", False):
 					raise RuntimeError(
@@ -8268,7 +8270,7 @@ class BatchGenWorker:
 				self._assert_kv_region_mapped("prefill->decode")
 			return
 		if direction == "decode_to_prefill":
-			if self._decode_instance_is_reusable():
+			if reused:
 				# Inverted on the reuse path, deliberately: the decode graphs and
 				# the KV region are supposed to outlive this switch. Tearing either
 				# down is what would force the recapture this lifecycle exists to
@@ -8417,7 +8419,7 @@ class BatchGenWorker:
 			# baked moves and nothing has to be rebuilt on the way back.
 			self._k3_startup_prefill_ready = False
 			self._release_reused_decode_instance()
-			self._assert_phase_switch_clean("decode_to_prefill")
+			self._assert_phase_switch_clean("decode_to_prefill", reused=True)
 		elif reuse_startup_prefill:
 			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
 			# decode model has run yet, and this prefill phase — model,
@@ -8449,7 +8451,7 @@ class BatchGenWorker:
 			self._k3_startup_prefill_ready = False
 			logging.info("Deep freeing model memory before prefill config...")
 			self.deep_free_model_memory()
-			self._assert_phase_switch_clean("decode_to_prefill")
+			self._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
@@ -8731,7 +8733,7 @@ class BatchGenWorker:
 			self.model, self.weight_copy_task = (
 				self.parallel_manager.activate_decoding()
 			)
-			self._assert_phase_switch_clean("prefill_to_decode")
+			self._assert_phase_switch_clean("prefill_to_decode", reused=True)
 			self.set_phase("decode")
 			self._install_decode_weight_copy_queue()
 			if self.rank == 0:
@@ -8763,7 +8765,10 @@ class BatchGenWorker:
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*padding_bsz))
 		# never overflows.
 		self._decode_padding_bsz = padding_bsz
-		self._assert_phase_switch_clean("prefill_to_decode")
+		# reused=False: this switch BUILDS the instance, and the KV pool is
+		# created after it returns by _init_gpu_kv_with_actual_size(), so the
+		# resident-region checks do not apply to it yet.
+		self._assert_phase_switch_clean("prefill_to_decode", reused=False)
 		self.set_phase("decode")
 
 		self._install_decode_weight_copy_queue()
