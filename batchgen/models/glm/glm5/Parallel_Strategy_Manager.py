@@ -95,6 +95,12 @@ class GLM5ParallelStrategyManager:
         # change, so they are uploaded once per process in one bulk copy and
         # handed out as views; see _device_scale.
         self._device_scales = None
+        # Shared device skeleton (see share_skeleton_on_device): whether it is
+        # on the device, the model keys the first instance bound to it, and the
+        # (parameter, checkpoint key) pairs of the instance configured last.
+        self._skeleton_on_device = False
+        self._shared_skeleton_keys = None
+        self._skeleton_bound_params = []
 
     @property
     def _instances_are_reused(self) -> bool:
@@ -180,6 +186,10 @@ class GLM5ParallelStrategyManager:
         timings['weight_mappings'] = time.perf_counter() - step_start
 
         step_start = time.perf_counter()
+        if self._instances_are_reused:
+            # Both kept instances bind one device skeleton; see
+            # share_skeleton_on_device. Must precede the first scale lookup.
+            self.share_skeleton_on_device()
         self._extract_dequantize_scale()
         timings['dequantize'] = time.perf_counter() - step_start
 
@@ -202,6 +212,7 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
+        self._assert_skeleton_still_shared("prefill")
         # GLM-5.2 long prompts run packed sparse absorbed FlashMLA prefill, which
         # has no dense fallback. Prove the required runtime exists here, at
         # configure time, instead of failing minutes into a long prefill.
@@ -330,6 +341,8 @@ class GLM5ParallelStrategyManager:
                         }
 
         torch.cuda.empty_cache()
+        if self._instances_are_reused:
+            self.share_skeleton_on_device()
         self._extract_dequantize_scale()
         self._load_model_skeleton()
         if self.persistent_phase_instances:
@@ -357,6 +370,7 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
+        self._assert_skeleton_still_shared("decode")
 
         if self.rank == 0:
             used = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
@@ -439,11 +453,162 @@ class GLM5ParallelStrategyManager:
         self._copy_expert_pairs(self._expert_copy_pairs)
 
     def share_skeleton_on_device(self):
-        """Upload the skeleton once so both persistent instances alias one copy."""
+        """Upload the skeleton once so both kept phase instances alias one copy.
+
+        Both instances' ``_load_model_skeleton`` bind ``param.data`` to the
+        entries of ``skeleton_state_dict``; once those entries live on the
+        device, ``model.to(device)`` keeps the bound tensors as they are, so
+        the prefill and decode instances hold ONE device copy of the skeleton
+        (norms, gates, indexer, dense MLP, embeddings, LM head, FP8 scales)
+        instead of one each. The phase-specific weights never come from here:
+        they are loaded under ``state_dict_name_map`` keys, which the skeleton
+        binding skips, and ``_assert_skeleton_still_shared`` checks both
+        properties after every configure.
+
+        Idempotent. It has to run before the first scale lookup: scales
+        uploaded from the host copies would otherwise stay a second copy.
+        """
+        if self._skeleton_on_device:
+            return
+        if self._device_scales is not None:
+            raise RuntimeError(
+                "share_skeleton_on_device() after the FP8 scales were uploaded "
+                "from the host skeleton: share the skeleton before the first "
+                "phase configure"
+            )
         device = self.engine_config.Basic_Config.device_torch
-        self.skeleton_state_dict = {
-            key: tensor.to(device) for key, tensor in self.skeleton_state_dict.items()
-        }
+        start = time.perf_counter()
+        buckets = {}
+        moved = {}
+        for key, tensor in self.skeleton_state_dict.items():
+            bucket = self._skeleton_bucket(key)
+            count, nbytes = buckets.get(bucket, (0, 0))
+            buckets[bucket] = (count + 1, nbytes + tensor.numel() * tensor.element_size())
+            moved[key] = tensor.to(device)
+        self.skeleton_state_dict = moved
+        self._skeleton_on_device = True
+        if self.rank == 0:
+            total = sum(nbytes for _, nbytes in buckets.values())
+            logging.info(
+                "[SKELETON] shared on device in %.2fs: %d tensors, %.3f GiB | %s",
+                time.perf_counter() - start,
+                len(moved),
+                total / (1024 ** 3),
+                ", ".join(
+                    f"{name}={count}/{nbytes / (1024 ** 3):.3f}GiB"
+                    for name, (count, nbytes) in sorted(
+                        buckets.items(), key=lambda item: -item[1][1]
+                    )
+                ),
+            )
+
+    @staticmethod
+    def _skeleton_bucket(key: str) -> str:
+        """Coarse category of a skeleton key, for the binding and upload logs."""
+        if "weight_scale_inv" in key:
+            return "scale"
+        if "q_a_layernorm" in key or "kv_a_layernorm" in key:
+            return "attn_norm"
+        if "input_layernorm" in key or "post_attention_layernorm" in key:
+            return "layer_norm"
+        if "e_score_correction_bias" in key:
+            return "gate_bias"
+        if "indexer" in key:
+            return "indexer"
+        if ".mlp.gate.weight" in key:
+            return "gate_weight"
+        if "embed_tokens" in key or "lm_head" in key or "model.norm" in key:
+            return "global"
+        if ".self_attn." in key:
+            return "attn_other"
+        if ".mlp." in key:
+            return "mlp_other"
+        return "other"
+
+    def _check_shared_skeleton_binding(self, bound):
+        """Pin what one instance bound to the shared device skeleton.
+
+        ``bound`` maps model key -> (checkpoint key, parameter). Fails loud if
+        a phase-managed key was bound (its loads would then write into memory
+        the other phase reads), if a parameter does not alias the shared
+        tensor, or if this instance binds a different key set than the first
+        one did. Logs, once, the skeleton entries no instance binds.
+        """
+        overlap = sorted(set(bound) & set(self.state_dict_name_map))
+        if overlap:
+            raise RuntimeError(
+                f"shared skeleton bound {len(overlap)} phase-managed keys, "
+                f"e.g. {overlap[:3]}"
+            )
+        for key, (ckpt_key, param) in bound.items():
+            if param.data_ptr() != self.skeleton_state_dict[ckpt_key].data_ptr():
+                raise RuntimeError(
+                    f"{key} does not alias the shared device skeleton entry "
+                    f"{ckpt_key}"
+                )
+        keys = frozenset(bound)
+        phase = getattr(self.loaded_model_config, "phase", None)
+        if self._shared_skeleton_keys is None:
+            self._shared_skeleton_keys = keys
+            if self.rank == 0:
+                used = {ckpt_key for ckpt_key, _ in bound.values()}
+                unbound = {}
+                for key, tensor in self.skeleton_state_dict.items():
+                    if key in used or "weight_scale_inv" in key:
+                        continue
+                    bucket = self._skeleton_bucket(key)
+                    count, nbytes = unbound.get(bucket, (0, 0))
+                    unbound[bucket] = (
+                        count + 1,
+                        nbytes + tensor.numel() * tensor.element_size(),
+                    )
+                logging.info(
+                    "[SKELETON] unbound non-scale entries on device: %d, %.3f GiB | %s",
+                    sum(count for count, _ in unbound.values()),
+                    sum(nbytes for _, nbytes in unbound.values()) / (1024 ** 3),
+                    ", ".join(
+                        f"{name}={count}/{nbytes / (1024 ** 3):.3f}GiB"
+                        for name, (count, nbytes) in sorted(unbound.items())
+                    ) or "none",
+                )
+        elif keys != self._shared_skeleton_keys:
+            raise RuntimeError(
+                f"phase {phase!r} binds a different shared skeleton key set: "
+                f"{len(keys - self._shared_skeleton_keys)} extra, "
+                f"{len(self._shared_skeleton_keys - keys)} missing"
+            )
+        if self.rank == 0:
+            nbytes = sum(
+                param.numel() * param.element_size() for _, param in bound.values()
+            )
+            logging.info(
+                "[SKELETON] phase=%s binds %d shared device tensors (%.3f GiB); "
+                "same key set as the first binding; no overlap with %d "
+                "phase-managed keys",
+                phase,
+                len(bound),
+                nbytes / (1024 ** 3),
+                len(self.state_dict_name_map),
+            )
+
+    def _assert_skeleton_still_shared(self, phase: str) -> None:
+        """After a configure: every bound parameter still aliases the shared copy.
+
+        A phase-specific load, wrapper or cast that rebinds one of them would
+        silently give this instance a private copy again.
+        """
+        if not self._skeleton_on_device:
+            return
+        moved = [
+            ckpt_key
+            for param, ckpt_key in self._skeleton_bound_params
+            if param.data_ptr() != self.skeleton_state_dict[ckpt_key].data_ptr()
+        ]
+        if moved:
+            raise RuntimeError(
+                f"{phase} configure left {len(moved)} skeleton parameters off the "
+                f"shared device copy, e.g. {moved[:3]}"
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
@@ -947,6 +1112,7 @@ class GLM5ParallelStrategyManager:
                 return "mlp_other"
             return "other"
 
+        bound = {}
         for key, param in self.model.named_parameters():
             if key in self.state_dict_name_map:
                 skipped += 1
@@ -961,6 +1127,7 @@ class GLM5ParallelStrategyManager:
                     break
             if ckpt_key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[ckpt_key]
+                bound[key] = (ckpt_key, param)
                 loaded += 1
                 loaded_bucket[_bucket_for(key)] += 1
                 if ckpt_key != key:
@@ -969,6 +1136,7 @@ class GLM5ParallelStrategyManager:
                     qa_trace.append(f"LOADED: {key} (ckpt_key={ckpt_key})")
             elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
+                bound[key] = (key, param)
                 loaded += 1
                 loaded_bucket[_bucket_for(key)] += 1
                 if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
@@ -1010,6 +1178,11 @@ class GLM5ParallelStrategyManager:
         ) / (1024**3)
         if self.rank == 0:
             logging.info(f"Model skeleton size: {skeleton_size:.2f} GB")
+        if self._skeleton_on_device:
+            self._check_shared_skeleton_binding(bound)
+            self._skeleton_bound_params = [
+                (param, ckpt_key) for ckpt_key, param in bound.values()
+            ]
 
     def _setup_fp8_scales(self):
         """Attach FP8 scale tensors to indexer and dense MLP for on-the-fly dequant."""
