@@ -2,6 +2,8 @@ import concurrent.futures
 import copy
 import ctypes
 import functools
+import hashlib
+import heapq
 import json
 import psutil
 import logging
@@ -273,6 +275,21 @@ _MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128")
 # Kimi-Linear/K2.5 checkpoints share this architecture but not this lifecycle.
 KIMI_K3_MODEL_ID = "moonshotai/Kimi-K3"
 
+def _reentry_history_length(
+	prompt_length: int, original_prompt_length: int, original_max_decode_length: int,
+) -> int:
+	"""Tokens a re-entering sequence already decoded, capped by its own budget.
+
+	The reconstructed prompt carries the whole history, so the history length is
+	prompt_length - original_prompt_length. Cap it by the request's absolute
+	decode budget, which also bounds its decoded_tokens row (admission grows the
+	pool to every request's max_decode_length). The worker-wide
+	max_decoding_length must not be used: in pool mode it is the budget of the
+	first batch the server saw and can be smaller than a later request's history.
+	"""
+	return max(0, min(prompt_length - original_prompt_length, original_max_decode_length))
+
+
 # Decode budget the startup pass uses. max_decoding_length only sizes scheduler
 # hints at this point; the real per-batch value arrives with the pool "init"
 # message, which re-enters Init() before any sequence is admitted.
@@ -533,7 +550,11 @@ class QueryBookBufferPool:
 		self.num_sequences = num_sequences
 		self.input_ids_width = input_ids_width
 		self.max_decoding_length = max_decoding_length
-		self._free_slots: set = set()
+		# Min-heap: input_ids is node-shared, so every rank must hand the same
+		# slot to the same sequence. Taking the lowest free slot depends only on
+		# which slots are free, not on the order completions freed them (a set's
+		# pop() order does, and that order differs across ranks).
+		self._free_slots: list = []
 		self._next_slot: int = 0
 
 	def adopt(self, old: "QueryBookBufferPool") -> None:
@@ -544,12 +565,12 @@ class QueryBookBufferPool:
 			self.input_ids_buffer[:rows, :cols] = old.input_ids_buffer[:rows, :cols]
 		dec = min(self.max_decoding_length, old.max_decoding_length)
 		self.decoded_tokens_buffer[:rows, :dec] = old.decoded_tokens_buffer[:rows, :dec]
-		self._free_slots = set(old._free_slots)
+		self._free_slots = list(old._free_slots)
 		self._next_slot = old._next_slot
 
 	def allocate_slot(self) -> int:
 		if self._free_slots:
-			slot = self._free_slots.pop()
+			slot = heapq.heappop(self._free_slots)
 			# Clear stale data from previous occupant to prevent EOS/token contamination
 			self.decoded_tokens_buffer[slot, :] = self.pad_token_id
 			if self.input_ids_buffer is not None:
@@ -565,7 +586,7 @@ class QueryBookBufferPool:
 		return slot
 
 	def free_slot(self, slot: int):
-		self._free_slots.add(slot)
+		heapq.heappush(self._free_slots, slot)
 
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
 		if self.input_ids_buffer is None:
@@ -1821,6 +1842,11 @@ class BatchGenWorker:
 					self._trajectory_book.release(slot)
 			raise
 		self._publish_trajectory_pool_capacity()
+
+		# packing_v2: order the admission by prompt prefix before ownership,
+		# so a prefix family is not split across two prefill waves.
+		if self._prefill_prefix_pool_enabled():
+			self._stamp_prefix_prefill_order(valid_uuids)
 
 		# Ownership assignment runs identically on every rank; the book write
 		# above already materialized each prompt node-shared, so the
@@ -5759,15 +5785,24 @@ class BatchGenWorker:
 			per_node_sequence_free=per_node_sequence_free,
 		)
 		prefill_batch = PrefillScheduler.select_prefill_batch(selection)
+		# The in-wave prefix pool releases every cross-wave lookup hit and
+		# recomputes it (_plan_prefill_pool_wave), so a hit saves no Host pages
+		# there: discounting it over-admits, and the allocation fails once the
+		# retained prefixes are all pinned by live sequences. Those retained
+		# pages are reclaimable instead.
+		pool_mode = self._prefill_prefix_pool_enabled()
 		if (
-			self.enable_prefix_cache and not prefill_batch
+			self.enable_prefix_cache and selection.candidates and not pool_mode
 			and per_rank_sequence_free is None
 			and per_node_sequence_free is None
 		):
-			# A cached prefix already occupies Host pages. Estimate on each node
-			# leader before reclaiming those pages; the actual lookup and attach
-			# still happen in _config_prefill_for_batch. EVICTED prompts are
-			# reconstructed there, so retain their existing full-page path.
+			# A cached prefix already occupies Host pages, so charging a hit its
+			# full reservation lets one full-cost prompt fill the wave while
+			# cheap hits wait (one sequence per wave under tight Host KV).
+			# Estimate on each node leader and select with the discount whenever
+			# any candidate has a hit; the actual lookup and attach still happen
+			# in _config_prefill_for_batch. EVICTED prompts are reconstructed
+			# there, so retain their existing full-page path.
 			from batchgen.prefix_reuse.prefill import (
 				estimate_prefix_cached_pages_for_prefill,
 			)
@@ -5814,13 +5849,16 @@ class BatchGenWorker:
 					estimated_selection
 				)
 		if (
-			self.enable_prefix_cache and not prefill_batch
+			self.enable_prefix_cache
+			and (len(prefill_batch) < len(selection.candidates) if pool_mode else not prefill_batch)
 			and per_rank_sequence_free is None
 			and per_node_sequence_free is None
 		):
 			# No candidate fits even after a non-mutating prefix estimate.
 			# Reclaim against the original full-page requirement so a later
-			# lookup miss cannot make the allocation unsafe.
+			# lookup miss cannot make the allocation unsafe. The pool never
+			# reuses retained prefixes, so it reclaims toward every candidate
+			# rather than the smallest one (one sequence per wave otherwise).
 			failure = 0
 			has_fitting_candidate = 0
 			updated_local_free = -1
@@ -5840,7 +5878,7 @@ class BatchGenWorker:
 					updated_local_free = int(stats.num_free_pages)
 					if fitting:
 						has_fitting_candidate = 1
-						required = min(fitting)
+						required = sum(fitting) if pool_mode else min(fitting)
 						from batchgen.prefix_reuse.eviction import (
 							reclaim_prefix_pages_for_host_admission,
 						)
@@ -6057,6 +6095,7 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
 				host_kv_replication_factor=G,
+				prefill_order=getattr(seq, "prefill_order", None),
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -7363,12 +7402,21 @@ class BatchGenWorker:
 					pool_wave_start is not None
 					and self._get_num_nodes() == 1
 					and not self._prefill_sequence_limits()
-					and all(
-						self.global_batch.get_sequence(uuid).status == SequenceStatus.QUEUEING
-						for uuid in prefill_uuids
-					)
 				):
-					self._assign_ranks_for_prefix_sharing(prefill_uuids, current_wave=True)
+					wave_seqs = [
+						self.global_batch.get_sequence(uuid) for uuid in prefill_uuids
+					]
+					queueing = [
+						seq.status == SequenceStatus.QUEUEING for seq in wave_seqs
+					]
+					# The packer pins an evicted member on the rank holding
+					# its Host KV, so it only needs one placeable member.
+					placeable = (
+						any(queueing) if self._prefix_rank_packing_mode(wave_seqs)
+						else all(queueing)
+					)
+					if placeable:
+						self._assign_ranks_for_prefix_sharing(prefill_uuids, current_wave=True)
 				if prefill_uuids and not self._reserve_prefill_host_kv(prefill_uuids):
 					# The fresh capacity transaction rejected the snapshot.  Keep
 					# QUEUEING/EVICTED state untouched and retry on a later scheduler
@@ -8234,14 +8282,10 @@ class BatchGenWorker:
 			# into decoded_tokens. With the Phase 4.C cascade fix, this is
 			# exactly (prompt_length - original_prompt_length) = sum of new
 			# decoded counts across all past cycles.
-			baseline_candidate = seq.prompt_length - seq.original_prompt_length
-			# This is a per-request cumulative count. Capping it by the worker's
-			# first-batch global decode length truncates long requests and diverges
-			# from the trajectory ledger; the request-specific original cap is the
-			# correct bound.
-			n_old = min(baseline_candidate, seq.original_max_decode_length)
-			if n_old < 0:
-				n_old = 0
+			n_old = _reentry_history_length(
+				seq.prompt_length, seq.original_prompt_length,
+				seq.original_max_decode_length,
+			)
 			seq.decoded_length = n_old
 			seq.reentry_decoded_baseline = n_old
 
@@ -9088,30 +9132,211 @@ class BatchGenWorker:
 		self._pool_sid_counter += 1
 		return -(self.rank + 1 + self.world_size * self._pool_sid_counter)
 
+	def _prefix_rank_packing_mode(self, seqs) -> bool:
+		"""True when this batch asked for the predicted-time wave packer."""
+		active_debug = getattr(self, "_active_batchgen_debug_for_sequences", None)
+		debug = (active_debug(seqs) if active_debug is not None else None) or {}
+		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
+
+	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
+		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
+
+		Prefill waves are cut by free Host-KV pages in candidate order, and a
+		wave releases its prefix pool before the next one starts. A prefix
+		family split across that cut therefore recomputes its shared prefix.
+		Sorting the admission lexicographically by prompt token ids is a
+		prefix-tree DFS order, so a family stays contiguous and the cut falls
+		between families instead of inside one.
+
+		Identical on every rank: admission is broadcast from rank 0 and every
+		rank tokenizes, so the prompt ids read here are already replicated.
+		``global_idx`` grows across admissions and the base is this
+		admission's smallest one, so earlier admissions still order first.
+		"""
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		seqs = [seq for seq in seqs if seq is not None]
+		if not seqs or not self._prefix_rank_packing_mode(seqs):
+			return
+		base = min(seq.global_idx for seq in seqs)
+		ordered = sorted(
+			seqs,
+			key=lambda seq: (
+				self._trajectory_tokens(seq, length=seq.prompt_length).tolist(),
+				seq.global_idx,
+			),
+		)
+		for offset, seq in enumerate(ordered):
+			seq.prefill_order = base + offset
+		if self.rank == 0:
+			logging.info(
+				f"[PREFIX_ORDER] Stamped prefill_order on {len(ordered)} sequences"
+			)
+
 	def _assign_ranks_for_prefix_sharing(
 		self, uuids: List[str], *, current_wave: bool = False
 	) -> None:
-		"""Keep prompts sharing a prefix on one DP rank: each rank has its own pool."""
+		"""Keep prompts sharing a prefix on one DP rank: each rank has its own pool.
+
+		``packing_v2`` batches balance predicted executor seconds instead of
+		computed tokens, and leave a re-entering sequence on the rank that still
+		holds its Host KV: that sequence only pins load onto its rank.
+		"""
 		from batchgen.prefix_reuse.wave_plan import assign_ranks_for_sharing
 
 		pending = set(uuids)
-		loads = [0] * self.world_size
-		if not current_wave:
-			for seq in self.global_batch:
-				if seq.uuid in pending or seq.assigned_rank is None:
-					continue
-				loads[seq.assigned_rank] += int(getattr(seq, "prompt_length", 0) or 0)
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in uuids]
 		seqs = [seq for seq in seqs if seq is not None]
-		ranks = assign_ranks_for_sharing(
-			[
-				self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
-				for seq in seqs
-			],
-			world_size=self.world_size,
-			block_tokens=int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens),
-			initial_loads=loads,
-		)
+
+		def prompt_tokens(seq):
+			# Prompts live in the node-shared trajectory book after admission
+			# (a re-entry's reconstructed prompt included), so every rank reads
+			# the same tokens.
+			return self._trajectory_tokens(seq, length=seq.prompt_length)
+
+		packing = None
+		if self._prefix_rank_packing_mode(seqs):
+			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
+			from batchgen.prefix_reuse.rank_packing import (
+				pack_wave_ranks,
+				prompt_score_from_length,
+			)
+
+			if not hasattr(self, "_prefix_rank_cost_profile"):
+				# No profile is valid: the packer then balances computed tokens.
+				props = torch.cuda.get_device_properties(self.local_rank)
+				self._prefix_rank_cost_profile = find_executor_cost_profile(
+					self.model_name or "",
+					(props.major, props.minor),
+					props.total_memory,
+					self.world_size,
+				)
+			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+			chunk_tokens = int(
+				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+			)
+
+			def pinned_load(seq):
+				# Length-only on purpose: a pinned sequence's token storage may
+				# live on another node (its Host KV migrated away), and the
+				# score of a lone prompt depends only on its length anyway.
+				return prompt_score_from_length(
+					int(seq.prompt_length),
+					block_tokens=page_tokens,
+					chunk_tokens=chunk_tokens,
+					profile=self._prefix_rank_cost_profile,
+				)
+
+			# Only sequences that still owe a prefill load a rank. Completed or
+			# already-prefilled ones from earlier batches do not, and counting
+			# them skews the packing (one rank received a whole admission).
+			owes_prefill = (
+				SequenceStatus.QUEUEING, SequenceStatus.IN_PREFILL, SequenceStatus.EVICTED
+			)
+			fixed = []
+			if not current_wave:
+				for seq in self.global_batch:
+					if (
+						seq.uuid in pending or seq.assigned_rank is None
+						or seq.status not in owes_prefill
+					):
+						continue
+					fixed.append((seq.assigned_rank, pinned_load(seq)))
+			queued = []
+			for seq in seqs:
+				reentry = (
+					seq.status == SequenceStatus.EVICTED
+					or getattr(seq, "evicted_token_ids", None) is not None
+				)
+				if reentry:
+					# A re-entry stays on the rank that holds its Host KV; an
+					# ownerless re-entry cannot be packed identically anywhere.
+					if seq.assigned_rank is None:
+						raise RuntimeError(
+							f"re-entering sequence {seq.uuid} has no Host-KV owner rank"
+						)
+					fixed.append((seq.assigned_rank, pinned_load(seq)))
+				else:
+					queued.append(seq)
+			seqs = queued
+			prompts = [prompt_tokens(seq).tolist() for seq in seqs]
+			packing = pack_wave_ranks(
+				prompts,
+				world_size=self.world_size,
+				block_tokens=page_tokens,
+				chunk_tokens=chunk_tokens,
+				profile=self._prefix_rank_cost_profile,
+				fixed=fixed,
+			)
+			ranks = packing.ranks
+			# Every rank packs the same wave from synced metadata. A divergence
+			# would hand two ranks different owners for one sequence, so compare
+			# a digest rather than discover it as a missing local slot later.
+			# The input fingerprint tells an input divergence (unsynced prompts or
+			# pinned loads) apart from a non-deterministic packer.
+			mod = (1 << 61) - 1
+			digest = 0
+			for index, rank in enumerate(ranks):
+				digest = (digest * 1_000_003 + (index + 1) * 131 + rank + 1) % mod
+			hasher = hashlib.blake2b(digest_size=7)
+			for seq in seqs:
+				hasher.update(prompt_tokens(seq).numpy().tobytes())
+				hasher.update(int(seq.prompt_length).to_bytes(8, "little"))
+			for rank, load in fixed:
+				hasher.update(f"{rank}:{load:.9e};".encode())
+			inputs = int.from_bytes(hasher.digest(), "little")
+			check = torch.tensor(
+				[inputs, digest], dtype=torch.int64, device=self.torch_device
+			)
+			gathered = [torch.zeros_like(check) for _ in range(self.world_size)]
+			dist.all_gather(gathered, check)
+			if len({int(item[1].item()) for item in gathered}) != 1:
+				same_inputs = len({int(item[0].item()) for item in gathered}) == 1
+				if not same_inputs:
+					# Every rank saw the digests differ, so this extra collective is
+					# reached everywhere. Name the first prompt whose tokens differ,
+					# with its trajectory slot on each rank.
+					per_prompt = torch.tensor(
+						[
+							int.from_bytes(hashlib.blake2b(
+								prompt_tokens(seq).numpy().tobytes(),
+								digest_size=7,
+							).digest(), "little")
+							for seq in seqs
+						] + [getattr(seq, "_buffer_slot", -1) for seq in seqs],
+						dtype=torch.int64, device=self.torch_device,
+					)
+					views = [torch.zeros_like(per_prompt) for _ in range(self.world_size)]
+					dist.all_gather(views, per_prompt)
+					n = len(seqs)
+					for index in range(n):
+						hashes = {int(view[index].item()) for view in views}
+						if len(hashes) > 1:
+							logging.error(
+								"[PREFIX_POOL] rank %d: first diverging prompt #%d uuid=%s "
+								"prompt_length=%d slots_by_rank=%s differing_ranks_by_hash=%d",
+								self.rank, index, seqs[index].uuid, seqs[index].prompt_length,
+								[int(view[n + index].item()) for view in views], len(hashes),
+							)
+							break
+				raise RuntimeError(
+					"packing_v2 prefix rank assignment diverged across ranks "
+					f"({'identical inputs: packer non-determinism' if same_inputs else 'inputs differ across ranks'}): "
+					f"rank {self.rank} digest {digest} inputs {inputs} "
+					f"prompts {len(prompts)} tokens {sum(map(len, prompts))} fixed {len(fixed)}"
+				)
+		else:
+			loads = [0] * self.world_size
+			if not current_wave:
+				for seq in self.global_batch:
+					if seq.uuid in pending or seq.assigned_rank is None:
+						continue
+					loads[seq.assigned_rank] += int(getattr(seq, "prompt_length", 0) or 0)
+			ranks = assign_ranks_for_sharing(
+				[prompt_tokens(seq).tolist() for seq in seqs],
+				world_size=self.world_size,
+				block_tokens=int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens),
+				initial_loads=loads,
+			)
 		for seq, rank in zip(seqs, ranks):
 			if current_wave and seq.assigned_rank == self.rank and rank != self.rank:
 				local_idx = release_local_query_slot(
@@ -9130,10 +9355,19 @@ class BatchGenWorker:
 			counts = [0] * self.world_size
 			for rank in ranks:
 				counts[rank] += 1
-			logging.info(
-				"[PREFIX_POOL] %s rank assignment: %d sequences, per-rank %s",
-				"wave" if current_wave else "sharing-aware", len(seqs), counts,
-			)
+			if packing is not None:
+				logging.info(
+					"[PREFIX_POOL] packing_v2 rank assignment: %d sequences, per-rank %s, "
+					"predicted seconds %s, round %d",
+					len(seqs), counts,
+					[round(value, 4) for value in packing.predicted],
+					packing.round_used,
+				)
+			else:
+				logging.info(
+					"[PREFIX_POOL] %s rank assignment: %d sequences, per-rank %s",
+					"wave" if current_wave else "sharing-aware", len(seqs), counts,
+				)
 
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
 		"""Plan this rank's in-wave sharing. CPU-only: the GPU pool is built in
@@ -10437,7 +10671,17 @@ class BatchGenWorker:
 		# the batch is the MAX of each timing field over the emitting ranks.
 		# `prefill_s` retains its historical host-forward meaning; schema-aware
 		# reporters use `prefill_kv_ready_s` as the canonical capability boundary.
+		# The legacy/full-attention path does not build a WavePrefixPlan, but it
+		# still has the same workload geometry. Keep the stress metric contract
+		# comparable: every prompt is recomputed, one item row is emitted per
+		# sequence, and each FA3 micro-batch is one chunk. Causal pairs are the
+		# exact full-attention work count for each prompt.
+		legacy_full_attention_pairs = sum(
+			(int(seq_len) * (int(seq_len) + 1)) // 2
+			for seq_len in seq_lengths_list
+		)
 		logging.info("[METRICS] %s", json.dumps({
+			"component": "prefill_full_attention",
 			"phase": "prefill",
 			"prefill_metrics_contract": "forward-host+gpu-complete+kv-ready-v1",
 			"prefill_s": _prefill_forward_host_s,
@@ -10446,6 +10690,13 @@ class BatchGenWorker:
 			"prefill_kv_ready_s": _prefill_kv_ready_s,
 			"final_kv_offload_tasks_retired": _num_final_kv_tasks,
 			"sequences": num_sequences,
+			"prompt_tokens": total_tokens_all,
+			"computed_tokens": total_tokens_all,
+			"full_attention_pairs": legacy_full_attention_pairs,
+			"item_rows": num_sequences,
+			"chunks": len(micro_batches),
+			"saved_tokens": 0,
+			"recomputed_tokens": total_tokens_all,
 			"tokens_total": total_tokens_all,
 			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
 			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,

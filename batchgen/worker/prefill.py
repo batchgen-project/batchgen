@@ -78,7 +78,8 @@ class PrefillCandidate:
 
     ``is_evicted`` selects the priority group: evicted sequences are
     admitted first (ordered by most-decoded-first to minimise wasted
-    recompute), then queueing sequences (ordered by arrival ``global_idx``).
+    recompute), then queueing sequences (ordered by ``prefill_order``,
+    defaulting to arrival ``global_idx``).
     """
 
     uuid: str
@@ -97,6 +98,11 @@ class PrefillCandidate:
     # Read-only prefix estimate used only when physical free pages cannot
     # admit any candidate. Attached pages already occupy the Host pool.
     cached_prefix_pages: int = 0
+    # Queueing admission order. ``None`` means "use ``global_idx``" (arrival).
+    # The worker stamps it so prompts sharing a prefix stay adjacent and land
+    # in one wave, instead of being split by a capacity cut and recomputing
+    # their shared prefix.
+    prefill_order: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -158,8 +164,9 @@ class PrefillScheduler:
 
         Priority order: EVICTED sequences first (most decoded → least
         wasted recompute, ``global_idx`` tie-break), then QUEUEING (by
-        ``global_idx``). Each candidate is admitted iff its node still has
-        room for its initial page reservation.
+        ``prefill_order`` where set, else arrival ``global_idx``, with
+        ``global_idx`` as tie-break). Each candidate is admitted iff its
+        node still has room for its initial page reservation.
 
         Initial reservation (matches the worker's dynamic host-KV sizing):
         ``max(prompt_length + chunk_size, gpu_initial_tokens)`` capped at
@@ -176,7 +183,12 @@ class PrefillScheduler:
         evicted = [c for c in req.candidates if c.is_evicted]
         queueing = [c for c in req.candidates if not c.is_evicted]
         evicted.sort(key=lambda c: (-c.total_decoded_before_eviction, c.global_idx))
-        queueing.sort(key=lambda c: c.global_idx)
+        queueing.sort(
+            key=lambda c: (
+                c.global_idx if c.prefill_order is None else c.prefill_order,
+                c.global_idx,
+            )
+        )
         all_candidates = evicted + queueing
         if not all_candidates:
             return []
