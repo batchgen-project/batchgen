@@ -387,3 +387,128 @@ def test_fixed_pool_requires_an_indexed_cuda_device_in_production():
     )
     with pytest.raises(RuntimeError, match="indexed CUDA device"):
         manager.initialize()
+
+
+# ---------------------------------------------------------------------------
+# The DSA coordinator mirrors the lifecycle state of both pools
+# ---------------------------------------------------------------------------
+#
+# GLM-5.2 serves through DualKVCacheCoordinator (MLA primary + indexer aux).
+# The phase switch asks the bound manager — i.e. the coordinator — whether the
+# pool is mapped, holds it mapped for a capacity snapshot, and releases it, so
+# the coordinator must answer for both pools and refuse to answer at all if
+# they ever disagree.
+
+
+def _load_coordinator_module():
+    saved = dict(sys.modules)
+    saved_path = list(sys.path)
+    try:
+        for name, path in (
+            ("batchgen", "batchgen"),
+            ("batchgen.config", "batchgen/config"),
+            ("batchgen.kv_cache", "batchgen/kv_cache"),
+        ):
+            module = types.ModuleType(name)
+            module.__path__ = [str(ROOT / path)]
+            sys.modules[name] = module
+        stub = types.ModuleType("batchgen.kv_cache.gpu_kv_kernels")
+        stub.run_paged_kv_token_update = lambda *a, **k: None
+        stub.run_paged_kv_token_update_fused = lambda *a, **k: None
+        sys.modules["batchgen.kv_cache.gpu_kv_kernels"] = stub
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        return importlib.import_module("batchgen.kv_cache.dual_kv_cache_coordinator")
+    finally:
+        for name in [n for n in sys.modules if n not in saved]:
+            del sys.modules[name]
+        for name, module in saved.items():
+            sys.modules[name] = module
+        sys.path[:] = saved_path
+
+
+COORDINATOR = _load_coordinator_module()
+
+
+class _StubPool:
+    """Only the lifecycle surface the coordinator delegates."""
+
+    def __init__(self, *, mapped=True, fixed=True):
+        self.config = types.SimpleNamespace(page_size_tokens=64)
+        self.pool_is_mapped = mapped
+        self.uses_fixed_address_pool = fixed
+        self.depth = 0
+
+    def assert_pool_mapped(self, context):
+        if not self.pool_is_mapped:
+            raise RuntimeError(f"{context}: GPU KV pool is not mapped")
+
+    def capacity_snapshot(self):
+        pool = self
+
+        class _Section:
+            def __enter__(self_inner):
+                pool.assert_pool_mapped("capacity_snapshot")
+                pool.depth += 1
+                return pool
+
+            def __exit__(self_inner, *exc):
+                pool.depth -= 1
+                return False
+
+        return _Section()
+
+
+def _coordinator(**kwargs):
+    primary = _StubPool(**kwargs)
+    auxiliary = _StubPool(**kwargs)
+    return COORDINATOR.DualKVCacheCoordinator(primary, auxiliary), primary, auxiliary
+
+
+def test_coordinator_reports_the_shared_pool_state():
+    mapped, _, _ = _coordinator(mapped=True)
+    assert mapped.pool_is_mapped is True
+    assert mapped.uses_fixed_address_pool is True
+
+    released, _, _ = _coordinator(mapped=False)
+    assert released.pool_is_mapped is False
+
+
+def test_coordinator_refuses_to_answer_for_diverged_pools():
+    coordinator, _, auxiliary = _coordinator(mapped=True)
+    auxiliary.pool_is_mapped = False
+
+    with pytest.raises(RuntimeError, match="diverged in mapped state"):
+        coordinator.pool_is_mapped
+
+    coordinator, _, auxiliary = _coordinator(fixed=True)
+    auxiliary.uses_fixed_address_pool = False
+
+    with pytest.raises(RuntimeError, match="disagree on fixed addressing"):
+        coordinator.uses_fixed_address_pool
+
+
+def test_coordinator_capacity_snapshot_holds_both_pools():
+    coordinator, primary, auxiliary = _coordinator()
+
+    with coordinator.capacity_snapshot():
+        assert (primary.depth, auxiliary.depth) == (1, 1)
+
+    assert (primary.depth, auxiliary.depth) == (0, 0)
+
+
+def test_coordinator_capacity_snapshot_refuses_an_unmapped_pool():
+    coordinator, _, auxiliary = _coordinator()
+    auxiliary.pool_is_mapped = False
+
+    with pytest.raises(RuntimeError, match="not mapped"):
+        with coordinator.capacity_snapshot():
+            pass
+
+
+def test_coordinator_assert_pool_mapped_names_the_failing_side():
+    coordinator, _, auxiliary = _coordinator()
+    auxiliary.pool_is_mapped = False
+
+    with pytest.raises(RuntimeError, match=r"auxiliary"):
+        coordinator.assert_pool_mapped("decode replay")

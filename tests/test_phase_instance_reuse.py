@@ -10,24 +10,29 @@ process and switches it in:
   captures the graphs — strictly from the decode phase, after the prefill ring
   and the prefill model have been released, so the measurement cannot charge
   prefill-only residency against a pool that is then kept for the process;
-* decode -> prefill releases only the routed experts, at reserved addresses, and
-  keeps the KV region and the captured graph state mapped;
-* prefill -> decode maps the experts back and activates, with no model
-  construction, no kernel re-init and no capture;
+* decode -> prefill returns the physical memory of BOTH large decode classes —
+  the routed-expert stacks and the KV pool — at reserved addresses, and keeps
+  the captured graph state;
+* prefill -> decode maps the experts and the KV pool back under the same
+  addresses and activates, with no model construction, no sizing, no kernel
+  re-init and no capture;
 * the end of every decode interval leaves a reused instance alone: the
   rebuild path's unregister + deep-free there is what nulled the graph
   manager and the fused attention pointers in the first measured lifetime.
 
-The switch invariants are inverted for this path on purpose, and that inversion
-is pinned here: on the reuse lifecycle a decode -> prefill switch that tore down
-the graph state or the KV region is a bug, where on the rebuild path leaving
-them behind was the bug.
+The graph-state invariant is inverted for this path on purpose, and that
+inversion is pinned here: on the reuse lifecycle a decode -> prefill switch
+that tore the captured graph state down is a bug, where on the rebuild path
+leaving it behind was the bug. The memory invariants are not inverted — both
+large classes still go back to the prefill phase, which is what keeps a long
+prefill inside the budget of a smaller HBM class.
 
 Worker methods are exec'd in isolation, so no CUDA, core engine or model is
 needed.
 """
 
 import ast
+import contextlib
 import copy
 import importlib.util
 from pathlib import Path
@@ -170,20 +175,25 @@ def test_a_built_instance_is_reusable():
 # ---------------------------------------------------------------------------
 
 
-def _release_worker(*, experts_resident=True, graph=True):
+def _release_worker(*, experts_resident=True, graph=True, fixed_pool=True):
     cls = _isolated(
         [
             "_release_reused_decode_instance",
+            "_assert_kv_pool_addresses_are_fixed",
             "_decode_graph_state_present",
         ]
     )
     worker = cls()
+    worker.rank = 4
     calls = []
     pm = SimpleNamespace(
         decode_experts_resident=experts_resident,
         release_decode_routed_experts=lambda: calls.append("release_experts"),
     )
     worker.parallel_manager = pm
+    worker.gpu_paged_kv_cache_manager = SimpleNamespace(
+        uses_fixed_address_pool=fixed_pool
+    )
     worker._destroy_gpu_paged_kv_cache = lambda **kw: calls.append(
         ("destroy_kv", tuple(sorted(kw.items())))
     )
@@ -194,15 +204,20 @@ def _release_worker(*, experts_resident=True, graph=True):
     return worker, calls
 
 
-def test_release_drops_sequences_through_the_pools_and_unmaps_experts():
+def test_release_returns_the_kv_physical_pages_and_unmaps_the_experts():
+    """Both large classes go back, at addresses that stay reserved.
+
+    The first revision of this lifecycle kept the KV pools MAPPED across
+    prefill (`keep_buffers=True`), which only fits where the device has the
+    headroom to spare: a smaller HBM class cannot run a long prefill beside a
+    resident KV pool. The release is a real `destroy()`, which on a
+    reserved-range pool unmaps the physical pages and keeps every address.
+    """
     worker, calls = _release_worker()
 
     worker._release_reused_decode_instance()
 
-    assert calls == [
-        ("destroy_kv", (("keep_buffers", True),)),
-        "release_experts",
-    ]
+    assert calls == [("destroy_kv", ()), "release_experts"]
 
 
 def test_release_is_idempotent_when_the_experts_are_already_unmapped():
@@ -210,7 +225,31 @@ def test_release_is_idempotent_when_the_experts_are_already_unmapped():
 
     worker._release_reused_decode_instance()
 
-    assert calls == [("destroy_kv", (("keep_buffers", True),))]
+    assert calls == [("destroy_kv", ())]
+
+
+def test_release_refuses_a_pool_whose_addresses_can_move():
+    """The captured graphs bake the pool pointers.
+
+    Releasing an allocator-backed pool would hand those addresses to the next
+    allocation, so an unsupported pool fails the switch instead of silently
+    taking the old destroy/recreate path.
+    """
+    worker, calls = _release_worker(fixed_pool=False)
+
+    with pytest.raises(RuntimeError, match="not held at fixed addresses"):
+        worker._release_reused_decode_instance()
+
+    assert calls == []
+
+
+def test_release_tolerates_a_lifetime_that_never_sized_a_pool():
+    worker, calls = _release_worker()
+    worker.gpu_paged_kv_cache_manager = None
+
+    worker._release_reused_decode_instance()
+
+    assert calls == [("destroy_kv", ()), "release_experts"]
 
 
 def test_release_leaves_the_captured_graph_state_in_place():
@@ -253,15 +292,22 @@ def _invariant_worker(
     reusable=True,
     graph_present=True,
     graph_was_present=True,
-    kv_initialized=True,
+    kv="mapped",
     experts_resident=False,
     ring_released=True,
     attn_registered=True,
 ):
+    """``kv`` is the pool's state at the switch: mapped, released or absent.
+
+    "released" is a pool whose physical pages went back to the driver while its
+    reserved addresses stayed — what decode -> prefill now leaves behind.
+    "absent" is a lifetime that has not sized a pool yet.
+    """
     cls = _isolated(
         [
             "_assert_phase_switch_clean",
             "_assert_kv_region_mapped",
+            "_assert_kv_region_released",
             "_assert_decode_graph_state_kept",
             "_assert_decode_attention_weights_registered",
             "_decode_instance_is_reusable",
@@ -281,19 +327,31 @@ def _invariant_worker(
     worker._whole_model_segment = None
     worker._decode_graph_captures = 1 if graph_was_present else 0
     worker.model = _decode_model(registered=attn_registered)
-    worker.gpu_paged_kv_cache_manager = (
-        SimpleNamespace(is_initialized=True) if kv_initialized else None
-    )
+    if kv == "absent":
+        worker.gpu_paged_kv_cache_manager = None
+    else:
+        mapped = kv == "mapped"
+        worker.gpu_paged_kv_cache_manager = SimpleNamespace(
+            # initialize() maps the pool and destroy() releases it, so the two
+            # move together on a reserved-range pool.
+            is_initialized=mapped,
+            pool_is_mapped=mapped,
+            uses_fixed_address_pool=True,
+        )
     worker._prefill_ring_released_for_switch = ring_released
     return worker
 
 
-def test_reuse_decode_to_prefill_accepts_surviving_graphs_and_kv():
-    _invariant_worker()._assert_phase_switch_clean("decode_to_prefill", reused=True)
+def test_reuse_decode_to_prefill_accepts_surviving_graphs_and_a_released_pool():
+    _invariant_worker(kv="released")._assert_phase_switch_clean(
+        "decode_to_prefill", reused=True
+    )
 
 
 def test_reuse_decode_to_prefill_raises_when_graph_state_was_torn_down():
-    worker = _invariant_worker(graph_present=False, graph_was_present=True)
+    worker = _invariant_worker(
+        kv="released", graph_present=False, graph_was_present=True
+    )
 
     with pytest.raises(RuntimeError, match="tore down the captured decode graph"):
         worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
@@ -301,19 +359,33 @@ def test_reuse_decode_to_prefill_raises_when_graph_state_was_torn_down():
 
 def test_reuse_decode_to_prefill_tolerates_a_lifetime_with_graphs_off():
     """Nothing to preserve when nothing was captured."""
-    worker = _invariant_worker(graph_present=False, graph_was_present=False)
+    worker = _invariant_worker(
+        kv="released", graph_present=False, graph_was_present=False
+    )
     worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
-def test_reuse_decode_to_prefill_raises_when_the_kv_region_went_away():
-    worker = _invariant_worker(kv_initialized=False)
+def test_reuse_decode_to_prefill_raises_when_the_kv_pool_stayed_mapped():
+    """The inversion POIS ruled on: prefill gets the KV pages back.
 
-    with pytest.raises(RuntimeError, match="left the GPU KV region"):
+    Keeping the whole KV pool mapped through prefill is a bet on one HBM
+    class. The pool's addresses stay reserved, so the remap on the way back is
+    a map, not an allocation — there is no reason to hold the pages.
+    """
+    worker = _invariant_worker(kv="mapped")
+
+    with pytest.raises(RuntimeError, match="left the GPU KV pool mapped"):
         worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
 
 
+def test_reuse_decode_to_prefill_tolerates_a_lifetime_without_a_pool_yet():
+    worker = _invariant_worker(kv="absent")
+
+    worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
+
+
 def test_reuse_decode_to_prefill_raises_when_the_experts_stayed_mapped():
-    worker = _invariant_worker(experts_resident=True)
+    worker = _invariant_worker(kv="released", experts_resident=True)
 
     with pytest.raises(RuntimeError, match="left the decode routed experts"):
         worker._assert_phase_switch_clean("decode_to_prefill", reused=True)
@@ -329,10 +401,32 @@ def test_reuse_prefill_to_decode_requires_mapped_experts_and_kv():
             "prefill_to_decode", reused=True
         )
 
+    # The activation must have remapped the pool before this point.
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
         _invariant_worker(
-            experts_resident=True, kv_initialized=False
+            experts_resident=True, kv="absent"
         )._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+    with pytest.raises(RuntimeError, match="left the GPU KV region"):
+        _invariant_worker(
+            experts_resident=True, kv="released"
+        )._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+
+def test_prefill_to_decode_rejects_an_initialized_but_unmapped_pool():
+    """A pool that reports initialized while its pages are gone is a bug.
+
+    Belt and braces around the reserved-range lifecycle: the mapped check does
+    not trust the initialized flag alone, because only the first is what a
+    graph replay dereferences.
+    """
+    worker = _invariant_worker(experts_resident=True)
+    worker.gpu_paged_kv_cache_manager = SimpleNamespace(
+        is_initialized=True, pool_is_mapped=False, uses_fixed_address_pool=True
+    )
+
+    with pytest.raises(RuntimeError, match="physical pages unmapped"):
+        worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
 
 
 def test_rebuild_path_keeps_the_original_invariant():
@@ -431,7 +525,15 @@ def test_the_first_build_sizes_for_the_largest_admissible_batch():
     assert "self._decode_padding_bsz = padding_bsz" in src
 
 
-def test_decode_to_prefill_keeps_the_kv_pools_on_the_reuse_path():
+def test_decode_to_prefill_releases_the_kv_pool_on_the_reuse_path():
+    """The reuse path hands the pool's pages back through its own release.
+
+    `_config_prefill_for_batch` still carries exactly one
+    `_destroy_gpu_paged_kv_cache` call, guarded for the rebuild path only: the
+    reuse path must not reach that one, because the destroy/recreate it
+    performs is what moves the pool's addresses. Its own release
+    (`_release_reused_decode_instance`) is the reserved-range one.
+    """
     method = _method_ast("_config_prefill_for_batch")
     destroys = [
         node
@@ -453,6 +555,160 @@ def test_decode_to_prefill_keeps_the_kv_pools_on_the_reuse_path():
     src = ast.unparse(method)
     assert "self._release_reused_decode_instance()" in src
     assert "reuse = not persistent and self._decode_instance_is_reusable()" in src
+
+    # And the release itself asks for a full destroy, not a buffer-keeping one.
+    release = ast.unparse(_method_ast("_release_reused_decode_instance"))
+    assert "self._destroy_gpu_paged_kv_cache()" in release
+    assert "keep_buffers" not in release
+
+
+def test_the_persistent_path_still_keeps_its_pools_mapped():
+    """Untouched by this change: the flag's own lifecycle is unchanged."""
+    release = ast.unparse(_method_ast("_release_persistent_decode_instance"))
+    assert "self._destroy_gpu_paged_kv_cache(keep_buffers=True)" in release
+
+
+def test_decode_activation_remaps_the_pool_before_anything_reads_it():
+    """Order inside the activation: map, then assert, then switch the phase.
+
+    Decode admission reads live capacity through the pool and the captured
+    graphs dereference its baked pointers, so the remap cannot wait for
+    `_init_gpu_kv_with_actual_size()` (which the caller runs afterwards, and
+    which finds a live pool and returns).
+    """
+    method = _method_ast("_load_decode_model")
+    reuse_branch = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "_decode_instance_is_reusable" in ast.unparse(node.test)
+    )
+    order = _call_names(
+        ast.Module(body=reuse_branch.body, type_ignores=[]),
+        {
+            "activate_decoding",
+            "_remap_reused_kv_pool",
+            "_assert_phase_switch_clean",
+            "set_phase",
+        },
+    )
+    assert order == [
+        "activate_decoding",
+        "_remap_reused_kv_pool",
+        "_assert_phase_switch_clean",
+        "set_phase",
+    ]
+
+    # generate() reads capacity only after the model step that remaps.
+    generate = _method_ast("generate")
+    names = _call_names(
+        generate, {"_load_decode_model", "_init_gpu_kv_with_actual_size", "_prepare_decode_batch"}
+    )
+    assert names.index("_load_decode_model") < names.index(
+        "_init_gpu_kv_with_actual_size"
+    ) < names.index("_prepare_decode_batch")
+
+
+def _remap_worker(*, pool="released", manager=True, fixed=True):
+    cls = _isolated(
+        [
+            "_remap_reused_kv_pool",
+            "_assert_kv_pool_addresses_are_fixed",
+        ],
+        time=SimpleNamespace(perf_counter=lambda: 0.0),
+        logging=SimpleNamespace(info=lambda *a, **k: None),
+    )
+    worker = cls()
+    worker.rank = 0
+    calls = []
+
+    class _Pool:
+        """A reserved-range pool: initialize() maps, destroy() releases."""
+
+        uses_fixed_address_pool = fixed
+
+        def __init__(self, mapped):
+            self.pool_is_mapped = mapped
+
+        def initialize(self):
+            calls.append("initialize")
+            self.pool_is_mapped = True
+
+        @staticmethod
+        def get_stats():
+            return SimpleNamespace(num_total_pages=512)
+
+    worker.gpu_paged_kv_cache_manager = (
+        _Pool(pool == "mapped") if manager else None
+    )
+    return worker, calls
+
+
+def test_remap_maps_a_released_pool_back():
+    worker, calls = _remap_worker(pool="released")
+
+    worker._remap_reused_kv_pool()
+
+    assert calls == ["initialize"]
+
+
+def test_remap_is_a_no_op_on_an_already_mapped_pool():
+    worker, calls = _remap_worker(pool="mapped")
+
+    worker._remap_reused_kv_pool()
+
+    assert calls == []
+
+
+def test_remap_refuses_a_pool_whose_addresses_can_move():
+    worker, calls = _remap_worker(fixed=False)
+
+    with pytest.raises(RuntimeError, match="not held at fixed addresses"):
+        worker._remap_reused_kv_pool()
+
+    assert calls == []
+
+
+def test_remap_fails_loud_without_a_pool_to_remap():
+    """A reused instance's own build sized the pool, so one must exist."""
+    worker, _ = _remap_worker(manager=False)
+
+    with pytest.raises(RuntimeError, match="no GPU KV manager"):
+        worker._remap_reused_kv_pool()
+
+
+def test_sizing_remaps_a_reserved_pool_instead_of_building_a_second_one():
+    """One pool, one page count, for the whole process.
+
+    A rank that rebuilds its decode instance reaches the sizing path with its
+    reserved range still held. Creating a second pool there would reserve a
+    second virtual range AND apply the cached (smaller) finalized size, so
+    `num_total_pages` would differ between that rank and a reusing rank — which
+    the cross-rank capacity snapshot rejects.
+    """
+    method = _method_ast("_init_gpu_kv_with_actual_size")
+    order = _call_names(
+        method,
+        {"_remap_reused_kv_pool", "_initialize_gpu_kv_manager_fixed_size"},
+    )
+    assert order[0] == "_remap_reused_kv_pool"
+
+    guard = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "uses_fixed_address_pool" in ast.unparse(node.test)
+    )
+    assert "_remap_reused_kv_pool" in ast.unparse(guard.body)
+    assert any(isinstance(node, ast.Return) for node in guard.body)
+    # Still after the fail-loud phase guard: nothing about the pool is touched
+    # from the prefill phase.
+    phase_guard = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If) and "_phase" in ast.unparse(node.test)
+    )
+    assert phase_guard.lineno < guard.lineno
 
 
 def test_prefill_activation_covers_both_reuse_paths():
@@ -535,7 +791,7 @@ def test_the_building_switch_does_not_require_a_mapped_kv_region():
     """
     worker = _invariant_worker(
         reusable=True,             # the instance has just been cached
-        kv_initialized=False,      # ...but the pool does not exist yet
+        kv="absent",               # ...but the pool does not exist yet
         experts_resident=True,
         ring_released=True,
     )
@@ -878,3 +1134,210 @@ def test_batches_with_different_spans_never_invalidate_the_capture():
         assert (path, reason) == ("graph", "captured"), (max_bsz, span, reason)
 
     assert invalidations == 0
+
+
+# ---------------------------------------------------------------------------
+# #424: the capacity snapshot holds the pool mapped
+# ---------------------------------------------------------------------------
+
+
+def _capacity_worker(world_size=1):
+    class _Dist:
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def all_gather(out, local):
+            for item in out:
+                item.copy_(local)
+
+    cls = _isolated(
+        ["_snapshot_decode_capacity"],
+        torch=__import__("torch"),
+        dist=_Dist,
+        DecodeCapacitySnapshot=tuple,
+        reduce_decode_capacity_snapshot=lambda totals, free, **kw: (
+            totals,
+            free,
+            kw,
+        ),
+    )
+    worker = cls()
+    worker.rank = 0
+    worker.world_size = world_size
+    worker.torch_device = "cpu"
+    worker._decode_attn_tp_size = lambda: 1
+    return worker
+
+
+class _SnapshotPool:
+    """Records whether the stats read happened inside the guarded section."""
+
+    is_initialized = True
+
+    def __init__(self):
+        self.depth = 0
+        self.read_depths = []
+
+    @contextlib.contextmanager
+    def capacity_snapshot(self):
+        self.depth += 1
+        try:
+            yield self
+        finally:
+            self.depth -= 1
+
+    def get_stats(self):
+        self.read_depths.append(self.depth)
+        return SimpleNamespace(num_total_pages=512, num_free_pages=480)
+
+
+def test_the_decode_capacity_snapshot_holds_the_pool_mapped():
+    """The whole read, local stats and all_gather, runs inside the section.
+
+    PR #424 made decode admission read live all-rank capacity. With the pool
+    released for prefill at every switch, a release racing this read would
+    produce a plan for pages that no longer exist; inside the section the
+    release fails loud instead.
+    """
+    worker = _capacity_worker(world_size=2)
+    pool = _SnapshotPool()
+    worker.gpu_paged_kv_cache_manager = pool
+
+    worker._snapshot_decode_capacity()
+
+    assert pool.read_depths == [1]
+    assert pool.depth == 0
+
+    method = _method_ast("_snapshot_decode_capacity")
+    guarded = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.With)
+        and "capacity_snapshot" in ast.unparse(node.items[0].context_expr)
+    )
+    inner = _call_names(
+        ast.Module(body=guarded.body, type_ignores=[]),
+        {"get_stats", "all_gather"},
+    )
+    assert inner == ["get_stats", "all_gather"]
+
+
+def test_the_capacity_snapshot_section_is_left_on_failure():
+    worker = _capacity_worker()
+    pool = _SnapshotPool()
+
+    def boom():
+        raise RuntimeError("allocator stats failed")
+
+    pool.get_stats = boom
+    worker.gpu_paged_kv_cache_manager = pool
+
+    with pytest.raises(RuntimeError, match="allocator stats failed"):
+        worker._snapshot_decode_capacity()
+
+    assert pool.depth == 0
+
+
+# ---------------------------------------------------------------------------
+# First-batch reuse: the FIRST prefill instance is the one that is kept
+# ---------------------------------------------------------------------------
+#
+# On the first lifetime of this lifecycle the first decode -> prefill switch
+# cost an order of magnitude more than every later one, because the startup
+# prefill configure ran BEFORE the first decode build requested reuse.
+# The strategy manager therefore did not keep that prefill model, and the next
+# prefill built it again — inside the first measured batch.
+
+
+def test_reuse_is_requested_before_the_first_prefill_configure():
+    method = _method_ast("_config_prefill_for_batch")
+    order = _call_names(
+        method,
+        {
+            "_persistent_phase_enabled",
+            "_request_phase_instance_reuse",
+            "_decode_instance_is_reusable",
+            "configure_prefill",
+            "activate_prefill",
+        },
+    )
+    request = order.index("_request_phase_instance_reuse")
+    assert request < order.index("configure_prefill")
+    assert request < order.index("activate_prefill")
+    # The persistent flag owns its own instances; it must not be asked.
+    assert order.index("_persistent_phase_enabled") < request
+
+    guard = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "_request_phase_instance_reuse" in ast.unparse(node.body)
+    )
+    assert ast.unparse(guard.test) == "not persistent"
+
+
+def test_requesting_reuse_early_does_not_change_the_switch_decision():
+    """`reuse` still means "a decode instance is waiting", not "requested"."""
+    pm = SimpleNamespace(
+        reuse_phase_instances=False,
+        activate_decoding=lambda: None,
+        decode_instance=None,
+    )
+    worker = _lifecycle(parallel_manager=pm)
+
+    assert worker._request_phase_instance_reuse() is True
+    assert worker._decode_instance_is_reusable() is False
+
+
+# ---------------------------------------------------------------------------
+# The pools are built as reserved-range pools in the first place
+# ---------------------------------------------------------------------------
+
+
+def test_every_phase_switch_pool_is_built_at_fixed_addresses():
+    """Both DSA pools and the single-pool path opt in.
+
+    Without this the mechanism is dormant: `fixed_address_pool` defaults to
+    False, so a `destroy()` would free the pools and the next `initialize()`
+    would cudaMalloc them somewhere else, under the pointers capture baked.
+    """
+    method = _method_ast("_initialize_gpu_kv_manager_fixed_size")
+    constructions = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "GPUPagedKVCacheManager"
+    ]
+    assert len(constructions) == 3  # DSA primary + aux, and the single pool
+    src = ast.unparse(method)
+    for call in constructions:
+        passed = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        assert "fixed_address_pool" in passed, ast.unparse(call)
+        # Either the predicate directly or the local it was bound to.
+        value = passed["fixed_address_pool"]
+        assert (
+            "_kv_fixed_address_pool_available" in value
+            or f"{value} = self._kv_fixed_address_pool_available()" in src
+        ), value
+
+
+def test_the_fixed_address_pool_needs_an_indexed_cuda_device():
+    cls = _isolated(
+        ["_kv_fixed_address_pool_available"],
+        torch=SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+    worker = cls()
+    worker.local_rank = 0
+    assert worker._kv_fixed_address_pool_available() is True
+    worker.local_rank = None
+    assert worker._kv_fixed_address_pool_available() is False
+
+    cpu = _isolated(
+        ["_kv_fixed_address_pool_available"],
+        torch=SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+    )()
+    cpu.local_rank = 0
+    assert cpu._kv_fixed_address_pool_available() is False
