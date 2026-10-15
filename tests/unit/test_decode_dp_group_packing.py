@@ -452,3 +452,56 @@ def test_l2_double_eviction_round_trip():
     assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (None, 1)
     worker._assign_decode_dp_groups(["e"])
     assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (1, None)
+
+
+
+# --------------------------------------------------------------------------- #
+#  Saved-group lifecycle                                                      #
+# --------------------------------------------------------------------------- #
+
+def test_redundant_eviction_keeps_the_saved_group():
+    seq = _evicted("e", _singleton(1, 6), decoded_on=1)
+    # Already EVICTED and never re-grouped: evicted again, it holds no group.
+    evict_from_decode_dp_group(seq)
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (None, 1)
+
+    worker = _worker([seq])
+    worker._trajectory_tokens = _reader_refusing("e")
+    worker._assign_decode_dp_groups(["e"])
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (1, None)
+
+
+def _completion_cleanup_loops():
+    """Every all-ranks scalar cleanup loop over completed sequences."""
+    loops = []
+    for node in ast.walk(_worker_class()):
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Name)
+            and node.iter.id in ("completed_uuids", "completed_list")
+            and "seq.host_token_capacity = 0" in ast.unparse(node)
+        ):
+            loops.append(node)
+    return loops
+
+
+def test_completion_cleanup_clears_the_saved_group():
+    loops = _completion_cleanup_loops()
+    # Prefill-time completions, the decode loop, and the page boundary.
+    assert len(loops) == 3
+    for loop in loops:
+        seq = _evicted("c", _singleton(1, 6), decoded_on=1)
+        seq.status = SequenceStatus.COMPLETED
+        seq.gpu_pages_allocated = seq.host_pages_allocated = 4
+        seq.host_owned_pages = seq.host_token_capacity = 4
+        fake = SimpleNamespace(
+            global_batch=_Batch([seq]), _sequences_with_gpu_kv={"c"},
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+        exec(
+            compile(module, str(WORKER), "exec"),
+            {"self": fake, loop.iter.id: ["c"]},
+        )
+        assert seq.evicted_from_dp_group is None
+        assert seq.host_token_capacity == 0
+        assert fake._sequences_with_gpu_kv == set()

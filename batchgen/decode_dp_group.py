@@ -87,10 +87,13 @@ def evict_from_decode_dp_group(seq) -> None:
     so the re-entry must be grouped back onto that group:
     ``evicted_from_dp_group`` keeps it until the next assignment restamps the
     sequence and clears it. A later eviction records the then-current group.
-    Every rank runs this on the same replicated group id, so the record is
-    replicated too. G==1 never stamps a group, so this stores ``None``.
+    A redundant eviction of a sequence that holds no group (already EVICTED,
+    never re-grouped) must not erase that record, so only a held group is
+    saved. Every rank runs this on the same replicated group id, so the
+    record is replicated too. G==1 never stamps a group, so nothing is saved.
     """
-    seq.evicted_from_dp_group = seq.decode_dp_group
+    if seq.decode_dp_group is not None:
+        seq.evicted_from_dp_group = seq.decode_dp_group
     seq.decode_dp_group = None
 
 
