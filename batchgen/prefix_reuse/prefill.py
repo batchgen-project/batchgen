@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -23,9 +23,11 @@ class PrefixCacheSequenceState:
     attached_tokens: int
     compute_cached_tokens: int
     commit_attachment_handles: tuple[int, ...] = ()
-    # In-wave prefix pool: the planner's chain of segment Host pages, used
-    # instead of a coordinator lookup result.
-    planned_shared_page_ids: tuple[int, ...] = ()
+    # In-wave prefix pool: the planner's chain of segment Host pages per KV
+    # group, used instead of a coordinator lookup result.
+    planned_shared_page_ids: Mapping[int, tuple[int, ...]] = field(
+        default_factory=dict
+    )
 
     @property
     def attachment_handle(self) -> int:
@@ -33,14 +35,23 @@ class PrefixCacheSequenceState:
 
     @property
     def shared_page_ids(self) -> tuple[int, ...]:
+        """Group-0 Host pages this sequence reads but does not own."""
+
+        return self.shared_page_ids_for_group(0)
+
+    def shared_page_ids_for_group(self, group_id: int) -> tuple[int, ...]:
         if self.attached_tokens == 0:
             return ()
         if self.lookup_result is None:
-            return self.planned_shared_page_ids
-        spans = list(getattr(self.lookup_result, "materialization_spans", ()))
-        if len(spans) != 1 or int(spans[0].group_id) != 0:
+            return tuple(self.planned_shared_page_ids.get(int(group_id), ()))
+        spans = [
+            span
+            for span in getattr(self.lookup_result, "materialization_spans", ())
+            if int(span.group_id) == int(group_id)
+        ]
+        if len(spans) != 1:
             raise RuntimeError(
-                "GPT-OSS prefix state requires exactly one FULL_KV group"
+                f"prefix state needs exactly one span for KV group {group_id}"
             )
         return tuple(int(page.page_id) for page in spans[0].pages)
 
@@ -51,11 +62,15 @@ def lookup_prefix_cache_for_prefill(
     namespace_digest: Sequence[int],
     prompt_token_ids: Sequence[Sequence[int]],
     page_size_tokens: int,
+    num_groups: int = 1,
 ) -> PrefixCachePrefillLookup:
-    """Attach page-aligned GPT-OSS prefixes in request order.
+    """Attach page-aligned prefixes in request order.
 
-    A raw full hit remains fully attached in Host memory, but the compute path
-    recomputes the last prompt token so it can produce the first output token.
+    A reusable prefix is resident in every configured KV group, so a hit must
+    come back as one span per group (``num_groups``), all covering the same
+    tokens. A raw full hit remains fully attached in Host memory, but the
+    compute path recomputes the last prompt token so it can produce the first
+    output token.
     """
 
     page_size = int(page_size_tokens)
@@ -78,6 +93,7 @@ def lookup_prefix_cache_for_prefill(
                 result=result,
                 prompt_length=len(token_ids),
                 page_size_tokens=page_size,
+                num_groups=num_groups,
             )
             attached_tokens.append(cached)
             compute_cached_tokens.append(
@@ -138,7 +154,11 @@ def estimate_prefix_cached_pages_for_prefill(
 
 
 def _validate_lookup_result(
-    *, result: object, prompt_length: int, page_size_tokens: int
+    *,
+    result: object,
+    prompt_length: int,
+    page_size_tokens: int,
+    num_groups: int = 1,
 ) -> int:
     cached = int(result.common_cached_tokens)
     handle = int(result.attachment_handle)
@@ -162,19 +182,23 @@ def _validate_lookup_result(
         if spans:
             raise RuntimeError("prefix cache miss returned materialization spans")
         return 0
-    if len(spans) != 1 or int(spans[0].group_id) != 0:
+    groups = int(num_groups)
+    group_ids = sorted(int(span.group_id) for span in spans)
+    if len(spans) != groups or group_ids != list(range(groups)):
         raise RuntimeError(
-            "GPT-OSS prefix lookup requires exactly one FULL_KV group"
-        )
-    span = spans[0]
-    if int(span.raw_end_token) != cached:
-        raise RuntimeError(
-            "prefix materialization span does not cover the attached prefix"
+            "prefix lookup needs exactly one span per KV group: "
+            f"groups={groups}, spans={group_ids}"
         )
     expected_pages = cached // int(page_size_tokens)
-    if len(span.pages) != expected_pages:
-        raise RuntimeError(
-            "prefix materialization span page count mismatch: "
-            f"got={len(span.pages)}, expected={expected_pages}"
-        )
+    for span in spans:
+        if int(span.raw_end_token) != cached:
+            raise RuntimeError(
+                "prefix materialization span does not cover the attached prefix"
+            )
+        if len(span.pages) != expected_pages:
+            raise RuntimeError(
+                "prefix materialization span page count mismatch: "
+                f"group={int(span.group_id)}, got={len(span.pages)}, "
+                f"expected={expected_pages}"
+            )
     return cached

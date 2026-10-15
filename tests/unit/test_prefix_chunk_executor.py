@@ -55,11 +55,16 @@ def item_prompt(plan, prompts, item):
     return prompts[plan.segments[item.ref].members[0]]
 
 
-def replay(prompts, pool_pages=1000, chunk_tokens=1000):
-    """Run every chunk against a fake paged cache and check what it reads."""
+def replay(prompts, pool_pages=1000, chunk_tokens=1000, same_chunk=False):
+    """Run every chunk against a fake paged cache and check what it reads.
+
+    A chunk's tokens are all written before any row is checked, as a layer
+    writes the whole chunk's KV before attending over it.
+    """
 
     plan = plan_wave_prefix_sharing(
-        prompts, block_tokens=B, pool_pages=pool_pages, chunk_tokens=chunk_tokens
+        prompts, block_tokens=B, pool_pages=pool_pages, chunk_tokens=chunk_tokens,
+        same_chunk_ancestors=same_chunk,
     )
     validate_wave_prefix_plan(plan, prompts)
     scratch = scratch_pages_bound(
@@ -145,8 +150,36 @@ def test_random_waves_replay():
                 [t for _ in range(blocks) for t in rng.choice(vocab)]
                 + [rng.randint(0, 3) for _ in range(rng.randint(1, 5))]
             )
-        replay(
-            prompts,
-            pool_pages=rng.randint(0, 12),
-            chunk_tokens=rng.randint(1, 40),
-        )
+        for same_chunk in (False, True):
+            replay(
+                prompts,
+                pool_pages=rng.randint(0, 12),
+                chunk_tokens=rng.randint(1, 40),
+                same_chunk=same_chunk,
+            )
+
+
+def test_same_chunk_ancestors_finish_the_tree_in_one_forward():
+    # Without it the depth-2 tree needs 3 chunks (one per pooled level).
+    plan = replay(TREE, same_chunk=True)
+    assert len(plan.chunks) == 1
+    assert plan.saved_tokens == 40
+
+
+def test_same_chunk_ancestors_still_respect_the_chunk_cap():
+    plan = replay(TREE, chunk_tokens=10, same_chunk=True)
+    assert all(sum(item.tokens for item in c.items) <= 10 or len(c.items) == 1
+               for c in plan.chunks)
+
+
+def test_chunk_key_cap_bounds_the_prefix_keys_each_chunk_gathers():
+    uncapped = replay(TREE, same_chunk=True)
+    plan = _PLAN.plan_wave_prefix_sharing(
+        TREE, block_tokens=B, pool_pages=1000, chunk_tokens=1000,
+        same_chunk_ancestors=True, chunk_keys=40,
+    )
+    _PLAN.validate_wave_prefix_plan(plan, TREE)
+    assert len(plan.chunks) > len(uncapped.chunks)
+    assert plan.computed_tokens == uncapped.computed_tokens
+    for chunk in plan.chunks:
+        assert sum(i.token_end for i in chunk.items) <= 40 or len(chunk.items) == 1

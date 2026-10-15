@@ -84,6 +84,12 @@ class WavePrefixPlan:
     prompt_tokens: int
     computed_tokens: int
     peak_pool_pages: int
+    # An item may read a segment written earlier in its own chunk. Valid when
+    # every layer writes the whole chunk's KV before attending over it.
+    same_chunk_ancestors: bool = False
+    # Cap on the keys a chunk's rows attend over (sum of item token_end), for
+    # executors that gather every row's prefix keys; None: uncapped.
+    chunk_keys: Optional[int] = None
 
     @property
     def saved_tokens(self) -> int:
@@ -198,6 +204,8 @@ def _schedule(
     pool_pages: int,
     chunk_tokens: int,
     threshold: Optional[int],
+    same_chunk_ancestors: bool = False,
+    chunk_keys: Optional[int] = None,
 ) -> Optional[WavePrefixPlan]:
     """List-schedule one threshold; None if the pool deadlocks."""
 
@@ -287,18 +295,30 @@ def _schedule(
     while remaining:
         chosen: list[PlanItem] = []
         used = 0
+        keys = 0
         written = 0
         rest: list[PlanItem] = []
+        chosen_segments: set[int] = set()
         for item in remaining:
-            ready = all(seg in done_segments for seg in item.prefix_segments)
-            fits = not chosen or used + item.tokens <= chunk_tokens
+            # Items are in DFS order, so a segment precedes every reader.
+            ready = all(
+                seg in done_segments
+                or (same_chunk_ancestors and seg in chosen_segments)
+                for seg in item.prefix_segments
+            )
+            fits = not chosen or (
+                used + item.tokens <= chunk_tokens
+                and (chunk_keys is None or keys + item.token_end <= chunk_keys)
+            )
             if item.kind == "segment":
                 fits = fits and live + written + need[item.ref] <= pool_pages
             if ready and fits:
                 chosen.append(item)
                 used += item.tokens
+                keys += item.token_end
                 if item.kind == "segment":
                     written += pages[item.ref]
+                    chosen_segments.add(item.ref)
             else:
                 rest.append(item)
         if not chosen:
@@ -337,6 +357,8 @@ def _schedule(
         prompt_tokens=prompt_tokens,
         computed_tokens=computed,
         peak_pool_pages=peak,
+        same_chunk_ancestors=same_chunk_ancestors,
+        chunk_keys=chunk_keys,
     )
 
 
@@ -346,6 +368,8 @@ def plan_wave_prefix_sharing(
     block_tokens: int,
     pool_pages: int,
     chunk_tokens: int,
+    same_chunk_ancestors: bool = False,
+    chunk_keys: Optional[int] = None,
 ) -> WavePrefixPlan:
     """Plan one wave; pools the most segments whose schedule fits the pool.
 
@@ -362,10 +386,12 @@ def plan_wave_prefix_sharing(
     tree = _build_tree(prompts, block_tokens)
     # 2 means every shared segment; higher values only where counts exist.
     for threshold in sorted({2} | {c for c in tree.count if c > 2}):
-        plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, threshold)
+        plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
+                         threshold, same_chunk_ancestors, chunk_keys)
         if plan is not None:
             return plan
-    plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, None)
+    plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, None,
+                     same_chunk_ancestors, chunk_keys)
     assert plan is not None
     return plan
 
@@ -483,6 +509,7 @@ def validate_wave_prefix_plan(
             assert list(tokens[seg.token_start:seg.token_end]) == list(first)
 
     computed_at: dict[tuple[str, int], int] = {}
+    order_at: dict[tuple[str, int], int] = {}
     released_at: dict[int, int] = {}
     live = 0
     peak = 0
@@ -490,12 +517,21 @@ def validate_wave_prefix_plan(
         assert chunk.items, "empty chunk"
         size = sum(item.tokens for item in chunk.items)
         assert size <= plan.chunk_tokens or len(chunk.items) == 1
-        for item in chunk.items:
+        if plan.chunk_keys is not None:
+            keys = sum(item.token_end for item in chunk.items)
+            assert keys <= plan.chunk_keys or len(chunk.items) == 1
+        for order, item in enumerate(chunk.items):
             key = (item.kind, item.ref)
             assert key not in computed_at, f"{key} computed twice"
             computed_at[key] = position
+            order_at[key] = order
             for seg in item.prefix_segments:
-                assert computed_at.get(("segment", seg), position) < position, (
+                written = computed_at.get(("segment", seg), position + 1)
+                same_chunk = (
+                    plan.same_chunk_ancestors and written == position
+                    and order_at[("segment", seg)] < order
+                )
+                assert written < position or same_chunk, (
                     f"{key} reads segment {seg} before it is computed"
                 )
                 assert released_at.get(seg, position) >= position, (

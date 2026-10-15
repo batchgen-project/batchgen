@@ -451,6 +451,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
     _dsa_prefill_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
     _dsa_prefill_causal_starts: ClassVar[Optional[torch.Tensor]] = None
     _dsa_prefill_causal_ends: ClassVar[Optional[torch.Tensor]] = None
+    # Prefix-pool chunk addressing (sparse_prefill.Glm52PoolPrefill) or None.
+    _dsa_prefill_pool: ClassVar[Optional[Any]] = None
     _dsa_prefill_path_counts: ClassVar[Optional[Dict[str, Dict[int, int]]]] = None
     # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
     # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
@@ -846,11 +848,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
         GLM5AttnWrapper._dsa_prefill_prev_topk_indices = None
         GLM5AttnWrapper._dsa_prefill_causal_starts = None
         GLM5AttnWrapper._dsa_prefill_causal_ends = None
+        GLM5AttnWrapper._dsa_prefill_pool = None
 
     def _glm52_sparse_prefill_active(self) -> bool:
         from . import sparse_prefill
 
         config = getattr(self.module, "config", None)
+        if AttnWrapperBase.prefill_pool_batch is not None:
+            # Pool rows continue pooled prefixes: only the sparse path reads the
+            # pool, and it equals dense attention for contexts <= index_topk.
+            if getattr(config, "model_type", None) not in {
+                "glm_moe_dsa_5_2", "glm_moe_dsa_5_3",
+            }:
+                raise RuntimeError("the prefill prefix pool needs GLM-5.2 sparse DSA prefill")
+            return True
         return sparse_prefill.should_use_glm52_sparse_prefill(
             getattr(config, "model_type", None),
             int(self.prepack_max_seqlen),
@@ -875,17 +886,40 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # micro-batch (or an aborted one) can never leak its ranges/top-k.
             self._reset_glm52_prefill_carry()
             self._reset_glm52_prefill_path_counts()
-            starts, ends = sparse_prefill.build_packed_causal_ranges(
-                self.prepack_cu_seqlens.to(device),
-                position_ids,
-                hidden_states_2d.shape[0],
-                sequence_lengths=list(self.prepack_seq_lengths),
-            )
+            pool_batch = AttnWrapperBase.prefill_pool_batch
+            if pool_batch is not None:
+                pool_ctx = sparse_prefill.build_glm52_pool_prefill(
+                    page_table=pool_batch.page_table,
+                    cache_seqlens=pool_batch.cache_seqlens,
+                    cu_seqlens_q=pool_batch.cu_seqlens_q,
+                    position_ids=position_ids,
+                    slots=pool_batch.slots,
+                    page_tokens=AttnWrapperBase.prefill_pool.page_tokens,
+                    max_cache_seqlen=pool_batch.max_cache_seqlen,
+                )
+                GLM5AttnWrapper._dsa_prefill_pool = pool_ctx
+                starts, ends = pool_ctx.causal_starts, pool_ctx.causal_ends
+            else:
+                starts, ends = sparse_prefill.build_packed_causal_ranges(
+                    self.prepack_cu_seqlens.to(device),
+                    position_ids,
+                    hidden_states_2d.shape[0],
+                    sequence_lengths=list(self.prepack_seq_lengths),
+                )
             GLM5AttnWrapper._dsa_prefill_causal_starts = starts
             GLM5AttnWrapper._dsa_prefill_causal_ends = ends
 
         indexer = self.module.indexer
         carried = GLM5AttnWrapper._dsa_prefill_prev_topk_indices
+        pool_ctx = GLM5AttnWrapper._dsa_prefill_pool
+        latent_pool = indexer_pool = None
+        if pool_ctx is not None:
+            prefill_pool = AttnWrapperBase.prefill_pool
+            latent_pool = prefill_pool.k[self.layer_idx]
+            if indexer is not None:
+                indexer_pool = prefill_pool.indexer[
+                    prefill_pool.indexer_row[self.layer_idx]
+                ]
         result = sparse_prefill.glm52_sparse_prefill_prepacked(
             attn=self.module,
             hidden_states=hidden_states_2d,
@@ -897,6 +931,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
             reusable_topk_indices=carried if indexer is not None else None,
             causal_starts=GLM5AttnWrapper._dsa_prefill_causal_starts,
             causal_ends=GLM5AttnWrapper._dsa_prefill_causal_ends,
+            pool=pool_ctx,
+            latent_pool=latent_pool,
+            indexer_pool=indexer_pool,
         )
         GLM5AttnWrapper._dsa_prefill_prev_topk_indices = result.topk_indices
         self._record_glm52_prefill_path("sparse", self.layer_idx)
@@ -905,14 +942,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
             self.layer_idx,
         )
 
-        if indexer is not None:
-            if result.indexer_kv is None:
-                raise RuntimeError(
-                    "GLM-5.2 full sparse-prefill layer returned no indexer KV; "
-                    "refusing primary-only host offload"
-                )
-            self._offload_prepacked_indexer_kv(result.indexer_kv.squeeze(0))
-        self._offload_prepacked_kv(result.primary_kv)
+        if indexer is not None and result.indexer_kv is None:
+            raise RuntimeError(
+                "GLM-5.2 full sparse-prefill layer returned no indexer KV; "
+                "refusing primary-only host offload"
+            )
+        if pool_ctx is not None:
+            self._offload_prefill_pool_rows(
+                result.primary_kv,
+                None if indexer is None else result.indexer_kv[0, :, 0, :],
+            )
+        else:
+            if indexer is not None:
+                self._offload_prepacked_indexer_kv(result.indexer_kv.squeeze(0))
+            self._offload_prepacked_kv(result.primary_kv)
 
         if self.layer_idx == config.num_hidden_layers - 1:
             self._finish_glm52_prefill_path_counts()
@@ -976,6 +1019,45 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "auxiliary/indexer KV are offloaded with identical sequence "
                 "boundaries"
             )
+
+    def _offload_prefill_pool_rows(
+        self, primary_kv: torch.Tensor, indexer_kv: Optional[torch.Tensor]
+    ) -> None:
+        """Offload each prefix-pool row from its own activations, at its start.
+
+        A pooled segment row goes to its segment's pseudo sequence at 0, a tail
+        row to its prompt's pages at the tail start. Primary latent on every
+        layer; indexer keys only on full layers (``indexer_kv`` given).
+        """
+        view = self.core_engine.host_paged_kv_worker_view
+        primary_view = getattr(view, "primary", view)
+        aux_view = AttnWrapperBase.host_paged_kv_worker_view_aux
+        if indexer_kv is not None and aux_view is None:
+            raise RuntimeError(
+                "GLM-5 DSA auxiliary host KV worker view is required for "
+                "indexer KV offload"
+            )
+        bounds = AttnWrapperBase.prefill_pool_batch.row_bounds
+        starts = AttnWrapperBase.prefill_pool_row_starts
+        sequence_ids = self.cur_batch
+        if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
+            raise RuntimeError("GLM-5 prefix-pool row metadata size mismatch")
+        targets = [(primary_view, primary_kv)]
+        if indexer_kv is not None:
+            targets.append((aux_view, indexer_kv))
+        for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
+            for worker_view, kv in targets:
+                row_kv = kv[start:end].view(1, end - start, 1, kv.shape[-1]).contiguous()
+                task = worker_view.async_offload_layer_kv_range_to_host(
+                    layer_idx=self.layer_idx,
+                    sequence_ids=[sequence_ids[row]],
+                    k_tensor=row_kv,
+                    v_tensor=None,
+                    raw_start_positions=[starts[row]],
+                    token_counts=[end - start],
+                )
+                AttnWrapperBase.pin_prefill_offload_tensor(row_kv, self.layer_idx)
+                AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
         """Offload packed indexer KV with one asynchronous task per layer."""
