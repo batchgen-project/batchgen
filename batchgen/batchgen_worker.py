@@ -2152,7 +2152,19 @@ class BatchGenWorker:
 		):
 			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp)
 		else:
-			groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+			# An evicted re-entry returns to the group it decoded on: its
+			# decoded suffix lives only in that group's node's trajectory book.
+			# It loads that group like any grouped sequence; the rest balance.
+			groups = [seq.evicted_from_dp_group for seq in seqs]
+			fresh = [i for i, g in enumerate(groups) if g is None]
+			for i, g in enumerate(groups):
+				if g is not None:
+					prior[g] += float(lengths[i]) * float(lengths[i])
+			placed = assign_decode_dp_groups(
+				[lengths[i] for i in fresh], num_dp, prior_load=prior
+			)
+			for i, g in zip(fresh, placed):
+				groups[i] = g
 		for seq, g in zip(seqs, groups):
 			seq.decode_dp_group = g
 			# Grouped again: the eviction record has served its purpose, and

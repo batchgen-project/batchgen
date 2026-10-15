@@ -409,3 +409,46 @@ def test_assignment_is_deterministic():
     first = run()
     assert all(g in range(4) for g in first)
     assert run() == first
+
+
+# --------------------------------------------------------------------------- #
+#  L^2 path: an evicted re-entry returns to its node                          #
+# --------------------------------------------------------------------------- #
+
+def test_l2_restamps_evicted_reentry_and_counts_it_as_prior_load():
+    evicted = _evicted("e", _singleton(9, 40), decoded_on=0)
+    decoding = _seq("d", _singleton(8, 5), status=SequenceStatus.IN_DECODE, group=1)
+    fresh = _make("n", [_singleton(1, 10), _singleton(2, 10)])
+    worker = _worker([decoding, evicted] + fresh, packing=False)
+    worker._trajectory_tokens = _reader_refusing("e", "n0", "n1", "d")
+    worker._assign_decode_dp_groups(["e", "n0", "n1"])
+
+    assert (evicted.decode_dp_group, evicted.evicted_from_dp_group) == (0, None)
+    # Only the fresh sequences reach the balancer, against a prior that
+    # charges group 0 for the re-entry.
+    prior = [float(evicted.prompt_length) ** 2, float(decoding.prompt_length) ** 2]
+    expected = assign_decode_dp_groups(
+        [seq.prompt_length for seq in fresh], 2, prior_load=prior
+    )
+    assert _assigned(fresh) == expected == [1, 1]
+
+    # A lone re-entry recorded on group 1 returns there, although the
+    # balancer would put it on group 0 of two empty groups.
+    moved = _evicted("e", _singleton(9, 40), decoded_on=1)
+    worker = _worker([moved], packing=False)
+    worker._assign_decode_dp_groups(["e"])
+    assert moved.decode_dp_group == 1
+
+
+def test_l2_double_eviction_round_trip():
+    seq = _evicted("e", _singleton(1, 6), decoded_on=1)
+    worker = _worker([seq], packing=False)
+    worker._assign_decode_dp_groups(["e"])
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (1, None)
+
+    seq.status = SequenceStatus.IN_DECODE
+    evict_from_decode_dp_group(seq)
+    seq.status = SequenceStatus.EVICTED
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (None, 1)
+    worker._assign_decode_dp_groups(["e"])
+    assert (seq.decode_dp_group, seq.evicted_from_dp_group) == (1, None)
