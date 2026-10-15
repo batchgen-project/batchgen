@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     from batchgen.prefix_reuse.wave_plan import PlanChunk, PlanItem, WavePrefixPlan
 
 
+# Batch-level ``batchgen_debug`` flag, read by the worker when it builds the
+# executor. DIAGNOSTIC ONLY: see ``PoolChunkExecutor.__init__``.
+PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
+
+
 @dataclass(frozen=True)
 class ChunkBatch:
     """The tensors one prepacked forward needs; rows follow ``items``."""
@@ -29,7 +34,9 @@ class ChunkBatch:
     position_ids: torch.Tensor  # int64 [T], absolute positions of the item
     cu_seqlens_q: torch.Tensor  # int32 [n + 1]
     cache_seqlens: torch.Tensor  # int32 [n], prefix plus own tokens
-    page_table: torch.Tensor  # int32 [n, W], ancestors then own pages, 0 pad
+    # int32 [n, W], ancestors then own pages; padded to W with 0, or with the
+    # row's own last page under the prefix_pool_pad_poison probe.
+    page_table: torch.Tensor
     slots: torch.Tensor  # int64 [T], where each query token's KV is written
     tail_rows: torch.Tensor  # int64, flat index of each tail's last token
     tail_wave_indices: tuple[int, ...]  # wave index per entry of tail_rows
@@ -47,7 +54,27 @@ class PoolChunkExecutor:
         plan: "WavePrefixPlan",
         prompts: Sequence[Sequence[int]],
         pool: "PrefillPrefixPool",
+        *,
+        pad_poison: bool = False,
     ) -> None:
+        """``pad_poison`` is the batch-level ``prefix_pool_pad_poison`` probe.
+
+        A chunk's page table is one rectangle, so a row shorter than the
+        widest one is padded. The pad value is 0, which is a REAL pool page -
+        normally the one holding the start of the root segment. A kernel that
+        honours ``cache_seqlens`` never reads those columns, so the value is
+        free; one that derives its page count from the table width instead
+        reads the root segment's first page as if it were this row's context.
+
+        With the flag on, each row is padded with ITS OWN last valid page id
+        instead. That is equally unread under a correct kernel, so output
+        parity between off and on exonerates the padding; a change in output
+        proves padding is being read, and the widest-padded rows are the
+        shortest members - which is where the live corruption appeared.
+
+        Off by default: the packed table is then byte-identical to before.
+        """
+
         if plan.block_tokens != pool.page_tokens:
             raise ValueError(
                 f"plan block_tokens {plan.block_tokens} != pool page_tokens "
@@ -56,6 +83,7 @@ class PoolChunkExecutor:
         self.plan = plan
         self.prompts = prompts
         self.pool = pool
+        self.pad_poison = bool(pad_poison)
         self.segment_pages: dict[int, list[int]] = {}
         self._tail_pages: list[int] = []
 
@@ -94,7 +122,11 @@ class PoolChunkExecutor:
             slots.extend(self.pool.slot_list(own, 0, item.tokens))
 
         width = max(len(row) for row in rows)
-        table = [row + [0] * (width - len(row)) for row in rows]
+        # Every row owns at least one page, so row[-1] is always a valid id.
+        table = [
+            row + [row[-1] if self.pad_poison else 0] * (width - len(row))
+            for row in rows
+        ]
         device = self.pool.device
         return ChunkBatch(
             input_ids=torch.tensor(input_ids, dtype=torch.long, device=device),

@@ -10000,7 +10000,10 @@ class BatchGenWorker:
 				f"{geometry_page_bytes} B"
 			)
 		wave.pool = pool
-		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
+		wave.executor = PoolChunkExecutor(
+			wave.plan, wave.prompts, pool,
+			pad_poison=self._pool_pad_poison_enabled(wave),
+		)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -10338,6 +10341,29 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _pool_pad_poison_enabled(self, wave) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
+
+		Read through the same seam as ``prefix_pool_offload_check``: the flag
+		rides on the wave's own sequences, so a batch arms the probe against a
+		server that is already up. False when the batch did not ask, which
+		leaves the packed page table byte-identical to the default.
+		"""
+		from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
+			return False
+		logging.info(
+			"[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
+			"with its own last page: members=%s segments=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+		)
+		return True
 
 	def _new_pool_offload_check_recorder(self, wave):
 		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
