@@ -15,6 +15,30 @@ addresses READ BACK from the pool tensor right before the kernel call, and a
 digest of every row's SOURCE K at the write site. Digests and small integer
 tensors only; no raw KV ever leaves the device.
 
+Why the row digest alone was not enough (schema 2)
+--------------------------------------------------
+A row's write digest covers its whole source slice while the read digest
+covers one page, so the two are only comparable where a row happens to own
+exactly one full page. In the live gapped two-group wave that was true for a
+single row out of 126 (the one tail whose own tokens are exactly
+``page_tokens``), which left write->read byte identity unchecked for every
+other row and for every ancestor page a row attends over.
+
+Schema 2 therefore also splits each row's source K at the pool's PAGE
+boundaries, the same split the write itself makes, and digests each piece
+against exactly the slots it lands in. The split is derived from
+``batch.slots`` - the very index tensor ``index_copy_`` is handed - as maximal
+runs of consecutive slots inside one page, so it describes where the KV went
+even if a row's slots were NOT one page-aligned ascending block. For each run
+the dump carries the source digest and the digest of ``k_cache[page][offset:
+offset + length]`` read back from the pool, which are the SAME bytes in the
+same layout: unequal means that page does not hold what the layout says it
+holds, per page, for every row.
+
+A page written by an earlier chunk of the wave has no write run in this
+chunk's dump (it was checkable in the dump of the chunk that wrote it); its
+whole-page read digest is still recorded.
+
 Two modes, because the sync is itself a hypothesis:
 
 * ``sync``   - ``torch.cuda.synchronize()`` before reading the pool back, so
@@ -51,7 +75,7 @@ MODE_SYNC = "sync"
 MODE_NOSYNC = "nosync"
 MODES = (MODE_SYNC, MODE_NOSYNC)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DUMP_PARENT = "/dev/shm"
 # blake2b digest size; 16 bytes is plenty to separate page contents and keeps
 # the npz small enough to scp off a node.
@@ -123,6 +147,52 @@ def _tensor_digest(tensor: torch.Tensor) -> str:
     return _digest(host.view(torch.uint8).numpy().tobytes())
 
 
+@dataclass(frozen=True)
+class PageWriteRun:
+    """One maximal run of a row's source K that lands inside ONE pool page.
+
+    ``source_start``/``length`` index the row's own query tokens; the bytes go
+    to ``page`` at token offset ``offset``. ``token_start`` is the absolute
+    position of the run's first token, so a run names a (member, position)
+    range without the reader re-deriving it.
+    """
+
+    row: int
+    page: int
+    offset: int
+    length: int
+    source_start: int
+    token_start: int
+    digest: str
+
+
+def slot_write_runs(slots: Sequence[int], page_tokens: int) -> list[tuple]:
+    """Cut one row's slot list into ``(source_start, length, page, offset)``.
+
+    A run is maximal in both senses that matter to a per-page digest: the
+    slots are consecutive AND they stay inside one page, so the run's bytes
+    are exactly ``k_cache[page][offset:offset + length]`` in pool layout. The
+    slots are the index tensor the pool write is handed, so this describes
+    where the KV actually went, not where the layout meant to put it: a row
+    whose slots are not one page-aligned ascending block simply yields more
+    runs instead of being mis-described by a single digest.
+    """
+
+    if page_tokens <= 0:
+        raise ValueError(f"page_tokens must be positive, got {page_tokens}")
+    runs: list[tuple] = []
+    for index, slot in enumerate(slots):
+        slot = int(slot)
+        page, offset = divmod(slot, page_tokens)
+        if runs:
+            start, length, last_page, last_offset = runs[-1]
+            if page == last_page and offset == last_offset + length:
+                runs[-1] = (start, length + 1, last_page, last_offset)
+                continue
+        runs.append((index, 1, page, offset))
+    return runs
+
+
 @dataclass
 class PoolKernelDumpRecorder:
     """Collects one npz per (chunk, dumped pool layer) for one rank."""
@@ -139,6 +209,8 @@ class PoolKernelDumpRecorder:
     bytes_hashed: int = 0
     # Set at the write site, consumed by the read site of the same call.
     _write_digests: dict = field(default_factory=dict)
+    # Per-page source digests of the same write, in row then page order.
+    _write_runs: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -151,6 +223,7 @@ class PoolKernelDumpRecorder:
 
         self.chunk_index += 1
         self._write_digests.clear()
+        self._write_runs.clear()
 
     def wants_layer(self, pool_layer: int, num_pool_layers: int) -> bool:
         if self.layers is None:
@@ -168,12 +241,32 @@ class PoolKernelDumpRecorder:
 
     # -- the two sites ------------------------------------------------------ #
     def record_write_sources(self, batch, key: torch.Tensor) -> None:
-        """Digest each row's SOURCE K, as handed to the pool write."""
+        """Digest each row's SOURCE K, as handed to the pool write.
+
+        Twice over: once for the whole row, and once per pool page the row's
+        slots cover, so the read site can compare the SAME bytes it hashes
+        out of the pool. Both digests come from ``key`` before the
+        ``index_copy_``, so nothing here depends on the write having worked.
+        """
 
         bounds = batch.row_bounds
+        slots = batch.slots.detach().cpu().tolist()
+        self._write_digests.clear()
+        self._write_runs.clear()
         for row in range(len(batch.items)):
             lo, hi = bounds[row], bounds[row + 1]
             self._write_digests[row] = _tensor_digest(key[lo:hi])
+            token_start = int(batch.items[row].token_start)
+            for start, length, page, offset in slot_write_runs(
+                slots[lo:hi], self.page_tokens
+            ):
+                piece = key[lo + start:lo + start + length]
+                self._write_runs.append(PageWriteRun(
+                    row=row, page=page, offset=offset, length=length,
+                    source_start=start, token_start=token_start + start,
+                    digest=_tensor_digest(piece),
+                ))
+                self.bytes_hashed += piece.numel() * piece.element_size()
 
     def record_kernel_inputs(
         self, batch, k_cache: torch.Tensor, pool_layer: int, num_pool_layers: int
@@ -182,6 +275,12 @@ class PoolKernelDumpRecorder:
 
         ``k_cache`` is this layer's pool K, shaped
         ``(num_pages, page_tokens, heads, head_dim)``.
+
+        Two read-side digests per dump: the whole of every page the table
+        addresses, and - for every write run the write site recorded - exactly
+        the slots that run claims to have filled. The second is directly
+        comparable with the run's source digest, so write->read byte identity
+        is a per-page equality instead of an inference.
         """
 
         import numpy as np
@@ -213,6 +312,29 @@ class PoolKernelDumpRecorder:
             token_start[row] = item.token_start
             token_end[row] = item.token_end
             write_digest[row] = self._write_digests.get(row, "").encode()
+
+        # Per-page write runs, each read back over exactly its own slots.
+        runs = self._write_runs
+        run_count = len(runs)
+        run_row = np.empty(run_count, dtype=np.int32)
+        run_page = np.empty(run_count, dtype=np.int32)
+        run_offset = np.empty(run_count, dtype=np.int32)
+        run_length = np.empty(run_count, dtype=np.int32)
+        run_source_start = np.empty(run_count, dtype=np.int32)
+        run_token_start = np.empty(run_count, dtype=np.int32)
+        run_write_digest = np.empty(run_count, dtype=f"S{_HEX_WIDTH}")
+        run_read_digest = np.empty(run_count, dtype=f"S{_HEX_WIDTH}")
+        for index, run in enumerate(runs):
+            run_row[index] = run.row
+            run_page[index] = run.page
+            run_offset[index] = run.offset
+            run_length[index] = run.length
+            run_source_start[index] = run.source_start
+            run_token_start[index] = run.token_start
+            run_write_digest[index] = run.digest.encode()
+            slice_ = k_cache[run.page][run.offset:run.offset + run.length]
+            run_read_digest[index] = _tensor_digest(slice_).encode()
+            self.bytes_hashed += slice_.numel() * slice_.element_size()
 
         path = os.path.join(
             self.directory,
@@ -246,6 +368,14 @@ class PoolKernelDumpRecorder:
                 [d.encode() for d in digests], dtype=f"S{_HEX_WIDTH}"
             ),
             write_digest=write_digest,
+            write_run_row=run_row,
+            write_run_page=run_page,
+            write_run_offset=run_offset,
+            write_run_length=run_length,
+            write_run_source_start=run_source_start,
+            write_run_token_start=run_token_start,
+            write_run_digest=run_write_digest,
+            write_run_read_digest=run_read_digest,
         )
         self.files.append(path)
         return path
@@ -287,9 +417,25 @@ def read_dump(path: str) -> dict:
             "read_pages": data["read_pages"].tolist(),
             "read_digest": [v.decode() for v in data["read_digest"]],
             "write_digest": [v.decode() for v in data["write_digest"]],
+            "write_run_row": data["write_run_row"].tolist(),
+            "write_run_page": data["write_run_page"].tolist(),
+            "write_run_offset": data["write_run_offset"].tolist(),
+            "write_run_length": data["write_run_length"].tolist(),
+            "write_run_source_start": data["write_run_source_start"].tolist(),
+            "write_run_token_start": data["write_run_token_start"].tolist(),
+            "write_run_digest": [v.decode() for v in data["write_run_digest"]],
+            "write_run_read_digest": [
+                v.decode() for v in data["write_run_read_digest"]
+            ],
         }
     out["kind"] = [
         "segment" if code == _KIND_CODE["segment"] else "tail"
         for code in out["row_kind"]
+    ]
+    # The verdict the per-page digests exist for: True means that page holds,
+    # over exactly those slots, the bytes the row handed the pool.
+    out["write_run_match"] = [
+        write == read for write, read in
+        zip(out["write_run_digest"], out["write_run_read_digest"])
     ]
     return out

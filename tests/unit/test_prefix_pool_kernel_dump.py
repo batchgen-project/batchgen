@@ -3,9 +3,13 @@
 The probe records, at the one seam where the pooled prefill both writes the
 pool and reads it back (``pool_prefill_attention``), the kernel arguments plus
 a digest of every pool page the page table addresses and of every row's source
-K. Pinned here: the mode parser, the dump directory rule, the two-layer limit,
-the file schema round-tripped through ``read_dump`` with every digest
-recomputed independently, and that nothing happens with the flag off.
+K, and - schema 2 - the same source split at the pool's PAGE boundaries so
+write->read byte identity is checkable per page instead of only on a row that
+happens to own exactly one full page. Pinned here: the mode parser, the dump
+directory rule, the two-layer limit, the file schema round-tripped through
+``read_dump`` with every digest recomputed independently, the slot-run split
+itself, that a clean write matches on every page and a wrong write is caught
+on exactly the pages it damaged, and that nothing happens with the flag off.
 
 CPU only: the pool and the executor are the real classes, loaded by file path,
 and ``gqa_extend_fa`` is stubbed because the paged kernel is GPU work.
@@ -56,6 +60,14 @@ PROMPTS = [
     for depth in range(1, 6)
 ]
 
+# The same chain with a per-member TEMPLATE SUFFIX, the shape of the live
+# gapped wave: no prompt length is a multiple of the page, so a member
+# diverges inside a block and every tail ends on a PARTIALLY filled page. In
+# the live wave exactly one row out of 126 owned a whole page, which is why a
+# whole-row digest was comparable almost nowhere.
+TEMPLATE = [9000, 9001, 9002]
+PROMPTS_RAGGED = [prompt + TEMPLATE for prompt in PROMPTS]
+
 
 def _digest(tensor: torch.Tensor) -> str:
     """The oracle digest, recomputed here instead of trusting the module."""
@@ -83,12 +95,12 @@ def stub_kernel(monkeypatch):
     return calls
 
 
-def _wave(num_layers=1):
+def _wave(num_layers=1, prompts=PROMPTS):
     plan = _PLAN.plan_wave_prefix_sharing(
-        PROMPTS, block_tokens=B, pool_pages=64, chunk_tokens=4096,
+        prompts, block_tokens=B, pool_pages=64, chunk_tokens=4096,
         same_chunk_ancestors=True,
     )
-    _PLAN.validate_wave_prefix_plan(plan, PROMPTS)
+    _PLAN.validate_wave_prefix_plan(plan, prompts)
     pool = _POOL.PrefillPrefixPool(
         num_layers=num_layers, num_pages=plan.pool_pages + 32, page_tokens=B,
         num_kv_heads=HEADS, head_dim=K_DIM, dtype=torch.float32, device="cpu",
@@ -251,6 +263,34 @@ def test_the_dump_round_trips_with_independently_recomputed_digests(
     ]
     assert record["bytes_hashed"] > 0
 
+    # Schema 2: the same source split at the pool's page boundaries, with the
+    # read side taken over exactly the slots each piece claims to have filled.
+    runs = list(zip(
+        record["write_run_row"], record["write_run_page"],
+        record["write_run_offset"], record["write_run_length"],
+        record["write_run_source_start"], record["write_run_token_start"],
+    ))
+    expected_runs = []
+    for row, item in enumerate(batch.items):
+        lo, hi = batch.row_bounds[row], batch.row_bounds[row + 1]
+        for start, length, page, offset in _DUMP.slot_write_runs(
+            batch.slots[lo:hi].tolist(), B
+        ):
+            expected_runs.append(
+                (row, page, offset, length, start, item.token_start + start)
+            )
+    assert runs == expected_runs
+    assert record["write_run_digest"] == [
+        _digest(key[batch.row_bounds[row] + start:
+                    batch.row_bounds[row] + start + length])
+        for row, _, _, length, start, _ in expected_runs
+    ]
+    assert record["write_run_read_digest"] == [
+        _digest(pool.k[0][page][offset:offset + length])
+        for _, page, offset, length, _, _ in expected_runs
+    ]
+    assert record["write_run_match"] == [True] * len(expected_runs)
+
 
 def test_each_chunk_and_dumped_layer_gets_its_own_file(tmp_path, stub_kernel):
     """Four pool layers dump rows 0 and 2 only; chunk ids count up."""
@@ -316,7 +356,145 @@ def test_the_recorder_refuses_an_unknown_mode(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-#  (iv) The worker plumbing, through the real batch-debug seam
+#  (iv) Per-page write digests: the split, the clean case, the caught case
+# --------------------------------------------------------------------------- #
+def test_a_row_is_split_at_every_page_boundary_it_writes():
+    """One page-aligned ascending block per page, each run its own page."""
+
+    slots = list(range(8, 8 + 10))  # pages 2, 3, 4 at B == 4
+    assert _DUMP.slot_write_runs(slots, B) == [
+        (0, 4, 2, 0), (4, 4, 3, 0), (8, 2, 4, 0),
+    ]
+    # A row that starts mid page, and one that fills exactly one page.
+    assert _DUMP.slot_write_runs([6, 7, 8], B) == [(0, 2, 1, 2), (2, 1, 2, 0)]
+    assert _DUMP.slot_write_runs([12, 13, 14, 15], B) == [(0, 4, 3, 0)]
+    assert _DUMP.slot_write_runs([], B) == []
+
+
+def test_the_split_follows_the_slots_rather_than_an_assumed_layout():
+    """A row whose slots are not one ascending block yields more runs.
+
+    The point of deriving the split from ``batch.slots`` is that a defect in
+    the slot list cannot hide inside one whole-row digest.
+    """
+
+    # Backwards inside a page, and a page revisited after leaving it.
+    assert _DUMP.slot_write_runs([5, 4], B) == [(0, 1, 1, 1), (1, 1, 1, 0)]
+    assert _DUMP.slot_write_runs([0, 1, 8, 2], B) == [
+        (0, 2, 0, 0), (2, 1, 2, 0), (3, 1, 0, 2),
+    ]
+    # Consecutive slots that cross a page boundary still split by page.
+    assert _DUMP.slot_write_runs([3, 4], B) == [(0, 1, 0, 3), (1, 1, 1, 0)]
+
+
+@pytest.mark.parametrize("page_tokens", [0, -4])
+def test_a_slot_split_refuses_a_non_positive_page(page_tokens):
+    with pytest.raises(ValueError, match="page_tokens must be positive"):
+        _DUMP.slot_write_runs([0, 1], page_tokens)
+
+
+def test_every_token_of_every_row_is_covered_by_exactly_one_run(
+    tmp_path, stub_kernel
+):
+    """The runs partition the chunk's tokens, and a partial page is covered.
+
+    The live wave had exactly one row owning a whole page, which is why the
+    row digest could not be compared anywhere else; a partial run is the case
+    schema 2 adds.
+    """
+
+    plan, pool = _wave(prompts=PROMPTS_RAGGED)
+    pool.kernel_dump = _DUMP.PoolKernelDumpRecorder(
+        rank=2, mode="sync", directory=str(tmp_path), page_tokens=B,
+        global_ids=GLOBAL_IDS,
+    )
+    executor = _EXEC.PoolChunkExecutor(plan, PROMPTS_RAGGED, pool)
+    chunk, = plan.chunks
+    batch = executor.build(chunk)
+    _attend(pool, batch, 0)
+    record = _DUMP.read_dump(pool.kernel_dump.files[0])
+
+    # Each row's runs tile its own tokens from 0, in order.
+    for row in range(len(batch.items)):
+        own = batch.row_bounds[row + 1] - batch.row_bounds[row]
+        spans = [
+            (start, length) for run_row, start, length in zip(
+                record["write_run_row"], record["write_run_source_start"],
+                record["write_run_length"])
+            if run_row == row
+        ]
+        assert spans, f"row {row} has no write run"
+        at = 0
+        for start, length in spans:
+            assert start == at
+            at += length
+        assert at == own
+    # Every run's slots are the batch's own slots, page and offset agreed.
+    slots = batch.slots.tolist()
+    for run_row, start, length, page, offset in zip(
+        record["write_run_row"], record["write_run_source_start"],
+        record["write_run_length"], record["write_run_page"],
+        record["write_run_offset"],
+    ):
+        lo = batch.row_bounds[run_row]
+        assert slots[lo + start:lo + start + length] == [
+            page * B + offset + step for step in range(length)
+        ]
+    assert sum(record["write_run_length"]) == int(batch.input_ids.numel())
+    assert any(length < B for length in record["write_run_length"]), (
+        "the fixture must contain a partially filled page"
+    )
+    assert any(length == B for length in record["write_run_length"])
+    assert record["write_run_match"] == [True] * len(record["write_run_row"])
+
+
+def test_a_wrong_pool_write_is_caught_on_exactly_the_pages_it_damaged(tmp_path):
+    """The defect class the per-page digests exist for.
+
+    The recorder is driven directly so the write between its two sites can be
+    the WRONG one: one row's source rotated by a token, which is the shape a
+    misaligned prefix would have. Every page of that row must mismatch and no
+    other page may.
+    """
+
+    plan, pool = _wave(prompts=PROMPTS_RAGGED)
+    recorder = _DUMP.PoolKernelDumpRecorder(
+        rank=5, mode="nosync", directory=str(tmp_path), page_tokens=B,
+        global_ids=GLOBAL_IDS,
+    )
+    pool.kernel_dump = recorder
+    executor = _EXEC.PoolChunkExecutor(plan, PROMPTS_RAGGED, pool)
+    chunk, = plan.chunks
+    batch = executor.build(chunk)
+
+    tokens = int(batch.input_ids.numel())
+    generator = torch.Generator().manual_seed(11)
+    key = torch.randn(tokens, HEADS, K_DIM, generator=generator)
+    recorder.record_write_sources(batch, key)
+
+    damaged_row = len(batch.items) - 1
+    lo, hi = batch.row_bounds[damaged_row], batch.row_bounds[damaged_row + 1]
+    assert hi - lo > 1, "rotating a one-token row would be a no-op"
+    wrong = key.clone()
+    wrong[lo:hi] = key[lo:hi].roll(1, dims=0)
+    pool.k[0].view(-1, HEADS, K_DIM).index_copy_(0, batch.slots, wrong)
+    recorder.record_kernel_inputs(batch, pool.k[0], 0, 1)
+
+    record = _DUMP.read_dump(recorder.files[0])
+    mismatched = {
+        row for row, match in zip(record["write_run_row"],
+                                  record["write_run_match"])
+        if not match
+    }
+    assert mismatched == {damaged_row}
+    # ... and the whole-row digest of a clean row still agrees with the pool.
+    assert record["write_run_match"].count(False) == sum(
+        1 for row in record["write_run_row"] if row == damaged_row
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  (v) The worker plumbing, through the real batch-debug seam
 # --------------------------------------------------------------------------- #
 def test_the_worker_reads_both_flags_through_the_batch_debug_seam():
     source = Path(__file__).resolve().parents[2].joinpath(
