@@ -1020,6 +1020,9 @@ class BatchGenWorker:
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
+		# Edge trigger for the prefix_drain metric: set when the row is
+		# emitted, cleared when admission adds new sequences.
+		self._prefix_drain_metric_emitted = False
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
@@ -1591,6 +1594,8 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# New live work: the next drain is a new edge for the prefix_drain row.
+		self._prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2324,6 +2329,8 @@ class BatchGenWorker:
 					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
 					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
 				)
+
+		self._maybe_emit_prefix_drain_metric()
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
@@ -9325,6 +9332,29 @@ class BatchGenWorker:
 		return host_resource_fields(
 			coordinator=self.prefix_cache_coordinator,
 			worker_view=self.core_engine.host_paged_kv_worker_view,
+		)
+
+	def _maybe_emit_prefix_drain_metric(self) -> None:
+		"""Emit one prefix_drain row when the live sequence set drains to empty.
+
+		Called from _report_completion, which every completion path runs after
+		the sequence reached COMPLETED and its Host pages and prefix
+		attachments were released, so the row records active_attachments at the
+		drain moment. Live means any status other than COMPLETED: a QUEUEING,
+		IN_PREFILL, PREFILLED, IN_DECODE, ON_HOLD or EVICTED sequence can still
+		hold or regain an attachment. Edge-triggered: one row per drain,
+		re-armed by _admit_sequences_from_message.
+		"""
+		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
+			return
+		if self._prefix_drain_metric_emitted:
+			return
+		if not self.global_batch.all_completed():
+			return
+		self._prefix_drain_metric_emitted = True
+		self._emit_prefix_cache_metric(
+			"prefix_drain",
+			**self._prefix_host_resource_fields(),
 		)
 
 	def _close_prefix_materialization(
