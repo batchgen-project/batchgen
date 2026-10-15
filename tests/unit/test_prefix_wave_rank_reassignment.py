@@ -177,6 +177,12 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
         worker_state,
     )
+    worker_state._cached_prefix_rank_cost_profile = types.MethodType(
+        _worker_methods("_cached_prefix_rank_cost_profile")[
+            "_cached_prefix_rank_cost_profile"
+        ],
+        worker_state,
+    )
     # Prompts live in the trajectory book after admission; these stubs keep
     # the tokens on input_ids and serve them through the book contract.
     worker_state._trajectory_tokens = (
