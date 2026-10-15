@@ -13,13 +13,16 @@ shared tensor. These tests run the REAL ``configure_prefill`` and
 ``configure_decoding`` (name-map construction, skeleton binding, the decode
 attention / shared-expert loads) against a small GLM-5-shaped model and pin:
 
+* only the entries the instances bind, plus the FP8 scales the lookups read
+  by name, are moved to the device; everything else stays in host memory;
 * the bound skeleton key set is disjoint from both phases' phase-managed keys,
   and both phases bind the identical key -> tensor alias set;
 * after both configures, every skeleton-bound parameter of BOTH instances is
   the one shared tensor, and its values are unchanged by the decode loads;
 * phase-managed parameters never alias a skeleton entry;
-* the runtime checks fail loud on an overlap, a non-aliasing binding, a
-  different key set, or a configure that rebinds a skeleton parameter;
+* the runtime checks fail loud on an overlap, a binding of an entry that was
+  not uploaded, a non-aliasing binding, a different key set, or a configure
+  that rebinds a skeleton parameter;
 * a rank that does not keep its instances never moves the skeleton.
 
 The PSM module cannot be imported on a CPU-only machine (its model module needs
@@ -50,6 +53,7 @@ _METHODS = [
     "configure_prefill",
     "configure_decoding",
     "share_skeleton_on_device",
+    "_skeleton_bind_keys",
     "_skeleton_bucket",
     "_check_shared_skeleton_binding",
     "_assert_skeleton_still_shared",
@@ -286,6 +290,7 @@ def _psm(*, reuse=True, resident_split=None):
     psm.decode_instance = None
     psm._device_scales = None
     psm._skeleton_on_device = False
+    psm._skeleton_uploaded_keys = frozenset()
     psm._shared_skeleton_keys = None
     psm._skeleton_bound_params = []
     psm.skeleton_state_dict = _skeleton()
@@ -401,12 +406,57 @@ def test_phase_managed_parameters_never_alias_a_skeleton_entry():
                 assert param.data_ptr() not in skeleton_ptrs, key
 
 
-def test_unbound_skeleton_entries_are_reported():
+def test_upload_set_is_the_bound_keys_plus_the_consumed_scales():
+    """Only what the device reads moves; the rest stays in host memory.
+
+    The skeleton the parameter server ships also carries entries no instance
+    binds (on the real checkpoint, chiefly the MTP layer's weights). Moving
+    those would charge dead weight against the KV pool.
+    """
+    psm, _, _, _ = _configure_both()
+    scales = {k for k in psm.skeleton_state_dict if "weight_scale_inv" in k}
+
+    assert psm._skeleton_uploaded_keys == (
+        set(psm._shared_skeleton_keys) | scales
+    )
+    assert "model.layers.3.eh_proj.weight" not in psm._skeleton_uploaded_keys
+    assert "model.layers.3.eh_proj.weight" in psm.skeleton_state_dict
+
+
+def test_unbound_entries_stay_on_the_host_and_are_reported():
     _, log, _, _ = _configure_both()
 
+    upload = next(line for line in log.lines if "shared on device" in line)
+    assert "kept on host (bound by no instance): 1 tensors" in upload
     unbound = [line for line in log.lines if "unbound non-scale entries" in line]
     assert len(unbound) == 1
-    assert "unbound non-scale entries on device: 1," in unbound[0]
+    assert "unbound non-scale entries on device: 0," in unbound[0]
+
+
+def test_the_upload_set_follows_the_skeleton_bind_rule():
+    """The set is computed with ``_load_model_skeleton``'s own rule."""
+    psm, _ = _psm()
+    psm.configure_prefill()
+    bound = {ckpt_key for _, ckpt_key in psm._skeleton_bound_params}
+
+    assert psm._skeleton_bind_keys() == bound
+
+
+def test_sharing_before_any_model_is_built_defers_to_the_configure():
+    """The persistent path asks at startup, before its first configure."""
+    psm, log = _psm()
+    host = dict(psm.skeleton_state_dict)
+
+    psm.share_skeleton_on_device()
+
+    assert psm._skeleton_on_device is False
+    assert all(psm.skeleton_state_dict[k] is v for k, v in host.items())
+    assert not any("shared on device" in line for line in log.lines)
+
+    psm.configure_prefill()
+
+    assert psm._skeleton_on_device is True
+    assert sum("shared on device" in line for line in log.lines) == 1
 
 
 def test_a_rank_that_keeps_no_instances_never_moves_the_skeleton():
@@ -437,68 +487,74 @@ def test_sharing_after_the_scales_were_uploaded_fails_loud():
 
 def test_sharing_twice_is_a_no_op():
     psm, log = _psm()
-    psm.share_skeleton_on_device()
+    psm.configure_prefill()
     first = dict(psm.skeleton_state_dict)
+    uploaded = psm._skeleton_uploaded_keys
 
     psm.share_skeleton_on_device()
 
     assert all(psm.skeleton_state_dict[k] is v for k, v in first.items())
+    assert psm._skeleton_uploaded_keys is uploaded
     assert sum("shared on device" in line for line in log.lines) == 1
 
 
 def test_upload_log_breaks_the_bytes_down_by_bucket():
     psm, log = _psm()
-    psm.share_skeleton_on_device()
+    psm.configure_prefill()
 
     line = next(line for line in log.lines if "shared on device" in line)
-    expected = len(psm.skeleton_state_dict)
-    assert f": {expected} tensors," in line
-    for bucket in ("global=", "layer_norm=", "indexer=", "scale=", "other="):
+    assert f": {len(psm._skeleton_uploaded_keys)} tensors," in line
+    for bucket in ("global=", "layer_norm=", "indexer=", "scale="):
         assert bucket in line
 
 
-def test_a_phase_managed_key_in_the_binding_fails_loud():
+def _shared_psm():
+    """A manager whose prefill instance already bound the shared skeleton."""
     psm, _ = _psm()
-    psm.share_skeleton_on_device()
+    psm.configure_prefill()
+    psm.loaded_model_config.phase = "decode"
+    return psm
+
+
+def test_a_phase_managed_key_in_the_binding_fails_loud():
+    psm = _shared_psm()
     key = "model.layers.0.self_attn.q_a_layernorm.weight"
     param = nn.Parameter(psm.skeleton_state_dict[key])
     psm.state_dict_name_map = {key: {}}
-    psm.loaded_model_config.phase = "decode"
 
     with pytest.raises(RuntimeError, match="phase-managed keys"):
         psm._check_shared_skeleton_binding({key: (key, param)})
 
 
+def test_binding_an_entry_that_was_not_uploaded_fails_loud():
+    """It would give this instance a private device copy at model.to()."""
+    psm = _shared_psm()
+    key = "model.layers.3.eh_proj.weight"
+    param = nn.Parameter(psm.skeleton_state_dict[key])
+    psm.state_dict_name_map = {}
+
+    with pytest.raises(RuntimeError, match="not uploaded to the device"):
+        psm._check_shared_skeleton_binding({key: (key, param)})
+
+
 def test_a_binding_that_does_not_alias_the_shared_tensor_fails_loud():
-    psm, _ = _psm()
-    psm.share_skeleton_on_device()
+    psm = _shared_psm()
     key = "model.norm.weight"
     private = nn.Parameter(psm.skeleton_state_dict[key].clone())
     psm.state_dict_name_map = {}
-    psm.loaded_model_config.phase = "decode"
 
     with pytest.raises(RuntimeError, match="does not alias"):
         psm._check_shared_skeleton_binding({key: (key, private)})
 
 
 def test_a_phase_binding_a_different_key_set_fails_loud():
-    psm, _ = _psm()
-    psm.share_skeleton_on_device()
-    psm.state_dict_name_map = {}
-    psm.loaded_model_config.phase = "prefill"
+    psm = _shared_psm()
     norm = "model.norm.weight"
-    embed = "model.embed_tokens.weight"
-    psm._check_shared_skeleton_binding(
-        {norm: (norm, nn.Parameter(psm.skeleton_state_dict[norm]))}
-    )
-    psm.loaded_model_config.phase = "decode"
+    psm.state_dict_name_map = {}
 
     with pytest.raises(RuntimeError, match="different shared skeleton key set"):
         psm._check_shared_skeleton_binding(
-            {
-                norm: (norm, nn.Parameter(psm.skeleton_state_dict[norm])),
-                embed: (embed, nn.Parameter(psm.skeleton_state_dict[embed])),
-            }
+            {norm: (norm, nn.Parameter(psm.skeleton_state_dict[norm]))}
         )
 
 
