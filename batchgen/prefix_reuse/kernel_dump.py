@@ -119,7 +119,8 @@ def _tensor_digest(tensor: torch.Tensor) -> str:
     host = tensor.detach().contiguous()
     if host.is_cuda:
         host = host.cpu()
-    return _digest(host.numpy().tobytes())
+    # numpy cannot represent bfloat16; hash the raw bytes bit-exactly instead.
+    return _digest(host.view(torch.uint8).numpy().tobytes())
 
 
 @dataclass

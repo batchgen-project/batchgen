@@ -330,3 +330,31 @@ def test_the_worker_reads_both_flags_through_the_batch_debug_seam():
     assert "parse_dump_mode" in seam
     assert "dump_directory" in seam
     assert "return None" in seam
+
+
+def test_tensor_digest_handles_bfloat16_and_matches_raw_bytes():
+    """bf16 broke the live run: numpy has no bfloat16, so the digest must hash
+    the bit-exact uint8 view; for float32 the digest must equal hashing the
+    plain numpy bytes (backward-compatible)."""
+    import hashlib
+
+    import torch
+
+    from batchgen.prefix_reuse.kernel_dump import DIGEST_BYTES, _tensor_digest
+
+    bf16 = torch.arange(64, dtype=torch.float32).to(torch.bfloat16).reshape(4, 16)
+    expected_bf16 = hashlib.blake2b(
+        bf16.contiguous().view(torch.uint8).numpy().tobytes(),
+        digest_size=DIGEST_BYTES,
+    ).hexdigest()
+    assert _tensor_digest(bf16) == expected_bf16
+
+    f32 = torch.arange(48, dtype=torch.float32).reshape(3, 16)
+    expected_f32 = hashlib.blake2b(
+        f32.numpy().tobytes(), digest_size=DIGEST_BYTES
+    ).hexdigest()
+    assert _tensor_digest(f32) == expected_f32
+
+    # non-contiguous input must be handled too (the live call slices rows)
+    sliced = bf16[:, ::2]
+    assert _tensor_digest(sliced) == _tensor_digest(sliced.contiguous())
