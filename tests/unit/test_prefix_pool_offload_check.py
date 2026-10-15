@@ -33,6 +33,7 @@ from batchgen.prefix_reuse.offload_check import (
     compare_row_bytes,
     digest_bytes,
     page_digests,
+    probe_destination_pages,
     read_host_row_bytes,
     verify_pool_offload_rows,
 )
@@ -48,32 +49,56 @@ WORKER_TREE = ast.parse(WORKER.read_text())
 # --------------------------------------------------------------------------
 # Synthetic destination Host pages: real memory, addressed as the view does.
 # --------------------------------------------------------------------------
-class _FakeHostPages:
-    """One layer of Host pages for one sequence, behind the view's API."""
+class _FakeHostView:
+    """Host pages behind the worker view's two page-table APIs.
 
-    def __init__(self, *, num_pages, page_bytes, fill=0):
+    ``build_page_table`` returns the LOGICAL page ids (an attached prefix chain
+    first, then the sequence's private pages), ``k_page_ptr`` maps a page id to
+    its real address, and ``get_sequence_layer_page_pointers`` deliberately
+    lists only the OWNED pages -- the split the probe must not trip over.
+
+    Page ids are not 0..n, so code that mistook a page ORDINAL for a page id
+    would fail instead of silently reading the wrong page.
+    """
+
+    def __init__(self, *, page_bytes, attached=0, owned=1, fill=0):
         self.page_bytes = page_bytes
         self.pointer_calls = []
-        self._pages = []
-        for _ in range(num_pages):
+        self.table_calls = []
+        self.attached_ids = [700 + index for index in range(attached)]
+        self.owned_ids = [900 + index for index in range(owned)]
+        self.logical_ids = self.attached_ids + self.owned_ids
+        self._pages = {}
+        for page_id in self.logical_ids:
             page = ctypes.create_string_buffer(page_bytes)
             ctypes.memset(ctypes.addressof(page), fill, page_bytes)
-            self._pages.append(page)
+            self._pages[page_id] = page
 
     def write_at(self, byte_offset, data):
-        """Write bytes across page boundaries, as the D2H range offload does."""
+        """Write across LOGICAL page boundaries, as the range offload does."""
         pos = 0
         while pos < len(data):
-            page, inner = divmod(byte_offset + pos, self.page_bytes)
+            slot, inner = divmod(byte_offset + pos, self.page_bytes)
             take = min(self.page_bytes - inner, len(data) - pos)
+            page = self._pages[self.logical_ids[slot]]
             ctypes.memmove(
-                ctypes.addressof(self._pages[page]) + inner, data[pos : pos + take], take
+                ctypes.addressof(page) + inner, data[pos : pos + take], take
             )
             pos += take
 
+    def build_page_table(self, sequence_ids):
+        self.table_calls.append(list(sequence_ids))
+        return [list(self.logical_ids) for _ in sequence_ids]
+
+    def k_page_ptr(self, layer_idx, page_idx):
+        return ctypes.addressof(self._pages[int(page_idx)])
+
     def get_sequence_layer_page_pointers(self, sequence_id, layer_idx, max_tokens):
         self.pointer_calls.append((sequence_id, layer_idx, max_tokens))
-        return [ctypes.addressof(page) for page in self._pages], None
+        return (
+            [ctypes.addressof(self._pages[page_id]) for page_id in self.owned_ids],
+            None,
+        )
 
 
 class _Logger:
@@ -197,32 +222,122 @@ def test_comparison_reports_a_short_destination_without_hashing_pages():
 
 
 # --------------------------------------------------------------------------
-# Host page read: the method the probe uses on the node
+# Host page read: the LOGICAL table, which is the table the offload walks
 # --------------------------------------------------------------------------
-def test_host_read_walks_the_page_table_from_the_destination_start():
+def test_host_read_walks_the_logical_table_from_the_destination_start():
     page_bytes = 4 * 4  # page_tokens=4, token_bytes=4
-    pages = _FakeHostPages(num_pages=8, page_bytes=page_bytes, fill=0xAA)
+    view = _FakeHostView(page_bytes=page_bytes, owned=8, fill=0xAA)
     payload = bytes(range(48))
-    pages.write_at(8 * 4, payload)  # destination token 8
-    record = _record(view=pages)
+    view.write_at(8 * 4, payload)  # destination token 8
+    record = _record(view=view)
     assert read_host_row_bytes(record) == payload
-    assert pages.pointer_calls == [(41, 7, None)]
+    # The logical table is what it asked for, by sequence id.
+    assert view.table_calls == [[41]]
 
 
 def test_host_read_handles_a_row_that_starts_inside_a_page():
     page_bytes = 8 * 4
-    pages = _FakeHostPages(num_pages=4, page_bytes=page_bytes, fill=0x5A)
+    view = _FakeHostView(page_bytes=page_bytes, owned=4, fill=0x5A)
     payload = bytes(range(48))
-    pages.write_at(2 * 4, payload)
-    record = _record(view=pages, dest_start_tokens=2, page_tokens=8)
+    view.write_at(2 * 4, payload)
+    record = _record(view=view, dest_start_tokens=2, page_tokens=8)
     assert read_host_row_bytes(record) == payload
 
 
-def test_host_read_hard_fails_when_the_page_table_is_too_short():
-    pages = _FakeHostPages(num_pages=2, page_bytes=16)
-    record = _record(view=pages)
-    with pytest.raises(RuntimeError, match="needs Host page ordinal 2"):
+def test_host_read_reaches_pages_the_owned_only_api_cannot_see():
+    """A member holding an attached chain: 12 attached + 2 private pages.
+
+    The owned-pages API lists 2, so a probe reading it would stop at page 2;
+    the destination lives at logical pages 12-13 and the read must reach it.
+    """
+    page_bytes = 4 * 4
+    view = _FakeHostView(page_bytes=page_bytes, attached=12, owned=2)
+    payload = bytes(range(32))
+    view.write_at(48 * 4, payload)  # destination token 48 == logical page 12
+    record = _record(view=view, dest_start_tokens=48, token_count=8)
+    assert len(view.get_sequence_layer_page_pointers(41, 7, None)[0]) == 2
+    assert read_host_row_bytes(record) == payload
+
+
+def test_host_read_hard_fails_only_when_the_logical_table_is_short():
+    view = _FakeHostView(page_bytes=16, owned=2)
+    record = _record(view=view)
+    with pytest.raises(RuntimeError, match="TRUNCATED.*logical page slot 2"):
         read_host_row_bytes(record)
+
+
+def test_host_read_hard_fails_without_a_logical_page_table_api():
+    record = _record(view=object())
+    with pytest.raises(RuntimeError, match="exposes no build_page_table"):
+        read_host_row_bytes(record)
+
+
+def test_host_read_hard_fails_without_a_page_pointer_api():
+    class _TableOnly:
+        def build_page_table(self, sequence_ids):
+            return [[700] for _ in sequence_ids]
+
+    record = _record(view=_TableOnly(), dest_start_tokens=0, token_count=4)
+    with pytest.raises(RuntimeError, match="exposes no k_page_ptr"):
+        read_host_row_bytes(record)
+
+
+# --------------------------------------------------------------------------
+# The api-split discriminator: observation, never a fault
+# --------------------------------------------------------------------------
+def test_api_split_is_classified_and_the_bytes_still_verify():
+    page_bytes = 4 * 4
+    view = _FakeHostView(page_bytes=page_bytes, attached=12, owned=2)
+    payload = bytes(range(32))
+    view.write_at(48 * 4, payload)
+    record = _recorded(
+        payload, view=view, dest_start_tokens=48, token_count=8, kind="tail",
+    )
+    probe, page_ids = probe_destination_pages(record)
+    assert (probe.logical_pages, probe.backend_pages) == (14, 2)
+    assert probe.dest_pages_needed == 14 and probe.classification == "api-split"
+    assert page_ids == view.logical_ids
+    assert read_host_row_bytes(record, page_ids) == payload
+
+    logger = _Logger()
+    result = verify_pool_offload_rows([record], logger=logger, wave_tag="m1s1")
+    assert result.matched and result.api_split_rows == 1
+    assert logger.errors == []
+    split_line = next(line for line in logger.infos if "api-split" in line)
+    for fragment in (
+        "logical_pages=14", "backend_pages=2", "dest_ordinal_needed=14",
+        "host_sid=41", "layer=7", "kind=tail",
+    ):
+        assert fragment in split_line, split_line
+    assert "api_split_rows=1" in logger.infos[-1]
+
+
+def test_an_owned_only_destination_is_not_flagged_as_split():
+    view = _FakeHostView(page_bytes=16, owned=8)
+    payload = bytes(range(48))
+    view.write_at(8 * 4, payload)
+    record = _recorded(payload, view=view)
+    probe, _ = probe_destination_pages(record)
+    assert probe.classification == "aligned"
+    assert (probe.logical_pages, probe.backend_pages, probe.dest_pages_needed) == (
+        8, 8, 5,
+    )
+    logger = _Logger()
+    assert verify_pool_offload_rows([record], logger=logger).api_split_rows == 0
+    assert [line for line in logger.infos if "api-split" in line] == []
+
+
+def test_a_logical_table_short_of_the_destination_raises():
+    view = _FakeHostView(page_bytes=16, attached=1, owned=1)
+    record = _record(view=view, dest_start_tokens=48, token_count=8)
+    with pytest.raises(RuntimeError) as excinfo:
+        probe_destination_pages(record)
+    message = str(excinfo.value)
+    for fragment in (
+        "TRUNCATED", "sid=41", "layer=7", "logical_pages=2", "backend_pages=1",
+        "dest_ordinal_needed=14", "dest_tokens=[48,56)",
+    ):
+        assert fragment in message, message
 
 
 # --------------------------------------------------------------------------
@@ -274,8 +389,8 @@ def test_recorder_rejects_metadata_it_cannot_digest():
 # --------------------------------------------------------------------------
 def _two_row_wave():
     """A segment row at token 0 and a tail row at token 8, both in Host pages."""
-    segment_pages = _FakeHostPages(num_pages=4, page_bytes=16)
-    tail_pages = _FakeHostPages(num_pages=8, page_bytes=16)
+    segment_pages = _FakeHostView(page_bytes=16, owned=4)
+    tail_pages = _FakeHostView(page_bytes=16, owned=8)
     segment_bytes = bytes(range(32))
     tail_bytes = bytes(range(100, 148))
     segment_pages.write_at(0, segment_bytes)
@@ -307,7 +422,8 @@ def test_matching_wave_logs_one_summary_line_and_no_error():
     assert summary.startswith(LOG_TAG)
     for fragment in (
         "rank=3", "wave=m2s1", "rows_checked=2", "bytes_hashed=80",
-        "segment_rows=1", "tail_rows=1", "layers=1", "mismatches=0",
+        "segment_rows=1", "tail_rows=1", "layers=1", "api_split_rows=0",
+        "mismatches=0",
     ):
         assert fragment in summary, summary
 
@@ -327,7 +443,9 @@ def test_mismatching_row_logs_one_localizing_line():
     for fragment in (
         f"{LOG_TAG} MISMATCH", "rank=3", "kind=tail", "row=1", "host_sid=41",
         "layer=7", "dest_start_tokens=8", "dest_tokens=[8,20)", "token_bytes=4",
-        "page_tokens=4", f"src_digest={record.row_digest}",
+        "page_tokens=4", "logical_pages=8", "backend_pages=8",
+        "dest_ordinal_needed=5", "page_table=aligned",
+        f"src_digest={record.row_digest}",
         f"dst_digest={comparison.dest_digest}", "first_bad_page=4", "wave=m2s1",
     ):
         assert fragment in line, line

@@ -640,7 +640,7 @@ def test_the_offload_check_digests_each_row_against_its_own_destination():
         assert record.token_bytes == (LORA + ROPE) * latent.element_size()
         assert record.page_tokens == PAGE
 
-    def _destination(record, corrupt_row=None):
+    def _destination(record, page_ids=None, corrupt_row=None):
         """The row's Host bytes, rebuilt from the activations it offloaded."""
         lo, hi = batch.row_bounds[record.row], batch.row_bounds[record.row + 1]
         tokens = latent[lo:hi].clone()
@@ -653,7 +653,8 @@ def test_the_offload_check_digests_each_row_against_its_own_destination():
 
     clean_log = _Lines()
     clean = _CHECK.verify_pool_offload_rows(
-        recorder.rows, logger=clean_log, reader=_destination, wave_tag="m3s1",
+        recorder.rows, logger=clean_log, reader=_destination, prober=None,
+        wave_tag="m3s1",
     )
     assert clean.matched and clean.rows_checked == len(batch.items)
     assert clean.segment_rows and clean.tail_rows
@@ -667,7 +668,10 @@ def test_the_offload_check_digests_each_row_against_its_own_destination():
     bad = _CHECK.verify_pool_offload_rows(
         recorder.rows,
         logger=bad_log,
-        reader=lambda record: _destination(record, corrupt_row=tail_row),
+        reader=lambda record, page_ids: _destination(
+            record, page_ids, corrupt_row=tail_row
+        ),
+        prober=None,
         wave_tag="m3s1",
     )
     assert len(bad.mismatches) == 1
