@@ -9558,17 +9558,20 @@ class BatchGenWorker:
 
 		Model, device properties and parallel layout are deployment constants,
 		so every packer call site shares one lookup. ``None`` is a valid result:
-		no profile matches, and the packer then balances computed tokens.
+		no profile matches, and the packer then balances computed tokens. A
+		profile scores one serve group, so it is keyed by the group size too.
 		"""
 		if not hasattr(self, "_prefix_rank_cost_profile"):
 			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 
+			G = self._decode_attn_tp_size()
 			props = torch.cuda.get_device_properties(self.local_rank)
 			self._prefix_rank_cost_profile = find_executor_cost_profile(
 				self.model_name or "",
 				(props.major, props.minor),
 				props.total_memory,
 				self.world_size,
+				G if G > 1 else 1,
 			)
 		return self._prefix_rank_cost_profile
 

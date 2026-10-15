@@ -1,9 +1,11 @@
-"""Offline linear cost model for one DP rank's prefill executor time.
+"""Offline linear cost model for one prefill executor's time.
 
-A profile turns the four features of ``wave_plan.prefill_plan_work`` into
-predicted executor seconds. The coefficients are a measured fit, so a profile
-is only valid for the exact model and machine it was fitted on; lookup is
-therefore explicit and returns ``None`` rather than falling back.
+An executor is one serve group: a single rank under pure DP, or the G ranks
+that prefill a group's sequences in TP-G lockstep. A profile turns the four
+features of ``wave_plan.prefill_plan_work`` into that executor's predicted
+seconds. The coefficients are a measured fit, so a profile is only valid for
+the exact model, machine and group it was fitted on; lookup is therefore
+explicit and returns ``None`` rather than falling back.
 """
 
 from __future__ import annotations
@@ -18,9 +20,14 @@ class ExecutorCostProfile:
     machine: str  # label only; matching uses the device properties below
     compute_capability: tuple[int, int]
     memory_gib: tuple[float, float]  # inclusive range of total device memory
-    # The fit holds only for the parallel layout it was measured on: a rank's
-    # executor seconds change with its expert/attention shard sizes.
-    world_size: int
+    # Ranks per executor: 1 is a pure-DP rank, 8 one K3 serve group. A group's
+    # seconds change with its TP width, so this always matches exactly.
+    group_size: int
+    # The world the fit holds for. Set, it matches exactly: an executor whose
+    # expert shards change with the world size (GPT-OSS) must not transfer.
+    # ``None`` matches any world: the fit was validated group-local.
+    world_size: Optional[int]
+    fitted_world_size: int  # provenance only; never matched
     intercept: float
     per_1e5_computed_tokens: float
     per_1e9_attention_pairs: float
@@ -52,7 +59,9 @@ PROFILES: tuple[ExecutorCostProfile, ...] = (
     ExecutorCostProfile(
         model="gpt-oss-120b",
         machine="sm90-141g",
+        group_size=1,
         world_size=4,
+        fitted_world_size=4,
         # sm_90 with ~141 GB device memory. Other sm_90 parts carry 80 or
         # 96 GB and fall outside this memory range, so they never match.
         compute_capability=(9, 0),
@@ -71,8 +80,9 @@ def find_executor_cost_profile(
     compute_capability: tuple[int, int],
     total_memory_bytes: int,
     world_size: int,
+    group_size: int,
 ) -> Optional[ExecutorCostProfile]:
-    """Match a profile by exact model spec, device properties, and world size.
+    """Match a profile by exact model spec, device properties, and layout.
 
     Device marketing names vary by vendor SKU and firmware, so the machine is
     identified by compute capability and total memory instead of by name. A
@@ -80,6 +90,13 @@ def find_executor_cost_profile(
     smaller model sharing a name prefix must not inherit a larger model's
     coefficients, so both match exactly; no match returns ``None`` and the
     packer balances computed tokens instead.
+
+    ``group_size`` always matches exactly. ``world_size`` matches exactly
+    unless the profile leaves it ``None``, which claims its group's seconds do
+    not depend on how many groups the world holds. Such a group-local profile
+    may only land together with the residual check that shows per-group cost
+    independent of group count, and any scale-out beyond the group counts that
+    check covered re-runs it before trusting the profile.
     """
 
     # Checkpoint ids carry an org prefix ("openai/gpt-oss-120b"); the profile
@@ -92,7 +109,8 @@ def find_executor_cost_profile(
             profile.model.lower() == model
             and tuple(compute_capability) == profile.compute_capability
             and low <= memory_gib <= high
-            and world_size == profile.world_size
+            and group_size == profile.group_size
+            and (profile.world_size is None or world_size == profile.world_size)
         ):
             return profile
     return None
