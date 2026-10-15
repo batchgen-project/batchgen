@@ -7721,6 +7721,11 @@ class BatchGenWorker:
 							device=self.torch_device,
 							reason="end of prefill",
 						)
+						# Every D2H of the wave has retired, and the segment
+						# pseudo sequences still hold their page tables: the
+						# only window where a row's destination Host bytes can
+						# be read back and compared to its source.
+						self._verify_prefill_pool_offload_bytes()
 						self._finish_prefill_pool_wave()
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
@@ -10185,6 +10190,11 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_layer_map = (
 			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
+		)
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
@@ -10328,6 +10338,58 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _new_pool_offload_check_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
+
+		Read through the same seam as ``prefix_rank_assignment_mode``: the flag
+		rides on the wave's own sequences, so a batch arms the check against a
+		server that is already up and no env var exists for it. Returns None
+		when the batch did not ask, which is what keeps the check free.
+		"""
+		from batchgen.prefix_reuse.offload_check import (
+			DEBUG_FLAG as _POOL_OFFLOAD_CHECK_FLAG,
+			PoolOffloadCheckRecorder,
+		)
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
+			return None
+		logging.info(
+			"[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
+			"members=%s segments=%s page_tokens=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return PoolOffloadCheckRecorder(
+			rank=self.rank, page_tokens=wave.page_tokens
+		)
+
+	def _verify_prefill_pool_offload_bytes(self) -> None:
+		"""Compare every pooled row's Host destination bytes to its source.
+
+		Runs at the one point where that is both meaningful and safe: after the
+		wave's D2H has retired, so the destination pages are written, and before
+		``_finish_prefill_pool_wave`` publishes the segments and drops the
+		pseudo-sequence page tables the check reads back through.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.offload_check import verify_pool_offload_rows
+
+		recorder = AttnWrapperBase.prefill_pool_offload_recorder
+		if recorder is None:
+			return
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+		wave = self._prefill_pool_wave
+		wave_tag = (
+			f"m{len(wave.uuids)}s{len(wave.plan.segments)}"
+			if wave is not None
+			else "-"
+		)
+		verify_pool_offload_rows(recorder.rows, logger=logging, wave_tag=wave_tag)
 
 	def _finish_prefill_pool_wave(self) -> None:
 		"""After every D2H retired: publish the segments, pin members to them.

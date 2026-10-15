@@ -42,6 +42,7 @@ itself is GPU work (S6).
 Run: python -m pytest tests/unit/test_k3_mla_pool_attention.py -q
 """
 
+import ctypes
 import importlib
 import importlib.util
 import inspect
@@ -72,6 +73,9 @@ def _load(name, *relative):
 _PLAN = _load("test_mla_pool_plan_mod", "batchgen", "prefix_reuse", "wave_plan.py")
 _POOL = _load("test_mla_pool_pool_mod", "batchgen", "prefix_reuse", "pool.py")
 _EXEC = _load("test_mla_pool_exec_mod", "batchgen", "prefix_reuse", "executor.py")
+_CHECK = _load(
+    "test_mla_pool_check_mod", "batchgen", "prefix_reuse", "offload_check.py"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +151,10 @@ class FakeAttnWrapperBase:
     prefill_pool = None
     prefill_pool_batch = None
     prefill_pool_row_starts = None
+    # Batch-level batchgen_debug.prefix_pool_offload_check installs a recorder
+    # here; None is the production default and the only state the offload path
+    # needs to stay free of the check.
+    prefill_pool_offload_recorder = None
     cur_batch = None
     prepack_num_sequences = None
     prepack_seq_lengths = None
@@ -216,7 +224,8 @@ def _fa3_and_executor(monkeypatch):
     FakeAttnWrapperBase.tracked = []
     yield
     for name in ("prefill_pool", "prefill_pool_batch",
-                 "prefill_pool_row_starts", "cur_batch"):
+                 "prefill_pool_row_starts", "prefill_pool_offload_recorder",
+                 "cur_batch"):
         setattr(FakeAttnWrapperBase, name, None)
 
 
@@ -579,6 +588,96 @@ def test_each_pool_row_offloads_its_own_latent_at_its_own_start():
     ):
         assert pinned is call.kv and tracked is call.task
         assert pin_layer == task_layer == 11
+
+
+class _Lines:
+    """Collect the check's log lines as they would land in a server log."""
+
+    def __init__(self):
+        self.errors = []
+        self.infos = []
+
+    def error(self, message, *args):
+        self.errors.append(message % args)
+
+    def info(self, message, *args):
+        self.infos.append(message % args)
+
+
+def test_the_offload_check_digests_each_row_against_its_own_destination():
+    """``prefix_pool_offload_check``: one record per row, keyed to its target.
+
+    The digest covers the row's own latent, so a destination rebuilt from that
+    latent matches, and flipping the last token of one tail names that tail's
+    LAST Host page -- the multi-page stride the gapped-chain corruption lives
+    in. Every other test in this file runs with the recorder left at None, so
+    they are the flag-off path: nothing here is reachable without it.
+    """
+    prompts = DEPTH1
+    plan = _plan(prompts, same_chunk=True)
+    batch, = _chunk_batches(prompts, plan, _pool(prompts, plan))
+    segment_sids = {seg.segment_id: -(1 + seg.segment_id) for seg in plan.segments}
+    global_ids = {index: 500 + index for index in range(len(prompts))}
+    ids, starts = _host_targets(batch, segment_sids, global_ids)
+    FakeAttnWrapperBase.prefill_pool_batch = batch
+    FakeAttnWrapperBase.prefill_pool_row_starts = starts
+    FakeAttnWrapperBase.cur_batch = ids
+    recorder = _CHECK.PoolOffloadCheckRecorder(rank=4, page_tokens=PAGE)
+    FakeAttnWrapperBase.prefill_pool_offload_recorder = recorder
+    layer = _offload_layer(11, _RecordingView())
+    latent = torch.randn(batch.input_ids.numel(), LORA + ROPE)
+
+    WR.KimiLinearAttnWrapper._offload_prepacked_kv(layer, latent, None)
+
+    assert len(recorder.rows) == len(batch.items)
+    for row, record in enumerate(recorder.rows):
+        lo, hi = batch.row_bounds[row], batch.row_bounds[row + 1]
+        assert (record.kind, record.host_sid, record.dest_start_tokens) == (
+            batch.items[row].kind, ids[row], starts[row],
+        )
+        assert (record.row, record.layer_idx, record.rank) == (row, 11, 4)
+        assert record.token_count == hi - lo
+        assert record.token_bytes == (LORA + ROPE) * latent.element_size()
+        assert record.page_tokens == PAGE
+
+    def _destination(record, corrupt_row=None):
+        """The row's Host bytes, rebuilt from the activations it offloaded."""
+        lo, hi = batch.row_bounds[record.row], batch.row_bounds[record.row + 1]
+        tokens = latent[lo:hi].clone()
+        if record.row == corrupt_row:
+            tokens[-1, -1] = -tokens[-1, -1] - 1.0
+        flat = tokens.contiguous().reshape(-1)
+        return ctypes.string_at(
+            flat.data_ptr(), flat.numel() * flat.element_size()
+        )
+
+    clean_log = _Lines()
+    clean = _CHECK.verify_pool_offload_rows(
+        recorder.rows, logger=clean_log, reader=_destination, wave_tag="m3s1",
+    )
+    assert clean.matched and clean.rows_checked == len(batch.items)
+    assert clean.segment_rows and clean.tail_rows
+    assert clean_log.errors == [] and len(clean_log.infos) == 1
+    assert "rows_checked=%d" % len(batch.items) in clean_log.infos[0]
+
+    tail_row = max(
+        row for row, item in enumerate(batch.items) if item.kind == "tail"
+    )
+    bad_log = _Lines()
+    bad = _CHECK.verify_pool_offload_rows(
+        recorder.rows,
+        logger=bad_log,
+        reader=lambda record: _destination(record, corrupt_row=tail_row),
+        wave_tag="m3s1",
+    )
+    assert len(bad.mismatches) == 1
+    record, comparison = bad.mismatches[0]
+    assert record.row == tail_row and record.kind == "tail"
+    # The last token of the row, so the walk reached the row's final page.
+    assert comparison.first_differing_page == (record.dest_end_tokens - 1) // PAGE
+    assert len(bad_log.errors) == 1
+    assert f"host_sid={ids[tail_row]}" in bad_log.errors[0]
+    assert "mismatches=1" in bad_log.infos[0]
 
 
 def test_a_row_count_that_disagrees_with_the_published_targets_is_refused():
