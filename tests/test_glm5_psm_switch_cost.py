@@ -501,9 +501,14 @@ def test_blockwise_init_adopts_preallocated_stacks_without_recopying():
 
 
 def _reuse_psm(*, flag=False, reuse=False, resident=4, experts_per_rank=4,
-               world_size=2):
+               world_size=2, offloading=False, offloading_ratio=0.5,
+               configured_resident=None):
     cls = _isolated(
-        ["_instances_are_reused", "_local_routed_experts_fully_resident"],
+        [
+            "_instances_are_reused",
+            "_local_routed_experts_fully_resident",
+            "_plan_local_expert_split",
+        ],
         torch=_TorchProxy(),
         logging=_QUIET_LOGGING,
     )
@@ -512,6 +517,13 @@ def _reuse_psm(*, flag=False, reuse=False, resident=4, experts_per_rank=4,
     psm.reuse_phase_instances = reuse
     psm.NUM_TOTAL_EXPERTS = experts_per_rank * world_size
     psm.world_size = world_size
+    psm.engine_config = SimpleNamespace(
+        EP_Config=SimpleNamespace(
+            enable_offloading=offloading,
+            offloading_ratio=offloading_ratio,
+            num_local_expert_per_layer=configured_resident,
+        )
+    )
     if resident is not None:
         psm.num_local_expert_per_layer = resident
     return psm
@@ -538,15 +550,58 @@ def test_default_lifecycle_reuses_only_a_fully_resident_rank():
     assert _reuse_psm(reuse=True, resident=2)._instances_are_reused is False
 
 
-def test_residency_is_unknown_before_the_first_decode_configure():
-    """`num_local_expert_per_layer` is set inside configure_decoding.
+def test_residency_is_planned_before_the_first_decode_configure():
+    """The FIRST prefill configure already knows whether reuse applies.
 
-    Reported as not resident rather than guessed, so a prefill-first process
-    cannot cache an instance it has not proven it can reuse.
+    `num_local_expert_per_layer` is assigned inside `configure_decoding`, so
+    answering "not resident" until then meant the first prefill instance was
+    not kept and the next prefill built it again — the first decode -> prefill
+    switch of the first measured batch paid a whole prefill model build.
+
+    The split is a deployment constant (world size + EP config), so it is
+    planned instead of guessed, and the planner is the same one
+    `configure_decoding` assigns from.
     """
     psm = _reuse_psm(reuse=True, resident=None)
+    assert psm._local_routed_experts_fully_resident() is True
+    assert psm._instances_are_reused is True
+
+
+def test_a_streaming_rank_is_still_not_reusable_before_the_first_configure():
+    psm = _reuse_psm(reuse=True, resident=None, offloading=True,
+                     offloading_ratio=0.5)
     assert psm._local_routed_experts_fully_resident() is False
     assert psm._instances_are_reused is False
+
+    partial = _reuse_psm(reuse=True, resident=None, configured_resident=2)
+    assert partial._local_routed_experts_fully_resident() is False
+
+
+def test_the_planned_split_matches_what_configure_decoding_assigns():
+    """One planner, so the capability and the loader can never disagree."""
+    # Multi-node: every rank's shard is resident.
+    wide = _reuse_psm(resident=None, world_size=16, experts_per_rank=16,
+                      offloading=True, offloading_ratio=0.5)
+    assert wide._plan_local_expert_split() == (False, 16)
+    # Offloading on: a fraction stays resident.
+    assert _reuse_psm(
+        resident=None, offloading=True, offloading_ratio=0.25
+    )._plan_local_expert_split() == (True, 3)
+    # Unset / zero means the whole per-rank shard.
+    assert _reuse_psm(resident=None)._plan_local_expert_split() == (False, 4)
+    assert _reuse_psm(
+        resident=None, configured_resident=0
+    )._plan_local_expert_split() == (False, 4)
+    assert _reuse_psm(
+        resident=None, configured_resident=3
+    )._plan_local_expert_split() == (False, 3)
+
+
+def test_configure_decoding_assigns_the_split_from_the_planner():
+    src = ast.unparse(_method("configure_decoding"))
+    assert "self._plan_local_expert_split()" in src
+    # The inline branch chain it replaced must not come back.
+    assert "EP_Config.offloading_ratio" not in src
 
 
 def test_expert_loader_selection_keeps_the_flag_path_separate():
