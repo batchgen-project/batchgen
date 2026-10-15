@@ -949,6 +949,17 @@ class GPUPagedKVCacheManager:
 		self._is_initialized = False
 
 	@property
+	def uses_fixed_address_pool(self) -> bool:
+		"""True when destroy()/initialize() unmap and map one reserved range.
+
+		The phase-switch lifecycle needs this: it releases the pool's physical
+		pages for the prefill phase and maps them back afterwards, and anything
+		that baked a pool pointer (a captured decode graph above all) is only
+		still correct because the addresses did not move.
+		"""
+		return self._fixed_address_pool
+
+	@property
 	def pool_is_mapped(self) -> bool:
 		"""True when the KV pool's physical memory is currently mapped."""
 		if self._fixed_address_pool:

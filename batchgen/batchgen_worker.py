@@ -1310,6 +1310,15 @@ class BatchGenWorker:
 
 		return gpu_kv_cache_gb
 
+	def _kv_fixed_address_pool_available(self) -> bool:
+		"""Whether the KV pools can be carved from a reserved virtual range.
+
+		CUDA VMM is the only implementation, and it needs an indexed device.
+		Every serving path has one; CPU-only unit tests that build a manager
+		directly keep the allocator-backed default.
+		"""
+		return bool(torch.cuda.is_available() and isinstance(self.local_rank, int))
+
 	def _initialize_gpu_kv_manager_fixed_size(self) -> GPUPagedKVCacheManager:
 		"""
 		Initialize GPU KV manager with pre-determined fixed size.
@@ -1317,6 +1326,14 @@ class BatchGenWorker:
 
 		For DSA models, splits the memory budget between primary (MLA) and
 		auxiliary (indexer) caches, wrapping both in a DualKVCacheCoordinator.
+
+		The pools are carved from one reserved virtual range per pool
+		(``fixed_address_pool``), so the phase-switch lifecycle can hand their
+		physical pages back to the driver for the prefill phase and map them
+		again afterwards WITHOUT the pool base, the page-pointer tables or the
+		page-table storage moving. A captured decode graph bakes those
+		pointers, so releasing an allocator-backed pool under it would make the
+		next replay read freed memory.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import (
 			build_gpu_kv_config_fixed_size,
@@ -1373,9 +1390,18 @@ class BatchGenWorker:
 			)
 			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
 
-			primary = GPUPagedKVCacheManager(config=primary_config, device=self.local_rank)
+			fixed_addresses = self._kv_fixed_address_pool_available()
+			primary = GPUPagedKVCacheManager(
+				config=primary_config,
+				device=self.local_rank,
+				fixed_address_pool=fixed_addresses,
+			)
 			primary.initialize()
-			auxiliary = GPUPagedKVCacheManager(config=aux_config, device=self.local_rank)
+			auxiliary = GPUPagedKVCacheManager(
+				config=aux_config,
+				device=self.local_rank,
+				fixed_address_pool=fixed_addresses,
+			)
 			auxiliary.initialize()
 			manager = DualKVCacheCoordinator(primary, auxiliary)
 			self._bind_gpu_paged_kv_manager(manager)
@@ -1399,6 +1425,7 @@ class BatchGenWorker:
 			manager = GPUPagedKVCacheManager(
 				config=config,
 				device=self.local_rank,
+				fixed_address_pool=self._kv_fixed_address_pool_available(),
 			)
 			manager.initialize()
 			self._bind_gpu_paged_kv_manager(manager)
@@ -6370,27 +6397,34 @@ class BatchGenWorker:
 		rank.  Free pages are dynamic; the pure reducer takes the tightest rank
 		in each replicated attention group so the admission plan is safe for all
 		ranks that will allocate the selected sequence.
+
+		The whole read — local stats and the cross-rank all_gather — runs inside
+		the manager's ``capacity_snapshot()`` section (#424), so the phase
+		switch cannot release the pool underneath a decision that is already
+		being taken against it: a release attempted here fails loud instead of
+		producing a plan for pages that no longer exist.
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not manager.is_initialized:
 			raise RuntimeError(
 				"GPU KV manager must be initialized before taking a decode capacity snapshot"
 			)
-		stats = manager.get_stats()
-		local = torch.tensor(
-			[int(stats.num_total_pages), int(stats.num_free_pages)],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		if self.world_size == 1:
-			rank_stats = [local]
-		else:
-			if not dist.is_initialized():
-				raise RuntimeError(
-					"distributed process group is required for a multi-rank decode capacity snapshot"
-				)
-			rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
-			dist.all_gather(rank_stats, local)
+		with manager.capacity_snapshot():
+			stats = manager.get_stats()
+			local = torch.tensor(
+				[int(stats.num_total_pages), int(stats.num_free_pages)],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			if self.world_size == 1:
+				rank_stats = [local]
+			else:
+				if not dist.is_initialized():
+					raise RuntimeError(
+						"distributed process group is required for a multi-rank decode capacity snapshot"
+					)
+				rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
+				dist.all_gather(rank_stats, local)
 		return reduce_decode_capacity_snapshot(
 			tuple(int(item[0].item()) for item in rank_stats),
 			tuple(int(item[1].item()) for item in rank_stats),
@@ -8274,12 +8308,14 @@ class BatchGenWorker:
 			return
 		if direction == "decode_to_prefill":
 			if reused:
-				# Inverted on the reuse path, deliberately: the decode graphs and
-				# the KV region are supposed to outlive this switch. Tearing either
-				# down is what would force the recapture this lifecycle exists to
-				# remove, and the KV region must stay mapped for #424 anyway.
+				# Partly inverted on the reuse path, deliberately: the decode
+				# graphs are supposed to outlive this switch (tearing them down
+				# is what forces the recapture this lifecycle exists to remove),
+				# while the two large memory classes — the KV pool and the
+				# routed experts — give their physical pages back to the
+				# prefill phase at addresses those same graphs baked.
 				self._assert_decode_graph_state_kept("decode->prefill")
-				self._assert_kv_region_mapped("decode->prefill")
+				self._assert_kv_region_released("decode->prefill")
 				pm = self.parallel_manager
 				if getattr(pm, "decode_experts_resident", False):
 					raise RuntimeError(
@@ -8404,6 +8440,14 @@ class BatchGenWorker:
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
 		persistent = self._persistent_phase_enabled()
+		if not persistent:
+			# Request reuse BEFORE the FIRST prefill configure, so the prefill
+			# instance this process keeps is the one that configure builds.
+			# Requesting it only at the first decode build left the first
+			# prefill model unkept, and the next decode->prefill switch — the
+			# first one inside a measured batch — paid a second full prefill
+			# build to produce the instance it keeps. Idempotent afterwards.
+			self._request_phase_instance_reuse()
 		reuse = (not persistent) and self._decode_instance_is_reusable()
 		if persistent:
 			self._release_persistent_decode_instance()
@@ -8452,11 +8496,12 @@ class BatchGenWorker:
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
-		# The KV region stays mapped across the switch on both reuse paths:
-		# the decode graphs bake its pointers, and PR #424 made decode
-		# admission read live all-rank capacity, so it may not vanish under a
-		# capacity decision. _release_reused_decode_instance already dropped
-		# every sequence through it.
+		# Both reuse paths already handled the pool above, differently:
+		# _release_reused_decode_instance() returned its physical pages at
+		# reserved addresses (the default lifecycle), while the persistent path
+		# keeps its pools mapped by design. Neither may be destroyed here — the
+		# destroy/recreate this call performs is what moves the pool, and the
+		# decode graphs bake its pointers.
 		if not persistent and not reuse:
 			self._destroy_gpu_paged_kv_cache()
 		if not persistent and not reuse and k3_prefill_profile and torch.cuda.is_available():
@@ -8735,6 +8780,13 @@ class BatchGenWorker:
 			self.model, self.weight_copy_task = (
 				self.parallel_manager.activate_decoding()
 			)
+			# Map the KV pool's physical pages back under the same addresses
+			# BEFORE anything can read capacity through it or replay a graph
+			# that baked its pointers. _init_gpu_kv_with_actual_size(), which
+			# the caller runs next, then finds a live pool and skips: the pool
+			# is sized exactly once per process and every later activation maps
+			# that same size, so the page count never moves.
+			self._remap_reused_kv_pool()
 			self._assert_phase_switch_clean("prefill_to_decode", reused=True)
 			self.set_phase("decode")
 			self._install_decode_weight_copy_queue()
@@ -8855,12 +8907,67 @@ class BatchGenWorker:
 		except Exception as e:  # informational only
 			logging.debug("parameter residency breakdown failed: %r", e)
 
-	def _assert_kv_region_mapped(self, context: str) -> None:
-		"""#424: the KV region may not vanish under a live capacity decision.
+	def _remap_reused_kv_pool(self) -> None:
+		"""P->D on the default lifecycle: map the KV pool back where it was.
 
-		Decode admission reads live all-rank capacity, and the decode graphs bake
-		the pool pointers, so on the reuse lifecycle the region stays mapped
-		across both switch directions.
+		``initialize()`` on a reserved-range pool maps fresh physical memory
+		under the SAME virtual addresses, zeroes it the way a freshly built
+		pool hands out zeroed pages, and refreshes the page-pointer tables in
+		place. Nothing is allocated, nothing is sized: the page count is the
+		one the first decode configure measured.
+
+		Called from inside the activation so the pool is live before the
+		capacity snapshot, before decode admission allocates a page and before
+		a captured graph dereferences a pool pointer.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill->decode activated a reused decode "
+				"instance with no GPU KV manager; the instance's first build "
+				"sizes the pool, so one must exist by this point"
+			)
+		self._assert_kv_pool_addresses_are_fixed("prefill->decode")
+		if manager.pool_is_mapped:
+			# decode -> decode returns before the activation, so this is only
+			# reached if a future caller activates an already-active instance.
+			return
+		start = time.perf_counter()
+		manager.initialize()
+		stats = manager.get_stats()
+		logging.info(
+			"[GPU-KV] rank=%d remapped the reserved KV pool in %.3fs (%d pages)",
+			self.rank,
+			time.perf_counter() - start,
+			stats.num_total_pages,
+		)
+
+	def _assert_kv_pool_addresses_are_fixed(self, context: str) -> None:
+		"""A reused decode instance requires an address-stable KV pool.
+
+		Its captured graphs dereference the pool bases and page-pointer tables
+		recorded at capture time. Releasing an allocator-backed pool under them
+		would hand those addresses to the next allocation and the following
+		replay would read someone else's memory, so an unsupported pool fails
+		the switch instead of silently taking the old destroy/recreate path.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			return
+		if not getattr(manager, "uses_fixed_address_pool", False):
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch would release a GPU KV "
+				"pool that is not held at fixed addresses while the decode "
+				"instance is reused; its captured graphs bake the pool "
+				"pointers, so the pool must be a reserved-range pool"
+			)
+
+	def _assert_kv_region_mapped(self, context: str) -> None:
+		"""Before decode configure and replay the KV pool is mapped.
+
+		Decode admission reads live all-rank capacity through it (#424) and the
+		decode graphs bake its pointers, so the activation maps the pool back
+		before either can run.
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not manager.is_initialized:
@@ -8869,6 +8976,33 @@ class BatchGenWorker:
 				"unmapped while phase instances are reused; decode admission "
 				"reads live capacity through it and the decode graphs bake its "
 				"pointers"
+			)
+		if not manager.pool_is_mapped:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV pool's "
+				"physical pages unmapped at their reserved addresses; a decode "
+				"replay or capacity read would touch unmapped device memory"
+			)
+
+	def _assert_kv_region_released(self, context: str) -> None:
+		"""After decode->prefill the KV pool's physical pages are back.
+
+		The addresses stay reserved — that is what lets the activation map the
+		same range again — but the pages themselves belong to the prefill phase
+		until then. A pool still mapped here is the cleanup bug this lifecycle
+		exists to avoid: the prefill phase would run with the whole decode KV
+		pool charged against it.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			# Never created: a lifetime whose decode phase has not sized a pool
+			# yet has nothing to release.
+			return
+		if manager.pool_is_mapped:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV pool "
+				"mapped; prefill needs its physical pages back, and the "
+				"reserved addresses are what make the remap free"
 			)
 
 	def _request_phase_instance_reuse(self) -> bool:
@@ -8915,17 +9049,23 @@ class BatchGenWorker:
 		)
 
 	def _release_reused_decode_instance(self) -> None:
-		"""D->P on the default lifecycle: give back only the routed experts.
+		"""D->P on the default lifecycle: give the GPU back its large classes.
 
-		Everything a decode graph baked stays put — the KV pools and their
-		page-table storage, the graph statics, the kernel and descriptor state,
-		the non-expert decode residents. Every sequence's GPU KV is dropped
-		through the pools rather than with them, and the routed experts hand back
-		their physical memory at reserved virtual addresses, which is the only
-		large class prefill actually needs back.
+		Both the KV pools and the routed-expert stacks return their PHYSICAL
+		memory to the driver and keep their virtual addresses. The prefill
+		phase gets that memory — on a smaller HBM class a long prefill does not
+		fit beside a resident KV pool — while everything a decode graph baked
+		(pool bases, page-pointer tables, page-table storage, graph statics,
+		kernel and descriptor state, the non-expert decode residents) stays at
+		the address capture recorded, so the next activation only has to map.
+
+		Keeping the pools mapped across prefill instead would be a budget bet
+		on one device class; the release costs an unmap here and a map in
+		``_remap_reused_kv_pool`` on the way back.
 		"""
 		pm = self.parallel_manager
-		self._destroy_gpu_paged_kv_cache(keep_buffers=True)
+		self._assert_kv_pool_addresses_are_fixed("decode->prefill")
+		self._destroy_gpu_paged_kv_cache()
 		if getattr(pm, "decode_experts_resident", False):
 			pm.release_decode_routed_experts()
 
@@ -9160,6 +9300,18 @@ class BatchGenWorker:
 				"measurement cannot charge prefill-only residency against the "
 				"pool it then keeps"
 			)
+
+		# A reserved-range pool is never re-created: its virtual range is still
+		# held and its page count was fixed by the sizing below on the first
+		# decode configure, so a later decode phase maps the same pages back
+		# instead of sizing a second, different pool. The reuse lifecycle has
+		# already remapped inside its activation; this covers a rank that
+		# rebuilds its decode instance, and keeps every rank's num_total_pages
+		# identical, which the cross-rank capacity snapshot requires.
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None and getattr(manager, "uses_fixed_address_pool", False):
+			self._remap_reused_kv_pool()
+			return
 
 		# Measure-once-cache: once the post-capture steady state has been
 		# measured, every later pool (re)creation reuses the cached size —

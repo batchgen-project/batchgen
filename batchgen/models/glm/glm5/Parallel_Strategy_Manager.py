@@ -273,18 +273,11 @@ class GLM5ParallelStrategyManager:
 
         NUM_EXPERT_PER_RANK = self.NUM_TOTAL_EXPERTS // self.world_size
 
-        if self.world_size > 8:
-            self.enable_ep_offloading = False
-            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
-        elif self.engine_config.EP_Config.enable_offloading:
-            self.enable_ep_offloading = True
-            offload_ratio = self.engine_config.EP_Config.offloading_ratio
-            NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
-        else:
-            self.enable_ep_offloading = False
-            NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer
-            if NUM_LOCAL_EXPERT_PER_LAYER is None or NUM_LOCAL_EXPERT_PER_LAYER == 0:
-                NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+        # Same planner the reuse capability is decided with before the first
+        # configure, so the two can never disagree.
+        self.enable_ep_offloading, NUM_LOCAL_EXPERT_PER_LAYER = (
+            self._plan_local_expert_split()
+        )
 
         self.num_local_expert_per_layer = NUM_LOCAL_EXPERT_PER_LAYER
 
@@ -624,10 +617,32 @@ class GLM5ParallelStrategyManager:
         """
         resident = getattr(self, "num_local_expert_per_layer", None)
         if resident is None:
-            # configure_decoding has not run yet, so the per-rank expert split
-            # is not known. Reported as not resident rather than guessed.
-            return False
+            # configure_decoding has not run yet. The split is a deployment
+            # constant (world size + EP config), so plan it instead of
+            # reporting "not resident": the FIRST prefill configure asks this
+            # question to decide whether this process keeps its phase
+            # instances, and answering False there meant the first prefill
+            # model was discarded and rebuilt at the next switch.
+            _, resident = self._plan_local_expert_split()
         return resident == self.NUM_TOTAL_EXPERTS // self.world_size
+
+    def _plan_local_expert_split(self) -> tuple[bool, int]:
+        """(offloading enabled, routed experts this rank keeps resident).
+
+        Derived from the world size and the EP configuration only, so it is
+        the same answer before and after ``configure_decoding`` assigns it.
+        """
+        experts_per_rank = self.NUM_TOTAL_EXPERTS // self.world_size
+        if self.world_size > 8:
+            # Multi-node: every rank's shard is resident.
+            return False, experts_per_rank
+        if self.engine_config.EP_Config.enable_offloading:
+            offload_ratio = self.engine_config.EP_Config.offloading_ratio
+            return True, int(experts_per_rank * (1 - offload_ratio))
+        configured = self.engine_config.EP_Config.num_local_expert_per_layer
+        if configured is None or configured == 0:
+            return False, experts_per_rank
+        return False, configured
 
     def _bind_local_routed_expert_stacks(self, carve):
         """Point every local routed expert at a row of its layer's 3D stack.
