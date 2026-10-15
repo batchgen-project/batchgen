@@ -594,3 +594,35 @@ def pack_wave_ranks(
 
     assert best is not None
     return RankPacking(best[2], best[3], best[1])
+
+
+def pack_groups_for_sharing(
+    prompts: Sequence[Sequence[int]],
+    *,
+    num_groups: int,
+    block_tokens: int,
+    chunk_tokens: int,
+    profile: Optional[ExecutorCostProfile],
+    fixed: Sequence[tuple[int, float]] = (),
+) -> tuple[int, ...]:
+    """Assign prompts to serve groups so prefix families share one group's pool.
+
+    A serve group of G ranks prefills its members together and owns one prefix
+    pool, so it is a single packing target: this is ``pack_wave_ranks`` with
+    ``world_size=num_groups``. A family therefore stays on one group unless
+    splitting it lowers the busiest group's predicted seconds, and ``fixed``
+    pins load already committed to a group exactly as it pins a rank's.
+
+    Returns one group id per prompt, in input order.
+    """
+
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive")
+    return pack_wave_ranks(
+        prompts,
+        world_size=num_groups,
+        block_tokens=block_tokens,
+        chunk_tokens=chunk_tokens,
+        profile=profile,
+        fixed=fixed,
+    ).ranks

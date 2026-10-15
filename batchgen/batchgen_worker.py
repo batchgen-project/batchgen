@@ -2113,6 +2113,10 @@ class BatchGenWorker:
 		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
 		Idempotent (skips already-grouped seqs) and deterministic across ranks:
 		identical inputs -> identical map.
+
+		``packing_v2`` batches served through the in-wave prefix pool with more
+		than one group instead pack by predicted prefill seconds, so a prefix
+		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2141,9 +2145,101 @@ class BatchGenWorker:
 			seqs.append(seq)
 		if not seqs:
 			return
-		groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+		if (
+			num_dp > 1
+			and self._prefill_prefix_pool_enabled()
+			and self._prefix_rank_packing_mode(seqs)
+		):
+			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp)
+		else:
+			groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
 		for seq, g in zip(seqs, groups):
 			seq.decode_dp_group = g
+			# Grouped again: the eviction record has served its purpose, and
+			# a later eviction records the then-current group afresh.
+			seq.evicted_from_dp_group = None
+
+	def _pack_decode_dp_groups_for_sharing(self, seqs, num_dp: int) -> List[int]:
+		"""Place ungrouped sequences on serve groups by predicted prefill seconds.
+
+		A group prefills its members through its own in-wave prefix pool, so a
+		prefix family split across groups recomputes the shared prefix once per
+		group. ``pack_groups_for_sharing`` keeps a family on one group unless
+		splitting it lowers the busiest group's predicted seconds.
+
+		Load already committed to a group is pinned there: every grouped
+		sequence that still owes a prefill, scored by its length alone (see
+		``prompt_score_from_length``). Sequences already decoding owe no prefill
+		seconds and are not counted, unlike the L^2 prior, which charges a group
+		for its whole standing decode batch.
+
+		Prompts are read from the node-shared trajectory book, which admission
+		writes on every rank before grouping, and every input here is replicated,
+		so every rank computes the same map. A re-entry is not packed and its
+		prompt is never read: its decoded suffix lives only in the trajectory
+		book of the node it decoded on, so it returns to the group recorded at
+		eviction (``evicted_from_dp_group``) and pins its length-only score
+		there. A re-entry without that record cannot be placed and is refused.
+		"""
+		from batchgen.prefix_reuse.rank_packing import (
+			pack_groups_for_sharing,
+			prompt_score_from_length,
+		)
+
+		profile = self._cached_prefix_rank_cost_profile()
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		chunk_tokens = int(
+			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		)
+
+		def pinned_load(seq):
+			# Length-only: a re-entry's tokens are readable on one node only.
+			return prompt_score_from_length(
+				int(seq.prompt_length),
+				block_tokens=page_tokens,
+				chunk_tokens=chunk_tokens,
+				profile=profile,
+			)
+
+		groups = []
+		queued = []
+		fixed = []
+		for seq in seqs:
+			group = seq.evicted_from_dp_group
+			if group is None and (
+				seq.status == SequenceStatus.EVICTED
+				or getattr(seq, "evicted_token_ids", None) is not None
+			):
+				raise RuntimeError(
+					f"re-entering sequence {seq.uuid} has no recorded serve group "
+					"to return to; its decoded tokens live only on the node it "
+					"decoded on, so it cannot be placed identically on every rank"
+				)
+			if group is not None:
+				fixed.append((int(group), pinned_load(seq)))
+			else:
+				queued.append(seq)
+			groups.append(group)
+		owes_prefill = (
+			SequenceStatus.QUEUEING, SequenceStatus.IN_PREFILL, SequenceStatus.EVICTED
+		)
+		for seq in self.global_batch:
+			if seq.decode_dp_group is None or seq.status not in owes_prefill:
+				continue
+			fixed.append((int(seq.decode_dp_group), pinned_load(seq)))
+		prompts = [
+			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+			for seq in queued
+		]
+		packed = iter(pack_groups_for_sharing(
+			prompts,
+			num_groups=num_dp,
+			block_tokens=page_tokens,
+			chunk_tokens=chunk_tokens,
+			profile=profile,
+			fixed=fixed,
+		))
+		return [next(packed) if group is None else group for group in groups]
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -9457,6 +9553,25 @@ class BatchGenWorker:
 		debug = (active_debug(seqs) if active_debug is not None else None) or {}
 		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
 
+	def _cached_prefix_rank_cost_profile(self):
+		"""This deployment's prefill executor cost profile, looked up once.
+
+		Model, device properties and parallel layout are deployment constants,
+		so every packer call site shares one lookup. ``None`` is a valid result:
+		no profile matches, and the packer then balances computed tokens.
+		"""
+		if not hasattr(self, "_prefix_rank_cost_profile"):
+			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
+
+			props = torch.cuda.get_device_properties(self.local_rank)
+			self._prefix_rank_cost_profile = find_executor_cost_profile(
+				self.model_name or "",
+				(props.major, props.minor),
+				props.total_memory,
+				self.world_size,
+			)
+		return self._prefix_rank_cost_profile
+
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
 
@@ -9514,21 +9629,12 @@ class BatchGenWorker:
 
 		packing = None
 		if self._prefix_rank_packing_mode(seqs):
-			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 			from batchgen.prefix_reuse.rank_packing import (
 				pack_wave_ranks,
 				prompt_score_from_length,
 			)
 
-			if not hasattr(self, "_prefix_rank_cost_profile"):
-				# No profile is valid: the packer then balances computed tokens.
-				props = torch.cuda.get_device_properties(self.local_rank)
-				self._prefix_rank_cost_profile = find_executor_cost_profile(
-					self.model_name or "",
-					(props.major, props.minor),
-					props.total_memory,
-					self.world_size,
-				)
+			profile = self._cached_prefix_rank_cost_profile()
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 			chunk_tokens = int(
 				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
@@ -9542,7 +9648,7 @@ class BatchGenWorker:
 					int(seq.prompt_length),
 					block_tokens=page_tokens,
 					chunk_tokens=chunk_tokens,
-					profile=self._prefix_rank_cost_profile,
+					profile=profile,
 				)
 
 			# Only sequences that still owe a prefill load a rank. Completed or
@@ -9583,7 +9689,7 @@ class BatchGenWorker:
 				world_size=self.world_size,
 				block_tokens=page_tokens,
 				chunk_tokens=chunk_tokens,
-				profile=self._prefix_rank_cost_profile,
+				profile=profile,
 				fixed=fixed,
 			)
 			ranks = packing.ranks
@@ -12079,9 +12185,12 @@ class BatchGenWorker:
 				# group's ranks, so drop the decode DP-group. A re-prefilled
 				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
 				# treats the stale non-None group id as a preserved re-entry and
-				# skips it, stranding the sequence with no live state. No-op for
-				# G==1 (the field is always None on the validated pure-DP path).
-				seq.decode_dp_group = None
+				# skips it, stranding the sequence with no live state. The group
+				# is remembered: the decoded suffix lives only in that group's
+				# node's trajectory book, so re-grouping must land on it. No-op
+				# for G==1 (the field is always None on the validated pure-DP path).
+				from batchgen.decode_dp_group import evict_from_decode_dp_group
+				evict_from_decode_dp_group(seq)
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)

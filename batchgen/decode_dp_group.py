@@ -78,6 +78,22 @@ def host_kv_owner_rank(decode_dp_group: int, group_size: int) -> int:
     return int(decode_dp_group) * group_size
 
 
+def evict_from_decode_dp_group(seq) -> None:
+    """Drop an evicted sequence's serve group, remembering where it decoded.
+
+    Eviction destroys the head-sharded KDA state on the group's ranks, so the
+    re-prefilled sequence is grouped afresh. Its decoded tokens, however, were
+    written only into the node-shared trajectory book of the group's own node,
+    so the re-entry must be grouped back onto that group:
+    ``evicted_from_dp_group`` keeps it until the next assignment restamps the
+    sequence and clears it. A later eviction records the then-current group.
+    Every rank runs this on the same replicated group id, so the record is
+    replicated too. G==1 never stamps a group, so this stores ``None``.
+    """
+    seq.evicted_from_dp_group = seq.decode_dp_group
+    seq.decode_dp_group = None
+
+
 def assign_decode_dp_groups(
     lengths: Sequence[int],
     num_dp: int,
