@@ -290,9 +290,10 @@ def _plan_worker(
             "_decode_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
-            # The executor is built with the batch-level pad-poison probe, read
-            # through the shared batchgen_debug seam.
+            # The executor and the pool are built with the batch-level probes,
+            # read through the shared batchgen_debug seam.
             "_pool_pad_poison_enabled",
+            "_new_pool_kernel_dump_recorder",
             "_active_batchgen_debug_for_sequences",
             "_debug_flag_enabled",
         ],
@@ -389,6 +390,44 @@ def test_another_batch_flag_does_not_arm_the_pad_poison_probe(monkeypatch):
     wave = _pool_with_debug(monkeypatch, {"prefix_pool_offload_check": True})
 
     assert wave.executor.pad_poison is False
+
+
+@pytest.mark.parametrize("mode", ["sync", "nosync"])
+def test_a_batch_can_arm_the_kernel_dump_in_either_mode(
+    monkeypatch, tmp_path, mode
+):
+    """``prefix_pool_dump_kernel_args`` reaches the pool, with its dump dir."""
+    wave = _pool_with_debug(monkeypatch, {
+        "prefix_pool_dump_kernel_args": mode,
+        "prefix_pool_dump_dir": str(tmp_path),
+    })
+
+    recorder = wave.pool.kernel_dump
+    assert recorder is not None
+    assert recorder.mode == mode
+    assert recorder.rank == 0
+    assert recorder.directory == str(tmp_path / "pool_dump_rank0")
+    assert recorder.page_tokens == wave.page_tokens
+    # Row metadata can name a live member only if the global ids came along.
+    assert list(recorder.global_ids) == list(wave.global_ids)
+
+
+def test_the_kernel_dump_is_off_by_default(monkeypatch):
+    assert _pool_with_debug(monkeypatch, None).pool.kernel_dump is None
+
+
+def test_another_batch_flag_does_not_arm_the_kernel_dump(monkeypatch):
+    wave = _pool_with_debug(monkeypatch, {"prefix_pool_pad_poison": True})
+
+    assert wave.pool.kernel_dump is None
+
+
+def test_a_mistyped_dump_mode_is_refused_at_pool_construction(monkeypatch):
+    """Not silently off: a typo must fail the wave, not look like a clean run."""
+    with pytest.raises(ValueError, match="prefix_pool_dump_kernel_args"):
+        _pool_with_debug(
+            monkeypatch, {"prefix_pool_dump_kernel_args": "synch"}
+        )
 
 
 def test_pool_budget_is_the_group_minimum(monkeypatch):

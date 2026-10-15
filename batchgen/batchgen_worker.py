@@ -10000,6 +10000,7 @@ class BatchGenWorker:
 				f"{geometry_page_bytes} B"
 			)
 		wave.pool = pool
+		pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
 		wave.executor = PoolChunkExecutor(
 			wave.plan, wave.prompts, pool,
 			pad_poison=self._pool_pad_poison_enabled(wave),
@@ -10341,6 +10342,48 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _new_pool_kernel_dump_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		wave's own sequences. The value is the mode, ``"sync"`` or
+		``"nosync"`` - with ``sync`` the probe synchronizes before reading the
+		pool back, so a corruption that only survives ``nosync`` is a
+		write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
+		directory (default /dev/shm). Returns None when the batch did not ask.
+		"""
+		from batchgen.prefix_reuse.kernel_dump import (
+			DEBUG_FLAG as _POOL_DUMP_FLAG,
+			DUMP_DIR_FLAG as _POOL_DUMP_DIR_FLAG,
+			PoolKernelDumpRecorder,
+			dump_directory,
+			parse_dump_mode,
+		)
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		mode = parse_dump_mode(debug.get(_POOL_DUMP_FLAG))
+		if mode is None:
+			return None
+		directory = dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank)
+		logging.info(
+			"[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
+			"segments=%s page_tokens=%s",
+			self.rank,
+			mode,
+			directory,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return PoolKernelDumpRecorder(
+			rank=self.rank,
+			mode=mode,
+			directory=directory,
+			page_tokens=wave.page_tokens,
+			global_ids=list(wave.global_ids),
+		)
 
 	def _pool_pad_poison_enabled(self, wave) -> bool:
 		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.

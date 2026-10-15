@@ -128,7 +128,7 @@ class PoolChunkExecutor:
             for row in rows
         ]
         device = self.pool.device
-        return ChunkBatch(
+        batch = ChunkBatch(
             input_ids=torch.tensor(input_ids, dtype=torch.long, device=device),
             position_ids=torch.tensor(position_ids, dtype=torch.long, device=device),
             cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
@@ -142,6 +142,9 @@ class PoolChunkExecutor:
             max_seqlen_q=max(item.tokens for item in chunk.items),
             max_cache_seqlen=max(cache_seqlens),
         )
+        if self.pool.kernel_dump is not None:
+            self.pool.kernel_dump.begin_chunk(batch)
+        return batch
 
     def finish(self, chunk: "PlanChunk") -> None:
         """Give back this chunk's scratch and the segments it completed."""
@@ -191,8 +194,17 @@ def pool_prefill_attention(
     from batchgen.attention.gqa import gqa_extend_fa
 
     k_cache, v_cache = pool.k[layer_idx], pool.v[layer_idx]
+    # Batch-level ``prefix_pool_dump_kernel_args``: digest the row sources here
+    # and the pool pages the table addresses just below, so the two can be
+    # compared at the exact point the kernel reads them. None in production.
+    dump = pool.kernel_dump
+    dumping = dump is not None and dump.wants_layer(layer_idx, pool.k.shape[0])
+    if dumping:
+        dump.record_write_sources(batch, key)
     k_cache.view(-1, *k_cache.shape[-2:]).index_copy_(0, batch.slots, key)
     v_cache.view(-1, *v_cache.shape[-2:]).index_copy_(0, batch.slots, value)
+    if dumping:
+        dump.record_kernel_inputs(batch, k_cache, layer_idx, pool.k.shape[0])
     return gqa_extend_fa(
         q=query,
         k_cache=k_cache,
