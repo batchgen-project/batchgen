@@ -78,10 +78,42 @@ class GLM5ParallelStrategyManager:
         # --persistent-phase-instances: each phase's (model, weight_copy_task)
         # is built once and switched in by activate_prefill/activate_decoding.
         self.persistent_phase_instances = False
+        # The same build-once/activate machinery, requested by the worker's
+        # default phase-switch lifecycle instead of by the CLI flag. It is a
+        # capability condition, not a mode: the worker turns it on only for a
+        # rank that keeps every one of its local routed experts resident, which
+        # is already the hard precondition of the 3D grouped-GEMM decode path.
+        # A rank that streams part of its experts leaves it off, keeps the
+        # legacy per-expert loader and reports no reusable instance, so the
+        # worker rebuilds that phase exactly as before.
+        self.reuse_phase_instances = False
         self.prefill_instance = None
         self.decode_instance = None
         self._expert_arena = None
         self._expert_copy_pairs = []
+        # Device copies of the skeleton's FP8 dequant scales. The scales never
+        # change, so they are uploaded once per process in one bulk copy and
+        # handed out as views; see _device_scale.
+        self._device_scales = None
+
+    @property
+    def _instances_are_reused(self) -> bool:
+        """True when this process keeps its phase instances and switches them in.
+
+        Either the CLI flag or the worker's default lifecycle asks for it. The
+        arena-backed routed-expert stacks come with it: they are what lets the
+        experts' physical memory be released for prefill and remapped at the
+        same addresses afterwards.
+        """
+        if self.persistent_phase_instances:
+            return True
+        # The default lifecycle only gets reusable instances when the arena
+        # path is actually available for this rank. A streaming rank keeps
+        # decode_instance None, which is how the worker learns to rebuild.
+        return bool(
+            self.reuse_phase_instances
+            and self._local_routed_experts_fully_resident()
+        )
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
@@ -216,7 +248,7 @@ class GLM5ParallelStrategyManager:
                 f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
                 f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
             )
-        if self.persistent_phase_instances:
+        if self._instances_are_reused:
             self.prefill_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
@@ -308,8 +340,18 @@ class GLM5ParallelStrategyManager:
         self._extract_dequantize_scale()
         self._load_model_skeleton()
         if self.persistent_phase_instances:
+            # Unchanged: the flag requires full residency and says so loudly.
             self._load_local_routed_experts_into_arena()
+        elif self.reuse_phase_instances and self._local_routed_experts_fully_resident():
+            # Default lifecycle: same fixed-address stacks, so the experts can
+            # be released for prefill and remapped at the same addresses.
+            self._load_local_routed_experts_into_arena()
+        elif self._local_routed_experts_fully_resident():
+            self._load_local_routed_experts_prealloc()
         else:
+            # Partially resident rank: the rest of its experts stream through
+            # the H2D copy engine, so there is no full stack row per expert
+            # and the 3D grouped-GEMM path is disabled anyway.
             self._load_local_routed_experts()
         self._load_attn_module()
         self._load_shared_expert_module()
@@ -334,7 +376,7 @@ class GLM5ParallelStrategyManager:
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
             self._init_ata_comms(effective_bsz)
 
-        if self.persistent_phase_instances:
+        if self._instances_are_reused:
             self.decode_instance = (self.model, self.weight_copy_task)
         return self.model, self.weight_copy_task
 
@@ -388,11 +430,20 @@ class GLM5ParallelStrategyManager:
             time.perf_counter() - start,
         )
 
-    def refill_local_routed_experts(self):
-        """H2D-copy every local routed expert into its fixed-address stack row."""
-        for dst, src in self._expert_copy_pairs:
+    @staticmethod
+    def _copy_expert_pairs(pairs):
+        """H2D-copy every (stack row, pinned host source) pair, then await once.
+
+        The destinations already exist, so these are plain async copies into
+        existing memory rather than one blocking copy-plus-allocate per tensor.
+        """
+        for dst, src in pairs:
             dst.copy_(src, non_blocking=True)
         torch.cuda.current_stream().synchronize()
+
+    def refill_local_routed_experts(self):
+        """H2D-copy every local routed expert into its fixed-address stack row."""
+        self._copy_expert_pairs(self._expert_copy_pairs)
 
     def share_skeleton_on_device(self):
         """Upload the skeleton once so both persistent instances alias one copy."""
@@ -563,6 +614,104 @@ class GLM5ParallelStrategyManager:
             expert.fp8_down = tensors["down_proj.weight"].to(device)
         logging.debug("Local routed experts loaded")
 
+    def _local_routed_experts_fully_resident(self) -> bool:
+        """True when this rank keeps every one of its routed experts on GPU.
+
+        The 3D grouped-GEMM decode path requires it (see
+        ``_glm5_moe_3d_blockwise_supported``), and so do the preallocated
+        stacks: a partially resident rank streams the rest through the H2D
+        copy engine and cannot own a full stack row per expert.
+        """
+        resident = getattr(self, "num_local_expert_per_layer", None)
+        if resident is None:
+            # configure_decoding has not run yet, so the per-rank expert split
+            # is not known. Reported as not resident rather than guessed.
+            return False
+        return resident == self.NUM_TOTAL_EXPERTS // self.world_size
+
+    def _bind_local_routed_expert_stacks(self, carve):
+        """Point every local routed expert at a row of its layer's 3D stack.
+
+        ``carve(shape, dtype) -> tensor`` supplies the per-layer stacks. Both
+        decode paths use this: the stacks become ``moe._w3d_prealloc``, so
+        ``Glm5MoE._init_fp8_blockwise_weights`` adopts them instead of
+        allocating its own and copying every expert in again. That second copy
+        moved this rank's whole routed-expert shard device-to-device on every
+        prefill -> decode switch, for no change in the bytes.
+
+        Returns the (destination row, pinned host source) pairs, which
+        ``refill_local_routed_experts`` copies. The host sources are
+        address-stable, so the pairs stay valid for the life of the stacks.
+        """
+        experts_per_rank = self.NUM_TOTAL_EXPERTS // self.world_size
+        if not self._local_routed_experts_fully_resident():
+            raise RuntimeError(
+                "preallocated routed-expert stacks need every local routed "
+                f"expert resident: {self.num_local_expert_per_layer}/"
+                f"{experts_per_rank} per layer"
+            )
+        names = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+        start = self.global_rank * experts_per_rank
+        first = self.core_engine.get_tensor(self.local_routed_experts[0])
+        moe_layers = range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers)
+        pairs = []
+        for layer_idx in moe_layers:
+            moe = self.model.model.layers[layer_idx].mlp
+            stacks = tuple(
+                carve((experts_per_rank, *first[name].shape), first[name].dtype)
+                for name in names
+            )
+            moe._w3d_prealloc = stacks
+            for i in range(experts_per_rank):
+                tensors = self.core_engine.get_tensor(
+                    f"routed_expert_{layer_idx}_{start + i}"
+                )
+                for stack, name in zip(stacks, names):
+                    src = tensors[name]
+                    if src.shape != stack.shape[1:] or src.dtype != stack.dtype:
+                        raise RuntimeError(
+                            f"routed_expert_{layer_idx}_{start + i}.{name}: host "
+                            f"{tuple(src.shape)}/{src.dtype} does not match stack row "
+                            f"{tuple(stack.shape[1:])}/{stack.dtype}"
+                        )
+                    pairs.append((stack[i], src))
+                expert = moe.experts[start + i]
+                expert.fp8_gate, expert.fp8_up, expert.fp8_down = (
+                    stack[i] for stack in stacks
+                )
+        return pairs
+
+    def _expert_stack_layer_bytes(self, first, names, experts_per_rank):
+        return sum(
+            experts_per_rank * first[name].numel() * first[name].element_size() + 256
+            for name in names
+        )
+
+    def _load_local_routed_experts_prealloc(self):
+        """Load this rank's routed experts straight into per-layer 3D stacks.
+
+        The default decode path used to upload every expert tensor into its own
+        fresh allocation and then let ``_init_fp8_blockwise_weights`` copy the
+        whole shard again, device-to-device, into the stacks the grouped GEMM
+        actually reads. Allocating the stacks first makes the host-to-device
+        copy land where the kernels want it and removes the second copy
+        entirely. The copies are issued asynchronously into memory that already
+        exists and are awaited once, instead of one blocking copy per tensor
+        each of which also had to allocate its destination.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+
+        def carve(shape, dtype):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        # Deliberately NOT stored on self: on this path the stacks belong to
+        # the decode model and must die with it at the next switch. Keeping a
+        # manager-level reference would pin this rank's whole routed-expert
+        # shard across the prefill phase.
+        pairs = self._bind_local_routed_expert_stacks(carve)
+        self._copy_expert_pairs(pairs)
+        logging.debug("Local routed experts loaded into preallocated 3D stacks")
+
     def _load_local_routed_experts_into_arena(self):
         """Load this rank's routed experts into fixed-address per-layer 3D stacks.
 
@@ -582,9 +731,8 @@ class GLM5ParallelStrategyManager:
         names = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
         first = self.core_engine.get_tensor(self.local_routed_experts[0])
         moe_layers = range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers)
-        layer_bytes = sum(
-            experts_per_rank * first[name].numel() * first[name].element_size() + 256
-            for name in names
+        layer_bytes = self._expert_stack_layer_bytes(
+            first, names, experts_per_rank
         )
         # 512 MiB chunks keep the round-up waste under 0.5 GiB of HBM.
         self._expert_arena = VmmArena(
@@ -593,34 +741,9 @@ class GLM5ParallelStrategyManager:
             chunk_bytes=512 << 20,
         )
         self._expert_arena.map()
-        start = self.global_rank * experts_per_rank
-        self._expert_copy_pairs = []
-        for layer_idx in moe_layers:
-            moe = self.model.model.layers[layer_idx].mlp
-            stacks = tuple(
-                self._expert_arena.carve(
-                    (experts_per_rank, *first[name].shape), first[name].dtype
-                )
-                for name in names
-            )
-            moe._w3d_prealloc = stacks
-            for i in range(experts_per_rank):
-                tensors = self.core_engine.get_tensor(
-                    f"routed_expert_{layer_idx}_{start + i}"
-                )
-                for stack, name in zip(stacks, names):
-                    src = tensors[name]
-                    if src.shape != stack.shape[1:] or src.dtype != stack.dtype:
-                        raise RuntimeError(
-                            f"routed_expert_{layer_idx}_{start + i}.{name}: host "
-                            f"{tuple(src.shape)}/{src.dtype} does not match stack row "
-                            f"{tuple(stack.shape[1:])}/{stack.dtype}"
-                        )
-                    self._expert_copy_pairs.append((stack[i], src))
-                expert = moe.experts[start + i]
-                expert.fp8_gate, expert.fp8_up, expert.fp8_down = (
-                    stack[i] for stack in stacks
-                )
+        self._expert_copy_pairs = self._bind_local_routed_expert_stacks(
+            self._expert_arena.carve
+        )
         self.refill_local_routed_experts()
 
     def _config_attn_module(self):
@@ -675,14 +798,13 @@ class GLM5ParallelStrategyManager:
             weight_dequant_scales = {}
             prefix = f"model.layers.{layer_idx}.self_attn."
             postfix = ".weight_scale_inv"
-            for name, param in self.skeleton_state_dict.items():
+            for name in self.skeleton_state_dict:
                 if name.startswith(prefix) and name.endswith(postfix):
                     # Skip indexer scales
                     if ".indexer." in name:
                         continue
-                    key = name[len(prefix):]
-                    weight_dequant_scales[key] = param.to(
-                        self.engine_config.Basic_Config.device_torch
+                    weight_dequant_scales[name[len(prefix):]] = (
+                        self._device_scale(name)
                     )
 
             wrapper = GLM5AttnWrapper(
@@ -712,11 +834,9 @@ class GLM5ParallelStrategyManager:
             prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
             shared_scales = {}
             for name in mlp_names:
-                key = prefix + name + postfix
-                if key in self.skeleton_state_dict:
-                    shared_scales[name + postfix] = self.skeleton_state_dict[key].to(
-                        self.engine_config.Basic_Config.device_torch
-                    )
+                scale = self._device_scale(prefix + name + postfix)
+                if scale is not None:
+                    shared_scales[name + postfix] = scale
             layer.mlp.shared_experts = GLM5ExpertWrapper(
                 layer.mlp.shared_experts, layer_idx, -1,
                 self.core_engine, self.engine_config, self.model_config,
@@ -734,11 +854,9 @@ class GLM5ParallelStrategyManager:
                 prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
                 expert_scales = {}
                 for name in mlp_names:
-                    key = prefix + name + postfix
-                    if key in self.skeleton_state_dict:
-                        expert_scales[name + postfix] = self.skeleton_state_dict[key].to(
-                            self.engine_config.Basic_Config.device_torch
-                        )
+                    scale = self._device_scale(prefix + name + postfix)
+                    if scale is not None:
+                        expert_scales[name + postfix] = scale
                 layer.mlp.experts[expert_idx] = GLM5ExpertWrapper(
                     layer.mlp.experts[expert_idx], layer_idx, expert_idx,
                     self.core_engine, self.engine_config, self.model_config,
@@ -880,7 +998,6 @@ class GLM5ParallelStrategyManager:
 
     def _setup_fp8_scales(self):
         """Attach FP8 scale tensors to indexer and dense MLP for on-the-fly dequant."""
-        device = self.engine_config.Basic_Config.device_torch
         for layer_idx in range(self.model_config.num_hidden_layers):
             attn = self.model.model.layers[layer_idx].self_attn
             # After wrapping, self_attn is GLM5AttnWrapper; original Glm5MLA is at .module
@@ -892,15 +1009,16 @@ class GLM5ParallelStrategyManager:
                 indexer = inner.indexer
                 for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
                     key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"
-                    if key in self.dequant_scale:
-                        setattr(indexer, attr, self.dequant_scale[key].to(device))
+                    scale = self._device_scale(key)
+                    if scale is not None:
+                        setattr(indexer, attr, scale)
         for layer_idx in range(self.FIRST_K_DENSE):
             mlp = self.model.model.layers[layer_idx].mlp
             for proj in ["gate_proj", "up_proj", "down_proj"]:
                 key = f"model.layers.{layer_idx}.mlp.{proj}.weight_scale_inv"
-                if key in self.dequant_scale:
-                    setattr(mlp, f"{proj.split('_')[0]}_scale",
-                            self.dequant_scale[key].to(device))
+                scale = self._device_scale(key)
+                if scale is not None:
+                    setattr(mlp, f"{proj.split('_')[0]}_scale", scale)
 
     def _init_fused_kernels(self):
         """Initialize and require the production DSA kernels before serving."""
@@ -977,6 +1095,84 @@ class GLM5ParallelStrategyManager:
 
     def _config_lm_head_hook(self):
         self.model.lm_head.register_forward_pre_hook(self._lm_head_forward_pre_hook)
+
+    @staticmethod
+    def _pack_scales(entries, dtype):
+        """Flatten ``[(key, tensor), ...]`` of one dtype into one pinned buffer.
+
+        Returns ``(staging, layout)`` where ``layout`` is
+        ``[(key, offset, shape), ...]``: every tensor's elements sit
+        contiguously at its offset, so one host-to-device copy of ``staging``
+        followed by one reshaped slice per key reproduces each tensor exactly.
+        """
+        total = sum(tensor.numel() for _, tensor in entries)
+        # Pinning is what makes the single copy async; it is also only
+        # meaningful with a CUDA runtime present.
+        staging = torch.empty(
+            total, dtype=dtype, pin_memory=torch.cuda.is_available()
+        )
+        layout = []
+        offset = 0
+        for key, tensor in entries:
+            count = tensor.numel()
+            staging[offset:offset + count] = tensor.reshape(-1)
+            layout.append((key, offset, tuple(tensor.shape)))
+            offset += count
+        return staging, layout
+
+    def _upload_skeleton_scales(self):
+        """One host-to-device copy for every host-resident FP8 scale.
+
+        Each phase configure used to move these per tensor: the routed experts
+        alone are num_layers x num_experts x 3 separate `.to(device)` calls for
+        a very small total payload, i.e. almost pure launch overhead, paid again
+        on every switch in both directions although the scales never change.
+        They are packed per dtype into one pinned buffer, copied once, and
+        handed out as views.
+
+        Tensors already on the target device are returned as themselves, not
+        repacked: that keeps `share_skeleton_on_device()` (the persistent phase
+        path) handing out exactly the objects it handed out before.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        target = torch.device(device)
+        scales = {}
+        by_dtype = {}
+        for key, tensor in self.skeleton_state_dict.items():
+            if "weight_scale_inv" not in key:
+                continue
+            if tensor.device == target:
+                scales[key] = tensor
+                continue
+            by_dtype.setdefault(tensor.dtype, []).append((key, tensor))
+
+        uploaded = 0
+        for dtype, entries in by_dtype.items():
+            staging, layout = self._pack_scales(entries, dtype)
+            packed = staging.to(device, non_blocking=True)
+            for key, offset, shape in layout:
+                count = 1
+                for dim in shape:
+                    count *= dim
+                scales[key] = packed[offset:offset + count].view(shape)
+            uploaded += len(layout)
+        if by_dtype:
+            torch.cuda.current_stream().synchronize()
+        if self.rank == 0:
+            logging.info(
+                "[SCALES] %d skeleton scale tensors on device (%d uploaded in "
+                "%d bulk copies)",
+                len(scales),
+                uploaded,
+                len(by_dtype),
+            )
+        return scales
+
+    def _device_scale(self, key):
+        """Device copy of skeleton scale ``key``, or None when absent."""
+        if self._device_scales is None:
+            self._device_scales = self._upload_skeleton_scales()
+        return self._device_scales.get(key)
 
     def _extract_dequantize_scale(self):
         self.dequant_scale = {}
