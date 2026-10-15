@@ -6804,6 +6804,7 @@ class BatchGenWorker:
 				seq.host_pages_allocated = 0
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
+				seq.evicted_from_dp_group = None
 				self._sequences_with_gpu_kv.discard(uuid)
 
 		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
@@ -8059,6 +8060,7 @@ class BatchGenWorker:
 							seq.host_pages_allocated = 0
 							seq.host_owned_pages = 0
 							seq.host_token_capacity = 0
+							seq.evicted_from_dp_group = None
 							self._sequences_with_gpu_kv.discard(uuid)
 					# Report completions (pops local_map; runs LAST).
 					# Guard: only report if status actually reached COMPLETED.
@@ -10059,18 +10061,34 @@ class BatchGenWorker:
 		so every packer call site shares one lookup. ``None`` is a valid result:
 		no profile matches, and the packer then balances computed tokens. A
 		profile scores one serve group, so it is keyed by the group size too.
+
+		Every rank must resolve the same profile, or ranks pack differently.
+		Device 0 stands for the node, not this rank's own device, and
+		cross-node GPU homogeneity is a deployment precondition that the launch
+		identity gate verifies; no collective is run here. Each rank logs what
+		it resolved, so a divergence is visible in the logs.
 		"""
 		if not hasattr(self, "_prefix_rank_cost_profile"):
 			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 
 			G = self._decode_attn_tp_size()
-			props = torch.cuda.get_device_properties(self.local_rank)
-			self._prefix_rank_cost_profile = find_executor_cost_profile(
+			group_size = G if G > 1 else 1
+			props = torch.cuda.get_device_properties(0)
+			profile = find_executor_cost_profile(
 				self.model_name or "",
 				(props.major, props.minor),
 				props.total_memory,
 				self.world_size,
-				G if G > 1 else 1,
+				group_size,
+			)
+			self._prefix_rank_cost_profile = profile
+			logging.info(
+				"[PREFIX_PACK] rank %d executor cost profile: model=%s group_size=%d -> %s",
+				self.rank,
+				(self.model_name or "").lower().rsplit("/", 1)[-1],
+				group_size,
+				"none" if profile is None
+				else f"{profile.model}/{profile.machine}/g{profile.group_size}",
 			)
 		return self._prefix_rank_cost_profile
 
@@ -12547,6 +12565,7 @@ class BatchGenWorker:
 					seq.host_pages_allocated = 0
 					seq.host_owned_pages = 0
 					seq.host_token_capacity = 0
+					seq.evicted_from_dp_group = None
 					self._sequences_with_gpu_kv.discard(uuid)
 
 			# Report completions (this is what pops local_map on the owner).

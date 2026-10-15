@@ -7,6 +7,7 @@ exactly unless a group-local profile leaves it unset.
 
 import ast
 import dataclasses
+import logging
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -98,29 +99,44 @@ def _cached_profile_method():
               and node.name == "_cached_prefix_rank_cost_profile"]
     assert len(wanted) == 1
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
-    namespace = {"torch": torch}
+    namespace = {"torch": torch, "logging": logging}
     exec(compile(module, str(WORKER), "exec"), namespace)
     return namespace["_cached_prefix_rank_cost_profile"]
 
 
-@pytest.mark.parametrize("G,expected_group", [(1, 1), (8, 8)])
-def test_worker_lookup_passes_the_serve_group_size(monkeypatch, G, expected_group):
+@pytest.mark.parametrize("G,expected_group,matched", [(1, 1, False), (8, 8, True)])
+def test_worker_lookup_passes_the_serve_group_size(
+    monkeypatch, caplog, G, expected_group, matched
+):
     calls = []
+    devices = []
+    profile = _group_local(group_size=expected_group) if matched else None
 
     def lookup(*args):
         calls.append(args)
-        return "profile"
+        return profile
+
+    def device_properties(index):
+        devices.append(index)
+        return SimpleNamespace(major=9, minor=0, total_memory=141 * GIB)
 
     monkeypatch.setattr(executor_cost, "find_executor_cost_profile", lookup)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_properties",
-        lambda index: SimpleNamespace(major=9, minor=0, total_memory=141 * GIB),
-    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties)
     worker = SimpleNamespace(
-        local_rank=0, world_size=16, model_name="moonshotai/kimi-k3",
+        rank=11, local_rank=3, world_size=16, model_name="moonshotai/Kimi-K3",
         _decode_attn_tp_size=lambda: G,
     )
     worker._cached_prefix_rank_cost_profile = MethodType(_cached_profile_method(), worker)
-    assert worker._cached_prefix_rank_cost_profile() == "profile"
-    assert worker._cached_prefix_rank_cost_profile() == "profile"
-    assert calls == [("moonshotai/kimi-k3", (9, 0), 141 * GIB, 16, expected_group)]
+    with caplog.at_level(logging.INFO):
+        assert worker._cached_prefix_rank_cost_profile() is profile
+        assert worker._cached_prefix_rank_cost_profile() is profile
+    assert calls == [("moonshotai/Kimi-K3", (9, 0), 141 * GIB, 16, expected_group)]
+    # Node-uniform device, not this rank's own local device.
+    assert devices == [0]
+    # Logged once, at first resolution, with the resolved identity.
+    lines = [r.getMessage() for r in caplog.records if "[PREFIX_PACK]" in r.getMessage()]
+    resolved = f"kimi-k3/test/g{expected_group}" if matched else "none"
+    assert lines == [
+        f"[PREFIX_PACK] rank 11 executor cost profile: model=kimi-k3 "
+        f"group_size={expected_group} -> {resolved}"
+    ]
