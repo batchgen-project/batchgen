@@ -524,7 +524,182 @@ def test_every_member_resumes_its_chain_exactly(group, same_chunk):
 
 
 # --------------------------------------------------------------------------- #
-#  (iii) Copy-on-branch: a segment's slot still holds its own end state
+#  (iii) The CONV half on its own: fork, resume and the three conv pools
+# --------------------------------------------------------------------------- #
+#  ``_kda_chunk_segments`` (serving_modules.py:794-842) touches ONLY
+#  ``recurrent_pool`` (index_select 814/835, index_copy_ 818/840). The conv
+#  state is threaded separately, inside ``_kda_prefill_levels``: the fork
+#  copies all FOUR pools (recurrent_pool, conv_q, conv_k, conv_v) at
+#  serving_modules.py:913-921, and the per-level conv calls are at 922-924.
+#  The gate above would catch a conv defect only through the recurrence it
+#  feeds; these tests isolate it, and they are the only ones that look at the
+#  conv pools at all.
+#
+#  Production code does the forking and the sequencing here - the recurrent
+#  kernel is replaced by a recorder, so what is compared IS the conv output
+#  ``_kda_prefill_levels`` produced.
+# --------------------------------------------------------------------------- #
+class ConvRecorder:
+    """A chunk_kda stand-in that records the conv output handed to it."""
+
+    def __init__(self, heads, head_dim):
+        self.heads, self.head_dim = heads, head_dim
+        self.calls = []
+
+    def __call__(self, *, q, k, v, g, beta, initial_state, cu_seqlens, **kw):
+        self.calls.append((q.clone(), k.clone(), v.clone(),
+                           None if cu_seqlens is None else cu_seqlens.clone()))
+        return (torch.zeros(1, q.shape[1], self.heads, self.head_dim,
+                            dtype=v.dtype),
+                torch.zeros_like(initial_state))
+
+
+def run_conv_only(group: int) -> dict:
+    """One group's wave through the production level/fork path, conv isolated."""
+
+    members, prompts, pooled = oracle_wave(group)
+    plan = _plan(prompts, same_chunk=True)
+    weights, kwargs = _KDA._conv_weights(), _KDA._kernel_kwargs()
+    state = _state_pools(len(plan.segments) + len(members) + 4)
+    slots = _KDA.Slots(state)
+    sids = {seg.segment_id: -(1 + seg.segment_id) for seg in plan.segments}
+    recorder = ConvRecorder(_KDA.H, _KDA.D)
+    conv_rows: dict[tuple[str, int], tuple] = {}
+
+    for batch in _batches(plan, prompts):
+        row_ids = [
+            sids[item.ref] if item.kind == "segment" else item.ref
+            for item in batch.items
+        ]
+        slot_ids, has_initial_state = slots.prepare_prefill(row_ids)
+        levels = _LEVELS.state_levels(
+            batch, segment_sids=sids, row_ids=row_ids, slots=slot_ids,
+            has_initial_state=has_initial_state, slot_of=slots.lookup,
+        )
+        before = len(recorder.calls)
+        SM._kda_prefill_levels(
+            _KDA.FAKE_LAYER, recorder, state, levels,
+            *_KDA._split([(int(p), int(t)) for p, t in
+                          zip(batch.position_ids, batch.input_ids)]),
+            weights, kwargs, None,
+        )
+        # One recorded call per level, in level order; map rows to their slice.
+        for level, (q_l, k_l, v_l, bounds) in zip(
+            levels, recorder.calls[before:]
+        ):
+            cuts = _LEVELS.chunk_levels(batch)
+            run = next(c for c in cuts if c.token_start == level.token_start)
+            for row in range(run.row_start, run.row_end):
+                item = batch.items[row]
+                lo = batch.row_bounds[row] - level.token_start
+                hi = batch.row_bounds[row + 1] - level.token_start
+                conv_rows[(item.kind, item.ref)] = (
+                    q_l[0, lo:hi].clone(), k_l[0, lo:hi].clone(),
+                    v_l[0, lo:hi].clone(),
+                )
+    return {"members": members, "prompts": prompts, "plan": plan,
+            "conv_rows": conv_rows, "state": state, "slots": slots,
+            "sids": sids, "weights": weights}
+
+
+_CONV_WAVES: dict[int, dict] = {}
+
+
+def conv_wave(group: int) -> dict:
+    if group not in _CONV_WAVES:
+        _CONV_WAVES[group] = run_conv_only(group)
+    return _CONV_WAVES[group]
+
+
+def whole_prompt_conv(weights, rows):
+    """The three convs over one whole prompt from zero state."""
+
+    state = _state_pools(1)
+    slot = torch.tensor([0], dtype=torch.int32)
+    fresh = torch.zeros(1, dtype=torch.bool)
+    bounds = torch.tensor([0, len(rows)], dtype=torch.int32)
+    q, k, v, _, _ = _KDA._split(rows)
+    (qw, qb), (kw, kb), (vw, vb) = weights
+    out = (
+        _KDA._cpu_conv(q, qw, qb, state.conv_q, bounds, slot, fresh).clone(),
+        _KDA._cpu_conv(k, kw, kb, state.conv_k, bounds, slot, fresh).clone(),
+        _KDA._cpu_conv(v, vw, vb, state.conv_v, bounds, slot, fresh).clone(),
+    )
+    return out, state
+
+
+@pytest.mark.parametrize("group", range(NUM_GROUPS))
+def test_every_member_resumes_its_conv_state_exactly(group):
+    """Per member: the pooled rows' conv output == the whole prompt's.
+
+    A tail resumes the conv from its parent segment's last W-1 = 3 RAW rows.
+    A wrong fork index would give the tail's first 3 tokens another row's
+    context - which is why the SHORTEST tails would suffer most.
+    """
+
+    wave = conv_wave(group)
+    plan, members = wave["plan"], wave["members"]
+    failures = []
+    for index, member in enumerate(members):
+        chain = [seg for seg in plan.segments if index in seg.members]
+        pieces = [wave["conv_rows"][("segment", seg.segment_id)]
+                  for seg in chain]
+        pieces.append(wave["conv_rows"][("tail", index)])
+        expected, _ = whole_prompt_conv(
+            wave["weights"], _KDA._rows_of(member_prompt(member)))
+        for which, name in enumerate(("q", "k", "v")):
+            # The recorder sees what chunk_kda is handed, i.e. the conv output
+            # rearranged "l (h d) -> 1 l h d" (serving_modules.py:928-930).
+            got = torch.cat([piece[which] for piece in pieces])
+            want = expected[which].view(-1, _KDA.H, _KDA.D)
+            if got.shape != want.shape or not torch.equal(got, want):
+                # (tokens, heads, dim) -> one flag per TOKEN, so the index is
+                # the absolute position and not a (token, head) pair.
+                moved = (got != want).flatten(1).any(dim=-1).nonzero()
+                first = int(moved[0, 0]) if moved.numel() else -1
+                failures.append(
+                    f"ch-{member:03d} conv_{name}: first differing token "
+                    f"{first} of {want.shape[0]} (abs pos {first}), "
+                    f"max_abs={(got - want).abs().max().item():.3e}"
+                )
+                break
+    if failures:
+        pytest.fail(
+            f"group {group}: {len(failures)} members' conv output moved; "
+            f"first:\n" + "\n".join(failures[:5])
+        )
+
+
+@pytest.mark.parametrize("group", range(NUM_GROUPS))
+def test_every_segment_slot_still_holds_its_own_conv_state(group):
+    """The conv pools are never inspected anywhere else.
+
+    After the wave each segment's three conv slots must hold the last three
+    RAW rows of ITS OWN range - a child writing its parent's conv slot would
+    corrupt every deeper member.
+    """
+
+    wave = conv_wave(group)
+    state, slots, sids = wave["state"], wave["slots"], wave["sids"]
+    for segment in wave["plan"].segments:
+        _, expected = whole_prompt_conv(
+            wave["weights"], chain_rows(segment.token_end))
+        slot = slots.lookup(sids[segment.segment_id])
+        for pool, reference, name in (
+            (state.conv_q, expected.conv_q, "conv_q"),
+            (state.conv_k, expected.conv_k, "conv_k"),
+            (state.conv_v, expected.conv_v, "conv_v"),
+        ):
+            assert torch.equal(pool[slot], reference[0]), (
+                f"group {group} segment {segment.segment_id} "
+                f"[{segment.token_start}, {segment.token_end}): {name} was "
+                f"overwritten by a child; "
+                f"max_abs={(pool[slot] - reference[0]).abs().max().item():.3e}"
+            )
+
+
+# --------------------------------------------------------------------------- #
+#  (iv) Copy-on-branch: a segment's slot still holds its own end state
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("group", range(NUM_GROUPS))
 def test_every_segment_slot_still_holds_its_own_end_state(group):
