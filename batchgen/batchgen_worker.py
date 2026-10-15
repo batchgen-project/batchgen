@@ -9065,7 +9065,19 @@ class BatchGenWorker:
 		"""
 		pm = self.parallel_manager
 		self._assert_kv_pool_addresses_are_fixed("decode->prefill")
+		manager = self.gpu_paged_kv_cache_manager
+		pages = manager.get_stats().num_total_pages if manager is not None else 0
+		start = time.perf_counter()
 		self._destroy_gpu_paged_kv_cache()
+		if manager is not None:
+			logging.info(
+				"[GPU-KV] rank=%d released the reserved KV pool's physical "
+				"pages in %.3fs (%d pages, %.2f GB)",
+				self.rank,
+				time.perf_counter() - start,
+				pages,
+				self.gpu_kv_cache_size_gb,
+			)
 		if getattr(pm, "decode_experts_resident", False):
 			pm.release_decode_routed_experts()
 

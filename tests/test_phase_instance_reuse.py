@@ -175,16 +175,22 @@ def test_a_built_instance_is_reusable():
 # ---------------------------------------------------------------------------
 
 
-def _release_worker(*, experts_resident=True, graph=True, fixed_pool=True):
+def _release_worker(
+    *, experts_resident=True, graph=True, fixed_pool=True, logged=None
+):
+    logged = [] if logged is None else logged
     cls = _isolated(
         [
             "_release_reused_decode_instance",
             "_assert_kv_pool_addresses_are_fixed",
             "_decode_graph_state_present",
-        ]
+        ],
+        time=SimpleNamespace(perf_counter=lambda: 0.0),
+        logging=SimpleNamespace(info=lambda *a, **k: logged.append(a)),
     )
     worker = cls()
     worker.rank = 4
+    worker.gpu_kv_cache_size_gb = 18.5
     calls = []
     pm = SimpleNamespace(
         decode_experts_resident=experts_resident,
@@ -192,7 +198,8 @@ def _release_worker(*, experts_resident=True, graph=True, fixed_pool=True):
     )
     worker.parallel_manager = pm
     worker.gpu_paged_kv_cache_manager = SimpleNamespace(
-        uses_fixed_address_pool=fixed_pool
+        uses_fixed_address_pool=fixed_pool,
+        get_stats=lambda: SimpleNamespace(num_total_pages=3307),
     )
     worker._destroy_gpu_paged_kv_cache = lambda **kw: calls.append(
         ("destroy_kv", tuple(sorted(kw.items())))
@@ -218,6 +225,33 @@ def test_release_returns_the_kv_physical_pages_and_unmaps_the_experts():
     worker._release_reused_decode_instance()
 
     assert calls == [("destroy_kv", ()), "release_experts"]
+
+
+def test_release_logs_the_physical_kv_release():
+    """The d->p release is observable, as the p->d remap already is.
+
+    One line per rank with the page count it gave back: the evidence that the
+    pool's physical memory left the device for the prefill phase.
+    """
+    logged = []
+    worker, _ = _release_worker(logged=logged)
+
+    worker._release_reused_decode_instance()
+
+    assert len(logged) == 1
+    fmt, rank, _seconds, pages, size_gb = logged[0]
+    assert "released the reserved KV pool's physical pages" in fmt
+    assert (rank, pages, size_gb) == (4, 3307, 18.5)
+
+
+def test_release_without_a_pool_logs_nothing():
+    logged = []
+    worker, _ = _release_worker(logged=logged)
+    worker.gpu_paged_kv_cache_manager = None
+
+    worker._release_reused_decode_instance()
+
+    assert logged == []
 
 
 def test_release_is_idempotent_when_the_experts_are_already_unmapped():
