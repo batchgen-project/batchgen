@@ -74,7 +74,8 @@ def test_declined_waves_keep_their_hits_and_pooled_waves_release_them():
                 assert not any(
                     _calls(prior, "_replace_prefix_lookup_hits") for prior in body[:index]
                 ), f"return None at line {stmt.lineno} must keep its lookup hits"
-    # no budget yet / pool under scratch bound / nothing shared
+    # no budget yet / pool under scratch bound / nothing shared or no
+    # state slots
     assert declines == 3
     # The pooled return releases hits exactly once, per chain end.
     assert len(_calls(plan, "_replace_prefix_lookup_hits")) == 1

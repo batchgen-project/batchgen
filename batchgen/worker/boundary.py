@@ -513,4 +513,11 @@ class BoundaryHandler:
             new_load_uuids=new_load_uuids,
             decode_uuids_final=decode_uuids_final,
             scheduler_error=scheduler_error,
+            host_planned_free_pages=(
+                {
+                    node: int(info['expected_free_pages'])
+                    for node, info in per_node_growth_plans.items()
+                }
+                if per_node_growth_plans else None
+            ),
         )

@@ -150,14 +150,17 @@ def pool_prefill_attention(
 
     Every row reads its pooled ancestors plus its own tokens through its page
     table, so the write must cover the whole chunk before attention runs.
+
+    K and V are indexed with their own head dim: a GQA model keeps one dim for
+    both, an MLA model attending on the expanded heads keeps a wider K than V
+    (192 against 128 per head on Kimi-K3).
     """
 
     from batchgen.attention.gqa import gqa_extend_fa
 
     k_cache, v_cache = pool.k[layer_idx], pool.v[layer_idx]
-    heads, dim = k_cache.shape[-2:]
-    k_cache.view(-1, heads, dim).index_copy_(0, batch.slots, key)
-    v_cache.view(-1, heads, dim).index_copy_(0, batch.slots, value)
+    k_cache.view(-1, *k_cache.shape[-2:]).index_copy_(0, batch.slots, key)
+    v_cache.view(-1, *v_cache.shape[-2:]).index_copy_(0, batch.slots, value)
     return gqa_extend_fa(
         q=query,
         k_cache=k_cache,

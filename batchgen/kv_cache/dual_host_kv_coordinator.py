@@ -357,6 +357,12 @@ class DualHostKVCoordinator:
 				)
 			raise
 
+	def set_sequence_pages(self, sequence_id, page_ids) -> None:
+		self.primary.set_sequence_pages(sequence_id, page_ids)
+		self.require_auxiliary("set_sequence_pages").set_sequence_pages(
+			sequence_id, page_ids
+		)
+
 	def allocate_pages_for_sequences(self, seq_token_pairs) -> None:
 		seq_token_pairs = list(seq_token_pairs)
 		sequence_ids = [seq_id for seq_id, _ in seq_token_pairs]

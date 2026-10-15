@@ -201,7 +201,10 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
     # TP8-sharded latent projections (8.3 GiB) + vocab-parallel embed/lm_head (3.84 GiB) -> 256 KDA slots/node
     assert config.Module_Batching_Config.k3_shard_latent_projections is True
     assert config.Module_Batching_Config.k3_shard_vocab_parallel is True
-    assert config.GPU_Buffer_Config.kda_state_slots == 257
+    # 256 user slots + 1 graph scratch + the prefix-pool segment reserve, which
+    # prefill_sequence_limits holds back so admission still sees exactly 256.
+    assert config.GPU_Buffer_Config.kda_prefix_segment_slots == 16
+    assert config.GPU_Buffer_Config.kda_state_slots == 257 + 16
     assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 256
     # the admission cap itself must be a bucket: a full batch with a lower top
     # bucket has no graph and silently runs eager for the whole run

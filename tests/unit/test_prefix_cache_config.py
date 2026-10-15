@@ -19,6 +19,7 @@ _SPEC.loader.exec_module(_CONFIG)
 
 PrefixKVGroupSemantic = _CONFIG.PrefixKVGroupSemantic
 build_prefix_cache_runtime_config = _CONFIG.build_prefix_cache_runtime_config
+prefix_reuse_requires_prefill_pool = _CONFIG.prefix_reuse_requires_prefill_pool
 require_prefix_cache_model_support = _CONFIG.require_prefix_cache_model_support
 
 _SHM = "batchgen_lane_0123.prefix_cache"
@@ -181,7 +182,7 @@ def test_namespace_changes_with_kv_dtype_or_page_geometry():
 
 @pytest.mark.parametrize(
     "model_name",
-    ["moonshotai/kimi-k3", "zai-org/glm-5", "minimax-m2.5"],
+    ["moonshotai/Kimi-K2.5", "zai-org/glm-5", "minimax-m2.5"],
 )
 def test_unsupported_models_fail_loud(model_name):
     with pytest.raises(ValueError, match="currently supports only"):
@@ -298,3 +299,81 @@ def test_dsa_and_full_kv_namespaces_differ():
         shm_name=_SHM,
     )
     assert glm.namespace_digest != gpt.namespace_digest
+
+
+def _k3_host_config(**overrides):
+    # kimi_k3_mla: the 24 physical MLA layers of the 93 engine layers, one
+    # 576-dim latent head, no V, page 64.
+    return _host_config(num_layers=24, num_k_heads=1, k_head_dim=576,
+                        num_v_heads=0, v_head_dim=0, **overrides)
+
+
+def _k3_config(**kwargs):
+    return build_prefix_cache_runtime_config(
+        model_name="moonshotai/Kimi-K3",
+        kv_dtype="bfloat16",
+        host_kv_config=_k3_host_config(),
+        shm_name=_SHM,
+        **kwargs,
+    )
+
+
+def test_kimi_k3_gets_one_mla_latent_group():
+    config = _k3_config()
+
+    assert [spec.semantic for spec in config.group_specs] == [
+        PrefixKVGroupSemantic.MLA_LATENT
+    ]
+    assert [spec.group_id for spec in config.group_specs] == [0]
+    assert config.group_specs[0].required_for_reuse
+    assert config.hash_block_tokens == config.publish_boundary_tokens == 64
+    assert config.max_group_entries == 4097
+    assert config.max_page_handles == 4096
+    assert config.host_page_bytes_all_layers == 24 * 64 * 576 * 2
+
+
+def test_kimi_k3_has_no_aux_region_and_its_own_namespace():
+    with pytest.raises(ValueError, match="no aux Host-KV region"):
+        _k3_config(aux_host_kv_config=_k3_host_config())
+
+    gpt = build_prefix_cache_runtime_config(
+        model_name="openai/gpt-oss-120b",
+        kv_dtype="bfloat16",
+        host_kv_config=_host_config(),
+        shm_name=_SHM,
+    )
+    digest = _k3_config().namespace_digest
+    assert digest != _glm_config("zai-org/GLM-5.3-FP8").namespace_digest
+    assert digest != gpt.namespace_digest
+
+
+def test_kimi_k3_group_converts_to_the_core_mla_semantic():
+    class CoreConfig:
+        pass
+
+    class CoreGroupSpec:
+        pass
+
+    core = SimpleNamespace(
+        HostPrefixCacheConfig=CoreConfig,
+        HostKVGroupSpec=CoreGroupSpec,
+        HostKVGroupSemantic=SimpleNamespace(
+            FULL_KV="full-kv-enum", MLA_COMPRESSED_KV="mla-enum"
+        ),
+    )
+    converted = _k3_config().to_core_config(core)
+
+    assert [spec.semantic for spec in converted.group_specs] == ["mla-enum"]
+
+
+def test_only_the_pool_serves_k3_and_dsa_reuse():
+    # K3 and DSA have no cross-wave materialization path; GPT-OSS keeps both.
+    assert prefix_reuse_requires_prefill_pool(
+        require_prefix_cache_model_support("moonshotai/Kimi-K3")
+    )
+    assert prefix_reuse_requires_prefill_pool(
+        require_prefix_cache_model_support("zai-org/GLM-5.3-FP8")
+    )
+    assert not prefix_reuse_requires_prefill_pool(
+        require_prefix_cache_model_support("openai/gpt-oss-120b")
+    )
