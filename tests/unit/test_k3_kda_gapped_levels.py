@@ -3,7 +3,20 @@
 #  Copyright (c) 2025-2026 BatchGen Team                                        #
 #  Licensed under the Apache License, Version 2.0                               #
 # ---------------------------------------------------------------------------- #
-"""The KDA level/fork path on the LIVE two-group gapped chain wave.
+"""The KDA level/fork path on a PAGE-ALIGNED two-group gapped chain wave.
+
+CORRECTION (2026-10-15, from the schema-2 kernel dumps of the live two-node
+run): this file's wave is not the live one. Every row's own length here is a
+multiple of ``_KDA_CHUNK_SIZE`` and every prompt is a prefix of one chain; the
+live wave is ``L(k) = 525 + 313k`` with a 40-token per-member template suffix,
+so every tail is RAGGED and no prompt is a prefix of the next. That difference
+is load-bearing for a recurrent layer: a packed level call whose earlier row is
+ragged starts its next row off the chunk grid. With a chunk grid deliberately
+anchored at the packed buffer instead of per sequence,
+``tests/unit/test_k3_kda_live_wave_levels.py`` (the live shape) fails on 62 of
+64 members while this file passes on all 64. Keep both; a clean run here does
+not exonerate the live shape.
+
 
 ``tests/unit/test_k3_kda_pool_levels.py`` pins the recurrent half of the prefix
 pool on small hand-built trees (one two-block segment, and a depth-3 binary

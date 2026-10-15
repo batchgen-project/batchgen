@@ -3,7 +3,21 @@
 #  Copyright (c) 2025-2026 BatchGen Team                                        #
 #  Licensed under the Apache License, Version 2.0                               #
 # ---------------------------------------------------------------------------- #
-"""The live two-group gapped chain wave, down to the pool attention kernel args.
+"""A page-aligned two-group gapped chain wave, down to the pool attention args.
+
+CORRECTION (2026-10-15, from the schema-2 kernel dumps of the live two-node
+run): the wave shape below is NOT the one the live corruption appeared in. It
+uses page-aligned prompt lengths (32..158 whole pages) nested in one chain,
+which the planner then spreads over 32 chunks. The live wave is
+``L(k) = 525 + 313k`` with a 40-token per-member TEMPLATE SUFFIX, so a member
+leaves the chain INSIDE a page and every tail ends on a partially filled one,
+and the whole wave is ONE level-ordered chunk per group.
+``tests/unit/test_k3_pool_live_wave_oracle.py`` is that shape, verified
+against the dumps; this file remains a valid - and cheaper - exercise of the
+same code on a page-aligned wave, but a clean run here does NOT exonerate the
+live shape. Measured: a chunk-grid defect that the true shape catches on 62 of
+64 members is invisible to this one on all 64.
+
 
 Round 1 (``tests/unit/test_prefix_gapped_chain_plan.py``) cleared the planner
 and the executor layout; the Host-side offload bytes were then verified on the
