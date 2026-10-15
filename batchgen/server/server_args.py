@@ -83,6 +83,9 @@ class ServerArgs:
     cache_dir: Optional[Path] = None
     converted_ckpt_dir: Optional[Path] = None
     distributed_weight_config: Optional[Path] = None
+    # Explicit opt-in to the replicated parameter server on Kimi-K3 multi-node,
+    # where the distributed host-weight store is the default path.
+    replicated_weights: bool = False
     # Enable the DeepEP low-latency EP exchange for the decode graph (generic across
     # EP models). Default off = NCCL all_gather + reduce_scatter; on requires the
     # DeepEP build and fails fast at startup if it is unavailable (no silent NCCL fallback).
@@ -246,6 +249,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "Node-local distributed host-weight source configuration. "
             "When set, the server skips the replicated parameter server and "
             "workers map the compact store described by this file."
+        ),
+    )
+    parser.add_argument(
+        "--replicated-weights",
+        action="store_true",
+        default=False,
+        help=(
+            "Explicit opt-in to the replicated parameter server for Kimi-K3 "
+            "multi-node serving (the distributed host-weight store is the "
+            "default there; see docs/deploy-kimi-k3-h200.md §6)."
         ),
     )
     parser.add_argument(
@@ -619,6 +632,12 @@ def validate_server_args(args: ServerArgs) -> None:
 
         require_prefix_cache_model_support(args.model)
     validate_shared_runtime_capability(args)
+    if args.distributed_weight_config is not None and args.replicated_weights:
+        raise ValueError(
+            "--distributed-weight-config and --replicated-weights are "
+            "contradictory: pick either the distributed host-weight store or "
+            "the replicated parameter server, not both"
+        )
     if args.distributed_weight_config is not None:
         if not args.distributed_weight_config.is_file():
             raise ValueError(
@@ -634,6 +653,26 @@ def validate_server_args(args: ServerArgs) -> None:
                 "Kimi-K3 distributed host weights require "
                 "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
             )
+    elif (
+        "kimi-k3" in args.model.lower()
+        and args.nnodes > 1
+        and not args.replicated_weights
+    ):
+        # The distributed host-weight store is the default Kimi-K3 multi-node
+        # path (POIS decision 2026-10-15). The replicated parameter server
+        # stages ~1454 GiB per node, which does not fit shared multi-tenant
+        # 2 TB hosts -- three host OOMs on 2026-10-15, matching the
+        # multi-tenant warning in docs/deploy-kimi-k3-h200.md -- whereas the
+        # store's RDMA path was profile-validated on the original H20
+        # deployment. Single-node Kimi-K3 keeps the replicated path untouched.
+        raise ValueError(
+            "Kimi-K3 multi-node defaults to the distributed host-weight "
+            "store: pass --distributed-weight-config <node.json> (build the "
+            "store as described in docs/deploy-kimi-k3-h200.md §6), or opt in "
+            "to the replicated parameter server with --replicated-weights "
+            "(it needs roughly 1.5 TiB of free host memory per node and is "
+            "not safe on shared nodes)"
+        )
     if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
         raise ValueError("watchdog_timeout must be non-negative (0 to disable)")
     if args.watchdog_heartbeat_interval is not None:
@@ -766,6 +805,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         cache_dir=parsed.cache_dir,
         converted_ckpt_dir=parsed.converted_ckpt_dir,
         distributed_weight_config=parsed.distributed_weight_config,
+        replicated_weights=parsed.replicated_weights,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,

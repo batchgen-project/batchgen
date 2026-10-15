@@ -96,6 +96,15 @@ replicated ~1454 GiB store can trip a **pod eviction / container restart** from 
 pressure *even when the container's own cgroup limit is unlimited* — the ~838 GiB/node
 distributed-weight store (§6) is the reliable path there.
 
+### Choose the weight source (required on multiple nodes)
+
+Multi-node Kimi-K3 **defaults to the compact per-node distributed-weight store** (§6): launch
+without `--distributed-weight-config` and the server aborts at argument validation, naming the
+flag. The replicated parameter server the commands below use is still available, but it is now an
+explicit `--replicated-weights` opt-in — add that flag to both nodes, and only where ~1.5 TiB of
+host memory per node is genuinely free (never on a shared / multi-tenant host). Single-node launches
+are unaffected.
+
 ### NCCL environment (optional tuning)
 
 ```bash
@@ -111,6 +120,7 @@ python -m batchgen.launch_http_server \
     --listen-port 10900 \
     --world-size 16 --nnodes 2 --node-rank 0 \
     --dist-init-addr node0-ip:12355 \
+    --replicated-weights \
     --kv-dtype bf16 \
     --host-kv-cache-size 512 \
     --gpu-memory-frac 0.85 \
@@ -129,6 +139,7 @@ python -m batchgen.launch_http_server \
     --listen-port 10900 \
     --world-size 16 --nnodes 2 --node-rank 1 \
     --dist-init-addr node0-ip:12355 \
+    --replicated-weights \
     --kv-dtype bf16 \
     --host-kv-cache-size 512 \
     --gpu-memory-frac 0.85 \
@@ -171,7 +182,8 @@ create a batch, and download results.
 
 ## 6. Optional: DeepEP and Distributed Weights
 
-Both are opt-in; the defaults above run without either.
+DeepEP is opt-in. The distributed-weight store is the **default** multi-node weight source: the
+commands in §4 reach the replicated parameter server only because they pass `--replicated-weights`.
 
 - **`--enable-deepep`** — use the DeepEP low-latency expert-parallel exchange for the decode
   graph instead of the default NCCL all-gather + reduce-scatter. It requires a DeepEP build

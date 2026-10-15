@@ -83,11 +83,14 @@ def test_distributed_weights_require_eight_ranks_per_node(tmp_path):
 
 
 def test_topology_rules_apply_only_to_distributed_host_weights(tmp_path):
-    # Without --distributed-weight-config any positive world_size stands.
+    # Off the distributed store any positive world_size stands. Kimi-K3
+    # multi-node now defaults to that store, so the replicated path this case
+    # describes has to be requested explicitly.
     validate_server_args(
         _args(
             tmp_path,
             distributed_weight_config=None,
+            replicated_weights=True,
             nnodes=3,
             world_size=24,
         )
