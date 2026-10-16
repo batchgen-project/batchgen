@@ -48,6 +48,7 @@ absorbed into a tolerance.
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import pytest
@@ -409,7 +410,12 @@ def test_every_legal_block_h_gives_identical_bits():
     picks BLOCK_H from the bucket width, so the result must not depend on it.
     """
     pytest.importorskip("batchgen_kernels")
-    from batchgen_kernels.triton import fused_rmsnorm_rope as frr
+    # ``batchgen_kernels.triton.__init__`` re-exports a function named
+    # ``fused_rmsnorm_rope``, which shadows the submodule of the same name, so
+    # ``from batchgen_kernels.triton import fused_rmsnorm_rope`` hands back the
+    # function, not the module. Resolve the module by its dotted name, which
+    # always comes from ``sys.modules``.
+    frr = importlib.import_module("batchgen_kernels.triton.fused_rmsnorm_rope")
 
     bsz, num_heads, kv_lora_rank, rope_dim = 64, GLM52_HEADS, 512, 64
     kv, q_pe, cos, sin, positions, weight = _inputs(
