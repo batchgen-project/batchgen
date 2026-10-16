@@ -659,6 +659,15 @@ class KimiLinearParallelStrategyManager:
         # Restores the old model's forwards and drops its captured buckets;
         # None-safe, so the first build is a no-op.
         self.release_decode_graph()
+        # The FP32 combine output of the previous model's last resident prefill
+        # is class-level, so nothing above drops it: a new model's passes
+        # reserve their own (``prepare_prefill_output``), and holding the dead
+        # pass's buffer across every rebuild is a per-switch leak.
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        ResidentEPMXFP4MoELayer.release_prefill_output()
 
     def _assert_resident_ep_attached(self):
         """The resident shard must be ON the live model when the flag says so.
@@ -696,16 +705,22 @@ class KimiLinearParallelStrategyManager:
         addresses and must be released first; configure_decoding rebuilds the
         shard and reinstalls/captures graphs before the next decode forward.
         """
-        if not self._resident_ep_built:
-            return 0
-
-        self.release_decode_graph()
-
+        # Class-level, so it belongs to the PASS that allocated it and not to
+        # any model instance: it must go back whether or not a shard is
+        # currently attached. Keeping this above the flag check is load-bearing
+        # — once a rebuild clears the flag (``_reset_model_attached_state``),
+        # everything below is skipped, and leaving the FP32 combine
+        # output of a finished prefill mapped would be a per-switch leak.
         from batchgen.moe.fused_moe_mxfp4_resident import (
             ResidentEPMXFP4MoELayer,
         )
 
         ResidentEPMXFP4MoELayer.release_prefill_output()
+        if not self._resident_ep_built:
+            return 0
+
+        self.release_decode_graph()
+
         released_bytes = 0
         released_layers = 0
         for layer in self.model.model.layers:

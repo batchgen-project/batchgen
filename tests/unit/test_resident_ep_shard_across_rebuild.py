@@ -188,3 +188,55 @@ def test_the_resident_build_checks_the_claim_on_the_skip_path():
     check = body.index("self._assert_resident_ep_attached()")
     build = body.index("_resident_ep_built = True")
     assert guard < check < build
+
+
+# -------------------------------------------- pass-scoped scratch buffers --- #
+#
+# ``ResidentEPMXFP4MoELayer._prefill_y`` is the FP32 combine output a
+# resident prefill reserves. It is CLASS level, so it survives the model that
+# used it: it belongs to the pass, and every switch must give it back or the
+# rebuild path grows by one buffer per cycle. Once a rebuild clears
+# ``_resident_ep_built``, everything below that flag check is skipped, so the
+# release cannot live there.
+
+
+def _resident_class():
+    from batchgen.moe.fused_moe_mxfp4_resident import ResidentEPMXFP4MoELayer
+
+    return ResidentEPMXFP4MoELayer
+
+
+def _release_resident(psm):
+    function = _methods(("_release_resident_ep_decode",))[
+        "_release_resident_ep_decode"
+    ]
+    return MethodType(function, psm)()
+
+
+def test_the_pass_scratch_is_released_even_with_the_flag_already_cleared():
+    resident = _resident_class()
+    resident._prefill_y = object()
+    psm = _psm(model=_model(attached=False), built=False)
+    try:
+        assert _release_resident(psm) == 0      # nothing attached to release
+        assert resident._prefill_y is None     # ... but the scratch went back
+    finally:
+        resident._prefill_y = None
+
+
+def test_the_reset_releases_the_pass_scratch_of_the_dead_model():
+    resident = _resident_class()
+    resident._prefill_y = object()
+    psm = _psm(model=_model(attached=True), built=True, graph=_Graph())
+    try:
+        psm._reset_model_attached_state()
+        assert resident._prefill_y is None
+    finally:
+        resident._prefill_y = None
+
+
+def test_the_scratch_release_precedes_the_flag_check():
+    body = ast.unparse(_method_ast("_release_resident_ep_decode"))
+    release = body.index("ResidentEPMXFP4MoELayer.release_prefill_output()")
+    flag = body.index("if not self._resident_ep_built:")
+    assert release < flag
