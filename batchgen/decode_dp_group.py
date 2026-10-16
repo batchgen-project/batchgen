@@ -142,6 +142,59 @@ def assign_decode_dp_groups(
     return groups
 
 
+def decode_group_plan_digest(pairs: Sequence[tuple]) -> int:
+    """Fold a ``(global_idx, decode_dp_group)`` map into one comparable int.
+
+    The serve-group map IS the ownership decision: ``rank_in_decode_group``
+    makes every rank bind, prefill and decode exactly the sequences its own
+    copy of the map claims. Two ranks that derive different maps therefore
+    disagree about who holds a sequence, and the disagreement only surfaces
+    much later — as a missing KDA state item or a missing local row — on a
+    rank that never ran the prefill. One digest per rank turns that into a
+    single comparison at the moment the map is stamped.
+
+    Sorted by ``global_idx`` so the digest depends on the MAP, not on the
+    order the caller enumerated it in: two ranks may legitimately walk their
+    candidate lists in a different order, and that must not read as a
+    divergence. A group of ``None`` (not yet stamped) folds as -1, so a map
+    that is merely incomplete on one rank is caught too.
+    """
+    modulus = (1 << 61) - 1
+    digest = 146_527
+    for global_idx, group in sorted(pairs, key=lambda item: int(item[0])):
+        digest = (digest * 1_000_003 + int(global_idx) + 1) % modulus
+        digest = (digest * 1_000_003
+                  + (-1 if group is None else int(group)) + 2) % modulus
+    return digest
+
+
+def first_group_disagreement(
+    global_idxs: Sequence[int], group_views: Sequence[Sequence[int]]
+) -> Optional[tuple]:
+    """First sequence whose group differs across ranks: ``(global_idx, groups)``.
+
+    ``group_views[r][i]`` is rank ``r``'s group for ``global_idxs[i]``. Returns
+    ``None`` when every rank agrees on every entry, so the caller can report
+    the exact sequence instead of only "the digests differ".
+    """
+    if not group_views:
+        return None
+    width = len(global_idxs)
+    for view in group_views:
+        if len(view) != width:
+            raise ValueError(
+                f"group view has {len(view)} entries for {width} sequences"
+            )
+    for index in range(width):
+        seen = {int(view[index]) for view in group_views}
+        if len(seen) > 1:
+            return (
+                int(global_idxs[index]),
+                tuple(int(view[index]) for view in group_views),
+            )
+    return None
+
+
 def moe_ntp_from_group_max(max_group_batch: int, group_size: int) -> int:
     """Per-rank resident-EP MoE row count after the intra-group row scatter.
 
