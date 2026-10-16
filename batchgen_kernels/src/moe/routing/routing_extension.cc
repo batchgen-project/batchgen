@@ -45,7 +45,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              torch::Tensor topk_weights,
              c10::optional<torch::Tensor> num_valid_tokens,
              c10::optional<torch::Tensor> latent_out,
-             c10::optional<int64_t> latent_offset) {
+             c10::optional<int64_t> latent_offset,
+             c10::optional<torch::Tensor> rank_token_counts,
+             c10::optional<int64_t> rows_per_rank) {
               return gate_sigmoid_topk_cuda(
                   router_logits, e_score_correction, k, routed_scaling_factor,
                   topk_indices, topk_weights,
@@ -54,7 +56,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                   // 0 can never be a valid offset (it would overlap the router
                   // columns), so an omitted offset fails closed in the CUDA
                   // implementation rather than reading the wrong columns.
-                  latent_offset.value_or(0));
+                  latent_offset.value_or(0),
+                  rank_token_counts.value_or(torch::Tensor()),
+                  // 0 rows per rank is rejected whenever the counts are given,
+                  // so an omitted value cannot pass as a real block size.
+                  rows_per_rank.value_or(0));
           },
           "Gate: fused sigmoid + top-k + normalize + scale (CUDA, K2.5/K3)",
           py::arg("router_logits"),
@@ -65,7 +71,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_weights"),
           py::arg("num_valid_tokens") = c10::nullopt,
           py::arg("latent_out") = c10::nullopt,
-          py::arg("latent_offset") = c10::nullopt);
+          py::arg("latent_offset") = c10::nullopt,
+          py::arg("rank_token_counts") = c10::nullopt,
+          py::arg("rows_per_rank") = c10::nullopt);
 
     m.def("router_bias_cast", &router_bias_cast_cuda,
           "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",

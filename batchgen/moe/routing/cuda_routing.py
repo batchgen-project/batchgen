@@ -72,6 +72,7 @@ def gate_sigmoid_topk_cuda(
     topk_indices=None, topk_weights=None,
     num_valid_tokens=None,
     latent_out=None, latent_offset=None,
+    rank_token_counts=None, rows_per_rank=None,
 ):
     """
     CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5, K3).
@@ -104,11 +105,44 @@ def gate_sigmoid_topk_cuda(
             ``num_valid_tokens`` are written as zero.
         latent_offset: first latent column within the ``router_logits`` row
             stride. Required whenever ``latent_out`` is given.
+        rank_token_counts: device int64 [R] (optional). The EP all-gathered
+            padding shape: the ``N`` rows are ``R`` contiguous blocks of
+            ``rows_per_rank`` rows and block ``r`` is live only up to
+            ``rank_token_counts[r]``, so the live rows are NOT a prefix of
+            ``N``. Padding rows get index -1 / weight 0, same as the
+            ``num_valid_tokens`` prefix shape. Mutually exclusive with
+            ``num_valid_tokens`` — the two describe different geometries and
+            combining them would silently drop one.
+        rows_per_rank: rows per rank block. Required whenever
+            ``rank_token_counts`` is given, and meaningless without it.
 
     Returns:
         topk_indices: [N, K] int32
         topk_weights: [N, K] FP32
     """
+    # Argument-shape policy is enforced before the extension loads so a caller
+    # mistake is a named Python error, not a CUDA-side abort mid-capture.
+    if rank_token_counts is not None:
+        if num_valid_tokens is not None:
+            raise ValueError(
+                "rank_token_counts and num_valid_tokens are mutually exclusive "
+                "padding descriptions; pass exactly one"
+            )
+        if rows_per_rank is None:
+            raise ValueError(
+                "rows_per_rank is required when rank_token_counts is given"
+            )
+        if int(rows_per_rank) <= 0:
+            raise ValueError(
+                f"rows_per_rank must be positive, got {rows_per_rank}"
+            )
+    elif rows_per_rank is not None:
+        raise ValueError(
+            "rows_per_rank is only meaningful together with rank_token_counts"
+        )
+    if latent_out is not None and latent_offset is None:
+        raise ValueError("latent_offset is required when latent_out is given")
+
     ext = _get_ext()
     N = router_logits.shape[0]
     device = router_logits.device
@@ -133,17 +167,17 @@ def gate_sigmoid_topk_cuda(
     # Preserve the legacy K2.5/GLM call exactly: the extension's trailing
     # arguments are Python optionals, so callers without a live-row scalar or a
     # latent epilogue should not create even a zero-sized CUDA tensor inside
-    # graph capture.
+    # graph capture. Only the options the caller actually asked for are sent.
+    opts = {}
+    if num_valid_tokens is not None:
+        opts["num_valid_tokens"] = num_valid_tokens
     if latent_out is not None:
-        if latent_offset is None:
-            raise ValueError("latent_offset is required when latent_out is given")
-        result = ext.gate_sigmoid_topk(
-            *args, num_valid_tokens, latent_out, int(latent_offset)
-        )
-    elif num_valid_tokens is not None:
-        result = ext.gate_sigmoid_topk(*args, num_valid_tokens)
-    else:
-        result = ext.gate_sigmoid_topk(*args)
+        opts["latent_out"] = latent_out
+        opts["latent_offset"] = int(latent_offset)
+    if rank_token_counts is not None:
+        opts["rank_token_counts"] = rank_token_counts
+        opts["rows_per_rank"] = int(rows_per_rank)
+    result = ext.gate_sigmoid_topk(*args, **opts)
     return result[0], result[1]
 
 

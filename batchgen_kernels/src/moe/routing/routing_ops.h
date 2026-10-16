@@ -66,7 +66,13 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor latent_out,         // optional [N, L] BF16 pre-allocated: K3's
                                       // latent suffix of the same fused GEMM row,
                                       // cast in place. Undefined/empty disables it.
-    int64_t latent_offset             // column where the latent suffix starts
+    int64_t latent_offset,            // column where the latent suffix starts
+    torch::Tensor rank_token_counts,  // optional device int64 [R]: the EP
+                                      // all-gathered padding shape, R blocks of
+                                      // rows_per_rank rows each live up to
+                                      // rank_token_counts[r]. Mutually exclusive
+                                      // with num_valid_tokens.
+    int64_t rows_per_rank             // rows per rank block; 0 without the above
 );
 
 // GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits.
