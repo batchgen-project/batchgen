@@ -201,8 +201,11 @@ class KimiLinearParallelStrategyManager:
         self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
         self._attn_tp_group = None  # torch NCCL sub-group, built at configure
         # World-level, so built once per process and reused by every later
-        # model rebuild (``_build_attn_tp_group``).
+        # model rebuild (``_build_attn_tp_group``). The signature is the
+        # (world_size, attention TP degree) the live groups were built for; a
+        # later build request that disagrees is refused by name there.
         self._attn_tp_groups_built = False
+        self._attn_tp_group_signature = None
         # Weight assembly has its own communicator.  The streamed-SP8
         # prefetcher launches the next layer's six all-gathers from a host
         # thread while the main thread runs the next layer's attention.  A
@@ -1865,7 +1868,26 @@ class KimiLinearParallelStrategyManager:
         """
         if self._attn_tp_size <= 1:
             return
+        # The topology the live groups were built for. It is immutable for the
+        # life of the process today (both values are fixed at construction),
+        # so a later call that disagrees is a lifecycle error, not a request
+        # to rebuild: say so by name instead of handing back groups that no
+        # longer describe the world.
+        signature = (int(self.world_size), int(self._attn_tp_size))
         if self._attn_tp_groups_built:
+            if signature != self._attn_tp_group_signature:
+                raise RuntimeError(
+                    "attention TP topology changed in-process after the NCCL "
+                    "sub-groups were built: they were created for "
+                    "(world_size, attention_group_size)="
+                    f"{self._attn_tp_group_signature} and this call asks for "
+                    f"{signature}. The groups are world-level and cannot be "
+                    "rebuilt here (torch drops a group only at "
+                    "destroy_process_group, which no phase switch calls, and "
+                    "the live ones are already baked into captured decode "
+                    "graphs), so the new topology is refused rather than "
+                    "silently served with the old communicators."
+                )
             # Build ONCE per process. A NCCL sub-group is a world-level
             # resource: ``dist.new_group`` keeps every group it creates in
             # torch's global registry for the life of the process (only
@@ -1905,8 +1927,10 @@ class KimiLinearParallelStrategyManager:
             if g == self._attn_tp_group_id:
                 self._weight_tp_group = grp
         self._build_cross_weight_group()
-        # Every family is up; later rebuilds reuse them (see the guard above).
+        # Every family is up; later rebuilds reuse them (see the guard above),
+        # and the signature records the topology they belong to.
         self._attn_tp_groups_built = True
+        self._attn_tp_group_signature = signature
 
     def _build_cross_weight_group(self):
         """Build the eight cross-node weight groups (hierarchical GDR only).

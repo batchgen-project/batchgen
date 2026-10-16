@@ -87,6 +87,7 @@ def _psm(*, attn_tp_size=G, rank=0, built=False):
         _cross_weight_root=None,
         _cross_weight_source=None,
         _attn_tp_groups_built=built,
+        _attn_tp_group_signature=None,
         # Hierarchical GDR on: the cross-node weight family is built too.
         _hierarchical_gdr=True,
     )
@@ -147,6 +148,44 @@ def test_pure_dp_builds_nothing_and_stays_unbuilt(groups):
     assert psm._attn_tp_groups_built is False
 
 
+def test_the_signature_records_the_topology_the_groups_belong_to(groups):
+    psm = _psm()
+    assert psm._attn_tp_group_signature is None
+    psm._build_attn_tp_group()
+    assert psm._attn_tp_group_signature == (WORLD, G)
+    # A same-signature rebuild keeps the fast return.
+    psm._build_attn_tp_group()
+    assert psm._attn_tp_group_signature == (WORLD, G)
+
+
+@pytest.mark.parametrize("field,value,wanted", [
+    ("world_size", 32, (32, G)),
+    ("_attn_tp_size", 4, (WORLD, 4)),
+])
+def test_a_changed_topology_is_refused_by_name(groups, field, value, wanted):
+    """Silent reuse would serve groups that no longer describe the world.
+
+    In-process topology is immutable today (both values are fixed at PSM
+    construction), so a second build request for a DIFFERENT one is a
+    lifecycle error. The groups cannot be rebuilt — torch drops a group only
+    at ``destroy_process_group`` and the live ones are baked into captured
+    decode graphs — so it is refused loudly, like ``init_state_pools``'
+    changed-layout refusal, rather than answered with the old communicators.
+    """
+    psm = _psm()
+    psm._build_attn_tp_group()
+    built = len(groups)
+    setattr(psm, field, value)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        psm._build_attn_tp_group()
+
+    message = str(excinfo.value)
+    assert str((WORLD, G)) in message, "the old signature is not named"
+    assert str(wanted) in message, "the new signature is not named"
+    assert len(groups) == built, "the refused call still created groups"
+
+
 def test_an_uninitialized_process_group_is_still_refused(monkeypatch):
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
     with pytest.raises(RuntimeError, match="needs torch.distributed"):
@@ -156,6 +195,7 @@ def test_an_uninitialized_process_group_is_still_refused(monkeypatch):
 def test_the_flag_starts_false_and_is_not_model_scoped():
     init = ast.unparse(_method_ast("__init__"))
     assert "self._attn_tp_groups_built = False" in init
+    assert "self._attn_tp_group_signature = None" in init
     # The groups are world-level: a model rebuild must NOT reset them, or the
     # leak returns.
     reset = ast.unparse(_method_ast("_reset_model_attached_state"))
