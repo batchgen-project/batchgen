@@ -25,7 +25,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import pytest
 import torch
@@ -79,8 +79,9 @@ def _worker_methods(names, globals_=None):
     wanted = [copy.deepcopy(_worker_method_node(name)) for name in names]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
-        "List": List, "Sequence": Sequence, "hashlib": hashlib,
-        "logging": logging, "math": math, "replace": dataclasses.replace,
+        "List": List, "Optional": Optional, "Sequence": Sequence,
+        "hashlib": hashlib, "logging": logging, "math": math,
+        "replace": dataclasses.replace,
         **(globals_ or {}),
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
@@ -289,6 +290,12 @@ def _plan_worker(
             "_decode_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
+            # The executor and the pool are built with the batch-level probes,
+            # read through the shared batchgen_debug seam.
+            "_pool_pad_poison_enabled",
+            "_new_pool_kernel_dump_recorder",
+            "_active_batchgen_debug_for_sequences",
+            "_debug_flag_enabled",
         ],
         {
             "torch": _fake_torch(free_pages * K3_PAGE_BYTES),
@@ -324,6 +331,9 @@ def _plan_worker(
         prefix_cache_coordinator=RecordingCoordinator(),
         _prefix_sequence_states={},
         _prefill_pool_base=(0, 0, 0),
+        # No worker-wide batchgen_debug: the batch-level flags are the only
+        # source, and none of these sequences sets one.
+        _batchgen_debug=None,
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
@@ -338,6 +348,86 @@ def _plan_worker(
 #  (i) The page and state budgets are the group MIN, and the pool is sized
 #      from the PSM layout, not from the Host geometry
 # --------------------------------------------------------------------------- #
+
+
+def _seqs_with_debug(debug):
+    """The wave's sequences, each carrying one batch-level debug dict."""
+    seqs = _seqs()
+    for seq in seqs.values():
+        seq.batchgen_debug = dict(debug)
+    return seqs
+
+
+def _pool_with_debug(monkeypatch, debug):
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker = _plan_worker(free_pages=20, fake_dist=FakeDist(peer_budget=[16, 32]))
+    if debug is not None:
+        worker.global_batch = SimpleNamespace(
+            get_sequence=_seqs_with_debug(debug).get
+        )
+    wave = worker._plan_prefill_pool_wave(UUIDS, {})
+    assert wave is not None
+    worker._construct_prefill_pool(wave)
+    return wave
+
+
+def test_the_executor_is_built_without_the_pad_poison_probe(monkeypatch):
+    """Production default: no batch asked, so the page table pads with 0."""
+    wave = _pool_with_debug(monkeypatch, None)
+
+    assert wave.executor.pad_poison is False
+
+
+def test_a_batch_can_arm_the_pad_poison_probe(monkeypatch):
+    """``batchgen_debug.prefix_pool_pad_poison`` reaches the chunk executor."""
+    wave = _pool_with_debug(monkeypatch, {"prefix_pool_pad_poison": True})
+
+    assert wave.executor.pad_poison is True
+
+
+def test_another_batch_flag_does_not_arm_the_pad_poison_probe(monkeypatch):
+    """Only its own flag arms it; an unrelated debug dict leaves it off."""
+    wave = _pool_with_debug(monkeypatch, {"prefix_pool_offload_check": True})
+
+    assert wave.executor.pad_poison is False
+
+
+@pytest.mark.parametrize("mode", ["sync", "nosync"])
+def test_a_batch_can_arm_the_kernel_dump_in_either_mode(
+    monkeypatch, tmp_path, mode
+):
+    """``prefix_pool_dump_kernel_args`` reaches the pool, with its dump dir."""
+    wave = _pool_with_debug(monkeypatch, {
+        "prefix_pool_dump_kernel_args": mode,
+        "prefix_pool_dump_dir": str(tmp_path),
+    })
+
+    recorder = wave.pool.kernel_dump
+    assert recorder is not None
+    assert recorder.mode == mode
+    assert recorder.rank == 0
+    assert recorder.directory == str(tmp_path / "pool_dump_rank0")
+    assert recorder.page_tokens == wave.page_tokens
+    # Row metadata can name a live member only if the global ids came along.
+    assert list(recorder.global_ids) == list(wave.global_ids)
+
+
+def test_the_kernel_dump_is_off_by_default(monkeypatch):
+    assert _pool_with_debug(monkeypatch, None).pool.kernel_dump is None
+
+
+def test_another_batch_flag_does_not_arm_the_kernel_dump(monkeypatch):
+    wave = _pool_with_debug(monkeypatch, {"prefix_pool_pad_poison": True})
+
+    assert wave.pool.kernel_dump is None
+
+
+def test_a_mistyped_dump_mode_is_refused_at_pool_construction(monkeypatch):
+    """Not silently off: a typo must fail the wave, not look like a clean run."""
+    with pytest.raises(ValueError, match="prefix_pool_dump_kernel_args"):
+        _pool_with_debug(
+            monkeypatch, {"prefix_pool_dump_kernel_args": "synch"}
+        )
 
 
 def test_pool_budget_is_the_group_minimum(monkeypatch):

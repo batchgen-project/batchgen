@@ -448,8 +448,27 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         sequence_ids = list(AttnWrapperBase.cur_batch or [])
         if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
             raise RuntimeError("Kimi-K3 prefix-pool row metadata size mismatch")
+        # Batch-level batchgen_debug.prefix_pool_offload_check. None unless the
+        # worker installed a recorder, and the check precedes every copy and
+        # hash below, so the flag being off costs one attribute read per layer
+        # per chunk and nothing else.
+        recorder = AttnWrapperBase.prefill_pool_offload_recorder
+        items = AttnWrapperBase.prefill_pool_batch.items if recorder is not None else ()
         for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
             row_kv = offload_kv[start:end].unsqueeze(0).unsqueeze(2)
+            if recorder is not None:
+                # Digested before the task is issued, so the recorded bytes are
+                # exactly the bytes the D2H is about to read.
+                recorder.record_row(
+                    view=view,
+                    layer_idx=self.layer_idx,
+                    row=row,
+                    kind=items[row].kind,
+                    host_sid=sequence_ids[row],
+                    dest_start_tokens=starts[row],
+                    token_count=end - start,
+                    source=row_kv,
+                )
             task = view.async_offload_layer_kv_range_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=[sequence_ids[row]],

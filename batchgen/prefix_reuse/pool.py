@@ -93,6 +93,10 @@ class PrefillPrefixPool:
         )
         self._num_pages = num_pages
         self._free = list(range(num_pages))  # kept ascending
+        # Batch-level ``prefix_pool_dump_kernel_args`` recorder, or None. The
+        # pool is the one object both the chunk executor and
+        # ``pool_prefill_attention`` hold, so it carries the probe.
+        self.kernel_dump = None
         self._page_bytes = (
             num_layers * page_tokens * num_kv_heads
             * (head_dim + (v_dim if with_v else 0))
