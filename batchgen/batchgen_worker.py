@@ -2288,6 +2288,125 @@ class BatchGenWorker:
 		))
 		return [next(packed) if group is None else group for group in groups]
 
+	def _check_decode_dp_group_plan_identical(self, uuids: List[str]) -> None:
+		"""All ranks must have stamped the SAME serve-group map. Collective.
+
+		``rank_in_decode_group`` resolves ownership from each rank's own copy of
+		the map, so the map is not a hint: it decides which ranks bind a
+		sequence, run its prefill and allocate its head-sharded KDA state. A
+		rank that derived a different group for one sequence binds a row whose
+		state another group created, and the mismatch first appears far away —
+		``KeyError: Sequence <global_idx> has no KDA state item`` at the decode
+		entry, on a rank that never prefilled it.
+
+		Both stampers are deterministic functions of replicated inputs: the
+		admission list (broadcast from rank 0), prompt lengths, and the prompts
+		themselves read through the node-shared trajectory book, which every
+		rank wrote before grouping. So agreement is derivable, not hoped for,
+		and a divergence means one of those inputs was not in fact replicated —
+		which is a bug to name here, at the stamp, rather than to debug three
+		phases later. The rank packer already carries this check
+		(``_assign_ranks_for_prefix_sharing``); the group packer did not.
+
+		Cheap: one int64 all_gather of two values per wave, plus a second one
+		only on the failing path to name the first diverging sequence.
+		"""
+		if self._decode_attn_tp_size() <= 1 or self.world_size <= 1:
+			return
+		from batchgen.decode_dp_group import (
+			decode_group_plan_digest,
+			first_group_disagreement,
+		)
+
+		pairs = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			pairs.append((int(seq.global_idx), seq.decode_dp_group))
+		pairs.sort(key=lambda item: item[0])
+		check = torch.tensor(
+			[decode_group_plan_digest(pairs), len(pairs)],
+			dtype=torch.int64, device=self.torch_device,
+		)
+		gathered = [torch.zeros_like(check) for _ in range(self.world_size)]
+		dist.all_gather(gathered, check)
+		# This rank's own digest joins the comparison explicitly rather than
+		# through ``gathered[self.rank]``: the check must hold on what this
+		# rank actually stamped, not on the slot the collective happened to
+		# fill for it.
+		digests = {int(item[0].item()) for item in gathered}
+		digests.add(int(check[0].item()))
+		if len(digests) == 1:
+			return
+		counts = {int(item[1].item()) for item in gathered}
+		counts.add(len(pairs))
+		named = None
+		if len(counts) == 1:
+			# Same sequences everywhere, so the group vectors are comparable
+			# column by column. Every rank reaches this second collective: they
+			# all saw the same differing digests.
+			groups = torch.tensor(
+				[-1 if group is None else int(group) for _, group in pairs],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			views = [torch.zeros_like(groups) for _ in range(self.world_size)]
+			dist.all_gather(views, groups)
+			named = first_group_disagreement(
+				[global_idx for global_idx, _ in pairs],
+				# This rank's own vector is compared explicitly, for the same
+				# reason its digest is.
+				[groups.tolist()] + [view.tolist() for view in views],
+			)
+		raise RuntimeError(
+			"decode serve-group map diverged across ranks: rank "
+			f"{self.rank} digest {int(check[0].item())} over {len(pairs)} "
+			f"sequences; per-rank sequence counts {sorted(counts)}"
+			+ (
+				f"; first disagreement global_idx={named[0]} "
+				f"groups_by_rank={named[1]}" if named is not None else ""
+			)
+		)
+
+	def _check_local_binding_matches_group(
+		self, uuids: List[str], where: str
+	) -> None:
+		"""A local row exists iff this rank's group owns the sequence (G>1).
+
+		``_get_local_indices_for_uuids`` resolves a wave from
+		``_uuid_to_local_map`` alone and silently skips what it does not find,
+		so a binding that disagrees with the serve-group map is not refused
+		anywhere: the rank prefills or decodes a row its group does not own, or
+		misses one it does. The second form is what raises ``KeyError:
+		Sequence <global_idx> has no KDA state item`` from
+		``prepare_decode_step`` — by then the stamping seam is long gone.
+
+		The invariant is an equivalence, so both directions are checked, and
+		both are local reads: no collective, O(len(uuids)) per call.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return
+		offenders = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			bound = uuid in self._uuid_to_local_map
+			owns = self._owns_local_sequence(seq)
+			if bound != owns:
+				offenders.append(
+					f"global_idx={seq.global_idx} group={seq.decode_dp_group} "
+					f"bound={int(bound)} owns={int(owns)}"
+				)
+		if offenders:
+			raise RuntimeError(
+				f"Rank {self.rank}: [SCHED_INVARIANT] {where}: "
+				f"{len(offenders)} sequences whose local row disagrees with the "
+				f"serve-group map (G={G}, rank//G={self.rank // G}): "
+				+ "; ".join(offenders[:10])
+			)
+
 	def _bind_local_sequence_to_query_book(
 		self,
 		uuid: str,
@@ -6089,6 +6208,11 @@ class BatchGenWorker:
 		# config, is idempotent (re-entrant sequences keep the group their
 		# head-sharded KDA state lives on), and is deterministic across ranks.
 		self._assign_decode_dp_groups(all_candidates)
+		# The map decides this wave's node mapping (below), its bindings and
+		# its KDA state, so verify agreement BEFORE any of them is derived:
+		# _prepare_prefill_batch is already collective, and this is the first
+		# all-ranks point after the stamp.
+		self._check_decode_dp_group_plan_identical(all_candidates)
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
@@ -8104,6 +8228,12 @@ class BatchGenWorker:
 				# M2b: stamp the decode DP-group before local-index resolution so
 				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
 				self._assign_decode_dp_groups(decode_uuids)
+				# The local rows this resolves are the rows the decode forward
+				# asks KDA state for, so refuse a row that the group map does
+				# not own here instead of inside prepare_decode_step.
+				self._check_local_binding_matches_group(
+					decode_uuids, "decode entry"
+				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
@@ -8828,6 +8958,12 @@ class BatchGenWorker:
 			logging.debug(
 				"[PREFILL] Host KV reservation already committed before phase config"
 			)
+		# The rows bound above are the rows this wave's prefill computes, and
+		# the prefill forward is what creates each row's KDA state item. Catch
+		# a binding that disagrees with the group map here, before the forward,
+		# so the error names the seam instead of the decode step that misses
+		# the state item.
+		self._check_local_binding_matches_group(prefill_uuids, "prefill config")
 
 		# Reached by EVERY rank — including ranks that serve no sequence this
 		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
@@ -12702,6 +12838,16 @@ class BatchGenWorker:
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
+				# Destroy the head-sharded KDA state the comment below relies
+				# on. Host eviction frees the sequence's pages but reached the
+				# group drop without releasing its state item, so the slot
+				# stayed charged to a sequence that no longer has a group: the
+				# pool leaked a slot per eviction, and a re-entry re-grouped
+				# onto another group found its stale state on the old one.
+				# Released only by the ranks holding the row, exactly like the
+				# completion path, because the item is per rank.
+				if uuid in self._uuid_to_local_map:
+					self._release_kda_state_slots([int(seq.global_idx)])
 				# M2b (d): eviction destroys the head-sharded KDA state on the
 				# group's ranks, so drop the decode DP-group. A re-prefilled
 				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
