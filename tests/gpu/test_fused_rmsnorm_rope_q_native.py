@@ -406,8 +406,9 @@ def test_strided_kv_input_matches_contiguous_and_reference(production):
 def test_every_legal_block_h_gives_identical_bits():
     """Forcing each BLOCK_H must not move a single bit.
 
-    This is the invariant behind CUDA-graph bucket independence: the policy
-    picks BLOCK_H from the bucket width, so the result must not depend on it.
+    This is the invariant behind CUDA-graph bucket independence, and it is
+    also what lets the policy pick its head tile from measurement alone: the
+    width changes only how the heads are partitioned, never a result bit.
     """
     pytest.importorskip("batchgen_kernels")
     # ``batchgen_kernels.triton.__init__`` re-exports a function named
@@ -426,15 +427,17 @@ def test_every_legal_block_h_gives_identical_bits():
         frr.fused_rmsnorm_rope_with_q_native_kernel
     )
 
-    # Every BLOCK_H the policy can emit at this geometry: it starts at
-    # Q_ROPE_MIN_BLOCK_H and doubles while that stays inside the head count
-    # and the per-program element budget.
-    widths = [frr.Q_ROPE_MIN_BLOCK_H]
+    # Every head-tile width that is legal at this geometry, not just the one
+    # the policy currently selects: one head per program up to the widest tile
+    # the per-program element budget allows.  A retune of Q_ROPE_BLOCK_H can
+    # then only pick a width this test has already proven bit-identical.
+    widths = [1]
     while (
         widths[-1] * 2 <= num_heads
         and widths[-1] * 2 * block_pairs <= frr.Q_ROPE_MAX_TILE_ELEMS
     ):
         widths.append(widths[-1] * 2)
+    assert frr.Q_ROPE_BLOCK_H in widths, f"policy width not covered: {widths}"
     assert len(widths) >= 2, f"nothing to compare: {widths}"
 
     baseline_kv = None

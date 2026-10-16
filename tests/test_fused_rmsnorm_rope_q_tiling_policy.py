@@ -12,11 +12,13 @@ whole partitioning contract is testable without a GPU:
   A  The head tiles cover ``[0, num_heads)`` exactly once -- no head computed
      twice (the kernel writes q_pe in place, so a double-covered head would
      be rotated twice) and none left unrotated.
-  B  Both tile axes are powers of two (``tl.arange`` requires it) and wide
-     enough to stay ordinary tiles rather than one-or-two-lane special cases,
-     and the per-program tile stays inside the register budget.
-  C  The launch grows as wide as the CTA target allows and no wider, and the
-     knob is pinned for the shapes decode actually uses.
+  B  Both tile axes are powers of two (``tl.arange`` requires it), the pair
+     axis covers the rope half-dim, the head axis is the measured
+     ``Q_ROPE_BLOCK_H`` unless the register budget forces a narrower one, and
+     the per-program tile stays inside that budget.
+  C  The tiling is the same for every bucket width -- no bucket gets a
+     partitioning another bucket would not get -- and the knob is pinned for
+     the shapes decode actually uses.
   D  Unsupported or nonsensical geometry fails loud with a named error
      instead of silently falling back to a different partitioning.
 
@@ -93,6 +95,13 @@ def _is_pow2(value: int) -> bool:
     return value >= 1 and value & (value - 1) == 0
 
 
+def _prev_pow2(value: int) -> int:
+    pow2 = 1
+    while pow2 * 2 <= value:
+        pow2 *= 2
+    return pow2
+
+
 @pytest.mark.parametrize("bsz", BUCKETS)
 @pytest.mark.parametrize(
     "num_heads",
@@ -132,44 +141,35 @@ def test_tile_shape_is_launchable(kernel_module, bsz, num_heads, half_dim):
     assert block_pairs >= kernel_module.Q_ROPE_MIN_PAIRS
     assert block_h * block_pairs <= kernel_module.Q_ROPE_MAX_TILE_ELEMS
 
-    # The head axis never degenerates below its floor, whatever the head
-    # count: a tile narrower than the head count is fine (there will be more
-    # of them) and a tile wider than it is fine too (the surplus lanes are
-    # masked).  Only the register budget may push it under the floor, and
-    # then it is as wide as that budget allows.
-    assert (
-        block_h >= kernel_module.Q_ROPE_MIN_BLOCK_H
-        or block_h * 2 * block_pairs > kernel_module.Q_ROPE_MAX_TILE_ELEMS
+    # The head axis is the measured width, whatever the head count: a tile
+    # narrower than the head count is fine (there will be more of them) and a
+    # tile wider than it is fine too (the surplus lanes are masked).  Only the
+    # register budget lowers it, and then it is as wide as that budget allows.
+    budget_block_h = max(
+        1, _prev_pow2(kernel_module.Q_ROPE_MAX_TILE_ELEMS // block_pairs)
     )
+    assert block_h == min(kernel_module.Q_ROPE_BLOCK_H, budget_block_h)
 
 
-@pytest.mark.parametrize("bsz", BUCKETS)
-def test_launch_is_as_wide_as_the_target_allows(kernel_module, bsz):
-    """C: the tiling is maximal -- no CTA width left on the table.
+@pytest.mark.parametrize("num_heads", [1, 7, 8, 16, GLM52_HEADS, 128])
+def test_the_tiling_does_not_depend_on_the_bucket_width(kernel_module, num_heads):
+    """C: one tiling per geometry, whatever the bucket.
 
-    Widening the tile once more must be blocked by something: the CTA target,
-    the register budget, or the head count.  Otherwise the policy should have
-    widened it and moved more bytes per program.  A launch already at the
-    floor has nothing to prove.
+    The first version of this policy doubled the head tile while a CTA target
+    was still met, so wide buckets ran a different -- and measurably slower
+    than pre-change -- partitioning than narrow ones.  Nothing in the launch
+    geometry predicts the optimum, so the policy now states the measured width
+    and leaves the bucket out of it: this is the contract that regression
+    cannot come back through.
     """
-    target = kernel_module.Q_ROPE_TARGET_CTAS
-    block_h, block_pairs, num_tiles = kernel_module.select_q_rope_tiling(
-        bsz, GLM52_HEADS, GLM52_HALF_DIM
-    )
-    ctas = bsz * (1 + num_tiles)
+    tilings = {
+        kernel_module.select_q_rope_tiling(bsz, num_heads, GLM52_HALF_DIM)
+        for bsz in BUCKETS
+    }
+    assert len(tilings) == 1, f"bucket-dependent tiling: {sorted(tilings)}"
 
-    assert ctas >= target or block_h <= kernel_module.Q_ROPE_MIN_BLOCK_H
-
-    widening_fits_the_budget = (
-        block_h * 2 * block_pairs <= kernel_module.Q_ROPE_MAX_TILE_ELEMS
-    )
-    if (
-        block_h * 2 <= GLM52_HEADS
-        and block_h >= kernel_module.Q_ROPE_MIN_BLOCK_H
-        and widening_fits_the_budget
-    ):
-        wider_tiles = -(-GLM52_HEADS // (block_h * 2))
-        assert bsz * (1 + wider_tiles) < target
+    block_h, _, _ = tilings.pop()
+    assert block_h == kernel_module.Q_ROPE_BLOCK_H
 
 
 def test_pinned_tiling_for_the_decode_buckets(kernel_module):
@@ -183,13 +183,13 @@ def test_pinned_tiling_for_the_decode_buckets(kernel_module):
     """
     expected = {
         # bsz: (BLOCK_H, BLOCK_PAIRS, head tiles, CTAs)
-        1: (16, 32, 4, 1 * 5),
-        8: (16, 32, 4, 8 * 5),
-        16: (16, 32, 4, 16 * 5),
-        64: (16, 32, 4, 64 * 5),
-        128: (16, 32, 4, 128 * 5),
-        256: (32, 32, 2, 256 * 3),
-        512: (32, 32, 2, 512 * 3),
+        1: (4, 32, 16, 1 * 17),
+        8: (4, 32, 16, 8 * 17),
+        16: (4, 32, 16, 16 * 17),
+        64: (4, 32, 16, 64 * 17),
+        128: (4, 32, 16, 128 * 17),
+        256: (4, 32, 16, 256 * 17),
+        512: (4, 32, 16, 512 * 17),
     }
     for bsz, (want_h, want_pairs, want_tiles, want_ctas) in expected.items():
         block_h, block_pairs, num_tiles = kernel_module.select_q_rope_tiling(
