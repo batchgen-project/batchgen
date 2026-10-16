@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -155,8 +155,19 @@ def release_evicted_prefix_pages(
     *,
     eviction_result: object,
     worker_views_by_group: Mapping[int, object],
+    frontier_hook: Callable[[Mapping[int, list[int]]], object] | None = None,
 ) -> dict[int, int]:
+    """Free the pages the coordinator evicted; retire frontiers standing on them.
+
+    ``frontier_hook`` is the M3 trajectory-frontier seam and is ``None`` unless
+    the batch asked for ``prefix_trajectory_commit``: with it unset this
+    function behaves exactly as before. When set it is called ONCE, after every
+    group's pages are released, with the full {group_id: page_ids} map, so a
+    frontier record never outlives its prefix pages across a lookup.
+    """
+
     released: dict[int, int] = {}
+    evicted_page_ids: dict[int, list[int]] = {}
     for group_pages in eviction_result.evicted_group_pages:
         group_id = int(group_pages.group_id)
         if group_id in released:
@@ -176,6 +187,9 @@ def release_evicted_prefix_pages(
         if page_ids:
             worker_view.release_resident_pages(page_ids)
         released[group_id] = len(page_ids)
+        evicted_page_ids[group_id] = page_ids
+    if frontier_hook is not None:
+        frontier_hook(evicted_page_ids)
     return released
 
 

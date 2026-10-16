@@ -1036,6 +1036,8 @@ class BatchGenWorker:
 		self._pool_sid_counter = time.time_ns() // 1000
 		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
 		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
+		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
+		self._trajectory_frontier_committer = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -6109,6 +6111,7 @@ class BatchGenWorker:
 								group_id=0,
 								page_target=page_target,
 								max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+								frontier_hook=self._trajectory_frontier_eviction_hook(),
 							)
 						updated_local_free = self._get_host_kv_free_pages()
 						if self.prefix_cache_debug_stats:
@@ -11133,6 +11136,152 @@ class BatchGenWorker:
 				if handle:
 					self.prefix_cache_coordinator.release_attachment(handle)
 
+	def _trajectory_commit_requested(self, batch_sequences) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		batch's own sequences, so it can be turned on against a server that is
+		already up. A value other than ``"on"``/``"off"`` is refused by name
+		rather than read as off -- a mistyped flag would look like a clean run
+		with no frontier committed.
+		"""
+		from batchgen.prefix_reuse.trajectory_commit import (
+			trajectory_commit_enabled,
+		)
+
+		return trajectory_commit_enabled(
+			self._active_batchgen_debug_for_sequences(batch_sequences)
+		)
+
+	def _get_trajectory_frontier_committer(self):
+		"""One trajectory-frontier committer per rank, built on first use.
+
+		The snapshot arena shares the pool-segment negative pseudo-sid
+		namespace (``_next_pool_segment_sid``), so the two Host-page
+		mechanisms cannot collide, and its page geometry comes from the
+		prefix-cache runtime config -- the same ``host_page_bytes_all_layers``
+		the frontier charge is expressed in.
+		"""
+		if self._trajectory_frontier_committer is not None:
+			return self._trajectory_frontier_committer
+		from batchgen.models.moonshotai.kimi_linear.wrappers import (
+			KimiLinearKDAWrapper,
+		)
+		from batchgen.prefix_reuse.trajectory_commit import (
+			HostKVSnapshotArenaAllocator,
+			KDAStateSnapshotReader,
+			TrajectoryFrontierCommitter,
+			TrajectoryStateUnavailable,
+			profile_from_kda_state_config,
+		)
+
+		manager = KimiLinearKDAWrapper.state_manager
+		if manager is None:
+			raise TrajectoryStateUnavailable(
+				"prefix_trajectory_commit needs a live KDA state pool; this "
+				"deployment has none"
+			)
+		runtime = self.prefix_cache_runtime_config
+		page_tokens = int(runtime.group_specs[0].raw_page_tokens)
+		page_bytes = int(runtime.host_page_bytes_all_layers)
+		self._trajectory_frontier_committer = TrajectoryFrontierCommitter(
+			rank=self.rank,
+			page_tokens=page_tokens,
+			host_page_bytes_all_layers=page_bytes,
+			arena_allocator=HostKVSnapshotArenaAllocator(
+				host_views_provider=self._host_views_by_group,
+				page_tokens=page_tokens,
+				host_page_bytes_all_layers=page_bytes,
+				next_pseudo_sid=self._next_pool_segment_sid,
+			),
+			snapshot_reader=KDAStateSnapshotReader(
+				state_manager_provider=(
+					lambda: KimiLinearKDAWrapper.state_manager
+				),
+				profile=profile_from_kda_state_config(manager.config),
+			),
+		)
+		return self._trajectory_frontier_committer
+
+	def _trajectory_frontier_eviction_hook(self):
+		"""The frontier eviction seam, or None when no frontier is committed.
+
+		Returns the committer's hook only once a committer EXISTS, so the
+		prefix eviction path keeps its exact previous behavior on every run
+		that never turned the flag on.
+		"""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return None
+		return committer.on_prefix_pages_released
+
+	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
+		"""Resident Host pages backing a committed prefix, per KV group.
+
+		``retain_inserted_prefix_pages`` reports only the pages THIS commit
+		inserted; a frontier whose leading nodes already existed is backed by
+		the coordinator's older pages. A frontier record has to name the pages
+		eviction will actually report, or it would outlive them, so the set is
+		read back from the coordinator. ``estimate_lookup`` is the read-only
+		form (it takes no attachment), and the commit's own active attachment
+		already protects the nodes while this runs. ``None`` means the
+		coordinator does not hold the whole prefix as resident pages.
+		"""
+		runtime = self.prefix_cache_runtime_config
+		estimate = self.prefix_cache_coordinator.estimate_lookup(
+			list(runtime.namespace_digest),
+			[int(token_id) for token_id in token_ids[: int(commit_tokens)]],
+		)
+		if int(estimate.common_cached_tokens) != int(commit_tokens):
+			return None
+		pages = {}
+		for span in estimate.materialization_spans:
+			pages[int(span.group_id)] = [
+				int(getattr(page, "page_id", page)) for page in span.pages
+			]
+		if len(pages) != len(runtime.group_specs):
+			return None
+		return pages
+
+	def _commit_trajectory_frontier(self, *, seq, token_ids, commit_tokens):
+		"""M3 Slice 1b: snapshot the KDA slot into Host KV pages (flag-gated).
+
+		Runs INSIDE the retention transaction, after ``retain_inserted_prefix
+		_pages`` and its ``host_owned_pages`` deduction. Per R1 the snapshot
+		bytes go into Host KV pages taken from the SAME allocator, so
+		``host_owned_pages`` is not touched here and nothing is credited back
+		to it when the snapshot is freed.
+		"""
+		from batchgen.prefix_reuse.trajectory_commit import (
+			PREFIX as _FRONTIER_PREFIX,
+		)
+
+		pages = self._resident_frontier_page_ids(
+			token_ids=token_ids, commit_tokens=commit_tokens
+		)
+		if pages is None:
+			logging.info(
+				"[%s] rank=%s seq=%s SKIPPED frontier commit: the coordinator "
+				"does not hold all %s committed tokens as resident pages in "
+				"every KV group",
+				_FRONTIER_PREFIX,
+				self.rank,
+				seq.global_idx,
+				int(commit_tokens),
+			)
+			return None
+		committer = self._get_trajectory_frontier_committer()
+		return committer.commit(
+			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
+			frontier_token_ids=token_ids[: int(commit_tokens)],
+			page_ids_by_group=pages,
+			# Group affinity: the KDA state is head-sharded for the layout its
+			# decode group holds, so a snapshot is only restorable into that
+			# group (same invariant as today's re-entry pinning).
+			owning_group_id=int(seq.decode_dp_group or 0),
+			sequence_id=seq.global_idx,
+		)
+
 	def _commit_prefix_cache_for_prefill(
 		self, local_sequence_ids: Sequence[int]
 	) -> None:
@@ -11156,6 +11305,14 @@ class BatchGenWorker:
 			int(spec.group_id): int(spec.raw_page_tokens)
 			for spec in runtime.group_specs
 		}
+		# ONE guard for the whole pass: with the flag off nothing below changes.
+		commit_sequences = [
+			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+			for local_idx in local_sequence_ids
+		]
+		trajectory_frontier = self._trajectory_commit_requested(
+			commit_sequences
+		)
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -11189,6 +11346,7 @@ class BatchGenWorker:
 				coordinator=self.prefix_cache_coordinator,
 				worker_views_by_group=host_views,
 				max_scan_nodes=runtime.max_nodes,
+				frontier_hook=self._trajectory_frontier_eviction_hook(),
 			)
 			result = commit_outcome.commit_result
 			commit_handle = int(result.active_attachment_handle)
@@ -11220,6 +11378,15 @@ class BatchGenWorker:
 			# Retained pages left the sequence chain for prefix residency. Every
 			# group retains the same page count; host_owned_pages counts one.
 			seq.host_owned_pages -= len(retained.get(0, ()))
+			if trajectory_frontier:
+				# M3 Slice 1b, inside this same transaction: the snapshot's
+				# Host pages come from the SAME allocator, so the deduction
+				# above is the only host_owned_pages move at this boundary.
+				self._commit_trajectory_frontier(
+					seq=seq,
+					token_ids=token_ids,
+					commit_tokens=commit_tokens,
+				)
 			logging.info(
 				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
 				"inserted_nodes=%s retained_pages=%s",

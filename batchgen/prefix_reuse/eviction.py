@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 from batchgen.prefix_reuse.commit import release_evicted_prefix_pages
 
@@ -27,6 +27,7 @@ def commit_prefix_pages_with_capacity_retry(
     coordinator: object,
     worker_views_by_group: Mapping[int, object],
     max_scan_nodes: int,
+    frontier_hook: Callable[[Mapping[int, list[int]]], object] | None = None,
 ) -> PrefixCommitRetryResult:
     """Commit once, evict on metadata pressure, then retry exactly once."""
 
@@ -45,6 +46,7 @@ def commit_prefix_pages_with_capacity_retry(
         release_evicted_prefix_pages(
             eviction_result=eviction,
             worker_views_by_group=worker_views_by_group,
+            frontier_hook=frontier_hook,
         )
         return PrefixCommitRetryResult(
             request.commit(coordinator),
@@ -60,6 +62,7 @@ def evict_prefix_pages_for_host_allocation(
     group_id: int,
     page_deficit: int,
     max_scan_nodes: int,
+    frontier_hook: Callable[[Mapping[int, list[int]]], object] | None = None,
 ) -> int:
     """Release at least ``page_deficit`` unprotected resident Host pages."""
 
@@ -70,6 +73,7 @@ def evict_prefix_pages_for_host_allocation(
         group_id=group_id,
         page_target=page_deficit,
         max_scan_nodes=max_scan_nodes,
+        frontier_hook=frontier_hook,
     )
     if released_pages < int(page_deficit):
         raise RuntimeError(
@@ -87,6 +91,7 @@ def reclaim_prefix_pages_for_host_admission(
     group_id: int,
     page_target: int,
     max_scan_nodes: int,
+    frontier_hook: Callable[[Mapping[int, list[int]]], object] | None = None,
 ) -> int:
     """Reclaim up to a target; live attachments may leave a shortfall."""
 
@@ -102,5 +107,6 @@ def reclaim_prefix_pages_for_host_admission(
     released = release_evicted_prefix_pages(
         eviction_result=eviction,
         worker_views_by_group=worker_views_by_group,
+        frontier_hook=frontier_hook,
     )
     return int(released.get(int(group_id), 0))
