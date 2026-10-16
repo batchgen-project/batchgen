@@ -190,8 +190,17 @@ def glm5_router_gemm(
     Shapes in the row range the split-K path targets are computed as a fixed
     partition of the K axis followed by a fixed-order reduction; every other
     shape keeps walking K serially in one program. Both paths produce, for a
-    given row, a result that depends only on that row's activations and on K
-    -- never on ``m`` or on how many padded rows shared the launch.
+    given row, a result that depends only on that row's activations, on K, and
+    on the split count the policy picked for the launch -- never on how many
+    padded rows shared the launch, and never on another row's values.
+
+    The policy picks that count from the row count alone, which the graphed
+    router path holds static per captured bucket, so one count and one
+    reduction order are baked into each bucket's graph at capture time. Two
+    buckets may use different counts, so the same row's logits can differ in
+    the last float32 bits between buckets, the way they already do across the
+    serial-K/split-K boundary; the exactness bound each count has to meet is
+    asserted per count in tests/test_glm5_router_gemm_cuda.py.
 
     Args:
         split_k: force a split count. ``None`` applies the shape policy, ``1``
