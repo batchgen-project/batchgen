@@ -12,11 +12,11 @@ whole partitioning contract is testable without a GPU:
   A  The head tiles cover ``[0, num_heads)`` exactly once -- no head computed
      twice (the kernel writes q_pe in place, so a double-covered head would
      be rotated twice) and none left unrotated.
-  B  ``BLOCK_H`` is a power of two (``tl.arange`` requires it), never wider
-     than the head count, and the per-program tile stays inside the register
-     budget.
-  C  The launch is wide enough to fill the device whenever the geometry
-     allows it, and the knob is pinned for the shapes decode actually uses.
+  B  Both tile axes are powers of two (``tl.arange`` requires it) and wide
+     enough to stay ordinary tiles rather than one-or-two-lane special cases,
+     and the per-program tile stays inside the register budget.
+  C  The launch grows as wide as the CTA target allows and no wider, and the
+     knob is pinned for the shapes decode actually uses.
   D  Unsupported or nonsensical geometry fails loud with a named error
      instead of silently falling back to a different partitioning.
 
@@ -128,26 +128,46 @@ def test_tile_shape_is_launchable(kernel_module, bsz, num_heads, half_dim):
 
     assert _is_pow2(block_h)
     assert _is_pow2(block_pairs)
-    assert 1 <= block_h <= num_heads
     assert block_pairs >= half_dim
     assert block_pairs >= kernel_module.Q_ROPE_MIN_PAIRS
     assert block_h * block_pairs <= kernel_module.Q_ROPE_MAX_TILE_ELEMS
 
+    # The head axis never degenerates below its floor, whatever the head
+    # count: a tile narrower than the head count is fine (there will be more
+    # of them) and a tile wider than it is fine too (the surplus lanes are
+    # masked).  Only the register budget may push it under the floor, and
+    # then it is as wide as that budget allows.
+    assert (
+        block_h >= kernel_module.Q_ROPE_MIN_BLOCK_H
+        or block_h * 2 * block_pairs > kernel_module.Q_ROPE_MAX_TILE_ELEMS
+    )
+
 
 @pytest.mark.parametrize("bsz", BUCKETS)
-def test_launch_fills_the_device_when_the_geometry_allows(kernel_module, bsz):
-    """C: CTA count reaches the target, or BLOCK_H is already minimal."""
+def test_launch_is_as_wide_as_the_target_allows(kernel_module, bsz):
+    """C: the tiling is maximal -- no CTA width left on the table.
+
+    Widening the tile once more must be blocked by something: the CTA target,
+    the register budget, or the head count.  Otherwise the policy should have
+    widened it and moved more bytes per program.  A launch already at the
+    floor has nothing to prove.
+    """
     target = kernel_module.Q_ROPE_TARGET_CTAS
-    block_h, _, num_tiles = kernel_module.select_q_rope_tiling(
+    block_h, block_pairs, num_tiles = kernel_module.select_q_rope_tiling(
         bsz, GLM52_HEADS, GLM52_HALF_DIM
     )
     ctas = bsz * (1 + num_tiles)
 
-    assert ctas >= target or block_h == 1
+    assert ctas >= target or block_h <= kernel_module.Q_ROPE_MIN_BLOCK_H
 
-    # And the tiling is maximal: widening it once more would drop below the
-    # target, so no CTA width is left on the table.
-    if block_h * 2 <= GLM52_HEADS:
+    widening_fits_the_budget = (
+        block_h * 2 * block_pairs <= kernel_module.Q_ROPE_MAX_TILE_ELEMS
+    )
+    if (
+        block_h * 2 <= GLM52_HEADS
+        and block_h >= kernel_module.Q_ROPE_MIN_BLOCK_H
+        and widening_fits_the_budget
+    ):
         wider_tiles = -(-GLM52_HEADS // (block_h * 2))
         assert bsz * (1 + wider_tiles) < target
 
@@ -163,12 +183,13 @@ def test_pinned_tiling_for_the_decode_buckets(kernel_module):
     """
     expected = {
         # bsz: (BLOCK_H, BLOCK_PAIRS, head tiles, CTAs)
-        1: (1, 32, 64, 1 * 65),
-        8: (1, 32, 64, 8 * 65),
-        16: (2, 32, 32, 16 * 33),
-        64: (8, 32, 8, 64 * 9),
+        1: (16, 32, 4, 1 * 5),
+        8: (16, 32, 4, 8 * 5),
+        16: (16, 32, 4, 16 * 5),
+        64: (16, 32, 4, 64 * 5),
         128: (16, 32, 4, 128 * 5),
-        512: (64, 32, 1, 512 * 2),
+        256: (32, 32, 2, 256 * 3),
+        512: (32, 32, 2, 512 * 3),
     }
     for bsz, (want_h, want_pairs, want_tiles, want_ctas) in expected.items():
         block_h, block_pairs, num_tiles = kernel_module.select_q_rope_tiling(

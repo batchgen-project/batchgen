@@ -673,7 +673,11 @@ def fused_rmsnorm_rope_with_q(
 Q_ROPE_TARGET_CTAS = 512
 
 #: Upper bound on ``BLOCK_H * BLOCK_PAIRS`` (register budget per program).
-Q_ROPE_MAX_TILE_ELEMS = 2048
+#: The tile is live twice over as fp32 (the even and odd halves of the pair,
+#: plus their rotated results and index vectors), so at the fixed
+#: ``num_warps=4`` this is the width that keeps the working set clear of a
+#: register spill rather than the widest that would fit.
+Q_ROPE_MAX_TILE_ELEMS = 1024
 
 #: Lower / upper bound on the pair-axis tile.  The floor keeps very small
 #: head dims off degenerate 1-2 lane tiles; the ceiling is the largest rope
@@ -681,10 +685,24 @@ Q_ROPE_MAX_TILE_ELEMS = 2048
 Q_ROPE_MIN_PAIRS = 16
 Q_ROPE_MAX_PAIRS = 256
 
+#: Floor on the head-axis tile, for the same reason as ``Q_ROPE_MIN_PAIRS``:
+#: both tile axes stay wide enough to be an ordinary tile rather than a
+#: one-or-two-lane special case, and a wider head tile is also a longer
+#: contiguous run of q_pe.  The head axis is masked, so this floor is allowed
+#: to exceed the head count; only the register budget lowers it.
+Q_ROPE_MIN_BLOCK_H = 16
+
 
 def _next_pow2(value: int) -> int:
     pow2 = 1
     while pow2 < value:
+        pow2 *= 2
+    return pow2
+
+
+def _prev_pow2(value: int) -> int:
+    pow2 = 1
+    while pow2 * 2 <= value:
         pow2 *= 2
     return pow2
 
@@ -708,10 +726,13 @@ def select_q_rope_tiling(
     a 64-row bucket a head-serial kernel can only ever occupy 64 CTAs; the
     head axis is what makes the launch wide enough to fill the device.
 
-    Returns ``(block_h, block_pairs, num_head_tiles)``.  ``block_h`` is the
-    largest power of two that still leaves at least ``target_ctas`` programs
-    (so wide buckets get fat, well-coalesced tiles and narrow buckets get
-    more of them), capped by the per-program element budget.
+    Returns ``(block_h, block_pairs, num_head_tiles)``.  ``block_h`` starts at
+    ``Q_ROPE_MIN_BLOCK_H`` and grows, by powers of two, as long as the launch
+    still leaves at least ``target_ctas`` programs -- so wide buckets get fat,
+    well-coalesced tiles and narrow buckets get more of them.  It never grows
+    past the head count (there would be nothing in the extra lanes) nor past
+    the per-program element budget, and it may *exceed* the head count only by
+    staying at its floor, where the surplus lanes are masked off.
 
     The choice is a pure function of the launch geometry and changes only how
     the work is partitioned: every output element is computed by exactly one
@@ -732,11 +753,12 @@ def select_q_rope_tiling(
         )
 
     block_pairs = max(Q_ROPE_MIN_PAIRS, _next_pow2(half_dim))
-    max_block_h = max(1, min(num_heads, max_tile_elems // block_pairs))
+    budget_block_h = max(1, _prev_pow2(max_tile_elems // block_pairs))
 
-    block_h = 1
+    block_h = min(Q_ROPE_MIN_BLOCK_H, budget_block_h)
+    grow_limit = min(_next_pow2(num_heads), budget_block_h)
     while (
-        block_h * 2 <= max_block_h
+        block_h * 2 <= grow_limit
         and bsz * (1 + _ceil_div(num_heads, block_h * 2)) >= target_ctas
     ):
         block_h *= 2

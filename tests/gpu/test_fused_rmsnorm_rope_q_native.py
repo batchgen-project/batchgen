@@ -31,9 +31,9 @@ What this file pins:
      tiny rope dim.
   C  The strided-kv-input contract (a non-contiguous ``new_compressed_kv``
      must give the same answer as its contiguous clone) still holds.
-  D  Tiling independence: forcing every legal ``BLOCK_H`` for one geometry
-     gives bit-identical results, which is what makes the result independent
-     of the CUDA-graph bucket the launch was sized for.
+  D  Tiling independence: forcing each ``BLOCK_H`` the policy can emit for
+     one geometry gives bit-identical results, which is what makes the result
+     independent of the CUDA-graph bucket the launch was sized for.
   E  Row isolation: a row's output depends only on that row, so padded rows
      in a capture bucket cannot perturb the live rows.
   F  CUDA-graph capture/replay reproduces the eager result bitwise.
@@ -409,20 +409,31 @@ def test_every_legal_block_h_gives_identical_bits():
     picks BLOCK_H from the bucket width, so the result must not depend on it.
     """
     pytest.importorskip("batchgen_kernels")
-    from batchgen_kernels.triton.fused_rmsnorm_rope import (
-        fused_rmsnorm_rope_with_q_native_kernel,
-        select_q_rope_tiling,
-    )
+    from batchgen_kernels.triton import fused_rmsnorm_rope as frr
 
     bsz, num_heads, kv_lora_rank, rope_dim = 64, GLM52_HEADS, 512, 64
     kv, q_pe, cos, sin, positions, weight = _inputs(
         bsz, num_heads=num_heads, kv_lora_rank=kv_lora_rank, rope_dim=rope_dim
     )
-    _, block_pairs, _ = select_q_rope_tiling(bsz, num_heads, rope_dim // 2)
+    _, block_pairs, _ = frr.select_q_rope_tiling(bsz, num_heads, rope_dim // 2)
+    fused_rmsnorm_rope_with_q_native_kernel = (
+        frr.fused_rmsnorm_rope_with_q_native_kernel
+    )
+
+    # Every BLOCK_H the policy can emit at this geometry: it starts at
+    # Q_ROPE_MIN_BLOCK_H and doubles while that stays inside the head count
+    # and the per-program element budget.
+    widths = [frr.Q_ROPE_MIN_BLOCK_H]
+    while (
+        widths[-1] * 2 <= num_heads
+        and widths[-1] * 2 * block_pairs <= frr.Q_ROPE_MAX_TILE_ELEMS
+    ):
+        widths.append(widths[-1] * 2)
+    assert len(widths) >= 2, f"nothing to compare: {widths}"
 
     baseline_kv = None
     baseline_q = None
-    for block_h in (1, 2, 4, 8, 16, 32, 64):
+    for block_h in widths:
         num_tiles = -(-num_heads // block_h)
         q_run = q_pe.clone()
         out = torch.empty_like(kv)
@@ -440,7 +451,7 @@ def test_every_legal_block_h_gives_identical_bits():
             baseline_kv, baseline_q = out, q_run
         else:
             _assert_bitwise(out, q_run, baseline_kv, baseline_q,
-                            f"BLOCK_H={block_h} vs BLOCK_H=1")
+                            f"BLOCK_H={block_h} vs the narrowest BLOCK_H")
 
 
 def test_bucket_width_does_not_change_a_row(production):
