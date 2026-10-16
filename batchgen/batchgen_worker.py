@@ -8567,6 +8567,7 @@ class BatchGenWorker:
 			if hasattr(self.parallel_manager, "set_comm"):
 				self.parallel_manager.set_comm(self.comm)
 			self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+			self._log_phase_memory_ledger("after_configure_prefill")
 			self.set_phase("prefill")
 
 		if torch.cuda.is_available():
@@ -8815,6 +8816,7 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=padding_bsz, comm=comm
 		)
+		self._log_phase_memory_ledger("after_configure_decoding")
 		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*padding_bsz))
 		# never overflows.
@@ -9266,6 +9268,65 @@ class BatchGenWorker:
 		end = getattr(self, "_phase_end", None)
 		if end is not None and end[1] is None:
 			end[1] = time.perf_counter()
+
+	def _log_phase_memory_ledger(self, label: str) -> None:
+		"""One line per phase-switch stage: who holds device memory right now.
+
+		The rebuild path tears a phase instance down and stages the next one, so
+		"every cycle gives back what it took" is an invariant with no owner: a
+		slice retained per switch only shows up as an OOM several cycles later,
+		at whichever allocation happens to be the largest (the KV pool remap's
+		``cuMemCreate``). Torch's own counters cannot see that slice — the KV
+		pool is CUDA-VMM, the captured graphs own private pools, and the weight
+		buffers are C++ — so the driver's free/total is reported beside them,
+		and the holders that survive a model are named explicitly.
+
+		Cheap: four driver queries and attribute reads, once per switch stage,
+		on rank 0 only. No synchronize (the callers that need one do it) and no
+		``.item()``.
+		"""
+		if self.rank != 0 or not torch.cuda.is_available():
+			return
+		free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
+		gib = 1024 ** 3
+		pm = getattr(self, "parallel_manager", None)
+		kda_slots = kda_live = -1
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import (
+				KimiLinearKDAWrapper,
+			)
+
+			manager = KimiLinearKDAWrapper.state_manager
+			if manager is not None:
+				# The pools are deliberately kept across a rebuild, so their
+				# slot count must stay FLAT; a growing one would mean the
+				# reuse decision stopped matching.
+				kda_slots = int(manager.config.num_state_items)
+				kda_live = len(manager.sequence_state_items)
+		except ImportError:
+			pass
+		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
+		logging.info(
+			"[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
+			"driver_total=%.2f torch_alloc=%.2f torch_reserved=%.2f "
+			"model=%d pm_model=%d resident_ep=%d sp8_buffer=%d decode_graph=%d "
+			"kv_pool_mapped=%s kda_slots=%d kda_live=%d",
+			self.rank,
+			label,
+			getattr(self, "_phase_mem_switch_index", 0),
+			(total_bytes - free_bytes) / gib,
+			total_bytes / gib,
+			torch.cuda.memory_allocated(self.local_rank) / gib,
+			torch.cuda.memory_reserved(self.local_rank) / gib,
+			int(getattr(self, "model", None) is not None),
+			int(getattr(pm, "model", None) is not None),
+			int(bool(getattr(pm, "_resident_ep_built", False))),
+			int(getattr(pm, "_streamed_sp8_buffer", None) is not None),
+			int(getattr(pm, "_decode_graph", None) is not None),
+			getattr(gpu_kv, "pool_is_mapped", "na"),
+			kda_slots,
+			kda_live,
+		)
 
 	def _log_phase_switch(self, phase: str) -> None:
 		"""Per-rank busy time from the previous phase's compute end to this phase's start."""
@@ -17412,6 +17473,11 @@ class BatchGenWorker:
 		if not hasattr(self, 'model') or self.model is None:
 			return
 
+		self._phase_mem_switch_index = (
+			getattr(self, "_phase_mem_switch_index", 0) + 1
+		)
+		self._log_phase_memory_ledger("deep_free_enter")
+
 		# Stage timings on every rank: the first decode configure after the
 		# streamed wave-1 prefill spent 34 s here on rank 0 (r30) / ~30 s on
 		# node 1 (r29), intermittently, with nothing logged.
@@ -17507,3 +17573,7 @@ class BatchGenWorker:
 		)
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
+		# After empty_cache: what is still held here is what this switch
+		# did NOT give back, which is the number the rebuild path's
+		# net-zero invariant is read from.
+		self._log_phase_memory_ledger("deep_free_done")
