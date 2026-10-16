@@ -9303,7 +9303,10 @@ class BatchGenWorker:
 				# reuse decision stopped matching.
 				kda_slots = int(manager.config.num_state_items)
 				kda_live = len(manager.sequence_state_items)
-		except ImportError:
+		except Exception:
+			# Observability must not take down the switch it observes: a
+			# half-initialized manager raises AttributeError/TypeError here,
+			# and the -1 sentinel is a readable "unknown" in the line.
 			pass
 		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
 		logging.info(
