@@ -624,6 +624,68 @@ class KimiLinearParallelStrategyManager:
                     if chunk_rows > 0:
                         resident.compact_large_pass_rows = chunk_rows
 
+    def _reset_model_attached_state(self):
+        """Forget what was attached to a model this instance no longer owns.
+
+        ``_build_model`` runs again whenever the phase instances are rebuilt:
+        the worker's ``deep_free_model_memory()`` drops the model, and the next
+        ``configure_prefill`` / ``configure_decoding`` finds ``self.model is
+        None`` and builds a new one. Everything the configure steps attach
+        lives ON that model's modules — the resident-EP shard hangs off
+        ``layer.block_sparse_moe._resident_ep_moe``, the streamed-SP8 buffer
+        off the MoE blocks and the attention modules, and a captured decode
+        graph swaps their ``forward`` methods and bakes their addresses — so a
+        freshly built model starts with none of it.
+
+        The flags that record "already attached" are therefore claims about the
+        PREVIOUS model and must not outlive it. With ``_resident_ep_built``
+        left True across the rebuild, ``configure_decoding``'s
+        ``_init_resident_ep_decode()`` returned early, the new model's MoE
+        blocks kept no resident layer, and decode fell through to the streamed
+        expert wrapper — whose decode weight-copy task is deliberately empty
+        under resident EP — so ``core_engine.get_weights`` had nothing staged
+        and every rank raised ``GPU_Weight_Buffer get_weights()`` at the
+        SECOND prefill->decode switch. The first switch worked because the
+        shard was genuinely built there.
+
+        Releasing is not this function's job: the owners run before the
+        rebuild (``deep_free_model_memory`` on the worker side,
+        ``_release_resident_ep_decode`` / ``_release_streamed_sp8_prefill``
+        here). This drops only the bookkeeping that refers to dead modules, so
+        each phase instance stages what it needs at its own build.
+        """
+        self._resident_ep_built = False
+        self._streamed_sp8_buffer = None
+        # Restores the old model's forwards and drops its captured buckets;
+        # None-safe, so the first build is a no-op.
+        self.release_decode_graph()
+
+    def _assert_resident_ep_attached(self):
+        """The resident shard must be ON the live model when the flag says so.
+
+        ``_resident_ep_built`` is a claim, and the claim is cheap to check: the
+        resident layer is an attribute of every MoE block. Checking it where
+        the build is skipped turns a stale flag into a named lifecycle error
+        instead of a weight-buffer failure three layers down in the decode MoE.
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "resident-EP decode shard is marked built while this strategy "
+                "manager holds no model; the flag outlived its model"
+            )
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None:
+                continue
+            if getattr(moe, "_resident_ep_moe", None) is None:
+                raise RuntimeError(
+                    "resident-EP decode shard is marked built but the live "
+                    "model's MoE blocks carry no resident layer: the flag "
+                    "survived a model rebuild, so decode would fall through "
+                    "to the streamed expert path with no staged weights"
+                )
+            return
+
     def _release_resident_ep_decode(self):
         """Drop phase-inactive resident decode experts before streamed prefill.
 
@@ -1094,6 +1156,7 @@ class KimiLinearParallelStrategyManager:
         (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
         """
         if self._resident_ep_built:
+            self._assert_resident_ep_attached()
             return
         assert self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
@@ -1450,6 +1513,10 @@ class KimiLinearParallelStrategyManager:
         # 256 experts/layer are never allocated on the host).
         with torch.device("meta"):
             self.model = KimiLinearForCausalLM(cfg)
+        # A new model carries none of the previous one's attachments, so the
+        # bookkeeping that says otherwise is dropped HERE, before any configure
+        # step consults it to decide whether to stage something.
+        self._reset_model_attached_state()
         logging.info(f"Rank {self.rank}: model skeleton constructed on meta "
                      f"({time.perf_counter() - start:.1f}s)")
 
