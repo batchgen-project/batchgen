@@ -2233,7 +2233,9 @@ class BatchGenWorker:
 			prompt_score_from_length,
 		)
 
-		profile = self._cached_prefix_rank_cost_profile()
+		profile = self._cached_prefix_rank_cost_profile(
+			self._prefix_rank_cost_profile_disabled(seqs)
+		)
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 		chunk_tokens = int(
 			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
@@ -10190,7 +10192,41 @@ class BatchGenWorker:
 		debug = (active_debug(seqs) if active_debug is not None else None) or {}
 		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
 
-	def _cached_prefix_rank_cost_profile(self):
+	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
+		"""``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
+
+		Scoring the packer's targets by predicted seconds and balancing their
+		computed tokens are the two arms of the packing comparison, and the
+		difference between them is a wall time: measuring it across two servers
+		would confound it with cold-start, allocator and JIT state, so the arm
+		has to be switchable inside one process. Batch level and nothing else:
+		the key rides the same admitted-batch broadcast as
+		``prefix_rank_assignment_mode``, so every rank of every group resolves
+		the same value and the packing stays replicated. Set it on EVERY
+		request of a corpus — ``_active_batchgen_debug_for_sequences`` merges
+		per-sequence dicts first-non-None-wins, exactly as the mode key does.
+
+		Only the two spellings are accepted; a mistyped value is refused rather
+		than read as "on", because a silently ignored arm switch would make the
+		two arms the same run.
+		"""
+		active = getattr(self, "_active_batchgen_debug_for_sequences", None)
+		debug = (active(seqs) if active is not None else None) or {}
+		value = debug.get("prefix_rank_cost_profile")
+		if value is None:
+			return False
+		if isinstance(value, str):
+			text = value.strip().lower()
+			if text == "off":
+				return True
+			if text == "on":
+				return False
+		raise ValueError(
+			"batchgen_debug.prefix_rank_cost_profile must be 'on' or 'off', "
+			f"got {value!r}"
+		)
+
+	def _cached_prefix_rank_cost_profile(self, disabled: bool = False):
 		"""This deployment's prefill executor cost profile, looked up once.
 
 		Model, device properties and parallel layout are deployment constants,
@@ -10203,30 +10239,44 @@ class BatchGenWorker:
 		cross-node GPU homogeneity is a deployment precondition that the launch
 		identity gate verifies; no collective is run here. Each rank logs what
 		it resolved, so a divergence is visible in the logs.
+
+		The cache is keyed by ``disabled``, not a single attribute: the A/B
+		switch is batch level, so one process serves both arms, and a lookup
+		cached under whichever arm arrived first would pin every later batch to
+		it. ``disabled`` resolves to ``None`` — the same value as "no profile
+		matches", which is exactly the fallback arm the packer already has.
 		"""
-		if not hasattr(self, "_prefix_rank_cost_profile"):
+		if not hasattr(self, "_prefix_rank_cost_profiles"):
+			self._prefix_rank_cost_profiles = {}
+		key = bool(disabled)
+		if key not in self._prefix_rank_cost_profiles:
 			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 
 			G = self._decode_attn_tp_size()
 			group_size = G if G > 1 else 1
-			props = torch.cuda.get_device_properties(0)
-			profile = find_executor_cost_profile(
-				self.model_name or "",
-				(props.major, props.minor),
-				props.total_memory,
-				self.world_size,
-				group_size,
-			)
-			self._prefix_rank_cost_profile = profile
+			if key:
+				profile = None
+			else:
+				props = torch.cuda.get_device_properties(0)
+				profile = find_executor_cost_profile(
+					self.model_name or "",
+					(props.major, props.minor),
+					props.total_memory,
+					self.world_size,
+					group_size,
+				)
+			self._prefix_rank_cost_profiles[key] = profile
 			logging.info(
-				"[PREFIX_PACK] rank %d executor cost profile: model=%s group_size=%d -> %s",
+				"[PREFIX_PACK] rank %d executor cost profile: model=%s "
+				"group_size=%d disabled=%d -> %s",
 				self.rank,
 				(self.model_name or "").lower().rsplit("/", 1)[-1],
 				group_size,
+				int(key),
 				"none" if profile is None
 				else f"{profile.model}/{profile.machine}/g{profile.group_size}",
 			)
-		return self._prefix_rank_cost_profile
+		return self._prefix_rank_cost_profiles[key]
 
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
@@ -10290,7 +10340,9 @@ class BatchGenWorker:
 				prompt_score_from_length,
 			)
 
-			profile = self._cached_prefix_rank_cost_profile()
+			profile = self._cached_prefix_rank_cost_profile(
+				self._prefix_rank_cost_profile_disabled(seqs)
+			)
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 			chunk_tokens = int(
 				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap

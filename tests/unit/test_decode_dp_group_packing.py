@@ -64,6 +64,9 @@ _METHODS = (
     "_pack_decode_dp_groups_for_sharing",
     "_prefix_rank_packing_mode",
     "_cached_prefix_rank_cost_profile",
+    # The A/B arm the packer call sites resolve per batch; these fakes carry no
+    # batchgen_debug, so it is always the default (profile) arm.
+    "_prefix_rank_cost_profile_disabled",
 )
 
 
@@ -109,7 +112,9 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
         world_size=world_size,
         global_batch=_Batch(seqs),
         # Preset: the cached lookup never reaches the CUDA device query.
-        _prefix_rank_cost_profile=profile,
+        # Pre-seeded cache (keyed by the A/B arm, False = profile arm),
+        # so no fake needs a CUDA device query.
+        _prefix_rank_cost_profiles={False: profile},
         prefix_cache_runtime_config=SimpleNamespace(
             group_specs=[SimpleNamespace(raw_page_tokens=B)]),
         engine_config=SimpleNamespace(
