@@ -1020,6 +1020,9 @@ class BatchGenWorker:
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
+		# Edge trigger for the prefix_drain metric: set when the row is
+		# emitted, cleared when admission adds new sequences.
+		self._prefix_drain_metric_emitted = False
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
@@ -1626,6 +1629,8 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# New live work: the next drain is a new edge for the prefix_drain row.
+		self._prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2359,6 +2364,8 @@ class BatchGenWorker:
 					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
 					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
 				)
+
+		self._maybe_emit_prefix_drain_metric()
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
@@ -7756,6 +7763,11 @@ class BatchGenWorker:
 							device=self.torch_device,
 							reason="end of prefill",
 						)
+						# Every D2H of the wave has retired, and the segment
+						# pseudo sequences still hold their page tables: the
+						# only window where a row's destination Host bytes can
+						# be read back and compared to its source.
+						self._verify_prefill_pool_offload_bytes()
 						self._finish_prefill_pool_wave()
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
@@ -9814,6 +9826,29 @@ class BatchGenWorker:
 			worker_view=self.core_engine.host_paged_kv_worker_view,
 		)
 
+	def _maybe_emit_prefix_drain_metric(self) -> None:
+		"""Emit one prefix_drain row when the live sequence set drains to empty.
+
+		Called from _report_completion, which every completion path runs after
+		the sequence reached COMPLETED and its Host pages and prefix
+		attachments were released, so the row records active_attachments at the
+		drain moment. Live means any status other than COMPLETED: a QUEUEING,
+		IN_PREFILL, PREFILLED, IN_DECODE, ON_HOLD or EVICTED sequence can still
+		hold or regain an attachment. Edge-triggered: one row per drain,
+		re-armed by _admit_sequences_from_message.
+		"""
+		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
+			return
+		if self._prefix_drain_metric_emitted:
+			return
+		if not self.global_batch.all_completed():
+			return
+		self._prefix_drain_metric_emitted = True
+		self._emit_prefix_cache_metric(
+			"prefix_drain",
+			**self._prefix_host_resource_fields(),
+		)
+
 	def _close_prefix_materialization(
 		self, materialization, *, empty_cuda_cache: bool
 	) -> None:
@@ -10452,7 +10487,11 @@ class BatchGenWorker:
 				f"{geometry_page_bytes} B"
 			)
 		wave.pool = pool
-		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
+		pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
+		wave.executor = PoolChunkExecutor(
+			wave.plan, wave.prompts, pool,
+			pad_poison=self._pool_pad_poison_enabled(wave),
+		)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -10622,6 +10661,18 @@ class BatchGenWorker:
 			self.parallel_manager, "gather_prefill_last_token_hidden", None
 		)
 		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
+		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
+		epilogue_trace = self._new_pool_epilogue_tracer(wave)
+		if epilogue_trace is not None:
+			# The wave boundary is the earliest point this seam can stamp: the
+			# plan and the Host attachment happen in the reservation
+			# transaction, before this method is entered.
+			epilogue_trace.phase(
+				"wave_begin",
+				rows=len(wave.plan.segments) + len(wave.global_ids),
+				tokens=wave.plan.computed_tokens,
+				chunks=len(wave.plan.chunks),
+			)
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -10642,11 +10693,22 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_layer_map = (
 			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
+		)
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
 				rows = wave.executor.build(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_begin(
+						epilogue_trace.chunk + 1,
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				host_ids, host_starts = wave.row_host_targets(rows)
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
@@ -10693,6 +10755,17 @@ class BatchGenWorker:
 						).view(batch_sz, seq_sz, hidden_dim)
 					if gather_last_token_hidden is None:
 						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+						if epilogue_trace is not None:
+							norms = last_hidden.detach().float().norm(dim=-1).tolist()
+							epilogue_trace.record_gather(
+								attn_tp_rank=0, attn_tp_size=1,
+								num_global_rows=int(rows.input_ids.numel()),
+								shard_start=0,
+								shard_end=int(rows.input_ids.numel()),
+								owned=[True] * len(norms),
+								pre_norms=norms, post_norms=norms,
+								canary_zero_rows=None,
+							)
 					else:
 						# Streamed-SP8 holds only this rank's row shard, so the
 						# tail rows are reassembled over the group.
@@ -10700,6 +10773,11 @@ class BatchGenWorker:
 							self.model.model.norm(hidden_states),
 							rows.tail_rows,
 							int(rows.input_ids.numel()),
+							**(
+								{"trace": epilogue_trace}
+								if epilogue_trace is not None
+								else {}
+							),
 						)
 					logits = (
 						self.model.lm_head.forward(last_hidden).float()
@@ -10714,12 +10792,36 @@ class BatchGenWorker:
 					)
 					for row, index in enumerate(rows.tail_wave_indices):
 						tokens_by_index[index] = selected[row]
+					if epilogue_trace is not None:
+						# The pairing side of the trace: the row -> wave index
+						# -> uuid -> global id chain, beside the gather-side
+						# facts the recorder already holds.
+						epilogue_trace.emit(
+							table_rows=[
+								row for row, item in enumerate(rows.items)
+								if item.kind == "tail"
+							],
+							tail_rows=rows.tail_rows.tolist(),
+							wave_indices=list(rows.tail_wave_indices),
+							global_ids=list(wave.global_ids),
+							uuids=list(wave.uuids),
+							tokens=[int(token) for token in selected],
+							# The SAME tensor _select_tokens consumed: full
+							# vocabulary in both branches (the vocab-parallel
+							# head all-gathers before returning).
+							logits=logits,
+						)
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
 				block_residual = None
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_end(
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				# Allocated bytes are what a chunk needs. The allocator's reserve
 				# grows into whatever the pool left free and drops cached blocks
 				# only when a cudaMalloc fails, so it is reported, not checked.
@@ -10738,6 +10840,17 @@ class BatchGenWorker:
 						f"{workspace} B kept beside the prefix pool"
 					)
 			prefill_s = time.perf_counter() - start
+			if epilogue_trace is not None:
+				# The last stamp a rank emits before it leaves the pooled
+				# prefill: comparing wave_end across the two nodes is what
+				# shows whether one group entered decode while the other was
+				# still inside a pooled chunk.
+				epilogue_trace.phase(
+					"wave_end",
+					elapsed_ms=prefill_s * 1e3,
+					tokens=executed,
+					chunks=len(wave.plan.chunks),
+				)
 			if executed != wave.plan.computed_tokens:
 				raise RuntimeError(
 					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
@@ -10785,6 +10898,151 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _new_pool_epilogue_tracer(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
+
+		Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
+		flag rides on the wave's own sequences. Traces the only stretch of the
+		pooled path the local oracles and the GPU replays never reached - the
+		tail-row gather, the streamed-SP8 shard reassembly and the row ->
+		wave index -> uuid -> sequence pairing that carries a hidden state to
+		sampling. Returns None when the batch did not ask.
+		"""
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		tracer = tracer_from_debug(debug, rank=self.rank, path="pool")
+		if tracer is None:
+			return None
+		logging.info(
+			"[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
+			"chunks=%s probe_token=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			len(wave.plan.chunks),
+			tracer.probe_token,
+		)
+		return tracer
+
+	def _new_pool_kernel_dump_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		wave's own sequences. The value is the mode, ``"sync"`` or
+		``"nosync"`` - with ``sync`` the probe synchronizes before reading the
+		pool back, so a corruption that only survives ``nosync`` is a
+		write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
+		directory (default /dev/shm). Returns None when the batch did not ask.
+		"""
+		from batchgen.prefix_reuse.kernel_dump import (
+			DEBUG_FLAG as _POOL_DUMP_FLAG,
+			DUMP_DIR_FLAG as _POOL_DUMP_DIR_FLAG,
+			PoolKernelDumpRecorder,
+			dump_directory,
+			parse_dump_mode,
+		)
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		mode = parse_dump_mode(debug.get(_POOL_DUMP_FLAG))
+		if mode is None:
+			return None
+		directory = dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank)
+		logging.info(
+			"[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
+			"segments=%s page_tokens=%s",
+			self.rank,
+			mode,
+			directory,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return PoolKernelDumpRecorder(
+			rank=self.rank,
+			mode=mode,
+			directory=directory,
+			page_tokens=wave.page_tokens,
+			global_ids=list(wave.global_ids),
+		)
+
+	def _pool_pad_poison_enabled(self, wave) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
+
+		Read through the same seam as ``prefix_pool_offload_check``: the flag
+		rides on the wave's own sequences, so a batch arms the probe against a
+		server that is already up. False when the batch did not ask, which
+		leaves the packed page table byte-identical to the default.
+		"""
+		from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
+			return False
+		logging.info(
+			"[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
+			"with its own last page: members=%s segments=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+		)
+		return True
+
+	def _new_pool_offload_check_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
+
+		Read through the same seam as ``prefix_rank_assignment_mode``: the flag
+		rides on the wave's own sequences, so a batch arms the check against a
+		server that is already up and no env var exists for it. Returns None
+		when the batch did not ask, which is what keeps the check free.
+		"""
+		from batchgen.prefix_reuse.offload_check import (
+			DEBUG_FLAG as _POOL_OFFLOAD_CHECK_FLAG,
+			PoolOffloadCheckRecorder,
+		)
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
+			return None
+		logging.info(
+			"[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
+			"members=%s segments=%s page_tokens=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return PoolOffloadCheckRecorder(
+			rank=self.rank, page_tokens=wave.page_tokens
+		)
+
+	def _verify_prefill_pool_offload_bytes(self) -> None:
+		"""Compare every pooled row's Host destination bytes to its source.
+
+		Runs at the one point where that is both meaningful and safe: after the
+		wave's D2H has retired, so the destination pages are written, and before
+		``_finish_prefill_pool_wave`` publishes the segments and drops the
+		pseudo-sequence page tables the check reads back through.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.offload_check import verify_pool_offload_rows
+
+		recorder = AttnWrapperBase.prefill_pool_offload_recorder
+		if recorder is None:
+			return
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+		wave = self._prefill_pool_wave
+		wave_tag = (
+			f"m{len(wave.uuids)}s{len(wave.plan.segments)}"
+			if wave is not None
+			else "-"
+		)
+		verify_pool_offload_rows(recorder.rows, logger=logging, wave_tag=wave_tag)
 
 	def _finish_prefill_pool_wave(self) -> None:
 		"""After every D2H retired: publish the segments, pin members to them.
@@ -11327,6 +11585,22 @@ class BatchGenWorker:
 			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
+		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
+		# same keys as the pooled wave, so one armed batch traces whichever
+		# prefill runs (the first batch on a fresh server, or reuse OFF).
+		# None in production.
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+
+		unpooled_trace = tracer_from_debug(
+			prefill_debug, rank=self.rank, path="unpooled"
+		)
+		if unpooled_trace is not None:
+			logging.info(
+				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
+				"micro_batches=%s probe_token=%s",
+				self.rank, len(prefill_sequences), len(micro_batches),
+				unpooled_trace.probe_token,
+			)
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
@@ -11653,6 +11927,32 @@ class BatchGenWorker:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+					)
+				if unpooled_trace is not None:
+					# One line per sequence, from the SAME logits the token
+					# choice consumed; the hidden norms are of the final-normed
+					# vectors fed to lm_head, as on the pooled path.
+					unpooled_trace.begin_chunk(batch_idx)
+					hidden_norms = (
+						last_token_hidden.detach().float().norm(dim=-1).tolist()
+					)
+					unpooled_trace.record_gather(
+						attn_tp_rank=0, attn_tp_size=1,
+						num_global_rows=int(batch_input_ids_flat.numel()),
+						shard_start=0,
+						shard_end=int(batch_input_ids_flat.numel()),
+						owned=[True] * len(hidden_norms),
+						pre_norms=hidden_norms, post_norms=hidden_norms,
+						canary_zero_rows=None,
+					)
+					unpooled_trace.emit(
+						table_rows=list(range(batch_num_seqs)),
+						tail_rows=last_token_indices.tolist(),
+						wave_indices=list(range(batch_num_seqs)),
+						global_ids=[int(seq.global_idx) for seq in batch_sequences],
+						uuids=[str(seq.uuid) for seq in batch_sequences],
+						tokens=[int(token) for token in batch_new_tokens],
+						logits=logits,
 					)
 				output_tokens.append(batch_new_tokens)
 

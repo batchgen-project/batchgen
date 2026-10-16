@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
 
@@ -98,7 +99,48 @@ class KDAStateGPUManager:
             self.config.logical_to_physical_layer,
             self.config.num_kda_layers,
         )
+        self._log_layer_mapping_isolation()
         self._reset_runtime_state()
+
+    def _log_layer_mapping_isolation(self) -> None:
+        """State the resolved layer map, and shout if two layers share a row.
+
+        Every KDA layer owns one row of the 4-D recurrent and conv pools, so
+        two logical layers resolving to the same physical row would silently
+        share all four states. ``validate_layer_mapping`` checks range and
+        non-emptiness but NOT injectivity, and a shared row cannot be
+        distinguished from a correct run by any downstream assertion, so it is
+        reported here once at construction.
+        """
+
+        mapping = self._logical_to_physical_layer
+        if mapping is None:
+            logging.info(
+                "[KDA_STATE] identity layer map over %d KDA layers "
+                "(each layer owns its own state row)",
+                self.config.num_kda_layers,
+            )
+            return
+        physical = [int(row) for row in mapping if int(row) >= 0]
+        duplicates = sorted(
+            {row for row in physical if physical.count(row) > 1}
+        )
+        logging.info(
+            "[KDA_STATE] layer map logical->physical %s over %d rows "
+            "(%d mapped, %d duplicate rows)",
+            list(mapping),
+            self.config.num_kda_layers,
+            len(physical),
+            len(duplicates),
+        )
+        if duplicates:
+            logging.error(
+                "[KDA_STATE] layer map is NOT injective: physical rows %s are "
+                "each claimed by more than one logical KDA layer, so those "
+                "layers share one recurrent and conv state. Map: %s",
+                duplicates,
+                list(mapping),
+            )
 
     # ------------------------------------------------------------------
     # lifecycle
