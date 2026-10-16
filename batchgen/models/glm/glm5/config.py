@@ -108,6 +108,12 @@ class GLM5Config(BaseModelConfig):
     moe_layer_freq: int = 1
 
     # Router
+    # Decode-only: route the graphed MoE dispatch/combine through the DeepEP
+    # low-latency exchange instead of the NCCL all_gather + reduce_scatter
+    # pair. Runtime knob, set from the server's --enable-deepep by
+    # glm5_initializer; never read from a checkpoint. Default False keeps NCCL.
+    enable_deepep: bool = False
+
     topk_method: str = "noaux_tc"
     n_group: int = 1
     topk_group: int = 1
