@@ -10176,6 +10176,16 @@ class BatchGenWorker:
 		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
 		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
 		epilogue_trace = self._new_pool_epilogue_tracer(wave)
+		if epilogue_trace is not None:
+			# The wave boundary is the earliest point this seam can stamp: the
+			# plan and the Host attachment happen in the reservation
+			# transaction, before this method is entered.
+			epilogue_trace.phase(
+				"wave_begin",
+				rows=len(wave.plan.segments) + len(wave.global_ids),
+				tokens=wave.plan.computed_tokens,
+				chunks=len(wave.plan.chunks),
+			)
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -10207,7 +10217,11 @@ class BatchGenWorker:
 				self.feed_watchdog()
 				rows = wave.executor.build(chunk)
 				if epilogue_trace is not None:
-					epilogue_trace.begin_chunk(epilogue_trace.chunk + 1)
+					epilogue_trace.chunk_begin(
+						epilogue_trace.chunk + 1,
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				host_ids, host_starts = wave.row_host_targets(rows)
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
@@ -10312,6 +10326,11 @@ class BatchGenWorker:
 				block_residual = None
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_end(
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				# Allocated bytes are what a chunk needs. The allocator's reserve
 				# grows into whatever the pool left free and drops cached blocks
 				# only when a cudaMalloc fails, so it is reported, not checked.
@@ -10330,6 +10349,17 @@ class BatchGenWorker:
 						f"{workspace} B kept beside the prefix pool"
 					)
 			prefill_s = time.perf_counter() - start
+			if epilogue_trace is not None:
+				# The last stamp a rank emits before it leaves the pooled
+				# prefill: comparing wave_end across the two nodes is what
+				# shows whether one group entered decode while the other was
+				# still inside a pooled chunk.
+				epilogue_trace.phase(
+					"wave_end",
+					elapsed_ms=prefill_s * 1e3,
+					tokens=executed,
+					chunks=len(wave.plan.chunks),
+				)
 			if executed != wave.plan.computed_tokens:
 				raise RuntimeError(
 					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "

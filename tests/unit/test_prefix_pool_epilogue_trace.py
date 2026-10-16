@@ -216,7 +216,104 @@ def test_a_new_chunk_drops_the_previous_gather():
 
 
 # --------------------------------------------------------------------------- #
-#  (iv) Both arming seams, through the real sources
+#  (iv) The per-chunk timing stamps
+# --------------------------------------------------------------------------- #
+def test_a_phase_line_carries_both_clocks():
+    """The wall clock is the only cross-NODE comparable field, so it is there.
+
+    ``perf_counter`` has a per-process origin: comparing two nodes with it
+    would be meaningless, which is why the line carries ``wall`` as well.
+    """
+
+    line = _TRACE.format_phase(
+        rank=3, phase="chunk_begin", chunk=0, wall=1760000000.5,
+        mono_ms=12.5, elapsed_ms=None, rows=63, tokens=22480, chunks=1,
+    )
+    assert line.startswith("[EPILOGUE_TRACE] kind=phase ")
+    for fragment in ("rank=3", "phase=chunk_begin", "chunk=0",
+                     "wall=1760000000.500000", "mono_ms=12.500",
+                     "elapsed_ms=na", "rows=63", "tokens=22480", "chunks=1"):
+        assert fragment in line, fragment
+
+
+def test_a_row_line_and_a_phase_line_are_greppable_apart():
+    """One prefix for both, a ``kind`` field to separate them."""
+
+    phase = _TRACE.format_phase(
+        rank=0, phase="wave_begin", chunk=-1, wall=1.0, mono_ms=0.0,
+        elapsed_ms=None, rows=None, tokens=None, chunks=None)
+    row = _TRACE.format_row(
+        rank=0, attn_tp_rank=0, attn_tp_size=1, chunk=0, table_row=0,
+        tail_row=5, wave_index=0, global_idx=64, uuid="u",
+        num_global_rows=10, shard_start=0, shard_end=10, owner=0,
+        owned_here=True, owned_count=1, pre_norm=1.0, post_norm=1.0,
+        canary_zero_rows=0, token=7)
+    assert "kind=phase" in phase and "kind=row" not in phase
+    assert "kind=row" in row and "kind=phase" not in row
+    assert phase.split()[0] == row.split()[0] == "[EPILOGUE_TRACE]"
+    # Missing counts read as na, never as 0.
+    assert "rows=na" in phase and "tokens=na" in phase and "chunks=na" in phase
+
+
+def test_a_chunk_is_stamped_at_both_ends_with_a_duration():
+    lines = []
+    tracer = _TRACE.EpilogueTracer(rank=1)
+    tracer.chunk_begin(0, rows=63, tokens=22480, log=lines.append)
+    tracer.chunk_end(rows=63, tokens=22480, log=lines.append)
+
+    assert len(lines) == 2
+    assert "phase=chunk_begin" in lines[0] and "elapsed_ms=na" in lines[0]
+    assert "phase=chunk_end" in lines[1]
+    assert "chunk=0" in lines[0] and "chunk=0" in lines[1]
+    elapsed = float(lines[1].split("elapsed_ms=")[1].split()[0])
+    assert elapsed >= 0.0
+    # Both clocks advance, and the wall clock is absolute.
+    walls = [float(line.split("wall=")[1].split()[0]) for line in lines]
+    assert walls[1] >= walls[0] > 1_600_000_000.0
+    monos = [float(line.split("mono_ms=")[1].split()[0]) for line in lines]
+    assert monos[1] >= monos[0] >= 0.0
+
+
+def test_chunk_begin_also_resets_the_gather_record():
+    """A new chunk must not report the previous chunk's norms."""
+
+    tracer = _TRACE.EpilogueTracer(rank=0)
+    tracer.chunk_begin(0, log=lambda line: None)
+    tracer.record_gather(
+        attn_tp_rank=0, attn_tp_size=1, num_global_rows=10, shard_start=0,
+        shard_end=10, owned=[True], pre_norms=[1.0], post_norms=[1.0],
+        canary_zero_rows=0)
+    tracer.chunk_begin(1, log=lambda line: None)
+
+    assert tracer.chunk == 1
+    assert tracer.pre_norms is None and tracer.post_norms is None
+    row = tracer.emit(
+        table_rows=[0], tail_rows=[3], wave_indices=[0], global_ids=[64],
+        uuids=["u"], log=lambda line: None)[0]
+    assert "pre_l2=na" in row and "chunk=1" in row
+
+
+def test_an_unclosed_chunk_reports_no_duration_rather_than_a_wrong_one():
+    tracer = _TRACE.EpilogueTracer(rank=0)
+    line = tracer.chunk_end(log=lambda _: None)  # never begun
+
+    assert "phase=chunk_end" in line and "elapsed_ms=na" in line
+
+
+def test_the_worker_stamps_the_wave_and_every_chunk():
+    source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+
+    assert 'epilogue_trace.phase(\n\t\t\t\t"wave_begin"' in source
+    assert 'epilogue_trace.phase(\n\t\t\t\t\t"wave_end"' in source
+    assert "epilogue_trace.chunk_begin(" in source
+    assert "epilogue_trace.chunk_end(" in source
+    # wave_end must carry the prefill duration the rank measured.
+    tail = source.split('"wave_end"')[1].split(")")[0]
+    assert "elapsed_ms=prefill_s * 1e3" in tail
+
+
+# --------------------------------------------------------------------------- #
+#  (v) Both arming seams, through the real sources
 # --------------------------------------------------------------------------- #
 def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()

@@ -52,6 +52,7 @@ Arming (batch level, no env var, no cold restart)::
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -121,6 +122,42 @@ def owner_of_row(row: int, num_rows: int, group_size: int) -> int:
     return rem + (row - boundary) // base
 
 
+def format_phase(
+    *,
+    rank: int,
+    phase: str,
+    chunk: int,
+    wall: float,
+    mono_ms: float,
+    elapsed_ms: Optional[float],
+    rows: Optional[int],
+    tokens: Optional[int],
+    chunks: Optional[int],
+) -> str:
+    """One timing line. ``wall`` is the only field comparable across NODES.
+
+    ``mono_ms`` is ``perf_counter`` since this tracer was built, which is
+    meaningful only within one process: perf_counter has a per-process origin,
+    so comparing two nodes with it would be meaningless. The wall clock
+    (CLOCK_REALTIME) is comparable to whatever the two hosts' clocks agree on,
+    which is what answers "did group 1 leave prefill while group 0 was still
+    inside its pooled chunk".
+    """
+
+    def number(value, digits=3):
+        return "na" if value is None else f"{value:.{digits}f}"
+
+    def count(value):
+        return "na" if value is None else str(int(value))
+
+    return (
+        f"[{PREFIX}] kind=phase rank={rank} phase={phase} chunk={chunk} "
+        f"wall={wall:.6f} mono_ms={mono_ms:.3f} "
+        f"elapsed_ms={number(elapsed_ms)} rows={count(rows)} "
+        f"tokens={count(tokens)} chunks={count(chunks)}"
+    )
+
+
 def format_row(
     *,
     rank: int,
@@ -149,7 +186,7 @@ def format_row(
         return "na" if value is None else f"{value:.6e}"
 
     return (
-        f"[{PREFIX}] rank={rank} tp={attn_tp_rank}/{attn_tp_size} "
+        f"[{PREFIX}] kind=row rank={rank} tp={attn_tp_rank}/{attn_tp_size} "
         f"chunk={chunk} row={table_row} tail_row={tail_row} "
         f"wave={wave_index} global_idx={global_idx} uuid={uuid} "
         f"rows={num_global_rows} shard=[{shard_start},{shard_end}) "
@@ -181,6 +218,49 @@ class EpilogueTracer:
     owned_count: int = 0
     canary_zero_rows: Optional[int] = None
     lines: list = field(default_factory=list)
+    # Timing. ``_origin`` anchors the per-process monotonic clock; the wall
+    # clock is emitted raw because it is the only cross-NODE comparable field.
+    _origin: float = field(default_factory=time.perf_counter)
+    _chunk_started: Optional[float] = None
+
+    # -- timing ------------------------------------------------------------ #
+    def phase(
+        self,
+        name: str,
+        *,
+        elapsed_ms: Optional[float] = None,
+        rows: Optional[int] = None,
+        tokens: Optional[int] = None,
+        chunks: Optional[int] = None,
+        log=None,
+    ) -> str:
+        """Stamp one boundary; returns the line so the tests can read it."""
+
+        line = format_phase(
+            rank=self.rank, phase=name, chunk=self.chunk, wall=time.time(),
+            mono_ms=(time.perf_counter() - self._origin) * 1e3,
+            elapsed_ms=elapsed_ms, rows=rows, tokens=tokens, chunks=chunks,
+        )
+        self.lines.append(line)
+        (logging.info if log is None else log)(line)
+        return line
+
+    def chunk_begin(self, chunk_index: int, *, rows=None, tokens=None,
+                    log=None) -> str:
+        """Open a chunk: resets the gather-side record and stamps the start."""
+
+        self.begin_chunk(chunk_index)
+        self._chunk_started = time.perf_counter()
+        return self.phase("chunk_begin", rows=rows, tokens=tokens, log=log)
+
+    def chunk_end(self, *, rows=None, tokens=None, log=None) -> str:
+        """Close a chunk, with its wall duration."""
+
+        elapsed = (None if self._chunk_started is None
+                   else (time.perf_counter() - self._chunk_started) * 1e3)
+        self._chunk_started = None
+        return self.phase("chunk_end", elapsed_ms=elapsed, rows=rows,
+                          tokens=tokens, log=log)
 
     def begin_chunk(self, chunk_index: int) -> None:
         self.chunk = int(chunk_index)
