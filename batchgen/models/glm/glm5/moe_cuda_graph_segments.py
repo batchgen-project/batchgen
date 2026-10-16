@@ -53,12 +53,6 @@ class _Glm5MoEGraphBuffers:
     router_logits: torch.Tensor
     topk_indices: torch.Tensor
     topk_weights: torch.Tensor
-    topk_masked_indices: torch.Tensor
-    topk_masked_weights: torch.Tensor
-    topk_negative_ones: torch.Tensor
-    topk_zero_weights: torch.Tensor
-    rank_ids: torch.Tensor
-    local_pos: torch.Tensor
     expert_counts: torch.Tensor
     expert_counters: torch.Tensor
     topk_pos: torch.Tensor
@@ -89,7 +83,6 @@ class _Glm5MoEGraphBuffers:
 #   * _MOE_SHARED_FIELDS     — bucket-independent per-expert metadata; one
 #     tensor handed to every bucket.
 #   * _MOE_REBUILT_FIELDS    — built per bucket:
-#       rank_ids/local_pos   values depend on bucket_size, not just length;
 #       x_scale/inter_scale  are TRANSPOSED [dim/128, capacity], so the bucket
 #                            dimension is dim 1 — a dim-1 slice is not
 #                            contiguous and the grouped GEMM requires a
@@ -102,10 +95,6 @@ _MOE_BUCKET_DIM_FIELDS = (
     "router_logits",
     "topk_indices",
     "topk_weights",
-    "topk_masked_indices",
-    "topk_masked_weights",
-    "topk_negative_ones",
-    "topk_zero_weights",
     "topk_pos",
     "dispatched_x",
     "intermediate",
@@ -123,8 +112,6 @@ _MOE_SHARED_FIELDS = (
 )
 
 _MOE_REBUILT_FIELDS = (
-    "rank_ids",
-    "local_pos",
     "x_scale",
     "inter_scale",
     "capacity",
@@ -211,10 +198,6 @@ class Glm5MoEGraphBufferPool:
         b["router_logits"] = torch.empty(max_global, 256, dtype=torch.float32, device=d)
         b["topk_indices"] = torch.empty(max_global, k, dtype=torch.int32, device=d)
         b["topk_weights"] = torch.empty(max_global, k, dtype=torch.float32, device=d)
-        b["topk_masked_indices"] = torch.empty(max_global, k, dtype=torch.int32, device=d)
-        b["topk_masked_weights"] = torch.empty(max_global, k, dtype=torch.float32, device=d)
-        b["topk_negative_ones"] = torch.full((max_global, k), -1, dtype=torch.int32, device=d)
-        b["topk_zero_weights"] = torch.zeros(max_global, k, dtype=torch.float32, device=d)
         b["expert_counts"] = torch.zeros(self.num_local_experts, dtype=torch.int32, device=d)
         b["expert_counters"] = torch.zeros(self.num_local_experts, dtype=torch.int32, device=d)
         # Written on device by dispatch_scatter_ragged every step (64-aligned
@@ -264,17 +247,12 @@ class Glm5MoEGraphBufferPool:
                 f"but the base allocation has {base_capacity}; setup() must run on "
                 "the largest bucket first."
             )
-        positions = torch.arange(global_rows, dtype=torch.int64, device=self.device)
         sliced = {
             "padded": b["padded"][:bucket_size],
             "all_tokens": b["all_tokens"][:global_rows],
             "router_logits": b["router_logits"][:global_rows],
             "topk_indices": b["topk_indices"][:global_rows],
             "topk_weights": b["topk_weights"][:global_rows],
-            "topk_masked_indices": b["topk_masked_indices"][:global_rows],
-            "topk_masked_weights": b["topk_masked_weights"][:global_rows],
-            "topk_negative_ones": b["topk_negative_ones"][:global_rows],
-            "topk_zero_weights": b["topk_zero_weights"][:global_rows],
             "topk_pos": b["topk_pos"][:nk],
             "dispatched_x": b["dispatched_x"][:capacity],
             "intermediate": b["intermediate"][:capacity],
@@ -297,8 +275,6 @@ class Glm5MoEGraphBufferPool:
         _, inter_scale = make_quant_buffers(capacity, self.intermediate_size, self.device)
         self._views[bucket_size] = _Glm5MoEGraphBuffers(
             **sliced,
-            rank_ids=positions // bucket_size,
-            local_pos=positions % bucket_size,
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
             cu_seqlens=b["cu_seqlens"],
@@ -437,6 +413,13 @@ class Glm5MoEGraphSegment:
                 bufs.all_tokens,
                 logits=bufs.router_logits,
             )
+        # The rank padding mask is the gate's own epilogue. The all-gathered row
+        # space is world_size contiguous blocks of bucket_size rows and block r
+        # is live only up to rank_token_counts[r], so padding rows come out as
+        # expert id -1 / weight 0 directly. This replaces four elementwise
+        # launches per routed layer (the rank_token_counts gather, the local_pos
+        # compare, and one torch.where per output) with the same values written
+        # by the gate call that was already running.
         gate_sigmoid_topk_cuda(
             bufs.router_logits,
             self.gate_bias_fp32,
@@ -444,29 +427,15 @@ class Glm5MoEGraphSegment:
             routed_scaling_factor=self.routed_scaling_factor,
             topk_indices=bufs.topk_indices,
             topk_weights=bufs.topk_weights,
-        )
-
-        valid_per_row = rank_token_counts[bufs.rank_ids]
-        padding_mask = bufs.local_pos >= valid_per_row
-        padding_mask_2d = padding_mask.unsqueeze(1).expand_as(bufs.topk_indices)
-        torch.where(
-            padding_mask_2d,
-            bufs.topk_negative_ones,
-            bufs.topk_indices,
-            out=bufs.topk_masked_indices,
-        )
-        torch.where(
-            padding_mask_2d,
-            bufs.topk_zero_weights,
-            bufs.topk_weights,
-            out=bufs.topk_masked_weights,
+            rank_token_counts=rank_token_counts,
+            rows_per_rank=bucket_size,
         )
 
         # No memset (see the eager path): TMA extents clip to seqlens[e] and
         # act_quant_ragged skips every row that is not a live token.
         expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
             bufs.all_tokens,
-            bufs.topk_masked_indices,
+            bufs.topk_indices,
             bufs.dispatched_x,
             self.expert_start,
             self.num_local_experts,
@@ -481,7 +450,7 @@ class Glm5MoEGraphSegment:
         routed_global_output = reduce_weighted_scatter(
             bufs.expert_out,
             topk_pos,
-            bufs.topk_masked_weights,
+            bufs.topk_weights,
             global_rows,
             self.hidden_size,
             self.num_experts_per_tok,
