@@ -313,7 +313,120 @@ def test_the_worker_stamps_the_wave_and_every_chunk():
 
 
 # --------------------------------------------------------------------------- #
-#  (v) Both arming seams, through the real sources
+#  (v) First-token logit diagnostics
+# --------------------------------------------------------------------------- #
+import torch  # noqa: E402  (the diagnostics take the real logits tensor)
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, None), (False, None), (1008, 1008), (0, 0), ("1008", 1008),
+    (" 646 ", 646),
+])
+def test_the_probe_parser_accepts_token_ids(value, expected):
+    assert _TRACE.parse_probe_token(value) == expected
+
+
+@pytest.mark.parametrize("value", [-1, True, "The", 1.5, "10x"])
+def test_a_bad_probe_is_refused_by_name(value):
+    """A mistyped probe must not quietly print na on every line."""
+
+    with pytest.raises(ValueError, match="prefix_pool_epilogue_probe_token"):
+        _TRACE.parse_probe_token(value)
+
+
+def _logits():
+    # row 0: a clear winner; row 1: a near tie between ids 3 and 5
+    return torch.tensor([
+        [0.0, 9.0, 1.0, 2.0, 0.5, 3.0],
+        [0.0, 1.0, 1.0, 7.25, 0.0, 7.0],
+    ])
+
+
+def test_top2_margin_and_probe_come_from_the_given_logits():
+    diags = _TRACE.logit_diagnostics(_logits(), probe_token=5)
+
+    assert diags[0]["top1"] == (1, 9.0) and diags[0]["top2"] == (5, 3.0)
+    assert diags[0]["margin"] == pytest.approx(6.0)
+    assert diags[0]["probe"] == (5, 3.0)
+    assert diags[1]["top1"] == (3, 7.25) and diags[1]["top2"] == (5, 7.0)
+    assert diags[1]["margin"] == pytest.approx(0.25)
+    assert diags[1]["probe"] == (5, 7.0)
+    assert all(d["vocab"] == 6 for d in diags)
+
+
+def test_without_a_probe_the_probe_reads_na_and_out_of_range_is_named():
+    plain = _TRACE.logit_diagnostics(_logits(), probe_token=None)
+    assert plain[0]["probe"] is None
+    assert "probe=na" in _TRACE.format_diag(plain[0])
+
+    far = _TRACE.logit_diagnostics(_logits(), probe_token=99)
+    assert far[0]["probe"] == (99, "out_of_range")
+    assert "probe=99:out_of_range" in _TRACE.format_diag(far[0])
+
+
+def test_the_diag_suffix_has_the_agreed_format():
+    text = _TRACE.format_diag(_TRACE.logit_diagnostics(_logits(), 5)[1])
+
+    assert text == (" top1=3:7.250000 top2=5:7.000000 margin=0.250000 "
+                    "probe=5:7.000000 vocab=6")
+
+
+def test_a_one_dimensional_or_mismatched_logits_tensor_is_refused():
+    with pytest.raises(ValueError, match=r"\[rows, vocab\]"):
+        _TRACE.logit_diagnostics(torch.zeros(6))
+
+    tracer = _TRACE.EpilogueTracer(rank=0)
+    with pytest.raises(ValueError, match="pair a row with another row"):
+        tracer.emit(table_rows=[0], tail_rows=[3], wave_indices=[0],
+                    global_ids=[64], uuids=["u"], logits=_logits(),
+                    log=lambda _: None)
+
+
+def test_emit_appends_the_diagnostics_to_each_row_line():
+    tracer = _TRACE.EpilogueTracer(rank=0, probe_token=5)
+    tracer.chunk_begin(0, log=lambda _: None)
+    lines = tracer.emit(
+        table_rows=[1, 5], tail_rows=[837, 1909], wave_indices=[0, 2],
+        global_ids=list(range(64, 96)), uuids=[f"u{i}" for i in range(32)],
+        tokens=[1, 3], logits=_logits(), log=lambda _: None)
+
+    assert "global_idx=64" in lines[0] and "top1=1:9.000000" in lines[0]
+    assert "margin=6.000000" in lines[0] and "probe=5:3.000000" in lines[0]
+    assert "global_idx=66" in lines[1] and "margin=0.250000" in lines[1]
+    # Without logits the line is exactly what it was before this change.
+    plain = tracer.emit(
+        table_rows=[1], tail_rows=[837], wave_indices=[0],
+        global_ids=list(range(64, 96)), uuids=[f"u{i}" for i in range(32)],
+        tokens=[1], log=lambda _: None)[0]
+    assert "top1=" not in plain and plain.endswith("token=1")
+
+
+def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
+    source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+
+    emit = source.split("epilogue_trace.emit(")[1].split("\n\t\t\t\t\t\t)")[0]
+    assert "logits=logits" in emit
+    assert "probe = parse_probe_token(debug.get(_EPILOGUE_PROBE_FLAG))" in source
+    assert "EpilogueTracer(rank=self.rank, probe_token=probe)" in source
+    # The logits handed over are the ones _select_tokens consumed, built from
+    # the vocab-parallel head when it is sharded.
+    block = source.split("logits = (\n\t\t\t\t\t\tself.model.lm_head.forward")[1]
+    assert block.index("self._select_tokens(") < block.index("logits=logits")
+
+
+def test_the_vocab_parallel_head_returns_the_full_vocabulary():
+    """So a top-k on the epilogue's logits is global, never shard-local."""
+
+    source = _ROOT.joinpath(
+        "batchgen", "models", "moonshotai", "kimi_linear", "vocab_parallel.py"
+    ).read_text()
+    head = source.split("class VocabParallelLMHead")[1].split("\ndef ")[0]
+    assert "all_gather_into_tensor" in head
+    assert "return assemble_gathered_logits(gathered, self.vocab_size)" in head
+
+
+# --------------------------------------------------------------------------- #
+#  (vi) Both arming seams, through the real sources
 # --------------------------------------------------------------------------- #
 def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()

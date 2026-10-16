@@ -56,8 +56,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-# Batch-level ``batchgen_debug`` key.
+# Batch-level ``batchgen_debug`` keys.
 DEBUG_FLAG = "prefix_pool_epilogue_trace"
+# Optional companion: a token id whose first-token logit every row reports, so
+# a run can ask "how far was the reference's first token from winning here".
+PROBE_FLAG = "prefix_pool_epilogue_probe_token"
 PREFIX = "EPILOGUE_TRACE"
 
 
@@ -83,6 +86,91 @@ def parse_trace_flag(value) -> bool:
     raise ValueError(
         f"{DEBUG_FLAG} must be a boolean (or 0/1/on/off), got {value!r}"
     )
+
+
+def parse_probe_token(value) -> Optional[int]:
+    """``None`` when not asked; a non-negative token id otherwise.
+
+    A value that is not an integer id is refused by name rather than read as
+    "no probe" - a mistyped probe must not quietly print ``na`` everywhere.
+    """
+
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{PROBE_FLAG} must be a token id, got {value!r}")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{PROBE_FLAG} must be >= 0, got {value!r}")
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    raise ValueError(f"{PROBE_FLAG} must be a token id, got {value!r}")
+
+
+def logit_diagnostics(logits, probe_token: Optional[int] = None) -> list:
+    """Per row: top-2 ids and logits, their margin, the probe's logit, vocab.
+
+    ``logits`` is the ``[rows, vocab]`` tensor ``_select_tokens`` consumes.
+    It must be the FULL vocabulary: the vocab-parallel head all-gathers and
+    reassembles ``[..., V]`` before returning (vocab_parallel.py, forward and
+    assemble_gathered_logits), so a top-k here is global. ``vocab`` is reported
+    on every line anyway, so a shard-local tensor could never pass as global.
+
+    The margin is what separates the two readings of a wrong first token: a
+    near-tie that pooled numerics tipped (small margin) from a hidden state
+    that is substantively elsewhere (large margin for the wrong token).
+    """
+
+    import torch
+
+    if logits.dim() != 2:
+        raise ValueError(f"expected [rows, vocab] logits, got {tuple(logits.shape)}")
+    rows, vocab = logits.shape
+    work = logits.detach().float()
+    k = min(2, vocab)
+    values, indices = torch.topk(work, k, dim=-1)
+    values = values.cpu().tolist()
+    indices = indices.cpu().tolist()
+    probe_values = None
+    if probe_token is not None and 0 <= probe_token < vocab:
+        probe_values = work[:, probe_token].cpu().tolist()
+    out = []
+    for row in range(rows):
+        top1 = (int(indices[row][0]), float(values[row][0]))
+        top2 = ((int(indices[row][1]), float(values[row][1]))
+                if k > 1 else None)
+        if probe_token is None:
+            probe = None
+        elif probe_values is None:
+            probe = (int(probe_token), "out_of_range")
+        else:
+            probe = (int(probe_token), float(probe_values[row]))
+        out.append({
+            "top1": top1, "top2": top2,
+            "margin": (top1[1] - top2[1]) if top2 is not None else None,
+            "probe": probe, "vocab": int(vocab),
+        })
+    return out
+
+
+def format_diag(diag: Optional[dict]) -> str:
+    """`` top1=<id>:<logit> top2=<id>:<logit> margin=<f> probe=<id>:<v|na> vocab=<V>``."""
+
+    if diag is None:
+        return ""
+
+    def pair(item):
+        if item is None:
+            return "na"
+        ident, value = item
+        return (f"{ident}:{value}" if isinstance(value, str)
+                else f"{ident}:{value:.6f}")
+
+    margin = "na" if diag["margin"] is None else f"{diag['margin']:.6f}"
+    probe = "na" if diag["probe"] is None else pair(diag["probe"])
+    return (f" top1={pair(diag['top1'])} top2={pair(diag['top2'])} "
+            f"margin={margin} probe={probe} vocab={diag['vocab']}")
 
 
 def balanced_shard(num_rows: int, group_size: int, group_rank: int):
@@ -179,6 +267,7 @@ def format_row(
     post_norm: Optional[float],
     canary_zero_rows: Optional[int],
     token: Optional[int],
+    diag: Optional[dict] = None,
 ) -> str:
     """One compact line. Pure, so the formatter is testable on its own."""
 
@@ -194,6 +283,7 @@ def format_row(
         f"owned_count={owned_count} pre_l2={number(pre_norm)} "
         f"post_l2={number(post_norm)} canary_zero={canary_zero_rows} "
         f"token={'na' if token is None else int(token)}"
+        f"{format_diag(diag)}"
     )
 
 
@@ -222,6 +312,8 @@ class EpilogueTracer:
     # clock is emitted raw because it is the only cross-NODE comparable field.
     _origin: float = field(default_factory=time.perf_counter)
     _chunk_started: Optional[float] = None
+    # ``prefix_pool_epilogue_probe_token``: the id whose logit every row reports.
+    probe_token: Optional[int] = None
 
     # -- timing ------------------------------------------------------------ #
     def phase(
@@ -308,10 +400,22 @@ class EpilogueTracer:
         uuids: Sequence[str],
         tokens: Sequence[int] = (),
         log=None,
+        logits=None,
     ) -> list:
-        """Log one line per tail row; returns the lines for the tests."""
+        """Log one line per tail row; returns the lines for the tests.
+
+        ``logits`` is the ``[rows, vocab]`` tensor ``_select_tokens`` consumed;
+        when given, each line also carries the first-token diagnostics.
+        """
 
         emit_log = logging.info if log is None else log
+        diags = (logit_diagnostics(logits, self.probe_token)
+                 if logits is not None else None)
+        if diags is not None and len(diags) != len(tail_rows):
+            raise ValueError(
+                f"{len(diags)} logit rows for {len(tail_rows)} tail rows: the "
+                f"diagnostics would pair a row with another row's logits"
+            )
         self.lines = []
         for index, tail_row in enumerate(tail_rows):
             wave_index = int(wave_indices[index])
@@ -347,6 +451,7 @@ class EpilogueTracer:
                            else None),
                 canary_zero_rows=self.canary_zero_rows,
                 token=(tokens[index] if index < len(tokens) else None),
+                diag=(diags[index] if diags is not None else None),
             )
             self.lines.append(line)
             emit_log(line)

@@ -10319,6 +10319,10 @@ class BatchGenWorker:
 							global_ids=list(wave.global_ids),
 							uuids=list(wave.uuids),
 							tokens=[int(token) for token in selected],
+							# The SAME tensor _select_tokens consumed: full
+							# vocabulary in both branches (the vocab-parallel
+							# head all-gathers before returning).
+							logits=logits,
 						)
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
@@ -10420,7 +10424,9 @@ class BatchGenWorker:
 		"""
 		from batchgen.prefix_reuse.epilogue_trace import (
 			DEBUG_FLAG as _EPILOGUE_TRACE_FLAG,
+			PROBE_FLAG as _EPILOGUE_PROBE_FLAG,
 			EpilogueTracer,
+			parse_probe_token,
 			parse_trace_flag,
 		)
 
@@ -10428,14 +10434,17 @@ class BatchGenWorker:
 		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
 		if not parse_trace_flag(debug.get(_EPILOGUE_TRACE_FLAG)):
 			return None
+		probe = parse_probe_token(debug.get(_EPILOGUE_PROBE_FLAG))
 		logging.info(
-			"[EPILOGUE_TRACE] rank=%s armed: members=%s segments=%s chunks=%s",
+			"[EPILOGUE_TRACE] rank=%s armed: members=%s segments=%s chunks=%s "
+			"probe_token=%s",
 			self.rank,
 			len(wave.uuids),
 			len(wave.plan.segments),
 			len(wave.plan.chunks),
+			probe,
 		)
-		return EpilogueTracer(rank=self.rank)
+		return EpilogueTracer(rank=self.rank, probe_token=probe)
 
 	def _new_pool_kernel_dump_recorder(self, wave):
 		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
