@@ -406,8 +406,13 @@ def test_the_worker_hands_the_trace_the_logits_select_tokens_consumed():
 
     emit = source.split("epilogue_trace.emit(")[1].split("\n\t\t\t\t\t\t)")[0]
     assert "logits=logits" in emit
-    assert "probe = parse_probe_token(debug.get(_EPILOGUE_PROBE_FLAG))" in source
-    assert "EpilogueTracer(rank=self.rank, probe_token=probe)" in source
+    # Both keys are parsed by the shared helper the two paths arm through.
+    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in source
+    helper = _ROOT.joinpath("batchgen", "prefix_reuse",
+                            "epilogue_trace.py").read_text()
+    rule = helper.split("def tracer_from_debug")[1].split("\ndef ")[0]
+    assert "parse_trace_flag(debug.get(DEBUG_FLAG))" in rule
+    assert "parse_probe_token(debug.get(PROBE_FLAG))" in rule
     # The logits handed over are the ones _select_tokens consumed, built from
     # the vocab-parallel head when it is sharded.
     block = source.split("logits = (\n\t\t\t\t\t\tself.model.lm_head.forward")[1]
@@ -426,7 +431,70 @@ def test_the_vocab_parallel_head_returns_the_full_vocabulary():
 
 
 # --------------------------------------------------------------------------- #
-#  (vi) Both arming seams, through the real sources
+#  (vi) The unpooled path, under the same keys
+# --------------------------------------------------------------------------- #
+def test_one_set_of_keys_arms_either_path_and_tags_it():
+    debug = {_TRACE.DEBUG_FLAG: True, _TRACE.PROBE_FLAG: 1008}
+    pool = _TRACE.tracer_from_debug(debug, rank=3, path="pool")
+    unpooled = _TRACE.tracer_from_debug(debug, rank=3, path="unpooled")
+
+    assert pool.path == "pool" and unpooled.path == "unpooled"
+    assert pool.probe_token == unpooled.probe_token == 1008
+    assert _TRACE.tracer_from_debug({}, rank=0, path="unpooled") is None
+    assert _TRACE.tracer_from_debug(None, rank=0, path="pool") is None
+
+
+def test_an_unknown_path_is_refused():
+    with pytest.raises(ValueError, match="path must be one of"):
+        _TRACE.tracer_from_debug({_TRACE.DEBUG_FLAG: True}, rank=0, path="both")
+
+
+def test_every_line_says_which_prefill_wrote_it():
+    tracer = _TRACE.tracer_from_debug(
+        {_TRACE.DEBUG_FLAG: True, _TRACE.PROBE_FLAG: 5}, rank=0, path="unpooled")
+    lines = []
+    tracer.chunk_begin(0, log=lines.append)
+    lines += tracer.emit(table_rows=[0, 1], tail_rows=[524, 1361],
+                         wave_indices=[0, 1], global_ids=[64, 65],
+                         uuids=["a", "b"], tokens=[1, 3], logits=_logits(),
+                         log=lambda _: None)
+
+    assert lines[0].startswith("[EPILOGUE_TRACE] kind=phase path=unpooled ")
+    assert lines[1].startswith("[EPILOGUE_TRACE] kind=row path=unpooled ")
+    assert "global_idx=65" in lines[2] and "margin=0.250000" in lines[2]
+    assert "probe=5:7.000000" in lines[2]
+    # The pooled default is unchanged apart from the tag.
+    assert _TRACE.EpilogueTracer(rank=0).path == "pool"
+
+
+def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
+    source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+    body = source.split("\tdef prefill_prepacked(self, batch: list[int]):")[1]
+    body = body.split("\n\tdef ")[0]
+
+    # Armed from the debug dict this path already resolves.
+    assert ('unpooled_trace = tracer_from_debug(\n\t\t\tprefill_debug, '
+            'rank=self.rank, path="unpooled"') in body
+    # The pooled wave still takes its own branch first.
+    assert body.index("return self._prefill_prepacked_pool(batch)") < body.index(
+        "unpooled_trace = tracer_from_debug(")
+    select = body.index("batch_new_tokens = self._select_tokens(logits, batch_sequences)")
+    emit = body.index("unpooled_trace.emit(")
+    assert select < emit
+    assert "logits=logits," in body[emit:emit + 900]
+    assert "tokens=[int(token) for token in batch_new_tokens]" in body[emit:emit + 900]
+
+
+def test_the_pooled_helper_now_shares_the_arming_rule():
+    source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
+    seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
+
+    assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in seam
+    assert "_active_batchgen_debug_for_sequences" in seam
+
+
+# --------------------------------------------------------------------------- #
+#  (vii) Both arming seams, through the real sources
 # --------------------------------------------------------------------------- #
 def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     source = _ROOT.joinpath("batchgen", "batchgen_worker.py").read_text()
@@ -435,7 +503,7 @@ def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     assert "epilogue_trace = self._new_pool_epilogue_tracer(wave)" in source
     seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
     assert "_active_batchgen_debug_for_sequences" in seam
-    assert "parse_trace_flag" in seam
+    assert "tracer_from_debug" in seam
     assert "return None" in seam
     # The pairing side is emitted beside the token selection.
     assert "epilogue_trace.emit(" in source

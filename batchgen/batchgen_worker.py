@@ -10422,29 +10422,23 @@ class BatchGenWorker:
 		wave index -> uuid -> sequence pairing that carries a hidden state to
 		sampling. Returns None when the batch did not ask.
 		"""
-		from batchgen.prefix_reuse.epilogue_trace import (
-			DEBUG_FLAG as _EPILOGUE_TRACE_FLAG,
-			PROBE_FLAG as _EPILOGUE_PROBE_FLAG,
-			EpilogueTracer,
-			parse_probe_token,
-			parse_trace_flag,
-		)
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
 
 		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
 		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
-		if not parse_trace_flag(debug.get(_EPILOGUE_TRACE_FLAG)):
+		tracer = tracer_from_debug(debug, rank=self.rank, path="pool")
+		if tracer is None:
 			return None
-		probe = parse_probe_token(debug.get(_EPILOGUE_PROBE_FLAG))
 		logging.info(
-			"[EPILOGUE_TRACE] rank=%s armed: members=%s segments=%s chunks=%s "
-			"probe_token=%s",
+			"[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
+			"chunks=%s probe_token=%s",
 			self.rank,
 			len(wave.uuids),
 			len(wave.plan.segments),
 			len(wave.plan.chunks),
-			probe,
+			tracer.probe_token,
 		)
-		return EpilogueTracer(rank=self.rank, probe_token=probe)
+		return tracer
 
 	def _new_pool_kernel_dump_recorder(self, wave):
 		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
@@ -11104,6 +11098,22 @@ class BatchGenWorker:
 			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
+		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
+		# same keys as the pooled wave, so one armed batch traces whichever
+		# prefill runs (the first batch on a fresh server, or reuse OFF).
+		# None in production.
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+
+		unpooled_trace = tracer_from_debug(
+			prefill_debug, rank=self.rank, path="unpooled"
+		)
+		if unpooled_trace is not None:
+			logging.info(
+				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
+				"micro_batches=%s probe_token=%s",
+				self.rank, len(prefill_sequences), len(micro_batches),
+				unpooled_trace.probe_token,
+			)
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
@@ -11430,6 +11440,32 @@ class BatchGenWorker:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+					)
+				if unpooled_trace is not None:
+					# One line per sequence, from the SAME logits the token
+					# choice consumed; the hidden norms are of the final-normed
+					# vectors fed to lm_head, as on the pooled path.
+					unpooled_trace.begin_chunk(batch_idx)
+					hidden_norms = (
+						last_token_hidden.detach().float().norm(dim=-1).tolist()
+					)
+					unpooled_trace.record_gather(
+						attn_tp_rank=0, attn_tp_size=1,
+						num_global_rows=int(batch_input_ids_flat.numel()),
+						shard_start=0,
+						shard_end=int(batch_input_ids_flat.numel()),
+						owned=[True] * len(hidden_norms),
+						pre_norms=hidden_norms, post_norms=hidden_norms,
+						canary_zero_rows=None,
+					)
+					unpooled_trace.emit(
+						table_rows=list(range(batch_num_seqs)),
+						tail_rows=last_token_indices.tolist(),
+						wave_indices=list(range(batch_num_seqs)),
+						global_ids=[int(seq.global_idx) for seq in batch_sequences],
+						uuids=[str(seq.uuid) for seq in batch_sequences],
+						tokens=[int(token) for token in batch_new_tokens],
+						logits=logits,
 					)
 				output_tokens.append(batch_new_tokens)
 

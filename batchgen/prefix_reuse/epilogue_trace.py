@@ -210,6 +210,27 @@ def owner_of_row(row: int, num_rows: int, group_size: int) -> int:
     return rem + (row - boundary) // base
 
 
+PATHS = ("pool", "unpooled")
+
+
+def tracer_from_debug(debug, *, rank: int, path: str):
+    """The armed tracer for one prefill, or None. Shared by both prefill paths.
+
+    The pooled wave and the unpooled prefill read the SAME batch-level keys,
+    so one armed batch traces whichever path actually runs; ``path`` tags
+    every line it emits.
+    """
+
+    if path not in PATHS:
+        raise ValueError(f"epilogue trace path must be one of {PATHS}, got {path!r}")
+    debug = debug or {}
+    if not parse_trace_flag(debug.get(DEBUG_FLAG)):
+        return None
+    return EpilogueTracer(
+        rank=rank, path=path, probe_token=parse_probe_token(debug.get(PROBE_FLAG))
+    )
+
+
 def format_phase(
     *,
     rank: int,
@@ -221,6 +242,7 @@ def format_phase(
     rows: Optional[int],
     tokens: Optional[int],
     chunks: Optional[int],
+    path: str = "pool",
 ) -> str:
     """One timing line. ``wall`` is the only field comparable across NODES.
 
@@ -239,7 +261,8 @@ def format_phase(
         return "na" if value is None else str(int(value))
 
     return (
-        f"[{PREFIX}] kind=phase rank={rank} phase={phase} chunk={chunk} "
+        f"[{PREFIX}] kind=phase path={path} rank={rank} phase={phase} "
+        f"chunk={chunk} "
         f"wall={wall:.6f} mono_ms={mono_ms:.3f} "
         f"elapsed_ms={number(elapsed_ms)} rows={count(rows)} "
         f"tokens={count(tokens)} chunks={count(chunks)}"
@@ -268,6 +291,7 @@ def format_row(
     canary_zero_rows: Optional[int],
     token: Optional[int],
     diag: Optional[dict] = None,
+    path: str = "pool",
 ) -> str:
     """One compact line. Pure, so the formatter is testable on its own."""
 
@@ -275,7 +299,8 @@ def format_row(
         return "na" if value is None else f"{value:.6e}"
 
     return (
-        f"[{PREFIX}] kind=row rank={rank} tp={attn_tp_rank}/{attn_tp_size} "
+        f"[{PREFIX}] kind=row path={path} rank={rank} "
+        f"tp={attn_tp_rank}/{attn_tp_size} "
         f"chunk={chunk} row={table_row} tail_row={tail_row} "
         f"wave={wave_index} global_idx={global_idx} uuid={uuid} "
         f"rows={num_global_rows} shard=[{shard_start},{shard_end}) "
@@ -314,6 +339,8 @@ class EpilogueTracer:
     _chunk_started: Optional[float] = None
     # ``prefix_pool_epilogue_probe_token``: the id whose logit every row reports.
     probe_token: Optional[int] = None
+    # Which prefill emitted the line: the pooled wave or the unpooled path.
+    path: str = "pool"
 
     # -- timing ------------------------------------------------------------ #
     def phase(
@@ -332,6 +359,7 @@ class EpilogueTracer:
             rank=self.rank, phase=name, chunk=self.chunk, wall=time.time(),
             mono_ms=(time.perf_counter() - self._origin) * 1e3,
             elapsed_ms=elapsed_ms, rows=rows, tokens=tokens, chunks=chunks,
+            path=self.path,
         )
         self.lines.append(line)
         (logging.info if log is None else log)(line)
@@ -452,6 +480,7 @@ class EpilogueTracer:
                 canary_zero_rows=self.canary_zero_rows,
                 token=(tokens[index] if index < len(tokens) else None),
                 diag=(diags[index] if diags is not None else None),
+                path=self.path,
             )
             self.lines.append(line)
             emit_log(line)
