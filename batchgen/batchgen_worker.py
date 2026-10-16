@@ -10174,6 +10174,8 @@ class BatchGenWorker:
 			self.parallel_manager, "gather_prefill_last_token_hidden", None
 		)
 		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
+		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
+		epilogue_trace = self._new_pool_epilogue_tracer(wave)
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -10204,6 +10206,8 @@ class BatchGenWorker:
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
 				rows = wave.executor.build(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.begin_chunk(epilogue_trace.chunk + 1)
 				host_ids, host_starts = wave.row_host_targets(rows)
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
@@ -10250,6 +10254,17 @@ class BatchGenWorker:
 						).view(batch_sz, seq_sz, hidden_dim)
 					if gather_last_token_hidden is None:
 						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+						if epilogue_trace is not None:
+							norms = last_hidden.detach().float().norm(dim=-1).tolist()
+							epilogue_trace.record_gather(
+								attn_tp_rank=0, attn_tp_size=1,
+								num_global_rows=int(rows.input_ids.numel()),
+								shard_start=0,
+								shard_end=int(rows.input_ids.numel()),
+								owned=[True] * len(norms),
+								pre_norms=norms, post_norms=norms,
+								canary_zero_rows=None,
+							)
 					else:
 						# Streamed-SP8 holds only this rank's row shard, so the
 						# tail rows are reassembled over the group.
@@ -10257,6 +10272,11 @@ class BatchGenWorker:
 							self.model.model.norm(hidden_states),
 							rows.tail_rows,
 							int(rows.input_ids.numel()),
+							**(
+								{"trace": epilogue_trace}
+								if epilogue_trace is not None
+								else {}
+							),
 						)
 					logits = (
 						self.model.lm_head.forward(last_hidden).float()
@@ -10271,6 +10291,21 @@ class BatchGenWorker:
 					)
 					for row, index in enumerate(rows.tail_wave_indices):
 						tokens_by_index[index] = selected[row]
+					if epilogue_trace is not None:
+						# The pairing side of the trace: the row -> wave index
+						# -> uuid -> global id chain, beside the gather-side
+						# facts the recorder already holds.
+						epilogue_trace.emit(
+							table_rows=[
+								row for row, item in enumerate(rows.items)
+								if item.kind == "tail"
+							],
+							tail_rows=rows.tail_rows.tolist(),
+							wave_indices=list(rows.tail_wave_indices),
+							global_ids=list(wave.global_ids),
+							uuids=list(wave.uuids),
+							tokens=[int(token) for token in selected],
+						)
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
@@ -10342,6 +10377,35 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _new_pool_epilogue_tracer(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
+
+		Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
+		flag rides on the wave's own sequences. Traces the only stretch of the
+		pooled path the local oracles and the GPU replays never reached - the
+		tail-row gather, the streamed-SP8 shard reassembly and the row ->
+		wave index -> uuid -> sequence pairing that carries a hidden state to
+		sampling. Returns None when the batch did not ask.
+		"""
+		from batchgen.prefix_reuse.epilogue_trace import (
+			DEBUG_FLAG as _EPILOGUE_TRACE_FLAG,
+			EpilogueTracer,
+			parse_trace_flag,
+		)
+
+		seqs = [self.global_batch.get_sequence(uuid) for uuid in wave.uuids]
+		debug = self._active_batchgen_debug_for_sequences(seqs) or {}
+		if not parse_trace_flag(debug.get(_EPILOGUE_TRACE_FLAG)):
+			return None
+		logging.info(
+			"[EPILOGUE_TRACE] rank=%s armed: members=%s segments=%s chunks=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			len(wave.plan.chunks),
+		)
+		return EpilogueTracer(rank=self.rank)
 
 	def _new_pool_kernel_dump_recorder(self, wave):
 		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
