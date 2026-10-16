@@ -93,7 +93,7 @@ PROFILES: tuple[ExecutorCostProfile, ...] = (
     # correlated in the fitted samples, so neither coefficient is trustworthy
     # alone; the packer consumes only their joint prediction.
     ExecutorCostProfile(
-        model="kimi-linear-48b-a3b",
+        model="kimi-linear-48b-a3b-instruct",
         machine="sm90-141g",
         group_size=8,
         world_size=16,

@@ -31,7 +31,7 @@ from batchgen.prefix_reuse.executor_cost import (
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
-K3_MODEL = "moonshotai/Kimi-Linear-48B-A3B"
+K3_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 SM90 = (9, 0)
 MEM_141G = int(141 * 1024 ** 3)
 WORLD = 16
@@ -96,7 +96,7 @@ def test_the_k3_entry_matches_this_deployment():
     )
     assert profile is not None
     assert (profile.model, profile.group_size, profile.world_size) == (
-        "kimi-linear-48b-a3b", G, WORLD
+        "kimi-linear-48b-a3b-instruct", G, WORLD
     )
 
 
@@ -106,6 +106,8 @@ def test_the_k3_entry_matches_this_deployment():
     (dict(compute_capability=(10, 0)), "another compute capability"),
     (dict(total_memory_bytes=int(96 * 1024 ** 3)), "another memory class"),
     (dict(model_name="moonshotai/Kimi-Linear-96B-A6B"), "another checkpoint"),
+    (dict(model_name="moonshotai/Kimi-Linear-48B-A3B"),
+     "the base name is not the served Instruct checkpoint"),
 ])
 def test_the_entry_refuses_every_neighbouring_layout(kwargs, why):
     call = dict(model_name=K3_MODEL, compute_capability=SM90,
@@ -161,7 +163,7 @@ def test_a_mistyped_arm_is_refused_not_read_as_on(value):
 def test_the_default_arm_resolves_the_profile():
     worker = _worker()
     profile = worker._cached_prefix_rank_cost_profile(False)
-    assert profile is not None and profile.model == "kimi-linear-48b-a3b"
+    assert profile is not None and profile.model == "kimi-linear-48b-a3b-instruct"
 
 
 def test_the_off_arm_resolves_to_the_token_balance_fallback():
