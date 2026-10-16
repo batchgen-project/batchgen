@@ -28,14 +28,15 @@ ROUTER_BLOCK_K = 64
 # growing the partial buffer and the reduction pass, so the best count falls as
 # the row count rises -- which is exactly what the sweep below shows.
 #
-# Each entry is the count a microbenchmark found fastest for that bucket, with
-# the count forced per run through ``split_k=`` and the kernel timed under graph
-# replay at the production K and expert count. Sweep and figures: internal
-# campaign glm52-decode-step-gap-vs-sglang, slice A, which is the record to
-# re-run before changing an entry. The shape of the result is that only the
-# lowest captured bucket is still short of programs; from 256 rows up the extra
-# reduction pass costs more than the shorter K walk saves, and the margin
-# against the higher count widens with the row count.
+# Each entry is the count a microbenchmark found fastest for that bucket, taken
+# as the minimum over every exact split count from 1 to 32 rather than from a
+# two-way comparison, with the count forced per run through ``split_k=`` and the
+# kernel timed under graph replay at the production K and expert count. Sweep
+# and figures: internal campaign glm52-decode-step-gap-vs-sglang, slice A, which
+# is the record to re-run before changing an entry. The shape of the result is
+# that only the lowest captured bucket is still short of programs; from 256 rows
+# up the extra reduction pass costs more than the shorter K walk saves, and the
+# margin against the higher count widens with the row count.
 ROUTER_SPLIT_K_MEASURED: tuple[tuple[int, int], ...] = (
     (192, 8),
     (256, 4),
