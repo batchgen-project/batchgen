@@ -667,6 +667,83 @@ def fused_rmsnorm_rope_with_q(
     return processed_kv
 
 
+#: Target number of CTAs the q-side RoPE launch aims for.  Sized a few waves
+#: above the SM count of the serving GPUs so a small decode bucket still fills
+#: the device; raising it only makes the tiles narrower.
+Q_ROPE_TARGET_CTAS = 512
+
+#: Upper bound on ``BLOCK_H * BLOCK_PAIRS`` (register budget per program).
+Q_ROPE_MAX_TILE_ELEMS = 2048
+
+#: Lower / upper bound on the pair-axis tile.  The floor keeps very small
+#: head dims off degenerate 1-2 lane tiles; the ceiling is the largest rope
+#: half-dim this kernel accepts in a single pass.
+Q_ROPE_MIN_PAIRS = 16
+Q_ROPE_MAX_PAIRS = 256
+
+
+def _next_pow2(value: int) -> int:
+    pow2 = 1
+    while pow2 < value:
+        pow2 *= 2
+    return pow2
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)
+
+
+def select_q_rope_tiling(
+    bsz: int,
+    num_heads: int,
+    half_dim: int,
+    target_ctas: int = Q_ROPE_TARGET_CTAS,
+    max_tile_elems: int = Q_ROPE_MAX_TILE_ELEMS,
+) -> tuple[int, int, int]:
+    """Pick the launch tiling for the fused RMSNorm+RoPE decode kernel.
+
+    The kernel is launched on a ``(bsz, 1 + num_head_tiles)`` grid: lane 0 of
+    each row carries the KV RMSNorm + k_pe rotation, lanes ``1..`` each rotate
+    ``BLOCK_H`` q heads.  Decode calls this with one row per sequence, so for
+    a 64-row bucket a head-serial kernel can only ever occupy 64 CTAs; the
+    head axis is what makes the launch wide enough to fill the device.
+
+    Returns ``(block_h, block_pairs, num_head_tiles)``.  ``block_h`` is the
+    largest power of two that still leaves at least ``target_ctas`` programs
+    (so wide buckets get fat, well-coalesced tiles and narrow buckets get
+    more of them), capped by the per-program element budget.
+
+    The choice is a pure function of the launch geometry and changes only how
+    the work is partitioned: every output element is computed by exactly one
+    program from the same inputs with the same expression, so the result is
+    independent of the tiling and therefore of the CUDA-graph bucket size.
+    """
+    if bsz <= 0:
+        raise ValueError(f"bsz must be positive, got {bsz}")
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if half_dim <= 0:
+        raise ValueError(f"half_dim must be positive, got {half_dim}")
+    if half_dim > Q_ROPE_MAX_PAIRS:
+        raise ValueError(
+            "fused_rmsnorm_rope_with_q_native supports a rope half-dim of at "
+            f"most {Q_ROPE_MAX_PAIRS}, got {half_dim} "
+            f"(qk_rope_head_dim={half_dim * 2})"
+        )
+
+    block_pairs = max(Q_ROPE_MIN_PAIRS, _next_pow2(half_dim))
+    max_block_h = max(1, min(num_heads, max_tile_elems // block_pairs))
+
+    block_h = 1
+    while (
+        block_h * 2 <= max_block_h
+        and bsz * (1 + _ceil_div(num_heads, block_h * 2)) >= target_ctas
+    ):
+        block_h *= 2
+
+    return block_h, block_pairs, _ceil_div(num_heads, block_h)
+
+
 @triton.jit
 def fused_rmsnorm_rope_with_q_native_kernel(
     new_compressed_kv_ptr,
@@ -683,6 +760,8 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     qk_rope_head_dim,
     variance_epsilon: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_PAIRS: tl.constexpr,
 ):
     """Fused RMSNorm + RoPE kernel with NATIVE INTERLEAVED output layout.
 
@@ -692,74 +771,88 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     This matches the element-for-element layout produced by
     ``rotary_pos_emb_interleaved_native`` in the prefill path, keeping the
     k_pe cache layout consistent across prefill writes and decode writes.
+
+    Launched on a 2D ``(row, lane)`` grid, see ``select_q_rope_tiling``:
+
+      ``lane == 0``   RMSNorm over the kv-lora slice + k_pe rotation.
+      ``lane >= 1``   rotate the ``BLOCK_H`` q heads of tile ``lane - 1`` as a
+                      single ``[BLOCK_H, BLOCK_PAIRS]`` tile.
+
+    The head axis lives in the grid rather than in a loop on purpose.  A
+    ``for head_idx in range(num_heads)`` body loads from and stores to the
+    same ``q_pe_ptr``, so the compiler must order every iteration's store
+    before the next iteration's load: each program paid ``num_heads`` serial
+    round trips to memory, and with one program per row there were no other
+    CTAs resident to hide them behind.  Tiling the heads turns that serial
+    latency chain into one wide, coalesced load/store pair per program.
     """
     batch_idx = tl.program_id(0)
+    lane_idx = tl.program_id(1)
+
     total_dim = kv_lora_rank + qk_rope_head_dim
-    input_offset = batch_idx * input_batch_stride
-    output_offset = batch_idx * total_dim
-    pos_id = tl.load(position_ids_ptr + batch_idx)
-
-    # ==================== RMSNorm on KV Lora slice ====================
-    sum_sq_fp32 = 0.0
-    for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < kv_lora_rank
-        data_bf16 = tl.load(
-            new_compressed_kv_ptr + input_offset + offsets,
-            mask=mask,
-            other=0.0,
-        )
-        data_fp32 = data_bf16.to(tl.float32)
-        sum_sq_fp32 += tl.sum(data_fp32 * data_fp32)
-
-    variance = sum_sq_fp32 / kv_lora_rank
-    inv_rms = 1.0 / tl.sqrt(variance + variance_epsilon)
-
-    for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < kv_lora_rank
-        data_bf16 = tl.load(
-            new_compressed_kv_ptr + input_offset + offsets,
-            mask=mask,
-            other=0.0,
-        )
-        weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=1.0)
-        data_fp32 = data_bf16.to(tl.float32)
-        normalized_fp32 = data_fp32 * inv_rms * weight.to(tl.float32)
-        tl.store(
-            processed_kv_ptr + output_offset + offsets,
-            normalized_fp32.to(data_bf16.dtype),
-            mask=mask,
-        )
-
-    # ==================== RoPE for KV + Q (native interleaved output) ====================
-    input_rope_offset = input_offset + kv_lora_rank
-    processed_rope_offset = output_offset + kv_lora_rank
     half_dim = qk_rope_head_dim // 2
+    pos_id = tl.load(position_ids_ptr + batch_idx)
     cos_sin_base = pos_id * qk_rope_head_dim
-    q_pe_batch_stride = num_heads * qk_rope_head_dim
-    q_pe_head_stride = qk_rope_head_dim
 
-    for block_start in range(0, half_dim, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < half_dim
+    pair_offsets = tl.arange(0, BLOCK_PAIRS)
+    pair_mask = pair_offsets < half_dim
+    even_indices = pair_offsets * 2
+    odd_indices = pair_offsets * 2 + 1
 
-        # cos/sin cache is stored as cat((freqs, freqs)), so the first and
-        # second halves hold the SAME values. Load once from the first half —
-        # a single set of (cos_i, sin_i) for each pair index i.
-        cos_i = tl.load(cos_ptr + cos_sin_base + offsets, mask=mask, other=1.0)
-        sin_i = tl.load(sin_ptr + cos_sin_base + offsets, mask=mask, other=0.0)
+    # cos/sin cache is stored as cat((freqs, freqs)), so the first and second
+    # halves hold the SAME values. Load once from the first half — a single
+    # set of (cos_i, sin_i) for each pair index i.
+    cos_i = tl.load(cos_ptr + cos_sin_base + pair_offsets, mask=pair_mask, other=1.0)
+    sin_i = tl.load(sin_ptr + cos_sin_base + pair_offsets, mask=pair_mask, other=0.0)
 
-        even_indices = offsets * 2
-        odd_indices = offsets * 2 + 1
+    if lane_idx == 0:
+        # ============ RMSNorm on KV Lora slice + k_pe RoPE ============
+        input_offset = batch_idx * input_batch_stride
+        output_offset = batch_idx * total_dim
+
+        sum_sq_fp32 = 0.0
+        for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < kv_lora_rank
+            data_bf16 = tl.load(
+                new_compressed_kv_ptr + input_offset + offsets,
+                mask=mask,
+                other=0.0,
+            )
+            data_fp32 = data_bf16.to(tl.float32)
+            sum_sq_fp32 += tl.sum(data_fp32 * data_fp32)
+
+        variance = sum_sq_fp32 / kv_lora_rank
+        inv_rms = 1.0 / tl.sqrt(variance + variance_epsilon)
+
+        for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < kv_lora_rank
+            data_bf16 = tl.load(
+                new_compressed_kv_ptr + input_offset + offsets,
+                mask=mask,
+                other=0.0,
+            )
+            weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=1.0)
+            data_fp32 = data_bf16.to(tl.float32)
+            normalized_fp32 = data_fp32 * inv_rms * weight.to(tl.float32)
+            tl.store(
+                processed_kv_ptr + output_offset + offsets,
+                normalized_fp32.to(data_bf16.dtype),
+                mask=mask,
+            )
+
+        input_rope_offset = input_offset + kv_lora_rank
+        processed_rope_offset = output_offset + kv_lora_rank
+
         kv_even = tl.load(
             new_compressed_kv_ptr + input_rope_offset + even_indices,
-            mask=mask,
+            mask=pair_mask,
             other=0.0,
         )
         kv_odd = tl.load(
             new_compressed_kv_ptr + input_rope_offset + odd_indices,
-            mask=mask,
+            mask=pair_mask,
             other=0.0,
         )
 
@@ -771,38 +864,39 @@ def fused_rmsnorm_rope_with_q_native_kernel(
         tl.store(
             processed_kv_ptr + processed_rope_offset + even_indices,
             kv_rot_even,
-            mask=mask,
+            mask=pair_mask,
         )
         tl.store(
             processed_kv_ptr + processed_rope_offset + odd_indices,
             kv_rot_odd,
-            mask=mask,
+            mask=pair_mask,
+        )
+    else:
+        # ============ RoPE on one tile of q heads ============
+        head_offsets = (lane_idx - 1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        head_mask = head_offsets < num_heads
+        tile_mask = head_mask[:, None] & pair_mask[None, :]
+
+        q_row_offset = batch_idx * num_heads * qk_rope_head_dim
+        q_even_offsets = (
+            q_row_offset
+            + head_offsets[:, None] * qk_rope_head_dim
+            + even_indices[None, :]
+        )
+        q_odd_offsets = (
+            q_row_offset
+            + head_offsets[:, None] * qk_rope_head_dim
+            + odd_indices[None, :]
         )
 
-        for head_idx in range(num_heads):
-            q_pe_base_offset = batch_idx * q_pe_batch_stride + head_idx * q_pe_head_stride
-            q_even = tl.load(
-                q_pe_ptr + q_pe_base_offset + even_indices,
-                mask=mask,
-                other=0.0,
-            )
-            q_odd = tl.load(
-                q_pe_ptr + q_pe_base_offset + odd_indices,
-                mask=mask,
-                other=0.0,
-            )
-            q_rot_even = q_even * cos_i - q_odd * sin_i
-            q_rot_odd = q_even * sin_i + q_odd * cos_i
-            tl.store(
-                q_pe_ptr + q_pe_base_offset + even_indices,
-                q_rot_even,
-                mask=mask,
-            )
-            tl.store(
-                q_pe_ptr + q_pe_base_offset + odd_indices,
-                q_rot_odd,
-                mask=mask,
-            )
+        q_even = tl.load(q_pe_ptr + q_even_offsets, mask=tile_mask, other=0.0)
+        q_odd = tl.load(q_pe_ptr + q_odd_offsets, mask=tile_mask, other=0.0)
+
+        q_rot_even = q_even * cos_i[None, :] - q_odd * sin_i[None, :]
+        q_rot_odd = q_even * sin_i[None, :] + q_odd * cos_i[None, :]
+
+        tl.store(q_pe_ptr + q_even_offsets, q_rot_even, mask=tile_mask)
+        tl.store(q_pe_ptr + q_odd_offsets, q_rot_odd, mask=tile_mask)
 
 
 def fused_rmsnorm_rope_with_q_native(
@@ -839,7 +933,13 @@ def fused_rmsnorm_rope_with_q_native(
         dtype=new_compressed_kv.dtype,
         device=new_compressed_kv.device,
     )
-    grid = (bsz,)
+
+    block_h, block_pairs, num_head_tiles = select_q_rope_tiling(
+        bsz,
+        num_heads,
+        qk_rope_head_dim // 2,
+    )
+    grid = (bsz, 1 + num_head_tiles)
 
     fused_rmsnorm_rope_with_q_native_kernel[grid](
         new_compressed_kv,
@@ -856,6 +956,11 @@ def fused_rmsnorm_rope_with_q_native(
         qk_rope_head_dim,
         eps,
         BLOCK_SIZE=64,
+        BLOCK_H=block_h,
+        BLOCK_PAIRS=block_pairs,
+        # Matches the previous launch's default so the kv-lora sum of squares
+        # keeps the same reduction tree, and with it the exact inv_rms bits.
+        num_warps=4,
     )
 
     return processed_kv
