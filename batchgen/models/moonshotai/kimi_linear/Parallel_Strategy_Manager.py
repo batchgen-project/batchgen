@@ -200,6 +200,9 @@ class KimiLinearParallelStrategyManager:
         self._attn_tp_hl = kda_num_heads // G
         self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
         self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        # World-level, so built once per process and reused by every later
+        # model rebuild (``_build_attn_tp_group``).
+        self._attn_tp_groups_built = False
         # Weight assembly has its own communicator.  The streamed-SP8
         # prefetcher launches the next layer's six all-gathers from a host
         # thread while the main thread runs the next layer's attention.  A
@@ -1893,6 +1896,25 @@ class KimiLinearParallelStrategyManager:
         """
         if self._attn_tp_size <= 1:
             return
+        if self._attn_tp_groups_built:
+            # Build ONCE per process. A NCCL sub-group is a world-level
+            # resource: ``dist.new_group`` keeps every group it creates in
+            # torch's global registry for the life of the process (only
+            # ``destroy_process_group`` drops one, which no phase switch
+            # calls), and each communicator's device buffers live OUTSIDE the
+            # caching allocator. ``_build_model`` runs again on every rebuild
+            # of a phase instance, so rebuilding these groups there added a
+            # fresh set of communicators per cycle that nothing held, nothing
+            # freed, and no torch counter could see — a driver-level leak that
+            # only surfaced as an OOM at the largest later allocation (the KV
+            # pool's ``cuMemCreate``). Unlike the model-attached state, these
+            # are deliberately NOT reset by ``_reset_model_attached_state``:
+            # the world did not change, so the groups are still the right ones.
+            #
+            # Collective-safe: ``new_group`` must be called by every rank in
+            # the same order, and this flag records THIS process's own build —
+            # every rank therefore takes the same branch on the same rebuild.
+            return
         import torch.distributed as dist
 
         if not dist.is_initialized():
@@ -1914,6 +1936,8 @@ class KimiLinearParallelStrategyManager:
             if g == self._attn_tp_group_id:
                 self._weight_tp_group = grp
         self._build_cross_weight_group()
+        # Every family is up; later rebuilds reuse them (see the guard above).
+        self._attn_tp_groups_built = True
 
     def _build_cross_weight_group(self):
         """Build the eight cross-node weight groups (hierarchical GDR only).
