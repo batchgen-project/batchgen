@@ -1351,6 +1351,10 @@ class KimiLinearParallelStrategyManager:
         Host KV keeps one 576-wide latent per token, so the pool cannot be
         sized from the Host geometry. ``layer_map`` maps an engine layer to its
         dense pool row, the same way the Host and GPU pools are mapped.
+
+        Answerable with or without a resident model: the worker calls this
+        while planning a wave, which happens in the decode phase where the
+        model may be deep-freed.
         """
         cfg = self.loaded_model_config
         mla_layers = [
@@ -1358,18 +1362,56 @@ class KimiLinearParallelStrategyManager:
             if cfg.is_mla_layer(layer_idx)
         ]
         rows = {layer_idx: row for row, layer_idx in enumerate(mla_layers)}
-        attn = self.model.model.layers[mla_layers[0]].self_attn
-        attn = getattr(attn, "module", attn)
-        return {
+        # Derived from the config, NOT from the module: the worker plans a
+        # pooled wave at reservation time, which can fall in a phase window
+        # where the model has been deep-freed and not rebuilt yet
+        # (``self.model is None``), and reading a layer there is an
+        # ``AttributeError: 'NoneType' object has no attribute 'model'``. Every
+        # number below is a model constant that does not move with the phase:
+        # the K/V widths are never sharded, and ``_load_attn_modules`` shards
+        # the head count by exactly ``_attn_tp_size``, which is fixed for the
+        # process. Same contract as the KDA state pools and as the worker's own
+        # DSA ``_prefill_pool_layout`` cache: decided once, reused across phases.
+        heads = int(cfg.num_attention_heads)
+        if self._attn_tp_size > 1:
+            heads //= self._attn_tp_size
+        layout = {
             "num_layers": len(mla_layers),
             "layer_map": tuple(
                 rows.get(layer_idx, -1)
                 for layer_idx in range(cfg.num_hidden_layers)
             ),
+            "num_kv_heads": heads,
+            "k_head_dim": int(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
+            "v_head_dim": int(cfg.v_head_dim),
+        }
+        if self.model is None:
+            return layout
+        # The module is the ground truth whenever it is resident, so compare
+        # instead of trusting the derivation: a future sharding seam that
+        # changes a head count or a width must fail here, where the pool is
+        # sized, rather than corrupt pool rows it no longer matches.
+        attn = self.model.model.layers[mla_layers[0]].self_attn
+        attn = getattr(attn, "module", attn)
+        live = {
             "num_kv_heads": int(attn.num_heads),
             "k_head_dim": int(attn.qk_nope_head_dim + attn.qk_rope_head_dim),
             "v_head_dim": int(attn.v_head_dim),
         }
+        divergent = {
+            key: (value, layout[key])
+            for key, value in live.items() if value != layout[key]
+        }
+        if divergent:
+            raise RuntimeError(
+                "prefill pool layout derived from the config disagrees with "
+                f"the resident MLA module (attn_tp_size={self._attn_tp_size}): "
+                + ", ".join(
+                    f"{key} module={module} config={config}"
+                    for key, (module, config) in sorted(divergent.items())
+                )
+            )
+        return layout
 
     @staticmethod
     def scatter_rows(x, group_size, group_rank):
