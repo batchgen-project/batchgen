@@ -72,6 +72,40 @@ PROFILES: tuple[ExecutorCostProfile, ...] = (
         per_100_item_rows=0.3697124295421248,
         per_chunk=0.1405919218614613,
     ),
+    # Kimi-Linear-48B-A3B, one 8-rank serve group of a two-node world, fitted
+    # from the dual-node gate ledger run; see internal records for the samples,
+    # the residual report and the identifiability analysis.
+    #
+    # ``per_chunk`` is pinned to zero rather than fitted: every pooled wave the
+    # fit could observe ran as a single chunk, so that column was an exact
+    # multiple of the intercept and no coefficient is identifiable for it. A
+    # multi-chunk pooled wave needs computed tokens above the planner's prefill
+    # token cap, which prefix sharing prevents — a wave with enough sharing to
+    # enter the pool saves most of its prompt tokens, and a wave without
+    # sharing declines the pool altogether. So the profile's validity domain is
+    # the single-chunk pooled wave, which is this deployment's actual domain,
+    # and a deployment that does cut pooled waves into chunks must re-fit
+    # before trusting it.
+    #
+    # ``world_size`` is exact: the fit saw one group count only, so the
+    # per-group-cost-independence check that a ``None`` world claims was not
+    # run. The computed-tokens and attention-pairs columns are strongly
+    # correlated in the fitted samples, so neither coefficient is trustworthy
+    # alone; the packer consumes only their joint prediction.
+    ExecutorCostProfile(
+        model="kimi-linear-48b-a3b",
+        machine="sm90-141g",
+        group_size=8,
+        world_size=16,
+        fitted_world_size=16,
+        compute_capability=(9, 0),
+        memory_gib=(130.0, 150.0),
+        intercept=5.186165427267378,
+        per_1e5_computed_tokens=1.7899117634244257,
+        per_1e9_attention_pairs=1.5830601489530896,
+        per_100_item_rows=0.9683259814970133,
+        per_chunk=0.0,
+    ),
 )
 
 

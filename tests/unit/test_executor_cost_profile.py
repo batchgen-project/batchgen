@@ -26,8 +26,11 @@ WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 
 
 def _gptoss():
-    (profile,) = executor_cost.PROFILES
-    return profile
+    """The GPT-OSS entry, by its key: the table holds more than one fit now."""
+    return next(
+        profile for profile in executor_cost.PROFILES
+        if profile.model == "gpt-oss-120b"
+    )
 
 
 def _group_local(**overrides):
@@ -130,6 +133,8 @@ def test_worker_lookup_passes_the_serve_group_size(
     with caplog.at_level(logging.INFO):
         assert worker._cached_prefix_rank_cost_profile() is profile
         assert worker._cached_prefix_rank_cost_profile() is profile
+        # The default arm uses the profile; the "off" arm is covered in
+        # test_prefix_cost_profile_switch.py.
     assert calls == [("moonshotai/Kimi-K3", (9, 0), 141 * GIB, 16, expected_group)]
     # Node-uniform device, not this rank's own local device.
     assert devices == [0]
@@ -138,5 +143,5 @@ def test_worker_lookup_passes_the_serve_group_size(
     resolved = f"kimi-k3/test/g{expected_group}" if matched else "none"
     assert lines == [
         f"[PREFIX_PACK] rank 11 executor cost profile: model=kimi-k3 "
-        f"group_size={expected_group} -> {resolved}"
+        f"group_size={expected_group} disabled=0 -> {resolved}"
     ]
