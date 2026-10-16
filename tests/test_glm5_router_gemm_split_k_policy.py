@@ -8,10 +8,13 @@ is a function of the row count and K alone, and that the K partition it implies
 is a function of K alone, which together are what make a row's result
 independent of its bucket's padding and of every other row.
 
-The count itself is per bucket, not global: the sweep in the policy module
-measures S=8 fastest only at the lowest captured bucket and S=4 fastest from
-256 rows up. So the invariant this file pins is not "one count everywhere" but
-"one count per bucket, taken from the measurement".
+The count is one constant over the whole captured range. The sweep in the
+policy module did measure S=8 marginally faster at the lowest captured bucket,
+but a count that changes with the bucket changes the float32 reduction order
+with it, and that breaks the bitwise cross-bucket M-independence contract the
+GPU suite asserts. So the invariant this file pins is "one count everywhere in
+the dispatched range, taken from the measurement", and the table is held to a
+single entry rather than trusted to be constant by inspection.
 
 The numerical bound is NOT derived here, and the CPU chain models below are not
 a model of either kernel's error. They materialise every block_k chunk partial
@@ -74,8 +77,16 @@ GRAPH_ROWS = (192, 256, 384, 512)
 # The measured split-count table, restated so this file asserts the policy
 # against the measurement rather than against whatever the policy now holds. The
 # sweep behind it is the one the policy module cites: internal campaign
-# glm52-decode-step-gap-vs-sglang, slice A.
-MEASURED_SPLITS = ((192, 8), (256, 4), (384, 4), (512, 4))
+# glm52-decode-step-gap-vs-sglang, slice A. One entry, because one count covers
+# the dispatched range by ruling (same campaign, 2026-10-17).
+MEASURED_SPLITS = ((192, 4),)
+
+# Counts the kernel can still be FORCED to run through ``split_k=``, which is
+# how the sweep measures them, even though the policy selects only one. S=8 is
+# the count the withdrawn per-bucket table selected at 192 rows; the chunk-level
+# models below keep it covered so the next sweep is not measuring an unasserted
+# path.
+FORCED_SPLITS = (4, 8)
 
 # The per-element error bound both suites use, restated here so this file can
 # check it against the chains it runs:
@@ -201,13 +212,12 @@ def _assert_inside(result, truth, bound, what):
     )
 
 
-def test_every_row_in_the_graph_range_resolves_to_a_measured_split():
-    # The split count now varies across buckets, so what has to hold for every
-    # row in the captured range is weaker but still sharp: a real split count,
-    # and one that appears in the measured table rather than an interpolation
-    # between two of its entries.
+def test_every_row_in_the_graph_range_resolves_to_the_one_measured_split():
+    # Every row in the captured range resolves to a real split count, the same
+    # one, and the one the table states -- never an interpolation and never a
+    # second count that some other bucket could pick instead.
     counts = {POLICY.select_router_split_k(m, GLM5_K) for m in range(192, 513)}
-    assert counts <= set(POLICY.ROUTER_SPLIT_K_VALUES)
+    assert len(counts) == 1, f"the captured range resolves to {sorted(counts)}"
     assert all(count > 1 for count in counts)
     assert counts == set(POLICY.ROUTER_SPLIT_K_VALUES), (
         "a table entry is unreachable from the captured row range"
@@ -216,10 +226,9 @@ def test_every_row_in_the_graph_range_resolves_to_a_measured_split():
 
 def test_the_split_count_takes_only_the_shape_as_input():
     # Bucket-M independence stated as a signature, the same way the partition's
-    # is below. The count may differ between captured buckets, but inside one
-    # bucket m is world_size * bucket_size and therefore fixed, so a count that
-    # takes nothing but m and k is a count that is constant for that bucket's
-    # whole graph -- and in particular cannot see how many rows are live.
+    # is below. The count is the same for every bucket, and a count that takes
+    # nothing but m and k cannot become bucket-dependent by accident either: in
+    # particular it cannot see how many rows of a launch are live.
     assert list(
         inspect.signature(POLICY.select_router_split_k).parameters
     ) == ["m", "k"]
@@ -240,79 +249,93 @@ def test_rows_outside_the_graph_row_range_stay_serial(m):
 
 @pytest.mark.parametrize("m,expected", MEASURED_SPLITS)
 def test_measured_rows_select_their_measured_split(m, expected):
-    # The table is the measurement, restated as the assertion. 192 is the one
-    # captured bucket where the extra parallelism still pays; 256 and above
-    # spend more in the reduction pass than the shorter K walk saves.
+    # The table is the measurement, restated as the assertion, at the row the
+    # measurement was taken at.
     assert POLICY.select_router_split_k(m, GLM5_K) == expected
 
 
-def test_the_table_covers_exactly_the_measured_rows():
-    assert [row for row, _ in POLICY.ROUTER_SPLIT_K_MEASURED] == list(GRAPH_ROWS)
+@pytest.mark.parametrize("m", GRAPH_ROWS)
+def test_every_captured_bucket_selects_the_same_split(m):
+    # The captured buckets are the ones whose graphs bake the count in, so each
+    # of them has to bake in the same one; otherwise the same row reduces in two
+    # different orders depending on which bucket carried it.
+    assert POLICY.select_router_split_k(m, GLM5_K) == MEASURED_SPLITS[0][1]
+
+
+def test_the_table_states_one_count_for_the_whole_range():
     assert POLICY.ROUTER_SPLIT_K_MEASURED == MEASURED_SPLITS
-    assert POLICY.ROUTER_SPLIT_K_VALUES == (4, 8)
+    assert len(POLICY.ROUTER_SPLIT_K_MEASURED) == 1
+    assert [row for row, _ in POLICY.ROUTER_SPLIT_K_MEASURED] == [GRAPH_ROWS[0]]
+    assert POLICY.ROUTER_SPLIT_K_VALUES == (4,)
 
 
 @pytest.mark.parametrize(
-    "m,expected",
+    "m",
     [
         # Unmeasured buckets generate_bucket_sizes can place: 14/20/28 at
-        # world_size 16. Each takes its nearest measured point, and 224 -- 32
-        # rows from both 192 and 256 -- takes the higher row count by the tie
-        # rule the policy documents.
-        (200, 8),
-        (208, 8),
-        (223, 8),
-        (224, 4),
-        (225, 4),
-        (240, 4),
-        (320, 4),
-        (448, 4),
+        # world_size 16. 200 is one of the two row counts (with 192, covered
+        # above) where the withdrawn per-bucket table resolved to a different
+        # count than the padded 512-row launch it has to stay bitwise equal to.
+        200,
+        208,
+        223,
+        224,
+        225,
+        240,
+        320,
+        448,
     ],
 )
-def test_unmeasured_rows_take_the_nearest_measured_split(m, expected):
+def test_unmeasured_rows_take_the_one_measured_split(m):
+    expected = MEASURED_SPLITS[0][1]
     assert POLICY.select_router_split_k(m, GLM5_K) == expected
     assert POLICY.router_measured_split_k(m) == expected
 
 
-def test_the_split_count_changes_exactly_once_over_the_range():
-    # One monotone step, not a sawtooth: the table has a single sign change, so
-    # the policy must too, or some bucket is getting a count no measurement
-    # supports.
+def test_the_split_count_never_changes_over_the_range():
+    # The contract the per-bucket table broke: the count fixes the float32
+    # reduction order, so a single change anywhere inside the dispatched range
+    # makes some row's logits depend on which bucket carried it.
     counts = [POLICY.select_router_split_k(m, GLM5_K) for m in range(192, 513)]
-    changes = [i for i in range(1, len(counts)) if counts[i] != counts[i - 1]]
-    assert len(changes) == 1, f"split count changes at {changes}"
-    assert counts[0] == 8
-    assert counts[-1] == 4
+    changes = [192 + i for i in range(1, len(counts)) if counts[i] != counts[i - 1]]
+    assert not changes, f"split count changes at rows {changes}"
+    assert set(counts) == {MEASURED_SPLITS[0][1]}
 
 
 @pytest.mark.parametrize(
     "table",
     [
         pytest.param((), id="empty"),
-        pytest.param(((192, 8), (256, 4)), id="stops-below-the-max"),
-        pytest.param(((256, 4), (512, 4)), id="starts-above-the-min"),
-        pytest.param(((256, 4), (192, 8), (512, 4)), id="unsorted"),
-        pytest.param(((192, 8), (256, 4), (256, 4), (512, 4)), id="duplicate-rows"),
-        pytest.param(((192, 8), (256, 1), (512, 4)), id="not-a-split"),
+        pytest.param(((192, 8), (256, 4), (384, 4), (512, 4)), id="bucket-dependent"),
+        pytest.param(((192, 4), (256, 8)), id="two-counts"),
+        pytest.param(((256, 4),), id="starts-above-the-min"),
+        pytest.param(((192, 4), (1024, 4)), id="measures-above-the-max"),
+        pytest.param(((192, 4), (512, 4), (256, 4)), id="unsorted"),
+        pytest.param(((192, 4), (256, 4), (256, 4)), id="duplicate-rows"),
+        pytest.param(((192, 1),), id="not-a-split"),
     ],
 )
-def test_a_table_that_stops_covering_the_dispatched_range_is_rejected(
+def test_a_table_that_does_not_state_one_count_for_the_range_is_rejected(
     table, monkeypatch
 ):
-    # The table is the only source of the count, so a table that does not span
-    # the dispatched rows has to fail loudly rather than extrapolate.
+    # The table is the only source of the count, so it has to fail loudly rather
+    # than extrapolate off the bottom of the dispatched range or hand two
+    # buckets two different reduction orders. "bucket-dependent" is the exact
+    # table this file's contract replaced.
     monkeypatch.setattr(POLICY, "ROUTER_SPLIT_K_MEASURED", table)
     with pytest.raises(POLICY.RouterGemmPolicyError):
         POLICY._validate_measured_table()
 
 
-def test_the_dispatched_range_matches_the_measured_rows():
+def test_the_dispatched_range_matches_the_captured_buckets():
+    # The range the split-K path serves is the range of captured buckets, which
+    # is what makes one count over that range enough.
     assert POLICY.ROUTER_SPLIT_K_MIN_ROWS == GRAPH_ROWS[0]
     assert POLICY.ROUTER_SPLIT_K_MAX_ROWS == GRAPH_ROWS[-1]
     POLICY._validate_measured_table()
 
 
-@pytest.mark.parametrize("split_k", [4, 8])
+@pytest.mark.parametrize("split_k", FORCED_SPLITS)
 def test_partition_is_exact_contiguous_and_ordered(split_k):
     bounds = POLICY.router_split_k_bounds(GLM5_K, split_k)
     assert len(bounds) == split_k
@@ -361,7 +384,11 @@ def test_bound_constants_match_the_gpu_suite():
     assert F32_EPS == GPU_SUITE.F32_EPS
     chunks = GLM5_K // POLICY.ROUTER_BLOCK_K
     assert GPU_SUITE.chain_addition_depth(chunks, 1) == chunks
-    for split_k in POLICY.ROUTER_SPLIT_K_VALUES:
+    # The selected count is one of the counts the sweep can force, so the two
+    # files' constants cannot drift apart either.
+    assert set(POLICY.ROUTER_SPLIT_K_VALUES) <= set(FORCED_SPLITS)
+    assert FORCED_SPLITS == GPU_SUITE.FORCED_SPLIT_COUNTS
+    for split_k in FORCED_SPLITS:
         assert GPU_SUITE.chain_addition_depth(chunks, split_k) == (
             chunks // split_k + split_k
         )
@@ -371,14 +398,15 @@ def test_bound_constants_match_the_gpu_suite():
         GPU_SUITE.chain_addition_depth(chunks, 0)
 
 
-@pytest.mark.parametrize("split_k", [4, 8])
+@pytest.mark.parametrize("split_k", FORCED_SPLITS)
 @pytest.mark.parametrize("regime", ["unit", "wide", "outlier"])
 def test_chunk_level_regrouping_stays_inside_the_chain_bound(regime, split_k):
     # The two models share one set of materialised chunk partials, so their
     # difference carries no intra-chunk error at all: it is exactly the
     # chunk-level reassociation, bounded by the two chains' depths together.
-    # Run for both counts the table can select, since each regroups the same
-    # chunks differently: depth 20 at S=8 and 28 at S=4, against 96 serial.
+    # Run for every count the sweep can force, not only the selected one, since
+    # each regroups the same chunks differently: depth 20 at S=8 and 28 at S=4,
+    # against 96 serial.
     rows = 128
     hidden, weight = _activations(regime, rows, GLM5_K, GLM5_EXPERTS, seed=20261016)
     partials = _chunk_partials(hidden, weight)
@@ -412,18 +440,19 @@ def test_chunk_level_regrouping_stays_inside_the_chain_bound(regime, split_k):
 
 
 @pytest.mark.parametrize("regime", ["unit", "wide", "outlier"])
-def test_the_table_counts_group_to_the_same_routed_expert_set(regime):
-    # The per-bucket table lets one row be summed at S=8 in one bucket and S=4
-    # in another, so the groupings must agree on the routed expert SET -- the
-    # only part of the logits the MoE dispatch reads. Asserted here on the
-    # chunk-level models and on the real kernels in the GPU suite.
+def test_the_forced_counts_group_to_the_same_routed_expert_set(regime):
+    # The policy now selects one count, so no two buckets disagree -- but the
+    # counts the sweep forces still have to agree on the routed expert SET, the
+    # only part of the logits the MoE dispatch reads, or the next measurement
+    # would be choosing between kernels that route differently. Asserted here on
+    # the chunk-level models and on the real kernels in the GPU suite.
     hidden, weight = _activations(regime, 128, GLM5_K, GLM5_EXPERTS, seed=515151)
     partials = _chunk_partials(hidden, weight)
     ids = {}
-    for split_k in POLICY.ROUTER_SPLIT_K_VALUES:
+    for split_k in FORCED_SPLITS:
         grouped = _split_k_model(partials, split_k)
         ids[split_k] = grouped.topk(GLM5_TOPK, dim=-1).indices.sort(dim=-1).values
-    reference = POLICY.ROUTER_SPLIT_K_VALUES[0]
+    reference = FORCED_SPLITS[0]
     for split_k, value in ids.items():
         assert torch.equal(value, ids[reference]), (
             f"{regime}: split_k={split_k} and split_k={reference} route to "
@@ -431,12 +460,13 @@ def test_the_table_counts_group_to_the_same_routed_expert_set(regime):
         )
 
 
-@pytest.mark.parametrize("split_k", [4, 8])
+@pytest.mark.parametrize("split_k", FORCED_SPLITS)
 def test_split_k_regrouping_is_row_local(split_k):
-    # Same rows, two row counts, one split count -- which is the within-bucket
-    # case, since a bucket fixes the count. The chunk partials and every grouped
-    # sum are bitwise identical, so nothing in the split-K order can make a
-    # row's result depend on how many rows shared its launch.
+    # Same rows, two row counts, one split count -- which is now every pair of
+    # launches in the dispatched range, since the count no longer varies with
+    # the row count. The chunk partials and every grouped sum are bitwise
+    # identical, so nothing in the split-K order can make a row's result depend
+    # on how many rows shared its launch.
     hidden, weight = _activations("outlier", 512, GLM5_K, GLM5_EXPERTS, seed=4321)
     wide = _split_k_model(_chunk_partials(hidden, weight), split_k)
     narrow = _split_k_model(_chunk_partials(hidden[:192], weight), split_k)

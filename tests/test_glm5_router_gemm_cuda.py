@@ -309,10 +309,12 @@ def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
 # activations, dropping one chunk overshoots the headroom-4 bound by 5.8e3x and
 # rounding the chunks to bf16 before accumulating them overshoots it by 1.4e2x,
 # while the undamaged chains sit at 0.007x (serial-K) and 0.018x of their bounds.
-# Those split-K ratios were measured at S=8. The formula is in S, so it covers
-# every count the policy can select; S=4 trades a longer per-split walk (C/S =
-# 24 chunks) for a shorter reduce chain (4), giving depth 28 against 20, and the
-# per-count assertions below are what hold each selected count to its own bound.
+# Those split-K ratios were measured at S=8, the count a withdrawn per-bucket
+# table selected at 192 rows. The formula is in S, so it covers the count the
+# policy now selects everywhere (S=4: a longer per-split walk, C/S = 24 chunks,
+# against a shorter reduce chain of 4, giving depth 28 rather than 20) as well as
+# every count the sweep can force, and the per-count assertions below hold each
+# of them to its own bound.
 #
 # "truth" is a float64 matmul of the same bf16 inputs. Its own error is bounded
 # by K * eps64 * sum_d |h_d w_d|, about 1e-8 of the float32 bounds above, so it
@@ -328,6 +330,14 @@ GLM5_ROUTER_EXPERTS = 256
 GLM5_ROUTER_TOPK = 8
 F32_EPS = 2.0**-23
 CHAIN_BOUND_HEADROOM = 4.0
+
+# Counts the kernel can be FORCED to run through ``split_k=``, which is how the
+# sweep measures them, even though the policy selects exactly one for the whole
+# captured row range. S=8 is the count a withdrawn per-bucket table selected at
+# 192 rows; it stays asserted here because the next sweep forces it again.
+# tests/test_glm5_router_gemm_split_k_policy.py restates this tuple and checks
+# the selected count is one of these, so the two files cannot drift.
+FORCED_SPLIT_COUNTS = (4, 8)
 
 
 def chain_addition_depth(chunks: int, split_k: int) -> int:
@@ -441,10 +451,12 @@ def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str) -> 
 def _selected_split_k(m: int) -> int:
     """The split count the policy picks for ``m``, asserted to be a real split.
 
-    The count is per-bucket now, so every test below takes it from the policy
-    for the shape it runs rather than from one module constant. That is also
-    what makes these tests cover both table entries: m=192 exercises the high
-    count and m>=256 the low one, each at the shape it is actually selected at.
+    Every test below takes the count from the policy for the shape it runs
+    rather than from a constant of its own, so the suite follows a re-measured
+    table instead of silently asserting the old one. The count is the same for
+    every row in the captured range, which is what makes the bitwise
+    cross-bucket comparisons below well posed: a compact launch and a padded
+    bucket reduce in the same order.
     """
     from batchgen_kernels.triton.glm5_router_gemm_config import (
         ROUTER_SPLIT_K_VALUES,
@@ -595,10 +607,10 @@ def test_glm5_router_split_k_is_launch_to_launch_deterministic():
 
 @pytest.mark.parametrize("m", [192, 512])
 def test_glm5_router_split_k_graph_replay_matches_eager(m):
-    # Both ends of the table, each captured at the bucket that selects it: the
-    # count is read once during capture, so the graph holds that bucket's split
-    # count, its partial buffer and its reduction order for every replay. m=192
-    # captures the high count and m=512 the low one.
+    # Both ends of the captured row range: the count is read once during
+    # capture, so each graph holds a split count, a partial buffer and a
+    # reduction order for every replay. Both ends select the same count, so this
+    # also shows the two graphs agree on which one was baked in.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 
     split_k = _selected_split_k(m)
@@ -648,16 +660,22 @@ def test_glm5_router_split_k_preallocated_partials_match_internal_buffer(m):
 
 
 @pytest.mark.parametrize("regime", ["random", "realistic"])
-def test_glm5_router_split_k_table_counts_agree_on_the_routed_expert_set(regime):
-    # What the per-bucket table newly makes possible: the same row can be summed
-    # with a different split count depending on which bucket carried it. The
-    # float32 tail is allowed to differ -- each count has its own bound, asserted
-    # above -- but the routed expert SET is what the MoE path consumes, so the
-    # two counts have to agree on it exactly, and neither may be the one that
-    # drifts further from float64 truth than the serial chain it replaces.
+def test_glm5_router_forced_split_counts_agree_on_the_routed_expert_set(regime):
+    # The policy selects one count, so no two buckets disagree -- but every
+    # count the sweep can force still has to be a kernel this path could adopt.
+    # The float32 tail is allowed to differ between counts, each has its own
+    # bound asserted here, while the routed expert SET is what the MoE path
+    # consumes, so the counts have to agree on it exactly, and none of them may
+    # be the one that drifts further from float64 truth than the serial chain it
+    # would replace. This is also the gate the next re-measurement reads: a
+    # count that fails here cannot be selected whatever it measures.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
     from batchgen_kernels.triton.glm5_router_gemm_config import ROUTER_SPLIT_K_VALUES
 
+    assert set(ROUTER_SPLIT_K_VALUES) <= set(FORCED_SPLIT_COUNTS), (
+        f"the policy selects {ROUTER_SPLIT_K_VALUES}, which this test does not "
+        f"force {FORCED_SPLIT_COUNTS}"
+    )
     m = 512
     hidden, weight = _router_activations(m, regime, seed=606060)
     truth, chunk_magnitude, chunks = _fp64_truth_and_chunk_magnitude(hidden, weight)
@@ -665,7 +683,7 @@ def test_glm5_router_split_k_table_counts_agree_on_the_routed_expert_set(regime)
     d_serial = float((serial.to(torch.float64) - truth).abs().max().item())
 
     sets = {}
-    for split_k in ROUTER_SPLIT_K_VALUES:
+    for split_k in FORCED_SPLIT_COUNTS:
         out = _run_router(glm5_router_gemm, hidden, weight, split_k=split_k)
         _assert_inside_chain_bound(
             out,
@@ -682,7 +700,7 @@ def test_glm5_router_split_k_table_counts_agree_on_the_routed_expert_set(regime)
         )
         sets[split_k] = out.topk(GLM5_ROUTER_TOPK, dim=-1).indices.sort(dim=-1).values
 
-    reference = ROUTER_SPLIT_K_VALUES[0]
+    reference = FORCED_SPLIT_COUNTS[0]
     for split_k, ids in sets.items():
         assert torch.equal(ids, sets[reference]), (
             f"{regime}: split_k={split_k} and split_k={reference} route to "
@@ -702,18 +720,15 @@ def test_glm5_router_split_k_rejects_an_inexact_split_count(split_k):
 
 
 def test_glm5_router_split_k_rejects_a_mismatched_partials_buffer():
-    # A buffer sized for a different bucket's split count is the mistake the
-    # per-bucket table makes reachable, so it has to be rejected rather than
-    # silently reinterpreted.
+    # A buffer sized for another split count has to be rejected rather than
+    # silently reinterpreted: its leading axis would be read as this launch's
+    # splits, so the reduction would sum partials that were never written.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
-    from batchgen_kernels.triton.glm5_router_gemm_config import (
-        ROUTER_SPLIT_K_VALUES,
-        RouterGemmShapeError,
-    )
+    from batchgen_kernels.triton.glm5_router_gemm_config import RouterGemmShapeError
 
     m = 256
     split_k = _selected_split_k(m)
-    other = next(s for s in ROUTER_SPLIT_K_VALUES if s != split_k)
+    other = next(s for s in FORCED_SPLIT_COUNTS if s != split_k)
     hidden, weight = _router_activations(m, "random", seed=12)
     output = torch.empty(m, GLM5_ROUTER_EXPERTS, device=hidden.device, dtype=torch.float32)
 
