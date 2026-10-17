@@ -9,6 +9,25 @@ import triton.language as tl
 _BLOCK_SIZE = 256
 
 
+def _require_matching_cache_dtype(
+    cache_tensor: torch.Tensor, src_tokens: torch.Tensor
+) -> None:
+    """Reject a source whose dtype differs from the cache's.
+
+    ``tl.store`` converts to the destination pointer's dtype, so a bf16 token
+    written into an FP8 (or byte-carrier) cache would be silently requantized
+    per element — the written page then neither matches the producer's values
+    nor the layout the cache's reader expects. The copy is a byte move by
+    contract, so a mismatch is a caller bug and is named here.
+    """
+
+    if cache_tensor.dtype != src_tokens.dtype:
+        raise ValueError(
+            "paged KV token update requires the source dtype to equal the "
+            f"cache dtype: cache={cache_tensor.dtype}, source={src_tokens.dtype}"
+        )
+
+
 @triton.jit
 def _paged_cache_update_kernel(
     cache_ptr,
@@ -59,6 +78,7 @@ def _launch_single_cache_update(
         raise ValueError(
             "page_indices/token_offsets must be on the same device as the cache tensor"
         )
+    _require_matching_cache_dtype(cache_tensor, src_tokens)
     if src_tokens.ndim != 2:
         raise ValueError("src_tokens must be flattened to [batch, elements]")
     if page_indices.ndim != 1 or token_offsets.ndim != 1:
@@ -211,6 +231,8 @@ def _launch_single_cache_update_with_page_table(
     page_size_tokens: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> None:
+    _require_matching_cache_dtype(cache_tensor, src_tokens)
+
     num_tokens = src_tokens.shape[0]
     if num_tokens == 0:
         return
