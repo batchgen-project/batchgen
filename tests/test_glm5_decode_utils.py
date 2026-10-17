@@ -1414,8 +1414,12 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
     AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
         (layer, tensor.clone())
     )
-    AttnWrapperBase.kv_append_callback_aux = lambda layer, tensor, _: aux_appends.append(
-        (layer, tensor.clone())
+    # The aux callback takes the optional trailing per-token scales; this
+    # fake graph output is bf16 AoS, so they arrive as None.
+    AttnWrapperBase.kv_append_callback_aux = (
+        lambda layer, tensor, _v, scale=None: aux_appends.append(
+            (layer, tensor.clone(), scale)
+        )
     )
 
     try:
@@ -1443,6 +1447,8 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
     assert inputs["aux_slot_indices"].tolist() == [7, 8]
     assert primary_appends[0][0] == 0
     assert aux_appends[0][0] == 0
+    # No `indexer_k_scale` in the graph outputs -> no scales forwarded.
+    assert aux_appends[0][2] is None
 
 
 def test_glm5_moe_graph_enable_records_cli_required_state():

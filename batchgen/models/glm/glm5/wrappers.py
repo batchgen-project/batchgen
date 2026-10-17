@@ -1289,10 +1289,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     None,
                 )
             if AttnWrapperBase.kv_append_callback_aux is not None:
+                # `indexer_k_scale` is present only when the aux cache is
+                # page-split FP8; the host region requires the scales there and
+                # rejects them for a bf16 AoS region.
                 AttnWrapperBase.kv_append_callback_aux(
                     self.layer_idx,
                     graph_outputs["indexer_k_tensor"],
                     None,
+                    graph_outputs.get("indexer_k_scale"),
                 )
             return graph_outputs["attn_output"]
 
@@ -1319,6 +1323,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self.layer_idx,
                 graph_inputs.indexer_k_tensor,
                 None,
+                graph_inputs.indexer_k_scales,
             )
 
         graph_outputs = self._dsa_cuda_graph_manager.replay(

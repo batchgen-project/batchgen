@@ -14443,6 +14443,9 @@ class BatchGenWorker:
 				include_lm_head=True,
 				compare_probe_layers=compare_probe_layers,
 				layer_segments=layer_segments,
+				# e4m3 for a page-split FP8 indexer pool, bf16 for AoS: the aux
+				# staging clone must not requantize the stream.
+				aux_kv_staging_dtype=aux_manager.config.kv_dtype,
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
 			manager.register_segment(segment_name, whole_seg)
