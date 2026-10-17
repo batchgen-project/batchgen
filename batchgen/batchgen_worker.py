@@ -2187,6 +2187,17 @@ class BatchGenWorker:
 					self._trajectory_session_summary() if trajectory else {}
 				),
 			}
+		if payload is None and trajectory:
+			# A leader with no prefill sequence this pass still speaks for its
+			# group's committed sessions: the summary is registry state, not
+			# pass state, and every rank's admission pin folds it from this
+			# same gather. Gating it on having host KV to mirror starves the
+			# world map whenever a flag-on pass lands entirely on the other
+			# group(s) -- the other groups' sessions then surface only one
+			# pass later, after that pass's pins and pool plan already ran.
+			summary = self._trajectory_session_summary()
+			if summary:
+				payload = {"frontier_sessions": summary}
 
 		gathered = [None] * self.world_size
 		dist.all_gather_object(gathered, payload)
@@ -2202,7 +2213,10 @@ class BatchGenWorker:
 		if leader == self.rank:
 			return
 		entry = gathered[leader]
-		if entry is None:
+		if entry is None or "global_ids" not in entry:
+			# None, or a summary-only payload from a leader that served no
+			# prefill this pass: either way the leader mirrored no host KV
+			# (the fold above already consumed its session summary).
 			if uuids:
 				raise RuntimeError(
 					f"Rank {self.rank}: serve-group leader {leader} mirrored no "
@@ -11247,6 +11261,7 @@ class BatchGenWorker:
 		hits: List[MaterializedPrefix] = []
 		pages: Dict[int, Dict[int, List[int]]] = {}
 		confirmed = True
+		unknown = 0
 		for position, seq in enumerate(seqs):
 			if seq is None:
 				continue
@@ -11255,6 +11270,7 @@ class BatchGenWorker:
 				# Own group: no peer to agree with, so the live record is the
 				# only truth there is.
 				if attachment is None:
+					unknown += 1
 					continue
 				boundary = int(attachment.boundary_tokens)
 				entry_group = int(attachment.owning_group_id)
@@ -11266,6 +11282,7 @@ class BatchGenWorker:
 					).tolist(),
 				)
 				if entry is None:
+					unknown += 1
 					continue
 				boundary = int(entry.boundary_tokens)
 				entry_group = int(entry.owning_group_id)
@@ -11334,6 +11351,19 @@ class BatchGenWorker:
 				confirmed = False
 				continue
 			pages[position] = record_pages
+		if unknown:
+			# A fresh (turn-1) prompt legitimately continues nothing, so this
+			# is one aggregate line, not a per-sequence warning. It exists so
+			# a wave whose EVERY continuation misses -- the mirrored index
+			# lagging its leader's registry -- is visible in the log instead
+			# of silently planning an unpooled wave.
+			logging.info(
+				"[PREFIX_POOL] Rank %s: %s of %s flag-on sequence(s) continue "
+				"no session known to %s; they are prefilled in full",
+				self.rank, unknown, len(seqs),
+				"this rank's live attachments" if group is None
+				else "the mirrored session index",
+			)
 		return hits, confirmed, pages
 
 	def _unmaterializable_frontier(

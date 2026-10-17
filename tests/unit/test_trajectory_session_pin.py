@@ -550,6 +550,56 @@ def test_every_rank_folds_every_leaders_summary_on_the_mirror(stub_modules):
     assert len({tuple(w._trajectory_session_groups.entries) for w in workers.values()}) == 1
 
 
+def test_an_idle_leader_still_publishes_its_sessions_on_a_flag_on_pass(
+    stub_modules,
+):
+    """The summary is registry state, not pass state (the m3gate blind spot).
+
+    A flag-on pass that lands entirely on one serve group must still carry the
+    OTHER group's committed sessions: the idle leader has no host KV to mirror
+    (payload would be None), but its registry speaks for sessions the next
+    pass's pins and pool plan need. The idle leader publishes a summary-only
+    payload; a follower with no sequences tolerates it (no host-KV fields).
+    """
+    world_size, G = 4, 2
+    left, right = _registry(), _registry()
+    left_record = _begin(left, tokens=G0_TOKENS, group_id=0)
+    right_record = _begin(right, tokens=G1_TOKENS, group_id=1, handle=9)
+    # The pass's only sequence serves on group 1; group 0 is idle.
+    seqs = {"g1": SimpleNamespace(uuid="g1", global_idx=2, decode_dp_group=1)}
+    fake_dist = _FakeDist(world_size)
+    registries = {0: left, 2: right}
+    workers = {
+        rank: _mirror_rank(
+            rank=rank,
+            world_size=world_size,
+            attn_tp_size=G,
+            seqs=seqs,
+            fake_dist=fake_dist,
+            registry=registries.get(rank),
+        )
+        for rank in range(world_size)
+    }
+    for _round in range(2):
+        for rank in range(world_size):
+            fake_dist.rank = rank
+            workers[rank]._mirror_group_host_kv(
+                [] if rank // G == 0 else ["g1"], {}, trajectory=True
+            )
+
+    # The idle leader published a summary-only payload: sessions, no host KV.
+    assert fake_dist.slots[0] == {
+        "frontier_sessions": workers[0]._trajectory_session_summary()
+    }
+    assert "global_ids" not in fake_dist.slots[0]
+    # Every rank -- the idle group's follower included -- resolves BOTH groups.
+    for rank in range(world_size):
+        index = workers[rank]._trajectory_session_groups
+        assert len(index) == 2, rank
+        assert index.get(left_record.session_key).owning_group_id == 0
+        assert index.get(right_record.session_key).owning_group_id == 1
+
+
 def test_a_flag_off_mirror_publishes_no_summary_and_builds_no_map(stub_modules):
     world_size, G = 4, 2
     registry = _registry()
