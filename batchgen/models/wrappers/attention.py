@@ -248,6 +248,11 @@ class AttnWrapperBase(BaseModuleWrapper):
     prefill_pool_row_starts: ClassVar[Optional[List[int]]] = None
     # Pseudo Host sequence id of each pooled segment, for KDA state forks.
     prefill_pool_segment_sids: ClassVar[Optional[dict]] = None
+    # Segment ids this wave LOADS instead of computing (M3 Slice 3). A loaded
+    # segment ran no row, so it has no recurrent state to fork and no pseudo
+    # sequence id; its reader resumes from its own restored slot. Empty tuple
+    # in every wave that materializes nothing.
+    prefill_pool_materialized_segments: ClassVar[tuple] = ()
     # Engine layer -> dense pool row, -1 for a layer the pool does not hold.
     # The pool holds one row per attention layer it caches, which is NOT the
     # Host cache's physical layer unless that cache compresses the same axis.

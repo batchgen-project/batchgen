@@ -27,6 +27,23 @@ PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
 
 
 @dataclass(frozen=True)
+class MaterializedStage:
+    """One materialized segment to LOAD into the pool before this forward.
+
+    It is not a row: it carries no query token, so it appears here and not in
+    ``ChunkBatch.items``. ``slots`` are the pool slots its tokens occupy, in
+    token order, exactly the slots a computed segment of the same geometry
+    would have written -- which is what lets a reader's page table stay
+    unchanged and the Slice-4 oracle compare load against compute.
+    """
+
+    segment_id: int
+    tokens: int
+    pages: tuple[int, ...]
+    slots: torch.Tensor  # int64 [tokens]
+
+
+@dataclass(frozen=True)
 class ChunkBatch:
     """The tensors one prepacked forward needs; rows follow ``items``."""
 
@@ -44,6 +61,9 @@ class ChunkBatch:
     row_bounds: tuple[int, ...]  # cu_seqlens_q on the host
     max_seqlen_q: int
     max_cache_seqlen: int
+    # Segments this chunk loads instead of computing; empty in every wave that
+    # materializes nothing, which is every flag-off wave.
+    materialized: tuple[MaterializedStage, ...] = ()
 
 
 class PoolChunkExecutor:
@@ -97,7 +117,24 @@ class PoolChunkExecutor:
         slots: list[int] = []
         tail_rows: list[int] = []
         tail_waves: list[int] = []
+        stages: list[MaterializedStage] = []
+        forward_items: list["PlanItem"] = []
         for item in chunk.items:
+            if item.kind == "materialize":
+                # Pages exactly as a computed segment of this geometry would
+                # take, from the same allocator and in the same order, so the
+                # readers' page tables cannot tell the two apart. No row, no
+                # query token: the loader writes these slots.
+                own = self.pool.alloc(-(-item.tokens // page_tokens))
+                self.segment_pages[item.ref] = own
+                stages.append(MaterializedStage(
+                    segment_id=item.ref,
+                    tokens=item.tokens,
+                    pages=tuple(own),
+                    slots=self.pool.slots(own, 0, item.tokens),
+                ))
+                continue
+            forward_items.append(item)
             row: list[int] = []
             for seg in item.prefix_segments:
                 pages = self.segment_pages.get(seg)
@@ -121,6 +158,12 @@ class PoolChunkExecutor:
             cache_seqlens.append(item.token_end)
             slots.extend(self.pool.slot_list(own, 0, item.tokens))
 
+        if not forward_items:
+            raise RuntimeError(
+                f"chunk loads {len(stages)} materialized segment(s) but has no "
+                "row to run them with; the plan must not schedule a load-only "
+                "chunk"
+            )
         width = max(len(row) for row in rows)
         # Every row owns at least one page, so row[-1] is always a valid id.
         table = [
@@ -137,10 +180,14 @@ class PoolChunkExecutor:
             slots=torch.tensor(slots, dtype=torch.long, device=device),
             tail_rows=torch.tensor(tail_rows, dtype=torch.long, device=device),
             tail_wave_indices=tuple(tail_waves),
-            items=chunk.items,
+            # Rows only: every consumer that walks items beside a row tensor
+            # (the level cut, the Host row targets, the offload) stays exactly
+            # as correct as it was before loads existed.
+            items=tuple(forward_items),
             row_bounds=tuple(cu_seqlens),
-            max_seqlen_q=max(item.tokens for item in chunk.items),
+            max_seqlen_q=max(item.tokens for item in forward_items),
             max_cache_seqlen=max(cache_seqlens),
+            materialized=tuple(stages),
         )
         if self.pool.kernel_dump is not None:
             self.pool.kernel_dump.begin_chunk(batch)

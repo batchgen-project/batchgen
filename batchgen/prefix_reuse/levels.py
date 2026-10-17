@@ -20,7 +20,7 @@ the state rows its fork copies.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Collection, Mapping, Optional, Sequence
 
 import torch
 
@@ -104,20 +104,31 @@ def chunk_levels(batch: "ChunkBatch") -> tuple[ChunkLevel, ...]:
 
 
 def fork_pairs(
-    batch: "ChunkBatch", segment_sids: Mapping[int, int]
+    batch: "ChunkBatch",
+    segment_sids: Mapping[int, int],
+    materialized: Collection[int] = (),
 ) -> tuple[tuple[int, int], ...]:
     """``(row, parent pseudo sequence id)`` for every row that continues a segment.
 
     The parent is the row's nearest pooled ancestor. A segment's state lives
     under its pseudo sequence id until the wave ends, so this resolves whether
     the parent ran earlier in this chunk or in an earlier chunk of the wave.
+
+    A MATERIALIZED parent is skipped: nothing ran it, so it left no recurrent
+    state to fork. Its reader carries the state at the frontier boundary in
+    its OWN slot, restored before the wave (M3 Slice 2), and forking a loaded
+    segment's unwritten slot over that would replace the restored state with
+    zeros -- which no later assertion could see.
     """
 
+    loaded = frozenset(int(segment_id) for segment_id in materialized)
     pairs: list[tuple[int, int]] = []
     for row, item in enumerate(batch.items):
         if not item.prefix_segments:
             continue
         parent = item.prefix_segments[-1]
+        if parent in loaded:
+            continue
         if parent not in segment_sids:
             raise RuntimeError(
                 f"row {row} continues segment {parent}, which has no pseudo "
@@ -154,6 +165,7 @@ def state_levels(
     slots: torch.Tensor,
     has_initial_state: torch.Tensor,
     slot_of: Callable[[int], int],
+    materialized: Collection[int] = (),
 ) -> tuple[StateLevel, ...]:
     """Cut a chunk into the levels a recurrent layer runs, state rows included.
 
@@ -174,7 +186,27 @@ def state_levels(
             f"chunk has {len(batch.items)} rows but {len(row_ids)} sequence "
             f"ids and {slots.numel()} state slots"
         )
-    parents = dict(fork_pairs(batch, segment_sids))
+    loaded = frozenset(int(segment_id) for segment_id in materialized)
+    parents = dict(fork_pairs(batch, segment_sids, loaded))
+    # A row reading a materialized segment resumes from its own slot, so that
+    # slot MUST already hold the state at the segment's boundary: the restore
+    # ran before this wave. If it did not, the row would start from zeros and
+    # attend over a prefix it never produced -- wrong output, no symptom. The
+    # ordering the executor relies on is therefore asserted here, at the one
+    # point that can still see it.
+    if loaded:
+        for row, item in enumerate(batch.items):
+            if not item.prefix_segments:
+                continue
+            if item.prefix_segments[-1] not in loaded:
+                continue
+            if not bool(has_initial_state[row].item()):
+                raise RuntimeError(
+                    f"row {row} (sequence {row_ids[row]}) reads materialized "
+                    f"segment {item.prefix_segments[-1]} but holds no "
+                    "recurrent state at its boundary; the trajectory restore "
+                    "must bind this row's state slot before the wave's forward"
+                )
     resumes = has_initial_state | torch.tensor(
         [row in parents for row in range(len(batch.items))],
         dtype=has_initial_state.dtype, device=has_initial_state.device,
