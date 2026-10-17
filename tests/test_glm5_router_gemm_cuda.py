@@ -294,14 +294,14 @@ def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
 # they are larger than the logit they add up to -- which is why a bound written
 # against max|logit| is not a bound on either kernel at all: measured against
 # float64, the pre-split serial-K kernel overruns a 32 * eps * max|logit| budget
-# by 1.92x-2.35x across the eight regimes below.
+# by 1.92x-2.35x across the regimes below.
 #
 # CHAIN_BOUND_HEADROOM = 4 covers the one depth the model above does not
 # enumerate: the order in which the tensor core sums the block_k products inside
 # a single chunk is hardware defined, and it is identical for the two kernels
 # (both hand the same block_k tile to the same tl.dot), so it cannot be derived
 # here. The factor is calibrated rather than guessed. Measured against a float64
-# oracle over these eight regimes, each kernel's actual error reaches at most
+# oracle over these regimes, each kernel's actual error reaches at most
 # 0.36 (serial-K) and 0.21 (split-K) of its own depth * eps * sum_c|chunk_c|, so
 # headroom 1 already passes with 2.8x margin and headroom 4 keeps about 11x. The
 # bound still sits orders of magnitude below the defects this gate exists to
@@ -309,12 +309,11 @@ def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
 # activations, dropping one chunk overshoots the headroom-4 bound by 5.8e3x and
 # rounding the chunks to bf16 before accumulating them overshoots it by 1.4e2x,
 # while the undamaged chains sit at 0.007x (serial-K) and 0.018x of their bounds.
-# Those split-K ratios were measured at S=8, the count a withdrawn per-bucket
-# table selected at 192 rows. The formula is in S, so it covers the count the
-# policy now selects everywhere (S=4: a longer per-split walk, C/S = 24 chunks,
-# against a shorter reduce chain of 4, giving depth 28 rather than 20) as well as
-# every count the sweep can force, and the per-count assertions below hold each
-# of them to its own bound.
+# Those split-K ratios were measured at S=8, which is the count the policy now
+# selects everywhere. The formula is in S, so it covers every other count the
+# sweep can force as well (S=4: a longer per-split walk, C/S = 24 chunks,
+# against a shorter reduce chain of 4, giving depth 28 rather than 20), and the
+# per-count assertions below hold each of them to its own bound.
 #
 # "truth" is a float64 matmul of the same bf16 inputs. Its own error is bounded
 # by K * eps64 * sum_d |h_d w_d|, about 1e-8 of the float32 bounds above, so it
@@ -331,10 +330,18 @@ GLM5_ROUTER_TOPK = 8
 F32_EPS = 2.0**-23
 CHAIN_BOUND_HEADROOM = 4.0
 
+# Row counts the graphed router is dispatched at, bottom to top of the range the
+# policy serves. The bottom two are the per-rank row counts the DeepEP exchange
+# routes on, which is why the exactness assertions below have to reach them and
+# not only the all-gathered row spaces.
+GRAPH_ROWS = (64, 128, 192, 256, 384, 512)
+
 # Counts the kernel can be FORCED to run through ``split_k=``, which is how the
 # sweep measures them, even though the policy selects exactly one for the whole
-# captured row range. S=8 is the count a withdrawn per-bucket table selected at
-# 192 rows; it stays asserted here because the next sweep forces it again.
+# dispatched row range. The other count is the one the cold sweep finds
+# marginally ahead at the very top of the range, and the one a withdrawn
+# per-bucket table would have selected there; it stays asserted here because the
+# next sweep forces it again.
 # tests/test_glm5_router_gemm_split_k_policy.py restates this tuple and checks
 # the selected count is one of these, so the two files cannot drift.
 FORCED_SPLIT_COUNTS = (4, 8)
@@ -472,7 +479,7 @@ def _selected_split_k(m: int) -> int:
     return split_k
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_each_kernel_stays_inside_its_own_chain_bound(m, regime):
     # Each kernel is asserted against float64 truth with the bound derived from
@@ -500,7 +507,7 @@ def test_glm5_router_each_kernel_stays_inside_its_own_chain_bound(m, regime):
     )
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_split_k_is_no_less_accurate_than_serial_k(m, regime):
     # Accuracy non-regression, the assert that actually protects the swap: the
@@ -523,7 +530,7 @@ def test_glm5_router_split_k_is_no_less_accurate_than_serial_k(m, regime):
     )
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_split_k_topk_set_matches_and_reorders_only_near_ties(m, regime):
     # The routed expert SET is the contract the MoE path consumes: dispatch
@@ -575,7 +582,7 @@ def test_glm5_router_split_k_topk_set_matches_and_reorders_only_near_ties(m, reg
         )
 
 
-@pytest.mark.parametrize("valid_rows", [192, 200, 256, 384])
+@pytest.mark.parametrize("valid_rows", [64, 128, 192, 200, 256, 384])
 def test_glm5_router_split_k_valid_rows_are_bucket_m_independent(valid_rows):
     # The graphed router runs on a padded bucket. A valid row's logits must be
     # bitwise identical whether the launch carried 512 rows or only its own,
@@ -607,9 +614,9 @@ def test_glm5_router_split_k_is_launch_to_launch_deterministic():
 
 @pytest.mark.parametrize("m", [192, 512])
 def test_glm5_router_split_k_graph_replay_matches_eager(m):
-    # Both ends of the captured row range: the count is read once during
+    # Two widely separated captured row counts: the count is read once during
     # capture, so each graph holds a split count, a partial buffer and a
-    # reduction order for every replay. Both ends select the same count, so this
+    # reduction order for every replay. Both select the same count, so this
     # also shows the two graphs agree on which one was baked in.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 

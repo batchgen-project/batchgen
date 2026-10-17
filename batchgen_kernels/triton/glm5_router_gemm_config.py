@@ -17,7 +17,7 @@ ROUTER_BLOCK_M = 16
 ROUTER_BLOCK_N = 64
 ROUTER_BLOCK_K = 64
 
-# Split count for the graphed row range, measured rather than assumed, and
+# Split count for the dispatched row range, measured rather than assumed, and
 # deliberately ONE count for the whole range.
 #
 # Splitting turns one program per output tile into ``split_k`` programs, each
@@ -31,23 +31,35 @@ ROUTER_BLOCK_K = 64
 # The entry is the count a microbenchmark found fastest, taken as the minimum
 # over every exact split count from 1 to 32 rather than from a two-way
 # comparison, with the count forced per run through ``split_k=`` and the kernel
-# timed under graph replay at the production K and expert count. Sweep and
-# figures: internal campaign glm52-decode-step-gap-vs-sglang, slice A, which is
-# the record to re-run before changing the entry.
+# timed under graph replay at the production K and expert count.
 #
-# That sweep also found S=8 marginally faster than S=4 at the lowest captured
-# bucket -- 192 rows, where the device is not yet full -- and an earlier
-# revision of this file carried a per-bucket table that selected it there. That
-# margin is small, and confined to a bucket the production dispatch does not
-# serve, while a count that varies with the bucket costs a contract worth far
-# more: the split count fixes the fp32 reduction order, so a 192-row launch
-# reducing at S=8 while the same rows inside a padded 512-row bucket reduce at
-# S=4 makes a valid row's logits differ between the two launches -- which is
-# exactly the cross-bucket bitwise M-independence contract the suites assert.
-# Ruled by the campaign above, 2026-10-17: the bitwise invariant wins over the
-# 192-row micro-win, so the count is constant and ``_validate_measured_table``
-# enforces that constancy at import rather than trusting this literal.
-ROUTER_SPLIT_K_MEASURED: tuple[tuple[int, int], ...] = ((192, 4),)
+# The measurement has to hold the ROUTER WEIGHT the way production holds it:
+# one distinct weight per routed layer, cycled through the timed region so that
+# no call finds its weight already resident in L2. An earlier sweep reused a
+# single weight across every call it timed, which left that one weight
+# L2-resident and flattered a latency-bound, low-occupancy launch well beyond
+# how it runs in the model -- far enough to move which count is fastest at the
+# bottom of the range and to understate the unsplit kernel outright. The
+# cold-weight bench agrees with an in-situ profiler trace of the real server to
+# a fraction of a percent and the warm one does not, so the cold-weight numbers
+# are the record here and the warm sweep is superseded. Both harnesses, the
+# sweep and the calibration against that trace: internal campaign
+# glm52-decode-step-gap-vs-sglang, slice F, which is the record to re-run
+# before changing the entry.
+#
+# One count covers the range by ruling rather than by coincidence. The count
+# fixes the fp32 reduction order, so a compact launch reducing at one count
+# while the same rows inside a padded larger bucket reduce at another makes a
+# valid row's logits differ between the two launches -- which is exactly the
+# cross-bucket bitwise M-independence contract the suites assert. Where the
+# per-row fastest count differs from the one stated here it does so only at the
+# very top of the range and by a small margin, against a recovery at the bottom
+# of the range that is larger by an order of magnitude; an earlier revision of
+# this file carried a per-bucket table and was withdrawn for the same reason.
+# Ruled by the campaign above, 2026-10-17: the bitwise invariant wins, so the
+# count is constant and ``_validate_measured_table`` enforces that constancy at
+# import rather than trusting this literal.
+ROUTER_SPLIT_K_MEASURED: tuple[tuple[int, int], ...] = ((64, 8),)
 
 # The distinct split counts the table can select -- one, by the constancy the
 # validation enforces. It has to partition the production K exactly, and it is
@@ -56,15 +68,23 @@ ROUTER_SPLIT_K_VALUES: tuple[int, ...] = tuple(
     sorted({split for _, split in ROUTER_SPLIT_K_MEASURED})
 )
 
-# Row range served by the split-K path. The lower bound is where the serial-K
-# program count stops being large enough to fill the device; above the upper
-# bound the graphed router path uses a different kernel entirely, so these
-# bounds mirror the dispatch the GLM-5 MoE graph segment already performs. The
-# measured table has to be anchored at the lower bound and may not claim a
-# measurement above the upper one -- ``_validate_measured_table`` below
-# enforces both, so the range and the table cannot drift apart. It needs no
-# upper anchor: one count covers the range by construction.
-ROUTER_SPLIT_K_MIN_ROWS = 192
+# Row range served by the split-K path, and the only place those bounds are
+# stated: the GLM-5 MoE graph segment dispatches its router to this kernel for
+# exactly this range, so it reads the bounds from here rather than repeating
+# them.
+#
+# The lower bound is the smallest row count the graphed router is dispatched
+# at. It is where the serial-K shape is at its worst -- fewest programs, so the
+# least able to hide its K-loop memory latency -- and the cold-weight
+# measurement finds the split-K pair ahead of it by the widest margin of the
+# whole range there, so there is no row count in the dispatched range the
+# serial-K kernel should be preferred at. Above the upper bound the graphed
+# router path uses a different kernel entirely. The measured table has to be
+# anchored at the lower bound and may not claim a measurement above the upper
+# one -- ``_validate_measured_table`` below enforces both, so the range and the
+# table cannot drift apart. It needs no upper anchor: one count covers the
+# range by construction.
+ROUTER_SPLIT_K_MIN_ROWS = 64
 ROUTER_SPLIT_K_MAX_ROWS = 512
 
 
