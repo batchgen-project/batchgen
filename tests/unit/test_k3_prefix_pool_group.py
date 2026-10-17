@@ -317,20 +317,22 @@ def _plan_worker(
             "_prefill_pool_group",
             "_prefill_pool_free_state_slots",
             "_replace_prefix_lookup_hits",
+            "_decode_attn_tp_size",
+            "_construct_prefill_pool",
+            "_prefill_pool_page_bytes",
+            # The executor and the pool are built with the batch-level probes,
+            # read ONCE per wave through the shared batchgen_debug seam.
+            "_pool_pad_poison_enabled",
+            "_new_pool_kernel_dump_recorder",
+            "_pool_probe_debug",
+            # The per-sequence flag merge _trajectory_commit_requested reads.
+            "_active_batchgen_debug_for_sequences",
             # M3 Slice 3 plan input: with the trajectory flag off these
             # return "no hits" and the plan is the pre-Slice-3 one.
             "_materialized_prefix_hits",
             "_unmaterializable_frontier",
             "_trajectory_commit_requested",
             "_owns_host_kv",
-            "_decode_attn_tp_size",
-            "_construct_prefill_pool",
-            "_prefill_pool_page_bytes",
-            # The executor and the pool are built with the batch-level probes,
-            # read through the shared batchgen_debug seam.
-            "_pool_pad_poison_enabled",
-            "_new_pool_kernel_dump_recorder",
-            "_active_batchgen_debug_for_sequences",
             "_debug_flag_enabled",
         ],
         {
@@ -465,12 +467,31 @@ def test_another_batch_flag_does_not_arm_the_kernel_dump(monkeypatch):
     assert wave.pool.kernel_dump is None
 
 
-def test_a_mistyped_dump_mode_is_refused_at_pool_construction(monkeypatch):
-    """Not silently off: a typo must fail the wave, not look like a clean run."""
-    with pytest.raises(ValueError, match="prefix_pool_dump_kernel_args"):
-        _pool_with_debug(
+def test_a_mistyped_dump_mode_is_refused_by_name_and_the_wave_survives(
+    monkeypatch, caplog
+):
+    """Not silently off, and not fatal either.
+
+    A typo must never read as a clean run, which is why ``parse_dump_mode``
+    refuses it rather than returning None. But the refusal is a DIAGNOSTICS
+    failure, so it costs the dump and not the prefill: it lands as one
+    ``probe_error`` WARNING naming the flag and the bad value, and the wave is
+    built with no dump recorder. Observability must not take down what it
+    observes.
+    """
+
+    with caplog.at_level(logging.WARNING):
+        wave = _pool_with_debug(
             monkeypatch, {"prefix_pool_dump_kernel_args": "synch"}
         )
+
+    assert wave.pool.kernel_dump is None
+    line = next(
+        record.getMessage() for record in caplog.records
+        if "PROBE_ERROR" in record.getMessage()
+    )
+    assert "probe=kernel_dump.setup" in line
+    assert "prefix_pool_dump_kernel_args" in line and "'synch'" in line
 
 
 def test_pool_budget_is_the_group_minimum(monkeypatch):
@@ -481,8 +502,8 @@ def test_pool_budget_is_the_group_minimum(monkeypatch):
 
     wave = worker._plan_prefill_pool_wave(UUIDS, {})
 
-    # Pages, state slots and the M3 Slice 3 materialization vote (1 = this
-    # rank has nothing to object to) travel in the one reduce.
+    # [pages, slots, materialization vote]: a wave with no hits still votes
+    # "confirmed" (1 -- the rank has nothing to object to) in the one reduce.
     assert fake_dist.reduced == [[20, 32, 1]], (
         "the rank must contribute its own budget"
     )
