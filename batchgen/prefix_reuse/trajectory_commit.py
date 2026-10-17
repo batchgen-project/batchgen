@@ -1846,14 +1846,13 @@ class TrajectoryFrontierCommitter:
                 int(sequence_id),
             )
             return None
+        chunks = self._read_chunks(int(sequence_id))
         written = self._arena_allocator.write_shard(
-            arena, shard_index=self._shard_index, chunks=self._read_chunks(
-                int(sequence_id)
-            )
+            arena, shard_index=self._shard_index, chunks=chunks
         )
         self._logger.info(
             "[%s] rank=%s seq=%s shard=%s/%s written boundary=%s bytes=%s "
-            "into the leader's arena (pseudo_sid=%s)",
+            "digest=%s into the leader's arena (pseudo_sid=%s)",
             PREFIX,
             self._rank,
             int(sequence_id),
@@ -1861,6 +1860,7 @@ class TrajectoryFrontierCommitter:
             self._shard_count,
             len(tokens),
             written,
+            snapshot_chunks_digest(chunks),
             arena.pseudo_sid,
         )
         return int(written)
