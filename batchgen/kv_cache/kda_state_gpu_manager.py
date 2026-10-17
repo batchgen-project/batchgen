@@ -99,18 +99,25 @@ class KDAStateGPUManager:
             self.config.logical_to_physical_layer,
             self.config.num_kda_layers,
         )
-        self._log_layer_mapping_isolation()
+        self._validate_layer_mapping_isolation()
         self._reset_runtime_state()
 
-    def _log_layer_mapping_isolation(self) -> None:
-        """State the resolved layer map, and shout if two layers share a row.
+    def _validate_layer_mapping_isolation(self) -> None:
+        """Every logical KDA layer must own its own physical state row.
 
-        Every KDA layer owns one row of the 4-D recurrent and conv pools, so
-        two logical layers resolving to the same physical row would silently
-        share all four states. ``validate_layer_mapping`` checks range and
-        non-emptiness but NOT injectivity, and a shared row cannot be
-        distinguished from a correct run by any downstream assertion, so it is
-        reported here once at construction.
+        Each KDA layer owns one row of the 4-D recurrent and conv pools, so two
+        logical layers resolving to the same physical row share all four states.
+        ``_normalize_gpu_layer_mapping`` checks range and non-emptiness but NOT
+        injectivity, and a shared row cannot be distinguished from a correct run
+        by any downstream assertion -- the states simply overwrite each other.
+
+        A non-injective map is therefore a CONFIGURATION error and is refused
+        here, at construction, before a single state row exists. Logging it and
+        continuing (the earlier behaviour) let the corrupted-sharing run
+        proceed on a line nobody reads in a serving log.
+
+        The healthy case is one INFO line of counts. The resolved map itself can
+        be hundreds of entries per rank, so it goes to DEBUG.
         """
 
         mapping = self._logical_to_physical_layer
@@ -125,22 +132,23 @@ class KDAStateGPUManager:
         duplicates = sorted(
             {row for row in physical if physical.count(row) > 1}
         )
+        if duplicates:
+            raise ValueError(
+                f"KDA state layer map is NOT injective: physical rows "
+                f"{duplicates} are each claimed by more than one logical KDA "
+                f"layer, so those layers would share one recurrent and conv "
+                f"state. Map: {list(mapping)}"
+            )
         logging.info(
-            "[KDA_STATE] layer map logical->physical %s over %d rows "
-            "(%d mapped, %d duplicate rows)",
-            list(mapping),
+            "[KDA_STATE] layer map resolved over %d KDA layers: %d mapped to "
+            "their own row, %d unmapped",
             self.config.num_kda_layers,
             len(physical),
-            len(duplicates),
+            len(mapping) - len(physical),
         )
-        if duplicates:
-            logging.error(
-                "[KDA_STATE] layer map is NOT injective: physical rows %s are "
-                "each claimed by more than one logical KDA layer, so those "
-                "layers share one recurrent and conv state. Map: %s",
-                duplicates,
-                list(mapping),
-            )
+        logging.debug(
+            "[KDA_STATE] layer map logical->physical %s", list(mapping)
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
