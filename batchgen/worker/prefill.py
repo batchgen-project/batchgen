@@ -299,9 +299,49 @@ class PrefillScheduler:
 # Consecutive scheduler iterations that may admit nothing, with nothing live
 # and no change in the gathered admission state, before the worker fails by
 # name. Such an iteration cannot make progress (no decode runs, no pages or
-# slots come back), so any small bound is correct; this one only has to sit
-# above transient retries such as a rejected reservation snapshot.
+# slots come back), so any small bound is correct; this one sits well above
+# transient retries, which the state components reset anyway -- a rejected
+# reservation snapshot, an in-flight prefix load and a changed candidate set
+# are each their own component (see ``PrefillProgressGuard``).
 PREFILL_NO_PROGRESS_LIMIT = 64
+
+# Candidates one admission reclaim buys room for. Minimal-progress reclaim:
+# one is enough to unblock the wave, and the next wave reclaims again if it
+# still cannot admit. See ``prefill_reclaim_target_pages``.
+PREFILL_RECLAIM_TARGET_CANDIDATES = 1
+
+
+def prefill_reclaim_target_pages(
+    *,
+    fitting_requirements: Sequence[int],
+    free_pages: int,
+    max_candidates: int = PREFILL_RECLAIM_TARGET_CANDIDATES,
+) -> Tuple[int, int]:
+	"""Return ``(required_pages, page_target)`` for a minimal-progress reclaim.
+
+	``fitting_requirements`` are the Host-page reservations of this node's
+	slot-admissible candidates that the pool can hold at all, in admission
+	priority order. The target covers the first ``max_candidates`` of them --
+	the minimum that lets the HIGHEST-PRIORITY admissible candidate proceed --
+	rather than the sum over the whole admissible set.
+
+	Policy (minimal-progress reclaim): a wave only has to admit something.
+	Reclaiming for the sum evicts retained prefixes the wave will not use, and
+	every evicted prefix is a hot prefix some later prompt must recompute; if
+	one wave's admission is still not enough, the next wave reclaims again from
+	the same LRU order. Taking the first requirement rather than the smallest
+	also keeps the priority walk honest: targeting the cheapest candidate can
+	admit later arrivals forever while the head of the queue never fits.
+
+	Returns ``(0, 0)`` when no candidate fits the pool at all.
+	"""
+	if int(max_candidates) <= 0:
+		raise ValueError("max_candidates must be > 0")
+	head = [int(pages) for pages in fitting_requirements[: int(max_candidates)]]
+	if not head:
+		return 0, 0
+	required = sum(head)
+	return required, max(0, required - int(free_pages))
 
 
 class PrefillAdmissionStalled(RuntimeError):
@@ -310,11 +350,32 @@ class PrefillAdmissionStalled(RuntimeError):
 	Raised instead of returning an empty wave forever: with no live sequence
 	nothing decodes, completes, or releases Host pages or sequence slots, so an
 	empty selection would repeat unchanged on every scheduler iteration.
+
+	NOTHING handles it. It leaves ``_prepare_prefill_batch`` through
+	``generate()`` / ``generate_persistent()`` into the worker fatal boundary,
+	which exits the rank and fails every active batch. That is the right
+	mapping for an engine invariant violation (pages pinned with nothing live;
+	an EVICTED sequence that no longer fits a pool it did fit) and it is
+	exactly why a single impossible REQUEST must not come here: an oversized
+	queued prompt is failed on the per-request error channel instead, by
+	``_reject_unsatisfiable_prefill_requests``.
 	"""
 
 
 class PrefillAdmissionNoProgress(PrefillAdmissionStalled):
 	"""The scheduler loop's hard guard tripped: repeated identical empty waves."""
+
+
+class PrefillAdmissionStateDivergence(RuntimeError):
+	"""Ranks disagree about the prefill admission candidate set.
+
+	Admission reclaim and the no-progress guard both branch on the candidate
+	snapshot, which every rank derives independently from a ``global_batch``
+	that is supposed to be replicated. A divergence sends ranks down different
+	branches -- one reclaiming and gathering while another walks on to the next
+	collective -- so it is named here instead of deadlocking or raising on a
+	single rank later.
+	"""
 
 
 def describe_prefill_blockers(
@@ -388,11 +449,30 @@ class PrefillProgressGuard:
 	``observe`` runs once per scheduler iteration, after the wave's Host
 	reservation. An iteration is DEAD when it admitted nothing and no sequence
 	is live (so the decode phase will not run either). A dead iteration whose
-	admission ``state`` (the rank-identical gathered free pages / slots /
-	candidate count) equals the previous one extends the streak; anything else
-	resets it. ``limit`` consecutive identical dead iterations raise
-	``PrefillAdmissionNoProgress``. Every input is identical across ranks, so
-	every rank raises on the same iteration.
+	admission ``state`` equals the previous one extends the streak; a change in
+	ANY component resets it. ``limit`` consecutive identical dead iterations
+	raise ``PrefillAdmissionNoProgress``.
+
+	``state`` must distinguish "waiting on something in flight" from "truly
+	stuck", or a recoverable wait repeats an identical snapshot until the limit
+	and the guard fails a healthy worker. The worker therefore builds it from
+	(see ``_prefill_admission_state``):
+
+	  - gathered per-node Host free AND total pages,
+	  - the gathered per-rank / per-node sequence-slot vectors,
+	  - a digest of the candidate IDENTITIES and their required pages, not just
+	    the candidate count,
+	  - the prefix-cache pressure counters that move while a load or an
+	    attachment release is in flight (resident nodes, active attachments,
+	    pending loads),
+	  - the admission reclaim's own outcome (whether it ran, pages released),
+	  - the last Host reservation outcome: not attempted / committed /
+	    rejected by the fresh capacity snapshot.
+
+	Every component is rank-uniform -- gathered, reduced, or derived from a
+	cross-rank-verified candidate digest -- and ``live`` is the OR across
+	ranks, so every rank raises on the same iteration instead of diverging on
+	the failure path.
 	"""
 
 	def __init__(self, limit: int = PREFILL_NO_PROGRESS_LIMIT) -> None:
