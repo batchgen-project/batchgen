@@ -38,6 +38,11 @@ from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
 )
+from batchgen.attention.dsa.aux_indexer_k_writer import (
+    aux_cache_data_dim,
+    aux_cache_is_page_split,
+    write_aux_indexer_k,
+)
 from batchgen.attention.dsa.sparse_decode_mla import (
     prepare_sparse_flash_mla_decode_tensor_metadata,
     prepare_sparse_flash_mla_decode_inputs,
@@ -136,8 +141,13 @@ class _Glm5FullDsaSegmentBuffers:
 @dataclass
 class _Glm5FullDsaSegmentOutputs:
     primary_k_tensor: torch.Tensor
+    # The aux tensor the host append must receive: bf16 keys for an AoS aux
+    # cache, e4m3 keys for a page-split one.
     indexer_k_tensor: torch.Tensor
     attn_output: torch.Tensor
+    # fp32 per-token scales, allocated only for a page-split aux cache (an AoS
+    # host region rejects scales, so None is the correct value there).
+    indexer_k_scale: torch.Tensor | None = None
 
 
 # Static-buffer footprint: capture runs largest-first, so the full per-row
@@ -314,10 +324,11 @@ class Glm5DsaAttnSegment:
             raise ValueError(
                 f"aux_blocked_k page size {aux_blocked_k.shape[1]} != {self.aux_page_size}"
             )
-        if aux_blocked_k.shape[3] != self.index_head_dim:
-            raise ValueError(
-                f"aux_blocked_k head dim {aux_blocked_k.shape[3]} != {self.index_head_dim}"
-            )
+        # See the full segment: both aux formats are accepted here, and a
+        # mis-sized cache is named by the shared discriminator.
+        self.aux_is_page_split = aux_cache_is_page_split(
+            aux_blocked_k, self.index_head_dim
+        )
         if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
             raise TypeError("cos_table and sin_table must be float32 for graph capture")
         if not cos_table.is_contiguous() or not sin_table.is_contiguous():
@@ -691,8 +702,18 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("aux_blocked_k page size does not match aux_page_size")
         if self.primary_blocked_k.shape[3] != self.attn.kv_lora_rank + self.attn.qk_rope_head_dim:
             raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
-        if self.aux_blocked_k.shape[3] != self.attn.indexer.index_head_dim:
-            raise ValueError("aux_blocked_k last dimension does not match GLM-5 indexer K")
+        # Accepts both aux formats and names a mis-sized cache: bf16 AoS keeps
+        # `index_head_dim` elements per token, page-split FP8 keeps
+        # `index_head_dim + 4` BYTES (the fp32 per-token scale included).
+        self.aux_is_page_split = aux_cache_is_page_split(
+            self.aux_blocked_k, self.attn.indexer.index_head_dim
+        )
+        # Shape/dtype of the aux tensor this segment hands to the host append;
+        # the composing layer segment declares its own spec from these.
+        self.aux_host_kv_dim = aux_cache_data_dim(self.aux_blocked_k)
+        self.aux_host_kv_dtype = (
+            torch.float8_e4m3fn if self.aux_is_page_split else torch.bfloat16
+        )
         if _fa3_with_kvcache is None:
             raise RuntimeError(
                 "GLM-5 DSA graph requires flash_attn_interface "
@@ -784,7 +805,7 @@ class Glm5FullDsaAttnSegment:
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
+        specs = {
             "attn_output": TensorSpec(
                 ("batch_size", 1, self.attn.hidden_size),
                 torch.bfloat16,
@@ -794,10 +815,15 @@ class Glm5FullDsaAttnSegment:
                 torch.bfloat16,
             ),
             "indexer_k_tensor": TensorSpec(
-                ("batch_size", 1, 1, self.aux_blocked_k.shape[3]),
-                torch.bfloat16,
+                ("batch_size", 1, 1, self.aux_host_kv_dim),
+                self.aux_host_kv_dtype,
             ),
         }
+        if self.aux_is_page_split:
+            specs["indexer_k_scale"] = TensorSpec(
+                ("batch_size",), torch.float32,
+            )
+        return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._buffers:
@@ -991,6 +1017,11 @@ class Glm5FullDsaAttnSegment:
                 primary_k_tensor=base.primary_k_tensor[:bucket_size],
                 indexer_k_tensor=base.indexer_k_tensor[:bucket_size],
                 attn_output=base.attn_output[:bucket_size],
+                indexer_k_scale=(
+                    None
+                    if base.indexer_k_scale is None
+                    else base.indexer_k_scale[:bucket_size]
+                ),
             )
             return
         device = self.primary_blocked_k.device
@@ -1002,11 +1033,16 @@ class Glm5FullDsaAttnSegment:
                 bucket_size,
                 1,
                 1,
-                attn.indexer.index_head_dim,
-                dtype=torch.bfloat16,
+                self.aux_host_kv_dim,
+                dtype=self.aux_host_kv_dtype,
                 device=device,
             ),
             attn_output=torch.empty(bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device),
+            indexer_k_scale=(
+                torch.empty(bucket_size, dtype=torch.float32, device=device)
+                if self.aux_is_page_split
+                else None
+            ),
         )
 
     def initialize_static_inputs(
@@ -1199,16 +1235,33 @@ class Glm5FullDsaAttnSegment:
             position_ids.view(batch_size),
             max_seqlen=self.max_seqlen,
         ).unsqueeze(2)
-        outputs.indexer_k_tensor.copy_(indexer_k_tensor)
-        run_paged_kv_token_update_fused(
-            k_cache=self.aux_blocked_k,
-            k_tokens=outputs.indexer_k_tensor.view(batch_size, -1),
-            page_table=self.aux_page_table,
-            slot_indices=buffers.kv_aux_slot_indices,
-            token_indices=token_indices,
-            page_size_tokens=self.aux_page_size,
-            num_valid_tokens=num_valid_tokens,
-        )
+        # Page-split aux cache: ONE launch quantizes the keys, writes the page's
+        # e4m3 K region and fp32 scale region, and fills the two static host
+        # staging buffers with the same bytes (no extra copy, no second
+        # quantization). A bf16 AoS cache keeps the copy + paged update pair.
+        if self.aux_is_page_split:
+            write_aux_indexer_k(
+                aux_blocked_k=self.aux_blocked_k,
+                indexer_k=indexer_k_tensor,
+                page_table=self.aux_page_table,
+                slot_indices=buffers.kv_aux_slot_indices,
+                token_indices=token_indices,
+                page_size_tokens=self.aux_page_size,
+                k_fp8_out=outputs.indexer_k_tensor,
+                scales_out=outputs.indexer_k_scale,
+                num_valid_tokens=num_valid_tokens,
+            )
+        else:
+            outputs.indexer_k_tensor.copy_(indexer_k_tensor)
+            write_aux_indexer_k(
+                aux_blocked_k=self.aux_blocked_k,
+                indexer_k=outputs.indexer_k_tensor,
+                page_table=self.aux_page_table,
+                slot_indices=buffers.kv_aux_slot_indices,
+                token_indices=token_indices,
+                page_size_tokens=self.aux_page_size,
+                num_valid_tokens=num_valid_tokens,
+            )
 
         if not self.all_short:
             head_gates_out(
@@ -1305,11 +1358,14 @@ class Glm5FullDsaAttnSegment:
         # is what makes them inert.
         outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 
-        return {
+        graph_outputs = {
             "attn_output": outputs.attn_output.view(batch_size, 1, attn.hidden_size),
             "primary_k_tensor": outputs.primary_k_tensor,
             "indexer_k_tensor": outputs.indexer_k_tensor,
         }
+        if outputs.indexer_k_scale is not None:
+            graph_outputs["indexer_k_scale"] = outputs.indexer_k_scale
+        return graph_outputs
 
 
 def make_glm5_dsa_graph_segment_name(layer_idx: int) -> str:

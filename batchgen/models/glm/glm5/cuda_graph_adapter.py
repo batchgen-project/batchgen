@@ -195,6 +195,9 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             hidden_size=hidden_size,
             max_bucket_size=max(bucketing.bucket_sizes),
             max_seqlen=max_seqlen_cap,
+            # The aux pool's own element type decides how its keys are staged:
+            # e4m3 for a page-split FP8 indexer cache, bf16 for AoS.
+            aux_kv_staging_dtype=aux_manager.config.kv_dtype,
         )
         bundle = SegmentBundle(whole_model=whole_segment)
 
@@ -463,9 +466,21 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         aux_buf = getattr(seg, "_aux_kv_key_buffer", None)
         if aux_cb is not None and aux_buf is not None:
             aux_stage = aux_buf[:, :bsz].clone()
+            # One clone for the scales too (page-split aux only): the host
+            # region takes the quantized keys and their fp32 per-token scales
+            # together, so a layer must never hand over one without the other.
+            aux_scale_buf = getattr(seg, "_aux_kv_scale_buffer", None)
+            aux_scale_stage = (
+                None if aux_scale_buf is None else aux_scale_buf[:, :bsz].clone()
+            )
             num_layers = aux_stage.shape[0]
             for layer_idx in range(num_layers):
-                aux_cb(layer_idx, aux_stage[layer_idx], None)
+                aux_cb(
+                    layer_idx,
+                    aux_stage[layer_idx],
+                    None,
+                    None if aux_scale_stage is None else aux_scale_stage[layer_idx],
+                )
 
     # ---- Compare / debug ------------------------------------------------
 

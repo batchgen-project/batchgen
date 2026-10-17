@@ -14,6 +14,35 @@ namespace batchgen::kv {
 
 using LayerMapping = std::vector<std::int32_t>;
 
+// How the bytes of ONE host K page are arranged.
+//
+// kContiguousAoS   token-major records: token t occupies
+//                  [t * k_token_bytes, (t + 1) * k_token_bytes).
+// kPageSplitFp8Scale  the SoA page DeepGEMM's fp8_paged_mqa_logits reads:
+//                  [page_size_tokens * data_bytes   e4m3 K bytes]
+//                  [page_size_tokens * 4            fp32 scale bytes]
+//                  with ONE fp32 scale per token (quantization block size ==
+//                  the token's data bytes). k_head_dim carries the TOTAL byte
+//                  count per token (data + scale), so every page/layer/region
+//                  size and the page identity stay a plain product.
+enum class HostKVPageFormat : std::uint32_t {
+    kContiguousAoS = 0,
+    kPageSplitFp8Scale = 1,
+};
+
+// One fp32 scale per token in kPageSplitFp8Scale.
+inline constexpr std::size_t kHostKVScaleBytesPerToken = 4;
+
+inline std::string ToString(HostKVPageFormat format) {
+    switch (format) {
+        case HostKVPageFormat::kContiguousAoS:
+            return "contiguous_aos";
+        case HostKVPageFormat::kPageSplitFp8Scale:
+            return "page_split_fp8_scale";
+    }
+    return "unknown";
+}
+
 struct HostPagedKVStats {
     std::size_t num_total_pages = 0;
     std::size_t num_free_pages = 0;
@@ -36,6 +65,11 @@ struct HostPagedKVConfig {
     std::size_t v_element_size_bytes = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t alignment_bytes = 64;
+    // Arrangement of the bytes inside one K page. It changes where a token's
+    // bytes live, so it IS part of the physical layout and is hashed into the
+    // shared-memory config fingerprint: a creator and an attacher that
+    // disagree fail loud instead of reading each other's tokens as noise.
+    HostKVPageFormat page_format = HostKVPageFormat::kContiguousAoS;
     // Transparent huge pages for the region (--fast-init). Purely a paging
     // hint: it changes neither the layout nor the lifetime of the region, so
     // it is deliberately absent from HashHostKVConfig().
@@ -78,6 +112,33 @@ inline HostPagedKVConfig SanitizeConfig(HostPagedKVConfig config) {
     }
     if (config.k_element_size_bytes == 0) {
         errors.emplace_back("k_element_size_bytes must be > 0");
+    }
+    if (config.page_format == HostKVPageFormat::kPageSplitFp8Scale) {
+        // The page-split page is one SoA block per region, so it carries no
+        // head dimension and no V cache, its data elements are e4m3 bytes,
+        // and k_head_dim is the per-token BYTE count (data + one fp32 scale).
+        if (config.num_k_heads != 1) {
+            errors.emplace_back(
+                "page_split_fp8_scale requires num_k_heads == 1");
+        }
+        if (config.k_element_size_bytes != 1) {
+            errors.emplace_back(
+                "page_split_fp8_scale requires k_element_size_bytes == 1 "
+                "(k_head_dim is a byte count)");
+        }
+        if (config.num_v_heads != 0) {
+            errors.emplace_back(
+                "page_split_fp8_scale requires num_v_heads == 0");
+        }
+        if (config.k_head_dim <= kHostKVScaleBytesPerToken) {
+            errors.emplace_back(
+                "page_split_fp8_scale requires k_head_dim > 4 (data bytes + "
+                "one fp32 scale)");
+        } else if ((config.k_head_dim - kHostKVScaleBytesPerToken) % 16 != 0) {
+            errors.emplace_back(
+                "page_split_fp8_scale requires (k_head_dim - 4) to be a "
+                "multiple of 16");
+        }
     }
     for (std::size_t logical_layer = 0;
          logical_layer < config.logical_to_physical_layer.size();
@@ -174,6 +235,7 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", v_element_size_bytes=" << config.v_element_size_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
         << ", alignment_bytes=" << config.alignment_bytes
+        << ", page_format=" << ToString(config.page_format)
         << ", logical_to_physical_layer=";
     AppendLogicalLayerMapping(oss, config.logical_to_physical_layer);
     oss << ")";
@@ -205,6 +267,10 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.v_element_size_bytes);
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
+    // The page format moves a token's bytes inside its page, so a creator and
+    // an attacher must agree on it exactly like they agree on the dimensions.
+    seed = HashCombine(
+        seed, static_cast<std::uint64_t>(sanitized.page_format));
     // logical_to_physical_layer is view-level routing. It does not change the
     // physical shared-memory layout, so it is intentionally excluded here.
     // enable_thp is likewise excluded: the creator and an attacher must agree

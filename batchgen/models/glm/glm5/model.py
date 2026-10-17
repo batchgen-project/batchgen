@@ -698,18 +698,34 @@ class Glm5Indexer(nn.Module):
         batch_size = block_table.shape[0]
         if max_seqlen is None:
             raise RuntimeError("GLM-5 DSA paged scoring requires explicit max_seqlen")
-        num_k_heads = indexer_blocked_k.shape[2]
-        k_head_dim = indexer_blocked_k.shape[3]
-
-        from batchgen_kernels.attention.dsa import fused_dense_paged_gather
 
         # Gather dense logical range [0, max_seqlen) without building token indices.
-        gathered = fused_dense_paged_gather(
-            indexer_blocked_k,
-            block_table,
-            max_seqlen,
-            page_size,
-        ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
+        # A 1-byte element type means the page-split FP8 cache (GLM-5.2): its
+        # pages hold e4m3 K bytes plus one fp32 scale per token, so the gather
+        # dequantizes on output and this scorer stays bf16 until the DeepGEMM
+        # fp8_paged_mqa_logits swap lands.
+        if indexer_blocked_k.element_size() == 1:
+            from batchgen_kernels.attention.dsa import (
+                fused_dense_paged_gather_fp8_pagesplit,
+            )
+
+            gathered = fused_dense_paged_gather_fp8_pagesplit(
+                indexer_blocked_k,
+                block_table,
+                max_seqlen,
+                out_dtype=hidden_states.dtype,
+            )
+        else:
+            from batchgen_kernels.attention.dsa import fused_dense_paged_gather
+
+            num_k_heads = indexer_blocked_k.shape[2]
+            k_head_dim = indexer_blocked_k.shape[3]
+            gathered = fused_dense_paged_gather(
+                indexer_blocked_k,
+                block_table,
+                max_seqlen,
+                page_size,
+            ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
 
         gathered_k = gathered.squeeze(2)
 

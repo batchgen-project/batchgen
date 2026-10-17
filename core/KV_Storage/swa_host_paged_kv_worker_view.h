@@ -218,7 +218,15 @@ class SWAHostPagedKVWorkerView {
     KVAsyncTask AsyncOffloadLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths raw_sequence_lengths) {
+        SequenceLengths raw_sequence_lengths,
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
+        // The constructor already rejects every non-AoS page format, so a
+        // scale tensor can only reach this view through a caller bug.
+        if (scale_tensor.has_value()) {
+            throw std::invalid_argument(
+                "SWAHostPagedKVWorkerView::AsyncOffloadLayerKVToHost: "
+                "scale_tensor is only valid for a page-split view");
+        }
         if (sequence_ids.empty()) {
             return transformed_detail::MakeAsyncTask([] {});
         }
@@ -272,7 +280,13 @@ class SWAHostPagedKVWorkerView {
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths raw_positions) {
+        SequenceLengths raw_positions,
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
+        if (scale_tensor.has_value()) {
+            throw std::invalid_argument(
+                "SWAHostPagedKVWorkerView::AsyncAppendDecodeKVToHost: "
+                "scale_tensor is only valid for a page-split view");
+        }
         if (sequence_ids.empty()) {
             return transformed_detail::MakeAsyncTask([] {});
         }
@@ -337,6 +351,16 @@ class SWAHostPagedKVWorkerView {
         if (page_size_tokens_ == 0) {
             throw std::invalid_argument(
                 "SWAHostPagedKVWorkerView requires page_size_tokens > 0");
+        }
+        // This view slides a window over whole pages and re-reads a page's
+        // token records directly; it has no notion of a page's second
+        // (scale) region, so a page-split region must never reach it.
+        if (base_view_.config().page_format !=
+            HostKVPageFormat::kContiguousAoS) {
+            throw std::invalid_argument(
+                "SWAHostPagedKVWorkerView supports only page_format="
+                "contiguous_aos (got " +
+                ToString(base_view_.config().page_format) + ")");
         }
         if (window_size_tokens_ == 0) {
             throw std::invalid_argument(

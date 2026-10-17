@@ -864,30 +864,38 @@ class HostPagedKVWorkerView : private LayerMapper {
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         // [B, S, H, D]
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        // Page-split only: fp32 per-token scales, [B, S].
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
         const std::size_t batch = sequence_ids.size();
         SequenceLengthVector raw_start_positions(batch, 0);
         return AsyncOffloadLayerKVRangeToHostImpl(
             layer_idx, std::move(sequence_ids), std::move(k_tensor),
             std::move(v_tensor), std::move(raw_start_positions),
-            std::move(sequence_lengths), "AsyncOffloadLayerKVToHost");
+            std::move(sequence_lengths), "AsyncOffloadLayerKVToHost",
+            std::move(scale_tensor));
     }
 
     KVAsyncTask AsyncOffloadLayerKVRangeToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths raw_start_positions, SequenceLengths token_counts) {
+        SequenceLengths raw_start_positions, SequenceLengths token_counts,
+        // Page-split only: fp32 per-token scales, [B, S].
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
         return AsyncOffloadLayerKVRangeToHostImpl(
             layer_idx, std::move(sequence_ids), std::move(k_tensor),
             std::move(v_tensor), std::move(raw_start_positions),
-            std::move(token_counts), "AsyncOffloadLayerKVRangeToHost");
+            std::move(token_counts), "AsyncOffloadLayerKVRangeToHost",
+            std::move(scale_tensor));
     }
 
     KVAsyncTask AsyncOffloadPackedLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         // K: [sum(sequence_lengths), H, D]
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        // Page-split only: fp32 per-token scales, [sum(sequence_lengths)].
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
         constexpr std::string_view kOpName =
             "AsyncOffloadPackedLayerKVToHost";
         const std::size_t physical_layer_idx =
@@ -896,6 +904,8 @@ class HostPagedKVWorkerView : private LayerMapper {
         const std::size_t batch = sequence_ids.size();
         const std::size_t total_tokens = ValidatePackedKTensorShape(k_tensor);
         ValidateSequenceLengthsInput(sequence_lengths, batch, kOpName);
+        auto prepared_scales =
+            PrepareScaleTensor(std::move(scale_tensor), total_tokens, kOpName);
 
         torch::Tensor prepared_k = k_tensor;
         std::optional<torch::Tensor> prepared_v;
@@ -941,14 +951,20 @@ class HostPagedKVWorkerView : private LayerMapper {
             this, physical_layer_idx,
             sequence_ids = std::move(sequence_ids),
             packed_lengths = std::move(packed_lengths), prepared_k, prepared_v,
-            producer_event]() {
+            prepared_scales, producer_event]() {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerEvent(cuda_stream, *producer_event);
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
-            const std::size_t k_token_bytes = geometry_.KTokenBytes();
+            const std::size_t k_token_bytes = geometry_.KDataTokenBytes();
+            const std::size_t scale_token_bytes = geometry_.ScaleTokenBytes();
+            const std::byte* scale_base =
+                prepared_scales.has_value()
+                    ? static_cast<const std::byte*>(
+                          prepared_scales->data_ptr())
+                    : nullptr;
 
             const std::byte* v_base = nullptr;
             std::size_t v_token_bytes = 0;
@@ -974,20 +990,38 @@ class HostPagedKVWorkerView : private LayerMapper {
                 geometry_.ValidatePageCapacity(pages, tokens_to_copy, kOpName);
                 const auto* seq_k_src =
                     k_base + packed_token_offset * k_token_bytes;
+                const std::byte* seq_scale_src =
+                    scale_base == nullptr
+                        ? nullptr
+                        : scale_base + packed_token_offset * scale_token_bytes;
 
                 ForEachPageChunk(
                     pages, 0, tokens_to_copy,
                     [&](std::int32_t page_idx, std::size_t page_offset_tokens,
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
-                        std::byte* dst = layout_.KPageAddress(
-                                             host_base, physical_layer_idx,
-                                             page_idx) +
-                                         page_offset_tokens * k_token_bytes;
+                        std::byte* dst = layout_.KDataTokenAddress(
+                            host_base, physical_layer_idx, page_idx,
+                            page_offset_tokens);
                         const std::byte* src =
                             seq_k_src + relative_token_offset * k_token_bytes;
                         EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
+                        if (seq_scale_src != nullptr) {
+                            // Second region of the same page: the chunk's
+                            // tokens are contiguous there too, so one more
+                            // flat copy per chunk covers the scales.
+                            std::byte* scale_dst = layout_.ScaleTokenAddress(
+                                host_base, physical_layer_idx, page_idx,
+                                page_offset_tokens);
+                            const std::byte* scale_src =
+                                seq_scale_src +
+                                relative_token_offset * scale_token_bytes;
+                            EnqueueCopy(scale_src, scale_dst,
+                                        chunk_tokens * scale_token_bytes,
+                                        CopyDirection::kDeviceToHost,
+                                        cuda_stream);
+                        }
                     });
                 if constexpr (kHasVCache) {
                     if (v_base != nullptr) {
@@ -1023,7 +1057,9 @@ class HostPagedKVWorkerView : private LayerMapper {
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        // Page-split only: fp32 per-token scales, one per sequence.
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
         const std::size_t physical_layer_idx =
             ResolvePhysicalLayer(layer_idx, "AsyncAppendDecodeKVToHost");
         EnsureDeviceReady();
@@ -1035,6 +1071,9 @@ class HostPagedKVWorkerView : private LayerMapper {
             ValidateKTensorShape(k_tensor, batch);
         ValidateSequenceLengthsInput(sequence_lengths, batch,
                                      "AsyncAppendDecodeKVToHost");
+        auto prepared_scales = PrepareScaleTensor(
+            std::move(scale_tensor), batch * tokens_per_sequence,
+            "AsyncAppendDecodeKVToHost");
         torch::Tensor prepared_k = k_tensor;
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
@@ -1057,7 +1096,7 @@ class HostPagedKVWorkerView : private LayerMapper {
         return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
-                                 prepared_k, prepared_v,
+                                 prepared_k, prepared_v, prepared_scales,
                                  producer_event]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
@@ -1065,8 +1104,14 @@ class HostPagedKVWorkerView : private LayerMapper {
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
-            const std::size_t k_token_bytes = geometry_.KTokenBytes();
+            const std::size_t k_token_bytes = geometry_.KDataTokenBytes();
             const std::size_t k_seq_stride = k_token_bytes;
+            const std::size_t scale_token_bytes = geometry_.ScaleTokenBytes();
+            const std::byte* scale_base =
+                prepared_scales.has_value()
+                    ? static_cast<const std::byte*>(
+                          prepared_scales->data_ptr())
+                    : nullptr;
 
             const std::byte* v_base = nullptr;
             std::size_t v_token_bytes = 0;
@@ -1098,12 +1143,21 @@ class HostPagedKVWorkerView : private LayerMapper {
                                         "AsyncAppendDecodeKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
-                std::byte* k_dst =
-                    layout_.KPageAddress(host_base, physical_layer_idx,
-                                         location.page_idx) +
-                                   location.page_offset_tokens * k_token_bytes;
+                std::byte* k_dst = layout_.KDataTokenAddress(
+                    host_base, physical_layer_idx, location.page_idx,
+                    location.page_offset_tokens);
                 EnqueueCopy(seq_k_src, k_dst, k_token_bytes,
                             CopyDirection::kDeviceToHost, cuda_stream);
+
+                if (scale_base != nullptr) {
+                    const auto* seq_scale_src =
+                        scale_base + batch_idx * scale_token_bytes;
+                    std::byte* scale_dst = layout_.ScaleTokenAddress(
+                        host_base, physical_layer_idx, location.page_idx,
+                        location.page_offset_tokens);
+                    EnqueueCopy(seq_scale_src, scale_dst, scale_token_bytes,
+                                CopyDirection::kDeviceToHost, cuda_stream);
+                }
 
                 if constexpr (kHasVCache) {
                     if (v_base != nullptr) {
@@ -1133,6 +1187,8 @@ class HostPagedKVWorkerView : private LayerMapper {
         std::size_t layer_idx;
         torch::Tensor k_tensor;
         std::optional<torch::Tensor> v_tensor;
+        // Page-split only: fp32 per-token scales, one per sequence.
+        std::optional<torch::Tensor> scale_tensor;
     };
 
     /**
@@ -1178,6 +1234,9 @@ class HostPagedKVWorkerView : private LayerMapper {
                         "V tensor provided but V cache is disabled");
                 }
             }
+            e.scale_tensor = PrepareScaleTensor(
+                std::move(e.scale_tensor), batch * tokens_per_seq,
+                "AsyncAppendDecodeKVToHostBatchedKernel");
         }
         ValidateSequenceLengthsInput(
             sequence_lengths, batch,
@@ -1207,7 +1266,8 @@ class HostPagedKVWorkerView : private LayerMapper {
             seq_locs.push_back({loc.page_idx, loc.page_offset_tokens});
         }
 
-        const std::size_t k_token_bytes = geometry_.KTokenBytes();
+        const std::size_t k_token_bytes = geometry_.KDataTokenBytes();
+        const std::size_t scale_token_bytes = geometry_.ScaleTokenBytes();
         std::size_t v_token_bytes = 0;
         if constexpr (kHasVCache) {
             if (has_v) {
@@ -1217,15 +1277,23 @@ class HostPagedKVWorkerView : private LayerMapper {
 
         const std::size_t k_total = entries.size() * batch;
         const std::size_t v_total = has_v ? k_total : 0;
+        // PrepareScaleTensor already proved every entry carries scales iff
+        // this region is page-split.
+        const std::size_t scale_total = geometry_.IsPageSplit() ? k_total : 0;
+        const std::size_t capacity = k_total + v_total + scale_total;
 
         // Pointer arrays the UVA kernel reads from pinned host memory (see
-        // PinnedPointerSlots): [k_src | v_src | k_dst | v_dst].
-        auto pointer_slots = PinnedPointerSlots(1, k_total + v_total).zero_();
-        auto** k_src_host = reinterpret_cast<uint8_t**>(
+        // PinnedPointerSlots): [k_src | v_src | s_src | k_dst | v_dst | s_dst].
+        auto pointer_slots = PinnedPointerSlots(1, capacity).zero_();
+        auto** src_host = reinterpret_cast<uint8_t**>(
             pointer_slots.data_ptr<std::int64_t>());
-        auto** k_dst_host = k_src_host + k_total + v_total;
-        auto** v_src_host = k_src_host + k_total;
-        auto** v_dst_host = k_dst_host + k_total;
+        auto** dst_host = src_host + capacity;
+        auto** k_src_host = src_host;
+        auto** k_dst_host = dst_host;
+        auto** v_src_host = src_host + k_total;
+        auto** v_dst_host = dst_host + k_total;
+        auto** s_src_host = src_host + k_total + v_total;
+        auto** s_dst_host = dst_host + k_total + v_total;
 
         std::byte* host_base = backend_.DataBase();
         for (std::size_t li = 0; li < entries.size(); ++li) {
@@ -1238,13 +1306,27 @@ class HostPagedKVWorkerView : private LayerMapper {
                         static_cast<uint8_t*>(e.v_tensor->data_ptr());
                 }
             }
+            uint8_t* scale_base =
+                e.scale_tensor.has_value()
+                    ? static_cast<uint8_t*>(e.scale_tensor->data_ptr())
+                    : nullptr;
             for (std::size_t b = 0; b < batch; ++b) {
                 const auto& loc = seq_locs[b];
                 const std::size_t idx = li * batch + b;
                 k_src_host[idx] = k_base + b * k_token_bytes;
                 k_dst_host[idx] = reinterpret_cast<uint8_t*>(
-                    layout_.KPageAddress(host_base, e.layer_idx, loc.page_idx)
-                    + loc.page_offset_tokens * k_token_bytes);
+                    layout_.KDataTokenAddress(
+                        host_base, e.layer_idx,
+                        static_cast<std::int32_t>(loc.page_idx),
+                        loc.page_offset_tokens));
+                if (scale_base != nullptr) {
+                    s_src_host[idx] = scale_base + b * scale_token_bytes;
+                    s_dst_host[idx] = reinterpret_cast<uint8_t*>(
+                        layout_.ScaleTokenAddress(
+                            host_base, e.layer_idx,
+                            static_cast<std::int32_t>(loc.page_idx),
+                            loc.page_offset_tokens));
+                }
                 if constexpr (kHasVCache) {
                     if (v_base != nullptr) {
                         v_src_host[idx] = v_base + b * v_token_bytes;
@@ -1259,8 +1341,10 @@ class HostPagedKVWorkerView : private LayerMapper {
 
         return LaunchAsyncTask([this, pointer_slots = std::move(pointer_slots),
                                  k_src_host, k_dst_host, v_src_host,
-                                 v_dst_host, k_token_bytes, v_token_bytes,
-                                 k_total, v_total, producer_event]() mutable {
+                                 v_dst_host, s_src_host, s_dst_host,
+                                 k_token_bytes, v_token_bytes,
+                                 scale_token_bytes, k_total, v_total,
+                                 scale_total, producer_event]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerEvent(cuda_stream, *producer_event);
@@ -1277,6 +1361,14 @@ class HostPagedKVWorkerView : private LayerMapper {
                 }
             }
 
+            // One extra launch per STEP (not per layer) writes every token's
+            // 4 scale bytes into the pages' scale regions.
+            if (scale_total > 0) {
+                worker_detail::LaunchUvaPageCopyKernel(
+                    s_src_host, s_dst_host, scale_token_bytes,
+                    static_cast<int>(scale_total), cuda_stream);
+            }
+
             this->SynchronizeWithEvent(cuda_stream);
         });
     }
@@ -1289,6 +1381,11 @@ class HostPagedKVWorkerView : private LayerMapper {
      * Read all KV pages for a sequence directly to CPU tensors.
      * Returns (k_tensor, v_tensor). For MLA mode, v_tensor is empty (0-dim).
      * Shape: [num_layers, num_pages, page_size_tokens, num_heads, head_dim]
+     *
+     * Pages are copied VERBATIM, so a page-split region comes back as a uint8
+     * byte carrier of exactly KPageBytes() per page: the trailing dimensions
+     * are bytes, not token-major values, and the scale region lives in the
+     * tail of each page. Reinterpret it with the layout, never as K values.
      */
     std::pair<torch::Tensor, torch::Tensor> ReadSequenceKVToCPU(
         std::int64_t sequence_id) const {
@@ -1301,8 +1398,12 @@ class HostPagedKVWorkerView : private LayerMapper {
         const std::size_t k_elem = config_.k_element_size_bytes;
         const std::size_t k_page_bytes = layout_.KPageBytes();
 
-        // Determine torch dtype from element size
-        auto k_dtype = (k_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+        // Determine torch dtype from element size. One byte per element means
+        // a byte carrier (FP8 / page-split): hand it back as uint8 so no
+        // consumer reads a scale byte as a K value.
+        auto k_dtype = (k_elem == 1)   ? torch::kUInt8
+                       : (k_elem == 2) ? torch::kBFloat16
+                                       : torch::kFloat32;
 
         auto k_out = torch::empty(
             {(int64_t)num_layers, (int64_t)num_pages, (int64_t)page_tokens,
@@ -1328,7 +1429,9 @@ class HostPagedKVWorkerView : private LayerMapper {
             const std::size_t v_dim = config_.v_head_dim;
             const std::size_t v_elem = config_.v_element_size_bytes;
             const std::size_t v_page_bytes = layout_.VPageBytes();
-            auto v_dtype = (v_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+            auto v_dtype = (v_elem == 1)   ? torch::kUInt8
+                           : (v_elem == 2) ? torch::kBFloat16
+                                           : torch::kFloat32;
 
             v_out = torch::empty(
                 {(int64_t)num_layers, (int64_t)num_pages,
@@ -1376,6 +1479,25 @@ class HostPagedKVWorkerView : private LayerMapper {
                 "(expected layers=" +
                 std::to_string(num_layers) +
                 " pages=" + std::to_string(num_pages) + ")");
+        }
+        // Pages are written VERBATIM, so the source must carry exactly one
+        // page of BYTES per (layer, page). A tensor of the right shape but
+        // the wrong element size would otherwise write a page's worth of
+        // bytes out of a smaller buffer, or silently truncate a page-split
+        // page's scale region.
+        {
+            const std::size_t provided_bytes =
+                static_cast<std::size_t>(k_tensor.numel()) *
+                static_cast<std::size_t>(k_tensor.element_size());
+            const std::size_t required_bytes =
+                num_layers * num_pages * k_page_bytes;
+            if (provided_bytes != required_bytes) {
+                throw std::invalid_argument(
+                    "WriteSequenceKVFromCPU: k_tensor holds " +
+                    std::to_string(provided_bytes) + " bytes but " +
+                    std::to_string(required_bytes) +
+                    " bytes of host pages are being written");
+            }
         }
 
         const auto* k_ptr =
@@ -1492,7 +1614,8 @@ class HostPagedKVWorkerView : private LayerMapper {
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths raw_start_positions, SequenceLengths token_counts,
-        std::string_view op_name) {
+        std::string_view op_name,
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
         const std::size_t physical_layer_idx =
             ResolvePhysicalLayer(layer_idx, op_name);
         EnsureDeviceReady();
@@ -1504,6 +1627,8 @@ class HostPagedKVWorkerView : private LayerMapper {
             ValidateKTensorShape(k_tensor, batch);
         ValidateSequenceLengthsInput(raw_start_positions, batch, op_name);
         ValidateSequenceLengthsInput(token_counts, batch, op_name);
+        auto prepared_scales = PrepareScaleTensor(
+            std::move(scale_tensor), batch * tokens_per_sequence, op_name);
         torch::Tensor prepared_k = std::move(k_tensor);
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
@@ -1522,7 +1647,7 @@ class HostPagedKVWorkerView : private LayerMapper {
             [this, physical_layer_idx, sequence_ids = std::move(sequence_ids),
              raw_start_positions = std::move(raw_start_positions),
              token_counts = std::move(token_counts), prepared_k, prepared_v,
-             tokens_per_sequence, producer_event,
+             prepared_scales, tokens_per_sequence, producer_event,
              op_name = std::move(op_name_string)]() {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
                 const auto cuda_stream =
@@ -1531,9 +1656,18 @@ class HostPagedKVWorkerView : private LayerMapper {
 
                 const auto* k_base =
                     static_cast<const std::byte*>(prepared_k.data_ptr());
-                const std::size_t k_token_bytes = geometry_.KTokenBytes();
+                const std::size_t k_token_bytes = geometry_.KDataTokenBytes();
                 const std::size_t k_seq_stride =
                     tokens_per_sequence * k_token_bytes;
+                const std::size_t scale_token_bytes =
+                    geometry_.ScaleTokenBytes();
+                const std::byte* scale_base =
+                    prepared_scales.has_value()
+                        ? static_cast<const std::byte*>(
+                              prepared_scales->data_ptr())
+                        : nullptr;
+                const std::size_t scale_seq_stride =
+                    tokens_per_sequence * scale_token_bytes;
 
                 const std::byte* v_base = nullptr;
                 std::size_t v_token_bytes = 0;
@@ -1574,22 +1708,38 @@ class HostPagedKVWorkerView : private LayerMapper {
 
                     const auto* seq_k_src =
                         k_base + batch_idx * k_seq_stride;
+                    const std::byte* seq_scale_src =
+                        scale_base == nullptr
+                            ? nullptr
+                            : scale_base + batch_idx * scale_seq_stride;
                     ForEachPageChunk(
                         pages, raw_start, tokens_to_copy,
                         [&](std::int32_t page_idx,
                             std::size_t page_offset_tokens,
                             std::size_t chunk_tokens,
                             std::size_t relative_token_offset) {
-                            std::byte* dst =
-                                layout_.KPageAddress(
-                                    host_base, physical_layer_idx, page_idx) +
-                                page_offset_tokens * k_token_bytes;
+                            std::byte* dst = layout_.KDataTokenAddress(
+                                host_base, physical_layer_idx, page_idx,
+                                page_offset_tokens);
                             const std::byte* src =
                                 seq_k_src +
                                 relative_token_offset * k_token_bytes;
                             EnqueueCopy(
                                 src, dst, chunk_tokens * k_token_bytes,
                                 CopyDirection::kDeviceToHost, cuda_stream);
+                            if (seq_scale_src != nullptr) {
+                                std::byte* scale_dst =
+                                    layout_.ScaleTokenAddress(
+                                        host_base, physical_layer_idx,
+                                        page_idx, page_offset_tokens);
+                                const std::byte* scale_src =
+                                    seq_scale_src +
+                                    relative_token_offset * scale_token_bytes;
+                                EnqueueCopy(
+                                    scale_src, scale_dst,
+                                    chunk_tokens * scale_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                            }
                         });
                     if constexpr (kHasVCache) {
                         if (v_base != nullptr) {
@@ -1854,10 +2004,11 @@ class HostPagedKVWorkerView : private LayerMapper {
                 const std::byte* token_ptr =
                     layout_.KPageAddress(host_base, physical_layer_idx,
                                          page_idx);
-                logger_->info("Layer {} Seq {} Page {} first_token_hex {}",
-                              layer_idx, sequence_id, page_idx,
-                              geometry_.DescribeBytes(token_ptr,
-                                                      geometry_.KTokenBytes()));
+                logger_->info(
+                    "Layer {} Seq {} Page {} first_token_hex {}", layer_idx,
+                    sequence_id, page_idx,
+                    geometry_.DescribeBytes(token_ptr,
+                                            geometry_.KDataTokenBytes()));
             }
         }
     }
@@ -1874,7 +2025,7 @@ class HostPagedKVWorkerView : private LayerMapper {
             return;
         }
 
-        const std::size_t k_token_bytes = geometry_.KTokenBytes();
+        const std::size_t k_token_bytes = geometry_.KDataTokenBytes();
 
         for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
              ++batch_idx) {
@@ -1904,10 +2055,9 @@ class HostPagedKVWorkerView : private LayerMapper {
                 const auto location = ResolvePageLocation(
                     pages, sequence_id, token_idx, "LogDecodeNeighborhood");
 
-                const std::byte* token_ptr =
-                    layout_.KPageAddress(host_base, physical_layer_idx,
-                                         location.page_idx) +
-                    location.page_offset_tokens * k_token_bytes;
+                const std::byte* token_ptr = layout_.KDataTokenAddress(
+                    host_base, physical_layer_idx, location.page_idx,
+                    location.page_offset_tokens);
 
                 logger_->info(
                     "DecodeDebug layer={} seq={} token_idx={} "
@@ -2661,7 +2811,8 @@ class HostPagedKVWorkerView : private LayerMapper {
                 "Batch size of K tensor does not match sequence_ids");
         }
         if (tensor.size(2) != static_cast<long>(config_.num_k_heads) ||
-            tensor.size(3) != static_cast<long>(config_.k_head_dim)) {
+            tensor.size(3) !=
+                static_cast<long>(geometry_.ExpectedKHeadDim())) {
             throw std::invalid_argument(
                 "K tensor head dimensions do not match configuration");
         }
@@ -2673,6 +2824,59 @@ class HostPagedKVWorkerView : private LayerMapper {
         return static_cast<std::size_t>(tensor.size(1));
     }
 
+    // The quantized source convention: a page-split K tensor ALWAYS travels
+    // with its fp32 per-token scales as a second contiguous tensor, and an
+    // AoS cache NEVER accepts one. Both directions are enforced so a caller
+    // that forgets the scales (or sends them to the wrong pool) fails loud
+    // instead of leaving a page's scale region at its previous contents.
+    std::optional<torch::Tensor> PrepareScaleTensor(
+        std::optional<torch::Tensor> scale_tensor, std::size_t expected_tokens,
+        std::string_view op_name) const {
+        if (!geometry_.IsPageSplit()) {
+            if (scale_tensor.has_value()) {
+                std::ostringstream oss;
+                oss << op_name
+                    << ": scale_tensor provided but this host KV region is "
+                       "not page-split (page_format="
+                    << ToString(config_.page_format) << ")";
+                throw std::invalid_argument(oss.str());
+            }
+            return std::nullopt;
+        }
+        if (!scale_tensor.has_value()) {
+            std::ostringstream oss;
+            oss << op_name
+                << ": page-split host KV requires scale_tensor alongside the "
+                   "quantized K tensor";
+            throw std::invalid_argument(oss.str());
+        }
+        const torch::Tensor& scales = *scale_tensor;
+        ValidateCudaTensor(scales);
+        EnsureContiguousTensor(scales, "scale tensor");
+        if (scales.scalar_type() != torch::kFloat32) {
+            std::ostringstream oss;
+            oss << op_name << ": scale_tensor must have dtype float32 (got "
+                << c10::toString(scales.scalar_type()) << ')';
+            throw std::invalid_argument(oss.str());
+        }
+        if (static_cast<std::size_t>(scales.element_size()) !=
+            geometry_.ScaleTokenBytes()) {
+            std::ostringstream oss;
+            oss << op_name << ": scale_tensor element size "
+                << scales.element_size() << " does not match the page's "
+                << geometry_.ScaleTokenBytes() << " scale bytes per token";
+            throw std::invalid_argument(oss.str());
+        }
+        if (static_cast<std::size_t>(scales.numel()) != expected_tokens) {
+            std::ostringstream oss;
+            oss << op_name << ": scale_tensor holds " << scales.numel()
+                << " scales but " << expected_tokens
+                << " tokens are being written";
+            throw std::invalid_argument(oss.str());
+        }
+        return scale_tensor;
+    }
+
     std::size_t ValidatePackedKTensorShape(const torch::Tensor& tensor) const {
         ValidateCudaTensor(tensor);
         EnsureContiguousTensor(tensor, "packed K tensor");
@@ -2681,7 +2885,8 @@ class HostPagedKVWorkerView : private LayerMapper {
                 "Expected packed K tensor with shape [T, H, D]");
         }
         if (tensor.size(1) != static_cast<long>(config_.num_k_heads) ||
-            tensor.size(2) != static_cast<long>(config_.k_head_dim)) {
+            tensor.size(2) !=
+                static_cast<long>(geometry_.ExpectedKHeadDim())) {
             throw std::invalid_argument(
                 "Packed K tensor head dimensions do not match configuration");
         }

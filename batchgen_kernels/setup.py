@@ -281,6 +281,21 @@ _sm90a_extensions = [
                      "--threads", _nvcc_threads],
         },
     ),
+    # Fused DSA indexer-K quantize (bf16 -> e4m3) + page-split cache write.
+    # No --use_fast_math: the quantization is byte-exact against the torch
+    # quantizer (and DeepGEMM's cast), and an approximate reciprocal/division
+    # would move values across an e4m3 rounding boundary.
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_indexer_k_write_fp8",
+        sources=["src/attention/fused_indexer_k_write_fp8.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads],
+        },
+    ),
     # Fused K3 KDA decode: short-conv update + recurrent delta rule + gated
     # RMSNorm.  The kernel is K3/SM90a-specific and is AOT-only at runtime.
     CUDAExtension(

@@ -214,6 +214,16 @@ def get_registry():
                 "--threads", "4",
             ],
         },
+        # No --use_fast_math here either: byte-exact quantization (see setup.py).
+        "batchgen_kernels.attention._C_fused_indexer_k_write_fp8": {
+            "sources": ["src/attention/fused_indexer_k_write_fp8.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17",
+                "-gencode", "arch=compute_90a,code=sm_90a",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads", "4",
+            ],
+        },
         "batchgen_kernels.attention._C_kda_fused_decode": {
             "sources": ["src/attention/kda_fused_decode.cu"],
             "nvcc_flags": [

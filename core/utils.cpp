@@ -292,6 +292,14 @@ HostPagedKVConfig parse_host_paged_kv_config(
         cfg.attr("v_head_dim").cast<long long>(),
         "Host_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    // The page format is optional in the engine config: every model but the
+    // GLM-5.2 aux cache uses the default token-major arrangement, and that
+    // cache is built through the direct host-KV config path, not from here.
+    // An unknown value is rejected downstream (ResolvePageFormat), never
+    // defaulted.
+    if (py::hasattr(cfg, "page_format")) {
+        config.page_format = cfg.attr("page_format").cast<std::string>();
+    }
     std::cout << "Host Paged KV Config Parsed Successfully" << std::endl;
     return config;
 }

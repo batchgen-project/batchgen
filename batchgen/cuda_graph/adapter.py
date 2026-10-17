@@ -288,6 +288,12 @@ class ModelCudaGraphAdapter(ABC):
         Implementations MUST invoke `AttnWrapperBase.kv_append_callback` and
         `kv_append_callback_aux` with the cloned tensors so the existing
         async D2H offload path remains intact.
+
+        A KV stream whose host region is page-split FP8 stages a SECOND
+        tensor: the fp32 per-token scales. It is cloned per stream like the
+        keys and passed as the aux callback's trailing `scale_tensor`, because
+        that host region requires the keys and their scales together (and an
+        AoS region rejects scales).
         """
 
     # ---- Compare / debug ------------------------------------------------
