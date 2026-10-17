@@ -94,6 +94,12 @@ def test_selected_wave_releases_old_owner_slots_before_prefill(monkeypatch):
             _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
             worker_state,
         )
+        worker_state._prefix_rank_cost_profile_disabled = types.MethodType(
+            _worker_methods("_prefix_rank_cost_profile_disabled")[
+                "_prefix_rank_cost_profile_disabled"
+            ],
+            worker_state,
+        )
         assign(worker_state, ["a", "b"], current_wave=True)
         assert worker_state._uuid_to_local_map == {}
         assert worker_state._local_to_uuid_map == {}
@@ -161,7 +167,9 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
         rank=rank, world_size=world_size, global_batch=batch, local_rank=rank,
         model_name="gpt-oss-120b", torch_device=torch.device("cpu"),
         # A cached profile keeps the CUDA device-name lookup out of this test.
-        _prefix_rank_cost_profile=None,
+        # Pre-seeded cache (keyed by the A/B arm, False = profile arm),
+        # so no fake needs a CUDA device query.
+        _prefix_rank_cost_profiles={False: None},
         prefix_cache_runtime_config=SimpleNamespace(
             group_specs=[SimpleNamespace(raw_page_tokens=2)]),
         engine_config=SimpleNamespace(
@@ -175,6 +183,20 @@ def _packing_worker(rank, seqs, slots, *, world_size=2):
     )
     worker_state._prefix_rank_packing_mode = types.MethodType(
         _worker_methods("_prefix_rank_packing_mode")["_prefix_rank_packing_mode"],
+        worker_state,
+    )
+    worker_state._cached_prefix_rank_cost_profile = types.MethodType(
+        _worker_methods("_cached_prefix_rank_cost_profile")[
+            "_cached_prefix_rank_cost_profile"
+        ],
+        worker_state,
+    )
+    # The arm is batch level: no batchgen_debug on these fakes means the
+    # default (profile) arm, which is what these tests pin.
+    worker_state._prefix_rank_cost_profile_disabled = types.MethodType(
+        _worker_methods("_prefix_rank_cost_profile_disabled")[
+            "_prefix_rank_cost_profile_disabled"
+        ],
         worker_state,
     )
     # Prompts live in the trajectory book after admission; these stubs keep

@@ -76,6 +76,10 @@ class SequenceEntry:
         # prefill->decode transition assigns it; unused (stays None) for the
         # pure-DP G==1 path, which keeps keying decode on assigned_rank.
         'decode_dp_group',
+        # The group an EVICTED sequence decoded on, kept until it is grouped
+        # again: its decoded tokens live only in that group's node's
+        # trajectory book, so the re-entry must regroup there. None otherwise.
+        'evicted_from_dp_group',
         # Two-page buffer tracking
         'gpu_pages_allocated',
         # Track whether this sequence has had its initial GPU reservation
@@ -148,6 +152,7 @@ class SequenceEntry:
         self.kv_token_budget: int = prompt_length + max_decode_length
         self.assigned_rank: Optional[int] = None
         self.decode_dp_group: Optional[int] = None
+        self.evicted_from_dp_group: Optional[int] = None
         self.text = text
         self.eos_reached: bool = False
         

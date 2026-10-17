@@ -2170,6 +2170,10 @@ class BatchGenWorker:
 		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
 		Idempotent (skips already-grouped seqs) and deterministic across ranks:
 		identical inputs -> identical map.
+
+		``packing_v2`` batches served through the in-wave prefix pool with more
+		than one group instead pack by predicted prefill seconds, so a prefix
+		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2198,9 +2202,234 @@ class BatchGenWorker:
 			seqs.append(seq)
 		if not seqs:
 			return
-		groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+		if (
+			num_dp > 1
+			and self._prefill_prefix_pool_enabled()
+			and self._prefix_rank_packing_mode(seqs)
+		):
+			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp)
+		else:
+			# An evicted re-entry returns to the group it decoded on: its
+			# decoded suffix lives only in that group's node's trajectory book.
+			# It loads that group like any grouped sequence; the rest balance.
+			groups = [seq.evicted_from_dp_group for seq in seqs]
+			fresh = [i for i, g in enumerate(groups) if g is None]
+			for i, g in enumerate(groups):
+				if g is not None:
+					prior[g] += float(lengths[i]) * float(lengths[i])
+			placed = assign_decode_dp_groups(
+				[lengths[i] for i in fresh], num_dp, prior_load=prior
+			)
+			for i, g in zip(fresh, placed):
+				groups[i] = g
 		for seq, g in zip(seqs, groups):
 			seq.decode_dp_group = g
+			# Grouped again: the eviction record has served its purpose, and
+			# a later eviction records the then-current group afresh.
+			seq.evicted_from_dp_group = None
+
+	def _pack_decode_dp_groups_for_sharing(self, seqs, num_dp: int) -> List[int]:
+		"""Place ungrouped sequences on serve groups by predicted prefill seconds.
+
+		A group prefills its members through its own in-wave prefix pool, so a
+		prefix family split across groups recomputes the shared prefix once per
+		group. ``pack_groups_for_sharing`` keeps a family on one group unless
+		splitting it lowers the busiest group's predicted seconds.
+
+		Load already committed to a group is pinned there: every grouped
+		sequence that still owes a prefill, scored by its length alone (see
+		``prompt_score_from_length``). Sequences already decoding owe no prefill
+		seconds and are not counted, unlike the L^2 prior, which charges a group
+		for its whole standing decode batch.
+
+		Prompts are read from the node-shared trajectory book, which admission
+		writes on every rank before grouping, and every input here is replicated,
+		so every rank computes the same map. A re-entry is not packed and its
+		prompt is never read: its decoded suffix lives only in the trajectory
+		book of the node it decoded on, so it returns to the group recorded at
+		eviction (``evicted_from_dp_group``) and pins its length-only score
+		there. A re-entry without that record cannot be placed and is refused.
+		"""
+		from batchgen.prefix_reuse.rank_packing import (
+			pack_groups_for_sharing,
+			prompt_score_from_length,
+		)
+
+		profile = self._cached_prefix_rank_cost_profile(
+			self._prefix_rank_cost_profile_disabled(seqs)
+		)
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		chunk_tokens = int(
+			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		)
+
+		def pinned_load(seq):
+			# Length-only: a re-entry's tokens are readable on one node only.
+			return prompt_score_from_length(
+				int(seq.prompt_length),
+				block_tokens=page_tokens,
+				chunk_tokens=chunk_tokens,
+				profile=profile,
+			)
+
+		groups = []
+		queued = []
+		fixed = []
+		for seq in seqs:
+			group = seq.evicted_from_dp_group
+			if group is None and (
+				seq.status == SequenceStatus.EVICTED
+				or getattr(seq, "evicted_token_ids", None) is not None
+			):
+				raise RuntimeError(
+					f"re-entering sequence {seq.uuid} has no recorded serve group "
+					"to return to; its decoded tokens live only on the node it "
+					"decoded on, so it cannot be placed identically on every rank"
+				)
+			if group is not None:
+				fixed.append((int(group), pinned_load(seq)))
+			else:
+				queued.append(seq)
+			groups.append(group)
+		owes_prefill = (
+			SequenceStatus.QUEUEING, SequenceStatus.IN_PREFILL, SequenceStatus.EVICTED
+		)
+		for seq in self.global_batch:
+			if seq.decode_dp_group is None or seq.status not in owes_prefill:
+				continue
+			fixed.append((int(seq.decode_dp_group), pinned_load(seq)))
+		prompts = [
+			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+			for seq in queued
+		]
+		packed = iter(pack_groups_for_sharing(
+			prompts,
+			num_groups=num_dp,
+			block_tokens=page_tokens,
+			chunk_tokens=chunk_tokens,
+			profile=profile,
+			fixed=fixed,
+		))
+		return [next(packed) if group is None else group for group in groups]
+
+	def _check_decode_dp_group_plan_identical(self, uuids: List[str]) -> None:
+		"""All ranks must have stamped the SAME serve-group map. Collective.
+
+		``rank_in_decode_group`` resolves ownership from each rank's own copy of
+		the map, so the map is not a hint: it decides which ranks bind a
+		sequence, run its prefill and allocate its head-sharded KDA state. A
+		rank that derived a different group for one sequence binds a row whose
+		state another group created, and the mismatch first appears far away —
+		``KeyError: Sequence <global_idx> has no KDA state item`` at the decode
+		entry, on a rank that never prefilled it.
+
+		Both stampers are deterministic functions of replicated inputs: the
+		admission list (broadcast from rank 0), prompt lengths, and the prompts
+		themselves read through the node-shared trajectory book, which every
+		rank wrote before grouping. So agreement is derivable, not hoped for,
+		and a divergence means one of those inputs was not in fact replicated —
+		which is a bug to name here, at the stamp, rather than to debug three
+		phases later. The rank packer already carries this check
+		(``_assign_ranks_for_prefix_sharing``); the group packer did not.
+
+		Cheap: one int64 all_gather of two values per wave, plus a second one
+		only on the failing path to name the first diverging sequence.
+		"""
+		if self._decode_attn_tp_size() <= 1 or self.world_size <= 1:
+			return
+		from batchgen.decode_dp_group import (
+			decode_group_plan_digest,
+			first_group_disagreement,
+		)
+
+		pairs = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			pairs.append((int(seq.global_idx), seq.decode_dp_group))
+		pairs.sort(key=lambda item: item[0])
+		check = torch.tensor(
+			[decode_group_plan_digest(pairs), len(pairs)],
+			dtype=torch.int64, device=self.torch_device,
+		)
+		gathered = [torch.zeros_like(check) for _ in range(self.world_size)]
+		dist.all_gather(gathered, check)
+		# This rank's own digest joins the comparison explicitly rather than
+		# through ``gathered[self.rank]``: the check must hold on what this
+		# rank actually stamped, not on the slot the collective happened to
+		# fill for it.
+		digests = {int(item[0].item()) for item in gathered}
+		digests.add(int(check[0].item()))
+		if len(digests) == 1:
+			return
+		counts = {int(item[1].item()) for item in gathered}
+		counts.add(len(pairs))
+		named = None
+		if len(counts) == 1:
+			# Same sequences everywhere, so the group vectors are comparable
+			# column by column. Every rank reaches this second collective: they
+			# all saw the same differing digests.
+			groups = torch.tensor(
+				[-1 if group is None else int(group) for _, group in pairs],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			views = [torch.zeros_like(groups) for _ in range(self.world_size)]
+			dist.all_gather(views, groups)
+			named = first_group_disagreement(
+				[global_idx for global_idx, _ in pairs],
+				# This rank's own vector is compared explicitly, for the same
+				# reason its digest is.
+				[groups.tolist()] + [view.tolist() for view in views],
+			)
+		raise RuntimeError(
+			"decode serve-group map diverged across ranks: rank "
+			f"{self.rank} digest {int(check[0].item())} over {len(pairs)} "
+			f"sequences; per-rank sequence counts {sorted(counts)}"
+			+ (
+				f"; first disagreement global_idx={named[0]} "
+				f"groups_by_rank={named[1]}" if named is not None else ""
+			)
+		)
+
+	def _check_local_binding_matches_group(
+		self, uuids: List[str], where: str
+	) -> None:
+		"""A local row exists iff this rank's group owns the sequence (G>1).
+
+		``_get_local_indices_for_uuids`` resolves a wave from
+		``_uuid_to_local_map`` alone and silently skips what it does not find,
+		so a binding that disagrees with the serve-group map is not refused
+		anywhere: the rank prefills or decodes a row its group does not own, or
+		misses one it does. The second form is what raises ``KeyError:
+		Sequence <global_idx> has no KDA state item`` from
+		``prepare_decode_step`` — by then the stamping seam is long gone.
+
+		The invariant is an equivalence, so both directions are checked, and
+		both are local reads: no collective, O(len(uuids)) per call.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return
+		offenders = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			bound = uuid in self._uuid_to_local_map
+			owns = self._owns_local_sequence(seq)
+			if bound != owns:
+				offenders.append(
+					f"global_idx={seq.global_idx} group={seq.decode_dp_group} "
+					f"bound={int(bound)} owns={int(owns)}"
+				)
+		if offenders:
+			raise RuntimeError(
+				f"Rank {self.rank}: [SCHED_INVARIANT] {where}: "
+				f"{len(offenders)} sequences whose local row disagrees with the "
+				f"serve-group map (G={G}, rank//G={self.rank // G}): "
+				+ "; ".join(offenders[:10])
+			)
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -6026,6 +6255,11 @@ class BatchGenWorker:
 		# config, is idempotent (re-entrant sequences keep the group their
 		# head-sharded KDA state lives on), and is deterministic across ranks.
 		self._assign_decode_dp_groups(all_candidates)
+		# The map decides this wave's node mapping (below), its bindings and
+		# its KDA state, so verify agreement BEFORE any of them is derived:
+		# _prepare_prefill_batch is already collective, and this is the first
+		# all-ranks point after the stamp.
+		self._check_decode_dp_group_plan_identical(all_candidates)
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
@@ -6741,6 +6975,7 @@ class BatchGenWorker:
 				seq.host_pages_allocated = 0
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
+				seq.evicted_from_dp_group = None
 				self._sequences_with_gpu_kv.discard(uuid)
 
 		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
@@ -7996,6 +8231,7 @@ class BatchGenWorker:
 							seq.host_pages_allocated = 0
 							seq.host_owned_pages = 0
 							seq.host_token_capacity = 0
+							seq.evicted_from_dp_group = None
 							self._sequences_with_gpu_kv.discard(uuid)
 					# Report completions (pops local_map; runs LAST).
 					# Guard: only report if status actually reached COMPLETED.
@@ -8039,6 +8275,12 @@ class BatchGenWorker:
 				# M2b: stamp the decode DP-group before local-index resolution so
 				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
 				self._assign_decode_dp_groups(decode_uuids)
+				# The local rows this resolves are the rows the decode forward
+				# asks KDA state for, so refuse a row that the group map does
+				# not own here instead of inside prepare_decode_step.
+				self._check_local_binding_matches_group(
+					decode_uuids, "decode entry"
+				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
@@ -8764,6 +9006,12 @@ class BatchGenWorker:
 			logging.debug(
 				"[PREFILL] Host KV reservation already committed before phase config"
 			)
+		# The rows bound above are the rows this wave's prefill computes, and
+		# the prefill forward is what creates each row's KDA state item. Catch
+		# a binding that disagrees with the group map here, before the forward,
+		# so the error names the seam instead of the decode step that misses
+		# the state item.
+		self._check_local_binding_matches_group(prefill_uuids, "prefill config")
 
 		# Reached by EVERY rank — including ranks that serve no sequence this
 		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
@@ -10053,6 +10301,92 @@ class BatchGenWorker:
 		debug = (active_debug(seqs) if active_debug is not None else None) or {}
 		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
 
+	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
+		"""``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
+
+		Scoring the packer's targets by predicted seconds and balancing their
+		computed tokens are the two arms of the packing comparison, and the
+		difference between them is a wall time: measuring it across two servers
+		would confound it with cold-start, allocator and JIT state, so the arm
+		has to be switchable inside one process. Batch level and nothing else:
+		the key rides the same admitted-batch broadcast as
+		``prefix_rank_assignment_mode``, so every rank of every group resolves
+		the same value and the packing stays replicated. Set it on EVERY
+		request of a corpus — ``_active_batchgen_debug_for_sequences`` merges
+		per-sequence dicts first-non-None-wins, exactly as the mode key does.
+
+		Only the two spellings are accepted; a mistyped value is refused rather
+		than read as "on", because a silently ignored arm switch would make the
+		two arms the same run.
+		"""
+		active = getattr(self, "_active_batchgen_debug_for_sequences", None)
+		debug = (active(seqs) if active is not None else None) or {}
+		value = debug.get("prefix_rank_cost_profile")
+		if value is None:
+			return False
+		if isinstance(value, str):
+			text = value.strip().lower()
+			if text == "off":
+				return True
+			if text == "on":
+				return False
+		raise ValueError(
+			"batchgen_debug.prefix_rank_cost_profile must be 'on' or 'off', "
+			f"got {value!r}"
+		)
+
+	def _cached_prefix_rank_cost_profile(self, disabled: bool = False):
+		"""This deployment's prefill executor cost profile, looked up once.
+
+		Model, device properties and parallel layout are deployment constants,
+		so every packer call site shares one lookup. ``None`` is a valid result:
+		no profile matches, and the packer then balances computed tokens. A
+		profile scores one serve group, so it is keyed by the group size too.
+
+		Every rank must resolve the same profile, or ranks pack differently.
+		Device 0 stands for the node, not this rank's own device, and
+		cross-node GPU homogeneity is a deployment precondition that the launch
+		identity gate verifies; no collective is run here. Each rank logs what
+		it resolved, so a divergence is visible in the logs.
+
+		The cache is keyed by ``disabled``, not a single attribute: the A/B
+		switch is batch level, so one process serves both arms, and a lookup
+		cached under whichever arm arrived first would pin every later batch to
+		it. ``disabled`` resolves to ``None`` — the same value as "no profile
+		matches", which is exactly the fallback arm the packer already has.
+		"""
+		if not hasattr(self, "_prefix_rank_cost_profiles"):
+			self._prefix_rank_cost_profiles = {}
+		key = bool(disabled)
+		if key not in self._prefix_rank_cost_profiles:
+			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
+
+			G = self._decode_attn_tp_size()
+			group_size = G if G > 1 else 1
+			if key:
+				profile = None
+			else:
+				props = torch.cuda.get_device_properties(0)
+				profile = find_executor_cost_profile(
+					self.model_name or "",
+					(props.major, props.minor),
+					props.total_memory,
+					self.world_size,
+					group_size,
+				)
+			self._prefix_rank_cost_profiles[key] = profile
+			logging.info(
+				"[PREFIX_PACK] rank %d executor cost profile: model=%s "
+				"group_size=%d disabled=%d -> %s",
+				self.rank,
+				(self.model_name or "").lower().rsplit("/", 1)[-1],
+				group_size,
+				int(key),
+				"none" if profile is None
+				else f"{profile.model}/{profile.machine}/g{profile.group_size}",
+			)
+		return self._prefix_rank_cost_profiles[key]
+
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
 
@@ -10110,21 +10444,14 @@ class BatchGenWorker:
 
 		packing = None
 		if self._prefix_rank_packing_mode(seqs):
-			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 			from batchgen.prefix_reuse.rank_packing import (
 				pack_wave_ranks,
 				prompt_score_from_length,
 			)
 
-			if not hasattr(self, "_prefix_rank_cost_profile"):
-				# No profile is valid: the packer then balances computed tokens.
-				props = torch.cuda.get_device_properties(self.local_rank)
-				self._prefix_rank_cost_profile = find_executor_cost_profile(
-					self.model_name or "",
-					(props.major, props.minor),
-					props.total_memory,
-					self.world_size,
-				)
+			profile = self._cached_prefix_rank_cost_profile(
+				self._prefix_rank_cost_profile_disabled(seqs)
+			)
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 			chunk_tokens = int(
 				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
@@ -10138,7 +10465,7 @@ class BatchGenWorker:
 					int(seq.prompt_length),
 					block_tokens=page_tokens,
 					chunk_tokens=chunk_tokens,
-					profile=self._prefix_rank_cost_profile,
+					profile=profile,
 				)
 
 			# Only sequences that still owe a prefill load a rank. Completed or
@@ -10179,7 +10506,7 @@ class BatchGenWorker:
 				world_size=self.world_size,
 				block_tokens=page_tokens,
 				chunk_tokens=chunk_tokens,
-				profile=self._prefix_rank_cost_profile,
+				profile=profile,
 				fixed=fixed,
 			)
 			ranks = packing.ranks
@@ -12535,6 +12862,7 @@ class BatchGenWorker:
 					seq.host_pages_allocated = 0
 					seq.host_owned_pages = 0
 					seq.host_token_capacity = 0
+					seq.evicted_from_dp_group = None
 					self._sequences_with_gpu_kv.discard(uuid)
 
 			# Report completions (this is what pops local_map on the owner).
@@ -12671,13 +12999,26 @@ class BatchGenWorker:
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
+				# Destroy the head-sharded KDA state the comment below relies
+				# on. Host eviction frees the sequence's pages but reached the
+				# group drop without releasing its state item, so the slot
+				# stayed charged to a sequence that no longer has a group: the
+				# pool leaked a slot per eviction, and a re-entry re-grouped
+				# onto another group found its stale state on the old one.
+				# Released only by the ranks holding the row, exactly like the
+				# completion path, because the item is per rank.
+				if uuid in self._uuid_to_local_map:
+					self._release_kda_state_slots([int(seq.global_idx)])
 				# M2b (d): eviction destroys the head-sharded KDA state on the
 				# group's ranks, so drop the decode DP-group. A re-prefilled
 				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
 				# treats the stale non-None group id as a preserved re-entry and
-				# skips it, stranding the sequence with no live state. No-op for
-				# G==1 (the field is always None on the validated pure-DP path).
-				seq.decode_dp_group = None
+				# skips it, stranding the sequence with no live state. The group
+				# is remembered: the decoded suffix lives only in that group's
+				# node's trajectory book, so re-grouping must land on it. No-op
+				# for G==1 (the field is always None on the validated pure-DP path).
+				from batchgen.decode_dp_group import evict_from_decode_dp_group
+				evict_from_decode_dp_group(seq)
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)
