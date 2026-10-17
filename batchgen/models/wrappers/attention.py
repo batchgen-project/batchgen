@@ -76,6 +76,11 @@ class AttnWrapperBase(BaseModuleWrapper):
         max_seqlen      -- int max context length in batch.
         gpu_paged_kv_manager (+ _aux) -- paged-KV read/write.
         kv_append_callback  (+ _aux)  -- fn(layer_idx, k, v) to append new KV.
+                           The aux form also takes an optional trailing
+                           scale tensor, fn(layer_idx, k, v, scale): a
+                           page-split FP8 aux region stores one fp32 scale
+                           per token next to the quantized keys and requires
+                           it; a bf16 AoS region rejects it.
       KV / misc:
         attn_mode, scale, past_key_states, past_value_states,
         kv_quantization_factor, batchgen_debug,

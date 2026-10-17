@@ -326,6 +326,25 @@ _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
 
+def _normalize_aux_kv_entry(entry) -> tuple:
+	"""(layer_idx, k_tensor, v_tensor, scale_tensor) of a deferred aux append.
+
+	A page-split FP8 aux region needs the fp32 per-token scales alongside the
+	quantized keys, so a producer may append a 4-tuple; a bf16 AoS producer
+	keeps appending a 3-tuple and gets ``scale_tensor=None``.
+	"""
+
+	if len(entry) == 4:
+		return tuple(entry)
+	if len(entry) == 3:
+		layer_idx, k_tensor, v_tensor = entry
+		return layer_idx, k_tensor, v_tensor, None
+	raise RuntimeError(
+		"deferred aux KV entry must be (layer_idx, k_tensor, v_tensor) or "
+		f"(layer_idx, k_tensor, v_tensor, scale_tensor); got {len(entry)} fields"
+	)
+
+
 class _DualAsyncLoadTask:
 	"""Forwards .wait() to both primary and aux async KV load tasks.
 
@@ -3049,12 +3068,16 @@ class BatchGenWorker:
 
 			if entries_aux and aux_view is not None and sequence_ids is not None:
 				_prepared_aux = []
-				for layer_idx, k_tensor, v_tensor in entries_aux:
+				for layer_idx, k_tensor, v_tensor, scale_tensor in (
+					_normalize_aux_kv_entry(entry) for entry in entries_aux
+				):
 					if k_tensor.dim() == 3:
 						k_tensor = k_tensor.unsqueeze(2)
 					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
-					_prepared_aux.append((layer_idx, k_tensor, None))
+					_prepared_aux.append((layer_idx, k_tensor, None, scale_tensor))
 					self._pending_kv_append_tensors.append(k_tensor)
+					if scale_tensor is not None:
+						self._pending_kv_append_tensors.append(scale_tensor)
 				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
 					entries=_prepared_aux,
 					sequence_ids=sequence_ids,
@@ -3088,7 +3111,9 @@ class BatchGenWorker:
 						self._pending_kv_append_tasks.append(task)
 
 			if entries_aux and aux_view is not None and sequence_ids is not None:
-				for layer_idx, k_tensor, v_tensor in entries_aux:
+				for layer_idx, k_tensor, v_tensor, scale_tensor in (
+					_normalize_aux_kv_entry(entry) for entry in entries_aux
+				):
 					if k_tensor.dim() == 3:
 						k_tensor = k_tensor.unsqueeze(2)
 					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
@@ -3099,9 +3124,12 @@ class BatchGenWorker:
 						k_tensor=k_tensor,
 						v_tensor=None,
 						sequence_lengths=sequence_lengths,
+						scale_tensor=scale_tensor,
 					)
 
 					self._pending_kv_append_tensors.append(k_tensor)
+					if scale_tensor is not None:
+						self._pending_kv_append_tensors.append(scale_tensor)
 					if task is not None:
 						self._pending_kv_append_tasks.append(task)
 
@@ -3325,11 +3353,18 @@ class BatchGenWorker:
 		batch: List[int],
 		k_tensor: torch.Tensor,
 		v_tensor: torch.Tensor = None,
+		scale_tensor: torch.Tensor = None,
 	) -> None:
 		"""Fire-and-forget auxiliary (indexer) KV append to host.
 
 		Mirrors _append_decode_kv_to_host_async but uses the auxiliary host
 		worker view. Shares the same pending task list for unified flushing.
+
+		``scale_tensor`` carries the fp32 per-token scales that a page-split
+		FP8 aux region requires alongside the quantized keys; an AoS region
+		rejects it. The host view validates the pairing, so a producer that
+		forgets the scales fails loud instead of leaving a page's scale region
+		at its previous contents.
 		"""
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is None or not batch:
@@ -3357,11 +3392,14 @@ class BatchGenWorker:
 			k_tensor=k_tensor,
 			v_tensor=None,
 			sequence_lengths=sequence_lengths,
+			scale_tensor=scale_tensor,
 		)
 
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)
+		if scale_tensor is not None:
+			self._pending_kv_append_tensors.append(scale_tensor)
 
 		if task is not None:
 			self._pending_kv_append_tasks.append(task)
@@ -15373,14 +15411,29 @@ class BatchGenWorker:
 				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 				if aux_view is not None:
 					if BATCHGEN_SYNC_KV:
-						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+						def kv_append_callback_aux(
+							layer_idx: int,
+							k_tensor: torch.Tensor,
+							v_tensor: torch.Tensor = None,
+							scale_tensor: torch.Tensor = None,
+						):
+							self._append_decode_kv_to_host_aux_async(
+								layer_idx, current_batch, k_tensor, v_tensor,
+								scale_tensor,
+							)
 					else:
-						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						def kv_append_callback_aux(
+							layer_idx: int,
+							k_tensor: torch.Tensor,
+							v_tensor: torch.Tensor = None,
+							scale_tensor: torch.Tensor = None,
+						):
 							valid_layers = self._aux_layers_with_slots()
 							if valid_layers is not None and layer_idx not in valid_layers:
 								return
-							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
+							self._deferred_kv_entries_aux.append(
+								(layer_idx, k_tensor, v_tensor, scale_tensor)
+							)
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
