@@ -21,6 +21,29 @@ try:
 except (ImportError, Exception):
     pass
 
+# Page-split FP8 indexer-K quantizer and page geometry (torch only)
+from batchgen_kernels.attention.dsa.indexer_k_quant import (
+    SCALE_BYTES_PER_TOKEN,
+    page_split_geometry,
+    page_split_write_reference,
+    quantize_indexer_k_fp8,
+)
+__all__ += [
+    "SCALE_BYTES_PER_TOKEN",
+    "page_split_geometry",
+    "page_split_write_reference",
+    "quantize_indexer_k_fp8",
+]
+
+# Dequantizing page-split paged gather (Triton)
+try:
+    from batchgen_kernels.attention.dsa.indexer_k_fp8 import (
+        fused_dense_paged_gather_fp8_pagesplit,
+    )
+    __all__ += ["fused_dense_paged_gather_fp8_pagesplit"]
+except (ImportError, Exception):
+    pass
+
 # Unified selected-KV selector (Triton)
 try:
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
