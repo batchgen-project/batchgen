@@ -338,6 +338,16 @@ class SWAHostPagedKVWorkerView {
             throw std::invalid_argument(
                 "SWAHostPagedKVWorkerView requires page_size_tokens > 0");
         }
+        // This view slides a window over whole pages and re-reads a page's
+        // token records directly; it has no notion of a page's second
+        // (scale) region, so a page-split region must never reach it.
+        if (base_view_.config().page_format !=
+            HostKVPageFormat::kContiguousAoS) {
+            throw std::invalid_argument(
+                "SWAHostPagedKVWorkerView supports only page_format="
+                "contiguous_aos (got " +
+                ToString(base_view_.config().page_format) + ")");
+        }
         if (window_size_tokens_ == 0) {
             throw std::invalid_argument(
                 "SWAHostPagedKVWorkerView requires window_size_tokens > 0");

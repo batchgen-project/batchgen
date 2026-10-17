@@ -276,6 +276,16 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
                 "CompressedRatioHostPagedKVWorkerView requires "
                 "page_size_tokens > 0");
         }
+        // This view decimates token positions and appends single tokens
+        // through the base view's AoS token arithmetic; it carries no scale
+        // region, so a page-split region must never reach it.
+        if (BaseView::config().page_format !=
+            HostKVPageFormat::kContiguousAoS) {
+            throw std::invalid_argument(
+                "CompressedRatioHostPagedKVWorkerView supports only "
+                "page_format=contiguous_aos (got " +
+                ToString(BaseView::config().page_format) + ")");
+        }
     }
 
     static std::size_t CompressedTokens(std::size_t raw_tokens) {
