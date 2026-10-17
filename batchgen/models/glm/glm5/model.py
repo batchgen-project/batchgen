@@ -592,6 +592,17 @@ class Glm5Indexer(nn.Module):
     ) -> torch.Tensor:
         """ReLU-gated scoring: score = (relu(Q·K * softmax_scale) * head_gates).sum(heads).
 
+        REFERENCE ONLY -- not a fallback. The production ReLU-gated implementation
+        is ``deep_gemm.fp8_paged_mqa_logits``, reached through
+        ``_score_and_select_paged_fp8`` (eager) and the DSA graph segments'
+        ``_score_and_topk`` (captured). This function stays as the readable
+        statement of the formula those kernels compute, and as the fp32 oracle
+        the top-k overlap acceptance measures against; it is deliberately NOT
+        wired into decode, because it materializes a dense ``[batch, n_heads,
+        max_seqlen]`` fp32 score tensor (hundreds of GB at production batch and
+        context) and would be a second, differently-quantized ReLU path able to
+        drift from the captured graph.
+
         Two differences vs ``score_and_select``:
 
         1. ``F.relu`` is applied to per-head scores BEFORE head-weighting. Without
@@ -698,68 +709,140 @@ class Glm5Indexer(nn.Module):
         batch_size = block_table.shape[0]
         if max_seqlen is None:
             raise RuntimeError("GLM-5 DSA paged scoring requires explicit max_seqlen")
-
-        # Gather dense logical range [0, max_seqlen) without building token indices.
-        # A 1-byte element type means the page-split FP8 cache (GLM-5.2): its
-        # pages hold e4m3 K bytes plus one fp32 scale per token, so the gather
-        # dequantizes on output and this scorer stays bf16 until the DeepGEMM
-        # fp8_paged_mqa_logits swap lands.
-        if indexer_blocked_k.element_size() == 1:
-            from batchgen_kernels.attention.dsa import (
-                fused_dense_paged_gather_fp8_pagesplit,
-            )
-
-            gathered = fused_dense_paged_gather_fp8_pagesplit(
-                indexer_blocked_k,
-                block_table,
-                max_seqlen,
-                out_dtype=hidden_states.dtype,
-            )
-        else:
-            from batchgen_kernels.attention.dsa import fused_dense_paged_gather
-
-            num_k_heads = indexer_blocked_k.shape[2]
-            k_head_dim = indexer_blocked_k.shape[3]
-            gathered = fused_dense_paged_gather(
-                indexer_blocked_k,
-                block_table,
-                max_seqlen,
-                page_size,
-            ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
-
-        gathered_k = gathered.squeeze(2)
-
-        # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if hasattr(self, '_fused_score_weights') and self._fused_score_weights is not None:
-            from batchgen_kernels.attention.dsa.fused_indexer_score import fused_score_pipeline
-            # Get RoPE cos/sin tables
-            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
-            cos, sin = self.rotary_emb(
-                gathered_k[:1, :1, :self.rope_head_dim],  # dummy for dtype/device
-                seq_len,
-            )
-            top_k_indices, _ = fused_score_pipeline(
-                q_a=q_a.squeeze(1),                      # [B, q_lora_rank]
-                hidden_states=hidden_states.squeeze(1),   # [B, hidden_size]
-                cached_k=gathered_k,                      # [B, max_seqlen, 128]
-                cache_seqlens=cache_seqlens.int(),
-                wq_b_weights=self._fused_score_weights,
-                weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
-                cos_table=cos.to(torch.bfloat16),
-                sin_table=sin.to(torch.bfloat16),
-                positions=positions,
-                module=self._fused_score_module,
-                n_heads=self.index_n_heads,
-                head_dim=self.index_head_dim,
-                rope_dim=self.rope_head_dim,
-                topk=min(self.index_topk, max_seqlen),
-            )
-            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
-        else:
+        if not (hasattr(self, '_fused_score_weights') and self._fused_score_weights is not None):
             raise RuntimeError(
                 f"[layer {self.layer_idx}] GLM-5 DSA selector requires WP4 fused "
                 "indexer scoring; PyTorch fallback is disabled"
             )
+
+        from batchgen_kernels.attention.dsa.indexer_k_quant import cache_is_page_split
+
+        # THE selector: the aux cache's own layout decides the scorer, because
+        # that is the one property that says whether DeepGEMM can read it.
+        # There is no SM-version axis to dispatch on (H20 and H200 are both
+        # arch_major 9) and no model-name axis either -- the KV manager's
+        # profile is what allocated the pages.
+        if cache_is_page_split(indexer_blocked_k, self.index_head_dim):
+            return self._score_and_select_paged_fp8(
+                q_a=q_a,
+                hidden_states=hidden_states,
+                indexer_blocked_k=indexer_blocked_k,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                page_size=page_size,
+                positions=positions,
+                max_seqlen=max_seqlen,
+            )
+
+        # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1, GLM-5.3 --
+        # keep the retired no-ReLU Triton scorer over a dense gather. GLM-5.2
+        # cannot reach this branch: its cache is page-split, and a mis-sized
+        # cache is named by `cache_is_page_split` rather than falling through.
+        from batchgen_kernels.attention.dsa import fused_dense_paged_gather
+
+        num_k_heads = indexer_blocked_k.shape[2]
+        k_head_dim = indexer_blocked_k.shape[3]
+        gathered = fused_dense_paged_gather(
+            indexer_blocked_k,
+            block_table,
+            max_seqlen,
+            page_size,
+        ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
+        gathered_k = gathered.squeeze(2)
+
+        # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
+        from batchgen_kernels.attention.dsa.fused_indexer_score import fused_score_pipeline
+        # Get RoPE cos/sin tables
+        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+        cos, sin = self.rotary_emb(
+            gathered_k[:1, :1, :self.rope_head_dim],  # dummy for dtype/device
+            seq_len,
+        )
+        top_k_indices, _ = fused_score_pipeline(
+            q_a=q_a.squeeze(1),                      # [B, q_lora_rank]
+            hidden_states=hidden_states.squeeze(1),   # [B, hidden_size]
+            cached_k=gathered_k,                      # [B, max_seqlen, 128]
+            cache_seqlens=cache_seqlens.int(),
+            wq_b_weights=self._fused_score_weights,
+            weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
+            cos_table=cos.to(torch.bfloat16),
+            sin_table=sin.to(torch.bfloat16),
+            positions=positions,
+            module=self._fused_score_module,
+            n_heads=self.index_n_heads,
+            head_dim=self.index_head_dim,
+            rope_dim=self.rope_head_dim,
+            topk=min(self.index_topk, max_seqlen),
+        )
+        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
+
+    def _score_and_select_paged_fp8(
+        self,
+        *,
+        q_a: torch.Tensor,
+        hidden_states: torch.Tensor,
+        indexer_blocked_k: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_size: int,
+        positions: Optional[torch.Tensor],
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Eager ReLU-gated scoring straight out of the page-split FP8 cache.
+
+        ``deep_gemm.fp8_paged_mqa_logits`` reads the paged cache itself, so the
+        dense ``[batch, max_seqlen, 128]`` gather this path used to materialize
+        is gone along with its dequantization. What remains is the Q half of
+        the retired pipeline (wq_b projection, then RoPE + Hadamard) plus the
+        head gates, which map 1:1 onto DeepGEMM's ``weights``.
+
+        The caller has already reordered the aux page table into batch-row
+        order (``reorder_block_table_to_batch_slots``), which is exactly the
+        ``block_table`` DeepGEMM wants, and the eager selector routes rows with
+        ``cache_seqlen <= index_topk`` down its own dense path, so every row
+        reaching here needs real selection.
+        """
+
+        from batchgen_kernels.attention.dsa.fused_indexer_score import (
+            compute_head_gates,
+            cuda_wq_b_proj,
+            rope_hadamard_q,
+        )
+        from batchgen_kernels.attention.dsa.paged_mqa_scorer import (
+            paged_mqa_score_and_topk,
+        )
+
+        batch_size = q_a.shape[0]
+        if positions is None:
+            raise RuntimeError(
+                "GLM-5.2 DSA paged FP8 scoring requires explicit token positions"
+            )
+        # FP32 cos/sin, matching the captured graph segment (which asserts
+        # float32 tables). The retired eager path round-tripped them through
+        # bf16; keeping fp32 here removes an eager-vs-graph divergence.
+        cos, sin = self.rotary_emb(hidden_states, int(max_seqlen))
+        q = cuda_wq_b_proj(
+            q_a.squeeze(1), self._fused_score_weights, self._fused_score_module
+        ).view(batch_size, self.index_n_heads, self.index_head_dim)
+        q = rope_hadamard_q(q, cos, sin, positions, self.rope_head_dim)
+        head_gates = compute_head_gates(
+            hidden_states.squeeze(1),
+            self.weights_proj.weight.data,
+            self.index_n_heads,
+            self.index_head_dim,
+        )
+        top_k_indices = paged_mqa_score_and_topk(
+            q=q,
+            aux_blocked_k=indexer_blocked_k,
+            block_table=block_table,
+            head_gates=head_gates,
+            cache_seqlens=cache_seqlens.to(torch.int32).contiguous(),
+            topk=min(self.index_topk, int(max_seqlen)),
+            max_seqlen=int(max_seqlen),
+            index_head_dim=self.index_head_dim,
+            page_size=int(page_size),
+        )
+        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
 
 
 # ============================================================================

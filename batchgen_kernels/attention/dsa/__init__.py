@@ -44,6 +44,27 @@ try:
 except (ImportError, Exception):
     pass
 
+# Page-split FP8 indexer scoring contract (torch only: shapes, the logits
+# row-stride trap, the top-k masking contract and the torch references).
+from batchgen_kernels.attention.dsa.paged_mqa_logits import (
+    PAGED_MQA_BLOCK_KV,
+    PAGED_MQA_LOGITS_ALIGN,
+    PAGED_MQA_NEXT_N,
+    PagedMqaLogitsPlan,
+    align_context_len,
+    plan_paged_mqa_logits,
+    require_page_split_aux_cache,
+)
+__all__ += [
+    "PAGED_MQA_BLOCK_KV",
+    "PAGED_MQA_LOGITS_ALIGN",
+    "PAGED_MQA_NEXT_N",
+    "PagedMqaLogitsPlan",
+    "align_context_len",
+    "plan_paged_mqa_logits",
+    "require_page_split_aux_cache",
+]
+
 # Unified selected-KV selector (Triton)
 try:
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
