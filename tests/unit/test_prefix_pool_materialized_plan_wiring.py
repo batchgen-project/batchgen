@@ -596,6 +596,26 @@ def test_a_loaded_segment_asks_for_no_recurrent_state_slot(monkeypatch):
     assert wave is not None and wave.materialized == frozenset({0})
 
 
+def test_a_dropped_hit_releases_its_attachment_exactly_once(monkeypatch):
+    """Dropped at plan time, so nothing reads those pages: the hold goes."""
+
+    _stub_heavy_modules(monkeypatch, free_state_slots=32)
+    worker, _ = _worker(
+        fake_dist=FakeDist(peer_budget=[40, 32, 0]),  # a peer vetoes
+        attachments={GLOBAL_IDS[0]: _Attachment()},
+        index=_Index([(BOUNDARY, _entry())]),
+        states=_hit_states(),
+    )
+    wave = _plan(worker)
+    assert wave is not None and wave.materialized == frozenset()
+    assert worker.prefix_cache_coordinator.released == [77]
+    state = worker._prefix_sequence_states[GLOBAL_IDS[0]]
+    assert state.commit_attachment_handles == (), "released, not also retained"
+    # And the sequence recomputes from token 0, which is what makes the KDA
+    # restore decline on its own suffix-offset identity.
+    assert state.compute_cached_tokens == 0
+
+
 def test_a_frontier_too_large_for_the_pool_recomputes_by_name(monkeypatch, caplog):
     _stub_heavy_modules(monkeypatch, free_state_slots=32)
     long_frontier = list(range(900, 900 + 8 * PAGE_TOKENS))
