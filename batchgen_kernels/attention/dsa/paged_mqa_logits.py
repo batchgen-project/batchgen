@@ -35,6 +35,12 @@ Three contract points are easy to get wrong and are therefore checked here:
 3. **q quantization.** DeepGEMM takes ``q`` as plain e4m3 with no scale
    channel, so the conversion is a saturating cast -- the same form DeepGEMM's
    own reference test and the item-2a node probe used.
+4. **Never all-zero lengths.** DeepGEMM's sm90 metadata scheduler reads past
+   its shared-memory prefix sum when EVERY ``context_len`` is 0 and the batch
+   is a multiple of 32 (``guard_deep_gemm_context_lens``). DeepGEMM is
+   therefore handed a guarded COPY whose row 0 is at least 1, while the top-k
+   keeps masking by the TRUE lengths; ``true <= guarded`` elementwise, so the
+   top-k still never reads a column DeepGEMM did not write.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ __all__ = [
     "PagedMqaLogitsPlan",
     "align_context_len",
     "check_logits_layout",
+    "guard_deep_gemm_context_lens",
     "plan_paged_mqa_logits",
     "prepare_paged_mqa_inputs_reference",
     "quantize_q_e4m3_reference",
@@ -350,14 +357,23 @@ def prepare_paged_mqa_inputs_reference(
     BATCH ROW and has no slot indirection, so the rows must be gathered. The
     same pass derives the 2-D ``context_lens``:
 
-    * ``block_table[b] = page_table[max(slot[b], 0)]`` -- ``-1`` page entries
-      are passed through unchanged. They are only reachable past a row's
-      allocated pages, which DeepGEMM never visits, and if one ever appeared
-      in range its TMA load is out of bounds and zero-fills, matching the
-      ``other=0.0`` the retired Triton scorer produced.
     * ``context_lens[b, 0] = cache_seqlens[b]`` for a live row and ``0`` for a
       row with no cache slot or past ``num_valid_tokens``. A zero-length row
-      makes DeepGEMM read nothing and the top-k emit ``-1`` padding.
+      makes DeepGEMM read nothing and the top-k emit ``-1`` padding. These are
+      the TRUE lengths; DeepGEMM itself is handed
+      ``guard_deep_gemm_context_lens(context_lens)``.
+    * ``block_table[b] = page_table[slot[b]]`` for a row that reads
+      (``context_lens[b] > 0``); ``-1`` page entries are passed through
+      unchanged. They are only reachable past a row's allocated pages, which
+      DeepGEMM never visits, and if one ever appeared in range its TMA load is
+      out of bounds and zero-fills, matching the ``other=0.0`` the retired
+      Triton scorer produced.
+    * ``block_table[b] = 0`` (every column is page 0, which the aux pool always
+      owns) for a row that reads nothing. Its slot is never dereferenced -- a
+      padded row past ``num_valid_tokens`` may carry any slot value -- and the
+      row is DEFINED, because the guard can force DeepGEMM to read one token
+      of row 0 even when row 0's true length is 0; that read must land on a
+      real page, never on another sequence's stale table row or garbage.
 
     Returns ``(block_table [batch, max_pages] int32, context_lens [batch, 1]
     int32)``.
@@ -388,12 +404,52 @@ def prepare_paged_mqa_inputs_reference(
         rows = torch.arange(batch, device=slot_indices.device, dtype=torch.int32)
         live = live & (rows < num_valid_tokens.reshape(()).to(torch.int32))
 
-    safe_slots = torch.clamp(slot_indices, min=0).to(torch.int64)
-    block_table = page_table.index_select(0, safe_slots).contiguous()
-    context_lens = torch.where(
-        live, cache_seqlens, torch.zeros_like(cache_seqlens)
-    ).reshape(batch, 1).contiguous()
+    true_lens = torch.where(live, cache_seqlens, torch.zeros_like(cache_seqlens))
+    reads = true_lens > 0
+    safe_slots = torch.where(
+        reads, slot_indices, torch.zeros_like(slot_indices)
+    ).to(torch.int64)
+    gathered = page_table.index_select(0, safe_slots)
+    block_table = torch.where(
+        reads.reshape(batch, 1), gathered, torch.zeros_like(gathered)
+    ).contiguous()
+    context_lens = true_lens.reshape(batch, 1).contiguous()
     return block_table, context_lens
+
+
+def guard_deep_gemm_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
+    """The ``context_lens`` DeepGEMM may be handed: row 0 forced to ``>= 1``.
+
+    Upstream defect (sgl deep_gemm 0.1.5.post3,
+    ``csrc/jit_kernels/impls/sm90_fp8_mqa_logits.hpp:188``; node repro
+    2026-10-17): the sm90 non-varlen ``get_paged_mqa_logits_metadata``
+    scheduler binary-searches each SM's segment start over the prefix sum of
+    per-row segment counts. When the total is 0 every search ends at
+    ``q_idx == batch_size`` and the kernel then reads ``prefix_sum[q_idx]``;
+    the shared buffer holds ``align(batch, 32)`` entries, so the read is out
+    of bounds exactly when ``batch % 32 == 0`` (CUDA_ERROR_ILLEGAL_ADDRESS).
+    It fires at whole-model capture warmup (all-zero inputs) and would fire at
+    replay on any rank with ``num_valid_tokens == 0`` at buckets 32/64/96/128.
+
+    Forcing row 0 to ``max(len0, 1)`` makes the total segment count >= 1, so
+    every search ends inside the batch. When row 0 genuinely reads nothing its
+    forced one-token read hits ``block_table[0, 0] == page 0`` (the
+    preparation pass defines that row) and the result is never selected: the
+    top-k masks by the TRUE ``context_lens``, not by this copy.
+
+    Pure tensor ops, no host read: graph-capturable, and replay recomputes it
+    from whatever the static ``context_lens`` holds that step. Returns a new
+    tensor; the input is not modified.
+    """
+
+    if context_lens.dim() != 2 or context_lens.dtype != torch.int32:
+        raise TypeError(
+            "context_lens must be a 2-D [batch, next_n] int32 tensor, got "
+            f"{tuple(context_lens.shape)} {context_lens.dtype}"
+        )
+    guarded = context_lens.clone(memory_format=torch.contiguous_format)
+    guarded[:1].clamp_(min=1)
+    return guarded
 
 
 def topk_from_logits_reference(

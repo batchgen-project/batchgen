@@ -330,8 +330,10 @@ def test_prepare_reference_zeroes_context_len_for_a_slotless_row():
         page_table, slots, seqlens
     )
     assert torch.equal(context_lens, torch.tensor([[128], [0]], dtype=torch.int32))
-    # The gather still uses a clamped slot, so no out-of-range row is addressed.
-    assert torch.equal(block_table[1], page_table[0])
+    # A row that reads nothing gets the defined all-page-0 row, never a
+    # borrowed (clamped-slot) row of another sequence.
+    assert torch.equal(block_table[1], torch.zeros(2, dtype=torch.int32))
+    assert torch.equal(block_table[0], page_table[1])
 
 
 def test_prepare_reference_zeroes_context_len_past_num_valid_tokens():
@@ -359,6 +361,29 @@ def test_prepare_reference_passes_unmapped_page_sentinels_through():
     assert torch.equal(block_table, page_table)
 
 
+def test_prepare_reference_writes_page_zero_rows_for_every_row_that_reads_nothing():
+    """Slotless, past-num_valid_tokens and live-but-empty rows all get a
+    DEFINED all-page-0 table row, and a padded row's slot -- which may be any
+    value, even past the page table -- is never dereferenced."""
+    page_table = torch.tensor(
+        [[10, 11, -1], [20, 21, 22], [30, -1, -1]], dtype=torch.int32
+    )
+    slots = torch.tensor([1, -1, 2, 0, 10**6], dtype=torch.int32)
+    seqlens = torch.tensor([130, 64, 0, 65, 64], dtype=torch.int32)
+    block_table, context_lens = _pm.prepare_paged_mqa_inputs_reference(
+        page_table, slots, seqlens, torch.tensor([4], dtype=torch.int32)
+    )
+    assert torch.equal(
+        context_lens, torch.tensor([[130], [0], [0], [65], [0]], dtype=torch.int32)
+    )
+    zeros = torch.zeros(3, dtype=torch.int32)
+    assert torch.equal(block_table[0], page_table[1])  # live, reads
+    assert torch.equal(block_table[1], zeros)  # slotless
+    assert torch.equal(block_table[2], zeros)  # live, seqlen 0
+    assert torch.equal(block_table[3], page_table[0])  # live, reads
+    assert torch.equal(block_table[4], zeros)  # past num_valid, garbage slot
+
+
 def test_prepare_reference_rejects_a_non_int32_page_table():
     with pytest.raises(TypeError, match="int32"):
         _pm.prepare_paged_mqa_inputs_reference(
@@ -366,6 +391,182 @@ def test_prepare_reference_rejects_a_non_int32_page_table():
             torch.zeros(2, dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )
+
+
+# --------------------------------------------------------------------------- #
+# The never-all-zero guard (DeepGEMM sm90 metadata scheduler defect)
+# --------------------------------------------------------------------------- #
+
+def _sm90_metadata_reads_in_bounds(
+    lens: list[int], num_sms: int, split_kv: int = 256
+) -> bool:
+    """CPU model of DeepGEMM's sm90 NON-varlen ``paged_mqa_logits_metadata``.
+
+    Transcribed from the scheduler's work-distribution branch: a 32-lane
+    prefix sum over ``align(batch, 32)`` shared entries (padding rows count 0
+    segments), then per SM a binary search for its segment start over
+    ``[0, batch)`` followed by reads of ``prefix_sum[q_idx]`` and
+    ``prefix_sum[q_idx - 1]``. Returns whether every shared read stays inside
+    the ``align(batch, 32)`` buffer. Only the zero/non-zero segment count of a
+    row matters, so ``split_kv`` and ``num_sms`` do not change the verdict.
+    """
+
+    batch = len(lens)
+    aligned = (batch + 31) // 32 * 32
+    segs = [(int(n) + split_kv - 1) // split_kv for n in lens] + [0] * (aligned - batch)
+    prefix, running = [], 0
+    for s in segs:
+        running += s
+        prefix.append(running)
+    q, r = divmod(running, num_sms)
+    pivot = num_sms - r
+    reads: set[int] = set()
+    for sm_idx in range(num_sms):
+        seg_starts = sm_idx * q + (sm_idx - pivot if sm_idx > pivot else 0)
+        lo, hi = 0, batch
+        while lo < hi:
+            mid = (lo + hi) // 2
+            reads.add(mid)
+            if prefix[mid] <= seg_starts:
+                lo = mid + 1
+            else:
+                hi = mid
+        reads.add(lo)  # num_segs_q = prefix_sum[q_idx] - prefix_sum[q_idx - 1]
+        if lo > 0:
+            reads.add(lo - 1)
+    return max(reads) < aligned
+
+
+# The node repro's CASE table (2026-10-17, sgl deep_gemm 0.1.5.post3, sm90):
+# (batch, fill, rows set to 64, node verdict).
+_NODE_CASES = [
+    (128, 0, 0, False),
+    (127, 0, 0, True),
+    (96, 0, 0, False),
+    (32, 0, 0, False),
+    (128, 64, 0, True),
+    (128, 0, 1, True),
+    (127, 0, 1, True),
+]
+
+
+@pytest.mark.parametrize("num_sms", [78, 132])
+@pytest.mark.parametrize("batch,fill,nonzero,node_ok", _NODE_CASES)
+def test_scheduler_model_reproduces_the_node_case_table(
+    num_sms, batch, fill, nonzero, node_ok
+):
+    """The CPU model must agree with every node-measured case, or the guard
+    tests below would be checking the wrong defect."""
+    lens = [fill] * batch
+    for b in range(nonzero):
+        lens[b] = 64
+    assert _sm90_metadata_reads_in_bounds(lens, num_sms) is node_ok
+
+
+_GUARD_BATCHES = [32, 64, 96, 127, 128]
+
+
+def _prepared(batch: int, case: str):
+    """Reference-prepared inputs for one guard case."""
+    page_table = torch.arange(1, (batch + 1) * 4 + 1, dtype=torch.int32).reshape(
+        batch + 1, 4
+    )
+    slots = torch.arange(batch, dtype=torch.int32)
+    seqlens = torch.full((batch,), 200, dtype=torch.int32)
+    nvt = None
+    if case == "all_invalid_num_valid_0":  # a rank with nothing to decode
+        nvt = torch.tensor([0], dtype=torch.int32)
+    elif case == "all_invalid_slotless":
+        slots = torch.full((batch,), -1, dtype=torch.int32)
+    elif case == "all_zero_inputs":  # whole-model capture warmup
+        slots = torch.zeros(batch, dtype=torch.int32)
+        seqlens = torch.zeros(batch, dtype=torch.int32)
+    elif case == "one_valid_last_row":
+        slots[:-1] = -1
+    elif case == "one_valid_row0":
+        nvt = torch.tensor([1], dtype=torch.int32)
+    else:
+        raise AssertionError(case)
+    block_table, true_lens = _pm.prepare_paged_mqa_inputs_reference(
+        page_table, slots, seqlens, nvt
+    )
+    return block_table, true_lens
+
+
+_GUARD_CASES = [
+    "all_invalid_num_valid_0",
+    "all_invalid_slotless",
+    "all_zero_inputs",
+    "one_valid_last_row",
+    "one_valid_row0",
+]
+
+
+@pytest.mark.parametrize("num_sms", [78, 132])
+@pytest.mark.parametrize("case", _GUARD_CASES)
+@pytest.mark.parametrize("batch", _GUARD_BATCHES)
+def test_lens_handed_to_deep_gemm_are_never_all_zero(batch, case, num_sms):
+    block_table, true_lens = _prepared(batch, case)
+    guarded = _pm.guard_deep_gemm_context_lens(true_lens)
+
+    assert guarded.shape == true_lens.shape
+    assert guarded.dtype == torch.int32 and guarded.is_contiguous()
+    assert int(guarded.sum()) > 0
+    assert int(guarded[0, 0]) == max(int(true_lens[0, 0]), 1)
+    # Only row 0 may differ, and only upward: the top-k's TRUE bound never
+    # exceeds what DeepGEMM computed.
+    assert torch.equal(guarded[1:], true_lens[1:])
+    assert bool((true_lens <= guarded).all())
+    assert _sm90_metadata_reads_in_bounds(guarded.reshape(-1).tolist(), num_sms)
+
+    if int(true_lens.sum()) == 0:
+        # The case really is the defect's trigger whenever the batch is
+        # 32-aligned -- the guard is what makes it safe.
+        unguarded_ok = _sm90_metadata_reads_in_bounds(
+            true_lens.reshape(-1).tolist(), num_sms
+        )
+        assert unguarded_ok is (batch % 32 != 0)
+    if int(true_lens[0, 0]) == 0:
+        # The forced one-token read of row 0 lands on page 0.
+        assert int(block_table[0, 0]) == 0
+
+
+def test_guard_returns_a_copy_and_leaves_the_true_lengths_alone():
+    true_lens = torch.zeros(32, 1, dtype=torch.int32)
+    guarded = _pm.guard_deep_gemm_context_lens(true_lens)
+    assert int(true_lens.sum()) == 0
+    assert guarded.data_ptr() != true_lens.data_ptr()
+    live = torch.tensor([[5], [0], [7]], dtype=torch.int32)
+    assert torch.equal(_pm.guard_deep_gemm_context_lens(live), live)
+
+
+def test_guard_rejects_a_one_dimensional_or_non_int32_input():
+    with pytest.raises(TypeError, match="2-D"):
+        _pm.guard_deep_gemm_context_lens(torch.zeros(32, dtype=torch.int32))
+    with pytest.raises(TypeError, match="int32"):
+        _pm.guard_deep_gemm_context_lens(torch.zeros(32, 1, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("batch", _GUARD_BATCHES)
+def test_topk_masks_by_the_true_lengths_so_a_forced_row_selects_nothing(batch):
+    """DeepGEMM computed a score for row 0's forced token; the top-k must not
+    select it, because it bounds rows by the TRUE lengths."""
+    torch.manual_seed(2)
+    topk = 16
+    _, true_lens = _prepared(batch, "one_valid_last_row")
+    guarded = _pm.guard_deep_gemm_context_lens(true_lens)
+    assert int(true_lens[0, 0]) == 0 and int(guarded[0, 0]) == 1
+    logits = torch.randn(batch, 256, dtype=torch.float32)
+    logits[0, 0] = float("inf")  # whatever the forced read produced
+
+    picked = _pm.topk_from_logits_reference(logits, true_lens.view(batch), topk)
+    assert picked[0].tolist() == [-1] * topk
+    assert bool((picked[1:-1] == -1).all())
+    expected_last = torch.topk(logits[-1, :200], topk).indices.to(torch.int32)
+    assert torch.equal(picked[-1], expected_last)
+    # Masking by the guarded copy instead WOULD leak the forced token.
+    leaked = _pm.topk_from_logits_reference(logits, guarded.view(batch), topk)
+    assert leaked[0, 0].item() == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -468,13 +669,76 @@ def test_triton_prepare_matches_the_reference(num_valid):
         else torch.tensor([num_valid], dtype=torch.int32, device=device)
     )
 
-    block_table = torch.empty(batch, max_pages, dtype=torch.int32, device=device)
-    context_lens = torch.empty(batch, 1, dtype=torch.int32, device=device)
+    # Poisoned outputs: every element must be WRITTEN, never left behind.
+    block_table = torch.full((batch, max_pages), 12345, dtype=torch.int32, device=device)
+    context_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
+    dg_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
     prepare_paged_mqa_inputs_out(
-        page_table, slots, seqlens, block_table, context_lens, num_valid_tokens=nvt
+        page_table,
+        slots,
+        seqlens,
+        block_table,
+        context_lens,
+        num_valid_tokens=nvt,
+        deep_gemm_context_lens_out=dg_lens,
     )
     ref_bt, ref_ctx = _pm.prepare_paged_mqa_inputs_reference(
         page_table, slots, seqlens, nvt
     )
     assert torch.equal(block_table, ref_bt)
     assert torch.equal(context_lens, ref_ctx)
+    assert torch.equal(dg_lens, _pm.guard_deep_gemm_context_lens(ref_ctx))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for Triton")
+@pytest.mark.parametrize("case", _GUARD_CASES)
+@pytest.mark.parametrize("batch", _GUARD_BATCHES)
+def test_triton_prepare_guards_the_deep_gemm_lens(batch, case):
+    """The fused guard in the Triton pass matches the torch guard, defines
+    page-0 rows for rows that read nothing, and never hands DeepGEMM an
+    all-zero length vector -- including at the 32-aligned buckets."""
+    from batchgen_kernels.attention.dsa.paged_mqa_scorer import (
+        prepare_paged_mqa_inputs_out,
+    )
+
+    device = torch.device("cuda")
+    page_table = torch.arange(1, (batch + 1) * 4 + 1, dtype=torch.int32).reshape(
+        batch + 1, 4
+    )
+    slots = torch.arange(batch, dtype=torch.int32)
+    seqlens = torch.full((batch,), 200, dtype=torch.int32)
+    nvt = None
+    if case == "all_invalid_num_valid_0":
+        nvt = torch.tensor([0], dtype=torch.int32)
+        slots[:] = 10**6  # padded rows: the slot must never be dereferenced
+    elif case == "all_invalid_slotless":
+        slots[:] = -1
+    elif case == "all_zero_inputs":
+        slots.zero_()
+        seqlens.zero_()
+    elif case == "one_valid_last_row":
+        slots[:-1] = -1
+    elif case == "one_valid_row0":
+        nvt = torch.tensor([1], dtype=torch.int32)
+        slots[1:] = 10**6
+    # The reference never dereferences a non-reading row's slot either.
+    ref_bt, ref_ctx = _pm.prepare_paged_mqa_inputs_reference(
+        page_table, slots, seqlens, nvt
+    )
+
+    block_table = torch.full((batch, 4), 12345, dtype=torch.int32, device=device)
+    context_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
+    dg_lens = torch.full((batch, 1), 12345, dtype=torch.int32, device=device)
+    prepare_paged_mqa_inputs_out(
+        page_table.to(device),
+        slots.to(device),
+        seqlens.to(device),
+        block_table,
+        context_lens,
+        num_valid_tokens=None if nvt is None else nvt.to(device),
+        deep_gemm_context_lens_out=dg_lens,
+    )
+    assert torch.equal(block_table.cpu(), ref_bt)
+    assert torch.equal(context_lens.cpu(), ref_ctx)
+    assert torch.equal(dg_lens.cpu(), _pm.guard_deep_gemm_context_lens(ref_ctx))
+    assert int(dg_lens.sum()) > 0

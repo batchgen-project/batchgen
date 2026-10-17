@@ -237,7 +237,7 @@ def test_scorer_passes_the_two_dimensional_context_lens_and_no_clean_logits():
             "fp8_paged_mqa_logits"
         ):
             args = [ast.unparse(a) for a in sub.args]
-            assert args[3] == "context_lens"
+            assert args[3] == "deep_gemm_context_lens"
             assert args[6] == "plan.max_context_len"
             assert args[7] == "False", "clean_logits must stay False"
             break
@@ -255,13 +255,89 @@ def test_scorer_rechecks_the_logits_row_stride_after_every_call():
 
 def test_scorer_bounds_the_topk_by_the_same_context_lens():
     """DeepGEMM leaves the tail unmasked, so the top-k's lengths MUST be the
-    same context_lens the kernel was given -- not max_seqlen, not the raw
-    cache_seqlens."""
+    TRUE per-row context_lens -- not max_seqlen, not the raw cache_seqlens, and
+    not the guarded copy DeepGEMM was handed (which is elementwise >= them)."""
     fn = _top_level(_tree(_SCORER_SRC), "_topk_from_logits")
     src = ast.unparse(fn)
     assert "lengths = context_lens.view(plan.batch)" in src
     kwargs = _call_kwargs(fn, "_topk_from_scores_kernel[plan.batch,]")
     assert kwargs["MASK_BY_SEQLEN"] == "True"
+
+
+def _positional_calls(fn, callee: str) -> list[list[str]]:
+    return [
+        [ast.unparse(a) for a in sub.args]
+        for sub in ast.walk(fn)
+        if isinstance(sub, ast.Call) and ast.unparse(sub.func) == callee
+    ]
+
+
+def test_graph_scorer_hands_deepgemm_the_guarded_lens_and_the_topk_the_true_ones():
+    """The all-zero-context_lens guard (DeepGEMM sm90 metadata OOB): the
+    Triton pass writes BOTH lengths in one launch; DeepGEMM reads only the
+    guarded one, the top-k only the true one."""
+    fn = _top_level(_tree(_SCORER_SRC), "paged_mqa_score_and_topk_out")
+    prep = _call_kwargs(fn, "prepare_paged_mqa_inputs_out")
+    assert prep["deep_gemm_context_lens_out"] == "deep_gemm_context_lens"
+    (dg_args,) = _positional_calls(fn, "deep_gemm_paged_mqa_logits")
+    assert dg_args[3] == "deep_gemm_context_lens"
+    (topk_args,) = _positional_calls(fn, "_topk_from_logits")
+    assert topk_args[1] == "context_lens"
+
+
+def test_eager_scorer_hands_deepgemm_the_guarded_lens_and_the_topk_the_true_ones():
+    fn = _top_level(_tree(_SCORER_SRC), "paged_mqa_score_and_topk")
+    src = ast.unparse(fn)
+    assert (
+        "deep_gemm_context_lens = guard_deep_gemm_context_lens(context_lens)" in src
+    )
+    (dg_args,) = _positional_calls(fn, "deep_gemm_paged_mqa_logits")
+    assert dg_args[3] == "deep_gemm_context_lens"
+    (topk_args,) = _positional_calls(fn, "_topk_from_logits")
+    assert topk_args[1] == "context_lens"
+
+
+def test_every_deepgemm_launch_gets_guarded_or_positive_lengths():
+    """No call site may hand DeepGEMM unguarded lengths. The JIT warm-up is
+    the one exception, and only because its lengths are a positive fill."""
+    tree = _tree(_SCORER_SRC)
+    sites = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            for args in _positional_calls(node, "deep_gemm_paged_mqa_logits"):
+                sites[node.name] = args[3]
+    assert sites == {
+        "paged_mqa_score_and_topk_out": "deep_gemm_context_lens",
+        "paged_mqa_score_and_topk": "deep_gemm_context_lens",
+        "warm_paged_mqa_logits": "context_lens",
+    }
+    warm = ast.unparse(_top_level(tree, "warm_paged_mqa_logits"))
+    assert "min(int(page_size), int(max_seqlen))" in warm
+
+
+def test_triton_prepare_fuses_the_row0_guard():
+    src = _SCORER_SRC.read_text()
+    kernel = ast.get_source_segment(
+        src, _top_level(_tree(_SCORER_SRC), "_prepare_paged_mqa_inputs_kernel")
+    )
+    assert "tl.where(pid_b == 0, tl.maximum(context_len, 1), context_len)" in kernel
+    assert "tl.store(DG_CONTEXT_LENS_ptr + pid_b, dg_len)" in kernel
+    assert "tl.store(CONTEXT_LENS_ptr + pid_b, context_len)" in kernel
+    # Rows that read nothing never dereference their slot and get page 0.
+    assert "mask=mask & reads" in kernel
+    assert "other=0," in kernel
+
+
+def test_deepgemm_call_names_the_upstream_defect():
+    """A future DeepGEMM pin bump must find WHY the guard exists at the call."""
+    src = _SCORER_SRC.read_text()
+    fn = ast.get_source_segment(
+        src, _top_level(_tree(_SCORER_SRC), "deep_gemm_paged_mqa_logits")
+    )
+    assert "0.1.5.post3" in fn
+    assert "sm90_fp8_mqa_logits.hpp:188" in fn
+    assert "batch % 32 == 0" in fn
+    assert "2026-10-17" in fn
 
 
 def test_scorer_reinterprets_the_cache_as_bytes_without_copying():

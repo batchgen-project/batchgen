@@ -314,8 +314,9 @@ def _make_scorer_buffers(
     * ``aux_block_table``: the aux page table's rows gathered into BATCH order.
       DeepGEMM indexes the block table by batch row and has no slot
       indirection, which BatchGen's slot-major table needs resolving first.
-    * ``aux_context_lens``: the 2-D ``[bucket, next_n]`` ``context_lens`` the
-      serving build requires, also reused as the top-k's per-row length.
+    * ``aux_context_lens``: the TRUE 2-D ``[bucket, next_n]`` per-row lengths,
+      the top-k's bound. DeepGEMM is handed a guarded copy derived in the
+      same preparation launch (``guard_deep_gemm_context_lens``).
     """
 
     if not page_split:
