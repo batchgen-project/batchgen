@@ -296,8 +296,14 @@ def _make_scorer_buffers(
     """``(agg_scores, q_index_fp8, aux_block_table, aux_context_lens)``.
 
     The two scorers need disjoint statics, and only one of them can ever run
-    for a given aux cache, so the other group is a 1-element placeholder rather
-    than a real allocation. That matters: ``agg_scores`` is a dense
+    for a given aux cache, so the other group is a zero-byte placeholder rather
+    than a real allocation. The placeholder still carries ``bucket_size`` as
+    its leading dim (with a zero-extent trailing dim): every field here is a
+    ``_GLM5_DSA_VIEW_FIELDS`` member, which smaller buckets slice as
+    ``base[:bucket]``, so a placeholder must obey the same "leading dim is the
+    bucket" invariant as the live group -- a 1-element placeholder sliced to
+    ``[:2]`` silently stays 1 row and becomes a wrongly-shaped view. That matters
+    for footprint too: ``agg_scores`` is a dense
     ``[bucket, max_seqlen]`` fp32 aggregate, which at production bucket and
     context is tens of MB charged against the same memory the KV pages come
     from, and the DeepGEMM scorer never writes it (it hands the top-k the
@@ -315,12 +321,12 @@ def _make_scorer_buffers(
     if not page_split:
         return (
             torch.empty(bucket_size, max_seqlen, dtype=torch.float32, device=device),
-            torch.empty(1, 1, 1, 1, dtype=torch.float8_e4m3fn, device=device),
-            torch.empty(1, 1, dtype=torch.int32, device=device),
-            torch.empty(1, 1, dtype=torch.int32, device=device),
+            torch.empty(bucket_size, 0, 0, 0, dtype=torch.float8_e4m3fn, device=device),
+            torch.empty(bucket_size, 0, dtype=torch.int32, device=device),
+            torch.empty(bucket_size, 0, dtype=torch.int32, device=device),
         )
     return (
-        torch.empty(1, 1, dtype=torch.float32, device=device),
+        torch.empty(bucket_size, 0, dtype=torch.float32, device=device),
         torch.empty(
             bucket_size,
             PAGED_MQA_NEXT_N,

@@ -762,7 +762,11 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
         attn.indexer.index_topk,
     )
     assert torch.count_nonzero(buffers.selected_lengths[actual_bsz:]).item() == 0
-    assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
+    # `attn_heads` padded rows are deliberately NOT asserted zero: the decode
+    # row-mask contract (#473) masks only at the attention-output -> MoE seam.
+    # Every producer of `attn_heads` is row-local, so a padded row may carry
+    # stale/garbage values there; `attn_output` is the one buffer whose padded
+    # rows must be zero, because it is the one that feeds a row-mixing op.
     assert torch.count_nonzero(static_outputs.attn_output[actual_bsz:]).item() == 0
 
     manager.drop_bucket(bucket_size)
