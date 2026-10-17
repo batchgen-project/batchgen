@@ -59,12 +59,19 @@ def _paged_cache_update_kernel(
     tl.store(dest_base + element_offsets, values, mask=mask)
 
 
-def _launch_single_cache_update(
+def _validate_single_cache_update(
     cache_tensor: torch.Tensor,
     src_tokens: torch.Tensor,
     page_indices: torch.Tensor,
     token_offsets: torch.Tensor,
 ) -> None:
+    """Every precondition of ``_launch_single_cache_update``, launch-free.
+
+    Kept separate so a K+V update can validate BOTH caches before the first
+    kernel is enqueued: a V-side rejection raised after the K launch would
+    leave the K cache written and the V cache not -- a half-applied update.
+    """
+
     if cache_tensor is None:
         raise ValueError("cache_tensor must be defined")
     if cache_tensor.device != src_tokens.device:
@@ -88,17 +95,27 @@ def _launch_single_cache_update(
         or token_offsets.shape[0] != src_tokens.shape[0]
     ):
         raise ValueError("page_indices/token_offsets must match the batch size")
+    if src_tokens.shape[0] == 0:
+        return
+    if src_tokens.shape[1] <= 0:
+        raise ValueError("Token vectors must contain at least one element")
+    if cache_tensor.ndim < 2:
+        raise ValueError("cache_tensor must have at least two dimensions")
+
+
+def _launch_single_cache_update(
+    cache_tensor: torch.Tensor,
+    src_tokens: torch.Tensor,
+    page_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+) -> None:
+    """Enqueue one cache's copy. Callers MUST have run the validator first."""
 
     num_tokens = src_tokens.shape[0]
     if num_tokens == 0:
         return
 
-    if src_tokens.shape[1] <= 0:
-        raise ValueError("Token vectors must contain at least one element")
-
     strides = cache_tensor.stride()
-    if len(strides) < 2:
-        raise ValueError("cache_tensor must have at least two dimensions")
     page_stride = strides[0]
     token_stride = strides[1]
     elements_per_token = src_tokens.shape[1]
@@ -118,6 +135,22 @@ def _launch_single_cache_update(
         num_chunks,
         BLOCK_SIZE=_BLOCK_SIZE,
     )
+
+
+def _validate_kv_pair(
+    v_cache: Optional[torch.Tensor], v_tokens: Optional[torch.Tensor]
+) -> bool:
+    """Check the optional V operands; return whether a V update is requested."""
+
+    if v_cache is None:
+        if v_tokens is not None:
+            raise ValueError("v_tokens provided but v_cache is None")
+        return False
+    if v_tokens is None:
+        raise ValueError("v_cache requires matching v_tokens input")
+    if v_tokens.device != v_cache.device:
+        raise ValueError("v_tokens must be on the same device as v_cache")
+    return True
 
 
 def run_paged_kv_token_update(
@@ -140,6 +173,8 @@ def run_paged_kv_token_update(
         v_cache: Optional V cache tensor on device.
         v_tokens: Optional flattened V tokens matching ``v_cache``.
     """
+    # Validate K AND V before the first launch: nothing is written unless the
+    # whole update is admissible (no half-applied K-only update).
     if k_tokens.device != k_cache.device:
         raise ValueError(
             "k_tokens must be placed on the same device as k_cache"
@@ -148,6 +183,10 @@ def run_paged_kv_token_update(
         raise ValueError("page_indices must be int32")
     if token_offsets.dtype != torch.int32:
         raise ValueError("token_offsets must be int32")
+    _validate_single_cache_update(k_cache, k_tokens, page_indices, token_offsets)
+    has_v = _validate_kv_pair(v_cache, v_tokens)
+    if has_v:
+        _validate_single_cache_update(v_cache, v_tokens, page_indices, token_offsets)
 
     _launch_single_cache_update(
         cache_tensor=k_cache,
@@ -155,23 +194,13 @@ def run_paged_kv_token_update(
         page_indices=page_indices,
         token_offsets=token_offsets,
     )
-
-    if v_cache is None:
-        if v_tokens is not None:
-            raise ValueError("v_tokens provided but v_cache is None")
-        return
-
-    if v_tokens is None:
-        raise ValueError("v_cache requires matching v_tokens input")
-    if v_tokens.device != v_cache.device:
-        raise ValueError("v_tokens must be on the same device as v_cache")
-
-    _launch_single_cache_update(
-        cache_tensor=v_cache,
-        src_tokens=v_tokens,
-        page_indices=page_indices,
-        token_offsets=token_offsets,
-    )
+    if has_v:
+        _launch_single_cache_update(
+            cache_tensor=v_cache,
+            src_tokens=v_tokens,
+            page_indices=page_indices,
+            token_offsets=token_offsets,
+        )
 
 
 @triton.jit
@@ -222,33 +251,21 @@ def _paged_cache_update_with_page_table_kernel(
     tl.store(dest_base + element_offsets, values, mask=mask)
 
 
-def _launch_single_cache_update_with_page_table(
+def _validate_single_cache_update_with_page_table(
     cache_tensor: torch.Tensor,
     src_tokens: torch.Tensor,
-    page_table: torch.Tensor,
-    slot_indices: torch.Tensor,
-    token_indices: torch.Tensor,
-    page_size_tokens: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> None:
+    """Every precondition of the page-table launch, launch-free (see
+    ``_validate_single_cache_update`` for why validation is split out)."""
+
     _require_matching_cache_dtype(cache_tensor, src_tokens)
-
-    num_tokens = src_tokens.shape[0]
-    if num_tokens == 0:
+    if src_tokens.shape[0] == 0:
         return
-
     if src_tokens.shape[1] <= 0:
         raise ValueError("Token vectors must contain at least one element")
-
-    strides = cache_tensor.stride()
-    if len(strides) < 2:
+    if cache_tensor.ndim < 2:
         raise ValueError("cache_tensor must have at least two dimensions")
-    page_stride = strides[0]
-    token_stride = strides[1]
-    elements_per_token = src_tokens.shape[1]
-    num_chunks = (elements_per_token + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-
-    page_table_cols = page_table.shape[1]
     if num_valid_tokens is not None:
         if num_valid_tokens.device != src_tokens.device:
             raise ValueError("num_valid_tokens must be on the same device as src_tokens")
@@ -258,6 +275,30 @@ def _launch_single_cache_update_with_page_table(
             raise ValueError(
                 f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
             )
+
+
+def _launch_single_cache_update_with_page_table(
+    cache_tensor: torch.Tensor,
+    src_tokens: torch.Tensor,
+    page_table: torch.Tensor,
+    slot_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    page_size_tokens: int,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+) -> None:
+    """Enqueue one cache's copy. Callers MUST have run the validator first."""
+
+    num_tokens = src_tokens.shape[0]
+    if num_tokens == 0:
+        return
+
+    strides = cache_tensor.stride()
+    page_stride = strides[0]
+    token_stride = strides[1]
+    elements_per_token = src_tokens.shape[1]
+    num_chunks = (elements_per_token + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+
+    page_table_cols = page_table.shape[1]
 
     grid = (num_tokens, num_chunks)
 
@@ -298,7 +339,15 @@ def run_paged_kv_token_update_fused(
         page_table: int32 tensor on device with shape [num_slots, max_pages_per_sequence]
         slot_indices: int32 tensor [batch] mapping each token to a slot row
         token_indices: int32 tensor [batch] giving the absolute token index in sequence
+
+    All K and V preconditions are checked before the first launch, so a
+    rejected update writes neither cache.
     """
+
+    _validate_single_cache_update_with_page_table(k_cache, k_tokens, num_valid_tokens)
+    has_v = _validate_kv_pair(v_cache, v_tokens)
+    if has_v:
+        _validate_single_cache_update_with_page_table(v_cache, v_tokens, num_valid_tokens)
 
     _launch_single_cache_update_with_page_table(
         cache_tensor=k_cache,
@@ -309,23 +358,13 @@ def run_paged_kv_token_update_fused(
         page_size_tokens=page_size_tokens,
         num_valid_tokens=num_valid_tokens,
     )
-
-    if v_cache is None:
-        if v_tokens is not None:
-            raise ValueError("v_tokens provided but v_cache is None")
-        return
-
-    if v_tokens is None:
-        raise ValueError("v_cache requires matching v_tokens input")
-    if v_tokens.device != v_cache.device:
-        raise ValueError("v_tokens must be on the same device as v_cache")
-
-    _launch_single_cache_update_with_page_table(
-        cache_tensor=v_cache,
-        src_tokens=v_tokens,
-        page_table=page_table,
-        slot_indices=slot_indices,
-        token_indices=token_indices,
-        page_size_tokens=page_size_tokens,
-        num_valid_tokens=num_valid_tokens,
-    )
+    if has_v:
+        _launch_single_cache_update_with_page_table(
+            cache_tensor=v_cache,
+            src_tokens=v_tokens,
+            page_table=page_table,
+            slot_indices=slot_indices,
+            token_indices=token_indices,
+            page_size_tokens=page_size_tokens,
+            num_valid_tokens=num_valid_tokens,
+        )
