@@ -324,7 +324,7 @@ def test_prefill_completion_does_not_double_release_kda_with_gpu_kv():
 
 def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
     from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
-        load_distributed_weight_config,
+        read_distributed_weight_config,
     )
 
     store = tmp_path / "store.bin"
@@ -346,11 +346,11 @@ def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
     invalid = tmp_path / "invalid.json"
     invalid.write_text(json.dumps({**base, "worker_sharded": "true"}))
     with pytest.raises(ValueError, match="worker_sharded=true"):
-        load_distributed_weight_config(invalid)
+        read_distributed_weight_config(invalid)
 
     valid = tmp_path / "valid.json"
     valid.write_text(json.dumps({**base, "worker_sharded": True}))
-    assert load_distributed_weight_config(valid)["workers"] == 8
+    assert read_distributed_weight_config(valid)["workers"] == 8
 
 
 def test_resident_prefill_is_refused_for_non_k3():
