@@ -176,6 +176,25 @@ class IntakePool:
         with self._lock:
             self._batch_info.pop(batch_id, None)
 
+    def remove_batch_entries(self, batch_id: str) -> int:
+        """Drop every queued entry of *batch_id*; return how many were dropped.
+
+        A batch that has been persisted as failed must never send another
+        request to a worker, so its still-queued entries are discarded rather
+        than left for the drain to admit to a later worker generation.
+        """
+        with self._lock:
+            removed = 0
+            for name in ("_high", "_normal"):
+                entries: Deque[IntakeEntry] = getattr(self, name)
+                kept = deque(e for e in entries if e.batch_id != batch_id)
+                removed += len(entries) - len(kept)
+                setattr(self, name, kept)
+            info = self._batch_info.get(batch_id)
+            if info is not None:
+                info.remaining_in_intake = 0
+            return removed
+
     # -------------------- Internal --------------------
 
     def _decrement_batch_remaining(self, batch_id: str) -> None:

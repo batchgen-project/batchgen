@@ -815,8 +815,29 @@ class WorkerManager:
         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
         return {"failed_batches": failed_batches}
 
+    def _abort_restart_if_stopping(self) -> None:
+        """Raise when server shutdown has begun or already finished.
+
+        ``stop()`` sets ``_stopping`` first and clears it again when it
+        returns, while ``started`` stays False from then on; checking both
+        covers a restart phase that outlasted the whole of ``stop()``.
+        """
+        if self._stopping or not self.started:
+            raise RuntimeError("worker restart aborted: server is stopping")
+
     def restart_workers(self, timeout_s: Optional[float] = None) -> Dict[str, Any]:
-        """Replace one worker cohort while retaining server-owned resources."""
+        """Replace one worker cohort while retaining server-owned resources.
+
+        The restart runs on a worker thread (``asyncio.to_thread``), which
+        neither request cancellation nor server shutdown can interrupt.  It
+        therefore checks for shutdown at its phase boundaries -- on entry,
+        after teardown, and immediately before the respawn -- and aborts to
+        ``workers_down`` there, so it never spawns a cohort once ``stop()``
+        has begun.  Residual window: a phase already in flight when shutdown
+        begins (a teardown, or a spawn already dispatched) runs to completion
+        before the next boundary sees the shutdown; ``stop()`` tears down
+        whatever cohort is live when it reaches the worker processes.
+        """
         timeout_s = self._restart_timeout_s if timeout_s is None else float(timeout_s)
         started_at = time.monotonic()
         with self._lock:
@@ -828,6 +849,7 @@ class WorkerManager:
         # ANY point leaves the manager in the retryable workers_down state,
         # never stuck in "restarting".
         try:
+            self._abort_restart_if_stopping()
             quiesce_start = time.monotonic()
             if self._quiesce_hook is not None:
                 self._quiesce_hook()
@@ -842,6 +864,7 @@ class WorkerManager:
                 self._stop_workers()
                 self.worker_process = None
             teardown_s = time.monotonic() - teardown_start
+            self._abort_restart_if_stopping()
 
             reconcile_start = time.monotonic()
             # In-flight batches are persisted as failed exactly once:
@@ -878,6 +901,7 @@ class WorkerManager:
             # stale failure reason must not abort the readiness wait of the
             # cohort spawned below.
             self._worker_exit_state.clear()
+            self._abort_restart_if_stopping()
             self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
             self._start_worker_monitor()
             self._wait_for_workers_ready(timeout_s=timeout_s)
@@ -892,21 +916,26 @@ class WorkerManager:
                 "max_output_len": init_params.get("max_output_len", 4096),
                 "max_context_length": init_params.get("max_context_length"),
             })
+            spawn_to_ready_s = time.monotonic() - spawn_start
+            # The scheduler side of the new generation (completion pump,
+            # listener re-arm, then resume) is part of the restart: neither
+            # hook needs the serving state, and if either fails the restart
+            # failed, so it must end in workers_down rather than in a serving
+            # state with a quiesced scheduler or no completion consumer.
+            if self._scheduler_generation_hook is not None:
+                self._scheduler_generation_hook()
+            if self._resume_hook is not None:
+                self._resume_hook()
         except BaseException:
             with self._lock:
                 self._state = "workers_down"
             raise
-        spawn_to_ready_s = time.monotonic() - spawn_start
         with self._lock:
             self._generation += 1
             self._state = "serving"
             self._first_ready = True
             self._worker_exit_state.clear()
             self._reconciled_failure = False
-        if self._scheduler_generation_hook is not None:
-            self._scheduler_generation_hook()
-        if self._resume_hook is not None:
-            self._resume_hook()
         return {
             "generation": self.generation,
             "failed_batches": reconciliation["failed_batches"],
@@ -1288,9 +1317,22 @@ class WorkerManager:
     ) -> None:
         if self._stopping:
             return
-        if self.state == "restarting":
-            return
-        if not self._first_ready:
+        # Teardown and reconciliation of a cohort have exactly one owner.  The
+        # ownership check and the transition that claims it share one critical
+        # section, so an explicit restart cannot take the cohort between them:
+        # a restart that already set "restarting" owns the teardown (its own
+        # reap and reconcile cover the dead cohort), and a cohort already in
+        # "workers_down" is owned by whoever entered that state or by the
+        # next restart.
+        with self._lock:
+            if self._state != "serving":
+                return
+            startup = not self._first_ready
+            if not startup:
+                if not self._worker_exit_state.set_failure(reason, exc):
+                    return
+                self._state = "workers_down"
+        if startup:
             if self._worker_exit_state.set_failure(reason, exc):
                 logging.getLogger("uvicorn.error").error(
                     "[shutdown] worker failure during startup epoch=%.6f: %s",
@@ -1299,14 +1341,10 @@ class WorkerManager:
                 )
                 self._request_server_shutdown()
             return
-        if not self._worker_exit_state.set_failure(reason, exc):
-            return
         logging.getLogger("uvicorn.error").error(
             "Worker cohort failed after readiness; entering workers_down: %s",
             reason,
         )
-        with self._lock:
-            self._state = "workers_down"
         if self._quiesce_hook is not None:
             self._quiesce_hook()
         self._monitor_stop_event.set()

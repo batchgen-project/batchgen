@@ -168,6 +168,9 @@ class BatchScheduler:
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
         # where request_id is f"{custom_id}@{batch_id}"
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # Batches whose leftover intake entries the drain discarded; each is
+        # logged once.
+        self._stale_intake_batches: set = set()
         self._quiesced = threading.Event()
         self._quiesce_ack = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -284,9 +287,10 @@ class BatchScheduler:
     def _ensure_completion_listener(self) -> None:
         """Start the completion listener task unless one is already running.
 
-        Runs on the scheduler loop.  The listener exits on a terminal message
-        (worker shutdown or a worker-reported error), so a restart has to be
-        able to bring it back.
+        Runs on the scheduler loop.  The listener serves every worker
+        generation and ends only when the scheduler stops, so this is crash
+        recovery: it recreates a listener task that died, and is otherwise a
+        no-op.
         """
         task = self._completion_listener_task
         if task is not None and not task.done():
@@ -408,7 +412,12 @@ class BatchScheduler:
             )
 
     def _offer_completion(self, generation: int, item: Any) -> None:
-        """Accept an item only from the live pump. Runs on the scheduler loop."""
+        """Accept an item only from the live pump. Runs on the scheduler loop.
+
+        The item is queued with its generation: an item accepted here can
+        still be waiting in the inbox when a restart advances the generation,
+        so the listener checks the tag again when it takes the item.
+        """
         if generation != self._pump_generation:
             logger.warning(
                 "[POOL] Dropping an item from superseded completion pump "
@@ -420,7 +429,7 @@ class BatchScheduler:
         inbox = self._completion_inbox
         if inbox is None:
             return
-        inbox.put_nowait(item)
+        inbox.put_nowait((generation, item))
 
     def pool_init_params(self) -> Dict[str, Any]:
         """Pool capacity for a worker generation's init message."""
@@ -980,6 +989,10 @@ class BatchScheduler:
             if not drained:
                 await asyncio.sleep(0.1)
                 continue
+            drained = self._drop_stale_intake_entries(drained)
+            if not drained:
+                await asyncio.sleep(0)
+                continue
 
             # Build admission message from drained entries
             admit_entries = []
@@ -1019,16 +1032,57 @@ class BatchScheduler:
 
         logger.info("[POOL] Intake drain task stopped")
 
+    def _drop_stale_intake_entries(
+        self, drained: List[IntakeEntry]
+    ) -> List[IntakeEntry]:
+        """Keep only entries whose batch can still accept results.
+
+        _fail_all_active_batches purges a failed batch's queued entries, but an
+        entry selected before the failure can be requeued after it.  An entry
+        whose batch tracker is gone, complete, or failed is discarded here,
+        before any slot is allocated for it, and is never sent to a worker.
+        """
+        live: List[IntakeEntry] = []
+        dropped: Dict[str, int] = {}
+        for entry in drained:
+            tracker = self._scheduling_pool.get_batch_tracker(entry.batch_id)
+            if (
+                tracker is None
+                or tracker.is_complete
+                or getattr(tracker, "is_failed", False)
+            ):
+                dropped[entry.batch_id] = dropped.get(entry.batch_id, 0) + 1
+                continue
+            live.append(entry)
+        for batch_id, count in dropped.items():
+            if batch_id in self._stale_intake_batches:
+                continue
+            self._stale_intake_batches.add(batch_id)
+            logger.warning(
+                "[POOL] Discarding %d queued requests of batch %s: the batch "
+                "is no longer active (failed, complete, or finalized)",
+                count,
+                batch_id,
+            )
+        return live
+
     def _fail_all_active_batches(self, error_msg: str) -> int:
         """Mark all in-progress batches as failed. Called on fatal listener error."""
         failed = 0
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
+                # A failed batch must send nothing more to any worker: its
+                # entries still queued in the intake pool would otherwise be
+                # admitted to the next worker generation.
+                purged = self._intake_pool.remove_batch_entries(batch_id)
                 self.storage.update_batch_status(
                     batch_id, BatchStatus.FAILED, error=f"worker_fatal: {error_msg}"
                 )
-                logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
+                logger.error(
+                    f"[POOL] Batch {batch_id} marked FAILED: {error_msg} "
+                    f"({purged} queued requests discarded)"
+                )
                 failed += 1
         clear_slots = getattr(self._scheduling_pool, "clear_active_slots", None)
         if clear_slots is not None:
@@ -1043,6 +1097,14 @@ class BatchScheduler:
         belongs to the generation's pump thread, never to this task: a read
         that can never return must not sit in the default executor, whose
         threads are not daemons and would keep the process from exiting.
+
+        One listener serves every worker generation and never exits on a
+        terminal item: a listener that ended with its generation could exit
+        after the next generation's re-arm check saw it still running, leaving
+        that generation with no consumer.  It ends only when the scheduler
+        stops.  Each inbox item carries the generation of the pump that read
+        it; an item of a superseded generation is dropped before it acts, so a
+        stale terminal item can never fail or report the live generation.
         """
         logger.info("[POOL] Completion listener started")
         inbox = self._completion_inbox
@@ -1053,12 +1115,29 @@ class BatchScheduler:
             )
         while not self._stopped.is_set():
             try:
-                result = await asyncio.wait_for(inbox.get(), timeout=1.0)
+                generation, result = await asyncio.wait_for(
+                    inbox.get(), timeout=1.0
+                )
             except asyncio.TimeoutError:
                 continue
 
+            if generation != self._pump_generation:
+                logger.info(
+                    "[POOL] Dropping a queued item of superseded worker "
+                    "generation %d (live generation is %d): %s",
+                    generation,
+                    self._pump_generation,
+                    result.get("type") if isinstance(result, dict) else result,
+                )
+                continue
+
             if result is None:
-                break
+                logger.info(
+                    "[POOL] Worker generation %d sent its end-of-stream "
+                    "sentinel",
+                    generation,
+                )
+                continue
 
             if isinstance(result, dict):
                 msg_type = result.get("type")
@@ -1093,14 +1172,14 @@ class BatchScheduler:
                 elif msg_type == "channel_error":
                     # The generation's pump could not read its response queue.
                     # Same handling as the in-task read failure this replaced:
-                    # the active batches are persisted as failed and this
-                    # generation's listener ends.
+                    # the active batches are persisted as failed.  The pump
+                    # has ended; the listener stays for the next generation.
                     error = result.get("error")
                     logger.error(
                         "[POOL] Completion listener fatal error: %s", error
                     )
                     self._fail_all_active_batches(f"Worker error: {error}")
-                    break
+                    continue
                 elif msg_type == "pool_shutdown":
                     error = result.get("error")
                     if error:
@@ -1112,7 +1191,7 @@ class BatchScheduler:
                         self.worker.report_worker_fatal(error, persisted=True)
                     else:
                         logger.info("[POOL] Worker shutdown signal received")
-                    break
+                    continue
                 elif msg_type == "trajectory_pool_capacity":
                     # ``total_capacity`` is immutable token-pool capacity and
                     # sizes SchedulingPool.  ``free_reservations`` changes on
@@ -1131,7 +1210,7 @@ class BatchScheduler:
                         logger.error("[POOL] %s", reason)
                         self._fail_all_active_batches(reason)
                         self.worker.report_worker_fatal(reason)
-                        break
+                        continue
                     total_capacity = int(result["total_capacity"])
                     if total_capacity != self._scheduling_pool.capacity:
                         if self._scheduling_pool.num_active_slots():
@@ -1155,7 +1234,7 @@ class BatchScheduler:
                     )
                 elif "error" in result:
                     logger.error(f"[POOL] Worker error: {result}")
-                    break
+                    continue
                 else:
                     # Anything else is a protocol error from the worker
                     logger.warning(f"[POOL] Unexpected result: {type(result)}")

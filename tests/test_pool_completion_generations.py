@@ -174,7 +174,10 @@ def _scheduler(tmp_path: Path):
     scheduler.worker = _WorkerStub()
     scheduler.storage = _StorageStub()
     scheduler._scheduling_pool = _SchedulingPoolStub()
-    scheduler._intake_pool = SimpleNamespace(size=lambda: 0)
+    scheduler._intake_pool = SimpleNamespace(
+        size=lambda: 0, remove_batch_entries=lambda batch_id: 0,
+    )
+    scheduler._stale_intake_batches = set()
     scheduler.server_args = SimpleNamespace(
         incremental_output_dir=str(tmp_path),
     )
@@ -258,9 +261,11 @@ def test_completion_from_the_new_generation_reaches_the_routing_path(tmp_path):
     asyncio.run(scenario())
 
 
-def test_pool_shutdown_fails_active_batches_once_then_listener_is_rearmed(tmp_path):
-    """pool_shutdown still persists the in-flight batches exactly once, and the
-    next generation brings the listener back so completions resume."""
+def test_listener_survives_pool_shutdown_and_routes_the_next_generation(tmp_path):
+    """pool_shutdown still persists the in-flight batches exactly once, but the
+    listener does NOT end with it: a listener that exits on a terminal item
+    can exit after the next generation's re-arm check saw it alive, leaving
+    that generation with a pump and no consumer."""
 
     async def scenario():
         scheduler = _scheduler(tmp_path)
@@ -268,6 +273,7 @@ def test_pool_shutdown_fails_active_batches_once_then_listener_is_rearmed(tmp_pa
         scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
         scheduler._ensure_completion_listener()
         scheduler._start_completion_pump()
+        listener = scheduler._completion_listener_task
 
         scheduler.worker.response_queue.put(
             {"type": "pool_shutdown", "error": "worker fatal"}
@@ -278,24 +284,118 @@ def test_pool_shutdown_fails_active_batches_once_then_listener_is_rearmed(tmp_pa
         assert tracker.error == "worker fatal"
         assert scheduler._scheduling_pool.cleared == 1
 
-        # The listener ends with the generation that reported the fatal.
-        assert await _await_true(
-            lambda: scheduler._completion_listener_task.done()
-        )
+        # The listener outlives the generation that reported the fatal.
+        await asyncio.sleep(0.1)
+        assert not listener.done()
 
-        # The restart re-arms it; without this, every later completion is
-        # decoded and then thrown away.
+        # The next generation reuses the SAME listener task.
         tracker.is_failed = True
         fresh_queue: Any = queue.Queue()
         scheduler.worker.response_queue = fresh_queue
         await asyncio.to_thread(scheduler.worker_generation_ready)
-        assert not scheduler._completion_listener_task.done()
+        assert scheduler._completion_listener_task is listener
+        assert not listener.done()
 
         fresh_queue.put(_completion("req-1", "batch-1"))
         assert await _await_true(lambda: scheduler._scheduling_pool.completed)
         assert scheduler._scheduling_pool.completed == [("req-1", "batch-1")]
-        # Still exactly one persisted failure for that batch.
+        # Still exactly one persisted failure for that batch, one report.
         assert [entry[0] for entry in scheduler.storage.statuses] == ["batch-1"]
+        assert scheduler.worker.fatals == [("worker fatal", True)]
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
+def test_listener_recreates_a_crashed_task_on_the_next_generation(tmp_path):
+    """_ensure_completion_listener remains as crash recovery: a listener task
+    that died is recreated when the next generation is announced."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        first = scheduler._completion_listener_task
+        first.cancel()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+
+        fresh_queue: Any = queue.Queue()
+        scheduler.worker.response_queue = fresh_queue
+        await asyncio.to_thread(scheduler.worker_generation_ready)
+        assert scheduler._completion_listener_task is not first
+        assert not scheduler._completion_listener_task.done()
+
+        fresh_queue.put(_completion("req-1", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.completed)
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
+def test_item_queued_before_a_generation_bump_is_dropped(tmp_path):
+    """An item accepted while its generation was live can still be waiting in
+    the inbox when a restart advances the generation. The listener re-checks
+    the tag, so the stale item never mutates live state."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        assert scheduler._pump_generation == 1
+
+        # Accepted by the insert-time filter while gen 1 is live, then the
+        # generation advances before the listener runs (no await in between).
+        scheduler._offer_completion(1, _completion("req-2", "batch-1"))
+        assert scheduler._completion_inbox.qsize() == 1
+        scheduler.worker.response_queue = queue.Queue()
+        scheduler._start_completion_pump()
+        assert scheduler._pump_generation == 2
+
+        assert await _await_true(lambda: scheduler._completion_inbox.empty())
+        await asyncio.sleep(0.1)
+        assert scheduler._scheduling_pool.completed == []
+        assert scheduler._scheduling_pool.freed == []
+        assert not (tmp_path / "batch-1.jsonl").exists()
+
+        # The live generation's items still route.
+        scheduler.worker.response_queue.put(_completion("req-1", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.completed)
+        assert scheduler._scheduling_pool.completed == [("req-1", "batch-1")]
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
+def test_stale_pool_shutdown_does_not_fail_or_report_the_live_generation(tmp_path):
+    """A pool_shutdown from the old cohort that is consumed after the bump
+    must not fail the live batches nor take the new cohort down."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+
+        scheduler._offer_completion(
+            1, {"type": "pool_shutdown", "error": "old cohort fatal"}
+        )
+        scheduler.worker.response_queue = queue.Queue()
+        scheduler._start_completion_pump()
+
+        assert await _await_true(lambda: scheduler._completion_inbox.empty())
+        await asyncio.sleep(0.1)
+        assert scheduler.worker.fatals == []
+        assert scheduler.storage.statuses == []
+        assert tracker.error is None
+        assert scheduler._scheduling_pool.cleared == 0
+        assert not scheduler._completion_listener_task.done()
 
         await _shutdown(scheduler)
 
@@ -482,3 +582,130 @@ def test_batch_admission_passes_the_state_gate_while_serving():
     # Past the state gate, into the pre-existing unknown-input-file rejection.
     assert excinfo.value.status_code == 400
     assert "file-missing" in str(excinfo.value.detail)
+
+
+def _load_intake_pool_module():
+    """Load intake_pool.py by path: it is stdlib-only, while importing it as
+    batchgen.server.intake_pool runs the package __init__ (GPU-only deps)."""
+    import importlib.util
+    import sys
+
+    path = ROOT / "batchgen/server/intake_pool.py"
+    spec = importlib.util.spec_from_file_location("_isolated_intake_pool", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _intake_entries(module, batch_id: str, count: int) -> List[Any]:
+    return [
+        module.IntakeEntry(
+            request_id=f"req-{idx}@{batch_id}",
+            batch_id=batch_id,
+            raw_request={"text": "prompt", "max_tokens": 4},
+            priority=module.Priority.NORMAL,
+        )
+        for idx in range(count)
+    ]
+
+
+def test_failing_a_batch_purges_its_queued_intake_entries(tmp_path):
+    """A batch persisted as failed must never reach a later worker generation:
+    its entries still queued in the intake pool are discarded with it."""
+
+    async def scenario():
+        intake_mod = _load_intake_pool_module()
+        scheduler = _scheduler(tmp_path)
+        intake = intake_mod.IntakePool(max_capacity=100)
+        scheduler._intake_pool = intake
+        intake.submit_batch("batch-1", _intake_entries(intake_mod, "batch-1", 3))
+        intake.submit_batch("batch-2", _intake_entries(intake_mod, "batch-2", 2))
+        failing = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        finished = SimpleNamespace(is_complete=True, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers.update(
+            {"batch-1": failing, "batch-2": finished}
+        )
+
+        assert scheduler._fail_all_active_batches("worker died") == 1
+
+        assert failing.error == "worker died"
+        assert intake.size() == 2
+        assert intake.batch_remaining("batch-1") == 0
+        assert {entry.batch_id for entry in intake.drain(10)} == {"batch-2"}
+
+    asyncio.run(scenario())
+
+
+class _DrainSchedulingPoolStub(_SchedulingPoolStub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.allocated: List[str] = []
+
+    def select_from_intake(self, intake, max_n=None):
+        return intake.drain(max_n)
+
+    def allocate_slot(self, request_id: str) -> int:
+        self.allocated.append(request_id)
+        return len(self.allocated) - 1
+
+    def get_batch_tracker(self, batch_id: str):
+        return self._batch_trackers.get(batch_id)
+
+
+class _RecordingRequestQueue:
+    def __init__(self) -> None:
+        self.items: List[Any] = []
+
+    def put(self, item: Any) -> None:
+        self.items.append(item)
+
+
+def test_drain_discards_entries_of_an_inactive_batch_without_a_slot(
+    tmp_path, caplog
+):
+    """Defense in depth: an entry of a failed, complete, or finalized batch
+    that is still in the intake pool (e.g. requeued after the purge) is
+    dropped by the drain, holds no scheduling slot, and is never admitted."""
+
+    async def scenario():
+        intake_mod = _load_intake_pool_module()
+        scheduler = _scheduler(tmp_path)
+        intake = intake_mod.IntakePool(max_capacity=100)
+        scheduler._intake_pool = intake
+        pool = _DrainSchedulingPoolStub()
+        scheduler._scheduling_pool = pool
+        scheduler._quiesced = threading.Event()
+        scheduler._quiesce_ack = threading.Event()
+        scheduler._pool_initialized = True
+        scheduler.worker.request_queue = _RecordingRequestQueue()
+        pool._batch_trackers.update({
+            "live": SimpleNamespace(is_complete=False, is_failed=False),
+            "failed": SimpleNamespace(is_complete=False, is_failed=True),
+            "complete": SimpleNamespace(is_complete=True, is_failed=False),
+        })
+        intake.submit_batch("failed", _intake_entries(intake_mod, "failed", 2))
+        intake.submit_batch("live", _intake_entries(intake_mod, "live", 1))
+        intake.submit_batch("complete", _intake_entries(intake_mod, "complete", 1))
+        intake.submit_batch("finalized", _intake_entries(intake_mod, "finalized", 1))
+
+        task = asyncio.create_task(scheduler._drain_intake_loop())
+        assert await _await_true(lambda: scheduler.worker.request_queue.items)
+        assert await _await_true(intake.is_empty)
+        await asyncio.sleep(0.3)
+        scheduler._stopped.set()
+        await asyncio.wait_for(task, timeout=5.0)
+
+        admitted = [
+            entry["request_id"]
+            for msg in scheduler.worker.request_queue.items
+            for entry in msg["entries"]
+        ]
+        assert admitted == ["req-0@live"]
+        assert pool.allocated == ["req-0@live"]
+        assert scheduler._stale_intake_batches == {"failed", "complete", "finalized"}
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    discards = [r for r in caplog.records if "Discarding" in r.getMessage()]
+    assert len(discards) == 3

@@ -113,6 +113,7 @@ def _manager(monkeypatch):
     manager._restart_timeout_s = 10.0
     manager._monitor_stop_event = threading.Event()
     manager._stopping = False
+    manager.started = True
     manager._ready_event = threading.Event()
     manager._fatal_ack_event = threading.Event()
     manager._monitor_thread = None
@@ -336,6 +337,132 @@ def test_startup_failure_keeps_fail_fast_signal(monkeypatch):
     assert manager.state == "serving"
 
 
+def test_monitor_failure_defers_to_a_running_restart(monkeypatch):
+    """A restart that already set "restarting" owns the cohort's teardown; a
+    monitor failure arriving then must not tear down, reconcile, or overwrite
+    the state."""
+    manager = _manager(monkeypatch)
+    manager._state = "restarting"
+    calls = []
+
+    class ExitState:
+        def set_failure(self, reason, exc):
+            calls.append("set_failure")
+            return True
+
+    manager._worker_exit_state = ExitState()
+    manager._quiesce_hook = lambda: calls.append("quiesce")
+    manager._stop_workers = lambda: calls.append("teardown")
+    manager._reconcile = lambda reason, fail_in_flight: calls.append("reconcile")
+
+    manager._handle_worker_failure("worker exited", None)
+
+    assert manager.state == "restarting"
+    assert calls == []
+
+
+def test_monitor_claims_teardown_in_the_same_critical_section(monkeypatch):
+    """The ownership check and the workers_down transition must be atomic: a
+    restart that tries to take the cohort while the monitor is deciding must
+    find the state lock held, then see workers_down (never a serving state
+    that the monitor is about to overwrite)."""
+    manager = _manager(monkeypatch)
+    calls = []
+    lock_free_during_claim = []
+
+    class ExitState:
+        def set_failure(self, reason, exc):
+            # A restart arriving now cannot get in between the check and the
+            # transition.
+            acquired = manager._lock.acquire(blocking=False)
+            if acquired:
+                manager._lock.release()
+            lock_free_during_claim.append(acquired)
+            return True
+
+    manager._worker_exit_state = ExitState()
+    manager._stop_workers = lambda: calls.append("teardown")
+    manager._reconcile = lambda reason, fail_in_flight: calls.append(
+        ("reconcile", fail_in_flight)
+    )
+
+    manager._handle_worker_failure("worker exited", None)
+
+    assert lock_free_during_claim == [False]
+    assert manager.state == "workers_down"
+    assert calls == ["teardown", ("reconcile", True)]
+
+    # A second report of the same cohort (e.g. the scheduler's pool_shutdown
+    # after the monitor's exit detection) finds workers_down and does nothing.
+    manager._handle_worker_failure("pool_shutdown fatal", None)
+    assert calls == ["teardown", ("reconcile", True)]
+
+
+def test_monitor_and_restart_race_has_a_single_teardown_owner(monkeypatch):
+    """Thread choreography: the monitor and an explicit restart enter
+    concurrently against one serving cohort. Whichever wins the state lock
+    owns teardown; the other does not tear down."""
+    for restart_first in (True, False):
+        manager = _manager(monkeypatch)
+        teardowns = []
+        entered_restart = threading.Event()
+        release_restart = threading.Event()
+
+        class ExitState:
+            def set_failure(self, reason, exc):
+                return True
+
+            def clear(self):
+                pass
+
+            def is_failed(self):
+                return False
+
+        manager._worker_exit_state = ExitState()
+        manager._reconcile = lambda reason, fail_in_flight: {"failed_batches": 0}
+        # The restart runs off the main thread here, as it does in the server.
+        manager.set_main_thread_dispatcher(lambda fn, timeout: fn())
+
+        def restart_quiesce():
+            entered_restart.set()
+            assert release_restart.wait(5)
+
+        manager._quiesce_hook = restart_quiesce if restart_first else (lambda: None)
+        manager._stop_workers = lambda: teardowns.append(
+            threading.current_thread().name
+        )
+
+        if restart_first:
+            restarter = threading.Thread(
+                target=manager.restart_workers, kwargs={"timeout_s": 1},
+                name="restart",
+            )
+            restarter.start()
+            assert entered_restart.wait(5)
+            assert manager.state == "restarting"
+            monitor = threading.Thread(
+                target=manager._handle_worker_failure,
+                args=("worker exited", None),
+                name="monitor",
+            )
+            monitor.start()
+            monitor.join(5)
+            release_restart.set()
+            restarter.join(5)
+            assert teardowns == ["restart"]
+            assert manager.state == "serving"
+        else:
+            monitor = threading.Thread(
+                target=manager._handle_worker_failure,
+                args=("worker exited", None),
+                name="monitor",
+            )
+            monitor.start()
+            monitor.join(5)
+            assert teardowns == ["monitor"]
+            assert manager.state == "workers_down"
+
+
 def test_explicit_restart_does_not_double_persist_prior_pool_shutdown(monkeypatch):
     manager = _manager(monkeypatch)
     calls = []
@@ -403,6 +530,102 @@ def test_stale_exit_state_is_cleared_before_ready_wait(monkeypatch):
     assert order[0] == "clear_exit_state"
     assert "wait_ready" in order
     assert manager.state == "serving"
+
+
+@pytest.mark.parametrize("hook", ["generation_ready", "resume"])
+def test_failing_scheduler_hook_leaves_workers_down_not_serving(monkeypatch, hook):
+    """The scheduler hooks are the last restart phase: if one raises, the
+    restart failed and the manager must be retryable, not falsely serving."""
+    manager = _manager(monkeypatch)
+
+    def failing():
+        raise RuntimeError(f"{hook} hook failed")
+
+    if hook == "generation_ready":
+        manager._scheduler_generation_hook = failing
+    else:
+        manager._resume_hook = failing
+
+    with pytest.raises(RuntimeError, match=f"{hook} hook failed"):
+        manager.restart_workers(timeout_s=1)
+
+    assert manager.state == "workers_down"
+    assert manager.generation == 3
+
+    # Retryable: a later restart with healthy hooks reaches serving.
+    manager._scheduler_generation_hook = lambda: None
+    manager._resume_hook = lambda: None
+    manager.restart_workers(timeout_s=1)
+    assert manager.state == "serving"
+    assert manager.generation == 4
+
+
+def test_scheduler_hooks_run_before_the_serving_flip(monkeypatch):
+    manager = _manager(monkeypatch)
+    observed = []
+    manager._scheduler_generation_hook = lambda: observed.append(
+        ("generation_ready", manager.state, manager.generation)
+    )
+    manager._resume_hook = lambda: observed.append(
+        ("resume", manager.state, manager.generation)
+    )
+
+    manager.restart_workers(timeout_s=1)
+
+    assert observed == [
+        ("generation_ready", "restarting", 3),
+        ("resume", "restarting", 3),
+    ]
+    assert manager.state == "serving"
+    assert manager.generation == 4
+
+
+@pytest.mark.parametrize("stop_phase", ["entry", "after_teardown", "before_spawn"])
+def test_restart_aborts_to_workers_down_once_shutdown_begins(monkeypatch, stop_phase):
+    """SIGINT cannot cancel the restart thread, so the restart checks for
+    shutdown at its phase boundaries and never spawns after stop() began."""
+    manager = _manager(monkeypatch)
+    phases = []
+    manager._quiesce_hook = lambda: phases.append("quiesce")
+    manager._resume_hook = lambda: phases.append("resume")
+
+    def teardown():
+        phases.append("teardown")
+        if stop_phase == "after_teardown":
+            manager._stopping = True
+
+    def channels_created():
+        phases.append("channels")
+        if stop_phase == "before_spawn":
+            # stop() ran to completion during this phase: _stopping is
+            # cleared again on its way out, only started stays False.
+            manager.started = False
+
+    manager._stop_workers = teardown
+    original_create = manager._create_worker_channels
+
+    def create_channels():
+        original_create()
+        channels_created()
+
+    manager._create_worker_channels = create_channels
+    manager._spawn_workers = lambda: phases.append("spawn")
+    if stop_phase == "entry":
+        manager._stopping = True
+
+    with pytest.raises(RuntimeError, match="server is stopping"):
+        manager.restart_workers(timeout_s=1)
+
+    assert manager.state == "workers_down"
+    assert manager.generation == 3
+    assert "spawn" not in phases
+    assert "resume" not in phases
+    if stop_phase == "entry":
+        assert phases == []
+    elif stop_phase == "after_teardown":
+        assert phases == ["quiesce", "teardown"]
+    else:
+        assert phases == ["quiesce", "teardown", "channels"]
 
 
 def test_restart_result_reports_all_phase_timings(monkeypatch):
