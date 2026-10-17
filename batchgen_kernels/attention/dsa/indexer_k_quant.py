@@ -17,6 +17,7 @@ stays importable (and testable) without Triton or a GPU.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -25,14 +26,25 @@ __all__ = [
     "SCALE_BYTES_PER_TOKEN",
     "FP8_MAX",
     "AMAX_FLOOR",
+    "MAX_DATA_DIM",
+    "WARP_SIZE",
     "quantize_indexer_k_fp8",
     "page_split_geometry",
     "page_split_write_reference",
+    "page_split_cache_pages",
+    "cache_is_page_split",
+    "cache_data_dim",
+    "PageSplitWritePlan",
+    "plan_page_split_write",
 ]
 
 SCALE_BYTES_PER_TOKEN = 4
 FP8_MAX = 448.0
 AMAX_FLOOR = 1e-4
+# One warp per token with at most 8 elements per lane, mirrored from
+# `src/attention/fused_indexer_k_write_fp8.cu`.
+WARP_SIZE = 32
+MAX_DATA_DIM = 256
 
 
 def quantize_indexer_k_fp8(
@@ -100,6 +112,129 @@ def page_split_geometry(blocked_kv: torch.Tensor) -> Tuple[int, int, int, int]:
             f"{SCALE_BYTES_PER_TOKEN} to address the scale region as fp32"
         )
     return num_pages, page_bytes, data_dim, page_size * data_dim
+
+
+def cache_is_page_split(blocked_kv: torch.Tensor, data_dim: int) -> bool:
+    """True when this paged cache stores page-split FP8 pages.
+
+    ``data_dim`` is the real head dim (elements of one token's keys). A
+    page-split cache has a 1-byte element type and carries ``data_dim + 4``
+    BYTES per token; an AoS cache carries ``data_dim`` elements of the key
+    dtype. Any other combination is a mis-sized cache and is named here
+    instead of being written through.
+    """
+
+    carrier = int(blocked_kv.shape[-1])
+    element_size = int(blocked_kv.element_size())
+    data_dim = int(data_dim)
+    if element_size == 1:
+        if carrier != data_dim + SCALE_BYTES_PER_TOKEN:
+            raise ValueError(
+                "a 1-byte indexer cache must be page-split, i.e. carry "
+                f"{data_dim} K bytes plus {SCALE_BYTES_PER_TOKEN} scale bytes "
+                f"per token, got a trailing dim of {carrier}"
+            )
+        return True
+    if carrier != data_dim:
+        raise ValueError(
+            f"an AoS indexer cache must carry {data_dim} elements per token, "
+            f"got a trailing dim of {carrier}"
+        )
+    return False
+
+
+def cache_data_dim(blocked_kv: torch.Tensor) -> int:
+    """Elements of K data per token in this paged cache.
+
+    ``trailing dim - 4`` for a page-split cache (its trailing dim counts
+    bytes, scale bytes included), the trailing dim itself for AoS.
+    """
+
+    carrier = int(blocked_kv.shape[-1])
+    if int(blocked_kv.element_size()) == 1:
+        return carrier - SCALE_BYTES_PER_TOKEN
+    return carrier
+
+
+def page_split_cache_pages(blocked_kv: torch.Tensor) -> torch.Tensor:
+    """``[num_pages, page_bytes]`` uint8 view of a page-split paged cache.
+
+    The fused writer and the host copy paths both address a page as flat
+    bytes, so the byte view is derived once, here, from the cache the KV
+    manager allocated (``[num_pages, page_size, 1, carrier_dim]``).
+    """
+
+    num_pages, page_bytes, _, _ = page_split_geometry(blocked_kv)
+    return blocked_kv.view(torch.uint8).reshape(num_pages, page_bytes)
+
+
+@dataclass(frozen=True)
+class PageSplitWritePlan:
+    """Resolved geometry of one fused quantize+write launch."""
+
+    num_tokens: int
+    num_pages: int
+    page_size: int
+    page_bytes: int
+    data_dim: int
+    scale_region_offset: int
+
+
+def plan_page_split_write(
+    blocked_kv: torch.Tensor,
+    k_src: torch.Tensor,
+    page_size_tokens: int,
+) -> PageSplitWritePlan:
+    """Validate a fused quantize+write against a cache and return its geometry.
+
+    ``k_src`` is the bf16 indexer K of this step, either ``[N, data_dim]`` or
+    any shape whose trailing dim is ``data_dim`` and whose remaining dims
+    multiply to ``N`` (the decode writers hand over ``[N, 1, 1, data_dim]``).
+
+    This is the whole precondition set of the CUDA kernel, expressed in torch
+    so it is checked -- and tested -- without a GPU. Every failure names the
+    two numbers that disagree instead of letting a launch write a wrong page.
+    """
+
+    num_pages, page_bytes, data_dim, scale_region_offset = page_split_geometry(
+        blocked_kv
+    )
+    page_size = int(blocked_kv.shape[1])
+    if int(page_size_tokens) != page_size:
+        raise ValueError(
+            f"page_size_tokens {int(page_size_tokens)} does not match the "
+            f"cache's page size {page_size}"
+        )
+    if data_dim % WARP_SIZE != 0 or data_dim > MAX_DATA_DIM:
+        raise ValueError(
+            f"the fused page-split writer supports a data dim that is a "
+            f"multiple of {WARP_SIZE} and at most {MAX_DATA_DIM}, got "
+            f"{data_dim}"
+        )
+    if k_src.dtype is not torch.bfloat16:
+        raise ValueError(
+            f"the fused page-split writer quantizes from bfloat16, got "
+            f"{k_src.dtype}"
+        )
+    if k_src.dim() < 1 or int(k_src.shape[-1]) != data_dim:
+        raise ValueError(
+            f"k_src trailing dim {tuple(k_src.shape)} does not match the "
+            f"cache's {data_dim} K data elements per token"
+        )
+    num_tokens = k_src.numel() // data_dim if data_dim else 0
+    if num_tokens * data_dim != k_src.numel():
+        raise ValueError(
+            f"k_src holds {k_src.numel()} elements, which is not a whole "
+            f"number of {data_dim}-element tokens"
+        )
+    return PageSplitWritePlan(
+        num_tokens=int(num_tokens),
+        num_pages=int(num_pages),
+        page_size=page_size,
+        page_bytes=int(page_bytes),
+        data_dim=int(data_dim),
+        scale_region_offset=int(scale_region_offset),
+    )
 
 
 def page_split_write_reference(
