@@ -150,11 +150,15 @@ class FakeDist:
         assert group is not None, "the pool budget must reduce over the group"
         self.reduced.append([int(value) for value in tensor.tolist()])
         if self.peer_budget is not None:
-            # The planner reduces [pages, slots]; pool construction reduces a
-            # 1-wide [pages] tensor over the same group.
-            peer = torch.tensor(
-                self.peer_budget[: tensor.numel()], dtype=tensor.dtype
-            )
+            # The planner reduces [pages, slots, materialization vote]; pool
+            # construction reduces a 1-wide [pages] tensor over the same
+            # group. A scripted peer that says nothing about the trailing
+            # values contributes a value the MIN ignores -- for the vote that
+            # is 1, "this peer confirms".
+            values = list(self.peer_budget[: tensor.numel()])
+            while len(values) < tensor.numel():
+                values.append(1)
+            peer = torch.tensor(values, dtype=tensor.dtype)
             torch.minimum(tensor, peer, out=tensor)
 
     def all_gather(self, out, tensor, group=None):
@@ -287,6 +291,12 @@ def _plan_worker(
             "_prefill_pool_group",
             "_prefill_pool_free_state_slots",
             "_replace_prefix_lookup_hits",
+            # M3 Slice 3 plan input: with the trajectory flag off these
+            # return "no hits" and the plan is the pre-Slice-3 one.
+            "_materialized_prefix_hits",
+            "_unmaterializable_frontier",
+            "_trajectory_commit_requested",
+            "_owns_host_kv",
             "_decode_attn_tp_size",
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
@@ -331,6 +341,9 @@ def _plan_worker(
         prefix_cache_coordinator=RecordingCoordinator(),
         _prefix_sequence_states={},
         _prefill_pool_base=(0, 0, 0),
+        # No trajectory frontier in play: no attachment, no mirrored index.
+        _trajectory_attachments={},
+        _trajectory_session_groups=None,
         # No worker-wide batchgen_debug: the batch-level flags are the only
         # source, and none of these sequences sets one.
         _batchgen_debug=None,
@@ -441,7 +454,11 @@ def test_pool_budget_is_the_group_minimum(monkeypatch):
 
     wave = worker._plan_prefill_pool_wave(UUIDS, {})
 
-    assert fake_dist.reduced == [[20, 32]], "the rank must contribute its own budget"
+    # Pages, state slots and the M3 Slice 3 materialization vote (1 = this
+    # rank has nothing to object to) travel in the one reduce.
+    assert fake_dist.reduced == [[20, 32, 1]], (
+        "the rank must contribute its own budget"
+    )
     assert wave is not None
     assert wave.total_pages == 16
     # The pool is built in the prefill phase; the group's 16 pages are each the

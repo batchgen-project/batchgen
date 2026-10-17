@@ -5947,6 +5947,20 @@ class BatchGenWorker:
 				)
 				self._prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
+		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# governs the whole trajectory path, so lookups cannot be on while
+		# commits are off. With it off nothing here runs and no attachment is
+		# taken, so the restore seam stays empty and this wave is
+		# byte-identical to a pre-Slice-2 one.
+		#
+		# Slice 3 moved this IN FRONT of the pool plan: a hit whose prefix the
+		# wave materializes is a plan input, and the reference this lookup
+		# takes is what keeps the frontier's pages resident from the plan that
+		# names them to the load that reads them.
+		if owned and self._trajectory_commit_requested(
+			[self.global_batch.get_sequence(uuid) for uuid in served]
+		):
+			self._lookup_trajectory_frontiers(owned)
 		# In-wave pool: plan this rank's shared segments from the same wave.
 		# The plan only reads tokens and states; Host pages for the segments
 		# are allocated inside the reservation transaction below.
@@ -5971,15 +5985,6 @@ class BatchGenWorker:
 					self._replace_prefix_lookup_hits(
 						seqs, prefix_states, [0] * len(seqs)
 					)
-		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
-		# governs the whole trajectory path, so lookups cannot be on while
-		# commits are off. With it off nothing below runs and no attachment
-		# is taken, so the restore seam stays empty and this wave is
-		# byte-identical to a pre-Slice-2 one.
-		if owned and self._trajectory_commit_requested(
-			[self.global_batch.get_sequence(uuid) for uuid in served]
-		):
-			self._lookup_trajectory_frontiers(owned)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -11209,6 +11214,148 @@ class BatchGenWorker:
 					"wave" if current_wave else "sharing-aware", len(seqs), counts,
 				)
 
+	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
+		"""``(hits, confirmed, pages)`` for this wave's trajectory re-entries.
+
+		M3 Slice 3, the plan input. EVERY rank of a serve group must derive
+		the SAME hit set BEFORE planning, or two ranks pack different chunks
+		of the per-layer collectives that pair them up. So the set is read
+		from the MIRRORED session index -- replicated read-only data every
+		rank folded from the same gather -- and never from the frontier
+		registry, which only the group's host-KV leader holds. At G==1 a rank
+		is its own group, and its own live attachments are that same data.
+
+		``confirmed`` is this rank's vote on whether the mirrored set is still
+		true. The index distributes on the prefill-config mirror, so it lags a
+		commit by one flag-on pass (Slice 3a addendum): a session that has
+		advanced or been evicted since would otherwise be materialized from
+		pages nobody holds any more. The leader compares the mirrored boundary
+		against the record it is holding a reference on; a rank with no
+		opinion votes yes and the group reduces with MIN, so one leader's
+		"no" takes the whole group back to recomputing.
+
+		``pages`` maps a hit's wave index to the frontier's resident Host
+		pages per KV group -- known only to the leader, which mirrors them to
+		the group inside this same pass.
+		"""
+		from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
+
+		if not self._trajectory_commit_requested(seqs):
+			return [], True, {}
+		digest = self.prefix_cache_runtime_config.namespace_digest
+		index = self._trajectory_session_groups
+		hits: List[MaterializedPrefix] = []
+		pages: Dict[int, Dict[int, List[int]]] = {}
+		confirmed = True
+		for position, seq in enumerate(seqs):
+			if seq is None:
+				continue
+			attachment = self._trajectory_attachments.get(int(seq.global_idx))
+			if group is None:
+				# Own group: no peer to agree with, so the live record is the
+				# only truth there is.
+				if attachment is None:
+					continue
+				boundary = int(attachment.boundary_tokens)
+				entry_group = int(attachment.owning_group_id)
+			else:
+				entry = None if index is None else index.resolve(
+					namespace_digest=digest,
+					prompt_token_ids=self._trajectory_tokens(
+						seq, length=seq.prompt_length
+					).tolist(),
+				)
+				if entry is None:
+					continue
+				boundary = int(entry.boundary_tokens)
+				entry_group = int(entry.owning_group_id)
+			reason = self._unmaterializable_frontier(
+				seq, boundary=boundary, owning_group_id=entry_group,
+				page_tokens=page_tokens,
+			)
+			if reason is not None:
+				logging.info(
+					"[PREFIX_POOL] Rank %s sequence %s continues a frontier at "
+					"%s token(s) the pool cannot materialize (%s); it is "
+					"prefilled in full",
+					self.rank, int(seq.global_idx), boundary, reason,
+				)
+				continue
+			hits.append(MaterializedPrefix(index=position, tokens=boundary))
+			if attachment is None:
+				if self._owns_host_kv(seq):
+					# This rank holds the registry the index came from and has
+					# no live record for it: the mirror is stale.
+					logging.warning(
+						"[PREFIX_POOL] Rank %s holds no live frontier for "
+						"sequence %s, which the mirrored session index places "
+						"at boundary %s; the group recomputes this wave",
+						self.rank, int(seq.global_idx), boundary,
+					)
+					confirmed = False
+				continue
+			if int(attachment.boundary_tokens) != boundary:
+				logging.warning(
+					"[PREFIX_POOL] Rank %s holds sequence %s's frontier at "
+					"boundary %s but the mirrored index says %s; the group "
+					"recomputes this wave",
+					self.rank, int(seq.global_idx),
+					int(attachment.boundary_tokens), boundary,
+				)
+				confirmed = False
+				continue
+			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			attached = 0 if state is None else int(state.attached_tokens)
+			if attached < boundary:
+				# The resident pages the load reads are kept resident by this
+				# sequence's own prefix-cache attachment, so that attachment
+				# must already cover the frontier. It normally covers more (the
+				# lookup attaches the longest resident prefix); less means the
+				# cache does not in fact hold what the index advertised.
+				logging.warning(
+					"[PREFIX_POOL] Rank %s: sequence %s holds %s attached "
+					"prefix token(s), fewer than the %s-token frontier the "
+					"index advertised; the group recomputes",
+					self.rank, int(seq.global_idx), attached, boundary,
+				)
+				confirmed = False
+				continue
+			record_pages = {
+				int(group_id): [int(page) for page in page_ids]
+				for group_id, page_ids in
+				attachment.record.page_ids_by_group.items()
+			}
+			if not record_pages:
+				logging.warning(
+					"[PREFIX_POOL] Rank %s: sequence %s's frontier record "
+					"names no resident Host page; the group recomputes",
+					self.rank, int(seq.global_idx),
+				)
+				confirmed = False
+				continue
+			pages[position] = record_pages
+		return hits, confirmed, pages
+
+	def _unmaterializable_frontier(
+		self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
+	) -> Optional[str]:
+		"""Why this frontier cannot become a pool segment, or None.
+
+		Each reason is a property of the wave, identical on every rank that
+		derived the same hit, so skipping on it keeps the plans identical.
+		"""
+
+		if boundary <= 0 or boundary % int(page_tokens):
+			return "boundary_off_the_page_grid"
+		if boundary > int(seq.prompt_length) - 1:
+			# The last prompt token must stay private: it produces the logit.
+			return "no_private_token_left"
+		if int(seq.decode_dp_group or 0) != int(owning_group_id):
+			# The snapshot is head-sharded for the owning group, so a
+			# sequence serving elsewhere could not restore its state.
+			return "serving_group_is_not_the_owning_group"
+		return None
+
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
 		"""Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
 		the prefill phase (`_construct_prefill_pool`), after configure_prefill
@@ -11233,6 +11380,7 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
+			PoolMaterializationDoesNotFit,
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
 		)
@@ -11263,18 +11411,36 @@ class BatchGenWorker:
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
 		state_slots = self._prefill_pool_free_state_slots()
+		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
+		# replicated data so every rank of the group has the same set, plus
+		# this rank's vote on whether that set is still live.
+		hits, hits_confirmed, hit_pages = self._materialized_prefix_hits(
+			seqs, page_tokens=page_tokens, group=group
+		)
 		if group is not None:
 			# Reached by every rank of the group (uuids is the group's sequence
 			# set): the tightest rank's budget is the group's, so the identical
-			# prompts then give every rank the identical plan.
+			# prompts then give every rank the identical plan. The
+			# materialization vote rides the SAME reduce -- it decides the
+			# plan, so it has to be settled before the plan is built, and a
+			# second collective here would be a second place to diverge.
 			budget = torch.tensor(
-				[total_pages, state_slots],
+				[total_pages, state_slots, 1 if hits_confirmed else 0],
 				dtype=torch.int64,
 				device=self.torch_device,
 			)
 			dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)
 			total_pages = int(budget[0].item())
 			state_slots = int(budget[1].item())
+			hits_confirmed = bool(int(budget[2].item()))
+		if hits and not hits_confirmed:
+			logging.warning(
+				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): the "
+				"serve group could not confirm the mirrored frontier set; the "
+				"wave recomputes them",
+				self.rank, len(hits),
+			)
+			hits = []
 		if self._prefill_pool_psm_layout() is not None:
 			# The pool holds EVERY token of a chunk, tails as well as segments,
 			# so a chunk wider than the pool can never be planned; leave half the
@@ -11304,8 +11470,7 @@ class BatchGenWorker:
 		# the pool layout above; GPT-OSS and GLM declare neither.
 		declares = getattr(self.parallel_manager, "supports_group_pool_prefill", None)
 		level_wise = declares is not None and bool(declares())
-		plan = plan_wave_prefix_sharing(
-			prompts,
+		plan_kwargs = dict(
 			block_tokens=page_tokens,
 			pool_pages=total_pages - scratch,
 			chunk_tokens=chunk_tokens,
@@ -11316,6 +11481,30 @@ class BatchGenWorker:
 			# plus an FP8 copy, ~384 B each); keep that inside the workspace.
 			chunk_keys=None if with_v else 8 * 1024 * 1024,
 		)
+		if hits and not plan_kwargs["same_chunk_ancestors"]:
+			# A model whose rows cannot read a segment resident in their own
+			# chunk cannot run a load either; named here rather than refused
+			# inside the planner on every wave.
+			logging.info(
+				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): this "
+				"model's pool does not read a segment resident in its own "
+				"chunk",
+				self.rank, len(hits),
+			)
+			hits = []
+		try:
+			plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
+		except PoolMaterializationDoesNotFit as exc:
+			# Deterministic in the group's own inputs (the same prompts, the
+			# same hit set, the same group-MIN budget), so every rank of the
+			# group falls back on the same wave.
+			logging.warning(
+				"[PREFIX_POOL] Rank %s plans this wave WITHOUT its %d "
+				"materialized prefix(es) and recomputes them: %s",
+				self.rank, len(hits), exc,
+			)
+			hits = []
+			plan = plan_wave_prefix_sharing(prompts, materialized=(), **plan_kwargs)
 		if level_wise:
 			# Rows grouped by level, so a recurrent layer runs one packed call
 			# per level, each after the level that left its parents' state.
@@ -11326,7 +11515,11 @@ class BatchGenWorker:
 		# row of its own, so on a model with per-sequence recurrent state it
 		# holds a slot of its own until the wave ends. The slot budget is the
 		# group MIN, so this decline is group-uniform like every other.
-		state_slots_needed = len(plan.segments) + len(prompts)
+		# A materialized segment is no row, so it holds no recurrent state
+		# slot; only the segments a row computes do.
+		state_slots_needed = (
+			len(plan.segments) - len(plan.materialized_segments) + len(prompts)
+		)
 		if not plan.segments or 0 <= state_slots < state_slots_needed:
 			logging.info(
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
@@ -11343,8 +11536,25 @@ class BatchGenWorker:
 			total_pages=total_pages,
 			scratch_pages=scratch,
 		)
+		for segment_id in sorted(wave.materialized):
+			members = plan.segments[segment_id].members
+			source = next(
+				(hit_pages[index] for index in members if index in hit_pages),
+				None,
+			)
+			if source is None:
+				# A follower holds no record: the leader mirrors these pages
+				# inside this same pass, before the forward reads them.
+				continue
+			wave.bind_materialized_host_pages(segment_id, source)
 		self._replace_prefix_lookup_hits(
-			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
+			seqs, prefix_states,
+			[wave.chain_tokens(index) for index in range(len(seqs))],
+			retain=frozenset(
+				index
+				for segment_id in wave.materialized
+				for index in plan.segments[segment_id].members
+			),
 		)
 		logging.info(
 			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
@@ -11575,22 +11785,37 @@ class BatchGenWorker:
 		self._prefill_pool_layout_cache = layout
 		return layout
 
-	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
+	def _replace_prefix_lookup_hits(
+		self, seqs, prefix_states, chain_tokens, retain=frozenset()
+	) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
 
 		A serve-group follower plans the same wave as its leader but holds no
 		lookup of its own — the leader owns every coordinator attachment and
 		mirrors the state afterwards — so a missing entry is its normal case and
 		leaves nothing to release.
+
+		``retain`` names the wave indices whose attachment must SURVIVE this
+		call (M3 Slice 3: a materialized prefix is read out of the prefix
+		cache's own resident pages for the whole wave, and that attachment is
+		what keeps them resident; a computed segment needs no such protection
+		because the wave publishes it afresh). The handle moves into the
+		sequence's retained-handle tuple, so the one release lane every
+		sequence leaves through frees it exactly once.
 		"""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
-		for seq, end in zip(seqs, chain_tokens):
+		for index, (seq, end) in enumerate(zip(seqs, chain_tokens)):
 			old = prefix_states.get(seq.global_idx)
-			if old is not None and old.attachment_handle:
-				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
+			handle = 0 if old is None else int(old.attachment_handle)
+			if handle and index not in retain:
+				self.prefix_cache_coordinator.release_attachment(handle)
+				handle = 0
 			state = PrefixCacheSequenceState(
-				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
+				lookup_result=None,
+				attached_tokens=end,
+				compute_cached_tokens=end,
+				commit_attachment_handles=(handle,) if handle else (),
 			)
 			prefix_states[seq.global_idx] = state
 			self._prefix_sequence_states[seq.global_idx] = state

@@ -996,8 +996,10 @@ def test_the_expansion_writes_what_computing_the_same_latent_writes():
     )
     pages = pool.alloc(2)
     slots = pool.slots(pages, 0, 2 * B)
-    untouched_k = pool.k[0].clone()
-    untouched_v = pool.v[0].clone()
+    # The pool is uninitialised memory, which can hold NaN -- zero it so
+    # "untouched" is a comparison and not a NaN lottery.
+    pool.k.zero_()
+    pool.v.zero_()
 
     written = mla_materialize_pool_segment(
         module, latent, pool=pool, pool_layer=1, slots=slots
@@ -1009,10 +1011,9 @@ def test_the_expansion_writes_what_computing_the_same_latent_writes():
     v_cache = pool.v[1].view(-1, *pool.v.shape[-2:])
     assert torch.equal(k_cache.index_select(0, slots), key)
     assert torch.equal(v_cache.index_select(0, slots), value)
-    # Only the addressed layer is touched (the pool is uninitialised memory,
-    # so the other layer is compared against what it held before the write).
-    assert torch.equal(pool.k[0], untouched_k)
-    assert torch.equal(pool.v[0], untouched_v)
+    # Only the addressed layer is touched.
+    assert torch.count_nonzero(pool.k[0]) == 0
+    assert torch.count_nonzero(pool.v[0]) == 0
 
 
 def test_the_expansion_goes_through_the_layers_own_projection_object():
