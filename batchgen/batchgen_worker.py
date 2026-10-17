@@ -1054,6 +1054,11 @@ class BatchGenWorker:
 		#     of G independent ones.
 		self._trajectory_arena_payload = {}
 		self._trajectory_mirrored_restores = {}
+		# M3 Slice 3a: the WORLD's session -> owning-group map, folded from
+		# every leader's summary on that same mirror. Built on the first fold,
+		# None whenever the trajectory flag never turned on, so the group
+		# assignment of a flag-off run reads one attribute and moves on.
+		self._trajectory_session_groups = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -2132,10 +2137,25 @@ class BatchGenWorker:
 				"frontier_restores": (
 					self._trajectory_restore_payload() if trajectory else {}
 				),
+				# M3 Slice 3a: this group's committed sessions. The gather
+				# below is over the DEFAULT process group -- the whole world,
+				# not the serve group -- so one leader's summary reaches every
+				# rank of every group, which is what makes the admission pin
+				# world-consistent.
+				"frontier_sessions": (
+					self._trajectory_session_summary() if trajectory else {}
+				),
 			}
 
 		gathered = [None] * self.world_size
 		dist.all_gather_object(gathered, payload)
+
+		if trajectory:
+			# EVERY rank folds EVERY leader's summary -- leaders included, so
+			# this runs before the leader's early return below. Group
+			# assignment is replicated across ranks and must agree, so its
+			# input may not be a rank-local subset.
+			self._fold_trajectory_session_groups(gathered)
 
 		leader = host_kv_owner_rank(self.rank // G, G)
 		if leader == self.rank:
@@ -2215,6 +2235,15 @@ class BatchGenWorker:
 		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
 		Idempotent (skips already-grouped seqs) and deterministic across ranks:
 		identical inputs -> identical map.
+
+		M3 Slice 3a adds ONE input in front of the balancer: a sequence that
+		continues a committed trajectory is PINNED to the group whose registry
+		holds that session. Without the pin the balancer places consecutive
+		batches independently, so a continuation lands on whichever group the
+		load says -- and a frontier registry is group-local, so landing on the
+		other group is a guaranteed miss. A pinned sequence is charged to its
+		pinned group's prior load, so the balancer places everything else
+		around it instead of ignoring it.
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2224,6 +2253,9 @@ class BatchGenWorker:
 			num_decode_dp_groups,
 		)
 		num_dp = num_decode_dp_groups(self.world_size, G)
+		# Free and byte-identical whenever no session map exists, which is
+		# every run that never turned the trajectory flag on.
+		pins = self._pin_trajectory_session_groups(uuids, num_groups=num_dp)
 		prior = [0.0] * num_dp
 		to_assign = set(uuids)
 		for seq in self.global_batch:
@@ -2238,6 +2270,14 @@ class BatchGenWorker:
 			# (ON_HOLD->IN_DECODE) keeps its group — its head-sharded KDA state
 			# already lives on that group's ranks, so re-grouping would strand it.
 			if seq is None or seq.decode_dp_group is not None:
+				continue
+			pinned_group = pins.get(uuid)
+			if pinned_group is not None:
+				# The session's own group, stamped here; the idempotent skip
+				# above then keeps it through every later assignment.
+				seq.decode_dp_group = int(pinned_group)
+				L = getattr(seq, "prompt_length", 0) or 0
+				prior[int(pinned_group)] += float(L) * float(L)
 				continue
 			lengths.append(getattr(seq, "prompt_length", 0) or 0)
 			seqs.append(seq)
@@ -11514,6 +11554,146 @@ class BatchGenWorker:
 			}
 		return payload
 
+	def _trajectory_session_summary(self) -> dict:
+		"""This serve group's committed sessions, for the world map.
+
+		Leader-only: the leader holds its group's ONE frontier registry (the
+		1c single-registry ruling), so its view is the whole truth about the
+		group and a follower has nothing of its own to publish. The summary is
+		compact -- one (owning group, boundary, frontier index key) triple per
+		session, no tokens -- and rides the host-KV mirror's existing
+		world-wide object gather, so no collective is added.
+
+		Published at mirror time, which is the END of a pass's prefill config,
+		while this pass's own records are installed later at the post-barrier
+		finalize. A session therefore becomes pinnable one pass after it is
+		committed; a same-pass continuation could not hit anyway, since its
+		record does not exist until finalize.
+		"""
+		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1 or not is_leader:
+			return {}
+		committer = self._trajectory_frontier_committer
+		if committer is None or not committer.owns_registry:
+			return {}
+		sessions = committer.registry.session_group_summary()
+		return {
+			# The group this leader speaks for. An empty ``sessions`` is
+			# meaningful: it says this group now holds no committed session,
+			# so the fold drops the entries it used to publish.
+			"group_id": int(self.rank // shard_count),
+			"sessions": {
+				str(session_key): [
+					int(owning_group_id),
+					int(boundary_tokens),
+					str(index_key),
+				]
+				for session_key, (
+					owning_group_id,
+					boundary_tokens,
+					index_key,
+				) in sessions.items()
+			},
+		}
+
+	def _fold_trajectory_session_groups(self, gathered) -> None:
+		"""Fold every leader's session summary into this rank's map.
+
+		Runs on EVERY rank, in gathered rank order, over the same list on
+		every rank -- that identity is what lets the pin below be part of a
+		replicated assignment. Nothing is built when no leader published a
+		summary, so a flag-on pass before the first commit allocates nothing.
+		"""
+		summaries = [
+			entry.get("frontier_sessions")
+			for entry in gathered
+			if isinstance(entry, dict) and entry.get("frontier_sessions")
+		]
+		if not summaries and self._trajectory_session_groups is None:
+			return
+		from batchgen.prefix_reuse.trajectory_frontier import (
+			TrajectorySessionGroupIndex,
+		)
+
+		index = self._trajectory_session_groups
+		if index is None:
+			index = TrajectorySessionGroupIndex()
+			self._trajectory_session_groups = index
+		changed = index.fold(summaries)
+		if changed:
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s folded %s session-group "
+				"change(s) from %s leader summary/summaries: %s session(s) "
+				"now pinnable",
+				self.rank,
+				changed,
+				len(summaries),
+				len(index),
+			)
+
+	def _pin_trajectory_session_groups(self, uuids, *, num_groups: int) -> dict:
+		"""``{uuid: owning group}`` for the flag-on continuations in ``uuids``.
+
+		The pin input of ``_assign_decode_dp_groups``. Only sequences that do
+		NOT already carry a group are consulted: a grouped sequence keeps its
+		group (that idempotence is what keeps an evicted re-entry on the ranks
+		holding its head-sharded KDA state), so re-pinning it would be either
+		a no-op or a contradiction.
+
+		Resolution is the map's, which probes the SAME
+		``frontier_index_key`` derivation the registry index is built from, so
+		nothing here re-implements the hashing or the boundary search. A miss
+		returns nothing for that sequence and default assignment is unchanged.
+		"""
+		index = self._trajectory_session_groups
+		if not index:
+			return {}
+		if not self.enable_prefix_cache:
+			return {}
+		runtime = self.prefix_cache_runtime_config
+		if runtime is None or self._trajectory_book is None:
+			return {}
+		sequences = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		if not self._trajectory_commit_requested(
+			[seq for seq in sequences if seq is not None]
+		):
+			return {}
+		namespace_digest = runtime.namespace_digest
+		pins = {}
+		for seq in sequences:
+			if seq is None or seq.decode_dp_group is not None:
+				continue
+			if not self._trajectory_book.has_sequence(seq.uuid):
+				# No trajectory reservation: the prompt is not readable yet, so
+				# this sequence is not a continuation this pin can place.
+				continue
+			entry = index.resolve(
+				namespace_digest=namespace_digest,
+				prompt_token_ids=self._trajectory_tokens(
+					seq, length=seq.prompt_length
+				).tolist(),
+			)
+			if entry is None:
+				continue
+			if not 0 <= int(entry.owning_group_id) < int(num_groups):
+				raise RuntimeError(
+					f"Rank {self.rank}: session {entry.session_key} is owned "
+					f"by serve group {entry.owning_group_id}, which does not "
+					f"exist in a {int(num_groups)}-group world"
+				)
+			pins[seq.uuid] = int(entry.owning_group_id)
+			index.record_pin()
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s pinned sequence %s to serve "
+				"group %s: it continues session %s committed at boundary %s",
+				self.rank,
+				int(seq.global_idx),
+				int(entry.owning_group_id),
+				entry.session_key,
+				int(entry.boundary_tokens),
+			)
+		return pins
+
 	@staticmethod
 	def _trajectory_arena_from_payload(entry: dict):
 		"""Rebuild the leader's arena object from its mirrored page ids."""
@@ -11729,10 +11909,18 @@ class BatchGenWorker:
 
 	def _trajectory_restore_fields(self) -> dict:
 		"""Drain-counter fields, or empty when the path never ran."""
+		fields = {}
 		restorer = self._trajectory_restorer
-		if restorer is None:
-			return {}
-		return restorer.counters()
+		if restorer is not None:
+			fields.update(restorer.counters())
+		# M3 Slice 3a: how many sequences the session map placed. Reported
+		# wherever the map exists, including on a rank that holds no restorer,
+		# because a pin is an admission-side decision; absent on a run that
+		# never turned the flag on.
+		index = self._trajectory_session_groups
+		if index is not None:
+			fields["trajectory_group_pins"] = int(index.pins)
+		return fields
 
 	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
 		"""Resident Host pages backing a committed prefix, per KV group.
