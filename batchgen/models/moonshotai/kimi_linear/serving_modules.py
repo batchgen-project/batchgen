@@ -275,6 +275,60 @@ def mla_prefill_nope_prepacked(
     return attn_output, offload_kv
 
 
+def mla_materialize_pool_segment(
+    self, latent, *, pool, pool_layer, slots
+):
+    """Expand a committed MLA latent into this layer's prefix-pool slots.
+
+    M3 Slice 3. ``latent`` is ``[tokens, kv_lora_rank + qk_rope_head_dim]``
+    exactly as ``mla_prefill_nope_prepacked`` returned it for the wave that
+    computed this prefix: the Host cache keeps ``offload_kv``, so the layer
+    norm is already in the stored bytes and only the expansion is left.
+
+    That expansion is the SAME module code the computed path runs -- this
+    layer's ``kv_b_proj``, the same split, the same per-head assembly with
+    ``k_pe`` broadcast over heads, the same ``index_copy_`` into the same pool
+    tensors at the same slots. A pooled segment and a materialized segment of
+    the same geometry therefore differ in who wrote the pages, not in what
+    the pages mean, which is what makes the load-against-compute oracle a
+    comparison rather than a reinterpretation.
+
+    ``slots`` are this slab's pool slots, in token order.
+    """
+
+    total_tokens = latent.shape[0]
+    if int(slots.numel()) != total_tokens:
+        raise ValueError(
+            f"materializing {total_tokens} token(s) into {int(slots.numel())} "
+            "pool slot(s)"
+        )
+    if latent.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+        raise ValueError(
+            f"a materialized MLA latent is "
+            f"{self.kv_lora_rank + self.qk_rope_head_dim} wide, got "
+            f"{latent.shape[-1]}"
+        )
+    normed_kv, k_pe = torch.split(
+        latent, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
+    kv = self.kv_b_proj(normed_kv)
+    kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+    k_nope, value_states = torch.split(
+        kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+    )
+    key_states = kv.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+    k_pe_h = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+    key_states[:, :, : self.qk_nope_head_dim] = k_nope
+    key_states[:, :, self.qk_nope_head_dim :] = k_pe_h  # broadcast over heads
+    key_states = key_states.contiguous()
+    value_states = value_states.contiguous()
+
+    k_cache, v_cache = pool.k[pool_layer], pool.v[pool_layer]
+    k_cache.view(-1, *k_cache.shape[-2:]).index_copy_(0, slots, key_states)
+    v_cache.view(-1, *v_cache.shape[-2:]).index_copy_(0, slots, value_states)
+    return total_tokens
+
+
 def mla_decoding_nope_with_pagekv(
     self,
     hidden_states: torch.Tensor,

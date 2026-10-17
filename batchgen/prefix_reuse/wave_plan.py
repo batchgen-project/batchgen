@@ -22,12 +22,54 @@ Definitions
 * Every prompt has one tail item: the tokens after its deepest pooled segment.
   Pooling a segment saves ``(count - 1) * length`` computed tokens, i.e.
   ``count - 1`` per pool page, independent of the segment length.
+
+Materialized segments (M3 Slice 3)
+----------------------------------
+A prompt that continues a committed trajectory frontier carries a prefix whose
+KV is already on the Host. Its plan contribution is a MATERIALIZED segment:
+the same geometry as a pooled segment, so the prompt's tail reads it through
+the same page table, but no row computes it -- the executor LOADS it. Such a
+prompt takes no part in the in-wave prefix tree (the arbitration of design
+note section 7.2: pooled waves keep recomputing, materialization serves only
+trajectory re-entry), so its chain is exactly its materialized segment and its
+tail starts at the frontier boundary.
+
+Accounting therefore splits three ways instead of two::
+
+    prompt_tokens == computed_tokens
+                   + sum (members - 1) * tokens  over computed segments
+                   + sum  members      * tokens  over materialized segments
+
+A computed segment saves every member but the one that computes it; a
+materialized segment computes for nobody, so it saves all of its members.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Sequence
+
+
+class PoolMaterializationDoesNotFit(RuntimeError):
+    """No threshold schedules this wave while its hits are materialized.
+
+    Named so the caller falls back deliberately -- drop the materialized
+    segments and plan the wave as a recompute -- instead of a silent reuse of
+    whichever plan happened to fit.
+    """
+
+
+@dataclass(frozen=True)
+class MaterializedPrefix:
+    """One prompt's committed prefix, to be LOADED into the pool.
+
+    ``index`` is the wave index of the prompt and ``tokens`` the frontier
+    boundary: page-aligned, at least one block, and leaving the prompt's last
+    token private exactly as a computed segment must.
+    """
+
+    index: int
+    tokens: int
 
 
 @dataclass(frozen=True)
@@ -37,6 +79,10 @@ class PlanSegment:
     token_start: int
     token_end: int
     members: tuple[int, ...]  # wave indices of the prompts sharing it
+    # LOADED from Host KV instead of computed by a row of this wave. The
+    # geometry is a pooled segment's, so a reader's page table is unchanged;
+    # only who writes the pages differs.
+    materialized: bool = False
 
     @property
     def tokens(self) -> int:
@@ -53,6 +99,13 @@ class PlanItem:
     and its last token produces the first output token.
     Either way attention reads ``prefix_segments`` from the pool as the
     already-computed prefix ``[0, token_start)``.
+
+    ``kind == "materialize"``: ``ref`` is a MATERIALIZED segment id. It is NOT
+    a forward row -- it carries no query token, contributes nothing to the
+    chunk's token budget and nothing to ``computed_tokens``. It is an item so
+    that the pool pages it occupies, the order it is resident in and the chunk
+    it is released after are planned by the one scheduler that plans the
+    computed segments.
     """
 
     kind: str
@@ -90,10 +143,18 @@ class WavePrefixPlan:
     # Cap on the keys a chunk's rows attend over (sum of item token_end), for
     # executors that gather every row's prefix keys; None: uncapped.
     chunk_keys: Optional[int] = None
+    # Tokens served by materialized segments: loaded once each, never computed.
+    materialized_tokens: int = 0
 
     @property
     def saved_tokens(self) -> int:
         return self.prompt_tokens - self.computed_tokens
+
+    @property
+    def materialized_segments(self) -> tuple[int, ...]:
+        return tuple(
+            seg.segment_id for seg in self.segments if seg.materialized
+        )
 
     def segment_pages(self, segment_id: int) -> int:
         return self.segments[segment_id].tokens // self.block_tokens
@@ -114,7 +175,12 @@ def prefill_plan_work(plan: WavePrefixPlan) -> PrefillPlanWork:
     attention layer, including keys supplied by a pooled prefix. Each planned
     item is computed once, so shared prefixes are counted only once here.
     """
-    items = [item for chunk in plan.chunks for item in chunk.items]
+    items = [
+        item
+        for chunk in plan.chunks
+        for item in chunk.items
+        if item.kind != "materialize"  # no row, no query token, no pair
+    ]
     pairs = sum(
         (
             item.token_end * (item.token_end + 1)
@@ -139,14 +205,26 @@ class _Tree:
     paths: tuple[tuple[int, ...], ...]  # per prompt: segments root to leaf
 
 
-def _build_tree(prompts: Sequence[Sequence[int]], block_tokens: int) -> _Tree:
+def _build_tree(
+    prompts: Sequence[Sequence[int]],
+    block_tokens: int,
+    skip: frozenset[int] = frozenset(),
+) -> _Tree:
+    """The wave's prefix tree; ``skip``ped prompts contribute no block.
+
+    A skipped prompt is one whose prefix is materialized: it shares nothing
+    in-wave by construction, so it must not create or deepen a tree node --
+    otherwise the same tokens would be both loaded and computed, and only one
+    of the two would be read.
+    """
+
     children: list[dict[tuple[int, ...], int]] = [{}]
     parent_node = [-1]
     depth = [0]
     count = [0]
     node_paths: list[list[int]] = []
-    for tokens in prompts:
-        shareable = (len(tokens) - 1) // block_tokens
+    for index, tokens in enumerate(prompts):
+        shareable = 0 if index in skip else (len(tokens) - 1) // block_tokens
         node = 0
         path = []
         for block in range(shareable):
@@ -206,12 +284,29 @@ def _schedule(
     threshold: Optional[int],
     same_chunk_ancestors: bool = False,
     chunk_keys: Optional[int] = None,
+    materialized: Sequence[tuple[int, tuple[int, ...]]] = (),
 ) -> Optional[WavePrefixPlan]:
-    """List-schedule one threshold; None if the pool deadlocks."""
+    """List-schedule one threshold; None if the pool deadlocks.
+
+    ``materialized`` is ``(tokens, members)`` per materialized segment, in the
+    order the segments are numbered. Its members take no part in ``tree`` (the
+    caller skipped them when building it), so a member's chain is exactly its
+    materialized segment.
+    """
 
     pooled_old = [
         threshold is not None and c >= max(threshold, 2) for c in tree.count
     ]
+    num_materialized = len(materialized)
+    # Which materialized segment each member reads; a non-member is absent.
+    materialized_of: dict[int, int] = {}
+    for segment_id, (_, members) in enumerate(materialized):
+        for index in members:
+            if index in materialized_of:
+                raise ValueError(
+                    f"prompt {index} is a member of two materialized segments"
+                )
+            materialized_of[index] = segment_id
     # Renumber pooled segments densely in DFS order of the pooled tree.
     kids: dict[Optional[int], list[int]] = {}
     for seg, is_pooled in enumerate(pooled_old):
@@ -219,11 +314,24 @@ def _schedule(
             kids.setdefault(tree.parent[seg], []).append(seg)
     chains: list[tuple[int, ...]] = []  # per prompt, old ids, root to leaf
     tails_at: dict[Optional[int], list[int]] = {}
+    # Tails whose chain is a materialized segment, keyed by its NEW id.
+    tails_at_materialized: dict[int, list[int]] = {
+        segment_id: [] for segment_id in range(num_materialized)
+    }
     for index, path in enumerate(tree.paths):
         chain = tuple(seg for seg in path if pooled_old[seg])
         if chain != path[:len(chain)]:
             raise AssertionError("pooled set must be closed under ancestors")
         chains.append(chain)
+        segment_id = materialized_of.get(index)
+        if segment_id is not None:
+            if chain:
+                raise AssertionError(
+                    f"prompt {index} materializes its prefix but also shares "
+                    "a computed segment"
+                )
+            tails_at_materialized[segment_id].append(index)
+            continue
         tails_at.setdefault(chain[-1] if chain else None, []).append(index)
 
     order_old: list[int] = []
@@ -232,12 +340,24 @@ def _schedule(
         seg = stack.pop()
         order_old.append(seg)
         stack.extend(reversed(kids.get(seg, [])))
-    new_id = {old: new for new, old in enumerate(order_old)}
+    # Materialized segments are numbered FIRST, so a plan's ids are stable
+    # whatever the tree does behind them.
+    new_id = {old: num_materialized + new for new, old in enumerate(order_old)}
     members: dict[int, list[int]] = {old: [] for old in order_old}
     for index, chain in enumerate(chains):
         for old in chain:
             members[old].append(index)
     segments = tuple(
+        PlanSegment(
+            segment_id=segment_id,
+            parent_id=None,
+            token_start=0,
+            token_end=tokens,
+            members=tuple(member_indices),
+            materialized=True,
+        )
+        for segment_id, (tokens, member_indices) in enumerate(materialized)
+    ) + tuple(
         PlanSegment(
             segment_id=new_id[old],
             parent_id=None if tree.parent[old] is None else new_id[tree.parent[old]],
@@ -264,6 +384,18 @@ def _schedule(
             chain = tuple(new_id[seg] for seg in chains[index])
             start = segments[chain[-1]].token_end if chain else 0
             items.append(PlanItem("tail", index, chain, start, prompt_lengths[index]))
+
+    # Materialized segments first, each followed by the tails that read it:
+    # they are resident before any computed row needs the pool, and a reader
+    # is never separated from its load by the whole computed tree.
+    for segment_id in range(num_materialized):
+        seg = segments[segment_id]
+        items.append(PlanItem("materialize", segment_id, (), 0, seg.token_end))
+        for index in tails_at_materialized[segment_id]:
+            items.append(PlanItem(
+                "tail", index, (segment_id,), seg.token_end,
+                prompt_lengths[index],
+            ))
 
     for old in order_old:
         seg = segments[new_id[old]]
@@ -306,22 +438,32 @@ def _schedule(
                 or (same_chunk_ancestors and seg in chosen_segments)
                 for seg in item.prefix_segments
             )
-            fits = not chosen or (
+            # A materialized segment is loaded, not forwarded: it spends pool
+            # pages but no chunk tokens and no attention keys.
+            loaded = item.kind == "materialize"
+            fits = not chosen or loaded or (
                 used + item.tokens <= chunk_tokens
                 and (chunk_keys is None or keys + item.token_end <= chunk_keys)
             )
-            if item.kind == "segment":
+            if item.kind in ("segment", "materialize"):
                 fits = fits and live + written + need[item.ref] <= pool_pages
             if ready and fits:
                 chosen.append(item)
-                used += item.tokens
-                keys += item.token_end
-                if item.kind == "segment":
+                if not loaded:
+                    used += item.tokens
+                    keys += item.token_end
+                if item.kind in ("segment", "materialize"):
                     written += pages[item.ref]
                     chosen_segments.add(item.ref)
             else:
                 rest.append(item)
         if not chosen:
+            return None
+        if all(item.kind == "materialize" for item in chosen):
+            # Every chunk is one forward, and the load rides that forward's
+            # layer loop. A chunk of loads alone would have no forward to ride,
+            # so this schedule is refused here and the caller falls back to a
+            # plan that recomputes -- rather than inventing a second pass.
             return None
         live += written
         peak = max(peak, live)
@@ -346,7 +488,12 @@ def _schedule(
         remaining = rest
 
     prompt_tokens = sum(prompt_lengths)
-    computed = sum(item.tokens for chunk in chunks for item in chunk.items)
+    computed = sum(
+        item.tokens
+        for chunk in chunks
+        for item in chunk.items
+        if item.kind != "materialize"
+    )
     return WavePrefixPlan(
         block_tokens=block_tokens,
         pool_pages=pool_pages,
@@ -359,6 +506,61 @@ def _schedule(
         peak_pool_pages=peak,
         same_chunk_ancestors=same_chunk_ancestors,
         chunk_keys=chunk_keys,
+        materialized_tokens=sum(
+            seg.tokens for seg in segments if seg.materialized
+        ),
+    )
+
+
+def group_materialized_prefixes(
+    prompts: Sequence[Sequence[int]],
+    materialized: Sequence[MaterializedPrefix],
+    *,
+    block_tokens: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Validate the hits and fold identical prefixes into one segment each.
+
+    Two prompts that re-enter the SAME frontier describe the same bytes, so
+    they must read one segment: loading it twice would spend the pages and the
+    H2D bandwidth twice for an identical result. Grouping is by (boundary,
+    prefix tokens), and segments are ordered by their first member, so every
+    rank that sees the same hits numbers them identically.
+    """
+
+    seen: set[int] = set()
+    groups: dict[tuple[int, tuple[int, ...]], list[int]] = {}
+    order: list[tuple[int, tuple[int, ...]]] = []
+    for hit in materialized:
+        index, tokens = int(hit.index), int(hit.tokens)
+        if not 0 <= index < len(prompts):
+            raise ValueError(
+                f"materialized prefix names prompt {index}, which is not one "
+                f"of this wave's {len(prompts)} prompts"
+            )
+        if index in seen:
+            raise ValueError(f"prompt {index} carries two materialized prefixes")
+        seen.add(index)
+        prompt = prompts[index]
+        if tokens <= 0 or tokens % block_tokens:
+            raise ValueError(
+                f"materialized prefix of prompt {index} is {tokens} tokens, "
+                f"which is not a positive multiple of the {block_tokens}-token "
+                "block"
+            )
+        if tokens > len(prompt) - 1:
+            raise ValueError(
+                f"materialized prefix of prompt {index} covers {tokens} of "
+                f"{len(prompt)} tokens; the last prompt token must stay "
+                "private so the row produces a logit"
+            )
+        key = (tokens, tuple(prompt[:tokens]))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(index)
+    return tuple(
+        (tokens, tuple(groups[(tokens, prefix)]))
+        for tokens, prefix in order
     )
 
 
@@ -370,29 +572,62 @@ def plan_wave_prefix_sharing(
     chunk_tokens: int,
     same_chunk_ancestors: bool = False,
     chunk_keys: Optional[int] = None,
+    materialized: Sequence[MaterializedPrefix] = (),
 ) -> WavePrefixPlan:
     """Plan one wave; pools the most segments whose schedule fits the pool.
 
     The threshold starts at 2 (every shared segment pooled) and rises until
     the schedule fits ``pool_pages``; with nothing pooled every prompt is a
     single tail, which always fits.
+
+    ``materialized`` names the prompts whose prefix is LOADED. They are kept
+    out of the prefix tree and get one materialized segment per distinct
+    frontier. When no threshold schedules the wave with them,
+    ``PoolMaterializationDoesNotFit`` is raised: the caller then plans the
+    same wave without them, which is the recompute fallback.
     """
 
     if block_tokens <= 0 or chunk_tokens <= 0 or pool_pages < 0:
         raise ValueError("block_tokens and chunk_tokens must be positive, pool_pages >= 0")
     if any(len(tokens) == 0 for tokens in prompts):
         raise ValueError("every prompt must be non-empty")
+    groups = group_materialized_prefixes(
+        prompts, materialized, block_tokens=block_tokens
+    )
+    if groups and not same_chunk_ancestors:
+        # The load rides the forward of the chunk it is planned in, so a
+        # reader that may not read a segment resident in its own chunk would
+        # have to wait a chunk for pages it already paid for -- and a
+        # load-only chunk has no forward to ride. Refused by name instead of
+        # planned into a shape this executor cannot run.
+        raise ValueError(
+            "materialized prefixes require a pool that lets a row read a "
+            "segment resident in its own chunk (same_chunk_ancestors)"
+        )
     lengths = [len(tokens) for tokens in prompts]
-    tree = _build_tree(prompts, block_tokens)
+    skip = frozenset(
+        index for _, members in groups for index in members
+    )
+    tree = _build_tree(prompts, block_tokens, skip)
     # 2 means every shared segment; higher values only where counts exist.
     for threshold in sorted({2} | {c for c in tree.count if c > 2}):
         plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens,
-                         threshold, same_chunk_ancestors, chunk_keys)
+                         threshold, same_chunk_ancestors, chunk_keys, groups)
         if plan is not None:
             return plan
     plan = _schedule(tree, lengths, block_tokens, pool_pages, chunk_tokens, None,
-                     same_chunk_ancestors, chunk_keys)
-    assert plan is not None
+                     same_chunk_ancestors, chunk_keys, groups)
+    if plan is None:
+        if not groups:
+            raise AssertionError(
+                "a wave with nothing pooled is one tail per prompt and always "
+                "schedules"
+            )
+        raise PoolMaterializationDoesNotFit(
+            f"{len(groups)} materialized segment(s) covering "
+            f"{sum(tokens for tokens, _ in groups)} token(s) do not schedule "
+            f"in {pool_pages} pool page(s)"
+        )
     return plan
 
 
@@ -495,7 +730,12 @@ def validate_wave_prefix_plan(
     for seg in segments:
         assert seg.token_start % block == 0 and seg.token_end % block == 0
         assert seg.token_end > seg.token_start
-        assert len(seg.members) >= 2
+        # A computed segment exists to be shared; a materialized one exists
+        # because its member's prefix is already KV, which one member is
+        # reason enough for.
+        assert len(seg.members) >= (1 if seg.materialized else 2)
+        if seg.materialized:
+            assert seg.parent_id is None and seg.token_start == 0
         if seg.parent_id is not None:
             parent = segments[seg.parent_id]
             assert parent.token_end == seg.token_start
@@ -515,13 +755,17 @@ def validate_wave_prefix_plan(
     peak = 0
     for position, chunk in enumerate(plan.chunks):
         assert chunk.items, "empty chunk"
-        size = sum(item.tokens for item in chunk.items)
-        assert size <= plan.chunk_tokens or len(chunk.items) == 1
+        forward = [item for item in chunk.items if item.kind != "materialize"]
+        assert forward, "a chunk must carry the forward its loads ride"
+        size = sum(item.tokens for item in forward)
+        assert size <= plan.chunk_tokens or len(forward) == 1
         if plan.chunk_keys is not None:
-            keys = sum(item.token_end for item in chunk.items)
-            assert keys <= plan.chunk_keys or len(chunk.items) == 1
+            keys = sum(item.token_end for item in forward)
+            assert keys <= plan.chunk_keys or len(forward) == 1
         for order, item in enumerate(chunk.items):
-            key = (item.kind, item.ref)
+            # A materialized segment is resident for its readers exactly as a
+            # computed one is, so both answer to the same key.
+            key = ("segment" if item.kind == "materialize" else item.kind, item.ref)
             assert key not in computed_at, f"{key} computed twice"
             computed_at[key] = position
             order_at[key] = order
@@ -542,9 +786,11 @@ def validate_wave_prefix_plan(
             chain = item.prefix_segments
             for up, down in zip(chain, chain[1:]):
                 assert segments[down].parent_id == up
-            if item.kind == "segment":
+            if item.kind in ("segment", "materialize"):
                 seg = segments[item.ref]
+                assert seg.materialized == (item.kind == "materialize")
                 assert (item.token_start, item.token_end) == (seg.token_start, seg.token_end)
+                assert item.prefix_segments == () or not seg.materialized
                 live += plan.segment_pages(item.ref)
             else:
                 assert item.token_end == len(prompts[item.ref])
@@ -575,8 +821,26 @@ def validate_wave_prefix_plan(
     assert released_at == last_read
 
     total = sum(len(tokens) for tokens in prompts)
-    computed = sum(item.tokens for chunk in plan.chunks for item in chunk.items)
-    saved = sum((len(seg.members) - 1) * seg.tokens for seg in segments)
+    computed = sum(
+        item.tokens
+        for chunk in plan.chunks
+        for item in chunk.items
+        if item.kind != "materialize"
+    )
+    saved = sum(
+        (len(seg.members) - 1) * seg.tokens
+        for seg in segments
+        if not seg.materialized
+    )
+    # A materialized segment computes for nobody, so it saves every member.
+    loaded = sum(
+        len(seg.members) * seg.tokens for seg in segments if seg.materialized
+    )
     assert plan.prompt_tokens == total
     assert plan.computed_tokens == computed
-    assert total == computed + saved, "computed + saved must equal prompt tokens"
+    assert plan.materialized_tokens == sum(
+        seg.tokens for seg in segments if seg.materialized
+    )
+    assert total == computed + saved + loaded, (
+        "computed + saved + loaded must equal prompt tokens"
+    )

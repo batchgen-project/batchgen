@@ -310,6 +310,11 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
             slots=slot_ids,
             has_initial_state=state.has_initial_state,
             slot_of=cls.slot_manager.lookup,
+            # A loaded segment left no state to fork; its reader resumes from
+            # the slot the restore bound, which state_levels verifies.
+            materialized=getattr(
+                AttnWrapperBase, "prefill_pool_materialized_segments", ()
+            ) or (),
         )
         cls._pool_levels = (batch, levels)
         return levels
@@ -455,6 +460,29 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             "pool_batch": pool_batch,
             "pool_layer": row,
         }
+
+    def materialize_pool_segment(self, *, latent, slots):
+        """Worker seam (M3 Slice 3): load one slab into THIS layer's pool row.
+
+        Duck-typed: the worker stages a chunk's materialized segments by
+        walking its attention layers and calling this on the ones that have
+        it, so a model without a materialization contract is simply skipped.
+        The pool row comes from the same layout map the computed path uses,
+        so a loaded segment and a computed one land in the same row.
+        """
+
+        kwargs = self._pool_prefill_kwargs()
+        if not kwargs:
+            raise RuntimeError(
+                f"MLA layer {self.layer_idx} was asked to materialize a "
+                "segment outside a prefix-pool wave"
+            )
+        return self.module.mla_materialize_pool_segment(
+            latent,
+            pool=kwargs["pool"],
+            pool_layer=kwargs["pool_layer"],
+            slots=slots,
+        )
 
     def _offload_prepacked_kv(self, offload_kv, cu_seqlens):
         """Offload compressed MLA KV per-sequence to host paged KV."""

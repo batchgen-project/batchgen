@@ -55,6 +55,11 @@ class PoolWave:
     probe_debug_read: bool = False
     # segment id -> KV group id -> that group's Host pages for the segment
     segment_host_pages: dict[int, dict[int, list[int]]] = field(default_factory=dict)
+    # Segments this wave LOADS (M3 Slice 3). Their Host pages are the
+    # trajectory frontier's, committed and retained by an earlier wave, so
+    # this wave allocates none, offloads none and publishes none; it only
+    # reads them. Derived from the plan, never set by hand.
+    materialized: frozenset[int] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         chains: list[list[int]] = [[] for _ in self.prompts]
@@ -62,6 +67,48 @@ class PoolWave:
             for index in seg.members:
                 chains[index].append(seg.segment_id)
         self.chains = [tuple(chain) for chain in chains]
+        self.materialized = frozenset(self.plan.materialized_segments)
+
+    def computed_segments(self) -> tuple:
+        """The plan's segments a row of this wave computes, in plan order."""
+
+        return tuple(
+            seg for seg in self.plan.segments if not seg.materialized
+        )
+
+    def bind_materialized_host_pages(
+        self, segment_id: int, pages_by_group: Mapping[int, Sequence[int]]
+    ) -> None:
+        """Name the resident Host pages a materialized segment loads from.
+
+        The pages belong to the prefix cache (the frontier record names them),
+        so they are recorded here as a read source and never as this wave's
+        property: nothing registers them under a pseudo sequence, nothing
+        offloads into them, nothing releases them.
+        """
+
+        if int(segment_id) not in self.materialized:
+            raise RuntimeError(
+                f"segment {segment_id} is not materialized in this wave, so "
+                "its Host pages are this wave's to allocate"
+            )
+        expected = self.plan.segments[int(segment_id)].tokens // self.page_tokens
+        bound: dict[int, list[int]] = {}
+        for group_id, pages in pages_by_group.items():
+            page_ids = [int(page) for page in pages]
+            if len(page_ids) != expected:
+                raise RuntimeError(
+                    f"materialized segment {segment_id} was given "
+                    f"{len(page_ids)} Host page(s) in group {group_id} for "
+                    f"{self.plan.segments[int(segment_id)].tokens} tokens of "
+                    f"{self.page_tokens}"
+                )
+            bound[int(group_id)] = page_ids
+        if not bound:
+            raise RuntimeError(
+                f"materialized segment {segment_id} was given no Host pages"
+            )
+        self.segment_host_pages[int(segment_id)] = bound
 
     def chain_tokens(self, index: int) -> int:
         chain = self.chains[index]
@@ -117,13 +164,27 @@ def allocate_segment_host_pages(
     """
 
     page_tokens = wave.page_tokens
-    sids = [next_sid() for _ in wave.plan.segments]
+    # A materialized segment's pages are already resident and already
+    # retained; this wave neither allocates nor owns them, so it registers no
+    # pseudo sequence for them either.
+    computed = wave.computed_segments()
+    unbound = sorted(
+        segment_id
+        for segment_id in wave.materialized
+        if segment_id not in wave.segment_host_pages
+    )
+    if unbound:
+        raise RuntimeError(
+            f"materialized segments {unbound} have no Host pages bound; "
+            "bind_materialized_host_pages must run before allocation"
+        )
+    sids = [next_sid() for _ in computed]
     if any(sid >= 0 for sid in sids):
         raise ValueError("pool segment pseudo sequence ids must be negative")
-    requests = [(sid, seg.tokens) for sid, seg in zip(sids, wave.plan.segments)]
+    requests = [(sid, seg.tokens) for sid, seg in zip(sids, computed)]
     # Published before the first group allocates: a group that runs out of pages
     # half way leaves the caller every pseudo id it has to release.
-    for sid, seg in zip(sids, wave.plan.segments):
+    for sid, seg in zip(sids, computed):
         wave.segment_sids[seg.segment_id] = sid
     tables_by_group: dict[int, list] = {}
     for group_id, worker_view in sorted(worker_views_by_group.items()):
@@ -131,7 +192,7 @@ def allocate_segment_host_pages(
         worker_view.allocate_pages_for_sequences(requests)
         tables_by_group[int(group_id)] = worker_view.build_page_table(sids)
     total = 0
-    for index, seg in enumerate(wave.plan.segments):
+    for index, seg in enumerate(computed):
         expected = seg.tokens // page_tokens
         group_pages: dict[int, list[int]] = {}
         for group_id, tables in tables_by_group.items():
@@ -158,24 +219,48 @@ def segment_mirror_payload(wave: PoolWave) -> dict:
 
     missing = sorted(
         seg.segment_id
-        for seg in wave.plan.segments
+        for seg in wave.computed_segments()
         if seg.segment_id not in wave.segment_sids
         or seg.segment_id not in wave.segment_host_pages
     )
     if missing:
         raise RuntimeError(f"segments {missing} have no Host pages to mirror")
+    unbound = sorted(
+        segment_id
+        for segment_id in wave.materialized
+        if segment_id not in wave.segment_host_pages
+    )
+    if unbound:
+        raise RuntimeError(
+            f"materialized segments {unbound} have no Host pages to mirror"
+        )
     return {
         "segment_sids": {
             int(segment_id): int(sid)
             for segment_id, sid in wave.segment_sids.items()
         },
         "segment_host_pages": {
-            int(segment_id): {
-                int(group_id): [int(page) for page in pages]
-                for group_id, pages in group_pages.items()
-            }
+            int(segment_id): _pages_payload(group_pages)
             for segment_id, group_pages in wave.segment_host_pages.items()
+            if segment_id not in wave.materialized
         },
+        # Read sources, not property: the loaded segments' resident pages, so
+        # every rank of the group expands the SAME committed latent into its
+        # own head shard of the pool. Mirrored in the wave's own pass, so a
+        # page here is one the leader is holding right now.
+        "materialized_host_pages": {
+            int(segment_id): _pages_payload(
+                wave.segment_host_pages[segment_id]
+            )
+            for segment_id in sorted(wave.materialized)
+        },
+    }
+
+
+def _pages_payload(group_pages: Mapping[int, Sequence[int]]) -> dict:
+    return {
+        int(group_id): [int(page) for page in pages]
+        for group_id, pages in group_pages.items()
     }
 
 
@@ -189,6 +274,11 @@ def install_mirrored_segments(
     Registers the page table the owner already allocated, so this rank's row
     offloads land on the owner's pages. Nothing is allocated here, and so
     nothing may be released here either.
+
+    A materialized segment has no pseudo sequence to point anywhere: no row of
+    any rank writes it. Its resident pages are bound as the load source of
+    this rank's expansion, which is all a follower needs to fill its own head
+    shard of the pool from the same committed latent.
     """
 
     sids = {
@@ -205,7 +295,8 @@ def install_mirrored_segments(
     # The GPU pool is not built until the prefill phase; the page geometry
     # lives on the wave itself.
     page_tokens = wave.page_tokens
-    for seg in wave.plan.segments:
+    computed = wave.computed_segments()
+    for seg in computed:
         sid = sids.get(seg.segment_id)
         group_pages = pages_by_segment.get(seg.segment_id)
         if sid is None or group_pages is None:
@@ -224,13 +315,24 @@ def install_mirrored_segments(
                     f"{group_id} for {seg.tokens} tokens of {page_tokens}"
                 )
     for group_id, worker_view in sorted(worker_views_by_group.items()):
-        for seg in wave.plan.segments:
+        for seg in computed:
             worker_view.set_sequence_pages(
                 sids[seg.segment_id],
                 pages_by_segment[seg.segment_id][int(group_id)],
             )
     wave.segment_sids = sids
     wave.segment_host_pages = pages_by_segment
+    loaded_pages = payload.get("materialized_host_pages") or {}
+    for segment_id in sorted(wave.materialized):
+        group_pages = loaded_pages.get(segment_id, loaded_pages.get(
+            str(segment_id)
+        ))
+        if group_pages is None:
+            raise RuntimeError(
+                f"materialized segment {segment_id} is missing from the "
+                "mirror payload; this rank cannot load what its leader holds"
+            )
+        wave.bind_materialized_host_pages(segment_id, group_pages)
 
 
 def commit_pool_segments(
@@ -249,6 +351,11 @@ def commit_pool_segments(
     first cannot be evicted before a child commit or the member attach. The
     caller releases the returned handles once the members hold their own
     attachments (attach_pool_members).
+
+    A materialized segment is not published here: it IS a published prefix,
+    committed and retained by the wave that computed it, and its members
+    attach to it like any resident chain. Publishing it again would insert
+    nothing and claim pages this wave never allocated.
     """
 
     from batchgen.prefix_reuse.commit import (
@@ -261,7 +368,7 @@ def commit_pool_segments(
 
     handles: list[int] = []
     try:
-        for seg in wave.plan.segments:
+        for seg in wave.computed_segments():
             tokens = wave.prompts[seg.members[0]][:seg.token_end]
             request = build_prefix_commit_request(
                 namespace_digest=namespace_digest,

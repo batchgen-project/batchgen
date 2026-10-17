@@ -640,6 +640,11 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         [
             "_release_host_kv_pages_for_batch",
             "_release_prefix_cache_attachments",
+            "_release_trajectory_attachments",
+            # M3 Slice 1c joined the same teardown seam: a config-time
+            # snapshot arena that never reached the post-barrier finalize
+            # gives its Host pages back here.
+            "_rollback_trajectory_reservations",
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",
@@ -669,6 +674,16 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         _prefix_sequence_states=states,
         _pool_member_sids={},
         _pool_sid_members={},
+        # M3 Slice 2: no trajectory flag on this path, so nothing is attached
+        # and the release seam has nothing of its own to drop.
+        _trajectory_attachments={},
+        # No committer was ever built on this path, so there is no snapshot
+        # arena to give back -- which is exactly what the release seam must
+        # tolerate on a run that never turned the trajectory flag on.
+        _trajectory_frontier_committer=None,
+        _trajectory_arena_payload={},
+        _trajectory_mirrored_restores={},
+        _trajectory_restorer=None,
         prefix_cache_coordinator=coordinator,
         gpu_paged_kv_cache_manager=None,
         # K3 semantics: ONE prefix group (primary); the indexer-key aux region

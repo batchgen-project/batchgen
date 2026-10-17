@@ -176,11 +176,15 @@ class FakeDist:
         assert group is not None, "the pool budget must reduce over the group"
         self.reduced.append([int(value) for value in tensor.tolist()])
         if self.peer_budget is not None:
-            # The planner reduces [pages, slots]; pool construction reduces a
-            # 1-wide [pages] tensor over the same group.
-            peer = torch.tensor(
-                self.peer_budget[: tensor.numel()], dtype=tensor.dtype
-            )
+            # The planner reduces [pages, slots, materialization vote]; pool
+            # construction reduces a 1-wide [pages] tensor over the same
+            # group. A scripted peer that says nothing about the trailing
+            # values contributes a value the MIN ignores -- for the vote that
+            # is 1, "this peer confirms".
+            values = list(self.peer_budget[: tensor.numel()])
+            while len(values) < tensor.numel():
+                values.append(1)
+            peer = torch.tensor(values, dtype=tensor.dtype)
             torch.minimum(tensor, peer, out=tensor)
 
     def all_gather(self, out, tensor, group=None):
@@ -321,6 +325,14 @@ def _plan_worker(
             "_pool_pad_poison_enabled",
             "_new_pool_kernel_dump_recorder",
             "_pool_probe_debug",
+            # The per-sequence flag merge _trajectory_commit_requested reads.
+            "_active_batchgen_debug_for_sequences",
+            # M3 Slice 3 plan input: with the trajectory flag off these
+            # return "no hits" and the plan is the pre-Slice-3 one.
+            "_materialized_prefix_hits",
+            "_unmaterializable_frontier",
+            "_trajectory_commit_requested",
+            "_owns_host_kv",
             "_debug_flag_enabled",
         ],
         {
@@ -358,9 +370,15 @@ def _plan_worker(
         prefix_cache_coordinator=RecordingCoordinator(),
         _prefix_sequence_states={},
         _prefill_pool_base=(0, 0, 0),
+        # No trajectory frontier in play: no attachment, no mirrored index.
+        _trajectory_attachments={},
+        _trajectory_session_groups=None,
         # No worker-wide batchgen_debug: the batch-level flags are the only
         # source, and none of these sequences sets one.
         _batchgen_debug=None,
+        # Request-level flags ARE the source here, so the per-sequence merge
+        # must stay reachable (the worker latches this at admission).
+        _any_sequence_batchgen_debug=True,
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,
@@ -484,7 +502,11 @@ def test_pool_budget_is_the_group_minimum(monkeypatch):
 
     wave = worker._plan_prefill_pool_wave(UUIDS, {})
 
-    assert fake_dist.reduced == [[20, 32]], "the rank must contribute its own budget"
+    # [pages, slots, materialization vote]: a wave with no hits still votes
+    # "confirmed" (1 -- the rank has nothing to object to) in the one reduce.
+    assert fake_dist.reduced == [[20, 32, 1]], (
+        "the rank must contribute its own budget"
+    )
     assert wave is not None
     assert wave.total_pages == 16
     # The pool is built in the prefill phase; the group's 16 pages are each the

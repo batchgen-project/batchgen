@@ -1088,6 +1088,29 @@ class BatchGenWorker:
 		# outcome, folded into the guard state so a rejected transaction is
 		# not mistaken for a wave that selected nothing.
 		self._prefill_reservation_outcome = None
+		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
+		self._trajectory_frontier_committer = None
+		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
+		# None otherwise. global_idx -> the live TrajectoryAttachment a hit
+		# took; empty whenever the flag is off, so the restore seam is free.
+		self._trajectory_restorer = None
+		self._trajectory_attachments = {}
+		# M3 Slice 1c, G>1 only. Both are per-PASS and both are published by
+		# the serve-group leader on the host-KV mirror that already runs in
+		# prefill config, so no new collective exists:
+		#   _trajectory_arena_payload: global_id -> the leader's G-wide arena,
+		#     so every rank can address its own shard window at the commit
+		#     boundary;
+		#   _trajectory_mirrored_restores: global_id -> the leader's frontier
+		#     HIT for this pass, so the group restores on one decision instead
+		#     of G independent ones.
+		self._trajectory_arena_payload = {}
+		self._trajectory_mirrored_restores = {}
+		# M3 Slice 3a: the WORLD's session -> owning-group map, folded from
+		# every leader's summary on that same mirror. Built on the first fold,
+		# None whenever the trajectory flag never turned on, so the group
+		# assignment of a flag-off run reads one attribute and moves on.
+		self._trajectory_session_groups = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -2077,7 +2100,13 @@ class BatchGenWorker:
 			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
 		)
 
-	def _mirror_group_host_kv(self, uuids: List[str], prefix_states: dict) -> None:
+	def _mirror_group_host_kv(
+		self,
+		uuids: List[str],
+		prefix_states: dict,
+		*,
+		trajectory: bool = False,
+	) -> None:
 		"""Copy the serve-group leader's host-KV bookkeeping onto its followers.
 
 		G>1 replicates a sequence onto all G ranks of its group, but only the
@@ -2116,6 +2145,17 @@ class BatchGenWorker:
 
 		host_views = self._host_views_by_group()
 		wave = getattr(self, "_prefill_pool_wave", None)
+		if trajectory:
+			# Pendings created during a pass's DECODE phase (a commit whose
+			# D2H retired after the post-prefill finalize, e.g. the last
+			# overflow wave's sequence) would otherwise install only at the
+			# NEXT pass's post-prefill finalize -- one publish window too
+			# late for this gather. Ordering is the pass boundary itself: a
+			# rank reaches this config only after returning from the previous
+			# pass, so every rank's shard writes for those pendings are done,
+			# and no pending from THIS pass can exist yet (its prefill has
+			# not run).
+			self._finalize_trajectory_frontiers()
 		payload = None
 		if uuids and all(
 			self._owns_host_kv(self.global_batch.get_sequence(uuid))
@@ -2160,16 +2200,57 @@ class BatchGenWorker:
 				# rank of the group offloads the segment rows it computed, so the
 				# followers need the pages those rows must land on.
 				"segments": segments,
+				# M3 Slice 1c rides THIS gather rather than adding one: the
+				# G-wide snapshot arena's page ids (so every rank can address
+				# its own shard window at the commit boundary) and the leader's
+				# frontier hits (so the group restores on one decision).
+				"frontier_arenas": (
+					self._reserve_trajectory_arenas(uuids)
+					if trajectory
+					else {}
+				),
+				"frontier_restores": (
+					self._trajectory_restore_payload() if trajectory else {}
+				),
+				# M3 Slice 3a: this group's committed sessions. The gather
+				# below is over the DEFAULT process group -- the whole world,
+				# not the serve group -- so one leader's summary reaches every
+				# rank of every group, which is what makes the admission pin
+				# world-consistent.
+				"frontier_sessions": (
+					self._trajectory_session_summary() if trajectory else {}
+				),
 			}
+		if payload is None and trajectory:
+			# A leader with no prefill sequence this pass still speaks for its
+			# group's committed sessions: the summary is registry state, not
+			# pass state, and every rank's admission pin folds it from this
+			# same gather. Gating it on having host KV to mirror starves the
+			# world map whenever a flag-on pass lands entirely on the other
+			# group(s) -- the other groups' sessions then surface only one
+			# pass later, after that pass's pins and pool plan already ran.
+			summary = self._trajectory_session_summary()
+			if summary:
+				payload = {"frontier_sessions": summary}
 
 		gathered = [None] * self.world_size
 		dist.all_gather_object(gathered, payload)
+
+		if trajectory:
+			# EVERY rank folds EVERY leader's summary -- leaders included, so
+			# this runs before the leader's early return below. Group
+			# assignment is replicated across ranks and must agree, so its
+			# input may not be a rank-local subset.
+			self._fold_trajectory_session_groups(gathered)
 
 		leader = host_kv_owner_rank(self.rank // G, G)
 		if leader == self.rank:
 			return
 		entry = gathered[leader]
-		if entry is None:
+		if entry is None or "global_ids" not in entry:
+			# None, or a summary-only payload from a leader that served no
+			# prefill this pass: either way the leader mirrored no host KV
+			# (the fold above already consumed its session summary).
 			if uuids:
 				raise RuntimeError(
 					f"Rank {self.rank}: serve-group leader {leader} mirrored no "
@@ -2204,6 +2285,32 @@ class BatchGenWorker:
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
+		if trajectory:
+			# M3 Slice 1c, follower side. Both halves come from the leader: the
+			# arena this rank writes its own shard into, and the hit it must
+			# restore. Taking the leader's decision is what keeps the group's
+			# prefill in lockstep -- G independent lookups could disagree, and
+			# a rank that declined while its peers restored would run the same
+			# suffix against a zeroed head shard.
+			self._trajectory_arena_payload = dict(
+				entry.get("frontier_arenas") or {}
+			)
+			self._trajectory_mirrored_restores = dict(
+				entry.get("frontier_restores") or {}
+			)
+			self._adopt_mirrored_trajectory_arenas(
+				self._trajectory_arena_payload
+			)
+			if self._trajectory_arena_payload or self._trajectory_mirrored_restores:
+				logging.info(
+					"[TRAJECTORY_FRONTIER] Rank %s shard=%s adopted %s arena(s) "
+					"and %s mirrored restore(s) from serve-group leader %s",
+					self.rank,
+					self._trajectory_group_geometry()[1],
+					len(self._trajectory_arena_payload),
+					len(self._trajectory_mirrored_restores),
+					leader,
+				)
 
 	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
 		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
@@ -2221,6 +2328,15 @@ class BatchGenWorker:
 		``packing_v2`` batches served through the in-wave prefix pool with more
 		than one group instead pack by predicted prefill seconds, so a prefix
 		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
+
+		M3 Slice 3a adds ONE input in front of the balancer: a sequence that
+		continues a committed trajectory is PINNED to the group whose registry
+		holds that session. Without the pin the balancer places consecutive
+		batches independently, so a continuation lands on whichever group the
+		load says -- and a frontier registry is group-local, so landing on the
+		other group is a guaranteed miss. A pinned sequence is charged to its
+		pinned group's prior load, so the balancer places everything else
+		around it instead of ignoring it.
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2230,6 +2346,9 @@ class BatchGenWorker:
 			num_decode_dp_groups,
 		)
 		num_dp = num_decode_dp_groups(self.world_size, G)
+		# Free and byte-identical whenever no session map exists, which is
+		# every run that never turned the trajectory flag on.
+		pins = self._pin_trajectory_session_groups(uuids, num_groups=num_dp)
 		prior = [0.0] * num_dp
 		to_assign = set(uuids)
 		for seq in self.global_batch:
@@ -2244,6 +2363,14 @@ class BatchGenWorker:
 			# (ON_HOLD->IN_DECODE) keeps its group — its head-sharded KDA state
 			# already lives on that group's ranks, so re-grouping would strand it.
 			if seq is None or seq.decode_dp_group is not None:
+				continue
+			pinned_group = pins.get(uuid)
+			if pinned_group is not None:
+				# The session's own group, stamped here; the idempotent skip
+				# above then keeps it through every later assignment.
+				seq.decode_dp_group = int(pinned_group)
+				L = getattr(seq, "prompt_length", 0) or 0
+				prior[int(pinned_group)] += float(L) * float(L)
 				continue
 			lengths.append(getattr(seq, "prompt_length", 0) or 0)
 			seqs.append(seq)
@@ -5868,6 +5995,20 @@ class BatchGenWorker:
 				)
 				self._prefix_sequence_states[seq.global_idx] = state
 				prefix_states[seq.global_idx] = state
+		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# governs the whole trajectory path, so lookups cannot be on while
+		# commits are off. With it off nothing here runs and no attachment is
+		# taken, so the restore seam stays empty and this wave is
+		# byte-identical to a pre-Slice-2 one.
+		#
+		# Slice 3 moved this IN FRONT of the pool plan: a hit whose prefix the
+		# wave materializes is a plan input, and the reference this lookup
+		# takes is what keeps the frontier's pages resident from the plan that
+		# names them to the load that reads them.
+		if owned and self._trajectory_commit_requested(
+			[self.global_batch.get_sequence(uuid) for uuid in served]
+		):
+			self._lookup_trajectory_frontiers(owned)
 		# In-wave pool: plan this rank's shared segments from the same wave.
 		# The plan only reads tokens and states; Host pages for the segments
 		# are allocated inside the reservation transaction below.
@@ -6578,11 +6719,14 @@ class BatchGenWorker:
 			# this wave will not use, and every one of them is a hot prefix a
 			# later prompt has to recompute.
 			from batchgen.prefix_reuse.eviction import (
+				EvictedPageRecorder,
 				reclaim_prefix_pages_for_host_admission,
+				retire_node_frontiers,
 			)
 			failure = 0
 			updated_local_free = -1
-			released = 0
+			local_frontier_hook = self._trajectory_frontier_eviction_hook()
+			reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
 			if self.local_rank == 0:
 				try:
 					worker_view = self.core_engine.host_paged_kv_worker_view
@@ -6600,6 +6744,7 @@ class BatchGenWorker:
 							group_id=0,
 							page_target=page_target,
 							max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+							frontier_hook=reclaimed_pages,
 						)
 						updated_local_free = self._get_host_kv_free_pages()
 						logging.info(
@@ -6620,22 +6765,53 @@ class BatchGenWorker:
 					logging.exception("[PREFIX_CACHE] admission eviction failed")
 					failure = 1
 			failed = torch.tensor(
-				[failure, int(released)],
+				[failure, reclaimed_pages.page_count],
 				dtype=torch.int64, device=self.torch_device,
 			)
 			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
 			if int(failed[0].item()) != 0:
 				raise RuntimeError("prefix cache admission eviction failed on a worker")
-			# Only the node leader reclaims, so the MAX is the largest per-node
-			# release: rank-uniform, and nonzero exactly when some node freed
-			# pages. It enters the guard state as this wave's reclaim outcome.
-			reclaim_outcome = (1, int(failed[1].item()))
+			reclaimed_page_count = int(failed[1].item())
+			reclaim_outcome = (1, reclaimed_page_count)
+			# The leader already retired its own frontiers inside the release.
+			# Any other rank of the node may own frontier records standing on
+			# the reclaimed pages (G=1, or several serve groups per node), so
+			# every rank runs its own hook on its node's reclaimed map.
+			frontier_failure = 0
+			if reclaimed_page_count != 0:
+				gathered_reclaims = [None] * self.world_size
+				dist.all_gather_object(
+					gathered_reclaims,
+					(
+						report_node,
+						reclaimed_pages.pages_by_group
+						if self.local_rank == 0 else None,
+					),
+				)
+				if self.local_rank != 0:
+					try:
+						retire_node_frontiers(
+							gathered=gathered_reclaims,
+							node_id=report_node,
+							frontier_hook=local_frontier_hook,
+						)
+					except Exception:
+						logging.exception(
+							"[PREFIX_CACHE] frontier retirement after admission "
+							"reclaim failed"
+						)
+						frontier_failure = 1
 			updated = torch.tensor(
-				[report_node, updated_local_free],
+				[report_node, updated_local_free, frontier_failure],
 				dtype=torch.int64, device=self.torch_device,
 			)
 			gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
 			dist.all_gather(gathered, updated)
+			if any(int(item[2].item()) != 0 for item in gathered):
+				raise RuntimeError(
+					"trajectory frontier retirement after admission reclaim "
+					"failed on a worker"
+				)
 			for item in gathered:
 				node, free = int(item[0].item()), int(item[1].item())
 				if free >= 0:
@@ -8417,6 +8593,15 @@ class BatchGenWorker:
 						prefill_start = time.perf_counter()
 						try:
 							with torch.inference_mode():
+								# M3 Slice 2 restore. THE single
+								# pre-suffix-prefill seam: above the
+								# prepack/plain dispatch so both paths get the
+								# restored KDA state, and above every forward
+								# launch of this wave, so the slot write is
+								# ordered before any kernel that reads it.
+								self._restore_trajectory_frontiers(
+									local_prefill_indices
+								)
 								if self.enable_prepack:
 									self.prefill_prepacked(local_prefill_indices)
 								else:
@@ -8519,6 +8704,13 @@ class BatchGenWorker:
 						if pool_wave_start is not None else None
 					)
 					dist.barrier()
+					# M3 Slice 1c: THE post-barrier finalize. Every rank of
+					# every serve group has returned from its own shard write
+					# before any rank gets past the barrier above, so a frontier
+					# record installed here binds a complete G-shard snapshot.
+					# This is also where an arena no commit consumed gives its
+					# Host pages back.
+					self._finalize_trajectory_frontiers()
 					if pool_wave_start is not None:
 						logging.info("[METRICS] %s", json.dumps({
 							"component": "prefix_pool",
@@ -9443,7 +9635,30 @@ class BatchGenWorker:
 		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
 		# hands the leader's page tables, prefix metadata and pool segment
 		# pages to the rest of its serve group.
-		self._mirror_group_host_kv(my_prefill_uuids, self._prefix_sequence_states)
+		#
+		# M3 Slice 1c rides this same gather when the trajectory flag is on and
+		# the group is head-sharded: the leader's G-wide snapshot arenas and
+		# its frontier hits travel with the page tables, so no new collective
+		# is introduced. The predicate is broadcast-identical (the flag is on
+		# the batch's own sequences and the batch is replicated), so every rank
+		# reaches the gather with the same expectation.
+		self._trajectory_arena_payload = {}
+		self._trajectory_mirrored_restores = {}
+		mirror_trajectory = (
+			self._decode_attn_tp_size() > 1
+			and self.enable_prefix_cache
+			and self._trajectory_commit_requested(
+				[
+					self.global_batch.get_sequence(uuid)
+					for uuid in prefill_uuids
+				]
+			)
+		)
+		self._mirror_group_host_kv(
+			my_prefill_uuids,
+			self._prefix_sequence_states,
+			trajectory=mirror_trajectory,
+		)
 
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
@@ -10618,6 +10833,10 @@ class BatchGenWorker:
 		self._emit_prefix_cache_metric(
 			"prefix_drain",
 			**self._prefix_host_resource_fields(),
+			# M3 Slice 2: live attachments must be zero at the drain, beside
+			# the coordinator's own active_attachments. Absent on a run that
+			# never turned the trajectory flag on.
+			**self._trajectory_restore_fields(),
 		)
 
 	def _close_prefix_materialization(
@@ -11060,6 +11279,164 @@ class BatchGenWorker:
 					"wave" if current_wave else "sharing-aware", len(seqs), counts,
 				)
 
+	def _materialized_prefix_hits(self, seqs, *, page_tokens: int, group):
+		"""``(hits, confirmed, pages)`` for this wave's trajectory re-entries.
+
+		M3 Slice 3, the plan input. EVERY rank of a serve group must derive
+		the SAME hit set BEFORE planning, or two ranks pack different chunks
+		of the per-layer collectives that pair them up. So the set is read
+		from the MIRRORED session index -- replicated read-only data every
+		rank folded from the same gather -- and never from the frontier
+		registry, which only the group's host-KV leader holds. At G==1 a rank
+		is its own group, and its own live attachments are that same data.
+
+		``confirmed`` is this rank's vote on whether the mirrored set is still
+		true. The index distributes on the prefill-config mirror, so it lags a
+		commit by one flag-on pass (Slice 3a addendum): a session that has
+		advanced or been evicted since would otherwise be materialized from
+		pages nobody holds any more. The leader compares the mirrored boundary
+		against the record it is holding a reference on; a rank with no
+		opinion votes yes and the group reduces with MIN, so one leader's
+		"no" takes the whole group back to recomputing.
+
+		``pages`` maps a hit's wave index to the frontier's resident Host
+		pages per KV group -- known only to the leader, which mirrors them to
+		the group inside this same pass.
+		"""
+		from batchgen.prefix_reuse.wave_plan import MaterializedPrefix
+
+		if not self._trajectory_commit_requested(seqs):
+			return [], True, {}
+		digest = self.prefix_cache_runtime_config.namespace_digest
+		index = self._trajectory_session_groups
+		hits: List[MaterializedPrefix] = []
+		pages: Dict[int, Dict[int, List[int]]] = {}
+		confirmed = True
+		unknown = 0
+		for position, seq in enumerate(seqs):
+			if seq is None:
+				continue
+			attachment = self._trajectory_attachments.get(int(seq.global_idx))
+			if group is None:
+				# Own group: no peer to agree with, so the live record is the
+				# only truth there is.
+				if attachment is None:
+					unknown += 1
+					continue
+				boundary = int(attachment.boundary_tokens)
+				entry_group = int(attachment.owning_group_id)
+			else:
+				entry = None if index is None else index.resolve(
+					namespace_digest=digest,
+					prompt_token_ids=self._trajectory_tokens(
+						seq, length=seq.prompt_length
+					).tolist(),
+				)
+				if entry is None:
+					unknown += 1
+					continue
+				boundary = int(entry.boundary_tokens)
+				entry_group = int(entry.owning_group_id)
+			reason = self._unmaterializable_frontier(
+				seq, boundary=boundary, owning_group_id=entry_group,
+				page_tokens=page_tokens,
+			)
+			if reason is not None:
+				logging.info(
+					"[PREFIX_POOL] Rank %s sequence %s continues a frontier at "
+					"%s token(s) the pool cannot materialize (%s); it is "
+					"prefilled in full",
+					self.rank, int(seq.global_idx), boundary, reason,
+				)
+				continue
+			hits.append(MaterializedPrefix(index=position, tokens=boundary))
+			if attachment is None:
+				if self._owns_host_kv(seq):
+					# This rank holds the registry the index came from and has
+					# no live record for it: the mirror is stale.
+					logging.warning(
+						"[PREFIX_POOL] Rank %s holds no live frontier for "
+						"sequence %s, which the mirrored session index places "
+						"at boundary %s; the group recomputes this wave",
+						self.rank, int(seq.global_idx), boundary,
+					)
+					confirmed = False
+				continue
+			if int(attachment.boundary_tokens) != boundary:
+				logging.warning(
+					"[PREFIX_POOL] Rank %s holds sequence %s's frontier at "
+					"boundary %s but the mirrored index says %s; the group "
+					"recomputes this wave",
+					self.rank, int(seq.global_idx),
+					int(attachment.boundary_tokens), boundary,
+				)
+				confirmed = False
+				continue
+			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			attached = 0 if state is None else int(state.attached_tokens)
+			if attached < boundary:
+				# The resident pages the load reads are kept resident by this
+				# sequence's own prefix-cache attachment, so that attachment
+				# must already cover the frontier. It normally covers more (the
+				# lookup attaches the longest resident prefix); less means the
+				# cache does not in fact hold what the index advertised.
+				logging.warning(
+					"[PREFIX_POOL] Rank %s: sequence %s holds %s attached "
+					"prefix token(s), fewer than the %s-token frontier the "
+					"index advertised; the group recomputes",
+					self.rank, int(seq.global_idx), attached, boundary,
+				)
+				confirmed = False
+				continue
+			record_pages = {
+				int(group_id): [int(page) for page in page_ids]
+				for group_id, page_ids in
+				attachment.record.page_ids_by_group.items()
+			}
+			if not record_pages:
+				logging.warning(
+					"[PREFIX_POOL] Rank %s: sequence %s's frontier record "
+					"names no resident Host page; the group recomputes",
+					self.rank, int(seq.global_idx),
+				)
+				confirmed = False
+				continue
+			pages[position] = record_pages
+		if unknown:
+			# A fresh (turn-1) prompt legitimately continues nothing, so this
+			# is one aggregate line, not a per-sequence warning. It exists so
+			# a wave whose EVERY continuation misses -- the mirrored index
+			# lagging its leader's registry -- is visible in the log instead
+			# of silently planning an unpooled wave.
+			logging.info(
+				"[PREFIX_POOL] Rank %s: %s of %s flag-on sequence(s) continue "
+				"no session known to %s; they are prefilled in full",
+				self.rank, unknown, len(seqs),
+				"this rank's live attachments" if group is None
+				else "the mirrored session index",
+			)
+		return hits, confirmed, pages
+
+	def _unmaterializable_frontier(
+		self, seq, *, boundary: int, owning_group_id: int, page_tokens: int
+	) -> Optional[str]:
+		"""Why this frontier cannot become a pool segment, or None.
+
+		Each reason is a property of the wave, identical on every rank that
+		derived the same hit, so skipping on it keeps the plans identical.
+		"""
+
+		if boundary <= 0 or boundary % int(page_tokens):
+			return "boundary_off_the_page_grid"
+		if boundary > int(seq.prompt_length) - 1:
+			# The last prompt token must stay private: it produces the logit.
+			return "no_private_token_left"
+		if int(seq.decode_dp_group or 0) != int(owning_group_id):
+			# The snapshot is head-sharded for the owning group, so a
+			# sequence serving elsewhere could not restore its state.
+			return "serving_group_is_not_the_owning_group"
+		return None
+
 	def _plan_prefill_pool_wave(self, uuids, prefix_states):
 		"""Plan this rank's in-wave sharing. CPU-side: the GPU pool is built in
 		the prefill phase (`_construct_prefill_pool`), after configure_prefill
@@ -11084,6 +11461,7 @@ class BatchGenWorker:
 		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
+			PoolMaterializationDoesNotFit,
 			plan_wave_prefix_sharing,
 			validate_wave_prefix_plan,
 		)
@@ -11114,18 +11492,36 @@ class BatchGenWorker:
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
 		state_slots = self._prefill_pool_free_state_slots()
+		# M3 Slice 3: the wave's trajectory re-entry hits, derived from
+		# replicated data so every rank of the group has the same set, plus
+		# this rank's vote on whether that set is still live.
+		hits, hits_confirmed, hit_pages = self._materialized_prefix_hits(
+			seqs, page_tokens=page_tokens, group=group
+		)
 		if group is not None:
 			# Reached by every rank of the group (uuids is the group's sequence
 			# set): the tightest rank's budget is the group's, so the identical
-			# prompts then give every rank the identical plan.
+			# prompts then give every rank the identical plan. The
+			# materialization vote rides the SAME reduce -- it decides the
+			# plan, so it has to be settled before the plan is built, and a
+			# second collective here would be a second place to diverge.
 			budget = torch.tensor(
-				[total_pages, state_slots],
+				[total_pages, state_slots, 1 if hits_confirmed else 0],
 				dtype=torch.int64,
 				device=self.torch_device,
 			)
 			dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=group)
 			total_pages = int(budget[0].item())
 			state_slots = int(budget[1].item())
+			hits_confirmed = bool(int(budget[2].item()))
+		if hits and not hits_confirmed:
+			logging.warning(
+				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): the "
+				"serve group could not confirm the mirrored frontier set; the "
+				"wave recomputes them",
+				self.rank, len(hits),
+			)
+			hits = []
 		if self._prefill_pool_psm_layout() is not None:
 			# The pool holds EVERY token of a chunk, tails as well as segments,
 			# so a chunk wider than the pool can never be planned; leave half the
@@ -11155,8 +11551,7 @@ class BatchGenWorker:
 		# the pool layout above; GPT-OSS and GLM declare neither.
 		declares = getattr(self.parallel_manager, "supports_group_pool_prefill", None)
 		level_wise = declares is not None and bool(declares())
-		plan = plan_wave_prefix_sharing(
-			prompts,
+		plan_kwargs = dict(
 			block_tokens=page_tokens,
 			pool_pages=total_pages - scratch,
 			chunk_tokens=chunk_tokens,
@@ -11167,6 +11562,30 @@ class BatchGenWorker:
 			# plus an FP8 copy, ~384 B each); keep that inside the workspace.
 			chunk_keys=None if with_v else 8 * 1024 * 1024,
 		)
+		if hits and not plan_kwargs["same_chunk_ancestors"]:
+			# A model whose rows cannot read a segment resident in their own
+			# chunk cannot run a load either; named here rather than refused
+			# inside the planner on every wave.
+			logging.info(
+				"[PREFIX_POOL] Rank %s drops %d materialized prefix(es): this "
+				"model's pool does not read a segment resident in its own "
+				"chunk",
+				self.rank, len(hits),
+			)
+			hits = []
+		try:
+			plan = plan_wave_prefix_sharing(prompts, materialized=hits, **plan_kwargs)
+		except PoolMaterializationDoesNotFit as exc:
+			# Deterministic in the group's own inputs (the same prompts, the
+			# same hit set, the same group-MIN budget), so every rank of the
+			# group falls back on the same wave.
+			logging.warning(
+				"[PREFIX_POOL] Rank %s plans this wave WITHOUT its %d "
+				"materialized prefix(es) and recomputes them: %s",
+				self.rank, len(hits), exc,
+			)
+			hits = []
+			plan = plan_wave_prefix_sharing(prompts, materialized=(), **plan_kwargs)
 		if level_wise:
 			# Rows grouped by level, so a recurrent layer runs one packed call
 			# per level, each after the level that left its parents' state.
@@ -11177,7 +11596,11 @@ class BatchGenWorker:
 		# row of its own, so on a model with per-sequence recurrent state it
 		# holds a slot of its own until the wave ends. The slot budget is the
 		# group MIN, so this decline is group-uniform like every other.
-		state_slots_needed = len(plan.segments) + len(prompts)
+		# A materialized segment is no row, so it holds no recurrent state
+		# slot; only the segments a row computes do.
+		state_slots_needed = (
+			len(plan.segments) - len(plan.materialized_segments) + len(prompts)
+		)
 		if not plan.segments or 0 <= state_slots < state_slots_needed:
 			logging.info(
 				"[PREFIX_POOL] Rank %s wave keeps the existing path: %d segments "
@@ -11194,8 +11617,25 @@ class BatchGenWorker:
 			total_pages=total_pages,
 			scratch_pages=scratch,
 		)
+		for segment_id in sorted(wave.materialized):
+			members = plan.segments[segment_id].members
+			source = next(
+				(hit_pages[index] for index in members if index in hit_pages),
+				None,
+			)
+			if source is None:
+				# A follower holds no record: the leader mirrors these pages
+				# inside this same pass, before the forward reads them.
+				continue
+			wave.bind_materialized_host_pages(segment_id, source)
 		self._replace_prefix_lookup_hits(
-			seqs, prefix_states, [wave.chain_tokens(index) for index in range(len(seqs))]
+			seqs, prefix_states,
+			[wave.chain_tokens(index) for index in range(len(seqs))],
+			retain=frozenset(
+				index
+				for segment_id in wave.materialized
+				for index in plan.segments[segment_id].members
+			),
 		)
 		logging.info(
 			"[PREFIX_POOL] Rank %s wave plan: %d prompts, %d segments, %d chunks, "
@@ -11426,31 +11866,53 @@ class BatchGenWorker:
 		self._prefill_pool_layout_cache = layout
 		return layout
 
-	def _replace_prefix_lookup_hits(self, seqs, prefix_states, chain_tokens) -> None:
+	def _replace_prefix_lookup_hits(
+		self, seqs, prefix_states, chain_tokens, retain=frozenset()
+	) -> None:
 		"""Release each cross-wave lookup hit; a prompt starts at its chain end.
 
 		A serve-group follower plans the same wave as its leader but holds no
 		lookup of its own — the leader owns every coordinator attachment and
 		mirrors the state afterwards — so a missing entry is its normal case and
 		leaves nothing to release.
+
+		``retain`` names the wave indices whose attachment must SURVIVE this
+		call (M3 Slice 3: a materialized prefix is read out of the prefix
+		cache's own resident pages for the whole wave, and that attachment is
+		what keeps them resident; a computed segment needs no such protection
+		because the wave publishes it afresh). The handle moves into the
+		sequence's retained-handle tuple, so the one release lane every
+		sequence leaves through frees it exactly once.
 		"""
 		from batchgen.prefix_reuse.prefill import PrefixCacheSequenceState
 
-		for seq, end in zip(seqs, chain_tokens):
+		for index, (seq, end) in enumerate(zip(seqs, chain_tokens)):
 			old = prefix_states.get(seq.global_idx)
-			if old is not None and old.attachment_handle:
-				self.prefix_cache_coordinator.release_attachment(old.attachment_handle)
+			handle = 0 if old is None else int(old.attachment_handle)
+			if handle and index not in retain:
+				self.prefix_cache_coordinator.release_attachment(handle)
+				handle = 0
 			state = PrefixCacheSequenceState(
-				lookup_result=None, attached_tokens=end, compute_cached_tokens=end
+				lookup_result=None,
+				attached_tokens=end,
+				compute_cached_tokens=end,
+				commit_attachment_handles=(handle,) if handle else (),
 			)
 			prefix_states[seq.global_idx] = state
 			self._prefix_sequence_states[seq.global_idx] = state
 
 	def _prefill_pool_segment_host_pages(self) -> int:
+		"""Host pages this wave allocates for its segments.
+
+		A materialized segment is excluded: its pages are the frontier's,
+		already allocated and retained by the wave that computed it.
+		"""
 		wave = self._prefill_pool_wave
 		if wave is None:
 			return 0
-		return sum(seg.tokens for seg in wave.plan.segments) // wave.page_tokens
+		return sum(
+			seg.tokens for seg in wave.computed_segments()
+		) // wave.page_tokens
 
 	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
 		"""One Host copy per pooled segment; members attach their chain of them."""
@@ -11477,11 +11939,142 @@ class BatchGenWorker:
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
-			# A segment's Host pages live until its last member releases.
-			sids = tuple(wave.segment_sids[seg] for seg in wave.chains[index])
+			# A segment's Host pages live until its last member releases. A
+			# materialized segment has no pseudo sequence to refcount: its
+			# pages are the prefix cache's, kept by this sequence's own
+			# attachment and released with it.
+			sids = tuple(
+				wave.segment_sids[seg]
+				for seg in wave.chains[index]
+				if seg not in wave.materialized
+			)
 			self._pool_member_sids[global_id] = sids
 			for sid in sids:
 				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
+
+	def _materialized_pool_layers(self):
+		"""The attention layers that materialize, in Host physical order.
+
+		The n-th materializing layer must be pool row n: both the pool and the
+		Host cache hold one dense row per cached attention layer, in engine
+		order, and the load addresses them by that one index. Asserted rather
+		than assumed -- a model whose two orders disagree would load every
+		layer's prefix into the wrong row, and attention would read plausible
+		numbers from the wrong depth.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+
+		layer_map = AttnWrapperBase.prefill_pool_layer_map
+		if not layer_map:
+			raise RuntimeError(
+				"a materialized segment needs the pool's engine-layer map"
+			)
+		layers = []
+		for engine_layer, decoder_layer in enumerate(self.model.model.layers):
+			attn = decoder_layer.self_attn
+			if not hasattr(attn, "materialize_pool_segment"):
+				continue
+			row = int(layer_map[engine_layer])
+			if row < 0:
+				continue
+			if row != len(layers):
+				raise RuntimeError(
+					f"engine layer {engine_layer} is pool row {row} but the "
+					f"{len(layers)}th materializing layer; the pool and Host "
+					"orders must agree for a prefix load"
+				)
+			layers.append(attn)
+		return layers
+
+	def _materialized_segment_loader(self, wave):
+		"""Staging for this wave's loads, or None when it materializes none."""
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		from batchgen.prefix_reuse.pool_materialize import (
+			DEFAULT_SLAB_BYTES,
+			MaterializedSegmentLoader,
+		)
+
+		if not wave.materialized:
+			return None
+		views = self._host_views_by_group()
+		if len(views) != 1:
+			# A dual-region model keeps a second Host KV region (the DSA
+			# indexer keys), which a latent expansion does not reconstruct.
+			raise RuntimeError(
+				f"materializing a prefix needs exactly one Host KV region, "
+				f"this model has {len(views)}"
+			)
+		group_id, view = next(iter(sorted(views.items())))
+		geometry = build_gpu_kv_config(
+			self.huggingface_ckpt_name, [int(wave.page_tokens)]
+		)
+		loader = MaterializedSegmentLoader(
+			worker_view=view,
+			num_layers=int(geometry.num_layers),
+			page_tokens=int(wave.page_tokens),
+			latent_dim=int(geometry.num_k_heads) * int(geometry.k_head_dim),
+			dtype=geometry.kv_dtype,
+			device=self.torch_device,
+			max_slab_bytes=DEFAULT_SLAB_BYTES,
+		)
+		logging.info(
+			"[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
+			"%d B of device staging (%d Host page(s) per slab, group %s)",
+			self.rank, len(wave.materialized), loader.staging_bytes,
+			loader.slab_pages, group_id,
+		)
+		return loader
+
+	def _load_materialized_segments(self, wave, rows, loader) -> int:
+		"""Fill this chunk's loaded segments BEFORE its forward reads them.
+
+		Per slab: one H2D of the committed latent across every layer, waited
+		on, then each layer expands its own slab through its own projection
+		into the pool slots that layer's row would have written. Returns the
+		number of tokens loaded, for the wave's metrics.
+		"""
+		if not rows.materialized:
+			return 0
+		if loader is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: this chunk loads "
+				f"{len(rows.materialized)} materialized segment(s) with no "
+				"staging; the wave was built without a loader"
+			)
+		layers = self._materialized_pool_layers()
+		loaded = 0
+		for stage in rows.materialized:
+			pages_by_group = wave.segment_host_pages.get(stage.segment_id)
+			if not pages_by_group:
+				raise RuntimeError(
+					f"Rank {self.rank}: materialized segment "
+					f"{stage.segment_id} names no Host page to load from"
+				)
+			if len(pages_by_group) != 1:
+				raise RuntimeError(
+					f"Rank {self.rank}: materialized segment "
+					f"{stage.segment_id} spans {len(pages_by_group)} Host KV "
+					"regions; a latent expansion fills one"
+				)
+			pages = next(iter(pages_by_group.values()))
+			for slab in loader.slabs(
+				host_page_ids=pages, tokens=int(stage.tokens)
+			):
+				window = stage.slots[
+					slab.token_start:slab.token_start + slab.tokens
+				]
+				for physical, attn in enumerate(layers):
+					attn.materialize_pool_segment(
+						latent=slab.latent[physical], slots=window
+					)
+				loaded += int(slab.tokens)
+			logging.info(
+				"[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
+				"token(s) over %d Host page(s) into %d pool page(s)",
+				self.rank, stage.segment_id, int(stage.tokens), len(pages),
+				len(stage.pages),
+			)
+		return loaded
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
 		"""Prefill a planned wave: each pooled segment once, then every tail."""
@@ -11519,7 +12112,8 @@ class BatchGenWorker:
 			# transaction, before this method is entered.
 			epilogue_trace.phase(
 				"wave_begin",
-				rows=len(wave.plan.segments) + len(wave.global_ids),
+				# Rows, so loaded segments do not count: they run none.
+				rows=len(wave.computed_segments()) + len(wave.global_ids),
 				tokens=wave.plan.computed_tokens,
 				chunks=len(wave.plan.chunks),
 			)
@@ -11536,6 +12130,12 @@ class BatchGenWorker:
 		# A recurrent layer forks a row's state from its parent segment's state
 		# slot, which is keyed by that segment's pseudo sequence id.
 		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
+		# A LOADED segment ran no row, so it left no recurrent state to fork:
+		# its reader resumes from the slot the trajectory restore bound before
+		# this wave, which the level cut verifies.
+		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
+			sorted(wave.materialized)
+		)
 		# The pool row of an engine layer comes from the model's own pool
 		# layout, never from a KV cache's layer mapping: a cache that keeps
 		# every layer resolves to itself and would index past the pool.
@@ -11548,6 +12148,9 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_offload_recorder = (
 			self._new_pool_offload_check_recorder(wave)
 		)
+		# Staging for the wave's loads; None unless it materializes something.
+		materialized_loader = self._materialized_segment_loader(wave)
+		materialized_tokens = 0
 		offload_recorder_handed_off = False
 		try:
 			start = time.perf_counter()
@@ -11570,6 +12173,12 @@ class BatchGenWorker:
 				AttnWrapperBase.cur_batch = host_ids
 				AttnWrapperBase.prefill_pool_batch = rows
 				AttnWrapperBase.prefill_pool_row_starts = host_starts
+				# Before the forward, never during it: every layer's pool row
+				# holds the committed prefix by the time any row attends over
+				# it, and a failure here has not yet touched the forward.
+				materialized_tokens += self._load_materialized_segments(
+					wave, rows, materialized_loader
+				)
 				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
 				block_residual = (
 					self.model.model._new_block_residual(hidden_states)
@@ -11720,6 +12329,8 @@ class BatchGenWorker:
 			# has to live across the chunks that continue it, so it is released
 			# here — the wave is over and no later batch carries those ids.
 			self._release_kda_state_slots(list(wave.segment_sids.values()))
+			if materialized_loader is not None:
+				materialized_loader.release()
 			# Probe recorder teardown, unconditional: a wave that died anywhere
 			# above must not leave its records attached to a class attribute or
 			# to a pool the next wave inherits. The dump recorder is finished
@@ -11734,6 +12345,7 @@ class BatchGenWorker:
 			AttnWrapperBase.prefill_pool_batch = None
 			AttnWrapperBase.prefill_pool_row_starts = None
 			AttnWrapperBase.prefill_pool_segment_sids = None
+			AttnWrapperBase.prefill_pool_materialized_segments = ()
 			AttnWrapperBase.prefill_pool_layer_map = None
 			AttnWrapperBase.prepack_mode = False
 			AttnWrapperBase.prepack_cu_seqlens = None
@@ -11752,6 +12364,8 @@ class BatchGenWorker:
 			"full_attention_pairs": work.full_attention_pairs,
 			"item_rows": work.item_rows,
 			"saved_tokens": wave.plan.prompt_tokens - executed,
+			"materialized_tokens": materialized_tokens,
+			"materialized_segments": len(wave.materialized),
 			"segments": len(wave.plan.segments),
 			"chunks": len(wave.plan.chunks),
 			"threshold": wave.plan.threshold,
@@ -12125,6 +12739,19 @@ class BatchGenWorker:
 	) -> None:
 		if not self.enable_prefix_cache:
 			return
+		# M3 Slice 2: a trajectory attachment that never reached its restore
+		# leaves through the SAME seam, so a rejected wave, a rolled back
+		# allocation and a completed row all return the live count to zero.
+		self._release_trajectory_attachments(
+			[int(sequence_id) for sequence_id in global_sequence_ids]
+		)
+		# A pass that died between the config-time arena reservation and the
+		# post-barrier finalize never installed a record, so its arena is
+		# holding Host pages nothing names. This is the teardown seam every
+		# such path already goes through.
+		self._rollback_trajectory_reservations(
+			[int(sequence_id) for sequence_id in global_sequence_ids]
+		)
 		for sequence_id in global_sequence_ids:
 			self._release_pool_segment_refs(int(sequence_id))
 			state = self._prefix_sequence_states.pop(int(sequence_id), None)
@@ -12133,6 +12760,810 @@ class BatchGenWorker:
 			for handle in (*state.commit_attachment_handles, state.attachment_handle):
 				if handle:
 					self.prefix_cache_coordinator.release_attachment(handle)
+
+	def _trajectory_commit_requested(self, batch_sequences) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_trajectory_commit`` (M3 1b).
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		batch's own sequences, so it can be turned on against a server that is
+		already up. A value other than ``"on"``/``"off"`` is refused by name
+		rather than read as off -- a mistyped flag would look like a clean run
+		with no frontier committed.
+		"""
+		from batchgen.prefix_reuse.trajectory_commit import (
+			trajectory_commit_enabled,
+		)
+
+		return trajectory_commit_enabled(
+			self._active_batchgen_debug_for_sequences(batch_sequences)
+		)
+
+	def _trajectory_group_geometry(self) -> tuple:
+		"""(G, this rank's shard index, whether it leads its serve group).
+
+		The KDA state is head-sharded across the G ranks of a serve group, so a
+		complete snapshot is G shards and rank ``r`` of the group owns shard
+		``r``. The group leader is ``decode_dp_group * G`` (``host_kv_owner
+		_rank``), so within the group the leader is index 0 and this rank's
+		shard index is simply ``rank % G`` -- the same arithmetic, read from the
+		other end, so there is no second notion of group membership.
+		"""
+		G = self._decode_attn_tp_size()
+		shard_index = int(self.rank % G) if G > 1 else 0
+		return int(G), shard_index, shard_index == 0
+
+	def _get_trajectory_frontier_committer(self):
+		"""One trajectory-frontier committer per rank, built on first use.
+
+		The snapshot arena shares the pool-segment negative pseudo-sid
+		namespace (``_next_pool_segment_sid``), so the two Host-page
+		mechanisms cannot collide, and its page geometry comes from the
+		prefix-cache runtime config -- the same ``host_page_bytes_all_layers``
+		the frontier charge is expressed in.
+		"""
+		if self._trajectory_frontier_committer is not None:
+			return self._trajectory_frontier_committer
+		from batchgen.models.moonshotai.kimi_linear.wrappers import (
+			KimiLinearKDAWrapper,
+		)
+		from batchgen.prefix_reuse.trajectory_commit import (
+			HostKVSnapshotArenaAllocator,
+			KDAStateSnapshotReader,
+			TrajectoryFrontierCommitter,
+			TrajectoryStateUnavailable,
+			profile_from_kda_state_config,
+		)
+
+		manager = KimiLinearKDAWrapper.state_manager
+		if manager is None:
+			raise TrajectoryStateUnavailable(
+				"prefix_trajectory_commit needs a live KDA state pool; this "
+				"deployment has none"
+			)
+		runtime = self.prefix_cache_runtime_config
+		page_tokens = int(runtime.group_specs[0].raw_page_tokens)
+		page_bytes = int(runtime.host_page_bytes_all_layers)
+		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
+		self._trajectory_frontier_committer = TrajectoryFrontierCommitter(
+			rank=self.rank,
+			page_tokens=page_tokens,
+			host_page_bytes_all_layers=page_bytes,
+			# M3 Slice 1c: at G>1 every rank of the serve group snapshots its
+			# OWN head shard into the leader's one G-wide arena, and the leader
+			# alone keeps the registry -- a follower record would outlive the
+			# arena the leader can evict under it.
+			shard_count=shard_count,
+			shard_index=shard_index,
+			owns_registry=is_leader,
+			arena_allocator=HostKVSnapshotArenaAllocator(
+				host_views_provider=self._host_views_by_group,
+				page_tokens=page_tokens,
+				host_page_bytes_all_layers=page_bytes,
+				next_pseudo_sid=self._next_pool_segment_sid,
+			),
+			snapshot_reader=KDAStateSnapshotReader(
+				state_manager_provider=(
+					lambda: KimiLinearKDAWrapper.state_manager
+				),
+				profile=profile_from_kda_state_config(manager.config),
+			),
+		)
+		return self._trajectory_frontier_committer
+
+	def _trajectory_frontier_eviction_hook(self):
+		"""The frontier eviction seam, or None when no frontier is committed.
+
+		Returns the committer's hook only once a committer EXISTS, so the
+		prefix eviction path keeps its exact previous behavior on every run
+		that never turned the flag on.
+		"""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return None
+		return committer.on_prefix_pages_released
+
+	def _get_trajectory_restorer(self):
+		"""M3 Slice 2 restorer, or None when no frontier has been committed.
+
+		Deliberately does NOT construct a committer: with nothing committed on
+		this rank every lookup is a guaranteed miss, so a lookup must not be
+		the thing that builds the commit-side machinery (and must not raise
+		``TrajectoryStateUnavailable`` on a deployment that has no KDA pool).
+		The arena reader shares the committer's negative pseudo-sid namespace
+		(``_next_pool_segment_sid``), so its read row cannot collide with a
+		pool segment or with an arena being written.
+		"""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return None
+		if self._trajectory_restorer is not None:
+			return self._trajectory_restorer
+		from batchgen.models.moonshotai.kimi_linear.wrappers import (
+			KimiLinearKDAWrapper,
+		)
+		from batchgen.prefix_reuse.trajectory_restore import (
+			HostKVSnapshotArenaReader,
+			KDAStateSnapshotWriter,
+			TrajectoryRestorer,
+		)
+
+		self._trajectory_restorer = TrajectoryRestorer(
+			rank=self.rank,
+			committer=committer,
+			arena_reader=HostKVSnapshotArenaReader(
+				host_views_provider=self._host_views_by_group,
+				next_pseudo_sid=self._next_pool_segment_sid,
+			),
+			state_writer=KDAStateSnapshotWriter(
+				state_manager_provider=(
+					lambda: KimiLinearKDAWrapper.state_manager
+				),
+				profile=committer.layout.profile,
+			),
+			attention_group_size=committer.shard_count,
+			# WHICH head shard this rank restores: the same index its commit
+			# wrote, read from the committer so the two cannot disagree.
+			shard_index=committer.shard_index,
+		)
+		return self._trajectory_restorer
+
+	def _trajectory_commit_tokens(self, seq) -> int:
+		"""Page-aligned boundary this sequence would commit at, or 0.
+
+		ONE owner of the figure, read by the config-time reservation and by the
+		commit boundary, so the arena is sized for exactly the boundary that is
+		later stored. Returns 0 when the prompt does not END on a publish
+		boundary: Slice 1c refuses to store a snapshot whose live slot is ahead
+		of the boundary it would claim, so such a sequence gets no arena at all
+		and no rank writes a shard for it.
+		"""
+		runtime = self.prefix_cache_runtime_config
+		if runtime is None:
+			return 0
+		boundary = int(runtime.publish_boundary_tokens)
+		prompt_length = int(getattr(seq, "prompt_length", 0) or 0)
+		commit_tokens = (prompt_length // boundary) * boundary
+		if commit_tokens == 0 or commit_tokens != prompt_length:
+			return 0
+		return commit_tokens
+
+	def _reserve_trajectory_arenas(self, uuids) -> dict:
+		"""Pre-allocate each committing sequence's G-wide snapshot arena.
+
+		Runs in prefill config, on the serve-group LEADER only, because the
+		arena's page ids have to be on the host-KV mirror that runs at the end
+		of that same config -- that mirror is the existing channel every rank
+		uses to find its own shard window, and allocating later would leave the
+		followers with no way to learn it without a new collective.
+
+		The pages leave the Host free pool here, which is the R1 invariant
+		unchanged: the boundary planner sees them gone and cannot double-promise
+		them. Every arena reserved here is either consumed by a commit or given
+		back by ``_finalize_trajectory_frontiers``.
+
+		This is also where the committer takes its INSTALL DECISION, which is
+		why the reservation is handed the frontier identity and not just a page
+		count: the session key and the boundary are already known here, so a
+		sequence whose frontier is already committed reserves nothing and pays
+		neither the D2H nor the shard writes at the commit boundary.
+
+		No-op at G==1: one rank owns the whole arena, so it allocates, writes
+		and retains it inside the commit step exactly as before.
+		"""
+		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1 or not is_leader:
+			return {}
+		committer = self._get_trajectory_frontier_committer()
+		runtime = self.prefix_cache_runtime_config
+		page_tokens = int(runtime.group_specs[0].raw_page_tokens)
+		payload = {}
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or not self._owns_host_kv(seq):
+				continue
+			commit_tokens = self._trajectory_commit_tokens(seq)
+			if commit_tokens == 0:
+				continue
+			global_id = int(seq.global_idx)
+			if global_id in committer.reserved_sequence_ids():
+				continue
+			arena = committer.reserve_arena(
+				sequence_id=global_id,
+				prefix_page_count=commit_tokens // page_tokens,
+				namespace_digest=runtime.namespace_digest,
+				# The same page-aligned prefix the commit boundary will pass,
+				# so the decision taken here and the one taken at the barrier
+				# are about the same frontier.
+				frontier_token_ids=self._trajectory_tokens(
+					seq, length=int(commit_tokens)
+				).tolist(),
+			)
+			if arena is None:
+				# Pool pressure, or a frontier that is already committed and
+				# needs no second record: either way the committer named and
+				# counted it, and this sequence gets no shard write this pass.
+				continue
+			payload[global_id] = {
+				"pseudo_sid": int(arena.pseudo_sid),
+				"shard_count": int(arena.shard_count),
+				"pages_per_group": int(arena.pages_per_group),
+				"capacity_bytes": int(arena.capacity_bytes),
+				"pages": {
+					int(group_id): [int(page) for page in pages]
+					for group_id, pages in arena.page_ids_by_group.items()
+				},
+			}
+		return payload
+
+	def _trajectory_restore_payload(self) -> dict:
+		"""The leader's frontier hits for this pass, for the mirror.
+
+		A follower keeps no registry, so it restores on the LEADER's decision:
+		one decision for the whole group means hit/miss and boundary cannot
+		differ across ranks that must run prefill in lockstep.
+		"""
+		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1 or not is_leader or not self._trajectory_attachments:
+			return {}
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return {}
+		payload = {}
+		for global_id, attachment in self._trajectory_attachments.items():
+			arena = committer.arena_for(attachment.storage_handle)
+			if arena is None:
+				continue
+			payload[int(global_id)] = {
+				"session_key": str(attachment.session_key),
+				"boundary_tokens": int(attachment.boundary_tokens),
+				"owning_group_id": int(attachment.owning_group_id),
+				"shard_count": int(arena.shard_count),
+				"pseudo_sid": int(arena.pseudo_sid),
+				"pages_per_group": int(arena.pages_per_group),
+				"capacity_bytes": int(arena.capacity_bytes),
+				"pages": {
+					int(group_id): [int(page) for page in pages]
+					for group_id, pages in arena.page_ids_by_group.items()
+				},
+			}
+		return payload
+
+	def _trajectory_session_summary(self) -> dict:
+		"""This serve group's committed sessions, for the world map.
+
+		Leader-only: the leader holds its group's ONE frontier registry (the
+		1c single-registry ruling), so its view is the whole truth about the
+		group and a follower has nothing of its own to publish. The summary is
+		compact -- one (owning group, boundary, frontier index key) triple per
+		session, no tokens -- and rides the host-KV mirror's existing
+		world-wide object gather, so no collective is added.
+
+		Published at mirror time, which is the END of a pass's prefill config,
+		while this pass's own records are installed later at the post-barrier
+		finalize. A session therefore becomes pinnable one pass after it is
+		committed; a same-pass continuation could not hit anyway, since its
+		record does not exist until finalize.
+		"""
+		shard_count, _shard_index, is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1 or not is_leader:
+			return {}
+		committer = self._trajectory_frontier_committer
+		if committer is None or not committer.owns_registry:
+			return {}
+		sessions = committer.registry.session_group_summary()
+		return {
+			# The group this leader speaks for. An empty ``sessions`` is
+			# meaningful: it says this group now holds no committed session,
+			# so the fold drops the entries it used to publish.
+			"group_id": int(self.rank // shard_count),
+			"sessions": {
+				str(session_key): [
+					int(owning_group_id),
+					int(boundary_tokens),
+					str(index_key),
+				]
+				for session_key, (
+					owning_group_id,
+					boundary_tokens,
+					index_key,
+				) in sessions.items()
+			},
+		}
+
+	def _fold_trajectory_session_groups(self, gathered) -> None:
+		"""Fold every leader's session summary into this rank's map.
+
+		Runs on EVERY rank, in gathered rank order, over the same list on
+		every rank -- that identity is what lets the pin below be part of a
+		replicated assignment. Nothing is built when no leader published a
+		summary, so a flag-on pass before the first commit allocates nothing.
+		"""
+		summaries = [
+			entry.get("frontier_sessions")
+			for entry in gathered
+			if isinstance(entry, dict) and entry.get("frontier_sessions")
+		]
+		if not summaries and self._trajectory_session_groups is None:
+			return
+		from batchgen.prefix_reuse.trajectory_frontier import (
+			TrajectorySessionGroupIndex,
+		)
+
+		index = self._trajectory_session_groups
+		if index is None:
+			index = TrajectorySessionGroupIndex()
+			self._trajectory_session_groups = index
+		changed = index.fold(summaries)
+		if changed:
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s folded %s session-group "
+				"change(s) from %s leader summary/summaries: %s session(s) "
+				"now pinnable",
+				self.rank,
+				changed,
+				len(summaries),
+				len(index),
+			)
+
+	def _pin_trajectory_session_groups(self, uuids, *, num_groups: int) -> dict:
+		"""``{uuid: owning group}`` for the flag-on continuations in ``uuids``.
+
+		The pin input of ``_assign_decode_dp_groups``. Only sequences that do
+		NOT already carry a group are consulted: a grouped sequence keeps its
+		group (that idempotence is what keeps an evicted re-entry on the ranks
+		holding its head-sharded KDA state), so re-pinning it would be either
+		a no-op or a contradiction.
+
+		Resolution is the map's, which probes the SAME
+		``frontier_index_key`` derivation the registry index is built from, so
+		nothing here re-implements the hashing or the boundary search. A miss
+		returns nothing for that sequence and default assignment is unchanged.
+		"""
+		index = self._trajectory_session_groups
+		if not index:
+			return {}
+		if not self.enable_prefix_cache:
+			return {}
+		runtime = self.prefix_cache_runtime_config
+		if runtime is None or self._trajectory_book is None:
+			return {}
+		sequences = [self.global_batch.get_sequence(uuid) for uuid in uuids]
+		if not self._trajectory_commit_requested(
+			[seq for seq in sequences if seq is not None]
+		):
+			return {}
+		namespace_digest = runtime.namespace_digest
+		pins = {}
+		for seq in sequences:
+			if seq is None or seq.decode_dp_group is not None:
+				continue
+			if not self._trajectory_book.has_sequence(seq.uuid):
+				# No trajectory reservation: the prompt is not readable yet, so
+				# this sequence is not a continuation this pin can place.
+				continue
+			entry = index.resolve(
+				namespace_digest=namespace_digest,
+				prompt_token_ids=self._trajectory_tokens(
+					seq, length=seq.prompt_length
+				).tolist(),
+			)
+			if entry is None:
+				continue
+			if not 0 <= int(entry.owning_group_id) < int(num_groups):
+				raise RuntimeError(
+					f"Rank {self.rank}: session {entry.session_key} is owned "
+					f"by serve group {entry.owning_group_id}, which does not "
+					f"exist in a {int(num_groups)}-group world"
+				)
+			pins[seq.uuid] = int(entry.owning_group_id)
+			index.record_pin()
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s pinned sequence %s to serve "
+				"group %s: it continues session %s committed at boundary %s",
+				self.rank,
+				int(seq.global_idx),
+				int(entry.owning_group_id),
+				entry.session_key,
+				int(entry.boundary_tokens),
+			)
+		return pins
+
+	@staticmethod
+	def _trajectory_arena_from_payload(entry: dict):
+		"""Rebuild the leader's arena object from its mirrored page ids."""
+		from batchgen.prefix_reuse.trajectory_commit import SnapshotArena
+
+		return SnapshotArena(
+			# The handle is the leader's record-side identity; a follower never
+			# looks an arena up by handle, so a stable placeholder is honest
+			# here and a fake positive handle would not be.
+			storage_handle=0,
+			pseudo_sid=int(entry["pseudo_sid"]),
+			page_ids_by_group={
+				int(group_id): tuple(int(page) for page in pages)
+				for group_id, pages in entry["pages"].items()
+			},
+			pages_per_group=int(entry["pages_per_group"]),
+			capacity_bytes=int(entry["capacity_bytes"]),
+			payload_bytes=0,
+			shard_count=int(entry["shard_count"]),
+		)
+
+	def _adopt_mirrored_trajectory_arenas(self, arenas: dict) -> None:
+		"""Follower side: take the leader's arenas for this pass."""
+		if not arenas:
+			return
+		committer = self._get_trajectory_frontier_committer()
+		for global_id, entry in arenas.items():
+			committer.adopt_arena(
+				sequence_id=int(global_id),
+				arena=self._trajectory_arena_from_payload(entry),
+			)
+
+	def _lookup_trajectory_frontiers(self, uuids) -> None:
+		"""M3 Slice 2 admission lookup, beside the prefix-cache lookup.
+
+		Runs on the sequences this rank owns the Host KV for -- the same filter
+		the prefix lookup and the frontier COMMIT use, so a record is only ever
+		probed on the rank whose registry holds it and whose node holds its
+		arena pages. A hit takes a reference immediately; the reference is what
+		keeps the record un-evictable until the restore finishes.
+
+		Group affinity is M2's, not a new mechanism: ``decode_dp_group`` is
+		already stamped and ``_assign_decode_dp_groups`` is idempotent (a
+		sequence that carries a group keeps it), which is exactly how an
+		evicted re-entry stays on the ranks holding its head-sharded KDA state.
+		The restore asserts the record's owning group against that stamp rather
+		than re-deriving an affinity of its own.
+		"""
+		restorer = self._get_trajectory_restorer()
+		if restorer is None:
+			return
+		namespace_digest = self.prefix_cache_runtime_config.namespace_digest
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or not self._owns_host_kv(seq):
+				continue
+			global_id = int(seq.global_idx)
+			if global_id in self._trajectory_attachments:
+				# Back-to-back prefill of the same row: the earlier attachment
+				# is still live, so do not take a second reference for it.
+				continue
+			attachment = restorer.lookup(
+				namespace_digest=namespace_digest,
+				prompt_token_ids=self._trajectory_tokens(
+					seq, length=seq.prompt_length
+				).tolist(),
+				sequence_id=global_id,
+			)
+			if attachment is not None:
+				self._trajectory_attachments[global_id] = attachment
+
+	def _restore_trajectory_frontiers(self, local_indices) -> None:
+		"""Restore every pinned snapshot into its KDA slot before prefill.
+
+		THE ordering guarantee: this runs in the worker's host-side sequence
+		before any suffix-prefill kernel of the wave is launched, and the slot
+		write is a ``copy_`` from pageable host memory on the current stream,
+		so the restored bytes are in the slot before the forward reads it.
+
+		Empty whenever the flag is off -- nothing is attached, so this is a
+		dict lookup and a return.
+		"""
+		if self._trajectory_mirrored_restores:
+			self._restore_mirrored_trajectory_shards(local_indices)
+		if not self._trajectory_attachments:
+			return
+		restorer = self._get_trajectory_restorer()
+		if restorer is None:
+			return
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			attachment = self._trajectory_attachments.pop(
+				int(seq.global_idx), None
+			)
+			if attachment is None:
+				continue
+			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			restorer.restore(
+				attachment,
+				serving_group_id=int(seq.decode_dp_group or 0),
+				# The position the suffix prefill will start at. Absent state
+				# means the whole prompt is recomputed, which the restorer
+				# refuses by name rather than restoring a state the forward
+				# would double-count.
+				compute_cached_tokens=(
+					int(state.compute_cached_tokens) if state is not None else 0
+				),
+			)
+
+	def _restore_mirrored_trajectory_shards(self, local_indices) -> None:
+		"""Follower side of the restore: this rank's shard, leader's decision.
+
+		A follower holds no frontier record -- the leader's registry is the
+		group's only one, so a leader-side eviction can never leave a stale
+		record here pointing at freed arena pages. What it holds is the hit the
+		leader mirrored for this pass, which is why the whole group restores or
+		recomputes together.
+		"""
+		mirrored = self._trajectory_mirrored_restores
+		if not mirrored:
+			return
+		# Build the committer FIRST. It is this rank's only source of the
+		# snapshot layout, and ``_get_trajectory_restorer`` refuses to build
+		# one for itself -- so without this a follower whose leader mirrored a
+		# hit but no arena this pass would find no restorer and skip the
+		# restore silently, while its peers restored. That is the divergence
+		# the mirrored decision exists to prevent, so it must not be
+		# reintroduced by construction order.
+		committer = self._get_trajectory_frontier_committer()
+		restorer = self._get_trajectory_restorer()
+		if restorer is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: its serve-group leader mirrored "
+				f"{len(mirrored)} trajectory restore(s) but this rank has no "
+				"restorer; the group's prefill would diverge"
+			)
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			entry = mirrored.pop(int(seq.global_idx), None)
+			if entry is None:
+				continue
+			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			restorer.restore_mirrored_shard(
+				sequence_id=int(seq.global_idx),
+				arena=self._trajectory_arena_from_payload(entry),
+				layout=committer.layout,
+				session_key=str(entry["session_key"]),
+				boundary_tokens=int(entry["boundary_tokens"]),
+				owning_group_id=int(entry["owning_group_id"]),
+				serving_group_id=int(seq.decode_dp_group or 0),
+				compute_cached_tokens=(
+					int(state.compute_cached_tokens) if state is not None else 0
+				),
+			)
+
+	def _release_trajectory_attachments(self, global_sequence_ids) -> None:
+		"""Drop every un-consumed attachment for these rows.
+
+		Joins the prefix-attachment release seam, so a rejected wave, a rolled
+		back allocation and a completed sequence all return the live count to
+		zero through the same call.
+		"""
+		if not self._trajectory_attachments:
+			return
+		restorer = self._trajectory_restorer
+		for sequence_id in global_sequence_ids:
+			attachment = self._trajectory_attachments.pop(
+				int(sequence_id), None
+			)
+			if attachment is None or restorer is None:
+				continue
+			try:
+				restorer.release(attachment)
+			except Exception:
+				logging.exception(
+					"Rank %s: releasing the trajectory attachment of sequence "
+					"%s failed; its frontier stays pinned",
+					self.rank,
+					int(sequence_id),
+				)
+
+	def _rollback_trajectory_reservations(self, global_sequence_ids) -> None:
+		"""Give back any snapshot arena these rows reserved and never used."""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return
+		for sequence_id in global_sequence_ids:
+			self._trajectory_arena_payload.pop(int(sequence_id), None)
+			self._trajectory_mirrored_restores.pop(int(sequence_id), None)
+			try:
+				committer.rollback_reservation(sequence_id=int(sequence_id))
+			except Exception:
+				logging.exception(
+					"[TRAJECTORY_FRONTIER] Rank %s: could not give back the "
+					"reserved snapshot arena of sequence %s",
+					self.rank,
+					int(sequence_id),
+				)
+
+	def _trajectory_restore_fields(self) -> dict:
+		"""Drain-counter fields, or empty when the path never ran."""
+		fields = {}
+		restorer = self._trajectory_restorer
+		if restorer is not None:
+			fields.update(restorer.counters())
+		# M3 Slice 3a: how many sequences the session map placed. Reported
+		# wherever the map exists, including on a rank that holds no restorer,
+		# because a pin is an admission-side decision; absent on a run that
+		# never turned the flag on.
+		index = self._trajectory_session_groups
+		if index is not None:
+			fields["trajectory_group_pins"] = int(index.pins)
+		return fields
+
+	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
+		"""Resident Host pages backing a committed prefix, per KV group.
+
+		``retain_inserted_prefix_pages`` reports only the pages THIS commit
+		inserted; a frontier whose leading nodes already existed is backed by
+		the coordinator's older pages. A frontier record has to name the pages
+		eviction will actually report, or it would outlive them, so the set is
+		read back from the coordinator. ``estimate_lookup`` is the read-only
+		form (it takes no attachment), and the commit's own active attachment
+		already protects the nodes while this runs. ``None`` means the
+		coordinator does not hold the whole prefix as resident pages.
+		"""
+		runtime = self.prefix_cache_runtime_config
+		estimate = self.prefix_cache_coordinator.estimate_lookup(
+			list(runtime.namespace_digest),
+			[int(token_id) for token_id in token_ids[: int(commit_tokens)]],
+		)
+		if int(estimate.common_cached_tokens) != int(commit_tokens):
+			return None
+		pages = {}
+		for span in estimate.materialization_spans:
+			pages[int(span.group_id)] = [
+				int(getattr(page, "page_id", page)) for page in span.pages
+			]
+		if len(pages) != len(runtime.group_specs):
+			return None
+		return pages
+
+	def _write_trajectory_shards(self, local_sequence_ids) -> None:
+		"""Follower side of the commit boundary: write THIS rank's shard.
+
+		Runs on every rank of a head-sharded serve group that is NOT the
+		host-KV leader. It mutates no allocator state: the arena's pages were
+		allocated by the leader and mirrored here, and the write narrows this
+		rank's own page-table row to its own window before copying into it.
+
+		Which sequences get a shard is the LEADER's decision, carried here as
+		the set of arenas it mirrored, so the ranks of a group cannot disagree
+		about which frontiers exist.
+		"""
+		shard_count, shard_index, is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1 or is_leader or not self._trajectory_arena_payload:
+			return
+		committer = self._get_trajectory_frontier_committer()
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			global_id = int(seq.global_idx)
+			if global_id not in self._trajectory_arena_payload:
+				continue
+			commit_tokens = self._trajectory_commit_tokens(seq)
+			if commit_tokens == 0:
+				continue
+			token_ids = self._trajectory_tokens(
+				seq, length=seq.prompt_length
+			).tolist()
+			try:
+				committer.write_shard(
+					sequence_id=global_id,
+					frontier_token_ids=token_ids[:commit_tokens],
+					prompt_token_count=len(token_ids),
+				)
+			except Exception:
+				# A shard write is a memcpy into pages this rank already holds
+				# the ids of: the only way it fails is a bug, and a bug here
+				# would leave the leader installing a record whose shard is
+				# missing. Named and re-raised rather than degraded.
+				logging.exception(
+					"[TRAJECTORY_FRONTIER] Rank %s shard=%s/%s FAILED to write "
+					"its snapshot shard for sequence %s; the group's frontier "
+					"must not be installed",
+					self.rank,
+					shard_index,
+					shard_count,
+					global_id,
+				)
+				raise
+
+	def _finalize_trajectory_frontiers(self) -> None:
+		"""Install every pending frontier; give back every unused arena.
+
+		THE post-barrier step. It is called immediately after the pass's
+		existing unconditional ``dist.barrier()``, which is the ordering point
+		that makes a G-shard record sound: every rank of every serve group has
+		returned from its own shard write before any rank reaches here, so a
+		record installed now binds a COMPLETE snapshot. Before the barrier no
+		record exists at all, so a crash, a rejected wave or any named skip
+		leaves the previously committed frontier exactly as it was.
+
+		No-op at G==1, where the commit step installs its own record: one rank
+		owns the whole arena and there is nothing to wait for.
+		"""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return
+		shard_count, _shard_index, _is_leader = self._trajectory_group_geometry()
+		if shard_count <= 1:
+			return
+		try:
+			outcome = committer.finalize()
+		except Exception:
+			logging.exception(
+				"[TRAJECTORY_FRONTIER] Rank %s: finalizing the pass's frontier "
+				"records failed; previously committed frontiers are unchanged",
+				self.rank,
+			)
+			return
+		self._trajectory_arena_payload = {}
+		if outcome.installed or outcome.rolled_back_sequence_ids or outcome.failed_sequence_ids:
+			logging.info(
+				"[TRAJECTORY_FRONTIER] Rank %s finalize: installed=%s "
+				"rolled_back=%s deduped=%s failed=%s dedup_total=%s",
+				self.rank,
+				[item.session_key for item in outcome.installed],
+				list(outcome.rolled_back_sequence_ids),
+				list(outcome.deduped_sequence_ids),
+				list(outcome.failed_sequence_ids),
+				committer.dedup_skips(),
+			)
+
+	def _commit_trajectory_frontier(self, *, seq, token_ids, commit_tokens):
+		"""M3 Slice 1b: snapshot the KDA slot into Host KV pages (flag-gated).
+
+		Runs INSIDE the retention transaction, after ``retain_inserted_prefix
+		_pages`` and its ``host_owned_pages`` deduction. Per R1 the snapshot
+		bytes go into Host KV pages taken from the SAME allocator, so
+		``host_owned_pages`` is not touched here and nothing is credited back
+		to it when the snapshot is freed.
+		"""
+		from batchgen.prefix_reuse.trajectory_commit import (
+			PREFIX as _FRONTIER_PREFIX,
+		)
+
+		pages = self._resident_frontier_page_ids(
+			token_ids=token_ids, commit_tokens=commit_tokens
+		)
+		if pages is None:
+			logging.info(
+				"[%s] rank=%s seq=%s SKIPPED frontier commit: the coordinator "
+				"does not hold all %s committed tokens as resident pages in "
+				"every KV group",
+				_FRONTIER_PREFIX,
+				self.rank,
+				seq.global_idx,
+				int(commit_tokens),
+			)
+			return None
+		committer = self._get_trajectory_frontier_committer()
+		return committer.commit(
+			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
+			frontier_token_ids=token_ids[: int(commit_tokens)],
+			page_ids_by_group=pages,
+			# Group affinity: the KDA state is head-sharded for the layout its
+			# decode group holds, so a snapshot is only restorable into that
+			# group (same invariant as today's re-entry pinning).
+			owning_group_id=int(seq.decode_dp_group or 0),
+			sequence_id=seq.global_idx,
+			# Slice 1c's boundary identity: the live slot holds the state after
+			# every token the prefill just ran, so it only describes this
+			# boundary when the two are the same number.
+			prompt_token_count=len(token_ids),
+		)
 
 	def _commit_prefix_cache_for_prefill(
 		self, local_sequence_ids: Sequence[int]
@@ -12157,6 +13588,20 @@ class BatchGenWorker:
 			int(spec.group_id): int(spec.raw_page_tokens)
 			for spec in runtime.group_specs
 		}
+		# ONE guard for the whole pass: with the flag off nothing below changes.
+		commit_sequences = [
+			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+			for local_idx in local_sequence_ids
+		]
+		trajectory_frontier = self._trajectory_commit_requested(
+			commit_sequences
+		)
+		if trajectory_frontier:
+			# M3 Slice 1c: at G>1 every rank of the serve group snapshots its
+			# own head shard, so the followers do their write here too. The
+			# loop below stays leader-only (it publishes prefix pages and moves
+			# host_owned_pages, which exactly one rank may do).
+			self._write_trajectory_shards(local_sequence_ids)
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -12190,6 +13635,7 @@ class BatchGenWorker:
 				coordinator=self.prefix_cache_coordinator,
 				worker_views_by_group=host_views,
 				max_scan_nodes=runtime.max_nodes,
+				frontier_hook=self._trajectory_frontier_eviction_hook(),
 			)
 			result = commit_outcome.commit_result
 			commit_handle = int(result.active_attachment_handle)
@@ -12221,6 +13667,15 @@ class BatchGenWorker:
 			# Retained pages left the sequence chain for prefix residency. Every
 			# group retains the same page count; host_owned_pages counts one.
 			seq.host_owned_pages -= len(retained.get(0, ()))
+			if trajectory_frontier:
+				# M3 Slice 1b, inside this same transaction: the snapshot's
+				# Host pages come from the SAME allocator, so the deduction
+				# above is the only host_owned_pages move at this boundary.
+				self._commit_trajectory_frontier(
+					seq=seq,
+					token_ids=token_ids,
+					commit_tokens=commit_tokens,
+				)
 			logging.info(
 				"[PREFIX_CACHE] Rank %s committed sequence=%s tokens=%s "
 				"inserted_nodes=%s retained_pages=%s",

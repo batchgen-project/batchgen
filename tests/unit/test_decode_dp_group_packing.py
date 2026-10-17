@@ -10,6 +10,7 @@ so nothing here needs CUDA; the packer and the L^2 balancer are the real ones.
 
 import ast
 import functools
+import logging
 import itertools
 import sys
 from pathlib import Path
@@ -54,13 +55,17 @@ def _worker_methods(*names):
               if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(wanted) == len(names), [node.name for node in wanted]
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
-    namespace = {"List": List, "torch": torch, "SequenceStatus": SequenceStatus}
+    namespace = {"List": List, "torch": torch, "SequenceStatus": SequenceStatus,
+                 "logging": logging}
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in names}
 
 
 _METHODS = (
     "_assign_decode_dp_groups",
+    # The M3 pin input the balancer consults first; these fakes carry no
+    # session map, so it returns nothing and assignment is unchanged.
+    "_pin_trajectory_session_groups",
     "_pack_decode_dp_groups_for_sharing",
     "_prefix_rank_packing_mode",
     "_cached_prefix_rank_cost_profile",
@@ -123,6 +128,8 @@ def _worker(seqs, *, world_size=16, G=8, packing=True, pool=True, profile=None):
             {"prefix_rank_assignment_mode": "packing_v2"} if packing else None
         ),
         _decode_attn_tp_size=lambda: G,
+        # No trajectory session map: the pin is inert for these batches.
+        _trajectory_session_groups=None,
         _prefill_prefix_pool_enabled=lambda: pool,
         _trajectory_tokens=lambda seq, length=None, **_: torch.tensor(
             seq.tokens[:length], dtype=torch.int32

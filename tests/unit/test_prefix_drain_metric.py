@@ -39,6 +39,7 @@ exec(compile(ast.fix_missing_locations(ast.Module(
         copy.deepcopy(_method(name)) for name in (
             "_report_completion",
             "_maybe_emit_prefix_drain_metric",
+            "_trajectory_restore_fields",
             "_admit_sequences_from_message",
         )
     ],
@@ -56,6 +57,7 @@ class _Worker:
 
     _report_completion = _NAMESPACE["_report_completion"]
     _maybe_emit_prefix_drain_metric = _NAMESPACE["_maybe_emit_prefix_drain_metric"]
+    _trajectory_restore_fields = _NAMESPACE["_trajectory_restore_fields"]
     _admit_sequences_from_message = _NAMESPACE["_admit_sequences_from_message"]
 
     def __init__(self, *, enable_prefix_cache=True, debug_stats=True):
@@ -69,6 +71,11 @@ class _Worker:
         self.query_book = {}
         self._free_local_indices = set()
         self.active_attachments = 0
+        # M3 Slice 2: a run that never turned the trajectory flag on has no
+        # restorer, so the drain row carries no trajectory fields. Slice 3a
+        # adds the session -> owning-group map, which is None on that same run.
+        self._trajectory_restorer = None
+        self._trajectory_session_groups = None
         self.emitted = []
 
     def _publish_trajectory_pool_capacity(self):
@@ -228,3 +235,57 @@ def test_every_completion_site_releases_before_reporting():
                 name, report,
             )
             previous_report = report
+
+
+def test_the_drain_row_carries_the_trajectory_attachment_counter():
+    """M3 Slice 2: post-drain live attachments are evidence, not a guess.
+
+    The row is the place the gate reads "post-drain attachments == 0" from,
+    for the trajectory path beside the coordinator's own active_attachments.
+    """
+
+    class _Restorer:
+        def counters(self):
+            return {
+                "trajectory_lookups": 4,
+                "trajectory_hits": 2,
+                "trajectory_restores": 1,
+                "trajectory_live_attachments": 0,
+                "trajectory_declines": 1,
+            }
+
+    worker = _Worker()
+    worker._trajectory_restorer = _Restorer()
+    _admit(worker, "a")
+    _complete(worker, "a")
+
+    rows = _drain_rows(worker)
+    assert len(rows) == 1
+    assert rows[0]["active_attachments"] == 0
+    assert rows[0]["trajectory_live_attachments"] == 0
+    assert rows[0]["trajectory_restores"] == 1
+    assert rows[0]["trajectory_declines"] == 1
+    # No session map on this run, so the Slice 3a pin counter stays absent.
+    assert "trajectory_group_pins" not in rows[0]
+
+
+def test_the_drain_row_carries_the_session_group_pin_counter():
+    """M3 Slice 3a: how many sequences the session map placed.
+
+    Reported from the map itself, so a rank that pinned sequences but holds no
+    restorer still accounts for its pins.
+    """
+
+    class _Index:
+        pins = 3
+
+    worker = _Worker()
+    worker._trajectory_session_groups = _Index()
+    _admit(worker, "a")
+    _complete(worker, "a")
+
+    rows = _drain_rows(worker)
+    assert len(rows) == 1
+    assert rows[0]["trajectory_group_pins"] == 3
+    # No restorer on this rank: the pin counter does not depend on one.
+    assert "trajectory_lookups" not in rows[0]

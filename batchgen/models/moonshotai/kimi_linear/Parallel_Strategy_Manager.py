@@ -52,6 +52,7 @@ from .serving_modules import (
     kda_decode_serving,
     kda_prefill_serving,
     mla_decoding_nope_with_pagekv,
+    mla_materialize_pool_segment,
     mla_prefill_nope,
     mla_prefill_nope_prepacked,
     moe_forward_serving,
@@ -2150,6 +2151,11 @@ class KimiLinearParallelStrategyManager:
             )
             attn.mla_decoding_nope_with_pagekv = types.MethodType(
                 mla_decoding_nope_with_pagekv, attn
+            )
+            # M3 Slice 3: expands a committed latent into this layer's pool
+            # slots through the SAME kv_b_proj the prefill path uses.
+            attn.mla_materialize_pool_segment = types.MethodType(
+                mla_materialize_pool_segment, attn
             )
             attn.attn_tp_size = self._attn_tp_size
             attn.attn_tp_rank = self._attn_tp_rank

@@ -5,10 +5,11 @@ The livelock: with Kimi-K3's persistent KDA-slot limit the admission reclaim in
 the Host pool and every later wave selected zero sequences forever, with no
 eviction and no error. These tests drive the REAL ``_prepare_prefill_batch``
 (compiled out of the worker's AST onto fakes, as the other worker-method tests
-do) and the real ``PrefillScheduler``. Only the native boundaries are faked:
-the shared prefix-cache coordinator (a Python mirror of
-``EvictUntilReleasablePages``: LRU by last access, nodes with live attachments
-are protected and counted) and the Host-KV pool.
+do), the real ``PrefillScheduler`` and the real trajectory-frontier committer and
+registry. Only the native boundaries are faked: the shared prefix-cache
+coordinator (a Python mirror of ``EvictUntilReleasablePages``: LRU by last
+access, nodes with live attachments are protected and counted), the Host-KV
+pool, and the KDA snapshot reader.
 """
 
 import ast
@@ -25,7 +26,17 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pytest
 import torch
 
+from batchgen.prefix_reuse.eviction import (
+    EvictedPageRecorder,
+    retire_node_frontiers,
+)
 from batchgen.query_book import release_local_query_slot
+from batchgen.prefix_reuse.trajectory_commit import (
+    SnapshotArena,
+    SnapshotLayout,
+    TrajectoryFrontierCommitter,
+)
+from batchgen.prefix_reuse.trajectory_frontier import KDASnapshotProfile
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.prefill import (
     PREFILL_NO_PROGRESS_LIMIT,
@@ -44,16 +55,23 @@ from batchgen.worker.prefill import (
 
 WORKER = Path(__file__).resolve().parents[2] / "batchgen" / "batchgen_worker.py"
 PAGE_TOKENS = 64  # SequenceEntry.PAGE_SIZE
+HOST_PAGE_BYTES = 2048
+NAMESPACE = (1, 2, 3, 4)
 METHODS = (
     "_prepare_prefill_batch",
     "_make_prefill_selection_request",
     "_prefill_sequence_limits",
+    "_trajectory_frontier_eviction_hook",
     "_describe_prefill_admission_blockers",
     "_get_host_kv_total_pages",
     "_prefill_candidate_digest",
     "_prefill_prefix_pressure",
     "_prefill_admission_guard_state",
     "_reject_unsatisfiable_prefill_requests",
+    # Called by _prepare_prefill_batch right after the group stamp; a no-op at
+    # the G==1 these fakes run, but compiled from the real source so the call
+    # is exercised rather than stubbed away.
+    "_check_decode_dp_group_plan_identical",
 )
 
 
@@ -235,6 +253,77 @@ class FakePrefixCoordinator:
         )
 
 
+def _profile():
+    return KDASnapshotProfile(
+        num_kda_layers=2, num_heads_per_rank=2, head_dim=16,
+        conv_dim_per_rank=32, conv_width=4,
+        recurrent_element_bytes=4, conv_element_bytes=2,
+    )
+
+
+class _Chunk:
+    def __init__(self, nbytes):
+        self._nbytes = int(nbytes)
+
+    def numel(self):
+        return self._nbytes
+
+
+class _SnapshotReader:
+    def __init__(self, profile):
+        self.profile = profile
+
+    def read_slot(self, sequence_id):
+        return tuple(
+            _Chunk(size) for size in SnapshotLayout(profile=self.profile).chunk_bytes
+        )
+
+
+class PoolArenaAllocator:
+    """Snapshot arenas drawn from (and returned to) the same fake Host pool."""
+
+    def __init__(self, pool):
+        self.pool = pool
+        self.releases = []
+        self._next_sid = -1
+
+    def store(self, *, page_count, chunks):
+        pages = tuple(self.pool.take(page_count))
+        sid, self._next_sid = self._next_sid, self._next_sid - 1
+        return SnapshotArena(
+            storage_handle=0, pseudo_sid=sid, page_ids_by_group={0: pages},
+            pages_per_group=int(page_count),
+            capacity_bytes=int(page_count) * HOST_PAGE_BYTES,
+            payload_bytes=sum(int(c.numel()) for c in chunks),
+        )
+
+    def release(self, arena):
+        self.releases.append(arena.page_ids_by_group[0])
+        self.pool.release_resident_pages(arena.page_ids_by_group[0])
+        return {0: len(arena.page_ids_by_group[0])}
+
+
+def _committer(pool, rank=0):
+    allocator = PoolArenaAllocator(pool)
+    committer = TrajectoryFrontierCommitter(
+        rank=rank, page_tokens=PAGE_TOKENS,
+        host_page_bytes_all_layers=HOST_PAGE_BYTES,
+        arena_allocator=allocator, snapshot_reader=_SnapshotReader(_profile()),
+    )
+    return committer, allocator
+
+
+def _commit_frontier(committer, *, pages, seed, sequence_id):
+    tokens = [seed * 1000 + i for i in range(len(pages) * PAGE_TOKENS)]
+    outcome = committer.commit(
+        namespace_digest=NAMESPACE, frontier_token_ids=tokens,
+        page_ids_by_group={0: list(pages)}, owning_group_id=0,
+        sequence_id=sequence_id, prompt_token_count=len(tokens),
+    )
+    assert outcome is not None
+    return outcome
+
+
 class FakeBatch:
     def __init__(self, sequences):
         self.sequences = {seq.uuid: seq for seq in sequences}
@@ -273,7 +362,7 @@ def _seq(uuid, idx, prompt, status=SequenceStatus.QUEUEING):
 class FakeWorker:
     def __init__(
         self, *, pool, coordinator, sequences, slot_limit=None, pool_mode=True,
-        rank=0, local_rank=0, world_size=1, local_world_size=1,
+        committer=None, rank=0, local_rank=0, world_size=1, local_world_size=1,
         dist=None, trajectory_book=None,
     ):
         self.rank = rank
@@ -289,6 +378,7 @@ class FakeWorker:
         self.host_paged_kv_worker_view = pool
         self.core_engine = SimpleNamespace(host_paged_kv_worker_view=pool)
         self.global_batch = FakeBatch(sequences)
+        self._trajectory_frontier_committer = committer
         self._prefill_admission_state = None
         self._prefill_admission_selection = None
         self._prefill_admission_totals = None
@@ -387,20 +477,28 @@ PROMPT = 640
 NEED = _need(PROMPT)
 
 
-def _full_pool_of_retained_prefixes(*, total):
-    """A pool filled with retained prefixes, too little free for one prompt.
+def _full_pool_with_frontiers(*, total, protect_newest=False):
+    """A pool of retained prefixes (each carrying a frontier) and little free.
 
-    Node i retains 4 prefix pages. last_access grows with i, so node 0 is the
-    LRU.
+    Node i retains 4 prefix pages; its frontier arena takes more Host pages
+    from the same pool. last_access grows with i, so node 0 is the LRU.
     """
     pool = FakeHostPool(total)
     coordinator = FakePrefixCoordinator(pool)
+    committer, allocator = _committer(pool)
+    outcomes = []
     node = 0
-    while pool.get_stats().num_free_pages >= 4 + NEED // 2:
-        coordinator.retain(node, pages=pool.take(4), last_access=node)
+    while pool.get_stats().num_free_pages >= 4 + 8 + NEED // 2:
+        pages = pool.take(4)
+        outcomes.append(
+            _commit_frontier(committer, pages=pages, seed=node + 1, sequence_id=node)
+        )
+        coordinator.retain(node, pages=pages, last_access=node)
         node += 1
-    assert 0 < pool.get_stats().num_free_pages < NEED
-    return pool, coordinator
+    if protect_newest:
+        coordinator.nodes[node - 1]["active_refs"] = 1
+    assert pool.get_stats().num_free_pages < NEED
+    return pool, coordinator, committer, allocator, outcomes
 
 
 # --------------------------------------------------------------------------- #
@@ -409,9 +507,11 @@ def _full_pool_of_retained_prefixes(*, total):
 
 
 def test_slot_limited_admission_reclaims_lru_retained_prefixes_and_admits():
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
+        total=400
+    )
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=8,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
         sequences=[_seq("q0", 0, PROMPT)],
     )
     nodes_before = len(coordinator.nodes)
@@ -423,26 +523,37 @@ def test_slot_limited_admission_reclaims_lru_retained_prefixes_and_admits():
     assert batch == ["q0"]
     # One reclaim, sized to the shortfall, then one re-selection.
     assert coordinator.calls == [({0: NEED - free_before}, 0)]
-    assert worker.dist.calls == ["all_gather", "all_reduce", "all_gather"]
+    assert worker.dist.calls == ["all_gather", "all_reduce", "all_gather_object", "all_gather"]
     # LRU-first: exactly the oldest nodes went, in order, and no newer one.
     evicted = nodes_before - len(coordinator.nodes)
     assert evicted == coordinator.evicted_nodes_total > 0
     assert sorted(coordinator.nodes) == list(range(evicted, nodes_before))
-    # The reclaim outcome the guard state records: ran, pages released.
-    assert worker._prefill_admission_state[6] == (1, 4 * evicted)
+    # Their frontier records retired with them, arena pages back in the pool.
+    retired = {o.session_key for o in outcomes[:evicted]}
+    surviving = {o.session_key for o in outcomes[evicted:]}
+    assert set(committer.registry.session_keys) == surviving
+    assert not retired & set(committer.registry.session_keys)
+    assert len(allocator.releases) == evicted
+    for outcome in outcomes[:evicted]:
+        assert committer.arena_for(outcome.arena.storage_handle) is None
+    committer.registry.check_invariants()
     # The re-selection saw the reclaimed pages: the candidate now fits.
     assert pool.get_stats().num_free_pages >= NEED
     assert worker._prefill_admission_state[0] == (pool.get_stats().num_free_pages,)
 
 
-def test_reclaim_skips_attached_prefixes():
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+def test_reclaim_skips_attached_prefixes_and_their_frontiers_survive():
+    pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
+        total=400
+    )
     # Pin the two OLDEST nodes the way a live attachment does: the native
-    # coordinator protects them.
+    # coordinator protects them, and a restore attachment holds the record.
     coordinator.nodes[0]["active_refs"] = 1
     coordinator.nodes[1]["active_refs"] = 1
+    pinned = committer.registry.get(outcomes[0].session_key)
+    pinned.acquire()
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=8,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
         sequences=[_seq("q0", 0, PROMPT)],
     )
 
@@ -450,16 +561,23 @@ def test_reclaim_skips_attached_prefixes():
 
     assert coordinator.eviction_protected_skips_total == 2
     assert 0 in coordinator.nodes and 1 in coordinator.nodes
+    keys = set(committer.registry.session_keys)
+    assert outcomes[0].session_key in keys and outcomes[1].session_key in keys
+    assert pinned.refcount == 2
+    assert committer.arena_for(outcomes[0].arena.storage_handle) is not None
     # The unprotected LRU node after them was the first to go.
     assert 2 not in coordinator.nodes
+    committer.registry.check_invariants()
 
 
 def test_nothing_reclaimable_and_nothing_live_fails_by_name_without_spinning():
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
     for node in coordinator.nodes.values():
         node["active_refs"] = 1
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=8,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
         sequences=[_seq("q0", 0, PROMPT)],
     )
 
@@ -474,11 +592,13 @@ def test_nothing_reclaimable_and_nothing_live_fails_by_name_without_spinning():
 
 
 def test_nothing_reclaimable_with_live_sequences_waits_for_them():
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
     for node in coordinator.nodes.values():
         node["active_refs"] = 1
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=8,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
         sequences=[
             _seq("q0", 0, PROMPT),
             _seq("live", 1, PROMPT, status=SequenceStatus.IN_DECODE),
@@ -542,9 +662,11 @@ def test_an_evicted_sequence_larger_than_the_whole_pool_fails_by_name():
 
 def test_full_sequence_slots_reclaim_nothing():
     """Host pages are not the binding limit when every KDA slot is taken."""
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=0,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=0,
         sequences=[
             _seq("q0", 0, PROMPT),
             _seq("live", 1, PROMPT, status=SequenceStatus.IN_DECODE),
@@ -552,14 +674,16 @@ def test_full_sequence_slots_reclaim_nothing():
     )
     assert worker._prepare_prefill_batch() == []
     assert coordinator.calls == []
-    assert coordinator.evicted_nodes_total == 0
+    assert allocator.releases == []
 
 
 def test_reclaim_targets_only_slot_admissible_candidates():
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
     free = pool.get_stats().num_free_pages
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=2,
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=2,
         sequences=[_seq(f"q{i}", i, PROMPT) for i in range(6)],
     )
     batch = worker._prepare_prefill_batch()
@@ -573,13 +697,16 @@ def test_reclaim_targets_only_slot_admissible_candidates():
 @pytest.mark.parametrize("slot_limit", [None, 4])
 def test_reclaim_is_bounded_to_the_head_of_the_priority_order(slot_limit):
     """The target admits the first candidate, not the sum over all of them."""
-    pool, coordinator = _full_pool_of_retained_prefixes(total=400)
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
     free = pool.get_stats().num_free_pages
     retained_before = sum(
         len(node["pages"]) for node in coordinator.nodes.values()
     )
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=slot_limit,
+        pool=pool, coordinator=coordinator, committer=committer,
+        slot_limit=slot_limit,
         sequences=[_seq(f"q{i}", i, PROMPT) for i in range(3)],
     )
 
@@ -656,6 +783,19 @@ def test_reclaim_target_is_pure_and_skips_what_can_never_fit():
         )
 
 
+def test_reclaim_without_a_committer_releases_prefix_pages_only():
+    pool = FakeHostPool(400)
+    coordinator = FakePrefixCoordinator(pool)
+    for node in range(90):
+        coordinator.retain(node, pages=pool.take(4), last_access=node)
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    assert worker._prepare_prefill_batch() == ["q0"]
+    assert coordinator.evicted_nodes_total > 0
+
+
 # --------------------------------------------------------------------------- #
 #  Untouched when the pool has room
 # --------------------------------------------------------------------------- #
@@ -667,18 +807,21 @@ def test_room_in_the_pool_selects_without_any_reclaim_or_extra_collective(
 ):
     pool = FakeHostPool(10 * NEED)
     coordinator = FakePrefixCoordinator(pool)
-    coordinator.retain(0, pages=pool.take(4), last_access=0)
+    committer, allocator = _committer(pool)
+    pages = pool.take(4)
+    outcome = _commit_frontier(committer, pages=pages, seed=1, sequence_id=0)
+    coordinator.retain(0, pages=pages, last_access=0)
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=slot_limit,
-        sequences=[_seq(f"q{i}", i, PROMPT) for i in range(3)],
+        pool=pool, coordinator=coordinator, committer=committer,
+        slot_limit=slot_limit, sequences=[_seq(f"q{i}", i, PROMPT) for i in range(3)],
     )
 
     assert worker._prepare_prefill_batch() == ["q0", "q1", "q2"]
 
     assert worker.dist.calls == ["all_gather"]
     assert coordinator.calls == []
-    assert 0 in coordinator.nodes
-    assert worker._prefill_admission_state[6] == (0, 0)
+    assert allocator.releases == []
+    assert committer.registry.get(outcome.session_key) is not None
 
 
 def _reference_select(req):
@@ -1071,41 +1214,74 @@ def test_the_candidate_digest_covers_identity_and_the_reservation_inputs():
 
 
 # --------------------------------------------------------------------------- #
-#  A non-leader rank follows its node leader's reclaim
+#  Frontier retirement on every rank of the reclaiming node
 # --------------------------------------------------------------------------- #
 
 
-def test_a_non_leader_rank_adopts_the_leaders_reclaim():
-    """Only the node leader reclaims; every rank re-selects on its result.
+def test_recorder_records_and_forwards_once():
+    seen = []
+    recorder = EvictedPageRecorder(seen.append)
+    recorder({0: [3, 4]})
+    recorder({0: [5], 1: [9]})
+    assert recorder.pages_by_group == {0: [3, 4, 5], 1: [9]}
+    assert recorder.page_count == 4
+    assert seen == [{0: [3, 4]}, {0: [5], 1: [9]}]
+    assert EvictedPageRecorder(None)({0: [1]}) is None
 
-    Rank 1 shares node 0's Host pool with the leader (rank 0). It must enter
-    the same reclaim collectives, never touch the coordinator itself, and
-    re-select with the leader's post-reclaim free count.
-    """
+
+def test_retire_node_frontiers_uses_only_its_own_nodes_leader_map():
+    seen = []
+    gathered = [(0, {0: [1, 2]}), (0, None), (1, {0: [7]}), (1, None)]
+    assert retire_node_frontiers(
+        gathered=gathered, node_id=1, frontier_hook=seen.append
+    ) == 1
+    assert seen == [{0: [7]}]
+    assert retire_node_frontiers(
+        gathered=gathered, node_id=0, frontier_hook=None
+    ) == 0
+    with pytest.raises(RuntimeError, match="exactly one rank per node"):
+        retire_node_frontiers(
+            gathered=[(0, {0: [1]}), (0, {0: [2]})], node_id=0,
+            frontier_hook=seen.append,
+        )
+
+
+def test_a_non_leader_rank_retires_its_frontiers_on_the_leaders_reclaim():
+    """G=1: rank 1 owns a frontier on pages the node leader (rank 0) reclaims."""
     pool = FakeHostPool(400)
-    coordinator = FakePrefixCoordinator(pool)
-    released = 12
+    committer, allocator = _committer(pool, rank=1)
+    victim_pages = pool.take(4)
+    keeper_pages = pool.take(4)
+    victim = _commit_frontier(committer, pages=victim_pages, seed=1, sequence_id=0)
+    keeper = _commit_frontier(committer, pages=keeper_pages, seed=2, sequence_id=1)
+    free = pool.get_stats().num_free_pages
+    assert free >= NEED
     peers = {
-        # 0: the admission gather -- the leader reports a node pool short of
-        # NEED but large enough to hold it, no live sequence, and (None) the
-        # same candidate digest as this rank.
+        # 0: free/slot/total/live/digest/pressure gather -- the leader reports a
+        # node pool short of NEED but large enough to hold it, no live
+        # sequence, and (None) the same candidate digest as this rank.
         0: {0: [0, NEED - 1, 2, 8, 400, 0, None, 0, 0, 0]},
-        # 1: failure / released-pages MAX -- the leader reclaimed pages.
-        1: {0: [0, released]},
-        # 2: updated free -- the leader's post-reclaim count.
-        2: {0: [0, NEED + 3]},
+        # 1: failure/reclaimed-pages MAX -- the leader reclaimed victim_pages.
+        1: {0: [0, len(victim_pages)]},
+        # 2: the leader's reclaimed map.
+        2: {0: (0, {0: list(victim_pages)})},
+        # 3: updated free -- the leader's post-reclaim count.
+        3: {0: [0, NEED + 3, 0]},
     }
     dist = FakeDist(rank=1, world_size=2, peers=peers)
     seq = _seq("q0", 0, PROMPT)
     seq.assigned_rank = 1
     worker = FakeWorker(
-        pool=pool, coordinator=coordinator, slot_limit=8, sequences=[seq],
-        rank=1, local_rank=1, world_size=2, local_world_size=2, dist=dist,
+        pool=pool, coordinator=FakePrefixCoordinator(pool), committer=committer,
+        slot_limit=8, sequences=[seq], rank=1, local_rank=1, world_size=2,
+        local_world_size=2, dist=dist,
     )
-
     assert worker._prepare_prefill_batch() == ["q0"]
 
-    assert dist.calls == ["all_gather", "all_reduce", "all_gather"]
-    assert coordinator.calls == []
-    assert worker._prefill_admission_state[0] == (NEED + 3,)
-    assert worker._prefill_admission_state[6] == (1, released)
+    assert dist.calls == [
+        "all_gather", "all_reduce", "all_gather_object", "all_gather",
+    ]
+    assert committer.registry.get(victim.session_key) is None
+    assert committer.registry.get(keeper.session_key) is not None
+    assert allocator.releases == [victim.arena.page_ids_by_group[0]]
+    committer.registry.check_invariants()
