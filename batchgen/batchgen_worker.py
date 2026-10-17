@@ -795,6 +795,16 @@ def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
 	consume a stale top-k from the previous step. The graph-config path
 	resets it separately.
 	"""
+	# NOTE: for GLM-5.2 this branch is currently unreachable, and that is a
+	# defect being tracked elsewhere, not a property to rely on: the engine
+	# ModelConfig projection drops ``index_topk``, so the caller's
+	# ``getattr(self.model_config, "index_topk", None)`` is always None and
+	# ``_dsa_short_count`` stays None. See sub-project
+	# ``batchgen-glm52-index-topk-config-projection-loss``, which owns the
+	# fix (project the field / fail loud instead of defaulting to None). Once
+	# that lands, this ``.sum().item()`` becomes a live per-step device sync
+	# on the eager selector path and has to be gated on the non-graph path —
+	# so the line stays here rather than being deleted as dead code.
 	if index_topk is not None:
 		wrapper_cls._dsa_short_count = int(
 			(cache_seqlens <= int(index_topk)).sum().item()
@@ -1118,6 +1128,14 @@ class BatchGenWorker:
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
+		# Set by _release_prefill_weight_ring and consumed by the
+		# prefill->decode switch invariant.
+		self._prefill_ring_released_for_switch = False
+		self._phase = None
+		# Whole-model decode graph capture episodes completed by this process.
+		# On the reuse lifecycle it must stay at 1: the switch invariants and
+		# the capture-once guard in _setup_cuda_graphs read it.
+		self._decode_graph_captures = 0
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -1147,6 +1165,11 @@ class BatchGenWorker:
 		self.num_local_queries = 0
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
 		self._batchgen_debug: Optional[dict] = None
+		# Sticky: set once an admitted sequence carries per-request debug
+		# flags. Only gates the per-row scan in
+		# _active_batchgen_debug_for_sequences, whose result is None while no
+		# sequence carries any, so a sticky True merely restores the scan.
+		self._any_sequence_batchgen_debug: bool = False
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -1302,6 +1325,15 @@ class BatchGenWorker:
 
 		return gpu_kv_cache_gb
 
+	def _kv_fixed_address_pool_available(self) -> bool:
+		"""Whether the KV pools can be carved from a reserved virtual range.
+
+		CUDA VMM is the only implementation, and it needs an indexed device.
+		Every serving path has one; CPU-only unit tests that build a manager
+		directly keep the allocator-backed default.
+		"""
+		return bool(torch.cuda.is_available() and isinstance(self.local_rank, int))
+
 	def _initialize_gpu_kv_manager_fixed_size(self) -> GPUPagedKVCacheManager:
 		"""
 		Initialize GPU KV manager with pre-determined fixed size.
@@ -1309,6 +1341,14 @@ class BatchGenWorker:
 
 		For DSA models, splits the memory budget between primary (MLA) and
 		auxiliary (indexer) caches, wrapping both in a DualKVCacheCoordinator.
+
+		The pools are carved from one reserved virtual range per pool
+		(``fixed_address_pool``), so the phase-switch lifecycle can hand their
+		physical pages back to the driver for the prefill phase and map them
+		again afterwards WITHOUT the pool base, the page-pointer tables or the
+		page-table storage moving. A captured decode graph bakes those
+		pointers, so releasing an allocator-backed pool under it would make the
+		next replay read freed memory.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import (
 			build_gpu_kv_config_fixed_size,
@@ -1365,9 +1405,18 @@ class BatchGenWorker:
 			)
 			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
 
-			primary = GPUPagedKVCacheManager(config=primary_config, device=self.local_rank)
+			fixed_addresses = self._kv_fixed_address_pool_available()
+			primary = GPUPagedKVCacheManager(
+				config=primary_config,
+				device=self.local_rank,
+				fixed_address_pool=fixed_addresses,
+			)
 			primary.initialize()
-			auxiliary = GPUPagedKVCacheManager(config=aux_config, device=self.local_rank)
+			auxiliary = GPUPagedKVCacheManager(
+				config=aux_config,
+				device=self.local_rank,
+				fixed_address_pool=fixed_addresses,
+			)
 			auxiliary.initialize()
 			manager = DualKVCacheCoordinator(primary, auxiliary)
 			self._bind_gpu_paged_kv_manager(manager)
@@ -1391,6 +1440,7 @@ class BatchGenWorker:
 			manager = GPUPagedKVCacheManager(
 				config=config,
 				device=self.local_rank,
+				fixed_address_pool=self._kv_fixed_address_pool_available(),
 			)
 			manager.initialize()
 			self._bind_gpu_paged_kv_manager(manager)
@@ -1405,6 +1455,11 @@ class BatchGenWorker:
 	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
 		if self._batchgen_debug:
 			return self._batchgen_debug
+		if not self._any_sequence_batchgen_debug:
+			# No sequence admitted on this worker ever carried per-request
+			# debug flags, so the merge below can only return None. Decode
+			# calls this every step, once per row.
+			return None
 		merged = {}
 		for seq in batch_sequences or []:
 			seq_debug = getattr(seq, "batchgen_debug", None)
@@ -1612,6 +1667,8 @@ class BatchGenWorker:
 			)
 			seq.batch_id = entry.get("batch_id")
 			seq.batchgen_debug = entry.get("batchgen_debug")
+			if isinstance(seq.batchgen_debug, dict) and seq.batchgen_debug:
+				self._any_sequence_batchgen_debug = True
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
 			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
@@ -2113,6 +2170,10 @@ class BatchGenWorker:
 		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
 		Idempotent (skips already-grouped seqs) and deterministic across ranks:
 		identical inputs -> identical map.
+
+		``packing_v2`` batches served through the in-wave prefix pool with more
+		than one group instead pack by predicted prefill seconds, so a prefix
+		family shares one group's pool (``_pack_decode_dp_groups_for_sharing``).
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -2141,9 +2202,234 @@ class BatchGenWorker:
 			seqs.append(seq)
 		if not seqs:
 			return
-		groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+		if (
+			num_dp > 1
+			and self._prefill_prefix_pool_enabled()
+			and self._prefix_rank_packing_mode(seqs)
+		):
+			groups = self._pack_decode_dp_groups_for_sharing(seqs, num_dp)
+		else:
+			# An evicted re-entry returns to the group it decoded on: its
+			# decoded suffix lives only in that group's node's trajectory book.
+			# It loads that group like any grouped sequence; the rest balance.
+			groups = [seq.evicted_from_dp_group for seq in seqs]
+			fresh = [i for i, g in enumerate(groups) if g is None]
+			for i, g in enumerate(groups):
+				if g is not None:
+					prior[g] += float(lengths[i]) * float(lengths[i])
+			placed = assign_decode_dp_groups(
+				[lengths[i] for i in fresh], num_dp, prior_load=prior
+			)
+			for i, g in zip(fresh, placed):
+				groups[i] = g
 		for seq, g in zip(seqs, groups):
 			seq.decode_dp_group = g
+			# Grouped again: the eviction record has served its purpose, and
+			# a later eviction records the then-current group afresh.
+			seq.evicted_from_dp_group = None
+
+	def _pack_decode_dp_groups_for_sharing(self, seqs, num_dp: int) -> List[int]:
+		"""Place ungrouped sequences on serve groups by predicted prefill seconds.
+
+		A group prefills its members through its own in-wave prefix pool, so a
+		prefix family split across groups recomputes the shared prefix once per
+		group. ``pack_groups_for_sharing`` keeps a family on one group unless
+		splitting it lowers the busiest group's predicted seconds.
+
+		Load already committed to a group is pinned there: every grouped
+		sequence that still owes a prefill, scored by its length alone (see
+		``prompt_score_from_length``). Sequences already decoding owe no prefill
+		seconds and are not counted, unlike the L^2 prior, which charges a group
+		for its whole standing decode batch.
+
+		Prompts are read from the node-shared trajectory book, which admission
+		writes on every rank before grouping, and every input here is replicated,
+		so every rank computes the same map. A re-entry is not packed and its
+		prompt is never read: its decoded suffix lives only in the trajectory
+		book of the node it decoded on, so it returns to the group recorded at
+		eviction (``evicted_from_dp_group``) and pins its length-only score
+		there. A re-entry without that record cannot be placed and is refused.
+		"""
+		from batchgen.prefix_reuse.rank_packing import (
+			pack_groups_for_sharing,
+			prompt_score_from_length,
+		)
+
+		profile = self._cached_prefix_rank_cost_profile(
+			self._prefix_rank_cost_profile_disabled(seqs)
+		)
+		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
+		chunk_tokens = int(
+			self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		)
+
+		def pinned_load(seq):
+			# Length-only: a re-entry's tokens are readable on one node only.
+			return prompt_score_from_length(
+				int(seq.prompt_length),
+				block_tokens=page_tokens,
+				chunk_tokens=chunk_tokens,
+				profile=profile,
+			)
+
+		groups = []
+		queued = []
+		fixed = []
+		for seq in seqs:
+			group = seq.evicted_from_dp_group
+			if group is None and (
+				seq.status == SequenceStatus.EVICTED
+				or getattr(seq, "evicted_token_ids", None) is not None
+			):
+				raise RuntimeError(
+					f"re-entering sequence {seq.uuid} has no recorded serve group "
+					"to return to; its decoded tokens live only on the node it "
+					"decoded on, so it cannot be placed identically on every rank"
+				)
+			if group is not None:
+				fixed.append((int(group), pinned_load(seq)))
+			else:
+				queued.append(seq)
+			groups.append(group)
+		owes_prefill = (
+			SequenceStatus.QUEUEING, SequenceStatus.IN_PREFILL, SequenceStatus.EVICTED
+		)
+		for seq in self.global_batch:
+			if seq.decode_dp_group is None or seq.status not in owes_prefill:
+				continue
+			fixed.append((int(seq.decode_dp_group), pinned_load(seq)))
+		prompts = [
+			self._trajectory_tokens(seq, length=seq.prompt_length).tolist()
+			for seq in queued
+		]
+		packed = iter(pack_groups_for_sharing(
+			prompts,
+			num_groups=num_dp,
+			block_tokens=page_tokens,
+			chunk_tokens=chunk_tokens,
+			profile=profile,
+			fixed=fixed,
+		))
+		return [next(packed) if group is None else group for group in groups]
+
+	def _check_decode_dp_group_plan_identical(self, uuids: List[str]) -> None:
+		"""All ranks must have stamped the SAME serve-group map. Collective.
+
+		``rank_in_decode_group`` resolves ownership from each rank's own copy of
+		the map, so the map is not a hint: it decides which ranks bind a
+		sequence, run its prefill and allocate its head-sharded KDA state. A
+		rank that derived a different group for one sequence binds a row whose
+		state another group created, and the mismatch first appears far away —
+		``KeyError: Sequence <global_idx> has no KDA state item`` at the decode
+		entry, on a rank that never prefilled it.
+
+		Both stampers are deterministic functions of replicated inputs: the
+		admission list (broadcast from rank 0), prompt lengths, and the prompts
+		themselves read through the node-shared trajectory book, which every
+		rank wrote before grouping. So agreement is derivable, not hoped for,
+		and a divergence means one of those inputs was not in fact replicated —
+		which is a bug to name here, at the stamp, rather than to debug three
+		phases later. The rank packer already carries this check
+		(``_assign_ranks_for_prefix_sharing``); the group packer did not.
+
+		Cheap: one int64 all_gather of two values per wave, plus a second one
+		only on the failing path to name the first diverging sequence.
+		"""
+		if self._decode_attn_tp_size() <= 1 or self.world_size <= 1:
+			return
+		from batchgen.decode_dp_group import (
+			decode_group_plan_digest,
+			first_group_disagreement,
+		)
+
+		pairs = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			pairs.append((int(seq.global_idx), seq.decode_dp_group))
+		pairs.sort(key=lambda item: item[0])
+		check = torch.tensor(
+			[decode_group_plan_digest(pairs), len(pairs)],
+			dtype=torch.int64, device=self.torch_device,
+		)
+		gathered = [torch.zeros_like(check) for _ in range(self.world_size)]
+		dist.all_gather(gathered, check)
+		# This rank's own digest joins the comparison explicitly rather than
+		# through ``gathered[self.rank]``: the check must hold on what this
+		# rank actually stamped, not on the slot the collective happened to
+		# fill for it.
+		digests = {int(item[0].item()) for item in gathered}
+		digests.add(int(check[0].item()))
+		if len(digests) == 1:
+			return
+		counts = {int(item[1].item()) for item in gathered}
+		counts.add(len(pairs))
+		named = None
+		if len(counts) == 1:
+			# Same sequences everywhere, so the group vectors are comparable
+			# column by column. Every rank reaches this second collective: they
+			# all saw the same differing digests.
+			groups = torch.tensor(
+				[-1 if group is None else int(group) for _, group in pairs],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			views = [torch.zeros_like(groups) for _ in range(self.world_size)]
+			dist.all_gather(views, groups)
+			named = first_group_disagreement(
+				[global_idx for global_idx, _ in pairs],
+				# This rank's own vector is compared explicitly, for the same
+				# reason its digest is.
+				[groups.tolist()] + [view.tolist() for view in views],
+			)
+		raise RuntimeError(
+			"decode serve-group map diverged across ranks: rank "
+			f"{self.rank} digest {int(check[0].item())} over {len(pairs)} "
+			f"sequences; per-rank sequence counts {sorted(counts)}"
+			+ (
+				f"; first disagreement global_idx={named[0]} "
+				f"groups_by_rank={named[1]}" if named is not None else ""
+			)
+		)
+
+	def _check_local_binding_matches_group(
+		self, uuids: List[str], where: str
+	) -> None:
+		"""A local row exists iff this rank's group owns the sequence (G>1).
+
+		``_get_local_indices_for_uuids`` resolves a wave from
+		``_uuid_to_local_map`` alone and silently skips what it does not find,
+		so a binding that disagrees with the serve-group map is not refused
+		anywhere: the rank prefills or decodes a row its group does not own, or
+		misses one it does. The second form is what raises ``KeyError:
+		Sequence <global_idx> has no KDA state item`` from
+		``prepare_decode_step`` — by then the stamping seam is long gone.
+
+		The invariant is an equivalence, so both directions are checked, and
+		both are local reads: no collective, O(len(uuids)) per call.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return
+		offenders = []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			bound = uuid in self._uuid_to_local_map
+			owns = self._owns_local_sequence(seq)
+			if bound != owns:
+				offenders.append(
+					f"global_idx={seq.global_idx} group={seq.decode_dp_group} "
+					f"bound={int(bound)} owns={int(owns)}"
+				)
+		if offenders:
+			raise RuntimeError(
+				f"Rank {self.rank}: [SCHED_INVARIANT] {where}: "
+				f"{len(offenders)} sequences whose local row disagrees with the "
+				f"serve-group map (G={G}, rank//G={self.rank // G}): "
+				+ "; ".join(offenders[:10])
+			)
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -2227,6 +2513,26 @@ class BatchGenWorker:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		return self._trajectory_book.append_token(self._trajectory_slot(seq), int(token_id))
 
+	def _append_trajectory_tokens(
+		self, sequences: Sequence[SequenceEntry], token_ids: Sequence[int]
+	) -> None:
+		"""Append one host-side token per sequence through a single call.
+
+		The caller passes exactly the rows that must receive a token: the
+		decode loop drops retired rows first (see [COMPLETED_ROW_SKIP]), so
+		this helper never decides which rows are live.
+		"""
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		if len(sequences) != len(token_ids):
+			raise ValueError(
+				f"trajectory append batch mismatch: {len(sequences)} != {len(token_ids)}"
+			)
+		if not sequences:
+			return
+		slots = [self._trajectory_slot(seq) for seq in sequences]
+		self._trajectory_book.append_tokens(slots, token_ids)
+
 	def _append_trajectory_batch(
 		self, batch: Sequence[int], token_ids: torch.Tensor
 	) -> None:
@@ -2236,15 +2542,16 @@ class BatchGenWorker:
 			raise ValueError(
 				f"trajectory append batch mismatch: {len(batch)} != {token_ids.numel()}"
 			)
-		slots = []
-		values = token_ids.reshape(-1).to(device="cpu").tolist()
+		sequences = []
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				raise KeyError(f"missing sequence for local_idx={local_idx}")
-			slots.append(self._trajectory_slot(seq))
-		self._trajectory_book.append_tokens(slots, values)
+			sequences.append(seq)
+		self._append_trajectory_tokens(
+			sequences, token_ids.reshape(-1).to(device="cpu").tolist()
+		)
 
 	def _sync_trajectory_metadata(
 		self, seq: SequenceEntry, state: Dict[str, object]
@@ -3048,10 +3355,12 @@ class BatchGenWorker:
 			)
 		if self.global_batch is None:
 			return
-		by_gid = {seq.global_idx: seq for seq in self.global_batch}
+		# Resolve through SequenceBatch's maintained gid index. This runs on
+		# every decode step, so rebuilding a gid -> entry dict here cost one
+		# dict comprehension over the whole batch per step.
 		grow_requests = []
 		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
-			seq = by_gid.get(int(global_idx))
+			seq = self.global_batch.get_sequence_by_global_idx(int(global_idx))
 			if seq is None:
 				raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
 			if int(write_pos) < 0:
@@ -5946,6 +6255,11 @@ class BatchGenWorker:
 		# config, is idempotent (re-entrant sequences keep the group their
 		# head-sharded KDA state lives on), and is deterministic across ranks.
 		self._assign_decode_dp_groups(all_candidates)
+		# The map decides this wave's node mapping (below), its bindings and
+		# its KDA state, so verify agreement BEFORE any of them is derived:
+		# _prepare_prefill_batch is already collective, and this is the first
+		# all-ranks point after the stamp.
+		self._check_decode_dp_group_plan_identical(all_candidates)
 
 		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
@@ -6362,27 +6676,34 @@ class BatchGenWorker:
 		rank.  Free pages are dynamic; the pure reducer takes the tightest rank
 		in each replicated attention group so the admission plan is safe for all
 		ranks that will allocate the selected sequence.
+
+		The whole read — local stats and the cross-rank all_gather — runs inside
+		the manager's ``capacity_snapshot()`` section (#424), so the phase
+		switch cannot release the pool underneath a decision that is already
+		being taken against it: a release attempted here fails loud instead of
+		producing a plan for pages that no longer exist.
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not manager.is_initialized:
 			raise RuntimeError(
 				"GPU KV manager must be initialized before taking a decode capacity snapshot"
 			)
-		stats = manager.get_stats()
-		local = torch.tensor(
-			[int(stats.num_total_pages), int(stats.num_free_pages)],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		if self.world_size == 1:
-			rank_stats = [local]
-		else:
-			if not dist.is_initialized():
-				raise RuntimeError(
-					"distributed process group is required for a multi-rank decode capacity snapshot"
-				)
-			rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
-			dist.all_gather(rank_stats, local)
+		with manager.capacity_snapshot():
+			stats = manager.get_stats()
+			local = torch.tensor(
+				[int(stats.num_total_pages), int(stats.num_free_pages)],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			if self.world_size == 1:
+				rank_stats = [local]
+			else:
+				if not dist.is_initialized():
+					raise RuntimeError(
+						"distributed process group is required for a multi-rank decode capacity snapshot"
+					)
+				rank_stats = [torch.zeros_like(local) for _ in range(self.world_size)]
+				dist.all_gather(rank_stats, local)
 		return reduce_decode_capacity_snapshot(
 			tuple(int(item[0].item()) for item in rank_stats),
 			tuple(int(item[1].item()) for item in rank_stats),
@@ -6654,6 +6975,7 @@ class BatchGenWorker:
 				seq.host_pages_allocated = 0
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
+				seq.evicted_from_dp_group = None
 				self._sequences_with_gpu_kv.discard(uuid)
 
 		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
@@ -7909,6 +8231,7 @@ class BatchGenWorker:
 							seq.host_pages_allocated = 0
 							seq.host_owned_pages = 0
 							seq.host_token_capacity = 0
+							seq.evicted_from_dp_group = None
 							self._sequences_with_gpu_kv.discard(uuid)
 					# Report completions (pops local_map; runs LAST).
 					# Guard: only report if status actually reached COMPLETED.
@@ -7952,6 +8275,12 @@ class BatchGenWorker:
 				# M2b: stamp the decode DP-group before local-index resolution so
 				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
 				self._assign_decode_dp_groups(decode_uuids)
+				# The local rows this resolves are the rows the decode forward
+				# asks KDA state for, so refuse a row that the group map does
+				# not own here instead of inside prepare_decode_step.
+				self._check_local_binding_matches_group(
+					decode_uuids, "decode entry"
+				)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
@@ -8030,9 +8359,7 @@ class BatchGenWorker:
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
-				if not self._persistent_phase_enabled():
-					self._unregister_fp8_weights()
-					self.deep_free_model_memory()
+				self._finish_decode_interval()
 				dist.barrier()
 
 				# Poll for new admissions after each decode interval.
@@ -8223,6 +8550,86 @@ class BatchGenWorker:
 			fingerprint if streamed_sp8 else None
 		)
 
+	def _assert_phase_switch_clean(
+		self, direction: str, *, reused: bool
+	) -> None:
+		"""Fail loud when a phase switch left the other phase's state behind.
+
+		Checks worker-owned switch state only, which is what this module can
+		observe cheaply and deterministically:
+
+		* ``prefill_to_decode`` — the prefill routed-expert weight ring must
+		  have been released BEFORE the decode model was built. It used to stay
+		  mapped through the whole decode configure, so the switch ran at the
+		  tightest free-HBM point of the batch; that is a cleanup bug, not a
+		  design choice, so it fails the switch instead of degrading it.
+		* ``decode_to_prefill`` — the decode-only graph state must be gone.
+		  A stale manager or captured segment keeps Python references to the
+		  decode model and its static KV buffers alive, so they survive
+		  empty_cache() and the next prefill runs with that memory still held.
+
+		Raises RuntimeError; there is no degraded mode. A violated invariant
+		means the next phase runs with the previous phase's HBM still mapped,
+		which shows up later as an unrelated OOM or a silent capacity loss.
+		"""
+		if direction == "prefill_to_decode":
+			if not getattr(self, "_prefill_ring_released_for_switch", False):
+				raise RuntimeError(
+					f"Rank {self.rank}: prefill->decode switch did not release the "
+					"prefill routed-expert weight ring before building the decode "
+					"model; the decode configure would run with prefill-only GPU "
+					"bytes still mapped"
+				)
+			self._prefill_ring_released_for_switch = False
+			if reused:
+				pm = self.parallel_manager
+				if not getattr(pm, "decode_experts_resident", False):
+					raise RuntimeError(
+						f"Rank {self.rank}: prefill->decode switch activated a "
+						"reused decode instance whose routed experts are not "
+						"mapped; a graph replay would read unmapped memory"
+					)
+				self._assert_kv_region_mapped("prefill->decode")
+				self._assert_decode_graph_state_kept("prefill->decode")
+				self._assert_decode_attention_weights_registered()
+			return
+		if direction == "decode_to_prefill":
+			if reused:
+				# Partly inverted on the reuse path, deliberately: the decode
+				# graphs are supposed to outlive this switch (tearing them down
+				# is what forces the recapture this lifecycle exists to remove),
+				# while the two large memory classes — the KV pool and the
+				# routed experts — give their physical pages back to the
+				# prefill phase at addresses those same graphs baked.
+				self._assert_decode_graph_state_kept("decode->prefill")
+				self._assert_kv_region_released("decode->prefill")
+				pm = self.parallel_manager
+				if getattr(pm, "decode_experts_resident", False):
+					raise RuntimeError(
+						f"Rank {self.rank}: decode->prefill switch left the decode "
+						"routed experts mapped; prefill needs that memory back"
+					)
+				return
+			leftovers = [
+				name
+				for name in (
+					"_cuda_graph_manager",
+					"_glm5_moe_cuda_graph_manager",
+					"_glm5_layer_cuda_graph_manager",
+					"_whole_model_segment",
+				)
+				if getattr(self, name, None) is not None
+			]
+			if leftovers:
+				raise RuntimeError(
+					f"Rank {self.rank}: decode->prefill switch left decode-only GPU "
+					f"state mapped: {', '.join(leftovers)} still set; their Python "
+					"references keep the decode model and captured static buffers "
+					"alive across the prefill phase"
+				)
+			return
+		raise ValueError(f"unknown phase-switch direction {direction!r}")
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
@@ -8320,8 +8727,26 @@ class BatchGenWorker:
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
 		persistent = self._persistent_phase_enabled()
+		if not persistent:
+			# Request reuse BEFORE the FIRST prefill configure, so the prefill
+			# instance this process keeps is the one that configure builds.
+			# Requesting it only at the first decode build left the first
+			# prefill model unkept, and the next decode->prefill switch — the
+			# first one inside a measured batch — paid a second full prefill
+			# build to produce the instance it keeps. Idempotent afterwards.
+			self._request_phase_instance_reuse()
+		reuse = (not persistent) and self._decode_instance_is_reusable()
 		if persistent:
 			self._release_persistent_decode_instance()
+		elif reuse:
+			# Default lifecycle, second and later switches: the decode model,
+			# its CUDA graphs, its kernel/descriptor state and the KV pools all
+			# stay where they are. Only the routed experts give their physical
+			# memory back, at the same virtual addresses, so nothing a graph
+			# baked moves and nothing has to be rebuilt on the way back.
+			self._k3_startup_prefill_ready = False
+			self._release_reused_decode_instance()
+			self._assert_phase_switch_clean("decode_to_prefill", reused=True)
 		elif reuse_startup_prefill:
 			# EXCEPT on the first admission after the Kimi-K3 startup pass: no
 			# decode model has run yet, and this prefill phase — model,
@@ -8353,13 +8778,20 @@ class BatchGenWorker:
 			self._k3_startup_prefill_ready = False
 			logging.info("Deep freeing model memory before prefill config...")
 			self.deep_free_model_memory()
+			self._assert_phase_switch_clean("decode_to_prefill", reused=False)
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
-		if not persistent:
+		# Both reuse paths already handled the pool above, differently:
+		# _release_reused_decode_instance() returned its physical pages at
+		# reserved addresses (the default lifecycle), while the persistent path
+		# keeps its pools mapped by design. Neither may be destroyed here — the
+		# destroy/recreate this call performs is what moves the pool, and the
+		# decode graphs bake its pointers.
+		if not persistent and not reuse:
 			self._destroy_gpu_paged_kv_cache()
-		if not persistent and k3_prefill_profile and torch.cuda.is_available():
+		if not persistent and not reuse and k3_prefill_profile and torch.cuda.is_available():
 			torch.cuda.reset_peak_memory_stats(self.local_rank)
 
 		if (
@@ -8409,7 +8841,11 @@ class BatchGenWorker:
 		# STEP 1: Configure model for prefill. The normal first K3 admission
 		# inherits the exact phase installed before readiness; do not re-enter
 		# configure_prefill or stop/restart its H2D pipeline lazily here.
-		if persistent and self.parallel_manager.prefill_instance is not None:
+		if (
+			(persistent or reuse)
+			and self.parallel_manager.prefill_instance is not None
+		):
+			# Built once per process; switching it in is the whole step.
 			self.model, self.weight_copy_task = self.parallel_manager.activate_prefill()
 			self.set_phase("prefill")
 		elif not reuse_startup_prefill:
@@ -8418,6 +8854,7 @@ class BatchGenWorker:
 			if hasattr(self.parallel_manager, "set_comm"):
 				self.parallel_manager.set_comm(self.comm)
 			self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+			self._log_phase_memory_ledger("after_configure_prefill")
 			self.set_phase("prefill")
 
 		if torch.cuda.is_available():
@@ -8569,6 +9006,12 @@ class BatchGenWorker:
 			logging.debug(
 				"[PREFILL] Host KV reservation already committed before phase config"
 			)
+		# The rows bound above are the rows this wave's prefill computes, and
+		# the prefill forward is what creates each row's KDA state item. Catch
+		# a binding that disagrees with the group map here, before the forward,
+		# so the error names the seam instead of the decode step that misses
+		# the state item.
+		self._check_local_binding_matches_group(prefill_uuids, "prefill config")
 
 		# Reached by EVERY rank — including ranks that serve no sequence this
 		# wave — so the gather inside stays aligned. No-op for G==1; for G>1 it
@@ -8596,6 +9039,55 @@ class BatchGenWorker:
 		if self._persistent_phase_enabled():
 			self._activate_persistent_decode_instance(comm)
 			return
+		if self._decode_instance_is_active():
+			# decode -> decode interval: the reused instance is already switched
+			# in, its experts mapped and its graphs captured. Same early return
+			# as _activate_persistent_decode_instance; re-activating would map
+			# an arena that is already mapped.
+			return
+		# Release the prefill phase's H2D ring and queues BEFORE building the
+		# decode model, not after it. The routed-expert weight ring installed
+		# for prefill used to stay mapped through the whole decode configure, so
+		# the expert upload and the grouped-GEMM init ran at the tightest
+		# free-HBM point of the batch and the allocator churned at its peak.
+		# This is the ordering _activate_persistent_decode_instance already
+		# uses.
+		#
+		# Resident decode does not stream routed experts. Keep the installed
+		# streamed-SP8 state through this transition: host-RDMA needs its daemon
+		# cursor, while hierarchical GDR resets its local queue/ring at the next
+		# prefill boundary. reset_decoding_buffer() must not resize those slots
+		# to the decode layout in either case.
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		if not self._streamed_sp8_h2d_installed:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+		self._prefill_ring_released_for_switch = True
+
+		if self._decode_instance_is_reusable():
+			# Second and later switches: map the routed experts back at their
+			# reserved addresses, refill them from the pinned host copy, and
+			# switch the instance in. No model construction, no weight reload
+			# beyond the experts, no kernel or descriptor re-init, no graph
+			# capture, no KV pool allocation.
+			self.model, self.weight_copy_task = (
+				self.parallel_manager.activate_decoding()
+			)
+			# Map the KV pool's physical pages back under the same addresses
+			# BEFORE anything can read capacity through it or replay a graph
+			# that baked its pointers. _init_gpu_kv_with_actual_size(), which
+			# the caller runs next, then finds a live pool and skips: the pool
+			# is sized exactly once per process and every later activation maps
+			# that same size, so the page count never moves.
+			self._remap_reused_kv_pool()
+			self._assert_phase_switch_clean("prefill_to_decode", reused=True)
+			self.set_phase("decode")
+			self._install_decode_weight_copy_queue()
+			if self.rank == 0:
+				logging.info("[DECODE] Reused decode instance activated")
+			return
+
 		self.deep_free_model_memory()
 		_nv_t0 = time.perf_counter()
 		self.init_nvshmem()
@@ -8603,27 +9095,45 @@ class BatchGenWorker:
 		if _nv_dt > 1.0:
 			logging.info(f"[DECODE] Rank {self.rank}: init_nvshmem took {_nv_dt:.1f}s")
 
+		# Ask the strategy manager to keep this instance. It declines for a rank
+		# that streams part of its routed experts (no fixed-address stacks are
+		# possible there), leaving decode_instance None so the next switch
+		# rebuilds exactly as before.
+		reuse_requested = self._request_phase_instance_reuse()
+		# A reused instance and its padded MoE buffers are never rebuilt, so
+		# they are sized once for the largest batch admission can ever hand
+		# them, not for this batch. _max_decode_rank_bsz() is the cap the
+		# estimate above was already clamped to.
+		padding_bsz = self._max_decode_rank_bsz() if reuse_requested else max_num_seq
 		# Unified method handles all deployment scenarios
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
-			padding_bsz=max_num_seq, comm=comm
+			padding_bsz=padding_bsz, comm=comm
 		)
+		self._log_phase_memory_ledger("after_configure_decoding")
 		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
-		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
+		# in-decode at this value so the padded buffer (mtp = round_up(world_size*padding_bsz))
 		# never overflows.
-		self._decode_padding_bsz = max_num_seq
+		self._decode_padding_bsz = padding_bsz
+		# reused=False: this switch BUILDS the instance, and the KV pool is
+		# created after it returns by _init_gpu_kv_with_actual_size(), so the
+		# resident-region checks do not apply to it yet.
+		self._assert_phase_switch_clean("prefill_to_decode", reused=False)
 		self.set_phase("decode")
-		self.core_engine.stop_h2d_worker()
-		self.core_engine.clear_kv_copy_queue()
-		# Resident decode does not stream routed experts. Keep the installed
-		# streamed-SP8 state through this transition: host-RDMA needs its daemon
-		# cursor, while hierarchical GDR resets its local queue/ring at the next
-		# prefill boundary. reset_decoding_buffer() must not resize those slots to
-		# the decode layout in either case.
-		if not self._streamed_sp8_h2d_installed:
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 
-		# Only start H2D worker if there are experts to offload
+		self._install_decode_weight_copy_queue()
+
+		if self.rank == 0:
+			logging.info(f"[DECODE] Model loaded for decoding phase")
+			self._log_decode_parameter_residency()
+
+	def _install_decode_weight_copy_queue(self) -> None:
+		"""Point the H2D copy engine at the decode weight-copy schedule.
+
+		Only a rank that offloads part of its routed experts has one. Shared by
+		the first decode build and by every later activation of a reused
+		instance, whose task is the one its build produced.
+		"""
+		# Only start the H2D worker if there are experts to offload.
 		if self.weight_copy_task.get("routed_expert"):
 			if self._streamed_sp8_h2d_installed:
 				raise RuntimeError(
@@ -8633,10 +9143,6 @@ class BatchGenWorker:
 				)
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-
-		if self.rank == 0:
-			logging.info(f"[DECODE] Model loaded for decoding phase")
-			self._log_decode_parameter_residency()
 
 	def _max_decode_rank_bsz(self) -> int:
 		"""Per-rank in-decode cap: the generic guard, lifted to the planner's
@@ -8695,6 +9201,254 @@ class BatchGenWorker:
 			)
 		except Exception as e:  # informational only
 			logging.debug("parameter residency breakdown failed: %r", e)
+
+	def _remap_reused_kv_pool(self) -> None:
+		"""P->D on the default lifecycle: map the KV pool back where it was.
+
+		``initialize()`` on a reserved-range pool maps fresh physical memory
+		under the SAME virtual addresses, zeroes it the way a freshly built
+		pool hands out zeroed pages, and refreshes the page-pointer tables in
+		place. Nothing is allocated, nothing is sized: the page count is the
+		one the first decode configure measured.
+
+		Called from inside the activation so the pool is live before the
+		capacity snapshot, before decode admission allocates a page and before
+		a captured graph dereferences a pool pointer.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill->decode activated a reused decode "
+				"instance with no GPU KV manager; the instance's first build "
+				"sizes the pool, so one must exist by this point"
+			)
+		self._assert_kv_pool_addresses_are_fixed("prefill->decode")
+		if manager.pool_is_mapped:
+			# decode -> decode returns before the activation, so this is only
+			# reached if a future caller activates an already-active instance.
+			return
+		start = time.perf_counter()
+		manager.initialize()
+		stats = manager.get_stats()
+		logging.info(
+			"[GPU-KV] rank=%d remapped the reserved KV pool in %.3fs (%d pages)",
+			self.rank,
+			time.perf_counter() - start,
+			stats.num_total_pages,
+		)
+
+	def _assert_kv_pool_addresses_are_fixed(self, context: str) -> None:
+		"""A reused decode instance requires an address-stable KV pool.
+
+		Its captured graphs dereference the pool bases and page-pointer tables
+		recorded at capture time. Releasing an allocator-backed pool under them
+		would hand those addresses to the next allocation and the following
+		replay would read someone else's memory, so an unsupported pool fails
+		the switch instead of silently taking the old destroy/recreate path.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			return
+		if not getattr(manager, "uses_fixed_address_pool", False):
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch would release a GPU KV "
+				"pool that is not held at fixed addresses while the decode "
+				"instance is reused; its captured graphs bake the pool "
+				"pointers, so the pool must be a reserved-range pool"
+			)
+
+	def _assert_kv_region_mapped(self, context: str) -> None:
+		"""Before decode configure and replay the KV pool is mapped.
+
+		Decode admission reads live all-rank capacity through it (#424) and the
+		decode graphs bake its pointers, so the activation maps the pool back
+		before either can run.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not manager.is_initialized:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV region "
+				"unmapped while phase instances are reused; decode admission "
+				"reads live capacity through it and the decode graphs bake its "
+				"pointers"
+			)
+		if not manager.pool_is_mapped:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV pool's "
+				"physical pages unmapped at their reserved addresses; a decode "
+				"replay or capacity read would touch unmapped device memory"
+			)
+
+	def _assert_kv_region_released(self, context: str) -> None:
+		"""After decode->prefill the KV pool's physical pages are back.
+
+		The addresses stay reserved — that is what lets the activation map the
+		same range again — but the pages themselves belong to the prefill phase
+		until then. A pool still mapped here is the cleanup bug this lifecycle
+		exists to avoid: the prefill phase would run with the whole decode KV
+		pool charged against it.
+		"""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			# Never created: a lifetime whose decode phase has not sized a pool
+			# yet has nothing to release.
+			return
+		if manager.pool_is_mapped:
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch left the GPU KV pool "
+				"mapped; prefill needs its physical pages back, and the "
+				"reserved addresses are what make the remap free"
+			)
+
+	def _request_phase_instance_reuse(self) -> bool:
+		"""Ask the strategy manager to keep this process's phase instances.
+
+		Returns whether the request was made. The manager still decides whether
+		it can honour it: a rank that streams part of its routed experts has no
+		fixed-address stacks to unmap and remap, so it keeps its legacy loader and
+		leaves ``decode_instance`` None, and ``_decode_instance_is_reusable()``
+		stays False for the rest of the run — that rank rebuilds each phase
+		exactly as it did before.
+
+		This is not a mode and not a flag. Every deployment that alternates
+		prefill and decode runs through here; legacy non-pool serving, which never
+		alternated, was removed from the server.
+		``--persistent-phase-instances`` has its own gate and never reaches here.
+		"""
+		pm = self.parallel_manager
+		if not hasattr(pm, "reuse_phase_instances") or not hasattr(
+			pm, "activate_decoding"
+		):
+			return False
+		pm.reuse_phase_instances = True
+		return True
+
+	def _decode_instance_is_reusable(self) -> bool:
+		"""True when a built decode instance is waiting to be switched back in."""
+		pm = self.parallel_manager
+		return bool(
+			getattr(pm, "reuse_phase_instances", False)
+			and getattr(pm, "decode_instance", None) is not None
+		)
+
+	def _decode_graph_state_present(self) -> bool:
+		"""Whether any captured decode graph state is currently held."""
+		return any(
+			getattr(self, name, None) is not None
+			for name in (
+				"_cuda_graph_manager",
+				"_glm5_moe_cuda_graph_manager",
+				"_glm5_layer_cuda_graph_manager",
+				"_whole_model_segment",
+			)
+		)
+
+	def _release_reused_decode_instance(self) -> None:
+		"""D->P on the default lifecycle: give the GPU back its large classes.
+
+		Both the KV pools and the routed-expert stacks return their PHYSICAL
+		memory to the driver and keep their virtual addresses. The prefill
+		phase gets that memory — on a smaller HBM class a long prefill does not
+		fit beside a resident KV pool — while everything a decode graph baked
+		(pool bases, page-pointer tables, page-table storage, graph statics,
+		kernel and descriptor state, the non-expert decode residents) stays at
+		the address capture recorded, so the next activation only has to map.
+
+		Keeping the pools mapped across prefill instead would be a budget bet
+		on one device class; the release costs an unmap here and a map in
+		``_remap_reused_kv_pool`` on the way back.
+		"""
+		pm = self.parallel_manager
+		self._assert_kv_pool_addresses_are_fixed("decode->prefill")
+		manager = self.gpu_paged_kv_cache_manager
+		pages = manager.get_stats().num_total_pages if manager is not None else 0
+		start = time.perf_counter()
+		self._destroy_gpu_paged_kv_cache()
+		if manager is not None:
+			logging.info(
+				"[GPU-KV] rank=%d released the reserved KV pool's physical "
+				"pages in %.3fs (%d pages, %.2f GB)",
+				self.rank,
+				time.perf_counter() - start,
+				pages,
+				self.gpu_kv_cache_size_gb,
+			)
+		if getattr(pm, "decode_experts_resident", False):
+			pm.release_decode_routed_experts()
+
+	def _decode_instance_is_active(self) -> bool:
+		"""True when the reused decode instance is the one switched in now.
+
+		Its routed experts are mapped exactly while it is active: the building
+		switch maps them, decode -> prefill unmaps them, and every activation
+		maps them back.
+		"""
+		if not self._decode_instance_is_reusable():
+			return False
+		pm = self.parallel_manager
+		if not getattr(pm, "decode_experts_resident", False):
+			return False
+		if self.model is not pm.decode_instance[0]:
+			raise RuntimeError(
+				f"Rank {self.rank}: the reused decode instance has its routed "
+				"experts mapped but is not the active model; they are only "
+				"mapped while that instance is switched in"
+			)
+		return True
+
+	def _finish_decode_interval(self) -> None:
+		"""End-of-interval cleanup for the decode model that just ran.
+
+		The rebuild path unregisters the model's FP8 weight pointers and
+		deep-frees it, because its next decode configure builds a new model.
+		Persistent and reused instances are never rebuilt; they are switched
+		back in and their captured graphs replayed. Running this cleanup on a
+		reused instance nulled the graph manager, so the next activation
+		re-entered capture, and nulled every attention wrapper's fused
+		Q-A/KV-A pointers, which that capture requires.
+		"""
+		if self._persistent_phase_enabled() or self._decode_instance_is_reusable():
+			return
+		self._unregister_fp8_weights()
+		self.deep_free_model_memory()
+
+	def _assert_decode_graph_state_kept(self, context: str) -> None:
+		"""A reused instance's captured graphs outlive every phase switch."""
+		if getattr(self, "_decode_graph_captures", 0) > 0 and not (
+			self._decode_graph_state_present()
+		):
+			raise RuntimeError(
+				f"Rank {self.rank}: {context} switch tore down the captured "
+				"decode graph state of a reused instance; it is captured once "
+				"per process and must survive every phase switch"
+			)
+
+	def _assert_decode_attention_weights_registered(self) -> None:
+		"""A reused decode instance keeps its resident attention weights.
+
+		The build registers them once; its graphs were captured against them,
+		and an eager step or a capture reads the fused Q-A/KV-A pointers. Nothing
+		on the reuse lifecycle may unregister them.
+		"""
+		missing = []
+		for layer_idx, layer in enumerate(self.model.model.layers):
+			wrapper = layer.self_attn
+			if not getattr(wrapper, "persistent", False):
+				continue
+			if not hasattr(wrapper, "_fp8_qkv_a_proj"):
+				continue
+			if (
+				wrapper._fp8_qkv_a_proj is None
+				or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
+			):
+				missing.append(layer_idx)
+		if missing:
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill->decode switch activated a reused "
+				"decode instance whose fused Q-A/KV-A attention weights are "
+				f"unregistered on {len(missing)} layer(s) (first {missing[:5]}); "
+				"they must stay registered across the prefill phase"
+			)
 
 	def _persistent_phase_enabled(self) -> bool:
 		"""True when --persistent-phase-instances keeps both phase instances."""
@@ -8808,6 +9562,68 @@ class BatchGenWorker:
 		if end is not None and end[1] is None:
 			end[1] = time.perf_counter()
 
+	def _log_phase_memory_ledger(self, label: str) -> None:
+		"""One line per phase-switch stage: who holds device memory right now.
+
+		The rebuild path tears a phase instance down and stages the next one, so
+		"every cycle gives back what it took" is an invariant with no owner: a
+		slice retained per switch only shows up as an OOM several cycles later,
+		at whichever allocation happens to be the largest (the KV pool remap's
+		``cuMemCreate``). Torch's own counters cannot see that slice — the KV
+		pool is CUDA-VMM, the captured graphs own private pools, and the weight
+		buffers are C++ — so the driver's free/total is reported beside them,
+		and the holders that survive a model are named explicitly.
+
+		Cheap: four driver queries and attribute reads, once per switch stage,
+		on rank 0 only. No synchronize (the callers that need one do it) and no
+		``.item()``.
+		"""
+		if self.rank != 0 or not torch.cuda.is_available():
+			return
+		free_bytes, total_bytes = torch.cuda.mem_get_info(self.local_rank)
+		gib = 1024 ** 3
+		pm = getattr(self, "parallel_manager", None)
+		kda_slots = kda_live = -1
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import (
+				KimiLinearKDAWrapper,
+			)
+
+			manager = KimiLinearKDAWrapper.state_manager
+			if manager is not None:
+				# The pools are deliberately kept across a rebuild, so their
+				# slot count must stay FLAT; a growing one would mean the
+				# reuse decision stopped matching.
+				kda_slots = int(manager.config.num_state_items)
+				kda_live = len(manager.sequence_state_items)
+		except Exception:
+			# Observability must not take down the switch it observes: a
+			# half-initialized manager raises AttributeError/TypeError here,
+			# and the -1 sentinel is a readable "unknown" in the line.
+			pass
+		gpu_kv = getattr(self, "gpu_paged_kv_cache_manager", None)
+		logging.info(
+			"[PHASE_MEM] rank=%d stage=%s switch=%d driver_used=%.2f "
+			"driver_total=%.2f torch_alloc=%.2f torch_reserved=%.2f "
+			"model=%d pm_model=%d resident_ep=%d sp8_buffer=%d decode_graph=%d "
+			"kv_pool_mapped=%s kda_slots=%d kda_live=%d",
+			self.rank,
+			label,
+			getattr(self, "_phase_mem_switch_index", 0),
+			(total_bytes - free_bytes) / gib,
+			total_bytes / gib,
+			torch.cuda.memory_allocated(self.local_rank) / gib,
+			torch.cuda.memory_reserved(self.local_rank) / gib,
+			int(getattr(self, "model", None) is not None),
+			int(getattr(pm, "model", None) is not None),
+			int(bool(getattr(pm, "_resident_ep_built", False))),
+			int(getattr(pm, "_streamed_sp8_buffer", None) is not None),
+			int(getattr(pm, "_decode_graph", None) is not None),
+			getattr(gpu_kv, "pool_is_mapped", "na"),
+			kda_slots,
+			kda_live,
+		)
+
 	def _log_phase_switch(self, phase: str) -> None:
 		"""Per-rank busy time from the previous phase's compute end to this phase's start."""
 		previous = getattr(self, "_phase_end", None)
@@ -8836,6 +9652,34 @@ class BatchGenWorker:
 		"""
 		# Skip if GPU KV manager is already initialized (subsequent decode iterations)
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
+			return
+
+		# The pool is sized from what is free once the decode model is in
+		# place, so sizing it while the prefill phase is still resident
+		# permanently charges that phase's bytes against decode capacity. On
+		# the reuse lifecycle the size is then kept for the whole process,
+		# which is exactly how an earlier startup-time sizing attempt ended up
+		# with roughly half the pages the per-batch path got. Sizing therefore
+		# only happens from the decode phase, after the prefill ring and the
+		# prefill model have been released.
+		if getattr(self, "_phase", None) != "decode":
+			raise RuntimeError(
+				f"Rank {self.rank}: GPU KV pool sizing attempted in phase "
+				f"{self._phase!r}; it must run from the decode phase so the "
+				"measurement cannot charge prefill-only residency against the "
+				"pool it then keeps"
+			)
+
+		# A reserved-range pool is never re-created: its virtual range is still
+		# held and its page count was fixed by the sizing below on the first
+		# decode configure, so a later decode phase maps the same pages back
+		# instead of sizing a second, different pool. The reuse lifecycle has
+		# already remapped inside its activation; this covers a rank that
+		# rebuilds its decode instance, and keeps every rank's num_total_pages
+		# identical, which the cross-rank capacity snapshot requires.
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None and getattr(manager, "uses_fixed_address_pool", False):
+			self._remap_reused_kv_pool()
 			return
 
 		# Measure-once-cache: once the post-capture steady state has been
@@ -9457,6 +10301,92 @@ class BatchGenWorker:
 		debug = (active_debug(seqs) if active_debug is not None else None) or {}
 		return debug.get("prefix_rank_assignment_mode") == "packing_v2"
 
+	def _prefix_rank_cost_profile_disabled(self, seqs) -> bool:
+		"""``batchgen_debug.prefix_rank_cost_profile: "off"`` on this batch.
+
+		Scoring the packer's targets by predicted seconds and balancing their
+		computed tokens are the two arms of the packing comparison, and the
+		difference between them is a wall time: measuring it across two servers
+		would confound it with cold-start, allocator and JIT state, so the arm
+		has to be switchable inside one process. Batch level and nothing else:
+		the key rides the same admitted-batch broadcast as
+		``prefix_rank_assignment_mode``, so every rank of every group resolves
+		the same value and the packing stays replicated. Set it on EVERY
+		request of a corpus — ``_active_batchgen_debug_for_sequences`` merges
+		per-sequence dicts first-non-None-wins, exactly as the mode key does.
+
+		Only the two spellings are accepted; a mistyped value is refused rather
+		than read as "on", because a silently ignored arm switch would make the
+		two arms the same run.
+		"""
+		active = getattr(self, "_active_batchgen_debug_for_sequences", None)
+		debug = (active(seqs) if active is not None else None) or {}
+		value = debug.get("prefix_rank_cost_profile")
+		if value is None:
+			return False
+		if isinstance(value, str):
+			text = value.strip().lower()
+			if text == "off":
+				return True
+			if text == "on":
+				return False
+		raise ValueError(
+			"batchgen_debug.prefix_rank_cost_profile must be 'on' or 'off', "
+			f"got {value!r}"
+		)
+
+	def _cached_prefix_rank_cost_profile(self, disabled: bool = False):
+		"""This deployment's prefill executor cost profile, looked up once.
+
+		Model, device properties and parallel layout are deployment constants,
+		so every packer call site shares one lookup. ``None`` is a valid result:
+		no profile matches, and the packer then balances computed tokens. A
+		profile scores one serve group, so it is keyed by the group size too.
+
+		Every rank must resolve the same profile, or ranks pack differently.
+		Device 0 stands for the node, not this rank's own device, and
+		cross-node GPU homogeneity is a deployment precondition that the launch
+		identity gate verifies; no collective is run here. Each rank logs what
+		it resolved, so a divergence is visible in the logs.
+
+		The cache is keyed by ``disabled``, not a single attribute: the A/B
+		switch is batch level, so one process serves both arms, and a lookup
+		cached under whichever arm arrived first would pin every later batch to
+		it. ``disabled`` resolves to ``None`` — the same value as "no profile
+		matches", which is exactly the fallback arm the packer already has.
+		"""
+		if not hasattr(self, "_prefix_rank_cost_profiles"):
+			self._prefix_rank_cost_profiles = {}
+		key = bool(disabled)
+		if key not in self._prefix_rank_cost_profiles:
+			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
+
+			G = self._decode_attn_tp_size()
+			group_size = G if G > 1 else 1
+			if key:
+				profile = None
+			else:
+				props = torch.cuda.get_device_properties(0)
+				profile = find_executor_cost_profile(
+					self.model_name or "",
+					(props.major, props.minor),
+					props.total_memory,
+					self.world_size,
+					group_size,
+				)
+			self._prefix_rank_cost_profiles[key] = profile
+			logging.info(
+				"[PREFIX_PACK] rank %d executor cost profile: model=%s "
+				"group_size=%d disabled=%d -> %s",
+				self.rank,
+				(self.model_name or "").lower().rsplit("/", 1)[-1],
+				group_size,
+				int(key),
+				"none" if profile is None
+				else f"{profile.model}/{profile.machine}/g{profile.group_size}",
+			)
+		return self._prefix_rank_cost_profiles[key]
+
 	def _stamp_prefix_prefill_order(self, uuids: List[str]) -> None:
 		"""Order a ``packing_v2`` admission by prompt prefix, not by arrival.
 
@@ -9514,21 +10444,14 @@ class BatchGenWorker:
 
 		packing = None
 		if self._prefix_rank_packing_mode(seqs):
-			from batchgen.prefix_reuse.executor_cost import find_executor_cost_profile
 			from batchgen.prefix_reuse.rank_packing import (
 				pack_wave_ranks,
 				prompt_score_from_length,
 			)
 
-			if not hasattr(self, "_prefix_rank_cost_profile"):
-				# No profile is valid: the packer then balances computed tokens.
-				props = torch.cuda.get_device_properties(self.local_rank)
-				self._prefix_rank_cost_profile = find_executor_cost_profile(
-					self.model_name or "",
-					(props.major, props.minor),
-					props.total_memory,
-					self.world_size,
-				)
+			profile = self._cached_prefix_rank_cost_profile(
+				self._prefix_rank_cost_profile_disabled(seqs)
+			)
 			page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
 			chunk_tokens = int(
 				self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
@@ -9542,7 +10465,7 @@ class BatchGenWorker:
 					int(seq.prompt_length),
 					block_tokens=page_tokens,
 					chunk_tokens=chunk_tokens,
-					profile=self._prefix_rank_cost_profile,
+					profile=profile,
 				)
 
 			# Only sequences that still owe a prefill load a rank. Completed or
@@ -9583,7 +10506,7 @@ class BatchGenWorker:
 				world_size=self.world_size,
 				block_tokens=page_tokens,
 				chunk_tokens=chunk_tokens,
-				profile=self._prefix_rank_cost_profile,
+				profile=profile,
 				fixed=fixed,
 			)
 			ranks = packing.ranks
@@ -11939,6 +12862,7 @@ class BatchGenWorker:
 					seq.host_pages_allocated = 0
 					seq.host_owned_pages = 0
 					seq.host_token_capacity = 0
+					seq.evicted_from_dp_group = None
 					self._sequences_with_gpu_kv.discard(uuid)
 
 			# Report completions (this is what pops local_map on the owner).
@@ -12075,13 +12999,26 @@ class BatchGenWorker:
 				seq.host_owned_pages = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
+				# Destroy the head-sharded KDA state the comment below relies
+				# on. Host eviction frees the sequence's pages but reached the
+				# group drop without releasing its state item, so the slot
+				# stayed charged to a sequence that no longer has a group: the
+				# pool leaked a slot per eviction, and a re-entry re-grouped
+				# onto another group found its stale state on the old one.
+				# Released only by the ranks holding the row, exactly like the
+				# completion path, because the item is per rank.
+				if uuid in self._uuid_to_local_map:
+					self._release_kda_state_slots([int(seq.global_idx)])
 				# M2b (d): eviction destroys the head-sharded KDA state on the
 				# group's ranks, so drop the decode DP-group. A re-prefilled
 				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
 				# treats the stale non-None group id as a preserved re-entry and
-				# skips it, stranding the sequence with no live state. No-op for
-				# G==1 (the field is always None on the validated pure-DP path).
-				seq.decode_dp_group = None
+				# skips it, stranding the sequence with no live state. The group
+				# is remembered: the decoded suffix lives only in that group's
+				# node's trajectory book, so re-grouping must land on it. No-op
+				# for G==1 (the field is always None on the validated pure-DP path).
+				from batchgen.decode_dp_group import evict_from_decode_dp_group
+				evict_from_decode_dp_group(seq)
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)
@@ -13555,6 +14492,20 @@ class BatchGenWorker:
 						"configure-time capture; using eager decode instead of recapturing"
 					)
 					return
+			# Capture-once on the reuse lifecycle: the building switch captures a
+			# reused instance's graphs and every later activation replays them.
+			# Getting here again means their state was torn down; recapturing
+			# would hide that, and it needs model state (fused attention
+			# pointers, MoE pointer tables) a torn-down instance no longer has.
+			if (
+				getattr(self, "_decode_graph_captures", 0) > 0
+				and self._decode_instance_is_reusable()
+			):
+				raise RuntimeError(
+					f"Rank {self.rank}: decode graph capture requested again for a "
+					"reused decode instance; its graphs are captured once per "
+					"process and their state must survive every phase switch"
+				)
 
 			from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 				Glm5WholeModelSegment,
@@ -13621,13 +14572,24 @@ class BatchGenWorker:
 				None,
 			)
 			index_topk_cfg = int(getattr(_first_indexer, "index_topk", 0) or 0)
-			all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg
+			# ONE general graph lifetime (POIS 2026-10-13). The all_short lifetime
+			# is a second, narrower lifetime: it only serves rows whose final
+			# length fits in index_topk, so a batch that grows past that bound has
+			# to fall back to eager or force a recapture. That is why the default
+			# path recaptured every bucket on every phase switch, and why the
+			# persistent path rejected long rows outright. Pinning the selection to
+			# the general lifetime makes the decode graphs capture-once and
+			# length-agnostic (their span still comes from KV capacity via
+			# graph_max_seqlen above), at the cost of always scoring the indexer.
+			# The all_short capture code itself is left in place and never selected.
+			all_short = False
 			self._glm5_whole_model_all_short = all_short
 			self._glm5_whole_model_index_topk = index_topk_cfg
 			if self.rank == 0:
 				logging.info(
 					"Rank %s: GLM-5 whole-model graph attention span "
-					"required_seqlen=%s index_topk=%s all_short=%s",
+					"required_seqlen=%s index_topk=%s all_short=%s "
+					"(general lifetime pinned)",
 					self.rank,
 					required_seqlen,
 					index_topk_cfg,
@@ -13901,6 +14863,7 @@ class BatchGenWorker:
 				)
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
+			self._decode_graph_captures = getattr(self, "_decode_graph_captures", 0) + 1
 			# Phase B: hand the just-captured segment to the adapter so its
 			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
 			# can run against the same captured graph the legacy path uses.
@@ -14763,11 +15726,14 @@ class BatchGenWorker:
 				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
 				if _kv_worker_view is not None:
+					# ``batch_sequences`` was resolved from this same ``batch``
+					# above and neither the batch nor the local->uuid map moves
+					# inside a step, so re-resolving every row through
+					# _local_to_uuid_map + get_sequence here was pure
+					# duplication.
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
-					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
+					for seq in batch_sequences:
 						_kv_seq_ids.append(seq.global_idx)
 						_kv_seq_lengths.append(seq.current_context_length - 1)
 					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
@@ -15318,22 +16284,43 @@ class BatchGenWorker:
 			if self._pending_kv_append_tasks:
 				self._wait_pending_kv_append_tasks(defer_errors=True)
 			_split_t4 = time.perf_counter()
-			new_tokens_cpu = _new_tokens_pinned[:bs]
+			# One host read of this step's sampled tokens for the whole
+			# microbatch, replacing two `.item()` calls per row below.
+			new_token_ids = _new_tokens_pinned[:bs].reshape(-1).tolist()
+			if len(new_token_ids) < len(batch_sequences):
+				raise RuntimeError(
+					f"decode sampled {len(new_token_ids)} tokens for "
+					f"{len(batch_sequences)} rows"
+				)
+
+			# [COMPLETED_ROW_SKIP] A row that is already retired must not
+			# receive a trajectory token and must not be advanced below;
+			# losing this skip writes a token into a retired row's book.
+			# The predicate is still evaluated exactly once per row, and it
+			# reads only that row's own fields, so deciding every row before
+			# the appends cannot change any row's answer.
+			_row_active = [
+				not self._is_sequence_completed(seq) for seq in batch_sequences
+			]
+			# One batched QueryBook append for the step, over the live rows
+			# only, instead of one pybind call per row.
+			self._append_trajectory_tokens(
+				[seq for seq, live in zip(batch_sequences, _row_active) if live],
+				[tok for tok, live in zip(new_token_ids, _row_active) if live],
+			)
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if self._is_sequence_completed(seq):
+				if not _row_active[i]:
 					continue
-
-				self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
 
 				seq.decoded_length += 1
 				seq.current_context_length = (
 					seq.original_prompt_length + seq.decoded_length
 				)
 
-				# Use CPU tensor to avoid GPU sync
-				token_id = new_tokens_cpu[i].item()
+				# Already on the host from this step's single tolist()
+				token_id = new_token_ids[i]
 
 				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
 				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
@@ -16412,6 +17399,10 @@ class BatchGenWorker:
 
 	def set_phase(self, phase: str):
 		"""Control different behavior of the engine in different phases."""
+		# Kept on the worker too: the KV sizing guard needs to know which
+		# phase it is running in, and the wrapper class attributes below are
+		# model-side state.
+		self._phase = phase
 		torch.cuda.empty_cache()
 		self.core_engine.set_phase(phase)
 		Attn_Wrapper.phase = phase
@@ -16895,6 +17886,11 @@ class BatchGenWorker:
 		if not hasattr(self, 'model') or self.model is None:
 			return
 
+		self._phase_mem_switch_index = (
+			getattr(self, "_phase_mem_switch_index", 0) + 1
+		)
+		self._log_phase_memory_ledger("deep_free_enter")
+
 		# Stage timings on every rank: the first decode configure after the
 		# streamed wave-1 prefill spent 34 s here on rank 0 (r30) / ~30 s on
 		# node 1 (r29), intermittently, with nothing logged.
@@ -16951,6 +17947,22 @@ class BatchGenWorker:
 			pm = self.parallel_manager
 			if hasattr(pm, "_release_streamed_sp8_prefill"):
 				pm._release_streamed_sp8_prefill()
+			# The worker is not the only owner of the model: the parallel strategy
+			# manager keeps its own reference from configure_prefill/
+			# configure_decoding. Leaving that reference set is what made this
+			# function a measured no-op on the decode->prefill switch (allocated
+			# bytes unchanged across the call): the decode model was really freed
+			# later, by the refcount drop when configure_prefill rebound pm.model,
+			# so it stayed resident through the KV destroy and the first part of the
+			# prefill configure. Dropping it here is what makes the function free
+			# what its name says it frees.
+			#
+			# --persistent-phase-instances never reaches this function (its switch
+			# goes through _release_persistent_decode_instance), and its instance
+			# tuples own the models; the guard keeps that explicit.
+			if not getattr(pm, "persistent_phase_instances", False):
+				if getattr(pm, "model", None) is not None:
+					pm.model = None
 			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
 				if hasattr(pm, attr):
 					delattr(pm, attr)
@@ -16974,3 +17986,7 @@ class BatchGenWorker:
 		)
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
+		# After empty_cache: what is still held here is what this switch
+		# did NOT give back, which is the number the rebuild path's
+		# net-zero invariant is read from.
+		self._log_phase_memory_ledger("deep_free_done")

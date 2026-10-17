@@ -1385,6 +1385,10 @@ class Glm5MoE(nn.Module):
 
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
         self.use_3d_moe = True
+        # Server --enable-deepep, carried on the rich config by
+        # glm5_initializer. Read only by the decode MoE graph segment
+        # (moe_cuda_graph_segments.py); the eager path is unaffected.
+        self.glm5_deepep_ll = bool(getattr(config, "enable_deepep", False))
 
         self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]

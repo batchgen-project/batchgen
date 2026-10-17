@@ -73,7 +73,7 @@ B = 16  # block tokens
 POOL = 100_000  # effectively unlimited for these waves
 CHUNK = 131_072  # the server default; never binds at this scale
 GIB = 1 << 30
-GPTOSS = find_executor_cost_profile("gpt-oss-120b", (9, 0), 141 * GIB, 4)
+GPTOSS = find_executor_cost_profile("gpt-oss-120b", (9, 0), 141 * GIB, 4, 1)
 assert GPTOSS is not None
 
 
@@ -366,16 +366,16 @@ def test_pinned_load_shifts_prompts_off_the_busy_rank():
 
 
 def test_profile_lookup_matches_device_properties():
-    assert find_executor_cost_profile("openai/gpt-oss-120b", (9, 0), 140 * GIB, 4) is not None
+    assert find_executor_cost_profile("openai/gpt-oss-120b", (9, 0), 140 * GIB, 4, 1) is not None
     # Same sm_90, different total memory (80 GB and 96 GB parts).
-    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 80 * GIB, 4) is None
-    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 96 * GIB, 4) is None
-    assert find_executor_cost_profile("gpt-oss-120b", (10, 0), 141 * GIB, 4) is None
+    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 80 * GIB, 4, 1) is None
+    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 96 * GIB, 4, 1) is None
+    assert find_executor_cost_profile("gpt-oss-120b", (10, 0), 141 * GIB, 4, 1) is None
     # The fit is layout-specific: another world size must not match.
-    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 141 * GIB, 8) is None
+    assert find_executor_cost_profile("gpt-oss-120b", (9, 0), 141 * GIB, 8, 1) is None
     # A smaller model sharing the name prefix must not inherit coefficients.
-    assert find_executor_cost_profile("gpt-oss-20b", (9, 0), 141 * GIB, 4) is None
-    assert find_executor_cost_profile("GLM-5.2", (9, 0), 141 * GIB, 4) is None
+    assert find_executor_cost_profile("gpt-oss-20b", (9, 0), 141 * GIB, 4, 1) is None
+    assert find_executor_cost_profile("GLM-5.2", (9, 0), 141 * GIB, 4, 1) is None
 
 
 def _replay(prompts, world=4):

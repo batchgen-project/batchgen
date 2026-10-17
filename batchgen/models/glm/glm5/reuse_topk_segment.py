@@ -393,7 +393,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             buffers.valid_mask, buffers.valid_rows_ones, buffers.valid_rows_zeros,
             out=buffers.valid_rows_bf16,
         )
-        valid_rows_bf16_4d = buffers.valid_rows_bf16.view(batch_size, 1, 1, 1)
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(
@@ -411,7 +410,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             hidden_fp8, hidden_scale, fused_qkv_a_weight, fused_qkv_a_scale,
             out=buffers.qkv_a, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
-        buffers.qkv_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+        # Masked DeepGEMM leaves rows >= num_valid_tokens unwritten, so this
+        # buffer carries stale rows. They are not masked here: every consumer
+        # of a masked-GEMM output is row-local (fused_rmsnorm, act_quant, RoPE,
+        # the absorb GEMVs, FA3) and every write to state shared across rows is
+        # already gated on the same row validity -- see the invariant note on
+        # `attn_output`'s mask below, which is the one mask that must stay.
         q_a_normed = fused_rmsnorm(
             buffers.q_a,
             attn.q_a_layernorm.weight,
@@ -428,7 +432,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
             out=buffers.q_flat, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
-        buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
         q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
@@ -444,7 +447,18 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
         )
-        outputs.primary_k_tensor.copy_(offload_kv.view(batch_size, 1, 1, -1))
+        # This copy leaves the segment (the whole-model graph stages it for host
+        # KV offload), so it is the one place an invalid row's bytes would
+        # escape. Select instead of copy: a select costs the same single launch,
+        # writes the exact zeros the pre-mask path produced for invalid rows,
+        # and -- unlike a multiply, where bf16 NaN * 0 is NaN -- it cannot carry
+        # a non-finite stale row through.
+        torch.where(
+            buffers.valid_mask.view(batch_size, 1, 1, 1),
+            offload_kv.view(batch_size, 1, 1, -1),
+            buffers.valid_rows_zeros[:1],
+            out=outputs.primary_k_tensor,
+        )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
@@ -482,7 +496,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
         )
-        buffers.attn_heads.mul_(valid_rows_bf16_4d)
         attn_heads_flat = buffers.attn_heads.reshape(batch_size, attn.num_heads * attn.v_head_dim)
         attn_output_fp8, attn_output_scale = act_quant(
             attn_heads_flat,
@@ -495,6 +508,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             out=outputs.attn_output,
             num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
+        # The one load-bearing row mask in this segment. Everything above is
+        # row-local or already row-gated, but `attn_output` leaves the segment
+        # into the decoder layer's residual add and from there into the MoE
+        # router, whose gate top-k and ragged dispatch DO mix rows: an invalid
+        # row's stale activations would produce stale expert choices and inflate
+        # the per-expert counts. It also covers the rows that are inside
+        # num_valid_tokens but have no cache slot -- the masked GEMMs compute
+        # those rows, so no num_valid_tokens gate zeroes them, and `valid_mask`
+        # is what makes them inert.
         outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 
         return {

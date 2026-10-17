@@ -12,6 +12,7 @@ as a drop-in replacement.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import List, Optional, Sequence, Tuple
 
@@ -70,6 +71,46 @@ class DualKVCacheCoordinator:
 	@property
 	def is_initialized(self) -> bool:
 		return self.primary.is_initialized and self.auxiliary.is_initialized
+
+	@property
+	def uses_fixed_address_pool(self) -> bool:
+		"""True when BOTH pools unmap and map one reserved range each.
+
+		Mirrored like every other lifecycle property: a pair where only one
+		side keeps its addresses is a configuration error, not a half-usable
+		state, because the decode graphs bake pointers into both.
+		"""
+		primary = self.primary.uses_fixed_address_pool
+		auxiliary = self.auxiliary.uses_fixed_address_pool
+		if primary != auxiliary:
+			raise RuntimeError(
+				"DSA primary/aux GPU KV pools disagree on fixed addressing: "
+				f"primary={primary}, auxiliary={auxiliary}"
+			)
+		return primary
+
+	@property
+	def pool_is_mapped(self) -> bool:
+		"""True when both pools' physical memory is currently mapped."""
+		primary = self.primary.pool_is_mapped
+		auxiliary = self.auxiliary.pool_is_mapped
+		if primary != auxiliary:
+			raise RuntimeError(
+				"DSA primary/aux GPU KV pools diverged in mapped state: "
+				f"primary={primary}, auxiliary={auxiliary}"
+			)
+		return primary
+
+	def assert_pool_mapped(self, context: str) -> None:
+		"""Fail loud before anything dereferences an unmapped KV pool."""
+		self.primary.assert_pool_mapped(f"{context} (primary)")
+		self.auxiliary.assert_pool_mapped(f"{context} (auxiliary)")
+
+	@contextlib.contextmanager
+	def capacity_snapshot(self):
+		"""Hold both pools mapped for a decode admission / capacity read (#424)."""
+		with self.primary.capacity_snapshot(), self.auxiliary.capacity_snapshot():
+			yield self
 
 	# -- Page allocation --
 
