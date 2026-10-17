@@ -64,6 +64,10 @@ class KDASnapshotProfileInvalid(TrajectoryFrontierError):
     """The KDA snapshot geometry cannot describe a real state slot."""
 
 
+class SessionGroupMapError(TrajectoryFrontierError):
+    """A session-group summary does not describe a real owning group."""
+
+
 # ---------------------------------------------------------------------------
 # KDA snapshot sizing -- derived from model + parallel config, never a constant
 # ---------------------------------------------------------------------------
@@ -853,6 +857,31 @@ class TrajectoryFrontierRegistry:
             shard_count=shard_counts.pop() if shard_counts else 1,
         )
 
+    def session_group_summary(self) -> dict[str, tuple[int, int, str]]:
+        """Compact ``{session -> (owning group, boundary, index key)}`` view.
+
+        What ONE serve group's registry publishes so the rest of the world can
+        pin a continuation onto it. The index key is derived here with
+        ``frontier_index_key`` over the record's own committed tokens, which is
+        the SAME derivation ``resolve`` probes with, so a prompt that would hit
+        this record maps to this entry and nothing re-implements the hashing.
+
+        Tokens are deliberately NOT exported: the key is a digest of them, so
+        the summary stays O(1) per session.
+        """
+
+        summary: dict[str, tuple[int, int, str]] = {}
+        for session_key, record in self._records.items():
+            summary[str(session_key)] = (
+                int(record.owning_group_id),
+                int(record.frontier_boundary_tokens),
+                frontier_index_key(
+                    namespace_digest=record.namespace_digest,
+                    frontier_token_ids=record.frontier_token_ids,
+                ),
+            )
+        return summary
+
     def resolve(
         self,
         *,
@@ -1125,3 +1154,286 @@ class TrajectoryFrontierRegistry:
         )
         self._by_frontier.pop(index_key, None)
         self._records.pop(record.session_key, None)
+
+
+# ---------------------------------------------------------------------------
+# Session -> owning serve group map (the admission pin)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SessionGroupEntry:
+    """One session's owning serve group, as the whole world knows it."""
+
+    session_key: str
+    owning_group_id: int
+    boundary_tokens: int
+    frontier_index_key: str
+
+    def __post_init__(self) -> None:
+        if not str(self.session_key):
+            raise SessionGroupMapError(
+                "a session-group entry needs a session key"
+            )
+        if not str(self.frontier_index_key):
+            raise SessionGroupMapError(
+                f"session {self.session_key} published no frontier index key, "
+                "so no continuation prompt could ever find it"
+            )
+        if int(self.owning_group_id) < 0:
+            raise SessionGroupMapError(
+                f"session {self.session_key} names a negative owning group "
+                f"{self.owning_group_id}"
+            )
+        if int(self.boundary_tokens) <= 0:
+            raise SessionGroupMapError(
+                f"session {self.session_key} names a non-positive frontier "
+                f"boundary {self.boundary_tokens}"
+            )
+
+
+class TrajectorySessionGroupIndex:
+    """Rank-local copy of the WORLD's session -> owning-group map.
+
+    A frontier registry is group-local: the leader of a serve group holds the
+    ONE registry for that group, so a continuation that lands on a different
+    group is a clean MISS no matter how exactly its tokens match. Default group
+    assignment knows nothing about sessions, so consecutive batches place a
+    session's continuations wherever the balancer likes -- in the dual-node
+    run that was the opposite group every time. This map is the admission-side
+    input that fixes it: the owning group of every committed session, known to
+    EVERY rank.
+
+    Why every rank: group assignment runs identically on all ranks and its
+    output must agree, so the map it consults has to be world-identical. Every
+    rank folds the SAME gathered leader summaries, and both the replacement
+    rule and the resolution order below are total and order-independent, so
+    two ranks that folded the same summaries resolve the same prompt the same
+    way.
+
+    TIMING -- what this map can and cannot see. Leaders publish their summary
+    on the host-KV mirror, which runs at the END of a pass's prefill config,
+    while the pass's own frontier records are installed later, at the
+    post-barrier finalize. So a session committed by pass N first appears in
+    the summary published by pass N+1's config, and only an admission after
+    that sees it. A continuation admitted in the SAME pass could not hit
+    anyway (its record does not exist until finalize), so nothing is built
+    for that case.
+
+    This map decides SCHEDULING only. A resolution is a digest match, not the
+    token-level predicate: the lookup on the pinned group still decides hit or
+    miss on the tokens themselves, so a digest collision costs a placement,
+    never a wrong reuse.
+    """
+
+    __slots__ = ("_by_session", "_index", "_boundaries", "_pins")
+
+    def __init__(self) -> None:
+        self._by_session: dict[str, SessionGroupEntry] = {}
+        self._index: dict[str, SessionGroupEntry] | None = None
+        self._boundaries: tuple[int, ...] | None = None
+        self._pins = 0
+
+    # -- read ---------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._by_session)
+
+    @property
+    def pins(self) -> int:
+        """Sequences this rank stamped onto a session's owning group."""
+
+        return self._pins
+
+    @property
+    def entries(self) -> tuple[SessionGroupEntry, ...]:
+        """Every known session, in session-key order (rank-independent)."""
+
+        return tuple(
+            self._by_session[key] for key in sorted(self._by_session)
+        )
+
+    def get(self, session_key: str) -> SessionGroupEntry | None:
+        return self._by_session.get(str(session_key))
+
+    def record_pin(self) -> None:
+        """Count one sequence placed by this map, for the drain row."""
+
+        self._pins += 1
+
+    # -- write --------------------------------------------------------------
+
+    def fold(self, summaries: Iterable[Mapping | None]) -> int:
+        """Fold every leader's summary; returns how many entries moved.
+
+        ``summaries`` is the gathered list in rank order, with a ``None`` or
+        empty slot for every rank that published nothing.
+        """
+
+        changed = 0
+        for summary in summaries:
+            if not summary:
+                continue
+            try:
+                group_id = summary["group_id"]
+                sessions = summary["sessions"]
+            except (KeyError, TypeError) as exc:
+                raise SessionGroupMapError(
+                    "a session-group summary needs 'group_id' and 'sessions': "
+                    f"{exc}"
+                ) from exc
+            changed += self.fold_group_summary(
+                group_id=group_id, sessions=sessions or {}
+            )
+        return changed
+
+    def fold_group_summary(
+        self,
+        *,
+        group_id: int,
+        sessions: Mapping[str, Sequence],
+    ) -> int:
+        """Install ONE serve group's published sessions.
+
+        The group's leader holds that group's only registry, so its summary is
+        the WHOLE truth about it: a session this group no longer reports has
+        been evicted and leaves the map here. An entry claiming a different
+        owning group than the publisher is refused by name -- a leader cannot
+        speak for another group's registry.
+
+        A session key can legitimately exist on two groups: the key is derived
+        from the trajectory's baseline tokens, so after an eviction the same
+        baseline can be committed again on another group. The conflict is
+        settled by (newest boundary, then lowest group id), which is a total
+        order, so the outcome does not depend on fold order.
+        """
+
+        group = int(group_id)
+        if group < 0:
+            raise SessionGroupMapError(
+                f"a session-group summary names a negative serve group {group}"
+            )
+        incoming: dict[str, SessionGroupEntry] = {}
+        for session_key, fields in sessions.items():
+            try:
+                owning_group_id, boundary_tokens, index_key = fields
+            except (TypeError, ValueError) as exc:
+                raise SessionGroupMapError(
+                    f"session {session_key} of group {group} must publish "
+                    "(owning_group_id, boundary_tokens, frontier_index_key), "
+                    f"got {fields!r}"
+                ) from exc
+            if int(owning_group_id) != group:
+                raise SessionGroupMapError(
+                    f"serve group {group} published session {session_key} as "
+                    f"owned by group {int(owning_group_id)}; a leader holds "
+                    "the registry of its own group only"
+                )
+            incoming[str(session_key)] = SessionGroupEntry(
+                session_key=str(session_key),
+                owning_group_id=group,
+                boundary_tokens=int(boundary_tokens),
+                frontier_index_key=str(index_key),
+            )
+        changed = 0
+        for session_key, entry in list(self._by_session.items()):
+            if entry.owning_group_id != group or session_key in incoming:
+                continue
+            del self._by_session[session_key]
+            changed += 1
+        for session_key, entry in incoming.items():
+            existing = self._by_session.get(session_key)
+            if existing is not None and existing.owning_group_id != group:
+                keep_existing = (
+                    existing.boundary_tokens > entry.boundary_tokens
+                    or (
+                        existing.boundary_tokens == entry.boundary_tokens
+                        and existing.owning_group_id < group
+                    )
+                )
+                if keep_existing:
+                    continue
+            if existing == entry:
+                continue
+            self._by_session[session_key] = entry
+            changed += 1
+        if changed:
+            self._index = None
+            self._boundaries = None
+        return changed
+
+    # -- the pin ------------------------------------------------------------
+
+    def resolve(
+        self,
+        *,
+        namespace_digest: Sequence[int],
+        prompt_token_ids: Sequence[int],
+    ) -> SessionGroupEntry | None:
+        """The owning group of the session this prompt continues, if known.
+
+        Probes the committed boundaries longest-first with
+        ``frontier_index_key`` over the prompt's own prefix -- the SAME
+        derivation the registry index is built from -- so a prompt that the
+        owning group's registry would resolve is placed on that group. ``None``
+        means no committed session is known for this prompt, and the caller
+        leaves default assignment alone.
+        """
+
+        prompt = tuple(int(token_id) for token_id in prompt_token_ids)
+        if not self._by_session or not prompt:
+            return None
+        index = self._frontier_index()
+        for boundary in self._candidate_boundaries(len(prompt)):
+            entry = index.get(
+                frontier_index_key(
+                    namespace_digest=namespace_digest,
+                    frontier_token_ids=prompt[:boundary],
+                )
+            )
+            if entry is not None:
+                return entry
+        return None
+
+    # -- internals ----------------------------------------------------------
+
+    def _frontier_index(self) -> dict[str, SessionGroupEntry]:
+        """Index key -> entry, resolved by a total order.
+
+        Two different sessions can share an index key: the same prompt served
+        on two groups commits one session per group, and both are equally
+        valid pins. The winner is (longest boundary, lowest group id, lowest
+        session key), so every rank picks the same one regardless of the order
+        it folded the summaries in.
+        """
+
+        if self._index is None:
+            index: dict[str, SessionGroupEntry] = {}
+            for entry in sorted(
+                self._by_session.values(),
+                key=lambda item: (
+                    -item.boundary_tokens,
+                    item.owning_group_id,
+                    item.session_key,
+                ),
+            ):
+                index.setdefault(entry.frontier_index_key, entry)
+            self._index = index
+        return self._index
+
+    def _candidate_boundaries(self, prompt_length: int) -> tuple[int, ...]:
+        if self._boundaries is None:
+            self._boundaries = tuple(
+                sorted(
+                    {
+                        entry.boundary_tokens
+                        for entry in self._by_session.values()
+                    },
+                    reverse=True,
+                )
+            )
+        return tuple(
+            boundary
+            for boundary in self._boundaries
+            if 0 < boundary <= int(prompt_length)
+        )
