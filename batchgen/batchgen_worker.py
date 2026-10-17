@@ -795,6 +795,16 @@ def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
 	consume a stale top-k from the previous step. The graph-config path
 	resets it separately.
 	"""
+	# NOTE: for GLM-5.2 this branch is currently unreachable, and that is a
+	# defect being tracked elsewhere, not a property to rely on: the engine
+	# ModelConfig projection drops ``index_topk``, so the caller's
+	# ``getattr(self.model_config, "index_topk", None)`` is always None and
+	# ``_dsa_short_count`` stays None. See sub-project
+	# ``batchgen-glm52-index-topk-config-projection-loss``, which owns the
+	# fix (project the field / fail loud instead of defaulting to None). Once
+	# that lands, this ``.sum().item()`` becomes a live per-step device sync
+	# on the eager selector path and has to be gated on the non-graph path —
+	# so the line stays here rather than being deleted as dead code.
 	if index_topk is not None:
 		wrapper_cls._dsa_short_count = int(
 			(cache_seqlens <= int(index_topk)).sum().item()
@@ -1155,6 +1165,11 @@ class BatchGenWorker:
 		self.num_local_queries = 0
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
 		self._batchgen_debug: Optional[dict] = None
+		# Sticky: set once an admitted sequence carries per-request debug
+		# flags. Only gates the per-row scan in
+		# _active_batchgen_debug_for_sequences, whose result is None while no
+		# sequence carries any, so a sticky True merely restores the scan.
+		self._any_sequence_batchgen_debug: bool = False
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -1440,6 +1455,11 @@ class BatchGenWorker:
 	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
 		if self._batchgen_debug:
 			return self._batchgen_debug
+		if not self._any_sequence_batchgen_debug:
+			# No sequence admitted on this worker ever carried per-request
+			# debug flags, so the merge below can only return None. Decode
+			# calls this every step, once per row.
+			return None
 		merged = {}
 		for seq in batch_sequences or []:
 			seq_debug = getattr(seq, "batchgen_debug", None)
@@ -1647,6 +1667,8 @@ class BatchGenWorker:
 			)
 			seq.batch_id = entry.get("batch_id")
 			seq.batchgen_debug = entry.get("batchgen_debug")
+			if isinstance(seq.batchgen_debug, dict) and seq.batchgen_debug:
+				self._any_sequence_batchgen_debug = True
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
 			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
@@ -2262,6 +2284,26 @@ class BatchGenWorker:
 			raise RuntimeError("unified trajectory pool is not initialized")
 		return self._trajectory_book.append_token(self._trajectory_slot(seq), int(token_id))
 
+	def _append_trajectory_tokens(
+		self, sequences: Sequence[SequenceEntry], token_ids: Sequence[int]
+	) -> None:
+		"""Append one host-side token per sequence through a single call.
+
+		The caller passes exactly the rows that must receive a token: the
+		decode loop drops retired rows first (see [COMPLETED_ROW_SKIP]), so
+		this helper never decides which rows are live.
+		"""
+		if self._trajectory_book is None:
+			raise RuntimeError("unified trajectory pool is not initialized")
+		if len(sequences) != len(token_ids):
+			raise ValueError(
+				f"trajectory append batch mismatch: {len(sequences)} != {len(token_ids)}"
+			)
+		if not sequences:
+			return
+		slots = [self._trajectory_slot(seq) for seq in sequences]
+		self._trajectory_book.append_tokens(slots, token_ids)
+
 	def _append_trajectory_batch(
 		self, batch: Sequence[int], token_ids: torch.Tensor
 	) -> None:
@@ -2271,15 +2313,16 @@ class BatchGenWorker:
 			raise ValueError(
 				f"trajectory append batch mismatch: {len(batch)} != {token_ids.numel()}"
 			)
-		slots = []
-		values = token_ids.reshape(-1).to(device="cpu").tolist()
+		sequences = []
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				raise KeyError(f"missing sequence for local_idx={local_idx}")
-			slots.append(self._trajectory_slot(seq))
-		self._trajectory_book.append_tokens(slots, values)
+			sequences.append(seq)
+		self._append_trajectory_tokens(
+			sequences, token_ids.reshape(-1).to(device="cpu").tolist()
+		)
 
 	def _sync_trajectory_metadata(
 		self, seq: SequenceEntry, state: Dict[str, object]
@@ -3083,10 +3126,12 @@ class BatchGenWorker:
 			)
 		if self.global_batch is None:
 			return
-		by_gid = {seq.global_idx: seq for seq in self.global_batch}
+		# Resolve through SequenceBatch's maintained gid index. This runs on
+		# every decode step, so rebuilding a gid -> entry dict here cost one
+		# dict comprehension over the whole batch per step.
 		grow_requests = []
 		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
-			seq = by_gid.get(int(global_idx))
+			seq = self.global_batch.get_sequence_by_global_idx(int(global_idx))
 			if seq is None:
 				raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
 			if int(write_pos) < 0:
@@ -15276,11 +15321,14 @@ class BatchGenWorker:
 				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
 				if _kv_worker_view is not None:
+					# ``batch_sequences`` was resolved from this same ``batch``
+					# above and neither the batch nor the local->uuid map moves
+					# inside a step, so re-resolving every row through
+					# _local_to_uuid_map + get_sequence here was pure
+					# duplication.
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
-					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
+					for seq in batch_sequences:
 						_kv_seq_ids.append(seq.global_idx)
 						_kv_seq_lengths.append(seq.current_context_length - 1)
 					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
@@ -15831,22 +15879,43 @@ class BatchGenWorker:
 			if self._pending_kv_append_tasks:
 				self._wait_pending_kv_append_tasks(defer_errors=True)
 			_split_t4 = time.perf_counter()
-			new_tokens_cpu = _new_tokens_pinned[:bs]
+			# One host read of this step's sampled tokens for the whole
+			# microbatch, replacing two `.item()` calls per row below.
+			new_token_ids = _new_tokens_pinned[:bs].reshape(-1).tolist()
+			if len(new_token_ids) < len(batch_sequences):
+				raise RuntimeError(
+					f"decode sampled {len(new_token_ids)} tokens for "
+					f"{len(batch_sequences)} rows"
+				)
+
+			# [COMPLETED_ROW_SKIP] A row that is already retired must not
+			# receive a trajectory token and must not be advanced below;
+			# losing this skip writes a token into a retired row's book.
+			# The predicate is still evaluated exactly once per row, and it
+			# reads only that row's own fields, so deciding every row before
+			# the appends cannot change any row's answer.
+			_row_active = [
+				not self._is_sequence_completed(seq) for seq in batch_sequences
+			]
+			# One batched QueryBook append for the step, over the live rows
+			# only, instead of one pybind call per row.
+			self._append_trajectory_tokens(
+				[seq for seq, live in zip(batch_sequences, _row_active) if live],
+				[tok for tok, live in zip(new_token_ids, _row_active) if live],
+			)
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if self._is_sequence_completed(seq):
+				if not _row_active[i]:
 					continue
-
-				self._append_trajectory_token(seq, int(new_tokens_cpu[i].item()))
 
 				seq.decoded_length += 1
 				seq.current_context_length = (
 					seq.original_prompt_length + seq.decoded_length
 				)
 
-				# Use CPU tensor to avoid GPU sync
-				token_id = new_tokens_cpu[i].item()
+				# Already on the host from this step's single tolist()
+				token_id = new_token_ids[i]
 
 				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
 				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
