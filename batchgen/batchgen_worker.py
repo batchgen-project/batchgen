@@ -11821,10 +11821,17 @@ class BatchGenWorker:
 			self._prefix_sequence_states[seq.global_idx] = state
 
 	def _prefill_pool_segment_host_pages(self) -> int:
+		"""Host pages this wave allocates for its segments.
+
+		A materialized segment is excluded: its pages are the frontier's,
+		already allocated and retained by the wave that computed it.
+		"""
 		wave = self._prefill_pool_wave
 		if wave is None:
 			return 0
-		return sum(seg.tokens for seg in wave.plan.segments) // wave.page_tokens
+		return sum(
+			seg.tokens for seg in wave.computed_segments()
+		) // wave.page_tokens
 
 	def _allocate_prefill_pool_host_pages(self, host_views, prefix_states) -> None:
 		"""One Host copy per pooled segment; members attach their chain of them."""
@@ -11851,11 +11858,142 @@ class BatchGenWorker:
 			)
 			prefix_states[global_id] = state
 			self._prefix_sequence_states[global_id] = state
-			# A segment's Host pages live until its last member releases.
-			sids = tuple(wave.segment_sids[seg] for seg in wave.chains[index])
+			# A segment's Host pages live until its last member releases. A
+			# materialized segment has no pseudo sequence to refcount: its
+			# pages are the prefix cache's, kept by this sequence's own
+			# attachment and released with it.
+			sids = tuple(
+				wave.segment_sids[seg]
+				for seg in wave.chains[index]
+				if seg not in wave.materialized
+			)
 			self._pool_member_sids[global_id] = sids
 			for sid in sids:
 				self._pool_sid_members[sid] = self._pool_sid_members.get(sid, 0) + 1
+
+	def _materialized_pool_layers(self):
+		"""The attention layers that materialize, in Host physical order.
+
+		The n-th materializing layer must be pool row n: both the pool and the
+		Host cache hold one dense row per cached attention layer, in engine
+		order, and the load addresses them by that one index. Asserted rather
+		than assumed -- a model whose two orders disagree would load every
+		layer's prefix into the wrong row, and attention would read plausible
+		numbers from the wrong depth.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+
+		layer_map = AttnWrapperBase.prefill_pool_layer_map
+		if not layer_map:
+			raise RuntimeError(
+				"a materialized segment needs the pool's engine-layer map"
+			)
+		layers = []
+		for engine_layer, decoder_layer in enumerate(self.model.model.layers):
+			attn = decoder_layer.self_attn
+			if not hasattr(attn, "materialize_pool_segment"):
+				continue
+			row = int(layer_map[engine_layer])
+			if row < 0:
+				continue
+			if row != len(layers):
+				raise RuntimeError(
+					f"engine layer {engine_layer} is pool row {row} but the "
+					f"{len(layers)}th materializing layer; the pool and Host "
+					"orders must agree for a prefix load"
+				)
+			layers.append(attn)
+		return layers
+
+	def _materialized_segment_loader(self, wave):
+		"""Staging for this wave's loads, or None when it materializes none."""
+		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
+		from batchgen.prefix_reuse.pool_materialize import (
+			DEFAULT_SLAB_BYTES,
+			MaterializedSegmentLoader,
+		)
+
+		if not wave.materialized:
+			return None
+		views = self._host_views_by_group()
+		if len(views) != 1:
+			# A dual-region model keeps a second Host KV region (the DSA
+			# indexer keys), which a latent expansion does not reconstruct.
+			raise RuntimeError(
+				f"materializing a prefix needs exactly one Host KV region, "
+				f"this model has {len(views)}"
+			)
+		group_id, view = next(iter(sorted(views.items())))
+		geometry = build_gpu_kv_config(
+			self.huggingface_ckpt_name, [int(wave.page_tokens)]
+		)
+		loader = MaterializedSegmentLoader(
+			worker_view=view,
+			num_layers=int(geometry.num_layers),
+			page_tokens=int(wave.page_tokens),
+			latent_dim=int(geometry.num_k_heads) * int(geometry.k_head_dim),
+			dtype=geometry.kv_dtype,
+			device=self.torch_device,
+			max_slab_bytes=DEFAULT_SLAB_BYTES,
+		)
+		logging.info(
+			"[PREFIX_POOL] Rank %s stages %d materialized segment(s) through "
+			"%d B of device staging (%d Host page(s) per slab, group %s)",
+			self.rank, len(wave.materialized), loader.staging_bytes,
+			loader.slab_pages, group_id,
+		)
+		return loader
+
+	def _load_materialized_segments(self, wave, rows, loader) -> int:
+		"""Fill this chunk's loaded segments BEFORE its forward reads them.
+
+		Per slab: one H2D of the committed latent across every layer, waited
+		on, then each layer expands its own slab through its own projection
+		into the pool slots that layer's row would have written. Returns the
+		number of tokens loaded, for the wave's metrics.
+		"""
+		if not rows.materialized:
+			return 0
+		if loader is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: this chunk loads "
+				f"{len(rows.materialized)} materialized segment(s) with no "
+				"staging; the wave was built without a loader"
+			)
+		layers = self._materialized_pool_layers()
+		loaded = 0
+		for stage in rows.materialized:
+			pages_by_group = wave.segment_host_pages.get(stage.segment_id)
+			if not pages_by_group:
+				raise RuntimeError(
+					f"Rank {self.rank}: materialized segment "
+					f"{stage.segment_id} names no Host page to load from"
+				)
+			if len(pages_by_group) != 1:
+				raise RuntimeError(
+					f"Rank {self.rank}: materialized segment "
+					f"{stage.segment_id} spans {len(pages_by_group)} Host KV "
+					"regions; a latent expansion fills one"
+				)
+			pages = next(iter(pages_by_group.values()))
+			for slab in loader.slabs(
+				host_page_ids=pages, tokens=int(stage.tokens)
+			):
+				window = stage.slots[
+					slab.token_start:slab.token_start + slab.tokens
+				]
+				for physical, attn in enumerate(layers):
+					attn.materialize_pool_segment(
+						latent=slab.latent[physical], slots=window
+					)
+				loaded += int(slab.tokens)
+			logging.info(
+				"[PREFIX_POOL] Rank %s loaded materialized segment %s: %d "
+				"token(s) over %d Host page(s) into %d pool page(s)",
+				self.rank, stage.segment_id, int(stage.tokens), len(pages),
+				len(stage.pages),
+			)
+		return loaded
 
 	def _prefill_prepacked_pool(self, batch: list[int]) -> torch.Tensor:
 		"""Prefill a planned wave: each pooled segment once, then every tail."""
@@ -11893,7 +12031,8 @@ class BatchGenWorker:
 			# transaction, before this method is entered.
 			epilogue_trace.phase(
 				"wave_begin",
-				rows=len(wave.plan.segments) + len(wave.global_ids),
+				# Rows, so loaded segments do not count: they run none.
+				rows=len(wave.computed_segments()) + len(wave.global_ids),
 				tokens=wave.plan.computed_tokens,
 				chunks=len(wave.plan.chunks),
 			)
@@ -11910,6 +12049,12 @@ class BatchGenWorker:
 		# A recurrent layer forks a row's state from its parent segment's state
 		# slot, which is keyed by that segment's pseudo sequence id.
 		AttnWrapperBase.prefill_pool_segment_sids = wave.segment_sids
+		# A LOADED segment ran no row, so it left no recurrent state to fork:
+		# its reader resumes from the slot the trajectory restore bound before
+		# this wave, which the level cut verifies.
+		AttnWrapperBase.prefill_pool_materialized_segments = tuple(
+			sorted(wave.materialized)
+		)
 		# The pool row of an engine layer comes from the model's own pool
 		# layout, never from a KV cache's layer mapping: a cache that keeps
 		# every layer resolves to itself and would index past the pool.
@@ -11922,6 +12067,9 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_offload_recorder = (
 			self._new_pool_offload_check_recorder(wave)
 		)
+		# Staging for the wave's loads; None unless it materializes something.
+		materialized_loader = self._materialized_segment_loader(wave)
+		materialized_tokens = 0
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
@@ -11943,6 +12091,12 @@ class BatchGenWorker:
 				AttnWrapperBase.cur_batch = host_ids
 				AttnWrapperBase.prefill_pool_batch = rows
 				AttnWrapperBase.prefill_pool_row_starts = host_starts
+				# Before the forward, never during it: every layer's pool row
+				# holds the committed prefix by the time any row attends over
+				# it, and a failure here has not yet touched the forward.
+				materialized_tokens += self._load_materialized_segments(
+					wave, rows, materialized_loader
+				)
 				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
 				block_residual = (
 					self.model.model._new_block_residual(hidden_states)
@@ -12088,11 +12242,14 @@ class BatchGenWorker:
 			# has to live across the chunks that continue it, so it is released
 			# here — the wave is over and no later batch carries those ids.
 			self._release_kda_state_slots(list(wave.segment_sids.values()))
+			if materialized_loader is not None:
+				materialized_loader.release()
 			wave.pool.k = wave.pool.v = wave.pool.indexer = None
 			AttnWrapperBase.prefill_pool = None
 			AttnWrapperBase.prefill_pool_batch = None
 			AttnWrapperBase.prefill_pool_row_starts = None
 			AttnWrapperBase.prefill_pool_segment_sids = None
+			AttnWrapperBase.prefill_pool_materialized_segments = ()
 			AttnWrapperBase.prefill_pool_layer_map = None
 			AttnWrapperBase.prepack_mode = False
 			AttnWrapperBase.prepack_cu_seqlens = None
@@ -12111,6 +12268,8 @@ class BatchGenWorker:
 			"full_attention_pairs": work.full_attention_pairs,
 			"item_rows": work.item_rows,
 			"saved_tokens": wave.plan.prompt_tokens - executed,
+			"materialized_tokens": materialized_tokens,
+			"materialized_segments": len(wave.materialized),
 			"segments": len(wave.plan.segments),
 			"chunks": len(wave.plan.chunks),
 			"threshold": wave.plan.threshold,

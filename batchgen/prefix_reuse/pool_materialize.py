@@ -27,6 +27,15 @@ from typing import Iterator, Sequence
 import torch
 
 
+# Transient device staging for the H2D, sized in Host pages across every
+# layer (a K3 page is ~1.9 MiB over its 27 MLA layers, so this is a handful of
+# pages). It is NOT part of the pool's measured page budget, which is why it
+# is a small constant rather than a fraction of free memory: a load is
+# bandwidth-bound, and a deeper buffer buys nothing once the copy is in
+# flight.
+DEFAULT_SLAB_BYTES = 16 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class LatentSlab:
     """One resident slab of a segment, on the device and ready to expand.
