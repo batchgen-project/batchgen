@@ -914,6 +914,13 @@ class BatchScheduler:
 
         Builds an OpenAI-compatible BatchResultItem and appends it to
         {incremental_output_dir}/{batch_id}.jsonl.
+
+        A worker that failed ONE request publishes an ``error`` on the
+        completion instead of text (an over-context prompt, a reservation no
+        Host pool can ever hold). Such a request gets the Batch API's error
+        item -- ``response: null`` plus the worker's code and message -- not a
+        200 with empty text, which is indistinguishable from a generation that
+        legitimately produced nothing.
         """
         incr_dir = self.server_args.incremental_output_dir
         if not incr_dir:
@@ -922,6 +929,27 @@ class BatchScheduler:
         meta = self._pool_request_meta.get(batch_id, {}).get(request_id)
         if not meta:
             logger.warning(f"[POOL] No metadata for {request_id} in batch {batch_id}")
+            return
+
+        error = result.get("error")
+        if error:
+            logger.error(
+                "[POOL] Request %s of batch %s failed: %s",
+                request_id, batch_id, error,
+            )
+            self._append_pool_result_item(
+                batch_id,
+                request_id,
+                {
+                    "id": f"batch_req_{uuid.uuid4().hex[:24]}",
+                    "custom_id": meta["custom_id"],
+                    "response": None,
+                    "error": {
+                        "code": error.get("code", "worker_error"),
+                        "message": error.get("message", ""),
+                    },
+                },
+            )
             return
 
         decoded_text = result.get("text", "")
@@ -984,7 +1012,7 @@ class BatchScheduler:
                 },
             }
 
-        result_item = {
+        self._append_pool_result_item(batch_id, request_id, {
             "id": f"batch_req_{uuid.uuid4().hex[:24]}",
             "custom_id": custom_id,
             "response": {
@@ -993,9 +1021,15 @@ class BatchScheduler:
                 "body": body,
             },
             "error": None,
-        }
+        })
 
-        # Append to JSONL file
+    def _append_pool_result_item(
+        self, batch_id: str, request_id: str, result_item: dict
+    ) -> None:
+        """Append one BatchResultItem to the batch's incremental JSONL."""
+        incr_dir = self.server_args.incremental_output_dir
+        if not incr_dir:
+            return
         from pathlib import Path
         output_path = Path(incr_dir) / f"{batch_id}.jsonl"
         try:
