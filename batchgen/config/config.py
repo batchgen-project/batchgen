@@ -201,6 +201,11 @@ class HostPagedKVConfig:
     num_v_heads: int = 0 # Zero for MLA.
     v_head_dim: int = 0
     kv_dtype: str = "bfloat16" # "bfloat16 or float8_e4m3fn"
+    # Arrangement of one K page: "contiguous_aos" (token-major records) or
+    # "page_split_fp8_scale" (e4m3 K bytes then one fp32 scale per token,
+    # the layout deep_gemm.fp8_paged_mqa_logits reads). k_head_dim carries
+    # TOTAL bytes per token in the page-split format.
+    page_format: str = "contiguous_aos"
 
 @dataclass
 class DevicePagedKVConfig:

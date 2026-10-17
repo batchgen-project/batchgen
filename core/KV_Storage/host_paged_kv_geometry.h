@@ -55,6 +55,36 @@ class HostPagedKVGeometry {
                config_->k_element_size_bytes;
     }
 
+    [[nodiscard]] bool IsPageSplit() const noexcept {
+        return config_->page_format == HostKVPageFormat::kPageSplitFp8Scale;
+    }
+
+    // Bytes of ONE token's K DATA. The whole token record in the AoS format;
+    // the e4m3 bytes without the fp32 scale in the page-split format. This is
+    // both the source stride of the k_fp8 tensor and the destination stride
+    // inside the page's data region.
+    [[nodiscard]] std::size_t KDataTokenBytes() const noexcept {
+        if (IsPageSplit()) {
+            return config_->k_head_dim - kHostKVScaleBytesPerToken;
+        }
+        return KTokenBytes();
+    }
+
+    // Bytes of ONE token's scale; 0 unless page-split.
+    [[nodiscard]] std::size_t ScaleTokenBytes() const noexcept {
+        return IsPageSplit() ? kHostKVScaleBytesPerToken : 0;
+    }
+
+    // The head dim an incoming K tensor must declare. The page-split config
+    // carries TOTAL bytes per token in k_head_dim, while the tensor the model
+    // hands over holds only the data elements.
+    [[nodiscard]] std::size_t ExpectedKHeadDim() const noexcept {
+        if (IsPageSplit()) {
+            return config_->k_head_dim - kHostKVScaleBytesPerToken;
+        }
+        return config_->k_head_dim;
+    }
+
     template <bool HasVCache>
     [[nodiscard]] std::size_t VTokenBytes() const {
         if constexpr (HasVCache) {
