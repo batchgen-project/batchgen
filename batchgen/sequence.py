@@ -645,7 +645,7 @@ class SequenceEntry:
 
 
 class SequenceBatch:
-    __slots__ = ('sequences', '_status_index', '_rank_index')
+    __slots__ = ('sequences', '_status_index', '_rank_index', '_gid_index')
 
     def __init__(self):
         self.sequences: Dict[str, SequenceEntry] = {}
@@ -653,6 +653,13 @@ class SequenceBatch:
             status: set() for status in SequenceStatus
         }
         self._rank_index: Dict[int, Set[str]] = {}
+        # Third maintained index: global_idx -> entry. ``global_idx`` is
+        # assigned once in SequenceEntry.__init__ and never reassigned, so the
+        # only events that can change this mapping are the membership changes
+        # below. Decode resolves host-KV append metadata by global_idx every
+        # step; without this index that call site rebuilt the whole mapping
+        # per step.
+        self._gid_index: Dict[int, SequenceEntry] = {}
 
     def add_sequence(self, sequence: SequenceEntry) -> None:
         # Handle UUID collision: if a sequence with this uuid already exists,
@@ -667,12 +674,21 @@ class SequenceBatch:
             if (existing.assigned_rank is not None
                     and existing.assigned_rank in self._rank_index):
                 self._rank_index[existing.assigned_rank].discard(sequence.uuid)
+            # The replaced entry may have carried a different global_idx; drop
+            # its gid slot so no index entry outlives its sequence.
+            if self._gid_index.get(existing.global_idx) is existing:
+                del self._gid_index[existing.global_idx]
         self.sequences[sequence.uuid] = sequence
         self._status_index[sequence.status].add(sequence.uuid)
         if sequence.assigned_rank is not None:
             if sequence.assigned_rank not in self._rank_index:
                 self._rank_index[sequence.assigned_rank] = set()
             self._rank_index[sequence.assigned_rank].add(sequence.uuid)
+        # Admission reuses a gid only after its previous owner was removed, so
+        # a live collision is not expected here. Overwriting keeps the same
+        # resolution a dict comprehension over ``self.sequences`` would give
+        # (last writer wins) instead of inventing a new failure mode.
+        self._gid_index[sequence.global_idx] = sequence
 
     def remove_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         """Remove a sequence from the batch and all indices."""
@@ -681,10 +697,18 @@ class SequenceBatch:
             self._status_index[seq.status].discard(uuid)
             if seq.assigned_rank is not None and seq.assigned_rank in self._rank_index:
                 self._rank_index[seq.assigned_rank].discard(uuid)
+            # Delete only while the gid still resolves to this entry: a later
+            # add_sequence may already have taken the slot.
+            if self._gid_index.get(seq.global_idx) is seq:
+                del self._gid_index[seq.global_idx]
         return seq
 
     def get_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         return self.sequences.get(uuid, None)
+
+    def get_sequence_by_global_idx(self, global_idx: int) -> Optional[SequenceEntry]:
+        """Resolve a sequence by its immutable ``global_idx``."""
+        return self._gid_index.get(global_idx, None)
 
     def update_status(self, uuid: str, new_status: SequenceStatus) -> None:
         if uuid not in self.sequences:
@@ -766,6 +790,7 @@ class SequenceBatch:
                 seq = self.sequences[uuid]
                 view.sequences[uuid] = seq
                 view._status_index[seq.status].add(uuid)
+                view._gid_index[seq.global_idx] = seq
                 if seq.assigned_rank is not None:
                     if seq.assigned_rank not in view._rank_index:
                         view._rank_index[seq.assigned_rank] = set()

@@ -241,7 +241,9 @@ def create_app(
 
         content = await file.read()
         if file_purpose == FilePurpose.BATCH:
-            ok, error_message, _ = parse_batch_file(content)
+            ok, error_message, _ = parse_batch_file(
+                content, served_model=server_args.model
+            )
             if not ok:
                 raise HTTPException(
                     status_code=400,
