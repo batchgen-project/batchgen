@@ -27,6 +27,23 @@ def _bind_with_prompt(book, sequence_id, prompt, max_tokens):
     return slot
 
 
+def _written_cells(book, slot):
+    """The flat storage cells a slot has actually written.
+
+    `QueryBook` allocates its page storage with `torch.empty`, so every cell
+    outside a written span holds uninitialized memory. Comparing whole
+    `storage` tensors across two independently allocated books compares that
+    garbage, not the product's behavior. A slot's pages are a contiguous
+    extent and tokens are laid out logically contiguous across it, so the
+    written cells are the flat prefix of the extent.
+    """
+
+    page_start, _ = book._page_ranges[slot]
+    base = page_start * book.page_tokens
+    length = book.metadata(slot).token_length
+    return book.storage.view(-1)[base:base + length]
+
+
 def _state(book, slot):
     record = book.metadata(slot)
     return (
@@ -63,7 +80,13 @@ def test_batched_append_matches_per_row_appends():
     for sequence_id in prompts:
         row_slot, batch_slot = slots[sequence_id]
         assert _state(per_row, row_slot) == _state(batched, batch_slot)
-    assert torch.equal(per_row.storage, batched.storage)
+        # Only the written cells: `_state` already pins the tail page and
+        # offset, so matching written spans at matching physical positions is
+        # the whole storage claim minus the uninitialized cells.
+        assert torch.equal(
+            _written_cells(per_row, row_slot),
+            _written_cells(batched, batch_slot),
+        )
 
 
 def test_batched_append_crosses_a_page_boundary_like_per_row_appends():
