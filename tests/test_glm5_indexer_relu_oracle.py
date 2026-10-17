@@ -1,4 +1,10 @@
-"""ReLU-gated fp32 oracle and the acceptance metrics for the indexer scorer.
+"""ReLU-gated bf16-reference oracle and diagnostic metrics for the indexer scorer.
+
+POIS ruling 2026-10-17: the PRIMARY acceptance for the scorer swap is the
+end-to-end parity criterion v2 (4096-token cells, old-formula vs new-formula
+builds). The metrics in this file are DIAGNOSTICS against the bf16 reference
+(HF modeling precision), used to localize a parity regression; ``ACCEPTANCE``
+stays ``None`` unless POIS re-opens a metric bound.
 
 Swapping the bf16 Triton scorer for ``deep_gemm.fp8_paged_mqa_logits`` changes
 what the indexer COMPUTES -- ``sum_h w_h * relu(q_h . k_t)`` instead of
@@ -92,7 +98,8 @@ def relu_gated_oracle(
     head_gates: torch.Tensor,
     context_lens: torch.Tensor,
 ) -> list[torch.Tensor]:
-    """fp64 ``sum_h gates[b,h] * relu(q[b,h] . k[b,t])`` for ``t < len[b]``.
+    """``sum_h gates[b,h] * relu(q[b,h] . k[b,t])`` for ``t < len[b]``, with
+    inputs rounded to bf16 (the reference precision) and fp64 aggregation.
 
     Returns one 1-D tensor per row, of that row's own length. Rows are returned
     separately on purpose: a masked position must not exist at all. Padding
@@ -106,9 +113,15 @@ def relu_gated_oracle(
     """
 
     rows: list[torch.Tensor] = []
-    q64 = q.double()
-    k64 = k.double()
-    g64 = head_gates.double()
+    # POIS ruling 2026-10-17: the reference precision is bf16, not fp32/fp64.
+    # The checkpoint ships FP8 indexer weights with bf16 activations, SGLang's
+    # production scorer is itself FP8, and training was mixed precision -- so
+    # "the model's truth" is the bf16 forward (HF modeling precision), not an
+    # fp32 ideal. Inputs are therefore rounded through bf16 first; only the
+    # AGGREGATION then runs in fp64 so the referee adds no noise of its own.
+    q64 = q.to(torch.bfloat16).double()
+    k64 = k.to(torch.bfloat16).double()
+    g64 = head_gates.to(torch.bfloat16).double()
     for b in range(q.shape[0]):
         length = int(context_lens[b].item())
         if length <= 0:
@@ -128,7 +141,11 @@ def no_relu_oracle(
     """The retired formula: the same sum WITHOUT the per-head ReLU."""
 
     rows: list[torch.Tensor] = []
-    q64, k64, g64 = q.double(), k.double(), head_gates.double()
+    # Same bf16 reference precision as relu_gated_oracle, so the two oracles
+    # differ ONLY by the per-head ReLU.
+    q64 = q.to(torch.bfloat16).double()
+    k64 = k.to(torch.bfloat16).double()
+    g64 = head_gates.to(torch.bfloat16).double()
     for b in range(q.shape[0]):
         length = int(context_lens[b].item())
         if length <= 0:
@@ -261,7 +278,9 @@ def selection_metrics(
     )
 
 
-ACCEPTANCE_PROPOSAL = """Proposed acceptance bound (PENDING main-loop approval).
+ACCEPTANCE_PROPOSAL = """SUPERSEDED (POIS 2026-10-17): no metric bound is in force.
+The primary acceptance is parity criterion v2 end-to-end; the figures below are
+kept as the measurement record behind the original (withdrawn) proposal.
 
 Measured on the dev machine (CPU, fp64 oracle, isotropic synthetic q/K/gates,
 batch 4, topk 2048), FP8 inputs vs the fp32 ReLU-gated oracle:
@@ -317,8 +336,12 @@ def test_relu_gated_oracle_matches_the_deepgemm_epilogue_formula():
     for b, length in enumerate((16, 10)):
         expected = torch.einsum(
             "ht,h->t",
-            torch.relu(torch.einsum("hd,td->ht", q[b].double(), k[b, :length].double())),
-            gates[b].double(),
+            torch.relu(torch.einsum(
+                "hd,td->ht",
+                q[b].to(torch.bfloat16).double(),
+                k[b, :length].to(torch.bfloat16).double(),
+            )),
+            gates[b].to(torch.bfloat16).double(),
         )
         assert rows[b].shape == (length,)
         torch.testing.assert_close(rows[b], expected)
