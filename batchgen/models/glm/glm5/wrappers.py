@@ -29,6 +29,24 @@ import torch.nn.functional as F
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
+
+def _quantize_indexer_k_pagesplit(
+    k_tensor: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(e4m3 keys, fp32 per-token scales) for a page-split aux host write.
+
+    The host region stores the layout DeepGEMM reads, so the quantization
+    happens on the GPU before the copy: the host never sees bf16 indexer K,
+    and the C++ copy of each page's two regions stays a flat memcpy.
+    """
+
+    from batchgen_kernels.attention.dsa.indexer_k_quant import (
+        quantize_indexer_k_fp8,
+    )
+
+    k_fp8, scales = quantize_indexer_k_fp8(k_tensor)
+    return k_fp8.contiguous(), scales.contiguous()
+
 # Try importing FP8 absorb kernels (WP5)
 try:
     from batchgen_kernels.attention.dsa.fp8_absorb import (
@@ -1042,12 +1060,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
         sequence_ids = self.cur_batch
         if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
             raise RuntimeError("GLM-5 prefix-pool row metadata size mismatch")
-        targets = [(primary_view, primary_kv)]
+        targets = [(primary_view, primary_kv, False)]
         if indexer_kv is not None:
-            targets.append((aux_view, indexer_kv))
+            # A page-split aux region stores e4m3 keys plus one fp32 scale per
+            # token, so the host write quantizes here, at the offload
+            # boundary: the pool's own rows stay bf16 for this layer's
+            # prefill scoring.
+            targets.append(
+                (aux_view, indexer_kv, bool(getattr(aux_view, "is_page_split", False)))
+            )
         for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
-            for worker_view, kv in targets:
+            for worker_view, kv, quantize in targets:
                 row_kv = kv[start:end].view(1, end - start, 1, kv.shape[-1]).contiguous()
+                scale_tensor = None
+                if quantize:
+                    row_kv, row_scales = _quantize_indexer_k_pagesplit(row_kv)
+                    scale_tensor = row_scales
                 task = worker_view.async_offload_layer_kv_range_to_host(
                     layer_idx=self.layer_idx,
                     sequence_ids=[sequence_ids[row]],
@@ -1055,8 +1083,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     v_tensor=None,
                     raw_start_positions=[starts[row]],
                     token_counts=[end - start],
+                    scale_tensor=scale_tensor,
                 )
                 AttnWrapperBase.pin_prefill_offload_tensor(row_kv, self.layer_idx)
+                if scale_tensor is not None:
+                    AttnWrapperBase.pin_prefill_offload_tensor(
+                        scale_tensor, self.layer_idx
+                    )
                 AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
@@ -1073,15 +1106,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if sum(sequence_lengths) != offload_kv.shape[0]:
             raise RuntimeError("GLM-5 packed indexer KV token count mismatch")
 
+        aux_view = AttnWrapperBase.host_paged_kv_worker_view_aux
         packed_kv = offload_kv.contiguous()
-        task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_packed_layer_kv_to_host(
+        scale_tensor = None
+        if getattr(aux_view, "is_page_split", False):
+            packed_kv, scale_tensor = _quantize_indexer_k_pagesplit(packed_kv)
+        task = aux_view.async_offload_packed_layer_kv_to_host(
             layer_idx=self.layer_idx,
             sequence_ids=global_sequence_ids,
             k_tensor=packed_kv,
             v_tensor=None,
             sequence_lengths=sequence_lengths,
+            scale_tensor=scale_tensor,
         )
         AttnWrapperBase.pin_prefill_offload_tensor(packed_kv, self.layer_idx)
+        if scale_tensor is not None:
+            AttnWrapperBase.pin_prefill_offload_tensor(scale_tensor, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
