@@ -65,6 +65,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
+from batchgen.prefix_reuse.probe_guard import probe_safe
+
 import torch
 
 # Batch-level ``batchgen_debug`` keys.
@@ -205,6 +207,11 @@ class PoolKernelDumpRecorder:
     global_ids: Sequence[int] = ()
     layers: Optional[tuple[int, ...]] = None
     chunk_index: int = -1
+    # TESTS ONLY: re-raise instead of logging one ``probe_error`` line. The
+    # dump digests tensors and writes files from inside the prefill forward,
+    # so on a serving path a full /dev/shm or a shape it cannot read must
+    # cost the dump, not the wave.
+    strict: bool = False
     files: list = field(default_factory=list)
     bytes_hashed: int = 0
     # Set at the write site, consumed by the read site of the same call.
@@ -218,6 +225,7 @@ class PoolKernelDumpRecorder:
         os.makedirs(self.directory, exist_ok=True)
 
     # -- chunk lifecycle ---------------------------------------------------- #
+    @probe_safe("kernel_dump")
     def begin_chunk(self, batch) -> None:
         """Called by the executor as it packs a chunk, before any layer runs."""
 
@@ -225,13 +233,20 @@ class PoolKernelDumpRecorder:
         self._write_digests.clear()
         self._write_runs.clear()
 
+    @probe_safe("kernel_dump", default=False)
     def wants_layer(self, pool_layer: int, num_pool_layers: int) -> bool:
         if self.layers is None:
             self.layers = dumped_pool_layers(num_pool_layers)
         return int(pool_layer) in self.layers
 
     def maybe_synchronize(self) -> bool:
-        """True when it synchronized; ``nosync`` never does."""
+        """True when it synchronized; ``nosync`` never does.
+
+        Deliberately NOT guarded: a failed synchronize must drop the whole
+        dump through ``record_kernel_inputs``'s guard, never record
+        ``synced=False`` under ``mode=sync`` -- a dump that lies about its own
+        ordering is worse than no dump.
+        """
 
         if self.mode != MODE_SYNC:
             return False
@@ -240,6 +255,7 @@ class PoolKernelDumpRecorder:
         return True
 
     # -- the two sites ------------------------------------------------------ #
+    @probe_safe("kernel_dump")
     def record_write_sources(self, batch, key: torch.Tensor) -> None:
         """Digest each row's SOURCE K, as handed to the pool write.
 
@@ -268,6 +284,7 @@ class PoolKernelDumpRecorder:
                 ))
                 self.bytes_hashed += piece.numel() * piece.element_size()
 
+    @probe_safe("kernel_dump")
     def record_kernel_inputs(
         self, batch, k_cache: torch.Tensor, pool_layer: int, num_pool_layers: int
     ) -> Optional[str]:

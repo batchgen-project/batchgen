@@ -63,9 +63,11 @@ K3_PAGE_BYTES = 2 * PAGE_TOKENS * 2 * (6 + 4) * 2
 TOKEN_CAP = 64
 
 
+WORKER_TREE = ast.parse(WORKER.read_text())
+
+
 def _worker_class():
-    tree = ast.parse(WORKER.read_text())
-    return next(node for node in tree.body
+    return next(node for node in WORKER_TREE.body
                 if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
 
 
@@ -86,6 +88,30 @@ def _worker_methods(names, globals_=None):
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in names}
+
+
+def _worker_probe_debug_keys():
+    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+
+    The keys are module-level literals in the worker so that a prefill which
+    armed no probe never imports a probe module to find that out; the compiled
+    seam methods close over them, so the harness has to supply them.
+    """
+    literals = {
+        node.targets[0].id: node.value.value
+        for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    assign = next(
+        node for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
+    )
+    return tuple(literals[element.id] for element in assign.value.elts)
 
 
 def _bind(worker, methods):
@@ -291,14 +317,15 @@ def _plan_worker(
             "_construct_prefill_pool",
             "_prefill_pool_page_bytes",
             # The executor and the pool are built with the batch-level probes,
-            # read through the shared batchgen_debug seam.
+            # read ONCE per wave through the shared batchgen_debug seam.
             "_pool_pad_poison_enabled",
             "_new_pool_kernel_dump_recorder",
-            "_active_batchgen_debug_for_sequences",
+            "_pool_probe_debug",
             "_debug_flag_enabled",
         ],
         {
             "torch": _fake_torch(free_pages * K3_PAGE_BYTES),
+            "_POOL_PROBE_DEBUG_KEYS": _worker_probe_debug_keys(),
             "dist": fake_dist,
             # The pool layout branches on the DSA dual-region coordinator; a
             # single-region model (GPT-OSS, K3) is not an instance of it.
@@ -422,12 +449,31 @@ def test_another_batch_flag_does_not_arm_the_kernel_dump(monkeypatch):
     assert wave.pool.kernel_dump is None
 
 
-def test_a_mistyped_dump_mode_is_refused_at_pool_construction(monkeypatch):
-    """Not silently off: a typo must fail the wave, not look like a clean run."""
-    with pytest.raises(ValueError, match="prefix_pool_dump_kernel_args"):
-        _pool_with_debug(
+def test_a_mistyped_dump_mode_is_refused_by_name_and_the_wave_survives(
+    monkeypatch, caplog
+):
+    """Not silently off, and not fatal either.
+
+    A typo must never read as a clean run, which is why ``parse_dump_mode``
+    refuses it rather than returning None. But the refusal is a DIAGNOSTICS
+    failure, so it costs the dump and not the prefill: it lands as one
+    ``probe_error`` WARNING naming the flag and the bad value, and the wave is
+    built with no dump recorder. Observability must not take down what it
+    observes.
+    """
+
+    with caplog.at_level(logging.WARNING):
+        wave = _pool_with_debug(
             monkeypatch, {"prefix_pool_dump_kernel_args": "synch"}
         )
+
+    assert wave.pool.kernel_dump is None
+    line = next(
+        record.getMessage() for record in caplog.records
+        if "PROBE_ERROR" in record.getMessage()
+    )
+    assert "probe=kernel_dump.setup" in line
+    assert "prefix_pool_dump_kernel_args" in line and "'synch'" in line
 
 
 def test_pool_budget_is_the_group_minimum(monkeypatch):

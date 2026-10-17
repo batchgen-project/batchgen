@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -504,10 +505,17 @@ def test_the_worker_reads_both_flags_through_the_batch_debug_seam():
     assert "def _new_pool_kernel_dump_recorder(self, wave):" in source
     assert "pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)" in source
     seam = source.split("def _new_pool_kernel_dump_recorder")[1].split("\n\tdef ")[0]
-    assert "_active_batchgen_debug_for_sequences" in seam
+    # One cached read per wave, shared with the other pooled probes, and the
+    # flag decision precedes the import so the off path imports nothing.
+    assert "self._pool_probe_debug(wave)" in seam
+    assert seam.index("if debug is None:") < seam.index(
+        "from batchgen.prefix_reuse.kernel_dump import"
+    )
     assert "parse_dump_mode" in seam
     assert "dump_directory" in seam
     assert "return None" in seam
+    # Setup is guarded: an undumpable directory costs the dump, not the wave.
+    assert seam.count("run_probe(") == 3
 
 
 def test_tensor_digest_handles_bfloat16_and_matches_raw_bytes():
@@ -536,3 +544,61 @@ def test_tensor_digest_handles_bfloat16_and_matches_raw_bytes():
     # non-contiguous input must be handled too (the live call slices rows)
     sliced = bf16[:, ::2]
     assert _tensor_digest(sliced) == _tensor_digest(sliced.contiguous())
+
+
+# --------------------------------------------------------------------------
+# A dump failure costs the dump, never the wave
+# --------------------------------------------------------------------------
+def test_a_dump_it_cannot_write_logs_one_probe_error_and_returns_none(caplog):
+    """The dump writes files from inside the prefill forward."""
+
+    import logging as _logging
+
+    import torch as _torch
+
+    from batchgen.prefix_reuse.kernel_dump import PoolKernelDumpRecorder
+
+    recorder = PoolKernelDumpRecorder(
+        rank=6, mode="nosync", directory=tempfile.mkdtemp(), page_tokens=4,
+    )
+    with caplog.at_level(_logging.WARNING):
+        # ``batch`` is not a ChunkBatch at all: whatever the dump reaches for
+        # first is missing, which is exactly the shape of a probe bug.
+        assert recorder.record_kernel_inputs(
+            object(), _torch.zeros(2, 4, 1, 1), 0, 1
+        ) is None
+
+    line = next(
+        record.getMessage() for record in caplog.records
+        if "PROBE_ERROR" in record.getMessage()
+    )
+    assert "probe=kernel_dump.record_kernel_inputs" in line
+    assert "rank=6" in line
+    assert recorder.files == [] and recorder.strict is False
+
+
+def test_a_layer_question_it_cannot_answer_reads_as_not_dumping(caplog):
+    import logging as _logging
+
+    from batchgen.prefix_reuse.kernel_dump import PoolKernelDumpRecorder
+
+    recorder = PoolKernelDumpRecorder(
+        rank=0, mode="nosync", directory=tempfile.mkdtemp(), page_tokens=4,
+    )
+    with caplog.at_level(_logging.WARNING):
+        assert recorder.wants_layer(0, 0) is False
+
+    assert any("PROBE_ERROR" in r.getMessage() for r in caplog.records)
+
+
+def test_strict_mode_re_raises_for_the_tests_that_want_the_refusal():
+    import torch as _torch
+
+    from batchgen.prefix_reuse.kernel_dump import PoolKernelDumpRecorder
+
+    recorder = PoolKernelDumpRecorder(
+        rank=0, mode="nosync", directory=tempfile.mkdtemp(), page_tokens=4,
+        strict=True,
+    )
+    with pytest.raises(Exception):
+        recorder.record_kernel_inputs(object(), _torch.zeros(2, 4, 1, 1), 0, 1)
