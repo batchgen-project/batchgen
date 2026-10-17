@@ -27,6 +27,7 @@ try:
 except ImportError:  # pragma: no cover - resolved by the node's FA3 install
     _fa3_with_kvcache = None
 
+from batchgen.attention.dsa.aux_indexer_k_writer import write_aux_indexer_k
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -106,7 +107,12 @@ class Glm5DsaGraphSegmentInputs:
     primary_slot_indices: torch.Tensor
     aux_slot_indices: torch.Tensor
     primary_k_tensor: torch.Tensor
+    # The aux tensors the host append must receive: the bf16 keys for an AoS
+    # aux cache, the quantized e4m3 keys plus their fp32 per-token scales for a
+    # page-split one (the host region requires the scales and rejects them in
+    # the other format).
     indexer_k_tensor: torch.Tensor
+    indexer_k_scales: torch.Tensor | None = None
 
 
 def build_glm5_dsa_graph_segment_inputs(
@@ -253,13 +259,25 @@ def build_glm5_dsa_graph_segment_inputs(
             if aux_device == manager_device
             else new_token_pos.to(dtype=torch.int32, device=aux_device)
         )
+        # write_kv=False is the graph/eager compare prologue: no cache is
+        # written, so nothing quantizes, and a page-split aux cache leaves the
+        # bf16 source here (that debug comparison then faces the graph's e4m3
+        # output; the production path above always quantizes).
+        indexer_k_host = indexer_k_tensor
+        indexer_k_scales = None
         if write_kv:
-            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                k_tensor=indexer_k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32_aux,
-                layer_idx=li,
-                slot_indices=aux_slot_indices,
+            aux_blocked_k, _, aux_page_table = (
+                gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+            )
+            indexer_k_host, indexer_k_scales = write_aux_indexer_k(
+                aux_blocked_k=aux_blocked_k,
+                indexer_k=indexer_k_tensor,
+                page_table=aux_page_table,
+                slot_indices=aux_slot_indices.to(
+                    device=aux_page_table.device, dtype=torch.int32,
+                ),
+                token_indices=seq_lengths_i32_aux,
+                page_size_tokens=gpu_paged_kv_manager_aux.config.page_size_tokens,
             )
 
 
@@ -287,7 +305,8 @@ def build_glm5_dsa_graph_segment_inputs(
         primary_slot_indices=primary_slot_indices.to(dtype=torch.int32, device=manager_device),
         aux_slot_indices=aux_slot_indices.to(dtype=torch.int32, device=manager_device),
         primary_k_tensor=k_tensor,
-        indexer_k_tensor=indexer_k_tensor,
+        indexer_k_tensor=indexer_k_host,
+        indexer_k_scales=indexer_k_scales,
     )
 
 
@@ -420,6 +439,10 @@ def build_glm5_dsa_flashmla_inputs(
             AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
     indexer_k_tensor = None
+    # What the host append received: the bf16 keys for an AoS aux cache, the
+    # quantized e4m3 keys for a page-split one. Reported instead of the bf16
+    # source so the graph/eager compare checks the bytes both paths stored.
+    indexer_k_host = None
     if wrapper.module.indexer is not None:
         with (dt.timed("indexer_k", li) if dt else nullcontext()):
             if wrapper._indexer_cuda_weights is not None:
@@ -447,15 +470,28 @@ def build_glm5_dsa_flashmla_inputs(
                 if aux_device == manager_device
                 else new_token_pos.to(dtype=torch.int32, device=aux_device)
             )
-            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                k_tensor=indexer_k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32_aux,
-                layer_idx=li,
-                slot_indices=aux_slot_indices,
+            # The aux cache's own format decides how the keys are written: a
+            # GLM-5.2 page-split FP8 cache is quantized and page-split in one
+            # fused launch that also returns the (k_fp8, scales) pair the host
+            # region needs; a bf16 AoS cache keeps the plain paged update and
+            # gets no scales.
+            aux_blocked_k, _, aux_page_table = (
+                gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+            )
+            indexer_k_host, host_scales = write_aux_indexer_k(
+                aux_blocked_k=aux_blocked_k,
+                indexer_k=indexer_k_tensor,
+                page_table=aux_page_table,
+                slot_indices=aux_slot_indices.to(
+                    device=aux_page_table.device, dtype=torch.int32,
+                ),
+                token_indices=seq_lengths_i32_aux,
+                page_size_tokens=gpu_paged_kv_manager_aux.config.page_size_tokens,
             )
             if AttnWrapperBase.kv_append_callback_aux is not None:
-                AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
+                AttnWrapperBase.kv_append_callback_aux(
+                    li, indexer_k_host, None, host_scales,
+                )
 
     with (dt.timed("indexer_score", li) if dt else nullcontext()):
         if wrapper.module.skip_topk:
@@ -596,7 +632,7 @@ def build_glm5_dsa_flashmla_inputs(
         ),
         row_modes=row_modes,
         primary_k_tensor=k_tensor,
-        indexer_k_tensor=indexer_k_tensor,
+        indexer_k_tensor=indexer_k_host,
         branch_label=branch_label,
     )
 
