@@ -16,8 +16,14 @@ graph segment captures. Contract under test:
 * the router kernel dispatch is resolved on the row count THIS path routes —
   one rank's rows, not the all-gathered space — and reads its range from the
   kernel policy rather than from literals repeated here;
-* M-independence — stale rows past ``recv_count[e]`` cannot reach the output.
+* M-independence — stale rows past ``recv_count[e]`` cannot reach the output;
+* the shared-expert side-stream overlap — the fork opens before the exchange is
+  touched, the join closes after the combine, the accumulate consumes the
+  pool-owned staging buffer, and the stream/event are process-lifetime
+  resources that are never minted inside a capture.
 """
+import contextlib
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -123,6 +129,48 @@ class _FakeExchange:
             acc[t] += float(topk_weights[t, kk]) * x[le, pos].float()
         out.copy_(acc.to(out.dtype))
         return out
+
+
+class _RecordingOverlap:
+    """Stand-in for the shared-expert side stream.
+
+    The real fork/join is a pair of CUDA dependency edges, which a CPU test
+    cannot execute. What it CAN pin is the dataflow those edges exist for: the
+    fork opens before anything touches the exchange, the join closes after the
+    combine, and the accumulate reads a staging buffer that is only valid once
+    the join has run.
+
+    The last part is made observable rather than assumed: between fork and join
+    the staged rows are WITHHELD (overwritten with a sentinel) and restored only
+    by ``join``. An accumulate issued before the join therefore reads the
+    sentinel and fails a value assertion, instead of passing because the CPU
+    happened to run the two in the right order anyway.
+    """
+
+    WITHHELD = -31.0
+
+    def __init__(self, order, staging):
+        self.order = order
+        self._staging = staging
+        self._staged = None
+        self.forks = 0
+        self.joins = 0
+
+    @contextlib.contextmanager
+    def fork(self):
+        self.forks += 1
+        self.order.append("fork_enter")
+        yield
+        self._staged = self._staging.clone()
+        self._staging.fill_(self.WITHHELD)
+        self.order.append("fork_exit")
+
+    def join(self):
+        self.joins += 1
+        if self._staged is None:
+            raise AssertionError("join ran without a preceding fork")
+        self._staging.copy_(self._staged)
+        self.order.append("join")
 
 
 def _install_fake_exchange(monkeypatch):
@@ -282,7 +330,8 @@ def test_exchange_is_process_lifetime(monkeypatch):
 # Segment dataflow
 # --------------------------------------------------------------------------
 def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
-                   split_k_rows=()):
+                   split_k_rows=(), shared_value=0.0, shared_dtype=None,
+                   shared_rows=None):
     pool = _make_pool(monkeypatch, buckets=(bucket,))
     pool.setup()
     bufs = pool.get(bucket)
@@ -334,6 +383,16 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
 
     monkeypatch.setattr(
         glm5_moe_graph, "_graphed_router_split_k_kernel", fake_kernel_for)
+    # Call order across the three things the overlap has to interleave
+    # correctly: the shared expert, the exchange, and the join.
+    order = []
+
+    def fake_shared_expert(x):
+        order.append("shared_expert")
+        rows = x.shape[0] if shared_rows is None else shared_rows
+        return torch.full((rows, H), shared_value,
+                          dtype=shared_dtype or torch.bfloat16)
+
     segment.moe = SimpleNamespace(
         layer_idx=5,
         fp8_gate_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
@@ -341,9 +400,20 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
         fp8_gate_ws3d=torch.zeros(1), fp8_up_ws3d=torch.zeros(1),
         fp8_down_w3d=torch.zeros(E_LOCAL, H, N_INTER, dtype=torch.uint8),
         fp8_down_ws3d=torch.zeros(1),
-        shared_expert_forward=lambda x: torch.zeros(
-            x.shape[0], H, dtype=torch.bfloat16),
+        shared_expert_forward=fake_shared_expert,
     )
+
+    for name in ("dispatch_fp8", "combine"):
+        real = getattr(pool.deepep, name)
+
+        def tracing(*a, _real=real, _name=name, **kw):
+            order.append("dispatch" if _name == "dispatch_fp8" else "combine")
+            return _real(*a, **kw)
+
+        setattr(pool.deepep, name, tracing)
+
+    overlap = _RecordingOverlap(order, bufs.shared_out)
+    segment._shared_overlap = overlap
 
     # The gate writes global expert ids: every live row picks this rank's two
     # local experts plus two remote ones; row `valid` onwards is padding.
@@ -398,6 +468,8 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
     monkeypatch.setattr(glm5_moe_graph, "reduce_weighted_scatter", refuse)
 
     calls["router"] = router_calls
+    calls["order"] = order
+    calls["overlap"] = overlap
     rank_counts = torch.full((WORLD,), bucket, dtype=torch.int64)
     rank_counts[rank] = valid
     return segment, pool, bufs, calls, rank_counts, valid
@@ -547,9 +619,178 @@ def test_padded_rows_stay_inert(monkeypatch):
         bufs.expert_out[lo:hi] = -999.0
         bufs.intermediate[lo:hi] = -999.0
         bufs.ll_x_scale[:, lo:hi] = float("nan")
+    # ...and the shared-expert staging buffer, which the overlap added. It is a
+    # process-lifetime buffer now rather than a tensor minted per step, so it
+    # must carry no state between steps: the forked shared expert rewrites
+    # every row of the bucket slice before the join.
+    bufs.shared_out.fill_(float("nan"))
+    pool._base["shared_out"].fill_(float("nan"))
     poisoned = segment.forward(
         padded=padded, rank_token_counts=rank_counts)["moe_output"]
     assert torch.equal(poisoned, clean)
+
+
+# --------------------------------------------------------------------------
+# Shared-expert side-stream overlap
+# --------------------------------------------------------------------------
+def test_the_shared_expert_forks_before_the_exchange_and_joins_after_combine(
+        monkeypatch):
+    """The whole point of the slice: the shared expert is issued BEFORE the
+    dispatch and collected AFTER the combine, so the side stream has the entire
+    routed chain to run against rather than being appended to it."""
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+    assert calls["order"] == [
+        "fork_enter", "shared_expert", "fork_exit",
+        "dispatch", "combine", "join",
+    ]
+    # exactly one fork/join pair per layer per step -- not per bucket, not per
+    # expert, and never a fork left unjoined
+    assert calls["overlap"].forks == 1 and calls["overlap"].joins == 1
+
+
+def test_the_accumulate_reads_the_joined_staging_buffer(monkeypatch):
+    """Join-before-accumulate, as a value assertion.
+
+    The stand-in withholds the staged rows until ``join`` runs, so an
+    accumulate issued before the join would add the sentinel instead of the
+    shared-expert output. Comparing against the same forward with a zero shared
+    expert isolates exactly the staged contribution.
+    """
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, shared_value=0.0)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    routed = segment.forward(
+        padded=padded, rank_token_counts=rank_counts)["moe_output"].clone()
+
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, shared_value=0.5)
+    out = segment.forward(padded=padded, rank_token_counts=rank_counts)
+    assert torch.equal(out["moe_output"], routed + 0.5)
+    assert not torch.any(out["moe_output"] == _RecordingOverlap.WITHHELD)
+    # the accumulate consumes the POOL buffer, not a per-step temporary
+    assert out["moe_output"] is bufs.local_moe_output
+
+
+def test_the_staging_buffer_is_pool_owned_and_bucket_sliced(monkeypatch):
+    pool = _make_pool(monkeypatch, buckets=(4, 8, 16))
+    pool.setup()
+    base = pool._base["shared_out"]
+    assert base.shape == (16, H) and base.dtype == torch.bfloat16
+    for bucket in (4, 8, 16):
+        bufs = pool.get(bucket)
+        # the accumulate's operand must match local_moe_output exactly
+        assert bufs.shared_out.shape == bufs.local_moe_output.shape
+        assert bufs.shared_out.dtype == bufs.local_moe_output.dtype
+        # one allocation for every bucket AND every MoE layer: the layers are
+        # sequential and each joins before the next forks
+        assert bufs.shared_out.data_ptr() == base.data_ptr()
+
+
+def test_the_nccl_pool_carries_no_staging_buffer(monkeypatch):
+    """The side-stream fork is fenced to the DeepEP path, so the default path
+    must not pay for a buffer it never reads."""
+    pool = _make_pool(monkeypatch, configure=False)
+    pool.setup()
+    assert pool.get(BUCKET).shared_out.numel() == 0
+    assert pool._base["shared_out"].numel() == 0
+
+
+def test_the_nccl_forward_keeps_the_shared_expert_in_line():
+    """The NCCL path is the default and the merged baseline; a side stream
+    there would be a second unvalidated variable in the same measurement."""
+    nccl = inspect.getsource(Glm5MoEGraphSegment.forward)
+    deepep = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
+    assert "_shared_overlap" not in nccl
+    assert (
+        "bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))"
+        in nccl
+    )
+    assert "_shared_overlap.fork()" in deepep
+    assert "_shared_overlap.join()" in deepep
+
+
+def test_a_shared_output_the_staging_buffer_cannot_hold_fails_loud(monkeypatch):
+    """Staging is only value-preserving while the shared output and the buffer
+    agree on shape and dtype; a narrowing copy would round in the copy instead
+    of inside the accumulate, which is a silent change of the result."""
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, shared_dtype=torch.float32)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="shared expert returned"):
+        segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, shared_rows=BUCKET - 1)
+    with pytest.raises(RuntimeError, match="shared expert returned"):
+        segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+
+# --- the stream/event resources themselves -------------------------------
+class _FakeStream:
+    def __init__(self, device):
+        self.device = device
+
+
+def _fake_cuda(monkeypatch, *, capturing=False, current_device=0):
+    monkeypatch.setattr(glm5_moe_graph, "_SIDE_STREAMS", {})
+    monkeypatch.setattr(torch.cuda, "Stream", _FakeStream)
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current_device)
+
+
+def test_the_side_stream_is_one_process_resource_per_device(monkeypatch):
+    """Created once and shared by every MoE layer. The graph pool is dropped
+    and rebuilt around a mid-run prefill wave, so a stream owned by the pool
+    would leak one handle per rebuild."""
+    _fake_cuda(monkeypatch)
+    first = glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda", 0))
+    assert glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda", 0)) is first
+    # a device-less "cuda" resolves through the current device, same stream
+    assert glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda")) is first
+    # a second device gets its own
+    other = glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda", 1))
+    assert other is not first
+
+
+def test_the_side_stream_refuses_a_non_cuda_device(monkeypatch):
+    _fake_cuda(monkeypatch)
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        glm5_moe_graph._glm5_moe_side_stream(torch.device("cpu"))
+
+
+def test_the_overlap_resources_are_never_minted_inside_a_capture(monkeypatch):
+    """A stream or event created during ``torch.cuda.graph`` is a capture-time
+    resource the replay cannot reproduce. The fork/join CALLS belong inside the
+    capture -- they are the dependency edges -- but the handles must predate
+    it, and the graph manager builds segments before warmup and capture."""
+    _fake_cuda(monkeypatch, capturing=True)
+    with pytest.raises(RuntimeError, match="must exist before CUDA"):
+        glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda", 0))
+
+    # with the stream already cached, the per-layer event is the next thing
+    # that must not be minted under capture
+    _fake_cuda(monkeypatch, capturing=False)
+    glm5_moe_graph._glm5_moe_side_stream(torch.device("cuda", 0))
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="must be created before CUDA"):
+        glm5_moe_graph._SharedExpertOverlap(torch.device("cuda", 0), 5)
+
+
+def test_the_overlap_is_built_once_at_segment_construction(monkeypatch):
+    """Per forward there is no construction at all: the handles are attached to
+    the segment, so a replay issues only the two dependency edges."""
+    src = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
+    assert "_SharedExpertOverlap(" not in src
+    assert "torch.cuda.Stream(" not in src
+    assert "torch.cuda.Event(" not in src
+    ctor = inspect.getsource(Glm5MoEGraphSegment.__init__)
+    assert "_SharedExpertOverlap(" in ctor
 
 
 def _validation_segment(monkeypatch, *, rank=1, world=WORLD,

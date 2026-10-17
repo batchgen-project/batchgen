@@ -17,6 +17,7 @@ is the contents of ``expert_counts`` / ``cu_seqlens``, which are device tensors.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, fields as dataclass_fields
 from typing import Dict, List
@@ -78,6 +79,107 @@ def _graphed_router_split_k_kernel(rows: int):
     return glm5_router_gemm
 
 
+# ---------------------------------------------------------------------------
+# Shared-expert side-stream overlap (DeepEP decode path only).
+#
+# The DeepEP low-latency dispatch is a communication kernel that spends most of
+# its duration waiting on peers, so the SMs it occupies do no arithmetic. The
+# shared expert is the one piece of per-layer compute that depends on nothing
+# the exchange produces -- it reads ``padded`` and the shared-expert weights
+# only -- so issuing it on a second stream between the gate and the accumulate
+# turns critical-path work into work hidden behind the dispatch.
+#
+# The stream and the events are PROCESS-lifetime and are created here, never
+# inside a capture: a stream or event minted during ``torch.cuda.graph`` would
+# be a capture-time resource that replay cannot reproduce. The ``wait_stream`` /
+# ``record`` / ``wait_event`` calls, by contrast, are issued inside the capture
+# on purpose -- there they are recorded as dependency edges of the captured DAG,
+# and that is what makes the concurrency survive into every replay.
+_SIDE_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def _glm5_moe_side_stream(device: torch.device) -> torch.cuda.Stream:
+    """The one shared-expert side stream of this process, per CUDA device.
+
+    Process-lifetime by construction: the graph pool is dropped and rebuilt
+    around a mid-run prefill wave (``Glm5MoEGraphBufferPool.release``), and a
+    stream minted per pool would leak one handle per rebuild while the point of
+    the cache is that every MoE layer forks onto the SAME stream. Layers are
+    strictly sequential and each joins before the next forks, so one stream is
+    enough and two would only add fan-out the replay cannot use.
+    """
+    if device.type != "cuda":
+        raise RuntimeError(
+            "GLM-5 MoE shared-expert overlap requires a CUDA device, got "
+            f"{device!r}")
+    index = torch.cuda.current_device() if device.index is None else int(device.index)
+    stream = _SIDE_STREAMS.get(index)
+    if stream is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "GLM-5 MoE shared-expert side stream must exist before CUDA "
+                "graph capture; it is being created inside a capture, which "
+                "means a segment was constructed under torch.cuda.graph")
+        stream = torch.cuda.Stream(device=index)
+        _SIDE_STREAMS[index] = stream
+    return stream
+
+
+class _SharedExpertOverlap:
+    """One MoE layer's fork/join pair for the shared expert.
+
+    One event per layer rather than one per process: inside a single capture
+    every layer records and waits once, so each event carries exactly one
+    record/wait pair and the captured DAG needs no reasoning about re-recording
+    a live event. Both the stream and the event are allocated here, at segment
+    construction, which the graph manager runs before warmup and capture.
+    """
+
+    def __init__(self, device: torch.device, layer_idx: int) -> None:
+        self.stream = _glm5_moe_side_stream(device)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"Layer {layer_idx}: GLM-5 MoE shared-expert overlap event "
+                "must be created before CUDA graph capture")
+        self.event = torch.cuda.Event()
+        self.layer_idx = int(layer_idx)
+
+    @contextlib.contextmanager
+    def fork(self):
+        main = torch.cuda.current_stream()
+        # One ``wait_stream`` covers both orderings the side stream needs:
+        #   * ``padded`` and the gate's writes were issued on the main stream;
+        #   * the PREVIOUS layer's accumulate READ the shared-output buffer on
+        #     the main stream.
+        # The second is what makes a single process-wide output buffer correct
+        # instead of one per layer: the next write to it cannot start before
+        # the previous read of it has retired.
+        self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            yield
+        self.event.record(self.stream)
+
+    def join(self) -> None:
+        torch.cuda.current_stream().wait_event(self.event)
+
+
+class _InlineSharedExpert:
+    """No-stream stand-in: the shared expert runs in place, on the one stream.
+
+    Reachable only where there is no CUDA stream to fork onto, i.e. the CPU
+    contract tests. The arithmetic, the buffers and the order of the writes are
+    the side-stream path's; only the stream topology is absent, so the two
+    produce bitwise-identical output by construction.
+    """
+
+    @contextlib.contextmanager
+    def fork(self):
+        yield
+
+    def join(self) -> None:
+        return
+
+
 @dataclass
 class _Glm5MoEGraphBuffers:
     padded: torch.Tensor
@@ -107,6 +209,14 @@ class _Glm5MoEGraphBuffers:
     ll_topk_idx: torch.Tensor
     ll_x_scale: torch.Tensor
     ll_cu_seqlens: torch.Tensor
+    # DeepEP low-latency mode only: the shared expert's output, produced on the
+    # side stream and consumed by the accumulate on the main stream. A pool
+    # buffer rather than a side-stream temporary because the consumer is a
+    # DIFFERENT stream from the producer: a tensor minted on the side stream and
+    # freed by the main stream is a cross-stream lifetime the caching allocator
+    # has to be told about, while a process-lifetime buffer cannot be recycled
+    # under either stream at all. Empty on the NCCL path.
+    shared_out: torch.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +254,7 @@ _MOE_BUCKET_DIM_FIELDS = (
     "routed_global_output",
     "local_moe_output",
     "ll_topk_idx",
+    "shared_out",
 )
 
 _MOE_SHARED_FIELDS = (
@@ -310,6 +421,9 @@ class Glm5MoEGraphBufferPool:
         b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
         b["ll_x_scale"] = torch.empty(h // 128, 0, dtype=torch.float32, device=d)
         b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
+        # The shared expert stays on the one stream here, so it keeps writing
+        # the tensor it allocates and this buffer is never read.
+        b["shared_out"] = torch.empty(0, h, dtype=torch.bfloat16, device=d)
 
         for bucket_size in self.bucket_sizes:
             self._create_view(bucket_size)
@@ -388,6 +502,12 @@ class Glm5MoEGraphBufferPool:
         b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
         b["inter_fp8"] = torch.empty(rows, n, dtype=torch.uint8, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
+        # Shared-expert output, written on the side stream and read by the
+        # accumulate on the main stream. ONE buffer for all MoE layers: they run
+        # sequentially and each layer's join precedes the next layer's fork, so
+        # no two layers hold it live at once (a per-layer buffer would cost
+        # num_layers x this and displace KV pages for nothing).
+        b["shared_out"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
         b["expert_counts"] = torch.zeros(e, dtype=torch.int32, device=d)
         b["expert_counters"] = torch.zeros(e, dtype=torch.int32, device=d)
         # Constant uniform-stride segment table; the GEMMs take their live row
@@ -442,6 +562,7 @@ class Glm5MoEGraphBufferPool:
             routed_global_output=b["_unused_bf16_h"],
             local_moe_output=b["local_moe_output"][:bucket_size],
             ll_topk_idx=b["ll_topk_idx"][:bucket_size],
+            shared_out=b["shared_out"][:bucket_size],
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
             cu_seqlens=b["ll_cu_seqlens"],
@@ -482,8 +603,10 @@ class Glm5MoEGraphBufferPool:
             "inter_fp8": b["inter_fp8"][:capacity],
             "routed_global_output": b["routed_global_output"][:global_rows],
             "local_moe_output": b["local_moe_output"][:bucket_size],
-            # NCCL path: the exchange buffers do not exist.
+            # NCCL path: the exchange buffers and the side-stream staging
+            # buffer do not exist, so both stay the empty base tensor.
             "ll_topk_idx": b["ll_topk_idx"],
+            "shared_out": b["shared_out"],
         }
         if set(sliced) != set(_MOE_BUCKET_DIM_FIELDS):
             raise RuntimeError(
@@ -555,6 +678,23 @@ class Glm5MoEGraphSegment:
         self.deepep_ll = bool(getattr(moe, "glm5_deepep_ll", False))
         if self.deepep_ll:
             self._validate_deepep_graph_safe()
+
+        # Shared-expert fork/join, DeepEP path only: the NCCL path is the
+        # default and the merged baseline, and a side stream there would be a
+        # second unvalidated variable in the same measurement.
+        #
+        # Deliberately NOT capture-gated. The warmup iterations the graph
+        # manager runs before each capture execute this same forked code, which
+        # is what forces every lazy DeepGEMM/cuBLAS workspace to be allocated on
+        # the side stream BEFORE capture; a capture-only fork would first touch
+        # the side stream inside the capture. SGLang gates only its two
+        # attention-internal forks on capture mode -- the shared-expert fork
+        # this mirrors is ungated there as well.
+        self._shared_overlap = (
+            _SharedExpertOverlap(device, moe.layer_idx)
+            if self.deepep_ll and device.type == "cuda"
+            else _InlineSharedExpert()
+        )
 
         self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
@@ -795,6 +935,15 @@ class Glm5MoEGraphSegment:
           performs the fp32-accumulated top-k weighted sum on the owning rank
           and writes this rank's rows.
 
+        The shared expert is additionally forked onto a side stream for the
+        span of the routed chain (fork after the gate, join before the
+        accumulate). It reads only ``padded``, so the exchange and the grouped
+        GEMMs never wait on it, and the dispatch -- a comm kernel that mostly
+        waits on peers -- stops being time in which this rank's SMs do nothing.
+        The arithmetic, the operand values and the order of writes are
+        unchanged; only the stream the shared expert is issued on moves, so the
+        output is expected bitwise-identical to the in-line version.
+
         M-independence (padded rows stay inert): DeepEP leaves rows at or
         beyond ``recv_count[e]`` holding whatever the previous step left in the
         receive buffer. Both grouped GEMMs take their per-expert row count from
@@ -803,6 +952,14 @@ class Glm5MoEGraphSegment:
         ``layout_range``. Stale rows therefore cannot reach the output, and the
         captured graph's result depends only on the live row count, never on
         the padded extent.
+
+        The side-stream staging buffer does not weaken that: it is one process
+        buffer sliced to the bucket, the shared expert rewrites every row of
+        the slice each step, and the accumulate reads that slice only -- rows
+        beyond it keep a larger bucket's values and are unreachable. Within the
+        slice, padded rows carry exactly the garbage they carried when the
+        shared expert ran in line, because the rows it reads and writes are the
+        same ones.
         """
         exchange = self.pool.deepep
         if exchange is None:
@@ -839,6 +996,29 @@ class Glm5MoEGraphSegment:
             rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
             rows_per_rank=bucket_size,
         )
+
+        # FORK. The shared expert consumes ``padded`` and its own weights, and
+        # nothing the exchange produces, so from here it is independent of the
+        # whole routed chain below. On the side stream it runs against the
+        # dispatch, both grouped GEMMs and the combine instead of after them.
+        with self._shared_overlap.fork():
+            shared_out = self.moe.shared_expert_forward(padded)
+            if (shared_out.shape != bufs.shared_out.shape
+                    or shared_out.dtype != bufs.shared_out.dtype):
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: shared expert returned "
+                    f"{tuple(shared_out.shape)}/{shared_out.dtype}, but the "
+                    f"overlap buffer is {tuple(bufs.shared_out.shape)}/"
+                    f"{bufs.shared_out.dtype}. Staging through the buffer is "
+                    "only value-preserving while both agree: a narrowing copy "
+                    "would round here instead of inside the accumulate.")
+            # Staged on the SIDE stream, so the copy is hidden behind the
+            # dispatch exactly like the arithmetic above it and costs the
+            # critical path nothing. bf16 -> bf16 of the same shape, so the
+            # value the accumulate reads is the value the old in-line
+            # ``add_(shared_expert_forward(padded))`` read, bit for bit.
+            bufs.shared_out.copy_(shared_out)
+
         # DeepEP reads int64 expert ids; -1 padding rows stay unrouted.
         bufs.ll_topk_idx.copy_(bufs.topk_indices)
 
@@ -896,7 +1076,11 @@ class Glm5MoEGraphSegment:
             handle,
             out=bufs.local_moe_output,
         )
-        bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+
+        # JOIN, at the first point that reads the shared output -- the combine
+        # above is the last main-stream work the fork can hide behind.
+        self._shared_overlap.join()
+        bufs.local_moe_output.add_(bufs.shared_out)
         return {"moe_output": bufs.local_moe_output}
 
     def _fp8_blockwise_gemm_3d(
