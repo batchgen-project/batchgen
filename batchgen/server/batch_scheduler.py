@@ -334,6 +334,12 @@ class BatchScheduler:
         with self._pump_lock:
             if self._pump_stop is not None:
                 self._pump_stop.set()
+            # Retire the generation itself, not only its reader: anything the
+            # retired cohort's pump still forwards, or that already waits in
+            # the inbox, now fails the generation check and is dropped instead
+            # of acting during the restart.  _start_completion_pump advances
+            # the generation again for the next cohort.
+            self._pump_generation += 1
 
     def _completion_pump(
         self,
@@ -1139,105 +1145,115 @@ class BatchScheduler:
                 )
                 continue
 
-            if isinstance(result, dict):
-                msg_type = result.get("type")
-                if msg_type == "completion":
-                    request_id = result.get("request_id")
-                    batch_id = result.get("batch_id")
-                    if request_id:
-                        try:
-                            self._scheduling_pool.free_slot(request_id)
-                        except KeyError:
-                            pass
-                    # DIAG: Periodic slot status after completions
-                    if not hasattr(self, '_completion_count'):
-                        self._completion_count = 0
-                    self._completion_count += 1
-                    if self._completion_count % 500 == 0:
-                        logger.warning(
-                            f"[POOL] Completion #{self._completion_count}: "
-                            f"active={self._scheduling_pool.num_active_slots()}, "
-                            f"free={self._scheduling_pool.num_free_slots()}, "
-                            f"intake={self._intake_pool.size()}"
-                        )
-                    # Write output JSONL line
-                    if batch_id and request_id:
-                        self._write_pool_completion(batch_id, request_id, result)
-                    if batch_id:
-                        batch_done = self._scheduling_pool.mark_request_completed(
-                            request_id, batch_id
-                        )
-                        if batch_done:
-                            logger.info(f"[POOL] Batch {batch_id} completed")
-                elif msg_type == "channel_error":
-                    # The generation's pump could not read its response queue.
-                    # Same handling as the in-task read failure this replaced:
-                    # the active batches are persisted as failed.  The pump
-                    # has ended; the listener stays for the next generation.
-                    error = result.get("error")
-                    logger.error(
-                        "[POOL] Completion listener fatal error: %s", error
-                    )
-                    self._fail_all_active_batches(f"Worker error: {error}")
-                    continue
-                elif msg_type == "pool_shutdown":
-                    error = result.get("error")
-                    if error:
-                        logger.error("[POOL] Worker fatal received: %s", error)
-                        self._fail_all_active_batches(error)
-                        # The scheduler has already persisted this fatal before
-                        # notifying WorkerManager; persisted=True keeps monitor
-                        # reconciliation from persisting it a second time.
-                        self.worker.report_worker_fatal(error, persisted=True)
-                    else:
-                        logger.info("[POOL] Worker shutdown signal received")
-                    continue
-                elif msg_type == "trajectory_pool_capacity":
-                    # ``total_capacity`` is immutable token-pool capacity and
-                    # sizes SchedulingPool.  ``free_reservations`` changes on
-                    # bind/release and is status/admission telemetry only; it
-                    # must never resize the scheduler's slot list.
-                    if (
-                        result.get("capacity_semantics_version") != 1
-                        or "total_capacity" not in result
-                    ):
-                        reason = (
-                            "Incompatible trajectory-pool capacity snapshot: "
-                            "worker must publish capacity_semantics_version=1 "
-                            "and total_capacity; refusing the legacy ambiguous "
-                            "capacity field"
-                        )
-                        logger.error("[POOL] %s", reason)
-                        self._fail_all_active_batches(reason)
-                        self.worker.report_worker_fatal(reason)
-                        continue
-                    total_capacity = int(result["total_capacity"])
-                    if total_capacity != self._scheduling_pool.capacity:
-                        if self._scheduling_pool.num_active_slots():
-                            logger.error(
-                                "[POOL] Ignoring total capacity change while requests are active: "
-                                "old=%s new=%s active=%s",
-                                self._scheduling_pool.capacity,
-                                total_capacity,
-                                self._scheduling_pool.num_active_slots(),
+            # One malformed item must not end delivery for every later item:
+            # routing failures are logged with their traceback and skipped.
+            try:
+                if isinstance(result, dict):
+                    msg_type = result.get("type")
+                    if msg_type == "completion":
+                        request_id = result.get("request_id")
+                        batch_id = result.get("batch_id")
+                        if request_id:
+                            try:
+                                self._scheduling_pool.free_slot(request_id)
+                            except KeyError:
+                                pass
+                        # DIAG: Periodic slot status after completions
+                        if not hasattr(self, '_completion_count'):
+                            self._completion_count = 0
+                        self._completion_count += 1
+                        if self._completion_count % 500 == 0:
+                            logger.warning(
+                                f"[POOL] Completion #{self._completion_count}: "
+                                f"active={self._scheduling_pool.num_active_slots()}, "
+                                f"free={self._scheduling_pool.num_free_slots()}, "
+                                f"intake={self._intake_pool.size()}"
                             )
+                        # Write output JSONL line
+                        if batch_id and request_id:
+                            self._write_pool_completion(batch_id, request_id, result)
+                        if batch_id:
+                            batch_done = self._scheduling_pool.mark_request_completed(
+                                request_id, batch_id
+                            )
+                            if batch_done:
+                                logger.info(f"[POOL] Batch {batch_id} completed")
+                    elif msg_type == "channel_error":
+                        # The generation's pump could not read its response queue.
+                        # Same handling as the in-task read failure this replaced:
+                        # the active batches are persisted as failed.  The pump
+                        # has ended; the listener stays for the next generation.
+                        error = result.get("error")
+                        logger.error(
+                            "[POOL] Completion listener fatal error: %s", error
+                        )
+                        self._fail_all_active_batches(f"Worker error: {error}")
+                        continue
+                    elif msg_type == "pool_shutdown":
+                        error = result.get("error")
+                        if error:
+                            logger.error("[POOL] Worker fatal received: %s", error)
+                            self._fail_all_active_batches(error)
+                            # The scheduler has already persisted this fatal before
+                            # notifying WorkerManager; persisted=True keeps monitor
+                            # reconciliation from persisting it a second time.
+                            self.worker.report_worker_fatal(error, persisted=True)
                         else:
-                            self._scheduling_pool.set_capacity(total_capacity)
-                    self._trajectory_pool_info = dict(result)
-                    logger.info(
-                        "[POOL] Token pool capacity published: total_sequences=%s "
-                        "free_reservations=%s free_pages=%s page_tokens=%s",
-                        total_capacity,
-                        result.get("free_reservations"),
-                        result.get("free_pages"),
-                        result.get("page_tokens"),
-                    )
-                elif "error" in result:
-                    logger.error(f"[POOL] Worker error: {result}")
-                    continue
-                else:
-                    # Anything else is a protocol error from the worker
-                    logger.warning(f"[POOL] Unexpected result: {type(result)}")
+                            logger.info("[POOL] Worker shutdown signal received")
+                        continue
+                    elif msg_type == "trajectory_pool_capacity":
+                        # ``total_capacity`` is immutable token-pool capacity and
+                        # sizes SchedulingPool.  ``free_reservations`` changes on
+                        # bind/release and is status/admission telemetry only; it
+                        # must never resize the scheduler's slot list.
+                        if (
+                            result.get("capacity_semantics_version") != 1
+                            or "total_capacity" not in result
+                        ):
+                            reason = (
+                                "Incompatible trajectory-pool capacity snapshot: "
+                                "worker must publish capacity_semantics_version=1 "
+                                "and total_capacity; refusing the legacy ambiguous "
+                                "capacity field"
+                            )
+                            logger.error("[POOL] %s", reason)
+                            self._fail_all_active_batches(reason)
+                            self.worker.report_worker_fatal(reason)
+                            continue
+                        total_capacity = int(result["total_capacity"])
+                        if total_capacity != self._scheduling_pool.capacity:
+                            if self._scheduling_pool.num_active_slots():
+                                logger.error(
+                                    "[POOL] Ignoring total capacity change while requests are active: "
+                                    "old=%s new=%s active=%s",
+                                    self._scheduling_pool.capacity,
+                                    total_capacity,
+                                    self._scheduling_pool.num_active_slots(),
+                                )
+                            else:
+                                self._scheduling_pool.set_capacity(total_capacity)
+                        self._trajectory_pool_info = dict(result)
+                        logger.info(
+                            "[POOL] Token pool capacity published: total_sequences=%s "
+                            "free_reservations=%s free_pages=%s page_tokens=%s",
+                            total_capacity,
+                            result.get("free_reservations"),
+                            result.get("free_pages"),
+                            result.get("page_tokens"),
+                        )
+                    elif "error" in result:
+                        logger.error(f"[POOL] Worker error: {result}")
+                        continue
+                    else:
+                        # Anything else is a protocol error from the worker
+                        logger.warning(f"[POOL] Unexpected result: {type(result)}")
+            except Exception:
+                logger.exception(
+                    "[POOL] Completion listener failed to route an item of "
+                    "generation %d; skipping it: %r",
+                    generation,
+                    result.get("type") if isinstance(result, dict) else result,
+                )
 
         logger.info("[POOL] Completion listener stopped")
 

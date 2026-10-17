@@ -584,6 +584,80 @@ def test_batch_admission_passes_the_state_gate_while_serving():
     assert "file-missing" in str(excinfo.value.detail)
 
 
+def test_listener_survives_an_item_that_fails_to_route(tmp_path, caplog):
+    """A malformed item is logged with its traceback and skipped; the
+    listener keeps routing the items after it."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+
+        def broken_free_slot(request_id):
+            if request_id == "req-bad":
+                raise RuntimeError("malformed completion")
+
+        scheduler._scheduling_pool.free_slot = broken_free_slot
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        listener = scheduler._completion_listener_task
+
+        scheduler.worker.response_queue.put(_completion("req-bad", "batch-1"))
+        scheduler.worker.response_queue.put(_completion("req-1", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.completed)
+        assert scheduler._scheduling_pool.completed == [("req-1", "batch-1")]
+        assert not listener.done()
+
+        await _shutdown(scheduler)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    failures = [r for r in caplog.records if "failed to route" in r.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+
+
+def test_retiring_the_pump_retires_its_generation(tmp_path):
+    """Between the retire and the next generation's pump, an item of the
+    retired cohort -- already queued, or forwarded by its pump afterwards --
+    must not act: retiring advances the generation."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        assert scheduler._pump_generation == 1
+
+        # Queued while gen 1 was live, then the restart retires the pump
+        # before the listener runs.
+        scheduler._offer_completion(1, _completion("req-1", "batch-1"))
+        await asyncio.to_thread(scheduler.stop_completion_pump)
+        assert scheduler._pump_generation == 2
+        # Forwarded by the retired pump after the retire.
+        scheduler._offer_completion(
+            1, {"type": "pool_shutdown", "error": "old cohort fatal"}
+        )
+
+        assert await _await_true(lambda: scheduler._completion_inbox.empty())
+        await asyncio.sleep(0.1)
+        assert scheduler._scheduling_pool.completed == []
+        assert scheduler.worker.fatals == []
+        assert tracker.error is None
+
+        # The next cohort's pump gets its own, later generation and routes.
+        fresh_queue: Any = queue.Queue()
+        scheduler.worker.response_queue = fresh_queue
+        await asyncio.to_thread(scheduler.worker_generation_ready)
+        assert scheduler._pump_generation == 3
+        fresh_queue.put(_completion("req-2", "batch-1"))
+        assert await _await_true(lambda: scheduler._scheduling_pool.completed)
+        assert scheduler._scheduling_pool.completed == [("req-2", "batch-1")]
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
 def _load_intake_pool_module():
     """Load intake_pool.py by path: it is stdlib-only, while importing it as
     batchgen.server.intake_pool runs the package __init__ (GPU-only deps)."""

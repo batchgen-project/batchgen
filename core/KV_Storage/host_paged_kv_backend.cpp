@@ -279,6 +279,7 @@ struct HostPagedKVBackend::SharedState {
     SequenceEntry* FindOrInsertSequenceEntryLocked(std::int64_t sequence_id,
                                                    bool* is_new);
     SequenceEntry* FindSequenceEntryLocked(std::int64_t sequence_id) const;
+    void RebuildFreeStateLocked();
     std::size_t HashSequenceId(std::int64_t sequence_id) const;
 };
 
@@ -853,8 +854,11 @@ void HostPagedKVBackend::SharedState::ReleaseAllSequences() {
     std::vector<std::int64_t> sequence_ids;
     {
         ScopedMutexLock lock(&header->sequence_mutex);
-        sequence_ids.reserve(
-            header->active_sequences.load(std::memory_order_relaxed));
+        // A writer killed between inserting a sequence and counting it lets
+        // the counter wrap; it is only a size hint here.
+        sequence_ids.reserve(std::min<std::size_t>(
+            header->active_sequences.load(std::memory_order_relaxed),
+            sequence_capacity));
         for (std::size_t i = 0; i < sequence_capacity; ++i) {
             const SequenceEntry& entry = sequence_table[i];
             if (entry.sequence_id != kEmptySequenceId &&
@@ -870,6 +874,55 @@ void HostPagedKVBackend::SharedState::ReleaseAllSequences() {
     for (std::int64_t sequence_id : sequence_ids) {
         ReleaseSequence(sequence_id);
     }
+
+    // Same allocation -> sequence order as AcquirePagesForSequences.
+    ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    RebuildFreeStateLocked();
+}
+
+// Invariant: after ReleaseAllSequences the allocator state is identical to a
+// fresh region plus the prefix-resident set.
+//
+// A writer killed inside an allocation or a release can strand pages: the
+// free-stack commit and the sequence-metadata update are separate steps (and,
+// for AcquirePages and the release paths, separate critical sections), so a
+// SIGKILL between them leaves pages that are neither on the free stack nor
+// reachable from any sequence chain, and can leave active_sequences wrapped.
+// The only caller is the server's cohort reconcile, which runs after every
+// worker attached to this region has exited, so nothing else mutates it now.
+// With every chain released, page ownership is ground truth: a page is either
+// prefix-resident (owned by the prefix cache, which tracks those page ids in
+// its own structures and links them through no backend chain) or free.
+// The free stack, the free pages' owner/link slots, the sequence table, and
+// active_sequences are rewritten from that, in ConstructSharedState's layout.
+void HostPagedKVBackend::SharedState::RebuildFreeStateLocked() {
+    for (std::size_t i = 0; i < sequence_capacity; ++i) {
+        const std::int64_t id = sequence_table[i].sequence_id;
+        if (id != kEmptySequenceId && id != kTombstoneSequenceId) {
+            // Freeing this sequence's pages would hand them out twice.
+            throw std::logic_error(
+                "Host KV free-state rebuild found live sequence " +
+                std::to_string(id) +
+                " after releasing all sequences; ReleaseAllSequences "
+                "requires that no worker is attached to the region");
+        }
+    }
+    std::uint32_t top = 0;
+    for (std::size_t i = 0; i < config.num_pages; ++i) {
+        const std::size_t page = config.num_pages - 1 - i;
+        if (page_owners[page] == kPrefixResidentSequenceId) {
+            continue;
+        }
+        page_owners[page] = kEmptySequenceId;
+        page_links[page] = kInvalidPageIndex;
+        free_stack[top++] = static_cast<std::int32_t>(page);
+    }
+    for (std::size_t i = 0; i < sequence_capacity; ++i) {
+        sequence_table[i] = SequenceEntry();
+    }
+    header->free_stack_top.store(top, std::memory_order_relaxed);
+    header->active_sequences.store(0, std::memory_order_relaxed);
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(

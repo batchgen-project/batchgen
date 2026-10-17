@@ -186,6 +186,8 @@ class WorkerManager:
         self._monitor_stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._join_lock = threading.Lock()
+        # One owner per cohort teardown: see _handle_worker_failure.
+        self._teardown_lock = threading.Lock()
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
@@ -848,6 +850,7 @@ class WorkerManager:
         # Every phase runs inside one recovery scope: a restart that fails at
         # ANY point leaves the manager in the retryable workers_down state,
         # never stuck in "restarting".
+        teardown_owned = False
         try:
             self._abort_restart_if_stopping()
             quiesce_start = time.monotonic()
@@ -855,6 +858,12 @@ class WorkerManager:
                 self._quiesce_hook()
             quiesce_s = time.monotonic() - quiesce_start
             teardown_start = time.monotonic()
+            # Teardown of a cohort has one owner at a time: a monitor that
+            # claimed a failure holds this lock through its reconcile, and a
+            # restart from workers_down waits for it here rather than tearing
+            # down beside it.  Held through the channel rotation below.
+            self._teardown_lock.acquire()
+            teardown_owned = True
             self._monitor_stop_event.set()
             monitor = self._monitor_thread
             if monitor is not None and monitor is not threading.current_thread():
@@ -892,6 +901,8 @@ class WorkerManager:
                 self._retire_channels_hook()
             self._abandon_worker_channels()
             self._create_worker_channels()
+            teardown_owned = False
+            self._teardown_lock.release()
 
             spawn_start = time.monotonic()
             self._monitor_stop_event.clear()
@@ -927,6 +938,8 @@ class WorkerManager:
             if self._resume_hook is not None:
                 self._resume_hook()
         except BaseException:
+            if teardown_owned:
+                self._teardown_lock.release()
             with self._lock:
                 self._state = "workers_down"
             raise
@@ -1262,6 +1275,12 @@ class WorkerManager:
         self._monitor_thread.start()
 
     def _monitor_worker_processes(self) -> None:
+        # A failure is handed to _handle_worker_failure on every poll until
+        # this monitor is stopped or the cohort is gone, not just once: the
+        # handler declines while a restart owns the pool, and a cohort that
+        # dies just before that restart flips to serving must still be caught
+        # on the first poll after the flip.  Each reason is logged once.
+        reported = None
         while not self._monitor_stop_event.is_set():
             if self.worker_process is None:
                 return
@@ -1272,20 +1291,22 @@ class WorkerManager:
             except Exception as exc:
                 if self._stopping:
                     return
-                logger.exception("Worker process join failed")
-                self._handle_worker_failure(
-                    f"Worker process crashed: {exc}", exc
-                )
-                return
-            if self._monitor_stop_event.is_set():
-                return
-            exit_reason = self._collect_worker_exit_reason()
-            if exit_reason:
-                if self._stopping:
+                reason = f"Worker process crashed: {exc}"
+                if reason != reported:
+                    logger.exception("Worker process join failed")
+                    reported = reason
+                self._handle_worker_failure(reason, exc)
+            else:
+                if self._monitor_stop_event.is_set():
                     return
-                logger.error(exit_reason)
-                self._handle_worker_failure(exit_reason, None)
-                return
+                exit_reason = self._collect_worker_exit_reason()
+                if exit_reason:
+                    if self._stopping:
+                        return
+                    if exit_reason != reported:
+                        logger.error(exit_reason)
+                        reported = exit_reason
+                    self._handle_worker_failure(exit_reason, None)
             self._monitor_stop_event.wait(self._monitor_interval_s)
 
     def _collect_worker_exit_reason(self) -> Optional[str]:
@@ -1323,13 +1344,26 @@ class WorkerManager:
         # a restart that already set "restarting" owns the teardown (its own
         # reap and reconcile cover the dead cohort), and a cohort already in
         # "workers_down" is owned by whoever entered that state or by the
-        # next restart.
+        # next restart.  The claim also takes the teardown lock, held through
+        # the end of this reconcile: a restart requested from workers_down
+        # waits on it instead of racing this teardown and its SHM cleanup.
+        # Only a restart (state "restarting") or a claimed failure (state
+        # "workers_down") ever holds that lock, so it is free whenever the
+        # state is "serving".
         with self._lock:
             if self._state != "serving":
                 return
             startup = not self._first_ready
             if not startup:
+                if not self._teardown_lock.acquire(blocking=False):
+                    logger.error(
+                        "Worker failure not claimed: the cohort teardown is "
+                        "already owned while the pool is serving (%s)",
+                        reason,
+                    )
+                    return
                 if not self._worker_exit_state.set_failure(reason, exc):
+                    self._teardown_lock.release()
                     return
                 self._state = "workers_down"
         if startup:
@@ -1345,20 +1379,23 @@ class WorkerManager:
             "Worker cohort failed after readiness; entering workers_down: %s",
             reason,
         )
-        if self._quiesce_hook is not None:
-            self._quiesce_hook()
-        self._monitor_stop_event.set()
-        monitor = self._monitor_thread
-        if monitor is not None and monitor is not threading.current_thread():
-            monitor.join(timeout=5)
-            self._monitor_thread = None
         try:
-            if self.worker_process is not None:
-                self._stop_workers()
-                self.worker_process = None
-            self._reconcile(reason, fail_in_flight=True)
-        except Exception:
-            logger.exception("Worker failure reconciliation failed")
+            if self._quiesce_hook is not None:
+                self._quiesce_hook()
+            self._monitor_stop_event.set()
+            monitor = self._monitor_thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(timeout=5)
+                self._monitor_thread = None
+            try:
+                if self.worker_process is not None:
+                    self._stop_workers()
+                    self.worker_process = None
+                self._reconcile(reason, fail_in_flight=True)
+            except Exception:
+                logger.exception("Worker failure reconciliation failed")
+        finally:
+            self._teardown_lock.release()
 
     @staticmethod
     def _request_server_shutdown() -> None:

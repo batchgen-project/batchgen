@@ -113,6 +113,7 @@ def _manager(monkeypatch):
     manager._restart_timeout_s = 10.0
     manager._monitor_stop_event = threading.Event()
     manager._stopping = False
+    manager._teardown_lock = threading.Lock()
     manager.started = True
     manager._ready_event = threading.Event()
     manager._fatal_ack_event = threading.Event()
@@ -461,6 +462,135 @@ def test_monitor_and_restart_race_has_a_single_teardown_owner(monkeypatch):
             monitor.join(5)
             assert teardowns == ["monitor"]
             assert manager.state == "workers_down"
+
+
+def test_restart_from_workers_down_waits_for_the_monitors_reconcile(monkeypatch):
+    """The monitor claims a failure and is still inside its reconcile (whose
+    SHM cleanup must not run beside a respawn) when a restart is requested
+    from workers_down. The restart must wait for that reconcile to finish
+    before its own teardown, so the two never overlap."""
+    manager = _manager(monkeypatch)
+    manager.set_main_thread_dispatcher(lambda fn, timeout: fn())
+    events = []
+    in_reconcile = threading.Event()
+    finish_reconcile = threading.Event()
+
+    class ExitState:
+        def set_failure(self, reason, exc):
+            return True
+
+        def clear(self):
+            pass
+
+        def is_failed(self):
+            return False
+
+    manager._worker_exit_state = ExitState()
+
+    def reconcile(reason, fail_in_flight):
+        who = threading.current_thread().name
+        events.append(("reconcile-begin", who))
+        if who == "monitor":
+            in_reconcile.set()
+            assert finish_reconcile.wait(5)
+        events.append(("reconcile-end", who))
+        return {"failed_batches": 0}
+
+    manager._reconcile = reconcile
+    manager._stop_workers = lambda: events.append(
+        ("teardown", threading.current_thread().name)
+    )
+
+    monitor = threading.Thread(
+        target=manager._handle_worker_failure,
+        args=("worker exited", None),
+        name="monitor",
+    )
+    monitor.start()
+    assert in_reconcile.wait(5)
+    assert manager.state == "workers_down"
+
+    restarter = threading.Thread(
+        target=manager.restart_workers, kwargs={"timeout_s": 1}, name="restart",
+    )
+    restarter.start()
+    time.sleep(0.2)
+    # Blocked on the teardown lock: nothing of the restart's teardown ran.
+    assert manager.state == "restarting"
+    assert [e for e in events if e[1] == "restart"] == []
+
+    finish_reconcile.set()
+    monitor.join(5)
+    restarter.join(5)
+    assert not restarter.is_alive()
+    assert manager.state == "serving"
+    assert events.index(("reconcile-end", "monitor")) < events.index(
+        ("reconcile-begin", "restart")
+    )
+    assert not manager._teardown_lock.locked()
+
+
+def test_teardown_lock_is_released_when_a_restart_fails(monkeypatch):
+    manager = _manager(monkeypatch)
+
+    def failing_teardown():
+        raise RuntimeError("worker teardown left live owned PIDs")
+
+    manager._stop_workers = failing_teardown
+    with pytest.raises(RuntimeError, match="live owned PIDs"):
+        manager.restart_workers(timeout_s=1)
+    assert manager.state == "workers_down"
+    assert not manager._teardown_lock.locked()
+
+    # A later monitor claim can still own a teardown.
+    manager._stop_workers = lambda: None
+    manager._state = "serving"
+    claimed = []
+
+    class ExitState:
+        def set_failure(self, reason, exc):
+            return True
+
+    manager._worker_exit_state = ExitState()
+    manager._reconcile = lambda reason, fail_in_flight: claimed.append(reason)
+    manager._handle_worker_failure("worker exited", None)
+    assert claimed == ["worker exited"]
+    assert not manager._teardown_lock.locked()
+
+
+def test_monitor_keeps_polling_after_a_declined_failure(monkeypatch):
+    """A cohort that dies after readiness but before the restart's serving
+    flip is declined (state restarting). The monitor must stay alive and hand
+    the failure over again once the pool is serving."""
+    manager = _manager(monkeypatch)
+    manager._monitor_interval_s = 0.01
+    manager._join_lock = threading.Lock()
+    manager.worker_process = SimpleNamespace(
+        processes=[SimpleNamespace(join=lambda timeout: None)]
+    )
+    manager._collect_worker_exit_reason = lambda: "Detected worker process exit"
+    manager._state = "restarting"
+    handled = []
+
+    def handle(reason, exc):
+        handled.append(manager.state)
+        if manager.state == "serving":
+            manager._monitor_stop_event.set()
+
+    manager._handle_worker_failure = handle
+    monitor = threading.Thread(target=manager._monitor_worker_processes)
+    monitor.start()
+    deadline = time.monotonic() + 5
+    while len(handled) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.is_alive()
+    assert set(handled) == {"restarting"}
+
+    with manager._lock:
+        manager._state = "serving"
+    monitor.join(5)
+    assert not monitor.is_alive()
+    assert handled[-1] == "serving"
 
 
 def test_explicit_restart_does_not_double_persist_prior_pool_shutdown(monkeypatch):
