@@ -334,6 +334,9 @@ def _plan_worker(
         # No worker-wide batchgen_debug: the batch-level flags are the only
         # source, and none of these sequences sets one.
         _batchgen_debug=None,
+        # Request-level flags ARE the source here, so the per-sequence merge
+        # must stay reachable (the worker latches this at admission).
+        _any_sequence_batchgen_debug=True,
         # The planner reads the cached prefill-phase page budget (pages) and
         # prompts through the trajectory-book contract.
         _prefill_pool_page_budget=free_pages,

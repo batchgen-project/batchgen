@@ -68,6 +68,10 @@ METHODS = (
     "_prefill_prefix_pressure",
     "_prefill_admission_guard_state",
     "_reject_unsatisfiable_prefill_requests",
+    # Called by _prepare_prefill_batch right after the group stamp; a no-op at
+    # the G==1 these fakes run, but compiled from the real source so the call
+    # is exercised rather than stubbed away.
+    "_check_decode_dp_group_plan_identical",
 )
 
 

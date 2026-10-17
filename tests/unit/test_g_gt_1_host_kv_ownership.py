@@ -769,7 +769,11 @@ def _append_worker(attn_tp_size, view):
     worker = SimpleNamespace(
         rank=1,
         parallel_manager=SimpleNamespace(attn_tp_size=attn_tp_size),
-        global_batch=[seq],
+        # The append path resolves the row through SequenceBatch's maintained
+        # global_idx index, as the other fakes here expose get_sequence.
+        global_batch=SimpleNamespace(
+            get_sequence_by_global_idx={seq.global_idx: seq}.get,
+        ),
         host_paged_kv_worker_view=view,
         _wait_pending_kv_append_tasks=lambda defer_errors: 0,
     )

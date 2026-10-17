@@ -654,7 +654,14 @@ class QueryBook:
     def append_tokens(
         self, slots: Sequence[int], token_ids: Sequence[int]
     ) -> None:
-        """Append one token to every row in a decode microbatch."""
+        """Append one token to every row in a decode microbatch.
+
+        The decode loop calls this once per step, so the token store is issued
+        as one vectorized write over the flat page storage instead of a scalar
+        tensor assignment per row. Every row's capacity is still validated
+        before anything is written, which is what makes the single write safe:
+        a rejected row cannot leave a partially advanced batch behind.
+        """
 
         if len(slots) != len(token_ids):
             raise ValueError(
@@ -662,14 +669,37 @@ class QueryBook:
             )
         if len(set(slots)) != len(slots):
             raise ValueError("slots must be unique within a batch")
+        if not slots:
+            return
         prepared = []
+        positions = []
         for slot, token_id in zip(slots, token_ids):
             self._check_active_slot(slot)
             record = self._records[slot]
             self._check_length(slot, record.token_length + 1)
             prepared.append(int(token_id))
-        for slot, token_id in zip(slots, prepared):
-            self.append_token(slot, token_id)
+            # The cached tail is the same page/offset pair append_token would
+            # store through; storage is contiguous, so the flat index is
+            # exact.
+            positions.append(
+                self._tail_pages[slot] * self.page_tokens
+                + self._tail_offsets[slot]
+            )
+        self.storage.view(-1)[
+            torch.tensor(positions, dtype=torch.int64)
+        ] = torch.tensor(prepared, dtype=torch.int32)
+        for slot in slots:
+            record = self._records[slot]
+            index = record.token_length
+            self._records[slot] = QueryBookSlot(
+                slot,
+                record.prompt_length,
+                index + 1,
+                record.decoded_length + 1,
+                record.max_tokens,
+            )
+            self._update_tail(slot, index + 1)
+            self._increment_last_turn(slot, index + 1)
 
     def tokens(self, slot: int, length: Optional[int] = None) -> torch.Tensor:
         """Materialize a contiguous CPU tensor for a valid token span."""

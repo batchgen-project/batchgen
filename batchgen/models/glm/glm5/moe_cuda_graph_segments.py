@@ -17,6 +17,7 @@ is the contents of ``expert_counts`` / ``cu_seqlens``, which are device tensors.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, fields as dataclass_fields
 from typing import Dict, List
@@ -32,6 +33,7 @@ from batchgen.moe.grouped_fp8_blockwise_moe import (
 from batchgen.moe.routing import FusedGateContext, gate_sigmoid_topk_cuda
 
 from .moe_ragged import (
+    ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged,
     dispatch_scatter_ragged,
@@ -44,6 +46,138 @@ logger = logging.getLogger(__name__)
 
 def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
     return f"glm5_layer_{layer_idx}_moe"
+
+
+def _graphed_router_split_k_kernel(rows: int):
+    """The split-K router GEMM for ``rows``, or ``None`` outside its range.
+
+    Both MoE decode paths route a row count that is static per captured bucket,
+    so which router kernel runs is resolved once at capture time. Mid-size row
+    counts belong to the Triton small-M split-K router (block_m=16); outside
+    that range the WGMMA router is the better shape, and the split-K pair would
+    be launching more programs than there is work for.
+
+    The range is the kernel policy's own
+    ``ROUTER_SPLIT_K_MIN_ROWS``/``ROUTER_SPLIT_K_MAX_ROWS``, read here rather
+    than restated as literals, so the model layer and the kernel cannot
+    disagree about which shapes the split-K path serves. Both are imported
+    lazily because ``batchgen_kernels.triton`` imports Triton at package
+    import and this module stays importable without it; a missing Triton
+    therefore raises from this call rather than silently selecting the other
+    kernel.
+    """
+    from batchgen_kernels.triton.glm5_router_gemm_config import (
+        ROUTER_SPLIT_K_MAX_ROWS,
+        ROUTER_SPLIT_K_MIN_ROWS,
+    )
+
+    if not ROUTER_SPLIT_K_MIN_ROWS <= rows <= ROUTER_SPLIT_K_MAX_ROWS:
+        return None
+
+    from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
+
+    return glm5_router_gemm
+
+
+# ---------------------------------------------------------------------------
+# Shared-expert side-stream overlap (DeepEP decode path only).
+#
+# The DeepEP low-latency dispatch is a communication kernel that spends most of
+# its duration waiting on peers, so the SMs it occupies do no arithmetic. The
+# shared expert is the one piece of per-layer compute that depends on nothing
+# the exchange produces -- it reads ``padded`` and the shared-expert weights
+# only -- so issuing it on a second stream between the gate and the accumulate
+# turns critical-path work into work hidden behind the dispatch.
+#
+# The stream and the events are PROCESS-lifetime and are created here, never
+# inside a capture: a stream or event minted during ``torch.cuda.graph`` would
+# be a capture-time resource that replay cannot reproduce. The ``wait_stream`` /
+# ``record`` / ``wait_event`` calls, by contrast, are issued inside the capture
+# on purpose -- there they are recorded as dependency edges of the captured DAG,
+# and that is what makes the concurrency survive into every replay.
+_SIDE_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def _glm5_moe_side_stream(device: torch.device) -> torch.cuda.Stream:
+    """The one shared-expert side stream of this process, per CUDA device.
+
+    Process-lifetime by construction: the graph pool is dropped and rebuilt
+    around a mid-run prefill wave (``Glm5MoEGraphBufferPool.release``), and a
+    stream minted per pool would leak one handle per rebuild while the point of
+    the cache is that every MoE layer forks onto the SAME stream. Layers are
+    strictly sequential and each joins before the next forks, so one stream is
+    enough and two would only add fan-out the replay cannot use.
+    """
+    if device.type != "cuda":
+        raise RuntimeError(
+            "GLM-5 MoE shared-expert overlap requires a CUDA device, got "
+            f"{device!r}")
+    index = torch.cuda.current_device() if device.index is None else int(device.index)
+    stream = _SIDE_STREAMS.get(index)
+    if stream is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "GLM-5 MoE shared-expert side stream must exist before CUDA "
+                "graph capture; it is being created inside a capture, which "
+                "means a segment was constructed under torch.cuda.graph")
+        stream = torch.cuda.Stream(device=index)
+        _SIDE_STREAMS[index] = stream
+    return stream
+
+
+class _SharedExpertOverlap:
+    """One MoE layer's fork/join pair for the shared expert.
+
+    One event per layer rather than one per process: inside a single capture
+    every layer records and waits once, so each event carries exactly one
+    record/wait pair and the captured DAG needs no reasoning about re-recording
+    a live event. Both the stream and the event are allocated here, at segment
+    construction, which the graph manager runs before warmup and capture.
+    """
+
+    def __init__(self, device: torch.device, layer_idx: int) -> None:
+        self.stream = _glm5_moe_side_stream(device)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"Layer {layer_idx}: GLM-5 MoE shared-expert overlap event "
+                "must be created before CUDA graph capture")
+        self.event = torch.cuda.Event()
+        self.layer_idx = int(layer_idx)
+
+    @contextlib.contextmanager
+    def fork(self):
+        main = torch.cuda.current_stream()
+        # One ``wait_stream`` covers both orderings the side stream needs:
+        #   * ``padded`` and the gate's writes were issued on the main stream;
+        #   * the PREVIOUS layer's accumulate READ the shared-output buffer on
+        #     the main stream.
+        # The second is what makes a single process-wide output buffer correct
+        # instead of one per layer: the next write to it cannot start before
+        # the previous read of it has retired.
+        self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            yield
+        self.event.record(self.stream)
+
+    def join(self) -> None:
+        torch.cuda.current_stream().wait_event(self.event)
+
+
+class _InlineSharedExpert:
+    """No-stream stand-in: the shared expert runs in place, on the one stream.
+
+    Reachable only where there is no CUDA stream to fork onto, i.e. the CPU
+    contract tests. The arithmetic, the buffers and the order of the writes are
+    the side-stream path's; only the stream topology is absent, so the two
+    produce bitwise-identical output by construction.
+    """
+
+    @contextlib.contextmanager
+    def fork(self):
+        yield
+
+    def join(self) -> None:
+        return
 
 
 @dataclass
@@ -67,6 +201,22 @@ class _Glm5MoEGraphBuffers:
     local_moe_output: torch.Tensor
     cu_seqlens: torch.Tensor
     capacity: int
+    # DeepEP low-latency mode only (``Glm5MoEGraphBufferPool.configure_deepep``).
+    # ``ll_topk_idx`` is the int64 copy of the gate's int32 indices the exchange
+    # requires; ``ll_x_scale`` is the repacked activation scale the grouped GEMM
+    # requires; ``ll_cu_seqlens`` is the constant uniform-stride segment table.
+    # All three are empty tensors on the NCCL path.
+    ll_topk_idx: torch.Tensor
+    ll_x_scale: torch.Tensor
+    ll_cu_seqlens: torch.Tensor
+    # DeepEP low-latency mode only: the shared expert's output, produced on the
+    # side stream and consumed by the accumulate on the main stream. A pool
+    # buffer rather than a side-stream temporary because the consumer is a
+    # DIFFERENT stream from the producer: a tensor minted on the side stream and
+    # freed by the main stream is a cross-stream lifetime the caching allocator
+    # has to be told about, while a process-lifetime buffer cannot be recycled
+    # under either stream at all. Empty on the NCCL path.
+    shared_out: torch.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -103,12 +253,18 @@ _MOE_BUCKET_DIM_FIELDS = (
     "inter_fp8",
     "routed_global_output",
     "local_moe_output",
+    "ll_topk_idx",
+    "shared_out",
 )
 
 _MOE_SHARED_FIELDS = (
     "expert_counts",
     "expert_counters",
     "cu_seqlens",
+    # DeepEP mode: the receive row space is E_local * num_ranks * tokens/rank,
+    # which does not scale with the bucket, so both are bucket-independent.
+    "ll_x_scale",
+    "ll_cu_seqlens",
 )
 
 _MOE_REBUILT_FIELDS = (
@@ -171,6 +327,52 @@ class Glm5MoEGraphBufferPool:
         self.bucket_sizes = sorted({int(b) for b in bucket_sizes})
         self._base: Dict[str, torch.Tensor] = {}
         self._views: Dict[int, _Glm5MoEGraphBuffers] = {}
+        # DeepEP low-latency mode, installed by configure_deepep() before
+        # setup(). ``deepep`` is the process-lifetime exchange; ``ll_stride``
+        # is its per-local-expert row stride (num_ranks * tokens/rank).
+        self.deepep = None
+        self.ll_stride = 0
+        self._deepep_request = None
+
+    def configure_deepep(
+        self,
+        group,
+        *,
+        max_tokens_per_rank: int,
+        num_experts_global: int,
+    ) -> None:
+        """Select the DeepEP low-latency exchange for this pool's buffers.
+
+        Must run before ``setup()``: the receive layout is expert-major with a
+        uniform per-expert stride, which is a different row space from the
+        compact ragged layout, so the base allocation depends on it. Calling it
+        twice with a different request is a bug, not a reconfiguration — the
+        NVSHMEM buffer is process-lifetime and cannot be resized.
+        """
+        request = (int(max_tokens_per_rank), int(num_experts_global))
+        if self._base:
+            raise RuntimeError(
+                "Glm5MoEGraphBufferPool.configure_deepep must run before "
+                "setup(); the base buffers are already allocated")
+        if self._deepep_request is not None and self._deepep_request != request:
+            raise RuntimeError(
+                "Glm5MoEGraphBufferPool: DeepEP was already configured for "
+                f"{self._deepep_request}, cannot switch to {request}")
+        if max(self.bucket_sizes) > int(max_tokens_per_rank):
+            raise ValueError(
+                f"DeepEP max_tokens_per_rank {max_tokens_per_rank} is below "
+                f"the largest decode bucket {max(self.bucket_sizes)}")
+        if int(num_experts_global) != self.world_size * self.num_local_experts:
+            raise ValueError(
+                f"DeepEP num_experts_global {num_experts_global} != "
+                f"world_size {self.world_size} * local experts "
+                f"{self.num_local_experts}")
+        self._deepep_request = request
+        self._deepep_group = group
+
+    @property
+    def deepep_enabled(self) -> bool:
+        return self._deepep_request is not None
 
     def _capacity_for(self, bucket_size: int) -> int:
         return ragged_row_capacity(
@@ -181,6 +383,9 @@ class Glm5MoEGraphBufferPool:
 
     def setup(self) -> None:
         if self._base:
+            return
+        if self.deepep_enabled:
+            self._setup_deepep()
             return
 
         max_bucket = max(self.bucket_sizes)
@@ -211,6 +416,14 @@ class Glm5MoEGraphBufferPool:
         b["inter_fp8"] = torch.empty(capacity, n, dtype=torch.uint8, device=d)
         b["routed_global_output"] = torch.empty(max_global, h, dtype=torch.bfloat16, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
+        # DeepEP-only fields: empty on the NCCL path so the dataclass stays
+        # total and every consumer fails on a shape, never on a None.
+        b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
+        b["ll_x_scale"] = torch.empty(h // 128, 0, dtype=torch.float32, device=d)
+        b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
+        # The shared expert stays on the one stream here, so it keeps writing
+        # the tensor it allocates and this buffer is never read.
+        b["shared_out"] = torch.empty(0, h, dtype=torch.bfloat16, device=d)
 
         for bucket_size in self.bucket_sizes:
             self._create_view(bucket_size)
@@ -229,6 +442,135 @@ class Glm5MoEGraphBufferPool:
             max_bucket,
             self.world_size,
             capacity,
+        )
+
+    def _setup_deepep(self) -> None:
+        """Allocate the expert-major DeepEP receive layout.
+
+        DeepEP LL packs each local expert's received tokens at rows
+        ``[e * stride, e * stride + recv_count[e])`` of a
+        ``[E_local, stride, hidden]`` buffer with ``stride = num_ranks *
+        tokens/rank`` -- exactly the uniform mtp-stride activation layout the
+        grouped FP8 blockwise GEMM already documents (``cu_seqlens[e] =
+        e * stride``), so no compaction pass is needed. ``stride`` must stay
+        TileM-aligned for the GEMM's per-expert scale-tile addressing; 64 is
+        the largest TileM the dispatch maps.
+
+        Dropped against the NCCL path: ``all_tokens`` (the EP all-gather is
+        gone -- the router runs on local rows only), ``dispatched_x`` and
+        ``x_fp8`` (the exchange delivers FP8 rows directly), ``topk_pos`` and
+        ``routed_global_output`` (the LL combine applies the top-k weights and
+        returns this rank's rows, replacing reduce_weighted_scatter +
+        reduce_scatter).
+        """
+        from batchgen.moe.deepep_ll import get_low_latency_exchange
+
+        max_tokens_per_rank, num_experts_global = self._deepep_request
+        e = self.num_local_experts
+        d = self.device
+        h = self.hidden_size
+        n = self.intermediate_size
+        k = self.num_experts_per_tok
+
+        self.deepep = get_low_latency_exchange(
+            self._deepep_group,
+            max_tokens_per_rank=max_tokens_per_rank,
+            hidden=h,
+            num_experts=num_experts_global,
+            num_local_experts=e,
+        )
+        stride = int(self.deepep.expert_stride)
+        if stride % ROW_ALIGN != 0:
+            raise RuntimeError(
+                f"DeepEP expert stride {stride} (num_ranks "
+                f"{self.deepep.num_ranks} x {max_tokens_per_rank} tokens/rank) "
+                f"is not a multiple of {ROW_ALIGN}; the grouped FP8 GEMM "
+                "requires TileM-aligned segment starts")
+        rows = e * stride
+        self.ll_stride = stride
+
+        b = self._base
+        max_bucket = max(self.bucket_sizes)
+        b["padded"] = torch.zeros(max_bucket, h, dtype=torch.bfloat16, device=d)
+        # Router on LOCAL rows only: world_size x less gate work than the
+        # all-gathered row space the NCCL path routes.
+        b["router_logits"] = torch.empty(max_bucket, 256, dtype=torch.float32, device=d)
+        b["topk_indices"] = torch.empty(max_bucket, k, dtype=torch.int32, device=d)
+        b["topk_weights"] = torch.empty(max_bucket, k, dtype=torch.float32, device=d)
+        b["ll_topk_idx"] = torch.empty(max_bucket, k, dtype=torch.int64, device=d)
+        b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
+        b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
+        b["inter_fp8"] = torch.empty(rows, n, dtype=torch.uint8, device=d)
+        b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
+        # Shared-expert output, written on the side stream and read by the
+        # accumulate on the main stream. ONE buffer for all MoE layers: they run
+        # sequentially and each layer's join precedes the next layer's fork, so
+        # no two layers hold it live at once (a per-layer buffer would cost
+        # num_layers x this and displace KV pages for nothing).
+        b["shared_out"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
+        b["expert_counts"] = torch.zeros(e, dtype=torch.int32, device=d)
+        b["expert_counters"] = torch.zeros(e, dtype=torch.int32, device=d)
+        # Constant uniform-stride segment table; the GEMMs take their live row
+        # counts from DeepEP's recv_count instead.
+        b["ll_cu_seqlens"] = (
+            torch.arange(e + 1, dtype=torch.int32, device=d) * stride
+        ).contiguous()
+        b["cu_seqlens"] = b["ll_cu_seqlens"]
+        # Activation scales: DeepEP returns one contiguous [h/128, stride]
+        # block per local expert, the GEMM wants a single [h/128, rows]
+        # tensor, so the dispatch output is repacked into this buffer.
+        _, ll_x_scale = make_quant_buffers(rows, h, d)
+        b["ll_x_scale"] = ll_x_scale
+        _, inter_scale = make_quant_buffers(rows, n, d)
+        b["inter_scale"] = inter_scale
+        empty_h = torch.empty(0, h, dtype=torch.bfloat16, device=d)
+        b["_unused_bf16_h"] = empty_h
+        b["_unused_u8_h"] = torch.empty(0, h, dtype=torch.uint8, device=d)
+        b["_unused_i32"] = torch.empty(0, dtype=torch.int32, device=d)
+
+        for bucket_size in self.bucket_sizes:
+            self._create_view_deepep(bucket_size, rows)
+
+        total_bytes = sum(t.nelement() * t.element_size() for t in b.values())
+        logger.info(
+            "Glm5MoEGraphBufferPool[DeepEP]: allocated %.2f GiB "
+            "(max_bucket=%d, world_size=%d, expert_stride=%d, rows=%d, "
+            "rdma buffer %.0f MiB)",
+            total_bytes / (1024**3),
+            max_bucket,
+            self.world_size,
+            stride,
+            rows,
+            self.deepep.rdma_bytes / (1024**2),
+        )
+
+    def _create_view_deepep(self, bucket_size: int, rows: int) -> None:
+        b = self._base
+        self._views[int(bucket_size)] = _Glm5MoEGraphBuffers(
+            padded=b["padded"][:bucket_size],
+            # The router reads the local rows; there is no all-gathered space.
+            all_tokens=b["padded"][:bucket_size],
+            router_logits=b["router_logits"][:bucket_size],
+            topk_indices=b["topk_indices"][:bucket_size],
+            topk_weights=b["topk_weights"][:bucket_size],
+            topk_pos=b["_unused_i32"],
+            dispatched_x=b["_unused_bf16_h"],
+            intermediate=b["intermediate"],
+            expert_out=b["expert_out"],
+            x_fp8=b["_unused_u8_h"],
+            inter_fp8=b["inter_fp8"],
+            routed_global_output=b["_unused_bf16_h"],
+            local_moe_output=b["local_moe_output"][:bucket_size],
+            ll_topk_idx=b["ll_topk_idx"][:bucket_size],
+            shared_out=b["shared_out"][:bucket_size],
+            expert_counts=b["expert_counts"],
+            expert_counters=b["expert_counters"],
+            cu_seqlens=b["ll_cu_seqlens"],
+            ll_cu_seqlens=b["ll_cu_seqlens"],
+            ll_x_scale=b["ll_x_scale"],
+            x_scale=b["ll_x_scale"],
+            inter_scale=b["inter_scale"],
+            capacity=rows,
         )
 
     def get(self, bucket_size: int) -> _Glm5MoEGraphBuffers:
@@ -261,6 +603,10 @@ class Glm5MoEGraphBufferPool:
             "inter_fp8": b["inter_fp8"][:capacity],
             "routed_global_output": b["routed_global_output"][:global_rows],
             "local_moe_output": b["local_moe_output"][:bucket_size],
+            # NCCL path: the exchange buffers and the side-stream staging
+            # buffer do not exist, so both stay the empty base tensor.
+            "ll_topk_idx": b["ll_topk_idx"],
+            "shared_out": b["shared_out"],
         }
         if set(sliced) != set(_MOE_BUCKET_DIM_FIELDS):
             raise RuntimeError(
@@ -278,12 +624,17 @@ class Glm5MoEGraphBufferPool:
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
             cu_seqlens=b["cu_seqlens"],
+            ll_x_scale=b["ll_x_scale"],
+            ll_cu_seqlens=b["ll_cu_seqlens"],
             x_scale=x_scale,
             inter_scale=inter_scale,
             capacity=capacity,
         )
 
     def release(self) -> None:
+        """Drop the graph buffers. ``self.deepep`` is NOT dropped: the NVSHMEM
+        buffer is process-lifetime (see ``DeepEPLowLatencyExchange``) and a
+        rebuilt pool reuses the same exchange."""
         self._views.clear()
         self._base.clear()
 
@@ -321,6 +672,29 @@ class Glm5MoEGraphSegment:
         if comm is None:
             raise RuntimeError(f"Layer {moe.layer_idx}: GLM-5 MoE graph requires EP communicator")
         self._validate_shared_expert_graph_safe()
+        # ``glm5_deepep_ll`` is set on the MoE module by the GLM-5 initializer
+        # from the server's --enable-deepep; absent or False keeps the NCCL
+        # all_gather / reduce_scatter path, which stays the default.
+        self.deepep_ll = bool(getattr(moe, "glm5_deepep_ll", False))
+        if self.deepep_ll:
+            self._validate_deepep_graph_safe()
+
+        # Shared-expert fork/join, DeepEP path only: the NCCL path is the
+        # default and the merged baseline, and a side stream there would be a
+        # second unvalidated variable in the same measurement.
+        #
+        # Deliberately NOT capture-gated. The warmup iterations the graph
+        # manager runs before each capture execute this same forked code, which
+        # is what forces every lazy DeepGEMM/cuBLAS workspace to be allocated on
+        # the side stream BEFORE capture; a capture-only fork would first touch
+        # the side stream inside the capture. SGLang gates only its two
+        # attention-internal forks on capture mode -- the shared-expert fork
+        # this mirrors is ungated there as well.
+        self._shared_overlap = (
+            _SharedExpertOverlap(device, moe.layer_idx)
+            if self.deepep_ll and device.type == "cuda"
+            else _InlineSharedExpert()
+        )
 
         self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
@@ -354,11 +728,72 @@ class Glm5MoEGraphSegment:
                     f"shared expert FP8 weights; missing {missing}"
                 )
 
+    def _validate_deepep_graph_safe(self) -> None:
+        """Fail loudly before capture for every assumption the DeepEP decode
+        path makes. No silent NCCL fallback: --enable-deepep is explicit."""
+        from batchgen.moe.deepep_ll import deepep_unavailable_reason
+
+        moe = self.moe
+        num_experts_global = self.world_size * self.num_local_experts
+        max_tokens_per_rank = max(self.pool.bucket_sizes)
+        reason = deepep_unavailable_reason(
+            hidden=self.hidden_size,
+            topk=self.num_experts_per_tok,
+            num_experts=num_experts_global,
+            num_ranks=self.world_size,
+            max_tokens_per_rank=max_tokens_per_rank,
+            use_fp8=True,
+        )
+        if reason is not None:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: --enable-deepep requested for GLM-5 "
+                f"decode MoE but {reason}")
+        # DeepEP owns local experts [rank * E_local, (rank + 1) * E_local) and
+        # returns recv_count in that order; GLM's own expert window must agree
+        # or every routed row would land on the wrong weight block.
+        expected_start = self.rank * self.num_local_experts
+        if self.expert_start != expected_start:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: DeepEP expects local experts to start "
+                f"at rank * experts_per_rank = {expected_start}, but this rank "
+                f"owns experts from {self.expert_start}")
+        # O5: the offloading/mixed-compute path loads and frees expert weights
+        # inside forward, so the expert-major receive layout has no stable
+        # weight block to GEMM against.
+        if bool(getattr(moe, "enable_ep_offloading", False)) or bool(
+                getattr(moe, "enable_ep_with_offloading", False)):
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: --enable-deepep and EP expert "
+                "offloading are mutually exclusive for GLM-5 decode")
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: --enable-deepep requires an "
+                "initialized torch.distributed process group")
+        if dist.get_world_size() != self.world_size:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: --enable-deepep requires the "
+                f"torch.distributed world ({dist.get_world_size()}) to equal "
+                f"the EP world ({self.world_size})")
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
+        if self.deepep_ll and not self.pool.deepep_enabled:
+            import torch.distributed as dist
+
+            self.pool.configure_deepep(
+                dist.group.WORLD,
+                max_tokens_per_rank=max(self.pool.bucket_sizes),
+                num_experts_global=self.world_size * self.num_local_experts,
+            )
         self.pool.setup()
-        self.router_context.warmup(self.pool._base["all_tokens"])
+        # DeepEP routes on local rows, so the router's largest input is the
+        # bucket itself; the NCCL path routes the all-gathered row space.
+        self.router_context.warmup(
+            self.pool._base["padded"] if self.deepep_ll
+            else self.pool._base["all_tokens"])
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self.pool.release()
@@ -387,6 +822,15 @@ class Glm5MoEGraphSegment:
         bufs = self.pool.get(bucket_size)
         global_rows = self.world_size * bucket_size
 
+        if self.deepep_ll:
+            return self._forward_deepep(
+                padded=padded,
+                rank_token_counts=rank_token_counts,
+                bufs=bufs,
+                bucket_size=bucket_size,
+                global_rows=global_rows,
+            )
+
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 bufs.all_tokens,
@@ -394,16 +838,11 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # global_rows is static per captured bucket, so this dispatch is
-        # resolved at capture time. Mid-size global batches hit the Triton
-        # small-M tensor-core router (block_m=16); everything else uses the
-        # WGMMA router, whose tile shape underutilizes at those sizes.
-        if 192 <= global_rows <= 512:
-            from batchgen_kernels.triton.glm5_router_gemm import (
-                glm5_router_gemm,
-            )
-
-            glm5_router_gemm(
+        # This path routes the ALL-GATHERED row space, so the row count the
+        # dispatch is resolved on is global_rows, static per captured bucket.
+        split_k_router = _graphed_router_split_k_kernel(global_rows)
+        if split_k_router is not None:
+            split_k_router(
                 bufs.all_tokens,
                 self.gate_weight_bf16,
                 bufs.router_logits,
@@ -468,6 +907,180 @@ class Glm5MoEGraphSegment:
             )
 
         bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+        return {"moe_output": bufs.local_moe_output}
+
+    def _forward_deepep(
+        self,
+        *,
+        padded: torch.Tensor,
+        rank_token_counts: torch.Tensor,
+        bufs: _Glm5MoEGraphBuffers,
+        bucket_size: int,
+        global_rows: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Route-based decode MoE over the DeepEP low-latency exchange.
+
+        Replaces, per routed layer, the NCCL all_gather (dispatch) and
+        reduce_scatter (combine) plus the three expert-adjacent kernels they
+        forced:
+
+        * no all_gather    -- the router runs on this rank's ``bucket_size``
+          rows instead of ``world_size * bucket_size``;
+        * no dispatch_scatter_ragged -- the exchange delivers expert-major
+          rows directly in the grouped GEMM's uniform-stride layout;
+        * no act_quant_ragged on the activations -- the per-token 128-block
+          FP8 cast is folded into the dispatch (``use_fp8=True``), which also
+          halves the bytes on the wire;
+        * no reduce_weighted_scatter and no reduce_scatter -- the LL combine
+          performs the fp32-accumulated top-k weighted sum on the owning rank
+          and writes this rank's rows.
+
+        The shared expert is additionally forked onto a side stream for the
+        span of the routed chain (fork after the gate, join before the
+        accumulate). It reads only ``padded``, so the exchange and the grouped
+        GEMMs never wait on it, and the dispatch -- a comm kernel that mostly
+        waits on peers -- stops being time in which this rank's SMs do nothing.
+        The arithmetic, the operand values and the order of writes are
+        unchanged; only the stream the shared expert is issued on moves, so the
+        output is expected bitwise-identical to the in-line version.
+
+        M-independence (padded rows stay inert): DeepEP leaves rows at or
+        beyond ``recv_count[e]`` holding whatever the previous step left in the
+        receive buffer. Both grouped GEMMs take their per-expert row count from
+        ``recv_count``, so they neither read nor write those rows; the combine
+        reads only the rows named by the dispatch handle's ``src_info`` /
+        ``layout_range``. Stale rows therefore cannot reach the output, and the
+        captured graph's result depends only on the live row count, never on
+        the padded extent.
+
+        The side-stream staging buffer does not weaken that: it is one process
+        buffer sliced to the bucket, the shared expert rewrites every row of
+        the slice each step, and the accumulate reads that slice only -- rows
+        beyond it keep a larger bucket's values and are unreachable. Within the
+        slice, padded rows carry exactly the garbage they carried when the
+        shared expert ran in line, because the rows it reads and writes are the
+        same ones.
+        """
+        exchange = self.pool.deepep
+        if exchange is None:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: DeepEP decode path selected but "
+                "the pool holds no exchange")
+        stride = self.pool.ll_stride
+        e = self.num_local_experts
+
+        # Router on local rows only. The padding mask is the gate's epilogue,
+        # as on the NCCL path, but the geometry is a SINGLE rank block: this
+        # rank's row r is live only while r < rank_token_counts[rank].
+        #
+        # The kernel dispatch is the NCCL path's, resolved on the row count
+        # THIS path routes: dropping the all_gather divides the router's rows
+        # by the world size, so a bucket whose all-gathered space would have
+        # taken the split-K router must still take it on its local rows alone.
+        # Without this gate the whole decode range falls to the WGMMA router,
+        # whose tile shape is the wrong one at a single rank's row count.
+        split_k_router = _graphed_router_split_k_kernel(bucket_size)
+        if split_k_router is not None:
+            split_k_router(padded, self.gate_weight_bf16, bufs.router_logits)
+        else:
+            self.router_context.router_forward(
+                padded, logits=bufs.router_logits
+            )
+        gate_sigmoid_topk_cuda(
+            bufs.router_logits,
+            self.gate_bias_fp32,
+            k=self.num_experts_per_tok,
+            routed_scaling_factor=self.routed_scaling_factor,
+            topk_indices=bufs.topk_indices,
+            topk_weights=bufs.topk_weights,
+            rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
+            rows_per_rank=bucket_size,
+        )
+
+        # FORK. The shared expert consumes ``padded`` and its own weights, and
+        # nothing the exchange produces, so from here it is independent of the
+        # whole routed chain below. On the side stream it runs against the
+        # dispatch, both grouped GEMMs and the combine instead of after them.
+        with self._shared_overlap.fork():
+            shared_out = self.moe.shared_expert_forward(padded)
+            if (shared_out.shape != bufs.shared_out.shape
+                    or shared_out.dtype != bufs.shared_out.dtype):
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: shared expert returned "
+                    f"{tuple(shared_out.shape)}/{shared_out.dtype}, but the "
+                    f"overlap buffer is {tuple(bufs.shared_out.shape)}/"
+                    f"{bufs.shared_out.dtype}. Staging through the buffer is "
+                    "only value-preserving while both agree: a narrowing copy "
+                    "would round here instead of inside the accumulate.")
+            # Staged on the SIDE stream, so the copy is hidden behind the
+            # dispatch exactly like the arithmetic above it and costs the
+            # critical path nothing. bf16 -> bf16 of the same shape, so the
+            # value the accumulate reads is the value the old in-line
+            # ``add_(shared_expert_forward(padded))`` read, bit for bit.
+            bufs.shared_out.copy_(shared_out)
+
+        # DeepEP reads int64 expert ids; -1 padding rows stay unrouted.
+        bufs.ll_topk_idx.copy_(bufs.topk_indices)
+
+        recv_x, recv_scales, recv_count, handle = exchange.dispatch_fp8(
+            padded, bufs.ll_topk_idx
+        )
+        # recv_x [e, stride, h] fp8 -> the uniform-stride activation the
+        # grouped GEMM takes, expert i's rows at [i * stride, ...).
+        x_fp8 = recv_x.view(e * stride, self.hidden_size)
+        # recv_scales is logically [e, stride, h/128] but its last two
+        # dimensions are a transposed view of a contiguous [e, h/128, stride]
+        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
+        # The GEMM wants ONE contiguous [h/128, e * stride], so transpose back
+        # and repack: the only kernel this path adds.
+        bufs.ll_x_scale.view(self.hidden_size // 128, e, stride).copy_(
+            recv_scales.transpose(1, 2).permute(1, 0, 2)
+        )
+
+        avg = _glm5_gemm_tilem_avg(
+            global_rows,
+            self.num_experts_per_tok,
+            self.num_local_experts * self.world_size,
+        )
+        s1_result = grouped_fp8_blockwise_fused_s1(
+            x_fp8,
+            bufs.ll_x_scale,
+            self.moe.fp8_gate_w3d.view(torch.float8_e4m3fn),
+            self.moe.fp8_up_w3d.view(torch.float8_e4m3fn),
+            self.moe.fp8_gate_ws3d,
+            self.moe.fp8_up_ws3d,
+            recv_count,
+            bufs.ll_cu_seqlens,
+            avg,
+            output=bufs.intermediate,
+        )
+        act_quant_ragged(
+            s1_result, recv_count, bufs.ll_cu_seqlens,
+            bufs.inter_fp8, bufs.inter_scale,
+        )
+        grouped_fp8_blockwise_s3(
+            bufs.inter_fp8.view(torch.float8_e4m3fn),
+            bufs.inter_scale,
+            self.moe.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.moe.fp8_down_ws3d,
+            recv_count,
+            bufs.ll_cu_seqlens,
+            avg,
+            output=bufs.expert_out,
+        )
+
+        exchange.combine(
+            bufs.expert_out.view(e, stride, self.hidden_size),
+            bufs.ll_topk_idx,
+            bufs.topk_weights,
+            handle,
+            out=bufs.local_moe_output,
+        )
+
+        # JOIN, at the first point that reads the shared output -- the combine
+        # above is the last main-stream work the fork can hide behind.
+        self._shared_overlap.join()
+        bufs.local_moe_output.add_(bufs.shared_out)
         return {"moe_output": bufs.local_moe_output}
 
     def _fp8_blockwise_gemm_3d(

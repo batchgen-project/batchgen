@@ -200,6 +200,12 @@ class KimiLinearParallelStrategyManager:
         self._attn_tp_hl = kda_num_heads // G
         self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
         self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        # World-level, so built once per process and reused by every later
+        # model rebuild (``_build_attn_tp_group``). The signature is the
+        # (world_size, attention TP degree) the live groups were built for; a
+        # later build request that disagrees is refused by name there.
+        self._attn_tp_groups_built = False
+        self._attn_tp_group_signature = None
         # Weight assembly has its own communicator.  The streamed-SP8
         # prefetcher launches the next layer's six all-gathers from a host
         # thread while the main thread runs the next layer's attention.  A
@@ -624,6 +630,77 @@ class KimiLinearParallelStrategyManager:
                     if chunk_rows > 0:
                         resident.compact_large_pass_rows = chunk_rows
 
+    def _reset_model_attached_state(self):
+        """Forget what was attached to a model this instance no longer owns.
+
+        ``_build_model`` runs again whenever the phase instances are rebuilt:
+        the worker's ``deep_free_model_memory()`` drops the model, and the next
+        ``configure_prefill`` / ``configure_decoding`` finds ``self.model is
+        None`` and builds a new one. Everything the configure steps attach
+        lives ON that model's modules — the resident-EP shard hangs off
+        ``layer.block_sparse_moe._resident_ep_moe``, the streamed-SP8 buffer
+        off the MoE blocks and the attention modules, and a captured decode
+        graph swaps their ``forward`` methods and bakes their addresses — so a
+        freshly built model starts with none of it.
+
+        The flags that record "already attached" are therefore claims about the
+        PREVIOUS model and must not outlive it. With ``_resident_ep_built``
+        left True across the rebuild, ``configure_decoding``'s
+        ``_init_resident_ep_decode()`` returned early, the new model's MoE
+        blocks kept no resident layer, and decode fell through to the streamed
+        expert wrapper — whose decode weight-copy task is deliberately empty
+        under resident EP — so ``core_engine.get_weights`` had nothing staged
+        and every rank raised ``GPU_Weight_Buffer get_weights()`` at the
+        SECOND prefill->decode switch. The first switch worked because the
+        shard was genuinely built there.
+
+        Releasing is not this function's job: the owners run before the
+        rebuild (``deep_free_model_memory`` on the worker side,
+        ``_release_resident_ep_decode`` / ``_release_streamed_sp8_prefill``
+        here). This drops only the bookkeeping that refers to dead modules, so
+        each phase instance stages what it needs at its own build.
+        """
+        self._resident_ep_built = False
+        self._streamed_sp8_buffer = None
+        # Restores the old model's forwards and drops its captured buckets;
+        # None-safe, so the first build is a no-op.
+        self.release_decode_graph()
+        # The FP32 combine output of the previous model's last resident prefill
+        # is class-level, so nothing above drops it: a new model's passes
+        # reserve their own (``prepare_prefill_output``), and holding the dead
+        # pass's buffer across every rebuild is a per-switch leak.
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+
+        ResidentEPMXFP4MoELayer.release_prefill_output()
+
+    def _assert_resident_ep_attached(self):
+        """The resident shard must be ON the live model when the flag says so.
+
+        ``_resident_ep_built`` is a claim, and the claim is cheap to check: the
+        resident layer is an attribute of every MoE block. Checking it where
+        the build is skipped turns a stale flag into a named lifecycle error
+        instead of a weight-buffer failure three layers down in the decode MoE.
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "resident-EP decode shard is marked built while this strategy "
+                "manager holds no model; the flag outlived its model"
+            )
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None:
+                continue
+            if getattr(moe, "_resident_ep_moe", None) is None:
+                raise RuntimeError(
+                    "resident-EP decode shard is marked built but the live "
+                    "model's MoE blocks carry no resident layer: the flag "
+                    "survived a model rebuild, so decode would fall through "
+                    "to the streamed expert path with no staged weights"
+                )
+            return
+
     def _release_resident_ep_decode(self):
         """Drop phase-inactive resident decode experts before streamed prefill.
 
@@ -634,16 +711,22 @@ class KimiLinearParallelStrategyManager:
         addresses and must be released first; configure_decoding rebuilds the
         shard and reinstalls/captures graphs before the next decode forward.
         """
-        if not self._resident_ep_built:
-            return 0
-
-        self.release_decode_graph()
-
+        # Class-level, so it belongs to the PASS that allocated it and not to
+        # any model instance: it must go back whether or not a shard is
+        # currently attached. Keeping this above the flag check is load-bearing
+        # — once a rebuild clears the flag (``_reset_model_attached_state``),
+        # everything below is skipped, and leaving the FP32 combine
+        # output of a finished prefill mapped would be a per-switch leak.
         from batchgen.moe.fused_moe_mxfp4_resident import (
             ResidentEPMXFP4MoELayer,
         )
 
         ResidentEPMXFP4MoELayer.release_prefill_output()
+        if not self._resident_ep_built:
+            return 0
+
+        self.release_decode_graph()
+
         released_bytes = 0
         released_layers = 0
         for layer in self.model.model.layers:
@@ -1094,6 +1177,7 @@ class KimiLinearParallelStrategyManager:
         (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
         """
         if self._resident_ep_built:
+            self._assert_resident_ep_attached()
             return
         assert self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
@@ -1351,6 +1435,10 @@ class KimiLinearParallelStrategyManager:
         Host KV keeps one 576-wide latent per token, so the pool cannot be
         sized from the Host geometry. ``layer_map`` maps an engine layer to its
         dense pool row, the same way the Host and GPU pools are mapped.
+
+        Answerable with or without a resident model: the worker calls this
+        while planning a wave, which happens in the decode phase where the
+        model may be deep-freed.
         """
         cfg = self.loaded_model_config
         mla_layers = [
@@ -1358,18 +1446,56 @@ class KimiLinearParallelStrategyManager:
             if cfg.is_mla_layer(layer_idx)
         ]
         rows = {layer_idx: row for row, layer_idx in enumerate(mla_layers)}
-        attn = self.model.model.layers[mla_layers[0]].self_attn
-        attn = getattr(attn, "module", attn)
-        return {
+        # Derived from the config, NOT from the module: the worker plans a
+        # pooled wave at reservation time, which can fall in a phase window
+        # where the model has been deep-freed and not rebuilt yet
+        # (``self.model is None``), and reading a layer there is an
+        # ``AttributeError: 'NoneType' object has no attribute 'model'``. Every
+        # number below is a model constant that does not move with the phase:
+        # the K/V widths are never sharded, and ``_load_attn_modules`` shards
+        # the head count by exactly ``_attn_tp_size``, which is fixed for the
+        # process. Same contract as the KDA state pools and as the worker's own
+        # DSA ``_prefill_pool_layout`` cache: decided once, reused across phases.
+        heads = int(cfg.num_attention_heads)
+        if self._attn_tp_size > 1:
+            heads //= self._attn_tp_size
+        layout = {
             "num_layers": len(mla_layers),
             "layer_map": tuple(
                 rows.get(layer_idx, -1)
                 for layer_idx in range(cfg.num_hidden_layers)
             ),
+            "num_kv_heads": heads,
+            "k_head_dim": int(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
+            "v_head_dim": int(cfg.v_head_dim),
+        }
+        if self.model is None:
+            return layout
+        # The module is the ground truth whenever it is resident, so compare
+        # instead of trusting the derivation: a future sharding seam that
+        # changes a head count or a width must fail here, where the pool is
+        # sized, rather than corrupt pool rows it no longer matches.
+        attn = self.model.model.layers[mla_layers[0]].self_attn
+        attn = getattr(attn, "module", attn)
+        live = {
             "num_kv_heads": int(attn.num_heads),
             "k_head_dim": int(attn.qk_nope_head_dim + attn.qk_rope_head_dim),
             "v_head_dim": int(attn.v_head_dim),
         }
+        divergent = {
+            key: (value, layout[key])
+            for key, value in live.items() if value != layout[key]
+        }
+        if divergent:
+            raise RuntimeError(
+                "prefill pool layout derived from the config disagrees with "
+                f"the resident MLA module (attn_tp_size={self._attn_tp_size}): "
+                + ", ".join(
+                    f"{key} module={module} config={config}"
+                    for key, (module, config) in sorted(divergent.items())
+                )
+            )
+        return layout
 
     @staticmethod
     def scatter_rows(x, group_size, group_rank):
@@ -1408,6 +1534,10 @@ class KimiLinearParallelStrategyManager:
         # 256 experts/layer are never allocated on the host).
         with torch.device("meta"):
             self.model = KimiLinearForCausalLM(cfg)
+        # A new model carries none of the previous one's attachments, so the
+        # bookkeeping that says otherwise is dropped HERE, before any configure
+        # step consults it to decide whether to stage something.
+        self._reset_model_attached_state()
         logging.info(f"Rank {self.rank}: model skeleton constructed on meta "
                      f"({time.perf_counter() - start:.1f}s)")
 
@@ -1769,6 +1899,44 @@ class KimiLinearParallelStrategyManager:
         """
         if self._attn_tp_size <= 1:
             return
+        # The topology the live groups were built for. It is immutable for the
+        # life of the process today (both values are fixed at construction),
+        # so a later call that disagrees is a lifecycle error, not a request
+        # to rebuild: say so by name instead of handing back groups that no
+        # longer describe the world.
+        signature = (int(self.world_size), int(self._attn_tp_size))
+        if self._attn_tp_groups_built:
+            if signature != self._attn_tp_group_signature:
+                raise RuntimeError(
+                    "attention TP topology changed in-process after the NCCL "
+                    "sub-groups were built: they were created for "
+                    "(world_size, attention_group_size)="
+                    f"{self._attn_tp_group_signature} and this call asks for "
+                    f"{signature}. The groups are world-level and cannot be "
+                    "rebuilt here (torch drops a group only at "
+                    "destroy_process_group, which no phase switch calls, and "
+                    "the live ones are already baked into captured decode "
+                    "graphs), so the new topology is refused rather than "
+                    "silently served with the old communicators."
+                )
+            # Build ONCE per process. A NCCL sub-group is a world-level
+            # resource: ``dist.new_group`` keeps every group it creates in
+            # torch's global registry for the life of the process (only
+            # ``destroy_process_group`` drops one, which no phase switch
+            # calls), and each communicator's device buffers live OUTSIDE the
+            # caching allocator. ``_build_model`` runs again on every rebuild
+            # of a phase instance, so rebuilding these groups there added a
+            # fresh set of communicators per cycle that nothing held, nothing
+            # freed, and no torch counter could see — a driver-level leak that
+            # only surfaced as an OOM at the largest later allocation (the KV
+            # pool's ``cuMemCreate``). Unlike the model-attached state, these
+            # are deliberately NOT reset by ``_reset_model_attached_state``:
+            # the world did not change, so the groups are still the right ones.
+            #
+            # Collective-safe: ``new_group`` must be called by every rank in
+            # the same order, and this flag records THIS process's own build —
+            # every rank therefore takes the same branch on the same rebuild.
+            return
         import torch.distributed as dist
 
         if not dist.is_initialized():
@@ -1790,6 +1958,10 @@ class KimiLinearParallelStrategyManager:
             if g == self._attn_tp_group_id:
                 self._weight_tp_group = grp
         self._build_cross_weight_group()
+        # Every family is up; later rebuilds reuse them (see the guard above),
+        # and the signature records the topology they belong to.
+        self._attn_tp_groups_built = True
+        self._attn_tp_group_signature = signature
 
     def _build_cross_weight_group(self):
         """Build the eight cross-node weight groups (hierarchical GDR only).

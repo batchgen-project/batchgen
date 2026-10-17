@@ -625,6 +625,13 @@ def _assign_worker(
             namespace_digest=NAMESPACE
         ),
         _batchgen_debug=debug,
+        # The real worker latches this when an admitted sequence carries
+        # per-request debug flags; these sequences do, so the merge path the
+        # pin depends on stays reachable.
+        _any_sequence_batchgen_debug=True,
+        # These fakes exercise the balancer path, not main's sharing-aware
+        # packer: no in-wave prefix pool is configured for them.
+        _prefill_prefix_pool_enabled=lambda: False,
         _trajectory_book=SimpleNamespace(
             has_sequence=lambda uuid: uuid in tokens_by_uuid
         ),
@@ -656,6 +663,9 @@ def _sequence(uuid, *, prompt_length, debug="on"):
         global_idx=int(uuid[-1]),
         prompt_length=prompt_length,
         decode_dp_group=None,
+        # Real Sequence field read by the balancer path: a first admission
+        # has no eviction history.
+        evicted_from_dp_group=None,
         batchgen_debug=(
             {"prefix_trajectory_commit": debug} if debug is not None else None
         ),

@@ -506,6 +506,10 @@ class _Wave:
 class _Worker:
     rank = 2
     _batchgen_debug = None
+    # Main's decode fast path: the per-sequence merge is skipped unless some
+    # admitted sequence carried request-level flags. These fakes drive the
+    # flag through the wave's sequences, so the latch is on.
+    _any_sequence_batchgen_debug = True
 
     _active_batchgen_debug_for_sequences = _NAMESPACE[
         "_active_batchgen_debug_for_sequences"

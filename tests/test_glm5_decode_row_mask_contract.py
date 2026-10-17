@@ -144,12 +144,18 @@ def test_moe_rank_padding_is_folded_into_the_gate():
         if isinstance(node, ast.Call)
         and ast.unparse(node.func) == "gate_sigmoid_topk_cuda"
     ]
-    assert len(gate_calls) == 1
-    passed = {kw.arg for kw in gate_calls[0].keywords}
-    assert {"rank_token_counts", "rows_per_rank"} <= passed, (
-        "the MoE graph must hand the gate its EP padding shape so padding rows "
-        f"come out as expert -1 / weight 0 directly, got {sorted(passed)}"
-    )
+    # One call per captured decode path: the NCCL all_gather path routes the
+    # all-gathered row space, the DeepEP low-latency path routes this rank's
+    # rows only. EVERY call must hand the gate its padding shape -- that is the
+    # contract, not the call count.
+    assert len(gate_calls) >= 1
+    for call in gate_calls:
+        passed = {kw.arg for kw in call.keywords}
+        assert {"rank_token_counts", "rows_per_rank"} <= passed, (
+            "the MoE graph must hand the gate its EP padding shape so padding "
+            "rows come out as expert -1 / weight 0 directly, got "
+            f"{sorted(passed)}"
+        )
 
     # The four launches that shape replaces must be gone, buffers included.
     used = _identifiers(tree)
