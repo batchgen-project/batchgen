@@ -56,6 +56,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
+from batchgen.prefix_reuse.probe_guard import probe_safe
+
 # Batch-level ``batchgen_debug`` keys.
 DEBUG_FLAG = "prefix_pool_epilogue_trace"
 # Optional companion: a token id whose first-token logit every row reports, so
@@ -231,6 +233,49 @@ def tracer_from_debug(debug, *, rank: int, path: str):
     )
 
 
+def record_unsharded_gather(trace, selected, *, num_global_rows, manager=None):
+    """Hand-write the gather record for a path that has NO sharded gather.
+
+    ``attn_tp_rank=0, attn_tp_size=1, owned=True`` is the one record shape a
+    caller can write itself, and it is only true where this rank holds EVERY
+    row. Writing it on a path that is really sharded would report a broken
+    multi-rank gather as healthy, which is the worst failure an acceptance
+    probe has, so the claim is ASSERTED against the parallel manager instead
+    of assumed: a manager that reports streamed-SP8 keeps only a row shard and
+    its real gather must be traced through ``trace=`` instead.
+
+    Raising here is correct and does not reach serving: both call sites go
+    through ``EpilogueTracer``-owning code that the probe guard wraps, so the
+    refusal lands as a ``probe_error`` WARNING and the forward continues with
+    no gather record rather than a false one.
+    """
+
+    streamed = getattr(manager, "prefill_uses_streamed_sp8", None)
+    if streamed is not None and streamed():
+        raise RuntimeError(
+            f"[{PREFIX}] refusing to hand-write a single-rank gather record: "
+            f"the parallel manager reports streamed-SP8, so this rank holds "
+            f"only a row shard and the real gather must receive the tracer"
+        )
+    gather = getattr(manager, "gather_prefill_last_token_hidden", None)
+    if gather is not None and streamed is None:
+        raise RuntimeError(
+            f"[{PREFIX}] refusing to hand-write a single-rank gather record: "
+            f"the parallel manager exposes gather_prefill_last_token_hidden "
+            f"but no streamed-SP8 predicate, so whether it shards rows here "
+            f"is unknown"
+        )
+    norms = selected.detach().float().norm(dim=-1).tolist()
+    trace.record_gather(
+        attn_tp_rank=0, attn_tp_size=1,
+        num_global_rows=int(num_global_rows),
+        shard_start=0, shard_end=int(num_global_rows),
+        owned=[True] * len(norms),
+        pre_norms=norms, post_norms=norms,
+        canary_zero_rows=None,
+    )
+
+
 def format_phase(
     *,
     rank: int,
@@ -341,8 +386,14 @@ class EpilogueTracer:
     probe_token: Optional[int] = None
     # Which prefill emitted the line: the pooled wave or the unpooled path.
     path: str = "pool"
+    # TESTS ONLY (probe_guard.probe_safe): re-raise instead of logging one
+    # ``probe_error`` line. A serving path never sets this - a trace that
+    # cannot format a line must not end the prefill that armed it, and on the
+    # streamed-SP8 path it would strand the other ranks in the all-reduce.
+    strict: bool = False
 
     # -- timing ------------------------------------------------------------ #
+    @probe_safe("epilogue_trace", default="")
     def phase(
         self,
         name: str,
@@ -365,6 +416,7 @@ class EpilogueTracer:
         (logging.info if log is None else log)(line)
         return line
 
+    @probe_safe("epilogue_trace", default="")
     def chunk_begin(self, chunk_index: int, *, rows=None, tokens=None,
                     log=None) -> str:
         """Open a chunk: resets the gather-side record and stamps the start."""
@@ -373,6 +425,7 @@ class EpilogueTracer:
         self._chunk_started = time.perf_counter()
         return self.phase("chunk_begin", rows=rows, tokens=tokens, log=log)
 
+    @probe_safe("epilogue_trace", default="")
     def chunk_end(self, *, rows=None, tokens=None, log=None) -> str:
         """Close a chunk, with its wall duration."""
 
@@ -382,6 +435,7 @@ class EpilogueTracer:
         return self.phase("chunk_end", elapsed_ms=elapsed, rows=rows,
                           tokens=tokens, log=log)
 
+    @probe_safe("epilogue_trace")
     def begin_chunk(self, chunk_index: int) -> None:
         self.chunk = int(chunk_index)
         self.pre_norms = None
@@ -391,6 +445,7 @@ class EpilogueTracer:
         self.canary_zero_rows = None
 
     # -- the gather side --------------------------------------------------- #
+    @probe_safe("epilogue_trace")
     def record_gather(
         self,
         *,
@@ -404,20 +459,31 @@ class EpilogueTracer:
         post_norms,
         canary_zero_rows: Optional[int],
     ) -> None:
-        """Called from inside the gather, before and after the all-reduce."""
+        """Called from inside the gather, before and after the all-reduce.
 
+        Every field is converted BEFORE anything is stored, so a value the
+        probe cannot read leaves the record untouched rather than half
+        written: a partially overwritten gather record would be read as this
+        chunk's facts and is worse than no record (probe_guard.probe_safe
+        turns the refusal into one ``probe_error`` line).
+        """
+
+        owned_mask = [bool(x) for x in owned]
+        pre = [float(x) for x in pre_norms]
+        post = [float(x) for x in post_norms]
+        canary = None if canary_zero_rows is None else int(canary_zero_rows)
         self.attn_tp_rank = int(attn_tp_rank)
         self.attn_tp_size = int(attn_tp_size)
         self.num_global_rows = int(num_global_rows)
         self.shard = (int(shard_start), int(shard_end))
-        self.owned = [bool(x) for x in owned]
-        self.pre_norms = [float(x) for x in pre_norms]
-        self.post_norms = [float(x) for x in post_norms]
-        self.owned_count = sum(1 for x in self.owned if x)
-        self.canary_zero_rows = (None if canary_zero_rows is None
-                                 else int(canary_zero_rows))
+        self.owned = owned_mask
+        self.pre_norms = pre
+        self.post_norms = post
+        self.owned_count = sum(1 for x in owned_mask if x)
+        self.canary_zero_rows = canary
 
     # -- the pairing side -------------------------------------------------- #
+    @probe_safe("epilogue_trace", default=list)
     def emit(
         self,
         *,

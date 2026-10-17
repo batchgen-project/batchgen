@@ -387,20 +387,30 @@ class KimiLinearParallelStrategyManager:
         ``trace`` is the batch-level ``prefix_pool_epilogue_trace`` recorder or
         None. It is given the shard, the owned mask and the per-row norms on
         both sides of the all-reduce, because none of that is visible to the
-        caller; production behaviour with ``trace=None`` is unchanged.
+        caller; production behaviour with ``trace=None`` is unchanged. Every
+        trace statement here is wrapped: this function runs a collective, so a
+        diagnostics failure before the all_reduce would strand every other
+        rank inside it.
         """
+
+        from batchgen.prefix_reuse.probe_guard import run_probe
 
         if not self.prefill_uses_streamed_sp8():
             selected = hidden_states[0, last_token_indices, :]
             if trace is not None:
-                norms = selected.detach().float().norm(dim=-1).tolist()
-                trace.record_gather(
-                    attn_tp_rank=0, attn_tp_size=1,
-                    num_global_rows=int(hidden_states.shape[1]),
-                    shard_start=0, shard_end=int(hidden_states.shape[1]),
-                    owned=[True] * len(norms),
-                    pre_norms=norms, post_norms=norms,
-                    canary_zero_rows=None,
+                from batchgen.prefix_reuse.epilogue_trace import (
+                    record_unsharded_gather,
+                )
+
+                run_probe(
+                    "epilogue_trace.gather_unsharded",
+                    lambda: record_unsharded_gather(
+                        trace,
+                        selected,
+                        num_global_rows=int(hidden_states.shape[1]),
+                        manager=self,
+                    ),
+                    rank=self.global_rank,
                 )
             return selected
 
@@ -459,19 +469,30 @@ class KimiLinearParallelStrategyManager:
 
         import torch.distributed as dist
 
-        pre_norms = (selected.detach().float().norm(dim=-1).tolist()
-                     if trace is not None else None)
+        # Read BEFORE the collective, so it must not be able to skip it.
+        pre_norms = (
+            run_probe(
+                "epilogue_trace.gather_pre_norms",
+                lambda: selected.detach().float().norm(dim=-1).tolist(),
+                rank=self.global_rank,
+            )
+            if trace is not None else None
+        )
         dist.all_reduce(selected, group=self._attn_tp_group)
         if trace is not None:
-            trace.record_gather(
-                attn_tp_rank=self._attn_tp_rank,
-                attn_tp_size=self._attn_tp_size,
-                num_global_rows=num_global_rows,
-                shard_start=start, shard_end=end,
-                owned=owned.detach().cpu().tolist(),
-                pre_norms=pre_norms,
-                post_norms=selected.detach().float().norm(dim=-1).tolist(),
-                canary_zero_rows=(owned_all_zero if owned.any() else 0),
+            run_probe(
+                "epilogue_trace.gather_record",
+                lambda: trace.record_gather(
+                    attn_tp_rank=self._attn_tp_rank,
+                    attn_tp_size=self._attn_tp_size,
+                    num_global_rows=num_global_rows,
+                    shard_start=start, shard_end=end,
+                    owned=owned.detach().cpu().tolist(),
+                    pre_norms=pre_norms,
+                    post_norms=selected.detach().float().norm(dim=-1).tolist(),
+                    canary_zero_rows=(owned_all_zero if owned.any() else 0),
+                ),
+                rank=self.global_rank,
             )
         return selected
 

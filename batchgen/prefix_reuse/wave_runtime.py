@@ -45,6 +45,14 @@ class PoolWave:
     executor: PoolChunkExecutor | None = None
     chains: list[tuple[int, ...]] = field(default_factory=list)
     segment_sids: dict[int, int] = field(default_factory=dict)
+    # The pooled-prefill PROBE keys of this wave's own sequences, read exactly
+    # once per wave by the worker and cached here. Four probes (epilogue trace,
+    # offload check, kernel dump, pad poison) ask the same question, so without
+    # this they would walk the wave's sequences four times to be told "nothing
+    # is armed" four times. ``probe_debug is None`` with ``probe_debug_read``
+    # set is the production answer: no probe key on any member.
+    probe_debug: dict | None = None
+    probe_debug_read: bool = False
     # segment id -> KV group id -> that group's Host pages for the segment
     segment_host_pages: dict[int, dict[int, list[int]]] = field(default_factory=dict)
     # Segments this wave LOADS (M3 Slice 3). Their Host pages are the

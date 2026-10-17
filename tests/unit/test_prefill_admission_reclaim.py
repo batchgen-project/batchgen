@@ -416,6 +416,9 @@ class FakeWorker:
         for uuid in uuids:
             self.global_batch.get_sequence(uuid).decode_dp_group = 0
 
+    def _check_decode_dp_group_plan_identical(self, uuids):
+        pass
+
     def _decode_attn_tp_size(self):
         return 1
 

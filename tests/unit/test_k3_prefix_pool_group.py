@@ -63,9 +63,11 @@ K3_PAGE_BYTES = 2 * PAGE_TOKENS * 2 * (6 + 4) * 2
 TOKEN_CAP = 64
 
 
+WORKER_TREE = ast.parse(WORKER.read_text())
+
+
 def _worker_class():
-    tree = ast.parse(WORKER.read_text())
-    return next(node for node in tree.body
+    return next(node for node in WORKER_TREE.body
                 if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker")
 
 
@@ -86,6 +88,30 @@ def _worker_methods(names, globals_=None):
     }
     exec(compile(module, str(WORKER), "exec"), namespace)
     return {name: namespace[name] for name in names}
+
+
+def _worker_probe_debug_keys():
+    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+
+    The keys are module-level literals in the worker so that a prefill which
+    armed no probe never imports a probe module to find that out; the compiled
+    seam methods close over them, so the harness has to supply them.
+    """
+    literals = {
+        node.targets[0].id: node.value.value
+        for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    assign = next(
+        node for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
+    )
+    return tuple(literals[element.id] for element in assign.value.elts)
 
 
 def _bind(worker, methods):
@@ -309,6 +335,7 @@ def _plan_worker(
         ],
         {
             "torch": _fake_torch(free_pages * K3_PAGE_BYTES),
+            "_POOL_PROBE_DEBUG_KEYS": _worker_probe_debug_keys(),
             "dist": fake_dist,
             # The pool layout branches on the DSA dual-region coordinator; a
             # single-region model (GPT-OSS, K3) is not an instance of it.

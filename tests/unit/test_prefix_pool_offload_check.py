@@ -105,12 +105,19 @@ class _Logger:
     def __init__(self):
         self.errors = []
         self.infos = []
+        self.warnings = []
 
     def error(self, message, *args):
         self.errors.append(message % args)
 
     def info(self, message, *args):
         self.infos.append(message % args)
+
+    def warning(self, message, *args):
+        self.warnings.append(message % args if args else message)
+
+    def debug(self, message, *args, **kwargs):
+        pass
 
 
 def _record(**overrides):
@@ -367,7 +374,9 @@ def test_recorder_digests_the_source_and_keeps_its_destination():
 
 
 def test_recorder_rejects_metadata_it_cannot_digest():
-    recorder = PoolOffloadCheckRecorder(rank=0, page_tokens=4)
+    # ``strict`` is the TESTS-ONLY contract: on a serving path the same
+    # refusal logs one probe_error line and the offload proceeds unrecorded.
+    recorder = PoolOffloadCheckRecorder(rank=0, page_tokens=4, strict=True)
     with pytest.raises(ValueError, match="token_count 0"):
         recorder.record_row(
             view=None, layer_idx=0, row=0, kind="tail", host_sid=1,
@@ -382,6 +391,26 @@ def test_recorder_rejects_metadata_it_cannot_digest():
         )
     with pytest.raises(ValueError, match="page_tokens must be positive"):
         PoolOffloadCheckRecorder(rank=0, page_tokens=0)
+
+
+def test_a_row_it_cannot_digest_costs_that_row_and_not_the_offload(caplog):
+    """record_row runs per layer per row inside the live offload loop."""
+
+    recorder = PoolOffloadCheckRecorder(rank=4, page_tokens=4)
+    with caplog.at_level(logging.WARNING):
+        assert recorder.record_row(
+            view=None, layer_idx=0, row=0, kind="tail", host_sid=1,
+            dest_start_tokens=0, token_count=0,
+            source=torch.zeros(4, dtype=torch.int16),
+        ) is None
+
+    assert recorder.rows == []
+    assert recorder.strict is False
+    line = next(
+        record.getMessage() for record in caplog.records
+        if "PROBE_ERROR" in record.getMessage()
+    )
+    assert "probe=offload_check.record_row" in line and "rank=4" in line
 
 
 # --------------------------------------------------------------------------
@@ -471,11 +500,40 @@ def _worker_method(name):
     )
 
 
-_NAMESPACE = {"logging": logging, "Optional": Optional}
+def _worker_probe_keys():
+    """``_POOL_PROBE_DEBUG_KEYS`` as the worker module declares it.
+
+    The keys live as module-level literals so the probe-off path never
+    imports a probe module; ``tests/unit/test_pool_probe_debug_seam.py`` pins
+    them against this module's own ``DEBUG_FLAG``.
+    """
+
+    literals = {
+        node.targets[0].id: node.value.value
+        for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    assign = next(
+        node for node in WORKER_TREE.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "_POOL_PROBE_DEBUG_KEYS"
+    )
+    return tuple(literals[element.id] for element in assign.value.elts)
+
+
+_NAMESPACE = {
+    "logging": logging,
+    "Optional": Optional,
+    "_POOL_PROBE_DEBUG_KEYS": _worker_probe_keys(),
+}
 exec(compile(ast.fix_missing_locations(ast.Module(
     body=[
         copy.deepcopy(_worker_method(name)) for name in (
-            "_active_batchgen_debug_for_sequences",
+            "_pool_probe_debug",
             "_debug_flag_enabled",
             "_new_pool_offload_check_recorder",
             "_verify_prefill_pool_offload_bytes",
@@ -501,19 +559,16 @@ class _Wave:
     def __init__(self, debug):
         self.uuids = ["a", "b"]
         self._debug = debug
+        # The worker reads the wave's probe keys once and caches them here.
+        self.probe_debug = None
+        self.probe_debug_read = False
 
 
 class _Worker:
     rank = 2
     _batchgen_debug = None
-    # Main's decode fast path: the per-sequence merge is skipped unless some
-    # admitted sequence carried request-level flags. These fakes drive the
-    # flag through the wave's sequences, so the latch is on.
-    _any_sequence_batchgen_debug = True
 
-    _active_batchgen_debug_for_sequences = _NAMESPACE[
-        "_active_batchgen_debug_for_sequences"
-    ]
+    _pool_probe_debug = _NAMESPACE["_pool_probe_debug"]
     _debug_flag_enabled = _NAMESPACE["_debug_flag_enabled"]
     _new_pool_offload_check_recorder = _NAMESPACE["_new_pool_offload_check_recorder"]
     _verify_prefill_pool_offload_bytes = _NAMESPACE[
@@ -640,3 +695,121 @@ def test_offload_issue_site_hashes_only_behind_the_flag():
     assert len(guards) == 1
     assert _call_lines(guards[0], "async_offload_layer_kv_range_to_host") == []
     assert _call_lines(offload, "async_offload_layer_kv_range_to_host")
+
+
+# --------------------------------------------------------------------------
+# A diagnostics failure costs the row, never the wave
+# --------------------------------------------------------------------------
+def test_an_unresolvable_row_is_isolated_counted_and_the_others_still_checked():
+    """One row with a truncated logical table must not lose the wave.
+
+    The check runs after the wave's D2H retires and before the pseudo
+    sequences are dropped; raising there ends the prefill that armed the
+    probe. So the row is skipped, counted as ``probe_errors`` in the summary
+    (which is what tells a dead probe from a silent clean one), and the
+    remaining rows are compared as usual.
+    """
+
+    good_view = _FakeHostView(page_bytes=16, owned=8)
+    payload = bytes(range(48))
+    good_view.write_at(8 * 4, payload)
+    good = _recorded(payload, view=good_view)
+    bad = _record(view=_FakeHostView(page_bytes=16, attached=1, owned=1),
+                  dest_start_tokens=48, token_count=8)
+
+    logger = _Logger()
+    result = verify_pool_offload_rows([bad, good], logger=logger, wave_tag="m2s1")
+
+    assert result.matched and result.rows_checked == 1
+    assert result.probe_errors == 1
+    assert len(logger.warnings) == 1
+    assert "probe=offload_check.verify" in logger.warnings[0]
+    assert "TRUNCATED" in logger.warnings[0]
+    assert "probe_errors=1" in logger.infos[-1]
+    assert logger.errors == []
+
+
+def test_strict_verification_re_raises_for_the_tests_that_want_the_refusal():
+    bad = _record(view=_FakeHostView(page_bytes=16, attached=1, owned=1),
+                  dest_start_tokens=48, token_count=8)
+
+    with pytest.raises(RuntimeError, match="TRUNCATED"):
+        verify_pool_offload_rows([bad], logger=_Logger(), strict=True)
+
+
+def test_a_clean_wave_still_reports_zero_probe_errors():
+    view = _FakeHostView(page_bytes=16, owned=8)
+    payload = bytes(range(48))
+    view.write_at(8 * 4, payload)
+    logger = _Logger()
+
+    result = verify_pool_offload_rows(
+        [_recorded(payload, view=view)], logger=logger
+    )
+
+    assert result.probe_errors == 0 and logger.warnings == []
+    assert "probe_errors=0" in logger.infos[-1]
+
+
+# --------------------------------------------------------------------------
+# The recorder is this wave's, on every exit (audit M2)
+# --------------------------------------------------------------------------
+def _pool_wave_finally() -> str:
+    """The ``finally`` of the pooled prefill wave, as source."""
+
+    method = _worker_method("_prefill_prepacked_pool")
+    tries = [node for node in method.body if isinstance(node, ast.Try)]
+    assert len(tries) == 1, f"{len(tries)} top-level try blocks"
+    return "\n".join(ast.unparse(node) for node in tries[0].finalbody)
+
+
+def test_a_wave_that_died_drops_both_probe_recorders():
+    """Installed before the try, so only a ``finally`` can be unconditional.
+
+    The old code cleared the offload recorder on the normal verification path
+    only, so a wave that raised mid-chunk left its records on a class
+    attribute and its dump recorder on a pool object.
+    """
+
+    final = _pool_wave_finally()
+
+    assert "wave.pool.kernel_dump = None" in final
+    assert "AttnWrapperBase.prefill_pool_offload_recorder = None" in final
+    # Dropped unless this wave completed and handed the recorder to the
+    # post-D2H verification step, which is the only other consumer.
+    assert "if not offload_recorder_handed_off" in final
+
+
+def test_the_handoff_flag_is_only_set_after_the_wave_completed():
+    method_source = ast.unparse(_worker_method("_prefill_prepacked_pool"))
+
+    assert method_source.count("offload_recorder_handed_off = False") == 1
+    assert method_source.count("offload_recorder_handed_off = True") == 1
+    assert method_source.index("wave.executor.close()") < method_source.index(
+        "offload_recorder_handed_off = True"
+    )
+
+
+def test_a_verification_that_raises_still_consumes_the_recorder(monkeypatch):
+    """The probe guard keeps a bad verification off the serving path."""
+
+    from batchgen.models.wrappers.attention import AttnWrapperBase
+
+    recorder = PoolOffloadCheckRecorder(rank=2, page_tokens=4)
+    monkeypatch.setattr(
+        AttnWrapperBase, "prefill_pool_offload_recorder", recorder, raising=False
+    )
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("probe is broken")
+
+    monkeypatch.setattr(
+        "batchgen.prefix_reuse.offload_check.verify_pool_offload_rows", _explode
+    )
+    worker = _Worker({})
+    worker.rank = 2
+
+    # Returns normally: a broken check must not end the prefill it checked.
+    worker._verify_prefill_pool_offload_bytes()
+
+    assert AttnWrapperBase.prefill_pool_offload_recorder is None

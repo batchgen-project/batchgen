@@ -12,10 +12,11 @@ live wave is ``L(k) = 525 + 313k`` with a 40-token per-member template suffix,
 so every tail is RAGGED and no prompt is a prefix of the next. That difference
 is load-bearing for a recurrent layer: a packed level call whose earlier row is
 ragged starts its next row off the chunk grid. With a chunk grid deliberately
-anchored at the packed buffer instead of per sequence,
-``tests/unit/test_k3_kda_live_wave_levels.py`` (the live shape) fails on 62 of
-64 members while this file passes on all 64. Keep both; a clean run here does
-not exonerate the live shape.
+anchored at the packed buffer instead of per sequence, this file's wave passes
+- every row here begins on the grid by construction - while
+``tests/unit/test_k3_kda_live_wave_levels.py`` (the live shape) fails for every
+member that any ragged row precedes, which is all but the first of each group.
+Keep both; a clean run here does not exonerate the live shape.
 
 
 ``tests/unit/test_k3_kda_pool_levels.py`` pins the recurrent half of the prefix

@@ -16,6 +16,7 @@ CPU only; no CUDA, no model.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 
@@ -375,7 +376,9 @@ def test_a_one_dimensional_or_mismatched_logits_tensor_is_refused():
     with pytest.raises(ValueError, match=r"\[rows, vocab\]"):
         _TRACE.logit_diagnostics(torch.zeros(6))
 
-    tracer = _TRACE.EpilogueTracer(rank=0)
+    # ``strict`` is the TESTS-ONLY contract: on a serving path the same
+    # mismatch logs one probe_error line and the prefill continues.
+    tracer = _TRACE.EpilogueTracer(rank=0, strict=True)
     with pytest.raises(ValueError, match="pair a row with another row"):
         tracer.emit(table_rows=[0], tail_rows=[3], wave_indices=[0],
                     global_ids=[64], uuids=["u"], logits=_logits(),
@@ -472,17 +475,25 @@ def test_the_unpooled_prefill_traces_the_logits_its_token_choice_consumed():
     body = source.split("\tdef prefill_prepacked(self, batch: list[int]):")[1]
     body = body.split("\n\tdef ")[0]
 
-    # Armed from the debug dict this path already resolves.
-    assert ('unpooled_trace = tracer_from_debug(\n\t\t\tprefill_debug, '
-            'rank=self.rank, path="unpooled"') in body
+    # Armed from the debug dict this path already resolves, and only after
+    # the one membership test that keeps the off path import-free.
+    arm = body.index("if _EPILOGUE_TRACE_DEBUG_FLAG in prefill_debug:")
+    assert arm < body.index(
+        "from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug"
+    )
+    assert 'path="unpooled"' in body[arm:arm + 600]
     # The pooled wave still takes its own branch first.
-    assert body.index("return self._prefill_prepacked_pool(batch)") < body.index(
-        "unpooled_trace = tracer_from_debug(")
+    assert body.index("return self._prefill_prepacked_pool(batch)") < arm
     select = body.index("batch_new_tokens = self._select_tokens(logits, batch_sequences)")
     emit = body.index("unpooled_trace.emit(")
     assert select < emit
     assert "logits=logits," in body[emit:emit + 900]
     assert "tokens=[int(token) for token in batch_new_tokens]" in body[emit:emit + 900]
+    # The chunk is opened BEFORE the gather, so the gather-side record the
+    # gather itself writes is still the one this emit reports.
+    assert body.index("unpooled_trace.begin_chunk(batch_idx)") < body.index(
+        "last_token_hidden = gather_last_token_hidden("
+    )
 
 
 def test_the_pooled_helper_now_shares_the_arming_rule():
@@ -490,7 +501,12 @@ def test_the_pooled_helper_now_shares_the_arming_rule():
     seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
 
     assert 'tracer_from_debug(debug, rank=self.rank, path="pool")' in seam
-    assert "_active_batchgen_debug_for_sequences" in seam
+    # One cached read per wave, shared with the other three pooled probes,
+    # and the flag decision precedes the import.
+    assert "self._pool_probe_debug(wave)" in seam
+    assert seam.index("if debug is None:") < seam.index(
+        "from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -502,7 +518,7 @@ def test_the_worker_arms_the_trace_through_the_batch_debug_seam():
     assert "def _new_pool_epilogue_tracer(self, wave):" in source
     assert "epilogue_trace = self._new_pool_epilogue_tracer(wave)" in source
     seam = source.split("def _new_pool_epilogue_tracer")[1].split("\n\tdef ")[0]
-    assert "_active_batchgen_debug_for_sequences" in seam
+    assert "self._pool_probe_debug(wave)" in seam
     assert "tracer_from_debug" in seam
     assert "return None" in seam
     # The pairing side is emitted beside the token selection.
@@ -532,17 +548,67 @@ def test_the_gather_takes_the_trace_and_defaults_to_none():
     assert "canary_zero_rows=(owned_all_zero" in body
 
 
-def test_the_kda_state_manager_reports_its_layer_map():
-    """A non-injective KDA layer map is logged as an ERROR at construction."""
 
-    source = _ROOT.joinpath(
-        "batchgen", "kv_cache", "kda_state_gpu_manager.py"
-    ).read_text()
+# --------------------------------------------------------------------------
+# A trace failure must never be the thing that ends a prefill
+# --------------------------------------------------------------------------
+def _probe_error_lines(caplog):
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelno == logging.WARNING and "PROBE_ERROR" in record.getMessage()
+    ]
 
-    assert "def _log_layer_mapping_isolation(self)" in source
-    assert "self._log_layer_mapping_isolation()" in source
-    body = source.split("def _log_layer_mapping_isolation")[1]
-    body = body.split("\n    def ")[0]
-    assert "is NOT injective" in body
-    assert "physical.count(row) > 1" in body
-    assert "logging.error" in body
+
+def test_a_row_emit_that_cannot_be_formatted_logs_one_probe_error(caplog):
+    """The pooled epilogue is the last stretch before the first token; a
+    trace that cannot pair its own rows must not take the wave down with it."""
+
+    tracer = _TRACE.EpilogueTracer(rank=7)
+    with caplog.at_level(logging.WARNING):
+        lines = tracer.emit(
+            table_rows=[0], tail_rows=[3], wave_indices=[0],
+            global_ids=[64], uuids=["u"], logits=_logits(),
+            log=lambda _: None,
+        )
+
+    assert lines == []
+    errors = _probe_error_lines(caplog)
+    assert len(errors) == 1, errors
+    assert "probe=epilogue_trace.emit" in errors[0]
+    assert "rank=7" in errors[0] and "ValueError" in errors[0]
+
+
+def test_a_gather_record_it_cannot_read_logs_one_probe_error(caplog):
+    tracer = _TRACE.EpilogueTracer(rank=1)
+    with caplog.at_level(logging.WARNING):
+        tracer.record_gather(
+            attn_tp_rank=0, attn_tp_size=1, num_global_rows=2,
+            shard_start=0, shard_end=2, owned=[True, True],
+            pre_norms=None, post_norms=[1.0, 2.0], canary_zero_rows=None,
+        )
+
+    # The record is left whole, not half overwritten.
+    assert tracer.pre_norms is None and tracer.owned is None
+    assert tracer.num_global_rows == 0 and tracer.shard == (0, 0)
+    errors = _probe_error_lines(caplog)
+    assert len(errors) == 1 and "probe=epilogue_trace.record_gather" in errors[0]
+
+
+def test_a_phase_stamp_that_cannot_format_logs_one_probe_error(caplog):
+    tracer = _TRACE.EpilogueTracer(rank=2)
+    with caplog.at_level(logging.WARNING):
+        line = tracer.phase("wave_begin", rows="not-a-count")
+
+    assert line == ""
+    assert len(_probe_error_lines(caplog)) == 1
+
+
+def test_strict_mode_is_the_inverse_and_only_the_tests_set_it():
+    tracer = _TRACE.EpilogueTracer(rank=0, strict=True)
+    with pytest.raises(ValueError):
+        tracer.record_gather(
+            attn_tp_rank=0, attn_tp_size=1, num_global_rows=2,
+            shard_start=0, shard_end=2, owned=[True],
+            pre_norms=["x"], post_norms=[1.0], canary_zero_rows=None,
+        )
+    assert _TRACE.EpilogueTracer(rank=0).strict is False

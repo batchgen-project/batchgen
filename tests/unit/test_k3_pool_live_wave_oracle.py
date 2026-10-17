@@ -35,10 +35,11 @@ no template to leak and no row that ends mid-page.
 What is asserted here
 ---------------------
 * the premise: the balancer's split IS the live split, and the planner plus
-  the executor reproduce the live layout - the row table, the page tables and
-  the fingerprints measured off the dumps (31 segments, 63 rows, one chunk,
-  317/312 table columns, 367/361 pages, 22480/22096 query tokens, the five
-  flagged members' own ranges);
+  the executor reproduce the layout the chain structure implies - the row
+  table, the page tables, the table width, the distinct pool pages, the query
+  token count, the widest row and each member's own token range, every one of
+  them derived from ``L(k)``, the suffix and the page size by ``oracle_layout``
+  rather than quoted from a run;
 * every key every row attends over, walked through the kernel's own
   ``page_table`` for ``[0, cache_seqlens)``, is the token THAT ROW's member
   has at that absolute position. A row that reads a neighbour's template
@@ -139,18 +140,6 @@ LIVE_FLAGGED = (1, 3, 4, 11, 13)
 # next-shallower member left the chain, so it is the one multi-page tail.
 DEEP_TAIL_MEMBER = {0: 63, 1: 62}
 
-# Fingerprints measured off the live dumps (rank 0 and rank 8, layer 00).
-LIVE_FINGERPRINT = {
-    0: {"rows": 63, "segments": 31, "tails": 32, "table_width": 317,
-        "pages": 367, "query_tokens": 22480, "max_seqlen_q": 980},
-    1: {"rows": 63, "segments": 31, "tails": 32, "table_width": 312,
-        "pages": 361, "query_tokens": 22096, "max_seqlen_q": 960},
-}
-# ch-N -> (token_start, token_end) of its tail row, off the same dumps.
-LIVE_FLAGGED_TAIL = {
-    1: (768, 838), 4: (1728, 1777),          # group 0
-    3: (1408, 1464), 11: (3904, 3968), 13: (4544, 4594),  # group 1
-}
 
 CHUNK_TOKENS = 1 << 20  # the live cap is far above the wave; one chunk
 POOL_PAGES = 4096
@@ -227,6 +216,63 @@ def oracle_chain_tokens(member: int, pooled_blocks: int) -> int:
     """How many tokens of ``member`` come out of the pool."""
 
     return PAGE * min(shared_blocks(member), pooled_blocks)
+
+
+def oracle_tail_range(member: int, pooled_blocks: int) -> tuple[int, int]:
+    """``(token_start, token_end)`` of a member's own tail row.
+
+    Its start is where the pool stopped carrying the member and its end is the
+    member's own length, so the range is a consequence of ``L(k)``, the suffix
+    and the page size - never a number read off a run.
+    """
+
+    return oracle_chain_tokens(member, pooled_blocks), LIVE_TOKENS[member]
+
+
+def oracle_layout(group: int) -> dict:
+    """The chunk layout one group's wave MUST have, from the lengths alone.
+
+    Every field here is implied by the chain structure, so the executor is
+    checked against the shape the inputs force rather than against a
+    fingerprint transcribed from one run - which would re-pass unchanged if
+    the inputs drifted and would have to be re-measured on a real node to be
+    updated at all.
+
+    * a segment row spans its run of blocks and is addressed by every block up
+      to its end, so the widest segment row is the pooled block count;
+    * a tail row is addressed by the pooled blocks its member passes through
+      plus its own pages, so its width follows from its tail length;
+    * every pooled block is one pool page and every tail page is another, and
+      one chunk allocates each exactly once, so the distinct pages in the
+      table are their sum.
+    """
+
+    members, _, pooled, pooled_blocks = oracle_wave(group)
+    tails = {
+        member: LIVE_TOKENS[member] - oracle_chain_tokens(member, pooled_blocks)
+        for member in members
+    }
+
+    def pages(tokens: int) -> int:
+        return -(-tokens // PAGE)
+
+    own_tokens = [PAGE * (end - start) for start, end, _ in pooled]
+    own_tokens += [tails[member] for member in members]
+    return {
+        "rows": len(pooled) + len(members),
+        "segments": len(pooled),
+        "tails": len(members),
+        "table_width": max(
+            [end for _, end, _ in pooled]
+            + [
+                min(shared_blocks(member), pooled_blocks) + pages(tails[member])
+                for member in members
+            ]
+        ),
+        "pages": pooled_blocks + sum(pages(tails[member]) for member in members),
+        "query_tokens": sum(own_tokens),
+        "max_seqlen_q": max(own_tokens),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -638,8 +684,8 @@ def test_each_group_is_the_31_segment_gapped_chain_the_ranks_dumped(group):
 
 
 @pytest.mark.parametrize("group", range(NUM_GROUPS))
-def test_the_layout_matches_the_live_dump_fingerprints(group):
-    """The executor's chunk IS the one the ranks dumped."""
+def test_the_layout_is_the_one_the_chain_structure_forces(group):
+    """The executor's chunk is the chunk the lengths imply, field by field."""
 
     members, prompts, pooled, pooled_blocks, plan = plan_group(group)
     assert len(plan.chunks) == 1, (
@@ -653,28 +699,34 @@ def test_the_layout_matches_the_live_dump_fingerprints(group):
         num_kv_heads=1, head_dim=1, dtype=torch.uint8, device="cpu",
     )
     batch = _EXEC.PoolChunkExecutor(plan, prompts, pool).build(plan.chunks[0])
-    fingerprint = LIVE_FINGERPRINT[group]
+    expected = oracle_layout(group)
     table = batch.page_table.tolist()
 
-    assert len(batch.items) == fingerprint["rows"]
+    assert len(batch.items) == expected["rows"]
     assert sum(1 for i in batch.items if i.kind == "segment") == \
-        fingerprint["segments"]
+        expected["segments"]
     assert sum(1 for i in batch.items if i.kind == "tail") == \
-        fingerprint["tails"]
-    assert len(table[0]) == fingerprint["table_width"]
-    assert len({page for row in table for page in row}) == fingerprint["pages"]
-    assert int(batch.cu_seqlens_q[-1]) == fingerprint["query_tokens"]
-    assert batch.max_seqlen_q == fingerprint["max_seqlen_q"]
+        expected["tails"]
+    assert len(table[0]) == expected["table_width"]
+    assert len({page for row in table for page in row}) == expected["pages"]
+    assert int(batch.cu_seqlens_q[-1]) == expected["query_tokens"]
+    assert batch.max_seqlen_q == expected["max_seqlen_q"]
     # Rows are grouped by level, as the live level-wise order requires.
     _LEVELS.chunk_levels(batch)
-    # The five flagged members' own token ranges, as dumped.
+    # Every member's own token range, the five live-corrupted ones included,
+    # is where the pool stopped carrying it through to its own length.
+    checked = 0
     for row, item in enumerate(batch.items):
         if item.kind != "tail":
             continue
         member = members[item.ref]
-        if member in LIVE_FLAGGED and GROUP_OF[member] == group:
-            assert (item.token_start, item.token_end) == \
-                LIVE_FLAGGED_TAIL[member], (member, row)
+        assert (item.token_start, item.token_end) == \
+            oracle_tail_range(member, pooled_blocks), (member, row)
+        checked += 1
+    assert checked == expected["tails"]
+    # The flagged members really are in this wave, so the ranges above cover
+    # the rows the live corruption appeared on.
+    assert [m for m in LIVE_FLAGGED if GROUP_OF[m] == group]
 
 
 # --------------------------------------------------------------------------- #

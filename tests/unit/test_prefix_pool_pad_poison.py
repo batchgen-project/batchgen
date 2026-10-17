@@ -206,8 +206,13 @@ def test_the_worker_reads_the_flag_through_the_batch_debug_seam():
     assert "def _pool_pad_poison_enabled(self, wave) -> bool:" in source
     assert "pad_poison=self._pool_pad_poison_enabled(wave)," in source
     # Same seam the offload check uses: the wave's own sequences.
-    seam = source.split("def _pool_pad_poison_enabled")[1].split("def ")[0]
-    assert "_active_batchgen_debug_for_sequences" in seam
+    seam = source.split("def _pool_pad_poison_enabled")[1].split("\n\tdef ")[0]
+    # One cached read per wave, shared with the other pooled probes, and the
+    # flag decision precedes the import so the off path imports nothing.
+    assert "self._pool_probe_debug(wave)" in seam
+    assert seam.index("if debug is None:") < seam.index(
+        "from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG"
+    )
     assert "_debug_flag_enabled" in seam
     assert "PAD_POISON_DEBUG_FLAG" in seam
     assert "return False" in seam

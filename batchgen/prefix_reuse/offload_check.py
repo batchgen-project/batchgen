@@ -24,7 +24,14 @@ a member's attached prefix chain lives only in the logical table, so a member
 with 12 attached and 2 private pages reads back as 2. Mistaking that for a
 truncated table is a probe artifact, reported as ``api-split`` and never as a
 fault; only a LOGICAL table too short for the destination is a real
-truncation, and that raises.
+truncation, and that fails the row.
+
+Failing a ROW is as far as any failure here reaches. The check runs inside a
+live serving forward, so every recording and every per-row comparison is
+wrapped (``prefix_reuse/probe_guard.py``): a row whose destination cannot be
+resolved or read logs one ``probe_error`` WARNING, is counted in the wave
+summary as ``probe_errors``, and the wave proceeds. A probe that was armed and
+silent is therefore distinguishable from a probe that died.
 
 Nothing here runs unless the flag installed a recorder:
 ``AttnWrapperBase.prefill_pool_offload_recorder is None`` is the entire cost
@@ -37,6 +44,8 @@ import ctypes
 import hashlib
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
+
+from batchgen.prefix_reuse.probe_guard import probe_error, probe_safe
 
 # Batch-level ``batchgen_debug`` key. Batch-level only, by project debug
 # policy: a per-sequence offload check would mix checked and unchecked rows
@@ -301,7 +310,9 @@ def read_host_row_bytes(record: PoolOffloadRow, page_ids=None) -> bytes:
 class PoolOffloadCheckRecorder:
     """Digest the source bytes of every pooled row the rank offloads."""
 
-    def __init__(self, *, rank: int, page_tokens: int) -> None:
+    def __init__(
+        self, *, rank: int, page_tokens: int, strict: bool = False
+    ) -> None:
         if page_tokens <= 0:
             raise ValueError(
                 f"{LOG_TAG} page_tokens must be positive, got {page_tokens}"
@@ -309,7 +320,13 @@ class PoolOffloadCheckRecorder:
         self.rank = int(rank)
         self.page_tokens = int(page_tokens)
         self.rows: list[PoolOffloadRow] = []
+        # TESTS ONLY: re-raise instead of logging one ``probe_error`` line.
+        # ``record_row`` runs per layer per row inside the offload loop, so on
+        # a serving path a row it cannot digest must cost that row's record,
+        # not the prefill.
+        self.strict = bool(strict)
 
+    @probe_safe("offload_check")
     def record_row(
         self,
         *,
@@ -369,6 +386,10 @@ class PoolOffloadCheckResult:
     layers: tuple[int, ...]
     mismatches: tuple[tuple[PoolOffloadRow, RowComparison], ...]
     api_split_rows: int = 0
+    # Rows whose destination could not be resolved, read or compared. They are
+    # neither matched nor mismatched: the probe failed on them, and saying so
+    # is what keeps a dead probe from reading as a clean wave.
+    probe_errors: int = 0
 
     @property
     def matched(self) -> bool:
@@ -382,12 +403,19 @@ def verify_pool_offload_rows(
     reader: Callable[..., bytes] = read_host_row_bytes,
     prober: Optional[Callable[[PoolOffloadRow], tuple]] = probe_destination_pages,
     wave_tag: str = "-",
+    strict: bool = False,
 ) -> PoolOffloadCheckResult:
     """Re-read every recorded row's destination and compare it to the source.
 
     One ``MISMATCH`` line per bad row carries everything needed to localize
     the offset bug; one summary line per wave always lands, so a gate can
     assert the check actually ran rather than inferring it from silence.
+
+    A row that cannot be resolved or read is ISOLATED: it logs one
+    ``probe_error`` line, raises ``probe_errors`` in the summary, and the
+    remaining rows are still checked -- a truncated page table on one row is
+    no reason to lose the wave's other rows, let alone the wave.
+    ``strict=True`` (tests only) re-raises instead.
     """
 
     rows_checked = 0
@@ -397,10 +425,26 @@ def verify_pool_offload_rows(
     api_split_rows = 0
     layers: set[int] = set()
     mismatches: list[tuple[PoolOffloadRow, RowComparison]] = []
+    probe_errors = 0
     rank = records[0].rank if records else -1
     for record in records:
-        probe, page_ids = prober(record) if prober is not None else (None, None)
-        comparison = compare_row_bytes(record, reader(record, page_ids))
+        try:
+            probe, page_ids = (
+                prober(record) if prober is not None else (None, None)
+            )
+            comparison = compare_row_bytes(record, reader(record, page_ids))
+        except Exception as exc:  # noqa: BLE001 - diagnostics never kill serving
+            if strict:
+                raise
+            probe_errors += 1
+            probe_error(
+                f"offload_check.verify[kind={record.kind} "
+                f"host_sid={record.host_sid} layer={record.layer_idx}]",
+                exc,
+                rank=record.rank,
+                logger=logger,
+            )
+            continue
         rows_checked += 1
         bytes_hashed += record.num_bytes
         layers.add(record.layer_idx)
@@ -459,7 +503,7 @@ def verify_pool_offload_rows(
     logger.info(
         "%s rank=%s wave=%s rows_checked=%s bytes_hashed=%s segment_rows=%s "
         "tail_rows=%s layers=%s layer_span=%s-%s api_split_rows=%s "
-        "mismatches=%s",
+        "probe_errors=%s mismatches=%s",
         LOG_TAG,
         rank,
         wave_tag,
@@ -471,6 +515,7 @@ def verify_pool_offload_rows(
         ordered_layers[0] if ordered_layers else "-",
         ordered_layers[-1] if ordered_layers else "-",
         api_split_rows,
+        probe_errors,
         len(mismatches),
     )
     return PoolOffloadCheckResult(
@@ -481,4 +526,5 @@ def verify_pool_offload_rows(
         layers=ordered_layers,
         mismatches=tuple(mismatches),
         api_split_rows=api_split_rows,
+        probe_errors=probe_errors,
     )
