@@ -11642,10 +11642,21 @@ class BatchGenWorker:
 		mirrored = self._trajectory_mirrored_restores
 		if not mirrored:
 			return
+		# Build the committer FIRST. It is this rank's only source of the
+		# snapshot layout, and ``_get_trajectory_restorer`` refuses to build
+		# one for itself -- so without this a follower whose leader mirrored a
+		# hit but no arena this pass would find no restorer and skip the
+		# restore silently, while its peers restored. That is the divergence
+		# the mirrored decision exists to prevent, so it must not be
+		# reintroduced by construction order.
+		committer = self._get_trajectory_frontier_committer()
 		restorer = self._get_trajectory_restorer()
 		if restorer is None:
-			return
-		committer = self._trajectory_frontier_committer
+			raise RuntimeError(
+				f"Rank {self.rank}: its serve-group leader mirrored "
+				f"{len(mirrored)} trajectory restore(s) but this rank has no "
+				"restorer; the group's prefill would diverge"
+			)
 		for local_idx in local_indices:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			seq = (
