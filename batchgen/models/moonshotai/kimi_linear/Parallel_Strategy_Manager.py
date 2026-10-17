@@ -372,7 +372,7 @@ class KimiLinearParallelStrategyManager:
         return self._prefill_moe_mode == "streamed_sp8"
 
     def gather_prefill_last_token_hidden(
-        self, hidden_states, last_token_indices, num_global_rows
+        self, hidden_states, last_token_indices, num_global_rows, trace=None
     ):
         """Reassemble only sequence-final rows from the TP8 token shards.
 
@@ -382,9 +382,36 @@ class KimiLinearParallelStrategyManager:
         gathering every token row here would discard the whole-stack sharding
         win.  Exactly one TP rank owns each requested global row, so a small
         zero-filled all-reduce reconstructs the requested vectors exactly.
+
+        ``trace`` is the batch-level ``prefix_pool_epilogue_trace`` recorder or
+        None. It is given the shard, the owned mask and the per-row norms on
+        both sides of the all-reduce, because none of that is visible to the
+        caller; production behaviour with ``trace=None`` is unchanged. Every
+        trace statement here is wrapped: this function runs a collective, so a
+        diagnostics failure before the all_reduce would strand every other
+        rank inside it.
         """
+
+        from batchgen.prefix_reuse.probe_guard import run_probe
+
         if not self.prefill_uses_streamed_sp8():
-            return hidden_states[0, last_token_indices, :]
+            selected = hidden_states[0, last_token_indices, :]
+            if trace is not None:
+                from batchgen.prefix_reuse.epilogue_trace import (
+                    record_unsharded_gather,
+                )
+
+                run_probe(
+                    "epilogue_trace.gather_unsharded",
+                    lambda: record_unsharded_gather(
+                        trace,
+                        selected,
+                        num_global_rows=int(hidden_states.shape[1]),
+                        manager=self,
+                    ),
+                    rank=self.global_rank,
+                )
+            return selected
 
         from .moe_tp_reshard import balanced_row_split
 
@@ -417,6 +444,7 @@ class KimiLinearParallelStrategyManager:
         # dropped it. Check the owned rows directly and warn only on the anomaly
         # -- the old form sampled a fixed trailing window (range(-8, 0)), which
         # both missed non-tail drops and IndexError'd on <8-sequence batches.
+        owned_all_zero = 0
         if owned.any():
             owned_all_zero = int(
                 (selected[owned].abs().sum(dim=-1) == 0).sum().item()
@@ -440,7 +468,31 @@ class KimiLinearParallelStrategyManager:
 
         import torch.distributed as dist
 
+        # Read BEFORE the collective, so it must not be able to skip it.
+        pre_norms = (
+            run_probe(
+                "epilogue_trace.gather_pre_norms",
+                lambda: selected.detach().float().norm(dim=-1).tolist(),
+                rank=self.global_rank,
+            )
+            if trace is not None else None
+        )
         dist.all_reduce(selected, group=self._attn_tp_group)
+        if trace is not None:
+            run_probe(
+                "epilogue_trace.gather_record",
+                lambda: trace.record_gather(
+                    attn_tp_rank=self._attn_tp_rank,
+                    attn_tp_size=self._attn_tp_size,
+                    num_global_rows=num_global_rows,
+                    shard_start=start, shard_end=end,
+                    owned=owned.detach().cpu().tolist(),
+                    pre_norms=pre_norms,
+                    post_norms=selected.detach().float().norm(dim=-1).tolist(),
+                    canary_zero_rows=(owned_all_zero if owned.any() else 0),
+                ),
+                rank=self.global_rank,
+            )
         return selected
 
     def streamed_sp8_reseeds_h2d_on_reentry(self):

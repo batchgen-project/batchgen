@@ -53,6 +53,7 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
         _get_finish_reason=lambda _seq: "stop",
         _trajectory_book=_TrajectoryBook(),
         _publish_trajectory_pool_capacity=lambda: None,
+        _maybe_emit_prefix_drain_metric=lambda: None,
     )
 
     BatchGenWorker._report_completion(worker, seq.uuid, gathered_text="answer")
@@ -127,6 +128,7 @@ def test_report_completion_fallback_applies_stop_token_trimming():
     worker._get_finish_reason = lambda _seq: "stop"
     worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
     worker._publish_trajectory_pool_capacity = lambda: None
+    worker.enable_prefix_cache = False
 
     worker._report_completion(seq.uuid)
 

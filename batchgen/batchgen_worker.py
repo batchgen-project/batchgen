@@ -161,11 +161,16 @@ from batchgen.worker.sync import (
 	TorchDistCollectiveBackend,
 )
 from batchgen.worker.prefill import (
+	PrefillAdmissionStalled,
+	PrefillAdmissionStateDivergence,
 	PrefillCandidate,
+	PrefillProgressGuard,
 	PrefillScheduler,
 	PrefillSelectionRequest,
 	compute_prefill_host_reservation,
+	describe_prefill_blockers,
 	host_kv_eviction_enabled,
+	prefill_reclaim_target_pages,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.boundary import (
@@ -324,6 +329,28 @@ ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '
 # gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
+
+# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
+# Spelled out here, instead of imported from the four probe modules, so that
+# deciding "is any probe armed on this prefill" is a membership test on a dict
+# the worker already holds: a production prefill must not import a probe module
+# or build a merged debug dict to be told that nothing is armed.
+# ``tests/unit/test_pool_probe_debug_seam.py`` pins these against the modules'
+# own constants, so the duplication cannot drift.
+_EPILOGUE_TRACE_DEBUG_FLAG = "prefix_pool_epilogue_trace"
+_EPILOGUE_TRACE_PROBE_TOKEN_FLAG = "prefix_pool_epilogue_probe_token"
+_POOL_OFFLOAD_CHECK_DEBUG_FLAG = "prefix_pool_offload_check"
+_POOL_KERNEL_DUMP_DEBUG_FLAG = "prefix_pool_dump_kernel_args"
+_POOL_KERNEL_DUMP_DIR_FLAG = "prefix_pool_dump_dir"
+_POOL_PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
+_POOL_PROBE_DEBUG_KEYS = (
+	_EPILOGUE_TRACE_DEBUG_FLAG,
+	_EPILOGUE_TRACE_PROBE_TOKEN_FLAG,
+	_POOL_OFFLOAD_CHECK_DEBUG_FLAG,
+	_POOL_KERNEL_DUMP_DEBUG_FLAG,
+	_POOL_KERNEL_DUMP_DIR_FLAG,
+	_POOL_PAD_POISON_DEBUG_FLAG,
+)
 
 
 class _DualAsyncLoadTask:
@@ -1030,6 +1057,9 @@ class BatchGenWorker:
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
+		# Edge trigger for the prefix_drain metric: set when the row is
+		# emitted, cleared when admission adds new sequences.
+		self._prefix_drain_metric_emitted = False
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
@@ -1043,6 +1073,21 @@ class BatchGenWorker:
 		self._pool_sid_counter = time.time_ns() // 1000
 		self._pool_sid_members = {}  # pool segment pseudo sid -> members reading it
 		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
+		# Scheduler-loop hard guard against identical empty prefill waves with
+		# nothing live; _prepare_prefill_batch publishes the rank-identical
+		# admission state (and its selection snapshot) the guard compares.
+		self._prefill_progress_guard = PrefillProgressGuard()
+		self._prefill_admission_state = None
+		self._prefill_admission_selection = None
+		self._prefill_admission_totals = None
+		# Reduced across ranks by the admission gather, so the guard's verdict
+		# cannot differ by rank.
+		self._prefill_admission_live = False
+		# None / "committed" / "rejected_by_capacity_snapshot" /
+		# "rolled_back_after_allocator_failure": the wave's Host reservation
+		# outcome, folded into the guard state so a rejected transaction is
+		# not mistaken for a wave that selected nothing.
+		self._prefill_reservation_outcome = None
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -1646,6 +1691,8 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# New live work: the next drain is a new edge for the prefix_drain row.
+		self._prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2631,6 +2678,8 @@ class BatchGenWorker:
 					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
 					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
 				)
+
+		self._maybe_emit_prefix_drain_metric()
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
@@ -5890,6 +5939,12 @@ class BatchGenWorker:
 				"rejected collectively before any allocator mutation"
 			)
 		if not capacity_ok:
+			# Record the KIND of outcome (never a counter) for the no-progress
+			# guard: a rejected transaction is a different stall cause from a
+			# wave that selected nothing, so it must not share their streak --
+			# but a rejection that repeats with everything else unchanged is
+			# deterministic, not contention, and must still reach the limit.
+			self._prefill_reservation_outcome = "rejected_by_capacity_snapshot"
 			if self.rank == 0:
 				logging.warning(
 					"[PREFILL] Host KV admission rejected by fresh capacity snapshot; "
@@ -6010,6 +6065,7 @@ class BatchGenWorker:
 						pass
 				self._prefill_pool_wave = None
 			self._release_prefix_cache_attachments(wave_global_ids)
+			self._prefill_reservation_outcome = "rolled_back_after_allocator_failure"
 			return False
 
 		# Commit scalar reservation metadata only after every allocator agrees.
@@ -6029,6 +6085,7 @@ class BatchGenWorker:
 			if state is not None and state.attached_tokens:
 				owned = pages - state.attached_tokens // seq.PAGE_SIZE
 			seq.host_owned_pages = owned
+		self._prefill_reservation_outcome = "committed"
 		return True
 
 	def _collective_host_kv_growth_capacity_ok(
@@ -6157,6 +6214,15 @@ class BatchGenWorker:
 		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
 
 		all_candidates = evicted_uuids + queueing_uuids
+		self._prefill_admission_state = None
+		self._prefill_admission_selection = None
+		self._prefill_admission_totals = None
+		self._prefill_admission_live = False
+		# Reset here, not at the reservation: _prepare_prefill_batch always runs
+		# before _reserve_prefill_host_kv in the scheduler loop, so an iteration
+		# that selects nothing reports "not attempted" rather than carrying the
+		# previous iteration's verdict into the guard.
+		self._prefill_reservation_outcome = None
 		if not all_candidates:
 			return []
 
@@ -6183,31 +6249,119 @@ class BatchGenWorker:
 		# Step 1: Get this node's host KV free pages
 		local_host_free = self._get_host_kv_free_pages()
 
+		# This iteration's live set, reported into the gather below so the
+		# reclaim branch and the scheduler loop's no-progress guard both decide
+		# on the OR across ranks. Read here because nothing between this point
+		# and the guard changes a sequence status -- selection, admission
+		# reclaim and the Host reservation do not -- while a rank-LOCAL read
+		# lets ranks raise on different iterations, i.e. diverge on the very
+		# failure path the guard exists to make clean.
+		local_live = (
+			self.global_batch.has_prefilled()
+			or self.global_batch.has_in_decode()
+			or self.global_batch.has_on_hold()
+		)
+		# Admission reclaim and the guard both branch on the candidate snapshot
+		# each rank builds from its own global_batch. Carry a digest of the
+		# fields that snapshot is derived from, so a divergence is named here
+		# instead of sending one rank into a reclaim collective the others
+		# never enter (same pattern as _check_pool_plan_identical).
+		candidate_digest = self._prefill_candidate_digest(all_candidates)
+		# Prefix-cache pressure moves while a prefix load or an attachment
+		# release is in flight -- an attachment release in particular makes
+		# pages reclaimable WITHOUT changing the free count -- which is what
+		# separates "waiting on something" from "stuck" for the guard. Reading
+		# it scans the coordinator's whole shared node table under its lock
+		# (max_nodes tracks pool pages), so it is taken only when this node has
+		# nothing live, the sole case where the guard can fire: a busy worker
+		# pays nothing. Node-leader only, like the pool stats, and every rank of
+		# the node uses the leader's gathered value, so gating on the leader's
+		# own live set keeps the component rank-uniform.
+		prefix_pressure = (
+			self._prefill_prefix_pressure()
+			if self.local_rank == 0 and not local_live
+			else (-1, -1, -1)
+		)
+
 		# Step 2: Gather host KV plus persistent sequence capacity. Host KV is
-		# one shared region per node, so only the node leader reports it. KDA
+		# one shared region per node, so only the node leader reports it --
+		# free AND total pages, because the total is what makes "this request
+		# can never fit the pool" decidable identically on every rank. KDA
 		# state is per GPU; every rank reports its free count and the scheduler
 		# uses the node minimum. This keeps every rank's selection identical
 		# even if a prior lifecycle bug left one TP group asymmetric.
 		report_node = self.rank // gpus_per_node
 		report_host_free = local_host_free if self.local_rank == 0 else -1
+		report_host_total = (
+			self._get_host_kv_total_pages() if self.local_rank == 0 else -1
+		)
+		# One row per rank; -1 marks "not reported by this rank":
+		#   [0] node id of this rank
+		#   [1] Host KV free pages (node leader only)
+		#   [2] sequence-slot limit scope: 0 none, 1 per rank, 2 per node
+		#   [3] free sequence slots in that scope (-1 when unlimited)
+		#   [4] Host KV total pages (node leader only): decides "can never
+		#       fit" for the per-request rejection and the stall verdict
+		#   [5] live bit: this rank has a prefilled/decoding/on-hold sequence;
+		#       OR-reduced for the reclaim stall check and the progress guard
+		#   [6] candidate digest (_prefill_candidate_digest); must be equal on
+		#       every rank or PrefillAdmissionStateDivergence is raised
+		#   [7..9] prefix-cache pressure of the node (resident nodes, active
+		#       attachments, pending loads; node leader with nothing live
+		#       only), so the guard tells an in-flight wait from a stall
 		free_tensor = torch.tensor(
-			[report_node, report_host_free, limit_scope, local_sequence_free],
+			[
+				report_node, report_host_free, limit_scope, local_sequence_free,
+				report_host_total, int(local_live), candidate_digest,
+				prefix_pressure[0], prefix_pressure[1], prefix_pressure[2],
+			],
 			dtype=torch.int64,
 			device=self.torch_device,
 		)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
 
-		# Extract per-node host KV free pages
+		gathered_digests = {int(item[6].item()) for item in gathered}
+		if len(gathered_digests) != 1:
+			raise PrefillAdmissionStateDivergence(
+				f"prefill admission candidates diverged across ranks: rank "
+				f"{self.rank} digest {candidate_digest} over "
+				f"{len(all_candidates)} candidates; gathered "
+				f"{sorted(gathered_digests)}"
+			)
+		# Rank-uniform liveness. OR, not AND: a false "live" only postpones the
+		# guard, a false "not live" fails a worker that still had work to do.
+		self._prefill_admission_live = any(
+			int(item[5].item()) != 0 for item in gathered
+		)
+
+		# Extract per-node host KV free/total pages and prefix pressure
 		reports_by_node = {}
+		totals_by_node = {}
+		pressure_by_node = {}
 		for item in gathered:
 			node_id = int(item[0].item())
 			host_free = int(item[1].item())
 			if node_id >= 0 and host_free >= 0:
 				reports_by_node[node_id] = host_free
+				totals_by_node[node_id] = int(item[4].item())
+				pressure_by_node[node_id] = (
+					int(item[7].item()), int(item[8].item()), int(item[9].item())
+				)
 		per_node_host_free = []
+		per_node_host_total = []
+		per_node_prefix_pressure = []
 		for node in range(num_nodes):
 			per_node_host_free.append(reports_by_node.get(node, 0))
+			# -1 means "no leader report": an unknown total must not be read as
+			# a zero-page pool that can never fit anything.
+			per_node_host_total.append(totals_by_node.get(node, -1))
+			per_node_prefix_pressure.append(
+				pressure_by_node.get(node, (-1, -1, -1))
+			)
+		# Pool sizes for the stall report. Gathered, so a multi-node stall can
+		# name "can never fit" too, where the old rank-local read could not.
+		self._prefill_admission_totals = tuple(per_node_host_total)
 
 		gathered_scopes = {int(item[2].item()) for item in gathered}
 		if len(gathered_scopes) != 1:
@@ -6275,6 +6429,34 @@ class BatchGenWorker:
 			per_rank_sequence_free=per_rank_sequence_free,
 			per_node_sequence_free=per_node_sequence_free,
 		)
+		# One reservation per candidate, reused by the rejection below, the
+		# reclaim target and the guard state. Independent of free pages, so it
+		# survives the post-reclaim `replace(selection, ...)`.
+		required_pages = {
+			candidate.uuid: PrefillScheduler.required_host_pages(
+				candidate, selection
+			)
+			for candidate in selection.candidates
+		}
+		# A request whose initial Host reservation exceeds its node's WHOLE pool
+		# can never be admitted -- not by this wave, not by any later one, no
+		# matter how much is reclaimed. Fail that REQUEST, not the worker: the
+		# stall exceptions below leave _prepare_prefill_batch for
+		# generate_persistent(), which has no handler for them, so they reach
+		# the worker fatal boundary and take every rank down for one oversized
+		# prompt. Rank-uniform: per_node_host_total is gathered and the
+		# candidate snapshot was digest-checked above, so every rank rejects the
+		# same uuids with no further collective.
+		if self._reject_unsatisfiable_prefill_requests(
+			selection, per_node_host_total, required_pages
+		):
+			# The candidate set changed under the snapshot. Rebuild it on the
+			# next iteration instead of selecting against removed sequences; the
+			# cleared state also resets the no-progress streak, which is correct
+			# -- this iteration did make progress.
+			self._prefill_admission_state = None
+			self._prefill_admission_selection = None
+			return []
 		prefill_batch = PrefillScheduler.select_prefill_batch(selection)
 		# The in-wave prefix pool releases every cross-wave lookup hit and
 		# recomputes it (_plan_prefill_pool_wave), so a hit saves no Host pages
@@ -6339,58 +6521,87 @@ class BatchGenWorker:
 				prefill_batch = PrefillScheduler.select_prefill_batch(
 					estimated_selection
 				)
+		# Admission reclaim targets what the persistent sequence-slot limits
+		# (Kimi-K3/Kimi-Linear KDA state) would admit with a fully reclaimed
+		# Host pool. Without slot limits that is every candidate, i.e. the
+		# previous trigger. A slot-limited model used to be excluded outright,
+		# so retained prefixes filled its Host pool and every later wave
+		# selected zero sequences forever with nothing ever evicted.
+		slot_admissible = PrefillScheduler.slot_admissible_candidates(selection)
+		# Split the slot-admissible set into what this node's pool can hold at all
+		# and what it can never hold, from the GATHERED totals rather than a
+		# rank-local stats read, so every rank enters the branch below -- and
+		# raises its stall -- on one shared verdict. A node whose leader reported
+		# no total (-1) counts as "unknown", never as a zero-page pool.
+		def _fits(candidate) -> bool:
+			total = per_node_host_total[candidate.node_id]
+			return total < 0 or required_pages[candidate.uuid] <= total
+
+		# The reclaim has to buy room for the next candidate the pool CANNOT
+		# take yet, so exclude the ones this wave already admitted: in pool mode
+		# the trigger fires while part of the set is in, and targeting the head
+		# of the whole set would evict for a sequence already admitted.
+		admitted_uuids = set(prefill_batch)
+		fitting_requirements = [
+			required_pages[candidate.uuid] for candidate in slot_admissible
+			if candidate.node_id == report_node
+			and candidate.uuid not in admitted_uuids
+			and _fits(candidate)
+		]
+		any_node_can_fit = any(_fits(c) for c in slot_admissible)
+		reclaim_outcome = (0, 0)
 		if (
 			self.enable_prefix_cache
-			and (len(prefill_batch) < len(selection.candidates) if pool_mode else not prefill_batch)
-			and per_rank_sequence_free is None
-			and per_node_sequence_free is None
+			and slot_admissible
+			and (
+				len(prefill_batch) < len(slot_admissible) if pool_mode
+				else not prefill_batch
+			)
 		):
+			if not any_node_can_fit:
+				# Every slot-admissible candidate needs more than its node's whole
+				# pool. Oversized QUEUEING requests were already failed one by one
+				# above, so what is left is an EVICTED sequence that no longer fits
+				# a pool it did fit once: an engine invariant violation, not a bad
+				# request. Raised before this branch's first collective, on a
+				# verdict every rank computed from the same gathered totals.
+				self._prefill_admission_selection = selection
+				raise PrefillAdmissionStalled(
+					"no prefix-cache request fits the total Host KV pool: "
+					+ self._describe_prefill_admission_blockers()
+				)
 			# No candidate fits even after a non-mutating prefix estimate.
-			# Reclaim against the original full-page requirement so a later
-			# lookup miss cannot make the allocation unsafe. The pool never
-			# reuses retained prefixes, so it reclaims toward every candidate
-			# rather than the smallest one (one sequence per wave otherwise).
+			# Reclaim against the original full-page requirement so a later lookup
+			# miss cannot make the allocation unsafe, and only as far as the head
+			# of the priority order needs (prefill_reclaim_target_pages):
+			# reclaiming for the whole admissible set evicts retained prefixes
+			# this wave will not use, and every one of them is a hot prefix a
+			# later prompt has to recompute.
+			from batchgen.prefix_reuse.eviction import (
+				reclaim_prefix_pages_for_host_admission,
+			)
 			failure = 0
-			has_fitting_candidate = 0
 			updated_local_free = -1
+			released = 0
 			if self.local_rank == 0:
 				try:
 					worker_view = self.core_engine.host_paged_kv_worker_view
 					stats = worker_view.get_stats()
-					requirements = [
-						PrefillScheduler.required_host_pages(candidate, selection)
-						for candidate in selection.candidates
-						if candidate.node_id == report_node
-					]
-					fitting = [
-						pages for pages in requirements
-						if pages <= int(stats.num_total_pages)
-					]
 					updated_local_free = int(stats.num_free_pages)
-					if fitting:
-						has_fitting_candidate = 1
-						required = sum(fitting) if pool_mode else min(fitting)
-						from batchgen.prefix_reuse.eviction import (
-							reclaim_prefix_pages_for_host_admission,
-						)
-						page_target = max(0, required - updated_local_free)
+					required, page_target = prefill_reclaim_target_pages(
+						fitting_requirements=fitting_requirements,
+						free_pages=updated_local_free,
+					)
+					if required:
 						released = reclaim_prefix_pages_for_host_admission(
-								core_engine_module=core_engine,
-								coordinator=self.prefix_cache_coordinator,
-								worker_views_by_group=self._host_views_by_group(),
-								group_id=0,
-								page_target=page_target,
-								max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
-							)
+							core_engine_module=core_engine,
+							coordinator=self.prefix_cache_coordinator,
+							worker_views_by_group=self._host_views_by_group(),
+							group_id=0,
+							page_target=page_target,
+							max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+						)
 						updated_local_free = self._get_host_kv_free_pages()
-						if self.prefix_cache_debug_stats:
-							self._emit_prefix_cache_metric(
-								"prefix_reclaim",
-								reason="host_admission",
-								page_target=int(page_target),
-								released_pages=int(released),
-								**self._prefix_host_resource_fields(),
-							)
 						logging.info(
 							"[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
 							"(free=%s, target=%s)",
@@ -6399,31 +6610,26 @@ class BatchGenWorker:
 						if self.prefix_cache_debug_stats:
 							self._emit_prefix_cache_metric(
 								"prefix_reclaim",
-								reason="scheduler_admission",
+								reason="host_admission",
 								node=int(report_node),
-								page_target=max(
-									0, required - int(stats.num_free_pages)
-								),
+								page_target=int(page_target),
 								released_pages=int(released),
 								**self._prefix_host_resource_fields(),
 							)
 				except Exception:
 					logging.exception("[PREFIX_CACHE] admission eviction failed")
 					failure = 1
-			live_sequences = (
-				self.global_batch.has_prefilled()
-				or self.global_batch.has_in_decode()
-				or self.global_batch.has_on_hold()
-			)
 			failed = torch.tensor(
-				[failure, has_fitting_candidate, int(live_sequences)],
+				[failure, int(released)],
 				dtype=torch.int64, device=self.torch_device,
 			)
 			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
 			if int(failed[0].item()) != 0:
 				raise RuntimeError("prefix cache admission eviction failed on a worker")
-			if int(failed[1].item()) == 0:
-				raise RuntimeError("no prefix-cache request fits the total Host KV pool")
+			# Only the node leader reclaims, so the MAX is the largest per-node
+			# release: rank-uniform, and nonzero exactly when some node freed
+			# pages. It enters the guard state as this wave's reclaim outcome.
+			reclaim_outcome = (1, int(failed[1].item()))
 			updated = torch.tensor(
 				[report_node, updated_local_free],
 				dtype=torch.int64, device=self.torch_device,
@@ -6436,10 +6642,45 @@ class BatchGenWorker:
 					per_node_host_free[node] = free
 			selection = replace(selection, per_node_host_free=tuple(per_node_host_free))
 			prefill_batch = PrefillScheduler.select_prefill_batch(selection)
-			if not prefill_batch:
-				if int(failed[2].item()) == 1:
-					return []
-				raise RuntimeError("prefix cache prefill admission made no progress after eviction")
+			if not prefill_batch and not self._prefill_admission_live:
+				# Nothing is live on ANY rank, so nothing will decode, complete, or
+				# free a page or a slot: an empty wave here would repeat forever.
+				self._prefill_admission_selection = selection
+				raise PrefillAdmissionStalled(
+					"prefix cache prefill admission made no progress after "
+					"eviction with no live sequence: "
+					+ self._describe_prefill_admission_blockers()
+				)
+
+		# Rank-uniform admission state for the scheduler loop's no-progress guard
+		# (PrefillProgressGuard). Every component is gathered, reduced, or derived
+		# from the digest-checked candidate snapshot, and the set is wide enough to
+		# separate a recoverable wait from a true stall: free AND total pages, the
+		# slot vectors, the candidate IDENTITIES with their required pages (a count
+		# alone cannot see one candidate swapped for another), the per-node
+		# prefix-cache pressure counters that move while a load or an attachment
+		# release is in flight, this wave's reclaim outcome, and the reduced live
+		# bit. The scheduler loop folds the Host reservation outcome in on top
+		# (_prefill_admission_guard_state).
+		self._prefill_admission_state = (
+			tuple(per_node_host_free),
+			tuple(per_node_host_total),
+			None if per_rank_sequence_free is None else tuple(per_rank_sequence_free),
+			None if per_node_sequence_free is None else tuple(per_node_sequence_free),
+			tuple(
+				(
+					candidate.uuid,
+					candidate.node_id,
+					candidate.is_evicted,
+					required_pages[candidate.uuid],
+				)
+				for candidate in selection.candidates
+			),
+			tuple(per_node_prefix_pressure),
+			reclaim_outcome,
+			self._prefill_admission_live,
+		)
+		self._prefill_admission_selection = selection
 
 		if self.rank == 0:
 			n_evicted = sum(
@@ -6452,6 +6693,172 @@ class BatchGenWorker:
 			)
 
 		return prefill_batch
+
+	def _describe_prefill_admission_blockers(self) -> str:
+		"""Name the candidates the last admission left out, and why.
+
+		Pool sizes come from the admission gather, not a rank-local stats read:
+		the report is then identical on every rank and covers every node, so a
+		multi-node stall can still say "can never fit".
+		"""
+		selection = self._prefill_admission_selection
+		if selection is None:
+			return "no admission snapshot"
+		totals = self._prefill_admission_totals
+		if (
+			totals is None
+			or len(totals) != selection.num_nodes
+			or any(int(value) < 0 for value in totals)
+		):
+			# A node without a leader report has an unknown pool size; omit the
+			# totals rather than printing a bogus "can never fit".
+			totals = None
+		return describe_prefill_blockers(selection, total_pages_by_node=totals)
+
+	def _get_host_kv_total_pages(self) -> int:
+		"""This node's shared Host-KV pool size in pages."""
+		return int(self.host_paged_kv_worker_view.get_stats().num_total_pages)
+
+	def _prefill_candidate_digest(self, candidate_uuids: List[str]) -> int:
+		"""Digest the inputs the prefill candidate snapshot is derived from.
+
+		Covers identity and ORDER plus every field
+		``_make_prefill_selection_request`` reads, including the two that decide
+		a candidate's node (``assigned_rank``, ``decode_dp_group``). Gathered by
+		the admission collective so a divergence is named instead of letting one
+		rank reclaim, raise, or enter a collective the others do not.
+		"""
+		hasher = hashlib.blake2b(digest_size=7)
+		for uuid in candidate_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			hasher.update(
+				f"{uuid}:{int(seq.status)}:{seq.global_idx}:{seq.prompt_length}:"
+				f"{seq.kv_token_budget}:{seq.PAGE_SIZE}:{seq.assigned_rank}:"
+				f"{seq.decode_dp_group}:"
+				f"{getattr(seq, 'prefill_order', None)};".encode()
+			)
+		return int.from_bytes(hasher.digest(), "little")
+
+	def _prefill_prefix_pressure(self) -> Tuple[int, int, int]:
+		"""``(resident_nodes, active_attachments, pending_loads)`` of this node.
+
+		Folded into the admission state so the no-progress guard can tell a wave
+		waiting on an in-flight prefix load or an attachment release from one
+		that is truly stuck. Read on the node leader only and distributed by the
+		admission gather, so every rank of the node sees one value. Diagnostic
+		read: an unreadable coordinator reports the ``-1`` sentinel instead of
+		masking the stall, and the sentinel is itself a state component.
+		"""
+		coordinator = getattr(self, "prefix_cache_coordinator", None)
+		if not self.enable_prefix_cache or coordinator is None:
+			return (-1, -1, -1)
+		try:
+			stats = coordinator.get_stats()
+			return (
+				int(stats.resident_nodes),
+				int(stats.active_attachments),
+				int(stats.pending_load_entries) + int(stats.pending_load_refs),
+			)
+		except Exception:
+			logging.exception(
+				"[PREFILL] prefix cache pressure unavailable for the admission state"
+			)
+			return (-1, -1, -1)
+
+	def _prefill_admission_guard_state(self):
+		"""The guard's state: the admission snapshot plus the wave's outcome.
+
+		``_prefill_admission_state`` is built before the Host reservation, so a
+		wave the fresh capacity transaction rejected would otherwise be
+		indistinguishable from a wave that selected nothing — two different
+		causes sharing one streak. ``None`` (no candidates) stays ``None``, which
+		resets the guard.
+		"""
+		if self._prefill_admission_state is None:
+			return None
+		return self._prefill_admission_state + (self._prefill_reservation_outcome,)
+
+	def _reject_unsatisfiable_prefill_requests(
+		self,
+		selection,
+		per_node_host_total: List[int],
+		required_pages: Dict[str, int],
+	) -> List[str]:
+		"""Fail every QUEUEING request larger than its node's whole Host pool.
+
+		Such a request can never be admitted, by this wave or any later one, so
+		leaving it queued blocks the queue until the no-progress guard kills the
+		worker over one oversized prompt. It is reported on the same per-request
+		error channel admission uses for ``context_length_exceeded``
+		(``SequenceStatus`` has no failure state) and dropped from
+		``global_batch``. Admission already bound the request a full
+		model-context reservation in the unified trajectory pool (its token
+		store), so that reservation is released here exactly as completion
+		releases it, together with any local QueryBook slot; otherwise every
+		rejected request would shrink the pool for the process lifetime.
+
+		EVICTED candidates are deliberately NOT rejected here: a sequence that
+		fitted the pool once and no longer does is an engine invariant
+		violation, not a bad request, and must keep failing by name.
+
+		Pure decision, no collective: ``per_node_host_total`` is gathered and
+		the candidate snapshot was digest-checked, so every rank rejects exactly
+		the same uuids. Returns the rejected uuids in candidate order.
+		"""
+		impossible: List[Tuple[str, int, int]] = []
+		for candidate in selection.candidates:
+			if candidate.is_evicted:
+				continue
+			total = int(per_node_host_total[candidate.node_id])
+			if total < 0:
+				continue
+			needed = int(required_pages[candidate.uuid])
+			if needed > total:
+				impossible.append((candidate.uuid, needed, total))
+		if not impossible:
+			return []
+		rejected: List[str] = []
+		for uuid, needed, total in impossible:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			rejected.append(uuid)
+			if self.rank == 0:
+				logging.error(
+					"[PREFILL] Rejecting %s: initial Host KV reservation %s pages "
+					"exceeds the whole node pool (total=%s)",
+					uuid[:8], needed, total,
+				)
+			if (
+				self._trajectory_book is not None
+				and self._trajectory_book.has_sequence(uuid)
+			):
+				self._trajectory_book.release(self._trajectory_book.slot_for(uuid))
+				seq._buffer_slot = -1
+			release_local_query_slot(
+				uuid,
+				uuid_to_local_map=self._uuid_to_local_map,
+				local_to_uuid_map=self._local_to_uuid_map,
+				query_book=self.query_book,
+				free_local_indices=self._free_local_indices,
+			)
+			if self.rank == 0 and self._response_queue is not None:
+				self._response_queue.put({
+					"type": "completion",
+					"request_id": uuid,
+					"batch_id": getattr(seq, "batch_id", None),
+					"error": {
+						"code": "host_kv_capacity_exceeded",
+						"message": (
+							f"Prompt needs {needed} Host KV pages, more than the "
+							f"whole node pool ({total} pages)"
+						),
+					},
+					"text": "",
+				})
+			self.global_batch.remove_sequence(uuid)
+		self._publish_trajectory_pool_capacity()
+		return rejected
 
 	def _prefill_sequence_limits(self) -> dict:
 		"""Return persistent model-state limits for prefill admission.
@@ -7932,6 +8339,20 @@ class BatchGenWorker:
 					# QUEUEING/EVICTED state untouched and retry on a later scheduler
 					# iteration after the live pool has changed.
 					prefill_uuids = []
+				# Hard guard: an iteration that admits nothing while nothing is
+				# live runs no decode either, so it repeats unchanged. Fail by
+				# name after a bounded streak instead of spinning forever.
+				# Both inputs are rank-uniform -- the live bit is the OR the
+				# admission collective gathered, the state is gathered or
+				# derived from a digest-checked snapshot -- so every rank
+				# raises on the SAME iteration instead of diverging on the
+				# failure path.
+				self._prefill_progress_guard.observe(
+					admitted=len(prefill_uuids),
+					live=self._prefill_admission_live,
+					state=self._prefill_admission_guard_state(),
+					describe=self._describe_prefill_admission_blockers,
+				)
 				
 				if prefill_uuids:
 					if self.rank == 0:
@@ -8036,6 +8457,11 @@ class BatchGenWorker:
 							device=self.torch_device,
 							reason="end of prefill",
 						)
+						# Every D2H of the wave has retired, and the segment
+						# pseudo sequences still hold their page tables: the
+						# only window where a row's destination Host bytes can
+						# be read back and compared to its source.
+						self._verify_prefill_pool_offload_bytes()
 						self._finish_prefill_pool_wave()
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
@@ -10171,6 +10597,29 @@ class BatchGenWorker:
 			worker_view=self.core_engine.host_paged_kv_worker_view,
 		)
 
+	def _maybe_emit_prefix_drain_metric(self) -> None:
+		"""Emit one prefix_drain row when the live sequence set drains to empty.
+
+		Called from _report_completion, which every completion path runs after
+		the sequence reached COMPLETED and its Host pages and prefix
+		attachments were released, so the row records active_attachments at the
+		drain moment. Live means any status other than COMPLETED: a QUEUEING,
+		IN_PREFILL, PREFILLED, IN_DECODE, ON_HOLD or EVICTED sequence can still
+		hold or regain an attachment. Edge-triggered: one row per drain,
+		re-armed by _admit_sequences_from_message.
+		"""
+		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
+			return
+		if self._prefix_drain_metric_emitted:
+			return
+		if not self.global_batch.all_completed():
+			return
+		self._prefix_drain_metric_emitted = True
+		self._emit_prefix_cache_metric(
+			"prefix_drain",
+			**self._prefix_host_resource_fields(),
+		)
+
 	def _close_prefix_materialization(
 		self, materialization, *, empty_cuda_cache: bool
 	) -> None:
@@ -10888,7 +11337,11 @@ class BatchGenWorker:
 				f"{geometry_page_bytes} B"
 			)
 		wave.pool = pool
-		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
+		pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
+		wave.executor = PoolChunkExecutor(
+			wave.plan, wave.prompts, pool,
+			pad_poison=self._pool_pad_poison_enabled(wave),
+		)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -11058,6 +11511,18 @@ class BatchGenWorker:
 			self.parallel_manager, "gather_prefill_last_token_hidden", None
 		)
 		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
+		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
+		epilogue_trace = self._new_pool_epilogue_tracer(wave)
+		if epilogue_trace is not None:
+			# The wave boundary is the earliest point this seam can stamp: the
+			# plan and the Host attachment happen in the reservation
+			# transaction, before this method is entered.
+			epilogue_trace.phase(
+				"wave_begin",
+				rows=len(wave.plan.segments) + len(wave.global_ids),
+				tokens=wave.plan.computed_tokens,
+				chunks=len(wave.plan.chunks),
+			)
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -11078,11 +11543,23 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_layer_map = (
 			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
+		)
+		offload_recorder_handed_off = False
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
 				rows = wave.executor.build(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_begin(
+						epilogue_trace.chunk + 1,
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				host_ids, host_starts = wave.row_host_targets(rows)
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
@@ -11129,6 +11606,18 @@ class BatchGenWorker:
 						).view(batch_sz, seq_sz, hidden_dim)
 					if gather_last_token_hidden is None:
 						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+						if epilogue_trace is not None:
+							# No gather exists on this manager, so the rank
+							# holds every row. record_unsharded_gather asserts
+							# that against the manager instead of trusting
+							# this branch: a hand-written single-rank record on
+							# a sharded path would report a broken multi-rank
+							# gather as healthy.
+							self._record_unsharded_epilogue_gather(
+								epilogue_trace,
+								last_hidden,
+								num_global_rows=int(rows.input_ids.numel()),
+							)
 					else:
 						# Streamed-SP8 holds only this rank's row shard, so the
 						# tail rows are reassembled over the group.
@@ -11136,6 +11625,11 @@ class BatchGenWorker:
 							self.model.model.norm(hidden_states),
 							rows.tail_rows,
 							int(rows.input_ids.numel()),
+							**(
+								{"trace": epilogue_trace}
+								if epilogue_trace is not None
+								else {}
+							),
 						)
 					logits = (
 						self.model.lm_head.forward(last_hidden).float()
@@ -11150,12 +11644,36 @@ class BatchGenWorker:
 					)
 					for row, index in enumerate(rows.tail_wave_indices):
 						tokens_by_index[index] = selected[row]
+					if epilogue_trace is not None:
+						# The pairing side of the trace: the row -> wave index
+						# -> uuid -> global id chain, beside the gather-side
+						# facts the recorder already holds.
+						epilogue_trace.emit(
+							table_rows=[
+								row for row, item in enumerate(rows.items)
+								if item.kind == "tail"
+							],
+							tail_rows=rows.tail_rows.tolist(),
+							wave_indices=list(rows.tail_wave_indices),
+							global_ids=list(wave.global_ids),
+							uuids=list(wave.uuids),
+							tokens=[int(token) for token in selected],
+							# The SAME tensor _select_tokens consumed: full
+							# vocabulary in both branches (the vocab-parallel
+							# head all-gathers before returning).
+							logits=logits,
+						)
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
 				block_residual = None
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_end(
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				# Allocated bytes are what a chunk needs. The allocator's reserve
 				# grows into whatever the pool left free and drops cached blocks
 				# only when a cudaMalloc fails, so it is reported, not checked.
@@ -11174,12 +11692,27 @@ class BatchGenWorker:
 						f"{workspace} B kept beside the prefix pool"
 					)
 			prefill_s = time.perf_counter() - start
+			if epilogue_trace is not None:
+				# The last stamp a rank emits before it leaves the pooled
+				# prefill: comparing wave_end across the two nodes is what
+				# shows whether one group entered decode while the other was
+				# still inside a pooled chunk.
+				epilogue_trace.phase(
+					"wave_end",
+					elapsed_ms=prefill_s * 1e3,
+					tokens=executed,
+					chunks=len(wave.plan.chunks),
+				)
 			if executed != wave.plan.computed_tokens:
 				raise RuntimeError(
 					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
 					f"{wave.plan.computed_tokens}"
 				)
 			wave.executor.close()
+			# The wave reached its end, so the offload recorder is handed to
+			# _verify_prefill_pool_offload_bytes - which runs after the D2H has
+			# retired, outside this method - and only it may clear the recorder.
+			offload_recorder_handed_off = True
 		finally:
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
@@ -11187,6 +11720,15 @@ class BatchGenWorker:
 			# has to live across the chunks that continue it, so it is released
 			# here — the wave is over and no later batch carries those ids.
 			self._release_kda_state_slots(list(wave.segment_sids.values()))
+			# Probe recorder teardown, unconditional: a wave that died anywhere
+			# above must not leave its records attached to a class attribute or
+			# to a pool the next wave inherits. The dump recorder is finished
+			# either way - it writes per chunk, nothing consumes it later - and
+			# the offload recorder is dropped UNLESS this wave completed and
+			# handed it to the post-D2H verification step.
+			wave.pool.kernel_dump = None
+			if not offload_recorder_handed_off:
+				AttnWrapperBase.prefill_pool_offload_recorder = None
 			wave.pool.k = wave.pool.v = wave.pool.indexer = None
 			AttnWrapperBase.prefill_pool = None
 			AttnWrapperBase.prefill_pool_batch = None
@@ -11221,6 +11763,287 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _pool_probe_debug(self, wave):
+		"""The probe keys this wave armed, or None. Read ONCE per wave.
+
+		The four pooled probes (epilogue trace, offload byte check, kernel dump,
+		pad poison) are armed through the same batch-level seam as
+		``prefix_rank_assignment_mode``: the flag rides on the wave's own
+		sequences, so a batch arms a probe against a server that is already up.
+
+		Off is the production path and has to cost nothing measurable, so this
+		is the ONLY place that walks the wave's sequences, the answer is cached
+		on the wave, and the walk itself allocates nothing: a member whose
+		``batchgen_debug`` is absent costs one attribute read, and the result
+		dict is not created until a probe key is actually found. Each probe's
+		own setup then imports its module only after this returned non-None.
+		"""
+
+		if wave.probe_debug_read:
+			return wave.probe_debug
+		armed = None
+		server_debug = self._batchgen_debug
+		if server_debug:
+			# Server-level ``--batchgen-debug`` wins outright, exactly as
+			# _active_batchgen_debug_for_sequences has it.
+			for key in _POOL_PROBE_DEBUG_KEYS:
+				value = server_debug.get(key)
+				if value is not None:
+					if armed is None:
+						armed = {}
+					armed[key] = value
+		else:
+			for uuid in wave.uuids:
+				seq_debug = getattr(
+					self.global_batch.get_sequence(uuid), "batchgen_debug", None
+				)
+				if not isinstance(seq_debug, dict):
+					continue
+				for key in _POOL_PROBE_DEBUG_KEYS:
+					value = seq_debug.get(key)
+					# First member that names a key wins, as the merge in
+					# _active_batchgen_debug_for_sequences does.
+					if value is None or (armed is not None and key in armed):
+						continue
+					if armed is None:
+						armed = {}
+					armed[key] = value
+		wave.probe_debug = armed
+		wave.probe_debug_read = True
+		return armed
+
+	def _new_pool_epilogue_tracer(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
+
+		Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
+		flag rides on the wave's own sequences. Traces the only stretch of the
+		pooled path the local oracles and the GPU replays never reached - the
+		tail-row gather, the streamed-SP8 shard reassembly and the row ->
+		wave index -> uuid -> sequence pairing that carries a hidden state to
+		sampling. Returns None when the batch did not ask.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None and this method touches
+		nothing else. A malformed flag value is a diagnostics failure, not a
+		serving failure, so it leaves a ``probe_error`` line and no tracer.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		tracer = run_probe(
+			"epilogue_trace.setup",
+			lambda: tracer_from_debug(debug, rank=self.rank, path="pool"),
+			rank=self.rank,
+		)
+		if tracer is None:
+			return None
+		logging.info(
+			"[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
+			"chunks=%s probe_token=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			len(wave.plan.chunks),
+			tracer.probe_token,
+		)
+		return tracer
+
+	def _record_unsharded_epilogue_gather(
+		self, tracer, selected, *, num_global_rows
+	) -> None:
+		"""Hand-write the gather record for a path with NO sharded gather.
+
+		Both prefill paths have a branch where the parallel manager exposes no
+		``gather_prefill_last_token_hidden`` at all, so this rank holds every
+		row and the gather-side facts are trivially ``tp=0/1, owned=all``. That
+		is the ONLY record a caller may write itself, and
+		``record_unsharded_gather`` asserts the premise against the manager
+		rather than taking the branch's word for it - the alternative is a
+		trace that reports a broken multi-rank gather as healthy, which is the
+		one failure an acceptance probe must never have.
+
+		Where a gather DOES exist the tracer goes into it (``trace=``) and the
+		record is written from inside, with the real shard and owned mask.
+		"""
+
+		from batchgen.prefix_reuse.epilogue_trace import record_unsharded_gather
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		run_probe(
+			"epilogue_trace.gather_unsharded",
+			lambda: record_unsharded_gather(
+				tracer,
+				selected,
+				num_global_rows=num_global_rows,
+				manager=self.parallel_manager,
+			),
+			rank=self.rank,
+		)
+
+	def _new_pool_kernel_dump_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		wave's own sequences. The value is the mode, ``"sync"`` or
+		``"nosync"`` - with ``sync`` the probe synchronizes before reading the
+		pool back, so a corruption that only survives ``nosync`` is a
+		write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
+		directory (default /dev/shm). Returns None when the batch did not ask.
+
+		The flag check comes BEFORE the import, and the whole setup - mode
+		parse, directory resolution, the recorder's own ``makedirs`` - is
+		guarded: an undumpable directory must cost the dump, not the wave.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.kernel_dump import (
+			DEBUG_FLAG as _POOL_DUMP_FLAG,
+			DUMP_DIR_FLAG as _POOL_DUMP_DIR_FLAG,
+			PoolKernelDumpRecorder,
+			dump_directory,
+			parse_dump_mode,
+		)
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		mode = run_probe(
+			"kernel_dump.setup",
+			lambda: parse_dump_mode(debug.get(_POOL_DUMP_FLAG)),
+			rank=self.rank,
+		)
+		if mode is None:
+			return None
+		directory = run_probe(
+			"kernel_dump.setup",
+			lambda: dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank),
+			rank=self.rank,
+		)
+		if directory is None:
+			return None
+		logging.info(
+			"[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
+			"segments=%s page_tokens=%s",
+			self.rank,
+			mode,
+			directory,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return run_probe(
+			"kernel_dump.setup",
+			lambda: PoolKernelDumpRecorder(
+				rank=self.rank,
+				mode=mode,
+				directory=directory,
+				page_tokens=wave.page_tokens,
+				global_ids=list(wave.global_ids),
+			),
+			rank=self.rank,
+		)
+
+	def _pool_pad_poison_enabled(self, wave) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
+
+		Read through the same seam as ``prefix_pool_offload_check``: the flag
+		rides on the wave's own sequences, so a batch arms the probe against a
+		server that is already up. False when the batch did not ask, which
+		leaves the packed page table byte-identical to the default.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return False
+		from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
+
+		if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
+			return False
+		logging.info(
+			"[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
+			"with its own last page: members=%s segments=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+		)
+		return True
+
+	def _new_pool_offload_check_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
+
+		Read through the same seam as ``prefix_rank_assignment_mode``: the flag
+		rides on the wave's own sequences, so a batch arms the check against a
+		server that is already up and no env var exists for it. Returns None
+		when the batch did not ask, which is what keeps the check free.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.offload_check import (
+			DEBUG_FLAG as _POOL_OFFLOAD_CHECK_FLAG,
+			PoolOffloadCheckRecorder,
+		)
+
+		if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
+			return None
+		logging.info(
+			"[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
+			"members=%s segments=%s page_tokens=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		return run_probe(
+			"offload_check.setup",
+			lambda: PoolOffloadCheckRecorder(
+				rank=self.rank, page_tokens=wave.page_tokens
+			),
+			rank=self.rank,
+		)
+
+	def _verify_prefill_pool_offload_bytes(self) -> None:
+		"""Compare every pooled row's Host destination bytes to its source.
+
+		Runs at the one point where that is both meaningful and safe: after the
+		wave's D2H has retired, so the destination pages are written, and before
+		``_finish_prefill_pool_wave`` publishes the segments and drops the
+		pseudo-sequence page tables the check reads back through.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.offload_check import verify_pool_offload_rows
+
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		recorder = AttnWrapperBase.prefill_pool_offload_recorder
+		if recorder is None:
+			return
+		# Cleared before the comparison, not after: the recorder is this wave's
+		# and must not survive a failure in the verification of its own rows.
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+		wave = self._prefill_pool_wave
+		wave_tag = (
+			f"m{len(wave.uuids)}s{len(wave.plan.segments)}"
+			if wave is not None
+			else "-"
+		)
+		run_probe(
+			"offload_check.verify",
+			lambda: verify_pool_offload_rows(
+				recorder.rows, logger=logging, wave_tag=wave_tag
+			),
+			rank=self.rank,
+		)
 
 	def _finish_prefill_pool_wave(self) -> None:
 		"""After every D2H retired: publish the segments, pin members to them.
@@ -11763,6 +12586,31 @@ class BatchGenWorker:
 			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
+		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
+		# same keys as the pooled wave, so one armed batch traces whichever
+		# prefill runs (the first batch on a fresh server, or reuse OFF).
+		# None in production: ``prefill_debug`` is read once above for
+		# ``k3_prefill_profile``, and this one membership test on it is the
+		# whole cost of the trace being off - no tracer, no import.
+		unpooled_trace = None
+		if _EPILOGUE_TRACE_DEBUG_FLAG in prefill_debug:
+			from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+			from batchgen.prefix_reuse.probe_guard import run_probe
+
+			unpooled_trace = run_probe(
+				"epilogue_trace.setup",
+				lambda: tracer_from_debug(
+					prefill_debug, rank=self.rank, path="unpooled"
+				),
+				rank=self.rank,
+			)
+		if unpooled_trace is not None:
+			logging.info(
+				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
+				"micro_batches=%s probe_token=%s",
+				self.rank, len(prefill_sequences), len(micro_batches),
+				unpooled_trace.probe_token,
+			)
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
@@ -12050,11 +12898,34 @@ class BatchGenWorker:
 					last_token_hidden = hidden_states[
 						0, last_token_indices, :
 					]
+					if unpooled_trace is not None:
+						# Genuinely single-rank: this manager has no gather, so
+						# the rank holds every row. Asserted inside, not
+						# assumed - see _record_unsharded_epilogue_gather.
+						unpooled_trace.begin_chunk(batch_idx)
+						self._record_unsharded_epilogue_gather(
+							unpooled_trace,
+							last_token_hidden,
+							num_global_rows=int(hidden_states.shape[1]),
+						)
 				else:
+					# The tracer goes INTO the real gather, exactly as on the
+					# pooled path: under streamed-SP8 this rank holds only a
+					# row shard, and the shard bounds, the owned mask and the
+					# norms either side of the all-reduce are visible only in
+					# there. Writing a tp=0/1 record out here instead would
+					# report a broken multi-rank gather as healthy.
+					if unpooled_trace is not None:
+						unpooled_trace.begin_chunk(batch_idx)
 					last_token_hidden = gather_last_token_hidden(
 						hidden_states,
 						last_token_indices,
 						batch_input_ids_flat.numel(),
+						**(
+							{"trace": unpooled_trace}
+							if unpooled_trace is not None
+							else {}
+						),
 					)
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
@@ -12089,6 +12960,22 @@ class BatchGenWorker:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+					)
+				if unpooled_trace is not None:
+					# One line per sequence, from the SAME logits the token
+					# choice consumed. The gather-side facts were recorded by
+					# the gather itself (or, where no gather exists, by the
+					# asserted single-rank helper), so nothing is hand-written
+					# here: the chunk was opened before the gather so those
+					# records survive to this line.
+					unpooled_trace.emit(
+						table_rows=list(range(batch_num_seqs)),
+						tail_rows=last_token_indices.tolist(),
+						wave_indices=list(range(batch_num_seqs)),
+						global_ids=[int(seq.global_idx) for seq in batch_sequences],
+						uuids=[str(seq.uuid) for seq in batch_sequences],
+						tokens=[int(token) for token in batch_new_tokens],
+						logits=logits,
 					)
 				output_tokens.append(batch_new_tokens)
 
