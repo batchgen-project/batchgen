@@ -166,6 +166,8 @@ class WorkerManager:
         self._mp_ctx = mp.get_context("spawn")
         self.request_queue: Optional[mp.Queue] = None
         self.response_queue: Optional[mp.Queue] = None
+        # Cohort-scoped teardown flag; bound with the channels below.
+        self._cohort_shutdown_event: Optional[Any] = None
         self._create_worker_channels()
         self.worker_process = None
         self.started = False
@@ -613,6 +615,18 @@ class WorkerManager:
                 # registrations and mappings before the signal fallback uses
                 # os._exit().  Workers blocked in NCCL or otherwise unable to
                 # consume the sentinel still follow the existing pidfd path.
+                #
+                # The out-of-band Event goes first, before the sentinel: a
+                # rank blocked in a collective consumes neither the sentinel
+                # (only rank 0 reads the queue) nor the status broadcast
+                # (itself a collective), so the Event is the only signal that
+                # reaches it.  Its watchdog gives the graceful path a short
+                # window and then aborts the communicators, which turns the
+                # blocked collective into an error the worker retires through
+                # the same ordered teardown.  The grace and signal fallback
+                # below are unchanged and remain the safety net.
+                if self._cohort_shutdown_event is not None:
+                    self._cohort_shutdown_event.set()
                 sentinel_sent = False
                 try:
                     self.request_queue.put(None)
@@ -750,9 +764,18 @@ class WorkerManager:
 
         The channels are cohort-scoped: every worker generation gets its own
         pair, so nothing a previous cohort wrote is ever read again.
+
+        The cohort's shutdown Event is bound here for the same reason.  It is
+        the out-of-band teardown signal: the queue sentinel below reaches only
+        rank 0, and the status tensor the other ranks learn shutdown from is
+        itself a collective, so a rank blocked in NCCL is reachable by
+        neither.  The Event reaches every local rank directly, and rotating it
+        with the cohort keeps a new generation from ever starting up already
+        holding the previous teardown's flag.
         """
         self.request_queue = self._mp_ctx.Queue()
         self.response_queue = self._mp_ctx.Queue()
+        self._cohort_shutdown_event = self._mp_ctx.Event()
 
     def _abandon_worker_channels(self) -> None:
         """Release the previous cohort's queues WITHOUT reading them.
@@ -790,6 +813,9 @@ class WorkerManager:
                     )
         self.request_queue = None
         self.response_queue = None
+        # The Event belongs to the cohort that was just torn down; the next
+        # one is created with its channels.
+        self._cohort_shutdown_event = None
 
     def _release_host_kv_sequences(self) -> None:
         for manager in (self.host_kv_manager, self.host_kv_aux_manager):
@@ -1185,6 +1211,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
                 self._fatal_ack_event,
+                self._cohort_shutdown_event,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,

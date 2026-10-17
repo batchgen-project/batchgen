@@ -32,6 +32,20 @@ from batchgen.server.watchdog import Watchdog
 _WORKER_FATAL_STORE_KEY = "batchgen_worker_fatal_v1"
 _WORKER_FATAL_ACK_TIMEOUT_S = 5.0
 
+# How long the shutdown watchdog lets the graceful path finish before it
+# aborts this worker's communicators.  A worker that is NOT stuck leaves the
+# main loop well inside this window (it consumes the queue sentinel or the
+# status broadcast) and the watchdog then does nothing at all.  A worker
+# blocked inside a collective because a peer died cannot reach either signal,
+# and only an abort makes that collective return.
+_SHUTDOWN_ABORT_GRACE_S = 5.0
+
+# Exit-path markers.  Every worker emits exactly one of these, so a teardown
+# can be read back per worker instead of inferred from timings.
+_EXIT_PATH_SENTINEL = "ordered-via-sentinel"
+_EXIT_PATH_ABORT = "ordered-via-abort"
+_EXIT_PATH_SIGNAL = "signal-fallback"
+
 # This worker's share of the run's liveness lock.  It is module state, not a
 # local, because it must outlive every function here: the kernel releases the
 # lock only when this process's last descriptor closes, which is what proves to
@@ -198,6 +212,111 @@ def _start_worker_fatal_monitor(
 	).start()
 
 
+def _abort_all_process_groups() -> None:
+	"""Abort every process group this worker created, the default one included.
+
+	Grounded in the installed torch (2.8.0 on the dev machine):
+	``torch/distributed/distributed_c10d.py:2232``,
+	``_abort_process_group(group=None)``.  Called with no group it aborts all
+	registered groups inside a single ``ncclGroupStart``/``ncclGroupEnd``
+	region, which is exactly what keeps two communicators' aborts from
+	deadlocking each other (pytorch/pytorch#119797), and it walks them in a
+	deterministic order (``_world.pg_names`` reverse-sorted, i.e. subgroups
+	before the default group).  Aborting group by group from here would
+	reintroduce that deadlock, so the abort is this one call and the ordering
+	is torch's.
+
+	The call also clears torch's ``_world`` and drops the default group, so
+	``dist.is_initialized()`` is False afterwards -- the ordered teardown must
+	not call ``destroy_process_group()`` unconditionally after it.
+	"""
+	try:
+		from torch.distributed.distributed_c10d import _abort_process_group
+	except ImportError as exc:
+		# Fail with the API that is missing named, never silently skip the
+		# abort: without it a blocked rank waits out the full teardown grace.
+		raise RuntimeError(
+			"torch.distributed.distributed_c10d._abort_process_group is "
+			f"missing from torch {torch.__version__}; the shutdown abort "
+			"watchdog has no communicator-abort API to call"
+		) from exc
+	_abort_process_group()
+
+
+def _resolve_main_loop_exit(
+	global_rank: int,
+	shutdown_event: Optional[mp.Event],
+	error: BaseException,
+) -> str:
+	"""Classify an error out of the main loop: this cohort's teardown, or fatal.
+
+	The abort the watchdog performs to unblock a stuck collective cannot be
+	told apart from a real communicator failure by exception type -- both
+	arrive as an error from a collective.  The cohort shutdown Event is the
+	only thing that separates them, and nothing but teardown sets it, so an
+	error that arrives with the Event unset is re-raised untouched and keeps
+	today's fatal behavior.
+	"""
+	if shutdown_event is None or not shutdown_event.is_set():
+		raise error
+	logging.warning(
+		"Rank %s: main loop left through the shutdown abort; running the "
+		"ordered teardown",
+		global_rank,
+		exc_info=error,
+	)
+	return _EXIT_PATH_ABORT
+
+
+def _start_shutdown_abort_watchdog(
+	global_rank: int,
+	shutdown_event: Optional[mp.Event],
+	loop_exited: threading.Event,
+	abort_process_groups: Optional[Any] = None,
+) -> Optional[threading.Thread]:
+	"""Let a collective blocked at teardown return instead of hanging.
+
+	The only thing this thread ever waits on is the cohort shutdown Event,
+	which nothing but ``WorkerManager._stop_workers`` sets.  It therefore
+	cannot fire during healthy serving: there is no timeout and no heartbeat
+	in this path.  Once teardown has set the Event the graceful path still
+	gets ``_SHUTDOWN_ABORT_GRACE_S`` to leave the main loop on its own, and
+	only a loop still running after that window is aborted.
+	"""
+	if shutdown_event is None:
+		return None
+	abort = abort_process_groups or _abort_all_process_groups
+
+	def _watch() -> None:
+		shutdown_event.wait()
+		if loop_exited.wait(timeout=_SHUTDOWN_ABORT_GRACE_S):
+			# The main loop honoured the sentinel/broadcast by itself.
+			return
+		logging.warning(
+			"Rank %s: main loop still running %.1fs after shutdown was "
+			"requested; aborting this worker's process groups so the blocked "
+			"collective returns",
+			global_rank,
+			_SHUTDOWN_ABORT_GRACE_S,
+		)
+		try:
+			abort()
+		except Exception:
+			# The signal fallback in WorkerManager still covers this worker.
+			logging.exception(
+				"Rank %s: aborting process groups at shutdown failed",
+				global_rank,
+			)
+
+	thread = threading.Thread(
+		target=_watch,
+		name=f"worker-shutdown-abort-{global_rank}",
+		daemon=True,
+	)
+	thread.start()
+	return thread
+
+
 def _setup_nccl_env():
 	"""
 	Set up NCCL environment variables for better reliability in multi-node setups.
@@ -272,6 +391,7 @@ def server_worker_main(
 	args: BatchGenWorkerArgs,
 	ready_event: Optional[mp.Event] = None,
 	fatal_ack_event: Optional[mp.Event] = None,
+	shutdown_event: Optional[mp.Event] = None,
 ):
 	try:
 		_server_worker_main_impl(
@@ -281,6 +401,7 @@ def server_worker_main(
 			args,
 			ready_event,
 			fatal_ack_event,
+			shutdown_event,
 		)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
@@ -328,6 +449,7 @@ def _server_worker_main_impl(
 	args: BatchGenWorkerArgs,
 	ready_event: Optional[mp.Event] = None,
 	fatal_ack_event: Optional[mp.Event] = None,
+	shutdown_event: Optional[mp.Event] = None,
 ):
 	"""
 	The main loop for the GPU workers.
@@ -366,6 +488,13 @@ def _server_worker_main_impl(
 			logging.info(
 				"[shutdown] worker process-group teardown elapsed=%.3fs",
 				time.monotonic() - start,
+			)
+			# This worker is about to os._exit from the signal handler, so
+			# its ordered teardown did not run; name the path it took.
+			logging.info(
+				"[shutdown] worker exit path=%s rank=%s",
+				_EXIT_PATH_SIGNAL,
+				getattr(args, "global_rank", "unknown"),
 			)
 
 	install_worker_signal_handlers(_worker_shutdown_callback)
@@ -525,93 +654,119 @@ def _server_worker_main_impl(
 	QUEUE_POLL_TIMEOUT = 30.0  # Rank 0 polls queue every 30 seconds
 
 	logging.info(f"Entering main server loop on rank {global_rank}.")
-	while True:
-		# --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
-		task_data = None
-		work_available = False
 
-		while not work_available:
-			if global_rank == 0:
-				# Rank 0: Non-blocking poll on queue with timeout
-				try:
-					task_data = request_queue.get(timeout=QUEUE_POLL_TIMEOUT)
-					work_available = True
-				except Exception:
-					# Queue.get timeout - no work yet, signal others
-					work_available = False
-			
-			# All ranks synchronize on work availability status
-			# This is a fast broadcast (single int) that keeps NCCL alive
-			status_tensor = torch.tensor([1 if work_available else 0], dtype=torch.int32, device='cuda')
-			dist.broadcast(status_tensor, src=0)
-			work_available = status_tensor.item() == 1
-			
-			if not work_available:
-				# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
-				# Also feed watchdog to prevent false stuck detection during idle periods
-				watchdog.feed()
-				# Loop back and poll again
-				continue
+	# The abort watchdog is armed with the loop and waits on the cohort
+	# shutdown Event alone, so arming it here cannot affect serving.
+	loop_exited = threading.Event()
+	_start_shutdown_abort_watchdog(global_rank, shutdown_event, loop_exited)
+	exit_path = _EXIT_PATH_SENTINEL
+	try:
+		while True:
+			# --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
+			task_data = None
+			work_available = False
 
-		# --- STEP 2: Broadcast full task to all ranks ---
-		task_container = [task_data]
-		dist.broadcast_object_list(task_container, src=0)
-		task_data = task_container[0]
-
-		# --- STEP 3: Shutdown Check ---
-		if task_data is None:
-			logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
-			break
-		
-		# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
-		if isinstance(task_data, dict) and task_data.get("type") == "init":
-			logging.info(f"Rank {global_rank}: Pool mode init received")
-			try:
-				current_max_output = task_data.get("max_output_len", 4096)
-				max_context_length = task_data.get("max_context_length", None)
-
-				# Initialize worker with pool capacity (no sequences yet)
-				worker.Init(None, current_max_output, 0,
-					max_context_length=max_context_length)
-
-				# Set admission and response queues for persistent generate()
-				worker.set_admission_queue(request_queue)
-				worker.set_response_queue(response_queue)
-				worker._publish_trajectory_pool_capacity()
-
+			while not work_available:
 				if global_rank == 0:
-					logging.info(
-						f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
-						f"Entering persistent generate() loop."
-					)
+					# Rank 0: Non-blocking poll on queue with timeout
+					try:
+						task_data = request_queue.get(timeout=QUEUE_POLL_TIMEOUT)
+						work_available = True
+					except Exception:
+						# Queue.get timeout - no work yet, signal others
+						work_available = False
+			
+				# All ranks synchronize on work availability status
+				# This is a fast broadcast (single int) that keeps NCCL alive
+				status_tensor = torch.tensor([1 if work_available else 0], dtype=torch.int32, device='cuda')
+				dist.broadcast(status_tensor, src=0)
+				work_available = status_tensor.item() == 1
+			
+				if not work_available:
+					# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
+					# Also feed watchdog to prevent false stuck detection during idle periods
+					watchdog.feed()
+					# Loop back and poll again
+					continue
 
-				# Enter persistent generate() — blocks until shutdown
-				# generate() starts with empty global_batch, polls for admissions
-				worker.generate_persistent()
+			# --- STEP 2: Broadcast full task to all ranks ---
+			task_container = [task_data]
+			dist.broadcast_object_list(task_container, src=0)
+			task_data = task_container[0]
 
-			except Exception as e:
-				logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
-				# Let the outer worker boundary publish this rank's exact traceback
-				# through the TCPStore sideband and its node-local response queue.
-				raise
+			# --- STEP 3: Shutdown Check ---
+			if task_data is None:
+				logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
+				break
+		
+			# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
+			if isinstance(task_data, dict) and task_data.get("type") == "init":
+				logging.info(f"Rank {global_rank}: Pool mode init received")
+				try:
+					current_max_output = task_data.get("max_output_len", 4096)
+					max_context_length = task_data.get("max_context_length", None)
 
-			# Pool mode exits here — send shutdown sentinel and break
-			if global_rank == 0:
-				response_queue.put({"type": "pool_shutdown"})
-			break
+					# Initialize worker with pool capacity (no sequences yet)
+					worker.Init(None, current_max_output, 0,
+						max_context_length=max_context_length)
 
-		# --- STEP 4: No other message shape is served ---
-		# The legacy non-pool inference path was removed; the batch API is the
-		# only way in. The message was broadcast above, so every rank reaches
-		# this line together and raises into the outer fatal boundary rather
-		# than leaving one rank behind in a collective.
-		if isinstance(task_data, dict) and "prompts" in task_data:
-			raise LegacyInferenceDeprecated()
-		raise RuntimeError(
-			f"Rank {global_rank}: unexpected worker message: {task_data!r}"
-		)
+					# Set admission and response queues for persistent generate()
+					worker.set_admission_queue(request_queue)
+					worker.set_response_queue(response_queue)
+					worker._publish_trajectory_pool_capacity()
+
+					if global_rank == 0:
+						logging.info(
+							f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
+							f"Entering persistent generate() loop."
+						)
+
+					# Enter persistent generate() — blocks until shutdown
+					# generate() starts with empty global_batch, polls for admissions
+					worker.generate_persistent()
+
+				except Exception as e:
+					logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
+					# Let the outer worker boundary publish this rank's exact traceback
+					# through the TCPStore sideband and its node-local response queue.
+					raise
+
+				# Pool mode exits here — send shutdown sentinel and break
+				if global_rank == 0:
+					response_queue.put({"type": "pool_shutdown"})
+				break
+
+			# --- STEP 4: No other message shape is served ---
+			# The legacy non-pool inference path was removed; the batch API is the
+			# only way in. The message was broadcast above, so every rank reaches
+			# this line together and raises into the outer fatal boundary rather
+			# than leaving one rank behind in a collective.
+			if isinstance(task_data, dict) and "prompts" in task_data:
+				raise LegacyInferenceDeprecated()
+			raise RuntimeError(
+				f"Rank {global_rank}: unexpected worker message: {task_data!r}"
+			)
+	except BaseException as exc:
+		# The watchdog's abort surfaces here as an error raised by whatever
+		# collective this rank was blocked in, and by every torch.distributed
+		# call after it.  This is the ONE guard: the collective call sites
+		# inside the loop are deliberately left alone.
+		exit_path = _resolve_main_loop_exit(global_rank, shutdown_event, exc)
+	finally:
+		# Tell the watchdog the loop is done BEFORE the ordered teardown
+		# below: that teardown releases a large registered mapping and can
+		# take minutes, and it must never be mistaken for a loop still
+		# running and aborted underneath.
+		loop_exited.set()
 
 	# Cleanup.  Keep the engine alive until its worker threads stop, then drop
-	# the storage mapping only after all non-owning references are gone.
+	# the storage mapping only after all non-owning references are gone.  The
+	# abort does not touch any of this: it only tears down communicators.
 	_shutdown_worker_runtime(worker)
-	dist.destroy_process_group()
+	# Conditional because the abort path already cleared torch's default
+	# group; destroy_process_group() asserts on a group that is gone.
+	if dist.is_available() and dist.is_initialized():
+		dist.destroy_process_group()
+	logging.info(
+		"[shutdown] worker exit path=%s rank=%s", exit_path, global_rank
+	)
