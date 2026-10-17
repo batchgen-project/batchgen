@@ -73,7 +73,3 @@ class RuntimeIdentity:
     @property
     def runtime_dir(self) -> Path:
         return Path(tempfile.gettempdir()) / self.resource_prefix
-
-    @property
-    def reload_status_dir(self) -> Path:
-        return self.runtime_dir / "reload_status"

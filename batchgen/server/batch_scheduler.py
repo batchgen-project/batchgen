@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,11 +106,15 @@ class BatchScheduler:
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._quiesced = threading.Event()
+        self._quiesce_ack = threading.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def start(self) -> None:
         if self._task:
             return
         self._stopped.clear()
+        self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._run())
         # Start pool mode background tasks
         self._completion_listener_task = asyncio.create_task(
@@ -150,6 +155,32 @@ class BatchScheduler:
 
     async def enqueue(self, batch_id: str) -> None:
         await self._queue.put(batch_id)
+
+    def quiesce(self) -> None:
+        """Stop dispatching new work while retaining the upstream queues."""
+        self._quiesced.set()
+        if self._loop is not None and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
+            self._quiesce_ack.wait(timeout=5)
+
+    def resume(self) -> None:
+        self._quiesced.clear()
+        self._quiesce_ack.clear()
+
+    def fail_in_flight(self, error_msg: str) -> int:
+        return self._fail_all_active_batches(error_msg)
+
+    def worker_generation_ready(self) -> None:
+        # WorkerManager sends the generation's init message before this hook;
+        # the drain task must not send a duplicate init after resume.
+        self._pool_initialized = True
+
+    def pool_init_params(self) -> Dict[str, Any]:
+        """Pool capacity for a worker generation's init message."""
+        return {
+            "max_output_len": getattr(self, "_pool_max_output_len", 4096),
+            "max_context_length": getattr(self, "_pool_max_context_length", None),
+        }
 
     async def _run(self) -> None:
         while not self._stopped.is_set():
@@ -633,17 +664,17 @@ class BatchScheduler:
         """
         logger.info("[POOL] Intake drain task started")
         while not self._stopped.is_set():
+            if self._quiesced.is_set():
+                self._quiesce_ack.set()
+                await asyncio.sleep(0.05)
+                continue
             if self._intake_pool.is_empty():
                 await asyncio.sleep(0.1)
                 continue
 
             # First drain: send init message to worker
             if not self._pool_initialized:
-                init_msg = {
-                    "type": "init",
-                    "max_output_len": getattr(self, '_pool_max_output_len', 4096),
-                    "max_context_length": getattr(self, '_pool_max_context_length', None),
-                }
+                init_msg = {"type": "init", **self.pool_init_params()}
                 self.worker.request_queue.put(init_msg)
                 self._pool_initialized = True
                 logger.info("[POOL] Init message sent to worker")
@@ -694,6 +725,15 @@ class BatchScheduler:
                 "type": "admit",
                 "entries": admit_entries,
             }
+            if self._quiesced.is_set():
+                # The entries were selected before quiesce. Put them back so
+                # upstream work survives; no worker message is sent.
+                for entry in reversed(drained):
+                    self._intake_pool.requeue(entry)
+                for entry in drained:
+                    self._scheduling_pool.free_slot(entry.request_id)
+                await asyncio.sleep(0)
+                continue
             self.worker.request_queue.put(admission_msg)
             logger.warning(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
@@ -704,8 +744,9 @@ class BatchScheduler:
 
         logger.info("[POOL] Intake drain task stopped")
 
-    def _fail_all_active_batches(self, error_msg: str) -> None:
+    def _fail_all_active_batches(self, error_msg: str) -> int:
         """Mark all in-progress batches as failed. Called on fatal listener error."""
+        failed = 0
         for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
             if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
                 tracker.error = error_msg
@@ -713,6 +754,11 @@ class BatchScheduler:
                     batch_id, BatchStatus.FAILED, error=f"worker_fatal: {error_msg}"
                 )
                 logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
+                failed += 1
+        clear_slots = getattr(self._scheduling_pool, "clear_active_slots", None)
+        if clear_slots is not None:
+            clear_slots()
+        return failed
 
     async def _pool_completion_listener(self) -> None:
         """Background task: read per-request completions from worker response queue.
@@ -773,7 +819,10 @@ class BatchScheduler:
                     if error:
                         logger.error("[POOL] Worker fatal received: %s", error)
                         self._fail_all_active_batches(error)
-                        self.worker.report_worker_fatal(error)
+                        # The scheduler has already persisted this fatal before
+                        # notifying WorkerManager; persisted=True keeps monitor
+                        # reconciliation from persisting it a second time.
+                        self.worker.report_worker_fatal(error, persisted=True)
                     else:
                         logger.info("[POOL] Worker shutdown signal received")
                     break

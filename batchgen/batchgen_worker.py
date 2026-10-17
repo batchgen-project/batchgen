@@ -291,7 +291,7 @@ class _DualAsyncLoadTask:
 	"""Forwards .wait() to both primary and aux async KV load tasks.
 
 	Either side may be None (non-DSA model or aux-disabled diagnostic mode);
-	.wait() skips None. Used by mid-decode reload paths where we must ensure
+	.wait() skips None. Used by mid-decode paths where we must ensure
 	both caches are on-GPU before the next decode step reads them.
 	"""
 	__slots__ = ("_primary", "_aux")
@@ -674,7 +674,7 @@ class BatchGenWorkerArgs:
 	host_kv_shm_name: str = "batchgen_host_kv_cache"
 	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
 	query_book_shm_prefix: str = "batchgen_input_ids"
-	reload_status_dir: str = "/tmp/batchgen_reload_status"
+	runtime_dir: str = "/tmp"
 	pynccl_port_base: int = 20003
 	pynccl_port_span: int = 100
 
@@ -1019,7 +1019,6 @@ class BatchGenWorker:
 		self._buffer_pool: Optional[QueryBookBufferPool] = None
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
-		self._reload_status_dir = args.reload_status_dir
 		# Superseded pools stay mapped for the process lifetime (see
 		# _retire_buffer_pool).
 		self._retired_buffer_pools: List[QueryBookBufferPool] = []
@@ -1380,8 +1379,7 @@ class BatchGenWorker:
 					# 410 and WorkerManager.infer is gone), so reaching this line
 					# means some other producer is putting legacy payloads on the
 					# queue: fail loudly rather than park. Deliberately NOT a
-					# catch-all for unknown messages -- {"command": "reload"} also
-					# lands here and must keep its current handling.
+					# Unknown messages must fail loudly rather than being swallowed.
 					raise LegacyInferenceDeprecated()
 			except queue_mod.Empty:
 				pass
@@ -3262,9 +3260,9 @@ class BatchGenWorker:
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
 		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
 
-		Why: mid-decode reload paths at lines 7688, 9201, 9370 load primary KV
+		Why: mid-decode paths at lines 7688, 9201, 9370 load primary KV
 		only. For DSA models, aux pages are allocated (coordinator mirrors
-		allocate/grow/free) but never filled on reload, so the indexer reads
+		allocate/grow/free) but never filled after a worker generation change, so the indexer reads
 		stale or zeroed K vectors and produces garbage top-K. This helper
 		mirrors the primary load under the same rebuilt-page-table state.
 
@@ -5050,7 +5048,7 @@ class BatchGenWorker:
 
 		# Update sequence status and reset GPU allocation
 		# NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
-		# ON_HOLD sequences are continuing decode when reloaded, so they should
+		# ON_HOLD sequences are continuing decode when resumed, so they should
 		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
@@ -6046,18 +6044,18 @@ class BatchGenWorker:
 				if self._shutdown_requested:
 					break  # Pool mode: shutdown requested and all done
 				# Pool mode: wait briefly for more work before exiting
-				# status tensor encoding: [has_new_work, shutdown, reload]
+				# status tensor encoding: [has_new_work, shutdown]
 				import queue as queue_mod
 				if self.rank == 0:
 					try:
 						msg = self._admission_queue.get(timeout=1.0)
 						if msg is None:
 							self._shutdown_requested = True
-							status = torch.tensor([0, 1, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 						elif isinstance(msg, dict) and msg.get("type") == "admit":
 							# Broadcast that we got new work
-							status = torch.tensor([1, 0, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
@@ -6069,18 +6067,6 @@ class BatchGenWorker:
 							generation_start_time = time.perf_counter()
 							self._timing_logged = False
 							# Continue loop — new sequences will be picked up
-						elif isinstance(msg, dict) and msg.get("command") == "reload":
-							# Hot-reload command — broadcast to all ranks then handle.
-							# Result is written below this run's reload-status directory
-							# inside _handle_hot_reload (via _write_reload_status), NOT
-							# put on response_queue. Putting on response_queue would
-							# deadlock the FastAPI event loop because the sync HTTP
-							# handler can't drain mp.Queue while blocking.
-							status = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.torch_device)
-							dist.broadcast(status, src=0)
-							container = [msg]
-							dist.broadcast_object_list(container, src=0)
-							self._handle_hot_reload(msg)
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
 							# guard in _poll_admissions. The `else` below would
@@ -6088,20 +6074,19 @@ class BatchGenWorker:
 							# completion off the shared response queue.
 							raise LegacyInferenceDeprecated()
 						else:
-							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
-						status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 						dist.broadcast(status, src=0)
 						continue  # Try again
 				else:
 					# Non-rank-0: wait for rank 0's broadcast
-					status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+					status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 					dist.broadcast(status, src=0)
 					has_new = status[0].item() == 1
 					is_shutdown = status[1].item() == 1
-					is_reload = status[2].item() == 1
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
@@ -6111,10 +6096,6 @@ class BatchGenWorker:
 						decoding_time = 0.0
 						generation_start_time = time.perf_counter()
 						self._timing_logged = False
-					elif is_reload:
-						container = [None]
-						dist.broadcast_object_list(container, src=0)
-						self._handle_hot_reload(container[0])
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
@@ -6603,7 +6584,7 @@ class BatchGenWorker:
 				# Check if there are queued sequences waiting for prefill AND
 				# host KV has enough free capacity to make prefill worthwhile.
 				# Without the watermark check, decode oscillates: breaks every
-				# DECISION_INTERVAL, puts all seqs ON_HOLD (~12s reload), prefills
+				# DECISION_INTERVAL, puts all seqs ON_HOLD during a phase transition, prefills
 				# only a handful of sequences, then resumes — destroying throughput.
 				has_pending = self.global_batch.has_queueing() or (
 					self.enable_host_kv_eviction and self.global_batch.has_evicted()
@@ -10061,7 +10042,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
 		# Phase B: also drop the adapter's reference to the captured segment so
-		# the next /v1/reload + recapture starts from a clean adapter context.
+		# the next worker generation starts from a clean adapter context.
 		if self._cuda_graph_adapter is not None:
 			try:
 				self._cuda_graph_adapter.release_all(manager=None)
@@ -13510,126 +13491,6 @@ class BatchGenWorker:
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
 				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
 					self.model.model.layers[layer_idx].mlp.cleanup()
-
-	def _handle_hot_reload(self, msg: dict) -> dict:
-		"""Hot-reload batchgen_worker module and rebind methods on this instance.
-
-		Called from inside generate_persistent() admission loop. Both rank 0
-		and other ranks must call this so all ranks reload in lockstep.
-
-		Returns: dict with status, rebound count, skipped count, missing attrs.
-		"""
-		import importlib
-		import inspect
-		import re
-		import sys
-		import logging as _log
-		try:
-			reload_deps = msg.get("reload_deps", True) if isinstance(msg, dict) else True
-
-			# Reload commonly-changed dependent modules first
-			if reload_deps:
-				dep_modules = [
-					"batchgen.server.batch_scheduler",
-					"batchgen.server.intake_pool",
-					"batchgen.server.scheduling_pool",
-					"batchgen.kv_cache.gpu_paged_kv_manager",
-					"batchgen.attention.dsa.glm5_decode_selector",
-				]
-				for mod_name in dep_modules:
-					if mod_name in sys.modules:
-						importlib.reload(sys.modules[mod_name])
-						_log.info(f"Rank {self.rank}: Reloaded dependency {mod_name}")
-
-			# Reload the worker module itself
-			import batchgen.batchgen_worker as worker_module
-			importlib.reload(worker_module)
-			NewClass = worker_module.BatchGenWorker
-
-			# Validate: warn if new __init__ adds attrs missing on this instance
-			missing = []
-			try:
-				new_init_src = inspect.getsource(NewClass.__init__)
-				old_init_src = inspect.getsource(type(self).__init__)
-				if new_init_src != old_init_src:
-					new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
-					missing = sorted([a for a in new_attrs if not hasattr(self, a)])
-					if missing:
-						_log.warning(
-							f"Rank {self.rank}: RELOAD WARNING — new __init__ has "
-							f"{len(missing)} attrs missing on existing worker: {missing[:10]}"
-						)
-			except (OSError, TypeError):
-				pass
-
-			# Rebind methods (skip __init__ and dunders). Preserve descriptor
-			# semantics so hot reload does not turn staticmethods into bound
-			# instance methods.
-			rebound = 0
-			skipped = 0
-			for name, descriptor in NewClass.__dict__.items():
-				if name == "__init__":
-					skipped += 1
-					continue
-				if name.startswith("__") and name.endswith("__"):
-					continue
-				try:
-					if isinstance(descriptor, staticmethod):
-						setattr(self, name, descriptor.__func__)
-					elif isinstance(descriptor, classmethod):
-						setattr(self, name, descriptor.__func__.__get__(type(self), type(self)))
-					elif inspect.isfunction(descriptor):
-						setattr(self, name, descriptor.__get__(self, type(self)))
-					else:
-						continue
-					rebound += 1
-				except Exception:
-					skipped += 1
-
-			_log.info(
-				f"Rank {self.rank}: Hot reload SUCCESS — "
-				f"rebound {rebound} methods, skipped {skipped}"
-				+ (f", {len(missing)} missing attrs" if missing else "")
-			)
-			result = {
-				"status": "reload_success",
-				"rank": self.rank,
-				"rebound": rebound,
-				"skipped": skipped,
-				"missing_attrs": missing,
-			}
-			self._write_reload_status(result)
-			return result
-		except Exception as e:
-			_log.error(f"Rank {self.rank}: Hot reload FAILED: {e}", exc_info=True)
-			result = {"status": "reload_failed", "rank": self.rank, "error": str(e)}
-			self._write_reload_status(result)
-			return result
-
-	def _write_reload_status(self, result: dict) -> None:
-		"""Write reload status atomically to this run's status directory.
-
-		The HTTP server polls these files instead of waiting on a queue,
-		which avoids deadlocks when the FastAPI event loop is blocked.
-		"""
-		import json
-		import os
-		import tempfile
-		import time as _time
-		try:
-			result_with_time = dict(result)
-			result_with_time["timestamp"] = _time.time()
-			status_dir = self._reload_status_dir
-			os.makedirs(status_dir, exist_ok=True)
-			# Write to temp then atomic rename
-			fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")
-			with os.fdopen(fd, "w") as f:
-				json.dump(result_with_time, f)
-			final_path = os.path.join(status_dir, f"rank_{self.rank}.json")
-			os.rename(tmp_path, final_path)
-		except Exception as e:
-			import logging as _log
-			_log.warning(f"Rank {self.rank}: Failed to write reload status: {e}")
 
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.

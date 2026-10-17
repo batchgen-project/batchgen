@@ -337,6 +337,11 @@ class DualHostKVCoordinator:
 		self.primary.release_sequence_pages(sequence_ids)
 		self.require_auxiliary("release_sequence_pages").release_sequence_pages(sequence_ids)
 
+	def release_all_sequences(self) -> None:
+		"""Release every host-KV sequence in both mirrored managers."""
+		self.primary.release_all_sequences()
+		self.require_auxiliary("release_all_sequences").release_all_sequences()
+
 	def unregister_sequences(self, sequence_ids) -> None:
 		self.primary.unregister_sequences(sequence_ids)
 		self.require_auxiliary("unregister_sequences").unregister_sequences(sequence_ids)

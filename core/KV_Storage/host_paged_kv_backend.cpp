@@ -217,6 +217,8 @@ struct HostPagedKVBackend::SharedState {
     std::vector<std::int32_t> AcquirePages(std::int64_t sequence_id,
                                            std::size_t num_pages);
     void ReleaseSequence(std::int64_t sequence_id);
+
+    void ReleaseAllSequences();
     std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
                                                  std::size_t num_pages);
     std::vector<std::int32_t> SequencePages(
@@ -687,6 +689,29 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
     }
 }
 
+void HostPagedKVBackend::SharedState::ReleaseAllSequences() {
+    std::vector<std::int64_t> sequence_ids;
+    {
+        ScopedMutexLock lock(&header->sequence_mutex);
+        sequence_ids.reserve(
+            header->active_sequences.load(std::memory_order_relaxed));
+        for (std::size_t i = 0; i < sequence_capacity; ++i) {
+            const SequenceEntry& entry = sequence_table[i];
+            if (entry.sequence_id != kEmptySequenceId &&
+                entry.sequence_id != kTombstoneSequenceId) {
+                sequence_ids.push_back(entry.sequence_id);
+            }
+        }
+    }
+
+    // ReleaseSequence owns the page-chain and free-stack updates.  The caller
+    // invokes this only after the worker cohort has exited, so no producer can
+    // insert a new sequence between the table walk and these releases.
+    for (std::int64_t sequence_id : sequence_ids) {
+        ReleaseSequence(sequence_id);
+    }
+}
+
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
     if (num_pages == 0) {
@@ -897,6 +922,10 @@ void HostPagedKVBackend::ReleaseSequences(
     for (auto& future : futures) {
         future.get();
     }
+}
+
+void HostPagedKVBackend::ReleaseAllSequences() {
+    state_->ReleaseAllSequences();
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(

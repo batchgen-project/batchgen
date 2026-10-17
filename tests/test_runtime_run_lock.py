@@ -321,13 +321,10 @@ def test_worker_joins_the_run_lock_right_after_die_with_parent():
     source = WORKER_MAIN_LOOP.read_text()
 
     assert "from batchgen.server.runtime_locks import hold_run_lock" in source
-    # The worker learns its runtime dir from the reload-status dir it is given.
-    assert (
-        "_run_lock_file = hold_run_lock(os.path.dirname(args.reload_status_dir))"
-        in source
-    )
+    # The worker opens the run lock inside the runtime dir it is given.
+    assert "_run_lock_file = hold_run_lock(args.runtime_dir)" in source
     assert "\tglobal _run_lock_file" in source
-    assert source.index("die_with_parent()") < source.index("hold_run_lock(os.path")
+    assert source.index("die_with_parent()") < source.index("hold_run_lock(args.runtime_dir)")
     # Only the server creates the file, and nothing ever closes it: the kernel
     # drops this worker's share when the process dies, however it dies.
     assert "create=True" not in source

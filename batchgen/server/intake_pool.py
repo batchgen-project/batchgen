@@ -142,6 +142,17 @@ class IntakePool:
             logger.info(f"[INTAKE] Drained {len(result)} entries (remaining: {remaining}/{self._max_capacity})")
         return result
 
+    def requeue(self, entry: IntakeEntry) -> None:
+        """Put one selected entry back when quiesce wins the send race."""
+        with self._lock:
+            info = self._batch_info.get(entry.batch_id)
+            if info is not None:
+                info.remaining_in_intake += 1
+            if entry.priority == Priority.HIGH:
+                self._high.appendleft(entry)
+            else:
+                self._normal.appendleft(entry)
+
     def is_empty(self) -> bool:
         with self._lock:
             return len(self._high) == 0 and len(self._normal) == 0

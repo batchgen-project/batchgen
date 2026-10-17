@@ -89,7 +89,7 @@ def test_runtime_identity_derives_disjoint_run_names():
     assert first.host_kv_shm_name != second.host_kv_shm_name
     assert first.host_kv_aux_shm_name != second.host_kv_aux_shm_name
     assert first.query_book_shm_prefix != second.query_book_shm_prefix
-    assert first.reload_status_dir != second.reload_status_dir
+    assert first.runtime_dir != second.runtime_dir
 
 
 @pytest.mark.parametrize(

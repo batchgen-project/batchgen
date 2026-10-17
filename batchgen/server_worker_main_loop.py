@@ -1,4 +1,3 @@
-import importlib
 import gc
 import json
 import logging
@@ -199,79 +198,6 @@ def _start_worker_fatal_monitor(
 	).start()
 
 
-def _reload_worker_module(reload_deps=False):
-	"""
-	Hot-reload the batchgen_worker module to pick up code changes.
-	This reloads the module but doesn't affect already-instantiated objects.
-	For method-level changes, we rebind all methods to the existing worker.
-
-	Args:
-		reload_deps: If True, also reload commonly-changed dependent modules
-			(batch_scheduler, intake_pool, scheduling_pool, gpu_paged_kv_manager)
-			before reloading batchgen_worker. This ensures cross-module changes
-			take effect.
-	"""
-	if reload_deps:
-		dep_modules = [
-			"batchgen.server.batch_scheduler",
-			"batchgen.server.intake_pool",
-			"batchgen.server.scheduling_pool",
-			"batchgen.kv_cache.gpu_paged_kv_manager",
-		]
-		for mod_name in dep_modules:
-			if mod_name in sys.modules:
-				importlib.reload(sys.modules[mod_name])
-				logging.info(f"  Reloaded dependency: {mod_name}")
-	import batchgen.batchgen_worker as worker_module
-	importlib.reload(worker_module)
-	return worker_module
-
-
-def _rebind_all_methods(worker, NewClass):
-	"""Rebind all methods from NewClass onto existing worker instance.
-
-	Skips __init__ and dunder methods. Returns (rebound, skipped) counts.
-	"""
-	import inspect
-	rebound = 0
-	skipped = 0
-	for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
-		if name == "__init__":
-			skipped += 1
-			continue
-		try:
-			setattr(worker, name, method.__get__(worker, type(worker)))
-			rebound += 1
-		except Exception:
-			skipped += 1
-	return rebound, skipped
-
-
-def _validate_reload(worker, NewClass):
-	"""Warn if new __init__ references instance attrs missing on existing worker.
-
-	Returns list of missing attribute names (empty if safe).
-	"""
-	import inspect
-	import re
-	try:
-		old_init_src = inspect.getsource(type(worker).__init__)
-		new_init_src = inspect.getsource(NewClass.__init__)
-	except (OSError, TypeError):
-		return []
-	if old_init_src == new_init_src:
-		return []
-	new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
-	missing = [a for a in sorted(new_attrs) if not hasattr(worker, a)]
-	if missing:
-		logging.warning(
-			f"RELOAD WARNING: New __init__ has {len(missing)} attrs "
-			f"missing on existing worker: {missing[:10]}. "
-			f"These will cause AttributeError if accessed."
-		)
-	return missing
-
-
 def _setup_nccl_env():
 	"""
 	Set up NCCL environment variables for better reliability in multi-node setups.
@@ -419,7 +345,8 @@ def _server_worker_main_impl(
 	# while any process of the run holds it LOCK_SH, a later run of this instance
 	# cannot take it LOCK_EX and so cannot reclaim this run's resources.
 	global _run_lock_file
-	_run_lock_file = hold_run_lock(os.path.dirname(args.reload_status_dir))
+	# args.runtime_dir IS the run directory holding the liveness lock file.
+	_run_lock_file = hold_run_lock(args.runtime_dir)
 
 	# Step 0: Configure logging for this worker process first
 	_setup_worker_logging(rank_idx)
@@ -636,33 +563,6 @@ def _server_worker_main_impl(
 			logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
 			break
 		
-		# --- STEP 3.5: Hot Reload Command ---
-		if isinstance(task_data, dict) and task_data.get("command") == "reload":
-			reload_deps = task_data.get("reload_deps", True)
-			logging.info(f"Rank {global_rank}: Received reload command (reload_deps={reload_deps}), hot-reloading...")
-			try:
-				new_module = _reload_worker_module(reload_deps=reload_deps)
-				NewClass = new_module.BatchGenWorker
-				missing = _validate_reload(worker, NewClass)
-				rebound, skipped = _rebind_all_methods(worker, NewClass)
-				logging.info(
-					f"Rank {global_rank}: Hot reload successful! "
-					f"Rebound {rebound} methods, skipped {skipped}"
-					+ (f", {len(missing)} missing attrs" if missing else "")
-				)
-				if global_rank == 0:
-					response_queue.put({
-						"status": "reload_success",
-						"rebound": rebound,
-						"skipped": skipped,
-						"missing_attrs": missing,
-					})
-			except Exception as e:
-				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
-				if global_rank == 0:
-					response_queue.put({"status": "reload_failed", "error": str(e)})
-			continue
-
 		# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
 		if isinstance(task_data, dict) and task_data.get("type") == "init":
 			logging.info(f"Rank {global_rank}: Pool mode init received")

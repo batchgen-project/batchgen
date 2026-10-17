@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.multiprocessing as mp
@@ -123,6 +123,12 @@ class WorkerExitState:
     def is_failed(self) -> bool:
         return self._event.is_set()
 
+    def clear(self) -> None:
+        with self._lock:
+            self._reason = None
+            self._exception = None
+            self._event.clear()
+
     @property
     def reason(self) -> Optional[str]:
         return self._reason
@@ -179,6 +185,17 @@ class WorkerManager:
         self._lane_lease: Optional[LaneLease] = None
         # Held LOCK_SH for this process's whole life; see hold_run_lock.
         self._run_lock = None
+        self._state = "serving"
+        self._generation = 0
+        self._first_ready = False
+        self._reconciled_failure = False
+        self._main_thread_dispatcher: Optional[Callable[[Callable[[], Any], float], Any]] = None
+        self._quiesce_hook: Optional[Callable[[], Any]] = None
+        self._resume_hook: Optional[Callable[[], Any]] = None
+        self._fail_in_flight_hook: Optional[Callable[[str], int]] = None
+        self._scheduler_generation_hook: Optional[Callable[[], Any]] = None
+        self._pool_init_params_hook: Optional[Callable[[], Dict[str, Any]]] = None
+        self._restart_timeout_s = 600.0
 
     def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
         """Serialize the skeleton state dict into an anonymous memfd.
@@ -240,6 +257,45 @@ class WorkerManager:
         self._runtime_namespace_owned = True
 
     # ---------------------- Public API ----------------------
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def set_lifecycle_hooks(
+        self,
+        *,
+        quiesce: Optional[Callable[[], Any]] = None,
+        resume: Optional[Callable[[], Any]] = None,
+        fail_in_flight: Optional[Callable[[str], int]] = None,
+        generation_ready: Optional[Callable[[], Any]] = None,
+        pool_init_params: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> None:
+        self._quiesce_hook = quiesce
+        self._resume_hook = resume
+        self._fail_in_flight_hook = fail_in_flight
+        self._scheduler_generation_hook = generation_ready
+        self._pool_init_params_hook = pool_init_params
+
+    def set_main_thread_dispatcher(
+        self,
+        dispatcher: Optional[Callable[[Callable[[], Any], float], Any]],
+    ) -> None:
+        """Install the event-loop bridge used when restart starts off-main-thread."""
+        self._main_thread_dispatcher = dispatcher
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "generation": self.generation,
+            "workers": len(getattr(self.worker_process, "processes", ()) or ()),
+        }
+
     def _acquire_runtime_admission(self) -> None:
         if self._runtime_locks is not None:
             return
@@ -351,6 +407,11 @@ class WorkerManager:
                     _time.monotonic() - spawn_start)
 
         self.started = True
+        with self._lock:
+            self._generation += 1
+            self._state = "serving"
+            self._first_ready = True
+            self._reconciled_failure = False
         logger.info(
             "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
             _time.monotonic() - startup_start,
@@ -605,94 +666,146 @@ class WorkerManager:
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
 
-    def report_worker_fatal(self, reason: str) -> None:
-        """Acknowledge a persisted worker fatal, then stop the server."""
+    def report_worker_fatal(self, reason: str, *, persisted: bool = False) -> None:
+        """Enter workers_down after the existing pool_shutdown fatal path."""
         self._fatal_ack_event.set()
+        if persisted:
+            self._reconciled_failure = True
         self._handle_worker_failure(reason, None)
 
-    def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
-        """Send hot-reload command via the main loop's sync RPC path.
-
-        Used before the worker enters generate_persistent(), while the main
-        loop still answers one request with one response on
-        request_queue/response_queue. Once pool mode is running, use
-        send_pool_reload() instead — pool mode never returns to the main loop.
-        """
-        import queue as _queue
+    def _set_state(self, expected: str, new: str) -> None:
         with self._lock:
-            self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
-            try:
-                return self.response_queue.get(timeout=timeout)
-            except _queue.Empty:
-                return {"status": "reload_timeout", "timeout_s": timeout}
+            if self._state != expected:
+                raise RuntimeError(
+                    f"invalid worker state transition {self._state!r} -> {new!r}; "
+                    f"expected {expected!r}"
+                )
+            self._state = new
 
-    def send_pool_reload(self, reload_deps: bool = True, timeout: float = 30.0,
-                         expected_ranks: Optional[int] = None) -> dict:
-        """Send hot-reload to pool-mode workers via fire-and-forget queue +
-        status file polling.
+    def _call_spawn_on_main_thread(self, fn: Callable[[], Any], timeout_s: float) -> Any:
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        if self._main_thread_dispatcher is None:
+            raise RuntimeError("worker respawn requires a main-thread dispatcher")
+        return self._main_thread_dispatcher(fn, timeout_s)
 
-        Pool-mode workers (generate_persistent loop) read the reload command
-        from request_queue and write per-rank status below this run's private
-        runtime directory. This method polls those files for up to `timeout`
-        seconds, returning aggregated status.
+    def _drain_queues(self) -> Dict[str, int]:
+        import queue as queue_mod
 
-        Why not response_queue: pool mode admission queue and response_queue
-        are designed for batched async I/O (per-completion notifications via
-        OutputWriter), not sync RPC. Putting reload results on response_queue
-        deadlocks the FastAPI event loop.
-        """
-        import json
-        import os
-        import shutil
-        import time as _time
-
-        status_dir = str(self.args.runtime_identity.reload_status_dir)
-        # Clear stale status files from previous reloads
-        if os.path.isdir(status_dir):
-            try:
-                shutil.rmtree(status_dir)
-            except OSError:
-                pass
-        os.makedirs(status_dir, exist_ok=True)
-
-        # Send the command (no lock — pool admission queue is fire-and-forget)
-        self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
-
-        # Poll for status files
-        if expected_ranks is None:
-            expected_ranks = self.args.world_size if self.args.world_size else 1
-        deadline = _time.monotonic() + timeout
-        results: List[dict] = []
-        seen_ranks: set = set()
-        while _time.monotonic() < deadline:
-            try:
-                for entry in os.listdir(status_dir):
-                    if not entry.startswith("rank_") or not entry.endswith(".json"):
-                        continue
-                    rank_str = entry[len("rank_"):-len(".json")]
-                    if rank_str in seen_ranks:
-                        continue
-                    path = os.path.join(status_dir, entry)
-                    try:
-                        with open(path, "r") as f:
-                            results.append(json.load(f))
-                        seen_ranks.add(rank_str)
-                    except (OSError, json.JSONDecodeError):
-                        continue
-                if len(seen_ranks) >= expected_ranks:
+        drained = {"request": 0, "response": 0}
+        for name, queue in (("request", self.request_queue), ("response", self.response_queue)):
+            while True:
+                try:
+                    queue.get_nowait()
+                except queue_mod.Empty:
                     break
-            except OSError:
-                pass
-            _time.sleep(0.1)
+                drained[name] += 1
+        return drained
 
-        # Aggregate
-        all_success = all(r.get("status") == "reload_success" for r in results)
+    def _release_host_kv_sequences(self) -> None:
+        for manager in (self.host_kv_manager, self.host_kv_aux_manager):
+            if manager is None:
+                continue
+            release_all = getattr(manager, "release_all_sequences", None)
+            if release_all is None:
+                raise RuntimeError("host-KV manager lacks release_all_sequences")
+            release_all()
+
+    def _reconcile(self, reason: str, *, fail_in_flight: bool) -> Dict[str, Any]:
+        failed_batches = 0
+        if fail_in_flight and not self._reconciled_failure:
+            if self._fail_in_flight_hook is not None:
+                failed_batches = int(self._fail_in_flight_hook(reason) or 0)
+            self._reconciled_failure = True
+        self._release_host_kv_sequences()
+        # All owned worker PIDs have exited before this method is called.  The
+        # quiesce hook prevents new admissions; draining now has no producer.
+        drained = self._drain_queues()
+        # The run prefix covers named QueryBook and token-store objects.  Host
+        # KV, weights, tensor metadata, and skeleton state are server-owned
+        # memfds and therefore intentionally remain open across this cleanup.
+        cleanup_shm_files(self.args.runtime_identity.shm_prefix)
+        return {"failed_batches": failed_batches, "drained": drained}
+
+    def restart_workers(self, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        """Replace one worker cohort while retaining server-owned resources."""
+        timeout_s = self._restart_timeout_s if timeout_s is None else float(timeout_s)
+        started_at = time.monotonic()
+        with self._lock:
+            if self._state not in {"serving", "workers_down"}:
+                raise RuntimeError(f"worker restart conflict: state={self._state}")
+            previous_state = self._state
+            self._state = "restarting"
+            # A pool_shutdown message may have persisted the fatal just before
+            # an explicit restart request arrived. Preserve that fact so the
+            # restart does not invoke the persistence hook twice.
+            self._reconciled_failure = (
+                self._reconciled_failure or previous_state == "workers_down"
+            )
+
+        if self._quiesce_hook is not None:
+            self._quiesce_hook()
+        teardown_start = time.monotonic()
+        self._monitor_stop_event.set()
+        monitor = self._monitor_thread
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=5)
+            self._monitor_thread = None
+        if self.worker_process is not None:
+            self._stop_workers()
+            self.worker_process = None
+        teardown_s = time.monotonic() - teardown_start
+
+        reconcile_start = time.monotonic()
+        reconciliation = self._reconcile(
+            "Worker pool restarted; in-flight batches were failed.",
+            fail_in_flight=previous_state == "serving",
+        )
+        reconcile_s = time.monotonic() - reconcile_start
+
+        spawn_start = time.monotonic()
+        self._monitor_stop_event.clear()
+        self._ready_event.clear()
+        self._fatal_ack_event.clear()
+        try:
+            self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
+            self._start_worker_monitor()
+            self._wait_for_workers_ready(timeout_s=timeout_s)
+            # Pool capacity params live with the scheduler (it accumulated them
+            # across batch submissions); re-init with the same values, never
+            # with hardcoded defaults.
+            if self._pool_init_params_hook is None:
+                raise RuntimeError("worker restart requires a pool_init_params hook")
+            init_params = self._pool_init_params_hook()
+            self.request_queue.put({
+                "type": "init",
+                "max_output_len": init_params.get("max_output_len", 4096),
+                "max_context_length": init_params.get("max_context_length"),
+            })
+        except BaseException:
+            with self._lock:
+                self._state = "workers_down"
+            raise
+        spawn_to_ready_s = time.monotonic() - spawn_start
+        with self._lock:
+            self._generation += 1
+            self._state = "serving"
+            self._first_ready = True
+            self._worker_exit_state.clear()
+            self._reconciled_failure = False
+        if self._scheduler_generation_hook is not None:
+            self._scheduler_generation_hook()
+        if self._resume_hook is not None:
+            self._resume_hook()
         return {
-            "status": "reload_success" if all_success and len(results) >= expected_ranks else "reload_partial",
-            "ranks_reported": len(results),
-            "ranks_expected": expected_ranks,
-            "elapsed_s": timeout - max(0, deadline - _time.monotonic()),
-            "per_rank": results,
+            "generation": self.generation,
+            "failed_batches": reconciliation["failed_batches"],
+            "elapsed_s": time.monotonic() - started_at,
+            "phase_timings": {
+                "teardown_s": teardown_s,
+                "reconcile_s": reconcile_s,
+                "spawn_to_ready_s": spawn_to_ready_s,
+            },
         }
 
     # ---------------------- Startup helpers ----------------------
@@ -889,9 +1002,7 @@ class WorkerManager:
             query_book_shm_prefix=(
                 self.args.runtime_identity.query_book_shm_prefix
             ),
-            reload_status_dir=str(
-                self.args.runtime_identity.reload_status_dir
-            ),
+            runtime_dir=str(self.args.runtime_identity.runtime_dir),
             pynccl_port_base=self.args.pynccl_port_base,
             pynccl_port_span=self.args.pynccl_port_span,
         )
@@ -964,10 +1075,13 @@ class WorkerManager:
             return ps.parameter_server.tensor_meta_memfd_fd()
         return -1
 
-    def _wait_for_workers_ready(self) -> None:
+    def _wait_for_workers_ready(self, timeout_s: Optional[float] = None) -> None:
         if self.worker_process is None:
             return
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while not self._ready_event.wait(timeout=self._monitor_interval_s):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("worker cohort did not become ready before restart timeout")
             if self._worker_exit_state.is_failed():
                 reason = (
                     self._worker_exit_state.reason
@@ -1045,13 +1159,39 @@ class WorkerManager:
     ) -> None:
         if self._stopping:
             return
-        if self._worker_exit_state.set_failure(reason, exc):
-            logging.getLogger("uvicorn.error").error(
-                "[shutdown] worker failure detected epoch=%.6f: %s",
-                time.time(),
-                reason,
-            )
-            self._request_server_shutdown()
+        if self.state == "restarting":
+            return
+        if not self._first_ready:
+            if self._worker_exit_state.set_failure(reason, exc):
+                logging.getLogger("uvicorn.error").error(
+                    "[shutdown] worker failure during startup epoch=%.6f: %s",
+                    time.time(),
+                    reason,
+                )
+                self._request_server_shutdown()
+            return
+        if not self._worker_exit_state.set_failure(reason, exc):
+            return
+        logging.getLogger("uvicorn.error").error(
+            "Worker cohort failed after readiness; entering workers_down: %s",
+            reason,
+        )
+        with self._lock:
+            self._state = "workers_down"
+        if self._quiesce_hook is not None:
+            self._quiesce_hook()
+        self._monitor_stop_event.set()
+        monitor = self._monitor_thread
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=5)
+            self._monitor_thread = None
+        try:
+            if self.worker_process is not None:
+                self._stop_workers()
+                self.worker_process = None
+            self._reconcile(reason, fail_in_flight=True)
+        except Exception:
+            logger.exception("Worker failure reconciliation failed")
 
     @staticmethod
     def _request_server_shutdown() -> None:
