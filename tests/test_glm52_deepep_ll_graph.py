@@ -13,8 +13,12 @@ graph segment captures. Contract under test:
   GEMM requires, element for element;
 * the LL combine applies the top-k weights and writes this rank's rows, so
   ``reduce_weighted_scatter`` and the NCCL pair never run;
+* the router kernel dispatch is resolved on the row count THIS path routes —
+  one rank's rows, not the all-gathered space — and reads its range from the
+  kernel policy rather than from literals repeated here;
 * M-independence — stale rows past ``recv_count[e]`` cannot reach the output.
 """
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -277,7 +281,8 @@ def test_exchange_is_process_lifetime(monkeypatch):
 # --------------------------------------------------------------------------
 # Segment dataflow
 # --------------------------------------------------------------------------
-def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None):
+def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
+                   split_k_rows=()):
     pool = _make_pool(monkeypatch, buckets=(bucket,))
     pool.setup()
     bufs = pool.get(bucket)
@@ -300,8 +305,35 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None):
     segment.deepep_ll = True
     segment.comm = SimpleNamespace(disabled=False)
     segment.gate_bias_fp32 = torch.zeros(256, dtype=torch.float32)
-    segment.router_context = SimpleNamespace(
-        router_forward=lambda x, logits=None: logits.fill_(0.0))
+    segment.gate_weight_bf16 = torch.zeros(256, H, dtype=torch.bfloat16)
+
+    # Which router kernel ran, and on how many rows. Both stand-ins record
+    # rather than compute: the logits are zeroed either way, and ``fake_gate``
+    # below writes the routed ids this suite asserts on.
+    router_calls = {"wgmma": [], "split_k": []}
+
+    def fake_router_forward(x, logits=None):
+        router_calls["wgmma"].append(tuple(x.shape))
+        return logits.fill_(0.0)
+
+    def fake_split_k_router(hidden, weight, out):
+        router_calls["split_k"].append(tuple(hidden.shape))
+        return out.fill_(0.0)
+
+    segment.router_context = SimpleNamespace(router_forward=fake_router_forward)
+
+    # The real dispatch reads the split-K range from
+    # ``batchgen_kernels.triton``, whose package import pulls in Triton, so the
+    # CPU contract patches that one seam and names the row counts standing for
+    # "inside the kernel policy's range". That the real seam reads the policy's
+    # own bounds is asserted separately, below.
+    wants_split_k = set(int(rows) for rows in split_k_rows)
+
+    def fake_kernel_for(rows):
+        return fake_split_k_router if int(rows) in wants_split_k else None
+
+    monkeypatch.setattr(
+        glm5_moe_graph, "_graphed_router_split_k_kernel", fake_kernel_for)
     segment.moe = SimpleNamespace(
         layer_idx=5,
         fp8_gate_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
@@ -365,6 +397,7 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None):
     monkeypatch.setattr(glm5_moe_graph, "dispatch_scatter_ragged", refuse)
     monkeypatch.setattr(glm5_moe_graph, "reduce_weighted_scatter", refuse)
 
+    calls["router"] = router_calls
     rank_counts = torch.full((WORLD,), bucket, dtype=torch.int64)
     rank_counts[rank] = valid
     return segment, pool, bufs, calls, rank_counts, valid
@@ -393,6 +426,75 @@ def test_forward_runs_the_exchange_and_skips_the_nccl_pair(monkeypatch):
     assert calls["s1"]["x_scale"] is bufs.ll_x_scale
     assert calls["s1"]["output"] is bufs.intermediate
     assert calls["s3"]["output"] is bufs.expert_out
+
+
+# --------------------------------------------------------------------------
+# Router kernel dispatch
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("local_rows", [64, 128])
+def test_the_deepep_router_takes_the_split_k_kernel_on_local_rows(
+        monkeypatch, local_rows):
+    """The gate that the all-gathered path already had, resolved on the row
+    count THIS path routes.
+
+    Dropping the all_gather divides the router's rows by the world size, so a
+    bucket whose all-gathered space would have taken the split-K router has to
+    still take it on one rank's rows. Without the gate every decode bucket fell
+    through to the WGMMA router, whose tile shape is the wrong one at a single
+    rank's row count — the one regression this path carried against the NCCL
+    path it replaces.
+    """
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, bucket=local_rows, split_k_rows=(local_rows,))
+    padded = torch.ones(local_rows, H, dtype=torch.bfloat16)
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+    # One router call, the split-K kernel, on the LOCAL rows -- not
+    # world_size * local_rows, which is what the all-gathered path routes.
+    assert calls["router"]["split_k"] == [(local_rows, H)]
+    assert calls["router"]["wgmma"] == []
+
+
+def test_the_deepep_router_keeps_the_wgmma_kernel_outside_the_range(
+        monkeypatch):
+    """Row counts the split-K policy does not serve keep the WGMMA router, and
+    the dispatch stays a single call either way."""
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+        monkeypatch, split_k_rows=())
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+    assert calls["router"]["wgmma"] == [(BUCKET, H)]
+    assert calls["router"]["split_k"] == []
+
+
+def test_the_router_dispatch_reads_the_kernel_policy_bounds(monkeypatch):
+    """The window is the kernel policy's own constants, not literals repeated
+    in the model layer: move the bounds and the dispatch moves with them.
+
+    This exercises the real seam, with the kernel package stood in for because
+    importing it needs Triton. Outside the range it must not even reach the
+    kernel import, which is what returning before it asserts.
+    """
+    sentinel = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.triton.glm5_router_gemm_config",
+        SimpleNamespace(ROUTER_SPLIT_K_MIN_ROWS=100,
+                        ROUTER_SPLIT_K_MAX_ROWS=200),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.triton.glm5_router_gemm",
+        SimpleNamespace(glm5_router_gemm=sentinel),
+    )
+
+    select = glm5_moe_graph._graphed_router_split_k_kernel
+    assert select(99) is None
+    assert select(100) is sentinel
+    assert select(137) is sentinel
+    assert select(200) is sentinel
+    assert select(201) is None
 
 
 def test_dispatch_scale_repack_is_elementwise_exact(monkeypatch):

@@ -47,6 +47,37 @@ def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
     return f"glm5_layer_{layer_idx}_moe"
 
 
+def _graphed_router_split_k_kernel(rows: int):
+    """The split-K router GEMM for ``rows``, or ``None`` outside its range.
+
+    Both MoE decode paths route a row count that is static per captured bucket,
+    so which router kernel runs is resolved once at capture time. Mid-size row
+    counts belong to the Triton small-M split-K router (block_m=16); outside
+    that range the WGMMA router is the better shape, and the split-K pair would
+    be launching more programs than there is work for.
+
+    The range is the kernel policy's own
+    ``ROUTER_SPLIT_K_MIN_ROWS``/``ROUTER_SPLIT_K_MAX_ROWS``, read here rather
+    than restated as literals, so the model layer and the kernel cannot
+    disagree about which shapes the split-K path serves. Both are imported
+    lazily because ``batchgen_kernels.triton`` imports Triton at package
+    import and this module stays importable without it; a missing Triton
+    therefore raises from this call rather than silently selecting the other
+    kernel.
+    """
+    from batchgen_kernels.triton.glm5_router_gemm_config import (
+        ROUTER_SPLIT_K_MAX_ROWS,
+        ROUTER_SPLIT_K_MIN_ROWS,
+    )
+
+    if not ROUTER_SPLIT_K_MIN_ROWS <= rows <= ROUTER_SPLIT_K_MAX_ROWS:
+        return None
+
+    from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
+
+    return glm5_router_gemm
+
+
 @dataclass
 class _Glm5MoEGraphBuffers:
     padded: torch.Tensor
@@ -667,16 +698,11 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # global_rows is static per captured bucket, so this dispatch is
-        # resolved at capture time. Mid-size global batches hit the Triton
-        # small-M tensor-core router (block_m=16); everything else uses the
-        # WGMMA router, whose tile shape underutilizes at those sizes.
-        if 192 <= global_rows <= 512:
-            from batchgen_kernels.triton.glm5_router_gemm import (
-                glm5_router_gemm,
-            )
-
-            glm5_router_gemm(
+        # This path routes the ALL-GATHERED row space, so the row count the
+        # dispatch is resolved on is global_rows, static per captured bucket.
+        split_k_router = _graphed_router_split_k_kernel(global_rows)
+        if split_k_router is not None:
+            split_k_router(
                 bufs.all_tokens,
                 self.gate_weight_bf16,
                 bufs.router_logits,
@@ -789,7 +815,20 @@ class Glm5MoEGraphSegment:
         # Router on local rows only. The padding mask is the gate's epilogue,
         # as on the NCCL path, but the geometry is a SINGLE rank block: this
         # rank's row r is live only while r < rank_token_counts[rank].
-        self.router_context.router_forward(padded, logits=bufs.router_logits)
+        #
+        # The kernel dispatch is the NCCL path's, resolved on the row count
+        # THIS path routes: dropping the all_gather divides the router's rows
+        # by the world size, so a bucket whose all-gathered space would have
+        # taken the split-K router must still take it on its local rows alone.
+        # Without this gate the whole decode range falls to the WGMMA router,
+        # whose tile shape is the wrong one at a single rank's row count.
+        split_k_router = _graphed_router_split_k_kernel(bucket_size)
+        if split_k_router is not None:
+            split_k_router(padded, self.gate_weight_bf16, bufs.router_logits)
+        else:
+            self.router_context.router_forward(
+                padded, logits=bufs.router_logits
+            )
         gate_sigmoid_topk_cuda(
             bufs.router_logits,
             self.gate_bias_fp32,
