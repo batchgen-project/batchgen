@@ -294,14 +294,14 @@ def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
 # they are larger than the logit they add up to -- which is why a bound written
 # against max|logit| is not a bound on either kernel at all: measured against
 # float64, the pre-split serial-K kernel overruns a 32 * eps * max|logit| budget
-# by 1.92x-2.35x across the eight regimes below.
+# by 1.92x-2.35x across the regimes below.
 #
 # CHAIN_BOUND_HEADROOM = 4 covers the one depth the model above does not
 # enumerate: the order in which the tensor core sums the block_k products inside
 # a single chunk is hardware defined, and it is identical for the two kernels
 # (both hand the same block_k tile to the same tl.dot), so it cannot be derived
 # here. The factor is calibrated rather than guessed. Measured against a float64
-# oracle over these eight regimes, each kernel's actual error reaches at most
+# oracle over these regimes, each kernel's actual error reaches at most
 # 0.36 (serial-K) and 0.21 (split-K) of its own depth * eps * sum_c|chunk_c|, so
 # headroom 1 already passes with 2.8x margin and headroom 4 keeps about 11x. The
 # bound still sits orders of magnitude below the defects this gate exists to
@@ -309,6 +309,11 @@ def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
 # activations, dropping one chunk overshoots the headroom-4 bound by 5.8e3x and
 # rounding the chunks to bf16 before accumulating them overshoots it by 1.4e2x,
 # while the undamaged chains sit at 0.007x (serial-K) and 0.018x of their bounds.
+# Those split-K ratios were measured at S=8, which is the count the policy now
+# selects everywhere. The formula is in S, so it covers every other count the
+# sweep can force as well (S=4: a longer per-split walk, C/S = 24 chunks,
+# against a shorter reduce chain of 4, giving depth 28 rather than 20), and the
+# per-count assertions below hold each of them to its own bound.
 #
 # "truth" is a float64 matmul of the same bf16 inputs. Its own error is bounded
 # by K * eps64 * sum_d |h_d w_d|, about 1e-8 of the float32 bounds above, so it
@@ -324,6 +329,22 @@ GLM5_ROUTER_EXPERTS = 256
 GLM5_ROUTER_TOPK = 8
 F32_EPS = 2.0**-23
 CHAIN_BOUND_HEADROOM = 4.0
+
+# Row counts the graphed router is dispatched at, bottom to top of the range the
+# policy serves. The bottom two are the per-rank row counts the DeepEP exchange
+# routes on, which is why the exactness assertions below have to reach them and
+# not only the all-gathered row spaces.
+GRAPH_ROWS = (64, 128, 192, 256, 384, 512)
+
+# Counts the kernel can be FORCED to run through ``split_k=``, which is how the
+# sweep measures them, even though the policy selects exactly one for the whole
+# dispatched row range. The other count is the one the cold sweep finds
+# marginally ahead at the very top of the range, and the one a withdrawn
+# per-bucket table would have selected there; it stays asserted here because the
+# next sweep forces it again.
+# tests/test_glm5_router_gemm_split_k_policy.py restates this tuple and checks
+# the selected count is one of these, so the two files cannot drift.
+FORCED_SPLIT_COUNTS = (4, 8)
 
 
 def chain_addition_depth(chunks: int, split_k: int) -> int:
@@ -434,27 +455,39 @@ def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str) -> 
         )
 
 
-def _assert_split_k_selected(m: int) -> None:
+def _selected_split_k(m: int) -> int:
+    """The split count the policy picks for ``m``, asserted to be a real split.
+
+    Every test below takes the count from the policy for the shape it runs
+    rather than from a constant of its own, so the suite follows a re-measured
+    table instead of silently asserting the old one. The count is the same for
+    every row in the captured range, which is what makes the bitwise
+    cross-bucket comparisons below well posed: a compact launch and a padded
+    bucket reduce in the same order.
+    """
     from batchgen_kernels.triton.glm5_router_gemm_config import (
-        ROUTER_SPLIT_K,
+        ROUTER_SPLIT_K_VALUES,
         select_router_split_k,
     )
 
-    assert select_router_split_k(m, GLM5_ROUTER_K) == ROUTER_SPLIT_K > 1, (
-        f"m={m} is expected to take the split-K path"
+    split_k = select_router_split_k(m, GLM5_ROUTER_K)
+    assert split_k > 1, f"m={m} is expected to take the split-K path"
+    assert split_k in ROUTER_SPLIT_K_VALUES, (
+        f"m={m} selected split_k={split_k}, which is not a measured count "
+        f"{ROUTER_SPLIT_K_VALUES}"
     )
+    return split_k
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_each_kernel_stays_inside_its_own_chain_bound(m, regime):
     # Each kernel is asserted against float64 truth with the bound derived from
     # the addition chain it executes -- not against the other kernel, whose own
     # rounding error is not a specification either of them has to reproduce.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
-    from batchgen_kernels.triton.glm5_router_gemm_config import ROUTER_SPLIT_K
 
-    _assert_split_k_selected(m)
+    split_k = _selected_split_k(m)
     hidden, weight = _router_activations(m, regime, seed=20261016 + m)
 
     serial = _run_router(glm5_router_gemm, hidden, weight, split_k=1)
@@ -469,12 +502,12 @@ def test_glm5_router_each_kernel_stays_inside_its_own_chain_bound(m, regime):
         truth,
         chunk_magnitude,
         chunks,
-        ROUTER_SPLIT_K,
-        f"m={m} {regime} split-K",
+        split_k,
+        f"m={m} {regime} split-K={split_k}",
     )
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_split_k_is_no_less_accurate_than_serial_k(m, regime):
     # Accuracy non-regression, the assert that actually protects the swap: the
@@ -482,7 +515,7 @@ def test_glm5_router_split_k_is_no_less_accurate_than_serial_k(m, regime):
     # long chain they replace. Shorter chains should and do win here.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 
-    _assert_split_k_selected(m)
+    _selected_split_k(m)
     hidden, weight = _router_activations(m, regime, seed=20261016 + m)
 
     serial = _run_router(glm5_router_gemm, hidden, weight, split_k=1)
@@ -497,7 +530,7 @@ def test_glm5_router_split_k_is_no_less_accurate_than_serial_k(m, regime):
     )
 
 
-@pytest.mark.parametrize("m", [192, 256, 384, 512])
+@pytest.mark.parametrize("m", GRAPH_ROWS)
 @pytest.mark.parametrize("regime", ["random", "realistic"])
 def test_glm5_router_split_k_topk_set_matches_and_reorders_only_near_ties(m, regime):
     # The routed expert SET is the contract the MoE path consumes: dispatch
@@ -513,7 +546,7 @@ def test_glm5_router_split_k_topk_set_matches_and_reorders_only_near_ties(m, reg
     # excused only when split-K is the kernel that is right.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 
-    _assert_split_k_selected(m)
+    _selected_split_k(m)
     hidden, weight = _router_activations(m, regime, seed=20261016 + m)
 
     serial = _run_router(glm5_router_gemm, hidden, weight, split_k=1)
@@ -549,14 +582,14 @@ def test_glm5_router_split_k_topk_set_matches_and_reorders_only_near_ties(m, reg
         )
 
 
-@pytest.mark.parametrize("valid_rows", [192, 200, 256, 384])
+@pytest.mark.parametrize("valid_rows", [64, 128, 192, 200, 256, 384])
 def test_glm5_router_split_k_valid_rows_are_bucket_m_independent(valid_rows):
     # The graphed router runs on a padded bucket. A valid row's logits must be
     # bitwise identical whether the launch carried 512 rows or only its own,
     # and the padded rows carry poison here to prove they stay inert.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 
-    _assert_split_k_selected(valid_rows)
+    _selected_split_k(valid_rows)
     hidden, weight = _router_activations(512, "realistic", seed=5120 + valid_rows)
     hidden[valid_rows:] = torch.tensor(
         float("nan"), device=hidden.device, dtype=torch.bfloat16
@@ -579,12 +612,17 @@ def test_glm5_router_split_k_is_launch_to_launch_deterministic():
     _assert_bitwise(second, first, "repeat launch")
 
 
-def test_glm5_router_split_k_graph_replay_matches_eager():
+@pytest.mark.parametrize("m", [192, 512])
+def test_glm5_router_split_k_graph_replay_matches_eager(m):
+    # Two widely separated captured row counts: the count is read once during
+    # capture, so each graph holds a split count, a partial buffer and a
+    # reduction order for every replay. Both select the same count, so this
+    # also shows the two graphs agree on which one was baked in.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
-    from batchgen_kernels.triton.glm5_router_gemm_config import ROUTER_SPLIT_K
 
-    hidden, weight = _router_activations(512, "realistic", seed=20260819)
-    output = torch.empty(512, GLM5_ROUTER_EXPERTS, device=hidden.device, dtype=torch.float32)
+    split_k = _selected_split_k(m)
+    hidden, weight = _router_activations(m, "realistic", seed=20260819 + m)
+    output = torch.empty(m, GLM5_ROUTER_EXPERTS, device=hidden.device, dtype=torch.float32)
 
     glm5_router_gemm(hidden, weight, output)
     torch.cuda.synchronize()
@@ -593,33 +631,88 @@ def test_glm5_router_split_k_graph_replay_matches_eager():
     with torch.cuda.graph(graph):
         glm5_router_gemm(hidden, weight, output)
 
-    replacement, _ = _router_activations(512, "random", seed=4242)
+    replacement, _ = _router_activations(m, "random", seed=4242 + m)
     hidden.copy_(replacement)
     graph.replay()
     torch.cuda.synchronize()
 
     eager = _run_router(glm5_router_gemm, hidden, weight)
-    _assert_bitwise(output, eager, "graph replay vs eager split-K")
+    _assert_bitwise(output, eager, f"m={m} graph replay vs eager split-K={split_k}")
 
     truth, chunk_magnitude, chunks = _fp64_truth_and_chunk_magnitude(hidden, weight)
     _assert_inside_chain_bound(
-        output, truth, chunk_magnitude, chunks, ROUTER_SPLIT_K, "graph replay output"
+        output,
+        truth,
+        chunk_magnitude,
+        chunks,
+        split_k,
+        f"m={m} graph replay output (split_k={split_k})",
     )
 
 
-def test_glm5_router_split_k_preallocated_partials_match_internal_buffer():
+@pytest.mark.parametrize("m", [192, 512])
+def test_glm5_router_split_k_preallocated_partials_match_internal_buffer(m):
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
-    from batchgen_kernels.triton.glm5_router_gemm_config import ROUTER_SPLIT_K
 
-    hidden, weight = _router_activations(512, "random", seed=31337)
+    split_k = _selected_split_k(m)
+    hidden, weight = _router_activations(m, "random", seed=31337 + m)
     internal = _run_router(glm5_router_gemm, hidden, weight)
     scratch = torch.empty(
-        (ROUTER_SPLIT_K, 512, GLM5_ROUTER_EXPERTS),
+        (split_k, m, GLM5_ROUTER_EXPERTS),
         device=hidden.device,
         dtype=torch.float32,
     )
     supplied = _run_router(glm5_router_gemm, hidden, weight, partials=scratch)
-    _assert_bitwise(supplied, internal, "supplied partials buffer")
+    _assert_bitwise(supplied, internal, f"m={m} supplied partials buffer")
+
+
+@pytest.mark.parametrize("regime", ["random", "realistic"])
+def test_glm5_router_forced_split_counts_agree_on_the_routed_expert_set(regime):
+    # The policy selects one count, so no two buckets disagree -- but every
+    # count the sweep can force still has to be a kernel this path could adopt.
+    # The float32 tail is allowed to differ between counts, each has its own
+    # bound asserted here, while the routed expert SET is what the MoE path
+    # consumes, so the counts have to agree on it exactly, and none of them may
+    # be the one that drifts further from float64 truth than the serial chain it
+    # would replace. This is also the gate the next re-measurement reads: a
+    # count that fails here cannot be selected whatever it measures.
+    from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
+    from batchgen_kernels.triton.glm5_router_gemm_config import ROUTER_SPLIT_K_VALUES
+
+    assert set(ROUTER_SPLIT_K_VALUES) <= set(FORCED_SPLIT_COUNTS), (
+        f"the policy selects {ROUTER_SPLIT_K_VALUES}, which this test does not "
+        f"force {FORCED_SPLIT_COUNTS}"
+    )
+    m = 512
+    hidden, weight = _router_activations(m, regime, seed=606060)
+    truth, chunk_magnitude, chunks = _fp64_truth_and_chunk_magnitude(hidden, weight)
+    serial = _run_router(glm5_router_gemm, hidden, weight, split_k=1)
+    d_serial = float((serial.to(torch.float64) - truth).abs().max().item())
+
+    sets = {}
+    for split_k in FORCED_SPLIT_COUNTS:
+        out = _run_router(glm5_router_gemm, hidden, weight, split_k=split_k)
+        _assert_inside_chain_bound(
+            out,
+            truth,
+            chunk_magnitude,
+            chunks,
+            split_k,
+            f"{regime} split_k={split_k}",
+        )
+        d_split = float((out.to(torch.float64) - truth).abs().max().item())
+        assert d_split <= d_serial, (
+            f"{regime} split_k={split_k}: further from float64 truth than "
+            f"serial-K ({d_split:.3e} > {d_serial:.3e})"
+        )
+        sets[split_k] = out.topk(GLM5_ROUTER_TOPK, dim=-1).indices.sort(dim=-1).values
+
+    reference = FORCED_SPLIT_COUNTS[0]
+    for split_k, ids in sets.items():
+        assert torch.equal(ids, sets[reference]), (
+            f"{regime}: split_k={split_k} and split_k={reference} route to "
+            f"different expert sets"
+        )
 
 
 @pytest.mark.parametrize("split_k", [0, -1, 5, 7, 128])
@@ -634,24 +727,29 @@ def test_glm5_router_split_k_rejects_an_inexact_split_count(split_k):
 
 
 def test_glm5_router_split_k_rejects_a_mismatched_partials_buffer():
+    # A buffer sized for another split count has to be rejected rather than
+    # silently reinterpreted: its leading axis would be read as this launch's
+    # splits, so the reduction would sum partials that were never written.
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
-    from batchgen_kernels.triton.glm5_router_gemm_config import (
-        ROUTER_SPLIT_K,
-        RouterGemmShapeError,
-    )
+    from batchgen_kernels.triton.glm5_router_gemm_config import RouterGemmShapeError
 
-    hidden, weight = _router_activations(256, "random", seed=12)
-    output = torch.empty(256, GLM5_ROUTER_EXPERTS, device=hidden.device, dtype=torch.float32)
-    wrong_shape = torch.empty(
-        (ROUTER_SPLIT_K - 1, 256, GLM5_ROUTER_EXPERTS),
-        device=hidden.device,
-        dtype=torch.float32,
-    )
-    with pytest.raises(RouterGemmShapeError):
-        glm5_router_gemm(hidden, weight, output, partials=wrong_shape)
+    m = 256
+    split_k = _selected_split_k(m)
+    other = next(s for s in FORCED_SPLIT_COUNTS if s != split_k)
+    hidden, weight = _router_activations(m, "random", seed=12)
+    output = torch.empty(m, GLM5_ROUTER_EXPERTS, device=hidden.device, dtype=torch.float32)
+
+    for leading in (split_k - 1, other):
+        wrong_shape = torch.empty(
+            (leading, m, GLM5_ROUTER_EXPERTS),
+            device=hidden.device,
+            dtype=torch.float32,
+        )
+        with pytest.raises(RouterGemmShapeError):
+            glm5_router_gemm(hidden, weight, output, partials=wrong_shape)
 
     wrong_dtype = torch.empty(
-        (ROUTER_SPLIT_K, 256, GLM5_ROUTER_EXPERTS),
+        (split_k, m, GLM5_ROUTER_EXPERTS),
         device=hidden.device,
         dtype=torch.bfloat16,
     )
@@ -663,7 +761,7 @@ def test_glm5_router_split_k_rejects_a_mismatched_partials_buffer():
 def test_glm5_router_split_k_still_matches_the_bf16_reference(m):
     from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
 
-    _assert_split_k_selected(m)
+    _selected_split_k(m)
     hidden, weight = _router_activations(m, "random", seed=818 + m)
     split = _run_router(glm5_router_gemm, hidden, weight)
     _assert_bf16_router_close(split, _reference_router(hidden, weight))
