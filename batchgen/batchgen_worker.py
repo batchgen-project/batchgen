@@ -2122,6 +2122,17 @@ class BatchGenWorker:
 
 		host_views = self._host_views_by_group()
 		wave = getattr(self, "_prefill_pool_wave", None)
+		if trajectory:
+			# Pendings created during a pass's DECODE phase (a commit whose
+			# D2H retired after the post-prefill finalize, e.g. the last
+			# overflow wave's sequence) would otherwise install only at the
+			# NEXT pass's post-prefill finalize -- one publish window too
+			# late for this gather. Ordering is the pass boundary itself: a
+			# rank reaches this config only after returning from the previous
+			# pass, so every rank's shard writes for those pendings are done,
+			# and no pending from THIS pass can exist yet (its prefill has
+			# not run).
+			self._finalize_trajectory_frontiers()
 		payload = None
 		if uuids and all(
 			self._owns_host_kv(self.global_batch.get_sequence(uuid))

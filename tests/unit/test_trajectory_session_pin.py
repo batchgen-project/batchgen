@@ -467,6 +467,7 @@ def _mirror_rank(
             "_trajectory_group_geometry",
             "_trajectory_session_summary",
             "_fold_trajectory_session_groups",
+            "_finalize_trajectory_frontiers",
         ],
         {"dist": fake_dist},
     )
@@ -484,7 +485,17 @@ def _mirror_rank(
         _trajectory_frontier_committer=(
             None
             if registry is None
-            else SimpleNamespace(owns_registry=True, registry=registry)
+            else SimpleNamespace(
+                owns_registry=True,
+                registry=registry,
+                # The pre-publish finalize: nothing pending in these fakes.
+                finalize=lambda: SimpleNamespace(
+                    installed=(),
+                    rolled_back_sequence_ids=(),
+                    deduped_sequence_ids=(),
+                    failed_sequence_ids=(),
+                ),
+            )
         ),
         _host_views_by_group=lambda: {0: _FakeView({})},
         _reserve_trajectory_arenas=lambda uuids: {},

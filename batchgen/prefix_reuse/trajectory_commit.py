@@ -61,6 +61,29 @@ _POOL_PRESSURE_MARKERS = ("Insufficient free pages",)
 # concatenated in this order, and a restore reads them back in it.
 SNAPSHOT_CHUNK_NAMES = ("recurrent", "conv_q", "conv_k", "conv_v")
 
+
+def snapshot_chunks_digest(chunks: Sequence[object]) -> str:
+    """Order-sensitive blake2b over a snapshot's chunk bytes (hex, 16 chars).
+
+    The SAME function digests the commit-side D2H chunks and the restore-side
+    arena window, so equal values are a live end-to-end proof that the bytes a
+    restore writes into the KDA slot are the bytes the commit snapshotted off
+    the freshly computed state.
+    """
+
+    import hashlib
+
+    digest = hashlib.blake2b(digest_size=8)
+    try:
+        for chunk in chunks:
+            tensor = (
+                chunk.contiguous() if hasattr(chunk, "contiguous") else chunk
+            )
+            digest.update(memoryview(tensor.numpy()).cast("B"))
+    except Exception:  # noqa: BLE001 - diagnostics only, never fail a commit
+        return "unavailable"
+    return digest.hexdigest()
+
 # Why a commit step did NOT install a frontier. Strings, not booleans, because
 # a skip must be countable and nameable in the log: every one of these looks
 # exactly like a clean run from the outside.
@@ -1749,8 +1772,8 @@ class TrajectoryFrontierCommitter:
         )
         self._logger.info(
             "[%s] rank=%s seq=%s shard=%s/%s written boundary=%s "
-            "arena_pages=%s shard_pages=%s bytes=%s; record pending until the "
-            "all-ranks barrier",
+            "arena_pages=%s shard_pages=%s bytes=%s digest=%s; record pending "
+            "until the all-ranks barrier",
             PREFIX,
             self._rank,
             int(sequence_id),
@@ -1760,6 +1783,7 @@ class TrajectoryFrontierCommitter:
             arena.pages_per_group,
             arena.pages_per_shard,
             written,
+            snapshot_chunks_digest(chunks),
         )
         return TrajectoryCommitOutcome(
             session_key="",

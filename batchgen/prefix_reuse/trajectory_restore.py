@@ -448,6 +448,31 @@ class KDAStateSnapshotWriter:
     def release_slot(self, sequence_id: int) -> None:
         self._manager().release_sequence_states([int(sequence_id)])
 
+    def slot_digest(self, sequence_id: int) -> str:
+        """Digest of the slot's CURRENT device bytes, commit-comparable.
+
+        Reads the slot back D2H through the SAME flatten-to-uint8 the commit
+        reader uses, then digests with the shared helper, so a value equal to
+        the commit log's ``digest=`` is a live proof the restored slot holds
+        exactly the committed state.
+        """
+
+        from batchgen.prefix_reuse.trajectory_commit import (
+            snapshot_chunks_digest,
+        )
+
+        torch = self._torch_module()
+        manager = self._manager()
+        slot = int(manager.get_sequence_state_item(int(sequence_id)))
+        recurrent = manager.get_recurrent_tensors()[:, slot]
+        conv_q, conv_k, conv_v = (
+            tensor[:, slot] for tensor in manager.get_conv_tensors()
+        )
+        return snapshot_chunks_digest([
+            tensor.contiguous().reshape(-1).to("cpu").view(torch.uint8)
+            for tensor in (recurrent, conv_q, conv_k, conv_v)
+        ])
+
     def write_slot(
         self, sequence_id: int, chunks: Sequence[object]
     ) -> tuple[int, int]:
@@ -766,7 +791,7 @@ class TrajectoryRestorer:
 
         sequence_id = attachment.sequence_id
         try:
-            slot, written, had_slot = self._read_window_and_bind_slot(
+            slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
                 arena=arena, layout=self._committer.layout, sequence_id=sequence_id
             )
         except _RestoreDeclined as declined:
@@ -783,8 +808,8 @@ class TrajectoryRestorer:
         self._restores += 1
         self._logger.info(
             "[%s] rank=%s seq=%s session=%s RESTORED boundary=%s slot=%s "
-            "bytes=%s group=%s allocated_slot=%s; suffix prefill resumes at "
-            "token %s",
+            "bytes=%s digest=%s group=%s allocated_slot=%s; suffix prefill "
+            "resumes at token %s",
             PREFIX,
             self._rank,
             sequence_id,
@@ -792,6 +817,7 @@ class TrajectoryRestorer:
             attachment.boundary_tokens,
             slot,
             written,
+            slot_digest,
             attachment.owning_group_id,
             not had_slot,
             int(compute_cached_tokens),
@@ -888,7 +914,15 @@ class TrajectoryRestorer:
             raise _RestoreDeclined(
                 DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
             ) from exc
-        return int(slot), int(written), bool(had_slot)
+        try:
+            # D2H readback of the slot just written, digested with the SAME
+            # helper the commit side logs with: equal values are the live
+            # bit-exactness proof. Best effort -- a digest failure must not
+            # decline a restore that already succeeded.
+            slot_digest = self._state_writer.slot_digest(int(sequence_id))
+        except Exception:  # noqa: BLE001 - diagnostics only
+            slot_digest = "unavailable"
+        return int(slot), int(written), bool(had_slot), slot_digest
 
     # -- the mirrored (follower) restore ------------------------------------
 
@@ -965,7 +999,7 @@ class TrajectoryRestorer:
             )
             return None
         try:
-            slot, written, had_slot = self._read_window_and_bind_slot(
+            slot, written, had_slot, slot_digest = self._read_window_and_bind_slot(
                 arena=arena, layout=layout, sequence_id=int(sequence_id)
             )
         except _RestoreDeclined as declined:
@@ -980,8 +1014,8 @@ class TrajectoryRestorer:
         self._restores += 1
         self._logger.info(
             "[%s] rank=%s seq=%s session=%s RESTORED shard=%s/%s boundary=%s "
-            "slot=%s bytes=%s group=%s allocated_slot=%s; suffix prefill "
-            "resumes at token %s",
+            "slot=%s bytes=%s digest=%s group=%s allocated_slot=%s; suffix "
+            "prefill resumes at token %s",
             PREFIX,
             self._rank,
             int(sequence_id),
@@ -991,6 +1025,7 @@ class TrajectoryRestorer:
             int(boundary_tokens),
             slot,
             written,
+            slot_digest,
             int(owning_group_id),
             not had_slot,
             int(compute_cached_tokens),
