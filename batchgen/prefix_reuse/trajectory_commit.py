@@ -38,9 +38,12 @@ from batchgen.prefix_reuse.trajectory_frontier import (
     FrontierReleaseOutcome,
     KDASnapshotDescriptor,
     KDASnapshotProfile,
+    TrajectoryFrontierError,
     TrajectoryFrontierRecord,
     TrajectoryFrontierRegistry,
     dtype_element_bytes,
+    frontier_index_key,
+    session_key_for_baseline,
 )
 
 
@@ -63,14 +66,43 @@ SNAPSHOT_CHUNK_NAMES = ("recurrent", "conv_q", "conv_k", "conv_v")
 # exactly like a clean run from the outside.
 SKIP_BOUNDARY_MISALIGNED = "boundary_misaligned"
 SKIP_ALREADY_COMMITTED = "already_committed"
+SKIP_SESSION_IN_FLIGHT = "session_in_flight"
 SKIP_ARENA_UNAVAILABLE = "arena_unavailable"
 SKIP_ARENA_MISSING = "arena_missing"
+SKIP_FRONTIER_DRIFT = "frontier_drift"
+SKIP_BOUNDARY_REGRESSION = "boundary_regression"
+SKIP_FRONTIER_DIVERGED = "frontier_diverged"
 
 SKIP_REASONS = (
     SKIP_BOUNDARY_MISALIGNED,
     SKIP_ALREADY_COMMITTED,
+    SKIP_SESSION_IN_FLIGHT,
     SKIP_ARENA_UNAVAILABLE,
     SKIP_ARENA_MISSING,
+    SKIP_FRONTIER_DRIFT,
+    SKIP_BOUNDARY_REGRESSION,
+    SKIP_FRONTIER_DIVERGED,
+)
+
+# A DEDUPE is a correct no-op: the frontier the operator asked for is already
+# committed (or is being committed this very pass by a sibling sequence over
+# the same baseline), so there is nothing to install and nothing is lost. It is
+# counted -- ``trajectory_commit_dedup`` is the sum over these -- and logged at
+# INFO, because unlike every other skip it is not a frontier that went missing.
+DEDUP_SKIP_REASONS = (
+    SKIP_ALREADY_COMMITTED,
+    SKIP_SESSION_IN_FLIGHT,
+)
+
+# A REFUSAL is the session saying "this is not a frontier I can hold": the
+# stored record is ahead of the boundary being committed, or its identity does
+# not line up with the one derived here. Those are the cases that must never
+# reach the registry, where they would surface as an unhandled error after the
+# arena and the D2H had already been paid for.
+REFUSAL_SKIP_REASONS = (
+    SKIP_FRONTIER_DRIFT,
+    SKIP_BOUNDARY_REGRESSION,
+    SKIP_FRONTIER_DIVERGED,
 )
 
 
@@ -875,7 +907,14 @@ class TrajectoryCommitOutcome:
 
 @dataclass(frozen=True)
 class _PendingFrontier:
-    """A shard written, waiting for the barrier before its record installs."""
+    """A shard written, waiting for the barrier before its record installs.
+
+    Deliberately carries NO install decision: the decision is re-taken at
+    finalize from the registry as it stands after the barrier, because a
+    sibling sequence of the same pass may have installed this very session in
+    between. A decision cached here would be exactly the stale answer that made
+    a replayed baseline blow up inside ``registry.begin``.
+    """
 
     sequence_id: int
     namespace_digest: tuple[int, ...]
@@ -883,16 +922,92 @@ class _PendingFrontier:
     page_ids_by_group: Mapping[int, tuple[int, ...]]
     snapshot: KDASnapshotDescriptor
     arena: SnapshotArena
-    previous_session_key: str | None
 
 
 @dataclass(frozen=True)
 class TrajectoryFinalizeOutcome:
-    """What the post-barrier finalize step installed and what it gave back."""
+    """What the post-barrier finalize step installed and what it gave back.
+
+    ``rolled_back_sequence_ids`` is every arena whose pages went home WITHOUT a
+    record: a reservation no commit consumed, and a pending shard the decision
+    table turned down at the barrier. ``deduped_sequence_ids`` is the subset of
+    those the table named a dedupe or a refusal for, so a no-op is countable
+    separately from a sequence that simply never committed.
+    """
 
     installed: tuple[TrajectoryCommitOutcome, ...]
     rolled_back_sequence_ids: tuple[int, ...]
     failed_sequence_ids: tuple[int, ...]
+    deduped_sequence_ids: tuple[int, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# The install decision table
+# ---------------------------------------------------------------------------
+
+# What a commit step is allowed to do to the session a frontier belongs to.
+INSTALL_BEGIN = "begin"
+INSTALL_ADVANCE = "advance"
+INSTALL_DEDUP = "dedup"
+INSTALL_REFUSE = "refuse"
+
+INSTALL_ACTIONS = (
+    INSTALL_BEGIN,
+    INSTALL_ADVANCE,
+    INSTALL_DEDUP,
+    INSTALL_REFUSE,
+)
+
+
+@dataclass(frozen=True)
+class FrontierInstallDecision:
+    """THE answer to "what does this commit do to its session?".
+
+    Produced by ``TrajectoryFrontierCommitter.decide_install`` and by nothing
+    else, so the single-phase (G==1) commit, the three-phase (G>1) reservation
+    and the post-barrier finalize cannot disagree about what a session already
+    holds. ``session_key`` is always the session the decision is ABOUT, even for
+    a dedupe or a refusal, so the log line names it.
+    """
+
+    action: str
+    session_key: str
+    boundary_tokens: int
+    previous_session_key: str | None = None
+    skip_reason: str = ""
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.action not in INSTALL_ACTIONS:
+            raise SnapshotArenaCorrupt(
+                f"unknown frontier install action {self.action!r}; known "
+                "actions are " + ", ".join(INSTALL_ACTIONS)
+            )
+        if self.action == INSTALL_ADVANCE and not self.previous_session_key:
+            raise SnapshotArenaCorrupt(
+                "an advance decision must name the session it advances"
+            )
+        if self.installs:
+            if self.skip_reason:
+                raise SnapshotArenaCorrupt(
+                    f"a {self.action!r} decision installs a record, so it "
+                    f"cannot also carry skip reason {self.skip_reason!r}"
+                )
+        elif self.skip_reason not in SKIP_REASONS:
+            raise SnapshotArenaCorrupt(
+                f"a {self.action!r} decision must carry a known skip reason, "
+                f"got {self.skip_reason!r}"
+            )
+
+    @property
+    def installs(self) -> bool:
+        """Does this decision put a record in the registry?"""
+
+        return self.action in (INSTALL_BEGIN, INSTALL_ADVANCE)
+
+    @property
+    def is_dedup(self) -> bool:
+        return self.action == INSTALL_DEDUP
 
 
 class TrajectoryFrontierCommitter:
@@ -958,6 +1073,16 @@ class TrajectoryFrontierCommitter:
         self._reserved: dict[int, SnapshotArena] = {}
         self._pending: dict[int, _PendingFrontier] = {}
         self._skips: dict[str, int] = {}
+        # G>1 only: the install decision taken for each sequence THIS pass.
+        # Two jobs, both of which the single-phase path gets from the registry
+        # for free because it installs inside the commit step:
+        #   * a sequence's decision claims its session key, so a sibling
+        #     sequence over the same baseline in the same batch dedupes instead
+        #     of racing it to a second record;
+        #   * the reserve step, the commit boundary and the finalize all ask the
+        #     same question, so a named skip is logged and counted ONCE.
+        # Cleared by ``finalize``, which is this path's pass boundary.
+        self._decisions: dict[int, FrontierInstallDecision] = {}
 
     # -- read ---------------------------------------------------------------
 
@@ -987,6 +1112,24 @@ class TrajectoryFrontierCommitter:
 
         return {reason: int(self._skips.get(reason, 0)) for reason in SKIP_REASONS}
 
+    def dedup_skips(self) -> int:
+        """``trajectory_commit_dedup``: commits the decision table no-oped.
+
+        A re-commit of an already-committed frontier is the common case in a
+        replay, and before the decision table existed it cost a G-wide arena,
+        a full D2H and a rollback each time. One counter makes "this run
+        deduped N commits" a number instead of a guess.
+        """
+
+        return sum(int(self._skips.get(reason, 0)) for reason in DEDUP_SKIP_REASONS)
+
+    def refused_skips(self) -> int:
+        """Commits the decision table refused by name (never a traceback)."""
+
+        return sum(
+            int(self._skips.get(reason, 0)) for reason in REFUSAL_SKIP_REASONS
+        )
+
     def reserved_sequence_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._reserved))
 
@@ -1000,9 +1143,16 @@ class TrajectoryFrontierCommitter:
                 "reasons are " + ", ".join(SKIP_REASONS)
             )
         self._skips[reason] = self._skips.get(reason, 0) + 1
-        # WARNING, not INFO: every one of these is a frontier the operator
-        # asked for and did not get, and it is indistinguishable from a clean
-        # run in the rest of the log.
+        if reason in DEDUP_SKIP_REASONS:
+            # The ONE skip that is not a loss: the frontier is committed, this
+            # commit simply had nothing to add. At WARNING a replay of a
+            # committed batch would log one alarming line per sequence for a
+            # mechanism working exactly as designed.
+            self._logger.info(message, *args)
+            return
+        # WARNING, not INFO: every other one of these is a frontier the
+        # operator asked for and did not get, and it is indistinguishable from
+        # a clean run in the rest of the log.
         self._logger.warning(message, *args)
 
     def arena_for(self, storage_handle: int) -> SnapshotArena | None:
@@ -1046,10 +1196,237 @@ class TrajectoryFrontierCommitter:
             shard_count=self._shard_count,
         )
 
+    # -- the install decision table ----------------------------------------
+
+    def decide_install(
+        self,
+        *,
+        namespace_digest: Sequence[int],
+        frontier_token_ids: Sequence[int],
+        sequence_id: int,
+    ) -> FrontierInstallDecision:
+        """What this commit does to its session. THE table, one owner.
+
+        Every path that ends in a registry write consults this and nothing
+        else: the single-phase commit, the G>1 reservation (where turning a
+        commit down costs nothing at all) and the post-barrier finalize. The
+        split that the three-phase path used to have -- a boundary-equality
+        test in ``commit`` and a bare ``registry.begin`` in the install -- is
+        what let a replayed baseline reach ``begin`` with a session key the
+        registry already held, after the arena and the D2H had been paid for.
+
+        The table, for a session that may already hold a record:
+
+        * SAME boundary and SAME frontier index key -> ``INSTALL_DEDUP``. The
+          record already describes this exact state; there is nothing to store.
+        * GREATER boundary whose stored frontier is a PREFIX of these tokens ->
+          ``INSTALL_ADVANCE``, the existing path.
+        * a sibling sequence of THIS pass already claims the session ->
+          ``INSTALL_DEDUP``: two sequences over one baseline are one session,
+          and the first to be decided owns it.
+        * nothing known about the session -> ``INSTALL_BEGIN``.
+        * anything else -- the stored boundary is AHEAD of this one, the stored
+          frontier DIVERGES from these tokens, or the identity derived two ways
+          disagrees -> ``INSTALL_REFUSE``, named, so the caller gives the arena
+          back and logs one line instead of raising through the install.
+
+        Identity is resolved two ways on purpose, because the registry keys two
+        ways: ``resolve`` finds a session by its CURRENT frontier tokens, while
+        a session's key is derived from the tokens it was BORN at and never
+        moves. A re-commit of a baseline whose session has since advanced is a
+        ``resolve`` miss AND a session-key hit -- exactly the case the live
+        failure walked into.
+        """
+
+        tokens = tuple(int(token_id) for token_id in frontier_token_ids)
+        boundary = len(tokens)
+        resolution = self._registry.resolve(
+            namespace_digest=namespace_digest, prompt_token_ids=tokens
+        )
+        if resolution.hit:
+            record = resolution.record
+            stored = int(record.frontier_boundary_tokens)
+            if stored == boundary:
+                # A hit at this boundary means the LCP covers every token of
+                # both chains, so the stored frontier IS these tokens and the
+                # two index keys are equal by construction.
+                return FrontierInstallDecision(
+                    action=INSTALL_DEDUP,
+                    session_key=record.session_key,
+                    boundary_tokens=boundary,
+                    skip_reason=SKIP_ALREADY_COMMITTED,
+                    detail=(
+                        f"session {record.session_key} already holds this exact "
+                        f"frontier at boundary={boundary}; nothing to advance"
+                    ),
+                )
+            if stored < boundary:
+                return FrontierInstallDecision(
+                    action=INSTALL_ADVANCE,
+                    session_key=record.session_key,
+                    boundary_tokens=boundary,
+                    previous_session_key=record.session_key,
+                )
+            # Unreachable through ``resolve``, which only probes boundaries at
+            # or below the prompt length. Named rather than trusted.
+            return FrontierInstallDecision(
+                action=INSTALL_REFUSE,
+                session_key=record.session_key,
+                boundary_tokens=boundary,
+                skip_reason=SKIP_BOUNDARY_REGRESSION,
+                detail=(
+                    f"session {record.session_key} resolved at stored "
+                    f"boundary={stored} for a {boundary}-token frontier"
+                ),
+            )
+
+        # A ``resolve`` miss says no committed frontier CONTINUES into these
+        # tokens. It does not say the session is unknown: the key is derived
+        # from the baseline, and these tokens are a baseline candidate.
+        session_key = session_key_for_baseline(
+            namespace_digest=namespace_digest, baseline_token_ids=tokens
+        )
+        existing = self._registry.get(session_key)
+        if existing is not None:
+            stored = int(existing.frontier_boundary_tokens)
+            if stored == boundary:
+                index_key = frontier_index_key(
+                    namespace_digest=namespace_digest, frontier_token_ids=tokens
+                )
+                stored_index_key = frontier_index_key(
+                    namespace_digest=existing.namespace_digest,
+                    frontier_token_ids=existing.frontier_token_ids,
+                )
+                if index_key == stored_index_key:
+                    # Same session, same boundary, same frontier content, yet
+                    # ``resolve`` did not find it: the frontier index is out of
+                    # step with the record table. The commit is still a no-op,
+                    # which is what matters here.
+                    return FrontierInstallDecision(
+                        action=INSTALL_DEDUP,
+                        session_key=session_key,
+                        boundary_tokens=boundary,
+                        skip_reason=SKIP_ALREADY_COMMITTED,
+                        detail=(
+                            f"session {session_key} already holds this frontier "
+                            f"at boundary={boundary}"
+                        ),
+                    )
+                return FrontierInstallDecision(
+                    action=INSTALL_REFUSE,
+                    session_key=session_key,
+                    boundary_tokens=boundary,
+                    skip_reason=SKIP_FRONTIER_DRIFT,
+                    detail=(
+                        f"session {session_key} holds a different "
+                        f"{boundary}-token frontier than the one derived here; "
+                        "the namespace digest or the token hashing drifted"
+                    ),
+                )
+            if stored > boundary:
+                return FrontierInstallDecision(
+                    action=INSTALL_REFUSE,
+                    session_key=session_key,
+                    boundary_tokens=boundary,
+                    skip_reason=SKIP_BOUNDARY_REGRESSION,
+                    detail=(
+                        f"session {session_key} has already advanced to "
+                        f"boundary={stored}, so committing its {boundary}-token "
+                        "baseline again would move the frontier backwards"
+                    ),
+                )
+            return FrontierInstallDecision(
+                action=INSTALL_REFUSE,
+                session_key=session_key,
+                boundary_tokens=boundary,
+                skip_reason=SKIP_FRONTIER_DIVERGED,
+                detail=(
+                    f"session {session_key} holds a {stored}-token frontier "
+                    f"that is not a prefix of this {boundary}-token one, so "
+                    "the two are different trajectories under one key"
+                ),
+            )
+
+        holder = self._session_claim_holder(
+            session_key, sequence_id=int(sequence_id)
+        )
+        if holder is not None:
+            return FrontierInstallDecision(
+                action=INSTALL_DEDUP,
+                session_key=session_key,
+                boundary_tokens=boundary,
+                skip_reason=SKIP_SESSION_IN_FLIGHT,
+                detail=(
+                    f"sequence {holder} of this pass is already committing "
+                    f"session {session_key} at boundary={boundary}; one "
+                    "baseline is one session"
+                ),
+            )
+        return FrontierInstallDecision(
+            action=INSTALL_BEGIN,
+            session_key=session_key,
+            boundary_tokens=boundary,
+        )
+
+    def _session_claim_holder(
+        self, session_key: str, *, sequence_id: int
+    ) -> int | None:
+        """Which OTHER sequence of this pass is committing that session."""
+
+        for other_id, decision in sorted(self._decisions.items()):
+            if int(other_id) == int(sequence_id):
+                continue
+            if decision.installs and decision.session_key == str(session_key):
+                return int(other_id)
+        return None
+
+    def _decide_for_pass(
+        self,
+        *,
+        namespace_digest: Sequence[int],
+        frontier_token_ids: Sequence[int],
+        sequence_id: int,
+    ) -> FrontierInstallDecision:
+        """``decide_install`` plus the pass bookkeeping a skip needs.
+
+        The G>1 path asks the same question up to three times for one sequence
+        (reserve, commit boundary, finalize), so the named skip is logged and
+        counted only when the answer CHANGES -- otherwise one deduped commit
+        would read as three in the counters.
+        """
+
+        key = int(sequence_id)
+        decision = self.decide_install(
+            namespace_digest=namespace_digest,
+            frontier_token_ids=frontier_token_ids,
+            sequence_id=key,
+        )
+        previous = self._decisions.get(key)
+        if self._shard_count > 1:
+            self._decisions[key] = decision
+        if not decision.installs and (
+            previous is None or previous.skip_reason != decision.skip_reason
+        ):
+            self._skip(
+                decision.skip_reason,
+                "[%s] rank=%s seq=%s NO frontier installed (%s): %s",
+                PREFIX,
+                self._rank,
+                key,
+                decision.skip_reason,
+                decision.detail,
+            )
+        return decision
+
     # -- G>1 arena reservation ---------------------------------------------
 
     def reserve_arena(
-        self, *, sequence_id: int, prefix_page_count: int
+        self,
+        *,
+        sequence_id: int,
+        prefix_page_count: int,
+        namespace_digest: Sequence[int],
+        frontier_token_ids: Sequence[int],
     ) -> SnapshotArena | None:
         """Pre-allocate the G-wide arena for a sequence. Leader-only.
 
@@ -1060,10 +1437,19 @@ class TrajectoryFrontierCommitter:
         holds exactly as before: the boundary planner cannot double-promise
         bytes a snapshot is already holding.
 
-        ``None`` means pool pressure, the one recoverable outcome: no arena, so
-        no rank writes a shard and the sequence's frontier is simply not
-        committed this pass. Every arena handed out here is either consumed by
-        a ``commit`` or rolled back by ``finalize`` -- never leaked.
+        ``None`` means no arena, so no rank writes a shard and the sequence's
+        frontier is simply not committed this pass. Two reasons, both named and
+        counted: pool pressure, the one recoverable allocation outcome, and a
+        decision table that says there is nothing to install. Every arena handed
+        out here is either consumed by a ``commit`` or rolled back by
+        ``finalize`` -- never leaked.
+
+        THIS is the earliest sound point for the install decision, which is why
+        the reservation needs the frontier identity: the session key and the
+        boundary are already known here, a full prefill config BEFORE the D2H
+        and the shard writes, and the registry cannot install a record between
+        here and the barrier. A dedupe therefore costs no Host pages, no device
+        copy and no page-table write at all.
         """
 
         if not self._owns_registry:
@@ -1078,6 +1464,13 @@ class TrajectoryFrontierCommitter:
                 f"sequence {key} already has a reserved snapshot arena; a "
                 "second reservation would leak the first one's Host pages"
             )
+        decision = self._decide_for_pass(
+            namespace_digest=namespace_digest,
+            frontier_token_ids=frontier_token_ids,
+            sequence_id=key,
+        )
+        if not decision.installs:
+            return None
         arena_pages = self.plan_arena_pages(prefix_page_count=prefix_page_count)
         try:
             arena = self._arena_allocator.allocate(
@@ -1097,6 +1490,10 @@ class TrajectoryFrontierCommitter:
                 arena_pages // self._shard_count,
                 exc,
             )
+            # The claim goes with the arena: this sequence will not commit the
+            # session this pass, so a sibling over the same baseline must be
+            # free to try rather than dedupe against a commit that never comes.
+            self._decisions.pop(key, None)
             return None
         self._reserved[key] = arena
         return arena
@@ -1112,6 +1509,9 @@ class TrajectoryFrontierCommitter:
         """
 
         arena = self._reserved.pop(int(sequence_id), None)
+        # The sequence is giving up its reservation, so it gives up its claim on
+        # the session too: a sibling over the same baseline may still commit it.
+        self._decisions.pop(int(sequence_id), None)
         if arena is None:
             return False
         if not self._owns_registry:
@@ -1200,26 +1600,39 @@ class TrajectoryFrontierCommitter:
                 "registry; it writes its shard with write_shard and installs "
                 "nothing"
             )
-        resolution = self._registry.resolve(
-            namespace_digest=namespace_digest, prompt_token_ids=tokens
+        # 1. The decision table, BEFORE the D2H: a commit with nothing to
+        #    install must not pay for a device copy it will throw away.
+        decision = self._decide_for_pass(
+            namespace_digest=namespace_digest,
+            frontier_token_ids=tokens,
+            sequence_id=int(sequence_id),
         )
-        previous = resolution.record if resolution.hit else None
-        if (
-            previous is not None
-            and previous.frontier_boundary_tokens == len(tokens)
-        ):
-            self._skip(
-                SKIP_ALREADY_COMMITTED,
-                "[%s] rank=%s session=%s already committed at boundary=%s; "
-                "nothing to advance",
-                PREFIX,
-                self._rank,
-                previous.session_key,
-                len(tokens),
-            )
+        if not decision.installs:
             return None
 
-        # 1. D2H copy of THIS rank's slot shard, in the fixed profile order.
+        # 2. At G>1 the arena was reserved in prefill config. No arena means no
+        #    frontier for this sequence this pass, and that is known BEFORE the
+        #    copy, so a missing reservation costs no D2H either.
+        reserved_arena = None
+        if self._shard_count > 1:
+            reserved_arena = self._reserved.pop(int(sequence_id), None)
+            if reserved_arena is None:
+                self._skip(
+                    SKIP_ARENA_MISSING,
+                    "[%s] rank=%s seq=%s SKIPPED frontier commit at "
+                    "boundary=%s: no snapshot arena was reserved for it this "
+                    "pass",
+                    PREFIX,
+                    self._rank,
+                    int(sequence_id),
+                    len(tokens),
+                )
+                # Nothing will be committed for this sequence, so it must not
+                # keep a sibling from committing the same session.
+                self._decisions.pop(int(sequence_id), None)
+                return None
+
+        # 3. D2H copy of THIS rank's slot shard, in the fixed profile order.
         chunks = self._snapshot_reader.read_slot(int(sequence_id))
         self._validate_chunks(chunks)
 
@@ -1230,7 +1643,8 @@ class TrajectoryFrontierCommitter:
                 page_ids_by_group=page_ids_by_group,
                 owning_group_id=int(owning_group_id),
                 sequence_id=int(sequence_id),
-                previous=previous,
+                decision=decision,
+                arena=reserved_arena,
                 chunks=chunks,
             )
 
@@ -1276,14 +1690,12 @@ class TrajectoryFrontierCommitter:
         #    intact; the NEW arena is the only thing rolled back.
         try:
             outcome = self._install(
+                decision=decision,
                 namespace_digest=namespace_digest,
                 tokens=tokens,
                 page_ids_by_group=page_ids_by_group,
                 snapshot=snapshot,
                 arena=arena,
-                previous_session_key=(
-                    None if previous is None else previous.session_key
-                ),
                 sequence_id=int(sequence_id),
             )
         except Exception:
@@ -1300,23 +1712,17 @@ class TrajectoryFrontierCommitter:
         page_ids_by_group: Mapping[int, Sequence[int]],
         owning_group_id: int,
         sequence_id: int,
-        previous,
+        decision: FrontierInstallDecision,
+        arena: SnapshotArena,
         chunks: Sequence[object],
-    ) -> TrajectoryCommitOutcome | None:
-        """G>1: write this rank's window and leave the record pending."""
+    ) -> TrajectoryCommitOutcome:
+        """G>1: write this rank's window and leave the record pending.
 
-        arena = self._reserved.pop(int(sequence_id), None)
-        if arena is None:
-            self._skip(
-                SKIP_ARENA_MISSING,
-                "[%s] rank=%s seq=%s SKIPPED frontier commit at boundary=%s: "
-                "no snapshot arena was reserved for it this pass",
-                PREFIX,
-                self._rank,
-                int(sequence_id),
-                len(tokens),
-            )
-            return None
+        The arena is the one ``commit`` took out of this pass's reservations,
+        and the decision is the table's answer for this sequence; both are
+        settled before the D2H, so everything here is the write itself.
+        """
+
         written = self._arena_allocator.write_shard(
             arena, shard_index=self._shard_index, chunks=chunks
         )
@@ -1340,9 +1746,6 @@ class TrajectoryFrontierCommitter:
             },
             snapshot=snapshot,
             arena=arena,
-            previous_session_key=(
-                None if previous is None else previous.session_key
-            ),
         )
         self._logger.info(
             "[%s] rank=%s seq=%s shard=%s/%s written boundary=%s "
@@ -1362,7 +1765,9 @@ class TrajectoryFrontierCommitter:
             session_key="",
             record=None,
             arena=arena,
-            advanced=previous is not None,
+            # Provisional, like the record itself: the install the barrier
+            # eventually runs re-decides against the registry as it stands then.
+            advanced=decision.action == INSTALL_ADVANCE,
             previous_release=None,
             installed=False,
             shard_index=self._shard_index,
@@ -1456,6 +1861,12 @@ class TrajectoryFrontierCommitter:
         and the record is installed immediately after. A failure in either
         gives that arena's pages back and leaves the old record installed,
         referenced and unreleased; the other sequences are unaffected.
+
+        The install decision is re-taken HERE, per sequence, against the
+        registry as it stands after the barrier -- never cached from the commit
+        boundary. Installs in this very loop change the answer: two sequences
+        over one baseline are one session, so the first installs and the second
+        is told, by name, that there is nothing left to do.
         """
 
         if not self._owns_registry:
@@ -1463,26 +1874,44 @@ class TrajectoryFrontierCommitter:
             # adopted arena objects is the whole of its finalize.
             self._reserved.clear()
             self._pending.clear()
+            self._decisions.clear()
             return TrajectoryFinalizeOutcome(
                 installed=(), rolled_back_sequence_ids=(), failed_sequence_ids=()
             )
         installed: list[TrajectoryCommitOutcome] = []
         failed: list[int] = []
+        rolled_back: list[int] = []
+        deduped: list[int] = []
         for sequence_id in sorted(self._pending):
             pending = self._pending.pop(sequence_id)
             arena = pending.arena
+            decision = self._decide_for_pass(
+                namespace_digest=pending.namespace_digest,
+                frontier_token_ids=pending.frontier_token_ids,
+                sequence_id=int(sequence_id),
+            )
+            if not decision.installs:
+                # A decision, not a failure: the shard bytes are simply not
+                # needed, so the arena goes back through the same rollback path
+                # a never-committed reservation takes -- before ``retain``, so
+                # the pages were never made prefix-resident in the first place.
+                # ``_decide_for_pass`` already named and counted it.
+                self._give_back_reservation(arena, sequence_id=int(sequence_id))
+                rolled_back.append(int(sequence_id))
+                deduped.append(int(sequence_id))
+                continue
             try:
                 self._arena_allocator.retain(arena)
-            except Exception:  # noqa: BLE001 - fail-safe by contract
+            except Exception as exc:  # noqa: BLE001 - fail-safe by contract
                 # ``retain`` hands its own pages back; nothing was installed, so
                 # the previously committed frontier is untouched.
-                self._logger.exception(
-                    "[%s] rank=%s seq=%s retaining the snapshot arena failed; "
-                    "its frontier is NOT committed and the previous record "
-                    "stands",
-                    PREFIX,
-                    self._rank,
-                    sequence_id,
+                self._log_commit_failure(
+                    exc,
+                    sequence_id=int(sequence_id),
+                    what=(
+                        "retaining the snapshot arena failed; its frontier is "
+                        "NOT committed and the previous record stands"
+                    ),
                 )
                 failed.append(int(sequence_id))
                 continue
@@ -1490,42 +1919,34 @@ class TrajectoryFrontierCommitter:
             try:
                 installed.append(
                     self._install(
+                        decision=decision,
                         namespace_digest=pending.namespace_digest,
                         tokens=pending.frontier_token_ids,
                         page_ids_by_group=pending.page_ids_by_group,
                         snapshot=pending.snapshot,
                         arena=arena,
-                        previous_session_key=pending.previous_session_key,
                         sequence_id=int(sequence_id),
                     )
                 )
-            except Exception:  # noqa: BLE001 - fail-safe by contract
-                self._logger.exception(
-                    "[%s] rank=%s seq=%s installing the frontier record "
-                    "failed; the arena's pages go back and the previous record "
-                    "stands",
-                    PREFIX,
-                    self._rank,
-                    sequence_id,
+            except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+                self._log_commit_failure(
+                    exc,
+                    sequence_id=int(sequence_id),
+                    what=(
+                        "installing the frontier record failed; the arena's "
+                        "pages go back and the previous record stands"
+                    ),
                 )
                 self._arenas_by_handle.pop(int(arena.storage_handle), None)
                 self._arena_allocator.release(arena)
                 failed.append(int(sequence_id))
-        rolled_back: list[int] = []
         for sequence_id in sorted(self._reserved):
             arena = self._reserved.pop(sequence_id)
-            try:
-                self._arena_allocator.rollback(arena)
-            except Exception:  # noqa: BLE001 - rollback is best effort
-                self._logger.exception(
-                    "[%s] rank=%s seq=%s could not give back the pages of an "
-                    "unused snapshot arena (pseudo_sid=%s)",
-                    PREFIX,
-                    self._rank,
-                    sequence_id,
-                    arena.pseudo_sid,
-                )
+            self._give_back_reservation(arena, sequence_id=int(sequence_id))
             rolled_back.append(int(sequence_id))
+        rolled_back.sort()
+        # The pass is over: no sequence holds a claim on a session any more.
+        self._decisions.clear()
         if rolled_back:
             self._logger.info(
                 "[%s] rank=%s gave back %s unused snapshot arena(s) for "
@@ -1539,22 +1960,74 @@ class TrajectoryFrontierCommitter:
             installed=tuple(installed),
             rolled_back_sequence_ids=tuple(rolled_back),
             failed_sequence_ids=tuple(failed),
+            deduped_sequence_ids=tuple(deduped),
+        )
+
+    def _give_back_reservation(
+        self, arena: SnapshotArena, *, sequence_id: int
+    ) -> None:
+        """Roll one never-retained arena back. Best effort, always named."""
+
+        try:
+            self._arena_allocator.rollback(arena)
+        except Exception as exc:  # noqa: BLE001 - rollback is best effort
+            self._log_commit_failure(
+                exc,
+                sequence_id=int(sequence_id),
+                what=(
+                    "could not give back the pages of an unused snapshot "
+                    f"arena (pseudo_sid={arena.pseudo_sid})"
+                ),
+            )
+
+    def _log_commit_failure(self, exc: BaseException, *, sequence_id, what) -> None:
+        """ONE line for a named refusal; a stack trace only for a surprise.
+
+        A named error carries its own reason, and at the commit boundary there
+        is one per sequence: sixteen stack traces for sixteen sequences hitting
+        the same named condition bury the one line that says what happened.
+        Anything NOT named by this mechanism is a bug, and a bug keeps its
+        traceback.
+        """
+
+        if isinstance(exc, (TrajectoryCommitError, TrajectoryFrontierError)):
+            self._logger.error(
+                "[%s] rank=%s seq=%s %s: %s",
+                PREFIX,
+                self._rank,
+                sequence_id,
+                what,
+                exc,
+            )
+            return
+        self._logger.exception(
+            "[%s] rank=%s seq=%s %s",
+            PREFIX,
+            self._rank,
+            sequence_id,
+            what,
         )
 
     def _install(
         self,
         *,
+        decision: FrontierInstallDecision,
         namespace_digest: Sequence[int],
         tokens: tuple[int, ...],
         page_ids_by_group: Mapping[int, Sequence[int]],
         snapshot: KDASnapshotDescriptor,
         arena: SnapshotArena,
-        previous_session_key: str | None,
         sequence_id: int,
     ) -> TrajectoryCommitOutcome:
-        """Begin or advance the session's record and index its prefix pages."""
+        """Begin or advance the session's record and index its prefix pages.
 
-        if previous_session_key is None:
+        The decision is an argument, never re-derived here: this is the ONE
+        place a record enters the registry, and it acts on the table's answer
+        rather than inferring one from whatever it happens to know. A decision
+        that does not install cannot reach this method at all.
+        """
+
+        if decision.action == INSTALL_BEGIN:
             record = self._registry.begin(
                 namespace_digest=namespace_digest,
                 frontier_token_ids=tokens,
@@ -1562,15 +2035,21 @@ class TrajectoryFrontierCommitter:
                 snapshot=snapshot,
             )
             advance = None
-        else:
+        elif decision.action == INSTALL_ADVANCE:
             advance = self._registry.advance(
-                session_key=previous_session_key,
+                session_key=decision.previous_session_key,
                 namespace_digest=namespace_digest,
                 frontier_token_ids=tokens,
                 page_ids_by_group=page_ids_by_group,
                 snapshot=snapshot,
             )
             record = advance.record
+        else:
+            raise SnapshotArenaCorrupt(
+                f"a {decision.action!r} decision for session "
+                f"{decision.session_key} must never reach the frontier "
+                f"install: {decision.detail}"
+            )
         self._index_pages(record)
         self._logger.info(
             "[%s] rank=%s seq=%s session=%s %s boundary=%s prefix_pages=%s "

@@ -24,7 +24,17 @@ import pytest
 from batchgen.prefix_reuse.commit import release_evicted_prefix_pages
 from batchgen.prefix_reuse.trajectory_commit import (
     DEBUG_FLAG,
+    INSTALL_ADVANCE,
+    INSTALL_BEGIN,
+    INSTALL_DEDUP,
+    INSTALL_REFUSE,
+    SKIP_ALREADY_COMMITTED,
+    SKIP_BOUNDARY_REGRESSION,
+    SKIP_FRONTIER_DIVERGED,
+    SKIP_FRONTIER_DRIFT,
+    SKIP_SESSION_IN_FLIGHT,
     SNAPSHOT_CHUNK_NAMES,
+    FrontierInstallDecision,
     HostKVSnapshotArenaAllocator,
     SnapshotArena,
     SnapshotArenaCorrupt,
@@ -42,6 +52,7 @@ from batchgen.prefix_reuse.trajectory_frontier import (
     FrontierCharge,
     FrontierRecordInvalid,
     FrontierReleaseFailed,
+    KDASnapshotDescriptor,
     KDASnapshotProfile,
     session_key_for_baseline,
 )
@@ -1260,11 +1271,26 @@ def _group(shard_count=4, *, allocator=None, profile=None):
     return ranks, allocator
 
 
-def _group_commit(ranks, allocator, *, tokens=tuple(range(8)), sequence_id=7):
+def _group_commit(
+    ranks,
+    allocator,
+    *,
+    tokens=tuple(range(8)),
+    sequence_id=7,
+    pages=None,
+):
     """The real pass order: reserve in config, every rank writes, finalize."""
 
     leader = ranks[0]
-    arena = leader.reserve_arena(sequence_id=sequence_id, prefix_page_count=2)
+    # The record checks its own page count against its token count, so the
+    # prefix pages follow the boundary unless a caller says otherwise.
+    pages = pages or {0: list(range(1, len(tokens) // PAGE_TOKENS + 1))}
+    arena = leader.reserve_arena(
+        sequence_id=sequence_id,
+        prefix_page_count=len(pages[0]),
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tokens,
+    )
     assert arena is not None
     # The arena page ids ride the host-KV mirror; every follower adopts them.
     for follower in ranks[1:]:
@@ -1273,7 +1299,7 @@ def _group_commit(ranks, allocator, *, tokens=tuple(range(8)), sequence_id=7):
         leader.commit(
             namespace_digest=NAMESPACE,
             frontier_token_ids=tokens,
-            page_ids_by_group={0: [1, 2]},
+            page_ids_by_group=pages,
             owning_group_id=0,
             sequence_id=sequence_id,
             prompt_token_count=len(tokens),
@@ -1296,7 +1322,12 @@ def test_the_leader_allocates_one_g_wide_arena():
     one_shard = leader.layout.shard_page_count(
         host_page_bytes_all_layers=HOST_PAGE_BYTES, prefix_page_count=2
     )
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
 
     assert arena is not None
     assert arena.shard_count == 4
@@ -1376,10 +1407,20 @@ def test_a_follower_may_not_allocate_and_a_leader_may_not_adopt():
     ranks, allocator = _group(shard_count=2)
     leader, follower = ranks
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        follower.reserve_arena(sequence_id=7, prefix_page_count=2)
+        follower.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     assert "does not own its group's frontier registry" in str(excinfo.value)
 
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
         leader.adopt_arena(sequence_id=7, arena=arena)
     assert "allocates its arenas rather than adopting one" in str(excinfo.value)
@@ -1388,7 +1429,12 @@ def test_a_follower_may_not_allocate_and_a_leader_may_not_adopt():
 def test_a_follower_cannot_install_a_record_and_a_leader_cannot_write_only():
     ranks, allocator = _group(shard_count=2)
     leader, follower = ranks
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     follower.adopt_arena(sequence_id=7, arena=arena)
 
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
@@ -1427,7 +1473,12 @@ def test_a_shard_write_failure_installs_no_record_and_gives_the_arena_back():
     assert older is None  # G>1 needs a reserved arena; none was reserved
     assert leader.skips()["arena_missing"] == 1
 
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     for follower in ranks[1:]:
         follower.adopt_arena(sequence_id=7, arena=arena)
     allocator.shard_write_error = RuntimeError("shard write exploded")
@@ -1462,7 +1513,12 @@ def test_finalize_gives_back_an_arena_no_commit_consumed():
 
     ranks, allocator = _group(shard_count=4)
     leader = ranks[0]
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     assert arena is not None
     # No commit for it this pass at all.
     finalized = leader.finalize()
@@ -1478,7 +1534,12 @@ def test_finalize_gives_back_an_arena_no_commit_consumed():
 def test_a_misaligned_boundary_at_g_gt_1_rolls_its_arena_back():
     ranks, allocator = _group(shard_count=4)
     leader = ranks[0]
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     outcome = leader.commit(
         namespace_digest=NAMESPACE,
         frontier_token_ids=range(8),
@@ -1561,7 +1622,12 @@ def test_a_reservation_can_be_given_back_outside_finalize():
 
     ranks, allocator = _group(shard_count=4)
     leader = ranks[0]
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
 
     assert leader.rollback_reservation(sequence_id=7) is True
     assert allocator.rollbacks == [arena.pseudo_sid]
@@ -1570,7 +1636,12 @@ def test_a_reservation_can_be_given_back_outside_finalize():
     assert leader.rollback_reservation(sequence_id=7) is False
     assert allocator.rollbacks == [arena.pseudo_sid]
     # And the sequence can be reserved again.
-    assert leader.reserve_arena(sequence_id=7, prefix_page_count=2) is not None
+    assert leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    ) is not None
 
 
 def test_a_follower_giving_back_an_adopted_arena_frees_nothing():
@@ -1578,7 +1649,12 @@ def test_a_follower_giving_back_an_adopted_arena_frees_nothing():
 
     ranks, allocator = _group(shard_count=2)
     leader, follower = ranks
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     follower.adopt_arena(sequence_id=7, arena=arena)
 
     assert follower.rollback_reservation(sequence_id=7) is True
@@ -1591,9 +1667,19 @@ def test_a_follower_giving_back_an_adopted_arena_frees_nothing():
 def test_a_double_reservation_is_refused_by_name():
     ranks, _allocator = _group(shard_count=2)
     leader = ranks[0]
-    leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
-        leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+        leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     assert "would leak the first one's Host pages" in str(excinfo.value)
 
 
@@ -1601,7 +1687,12 @@ def test_pool_pressure_at_reservation_time_is_named_and_reserves_nothing():
     allocator = _ArenaAllocator(fail_times=1)
     ranks, allocator = _group(shard_count=4, allocator=allocator)
     leader = ranks[0]
-    assert leader.reserve_arena(sequence_id=7, prefix_page_count=2) is None
+    assert leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    ) is None
     assert leader.skips()["arena_unavailable"] == 1
     assert leader.reserved_sequence_ids() == ()
     assert allocator.rollbacks == []
@@ -1614,10 +1705,454 @@ def test_pool_pressure_at_reservation_time_is_named_and_reserves_nothing():
 def test_a_follower_adopting_a_foreign_shard_count_is_refused():
     ranks, _allocator = _group(shard_count=4)
     leader, follower = ranks[0], ranks[1]
-    arena = leader.reserve_arena(sequence_id=7, prefix_page_count=2)
+    arena = leader.reserve_arena(
+        sequence_id=7,
+        prefix_page_count=2,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+    )
     two_shard = replace(arena, shard_count=2)
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
         follower.adopt_arena(sequence_id=7, arena=two_shard)
     assert "2 shard window(s) but this rank serves a 4-rank group" in str(
         excinfo.value
     )
+
+
+# ---------------------------------------------------------------------------
+# The install decision table (the re-commit defect)
+# ---------------------------------------------------------------------------
+
+
+def _readers(ranks):
+    """Each rank's injected D2H boundary, for "nothing was copied" asserts.
+
+    Reaches for the committer's own reader deliberately: the whole point of
+    deciding before the copy is that the D2H never happens, and the only
+    witness to a copy that did NOT happen is the boundary that would have
+    served it.
+    """
+
+    return [rank._snapshot_reader for rank in ranks]
+
+
+def _reserve(leader, *, sequence_id=7, tokens=tuple(range(8)), prefix_pages=2):
+    return leader.reserve_arena(
+        sequence_id=sequence_id,
+        prefix_page_count=prefix_pages,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tokens,
+    )
+
+
+def test_the_decision_table_names_every_outcome_for_one_session():
+    """The table itself, read straight: begin, dedupe, advance, refuse."""
+
+    committer, _allocator, _reader = _committer()
+    begin = committer.decide_install(
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+        sequence_id=7,
+    )
+    assert begin.action == INSTALL_BEGIN
+    assert begin.installs is True
+    assert begin.session_key == session_key_for_baseline(
+        namespace_digest=NAMESPACE, baseline_token_ids=list(range(8))
+    )
+
+    first = _commit(committer, tokens=range(8), pages={0: [1, 2]})
+
+    dedup = committer.decide_install(
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+        sequence_id=7,
+    )
+    assert dedup.action == INSTALL_DEDUP
+    assert dedup.installs is False
+    assert dedup.is_dedup is True
+    assert dedup.skip_reason == SKIP_ALREADY_COMMITTED
+    assert dedup.session_key == first.session_key
+
+    advance = committer.decide_install(
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(12)),
+        sequence_id=7,
+    )
+    assert advance.action == INSTALL_ADVANCE
+    assert advance.previous_session_key == first.session_key
+
+
+def test_replaying_a_committed_baseline_dedupes_before_the_copy():
+    """G==1: the same prompt again costs no arena and no D2H."""
+
+    committer, allocator, reader = _committer()
+    first = _commit(committer, tokens=range(8), pages={0: [1, 2]})
+
+    again = _commit(committer, tokens=range(8), pages={0: [1, 2]}, sequence_id=9)
+
+    assert again is None
+    assert committer.skips()[SKIP_ALREADY_COMMITTED] == 1
+    assert committer.dedup_skips() == 1
+    assert committer.refused_skips() == 0
+    # Nothing allocated, nothing copied, nothing released, record untouched.
+    assert len(allocator.stores) == 1
+    assert allocator.releases == []
+    assert allocator.rollbacks == []
+    assert reader.calls == [7]
+    assert committer.registry.require(first.session_key) is first.record
+    assert len(committer.registry) == 1
+    committer.registry.check_invariants()
+
+
+def test_a_deduped_commit_is_logged_at_info_not_as_a_warning(caplog):
+    """A dedupe is the mechanism working; it must not read as a loss."""
+
+    committer, _allocator, _reader = _committer()
+    _commit(committer, tokens=range(8), pages={0: [1, 2]})
+    with caplog.at_level(logging.INFO):
+        assert _commit(committer, tokens=range(8), pages={0: [1, 2]}) is None
+
+    deduped = [
+        record
+        for record in caplog.records
+        if SKIP_ALREADY_COMMITTED in record.getMessage()
+    ]
+    assert len(deduped) == 1, [r.getMessage() for r in caplog.records]
+    assert deduped[0].levelno == logging.INFO
+    assert deduped[0].exc_info is None
+    assert "NO frontier installed" in deduped[0].getMessage()
+
+
+def test_replaying_a_committed_baseline_at_g_gt_1_reserves_nothing():
+    """THE live defect: the three-phase path deduping as early as it can.
+
+    Before the decision table the reservation was unconditional, so a replayed
+    baseline paid a G-wide arena, a full D2H and a shard write per rank, and
+    then raised out of ``registry.begin`` inside finalize.
+    """
+
+    ranks, allocator = _group(shard_count=4)
+    leader = ranks[0]
+    readers = _readers(ranks)
+    tokens = tuple(range(8))
+    _group_commit(ranks, allocator, tokens=tokens)
+    record = leader.finalize().installed[0].record
+    copies_after_first_pass = [list(reader.calls) for reader in readers]
+    assert len(allocator.allocations) == 1
+
+    # Pass two: the same prompt batch, after its session was committed.
+    assert _reserve(leader, tokens=tokens) is None
+
+    assert leader.skips()[SKIP_ALREADY_COMMITTED] == 1
+    assert leader.dedup_skips() == 1
+    # No arena left the free pool and no shard window was written.
+    assert len(allocator.allocations) == 1
+    assert allocator.rollbacks == []
+    assert len(allocator.shard_writes) == 4
+    assert leader.reserved_sequence_ids() == ()
+
+    # The commit boundary still runs: the prefix IS resident, so the worker
+    # calls commit. It must not copy anything and must not count twice.
+    assert (
+        leader.commit(
+            namespace_digest=NAMESPACE,
+            frontier_token_ids=tokens,
+            page_ids_by_group={0: [1, 2]},
+            owning_group_id=0,
+            sequence_id=7,
+            prompt_token_count=len(tokens),
+        )
+        is None
+    )
+    assert leader.dedup_skips() == 1
+    assert [list(reader.calls) for reader in readers] == copies_after_first_pass
+
+    # And the barrier step is a no-op that raises nothing.
+    finalized = leader.finalize()
+    assert finalized.installed == ()
+    assert finalized.failed_sequence_ids == ()
+    assert finalized.rolled_back_sequence_ids == ()
+    assert leader.registry.require(record.session_key) is record
+    assert len(leader.registry) == 1
+    leader.registry.check_invariants()
+
+
+def test_two_sequences_over_one_baseline_commit_one_session():
+    """Same-pass duplicates: the first installs, the second dedupes by name."""
+
+    ranks, allocator = _group(shard_count=2)
+    leader = ranks[0]
+    tokens = tuple(range(8))
+
+    first = _reserve(leader, sequence_id=7, tokens=tokens)
+    assert first is not None
+    # The sibling asks for the very same baseline in the same batch.
+    assert _reserve(leader, sequence_id=9, tokens=tokens) is None
+    assert leader.skips()[SKIP_SESSION_IN_FLIGHT] == 1
+    assert leader.dedup_skips() == 1
+    assert len(allocator.allocations) == 1
+    assert leader.reserved_sequence_ids() == (7,)
+
+    for follower in ranks[1:]:
+        follower.adopt_arena(sequence_id=7, arena=first)
+    for rank, sequence_id in ((leader, 7),):
+        assert (
+            rank.commit(
+                namespace_digest=NAMESPACE,
+                frontier_token_ids=tokens,
+                page_ids_by_group={0: [1, 2]},
+                owning_group_id=0,
+                sequence_id=sequence_id,
+                prompt_token_count=len(tokens),
+            )
+            is not None
+        )
+    for follower in ranks[1:]:
+        assert (
+            follower.write_shard(
+                sequence_id=7,
+                frontier_token_ids=tokens,
+                prompt_token_count=len(tokens),
+            )
+            is not None
+        )
+
+    finalized = leader.finalize()
+    assert len(finalized.installed) == 1
+    assert finalized.installed[0].record.frontier_boundary_tokens == 8
+    assert finalized.failed_sequence_ids == ()
+    assert len(leader.registry) == 1
+    leader.registry.check_invariants()
+
+
+def test_a_pending_shard_dedupes_at_finalize_if_its_session_appeared():
+    """The late gate: the table is re-asked AFTER the barrier, not cached.
+
+    A decision taken at the commit boundary can be stale by the time finalize
+    runs -- another install may have landed in between -- so the arena goes
+    back through the rollback path instead of raising out of the install.
+    """
+
+    ranks, allocator = _group(shard_count=2)
+    leader = ranks[0]
+    tokens = tuple(range(8))
+    arena, _outcomes = _group_commit(ranks, allocator, tokens=tokens)
+    assert leader.pending_sequence_ids() == (7,)
+
+    # The session shows up between the shard write and the barrier.
+    leader.registry.begin(
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tokens,
+        page_ids_by_group={0: [1, 2]},
+        snapshot=KDASnapshotDescriptor(
+            storage_handle=4242,
+            owning_group_id=0,
+            profile=leader.layout.profile,
+            boundary_tokens=len(tokens),
+            shard_count=2,
+        ),
+    )
+
+    finalized = leader.finalize()
+
+    assert finalized.installed == ()
+    assert finalized.failed_sequence_ids == ()
+    assert finalized.deduped_sequence_ids == (7,)
+    assert finalized.rolled_back_sequence_ids == (7,)
+    # Rolled back, never retained, and never released as if it had been.
+    assert allocator.rollbacks == [arena.pseudo_sid]
+    assert allocator.retains == []
+    assert allocator.releases == []
+    assert leader.dedup_skips() == 1
+    assert len(leader.registry) == 1
+
+
+def test_recommitting_a_baseline_a_session_advanced_past_is_refused():
+    """The asymmetry that broke: resolve is frontier-keyed, identity is not.
+
+    A session that has advanced is invisible to ``resolve`` when the prompt is
+    its ORIGINAL baseline -- the stored boundary is longer than the prompt --
+    but its key still derives from exactly those tokens, which is how the old
+    code reached ``registry.begin`` with a key the registry already held.
+    """
+
+    committer, allocator, reader = _committer()
+    first = _commit(committer, tokens=range(8), pages={0: [1, 2]})
+    second = _commit(
+        committer, tokens=range(12), pages={0: [1, 2, 3]}, sequence_id=9
+    )
+    assert second is not None and second.advanced is True
+
+    again = _commit(committer, tokens=range(8), pages={0: [1, 2]}, sequence_id=11)
+
+    assert again is None
+    assert committer.skips()[SKIP_BOUNDARY_REGRESSION] == 1
+    assert committer.refused_skips() == 1
+    assert committer.dedup_skips() == 0
+    # No third arena, no third copy, and the advanced record still stands.
+    assert len(allocator.stores) == 2
+    assert reader.calls == [7, 9]
+    assert committer.registry.require(first.session_key) is second.record
+    assert second.record.frontier_boundary_tokens == 12
+    committer.registry.check_invariants()
+
+
+def test_a_backwards_recommit_at_g_gt_1_refuses_without_a_traceback(caplog):
+    """The 16-traceback case: one named WARNING line, arena rolled back."""
+
+    ranks, allocator = _group(shard_count=4)
+    leader = ranks[0]
+    _group_commit(ranks, allocator, tokens=tuple(range(8)))
+    leader.finalize()
+    _group_commit(ranks, allocator, tokens=tuple(range(12)), sequence_id=9)
+    advanced = leader.finalize().installed[0]
+    assert advanced.record.frontier_boundary_tokens == 12
+    allocations_before = len(allocator.allocations)
+
+    with caplog.at_level(logging.INFO):
+        assert _reserve(leader, sequence_id=11, tokens=tuple(range(8))) is None
+
+    refusals = [
+        record
+        for record in caplog.records
+        if SKIP_BOUNDARY_REGRESSION in record.getMessage()
+    ]
+    assert len(refusals) == 1, [r.getMessage() for r in caplog.records]
+    assert refusals[0].levelno == logging.WARNING
+    # A named refusal, not a crash: no stack trace is attached to it.
+    assert refusals[0].exc_info is None
+    assert "advanced backwards" not in refusals[0].getMessage()
+    assert "move the frontier backwards" in refusals[0].getMessage()
+
+    # Nothing was allocated for it and the advanced record is untouched.
+    assert len(allocator.allocations) == allocations_before
+    finalized = leader.finalize()
+    assert finalized.failed_sequence_ids == ()
+    assert leader.registry.require(advanced.session_key) is advanced.record
+
+
+def test_a_drifted_session_identity_is_refused_by_name(caplog):
+    """Same boundary, different frontier under one session key.
+
+    Reachable when the namespace digest or the token hashing drifts, so the two
+    derivations of a session's identity stop agreeing. It must be a named
+    refusal rather than a second record or an unhandled registry error.
+    """
+
+    committer, allocator, reader = _committer()
+    first = _commit(committer, tokens=range(8), pages={0: [1, 2]})
+    # Advance the session to a DIFFERENT frontier of the SAME length: the key
+    # still derives from the original baseline, but the frontier index does not
+    # hold those tokens any more.
+    committer.registry.advance(
+        session_key=first.session_key,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(100, 108)),
+        page_ids_by_group={0: [1, 2]},
+        snapshot=replace(first.record.snapshot, storage_handle=777),
+    )
+
+    with caplog.at_level(logging.INFO):
+        again = _commit(
+            committer, tokens=range(8), pages={0: [1, 2]}, sequence_id=9
+        )
+
+    assert again is None
+    assert committer.skips()[SKIP_FRONTIER_DRIFT] == 1
+    assert committer.refused_skips() == 1
+    assert len(allocator.stores) == 1  # no arena for the refused commit
+    assert reader.calls == [7]  # and no second D2H
+    drift = [
+        record
+        for record in caplog.records
+        if SKIP_FRONTIER_DRIFT in record.getMessage()
+    ]
+    assert len(drift) == 1
+    assert drift[0].levelno == logging.WARNING
+    assert drift[0].exc_info is None
+
+
+def test_a_diverged_frontier_under_one_session_key_is_refused():
+    """One session key, a stored frontier that is NOT a prefix of the commit.
+
+    Unreachable through the registry's own API -- a session is born at the
+    tokens its key derives from, and advancing backwards is refused -- so the
+    state is installed directly here. The branch exists because the only
+    alternative to naming this case is ``begin`` raising inside the install,
+    which is the failure mode being fixed.
+    """
+
+    committer, allocator, reader = _committer()
+    tokens = tuple(range(8))
+    registry = committer.registry
+    registry._install(
+        registry._build_record(
+            session_key=session_key_for_baseline(
+                namespace_digest=NAMESPACE, baseline_token_ids=tokens
+            ),
+            namespace_digest=NAMESPACE,
+            frontier_token_ids=(500, 501, 502, 503),
+            page_ids_by_group={0: [1]},
+            snapshot=KDASnapshotDescriptor(
+                storage_handle=4321,
+                owning_group_id=0,
+                profile=committer.layout.profile,
+                boundary_tokens=4,
+                shard_count=1,
+            ),
+        )
+    )
+
+    decision = committer.decide_install(
+        namespace_digest=NAMESPACE, frontier_token_ids=tokens, sequence_id=7
+    )
+    assert decision.action == INSTALL_REFUSE
+    assert decision.skip_reason == SKIP_FRONTIER_DIVERGED
+
+    assert _commit(committer, tokens=tokens, pages={0: [1, 2]}) is None
+    assert committer.skips()[SKIP_FRONTIER_DIVERGED] == 1
+    assert allocator.stores == []
+    assert reader.calls == []
+
+
+def test_a_decision_that_does_not_install_cannot_reach_the_install():
+    """The structural half of the fix: one gate, and the install obeys it."""
+
+    committer, _allocator, _reader = _committer()
+    first = _commit(committer, tokens=range(8), pages={0: [1, 2]})
+    dedup = committer.decide_install(
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=tuple(range(8)),
+        sequence_id=7,
+    )
+    assert dedup.installs is False
+
+    with pytest.raises(SnapshotArenaCorrupt) as excinfo:
+        committer._install(
+            decision=dedup,
+            namespace_digest=NAMESPACE,
+            tokens=tuple(range(8)),
+            page_ids_by_group={0: [1, 2]},
+            snapshot=first.record.snapshot,
+            arena=first.arena,
+            sequence_id=7,
+        )
+    assert "must never reach the frontier install" in str(excinfo.value)
+
+
+def test_an_install_decision_cannot_carry_a_skip_reason():
+    with pytest.raises(SnapshotArenaCorrupt):
+        FrontierInstallDecision(
+            action=INSTALL_BEGIN,
+            session_key="k",
+            boundary_tokens=8,
+            skip_reason=SKIP_ALREADY_COMMITTED,
+        )
+    with pytest.raises(SnapshotArenaCorrupt):
+        FrontierInstallDecision(
+            action=INSTALL_DEDUP, session_key="k", boundary_tokens=8
+        )
+    with pytest.raises(SnapshotArenaCorrupt):
+        FrontierInstallDecision(
+            action=INSTALL_ADVANCE, session_key="k", boundary_tokens=8
+        )
