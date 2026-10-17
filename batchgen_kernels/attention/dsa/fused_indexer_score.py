@@ -392,9 +392,11 @@ def _topk_from_scores_kernel(
     AGG_ptr,           # [B, max_seqlen] FP32
     OUT_ptr,           # [B, topk] int64/int32
     NUM_VALID_TOKENS_ptr,  # [1] int32, optional by HAS_VALID_TOKENS
+    SEQLENS_ptr,       # [B] int32, read only when MASK_BY_SEQLEN
     max_seqlen: tl.constexpr,
     topk: tl.constexpr,
     HAS_VALID_TOKENS: tl.constexpr,
+    MASK_BY_SEQLEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Select top-k indices from one row of scores.
@@ -404,6 +406,13 @@ def _topk_from_scores_kernel(
     then repairs the remaining slots with exact repeated maxima from the residual
     values. This keeps the common GLM case near O(log(score_range) * N) instead
     of O(topk * N), while preserving the exact top-k set.
+
+    ``MASK_BY_SEQLEN`` makes masking this kernel's own responsibility: scores
+    produced by ``deep_gemm.fp8_paged_mqa_logits`` are UNMASKED past each row's
+    ``context_len`` (its ``clean_logits`` pass is unreachable for the 2-D
+    ``context_lens`` form the integration must use), so the invalid tail has to
+    be driven to ``-inf`` here. The Triton scorers write ``-inf`` themselves and
+    pass ``MASK_BY_SEQLEN=False``; the flag is idempotent on their output.
     """
 
     pid_b = tl.program_id(0)
@@ -419,6 +428,8 @@ def _topk_from_scores_kernel(
             return
 
     mask = offs < max_seqlen
+    if MASK_BY_SEQLEN:
+        mask = mask & (offs < tl.load(SEQLENS_ptr + pid_b))
     vals = tl.load(
         AGG_ptr + pid_b * max_seqlen + offs,
         mask=mask,
@@ -556,9 +567,11 @@ def fused_score_and_topk_out(
             agg,
             top_k_indices,
             cache_seqlens,
+            cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
             HAS_VALID_TOKENS=False,
+            MASK_BY_SEQLEN=False,
             BLOCK_N=block_n,
         )
 
@@ -647,9 +660,11 @@ def fused_paged_score_and_topk_out(
             agg,
             top_k_indices,
             cache_seqlens,
+            cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
             HAS_VALID_TOKENS=False,
+            MASK_BY_SEQLEN=False,
             BLOCK_N=block_n,
         )
     return top_k_indices
@@ -754,9 +769,11 @@ def fused_paged_score_and_topk_with_slots_out(
             agg,
             top_k_indices,
             num_valid_tokens if num_valid_tokens is not None else cache_seqlens,
+            cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
             HAS_VALID_TOKENS=num_valid_tokens is not None,
+            MASK_BY_SEQLEN=False,
             BLOCK_N=block_n,
         )
     return top_k_indices

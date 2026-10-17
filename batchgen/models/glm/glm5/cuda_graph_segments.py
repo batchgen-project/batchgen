@@ -67,6 +67,11 @@ from batchgen_kernels.attention.dsa.fused_indexer_score import (
     rope_hadamard_q_out,
 )
 from batchgen_kernels.attention.dsa.head_gates import head_gates_out
+from batchgen_kernels.attention.dsa.paged_mqa_logits import PAGED_MQA_NEXT_N
+from batchgen_kernels.attention.dsa.paged_mqa_scorer import (
+    paged_mqa_score_and_topk_out,
+    warm_paged_mqa_logits,
+)
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
 from batchgen_kernels.attention.dsa.selected_page_table import (
     transform_selected_positions_out,
@@ -82,7 +87,13 @@ class _Glm5DsaSegmentBuffers:
     q_tma_desc: torch.Tensor
     q_flat: torch.Tensor
     q_index: torch.Tensor
+    # Scorer buffers. Exactly one of the two groups is allocated per bucket,
+    # decided by the aux cache's format: `agg_scores` for the retired bf16
+    # Triton scorer, the DeepGEMM trio for a page-split FP8 cache.
     agg_scores: torch.Tensor
+    q_index_fp8: torch.Tensor
+    aux_block_table: torch.Tensor
+    aux_context_lens: torch.Tensor
     top_k_indices: torch.Tensor
     selected_mla_kv: torch.Tensor
     selected_lengths: torch.Tensor
@@ -127,7 +138,14 @@ class _Glm5FullDsaSegmentBuffers:
     q_index: torch.Tensor
     head_gates: torch.Tensor
     positions_expanded: torch.Tensor
+    # Scorer buffers, one group per aux cache format (see
+    # ``_make_scorer_buffers``): ``agg_scores`` is the retired bf16 Triton
+    # scorer's dense aggregate, the other three are what
+    # ``deep_gemm.fp8_paged_mqa_logits`` reads.
     agg_scores: torch.Tensor
+    q_index_fp8: torch.Tensor
+    aux_block_table: torch.Tensor
+    aux_context_lens: torch.Tensor
     top_k_indices: torch.Tensor
     # Physical page-size-1 token IDs consumed as the FA3 ``page_table``; the
     # BF16 selected-KV slab (``selected_mla_kv``) and the FlashMLA query pack
@@ -196,6 +214,9 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "head_gates",
     "positions_expanded",
     "agg_scores",
+    "q_index_fp8",
+    "aux_block_table",
+    "aux_context_lens",
     "top_k_indices",
     "selected_token_ids",
     "selected_lengths",
@@ -214,6 +235,110 @@ if _split_delta:
     raise AssertionError(
         f"_Glm5FullDsaSegmentBuffers fields not covered by (or extraneous in) "
         f"the view/rebuild split: {sorted(_split_delta)}"
+    )
+
+
+def _warm_paged_mqa_scorer(
+    *,
+    page_split: bool,
+    aux_blocked_k: torch.Tensor,
+    bucket_size: int,
+    num_index_heads: int,
+    index_head_dim: int,
+    max_aux_pages_per_seq: int,
+    max_seqlen: int,
+    aux_page_size: int,
+) -> None:
+    """JIT-compile the DeepGEMM scorer for this bucket before capture.
+
+    ``get_paged_mqa_logits_metadata`` is templated on ``align(batch, 32)``, so
+    every captured bucket is a distinct instantiation and must be warmed
+    separately; the logits kernel itself compiles once. Static buffers are
+    built before capture on the production path, which makes this the natural
+    warm point (first-batch rule).
+    """
+
+    if not page_split or not torch.cuda.is_available():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        # Reached only if a capture entered `forward` without pre-built
+        # statics. Compiling would then happen inside the capture; warn rather
+        # than warm, so the cause is visible in the log instead of showing up
+        # as capture-time latency.
+        logging.warning(
+            "GLM-5.2 DSA scorer: static buffers for bucket %d were created "
+            "DURING capture, so the DeepGEMM paged-MQA JIT could not be warmed "
+            "first; build statics before capture",
+            bucket_size,
+        )
+        return
+    warm_paged_mqa_logits(
+        aux_blocked_k=aux_blocked_k,
+        batch=bucket_size,
+        num_heads=num_index_heads,
+        index_head_dim=index_head_dim,
+        max_pages_per_seq=max_aux_pages_per_seq,
+        max_seqlen=max_seqlen,
+        page_size=aux_page_size,
+    )
+
+
+def _make_scorer_buffers(
+    *,
+    page_split: bool,
+    bucket_size: int,
+    max_seqlen: int,
+    num_index_heads: int,
+    index_head_dim: int,
+    max_aux_pages_per_seq: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(agg_scores, q_index_fp8, aux_block_table, aux_context_lens)``.
+
+    The two scorers need disjoint statics, and only one of them can ever run
+    for a given aux cache, so the other group is a zero-byte placeholder rather
+    than a real allocation. The placeholder still carries ``bucket_size`` as
+    its leading dim (with a zero-extent trailing dim): every field here is a
+    ``_GLM5_DSA_VIEW_FIELDS`` member, which smaller buckets slice as
+    ``base[:bucket]``, so a placeholder must obey the same "leading dim is the
+    bucket" invariant as the live group -- a 1-element placeholder sliced to
+    ``[:2]`` silently stays 1 row and becomes a wrongly-shaped view. That matters
+    for footprint too: ``agg_scores`` is a dense
+    ``[bucket, max_seqlen]`` fp32 aggregate, which at production bucket and
+    context is tens of MB charged against the same memory the KV pages come
+    from, and the DeepGEMM scorer never writes it (it hands the top-k the
+    logits DeepGEMM allocated).
+
+    * ``q_index_fp8``: ``[bucket, next_n=1, heads, head_dim]`` e4m3, the only
+      ``q`` layout ``fp8_paged_mqa_logits`` accepts.
+    * ``aux_block_table``: the aux page table's rows gathered into BATCH order.
+      DeepGEMM indexes the block table by batch row and has no slot
+      indirection, which BatchGen's slot-major table needs resolving first.
+    * ``aux_context_lens``: the 2-D ``[bucket, next_n]`` ``context_lens`` the
+      serving build requires, also reused as the top-k's per-row length.
+    """
+
+    if not page_split:
+        return (
+            torch.empty(bucket_size, max_seqlen, dtype=torch.float32, device=device),
+            torch.empty(bucket_size, 0, 0, 0, dtype=torch.float8_e4m3fn, device=device),
+            torch.empty(bucket_size, 0, dtype=torch.int32, device=device),
+            torch.empty(bucket_size, 0, dtype=torch.int32, device=device),
+        )
+    return (
+        torch.empty(bucket_size, 0, dtype=torch.float32, device=device),
+        torch.empty(
+            bucket_size,
+            PAGED_MQA_NEXT_N,
+            num_index_heads,
+            index_head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        torch.empty(
+            bucket_size, max_aux_pages_per_seq, dtype=torch.int32, device=device
+        ),
+        torch.empty(bucket_size, PAGED_MQA_NEXT_N, dtype=torch.int32, device=device),
     )
 
 
@@ -416,6 +541,11 @@ class Glm5DsaAttnSegment:
         }
 
     def setup_static_buffers(self, bucket_size: int) -> None:
+        # Warm first and for EVERY bucket, including the ones that end up as
+        # views of a larger base: the DeepGEMM metadata kernel is templated on
+        # align(bucket, 32), so each bucket is its own JIT instantiation and a
+        # view-built bucket would otherwise compile during capture.
+        self._warm_scorer_jit(bucket_size)
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
@@ -439,11 +569,16 @@ class Glm5DsaAttnSegment:
             dtype=torch.bfloat16,
             device=device,
         )
-        agg_scores = torch.empty(
-            bucket_size,
-            self.max_seqlen,
-            dtype=torch.float32,
-            device=device,
+        agg_scores, q_index_fp8, aux_block_table, aux_context_lens = (
+            _make_scorer_buffers(
+                page_split=self.aux_is_page_split,
+                bucket_size=bucket_size,
+                max_seqlen=self.max_seqlen,
+                num_index_heads=self.num_index_heads,
+                index_head_dim=self.index_head_dim,
+                max_aux_pages_per_seq=self.max_aux_pages_per_seq,
+                device=device,
+            )
         )
         top_k_indices = torch.empty(
             bucket_size,
@@ -501,6 +636,9 @@ class Glm5DsaAttnSegment:
             q_flat=q_flat,
             q_index=q_index,
             agg_scores=agg_scores,
+            q_index_fp8=q_index_fp8,
+            aux_block_table=aux_block_table,
+            aux_context_lens=aux_context_lens,
             top_k_indices=top_k_indices,
             selected_mla_kv=selected_mla_kv,
             selected_lengths=selected_lengths,
@@ -511,6 +649,70 @@ class Glm5DsaAttnSegment:
             prepared_flashmla=prepared_flashmla,
         )
         self._setup_static_output_buffers(bucket_size)
+
+    def _warm_scorer_jit(self, bucket_size: int) -> None:
+        _warm_paged_mqa_scorer(
+            page_split=self.aux_is_page_split,
+            aux_blocked_k=self.aux_blocked_k,
+            bucket_size=bucket_size,
+            num_index_heads=self.num_index_heads,
+            index_head_dim=self.index_head_dim,
+            max_aux_pages_per_seq=self.max_aux_pages_per_seq,
+            max_seqlen=self.max_seqlen,
+            aux_page_size=self.aux_page_size,
+        )
+
+    def _score_and_topk(
+        self,
+        buffers: _Glm5DsaSegmentBuffers,
+        *,
+        aux_slot_indices: torch.Tensor,
+        head_gates: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Score the aux cache and select top-k, dispatching on CACHE FORMAT.
+
+        Page-split FP8 (GLM-5.2) goes to ``deep_gemm.fp8_paged_mqa_logits``,
+        which computes the ReLU-gated GLM-5 aggregation directly from the paged
+        cache. A bf16 AoS cache (GLM-5, 5.1, 5.3) keeps the retired no-ReLU
+        Triton scorer. There is no fallback between them: the FP8 cache is
+        unreadable by the Triton kernel and the bf16 cache is unreadable by
+        DeepGEMM, so a mis-detected format fails loud inside the callee.
+        """
+
+        if self.aux_is_page_split:
+            return paged_mqa_score_and_topk_out(
+                q=buffers.q_index,
+                aux_blocked_k=self.aux_blocked_k,
+                aux_page_table=self.aux_page_table,
+                aux_slot_indices=aux_slot_indices,
+                head_gates=head_gates,
+                cache_seqlens=cache_seqlens,
+                q_fp8=buffers.q_index_fp8,
+                block_table=buffers.aux_block_table,
+                context_lens=buffers.aux_context_lens,
+                top_k_indices=buffers.top_k_indices,
+                topk=self.index_topk,
+                max_seqlen=self.max_seqlen,
+                index_head_dim=self.index_head_dim,
+                page_size=self.aux_page_size,
+                num_valid_tokens=num_valid_tokens,
+            )
+        return fused_paged_score_and_topk_with_slots_out(
+            buffers.q_index,
+            self.aux_blocked_k,
+            self.aux_page_table,
+            aux_slot_indices,
+            head_gates,
+            cache_seqlens,
+            buffers.agg_scores,
+            buffers.top_k_indices,
+            topk=self.index_topk,
+            page_size=self.aux_page_size,
+            max_seqlen=self.max_seqlen,
+            num_valid_tokens=num_valid_tokens,
+        )
 
     def initialize_static_inputs(
         self,
@@ -586,18 +788,11 @@ class Glm5DsaAttnSegment:
             positions_expanded.view(-1),
             buffers.q_index,
         )
-        fused_paged_score_and_topk_with_slots_out(
-            buffers.q_index,
-            self.aux_blocked_k,
-            self.aux_page_table,
-            aux_slot_indices,
-            head_gates,
-            cache_seqlens,
-            buffers.agg_scores,
-            buffers.top_k_indices,
-            topk=self.index_topk,
-            page_size=self.aux_page_size,
-            max_seqlen=self.max_seqlen,
+        self._score_and_topk(
+            buffers,
+            aux_slot_indices=aux_slot_indices,
+            head_gates=head_gates,
+            cache_seqlens=cache_seqlens,
             num_valid_tokens=num_valid_tokens,
         )
         select_mla_kv_for_flashmla_bf16_out(
@@ -723,6 +918,72 @@ class Glm5FullDsaAttnSegment:
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
 
+    def _warm_scorer_jit(self, bucket_size: int) -> None:
+        indexer = self.attn.indexer
+        _warm_paged_mqa_scorer(
+            page_split=self.aux_is_page_split,
+            aux_blocked_k=self.aux_blocked_k,
+            bucket_size=bucket_size,
+            num_index_heads=indexer.index_n_heads,
+            index_head_dim=indexer.index_head_dim,
+            max_aux_pages_per_seq=int(self.aux_page_table.shape[1]),
+            max_seqlen=self.max_seqlen,
+            aux_page_size=self.aux_page_size,
+        )
+
+    def _score_and_topk(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        aux_slot_indices: torch.Tensor,
+        head_gates: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Score the aux cache and select top-k, dispatching on CACHE FORMAT.
+
+        Page-split FP8 (GLM-5.2) goes to ``deep_gemm.fp8_paged_mqa_logits``,
+        which computes the ReLU-gated GLM-5 aggregation -- the training-time
+        formulation -- directly from the paged cache. A bf16 AoS cache (GLM-5,
+        5.1, 5.3) keeps the retired no-ReLU Triton scorer, because that is the
+        formulation those profiles were qualified with. Neither kernel can read
+        the other's cache, so there is no fallback edge: a mis-sized cache is
+        named by the format discriminator at construction.
+        """
+
+        if self.aux_is_page_split:
+            return paged_mqa_score_and_topk_out(
+                q=buffers.q_index,
+                aux_blocked_k=self.aux_blocked_k,
+                aux_page_table=self.aux_page_table,
+                aux_slot_indices=aux_slot_indices,
+                head_gates=head_gates,
+                cache_seqlens=cache_seqlens,
+                q_fp8=buffers.q_index_fp8,
+                block_table=buffers.aux_block_table,
+                context_lens=buffers.aux_context_lens,
+                top_k_indices=buffers.top_k_indices,
+                topk=self.index_topk,
+                max_seqlen=self.max_seqlen,
+                index_head_dim=self.attn.indexer.index_head_dim,
+                page_size=self.aux_page_size,
+                num_valid_tokens=num_valid_tokens,
+            )
+        return fused_paged_score_and_topk_with_slots_out(
+            buffers.q_index,
+            self.aux_blocked_k,
+            self.aux_page_table,
+            aux_slot_indices,
+            head_gates,
+            cache_seqlens,
+            buffers.agg_scores,
+            buffers.top_k_indices,
+            topk=self.index_topk,
+            page_size=self.aux_page_size,
+            max_seqlen=self.max_seqlen,
+            num_valid_tokens=num_valid_tokens,
+        )
+
     def _run_all_short_fa3(
         self,
         buffers: _Glm5FullDsaSegmentBuffers,
@@ -826,6 +1087,11 @@ class Glm5FullDsaAttnSegment:
         return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
+        # Warm first and for EVERY bucket, including the ones that end up as
+        # views of a larger base: the DeepGEMM metadata kernel is templated on
+        # align(bucket, 32), so each bucket is its own JIT instantiation and a
+        # view-built bucket would otherwise compile during capture.
+        self._warm_scorer_jit(bucket_size)
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
@@ -877,6 +1143,17 @@ class Glm5FullDsaAttnSegment:
         )
         selected_lengths = torch.empty(bucket_size, dtype=torch.int32, device=device)
         selected_lengths.fill_(self._padding_selected_length())
+        agg_scores, q_index_fp8, aux_block_table, aux_context_lens = (
+            _make_scorer_buffers(
+                page_split=self.aux_is_page_split,
+                bucket_size=bucket_size,
+                max_seqlen=self.max_seqlen,
+                num_index_heads=indexer.index_n_heads,
+                index_head_dim=index_dim,
+                max_aux_pages_per_seq=int(self.aux_page_table.shape[1]),
+                device=device,
+            )
+        )
         qkv_a = torch.empty(
             bucket_size,
             attn.q_lora_rank + kv_dim,
@@ -952,7 +1229,10 @@ class Glm5FullDsaAttnSegment:
             ),
             head_gates=torch.empty(bucket_size, indexer.index_n_heads, dtype=torch.float32, device=device),
             positions_expanded=torch.empty(bucket_size, indexer.index_n_heads, dtype=torch.int64, device=device),
-            agg_scores=torch.empty(bucket_size, self.max_seqlen, dtype=torch.float32, device=device),
+            agg_scores=agg_scores,
+            q_index_fp8=q_index_fp8,
+            aux_block_table=aux_block_table,
+            aux_context_lens=aux_context_lens,
             top_k_indices=torch.empty(bucket_size, self.index_topk, dtype=torch.int32, device=device),
             selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
@@ -1291,18 +1571,11 @@ class Glm5FullDsaAttnSegment:
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
             )
-            fused_paged_score_and_topk_with_slots_out(
-                buffers.q_index,
-                self.aux_blocked_k,
-                self.aux_page_table,
-                buffers.safe_aux_slot_indices,
-                buffers.head_gates,
-                buffers.safe_cache_seqlens,
-                buffers.agg_scores,
-                buffers.top_k_indices,
-                topk=self.index_topk,
-                page_size=self.aux_page_size,
-                max_seqlen=self.max_seqlen,
+            self._score_and_topk(
+                buffers,
+                aux_slot_indices=buffers.safe_aux_slot_indices,
+                head_gates=buffers.head_gates,
+                cache_seqlens=buffers.safe_cache_seqlens,
                 num_valid_tokens=num_valid_tokens,
             )
 
