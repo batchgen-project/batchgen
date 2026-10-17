@@ -25,7 +25,9 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
+FrontierCharge = _MODULE.FrontierCharge
 FrontierRecordInvalid = _MODULE.FrontierRecordInvalid
+FrontierRegistryInvariantError = _MODULE.FrontierRegistryInvariantError
 FrontierRefcountError = _MODULE.FrontierRefcountError
 FrontierRegistryError = _MODULE.FrontierRegistryError
 FrontierReleaseFailed = _MODULE.FrontierReleaseFailed
@@ -87,12 +89,15 @@ def _profile(**overrides):
     return KDASnapshotProfile(**base)
 
 
-def _snapshot(*, boundary_tokens, handle=7, group_id=0, profile=None):
+def _snapshot(
+    *, boundary_tokens, handle=7, group_id=0, profile=None, shard_count=1
+):
     return KDASnapshotDescriptor(
         storage_handle=handle,
         owning_group_id=group_id,
         profile=profile if profile is not None else _profile(),
         boundary_tokens=boundary_tokens,
+        shard_count=shard_count,
     )
 
 
@@ -111,14 +116,19 @@ def _registry(*, releaser=None, page_tokens=PAGE_TOKENS):
     )
 
 
-def _begin(registry, *, tokens, groups=(0,), handle=7, group_id=0):
+def _begin(
+    registry, *, tokens, groups=(0,), handle=7, group_id=0, shard_count=1
+):
     boundary = len(tokens)
     return registry.begin(
         namespace_digest=NAMESPACE,
         frontier_token_ids=tokens,
         page_ids_by_group=_pages(boundary // registry.page_tokens, groups=groups),
         snapshot=_snapshot(
-            boundary_tokens=boundary, handle=handle, group_id=group_id
+            boundary_tokens=boundary,
+            handle=handle,
+            group_id=group_id,
+            shard_count=shard_count,
         ),
     )
 
@@ -984,3 +994,155 @@ def test_registry_refuses_a_non_positive_page_size():
             host_page_bytes_all_layers=HOST_PAGE_BYTES,
             release_record=_Releaser(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Slice 1c: the snapshot binds G head shards, and the charge counts all of them
+# ---------------------------------------------------------------------------
+
+
+def test_a_snapshot_defaults_to_one_shard():
+    """Pure DP is unchanged: one rank, one shard, the pre-Slice-1c numbers."""
+
+    snapshot = _snapshot(boundary_tokens=8)
+    assert snapshot.shard_count == 1
+    assert snapshot.snapshot_total_bytes == snapshot.snapshot_bytes
+
+
+def test_a_snapshot_binds_every_shard_of_its_owning_group():
+    snapshot = _snapshot(boundary_tokens=8, shard_count=4)
+    assert snapshot.shard_count == 4
+    # ``profile`` stays ONE rank's geometry -- what a single rank reads and
+    # writes -- while the descriptor says how many of those the record binds.
+    assert snapshot.snapshot_bytes == snapshot_bytes(snapshot.profile)
+    assert snapshot.snapshot_total_bytes == 4 * snapshot.snapshot_bytes
+
+
+def test_a_snapshot_needs_at_least_one_shard():
+    for bad in (0, -1):
+        with pytest.raises(FrontierRecordInvalid) as excinfo:
+            _snapshot(boundary_tokens=8, shard_count=bad)
+        assert "binds at least one head shard" in str(excinfo.value)
+
+
+def test_the_charge_rounds_each_shard_up_independently():
+    """A rank writes through its own page window, so its shard owns whole pages.
+
+    Rounding the summed bytes once would give a smaller arena whose windows
+    straddle a page boundary -- two ranks writing one page.
+    """
+
+    charge = FrontierCharge(
+        page_count=2,
+        host_page_bytes_all_layers=HOST_PAGE_BYTES,
+        snapshot_bytes=HOST_PAGE_BYTES + 1,
+        shard_count=4,
+    )
+    assert charge.snapshot_host_pages == 2
+    assert charge.arena_host_pages == 8
+    # The "round once" figure would have been 5 pages: strictly too small.
+    assert -(-(4 * (HOST_PAGE_BYTES + 1)) // HOST_PAGE_BYTES) == 5
+    assert charge.owned_host_pages == 2 + 8
+    assert charge.snapshot_total_bytes == 4 * (HOST_PAGE_BYTES + 1)
+    assert charge.total_bytes == charge.page_bytes + charge.snapshot_total_bytes
+
+
+def test_a_one_shard_charge_is_the_pre_slice_1c_charge():
+    charge = FrontierCharge(
+        page_count=3,
+        host_page_bytes_all_layers=HOST_PAGE_BYTES,
+        snapshot_bytes=HOST_PAGE_BYTES + 1,
+    )
+    assert charge.shard_count == 1
+    assert charge.arena_host_pages == charge.snapshot_host_pages == 2
+    assert charge.owned_host_pages == 3 + 2
+    assert charge.total_bytes == charge.page_bytes + charge.snapshot_bytes
+
+
+def test_a_charge_needs_at_least_one_shard():
+    with pytest.raises(KDASnapshotProfileInvalid) as excinfo:
+        FrontierCharge(
+            page_count=1,
+            host_page_bytes_all_layers=HOST_PAGE_BYTES,
+            snapshot_bytes=16,
+            shard_count=0,
+        )
+    assert "at least one snapshot shard" in str(excinfo.value)
+
+
+def test_a_record_reports_its_snapshot_shard_count():
+    registry = _registry()
+    record = _begin(registry, tokens=range(8), shard_count=4)
+    assert record.shard_count == 4
+    assert record.charge().shard_count == 4
+    assert record.charge().arena_host_pages == (
+        4 * record.charge().snapshot_host_pages
+    )
+
+
+def test_advance_refuses_a_shard_count_change():
+    """A session's head split cannot move: its arena windows are that split."""
+
+    registry = _registry()
+    record = _begin(registry, tokens=range(8), shard_count=4)
+    with pytest.raises(FrontierRegistryError) as excinfo:
+        registry.advance(
+            session_key=record.session_key,
+            namespace_digest=NAMESPACE,
+            frontier_token_ids=range(12),
+            page_ids_by_group=_pages(3),
+            snapshot=_snapshot(boundary_tokens=12, handle=8, shard_count=2),
+        )
+    assert "4-shard snapshot" in str(excinfo.value)
+    assert "2-shard" in str(excinfo.value)
+    # Refused BEFORE anything moved: the old frontier is untouched.
+    assert len(registry) == 1
+    assert registry.require(record.session_key) is record
+    assert record.frontier_boundary_tokens == 8
+
+
+def test_advance_keeps_the_shard_count():
+    registry = _registry()
+    record = _begin(registry, tokens=range(8), shard_count=4)
+    advance = registry.advance(
+        session_key=record.session_key,
+        namespace_digest=NAMESPACE,
+        frontier_token_ids=range(12),
+        page_ids_by_group=_pages(3),
+        snapshot=_snapshot(boundary_tokens=12, handle=8, shard_count=4),
+    )
+    assert advance.record.shard_count == 4
+    registry.check_invariants()
+
+
+def test_total_charge_refuses_records_that_disagree_on_shard_count():
+    """A mix means one record outlived a reconfiguration: its arena windows no
+    longer match the group that would restore it. Reported, not averaged."""
+
+    registry = _registry()
+    _begin(registry, tokens=range(8), shard_count=4)
+    _begin(registry, tokens=range(100, 108), handle=9, shard_count=2)
+    with pytest.raises(FrontierRegistryInvariantError) as excinfo:
+        registry.total_charge()
+    assert "disagree on their snapshot shard count" in str(excinfo.value)
+    assert "[2, 4]" in str(excinfo.value)
+
+
+def test_total_charge_of_matching_records_counts_every_shard():
+    registry = _registry()
+    first = _begin(registry, tokens=range(8), shard_count=4)
+    second = _begin(registry, tokens=range(100, 108), handle=9, shard_count=4)
+    charge = registry.total_charge()
+    assert charge.shard_count == 4
+    assert charge.page_count == first.page_count + second.page_count
+    assert charge.snapshot_bytes == (
+        first.snapshot.snapshot_bytes + second.snapshot.snapshot_bytes
+    )
+    assert charge.arena_host_pages == 4 * charge.snapshot_host_pages
+
+
+def test_an_empty_registry_still_reports_a_usable_charge():
+    charge = _registry().total_charge()
+    assert charge.shard_count == 1
+    assert charge.page_count == 0
+    assert charge.arena_host_pages == 0

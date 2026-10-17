@@ -100,8 +100,30 @@ class TrajectoryAttachmentInvalid(TrajectoryRestoreError):
     """An attachment was used in a state the mechanism does not allow."""
 
 
+class _RestoreDeclined(Exception):
+    """Internal: a named reason the restore core could not finish.
+
+    Never escapes the module. It exists so the attachment path and the
+    mirrored follower path share ONE implementation of read-slot-write and
+    still report the same named reasons: two copies of that sequence would be
+    two places for the fallback accounting to drift.
+    """
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = str(reason)
+        self.detail = str(detail)
+
+
 # Reasons a hit does NOT end in a restore. Strings, not booleans, because the
 # fallback log line and the metrics row both have to say WHICH one happened.
+#
+# ``head_sharded_group`` no longer means "G>1 at all". Slice 1c commits every
+# rank's head shard into one arena, so a G>1 record is restorable; what is NOT
+# restorable is a record whose SHARD COUNT is not this rank's group size. Its
+# windows then describe a different head split, and reading window r of it
+# would bind plausible-looking wrong state. That is the refusal this name now
+# carries.
 DECLINE_HEAD_SHARDED_GROUP = "head_sharded_group"
 DECLINE_GROUP_MISMATCH = "group_mismatch"
 DECLINE_SUFFIX_OFFSET = "suffix_offset_mismatch"
@@ -248,9 +270,22 @@ class HostKVSnapshotArenaReader:
         return self._torch
 
     def read(
-        self, arena: SnapshotArena, *, layout: SnapshotLayout
+        self,
+        arena: SnapshotArena,
+        *,
+        layout: SnapshotLayout,
+        shard_index: int = 0,
     ) -> tuple[object, ...]:
-        """The blob's chunks in ``SNAPSHOT_CHUNK_NAMES`` order, as uint8."""
+        """The blob's chunks in ``SNAPSHOT_CHUNK_NAMES`` order, as uint8.
+
+        ``shard_index`` selects WHICH rank's head shard is read. The window is
+        taken from ``SnapshotArena.shard_window``, the same method the commit
+        side wrote through, so the read and the write cannot derive it
+        differently -- a restore that computed the window itself could read a
+        neighbour's shard and bind state that looks entirely plausible.
+        ``shard_index=0`` of a one-shard arena is the whole arena, so the
+        pure-DP read is unchanged.
+        """
 
         torch = self._torch_module()
         views = dict(self._host_views_provider())
@@ -266,11 +301,12 @@ class HostKVSnapshotArenaReader:
                 f"sequence id so it cannot collide with a real sequence, got "
                 f"{pseudo_sid}"
             )
+        window_by_group = arena.shard_window(int(shard_index))
         windows: list[object] = []
         collected = 0
         registered: list[int] = []
         try:
-            for group_id, page_ids in sorted(arena.page_ids_by_group.items()):
+            for group_id, page_ids in sorted(window_by_group.items()):
                 view = views.get(int(group_id))
                 if view is None:
                     raise SnapshotArenaCorrupt(
@@ -490,6 +526,7 @@ class TrajectoryRestorer:
         arena_reader,
         state_writer,
         attention_group_size: int = 1,
+        shard_index: int = 0,
         logger=None,
     ) -> None:
         self._rank = int(rank)
@@ -497,6 +534,20 @@ class TrajectoryRestorer:
         self._arena_reader = arena_reader
         self._state_writer = state_writer
         self._attention_group_size = int(attention_group_size)
+        if self._attention_group_size <= 0:
+            raise TrajectoryRestoreError(
+                "attention_group_size must be positive, got "
+                f"{attention_group_size}"
+            )
+        if not 0 <= int(shard_index) < self._attention_group_size:
+            raise TrajectoryRestoreError(
+                f"shard_index {shard_index} is outside a "
+                f"{self._attention_group_size}-rank owning group"
+            )
+        # WHICH head shard this rank restores: its own position inside the
+        # owning group. The commit side wrote window ``shard_index`` from this
+        # same rank, so the two are the same index by construction.
+        self._shard_index = int(shard_index)
         self._logger = logger if logger is not None else logging
         self._live_attachments = 0
         self._lookups = 0
@@ -662,21 +713,20 @@ class TrajectoryRestorer:
                 f"trajectory attachment for session {attachment.session_key} "
                 "was already consumed; it cannot be restored"
             )
-        if self._attention_group_size > 1:
-            # Slice 1b snapshots on the host-KV LEADER of a serve group only
-            # (``_commit_prefix_cache_for_prefill`` skips non-owners), so at
-            # G>1 the committed blob holds ONE rank's head shard and the other
-            # G-1 shards were never captured. Restoring it would bind a slot
-            # whose remaining shards are zero -- wrong state that no downstream
-            # assertion can see. Refused by name until the commit path covers
-            # every rank of the group.
+        record_shards = int(attachment.record.shard_count)
+        if record_shards != self._attention_group_size:
+            # Slice 1c commits EVERY rank's head shard into one arena, so a
+            # G>1 record is restorable -- as long as its shard count is this
+            # rank's group size. A record taken at a different G describes a
+            # different head split: window r of it is not this rank's heads,
+            # and binding it would be wrong state no downstream assertion can
+            # see. Refused by name rather than reinterpreted.
             self.decline(
                 attachment,
                 reason=DECLINE_HEAD_SHARDED_GROUP,
                 detail=(
-                    f"attention_group_size={self._attention_group_size}: the "
-                    "committed snapshot covers only the host-KV leader's head "
-                    "shard"
+                    f"the record binds {record_shards} head shard(s) but this "
+                    f"rank serves a {self._attention_group_size}-rank group"
                 ),
             )
             return None
@@ -714,88 +764,14 @@ class TrajectoryRestorer:
             )
             return None
 
-        try:
-            chunks = self._arena_reader.read(
-                arena, layout=self._committer.layout
-            )
-        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
-            self._logger.exception(
-                "[%s] rank=%s seq=%s reading the snapshot arena failed",
-                PREFIX,
-                self._rank,
-                attachment.sequence_id,
-            )
-            self.decline(
-                attachment,
-                reason=DECLINE_ARENA_READ_FAILED,
-                detail=f"{type(exc).__name__}: {exc}",
-            )
-            return None
-
         sequence_id = attachment.sequence_id
-        # Captured BEFORE the allocation, because allocate_state_item is
-        # idempotent: a slot the sequence already owned must survive a failed
-        # restore, and only a slot THIS restore took may be handed back.
         try:
-            had_slot = self._state_writer.has_slot(sequence_id)
-        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+            slot, written, had_slot = self._read_window_and_bind_slot(
+                arena=arena, layout=self._committer.layout, sequence_id=sequence_id
+            )
+        except _RestoreDeclined as declined:
             self.decline(
-                attachment,
-                reason=DECLINE_SLOT_WRITE_FAILED,
-                detail=f"{type(exc).__name__}: {exc}",
-            )
-            return None
-        try:
-            self._state_writer.allocate_slot(sequence_id)
-        except KDAStateSlotsExhausted as exc:
-            self.decline(
-                attachment,
-                reason=DECLINE_SLOTS_EXHAUSTED,
-                detail=str(exc),
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
-            self._logger.exception(
-                "[%s] rank=%s seq=%s binding a KDA slot failed",
-                PREFIX,
-                self._rank,
-                sequence_id,
-            )
-            self.decline(
-                attachment,
-                reason=DECLINE_SLOT_WRITE_FAILED,
-                detail=f"{type(exc).__name__}: {exc}",
-            )
-            return None
-
-        try:
-            slot, written = self._state_writer.write_slot(sequence_id, chunks)
-        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
-            self._logger.exception(
-                "[%s] rank=%s seq=%s writing the snapshot into its KDA slot "
-                "failed",
-                PREFIX,
-                self._rank,
-                sequence_id,
-            )
-            if not had_slot:
-                # The slot was taken by THIS restore and holds a half-written
-                # state; hand it back so the pool does not leak it and no
-                # later sequence inherits the partial bytes.
-                try:
-                    self._state_writer.release_slot(sequence_id)
-                except Exception:  # noqa: BLE001 - cleanup is best effort
-                    self._logger.exception(
-                        "[%s] rank=%s seq=%s could not release the KDA slot a "
-                        "failed restore had taken",
-                        PREFIX,
-                        self._rank,
-                        sequence_id,
-                    )
-            self.decline(
-                attachment,
-                reason=DECLINE_SLOT_WRITE_FAILED,
-                detail=f"{type(exc).__name__}: {exc}",
+                attachment, reason=declined.reason, detail=declined.detail
             )
             return None
 
@@ -828,6 +804,234 @@ class TrajectoryRestorer:
             owning_group_id=attachment.owning_group_id,
             restored_bytes=int(written),
             allocated_slot=not had_slot,
+        )
+
+    # -- the shared core ----------------------------------------------------
+
+    def _read_window_and_bind_slot(
+        self, *, arena, layout, sequence_id: int
+    ) -> tuple[int, int, bool]:
+        """Read THIS rank's window and write it into the sequence's slot.
+
+        Returns ``(slot, bytes_written, had_slot)``. Every failure leaves the
+        pool exactly as it found it and is raised as ``_RestoreDeclined`` with
+        the name the caller reports -- the attachment path and the mirrored
+        follower path therefore produce identical reasons and identical
+        cleanup.
+        """
+
+        try:
+            chunks = self._arena_reader.read(
+                arena, layout=layout, shard_index=self._shard_index
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+            self._logger.exception(
+                "[%s] rank=%s seq=%s reading the snapshot arena failed",
+                PREFIX,
+                self._rank,
+                int(sequence_id),
+            )
+            raise _RestoreDeclined(
+                DECLINE_ARENA_READ_FAILED, f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # Captured BEFORE the allocation, because allocate_state_item is
+        # idempotent: a slot the sequence already owned must survive a failed
+        # restore, and only a slot THIS restore took may be handed back.
+        try:
+            had_slot = self._state_writer.has_slot(int(sequence_id))
+        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+            raise _RestoreDeclined(
+                DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            self._state_writer.allocate_slot(int(sequence_id))
+        except KDAStateSlotsExhausted as exc:
+            raise _RestoreDeclined(DECLINE_SLOTS_EXHAUSTED, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+            self._logger.exception(
+                "[%s] rank=%s seq=%s binding a KDA slot failed",
+                PREFIX,
+                self._rank,
+                int(sequence_id),
+            )
+            raise _RestoreDeclined(
+                DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            slot, written = self._state_writer.write_slot(
+                int(sequence_id), chunks
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-safe by contract
+            self._logger.exception(
+                "[%s] rank=%s seq=%s writing the snapshot into its KDA slot "
+                "failed",
+                PREFIX,
+                self._rank,
+                int(sequence_id),
+            )
+            if not had_slot:
+                # The slot was taken by THIS restore and holds a half-written
+                # state; hand it back so the pool does not leak it and no
+                # later sequence inherits the partial bytes.
+                try:
+                    self._state_writer.release_slot(int(sequence_id))
+                except Exception:  # noqa: BLE001 - cleanup is best effort
+                    self._logger.exception(
+                        "[%s] rank=%s seq=%s could not release the KDA slot a "
+                        "failed restore had taken",
+                        PREFIX,
+                        self._rank,
+                        int(sequence_id),
+                    )
+            raise _RestoreDeclined(
+                DECLINE_SLOT_WRITE_FAILED, f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return int(slot), int(written), bool(had_slot)
+
+    # -- the mirrored (follower) restore ------------------------------------
+
+    def restore_mirrored_shard(
+        self,
+        *,
+        sequence_id: int,
+        arena,
+        layout,
+        session_key: str,
+        boundary_tokens: int,
+        owning_group_id: int,
+        serving_group_id: int,
+        compute_cached_tokens: int,
+    ) -> TrajectoryRestoreOutcome | None:
+        """Restore this rank's shard from the LEADER's mirrored decision.
+
+        Why a follower has no record of its own: a frontier record's lifetime
+        is allocator state -- the arena's pages are retained and released by
+        exactly one rank. If every rank of the group kept its own record, a
+        leader-side eviction would free the arena while G-1 stale records still
+        named it, and those ranks would restore freed pages. So the group keeps
+        ONE registry, on the leader, and the followers take the leader's
+        decision for the pass through the host-KV mirror. Hit/miss and
+        commit/skip therefore cannot differ across the group: there is only one
+        decision to begin with.
+
+        The leader's own attachment pins the arena for the whole pass, which is
+        what makes it safe for this rank to read pages it holds no reference
+        to.
+
+        ``None`` means this rank recomputes, with the reason named -- the same
+        reasons and the same counters as the attachment path.
+        """
+
+        self._lookups += 1
+        self._hits += 1
+        shards = int(getattr(arena, "shard_count", 1))
+        if shards != self._attention_group_size:
+            self._decline_mirrored(
+                sequence_id=sequence_id,
+                session_key=session_key,
+                boundary_tokens=boundary_tokens,
+                reason=DECLINE_HEAD_SHARDED_GROUP,
+                detail=(
+                    f"the mirrored arena holds {shards} head shard(s) but this "
+                    f"rank serves a {self._attention_group_size}-rank group"
+                ),
+            )
+            return None
+        if int(serving_group_id) != int(owning_group_id):
+            self._decline_mirrored(
+                sequence_id=sequence_id,
+                session_key=session_key,
+                boundary_tokens=boundary_tokens,
+                reason=DECLINE_GROUP_MISMATCH,
+                detail=(
+                    f"serving_group={int(serving_group_id)} but the snapshot "
+                    f"is head-sharded for group {int(owning_group_id)}"
+                ),
+            )
+            return None
+        if int(compute_cached_tokens) != int(boundary_tokens):
+            self._decline_mirrored(
+                sequence_id=sequence_id,
+                session_key=session_key,
+                boundary_tokens=boundary_tokens,
+                reason=DECLINE_SUFFIX_OFFSET,
+                detail=(
+                    f"suffix prefill starts at token "
+                    f"{int(compute_cached_tokens)} but the snapshot is the "
+                    f"state after {int(boundary_tokens)} tokens"
+                ),
+            )
+            return None
+        try:
+            slot, written, had_slot = self._read_window_and_bind_slot(
+                arena=arena, layout=layout, sequence_id=int(sequence_id)
+            )
+        except _RestoreDeclined as declined:
+            self._decline_mirrored(
+                sequence_id=sequence_id,
+                session_key=session_key,
+                boundary_tokens=boundary_tokens,
+                reason=declined.reason,
+                detail=declined.detail,
+            )
+            return None
+        self._restores += 1
+        self._logger.info(
+            "[%s] rank=%s seq=%s session=%s RESTORED shard=%s/%s boundary=%s "
+            "slot=%s bytes=%s group=%s allocated_slot=%s; suffix prefill "
+            "resumes at token %s",
+            PREFIX,
+            self._rank,
+            int(sequence_id),
+            session_key,
+            self._shard_index,
+            self._attention_group_size,
+            int(boundary_tokens),
+            slot,
+            written,
+            int(owning_group_id),
+            not had_slot,
+            int(compute_cached_tokens),
+        )
+        return TrajectoryRestoreOutcome(
+            session_key=str(session_key),
+            sequence_id=int(sequence_id),
+            state_slot=int(slot),
+            boundary_tokens=int(boundary_tokens),
+            owning_group_id=int(owning_group_id),
+            restored_bytes=int(written),
+            allocated_slot=not had_slot,
+        )
+
+    def _decline_mirrored(
+        self,
+        *,
+        sequence_id: int,
+        session_key: str,
+        boundary_tokens: int,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Name a mirrored restore's fallback. No attachment to consume."""
+
+        if reason not in DECLINE_REASONS:
+            raise TrajectoryAttachmentInvalid(
+                f"unknown trajectory decline reason {reason!r}; known reasons "
+                "are " + ", ".join(DECLINE_REASONS)
+            )
+        self._declines[reason] = self._declines.get(reason, 0) + 1
+        self._logger.warning(
+            "[%s] rank=%s seq=%s session=%s FALLBACK reason=%s boundary=%s "
+            "%s; trajectory reuse degrades to full recompute",
+            PREFIX,
+            self._rank,
+            int(sequence_id),
+            session_key,
+            reason,
+            int(boundary_tokens),
+            detail,
         )
 
 

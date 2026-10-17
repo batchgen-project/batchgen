@@ -102,6 +102,7 @@ from batchgen.prefix_reuse.trajectory_restore import (  # noqa: E402
     KDAStateSlotsExhausted,
     KDAStateSnapshotWriter,
     TrajectoryAttachmentInvalid,
+    TrajectoryRestoreError,
     TrajectoryRestorer,
     trajectory_reuse_enabled,
 )
@@ -143,6 +144,11 @@ class _FakeHostView:
         self._free = list(range(num_pages))
         self._chains: dict[int, list[int]] = {}
         self._attached: dict[int, list[int]] = {}
+        # The rank-LOCAL page-table row, which the C++ view keeps separately
+        # from the node-shared allocator chain. ``set_sequence_pages`` writes
+        # only this, which is what lets a non-owner rank resolve pages it did
+        # not allocate (and what lets a shard write address one window).
+        self._rows: dict[int, list[int]] = {}
         self._resident: set[int] = set()
         self.calls: list[tuple] = []
 
@@ -158,6 +164,15 @@ class _FakeHostView:
             self.calls.append(("unregister", int(sequence_id)))
             self._chains.pop(int(sequence_id), None)
             self._attached.pop(int(sequence_id), None)
+            self._rows.pop(int(sequence_id), None)
+
+    def set_sequence_pages(self, sequence_id, page_ids):
+        """Overwrite the LOCAL row only; the allocator chain is untouched."""
+
+        self.calls.append(
+            ("set_row", int(sequence_id), tuple(int(p) for p in page_ids))
+        )
+        self._rows[int(sequence_id)] = [int(page_id) for page_id in page_ids]
 
     # -- allocation --------------------------------------------------------
 
@@ -179,6 +194,10 @@ class _FakeHostView:
         return [self._table(int(sequence_id)) for sequence_id in sequence_ids]
 
     def _table(self, sequence_id: int) -> list[int]:
+        # A local row set with ``set_sequence_pages`` wins: that is exactly the
+        # override the C++ view gives it.
+        if sequence_id in self._rows:
+            return list(self._rows[sequence_id])
         if sequence_id in self._attached:
             return list(self._attached[sequence_id])
         if sequence_id not in self._chains:
@@ -375,13 +394,25 @@ class _Harness:
             for group_id in self.views
         }
 
-    def commit(self, *, tokens=BASE_PROMPT, sequence_id=7, group_id=0):
+    def commit(
+        self,
+        *,
+        tokens=BASE_PROMPT,
+        sequence_id=7,
+        group_id=0,
+        prompt_token_count=None,
+    ):
+        # The prefill ran exactly the committed boundary (Slice 1c's only
+        # storable case), unless a test says otherwise.
         return self.committer.commit(
             namespace_digest=NAMESPACE,
             frontier_token_ids=tokens,
             page_ids_by_group=self.frontier_pages(),
             owning_group_id=int(group_id),
             sequence_id=int(sequence_id),
+            prompt_token_count=(
+                len(tokens) if prompt_token_count is None else prompt_token_count
+            ),
         )
 
 
@@ -848,6 +879,10 @@ def test_the_arena_reader_refuses_a_short_arena():
     short = replace(
         arena,
         page_ids_by_group={0: tuple(arena.page_ids_by_group[0][:1])},
+        # Internally CONSISTENT but too small for the blob: the arena's own
+        # geometry check now refuses a page list that disagrees with its page
+        # count, so shortness has to be expressed as a smaller arena.
+        pages_per_group=1,
     )
     with pytest.raises(SnapshotArenaCorrupt) as excinfo:
         harness.arena_reader.read(short, layout=harness.layout)
@@ -1080,11 +1115,15 @@ def test_a_serving_group_other_than_the_owning_group_is_refused():
     )
 
 
-def test_a_head_sharded_serve_group_is_refused_by_name(caplog):
-    """G>1: Slice 1b snapshots the host-KV leader's shard only.
+def test_a_shard_count_that_is_not_this_group_is_refused_by_name(caplog):
+    """A record whose shard count is not this rank's group size is refused.
 
-    Restoring that blob would bind a slot whose other G-1 shards were never
-    captured, which no downstream assertion can see. Refused, not approximated.
+    Slice 1c made a G>1 record restorable -- every rank's head shard is in the
+    arena -- so the refusal is no longer "G>1 at all". What stays refused is a
+    MISMATCH: a one-shard record read by a rank of a 4-rank group would take
+    the whole arena as its own heads, and a 4-shard record read at G=1 would
+    take a quarter of the state as all of it. Both bind wrong state that no
+    downstream assertion can see, so both are refused rather than approximated.
     """
 
     harness = _Harness()
@@ -1108,8 +1147,8 @@ def test_a_head_sharded_serve_group_is_refused_by_name(caplog):
         ]
         == 1
     )
-    assert "attention_group_size=4" in "\n".join(
-        record.getMessage() for record in caplog.records
+    assert "binds 1 head shard(s) but this rank serves a 4-rank group" in (
+        "\n".join(record.getMessage() for record in caplog.records)
     )
 
 
@@ -1286,3 +1325,347 @@ def test_a_misaligned_chunk_offset_still_round_trips():
     slot, written = writer.write_slot(2, chunks)
     assert written == layout.total_bytes
     assert _slot_chunks(manager, slot) == expected
+
+
+# ---------------------------------------------------------------------------
+# Slice 1c: G>1 -- every rank snapshots and restores its OWN head shard
+# ---------------------------------------------------------------------------
+
+
+class _GroupHarness:
+    """G ranks of one serve group over ONE node-shared Host KV region.
+
+    The views are shared because the real region is: that is what lets a
+    follower write and read its own window without allocating anything. The
+    KDA state managers are per rank, because the state is head-sharded -- each
+    rank holds different bytes, which is exactly what the windows must keep
+    apart.
+    """
+
+    def __init__(self, *, shard_count: int = 4, groups: int = 1, num_pages: int = 64):
+        self.shard_count = int(shard_count)
+        self.managers = [
+            _state_manager() for _ in range(self.shard_count)
+        ]
+        self.profile = profile_from_kda_state_config(self.managers[0].config)
+        self.layout = SnapshotLayout(profile=self.profile)
+        self.views = {
+            group_id: _FakeHostView(num_pages=num_pages)
+            for group_id in range(int(groups))
+        }
+        self.host_page_bytes_all_layers = int(groups) * GROUP_PAGE_BYTES
+        self._sid = 0
+        self.allocator = HostKVSnapshotArenaAllocator(
+            host_views_provider=lambda: self.views,
+            page_tokens=PAGE_TOKENS,
+            host_page_bytes_all_layers=self.host_page_bytes_all_layers,
+            next_pseudo_sid=self._next_pseudo_sid,
+        )
+        self.committers = [
+            TrajectoryFrontierCommitter(
+                rank=index,
+                page_tokens=PAGE_TOKENS,
+                host_page_bytes_all_layers=self.host_page_bytes_all_layers,
+                arena_allocator=self.allocator,
+                snapshot_reader=KDAStateSnapshotReader(
+                    state_manager_provider=(
+                        lambda manager=self.managers[index]: manager
+                    ),
+                    profile=self.profile,
+                ),
+                shard_count=self.shard_count,
+                shard_index=index,
+                owns_registry=(index == 0),
+            )
+            for index in range(self.shard_count)
+        ]
+
+    def _next_pseudo_sid(self) -> int:
+        self._sid += 1
+        return -self._sid
+
+    @property
+    def leader(self):
+        return self.committers[0]
+
+    def frontier_pages(self):
+        return {
+            group_id: tuple(100 + 10 * group_id + i for i in range(2))
+            for group_id in self.views
+        }
+
+    def restorer(self, shard_index: int, **kwargs) -> TrajectoryRestorer:
+        kwargs.setdefault(
+            "arena_reader",
+            HostKVSnapshotArenaReader(
+                host_views_provider=lambda: self.views,
+                next_pseudo_sid=self._next_pseudo_sid,
+            ),
+        )
+        kwargs.setdefault(
+            "state_writer",
+            KDAStateSnapshotWriter(
+                state_manager_provider=(
+                    lambda manager=self.managers[int(shard_index)]: manager
+                ),
+                profile=self.profile,
+            ),
+        )
+        kwargs.setdefault("attention_group_size", self.shard_count)
+        return TrajectoryRestorer(
+            rank=int(shard_index),
+            committer=self.leader,
+            shard_index=int(shard_index),
+            **kwargs,
+        )
+
+    def seed(self, sequence_id: int = 7):
+        """Distinct state per rank, so a crossed window is unmissable."""
+
+        slots, expected = [], []
+        for index, manager in enumerate(self.managers):
+            slot = _seed_slot(manager, sequence_id, seed=1000 + 7 * index)
+            slots.append(slot)
+            expected.append(_slot_chunks(manager, slot))
+        return slots, expected
+
+    def commit_pass(self, *, tokens=BASE_PROMPT, sequence_id=7):
+        """The real pass: reserve in config, all G ranks write, then finalize."""
+
+        arena = self.leader.reserve_arena(
+            sequence_id=sequence_id, prefix_page_count=2
+        )
+        assert arena is not None
+        for follower in self.committers[1:]:
+            follower.adopt_arena(sequence_id=sequence_id, arena=arena)
+        assert (
+            self.leader.commit(
+                namespace_digest=NAMESPACE,
+                frontier_token_ids=tokens,
+                page_ids_by_group=self.frontier_pages(),
+                owning_group_id=0,
+                sequence_id=sequence_id,
+                prompt_token_count=len(tokens),
+            )
+            is not None
+        )
+        for follower in self.committers[1:]:
+            assert (
+                follower.write_shard(
+                    sequence_id=sequence_id,
+                    frontier_token_ids=tokens,
+                    prompt_token_count=len(tokens),
+                )
+                is not None
+            )
+        finalized = self.leader.finalize()
+        for follower in self.committers[1:]:
+            follower.finalize()
+        assert len(finalized.installed) == 1
+        return arena, finalized.installed[0]
+
+
+def _group_hit(harness, restorer, *, sequence_id=9):
+    attachment = restorer.lookup(
+        namespace_digest=NAMESPACE,
+        prompt_token_ids=BASE_PROMPT + (201, 202),
+        sequence_id=sequence_id,
+    )
+    assert attachment is not None
+    return attachment
+
+
+@pytest.mark.parametrize("shard_count", [2, 4])
+def test_a_matching_shard_count_is_restored_instead_of_refused(shard_count):
+    """The Slice 2 blanket G>1 refusal is gone for a complete snapshot."""
+
+    harness = _GroupHarness(shard_count=shard_count)
+    harness.seed()
+    harness.commit_pass()
+    restorer = harness.restorer(0)
+    outcome = restorer.restore(
+        _group_hit(harness, restorer),
+        serving_group_id=0,
+        compute_cached_tokens=len(BASE_PROMPT),
+    )
+
+    assert outcome is not None
+    assert restorer.counters()[
+        f"trajectory_decline_{DECLINE_HEAD_SHARDED_GROUP}"
+    ] == 0
+    assert restorer.counters()["trajectory_restores"] == 1
+    assert restorer.live_attachments == 0
+
+
+@pytest.mark.parametrize("shard_index", [0, 1, 2, 3])
+def test_each_rank_restores_exactly_its_own_window(shard_index):
+    """Rank r's slot must come back with rank r's bytes, not a neighbour's.
+
+    Every rank's source state is seeded differently, so reading the wrong
+    window would restore bytes that are valid-looking but belong to another
+    rank's heads -- the exact failure no downstream assertion can see.
+    """
+
+    harness = _GroupHarness(shard_count=4)
+    _slots, expected = harness.seed()
+    harness.commit_pass()
+
+    restorer = harness.restorer(shard_index)
+    outcome = restorer.restore(
+        _group_hit(harness, restorer),
+        serving_group_id=0,
+        compute_cached_tokens=len(BASE_PROMPT),
+    )
+
+    assert outcome is not None
+    manager = harness.managers[shard_index]
+    restored = _slot_chunks(manager, outcome.state_slot)
+    assert restored == expected[shard_index]
+    # And it is NOT any other rank's shard.
+    for other in range(4):
+        if other != shard_index:
+            assert restored != expected[other]
+
+
+def test_a_shard_count_that_is_not_this_ranks_group_is_refused_at_g_gt_1():
+    """A 4-shard record read by a rank that thinks G==2 is refused by name."""
+
+    harness = _GroupHarness(shard_count=4)
+    harness.seed()
+    harness.commit_pass()
+    restorer = harness.restorer(0, attention_group_size=2)
+    attachment = _group_hit(harness, restorer)
+    assert (
+        restorer.restore(
+            attachment,
+            serving_group_id=0,
+            compute_cached_tokens=len(BASE_PROMPT),
+        )
+        is None
+    )
+    assert restorer.counters()[
+        f"trajectory_decline_{DECLINE_HEAD_SHARDED_GROUP}"
+    ] == 1
+    assert restorer.live_attachments == 0
+
+
+def test_a_restorer_refuses_a_shard_index_outside_its_group():
+    harness = _GroupHarness(shard_count=2)
+    with pytest.raises(TrajectoryRestoreError) as excinfo:
+        harness.restorer(1, attention_group_size=1)
+    assert "outside a 1-rank owning group" in str(excinfo.value)
+    with pytest.raises(TrajectoryRestoreError) as excinfo:
+        harness.restorer(0, attention_group_size=0)
+    assert "attention_group_size must be positive" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("shard_index", [1, 2, 3])
+def test_a_follower_restores_its_shard_from_the_mirrored_decision(shard_index):
+    """A rank with NO registry restores from the leader's mirrored record.
+
+    The follower keeps no record of its own precisely so a leader-side eviction
+    cannot leave it restoring freed pages; the decision and the arena both come
+    from the leader, so hit/miss cannot differ across the group.
+    """
+
+    harness = _GroupHarness(shard_count=4)
+    _slots, expected = harness.seed()
+    arena, installed = harness.commit_pass()
+
+    restorer = harness.restorer(shard_index)
+    outcome = restorer.restore_mirrored_shard(
+        sequence_id=9,
+        arena=arena,
+        layout=harness.layout,
+        session_key=installed.session_key,
+        boundary_tokens=len(BASE_PROMPT),
+        owning_group_id=0,
+        serving_group_id=0,
+        compute_cached_tokens=len(BASE_PROMPT),
+    )
+
+    assert outcome is not None
+    assert outcome.session_key == installed.session_key
+    restored = _slot_chunks(harness.managers[shard_index], outcome.state_slot)
+    assert restored == expected[shard_index]
+    counters = restorer.counters()
+    assert counters["trajectory_restores"] == 1
+    assert counters["trajectory_declines"] == 0
+    # No attachment was ever taken, so none can leak.
+    assert restorer.live_attachments == 0
+
+
+def test_the_mirrored_path_names_the_same_reasons_as_the_attachment_path():
+    harness = _GroupHarness(shard_count=4)
+    harness.seed()
+    arena, installed = harness.commit_pass()
+    restorer = harness.restorer(1)
+
+    # Wrong serving group.
+    assert (
+        restorer.restore_mirrored_shard(
+            sequence_id=9,
+            arena=arena,
+            layout=harness.layout,
+            session_key=installed.session_key,
+            boundary_tokens=len(BASE_PROMPT),
+            owning_group_id=0,
+            serving_group_id=3,
+            compute_cached_tokens=len(BASE_PROMPT),
+        )
+        is None
+    )
+    # Suffix that does not start exactly at the boundary.
+    assert (
+        restorer.restore_mirrored_shard(
+            sequence_id=9,
+            arena=arena,
+            layout=harness.layout,
+            session_key=installed.session_key,
+            boundary_tokens=len(BASE_PROMPT),
+            owning_group_id=0,
+            serving_group_id=0,
+            compute_cached_tokens=len(BASE_PROMPT) - 1,
+        )
+        is None
+    )
+    counters = restorer.counters()
+    assert counters[f"trajectory_decline_{DECLINE_GROUP_MISMATCH}"] == 1
+    assert counters[f"trajectory_decline_{DECLINE_SUFFIX_OFFSET}"] == 1
+    assert counters["trajectory_restores"] == 0
+    assert restorer.live_attachments == 0
+
+
+def test_the_mirrored_path_refuses_an_unknown_reason():
+    harness = _GroupHarness(shard_count=2)
+    restorer = harness.restorer(1)
+    with pytest.raises(TrajectoryAttachmentInvalid):
+        restorer._decline_mirrored(
+            sequence_id=9,
+            session_key="s",
+            boundary_tokens=8,
+            reason="not_a_reason",
+            detail="",
+        )
+
+
+def test_the_g_wide_arena_holds_every_shard_and_only_those_pages():
+    harness = _GroupHarness(shard_count=4)
+    harness.seed()
+    arena, _installed = harness.commit_pass()
+
+    one_shard = harness.layout.shard_page_count(
+        host_page_bytes_all_layers=harness.host_page_bytes_all_layers,
+        prefix_page_count=2,
+    )
+    assert arena.pages_per_group == 4 * one_shard
+    # Retained exactly once, by the leader, and every arena page is resident.
+    view = harness.views[0]
+    assert set(arena.page_ids_by_group[0]) <= view.resident_pages
+    # Every window carries real bytes: no shard was left zeroed.
+    for shard_index in range(4):
+        window = arena.shard_window(shard_index)
+        blob = b"".join(
+            view.page_bytes_of(page) for page in window[0]
+        )
+        assert blob.strip(b"\x00"), f"shard {shard_index} window is all zeros"

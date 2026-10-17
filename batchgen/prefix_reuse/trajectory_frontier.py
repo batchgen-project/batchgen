@@ -268,14 +268,27 @@ class KDASnapshotDescriptor:
     slice only carries it, the commit path fills it. ``owning_group_id`` keeps
     the group affinity the head sharding implies: a snapshot is only restorable
     into the group whose layout produced it.
+
+    ``shard_count`` is how many per-rank head shards the snapshot binds -- G,
+    the attention group size at commit time. It is part of the record's
+    identity, not a hint: a record taken at one G describes a head split that
+    a different G does not have, so a restore under a different G is refused by
+    name rather than reinterpreted. ``profile`` stays the geometry of ONE
+    shard, which is what a single rank reads and writes.
     """
 
     storage_handle: int
     owning_group_id: int
     profile: KDASnapshotProfile
     boundary_tokens: int
+    shard_count: int = 1
 
     def __post_init__(self) -> None:
+        if int(self.shard_count) <= 0:
+            raise FrontierRecordInvalid(
+                "a KDA snapshot binds at least one head shard, got "
+                f"shard_count={self.shard_count}"
+            )
         if int(self.storage_handle) <= 0:
             raise FrontierRecordInvalid(
                 "a KDA snapshot descriptor needs a non-zero storage handle; "
@@ -297,7 +310,15 @@ class KDASnapshotDescriptor:
 
     @property
     def snapshot_bytes(self) -> int:
+        """Bytes of ONE rank's shard of this snapshot."""
+
         return snapshot_bytes(self.profile)
+
+    @property
+    def snapshot_total_bytes(self) -> int:
+        """Bytes of every shard this snapshot binds."""
+
+        return int(self.shard_count) * snapshot_bytes(self.profile)
 
 
 # ---------------------------------------------------------------------------
@@ -422,11 +443,28 @@ class FrontierCharge:
     ``total_bytes`` is the real-bytes view the budget arithmetic uses. It is
     reported alongside, never instead: a byte figure charged into a page
     counter would silently under-credit the pool.
+
+    ``shard_count`` is G, the attention group size the snapshot was taken at.
+    ``snapshot_bytes`` is ONE rank's shard, so the node-wide cost of the
+    snapshot is ``shard_count`` shards: at G>1 every rank of the owning group
+    holds its own head shard and all G of them have to be stored for the
+    snapshot to describe the whole state. Each shard is rounded UP to whole
+    Host pages INDEPENDENTLY, because a rank writes its shard through its own
+    page-table window and a window is a whole number of pages -- summing bytes
+    first and rounding once would hand two ranks a shared page.
     """
 
     page_count: int
     host_page_bytes_all_layers: int
     snapshot_bytes: int
+    shard_count: int = 1
+
+    def __post_init__(self) -> None:
+        if int(self.shard_count) <= 0:
+            raise KDASnapshotProfileInvalid(
+                "a frontier charge needs at least one snapshot shard, got "
+                f"{self.shard_count}"
+            )
 
     @property
     def page_bytes(self) -> int:
@@ -434,20 +472,32 @@ class FrontierCharge:
 
     @property
     def snapshot_host_pages(self) -> int:
-        """Whole Host pages the snapshot occupies, rounded up."""
+        """Whole Host pages ONE rank's shard occupies, rounded up."""
 
         page_bytes = int(self.host_page_bytes_all_layers)
         return -(-int(self.snapshot_bytes) // page_bytes)
 
     @property
+    def arena_host_pages(self) -> int:
+        """Whole Host pages the WHOLE snapshot occupies: G x one shard."""
+
+        return int(self.shard_count) * self.snapshot_host_pages
+
+    @property
     def owned_host_pages(self) -> int:
         """Pages charged to the owner: retained prefix pages plus the snapshot."""
 
-        return int(self.page_count) + self.snapshot_host_pages
+        return int(self.page_count) + self.arena_host_pages
+
+    @property
+    def snapshot_total_bytes(self) -> int:
+        """Snapshot payload across every shard of the owning group."""
+
+        return int(self.shard_count) * int(self.snapshot_bytes)
 
     @property
     def total_bytes(self) -> int:
-        return self.page_bytes + int(self.snapshot_bytes)
+        return self.page_bytes + self.snapshot_total_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +654,12 @@ class TrajectoryFrontierRecord:
         return int(self._snapshot.owning_group_id)
 
     @property
+    def shard_count(self) -> int:
+        """Per-rank head shards this record's snapshot binds (G at commit)."""
+
+        return int(self._snapshot.shard_count)
+
+    @property
     def refcount(self) -> int:
         return self._refcount
 
@@ -624,6 +680,7 @@ class TrajectoryFrontierRecord:
             page_count=self.page_count,
             host_page_bytes_all_layers=self._host_page_bytes_all_layers,
             snapshot_bytes=self._snapshot.snapshot_bytes,
+            shard_count=int(self._snapshot.shard_count),
         )
 
     # -- lifetime ----------------------------------------------------------
@@ -766,8 +823,24 @@ class TrajectoryFrontierRegistry:
         return record
 
     def total_charge(self) -> FrontierCharge:
-        """Aggregate charge of every resident frontier record."""
+        """Aggregate charge of every resident frontier record.
 
+        Every resident record must share one ``shard_count``: G is fixed for a
+        rank's whole life, so a mix means a record survived a reconfiguration
+        and its arena no longer matches the group that would restore it. That
+        is reported as a broken invariant rather than averaged away -- the
+        aggregate page figure would otherwise be silently wrong.
+        """
+
+        shard_counts = {
+            int(record.shard_count) for record in self._records.values()
+        }
+        if len(shard_counts) > 1:
+            raise FrontierRegistryInvariantError(
+                "resident frontier records disagree on their snapshot shard "
+                f"count ({sorted(shard_counts)}); one of them was committed "
+                "under a different attention group size"
+            )
         return FrontierCharge(
             page_count=sum(
                 record.page_count for record in self._records.values()
@@ -777,6 +850,7 @@ class TrajectoryFrontierRegistry:
                 record.snapshot.snapshot_bytes
                 for record in self._records.values()
             ),
+            shard_count=shard_counts.pop() if shard_counts else 1,
         )
 
     def resolve(
@@ -889,6 +963,13 @@ class TrajectoryFrontierRegistry:
                 f"session {session_key} is pinned to KV group "
                 f"{previous.owning_group_id}; its snapshot cannot move to group "
                 f"{snapshot.owning_group_id}"
+            )
+        if previous.shard_count != int(snapshot.shard_count):
+            raise FrontierRegistryError(
+                f"session {session_key} holds a {previous.shard_count}-shard "
+                "snapshot; advancing it to a "
+                f"{int(snapshot.shard_count)}-shard one would change the head "
+                "split the record describes"
             )
         if int(len(frontier_token_ids)) < previous.frontier_boundary_tokens:
             raise FrontierRegistryError(
