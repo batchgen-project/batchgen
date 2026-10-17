@@ -143,7 +143,10 @@ _SCORING_CALLS = (
     "head_gates_out",
     "cuda_wq_b_proj_out",
     "rope_hadamard_q_out",
-    "fused_paged_score_and_topk_with_slots_out",
+    # The scorer is reached through the format dispatcher, which picks
+    # DeepGEMM's fp8_paged_mqa_logits for a page-split FP8 aux cache and the
+    # retired bf16 Triton scorer for an AoS one.
+    "self._score_and_topk",
 )
 _DROPPED_FLASHMLA_CALLS = (
     "pack_flashmla_query_out",
