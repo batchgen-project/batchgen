@@ -95,7 +95,13 @@ class _Region:
 
     def _locate_free_stack(self) -> int:
         fresh = struct.pack(f"<{NUM_PAGES}i", *range(NUM_PAGES - 1, -1, -1))
-        for offset in range(ACTIVE_SEQUENCES_OFFSET + 4, 1024, 8):
+        # The free-stack array is 8-byte aligned and sits after the counters
+        # AND the two pthread mutexes, so its offset is not derivable from
+        # ACTIVE_SEQUENCES_OFFSET alone (measured: 176 on glibc x86_64, which
+        # is ≡ 0 mod 8 — an 8-stride scan starting at 92 ≡ 4 mod 8 never saw
+        # it).  Scan every 4-byte offset instead; the content checks below
+        # make a false match implausible.
+        for offset in range(ACTIVE_SEQUENCES_OFFSET + 4, 2048, 4):
             if self._mm[offset:offset + 4 * NUM_PAGES] != fresh:
                 continue
             owners = _align(offset + 4 * NUM_PAGES, 8)
