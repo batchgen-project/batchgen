@@ -217,6 +217,80 @@ def test_explicit_restart_does_not_double_persist_prior_pool_shutdown(monkeypatc
     assert calls == []
 
 
+def test_failed_teardown_leaves_recoverable_state_and_retry_persists(monkeypatch):
+    """A restart that dies in ANY phase must stay retryable,
+    and the retry must still persist the in-flight batches exactly once."""
+    manager = _manager(monkeypatch)
+    persisted = []
+    manager._reconciled_failure = False
+    manager._fail_in_flight_hook = lambda reason: persisted.append(reason) or 2
+
+    def failing_teardown():
+        raise RuntimeError("worker teardown left live owned PIDs")
+
+    manager._stop_workers = failing_teardown
+    with pytest.raises(RuntimeError, match="live owned PIDs"):
+        manager.restart_workers(timeout_s=1)
+
+    # Not stuck in "restarting", and the failure path never reached reconcile.
+    assert manager.state == "workers_down"
+    assert persisted == []
+    assert manager._reconciled_failure is False
+
+    manager._stop_workers = lambda: None
+    result = manager.restart_workers(timeout_s=1)
+    assert manager.state == "serving"
+    assert result["failed_batches"] == 2
+    assert len(persisted) == 1
+
+
+def test_stale_exit_state_is_cleared_before_ready_wait(monkeypatch):
+    """A fatal recorded by the previous cohort must not abort the readiness
+    wait of the cohort a restart spawns."""
+    manager = _manager(monkeypatch)
+    order = []
+
+    class ExitState:
+        reason = "stale fatal from the dead cohort"
+
+        def clear(self):
+            self.reason = None
+            order.append("clear_exit_state")
+
+        def is_failed(self):
+            return self.reason is not None
+
+    manager._state = "workers_down"
+    manager._reconciled_failure = True
+    manager._worker_exit_state = ExitState()
+    manager._wait_for_workers_ready = (
+        lambda timeout_s=None: order.append("wait_ready")
+    )
+
+    manager.restart_workers(timeout_s=1)
+
+    assert order[0] == "clear_exit_state"
+    assert "wait_ready" in order
+    assert manager.state == "serving"
+
+
+def test_restart_result_reports_all_phase_timings(monkeypatch):
+    manager = _manager(monkeypatch)
+    result = manager.restart_workers(timeout_s=1)
+    assert set(result["phase_timings"]) == {
+        "quiesce_s", "teardown_s", "reconcile_s", "spawn_to_ready_s",
+    }
+
+
+def test_teardown_budgets_cover_pinned_page_release():
+    """Ordered release of a large cudaHostRegister'd footprint takes minutes,
+    and a SIGKILL'd worker is unreapable until the kernel unpins it."""
+    source = (ROOT / "batchgen/server/worker_manager.py").read_text()
+    assert "_WORKER_SENTINEL_GRACE_S = 180.0" in source
+    assert "_WORKER_KILL_REAP_TIMEOUT_S = 300.0" in source
+    assert "deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S" in source
+
+
 def test_legacy_reload_symbols_are_absent():
     symbols = (
         "send_" + "reload_command",

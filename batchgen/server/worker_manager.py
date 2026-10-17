@@ -48,8 +48,16 @@ PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 # A sentinel reaches the worker's ordered C++/Python teardown path.  That path
 # must be allowed to finish before the signal fallback can invoke os._exit and
 # skip the destructors it exists to run.  The bound still keeps a blocked
-# worker from holding server shutdown indefinitely.
-_WORKER_SENTINEL_GRACE_S = 20.0
+# worker from holding server shutdown indefinitely.  Releasing a large
+# cudaHostRegister'd weight footprint takes on the order of minutes, so the
+# grace must cover that or the fallback kills workers mid-unpin into
+# uninterruptible D state.
+_WORKER_SENTINEL_GRACE_S = 180.0
+# A SIGKILL'd worker still cannot be reaped until the kernel finishes
+# unpinning its registered pages, which again takes minutes for a large
+# cohort.  Proceeding while an owned PID is alive is never safe, so the
+# reap wait is long and loud rather than short and fatal.
+_WORKER_KILL_REAP_TIMEOUT_S = 300.0
 
 
 def _resolve_local_world_size(
@@ -615,9 +623,23 @@ class WorkerManager:
                     logger.warning("Workers did not exit gracefully, force-killing...")
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-                for proc, _ in remaining:
-                    proc.join(timeout=max(0, deadline - time.monotonic()))
+                deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S
+                next_progress_log = time.monotonic() + 30
+                while remaining and time.monotonic() < deadline:
+                    for proc, _ in remaining:
+                        proc.join(timeout=1)
+                    remaining = [
+                        (proc, fd) for proc, fd in remaining if proc.exitcode is None
+                    ]
+                    if remaining and time.monotonic() >= next_progress_log:
+                        next_progress_log = time.monotonic() + 30
+                        logging.getLogger("uvicorn.error").info(
+                            "[shutdown] waiting for SIGKILL'd workers to be "
+                            "reaped (page unpin in progress) elapsed=%.3fs "
+                            "remaining=%d",
+                            time.monotonic() - stop_start,
+                            len(remaining),
+                        )
                 logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
                     time.monotonic() - stop_start,
@@ -734,40 +756,46 @@ class WorkerManager:
         with self._lock:
             if self._state not in {"serving", "workers_down"}:
                 raise RuntimeError(f"worker restart conflict: state={self._state}")
-            previous_state = self._state
             self._state = "restarting"
-            # A pool_shutdown message may have persisted the fatal just before
-            # an explicit restart request arrived. Preserve that fact so the
-            # restart does not invoke the persistence hook twice.
-            self._reconciled_failure = (
-                self._reconciled_failure or previous_state == "workers_down"
-            )
 
-        if self._quiesce_hook is not None:
-            self._quiesce_hook()
-        teardown_start = time.monotonic()
-        self._monitor_stop_event.set()
-        monitor = self._monitor_thread
-        if monitor is not None and monitor is not threading.current_thread():
-            monitor.join(timeout=5)
-            self._monitor_thread = None
-        if self.worker_process is not None:
-            self._stop_workers()
-            self.worker_process = None
-        teardown_s = time.monotonic() - teardown_start
-
-        reconcile_start = time.monotonic()
-        reconciliation = self._reconcile(
-            "Worker pool restarted; in-flight batches were failed.",
-            fail_in_flight=previous_state == "serving",
-        )
-        reconcile_s = time.monotonic() - reconcile_start
-
-        spawn_start = time.monotonic()
-        self._monitor_stop_event.clear()
-        self._ready_event.clear()
-        self._fatal_ack_event.clear()
+        # Every phase runs inside one recovery scope: a restart that fails at
+        # ANY point leaves the manager in the retryable workers_down state,
+        # never stuck in "restarting".
         try:
+            quiesce_start = time.monotonic()
+            if self._quiesce_hook is not None:
+                self._quiesce_hook()
+            quiesce_s = time.monotonic() - quiesce_start
+            teardown_start = time.monotonic()
+            self._monitor_stop_event.set()
+            monitor = self._monitor_thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(timeout=5)
+                self._monitor_thread = None
+            if self.worker_process is not None:
+                self._stop_workers()
+                self.worker_process = None
+            teardown_s = time.monotonic() - teardown_start
+
+            reconcile_start = time.monotonic()
+            # In-flight batches are persisted as failed exactly once:
+            # _reconciled_failure stays True from the fatal path until a
+            # restart succeeds, while a restart that failed before reaching
+            # reconcile leaves it False so the retry still persists them.
+            reconciliation = self._reconcile(
+                "Worker pool restarted; in-flight batches were failed.",
+                fail_in_flight=True,
+            )
+            reconcile_s = time.monotonic() - reconcile_start
+
+            spawn_start = time.monotonic()
+            self._monitor_stop_event.clear()
+            self._ready_event.clear()
+            self._fatal_ack_event.clear()
+            # The previous cohort's fatal is fully handled by this point; a
+            # stale failure reason must not abort the readiness wait of the
+            # cohort spawned below.
+            self._worker_exit_state.clear()
             self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
             self._start_worker_monitor()
             self._wait_for_workers_ready(timeout_s=timeout_s)
@@ -802,6 +830,7 @@ class WorkerManager:
             "failed_batches": reconciliation["failed_batches"],
             "elapsed_s": time.monotonic() - started_at,
             "phase_timings": {
+                "quiesce_s": quiesce_s,
                 "teardown_s": teardown_s,
                 "reconcile_s": reconcile_s,
                 "spawn_to_ready_s": spawn_to_ready_s,
