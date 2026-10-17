@@ -41,6 +41,58 @@ def _load_worker_manager_class():
     return namespace["WorkerManager"]
 
 
+class _CohortQueue:
+    """Stands in for one cohort's mp.Queue.
+
+    Reading a queue whose writer was killed is the defect under test, so every
+    read fails loudly instead of returning. Lifecycle calls are recorded.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls: List[str] = []
+        self.items: List[Any] = []
+
+    def put(self, item: Any) -> None:
+        self.calls.append("put")
+        self.items.append(item)
+
+    def get(self, *args, **kwargs):
+        self.calls.append("get")
+        raise AssertionError(
+            f"{self.label} was read; a killed cohort's channel may leave a "
+            "partial frame, so any read can block forever"
+        )
+
+    def get_nowait(self, *args, **kwargs):
+        self.calls.append("get_nowait")
+        raise AssertionError(
+            f"{self.label} was read with get_nowait, which polls the pipe and "
+            "then performs an untimed blocking read"
+        )
+
+    def cancel_join_thread(self) -> None:
+        self.calls.append("cancel_join_thread")
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+    def empty(self) -> bool:
+        return not self.items
+
+
+class _CohortQueueContext:
+    """Stub mp context handing out a fresh _CohortQueue per request."""
+
+    def __init__(self) -> None:
+        self.created: List[_CohortQueue] = []
+
+    def Queue(self) -> _CohortQueue:  # noqa: N802 - mirrors mp context API
+        channel = _CohortQueue(f"channel#{len(self.created)}")
+        self.created.append(channel)
+        return channel
+
+
 def _manager(monkeypatch):
     cls = _load_worker_manager_class()
     manager = object.__new__(cls)
@@ -64,8 +116,8 @@ def _manager(monkeypatch):
     manager._fatal_ack_event = threading.Event()
     manager._monitor_thread = None
     manager._worker_exit_state = SimpleNamespace(clear=lambda: None)
-    manager.request_queue = queue.Queue()
-    manager.response_queue = queue.Queue()
+    manager._mp_ctx = _CohortQueueContext()
+    manager._create_worker_channels()
     manager.worker_process = SimpleNamespace(processes=[])
     manager.host_kv_manager = SimpleNamespace(release_all_sequences=lambda: None)
     manager.host_kv_aux_manager = SimpleNamespace(release_all_sequences=lambda: None)
@@ -101,11 +153,20 @@ def test_restart_conflict_is_rejected(monkeypatch):
         manager.restart_workers(timeout_s=1)
 
 
-def test_queue_drain_and_release_all_after_teardown(monkeypatch):
+def test_restart_rotates_cohort_queues_and_releases_all_after_teardown(monkeypatch):
+    """A restart must hand the new cohort fresh channels.
+
+    The queues the restart force-kills a cohort on can never be read again: a
+    writer killed mid-write leaves a frame whose length header is readable but
+    whose payload never arrives, so any later read blocks forever with no
+    timeout and no exception. They are abandoned unread instead.
+    """
     manager = _manager(monkeypatch)
     order = []
-    manager.request_queue.put("stale-request")
-    manager.response_queue.put("stale-response")
+    dead_request = manager.request_queue
+    dead_response = manager.response_queue
+    dead_request.put("stale-request")
+    dead_response.put("stale-response")
     manager.host_kv_manager.release_all_sequences = lambda: order.append("primary")
     manager.host_kv_aux_manager.release_all_sequences = lambda: order.append("aux")
 
@@ -124,13 +185,59 @@ def test_queue_drain_and_release_all_after_teardown(monkeypatch):
     manager.restart_workers(timeout_s=1)
 
     assert order == ["teardown", "reconcile", "primary", "aux", "spawn"]
-    init_msg = manager.request_queue.get_nowait()
+
+    # Both channels are replaced by fresh objects, after teardown+reconcile
+    # and before the spawn that hands them to the new cohort.
+    assert manager.request_queue is not dead_request
+    assert manager.response_queue is not dead_response
+
+    # The dead pair is abandoned: feeder cancelled, then closed, never read.
+    assert dead_request.calls == ["put", "cancel_join_thread", "close"]
+    assert dead_response.calls == ["put", "cancel_join_thread", "close"]
+    assert dead_request.items == ["stale-request"]
+    assert dead_response.items == ["stale-response"]
+
+    # The generation's init message lands in the NEW request queue, carrying
+    # the scheduler hook's pool capacity and never a hardcoded default.
+    assert manager.request_queue.calls == ["put"]
+    assert len(manager.request_queue.items) == 1
+    init_msg = manager.request_queue.items[0]
     assert init_msg["type"] == "init"
-    # Pool capacity must come from the scheduler hook, never defaults.
     assert init_msg["max_output_len"] == 8192
     assert init_msg["max_context_length"] == 65536
-    assert manager.request_queue.empty()
+    assert manager.response_queue.calls == []
     assert manager.response_queue.empty()
+
+
+def test_reconcile_never_reads_the_worker_queues(monkeypatch):
+    """Reconciliation runs after a force-killed teardown, so it must not read
+    the dead cohort's channels at all."""
+    manager = _manager(monkeypatch)
+    manager.request_queue.put("stale-request")
+    manager.response_queue.put("stale-response")
+
+    result = manager._reconcile("cohort died", fail_in_flight=True)
+
+    assert result == {"failed_batches": 2}
+    assert "drained" not in result
+    assert manager.request_queue.calls == ["put"]
+    assert manager.response_queue.calls == ["put"]
+
+    # The untimed blocking read is gone from the module's CODE, not merely
+    # unused: get_nowait() polls the pipe and only then performs an untimed
+    # recv. Checked on the AST so the comment naming the hazard may stay.
+    tree = ast.parse((ROOT / "batchgen/server/worker_manager.py").read_text())
+    read_attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+    }
+    assert "get_nowait" not in read_attrs
+    assert "_drain_queues" not in read_attrs
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "_drain_queues"
+        for node in ast.walk(tree)
+    )
 
 
 def test_spawn_dispatch_from_worker_thread_runs_on_main_thread(monkeypatch):
@@ -287,7 +394,7 @@ def test_teardown_budgets_cover_pinned_page_release():
     and a SIGKILL'd worker is unreapable until the kernel unpins it."""
     source = (ROOT / "batchgen/server/worker_manager.py").read_text()
     assert "_WORKER_SENTINEL_GRACE_S = 180.0" in source
-    assert "_WORKER_KILL_REAP_TIMEOUT_S = 300.0" in source
+    assert "_WORKER_KILL_REAP_TIMEOUT_S = 900.0" in source
     assert "deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S" in source
 
 

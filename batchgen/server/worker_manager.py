@@ -56,8 +56,11 @@ _WORKER_SENTINEL_GRACE_S = 180.0
 # A SIGKILL'd worker still cannot be reaped until the kernel finishes
 # unpinning its registered pages, which again takes minutes for a large
 # cohort.  Proceeding while an owned PID is alive is never safe, so the
-# reap wait is long and loud rather than short and fatal.
-_WORKER_KILL_REAP_TIMEOUT_S = 300.0
+# reap wait is long and loud rather than short and fatal.  Observed
+# teardowns of a large pinned footprint finished only just inside the
+# previous budget, leaving no usable margin, so the budget now covers
+# several times the time such a teardown is expected to need.
+_WORKER_KILL_REAP_TIMEOUT_S = 900.0
 
 
 def _resolve_local_world_size(
@@ -161,8 +164,9 @@ class WorkerManager:
             # Start method may already be set by the parent process.
             pass
         self._mp_ctx = mp.get_context("spawn")
-        self.request_queue: mp.Queue = self._mp_ctx.Queue()
-        self.response_queue: mp.Queue = self._mp_ctx.Queue()
+        self.request_queue: Optional[mp.Queue] = None
+        self.response_queue: Optional[mp.Queue] = None
+        self._create_worker_channels()
         self.worker_process = None
         self.started = False
         self.model_info: Dict[str, Any] = {}
@@ -711,18 +715,51 @@ class WorkerManager:
             raise RuntimeError("worker respawn requires a main-thread dispatcher")
         return self._main_thread_dispatcher(fn, timeout_s)
 
-    def _drain_queues(self) -> Dict[str, int]:
-        import queue as queue_mod
+    def _create_worker_channels(self) -> None:
+        """Bind a fresh request/response queue pair for the next cohort.
 
-        drained = {"request": 0, "response": 0}
-        for name, queue in (("request", self.request_queue), ("response", self.response_queue)):
-            while True:
+        The channels are cohort-scoped: every worker generation gets its own
+        pair, so nothing a previous cohort wrote is ever read again.
+        """
+        self.request_queue = self._mp_ctx.Queue()
+        self.response_queue = self._mp_ctx.Queue()
+
+    def _abandon_worker_channels(self) -> None:
+        """Release the previous cohort's queues WITHOUT reading them.
+
+        A worker killed mid-write leaves a frame whose length header is
+        readable but whose payload never arrives.  Any later read of that
+        queue -- including a nominally non-blocking ``get_nowait()``, which
+        polls the pipe and only then reads it -- therefore blocks forever
+        inside ``recv_bytes()``, with no timeout and no exception.  Teardown
+        force-kills the cohort, so a partial frame is an expected outcome and
+        the only safe handling is to abandon the channel unread.
+
+        The feeder thread may already be broken, so both steps are advisory:
+        ``cancel_join_thread()`` keeps a half-written buffer from blocking
+        this process, and ``close()`` releases the descriptors.
+        """
+        for label, channel in (
+            ("request", self.request_queue),
+            ("response", self.response_queue),
+        ):
+            if channel is None:
+                continue
+            for step in ("cancel_join_thread", "close"):
+                action = getattr(channel, step, None)
+                if action is None:
+                    continue
                 try:
-                    queue.get_nowait()
-                except queue_mod.Empty:
-                    break
-                drained[name] += 1
-        return drained
+                    action()
+                except Exception:
+                    logger.warning(
+                        "Abandoning the %s channel: %s failed",
+                        label,
+                        step,
+                        exc_info=True,
+                    )
+        self.request_queue = None
+        self.response_queue = None
 
     def _release_host_kv_sequences(self) -> None:
         for manager in (self.host_kv_manager, self.host_kv_aux_manager):
@@ -740,14 +777,15 @@ class WorkerManager:
                 failed_batches = int(self._fail_in_flight_hook(reason) or 0)
             self._reconciled_failure = True
         self._release_host_kv_sequences()
-        # All owned worker PIDs have exited before this method is called.  The
-        # quiesce hook prevents new admissions; draining now has no producer.
-        drained = self._drain_queues()
+        # Reconciliation never reads the worker queues.  The cohort it cleans
+        # up after was force-killed, so a read could block forever on a
+        # truncated frame; the channels are abandoned unread instead, see
+        # _abandon_worker_channels.
         # The run prefix covers named QueryBook and token-store objects.  Host
         # KV, weights, tensor metadata, and skeleton state are server-owned
         # memfds and therefore intentionally remain open across this cleanup.
         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
-        return {"failed_batches": failed_batches, "drained": drained}
+        return {"failed_batches": failed_batches}
 
     def restart_workers(self, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         """Replace one worker cohort while retaining server-owned resources."""
@@ -787,6 +825,16 @@ class WorkerManager:
                 fail_in_flight=True,
             )
             reconcile_s = time.monotonic() - reconcile_start
+
+            # The cohort that owned the previous channels has been killed, so
+            # those queues can never be read again -- a partial frame left by
+            # a killed writer makes any read block forever.  Abandon them
+            # unread and give the next cohort a fresh pair.  Everything that
+            # reaches a worker from here on (the init message below and the
+            # queues _spawn_workers hands the children) reads these
+            # attributes at call time, so it picks up the new pair.
+            self._abandon_worker_channels()
+            self._create_worker_channels()
 
             spawn_start = time.monotonic()
             self._monitor_stop_event.clear()

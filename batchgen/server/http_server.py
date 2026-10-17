@@ -349,6 +349,23 @@ def create_app(
     async def create_batch(request: Request, body: CreateBatchRequest):
         storage: StorageManager = request.app.state.storage
         scheduler: BatchScheduler = request.app.state.scheduler
+        worker_manager: WorkerManager = request.app.state.worker
+
+        # Admission control: a batch may only be created while the worker pool
+        # is serving. Accepting one during a restart or while the pool is down
+        # hands the client a success receipt for work the server knows it
+        # cannot start, and the batch can never run.
+        pool_state = worker_manager.state
+        if pool_state != "serving":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Worker pool is not serving (state={pool_state}). "
+                    "Batch creation is unavailable until the pool is serving "
+                    "again. Retry later."
+                ),
+                headers={"Retry-After": "30"},
+            )
 
         # Admission control: reject early if intake pool is near capacity (>90%)
         if scheduler.intake_pool_usage_pct() > 0.9:

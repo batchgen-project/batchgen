@@ -103,6 +103,15 @@ class BatchScheduler:
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
+        # Completion delivery is generation-scoped: one daemon pump thread per
+        # worker generation owns the blocking read of that generation's
+        # response queue and forwards items into this asyncio queue, which the
+        # listener task consumes.  See _completion_pump.
+        self._completion_inbox: Optional[asyncio.Queue] = None
+        self._pump_lock = threading.Lock()
+        self._pump_generation = 0
+        self._pump_thread: Optional[threading.Thread] = None
+        self._pump_stop: Optional[threading.Event] = None
         # Per-request metadata for building output JSONL in pool mode
         # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
         self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -115,11 +124,12 @@ class BatchScheduler:
             return
         self._stopped.clear()
         self._loop = asyncio.get_running_loop()
+        self._completion_inbox = asyncio.Queue()
         self._task = asyncio.create_task(self._run())
-        # Start pool mode background tasks
-        self._completion_listener_task = asyncio.create_task(
-            self._pool_completion_listener()
-        )
+        # Start pool mode background tasks.  The startup path uses the same
+        # mechanism as a restart: the first worker generation gets pump #1.
+        self._ensure_completion_listener()
+        self._start_completion_pump()
         self._drain_task = asyncio.create_task(
             self._drain_intake_to_worker()
         )
@@ -128,6 +138,14 @@ class BatchScheduler:
         if not self._task:
             return
         self._stopped.set()
+        # Ask the live pump to leave its read loop.  It is never joined: a
+        # pump blocked on a truncated frame can never return, and it is a
+        # daemon thread precisely so that cannot hold up process exit.
+        with self._pump_lock:
+            if self._pump_stop is not None:
+                self._pump_stop.set()
+            self._pump_stop = None
+            self._pump_thread = None
         # Cancel all tasks (background pool tasks + main task)
         for task in [self._completion_listener_task, self._drain_task, self._task]:
             if task:
@@ -174,6 +192,159 @@ class BatchScheduler:
         # WorkerManager sends the generation's init message before this hook;
         # the drain task must not send a duplicate init after resume.
         self._pool_initialized = True
+        # The new cohort writes to a new response queue, and the previous
+        # generation's pump owns a queue that was abandoned with its cohort.
+        # Completion delivery therefore has to be rebuilt here or no batch of
+        # this generation can ever complete.  This runs on the restart's
+        # thread, not the scheduler loop, so the task side is scheduled
+        # through the loop.
+        self._start_completion_pump()
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            # Already on the scheduler loop. Waiting for a scheduled callback
+            # here would deadlock, because this thread IS the one that would
+            # have to run it.
+            self._ensure_completion_listener()
+            return
+        ensured = threading.Event()
+
+        def ensure_on_loop() -> None:
+            try:
+                self._ensure_completion_listener()
+            finally:
+                ensured.set()
+
+        loop.call_soon_threadsafe(ensure_on_loop)
+        if not ensured.wait(timeout=5.0):
+            raise RuntimeError(
+                "completion listener could not be re-armed for the new worker "
+                "generation: the scheduler event loop did not run the "
+                "scheduling callback"
+            )
+
+    def _ensure_completion_listener(self) -> None:
+        """Start the completion listener task unless one is already running.
+
+        Runs on the scheduler loop.  The listener exits on a terminal message
+        (worker shutdown or a worker-reported error), so a restart has to be
+        able to bring it back.
+        """
+        task = self._completion_listener_task
+        if task is not None and not task.done():
+            return
+        self._completion_listener_task = asyncio.create_task(
+            self._pool_completion_listener()
+        )
+
+    def _start_completion_pump(self) -> None:
+        """Supersede the previous generation's pump and start this one's.
+
+        The pump captures the response queue object at start, so it can never
+        reach into a later generation's channel, and it is a daemon thread so
+        a read that can never return cannot block process exit.
+        """
+        with self._pump_lock:
+            previous = self._pump_stop
+            if previous is not None:
+                previous.set()
+            self._pump_generation += 1
+            generation = self._pump_generation
+            stop_event = threading.Event()
+            self._pump_stop = stop_event
+            thread = threading.Thread(
+                target=self._completion_pump,
+                args=(generation, self.worker.response_queue, stop_event),
+                name=f"pool-completion-pump-{generation}",
+                daemon=True,
+            )
+            self._pump_thread = thread
+            thread.start()
+
+    def _completion_pump(
+        self,
+        generation: int,
+        response_queue: Any,
+        stop_event: threading.Event,
+    ) -> None:
+        """Forward one generation's worker responses to the scheduler loop.
+
+        Owns the only blocking read of ``response_queue``.  It exits when the
+        scheduler stops, when it is superseded by a later generation, or once
+        it has forwarded a terminal message.  A pump whose read never returns
+        leaks one idle daemon thread and nothing else: it holds no lock, it
+        cannot touch a later generation's queue, and whatever it forwards
+        after supersession is dropped.
+        """
+        import queue as queue_mod
+
+        logger.info("[POOL] Completion pump gen=%d started", generation)
+        try:
+            while not stop_event.is_set() and not self._stopped.is_set():
+                try:
+                    item = response_queue.get(timeout=1.0)
+                except queue_mod.Empty:
+                    continue
+                except Exception as exc:
+                    # The channel of a killed cohort is abandoned rather than
+                    # drained, so a read on it can fail once it is closed.
+                    # Report it as this generation's terminal item.
+                    logger.error(
+                        "[POOL] Completion pump gen=%d read failed: %s",
+                        generation,
+                        exc,
+                        exc_info=True,
+                    )
+                    self._forward_completion(
+                        generation,
+                        {"type": "channel_error", "error": str(exc)},
+                    )
+                    break
+                terminal = item is None or (
+                    isinstance(item, dict)
+                    and (item.get("type") == "pool_shutdown" or "error" in item)
+                )
+                self._forward_completion(generation, item)
+                if terminal:
+                    break
+        finally:
+            logger.info("[POOL] Completion pump gen=%d stopped", generation)
+
+    def _forward_completion(self, generation: int, item: Any) -> None:
+        """Hand one item to the scheduler loop. Called on the pump thread."""
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._offer_completion, generation, item)
+        except RuntimeError:
+            # The loop is closed; the scheduler is gone and so is the batch
+            # state this item would have updated.
+            logger.warning(
+                "[POOL] Completion pump gen=%d dropped an item: "
+                "the scheduler loop is closed",
+                generation,
+            )
+
+    def _offer_completion(self, generation: int, item: Any) -> None:
+        """Accept an item only from the live pump. Runs on the scheduler loop."""
+        if generation != self._pump_generation:
+            logger.warning(
+                "[POOL] Dropping an item from superseded completion pump "
+                "gen=%d (live generation is %d)",
+                generation,
+                self._pump_generation,
+            )
+            return
+        inbox = self._completion_inbox
+        if inbox is None:
+            return
+        inbox.put_nowait(item)
 
     def pool_init_params(self) -> Dict[str, Any]:
         """Pool capacity for a worker generation's init message."""
@@ -761,25 +932,26 @@ class BatchScheduler:
         return failed
 
     async def _pool_completion_listener(self) -> None:
-        """Background task: read per-request completions from worker response queue.
+        """Background task: route per-request completions from the pump inbox.
 
         Routes each completion to the correct batch tracker and writes
-        incremental output.
+        incremental output.  The blocking read of the worker response queue
+        belongs to the generation's pump thread, never to this task: a read
+        that can never return must not sit in the default executor, whose
+        threads are not daemons and would keep the process from exiting.
         """
-        import queue as queue_mod
         logger.info("[POOL] Completion listener started")
+        inbox = self._completion_inbox
+        if inbox is None:
+            raise RuntimeError(
+                "completion listener started before the completion inbox "
+                "existed; BatchScheduler.start() creates it"
+            )
         while not self._stopped.is_set():
             try:
-                result = await asyncio.to_thread(
-                    self.worker.response_queue.get,
-                    timeout=1.0,
-                )
-            except queue_mod.Empty:
+                result = await asyncio.wait_for(inbox.get(), timeout=1.0)
+            except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"[POOL] Completion listener fatal error: {e}", exc_info=True)
-                self._fail_all_active_batches(f"Worker error: {e}")
-                break
 
             if result is None:
                 break
@@ -814,6 +986,17 @@ class BatchScheduler:
                         )
                         if batch_done:
                             logger.info(f"[POOL] Batch {batch_id} completed")
+                elif msg_type == "channel_error":
+                    # The generation's pump could not read its response queue.
+                    # Same handling as the in-task read failure this replaced:
+                    # the active batches are persisted as failed and this
+                    # generation's listener ends.
+                    error = result.get("error")
+                    logger.error(
+                        "[POOL] Completion listener fatal error: %s", error
+                    )
+                    self._fail_all_active_batches(f"Worker error: {error}")
+                    break
                 elif msg_type == "pool_shutdown":
                     error = result.get("error")
                     if error:
