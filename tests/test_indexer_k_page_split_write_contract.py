@@ -108,10 +108,15 @@ def reference_page_split_write(
     expected = cache_pages.clone()
     if rows:
         row_idx = torch.tensor(rows, dtype=torch.int64)
+        # Gather the e4m3 rows through their uint8 bytes: CPU advanced
+        # indexing ("index_cpu") is not implemented for Float8_e4m3fn on every
+        # supported torch (it raises NotImplementedError on 2.9). The reference
+        # writer consumes the keys as bytes anyway (``.view(torch.uint8)``), so
+        # the byte-exact oracle is unchanged.
         _quant.page_split_write_reference(
             expected,
             torch.tensor(absolute_slots, dtype=torch.int64),
-            k_fp8[row_idx],
+            k_fp8.view(torch.uint8)[row_idx],
             scales[row_idx],
             page_size,
         )
