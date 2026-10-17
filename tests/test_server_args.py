@@ -62,8 +62,24 @@ def _args(tmp_path, **overrides):
 
 
 def test_distributed_weights_accept_two_and_four_node_topologies(tmp_path):
-    validate_server_args(_args(tmp_path, nnodes=2, world_size=16))
-    validate_server_args(_args(tmp_path, nnodes=4, world_size=32))
+    # Acceptance needs a real published store: the launch preflight verifies
+    # its completion manifest (tests/test_kimi_k3_distributed_store_preflight.py).
+    from tests.test_kimi_k3_distributed_store_preflight import build_store
+    from tests.test_kimi_k3_store_builder import Env
+
+    env = Env(tmp_path / "k3")
+    for nnodes in (2, 4):
+        config = build_store(env, tmp_path / f"store{nnodes}", num_nodes=nnodes)
+        validate_server_args(
+            _args(
+                tmp_path,
+                nnodes=nnodes,
+                world_size=nnodes * 8,
+                distributed_weight_config=config,
+                converted_ckpt_dir=env.ckpt,
+                cache_dir=env.model_dir,
+            )
+        )
 
 
 def test_distributed_weights_reject_other_node_counts(tmp_path):

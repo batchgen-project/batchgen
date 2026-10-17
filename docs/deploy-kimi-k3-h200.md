@@ -196,6 +196,32 @@ commands in §4 reach the replicated parameter server only because they pass `--
   practical path on **2 TB-RAM nodes** where the replicated store does not fit with headroom. Pass
   the config file for the matching node rank.
 
+  Build each node's store with the store builder, one `--output-dir` per node:
+
+  ```bash
+  python -m batchgen.models.moonshotai.kimi_linear.store_builder \
+      --converted-ckpt /shared/models/Kimi-K3/converted_ckpt \
+      --cache-dir /shared/models/Kimi-K3 \
+      --output-dir /dev/shm/k3-store \
+      --num-nodes 2 --node-rank ${RANK} \
+      --node-ips node0-ip,node1-ip
+  ```
+
+  The builder checks the converted checkpoint against the full Kimi-K3 tensor map from
+  `config.json` (nothing missing, nothing unexpected) and every source span against its `.bin`
+  before writing anything, hashes every tensor while it copies, re-reads the store to verify it,
+  and only then publishes `store.bin`, `metadata.tsv` and `node${RANK}.json`, followed by the
+  completion manifest `store_manifest.json`. An interrupted build leaves no manifest; `--dry-run`
+  writes nothing.
+
+  At launch, argument validation refuses a store whose completion manifest is missing or
+  incomplete, whose files no longer match it (a cleared tmpfs, a partial copy, metadata of another
+  build), that was built from a different converted checkpoint or `config.json` than the launch's
+  `--converted-ckpt-dir` (or `--cache-dir`/converted_ckpt) and `--cache-dir`, that belongs to
+  another node rank, or whose sampled bytes no longer hash to the manifest. A distributed-store
+  launch must therefore name its converted checkpoint. The refusal ends with the exact builder
+  command that rebuilds the store.
+
   > **Requires a UCX with the InfiniBand transport.** The daemon exchanges shards between nodes over
   > UCX RDMA (`rc_x`). The `libucx-cu12` pip wheel provisioned by `install_deps.sh` is a
   > **CUDA/TCP/SM-only** UCX build — it has **no `libuct_ib.so`**, so the daemon fails at startup
@@ -230,6 +256,9 @@ commands in §4 reach the replicated parameter server only because they pass `--
   > sudo mount -o remount,size=2048G /dev/shm
   > cp /shared/.../node${RANK}_store.bin /dev/shm/node${RANK}_store.bin   # then set store_path to it
   > ```
+  >
+  > The launch check verifies the copy against the manifest by content, so a relocated store passes
+  > and a partial copy is refused. Building with `--output-dir` on the tmpfs avoids the copy.
   >
   > This is the same reason the single-node path (store on local/tmpfs) loads fast. On 2 TB-RAM nodes
   > the ~838 GiB tmpfs store still leaves ~1.1 TB for the workers.

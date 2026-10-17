@@ -78,7 +78,24 @@ def test_multinode_accepts_the_replicated_opt_in(tmp_path):
 
 
 def test_multinode_accepts_the_distributed_store(tmp_path):
-    validate_server_args(_args(tmp_path, with_config=True))
+    from tests.test_kimi_k3_distributed_store_preflight import build_store
+    from tests.test_kimi_k3_store_builder import Env
+
+    env = Env(tmp_path / "k3")
+    config = build_store(env, tmp_path / "store0")
+    validate_server_args(
+        _args(
+            tmp_path,
+            distributed_weight_config=config,
+            converted_ckpt_dir=env.ckpt,
+            cache_dir=env.model_dir,
+        )
+    )
+
+
+def test_a_config_file_that_is_not_a_published_store_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="is unusable: .* misses .*Rebuild it with"):
+        validate_server_args(_args(tmp_path, with_config=True))
 
 
 def test_distributed_store_constraints_still_apply(tmp_path):
@@ -127,12 +144,20 @@ def test_other_models_keep_the_replicated_default_on_multiple_nodes(tmp_path):
 
 def test_single_node_kimi_k3_is_unchanged(tmp_path):
     validate_server_args(_args(tmp_path, nnodes=1, world_size=8))
-    # The opt-in flag is inert where there is no multi-node default to switch.
-    validate_server_args(
-        _args(
-            tmp_path, nnodes=1, world_size=8, replicated_weights=True
-        )
-    )
+
+
+def test_the_opt_in_is_refused_where_there_is_no_default_to_switch(tmp_path):
+    for overrides in (
+        {"nnodes": 1, "world_size": 8},
+        {"model": "openai/gpt-oss-120b"},
+    ):
+        with pytest.raises(
+            server_args_module.WeightSourceError,
+            match="only selects the weight source",
+        ):
+            validate_server_args(
+                _args(tmp_path, replicated_weights=True, **overrides)
+            )
 
 
 def test_replicated_weights_defaults_to_false():
