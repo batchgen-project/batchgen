@@ -93,7 +93,12 @@ _GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
     "q_index",
     "head_gates",
     "positions_expanded",
+    # Both scorers' statics: a skip layer never scores, so neither the bf16
+    # aggregate nor the DeepGEMM paged-MQA inputs are ever read here.
     "agg_scores",
+    "q_index_fp8",
+    "aux_block_table",
+    "aux_context_lens",
 })
 # Rebuilt per bucket: top_k_indices is borrowed from the producing full
 # segment's buffer set FOR THIS BUCKET, never sliced from our own base.
@@ -335,6 +340,9 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             head_gates=one_bf16,
             positions_expanded=one_i32,
             agg_scores=one_bf16,
+            q_index_fp8=one_bf16,
+            aux_block_table=one_i32,
+            aux_context_lens=one_i32,
             # THE handoff: the producing full segment's static top-k buffer.
             top_k_indices=source_buffers.top_k_indices,
             selected_token_ids=selected_token_ids,
