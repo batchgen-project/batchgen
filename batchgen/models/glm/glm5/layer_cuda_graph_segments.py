@@ -43,8 +43,26 @@ class Glm5DecoderLayerGraphSegment:
         self.primary_kv_dim = int(dsa_segment.primary_blocked_k.shape[3])
         # Reuse-topk segments (GLM-5.2 skip layers) have no aux/indexer KV;
         # aux_kv_dim=0 marks the layer as producing no indexer_k_tensor.
+        # A page-split FP8 aux cache carries BYTES per token in its trailing
+        # dim (data + fp32 scale), so the dim and dtype of the tensor the layer
+        # hands out come from the DSA segment, which resolved the aux format
+        # when it was built. A segment that declares neither is AoS, and the
+        # cache's trailing dim is then the element count.
         _aux_blocked_k = getattr(dsa_segment, "aux_blocked_k", None)
-        self.aux_kv_dim = int(_aux_blocked_k.shape[3]) if _aux_blocked_k is not None else 0
+        if _aux_blocked_k is None:
+            self.aux_kv_dim = 0
+            self.aux_kv_dtype = torch.bfloat16
+            self.aux_is_page_split = False
+        else:
+            self.aux_is_page_split = bool(
+                getattr(dsa_segment, "aux_is_page_split", False)
+            )
+            self.aux_kv_dim = int(
+                getattr(dsa_segment, "aux_host_kv_dim", _aux_blocked_k.shape[3])
+            )
+            self.aux_kv_dtype = getattr(
+                dsa_segment, "aux_host_kv_dtype", torch.bfloat16
+            )
         self.capture_local_bsz: Optional[int] = None
         self.capture_rank_token_counts: Optional[torch.Tensor] = None
         self.set_capture_context(
@@ -109,8 +127,14 @@ class Glm5DecoderLayerGraphSegment:
         if self.aux_kv_dim > 0:
             specs["indexer_k_tensor"] = TensorSpec(
                 ("batch_size", 1, 1, self.aux_kv_dim),
-                torch.bfloat16,
+                self.aux_kv_dtype,
             )
+            if self.aux_is_page_split:
+                # The host region takes the quantized keys with their fp32
+                # per-token scales, so the layer exposes both.
+                specs["indexer_k_scale"] = TensorSpec(
+                    ("batch_size",), torch.float32,
+                )
         return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
@@ -192,4 +216,6 @@ class Glm5DecoderLayerGraphSegment:
         }
         if "indexer_k_tensor" in dsa_out:
             out["indexer_k_tensor"] = dsa_out["indexer_k_tensor"]
+        if "indexer_k_scale" in dsa_out:
+            out["indexer_k_scale"] = dsa_out["indexer_k_scale"]
         return out

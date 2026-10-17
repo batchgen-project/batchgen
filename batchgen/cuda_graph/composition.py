@@ -233,12 +233,36 @@ def compose_layer_from_segments(
 # allocate_kv_staging: contiguous primary/aux KV staging tensors
 # ---------------------------------------------------------------------------
 
+def resolve_kv_staging_dtypes(
+    kv_staging_dim: Mapping[str, int],
+    dtype: "torch.dtype | Mapping[str, torch.dtype]",
+) -> Dict[str, torch.dtype]:
+    """Per-stream staging dtypes, with no stream silently taking another's.
+
+    A hybrid model's KV streams need not share an element type: GLM-5.2 stages
+    its primary latent in bf16 while its indexer (aux) keys are e4m3 bytes. A
+    single dtype for every stream would quietly requantize the aux stream on
+    the clone, so a mapping is accepted and must name EVERY stream exactly.
+    """
+
+    if isinstance(dtype, Mapping):
+        missing = sorted(set(kv_staging_dim) - set(dtype))
+        extra = sorted(set(dtype) - set(kv_staging_dim))
+        if missing or extra:
+            raise ValueError(
+                "kv staging dtypes must name exactly the kv streams "
+                f"(missing={missing}, unexpected={extra})"
+            )
+        return {name: dtype[name] for name in kv_staging_dim}
+    return {name: dtype for name in kv_staging_dim}
+
+
 def allocate_kv_staging(
     *,
     num_layers: int,
     max_bucket: int,
     kv_staging_dim: Mapping[str, int],
-    dtype: torch.dtype,
+    dtype: "torch.dtype | Mapping[str, torch.dtype]",
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Allocate one contiguous KV staging tensor per stream.
@@ -249,6 +273,8 @@ def allocate_kv_staging(
 
     Args:
         kv_staging_dim: name -> kv-dim, e.g. {"primary": 576, "aux": 128}.
+        dtype: one dtype for every stream, or name -> dtype when the streams
+            differ (e.g. {"primary": bf16, "aux": float8_e4m3fn}).
 
     Returns mapping `stream_name -> tensor` with shape
     `[num_layers, max_bucket, 1, 1, kv_dim]`.
@@ -257,12 +283,15 @@ def allocate_kv_staging(
         raise ValueError(
             f"allocate_kv_staging: num_layers={num_layers}, max_bucket={max_bucket}"
         )
+    dtypes = resolve_kv_staging_dtypes(kv_staging_dim, dtype)
     out: Dict[str, torch.Tensor] = {}
     for name, kv_dim in kv_staging_dim.items():
         if kv_dim <= 0:
             raise ValueError(f"allocate_kv_staging: {name} kv_dim={kv_dim} must be > 0")
         out[name] = torch.zeros(
-            (num_layers, max_bucket, 1, 1, kv_dim), dtype=dtype, device=device,
+            (num_layers, max_bucket, 1, 1, kv_dim),
+            dtype=dtypes[name],
+            device=device,
         )
     return out
 
@@ -278,7 +307,7 @@ def compose_whole_model(
     final_norm: torch.nn.Module,
     lm_head: torch.nn.Module,
     kv_staging_dim: Mapping[str, int],
-    kv_staging_dtype: torch.dtype,
+    kv_staging_dtype: "torch.dtype | Mapping[str, torch.dtype]",
     max_bucket: int,
     device: torch.device,
     extra_input_specs: Mapping[str, TensorSpec],
@@ -300,6 +329,9 @@ def compose_whole_model(
             no per-layer KV interaction.
         kv_staging_dim: per-stream KV dim (e.g. {"primary": 576} for MLA, or
             {"primary": kv_dim, "aux": aux_dim} for hybrid attention).
+        kv_staging_dtype: one dtype for every stream, or name -> dtype when
+            the streams differ (an FP8 aux stream must not be staged in the
+            primary's bf16).
         forward_fn: `(layer_segments, embed, final_norm, lm_head, kv_staging,
             **inputs) -> Dict[str, Tensor]`. Implements embed -> layers ->
             final_norm -> lm_head.
@@ -344,4 +376,5 @@ __all__ = [
     "compose_sequential",
     "compose_layer_from_segments",
     "compose_whole_model",
+    "resolve_kv_staging_dtypes",
 ]

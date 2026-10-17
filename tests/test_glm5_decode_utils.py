@@ -1414,8 +1414,12 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
     AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
         (layer, tensor.clone())
     )
-    AttnWrapperBase.kv_append_callback_aux = lambda layer, tensor, _: aux_appends.append(
-        (layer, tensor.clone())
+    # The aux callback takes the optional trailing per-token scales; this
+    # fake graph output is bf16 AoS, so they arrive as None.
+    AttnWrapperBase.kv_append_callback_aux = (
+        lambda layer, tensor, _v, scale=None: aux_appends.append(
+            (layer, tensor.clone(), scale)
+        )
     )
 
     try:
@@ -1443,6 +1447,8 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
     assert inputs["aux_slot_indices"].tolist() == [7, 8]
     assert primary_appends[0][0] == 0
     assert aux_appends[0][0] == 0
+    # No `indexer_k_scale` in the graph outputs -> no scales forwarded.
+    assert aux_appends[0][2] is None
 
 
 def test_glm5_moe_graph_enable_records_cli_required_state():
@@ -1960,16 +1966,24 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             return {"total_capture_time_ms": 0.0}
 
     class FakeWholeSegment:
+        instances = []
+
         def __init__(self, **kwargs):
             self.capture_inputs = []
             self.max_seqlen = kwargs["max_seqlen"]
+            self.kwargs = kwargs
+            FakeWholeSegment.instances.append(self)
 
         def set_capture_inputs(self, **inputs):
             self.capture_inputs.append(inputs)
 
     class FakeKVManager:
         def __init__(self):
-            self.config = types.SimpleNamespace(page_size_tokens=64)
+            # kv_dtype: the worker reads the aux pool's dtype to size the aux
+            # KV staging stream (bf16 AoS here, matching k_cache below).
+            self.config = types.SimpleNamespace(
+                page_size_tokens=64, kv_dtype=torch.bfloat16
+            )
             self.storage = torch.empty(4, 8, dtype=torch.int32)
             self.k_cache = torch.empty(2, 1, 64, 1, 4, dtype=torch.bfloat16)
 
@@ -2118,6 +2132,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     assert full_segment_kwargs[0]["all_short"] is False
     assert reuse_segment_kwargs[0]["all_short"] is False
     assert worker._glm5_whole_model_all_short is False
+    # The aux staging stream takes the aux pool's dtype (bf16 for an AoS pool).
+    assert FakeWholeSegment.instances[-1].kwargs["aux_kv_staging_dtype"] is torch.bfloat16
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
 

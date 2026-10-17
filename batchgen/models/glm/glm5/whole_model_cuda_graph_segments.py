@@ -45,6 +45,7 @@ class Glm5WholeModelSegment:
         include_lm_head: bool = True,
         compare_probe_layers: Iterable[int] | None = None,
         layer_segments: Iterable[object] | None = None,
+        aux_kv_staging_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         if not include_embedding:
             raise NotImplementedError(
@@ -108,11 +109,26 @@ class Glm5WholeModelSegment:
         self.primary_kv_dim = int(attn0.kv_lora_rank + attn0.qk_rope_head_dim)
         self.aux_kv_dim = int(indexer0.index_head_dim)
         self.index_topk = int(indexer0.index_topk)
+        # The aux KV stream need not share the primary's element type: GLM-5.2
+        # stages its indexer keys as e4m3 bytes (one fp32 scale per token
+        # alongside), everything else stages bf16. Staging the FP8 stream in
+        # bf16 would requantize it on the clone, so the dtype is explicit and
+        # anything else is rejected here.
+        if aux_kv_staging_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError(
+                "aux_kv_staging_dtype must be torch.bfloat16 or "
+                f"torch.float8_e4m3fn, got {aux_kv_staging_dtype}"
+            )
+        self.aux_kv_staging_dtype = aux_kv_staging_dtype
+        self.aux_kv_is_page_split = aux_kv_staging_dtype is torch.float8_e4m3fn
 
         self._kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._aux_kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._kv_key_buffer: torch.Tensor | None = None
         self._aux_kv_key_buffer: torch.Tensor | None = None
+        # Page-split aux only: one fp32 scale per (layer, row), staged next to
+        # the quantized keys because the host region needs both or neither.
+        self._aux_kv_scale_buffer: torch.Tensor | None = None
         self.primary_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self.aux_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._no_v_cache = True
@@ -201,15 +217,33 @@ class Glm5WholeModelSegment:
                 1,
                 1,
                 self.aux_kv_dim,
-                dtype=torch.bfloat16,
+                dtype=self.aux_kv_staging_dtype,
                 device=self.device,
+            )
+            self._aux_kv_scale_buffer = (
+                torch.zeros(
+                    self.num_layers,
+                    alloc_size,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if self.aux_kv_is_page_split
+                else None
             )
             self._kv_buffers = [
                 {"key": self._kv_key_buffer[layer_idx], "value": None}
                 for layer_idx in range(self.num_layers)
             ]
             self._aux_kv_buffers = [
-                {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
+                {
+                    "key": self._aux_kv_key_buffer[layer_idx],
+                    "value": None,
+                    "scale": (
+                        None
+                        if self._aux_kv_scale_buffer is None
+                        else self._aux_kv_scale_buffer[layer_idx]
+                    ),
+                }
                 for layer_idx in range(self.num_layers)
             ]
             self.primary_kv_offload_buffers = self._kv_buffers
@@ -228,6 +262,7 @@ class Glm5WholeModelSegment:
         self._aux_kv_buffers = None
         self._kv_key_buffer = None
         self._aux_kv_key_buffer = None
+        self._aux_kv_scale_buffer = None
         self.primary_kv_offload_buffers = None
         self.aux_kv_offload_buffers = None
         self._capture_inputs = None
@@ -267,11 +302,35 @@ class Glm5WholeModelSegment:
         k_tensor = self._normalize_k_tensor(k_tensor, self.primary_kv_dim)
         self._kv_buffers[int(layer_idx)]["key"][: k_tensor.shape[0]].copy_(k_tensor)
 
-    def _copy_aux_kv(self, layer_idx: int, k_tensor: torch.Tensor, _v_tensor=None) -> None:
+    def _copy_aux_kv(
+        self,
+        layer_idx: int,
+        k_tensor: torch.Tensor,
+        _v_tensor=None,
+        scale_tensor: torch.Tensor | None = None,
+    ) -> None:
+        """Stage one layer's indexer keys (and their scales) for host offload.
+
+        Bound as ``kv_append_callback_aux`` for the capture/replay window, so
+        it takes the same optional trailing scales the real callback takes: a
+        page-split FP8 aux stream must carry them, and an AoS stream must not.
+        """
+
         if self._aux_kv_buffers is None:
             raise RuntimeError("GLM-5 whole-model graph aux KV buffers are not initialized")
         k_tensor = self._normalize_k_tensor(k_tensor, self.aux_kv_dim)
         self._aux_kv_buffers[int(layer_idx)]["key"][: k_tensor.shape[0]].copy_(k_tensor)
+        scale_buffer = self._aux_kv_buffers[int(layer_idx)].get("scale")
+        if (scale_tensor is None) != (scale_buffer is None):
+            raise RuntimeError(
+                "GLM-5 whole-model graph aux KV staging expects per-token "
+                "scales exactly when the aux stream is page-split FP8 "
+                f"(got scales={scale_tensor is not None}, "
+                f"page_split={scale_buffer is not None})"
+            )
+        if scale_tensor is not None:
+            scale_flat = scale_tensor.reshape(-1)
+            scale_buffer[: scale_flat.shape[0]].copy_(scale_flat)
 
     @staticmethod
     def _normalize_k_tensor(k_tensor: torch.Tensor, expected_dim: int) -> torch.Tensor:
@@ -346,7 +405,12 @@ class Glm5WholeModelSegment:
                 # return no indexer_k_tensor).
                 _indexer_k = graph_out.get("indexer_k_tensor")
                 if _indexer_k is not None:
-                    self._copy_aux_kv(layer_idx, _indexer_k, None)
+                    self._copy_aux_kv(
+                        layer_idx,
+                        _indexer_k,
+                        None,
+                        graph_out.get("indexer_k_scale"),
+                    )
                 if layer_idx in self._compare_probe_layer_set:
                     outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
         else:

@@ -11,11 +11,23 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 
 HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
 
+# Arrangement of one host/GPU KV page. "contiguous_aos" keeps token-major
+# records. "page_split_fp8_scale" is the SoA page deep_gemm.fp8_paged_mqa_logits
+# reads: the page's e4m3 K bytes, then one fp32 scale per token. In the
+# page-split format `k_head_dim` carries TOTAL BYTES per token (data + scale),
+# which keeps every page/layer/budget size a plain product.
+PAGE_FORMAT_CONTIGUOUS_AOS = "contiguous_aos"
+PAGE_FORMAT_FP8_PAGE_SPLIT = "page_split_fp8_scale"
+PAGE_SPLIT_SCALE_BYTES_PER_TOKEN = 4
+
 __all__ = [
 	"build_host_kv_config",
 	"build_host_kv_worker_view",
 	"build_gpu_kv_config",
 	"HOST_KV_SHM_NAME",
+	"PAGE_FORMAT_CONTIGUOUS_AOS",
+	"PAGE_FORMAT_FP8_PAGE_SPLIT",
+	"PAGE_SPLIT_SCALE_BYTES_PER_TOKEN",
 ]
 
 
@@ -58,6 +70,49 @@ class _HostKVModelProfile:
 	sequence_table_capacity: int | None = None
 	alignment_bytes: int = 64
 	logical_to_physical_layer: tuple[int, ...] | None = None
+	page_format: str = PAGE_FORMAT_CONTIGUOUS_AOS
+
+	def __post_init__(self) -> None:
+		if self.page_format == PAGE_FORMAT_CONTIGUOUS_AOS:
+			return
+		if self.page_format != PAGE_FORMAT_FP8_PAGE_SPLIT:
+			raise ValueError(f"Unsupported page_format '{self.page_format}'")
+		# Mirror of the C++ SanitizeConfig gate, applied where the profile is
+		# declared: the SoA page carries no head dimension and no V cache, its
+		# data elements are e4m3 bytes, and k_head_dim is a byte count.
+		if self.kv_dtype != "float8_e4m3fn":
+			raise ValueError(
+				f"{PAGE_FORMAT_FP8_PAGE_SPLIT} requires kv_dtype="
+				f"'float8_e4m3fn', got '{self.kv_dtype}'"
+			)
+		if self.num_k_heads != 1 or self.num_v_heads != 0:
+			raise ValueError(
+				f"{PAGE_FORMAT_FP8_PAGE_SPLIT} requires num_k_heads=1 and "
+				"num_v_heads=0"
+			)
+		data_bytes = self.k_head_dim - PAGE_SPLIT_SCALE_BYTES_PER_TOKEN
+		if data_bytes <= 0 or data_bytes % 16 != 0:
+			raise ValueError(
+				f"{PAGE_FORMAT_FP8_PAGE_SPLIT} requires k_head_dim to be the "
+				"per-token byte count (a positive multiple of 16, plus 4 "
+				f"scale bytes), got {self.k_head_dim}"
+			)
+
+	@property
+	def is_page_split(self) -> bool:
+		return self.page_format == PAGE_FORMAT_FP8_PAGE_SPLIT
+
+	def k_data_dim(self) -> int:
+		"""Elements of K data per token, i.e. the real indexer head dim.
+
+		Equal to ``k_head_dim`` in the AoS format; ``k_head_dim`` minus the
+		fp32 scale bytes in the page-split format, where ``k_head_dim`` counts
+		the token's total bytes.
+		"""
+
+		if self.is_page_split:
+			return self.k_head_dim - PAGE_SPLIT_SCALE_BYTES_PER_TOKEN
+		return self.k_head_dim
 
 	def bytes_per_page(self) -> int:
 		element_bytes = _dtype_size_bytes(self.kv_dtype)
@@ -162,14 +217,21 @@ _GLM5_2_INDEXER_LAYER_MAP = tuple(
 	_GLM5_2_INDEXER_PHYSICAL_BY_LOGICAL.get(layer_idx, -1)
 	for layer_idx in range(78)
 )
+# GLM-5.2 stores its indexer keys in DeepGEMM's page-split FP8 layout, the one
+# deep_gemm.fp8_paged_mqa_logits reads directly: per page
+# [64 x 128 B e4m3 K][64 x 4 B fp32 scale] = 8,448 B. k_head_dim is therefore
+# the per-token BYTE count (128 data + 4 scale = 132), not an element count:
+# 132 B/token against 256 B/token for bf16 AoS. GLM-5/5.1/5.3 keep
+# `glm5_indexer` (bf16 AoS) untouched.
 _GLM5_2_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=len(_GLM5_2_INDEXER_LOGICAL_LAYERS),
 	num_k_heads=1,
-	k_head_dim=128,
+	k_head_dim=128 + PAGE_SPLIT_SCALE_BYTES_PER_TOKEN,
 	num_v_heads=0,
 	v_head_dim=0,
-	kv_dtype="bfloat16",
+	kv_dtype="float8_e4m3fn",
 	logical_to_physical_layer=_GLM5_2_INDEXER_LAYER_MAP,
+	page_format=PAGE_FORMAT_FP8_PAGE_SPLIT,
 )
 
 # Kimi-K3 has 93 logical engine layers but only these 24 MLA layers own paged
@@ -344,6 +406,32 @@ def _resolve_indexer_profile(model_name: str) -> _HostKVModelProfile | None:
 	return _PROFILE_REGISTRY[canonical]
 
 
+def apply_page_format(config: Any, page_format: str) -> None:
+	"""Stamp a profile's page format onto a core HostPagedKVConfig.
+
+	The format is part of the physical layout and is hashed into the region's
+	config fingerprint, so a core_engine build without the field cannot serve a
+	page-split region: that combination raises instead of silently creating an
+	AoS region a page-split reader would misread.
+	"""
+
+	if page_format not in (PAGE_FORMAT_CONTIGUOUS_AOS, PAGE_FORMAT_FP8_PAGE_SPLIT):
+		raise ValueError(f"Unsupported page_format '{page_format}'")
+	enum_type = getattr(bg_lib, "HostKVPageFormat", None)
+	if enum_type is None or not hasattr(config, "page_format"):
+		if page_format != PAGE_FORMAT_CONTIGUOUS_AOS:
+			raise RuntimeError(
+				f"page_format='{page_format}' requires a core_engine build "
+				"with HostPagedKVConfig.page_format"
+			)
+		return
+	config.page_format = (
+		enum_type.PAGE_SPLIT_FP8_SCALE
+		if page_format == PAGE_FORMAT_FP8_PAGE_SPLIT
+		else enum_type.CONTIGUOUS_AOS
+	)
+
+
 def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 	"""Maps a user supplied model name to a cached profile."""
 
@@ -405,6 +493,7 @@ def build_host_kv_config(
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	apply_page_format(config, profile.page_format)
 	config.logical_to_physical_layer = list(
 		profile.logical_to_physical_layer or ()
 	)
@@ -550,6 +639,7 @@ def build_host_kv_config_aux(
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	apply_page_format(config, profile.page_format)
 	return config
 
 

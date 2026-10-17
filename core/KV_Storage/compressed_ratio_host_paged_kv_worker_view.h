@@ -155,7 +155,16 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
     KVAsyncTask AsyncOffloadLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths raw_sequence_lengths) {
+        SequenceLengths raw_sequence_lengths,
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
+        // The constructor already rejects every non-AoS page format, so a
+        // scale tensor can only reach this view through a caller bug.
+        if (scale_tensor.has_value()) {
+            throw std::invalid_argument(
+                "CompressedRatioHostPagedKVWorkerView::"
+                "AsyncOffloadLayerKVToHost: scale_tensor is only valid for "
+                "a page-split view");
+        }
         if (sequence_ids.empty()) {
             return transformed_detail::MakeAsyncTask([] {});
         }
@@ -192,7 +201,14 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths raw_positions) {
+        SequenceLengths raw_positions,
+        std::optional<torch::Tensor> scale_tensor = std::nullopt) {
+        if (scale_tensor.has_value()) {
+            throw std::invalid_argument(
+                "CompressedRatioHostPagedKVWorkerView::"
+                "AsyncAppendDecodeKVToHost: scale_tensor is only valid for "
+                "a page-split view");
+        }
         if (sequence_ids.empty()) {
             return transformed_detail::MakeAsyncTask([] {});
         }
@@ -275,6 +291,16 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
             throw std::invalid_argument(
                 "CompressedRatioHostPagedKVWorkerView requires "
                 "page_size_tokens > 0");
+        }
+        // This view decimates token positions and appends single tokens
+        // through the base view's AoS token arithmetic; it carries no scale
+        // region, so a page-split region must never reach it.
+        if (BaseView::config().page_format !=
+            HostKVPageFormat::kContiguousAoS) {
+            throw std::invalid_argument(
+                "CompressedRatioHostPagedKVWorkerView supports only "
+                "page_format=contiguous_aos (got " +
+                ToString(BaseView::config().page_format) + ")");
         }
     }
 

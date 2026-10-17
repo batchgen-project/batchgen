@@ -125,6 +125,10 @@ struct HostPagedKVConfig {
     std::size_t num_v_heads = 0;
     std::size_t v_head_dim = 0;
     std::string kv_dtype = "bfloat16";
+    // "contiguous_aos" (token-major records) or "page_split_fp8_scale" (the
+    // SoA FP8 page DeepGEMM reads: the page's e4m3 K bytes, then one fp32
+    // scale per token). An unknown value is rejected, never defaulted.
+    std::string page_format = "contiguous_aos";
 };
 
 struct DevicePagedKVConfig {

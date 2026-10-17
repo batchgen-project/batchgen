@@ -40,6 +40,20 @@ inline std::size_t ResolveElementSizeBytes(std::string_view kv_dtype) {
     throw std::invalid_argument(oss.str());
 }
 
+inline HostKVPageFormat ResolvePageFormat(std::string_view page_format) {
+    const std::string format =
+        page_format.empty() ? "contiguous_aos" : std::string(page_format);
+    if (format == "contiguous_aos") {
+        return HostKVPageFormat::kContiguousAoS;
+    }
+    if (format == "page_split_fp8_scale") {
+        return HostKVPageFormat::kPageSplitFp8Scale;
+    }
+    std::ostringstream oss;
+    oss << "Unsupported Host_Paged_KV_Config.page_format='" << format << "'";
+    throw std::invalid_argument(oss.str());
+}
+
 inline std::size_t DetermineSequenceTableCapacity(
     const KV_Storage_Config& storage_config, std::size_t fallback) {
     if (storage_config.num_host_slots > 0) {
@@ -78,6 +92,8 @@ inline HostPagedKVConfig BuildHostPagedKVConfig(
         config.v_head_dim = detail::RequirePositive(
             external.v_head_dim, "Host_Paged_KV_Config.v_head_dim");
     }
+
+    config.page_format = detail::ResolvePageFormat(external.page_format);
 
     const std::size_t element_size_bytes =
         detail::ResolveElementSizeBytes(external.kv_dtype);

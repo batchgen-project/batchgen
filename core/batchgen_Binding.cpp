@@ -135,16 +135,21 @@ std::vector<typename WorkerView::BatchedKVEntry> ParseBatchedKVEntries(
     entries.reserve(entries_py.size());
     for (auto item : entries_py) {
         auto tup = py::cast<py::tuple>(item);
-        if (py::len(tup) != 3) {
+        const auto fields = py::len(tup);
+        if (fields != 3 && fields != 4) {
             throw std::invalid_argument(
                 "async_append_decode_kv_to_host_batched_kernel entries must "
-                "be (layer_idx, k_tensor, v_tensor|None)");
+                "be (layer_idx, k_tensor, v_tensor|None) or "
+                "(layer_idx, k_tensor, v_tensor|None, scale_tensor|None)");
         }
         typename WorkerView::BatchedKVEntry entry;
         entry.layer_idx = py::cast<std::size_t>(tup[0]);
         entry.k_tensor = py::cast<torch::Tensor>(tup[1]);
         if (!tup[2].is_none()) {
             entry.v_tensor = py::cast<torch::Tensor>(tup[2]);
+        }
+        if (fields == 4 && !tup[3].is_none()) {
+            entry.scale_tensor = py::cast<torch::Tensor>(tup[3]);
         }
         entries.emplace_back(std::move(entry));
     }
@@ -248,17 +253,23 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
            py::arg("sequence_lengths"),
+           py::arg("scale_tensor") = py::none(),
            "Offload one layer of prefill KV into host pages. For mapped "
            "worker views, layer_idx is a logical layer id and is resolved to "
-           "a physical layer id before writing.")
+           "a physical layer id before writing. scale_tensor carries the "
+           "fp32 per-token scales and is required by, and only accepted by, "
+           "a page_split_fp8_scale region.")
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
            py::arg("sequence_lengths"),
+           py::arg("scale_tensor") = py::none(),
            "Append one decode token per sequence into host pages. For mapped "
            "worker views, layer_idx is a logical layer id and is resolved to "
-           "a physical layer id before writing.")
+           "a physical layer id before writing. scale_tensor carries the "
+           "fp32 per-token scales and is required by, and only accepted by, "
+           "a page_split_fp8_scale region.")
        .def("async_append_decode_kv_to_host_batched_kernel",
            [](WorkerView& self,
               py::list entries_py,
@@ -276,7 +287,11 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            "per-layer async_append_decode_kv_to_host loop of 78×bsz "
            "cudaMemcpyAsync with 1 kernel reading pinned pointer arrays. Each "
            "entry's layer_idx is a logical layer id for mapped worker views "
-           "and is resolved before building destination pointers.")
+           "and is resolved before building destination pointers. An entry "
+           "may be (layer_idx, k_tensor, v_tensor|None) or, for a "
+           "page_split_fp8_scale region, (layer_idx, k_tensor, v_tensor|None, "
+           "scale_tensor); the scales go out in one extra kernel launch per "
+           "step.")
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -328,6 +343,22 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
                                                       num_tokens);
             })
         .def_property_readonly("device_index", &WorkerView::device_index)
+        .def_property_readonly(
+            "page_format",
+            [](const WorkerView& self) {
+                return self.config().page_format;
+            },
+            "Arrangement of one K page in THIS region (the config the region "
+            "was created with), so a caller reads the format off the region "
+            "instead of re-deriving it from a model profile.")
+        .def_property_readonly(
+            "is_page_split",
+            [](const WorkerView& self) {
+                return self.config().page_format ==
+                       kv::HostKVPageFormat::kPageSplitFp8Scale;
+            },
+            "True when this region stores pages as [e4m3 K bytes][fp32 "
+            "scales], i.e. every write must carry its per-token scales.")
         .def_property_readonly_static(
             "has_v_cache",
             [](py::object /* cls */) { return WorkerView::kHasVCache; })
@@ -408,10 +439,13 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
                 py::arg("layer_idx"), py::arg("sequence_ids"),
                 py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
                 py::arg("sequence_lengths"),
+                py::arg("scale_tensor") = py::none(),
                 "Offload one packed, variable-length prefill layer with one "
                 "async task. K/V tensors use [sum(sequence_lengths), H, D] "
                 "layout. For mapped worker views, layer_idx is resolved "
-                "before writing.");
+                "before writing. scale_tensor holds the fp32 per-token "
+                "scales ([sum(sequence_lengths)]) and is required by, and "
+                "only accepted by, a page_split_fp8_scale region.");
     }
 }
 
@@ -422,7 +456,11 @@ void BindPrefixHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             py::arg("layer_idx"), py::arg("sequence_ids"),
             py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
             py::arg("raw_start_positions"), py::arg("token_counts"),
-            "Offload one layer of KV into a raw token range in host pages.")
+            py::arg("scale_tensor") = py::none(),
+            "Offload one layer of KV into a raw token range in host pages. "
+            "scale_tensor holds the fp32 per-token scales ([B, S]) and is "
+            "required by, and only accepted by, a page_split_fp8_scale "
+            "region.")
         .def("attach_shared_prefix_pages",
             &WorkerView::AttachSharedPrefixPages,
             py::arg("sequence_id"), py::arg("page_ids"),
@@ -666,6 +704,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
         .def("stop", &DistributedWeightDaemon::Stop);
     
+    py::enum_<kv::HostKVPageFormat>(m, "HostKVPageFormat")
+        .value("CONTIGUOUS_AOS", kv::HostKVPageFormat::kContiguousAoS,
+               "Token-major records: token t owns "
+               "[t * k_token_bytes, (t + 1) * k_token_bytes) of its page.")
+        .value("PAGE_SPLIT_FP8_SCALE",
+               kv::HostKVPageFormat::kPageSplitFp8Scale,
+               "The SoA page deep_gemm.fp8_paged_mqa_logits reads: the "
+               "page's e4m3 K bytes, then one fp32 scale per token. "
+               "k_head_dim carries TOTAL bytes per token (data + scale).")
+        .export_values();
+
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())
         .def_readwrite("shm_name", &kv::HostPagedKVConfig::shm_name)
@@ -685,6 +734,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVConfig::sequence_table_capacity)
         .def_readwrite("alignment_bytes",
                        &kv::HostPagedKVConfig::alignment_bytes)
+        .def_readwrite("page_format", &kv::HostPagedKVConfig::page_format)
         .def_readwrite("enable_thp", &kv::HostPagedKVConfig::enable_thp)
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
@@ -696,6 +746,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);
              });
+
+    // Pure functions over a config: no device, no shared memory, no region.
+    // They let a CPU test pin the page geometry and the config fingerprint
+    // that decides whether an existing shm region may be reused.
+    m.def(
+        "describe_host_kv_page_geometry",
+        [](const kv::HostPagedKVConfig& config) {
+            py::dict out;
+            if (config.num_v_heads == 0) {
+                kv::HostPagedKVLayout<kv::HostKVMode::kMLA> layout(config);
+                out["has_v_cache"] = false;
+                out["k_page_bytes"] = layout.KPageBytes();
+                out["k_data_token_bytes"] = layout.KDataTokenBytes();
+                out["scale_token_bytes"] = layout.ScaleTokenBytes();
+                out["scale_region_offset"] = layout.ScaleRegionOffset();
+                out["layer_stride_bytes"] = layout.LayerStrideBytes();
+                out["data_section_bytes"] = layout.DataSectionBytes();
+                out["fingerprint"] = layout.Fingerprint();
+                out["is_page_split"] = layout.IsPageSplit();
+            } else {
+                kv::HostPagedKVLayout<kv::HostKVMode::kMHA> layout(config);
+                out["has_v_cache"] = true;
+                out["k_page_bytes"] = layout.KPageBytes();
+                out["v_page_bytes"] = layout.VPageBytes();
+                out["k_data_token_bytes"] = layout.KDataTokenBytes();
+                out["scale_token_bytes"] = layout.ScaleTokenBytes();
+                out["scale_region_offset"] = layout.ScaleRegionOffset();
+                out["layer_stride_bytes"] = layout.LayerStrideBytes();
+                out["data_section_bytes"] = layout.DataSectionBytes();
+                out["fingerprint"] = layout.Fingerprint();
+                out["is_page_split"] = layout.IsPageSplit();
+            }
+            return out;
+        },
+        py::arg("config"),
+        "Byte geometry of one host-KV page for this config: page bytes, the "
+        "per-token data and scale bytes, the scale region's offset inside a "
+        "page, the layer stride, the data-section size and the layout "
+        "fingerprint. Raises for an invalid config (the same validation the "
+        "worker view applies).");
+    m.def(
+        "host_kv_config_hash",
+        [](const kv::HostPagedKVConfig& config) {
+            return kv::HashHostKVConfig(config);
+        },
+        py::arg("config"),
+        "Hash of the physical-layout fields of a host-KV config. An existing "
+        "shared-memory region is only reusable by a config with the same "
+        "hash, so the page format is part of it.");
 
     py::class_<kv::HostPagedKVStats>(m, "HostPagedKVStats")
         .def(py::init<>())

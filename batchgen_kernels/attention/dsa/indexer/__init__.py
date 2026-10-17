@@ -42,6 +42,15 @@ _fused_rope_hadamard_cuda = load(
 )
 
 
+# Fused indexer-K quantize + page-split write. Unlike the two kernels above it
+# is an AOT CUDA extension (setup.py + _jit_registry), and its wrapper loads
+# that extension lazily, so importing this package does not build it.
+from batchgen_kernels.attention.dsa.indexer.indexer_k_write_fp8 import (  # noqa: E402
+    fused_indexer_k_write_fp8,
+    page_split_write_plan,
+)
+
+
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return _hadamard_cuda.fast_hadamard_transform(x, scale)
 

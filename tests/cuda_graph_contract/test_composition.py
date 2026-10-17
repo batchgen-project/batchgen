@@ -17,6 +17,7 @@ from batchgen.cuda_graph.composition import (
     allocate_kv_staging,
     compose_layer_from_segments,
     compose_sequential,
+    resolve_kv_staging_dtypes,
 )
 from batchgen.cuda_graph.graph_manager import TensorSpec
 
@@ -153,4 +154,45 @@ def test_allocate_kv_staging_rejects_nonpositive():
         allocate_kv_staging(
             num_layers=0, max_bucket=8,
             kv_staging_dim={"p": 1}, dtype=torch.bfloat16, device=torch.device("cpu"),
+        )
+
+
+def test_allocate_kv_staging_per_stream_dtypes():
+    # A hybrid model's streams need not share an element type: GLM-5.2 stages
+    # its primary latent in bf16 while its indexer keys are e4m3 bytes.
+    out = allocate_kv_staging(
+        num_layers=2,
+        max_bucket=4,
+        kv_staging_dim={"primary": 576, "aux": 128, "aux_scale": 1},
+        dtype={
+            "primary": torch.bfloat16,
+            "aux": torch.float8_e4m3fn,
+            "aux_scale": torch.float32,
+        },
+        device=torch.device("cpu"),
+    )
+    assert out["primary"].dtype is torch.bfloat16
+    assert out["aux"].dtype is torch.float8_e4m3fn
+    assert out["aux_scale"].dtype is torch.float32
+    assert out["aux"].shape == (2, 4, 1, 1, 128)
+
+
+def test_resolve_kv_staging_dtypes_names_every_stream():
+    dims = {"primary": 576, "aux": 128}
+    assert resolve_kv_staging_dtypes(dims, torch.bfloat16) == {
+        "primary": torch.bfloat16,
+        "aux": torch.bfloat16,
+    }
+    # A mapping must name exactly the streams: a missing entry would silently
+    # stage one stream in another's dtype, an extra one hides a typo.
+    with pytest.raises(ValueError):
+        resolve_kv_staging_dtypes(dims, {"primary": torch.bfloat16})
+    with pytest.raises(ValueError):
+        resolve_kv_staging_dtypes(
+            dims,
+            {
+                "primary": torch.bfloat16,
+                "aux": torch.float8_e4m3fn,
+                "typo": torch.float32,
+            },
         )
