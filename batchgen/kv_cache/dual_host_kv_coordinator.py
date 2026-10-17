@@ -72,7 +72,9 @@ def _try_set_logger_name(config, name: str) -> bool:
 
 def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> Any:
 	"""Build a bg_lib.HostPagedKVConfig from a _HostKVModelProfile."""
-	from batchgen.kv_cache.host_kv_mananger_config import _dtype_size_bytes
+	from batchgen.kv_cache.host_kv_mananger_config import (
+		_dtype_size_bytes, apply_page_format,
+	)
 
 	config = bg_lib.HostPagedKVConfig()
 	config.shm_name = shm_name
@@ -91,6 +93,13 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	# The page format belongs to the physical layout (it is hashed into the
+	# region fingerprint), so it must be stamped on both the manager-side and
+	# the worker-side config of the SAME region.
+	apply_page_format(
+		config,
+		getattr(profile, "page_format", None) or "contiguous_aos",
+	)
 	if getattr(profile, "logical_to_physical_layer", None) is not None:
 		config.logical_to_physical_layer = list(profile.logical_to_physical_layer)
 	return config
@@ -263,8 +272,10 @@ class DualHostKVCoordinator:
 		coordinator = cls(primary_view, aux_view)
 		logger.info(
 			"DualHostKVCoordinator created: %d pages, "
-			"primary k_dim=%d, aux k_dim=%d",
-			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
+			"primary k_dim=%d, aux k_dim=%d, aux page_format=%s",
+			primary_config.num_pages, primary_config.k_head_dim,
+			aux_config.k_head_dim,
+			getattr(aux_config, "page_format", "contiguous_aos"),
 		)
 		return coordinator
 
@@ -316,8 +327,10 @@ class DualHostKVCoordinator:
 
 		logger.info(
 			"DualHostKVCoordinator managers created: %d pages, "
-			"primary k_dim=%d, aux k_dim=%d",
-			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
+			"primary k_dim=%d, aux k_dim=%d, aux page_format=%s",
+			primary_config.num_pages, primary_config.k_head_dim,
+			aux_config.k_head_dim,
+			getattr(aux_config, "page_format", "contiguous_aos"),
 		)
 		return primary_mgr, aux_mgr
 
