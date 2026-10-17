@@ -11545,6 +11545,12 @@ class BatchGenWorker:
 		them. Every arena reserved here is either consumed by a commit or given
 		back by ``_finalize_trajectory_frontiers``.
 
+		This is also where the committer takes its INSTALL DECISION, which is
+		why the reservation is handed the frontier identity and not just a page
+		count: the session key and the boundary are already known here, so a
+		sequence whose frontier is already committed reserves nothing and pays
+		neither the D2H nor the shard writes at the commit boundary.
+
 		No-op at G==1: one rank owns the whole arena, so it allocates, writes
 		and retains it inside the commit step exactly as before.
 		"""
@@ -11568,10 +11574,18 @@ class BatchGenWorker:
 			arena = committer.reserve_arena(
 				sequence_id=global_id,
 				prefix_page_count=commit_tokens // page_tokens,
+				namespace_digest=runtime.namespace_digest,
+				# The same page-aligned prefix the commit boundary will pass,
+				# so the decision taken here and the one taken at the barrier
+				# are about the same frontier.
+				frontier_token_ids=self._trajectory_tokens(
+					seq, length=int(commit_tokens)
+				).tolist(),
 			)
 			if arena is None:
-				# Pool pressure, already named by the committer: this sequence
-				# simply has no frontier committed this pass.
+				# Pool pressure, or a frontier that is already committed and
+				# needs no second record: either way the committer named and
+				# counted it, and this sequence gets no shard write this pass.
 				continue
 			payload[global_id] = {
 				"pseudo_sid": int(arena.pseudo_sid),
@@ -12103,11 +12117,13 @@ class BatchGenWorker:
 		if outcome.installed or outcome.rolled_back_sequence_ids or outcome.failed_sequence_ids:
 			logging.info(
 				"[TRAJECTORY_FRONTIER] Rank %s finalize: installed=%s "
-				"rolled_back=%s failed=%s",
+				"rolled_back=%s deduped=%s failed=%s dedup_total=%s",
 				self.rank,
 				[item.session_key for item in outcome.installed],
 				list(outcome.rolled_back_sequence_ids),
+				list(outcome.deduped_sequence_ids),
 				list(outcome.failed_sequence_ids),
+				committer.dedup_skips(),
 			)
 
 	def _commit_trajectory_frontier(self, *, seq, token_ids, commit_tokens):

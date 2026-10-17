@@ -1433,7 +1433,10 @@ class _GroupHarness:
         """The real pass: reserve in config, all G ranks write, then finalize."""
 
         arena = self.leader.reserve_arena(
-            sequence_id=sequence_id, prefix_page_count=2
+            sequence_id=sequence_id,
+            prefix_page_count=2,
+            namespace_digest=NAMESPACE,
+            frontier_token_ids=tokens,
         )
         assert arena is not None
         for follower in self.committers[1:]:
