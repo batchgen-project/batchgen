@@ -1966,16 +1966,24 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             return {"total_capture_time_ms": 0.0}
 
     class FakeWholeSegment:
+        instances = []
+
         def __init__(self, **kwargs):
             self.capture_inputs = []
             self.max_seqlen = kwargs["max_seqlen"]
+            self.kwargs = kwargs
+            FakeWholeSegment.instances.append(self)
 
         def set_capture_inputs(self, **inputs):
             self.capture_inputs.append(inputs)
 
     class FakeKVManager:
         def __init__(self):
-            self.config = types.SimpleNamespace(page_size_tokens=64)
+            # kv_dtype: the worker reads the aux pool's dtype to size the aux
+            # KV staging stream (bf16 AoS here, matching k_cache below).
+            self.config = types.SimpleNamespace(
+                page_size_tokens=64, kv_dtype=torch.bfloat16
+            )
             self.storage = torch.empty(4, 8, dtype=torch.int32)
             self.k_cache = torch.empty(2, 1, 64, 1, 4, dtype=torch.bfloat16)
 
@@ -2124,6 +2132,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     assert full_segment_kwargs[0]["all_short"] is False
     assert reuse_segment_kwargs[0]["all_short"] is False
     assert worker._glm5_whole_model_all_short is False
+    # The aux staging stream takes the aux pool's dtype (bf16 for an AoS pool).
+    assert FakeWholeSegment.instances[-1].kwargs["aux_kv_staging_dtype"] is torch.bfloat16
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
 
