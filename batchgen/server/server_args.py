@@ -58,6 +58,104 @@ def _is_glm_model(model_name: Optional[str]) -> bool:
     return "glm" in (model_name or "").lower()
 
 
+class WeightSourceError(ValueError):
+    """The launch names no usable host-weight source for its model/topology."""
+
+
+#: Node counts the Kimi-K3 distributed host-weight store supports (eight TP8
+#: workers per node); the store loader enforces the same set.
+_K3_DISTRIBUTED_NODE_COUNTS = (2, 4)
+
+
+def _is_kimi_k3_model(model_name: Optional[str]) -> bool:
+    """The registered Kimi-K3 identity, not a substring guess.
+
+    Resolved through the config registry every startup path already uses
+    (``model_registry._detect_model_type_from_identifier``), so a model that
+    the registry does not bind to ``kimi_k3`` is not treated as K3 here
+    either.
+    """
+    from batchgen.config.model_registry import (
+        _detect_model_type_from_identifier,
+    )
+
+    return _detect_model_type_from_identifier(model_name or "") == "kimi_k3"
+
+
+def _launch_converted_ckpt_dir(args: "ServerArgs") -> Optional[Path]:
+    """The converted checkpoint this launch names, as the worker resolves it.
+
+    ``WorkerManager`` uses ``--converted-ckpt-dir``, else
+    ``<--cache-dir>/converted_ckpt``. Without either it falls back to the
+    working directory, which identifies nothing, so that case is ``None``.
+    """
+    if args.converted_ckpt_dir is not None:
+        return Path(args.converted_ckpt_dir)
+    if args.cache_dir is not None:
+        return Path(args.cache_dir) / "converted_ckpt"
+    return None
+
+
+def _validate_distributed_weight_source(args: "ServerArgs") -> None:
+    """Preflight of a ``--distributed-weight-config`` launch.
+
+    Refuses before any server resource exists unless the config is the
+    completed output of the store builder for exactly this node, built from
+    the converted checkpoint this launch names, and a sample of the store
+    still hashes to its completion manifest. Each refusal ends with the exact
+    builder command that rebuilds the store.
+    """
+    if not args.distributed_weight_config.is_file():
+        raise WeightSourceError(
+            "distributed_weight_config does not exist: "
+            f"{args.distributed_weight_config}"
+        )
+    if not _is_kimi_k3_model(args.model):
+        raise WeightSourceError(
+            "--distributed-weight-config currently supports Kimi-K3 only"
+        )
+    if (
+        args.nnodes not in _K3_DISTRIBUTED_NODE_COUNTS
+        or args.world_size != args.nnodes * 8
+    ):
+        raise WeightSourceError(
+            "Kimi-K3 distributed host weights require "
+            "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
+        )
+    from batchgen.models.moonshotai.kimi_linear.store_builder import (
+        K3StoreManifestError,
+        rebuild_command,
+        verify_published_store,
+    )
+
+    converted_ckpt = _launch_converted_ckpt_dir(args)
+    verified = verify_published_store(
+        args.distributed_weight_config,
+        converted_ckpt=converted_ckpt,
+        cache_dir=args.cache_dir,
+        node_rank=args.node_rank,
+        num_nodes=args.nnodes,
+    )
+    config = verified["config"]
+    if (config["node_rank"], config["num_nodes"]) != (args.node_rank, args.nnodes):
+        raise K3StoreManifestError(
+            f"{args.distributed_weight_config} is node {config['node_rank']} "
+            f"of {config['num_nodes']}, but this launch is --node-rank "
+            f"{args.node_rank} --nnodes {args.nnodes}: pass this node's own "
+            "config, or build it with: "
+            + rebuild_command(
+                args.distributed_weight_config.parent
+                / f"node{args.node_rank}.json",
+                None,
+                converted_ckpt=converted_ckpt,
+                cache_dir=args.cache_dir,
+                manifest=verified["manifest"],
+                node_rank=args.node_rank,
+                num_nodes=args.nnodes,
+            )
+        )
+
+
 def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
     # Phase C: mode env vars retired. Activation is gated by the
     # `--enable-cuda-graph` / `--disable-cuda-graphs` CLI flags directly,
@@ -83,6 +181,9 @@ class ServerArgs:
     cache_dir: Optional[Path] = None
     converted_ckpt_dir: Optional[Path] = None
     distributed_weight_config: Optional[Path] = None
+    # Explicit opt-in to the replicated parameter server on Kimi-K3 multi-node,
+    # where the distributed host-weight store is the default path.
+    replicated_weights: bool = False
     # Enable the DeepEP low-latency EP exchange for the decode graph (generic across
     # EP models). Default off = NCCL all_gather + reduce_scatter; on requires the
     # DeepEP build and fails fast at startup if it is unavailable (no silent NCCL fallback).
@@ -246,6 +347,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "Node-local distributed host-weight source configuration. "
             "When set, the server skips the replicated parameter server and "
             "workers map the compact store described by this file."
+        ),
+    )
+    parser.add_argument(
+        "--replicated-weights",
+        action="store_true",
+        default=False,
+        help=(
+            "Explicit opt-in to the replicated parameter server for Kimi-K3 "
+            "multi-node serving (the distributed host-weight store is the "
+            "default there; see docs/deploy-kimi-k3-h200.md §6)."
         ),
     )
     parser.add_argument(
@@ -575,6 +686,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def validate_server_args(args: ServerArgs) -> None:
     """Validate parsed arguments."""
+    # Checked first: naming both weight sources is a contradiction whatever
+    # else is wrong with the launch.
+    if args.distributed_weight_config is not None and args.replicated_weights:
+        raise WeightSourceError(
+            "--distributed-weight-config and --replicated-weights are "
+            "contradictory: pick either the distributed host-weight store or "
+            "the replicated parameter server, not both"
+        )
     if args.max_pool_size <= 0:
         raise ValueError("legacy non-pool mode was removed; --max-pool-size must be positive")
     if args.input_ids_pool_size_gb <= 0:
@@ -620,20 +739,30 @@ def validate_server_args(args: ServerArgs) -> None:
         require_prefix_cache_model_support(args.model)
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
-        if not args.distributed_weight_config.is_file():
-            raise ValueError(
-                "distributed_weight_config does not exist: "
-                f"{args.distributed_weight_config}"
+        _validate_distributed_weight_source(args)
+    elif _is_kimi_k3_model(args.model) and args.nnodes > 1:
+        if not args.replicated_weights:
+            # The distributed host-weight store is the default Kimi-K3
+            # multi-node path. The replicated parameter server stages the
+            # whole checkpoint on every node, which does not fit shared
+            # multi-tenant hosts (the multi-tenant warning in
+            # docs/deploy-kimi-k3-h200.md), so it is an explicit opt-in.
+            raise WeightSourceError(
+                "Kimi-K3 multi-node defaults to the distributed host-weight "
+                "store: pass --distributed-weight-config <node.json> (build "
+                "it with python -m "
+                "batchgen.models.moonshotai.kimi_linear.store_builder, see "
+                "docs/deploy-kimi-k3-h200.md §6), or opt in to the replicated "
+                "parameter server with --replicated-weights (it needs room "
+                "for the whole checkpoint in host memory on every node and is "
+                "not safe on shared nodes)"
             )
-        if "kimi-k3" not in args.model.lower():
-            raise ValueError(
-                "--distributed-weight-config currently supports Kimi-K3 only"
-            )
-        if args.nnodes not in (2, 4) or args.world_size != args.nnodes * 8:
-            raise ValueError(
-                "Kimi-K3 distributed host weights require "
-                "--nnodes 2 --world-size 16 or --nnodes 4 --world-size 32"
-            )
+    elif args.replicated_weights:
+        raise WeightSourceError(
+            "--replicated-weights only selects the weight source of a "
+            "multi-node Kimi-K3 launch (--nnodes > 1); every other launch "
+            "already uses the replicated parameter server, so drop the flag"
+        )
     if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
         raise ValueError("watchdog_timeout must be non-negative (0 to disable)")
     if args.watchdog_heartbeat_interval is not None:
@@ -766,6 +895,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         cache_dir=parsed.cache_dir,
         converted_ckpt_dir=parsed.converted_ckpt_dir,
         distributed_weight_config=parsed.distributed_weight_config,
+        replicated_weights=parsed.replicated_weights,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
