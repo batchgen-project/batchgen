@@ -54,6 +54,13 @@ class GLM5Initializer:
         # Fail loud at build if the DSA indexer schedule (freq/offset) disagrees
         # with the checkpoint's per-layer indexer_types (no-op for GLM-5).
         assert_indexer_schedule_consistent(self.loaded_model_config)
+        # Server --enable-deepep: a runtime knob, not a checkpoint field. The
+        # MoE modules read it off the rich config, so the decode MoE graph can
+        # pick the DeepEP low-latency exchange without the worker knowing.
+        # Absent/False keeps the NCCL all_gather + reduce_scatter default.
+        self.loaded_model_config.enable_deepep = bool(
+            getattr(input_arguments, "enable_deepep", False)
+        )
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)

@@ -35,10 +35,46 @@ def completion_prompt_to_text(prompt: str | List[str]) -> str:
     return prompt
 
 
+def tokenizer_family_mismatch(
+    request_model: str, served_model: str,
+) -> Optional[str]:
+    """Return an error when a request names another tokenizer family.
+
+    The scheduler renders the chat template with the tokenizer resolved from
+    the request's ``model``; the worker encodes the rendered text with the
+    served checkpoint's tokenizer. A request from another tokenizer family
+    would be rendered with that family's template and control markers, then
+    encoded as plain text by the served tokenizer. Family is the tokenizer
+    type the registry resolves, so aliases of the served model still pass.
+    A request name that resolves to no family is left to the tokenizer load.
+    """
+    from batchgen.config.tokenizer_registry import resolve_tokenizer_type
+
+    served_family = resolve_tokenizer_type(served_model)
+    if served_family is None:
+        return (
+            f"served model {served_model!r} resolves to no registered "
+            f"tokenizer family"
+        )
+    request_family = resolve_tokenizer_type(request_model)
+    if request_family is None or request_family == served_family:
+        return None
+    return (
+        f"model {request_model!r} uses tokenizer family {request_family!r}, "
+        f"but this server serves {served_model!r} with tokenizer family "
+        f"{served_family!r}; send a model name of the {served_family!r} family"
+    )
+
+
 def parse_batch_file(
     content: bytes,
+    served_model: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], List[BatchRequestItem]]:
-    """Validate and parse a JSONL batch file."""
+    """Validate and parse a JSONL batch file.
+
+    With ``served_model`` set, a request whose model is a different tokenizer
+    family than the served checkpoint is rejected.
+    """
     try:
         lines = content.decode("utf-8").strip().split("\n")
     except UnicodeDecodeError:
@@ -76,6 +112,10 @@ def parse_batch_file(
 
         if model_name is None:
             model_name = current_model
+            if served_model is not None:
+                mismatch = tokenizer_family_mismatch(current_model, served_model)
+                if mismatch is not None:
+                    return False, f"Line {idx}: {mismatch}", []
         elif model_name != current_model:
             return False, f"Line {idx}: Inconsistent model value", []
 
@@ -216,7 +256,9 @@ class BatchScheduler:
         with input_path.open("rb") as handle:
             content = handle.read()
 
-        ok, error_message, requests = parse_batch_file(content)
+        ok, error_message, requests = parse_batch_file(
+            content, served_model=self.server_args.model
+        )
         if not ok:
             self.storage.update_batch_status(
                 batch_id, BatchStatus.FAILED, error=error_message

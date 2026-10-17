@@ -110,9 +110,16 @@ def test_build_block_derives_all_short_from_required_tokens():
     assert "index_topk_cfg = int(getattr(_first_indexer, 'index_topk', 0) or 0)" in src
     assert "self._glm5_whole_model_index_topk = index_topk_cfg" in src
     assert "model_config, 'index_topk'" not in src
+    # ONE general graph lifetime (POIS 2026-10-13): the lifetime is no longer
+    # derived per batch from required_seqlen vs index_topk. That derivation
+    # made the decode graphs length-dependent, so a batch that outgrew
+    # index_topk forced a recapture or an eager fallback — which is why the
+    # default path recaptured every bucket on each phase switch. required_seqlen
+    # and index_topk are still computed, for the capacity check and the log.
+    assert "all_short = False" in src
     assert (
         "all_short = bool(index_topk_cfg) and required_seqlen <= index_topk_cfg"
-        in src
+        not in src
     )
     assert "self._glm5_whole_model_all_short = all_short" in src
     # graph_max_seqlen keeps the capacity-based sizing.

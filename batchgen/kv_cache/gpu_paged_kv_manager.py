@@ -45,6 +45,19 @@ def _as_int_tensor(values: Iterable[int]) -> torch.Tensor:
 	return torch.as_tensor(list(values), dtype=torch.int32)
 
 
+# One carve alignment of slack when sizing a fixed-address KV reservation.
+_CARVE_SLACK_BYTES = 512
+
+
+def _tensor_nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
+	"""Bytes a contiguous tensor of ``shape``/``dtype`` occupies."""
+	element_size = torch.empty((), dtype=dtype).element_size()
+	count = 1
+	for dim in shape:
+		count *= int(dim)
+	return count * element_size
+
+
 def _positive_or_none(value: Optional[int]) -> Optional[int]:
 	if value is None:
 		return None
@@ -426,6 +439,18 @@ class _GPUPageTableManager:
 		self._slot_index_tensor: Optional[torch.Tensor] = None
 		# Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
 		self._slot_to_seq_id_tensor: Optional[torch.Tensor] = None
+		# Fixed-capacity backing for the two 1-D tensors above. Both are part
+		# of the CUDA-graph-visible state (``get_cuda_graph_state``) and the
+		# Kimi-K2.5 graph adapter reads them directly, so a rebuild updates
+		# them in place instead of allocating. This is hardening rather than a
+		# requirement of the GLM-5 path, which binds its slot indices as static
+		# graph inputs and copies values into them.
+		# ``_slot_index_storage`` is a constant arange, so a prefix of it holds
+		# exactly the values the per-rebuild tensor held.
+		self._slot_index_storage: Optional[torch.Tensor] = None
+		self._slot_to_seq_id_storage: Optional[torch.Tensor] = None
+		# Number of slots the current 1-D views expose.
+		self._slot_count: int = 0
 		# Flattened list of active page indices ordered by slot_to_seq_id.
 		self._active_page_indices_cpu: Optional[torch.Tensor] = None
 		# Monotonic version bumped on every logical page-table rebuild/clear so
@@ -527,10 +552,7 @@ class _GPUPageTableManager:
 			# table can still gain pages (decode extension), and a stale graph
 			# row would send KV writes to page -1.
 			self._update_cuda_graph_table(wanted_order, sequences, max_required)
-		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
-		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
-			self.slot_to_seq_id
-		)
+		self._refresh_slot_view_tensors(wanted_order)
 		self._active_page_indices_cpu = flat_pages_cpu
 		self.rebuild_version += 1
 		
@@ -636,17 +658,44 @@ class _GPUPageTableManager:
 			)
 		return tensor[:batch_size]
 
-	def _build_slot_index_tensor(self, num_slots: int) -> torch.Tensor:
-		return torch.arange(num_slots, dtype=torch.int32, device=self.device)
+	def _refresh_slot_view_tensors(self, sequence_ids: Sequence[int]) -> None:
+		"""Point the 1-D graph-visible tensors at fixed-capacity prefixes.
 
-	def _build_slot_to_seq_id_tensor(
-		self, sequence_ids: Sequence[int]
-	) -> torch.Tensor:
-		if not sequence_ids:
-			return torch.empty(0, dtype=torch.int64, device=self.device)
-		return torch.as_tensor(
-			sequence_ids, dtype=torch.int64, device=self.device
-		)
+		``_slot_index_tensor`` becomes a prefix of a constant arange and
+		``_slot_to_seq_id_tensor`` a prefix of storage written in place, so
+		both keep one address for the manager's life while holding exactly the
+		values the old per-rebuild tensors held. A batch past the reserved slot
+		capacity keeps the previous per-rebuild allocation rather than growing
+		the fixed storage; no captured graph can serve such a batch.
+		"""
+		num_slots = len(sequence_ids)
+		if num_slots > self.max_slots:
+			self._slot_index_tensor = torch.arange(
+				num_slots, dtype=torch.int32, device=self.device
+			)
+			self._slot_to_seq_id_tensor = torch.as_tensor(
+				list(sequence_ids), dtype=torch.int64, device=self.device
+			)
+			self._slot_count = num_slots
+			return
+		if self._slot_index_storage is None:
+			self._slot_index_storage = torch.arange(
+				self.max_slots, dtype=torch.int32, device=self.device
+			)
+		if self._slot_to_seq_id_storage is None:
+			self._slot_to_seq_id_storage = torch.zeros(
+				self.max_slots, dtype=torch.int64, device=self.device
+			)
+		if num_slots:
+			# In place: the storage may have been created under inference_mode
+			# by an earlier rebuild inside the decode loop.
+			with torch.inference_mode():
+				self._slot_to_seq_id_storage[:num_slots] = torch.as_tensor(
+					list(sequence_ids), dtype=torch.int64, device=self.device
+				)
+		self._slot_index_tensor = self._slot_index_storage[:num_slots]
+		self._slot_to_seq_id_tensor = self._slot_to_seq_id_storage[:num_slots]
+		self._slot_count = num_slots
 
 	def _build_flat_page_index_tensor(
 		self, sequence_ids: Sequence[int], sequences: Dict[int, _SequenceState]
@@ -672,6 +721,7 @@ class GPUPagedKVCacheManager:
 		*,
 		config: Optional[GPUPagedKVConfig] = None,
 		device: Optional[Union[str, int, torch.device]] = None,
+		fixed_address_pool: bool = False,
 	):
 		if config is not None and (
 			engine_config is not None or model_config is not None
@@ -710,6 +760,20 @@ class GPUPagedKVCacheManager:
 		self._geometry = GPUPagedKVGeometry(self.config)
 		self._layout = GPUPagedKVLayout(self.config)
 		self.device = resolved_device
+		# Fixed-address pool: the KV tensors are carved from one reserved
+		# virtual range instead of being cudaMalloc'd per initialize(), so a
+		# destroy()/initialize() cycle across a phase switch returns the
+		# physical pages to the driver while every pointer a decode graph
+		# baked — pool bases, page-pointer tables, page-table storage — stays
+		# put. These fields are set before _reset_runtime_state() and are NOT
+		# cleared by it: that is what makes them survive destroy().
+		self._fixed_address_pool = bool(fixed_address_pool)
+		self._pool_arena = None
+		self._fixed_pool_tensors: Optional[
+			Tuple[torch.Tensor, Optional[torch.Tensor]]
+		] = None
+		# Depth of active decode-admission / capacity-snapshot sections (#424).
+		self._capacity_snapshot_depth = 0
 		self._reset_runtime_state()
 
 	# ------------------------------------------------------------------
@@ -732,6 +796,22 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
+		v_shape = (
+			(
+				self.config.num_layers,
+				self.config.num_pages,
+				self.config.page_size_tokens,
+				self.config.num_v_heads,
+				self.config.v_head_dim,
+			)
+			if self.config.has_v_cache
+			else None
+		)
+		if self._fixed_address_pool:
+			self._initialize_fixed_address_pool(shape, v_shape)
+			self._is_initialized = True
+			return
+
 		# The pool tensors live in a dedicated allocator pool: its segments
 		# never serve other allocations, so when destroy() drops the tensors
 		# the segments are whole-segment free and return to CUDA. Without the
@@ -783,6 +863,133 @@ class GPUPagedKVCacheManager:
 		)
 		self._is_initialized = True
 
+	def _make_pool_arena(self, nbytes: int):
+		"""Reserve one virtual range for the KV pool.
+
+		Split out so the fixed-address lifecycle can be exercised without a
+		device: CUDA VMM is the only production implementation.
+		"""
+		if self.device.type != "cuda" or self.device.index is None:
+			raise RuntimeError(
+				"fixed_address_pool needs an indexed CUDA device, got "
+				f"{self.device}"
+			)
+		from batchgen.cuda_graph.vmm_arena import VmmArena
+
+		# 512 MiB chunks keep the round-up waste under 0.5 GiB and the
+		# map/unmap handle count small.
+		return VmmArena(self.device, nbytes, chunk_bytes=512 << 20)
+
+	def _initialize_fixed_address_pool(self, shape, v_shape) -> None:
+		"""Map (or re-map) the reserved KV range and restore its tensors.
+
+		The first call reserves one virtual range sized for the pool and carves
+		the K (and optional V) tensor out of it. Later calls only map fresh
+		physical memory under the *same* addresses, so the page-pointer tables
+		built on the first call stay correct and anything that baked a pool
+		pointer — a captured decode graph above all — keeps dereferencing the
+		right memory after a phase switch.
+		"""
+		if self._pool_arena is None:
+			k_bytes = _tensor_nbytes(shape, self.config.kv_dtype)
+			v_bytes = (
+				_tensor_nbytes(v_shape, self.config.kv_dtype) if v_shape else 0
+			)
+			self._pool_arena = self._make_pool_arena(
+				k_bytes + v_bytes + _CARVE_SLACK_BYTES
+			)
+			self._pool_arena.map()
+			k_cache = self._pool_arena.carve(shape, self.config.kv_dtype)
+			v_cache = (
+				self._pool_arena.carve(v_shape, self.config.kv_dtype)
+				if v_shape
+				else None
+			)
+			self._fixed_pool_tensors = (k_cache, v_cache)
+		elif not self._pool_arena.is_mapped:
+			self._pool_arena.map()
+
+		self._k_cache, self._v_cache = self._fixed_pool_tensors
+		# Arena contents are undefined right after map(); a freshly
+		# initialized manager hands out zeroed pages, so match that exactly
+		# rather than leaving a previous phase's bytes visible.
+		with torch.inference_mode():
+			self._k_cache.zero_()
+			if self._v_cache is not None:
+				self._v_cache.zero_()
+		self._refresh_page_pointer_tables()
+		logging.debug(
+			"GPUPagedKVCacheManager fixed-address pool mapped (device=%s, "
+			"pages=%d, k_ptr=0x%x)",
+			self.device,
+			self.config.num_pages,
+			self._k_cache.data_ptr(),
+		)
+
+	def _release_fixed_address_pool(self) -> None:
+		"""Return the pool's physical pages while keeping every address.
+
+		Unlike ``destroy()`` on the allocator-backed path this keeps the carved
+		tensors, the page-pointer tables and the page-table manager — only the
+		physical memory goes back to the driver, which is what the prefill
+		phase needs.
+		"""
+		self._set_device()
+		if self.device.type == "cuda":
+			# Nothing may still be reading the pool when its pages go back.
+			torch.cuda.synchronize(self.device)
+		self._sequences = {}
+		self._free_pages = _TensorStack(self.config.num_pages)
+		self._gpu_page_refcounts = {}
+		self._shared_page_key_to_gpu_page = {}
+		self._gpu_page_to_shared_key = {}
+		self.clear_page_table()
+		if self._pool_arena is not None and self._pool_arena.is_mapped:
+			self._pool_arena.unmap()
+		self._is_initialized = False
+
+	@property
+	def uses_fixed_address_pool(self) -> bool:
+		"""True when destroy()/initialize() unmap and map one reserved range.
+
+		The phase-switch lifecycle needs this: it releases the pool's physical
+		pages for the prefill phase and maps them back afterwards, and anything
+		that baked a pool pointer (a captured decode graph above all) is only
+		still correct because the addresses did not move.
+		"""
+		return self._fixed_address_pool
+
+	@property
+	def pool_is_mapped(self) -> bool:
+		"""True when the KV pool's physical memory is currently mapped."""
+		if self._fixed_address_pool:
+			return self._pool_arena is not None and self._pool_arena.is_mapped
+		return self._is_initialized
+
+	def assert_pool_mapped(self, context: str) -> None:
+		"""Fail loud before anything dereferences an unmapped KV pool."""
+		if not self.pool_is_mapped:
+			raise RuntimeError(
+				f"{context}: GPU KV pool is not mapped; a decode replay or KV "
+				"access in this state would read unmapped device memory"
+			)
+
+	@contextlib.contextmanager
+	def capacity_snapshot(self):
+		"""Hold the KV region mapped for a decode admission / capacity read.
+
+		PR #424 made decode admission read live all-rank capacity, so the pool
+		must not be torn down underneath a snapshot. Entering this section
+		asserts the pool is mapped and makes ``destroy()`` fail loud instead of
+		unmapping it mid-decision.
+		"""
+		self.assert_pool_mapped("capacity_snapshot")
+		self._capacity_snapshot_depth += 1
+		try:
+			yield self
+		finally:
+			self._capacity_snapshot_depth -= 1
+
 	def destroy(self, *, empty_cuda_cache: bool = False) -> None:
 		"""
 		Releases GPU buffers and resets the allocator state so it can be reused.
@@ -814,6 +1021,19 @@ class GPUPagedKVCacheManager:
 				"GPUPagedKVCacheManager.destroy called while uninitialized; "
 				"no-op (state was already reset by a prior destroy call)"
 			)
+			return
+
+		# #424 invariant: decode admission reads live all-rank capacity, so the
+		# KV region may never be torn down while a snapshot is in flight.
+		if self._capacity_snapshot_depth > 0:
+			raise RuntimeError(
+				"GPUPagedKVCacheManager.destroy() called inside a decode "
+				f"admission / capacity snapshot ({self._capacity_snapshot_depth} "
+				"open): the KV region must stay mapped for the whole section"
+			)
+
+		if self._fixed_address_pool:
+			self._release_fixed_address_pool()
 			return
 
 		had_mem_pool = self._mem_pool is not None
@@ -1280,8 +1500,7 @@ class GPUPagedKVCacheManager:
 		# Clear the slot mappings
 		mgr.seq_id_to_slot = {}
 		mgr.slot_to_seq_id = []
-		mgr._slot_index_tensor = torch.empty(0, dtype=torch.int32, device=mgr.device)
-		mgr._slot_to_seq_id_tensor = torch.empty(0, dtype=torch.int64, device=mgr.device)
+		mgr._refresh_slot_view_tensors([])
 		mgr._active_page_indices_cpu = torch.empty(0, dtype=torch.int64)
 		mgr.rebuild_version += 1
 		

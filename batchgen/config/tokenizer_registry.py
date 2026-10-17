@@ -131,6 +131,19 @@ def register_tokenizer(tokenizer_type: str):
     return decorator
 
 
+def resolve_tokenizer_type(model_identifier: str) -> Optional[str]:
+    """Return the tokenizer type load_tokenizer() selects for a model name.
+
+    This is the tokenizer family: two names that resolve to the same type
+    render the same chat template and encode with the same vocabulary. Returns
+    None when no pattern matches.
+    """
+    for pattern, tokenizer_type in TOKENIZER_NAME_PATTERNS.items():
+        if pattern in model_identifier:
+            return tokenizer_type
+    return None
+
+
 def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
     """Load appropriate tokenizer for model.
 
@@ -151,39 +164,38 @@ def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
         ValueError: If no registered tokenizer matches the model identifier
     """
     # Pattern match to find registered tokenizer
-    for pattern, tokenizer_type in TOKENIZER_NAME_PATTERNS.items():
-        if pattern in model_identifier:
-            if tokenizer_type in TOKENIZER_REGISTRY:
-                logger.info(f"Using registered tokenizer for type={tokenizer_type}")
-                # Tokenizer loads from its own package directory (no path argument)
-                return TOKENIZER_REGISTRY[tokenizer_type]()
-            module_path = _TOKENIZER_MODULES.get(tokenizer_type)
-            if module_path is None:
-                raise RuntimeError(
-                    f"model {model_identifier!r} selected tokenizer type "
-                    f"{tokenizer_type!r}, but no tokenizer module is declared"
-                )
-            try:
-                importlib.import_module(module_path)
-            except Exception as exc:  # noqa: BLE001 - preserve selected failure
-                raise RuntimeError(
-                    f"tokenizer module {module_path!r} for model "
-                    f"{model_identifier!r} failed to import: {exc}"
-                ) from exc
-            tokenizer_cls = TOKENIZER_REGISTRY.get(tokenizer_type)
-            if tokenizer_cls is None:
-                raise RuntimeError(
-                    f"tokenizer module {module_path!r} did not register "
-                    f"tokenizer type {tokenizer_type!r}"
-                )
-            logger.info("Using registered tokenizer for type=%s", tokenizer_type)
-            return tokenizer_cls()
-
-    raise ValueError(
-        f"No tokenizer registered for model: {model_identifier}. "
-        f"Known patterns: {list(TOKENIZER_NAME_PATTERNS.keys())}. "
-        f"Registered types: {list(TOKENIZER_REGISTRY.keys())}"
-    )
+    tokenizer_type = resolve_tokenizer_type(model_identifier)
+    if tokenizer_type is None:
+        raise ValueError(
+            f"No tokenizer registered for model: {model_identifier}. "
+            f"Known patterns: {list(TOKENIZER_NAME_PATTERNS.keys())}. "
+            f"Registered types: {list(TOKENIZER_REGISTRY.keys())}"
+        )
+    if tokenizer_type in TOKENIZER_REGISTRY:
+        logger.info(f"Using registered tokenizer for type={tokenizer_type}")
+        # Tokenizer loads from its own package directory (no path argument)
+        return TOKENIZER_REGISTRY[tokenizer_type]()
+    module_path = _TOKENIZER_MODULES.get(tokenizer_type)
+    if module_path is None:
+        raise RuntimeError(
+            f"model {model_identifier!r} selected tokenizer type "
+            f"{tokenizer_type!r}, but no tokenizer module is declared"
+        )
+    try:
+        importlib.import_module(module_path)
+    except Exception as exc:  # noqa: BLE001 - preserve selected failure
+        raise RuntimeError(
+            f"tokenizer module {module_path!r} for model "
+            f"{model_identifier!r} failed to import: {exc}"
+        ) from exc
+    tokenizer_cls = TOKENIZER_REGISTRY.get(tokenizer_type)
+    if tokenizer_cls is None:
+        raise RuntimeError(
+            f"tokenizer module {module_path!r} did not register "
+            f"tokenizer type {tokenizer_type!r}"
+        )
+    logger.info("Using registered tokenizer for type=%s", tokenizer_type)
+    return tokenizer_cls()
 
 
 def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
