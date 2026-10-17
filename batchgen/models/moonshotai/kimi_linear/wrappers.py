@@ -54,6 +54,52 @@ class KimiLinearExpertWrapper(ExpertWrapperBase):
         return self.module(hidden_states)
 
 
+def kda_state_pool_decision(
+    *,
+    existing_config,
+    existing_device,
+    live_sequences: int,
+    wanted_config,
+    wanted_device,
+) -> str:
+    """``"reuse"`` or ``"rebuild"`` for the KDA state pools. Pure.
+
+    For a linear-attention model the per-sequence recurrent + conv state IS
+    that sequence's KV: it is written by its prefill and read by every decode
+    step until the sequence completes or is evicted. The pools therefore
+    outlive one phase, exactly like the GPU KV pool, which is "sized exactly
+    once per process and every later activation maps that same size".
+
+    ``init_state_pools`` runs inside ``_build_model``, and the prefill->decode
+    switch rebuilds the model whenever the phase instances are not persistent
+    (``deep_free_model_memory`` then ``configure_decoding``'s
+    ``if self.model is None: self._build_model()``). Building a second
+    ``KDAStateGPUManager`` there replaces the sequence->slot map with an empty
+    one, so every sequence the prefill just wrote state for loses it and the
+    first decode step raises ``KeyError: Sequence <global_idx> has no KDA
+    state item``. Reusing a manager whose config and device are identical
+    keeps that map AND the pools' fixed addresses, which is what CUDA-graph
+    capture requires anyway.
+
+    A changed config cannot be reused: the pools' shapes differ. Dropping live
+    state to honour it would silently destroy decoded context, so that case is
+    refused by name instead; it is only a rebuild when nothing is live.
+    """
+    if existing_config is None:
+        return "rebuild"
+    if existing_config == wanted_config and existing_device == wanted_device:
+        return "reuse"
+    if live_sequences > 0:
+        raise RuntimeError(
+            "KDA state pools must be rebuilt with a different layout while "
+            f"{live_sequences} sequences still hold state in them: their "
+            "recurrent + conv state is their KV and cannot be recomputed. "
+            f"existing={existing_config} on {existing_device}; "
+            f"wanted={wanted_config} on {wanted_device}"
+        )
+    return "rebuild"
+
+
 class KDASlotManager:
     """Shared sequence(global id) -> slot facade for all KDA layers.
 
@@ -133,6 +179,10 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
     state_manager = None  # KDAStateGPUManager: pools + slot accounting
     slot_manager: Optional[KDASlotManager] = None
     layer_pools: Dict[int, KDALayerState] = {}
+    # (ChunkBatch, levels) of the prefix-pool chunk being prefilled. Every KDA
+    # layer of a chunk runs the same levels over the same slots, so the context
+    # is built at the first of them and reused by the other 68.
+    _pool_levels = None
 
     def __init__(self, module, layer_idx, core_engine, engine_config,
                  model_config, persistent=True):
@@ -152,26 +202,54 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         address (CUDA-graph capture requirement). Every KDALayerState
         receives VIEWS of the manager's tensors; slot alloc/free/zeroing is
         delegated to the manager through the KDASlotManager facade.
+
+        Idempotent for an identical layout: ``_build_model`` runs again on a
+        phase switch that does not keep its instances, and a second manager
+        there would drop every live sequence's state (see
+        ``kda_state_pool_decision``). The pools are then kept and only the
+        per-layer views and the facade are re-derived.
         """
         from batchgen.kv_cache.kda_state_gpu_manager import (
             KDAStateGPUConfig,
             KDAStateGPUManager,
         )
 
-        cls.state_manager = KDAStateGPUManager(
-            config=KDAStateGPUConfig(
-                num_kda_layers=len(kda_layer_indices),
-                num_state_items=num_slots,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                conv_dim=proj_size,
-                conv_width=conv_width,
-                conv_dtype=dtype,
-                cuda_graph_max_slots=num_slots,
-            ),
-            device=device,
+        config = KDAStateGPUConfig(
+            num_kda_layers=len(kda_layer_indices),
+            num_state_items=num_slots,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            conv_dim=proj_size,
+            conv_width=conv_width,
+            conv_dtype=dtype,
+            cuda_graph_max_slots=num_slots,
         )
-        cls.state_manager.initialize()
+        wanted_device = torch.device(device)
+        existing = cls.state_manager
+        live = (
+            len(existing.sequence_state_items) if existing is not None else 0
+        )
+        decision = kda_state_pool_decision(
+            existing_config=None if existing is None else existing.config,
+            existing_device=None if existing is None else existing.device,
+            live_sequences=live,
+            wanted_config=config,
+            wanted_device=wanted_device,
+        )
+        if decision == "reuse":
+            # A model rebuild (phase switch without persistent instances) must
+            # not cost the sequences their state; the views below are re-derived
+            # from the SAME pools, so their addresses do not move either.
+            logging.info(
+                "[KDA] reusing the existing state pools across a model "
+                "rebuild: %d slots, %d sequences still holding state",
+                num_slots, live,
+            )
+        else:
+            cls.state_manager = KDAStateGPUManager(
+                config=config, device=device
+            )
+            cls.state_manager.initialize()
         cls.slot_manager = KDASlotManager(cls.state_manager)
         cls.layer_pools = {}
         for physical, i in enumerate(kda_layer_indices):
@@ -196,6 +274,45 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         cls.state_manager = None
         cls.slot_manager = None
         cls.layer_pools = {}
+        cls._pool_levels = None
+
+    @classmethod
+    def _pool_level_context(cls, state, seq_ids, slot_ids):
+        """The levels of the prefix-pool chunk being prefilled, else None.
+
+        A pooled segment is a prefill row of its own, so a row that continues
+        one cannot start from zero state: the chunk runs level by level and a
+        child's slot is forked from its parent segment's. The parent is keyed
+        by the segment's pseudo sequence id, which holds its slot until the
+        wave ends, so it resolves whether the parent ran in this chunk or in an
+        earlier one.
+        """
+        batch = getattr(AttnWrapperBase, "prefill_pool_batch", None)
+        if batch is None:
+            cls._pool_levels = None
+            return None
+        if cls._pool_levels is not None and cls._pool_levels[0] is batch:
+            return cls._pool_levels[1]
+        from batchgen.prefix_reuse.levels import state_levels
+
+        segment_sids = getattr(
+            AttnWrapperBase, "prefill_pool_segment_sids", None
+        )
+        if segment_sids is None:
+            raise RuntimeError(
+                "a prefill prefix pool chunk reached a KDA layer without the "
+                "wave's segment pseudo sequence ids"
+            )
+        levels = state_levels(
+            batch,
+            segment_sids=segment_sids,
+            row_ids=seq_ids,
+            slots=slot_ids,
+            has_initial_state=state.has_initial_state,
+            slot_of=cls.slot_manager.lookup,
+        )
+        cls._pool_levels = (batch, levels)
+        return levels
 
     def dequantize_weights(self, weights_dict):
         return weights_dict
@@ -224,10 +341,12 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         slot_ids = state.prepare_prefill(seq_ids)
+        pool_levels = self._pool_level_context(state, seq_ids, slot_ids)
         segment_tokens = self._resident_prefill_segment_tokens
         if segment_tokens is None:
             out = self.module.kda_prefill_serving(
-                hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state
+                hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state,
+                pool_levels=pool_levels,
             )
         else:
             out = self.module.kda_prefill_serving(
@@ -237,6 +356,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
                 state.has_initial_state,
                 state,
                 segment_tokens=segment_tokens,
+                pool_levels=pool_levels,
             )
         if profiler is not None:
             profiler.end_profile_span("kda_attention", attention_span)
@@ -299,6 +419,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             cu_seqlens,
             AttnWrapperBase.prepack_max_seqlen,
             AttnWrapperBase.prepack_num_sequences,
+            **self._pool_prefill_kwargs(),
         )
         if profiler is not None:
             profiler.end_profile_span("mla_attention", attention_span)
@@ -310,8 +431,36 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             profiler.end_profile_span("mla_kv_offload", offload_span)
         return attn_output.unsqueeze(0)
 
+    def _pool_prefill_kwargs(self):
+        """This layer's prefix-pool arguments, empty outside a pool wave.
+
+        The pool holds the EXPANDED K/V of the MLA layers densely, one row per
+        MLA layer, so the row comes from the pool layout's own engine-layer map
+        (``prefill_pool_layout``). A Host-KV physical layer is NOT that row: the
+        48B profile keeps all 27 layers and resolves to itself, which indexes
+        past a 7-row pool, while K3's 93->24 map happens to coincide.
+        """
+        pool_batch = AttnWrapperBase.prefill_pool_batch
+        if pool_batch is None:
+            return {}
+        layer_map = AttnWrapperBase.prefill_pool_layer_map
+        row = int(layer_map[self.layer_idx]) if layer_map else -1
+        if row < 0:
+            raise RuntimeError(
+                f"MLA layer {self.layer_idx} has no prefix-pool row; the pool "
+                f"layout covers {len(layer_map) if layer_map else 0} engine layers"
+            )
+        return {
+            "pool": AttnWrapperBase.prefill_pool,
+            "pool_batch": pool_batch,
+            "pool_layer": row,
+        }
+
     def _offload_prepacked_kv(self, offload_kv, cu_seqlens):
         """Offload compressed MLA KV per-sequence to host paged KV."""
+        if AttnWrapperBase.prefill_pool_batch is not None:
+            self._offload_prefill_pool_rows(offload_kv)
+            return
         global_sequence_ids = list(AttnWrapperBase.cur_batch or [])
         num_sequences = AttnWrapperBase.prepack_num_sequences
         view = self.core_engine.host_paged_kv_worker_view
@@ -356,6 +505,38 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             # ~75 MB per MLA layer per rank at exact-64K, ~0.1 s in total.
             task.wait()
             start_idx = end_idx
+
+    def _offload_prefill_pool_rows(self, offload_kv):
+        """Offload each prefix-pool row's latent at its own Host start.
+
+        A pooled segment row goes to its segment's pseudo sequence at 0, a tail
+        row to its prompt's Host pages at the tail's start — the row's own
+        activations, never the pool, so the pool's pages are free again as soon
+        as the chunk ends. Every rank of a serve group offloads, exactly as the
+        packed path above does: the group replicates the rows and writes the
+        same bytes to the same mirrored pages.
+        """
+        view = self.core_engine.host_paged_kv_worker_view
+        bounds = AttnWrapperBase.prefill_pool_batch.row_bounds
+        starts = AttnWrapperBase.prefill_pool_row_starts
+        sequence_ids = list(AttnWrapperBase.cur_batch or [])
+        if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
+            raise RuntimeError("Kimi-K3 prefix-pool row metadata size mismatch")
+        for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
+            row_kv = offload_kv[start:end].unsqueeze(0).unsqueeze(2)
+            task = view.async_offload_layer_kv_range_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=[sequence_ids[row]],
+                k_tensor=row_kv,
+                v_tensor=None,
+                raw_start_positions=[starts[row]],
+                token_counts=[end - start],
+            )
+            # Same contract as the packed path: pin the source, register the
+            # task, and wait before issuing the next row.
+            AttnWrapperBase.pin_prefill_offload_tensor(row_kv, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
+            task.wait()
 
     def _forward_decode(self, hidden_states, **kwargs):
         position_ids = AttnWrapperBase.position_ids

@@ -91,6 +91,8 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	if getattr(profile, "logical_to_physical_layer", None) is not None:
+		config.logical_to_physical_layer = list(profile.logical_to_physical_layer)
 	return config
 
 
@@ -143,6 +145,68 @@ class DualHostKVCoordinator:
 			raise RuntimeError("DualHostKVCoordinator requires auxiliary host KV for DSA")
 		self.primary = primary
 		self.auxiliary = auxiliary
+		# The native worker-view API has no page-level rollback operation.  If
+		# one side accepts a mirrored growth and the other side rejects it, the
+		# two shared-memory regions cannot be repaired safely in Python (releasing
+		# the sequence would discard its already-valid pages).  Poison the
+		# coordinator and fail every subsequent operation so the worker restarts
+		# instead of continuing with divergent primary/auxiliary metadata.
+		self._transaction_error: RuntimeError | None = None
+
+	def _ensure_transaction_healthy(self, operation: str) -> None:
+		if self._transaction_error is not None:
+			raise RuntimeError(
+				f"{operation}: dual host KV coordinator is poisoned after a partial "
+				"mirrored operation; restart the worker before reusing either view"
+			) from self._transaction_error
+
+	def _poison_after_partial_operation(
+		self, operation: str, error: BaseException
+	) -> RuntimeError:
+		if self._transaction_error is None:
+			self._transaction_error = RuntimeError(
+				f"{operation}: mirrored primary/auxiliary host KV operation was "
+				"partially applied; the worker must restart"
+			)
+		logger.critical(
+			"%s; refusing further host KV operations until worker restart",
+			self._transaction_error,
+			exc_info=error,
+		)
+		return self._transaction_error
+
+	@staticmethod
+	def build_host_configs(
+		model_name: str,
+		host_kv_cache_size: int,
+		primary_shm_name: str | None = None,
+		aux_shm_name: str | None = None,
+	) -> Optional[Tuple[Any, Any]]:
+		"""Primary and aux Host-KV configs for a DSA model, or None otherwise.
+
+		The single source of the proportional split: the server's managers, the
+		workers' views and both sides' prefix-cache config must see the same
+		page count.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		)
+		if not is_dsa_model(model_name):
+			return None
+
+		if primary_shm_name is None:
+			primary_shm_name = HOST_KV_SHM_NAME
+		if aux_shm_name is None:
+			aux_shm_name = HOST_KV_AUX_SHM_NAME
+		if not primary_shm_name or not aux_shm_name:
+			raise ValueError("Host KV shared-memory names must be non-empty")
+		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
+			model_name, host_kv_cache_size,
+		)
+		return (
+			_build_host_config_from_profile(primary_profile, primary_shm_name, num_pages),
+			_build_host_config_from_profile(aux_profile, aux_shm_name, num_pages),
+		)
 
 	@classmethod
 	def from_budget(
@@ -161,28 +225,12 @@ class DualHostKVCoordinator:
 
 		Returns DualHostKVCoordinator or None if not a DSA model.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		configs = cls.build_host_configs(
+			model_name, host_kv_cache_size, primary_shm_name, aux_shm_name,
 		)
-		if not is_dsa_model(model_name):
+		if configs is None:
 			return None
-
-		if primary_shm_name is None:
-			primary_shm_name = HOST_KV_SHM_NAME
-		if aux_shm_name is None:
-			aux_shm_name = HOST_KV_AUX_SHM_NAME
-		if not primary_shm_name or not aux_shm_name:
-			raise ValueError("Host KV shared-memory names must be non-empty")
-		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
-			model_name, host_kv_cache_size,
-		)
-
-		primary_config = _build_host_config_from_profile(
-			primary_profile, primary_shm_name, num_pages,
-		)
-		aux_config = _build_host_config_from_profile(
-			aux_profile, aux_shm_name, num_pages,
-		)
+		primary_config, aux_config = configs
 
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVWorkerView")
@@ -197,9 +245,15 @@ class DualHostKVCoordinator:
 		aux_config.memfd_creator_pid = memfd_creator_pid
 		aux_config.memfd_fd = aux_memfd_fd
 
-		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
+		# Select the mapped view when the config carries a logical->physical
+		# layer map (GLM-5.2 aux stores only its 21 indexer layers); the mapped
+		# view translates engine layer ids inside every API, so callers keep
+		# logical indexing.
+		from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_worker_view
+
+		primary_view = build_host_kv_worker_view(core_engine_module, primary_config)
 		try:
-			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
+			aux_view = build_host_kv_worker_view(core_engine_module, aux_config)
 		except RuntimeError as e:
 			raise RuntimeError(
 				"Cannot create auxiliary KV worker view for DSA model; "
@@ -210,7 +264,7 @@ class DualHostKVCoordinator:
 		logger.info(
 			"DualHostKVCoordinator created: %d pages, "
 			"primary k_dim=%d, aux k_dim=%d",
-			num_pages, primary_profile.k_head_dim, aux_profile.k_head_dim,
+			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
 		)
 		return coordinator
 
@@ -227,35 +281,27 @@ class DualHostKVCoordinator:
 
 		Returns (primary_manager, aux_manager) or None if not DSA.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import (
-			is_dsa_model, HOST_KV_SHM_NAME, HOST_KV_AUX_SHM_NAME,
+		configs = cls.build_host_configs(
+			model_name, host_kv_cache_size, primary_shm_name, aux_shm_name,
 		)
-		if not is_dsa_model(model_name):
+		if configs is None:
 			return None
-
-		if primary_shm_name is None:
-			primary_shm_name = HOST_KV_SHM_NAME
-		if aux_shm_name is None:
-			aux_shm_name = HOST_KV_AUX_SHM_NAME
-		if not primary_shm_name or not aux_shm_name:
-			raise ValueError("Host KV shared-memory names must be non-empty")
-		primary_profile, aux_profile, num_pages = _compute_dual_page_count(
-			model_name, host_kv_cache_size,
-		)
-
-		primary_config = _build_host_config_from_profile(
-			primary_profile, primary_shm_name, num_pages,
-		)
-		aux_config = _build_host_config_from_profile(
-			aux_profile, aux_shm_name, num_pages,
-		)
+		primary_config, aux_config = configs
 
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
 		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
 
-		primary_config.enable_thp = enable_thp
-		aux_config.enable_thp = enable_thp
+		# Older prebuilt core_engine wheels do not expose the optional THP
+		# attribute. Keep the default (disabled) path compatible while still
+		# failing explicitly if fast-init was requested without a matching ABI.
+		if hasattr(primary_config, "enable_thp"):
+			primary_config.enable_thp = enable_thp
+			aux_config.enable_thp = enable_thp
+		elif enable_thp:
+			raise RuntimeError(
+				"fast-init requires a core_engine build with HostPagedKVConfig.enable_thp"
+			)
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)
@@ -271,7 +317,7 @@ class DualHostKVCoordinator:
 		logger.info(
 			"DualHostKVCoordinator managers created: %d pages, "
 			"primary k_dim=%d, aux k_dim=%d",
-			num_pages, primary_profile.k_head_dim, aux_profile.k_head_dim,
+			primary_config.num_pages, primary_config.k_head_dim, aux_config.k_head_dim,
 		)
 		return primary_mgr, aux_mgr
 
@@ -285,6 +331,15 @@ class DualHostKVCoordinator:
 		if self.auxiliary is None:
 			raise RuntimeError(f"{context}: auxiliary host KV is required for DSA")
 		return self.auxiliary
+
+	def views_by_group(self) -> dict:
+		"""The prefix-cache KV group of each region: 0 MLA latent, 1 indexer keys.
+
+		Same order as ``build_host_configs()``, which the prefix-cache group
+		specs are derived from, so a caller holding a group id can reach the
+		exact region that stores that group's pages.
+		"""
+		return {0: self.primary, 1: self.require_auxiliary("views_by_group")}
 
 	# -- Sequence management (mirrored) --
 
@@ -301,6 +356,12 @@ class DualHostKVCoordinator:
 					list(sequence_ids)[:10],
 				)
 			raise
+
+	def set_sequence_pages(self, sequence_id, page_ids) -> None:
+		self.primary.set_sequence_pages(sequence_id, page_ids)
+		self.require_auxiliary("set_sequence_pages").set_sequence_pages(
+			sequence_id, page_ids
+		)
 
 	def allocate_pages_for_sequences(self, seq_token_pairs) -> None:
 		seq_token_pairs = list(seq_token_pairs)
@@ -319,6 +380,7 @@ class DualHostKVCoordinator:
 			raise
 
 	def grow_pages_for_sequences(self, seq_page_pairs) -> None:
+		self._ensure_transaction_healthy("grow_pages_for_sequences")
 		seq_page_pairs = list(seq_page_pairs)
 		needed = sum(int(pages) for _, pages in seq_page_pairs)
 		primary_stats = self.primary.get_stats()
@@ -331,7 +393,15 @@ class DualHostKVCoordinator:
 				f"aux_free={aux_stats.num_free_pages}"
 			)
 		self.primary.grow_pages_for_sequences(seq_page_pairs)
-		aux.grow_pages_for_sequences(seq_page_pairs)
+		try:
+			aux.grow_pages_for_sequences(seq_page_pairs)
+		except Exception as error:
+			# Native host views expose no safe page-level compensation.  Do not
+			# release the sequence (that would discard its existing pages); poison
+			# this coordinator and force a worker restart instead.
+			raise self._poison_after_partial_operation(
+				"grow_pages_for_sequences", error
+			) from error
 
 	def release_sequence_pages(self, sequence_ids) -> None:
 		self.primary.release_sequence_pages(sequence_ids)

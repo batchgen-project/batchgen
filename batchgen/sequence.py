@@ -69,6 +69,8 @@ class SequenceEntry:
         'status', 'decoded_length', 'current_context_length',
         'input_ids', 'decoded_tokens',
         'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
+        # Prefix-grouped admission order (packing_v2); unset means global_idx.
+        'prefill_order',
         # Decode-side DP-group (M2b): 0..num_dp-1, the group of G ranks that
         # owns this sequence in DP-(world/G) x TP-G decode. None until the
         # prefill->decode transition assigns it; unused (stays None) for the
@@ -81,6 +83,7 @@ class SequenceEntry:
         # Dynamic host KV reservation tracking
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
+        'host_owned_pages',      # Pages in this sequence's own Host chain (what release frees)
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -159,6 +162,7 @@ class SequenceEntry:
         # Dynamic host KV reservation: starts at 0, set by worker at prefill time
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
+        self.host_owned_pages: int = 0
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None
@@ -197,9 +201,10 @@ class SequenceEntry:
         so ``kv_token_budget == original_prompt_length + original_max_decode_length``
         keeps holding on every rank.
         """
-        max_decode = min(self.original_max_decode_length, context_len - prompt_len)
+        max_decode = max(0, min(self.original_max_decode_length, context_len - prompt_len))
         self.max_decode_length = max_decode
         self.original_max_decode_length = max_decode
+        self.kv_token_budget = prompt_len + max_decode
         return prompt_len + max_decode
 
     def log_event(self, event: int, rank: int, detail: str = "") -> None:
@@ -237,8 +242,20 @@ class SequenceEntry:
             f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
         )
 
-    def validate_metadata(self, context: str, require_owner_tensors: bool = True) -> None:
-        """Reject inconsistent per-sequence metadata at module boundaries."""
+    def validate_metadata(
+        self,
+        context: str,
+        require_owner_tensors: bool = True,
+        allow_terminal_capacity_gap: bool = False,
+    ) -> None:
+        """Reject inconsistent per-sequence metadata at module boundaries.
+
+        A sampled EOS/length-capped token can advance the logical context by
+        one after the last KV row has been written.  Boundary code releases
+        that sequence before another forward, so it may validate the scalar
+        state while allowing only this terminal host/GPU capacity gap.  All
+        structural invariants and positive allocation checks remain strict.
+        """
         prefix = f"{context}: sequence {self.uuid} gid={self.global_idx}"
 
         def require(condition: bool, message: str) -> None:
@@ -289,6 +306,10 @@ class SequenceEntry:
         )
 
         require(self.host_pages_allocated >= 0, f"host_pages_allocated must be non-negative, got {self.host_pages_allocated}")
+        require(
+            0 <= self.host_owned_pages <= self.host_pages_allocated,
+            f"host_owned_pages={self.host_owned_pages} must be within [0, host_pages_allocated={self.host_pages_allocated}]",
+        )
         require(self.host_token_capacity >= 0, f"host_token_capacity must be non-negative, got {self.host_token_capacity}")
         require(self.gpu_pages_allocated >= 0, f"gpu_pages_allocated must be non-negative, got {self.gpu_pages_allocated}")
         if self.host_pages_allocated:
@@ -304,29 +325,49 @@ class SequenceEntry:
             SequenceStatus.IN_DECODE,
             SequenceStatus.ON_HOLD,
         }
+        terminal_capacity_gap = (
+            allow_terminal_capacity_gap
+            and self.status in {SequenceStatus.PREFILLED, SequenceStatus.IN_DECODE}
+            and (
+                self.eos_reached
+                or self.decoded_length >= self.max_decode_length
+                or getattr(self, "_rep_detected", False)
+            )
+        )
         if self.status in host_required_statuses:
             require(self.assigned_rank is not None, f"{self.status.name} requires assigned_rank")
             require(self.host_pages_allocated > 0, f"{self.status.name} requires host_pages_allocated > 0")
-            require(
-                self.host_token_capacity >= self.current_context_length,
-                f"host_token_capacity={self.host_token_capacity} is smaller than current_context_length={self.current_context_length}",
-            )
+            if not terminal_capacity_gap:
+                require(
+                    self.host_token_capacity >= self.current_context_length,
+                    f"host_token_capacity={self.host_token_capacity} is smaller than current_context_length={self.current_context_length}",
+                )
 
         if self.status == SequenceStatus.IN_DECODE:
             require(self.gpu_pages_allocated > 0, "IN_DECODE requires gpu_pages_allocated > 0")
-            require(
-                self.gpu_pages_allocated * self.PAGE_SIZE >= self.current_context_length,
-                f"gpu allocation tokens={self.gpu_pages_allocated * self.PAGE_SIZE} "
-                f"is smaller than current_context_length={self.current_context_length}",
-            )
+            if not terminal_capacity_gap:
+                require(
+                    self.gpu_pages_allocated * self.PAGE_SIZE >= self.current_context_length,
+                    f"gpu allocation tokens={self.gpu_pages_allocated * self.PAGE_SIZE} "
+                    f"is smaller than current_context_length={self.current_context_length}",
+                )
         elif self.status == SequenceStatus.ON_HOLD:
             require(self.gpu_pages_allocated == 0, f"ON_HOLD requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
         elif self.status == SequenceStatus.EVICTED:
             require(self.assigned_rank is not None, "EVICTED requires assigned_rank for deterministic re-entry")
             require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
             require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
+            require(self.host_owned_pages == 0, f"EVICTED requires host_owned_pages=0, got {self.host_owned_pages}")
             if require_owner_tensors:
-                require(self.evicted_token_ids is not None, "EVICTED owner requires evicted_token_ids")
+                # Unified QueryBook keeps the trajectory in its fixed token
+                # pages and deliberately clears the legacy dense handoff tensor.
+                # Retain the old requirement for callers that still use the
+                # owner-local eviction tensor.
+                if self.evicted_token_ids is None:
+                    require(
+                        self._buffer_slot >= 0 and self.input_ids is None,
+                        "EVICTED owner requires evicted_token_ids or a unified trajectory slot",
+                    )
             else:
                 require(
                     self.evicted_token_ids is None,
@@ -515,7 +556,10 @@ class SequenceEntry:
         """
         if self.host_token_capacity <= 0:
             return False
-        # Trigger growth when within one extension buffer of capacity
+        # Trigger growth when within one extension buffer of capacity.  The
+        # caller's effective chunk is also the decode-boundary lookahead, so
+        # the boundary planner reserves enough pages for the whole interval
+        # rather than relying on a post-sample emergency allocation.
         runway = self.host_token_capacity - self.current_context_length
         threshold = EXTENSION_GPU_PAGE_BUFFER * self.PAGE_SIZE
         return runway <= threshold
@@ -596,7 +640,7 @@ class SequenceEntry:
 
 
 class SequenceBatch:
-    __slots__ = ('sequences', '_status_index', '_rank_index')
+    __slots__ = ('sequences', '_status_index', '_rank_index', '_gid_index')
 
     def __init__(self):
         self.sequences: Dict[str, SequenceEntry] = {}
@@ -604,6 +648,13 @@ class SequenceBatch:
             status: set() for status in SequenceStatus
         }
         self._rank_index: Dict[int, Set[str]] = {}
+        # Third maintained index: global_idx -> entry. ``global_idx`` is
+        # assigned once in SequenceEntry.__init__ and never reassigned, so the
+        # only events that can change this mapping are the membership changes
+        # below. Decode resolves host-KV append metadata by global_idx every
+        # step; without this index that call site rebuilt the whole mapping
+        # per step.
+        self._gid_index: Dict[int, SequenceEntry] = {}
 
     def add_sequence(self, sequence: SequenceEntry) -> None:
         # Handle UUID collision: if a sequence with this uuid already exists,
@@ -618,12 +669,21 @@ class SequenceBatch:
             if (existing.assigned_rank is not None
                     and existing.assigned_rank in self._rank_index):
                 self._rank_index[existing.assigned_rank].discard(sequence.uuid)
+            # The replaced entry may have carried a different global_idx; drop
+            # its gid slot so no index entry outlives its sequence.
+            if self._gid_index.get(existing.global_idx) is existing:
+                del self._gid_index[existing.global_idx]
         self.sequences[sequence.uuid] = sequence
         self._status_index[sequence.status].add(sequence.uuid)
         if sequence.assigned_rank is not None:
             if sequence.assigned_rank not in self._rank_index:
                 self._rank_index[sequence.assigned_rank] = set()
             self._rank_index[sequence.assigned_rank].add(sequence.uuid)
+        # Admission reuses a gid only after its previous owner was removed, so
+        # a live collision is not expected here. Overwriting keeps the same
+        # resolution a dict comprehension over ``self.sequences`` would give
+        # (last writer wins) instead of inventing a new failure mode.
+        self._gid_index[sequence.global_idx] = sequence
 
     def remove_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         """Remove a sequence from the batch and all indices."""
@@ -632,10 +692,18 @@ class SequenceBatch:
             self._status_index[seq.status].discard(uuid)
             if seq.assigned_rank is not None and seq.assigned_rank in self._rank_index:
                 self._rank_index[seq.assigned_rank].discard(uuid)
+            # Delete only while the gid still resolves to this entry: a later
+            # add_sequence may already have taken the slot.
+            if self._gid_index.get(seq.global_idx) is seq:
+                del self._gid_index[seq.global_idx]
         return seq
 
     def get_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         return self.sequences.get(uuid, None)
+
+    def get_sequence_by_global_idx(self, global_idx: int) -> Optional[SequenceEntry]:
+        """Resolve a sequence by its immutable ``global_idx``."""
+        return self._gid_index.get(global_idx, None)
 
     def update_status(self, uuid: str, new_status: SequenceStatus) -> None:
         if uuid not in self.sequences:
@@ -717,6 +785,7 @@ class SequenceBatch:
                 seq = self.sequences[uuid]
                 view.sequences[uuid] = seq
                 view._status_index[seq.status].add(uuid)
+                view._gid_index[seq.global_idx] = seq
                 if seq.assigned_rank is not None:
                     if seq.assigned_rank not in view._rank_index:
                         view._rank_index[seq.assigned_rank] = set()

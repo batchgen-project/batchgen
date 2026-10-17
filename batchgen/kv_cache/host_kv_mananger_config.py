@@ -147,6 +147,31 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GLM-5.2 runs the DSA indexer on 21 of 78 layers ([0, 1, 2] + range(6, 78, 4),
+# i.e. index_topk_freq=4 / index_skip_topk_offset=3 — see
+# batchgen/models/glm/glm5/dsa_schedule.py); the other 57 skip_topk layers
+# reuse the previous full layer's top-k and never read the aux K cache. Store
+# only the 21 indexer layers densely in both host and GPU aux pools; the
+# logical map keeps engine-layer indexing at every caller (-1 = no slot).
+_GLM5_2_INDEXER_LOGICAL_LAYERS = (0, 1, 2) + tuple(range(6, 78, 4))
+_GLM5_2_INDEXER_PHYSICAL_BY_LOGICAL = {
+	logical_layer: physical_layer
+	for physical_layer, logical_layer in enumerate(_GLM5_2_INDEXER_LOGICAL_LAYERS)
+}
+_GLM5_2_INDEXER_LAYER_MAP = tuple(
+	_GLM5_2_INDEXER_PHYSICAL_BY_LOGICAL.get(layer_idx, -1)
+	for layer_idx in range(78)
+)
+_GLM5_2_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=len(_GLM5_2_INDEXER_LOGICAL_LAYERS),
+	num_k_heads=1,
+	k_head_dim=128,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+	logical_to_physical_layer=_GLM5_2_INDEXER_LAYER_MAP,
+)
+
 # Kimi-K3 has 93 logical engine layers but only these 24 MLA layers own paged
 # KV.  The logical map preserves engine-layer indexing at every caller while
 # both host and GPU pools store the MLA layers densely.  Host->GPU bulk loads
@@ -190,6 +215,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 	"glm5_mla": _GLM5_MLA_PROFILE,
 	"glm5_indexer": _GLM5_INDEXER_PROFILE,
+	"glm5_2_indexer": _GLM5_2_INDEXER_PROFILE,
 	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
 	"kimi_k3_mla": _KIMI_K3_MLA_PROFILE,
 }
@@ -280,11 +306,16 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
 	),
-	"glm5_indexer": (
+	# GLM-5.2 stores only its 21 indexer layers (dense mapped profile).
+	# GLM-5.3's skip-layer schedule is not established here; it stays on the
+	# full 78-layer profile with GLM-5/5.1.
+	"glm5_2_indexer": (
 		"zai-org/glm-5.2-fp8",
 		"zai-org/glm-5.2",
 		"glm-5.2-fp8",
 		"glm-5.2",
+	),
+	"glm5_indexer": (
 		"zai-org/glm-5.3-fp8",
 		"zai-org/glm-5.3",
 		"glm-5.3-fp8",

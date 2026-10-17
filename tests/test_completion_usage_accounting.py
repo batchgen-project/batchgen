@@ -8,6 +8,28 @@ from batchgen.batchgen_worker import BatchGenWorker
 from batchgen.sequence import SequenceEntry, SequenceStatus
 
 
+class _TrajectoryBook:
+    """Completion-path view of the unified trajectory book."""
+
+    def __init__(self, generated=None):
+        self._generated = dict(generated or {})
+        self._slots = {uuid: slot for slot, uuid in enumerate(self._generated)}
+        self.released = []
+
+    def has_sequence(self, uuid):
+        return uuid in self._slots
+
+    def slot_for(self, uuid):
+        return self._slots[uuid]
+
+    def generated_tokens(self, slot):
+        uuid = next(u for u, s in self._slots.items() if s == slot)
+        return torch.tensor(self._generated[uuid], dtype=torch.int32)
+
+    def release(self, slot):
+        self.released.append(slot)
+
+
 def test_report_completion_keeps_original_prompt_length_after_reentry():
     seq = SequenceEntry(
         "reentered",
@@ -29,6 +51,8 @@ def test_report_completion_keeps_original_prompt_length_after_reentry():
         rank=0,
         _response_queue=response_queue,
         _get_finish_reason=lambda _seq: "stop",
+        _trajectory_book=_TrajectoryBook(),
+        _publish_trajectory_pool_capacity=lambda: None,
     )
 
     BatchGenWorker._report_completion(worker, seq.uuid, gathered_text="answer")
@@ -56,9 +80,8 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
     worker = object.__new__(BatchGenWorker)
     worker._uuid_to_local_map = {seq.uuid: 0}
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
-    worker.query_book = {
-        0: SimpleNamespace(decoded_tokens=torch.tensor([[42, 154827]]))
-    }
+    worker.query_book = {0: SimpleNamespace()}
+    worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
     worker.world_size = 1
     worker.eos_token_ids = {154820, 154827, 154829}
     worker.pad_token_id = 154820
@@ -80,7 +103,6 @@ def test_report_completion_fallback_applies_stop_token_trimming():
         prompt_length=10,
         max_decode_length=32,
     )
-    seq.decoded_tokens = torch.tensor([[42, 154827]])
     seq.decoded_length = 2
     seq.status = SequenceStatus.COMPLETED
 
@@ -103,7 +125,11 @@ def test_report_completion_fallback_applies_stop_token_trimming():
     worker.detokenization_include_special_tokens = False
     worker.tokenizer = Tokenizer()
     worker._get_finish_reason = lambda _seq: "stop"
+    worker._trajectory_book = _TrajectoryBook({seq.uuid: [42, 154827]})
+    worker._publish_trajectory_pool_capacity = lambda: None
 
     worker._report_completion(seq.uuid)
 
     assert worker._response_queue.get()["text"] == "answer"
+    # Completion is the single release point of the trajectory reservation.
+    assert worker._trajectory_book.released == [0]

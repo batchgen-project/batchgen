@@ -6,9 +6,14 @@ boundary:
 
     q_a, q_nope/q_rope, auxiliary indexer pages, primary MLA pages
       -> fused indexer score/top-k
-      -> BF16 selected-KV gather
-      -> FlashMLA dense decode over selected pages
+      -> selected logical-to-physical token transform
+      -> FA3 over a page-size-1 view of the resident KV (no copy)
       -> q/out absorb
+
+``Glm5FullDsaAttnSegment`` additionally specializes an ``all_short`` graph
+lifetime: when every admissible row's KV budget fits in ``index_topk`` the
+whole indexer scoring chain and the transform are skipped and FA3 reads the
+resident page-size-``page_size`` cache directly.
 
 It deliberately does not change the default GLM-5 decode path.  Callers must
 explicitly construct and register this segment, and unsupported production
@@ -17,10 +22,18 @@ preconditions should fast-fail before replay rather than silently falling back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+
+from dataclasses import dataclass, fields
 from typing import Dict, Optional
 
 import torch
+
+try:
+    from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
+except ImportError:  # pragma: no cover - resolved by the node's FA3 install
+    _fa3_with_kvcache = None
+
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -50,7 +63,11 @@ from batchgen_kernels.attention.dsa.fused_indexer_score import (
 )
 from batchgen_kernels.attention.dsa.head_gates import head_gates_out
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
+from batchgen_kernels.attention.dsa.selected_page_table import (
+    transform_selected_positions_out,
+)
 from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
+from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
 
 
 @dataclass
@@ -87,7 +104,9 @@ class _Glm5FullDsaSegmentBuffers:
     safe_primary_slot_indices: torch.Tensor
     safe_aux_slot_indices: torch.Tensor
     safe_cache_seqlens: torch.Tensor
+    qkv_a: torch.Tensor
     q_a: torch.Tensor
+    q_a_normed: torch.Tensor
     q_flat: torch.Tensor
     q_nope: torch.Tensor
     q_rope_4d: torch.Tensor
@@ -105,13 +124,13 @@ class _Glm5FullDsaSegmentBuffers:
     positions_expanded: torch.Tensor
     agg_scores: torch.Tensor
     top_k_indices: torch.Tensor
-    selected_mla_kv: torch.Tensor
+    # Physical page-size-1 token IDs consumed as the FA3 ``page_table``; the
+    # BF16 selected-KV slab (``selected_mla_kv``) and the FlashMLA query pack
+    # (``query_states`` / ``prepared_flashmla``) are gone with the gather.
+    selected_token_ids: torch.Tensor
     selected_lengths: torch.Tensor
-    row_modes: torch.Tensor
     absorbed_q: torch.Tensor
-    query_states: torch.Tensor
     attn_heads: torch.Tensor
-    prepared_flashmla: object
 
 
 @dataclass
@@ -119,6 +138,73 @@ class _Glm5FullDsaSegmentOutputs:
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor
     attn_output: torch.Tensor
+
+
+# Static-buffer footprint: capture runs largest-first, so the full per-row
+# buffer set is allocated once for the largest bucket and every smaller bucket
+# is a leading-dim slice view of that base. Views are safe because exactly one
+# bucket's graph replays per step and every non-constant field is fully
+# rewritten (out=/copy_) for rows [0, bucket) before it is read within that
+# replay; constant fields are never written. One field class cannot be
+# views and is rebuilt per bucket:
+#   - FP8 activation scratch: its TMA descriptor bakes pointer + global rows.
+# (The former ``prepared_flashmla`` rebuild is gone with the FlashMLA call:
+# FA3 takes its inputs directly, so nothing bakes shapes at setup time.)
+_GLM5_DSA_REBUILT_FIELDS = frozenset({
+    "indexer_k_x_fp8",
+    "indexer_k_x_scale",
+    "indexer_k_tma_desc",
+    "q_x_fp8",
+    "q_x_scale",
+    "q_tma_desc",
+})
+_GLM5_DSA_VIEW_FIELDS = frozenset({
+    "valid_mask",
+    "aux_valid_mask",
+    "row_indices",
+    "valid_rows_bf16",
+    "valid_rows_ones",
+    "valid_rows_zeros",
+    "safe_slot_zeros",
+    "skip_slot_neg_ones",
+    "safe_seqlen_zeros",
+    "kv_primary_slot_indices",
+    "kv_aux_slot_indices",
+    "safe_primary_slot_indices",
+    "safe_aux_slot_indices",
+    "safe_cache_seqlens",
+    "qkv_a",
+    "q_a",
+    "q_a_normed",
+    "q_flat",
+    "q_nope",
+    "q_rope_4d",
+    "new_compressed_kv",
+    "indexer_k_raw",
+    "q_flat_indexer",
+    "q_index",
+    "head_gates",
+    "positions_expanded",
+    "agg_scores",
+    "top_k_indices",
+    "selected_token_ids",
+    "selected_lengths",
+    "absorbed_q",
+    "attn_heads",
+})
+
+# Fail loudly at import time if the dataclass gains a field this split does
+# not name: an unclassified field would silently become a stale full-size
+# allocation or, worse, a wrongly-shaped view.
+_split_delta = (
+    set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
+    ^ (_GLM5_DSA_VIEW_FIELDS | _GLM5_DSA_REBUILT_FIELDS)
+)
+if _split_delta:
+    raise AssertionError(
+        f"_Glm5FullDsaSegmentBuffers fields not covered by (or extraneous in) "
+        f"the view/rebuild split: {sorted(_split_delta)}"
+    )
 
 
 class Glm5DsaAttnSegment:
@@ -558,6 +644,7 @@ class Glm5FullDsaAttnSegment:
         index_topk: int = 2048,
         page_size: int = 64,
         aux_page_size: int | None = None,
+        all_short: bool = False,
         shared_buffers: Optional[Dict[int, _Glm5FullDsaSegmentBuffers]] = None,
     ) -> None:
         self.wrapper = wrapper
@@ -576,10 +663,15 @@ class Glm5FullDsaAttnSegment:
         self.index_topk = int(index_topk)
         self.page_size = int(page_size)
         self.aux_page_size = int(aux_page_size if aux_page_size is not None else page_size)
+        # Graph-lifetime specialization: True only when every admissible row's
+        # page-aligned KV budget is <= index_topk for the whole lifetime of
+        # this capture, so no row can ever need top-k selection. Decided by
+        # the caller (worker) per bucket; default False keeps the general
+        # transform + page-size-1 FA3 path, which covers every row.
+        self.all_short = bool(all_short)
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
-        self._flashmla_metadata_specs: Dict[int, tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]] = {}
 
         if self.primary_blocked_k.ndim != 4 or self.primary_blocked_k.shape[2] != 1:
             raise ValueError(
@@ -601,40 +693,76 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
         if self.aux_blocked_k.shape[3] != self.attn.indexer.index_head_dim:
             raise ValueError("aux_blocked_k last dimension does not match GLM-5 indexer K")
+        if _fa3_with_kvcache is None:
+            raise RuntimeError(
+                "GLM-5 DSA graph requires flash_attn_interface "
+                "(FlashAttention-3): flash_attn_with_kvcache is unavailable"
+            )
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
 
-    def _flashmla_tensor_metadata_specs(
+    def _run_all_short_fa3(
         self,
-        bucket_size: int,
-    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
-        cached = self._flashmla_metadata_specs.get(bucket_size)
-        if cached is not None:
-            return cached
-        lengths = torch.full(
-            (bucket_size,),
-            self._padding_selected_length(),
-            dtype=torch.int32,
-            device=self.primary_blocked_k.device,
+        buffers: _Glm5FullDsaSegmentBuffers,
+    ) -> torch.Tensor:
+        """Dense MLA decode straight over the resident page-size-N KV.
+
+        Valid only for an ``all_short`` graph: every row attends to its whole
+        context, so no selection is needed and the page table / slot indices
+        of the real cache are used as-is (no copy, no top-k).
+        """
+        if _fa3_with_kvcache is None:
+            raise RuntimeError("FlashAttention-3 is unavailable")
+        attn = self.attn
+        return _fa3_with_kvcache(
+            q=buffers.q_rope_4d.squeeze(2).unsqueeze(1),
+            k_cache=self.primary_blocked_k[..., attn.kv_lora_rank :],
+            v_cache=self.primary_blocked_k[..., : attn.kv_lora_rank],
+            qv=buffers.absorbed_q.unsqueeze(1),
+            page_table=self.primary_page_table,
+            cache_batch_idx=buffers.safe_primary_slot_indices,
+            cache_seqlens=buffers.safe_cache_seqlens,
+            softmax_scale=float(attn.softmax_scale),
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=False,
         )
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            lengths,
-            self.attn.num_heads,
+
+    def _run_selected_fa3(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+    ) -> torch.Tensor:
+        """Sparse MLA decode over the selected PHYSICAL token IDs.
+
+        The KV cache is re-viewed at page size 1 so the per-row selected
+        token IDs act directly as the FA3 page table: the selected KV is
+        never materialized. ``cache_batch_idx`` is intentionally absent —
+        the token IDs are already absolute, so there is no slot indirection.
+        """
+        if _fa3_with_kvcache is None:
+            raise RuntimeError("FlashAttention-3 is unavailable")
+        attn = self.attn
+        flat_kv = self.primary_blocked_k.view(
+            -1,
+            1,
+            1,
+            self.primary_blocked_k.shape[-1],
         )
-        spec = (
-            tuple(tile_scheduler_metadata.shape),
-            tile_scheduler_metadata.dtype,
-            tuple(num_splits.shape),
-            num_splits.dtype,
+        return _fa3_with_kvcache(
+            q=buffers.q_rope_4d.squeeze(2).unsqueeze(1),
+            k_cache=flat_kv[..., attn.kv_lora_rank :],
+            v_cache=flat_kv[..., : attn.kv_lora_rank],
+            qv=buffers.absorbed_q.unsqueeze(1),
+            page_table=buffers.selected_token_ids,
+            cache_seqlens=buffers.selected_lengths,
+            softmax_scale=float(attn.softmax_scale),
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=False,
         )
-        self._flashmla_metadata_specs[bucket_size] = spec
-        return spec
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
-            self._flashmla_tensor_metadata_specs(bucket_size)
-        )
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.attn.hidden_size),
@@ -653,8 +781,6 @@ class Glm5FullDsaAttnSegment:
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
-            "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
-            "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -677,6 +803,27 @@ class Glm5FullDsaAttnSegment:
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
+        if self._buffers and bucket_size < max(self._buffers):
+            # A larger base set already exists (capture runs largest-first, so
+            # the first captured bucket allocated the full set): build this
+            # bucket as leading-dim slice views plus the per-bucket rebuilt
+            # fields.
+            self._buffers[bucket_size] = self._make_bucket_view_buffers(bucket_size)
+            self._setup_static_output_buffers(bucket_size)
+            return
+        if self._buffers:
+            # A bucket larger than the current base: allocate a fresh full set
+            # (already-captured graphs keep their baked pointers). Correct but
+            # forfeits the max-bucket-view footprint for the existing sets —
+            # the production capture path is largest-first, so reaching this
+            # means the capture order regressed.
+            logging.warning(
+                "GLM-5 DSA statics: bucket %d requested after smaller base %d; "
+                "allocating a full set (largest-first capture restores the "
+                "max-bucket-view footprint)",
+                bucket_size,
+                max(self._buffers),
+            )
         device = self.primary_blocked_k.device
         attn = self.attn
         indexer = attn.indexer
@@ -696,32 +843,19 @@ class Glm5FullDsaAttnSegment:
             device=device,
         )
 
-        selected_mla_kv = torch.empty(
+        selected_token_ids = torch.empty(
             bucket_size,
             self.index_topk,
-            1,
-            kv_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.int32,
             device=device,
         )
         selected_lengths = torch.empty(bucket_size, dtype=torch.int32, device=device)
         selected_lengths.fill_(self._padding_selected_length())
-        query_states = torch.empty(
+        qkv_a = torch.empty(
             bucket_size,
-            1,
-            attn.num_heads,
-            kv_dim,
+            attn.q_lora_rank + kv_dim,
             dtype=torch.bfloat16,
             device=device,
-        )
-        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
-            query_states,
-            selected_mla_kv,
-            selected_lengths,
-            attn.num_heads,
-            float(attn.softmax_scale),
-            head_dim_v=attn.kv_lora_rank,
-            page_size=self.page_size,
         )
         self._buffers[bucket_size] = _Glm5FullDsaSegmentBuffers(
             valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
@@ -738,7 +872,14 @@ class Glm5FullDsaAttnSegment:
             safe_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_aux_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_cache_seqlens=torch.empty(bucket_size, dtype=torch.int32, device=device),
-            q_a=torch.empty(bucket_size, attn.q_lora_rank, dtype=torch.bfloat16, device=device),
+            qkv_a=qkv_a,
+            q_a=qkv_a[:, : attn.q_lora_rank],
+            q_a_normed=torch.empty(
+                bucket_size,
+                attn.q_lora_rank,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
             q_flat=torch.empty(
                 bucket_size,
                 attn.num_heads * attn.q_head_dim,
@@ -760,7 +901,9 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            new_compressed_kv=torch.empty(bucket_size, 1, kv_dim, dtype=torch.bfloat16, device=device),
+            new_compressed_kv=qkv_a[:, attn.q_lora_rank :].view(
+                bucket_size, 1, kv_dim
+            ),
             indexer_k_raw=torch.empty(bucket_size, index_dim, dtype=torch.bfloat16, device=device),
             indexer_k_x_fp8=indexer_k_x_fp8,
             indexer_k_x_scale=indexer_k_x_scale,
@@ -785,9 +928,8 @@ class Glm5FullDsaAttnSegment:
             positions_expanded=torch.empty(bucket_size, indexer.index_n_heads, dtype=torch.int64, device=device),
             agg_scores=torch.empty(bucket_size, self.max_seqlen, dtype=torch.float32, device=device),
             top_k_indices=torch.empty(bucket_size, self.index_topk, dtype=torch.int32, device=device),
-            selected_mla_kv=selected_mla_kv,
+            selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
-            row_modes=torch.empty(bucket_size, dtype=torch.int32, device=device),
             absorbed_q=torch.empty(
                 bucket_size,
                 attn.num_heads,
@@ -795,7 +937,6 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            query_states=query_states,
             attn_heads=torch.empty(
                 bucket_size,
                 1,
@@ -804,12 +945,53 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            prepared_flashmla=prepared_flashmla,
         )
         self._setup_static_output_buffers(bucket_size)
 
+    def _base_bucket(self) -> int:
+        return max(self._buffers)
+
+    def _make_bucket_view_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
+        base_bucket = self._base_bucket()
+        base = self._buffers[base_bucket]
+        attn = self.attn
+        view_kwargs = {
+            name: getattr(base, name)[:bucket_size] for name in _GLM5_DSA_VIEW_FIELDS
+        }
+        # FP8 activation scratch TMA descriptors bake pointer + global rows:
+        # re-encode per bucket (the scratch itself is tiny).
+        indexer_k_x_fp8, indexer_k_x_scale, indexer_k_tma_desc = make_fp8_activation_scratch(
+            bucket_size,
+            attn.hidden_size,
+            self.cuda_module,
+            device=self.primary_blocked_k.device,
+        )
+        q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
+            bucket_size,
+            attn.q_lora_rank,
+            self.cuda_module,
+            device=self.primary_blocked_k.device,
+        )
+        return _Glm5FullDsaSegmentBuffers(
+            indexer_k_x_fp8=indexer_k_x_fp8,
+            indexer_k_x_scale=indexer_k_x_scale,
+            indexer_k_tma_desc=indexer_k_tma_desc,
+            q_x_fp8=q_x_fp8,
+            q_x_scale=q_x_scale,
+            q_tma_desc=q_tma_desc,
+            **view_kwargs,
+        )
+
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._outputs:
+            return
+        if self._outputs and bucket_size < max(self._outputs):
+            base = self._outputs[max(self._outputs)]
+            self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+                primary_k_tensor=base.primary_k_tensor[:bucket_size],
+                indexer_k_tensor=base.indexer_k_tensor[:bucket_size],
+                attn_output=base.attn_output[:bucket_size],
+            )
             return
         device = self.primary_blocked_k.device
         attn = self.attn
@@ -837,27 +1019,13 @@ class Glm5FullDsaAttnSegment:
         static_inputs["cache_seqlens"].zero_()
         static_inputs["primary_slot_indices"].fill_(-1)
         static_inputs["aux_slot_indices"].fill_(-1)
-        # FlashMLA can illegal-access during graph capture with an all-zero
+        # FA3 can illegal-access during graph capture with an all-zero
         # selected-length schedule. Capture one safe dummy row; replay overwrites
         # this scalar with the real local batch size before graph launch.
         static_inputs["num_valid_tokens"].fill_(1)
         static_inputs["cache_seqlens"][:1].fill_(1)
         static_inputs["primary_slot_indices"][:1].fill_(0)
         static_inputs["aux_slot_indices"][:1].fill_(0)
-        selected_lengths = torch.ones(
-            (bucket_size,),
-            dtype=torch.int32,
-            device=self.primary_blocked_k.device,
-        )
-        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-            selected_lengths,
-            self.attn.num_heads,
-        )
-        static_inputs["flashmla_tile_scheduler_metadata"].copy_(
-            tile_scheduler_metadata,
-            non_blocking=True,
-        )
-        static_inputs["flashmla_num_splits"].copy_(num_splits, non_blocking=True)
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self._buffers.pop(bucket_size, None)
@@ -871,8 +1039,6 @@ class Glm5FullDsaAttnSegment:
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
-        flashmla_tile_scheduler_metadata: torch.Tensor,
-        flashmla_num_splits: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
@@ -931,7 +1097,6 @@ class Glm5FullDsaAttnSegment:
             buffers.valid_rows_zeros,
             out=buffers.valid_rows_bf16,
         )
-        valid_rows_bf16_4d = buffers.valid_rows_bf16.view(batch_size, 1, 1, 1)
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(
@@ -939,17 +1104,33 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
             scale_tma_aligned=num_valid_tokens is not None,
         )
+        fused_qkv_a_weight = getattr(self.wrapper, "_fp8_qkv_a_proj", None)
+        fused_qkv_a_scale = getattr(self.wrapper, "_fp8_qkv_a_scale", None)
+        if fused_qkv_a_weight is None or fused_qkv_a_scale is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 graph requires fused Q-A/KV-A weights"
+            )
         w8a8_deepgemm(
             hidden_fp8,
             hidden_scale,
-            attn.q_a_proj.weight,
-            self.wrapper.weight_dequant_scale["q_a_proj.weight_scale_inv"],
-            out=buffers.q_a,
+            fused_qkv_a_weight,
+            fused_qkv_a_scale,
+            out=buffers.qkv_a,
             num_valid_tokens=num_valid_tokens,
             expected_m=batch_size,
         )
-        buffers.q_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_a_normed = attn.q_a_layernorm(buffers.q_a).contiguous()
+        # Masked DeepGEMM leaves rows >= num_valid_tokens unwritten, so this
+        # buffer carries stale rows. They are not masked here: every consumer
+        # of a masked-GEMM output is row-local (fused_rmsnorm, act_quant, RoPE,
+        # the absorb GEMVs, FA3) and every write to state shared across rows is
+        # already gated on the same row validity -- see the invariant note on
+        # `attn_output`'s mask below, which is the one mask that must stay.
+        q_a_normed = fused_rmsnorm(
+            buffers.q_a,
+            attn.q_a_layernorm.weight,
+            attn.q_a_layernorm.eps,
+            out=buffers.q_a_normed,
+        )
         q_a_fp8, q_a_scale = act_quant(
             q_a_normed,
             num_valid_tokens=num_valid_tokens,
@@ -964,21 +1145,10 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
             expected_m=batch_size,
         )
-        buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
         q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
 
-        w8a8_deepgemm(
-            hidden_fp8,
-            hidden_scale,
-            attn.kv_a_proj_with_mqa.weight,
-            self.wrapper.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-            out=buffers.new_compressed_kv.view(batch_size, -1),
-            num_valid_tokens=num_valid_tokens,
-            expected_m=batch_size,
-        )
-        buffers.new_compressed_kv.mul_(buffers.valid_rows_bf16.view(batch_size, 1, 1))
         offload_kv = _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
@@ -990,7 +1160,18 @@ class Glm5FullDsaAttnSegment:
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
         )
-        outputs.primary_k_tensor.copy_(offload_kv.view(batch_size, 1, 1, -1))
+        # This copy leaves the segment (the whole-model graph stages it for host
+        # KV offload), so it is the one place an invalid row's bytes would
+        # escape. Select instead of copy: a select costs the same single launch,
+        # writes the exact zeros the pre-mask path produced for invalid rows,
+        # and -- unlike a multiply, where bf16 NaN * 0 is NaN -- it cannot carry
+        # a non-finite stale row through.
+        torch.where(
+            buffers.valid_mask.view(batch_size, 1, 1, 1),
+            offload_kv.view(batch_size, 1, 1, -1),
+            buffers.valid_rows_zeros[:1],
+            out=outputs.primary_k_tensor,
+        )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
@@ -1029,62 +1210,48 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
         )
 
-        head_gates_out(
-            hidden_flat,
-            indexer.weights_proj.weight.data,
-            buffers.head_gates,
-            scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.positions_expanded.copy_(
-            position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
-        )
-        cuda_wq_b_proj_out(
-            q_a_normed,
-            self.wq_b_weights,
-            self.cuda_module,
-            buffers.q_x_fp8,
-            buffers.q_x_scale,
-            buffers.q_tma_desc,
-            buffers.q_flat_indexer,
-            num_valid_tokens=num_valid_tokens,
-        )
-        rope_hadamard_q_out(
-            buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),
-            self.cos_table,
-            self.sin_table,
-            buffers.positions_expanded.view(-1),
-            buffers.q_index,
-        )
-        fused_paged_score_and_topk_with_slots_out(
-            buffers.q_index,
-            self.aux_blocked_k,
-            self.aux_page_table,
-            buffers.safe_aux_slot_indices,
-            buffers.head_gates,
-            buffers.safe_cache_seqlens,
-            buffers.agg_scores,
-            buffers.top_k_indices,
-            topk=self.index_topk,
-            page_size=self.aux_page_size,
-            max_seqlen=self.max_seqlen,
-            num_valid_tokens=num_valid_tokens,
-        )
-        select_mla_kv_for_flashmla_bf16_out(
-            self.primary_blocked_k,
-            self.primary_page_table,
-            buffers.safe_cache_seqlens,
-            buffers.top_k_indices,
-            self.page_size,
-            buffers.selected_mla_kv,
-            buffers.selected_lengths,
-            None,
-            buffers.row_modes,
-            index_topk=self.index_topk,
-            return_indices=False,
-            primary_slot_indices=buffers.safe_primary_slot_indices,
-            num_valid_tokens=num_valid_tokens,
-        )
+        if not self.all_short:
+            head_gates_out(
+                hidden_flat,
+                indexer.weights_proj.weight.data,
+                buffers.head_gates,
+                scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
+                num_valid_tokens=num_valid_tokens,
+            )
+            buffers.positions_expanded.copy_(
+                position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
+            )
+            cuda_wq_b_proj_out(
+                q_a_normed,
+                self.wq_b_weights,
+                self.cuda_module,
+                buffers.q_x_fp8,
+                buffers.q_x_scale,
+                buffers.q_tma_desc,
+                buffers.q_flat_indexer,
+                num_valid_tokens=num_valid_tokens,
+            )
+            rope_hadamard_q_out(
+                buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),
+                self.cos_table,
+                self.sin_table,
+                buffers.positions_expanded.view(-1),
+                buffers.q_index,
+            )
+            fused_paged_score_and_topk_with_slots_out(
+                buffers.q_index,
+                self.aux_blocked_k,
+                self.aux_page_table,
+                buffers.safe_aux_slot_indices,
+                buffers.head_gates,
+                buffers.safe_cache_seqlens,
+                buffers.agg_scores,
+                buffers.top_k_indices,
+                topk=self.index_topk,
+                page_size=self.aux_page_size,
+                max_seqlen=self.max_seqlen,
+                num_valid_tokens=num_valid_tokens,
+            )
 
         fp8_q_absorb_out(
             buffers.q_nope,
@@ -1092,25 +1259,26 @@ class Glm5FullDsaAttnSegment:
             buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
-        pack_flashmla_query_out(
-            buffers.absorbed_q,
-            buffers.q_rope_4d.squeeze(2),
-            buffers.query_states,
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.query_states.mul_(valid_rows_bf16_4d)
-        attn_out = run_prepared_sparse_flash_mla_decode(
-            buffers.prepared_flashmla,
-            tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            num_splits=flashmla_num_splits,
-        )
+        if self.all_short:
+            attn_out = self._run_all_short_fa3(buffers)
+        else:
+            transform_selected_positions_out(
+                self.primary_page_table,
+                buffers.safe_cache_seqlens,
+                buffers.top_k_indices,
+                buffers.selected_token_ids,
+                buffers.selected_lengths,
+                page_size=self.page_size,
+                primary_slot_indices=buffers.safe_primary_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            attn_out = self._run_selected_fa3(buffers)
         fp8_out_absorb_out(
             attn_out,
             self.absorb_weights,
             buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
         )
-        buffers.attn_heads.mul_(valid_rows_bf16_4d)
         attn_heads_flat = buffers.attn_heads.reshape(batch_size, attn.num_heads * attn.v_head_dim)
         attn_output_fp8, attn_output_scale = act_quant(
             attn_heads_flat,
@@ -1126,6 +1294,15 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
             expected_m=batch_size,
         )
+        # The one load-bearing row mask in this segment. Everything above is
+        # row-local or already row-gated, but `attn_output` leaves the segment
+        # into the decoder layer's residual add and from there into the MoE
+        # router, whose gate top-k and ragged dispatch DO mix rows: an invalid
+        # row's stale activations would produce stale expert choices and inflate
+        # the per-expert counts. It also covers the rows that are inside
+        # num_valid_tokens but have no cache slot -- the masked GEMMs compute
+        # those rows, so no num_valid_tokens gate zeroes them, and `valid_mask`
+        # is what makes them inert.
         outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 
         return {

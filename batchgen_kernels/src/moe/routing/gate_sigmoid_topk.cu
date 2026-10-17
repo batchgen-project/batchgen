@@ -26,6 +26,17 @@
  * the row, which removes the separate strided FP32->BF16 contiguous copy from
  * the decode graph.  Padding rows write zeros, matching the zero rows the fused
  * GEMM produces for a zero-padded activation.
+ *
+ * Padding shape.  Two mutually exclusive device-resident descriptions of which
+ * rows are live, so one captured graph can replay at different live-row counts
+ * without a host read:
+ *   * ``num_valid_tokens`` — one int32 scalar; rows [valid, N) are padding.
+ *     This is the single-rank layout (K3).
+ *   * ``rank_token_counts`` + ``rows_per_rank`` — the EP all-gathered layout
+ *     (GLM-5): the row space is ``R`` contiguous blocks of ``rows_per_rank``
+ *     rows, and block ``r`` is live only up to ``rank_token_counts[r]``.  The
+ *     live rows are therefore NOT a prefix of N, so a caller that needs this
+ *     shape cannot express it with ``num_valid_tokens``.
  */
 
 #include <torch/extension.h>
@@ -61,10 +72,12 @@ __global__ void gate_sigmoid_topk_kernel(
     int32_t* __restrict__ topk_indices,            // [N, K] output
     float* __restrict__ topk_weights,              // [N, K] output
     const int32_t* __restrict__ num_valid_tokens,  // device scalar, or nullptr for "all N"
+    const int64_t* __restrict__ rank_token_counts, // [R] per-rank live prefix, or nullptr
     __nv_bfloat16* __restrict__ latent_out,        // [N, L] output, or nullptr to skip
     float routed_scaling_factor,
     int N, int E, int logits_stride,
-    int latent_offset, int latent_size
+    int latent_offset, int latent_size,
+    int rows_per_rank
 ) {
     const int token_id = blockIdx.x;
     if (token_id >= N) return;
@@ -77,7 +90,16 @@ __global__ void gate_sigmoid_topk_kernel(
     // Padding rows: the live row count is only known on the device, so the grid
     // always covers the full static bucket.  The whole block takes this branch
     // together, so the early return never straddles a __syncthreads() below.
-    if (num_valid_tokens != nullptr && token_id >= *num_valid_tokens) {
+    // The two descriptions are mutually exclusive (checked by the host wrapper).
+    bool row_is_padding = false;
+    if (num_valid_tokens != nullptr) {
+        row_is_padding = token_id >= *num_valid_tokens;
+    } else if (rank_token_counts != nullptr) {
+        const int rank = token_id / rows_per_rank;
+        const int local_pos = token_id - rank * rows_per_rank;
+        row_is_padding = static_cast<int64_t>(local_pos) >= rank_token_counts[rank];
+    }
+    if (row_is_padding) {
         if (tid == 0) {
             int32_t* out_idx = topk_indices + token_id * K;
             float* out_w = topk_weights + token_id * K;
@@ -197,10 +219,12 @@ void launch_gate_sigmoid_topk(
     int32_t* topk_indices,
     float* topk_weights,
     const int32_t* num_valid_tokens,
+    const int64_t* rank_token_counts,
     __nv_bfloat16* latent_out,
     float routed_scaling_factor,
     int N, int E, int logits_stride,
     int latent_offset, int latent_size,
+    int rows_per_rank,
     cudaStream_t stream
 ) {
     dim3 grid(N);
@@ -209,8 +233,9 @@ void launch_gate_sigmoid_topk(
 #define GST_LAUNCH(KK)                                                       \
     gate_sigmoid_topk_kernel<KK, MAX_E><<<grid, block, 0, stream>>>(          \
         router_logits, e_score_correction, topk_indices, topk_weights,        \
-        num_valid_tokens, latent_out, routed_scaling_factor, N, E,            \
-        logits_stride, latent_offset, latent_size)
+        num_valid_tokens, rank_token_counts, latent_out,                      \
+        routed_scaling_factor, N, E,                                          \
+        logits_stride, latent_offset, latent_size, rows_per_rank)
 
     switch (k) {
         case 2:  GST_LAUNCH(2);  break;
@@ -239,7 +264,9 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor topk_weights,
     torch::Tensor num_valid_tokens,
     torch::Tensor latent_out,
-    int64_t latent_offset
+    int64_t latent_offset,
+    torch::Tensor rank_token_counts,
+    int64_t rows_per_rank
 ) {
     TORCH_CHECK(router_logits.is_cuda(), "router_logits must be CUDA tensor");
     TORCH_CHECK(router_logits.dtype() == torch::kFloat32, "router_logits must be FP32");
@@ -281,6 +308,39 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
         valid_ptr = num_valid_tokens.data_ptr<int32_t>();
     }
 
+    // EP all-gathered padding shape: R contiguous blocks of ``rows_per_rank``
+    // rows, block r live only up to ``rank_token_counts[r]``.  The live rows are
+    // not a prefix of N, so this cannot be folded into ``num_valid_tokens``;
+    // passing both is a caller bug rather than something to silently resolve.
+    const int64_t* rank_counts_ptr = nullptr;
+    int rows_per_rank_i = 0;
+    if (rank_token_counts.defined() && rank_token_counts.numel() > 0) {
+        TORCH_CHECK(valid_ptr == nullptr,
+                    "rank_token_counts and num_valid_tokens are mutually exclusive "
+                    "padding descriptions; pass exactly one");
+        TORCH_CHECK(rank_token_counts.is_cuda(), "rank_token_counts must be a CUDA tensor");
+        TORCH_CHECK(rank_token_counts.dtype() == torch::kInt64,
+                    "rank_token_counts must be int64");
+        TORCH_CHECK(rank_token_counts.dim() == 1, "rank_token_counts must be 1-D");
+        TORCH_CHECK(rank_token_counts.is_contiguous(), "rank_token_counts must be contiguous");
+        TORCH_CHECK(rank_token_counts.device() == router_logits.device(),
+                    "rank_token_counts must be on the router_logits device");
+        TORCH_CHECK(rows_per_rank > 0,
+                    "rows_per_rank must be positive when rank_token_counts is given, got ",
+                    rows_per_rank);
+        // Exact tiling: a short or long last block would make the rank index
+        // read past the counts, or silently mis-attribute rows to a rank.
+        TORCH_CHECK(rank_token_counts.size(0) * rows_per_rank == static_cast<int64_t>(N),
+                    "rank_token_counts.size(0)=", rank_token_counts.size(0),
+                    " x rows_per_rank=", rows_per_rank, " must equal N=", N);
+        rank_counts_ptr = rank_token_counts.data_ptr<int64_t>();
+        rows_per_rank_i = static_cast<int>(rows_per_rank);
+    } else {
+        TORCH_CHECK(rows_per_rank == 0,
+                    "rows_per_rank is only meaningful with rank_token_counts, got ",
+                    rows_per_rank);
+    }
+
     // Optional latent epilogue: ``router_logits`` is the leading-expert view of
     // a wider fused GEMM output, so the latent columns live in the same rows at
     // ``latent_offset``.  Everything is validated against the row stride so a
@@ -319,14 +379,14 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
         launch_gate_sigmoid_topk<MAX_EXPERTS_SMALL_GST>(
             k, router_logits.data_ptr<float>(), e_score_correction.data_ptr<float>(),
             topk_indices.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
-            valid_ptr, latent_ptr, routed_scaling_factor, N, E, logits_stride,
-            latent_off, latent_size, stream);
+            valid_ptr, rank_counts_ptr, latent_ptr, routed_scaling_factor,
+            N, E, logits_stride, latent_off, latent_size, rows_per_rank_i, stream);
     } else {
         launch_gate_sigmoid_topk<MAX_EXPERTS_GST>(
             k, router_logits.data_ptr<float>(), e_score_correction.data_ptr<float>(),
             topk_indices.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
-            valid_ptr, latent_ptr, routed_scaling_factor, N, E, logits_stride,
-            latent_off, latent_size, stream);
+            valid_ptr, rank_counts_ptr, latent_ptr, routed_scaling_factor,
+            N, E, logits_stride, latent_off, latent_size, rows_per_rank_i, stream);
     }
 
     return {topk_indices, topk_weights};

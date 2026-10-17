@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -42,6 +43,19 @@ def _require_positive(value: Optional[int], field_name: str) -> int:
 
 def _as_int_tensor(values: Iterable[int]) -> torch.Tensor:
 	return torch.as_tensor(list(values), dtype=torch.int32)
+
+
+# One carve alignment of slack when sizing a fixed-address KV reservation.
+_CARVE_SLACK_BYTES = 512
+
+
+def _tensor_nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
+	"""Bytes a contiguous tensor of ``shape``/``dtype`` occupies."""
+	element_size = torch.empty((), dtype=dtype).element_size()
+	count = 1
+	for dim in shape:
+		count *= int(dim)
+	return count * element_size
 
 
 def _positive_or_none(value: Optional[int]) -> Optional[int]:
@@ -101,6 +115,15 @@ class GPUPagedKVStats:
 
 
 @dataclass(frozen=True)
+class PrefixGPUShareStats:
+	logical_page_references: int
+	physical_pages: int
+	keyed_physical_pages: int
+	multi_referenced_pages: int
+	reused_logical_references: int
+
+
+@dataclass(frozen=True)
 class CUDAGraphPageTableState:
 	"""Fixed-capacity page-table state for CUDA graph consumers."""
 
@@ -111,6 +134,27 @@ class CUDAGraphPageTableState:
 	max_slots: int
 	max_pages_per_sequence: int
 	rebuild_version: int
+
+
+@dataclass(frozen=True)
+class GPUPagedKVSuffixAppendPlan:
+	"""Destination metadata for multi-token suffix writes into GPU paged KV."""
+
+	sequence_ids: List[int]
+	prefix_values: Tuple[int, ...]
+	suffix_values: Tuple[int, ...]
+	slot_values: Tuple[int, ...]
+	total_suffix_tokens: int
+	prefix_lens: torch.Tensor
+	suffix_lens: torch.Tensor
+	cache_seqlens: torch.Tensor
+	token_starts: torch.Tensor
+	slot_indices: torch.Tensor
+	page_table: torch.Tensor
+
+	@property
+	def batch_size(self) -> int:
+		return len(self.sequence_ids)
 
 
 @dataclass(frozen=True)
@@ -395,6 +439,18 @@ class _GPUPageTableManager:
 		self._slot_index_tensor: Optional[torch.Tensor] = None
 		# Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
 		self._slot_to_seq_id_tensor: Optional[torch.Tensor] = None
+		# Fixed-capacity backing for the two 1-D tensors above. Both are part
+		# of the CUDA-graph-visible state (``get_cuda_graph_state``) and the
+		# Kimi-K2.5 graph adapter reads them directly, so a rebuild updates
+		# them in place instead of allocating. This is hardening rather than a
+		# requirement of the GLM-5 path, which binds its slot indices as static
+		# graph inputs and copies values into them.
+		# ``_slot_index_storage`` is a constant arange, so a prefix of it holds
+		# exactly the values the per-rebuild tensor held.
+		self._slot_index_storage: Optional[torch.Tensor] = None
+		self._slot_to_seq_id_storage: Optional[torch.Tensor] = None
+		# Number of slots the current 1-D views expose.
+		self._slot_count: int = 0
 		# Flattened list of active page indices ordered by slot_to_seq_id.
 		self._active_page_indices_cpu: Optional[torch.Tensor] = None
 		# Monotonic version bumped on every logical page-table rebuild/clear so
@@ -496,10 +552,7 @@ class _GPUPageTableManager:
 			# table can still gain pages (decode extension), and a stale graph
 			# row would send KV writes to page -1.
 			self._update_cuda_graph_table(wanted_order, sequences, max_required)
-		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
-		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
-			self.slot_to_seq_id
-		)
+		self._refresh_slot_view_tensors(wanted_order)
 		self._active_page_indices_cpu = flat_pages_cpu
 		self.rebuild_version += 1
 		
@@ -605,17 +658,44 @@ class _GPUPageTableManager:
 			)
 		return tensor[:batch_size]
 
-	def _build_slot_index_tensor(self, num_slots: int) -> torch.Tensor:
-		return torch.arange(num_slots, dtype=torch.int32, device=self.device)
+	def _refresh_slot_view_tensors(self, sequence_ids: Sequence[int]) -> None:
+		"""Point the 1-D graph-visible tensors at fixed-capacity prefixes.
 
-	def _build_slot_to_seq_id_tensor(
-		self, sequence_ids: Sequence[int]
-	) -> torch.Tensor:
-		if not sequence_ids:
-			return torch.empty(0, dtype=torch.int64, device=self.device)
-		return torch.as_tensor(
-			sequence_ids, dtype=torch.int64, device=self.device
-		)
+		``_slot_index_tensor`` becomes a prefix of a constant arange and
+		``_slot_to_seq_id_tensor`` a prefix of storage written in place, so
+		both keep one address for the manager's life while holding exactly the
+		values the old per-rebuild tensors held. A batch past the reserved slot
+		capacity keeps the previous per-rebuild allocation rather than growing
+		the fixed storage; no captured graph can serve such a batch.
+		"""
+		num_slots = len(sequence_ids)
+		if num_slots > self.max_slots:
+			self._slot_index_tensor = torch.arange(
+				num_slots, dtype=torch.int32, device=self.device
+			)
+			self._slot_to_seq_id_tensor = torch.as_tensor(
+				list(sequence_ids), dtype=torch.int64, device=self.device
+			)
+			self._slot_count = num_slots
+			return
+		if self._slot_index_storage is None:
+			self._slot_index_storage = torch.arange(
+				self.max_slots, dtype=torch.int32, device=self.device
+			)
+		if self._slot_to_seq_id_storage is None:
+			self._slot_to_seq_id_storage = torch.zeros(
+				self.max_slots, dtype=torch.int64, device=self.device
+			)
+		if num_slots:
+			# In place: the storage may have been created under inference_mode
+			# by an earlier rebuild inside the decode loop.
+			with torch.inference_mode():
+				self._slot_to_seq_id_storage[:num_slots] = torch.as_tensor(
+					list(sequence_ids), dtype=torch.int64, device=self.device
+				)
+		self._slot_index_tensor = self._slot_index_storage[:num_slots]
+		self._slot_to_seq_id_tensor = self._slot_to_seq_id_storage[:num_slots]
+		self._slot_count = num_slots
 
 	def _build_flat_page_index_tensor(
 		self, sequence_ids: Sequence[int], sequences: Dict[int, _SequenceState]
@@ -641,6 +721,7 @@ class GPUPagedKVCacheManager:
 		*,
 		config: Optional[GPUPagedKVConfig] = None,
 		device: Optional[Union[str, int, torch.device]] = None,
+		fixed_address_pool: bool = False,
 	):
 		if config is not None and (
 			engine_config is not None or model_config is not None
@@ -679,6 +760,20 @@ class GPUPagedKVCacheManager:
 		self._geometry = GPUPagedKVGeometry(self.config)
 		self._layout = GPUPagedKVLayout(self.config)
 		self.device = resolved_device
+		# Fixed-address pool: the KV tensors are carved from one reserved
+		# virtual range instead of being cudaMalloc'd per initialize(), so a
+		# destroy()/initialize() cycle across a phase switch returns the
+		# physical pages to the driver while every pointer a decode graph
+		# baked — pool bases, page-pointer tables, page-table storage — stays
+		# put. These fields are set before _reset_runtime_state() and are NOT
+		# cleared by it: that is what makes them survive destroy().
+		self._fixed_address_pool = bool(fixed_address_pool)
+		self._pool_arena = None
+		self._fixed_pool_tensors: Optional[
+			Tuple[torch.Tensor, Optional[torch.Tensor]]
+		] = None
+		# Depth of active decode-admission / capacity-snapshot sections (#424).
+		self._capacity_snapshot_depth = 0
 		self._reset_runtime_state()
 
 	# ------------------------------------------------------------------
@@ -701,28 +796,56 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
-		# Initialize KV cache with zeros
-		self._k_cache = torch.zeros(
-			shape, dtype=self.config.kv_dtype, device=self.device
-		)
-		logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
-
-		if self.config.has_v_cache:
-			v_shape = (
+		v_shape = (
+			(
 				self.config.num_layers,
 				self.config.num_pages,
 				self.config.page_size_tokens,
 				self.config.num_v_heads,
 				self.config.v_head_dim,
 			)
-			self._v_cache = torch.zeros(
-				v_shape, dtype=self.config.kv_dtype, device=self.device
-			)
-			logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
-		else:
-			self._v_cache = None
+			if self.config.has_v_cache
+			else None
+		)
+		if self._fixed_address_pool:
+			self._initialize_fixed_address_pool(shape, v_shape)
+			self._is_initialized = True
+			return
 
-		self._refresh_page_pointer_tables()
+		# The pool tensors live in a dedicated allocator pool: its segments
+		# never serve other allocations, so when destroy() drops the tensors
+		# the segments are whole-segment free and return to CUDA. Without the
+		# isolation, allocations made while the pool is down (prefill
+		# transients, the fresh page-table manager built inside destroy)
+		# land in the freed segments and pin them partially occupied, and a
+		# later same-size pool allocation OOMs against the fragmented cache.
+		mem_pool_ctx = contextlib.nullcontext()
+		if self.device.type == "cuda":
+			self._mem_pool = torch.cuda.MemPool()
+			mem_pool_ctx = torch.cuda.use_mem_pool(self._mem_pool, device=self.device)
+		with mem_pool_ctx:
+			# Initialize KV cache with zeros
+			self._k_cache = torch.zeros(
+				shape, dtype=self.config.kv_dtype, device=self.device
+			)
+			logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
+
+			if self.config.has_v_cache:
+				v_shape = (
+					self.config.num_layers,
+					self.config.num_pages,
+					self.config.page_size_tokens,
+					self.config.num_v_heads,
+					self.config.v_head_dim,
+				)
+				self._v_cache = torch.zeros(
+					v_shape, dtype=self.config.kv_dtype, device=self.device
+				)
+				logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
+			else:
+				self._v_cache = None
+
+			self._refresh_page_pointer_tables()
 
 		total_bytes = self._k_cache.element_size() * self._k_cache.numel() + (
 			self._v_cache.element_size() * self._v_cache.numel()
@@ -740,6 +863,133 @@ class GPUPagedKVCacheManager:
 		)
 		self._is_initialized = True
 
+	def _make_pool_arena(self, nbytes: int):
+		"""Reserve one virtual range for the KV pool.
+
+		Split out so the fixed-address lifecycle can be exercised without a
+		device: CUDA VMM is the only production implementation.
+		"""
+		if self.device.type != "cuda" or self.device.index is None:
+			raise RuntimeError(
+				"fixed_address_pool needs an indexed CUDA device, got "
+				f"{self.device}"
+			)
+		from batchgen.cuda_graph.vmm_arena import VmmArena
+
+		# 512 MiB chunks keep the round-up waste under 0.5 GiB and the
+		# map/unmap handle count small.
+		return VmmArena(self.device, nbytes, chunk_bytes=512 << 20)
+
+	def _initialize_fixed_address_pool(self, shape, v_shape) -> None:
+		"""Map (or re-map) the reserved KV range and restore its tensors.
+
+		The first call reserves one virtual range sized for the pool and carves
+		the K (and optional V) tensor out of it. Later calls only map fresh
+		physical memory under the *same* addresses, so the page-pointer tables
+		built on the first call stay correct and anything that baked a pool
+		pointer — a captured decode graph above all — keeps dereferencing the
+		right memory after a phase switch.
+		"""
+		if self._pool_arena is None:
+			k_bytes = _tensor_nbytes(shape, self.config.kv_dtype)
+			v_bytes = (
+				_tensor_nbytes(v_shape, self.config.kv_dtype) if v_shape else 0
+			)
+			self._pool_arena = self._make_pool_arena(
+				k_bytes + v_bytes + _CARVE_SLACK_BYTES
+			)
+			self._pool_arena.map()
+			k_cache = self._pool_arena.carve(shape, self.config.kv_dtype)
+			v_cache = (
+				self._pool_arena.carve(v_shape, self.config.kv_dtype)
+				if v_shape
+				else None
+			)
+			self._fixed_pool_tensors = (k_cache, v_cache)
+		elif not self._pool_arena.is_mapped:
+			self._pool_arena.map()
+
+		self._k_cache, self._v_cache = self._fixed_pool_tensors
+		# Arena contents are undefined right after map(); a freshly
+		# initialized manager hands out zeroed pages, so match that exactly
+		# rather than leaving a previous phase's bytes visible.
+		with torch.inference_mode():
+			self._k_cache.zero_()
+			if self._v_cache is not None:
+				self._v_cache.zero_()
+		self._refresh_page_pointer_tables()
+		logging.debug(
+			"GPUPagedKVCacheManager fixed-address pool mapped (device=%s, "
+			"pages=%d, k_ptr=0x%x)",
+			self.device,
+			self.config.num_pages,
+			self._k_cache.data_ptr(),
+		)
+
+	def _release_fixed_address_pool(self) -> None:
+		"""Return the pool's physical pages while keeping every address.
+
+		Unlike ``destroy()`` on the allocator-backed path this keeps the carved
+		tensors, the page-pointer tables and the page-table manager — only the
+		physical memory goes back to the driver, which is what the prefill
+		phase needs.
+		"""
+		self._set_device()
+		if self.device.type == "cuda":
+			# Nothing may still be reading the pool when its pages go back.
+			torch.cuda.synchronize(self.device)
+		self._sequences = {}
+		self._free_pages = _TensorStack(self.config.num_pages)
+		self._gpu_page_refcounts = {}
+		self._shared_page_key_to_gpu_page = {}
+		self._gpu_page_to_shared_key = {}
+		self.clear_page_table()
+		if self._pool_arena is not None and self._pool_arena.is_mapped:
+			self._pool_arena.unmap()
+		self._is_initialized = False
+
+	@property
+	def uses_fixed_address_pool(self) -> bool:
+		"""True when destroy()/initialize() unmap and map one reserved range.
+
+		The phase-switch lifecycle needs this: it releases the pool's physical
+		pages for the prefill phase and maps them back afterwards, and anything
+		that baked a pool pointer (a captured decode graph above all) is only
+		still correct because the addresses did not move.
+		"""
+		return self._fixed_address_pool
+
+	@property
+	def pool_is_mapped(self) -> bool:
+		"""True when the KV pool's physical memory is currently mapped."""
+		if self._fixed_address_pool:
+			return self._pool_arena is not None and self._pool_arena.is_mapped
+		return self._is_initialized
+
+	def assert_pool_mapped(self, context: str) -> None:
+		"""Fail loud before anything dereferences an unmapped KV pool."""
+		if not self.pool_is_mapped:
+			raise RuntimeError(
+				f"{context}: GPU KV pool is not mapped; a decode replay or KV "
+				"access in this state would read unmapped device memory"
+			)
+
+	@contextlib.contextmanager
+	def capacity_snapshot(self):
+		"""Hold the KV region mapped for a decode admission / capacity read.
+
+		PR #424 made decode admission read live all-rank capacity, so the pool
+		must not be torn down underneath a snapshot. Entering this section
+		asserts the pool is mapped and makes ``destroy()`` fail loud instead of
+		unmapping it mid-decision.
+		"""
+		self.assert_pool_mapped("capacity_snapshot")
+		self._capacity_snapshot_depth += 1
+		try:
+			yield self
+		finally:
+			self._capacity_snapshot_depth -= 1
+
 	def destroy(self, *, empty_cuda_cache: bool = False) -> None:
 		"""
 		Releases GPU buffers and resets the allocator state so it can be reused.
@@ -753,6 +1003,11 @@ class GPUPagedKVCacheManager:
 				stage to the prefill stage. During the prefill stage, the GPU will
 				continue to rely on the caching allocator’s memory, so clearing the
 				cache is usually unnecessary.
+
+				When the manager allocated its tensors in a dedicated MemPool
+				(CUDA devices), the cache is cleared regardless of this flag:
+				the dead pool's segments cannot serve any other allocation, so
+				they are returned to CUDA here.
 
 		This is idempotent: calling destroy() twice in a row (e.g. back-to-back
 		prefill cycles in generate()) is a no-op on the second call because
@@ -768,8 +1023,27 @@ class GPUPagedKVCacheManager:
 			)
 			return
 
+		# #424 invariant: decode admission reads live all-rank capacity, so the
+		# KV region may never be torn down while a snapshot is in flight.
+		if self._capacity_snapshot_depth > 0:
+			raise RuntimeError(
+				"GPUPagedKVCacheManager.destroy() called inside a decode "
+				f"admission / capacity snapshot ({self._capacity_snapshot_depth} "
+				"open): the KV region must stay mapped for the whole section"
+			)
+
+		if self._fixed_address_pool:
+			self._release_fixed_address_pool()
+			return
+
+		had_mem_pool = self._mem_pool is not None
 		self._reset_runtime_state()
-		if empty_cuda_cache:
+		# A dedicated pool's segments are invisible to other allocations
+		# (that is the point of the isolation), so unlike general cached
+		# segments they are useless while the pool is down: always return
+		# them to CUDA. Prefill then reuses the memory through cudaMalloc
+		# instead of through the allocator cache.
+		if empty_cuda_cache or had_mem_pool:
 			self._release_cached_cuda_memory()
 
 	def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
@@ -787,6 +1061,7 @@ class GPUPagedKVCacheManager:
 				f"Insufficient free pages: need {missing}, have {self._free_pages.size}"
 			)
 		new_pages = self._free_pages.pop(missing)
+		self._retain_gpu_pages(new_pages)
 		if state is None:
 			state = _SequenceState(pages=new_pages)
 			self._sequences[sequence_id] = state
@@ -832,6 +1107,7 @@ class GPUPagedKVCacheManager:
 				)
 
 			new_pages = self._free_pages.pop(missing)
+			self._retain_gpu_pages(new_pages)
 			if state is None:
 				self._sequences[seq_id] = _SequenceState(pages=new_pages)
 			else:
@@ -839,6 +1115,144 @@ class GPUPagedKVCacheManager:
 			allocations[seq_id] = new_pages.tolist()
 			any_changes = True
 		if any_changes:
+			self._clear_active_page_pointer_tables()
+		return allocations
+
+	def count_new_shared_pages(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		page_keys_by_sequence: Sequence[Sequence[int]],
+	) -> int:
+		"""Read-only preview of ``allocate_pages_for_sequences_with_page_keys``.
+
+		Returns the number of distinct physical pages the allocation would
+		take from the free pool: a key already mapped by a resident sequence
+		costs nothing, and a key shared between sequences of this batch is
+		counted once. Runs the same validation as the allocation so a request
+		the preview accepts cannot fail validation later; never mutates state.
+		"""
+
+		self._ensure_initialized()
+		if not (
+			len(sequence_ids)
+			== len(num_tokens)
+			== len(page_keys_by_sequence)
+		):
+			raise ValueError(
+				"shared GPU allocation inputs must have equal lengths"
+			)
+		if len(set(int(seq_id) for seq_id in sequence_ids)) != len(sequence_ids):
+			raise ValueError("shared GPU allocation sequence ids must be unique")
+
+		required_counts = self._geometry.required_pages(num_tokens).tolist()
+		new_keys: set[int] = set()
+		for seq_id, required, raw_keys in zip(
+			sequence_ids, required_counts, page_keys_by_sequence
+		):
+			if int(seq_id) in self._sequences:
+				raise ValueError(
+					"shared GPU allocation requires a new sequence: "
+					f"{seq_id}"
+				)
+			keys = [int(key) for key in raw_keys]
+			if len(keys) != int(required):
+				raise ValueError(
+					"Host page-key count does not match required GPU pages: "
+					f"sequence={seq_id}, keys={len(keys)}, required={required}"
+				)
+			if len(keys) != len(set(keys)):
+				raise ValueError(
+					f"sequence {seq_id} contains duplicate Host page keys"
+				)
+			new_keys.update(
+				key for key in keys if key not in self._shared_page_key_to_gpu_page
+			)
+		return len(new_keys)
+
+	def allocate_pages_for_sequences_with_page_keys(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		page_keys_by_sequence: Sequence[Sequence[int]],
+	) -> Dict[int, List[int]]:
+		"""Allocate logical pages while sharing identical physical page keys.
+
+		``page_keys_by_sequence`` contains stable Host physical page ids in
+		logical order. Equal keys map to one GPU physical page and are released
+		only after the last sequence reference disappears.
+		"""
+
+		self._ensure_initialized()
+		if not (
+			len(sequence_ids)
+			== len(num_tokens)
+			== len(page_keys_by_sequence)
+		):
+			raise ValueError(
+				"shared GPU allocation inputs must have equal lengths"
+			)
+		if len(set(int(seq_id) for seq_id in sequence_ids)) != len(sequence_ids):
+			raise ValueError("shared GPU allocation sequence ids must be unique")
+
+		required_counts = self._geometry.required_pages(num_tokens).tolist()
+		normalized_rows: List[List[int]] = []
+		new_keys: set[int] = set()
+		for seq_id, required, raw_keys in zip(
+			sequence_ids, required_counts, page_keys_by_sequence
+		):
+			if int(seq_id) in self._sequences:
+				raise ValueError(
+					"shared GPU allocation requires a new sequence: "
+					f"{seq_id}"
+				)
+			keys = [int(key) for key in raw_keys]
+			if len(keys) != int(required):
+				raise ValueError(
+					"Host page-key count does not match required GPU pages: "
+					f"sequence={seq_id}, keys={len(keys)}, required={required}"
+				)
+			if len(keys) != len(set(keys)):
+				raise ValueError(
+					f"sequence {seq_id} contains duplicate Host page keys"
+				)
+			normalized_rows.append(keys)
+			new_keys.update(
+				key for key in keys if key not in self._shared_page_key_to_gpu_page
+			)
+
+		if len(new_keys) > self._free_pages.size:
+			raise RuntimeError(
+				"Insufficient free pages for shared GPU allocation: "
+				f"need {len(new_keys)}, have {self._free_pages.size}"
+			)
+
+		new_page_by_key: Dict[int, int] = {}
+		if new_keys:
+			new_pages = self._free_pages.pop(len(new_keys)).tolist()
+			for key, page in zip(sorted(new_keys), new_pages):
+				new_page_by_key[key] = int(page)
+				self._shared_page_key_to_gpu_page[key] = int(page)
+				self._gpu_page_to_shared_key[int(page)] = key
+
+		allocations: Dict[int, List[int]] = {}
+		for seq_id, keys in zip(sequence_ids, normalized_rows):
+			pages = [
+				self._shared_page_key_to_gpu_page[key]
+				for key in keys
+			]
+			page_tensor = torch.tensor(pages, dtype=torch.int32)
+			self._retain_gpu_pages(page_tensor)
+			self._sequences[int(seq_id)] = _SequenceState(
+				pages=page_tensor
+			)
+			allocations[int(seq_id)] = [
+				new_page_by_key[key]
+				for key in keys
+				if key in new_page_by_key
+			]
+
+		if allocations:
 			self._clear_active_page_pointer_tables()
 		return allocations
 
@@ -889,6 +1303,7 @@ class GPUPagedKVCacheManager:
 		allocations: Dict[int, List[int]] = {}
 		for seq_id, count in zip(sequence_ids, normalized_counts):
 			new_pages = self._free_pages.pop(count)
+			self._retain_gpu_pages(new_pages)
 			state = self._sequences[seq_id]
 			state.append_pages(new_pages)
 			allocations[seq_id] = new_pages.tolist()
@@ -896,6 +1311,172 @@ class GPUPagedKVCacheManager:
 		if allocations:
 			self._clear_active_page_pointer_tables()
 		return allocations
+
+	def prepare_prefill_suffix_append(
+		self,
+		*,
+		sequence_ids: Sequence[int],
+		prefix_lens: Sequence[int] | torch.Tensor,
+		suffix_lens: Sequence[int] | torch.Tensor,
+		rebuild_page_table: bool = True,
+	) -> GPUPagedKVSuffixAppendPlan:
+		"""Prepare destinations for flattened multi-token suffix K/V."""
+
+		self._ensure_initialized()
+		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
+		if not sequence_ids:
+			raise ValueError(
+				"prepare_prefill_suffix_append: sequence_ids must be non-empty"
+			)
+		prefix_values = self._normalize_cpu_int_vector(
+			prefix_lens,
+			expected_len=len(sequence_ids),
+			name="prefix_lens",
+		)
+		suffix_values = self._normalize_cpu_int_vector(
+			suffix_lens,
+			expected_len=len(sequence_ids),
+			name="suffix_lens",
+		)
+		full_lengths = [
+			prefix + suffix
+			for prefix, suffix in zip(prefix_values, suffix_values)
+		]
+		for seq_id, prefix, suffix, full_length in zip(
+			sequence_ids,
+			prefix_values,
+			suffix_values,
+			full_lengths,
+		):
+			if full_length <= 0:
+				raise ValueError(
+					"prepare_prefill_suffix_append: full sequence length must "
+					f"be positive for seq {seq_id}, got prefix={prefix}, "
+					f"suffix={suffix}"
+				)
+			state = self._sequences.get(seq_id)
+			if state is None:
+				if prefix > 0:
+					raise KeyError(
+						"prepare_prefill_suffix_append: prefix-reused sequence "
+						f"{seq_id} is not allocated on GPU"
+					)
+				self.allocate_pages(seq_id, full_length)
+				continue
+			required_pages = int(self._geometry.required_pages(full_length))
+			missing_pages = max(0, required_pages - int(state.pages.numel()))
+			if missing_pages:
+				self.grow_sequence_pages(seq_id, missing_pages)
+
+		if rebuild_page_table:
+			page_table = self.rebuild_page_table(sequence_ids)
+		else:
+			page_table = self._gpu_page_table_manager.gpu_table
+			if page_table is None:
+				raise RuntimeError(
+					"prepare_prefill_suffix_append: GPU page table is not initialized"
+				)
+
+		slot_values = []
+		for seq_id in sequence_ids:
+			slot = self._gpu_page_table_manager.seq_id_to_slot.get(seq_id)
+			if slot is None:
+				raise RuntimeError(
+					"prepare_prefill_suffix_append: missing page-table slot "
+					f"for sequence {seq_id}"
+				)
+			slot_values.append(int(slot))
+
+		return GPUPagedKVSuffixAppendPlan(
+			sequence_ids=sequence_ids,
+			prefix_values=tuple(prefix_values),
+			suffix_values=tuple(suffix_values),
+			slot_values=tuple(slot_values),
+			total_suffix_tokens=sum(suffix_values),
+			prefix_lens=torch.tensor(
+				prefix_values, dtype=torch.int32, device=self.device
+			),
+			suffix_lens=torch.tensor(
+				suffix_values, dtype=torch.int32, device=self.device
+			),
+			cache_seqlens=torch.tensor(
+				full_lengths, dtype=torch.int32, device=self.device
+			),
+			token_starts=torch.tensor(
+				prefix_values, dtype=torch.int32, device=self.device
+			),
+			slot_indices=torch.tensor(
+				slot_values, dtype=torch.int32, device=self.device
+			),
+			page_table=page_table,
+		)
+
+	def append_layer_prefill_suffix_tokens(
+		self,
+		*,
+		k_tensor: torch.Tensor,
+		v_tensor: Optional[torch.Tensor],
+		append_plan: GPUPagedKVSuffixAppendPlan,
+		layer_idx: int,
+	) -> None:
+		"""Write flattened multi-token suffix K/V into GPU paged KV."""
+
+		op_name = "append_layer_prefill_suffix_tokens"
+		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		k_tensor = self._prepare_flat_suffix_tensor(
+			k_tensor,
+			expected_heads=self.config.num_k_heads,
+			expected_dim=self.config.k_head_dim,
+			expected_tokens=append_plan.total_suffix_tokens,
+			name="k_tensor",
+			op_name=op_name,
+		)
+		if v_tensor is not None:
+			if not self.config.has_v_cache:
+				raise ValueError(
+					f"{op_name}: V tensor provided but V cache disabled"
+				)
+			v_tensor = self._prepare_flat_suffix_tensor(
+				v_tensor,
+				expected_heads=int(self.config.num_v_heads),
+				expected_dim=int(self.config.v_head_dim),
+				expected_tokens=append_plan.total_suffix_tokens,
+				name="v_tensor",
+				op_name=op_name,
+			)
+
+		k_layer = self._k_cache[layer_idx]
+		v_layer = self._v_cache[layer_idx] if self._v_cache is not None else None
+		source_offset = 0
+		for seq_id, prefix, suffix, slot in zip(
+			append_plan.sequence_ids,
+			append_plan.prefix_values,
+			append_plan.suffix_values,
+			append_plan.slot_values,
+		):
+			end_offset = source_offset + suffix
+			if suffix:
+				self._write_token_range_to_cache_by_page_table(
+					cache_layer=k_layer,
+					page_table=append_plan.page_table,
+					slot_index=slot,
+					sequence_id=seq_id,
+					token_start=prefix,
+					values=k_tensor[source_offset:end_offset],
+					context=op_name,
+				)
+				if v_layer is not None and v_tensor is not None:
+					self._write_token_range_to_cache_by_page_table(
+						cache_layer=v_layer,
+						page_table=append_plan.page_table,
+						slot_index=slot,
+						sequence_id=seq_id,
+						token_start=prefix,
+						values=v_tensor[source_offset:end_offset],
+						context=op_name,
+					)
+			source_offset = end_offset
 
 	def clear_page_table(self) -> None:
 		"""Clear the GPU page table to empty state (0 sequences).
@@ -919,8 +1500,7 @@ class GPUPagedKVCacheManager:
 		# Clear the slot mappings
 		mgr.seq_id_to_slot = {}
 		mgr.slot_to_seq_id = []
-		mgr._slot_index_tensor = torch.empty(0, dtype=torch.int32, device=mgr.device)
-		mgr._slot_to_seq_id_tensor = torch.empty(0, dtype=torch.int64, device=mgr.device)
+		mgr._refresh_slot_view_tensors([])
 		mgr._active_page_indices_cpu = torch.empty(0, dtype=torch.int64)
 		mgr.rebuild_version += 1
 		
@@ -1007,15 +1587,11 @@ class GPUPagedKVCacheManager:
 				+ ", ".join(str(seq_id) for seq_id in missing)
 			)
 
-		reclaimed: List[torch.Tensor] = []
 		for seq_id in sequence_ids:
 			state = self._sequences.pop(seq_id)
-			reclaimed.append(state.pages)
+			self._release_gpu_pages(state.pages)
 
-		if reclaimed:
-			concatenated = torch.cat(reclaimed, dim=0)
-			self._free_pages.push(concatenated)
-		if reclaimed:
+		if sequence_ids:
 			self._clear_active_page_pointer_tables()
 
 	def _release_sequence_prefix_pages(
@@ -1052,7 +1628,7 @@ class GPUPagedKVCacheManager:
 
 		released = state.pages[:num_pages].clone()
 		state.pages = state.pages[num_pages:].clone()
-		self._free_pages.push(released)
+		self._release_gpu_pages(released)
 		self._clear_active_page_pointer_tables()
 		return released.tolist()
 
@@ -1332,6 +1908,20 @@ class GPUPagedKVCacheManager:
 			num_total_pages_allocated=num_used,
 		)
 
+	def get_prefix_gpu_share_stats(self) -> PrefixGPUShareStats:
+		"""Return aggregate physical-page sharing without exposing page ids."""
+
+		refcounts = tuple(self._gpu_page_refcounts.values())
+		return PrefixGPUShareStats(
+			logical_page_references=sum(refcounts),
+			physical_pages=len(refcounts),
+			keyed_physical_pages=len(self._shared_page_key_to_gpu_page),
+			multi_referenced_pages=sum(count > 1 for count in refcounts),
+			reused_logical_references=sum(
+				max(0, count - 1) for count in refcounts
+			),
+		)
+
 	def copy_kv_to_tensor(self, sequence_id: int) -> torch.Tensor:
 		"""Extract KV cache for a sequence from paged storage into a contiguous tensor.
 
@@ -1455,6 +2045,117 @@ class GPUPagedKVCacheManager:
 		if state is None:
 			raise KeyError(f"Sequence {sequence_id} not registered on GPU")
 		return state
+
+	def _retain_gpu_pages(self, pages: torch.Tensor) -> None:
+		for page in pages.tolist():
+			page_id = int(page)
+			self._gpu_page_refcounts[page_id] = (
+				self._gpu_page_refcounts.get(page_id, 0) + 1
+			)
+
+	def _release_gpu_pages(self, pages: torch.Tensor) -> None:
+		reclaimed: List[int] = []
+		for page in pages.tolist():
+			page_id = int(page)
+			count = self._gpu_page_refcounts.get(page_id)
+			if count is None or count <= 0:
+				raise RuntimeError(
+					f"GPU page {page_id} has no live reference"
+				)
+			if count > 1:
+				self._gpu_page_refcounts[page_id] = count - 1
+				continue
+			del self._gpu_page_refcounts[page_id]
+			shared_key = self._gpu_page_to_shared_key.pop(page_id, None)
+			if shared_key is not None:
+				mapped_page = self._shared_page_key_to_gpu_page.pop(
+					shared_key, None
+				)
+				if mapped_page != page_id:
+					raise RuntimeError(
+						"GPU shared-page registry is inconsistent"
+					)
+			reclaimed.append(page_id)
+		if reclaimed:
+			self._free_pages.push(
+				torch.tensor(reclaimed, dtype=torch.int32)
+			)
+
+	def _normalize_cpu_int_vector(
+		self,
+		values: Sequence[int] | torch.Tensor,
+		*,
+		expected_len: int,
+		name: str,
+	) -> List[int]:
+		tensor = torch.as_tensor(values, dtype=torch.long, device="cpu")
+		if tensor.dim() != 1 or tensor.numel() != expected_len:
+			raise ValueError(
+				f"{name} must be 1-D with length {expected_len}, "
+				f"got shape={tuple(tensor.shape)}"
+			)
+		if not bool(torch.all(tensor >= 0).item()):
+			raise ValueError(f"{name} values must be non-negative")
+		return [int(value) for value in tensor.tolist()]
+
+	def _prepare_flat_suffix_tensor(
+		self,
+		tensor: torch.Tensor,
+		*,
+		expected_heads: int,
+		expected_dim: int,
+		expected_tokens: int,
+		name: str,
+		op_name: str,
+	) -> torch.Tensor:
+		if tensor.dim() == 2 and expected_heads == 1:
+			tensor = tensor.unsqueeze(1)
+		expected_shape = (expected_tokens, expected_heads, expected_dim)
+		if tensor.dim() != 3 or tuple(tensor.shape) != expected_shape:
+			raise ValueError(
+				f"{op_name}: {name} must have shape {expected_shape}, "
+				f"got {tuple(tensor.shape)}"
+			)
+		if tensor.device != self.device:
+			raise ValueError(f"{op_name}: {name} must be on device {self.device}")
+		return tensor.contiguous()
+
+	def _write_token_range_to_cache_by_page_table(
+		self,
+		*,
+		cache_layer: torch.Tensor,
+		page_table: torch.Tensor,
+		slot_index: int,
+		sequence_id: int,
+		token_start: int,
+		values: torch.Tensor,
+		context: str,
+	) -> None:
+		remaining = int(values.shape[0])
+		source_offset = 0
+		token_index = int(token_start)
+		while remaining:
+			page_slot = token_index // self.config.page_size_tokens
+			if page_slot >= page_table.shape[1]:
+				raise RuntimeError(
+					f"{context}: sequence {sequence_id} exceeds page table"
+				)
+			gpu_page = int(page_table[slot_index, page_slot].item())
+			if gpu_page < 0:
+				raise RuntimeError(
+					f"{context}: sequence {sequence_id} has no GPU page "
+					f"for logical page {page_slot}"
+				)
+			page_offset = token_index % self.config.page_size_tokens
+			take = min(
+				remaining, self.config.page_size_tokens - page_offset
+			)
+			cache_layer[gpu_page, page_offset : page_offset + take].copy_(
+				values[source_offset : source_offset + take]
+			)
+			remaining -= take
+			source_offset += take
+			token_index += take
 
 	def _validate_token_inputs(
 		self,
@@ -1643,8 +2344,14 @@ class GPUPagedKVCacheManager:
 		self._active_page_indices = None
 		self._k_active_page_ptr_table = None
 		self._v_active_page_ptr_table = None
+		# Dropped AFTER every tensor allocated under use_mem_pool: with all
+		# blocks freed, the dead pool's segments become releasable.
+		self._mem_pool = None
 		self._free_pages = _TensorStack(self.config.num_pages)
 		self._sequences: Dict[int, _SequenceState] = {}
+		self._gpu_page_refcounts: Dict[int, int] = {}
+		self._shared_page_key_to_gpu_page: Dict[int, int] = {}
+		self._gpu_page_to_shared_key: Dict[int, int] = {}
 		max_pages_per_seq = self._resolve_page_table_max_pages_per_sequence()
 		max_slots = self._resolve_page_table_max_slots()
 		self._gpu_page_table_manager = _GPUPageTableManager(
@@ -1660,13 +2367,17 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS" in os.environ
 			else None
 		)
+		# Decoupled from pool size (measure-once-cache contract): explicit
+		# capacities define the table SHAPE independent of the pool's page
+		# count, so captured graphs survive a pool resize. Stored values are
+		# runtime-bounded by the live pool.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_slots", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		candidates: List[int] = []
 		if self._engine_config is not None:
@@ -1682,7 +2393,7 @@ class GPUPagedKVCacheManager:
 					candidates.append(normalized)
 		if not candidates:
 			candidates.append(self.config.num_pages)
-		return max(1, min(max(candidates), self.config.num_pages))
+		return max(1, max(candidates))
 
 	def _resolve_page_table_max_pages_per_sequence(self) -> int:
 		env_value = _positive_or_none(
@@ -1690,13 +2401,14 @@ class GPUPagedKVCacheManager:
 			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
 			else None
 		)
+		# Decoupled from pool size: see _resolve_page_table_max_slots.
 		if env_value is not None:
-			return min(env_value, self.config.num_pages)
+			return max(1, env_value)
 		config_value = _positive_or_none(
 			getattr(self.config, "cuda_graph_max_pages_per_sequence", None)
 		)
 		if config_value is not None:
-			return min(config_value, self.config.num_pages)
+			return max(1, config_value)
 
 		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
 		if self._engine_config is not None:
@@ -1713,7 +2425,7 @@ class GPUPagedKVCacheManager:
 			if prepack_capacity is not None and prepack_capacity > 0:
 				token_capacity = max(token_capacity, int(prepack_capacity))
 		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
-		return max(1, min(page_capacity, self.config.num_pages))
+		return max(1, page_capacity)
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":
@@ -1909,6 +2621,7 @@ class GPUPagedKVCacheManager:
 			)
 		
 		new_pages = self._free_pages.pop(additional_pages)
+		self._retain_gpu_pages(new_pages)
 		
 		if state is None:
 			self._sequences[sequence_id] = _SequenceState(pages=new_pages)

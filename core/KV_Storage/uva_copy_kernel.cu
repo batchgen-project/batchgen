@@ -9,7 +9,8 @@ namespace batchgen::kv::worker_detail {
 namespace {
 
 // each block copies one page. page_idx = blockIdx.x
-// src_ptrs / dst_ptrs are device-resident arrays of byte pointers. Either side
+// src_ptrs / dst_ptrs are arrays of byte pointers in device or UVA-mapped
+// pinned host memory (the host-KV tasks use pinned). Either side
 // may point to GPU memory or UVA-mapped pinned host memory, so the same kernel
 // is used for host->device page loads and device->host decode appends.
 //

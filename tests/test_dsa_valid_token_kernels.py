@@ -320,3 +320,320 @@ def test_indexer_wgmma_valid_m_variant_zeroes_padding_rows(batch_size: int, vali
 
     _assert_bf16_wgmma_close(valid_out[:valid_m], full_out[:valid_m])
     assert torch.count_nonzero(valid_out[valid_m:].float()).item() == 0
+
+
+def test_score_topk_skips_dense_rows_and_keeps_long_row_result():
+    from batchgen_kernels.attention.dsa.fused_indexer_score import (
+        fused_paged_score_and_topk_with_slots_out,
+    )
+
+    torch.manual_seed(20260820)
+    batch_size = 3
+    num_heads = 1
+    head_dim = 4
+    page_size = 64
+    max_seqlen = 2112
+    topk_count = 2048
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    aux_k = torch.randn(
+        batch_size * (max_seqlen // page_size),
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(
+        batch_size * (max_seqlen // page_size),
+        device="cuda",
+        dtype=torch.int32,
+    ).view(batch_size, max_seqlen // page_size)
+    slots = torch.arange(batch_size, device="cuda", dtype=torch.int32)
+    gates = torch.randn(
+        batch_size,
+        num_heads,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    cache_seqlens = torch.tensor(
+        [17, topk_count, topk_count + 1],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    agg = torch.empty(
+        batch_size,
+        max_seqlen,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    topk = torch.empty(
+        batch_size,
+        topk_count,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    fused_paged_score_and_topk_with_slots_out(
+        q,
+        aux_k,
+        page_table,
+        slots,
+        gates,
+        cache_seqlens,
+        agg,
+        topk,
+        topk=topk_count,
+        page_size=page_size,
+        max_seqlen=max_seqlen,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        topk[0, :17],
+        torch.arange(17, device="cuda", dtype=torch.int32),
+    )
+    assert torch.all(topk[0, 17:] == -1)
+    assert torch.equal(
+        topk[1],
+        torch.arange(topk_count, device="cuda", dtype=torch.int32),
+    )
+    assert torch.all(torch.isneginf(agg[:2]))
+
+    long_k = aux_k[
+        2 * (max_seqlen // page_size) : 3 * (max_seqlen // page_size)
+    ].reshape(max_seqlen, head_dim)[: topk_count + 1].float()
+    reference_scores = (
+        q[2].float().unsqueeze(1) * long_k.unsqueeze(0)
+    ).sum(dim=-1)
+    reference_scores = (
+        reference_scores * gates[2].view(num_heads, 1)
+    ).sum(dim=0)
+    reference_topk = torch.topk(
+        reference_scores,
+        topk_count,
+    ).indices.sort().values
+    assert torch.equal(topk[2].sort().values, reference_topk.to(torch.int32))
+
+
+def test_fused_rmsnorm_rope_native_accepts_strided_kv_input():
+    from batchgen_kernels.triton.fused_rmsnorm_rope import (
+        fused_rmsnorm_rope_with_q_native,
+    )
+
+    torch.manual_seed(20260819)
+    batch_size = 3
+    num_heads = 2
+    kv_lora_rank = 8
+    rope_dim = 4
+    total_dim = kv_lora_rank + rope_dim
+    base = torch.randn(
+        batch_size,
+        total_dim + 5,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    strided_kv = base[:, :total_dim].view(batch_size, 1, total_dim)
+    assert not strided_kv.is_contiguous()
+    contiguous_kv = strided_kv.contiguous()
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        1,
+        rope_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_strided = q.clone()
+    q_contiguous = q.clone()
+    cos = torch.randn(16, rope_dim, device="cuda", dtype=torch.float32)
+    sin = torch.randn_like(cos)
+    positions = torch.tensor([[1], [4], [7]], device="cuda", dtype=torch.int64)
+    weight = torch.randn(kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+
+    strided_out = fused_rmsnorm_rope_with_q_native(
+        strided_kv,
+        q_strided,
+        cos,
+        sin,
+        positions,
+        weight,
+        kv_lora_rank,
+        rope_dim,
+    )
+    contiguous_out = fused_rmsnorm_rope_with_q_native(
+        contiguous_kv,
+        q_contiguous,
+        cos,
+        sin,
+        positions,
+        weight,
+        kv_lora_rank,
+        rope_dim,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(strided_out, contiguous_out)
+    assert torch.equal(q_strided, q_contiguous)
+
+
+def test_triton_rmsnorm_matches_cuda_on_strided_q_a_view():
+    from batchgen.attention.fused_kernels import cuda_rmsnorm
+    from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
+
+    torch.manual_seed(20260820)
+    batch_size = 7
+    q_rank = 2048
+    fused_width = q_rank + 576
+    fused = torch.randn(
+        batch_size,
+        fused_width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_a = fused[:, :q_rank]
+    assert not q_a.is_contiguous()
+    weight = torch.randn(q_rank, device="cuda", dtype=torch.bfloat16)
+    reference = cuda_rmsnorm(q_a, weight, 1e-5)
+    candidate = torch.empty_like(reference)
+    fused_rmsnorm(q_a, weight, 1e-5, out=candidate)
+    torch.cuda.synchronize()
+
+    diff = (reference.float() - candidate.float()).abs()
+    assert float(diff.max()) <= 0.03125
+    assert torch.nn.functional.cosine_similarity(
+        reference.float().reshape(-1),
+        candidate.float().reshape(-1),
+        dim=0,
+    ) >= 0.9999
+
+
+# ---------------------------------------------------------------------------
+# Containment of NON-FINITE padding rows.
+#
+# The GLM-5 decode segments used to mask every masked-DeepGEMM output with a
+# full-buffer `mul_(valid_rows_bf16)`, so an invalid row's activations were
+# always exactly zero and could never be NaN or Inf. Those per-layer masks are
+# gone: the only mask left is on the `attn_output` that leaves the segment. An
+# invalid row now carries whatever the previous replay left behind, and a
+# row-local op on stale garbage can produce a non-finite value (rmsnorm of a
+# huge row, for instance). These tests pin the three gates the removal leans
+# on, with the padding rows deliberately poisoned.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("poison", [float("nan"), float("inf"), -float("inf"), 3.0e38])
+def test_act_quant_contains_non_finite_padding_rows(poison: float):
+    """The keystone: no bf16 garbage reaches a GEMM, finite or not.
+
+    `act_quant` writes the padding rows unconditionally (zeros + eps scale)
+    rather than quantizing them, so a non-finite stale row cannot become a
+    non-finite FP8 row, and the live rows must be bit-identical to the same
+    call with clean padding.
+    """
+    from batchgen.attention.mla.fa3_backend import act_quant
+
+    rows, valid_rows, cols = 8, 3, 256
+    torch.manual_seed(0)
+    live = torch.randn(valid_rows, cols, device="cuda", dtype=torch.bfloat16)
+
+    clean = torch.zeros(rows, cols, device="cuda", dtype=torch.bfloat16)
+    clean[:valid_rows] = live
+    poisoned = clean.clone()
+    poisoned[valid_rows:].fill_(poison)
+    num_valid = torch.tensor([valid_rows], device="cuda", dtype=torch.int32)
+
+    y_clean, s_clean = act_quant(
+        clean, num_valid_tokens=num_valid, scale_tma_aligned=True
+    )
+    y_poisoned, s_poisoned = act_quant(
+        poisoned, num_valid_tokens=num_valid, scale_tma_aligned=True
+    )
+    torch.cuda.synchronize()
+
+    # Live rows: bitwise, not approximate. Removing the upstream masks must not
+    # move a single bit of a real token's activations.
+    assert torch.equal(
+        y_poisoned[:valid_rows].view(torch.uint8), y_clean[:valid_rows].view(torch.uint8)
+    )
+    assert torch.equal(s_poisoned[:valid_rows], s_clean[:valid_rows])
+    # Padding rows: exactly zero, and finite, whatever went in.
+    padded = y_poisoned[valid_rows:].float()
+    assert torch.count_nonzero(padded).item() == 0
+    assert torch.isfinite(padded).all()
+    assert torch.all(s_poisoned[valid_rows:] == 1e-12)
+
+
+def test_selected_positions_zeroes_lengths_for_invalid_rows_with_poisoned_topk():
+    """FA3 reads nothing for an invalid row, whatever the top-k buffer holds.
+
+    `top_k_indices` is produced by a row-gated scorer, so an invalid row keeps
+    whatever a previous replay wrote. The transform must still store
+    `selected_lengths = 0` for it -- that, not the content of the index buffer,
+    is what keeps a stale page out of the attention read.
+    """
+    from batchgen_kernels.attention.dsa.selected_page_table import (
+        transform_selected_positions_out,
+    )
+
+    batch, index_topk, slots, max_pages = 4, 8, 2, 4
+    page_table = torch.arange(slots * max_pages, device="cuda", dtype=torch.int32).view(
+        slots, max_pages
+    )
+    cache_seqlens = torch.tensor([6, 5, 9, 7], device="cuda", dtype=torch.int32)
+    # Rows 2-3 are padding; poison their selections with out-of-range positions.
+    topk = torch.zeros(batch, index_topk, device="cuda", dtype=torch.int32)
+    topk[2:] = 123456
+    slot_indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.int32)
+    physical = torch.full((batch, index_topk), 7, device="cuda", dtype=torch.int32)
+    lengths = torch.full((batch,), 7, device="cuda", dtype=torch.int32)
+    num_valid = torch.tensor([2], device="cuda", dtype=torch.int32)
+
+    transform_selected_positions_out(
+        page_table,
+        cache_seqlens,
+        topk,
+        physical,
+        lengths,
+        page_size=2,
+        primary_slot_indices=slot_indices,
+        num_valid_tokens=num_valid,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(lengths[2:], torch.zeros(2, device="cuda", dtype=torch.int32))
+    assert torch.all(physical[2:] < 0), "invalid rows must select no physical page"
+    # ...and the live rows are untouched by the poison.
+    assert torch.all(lengths[:2] > 0)
+
+
+def test_masked_select_not_multiply_cleans_the_offload_staging_write():
+    """Why the primary_k_tensor copy became a select.
+
+    The staging tensor leaves the segment for host KV offload, so an invalid
+    row's bytes would escape. bf16 `NaN * 0` is `NaN`, so the old
+    multiply-after-the-fact cannot clean a non-finite stale row; a select can.
+    """
+    batch, kv_dim, valid_rows = 4, 16, 2
+    offload = torch.randn(batch, 1, 1, kv_dim, device="cuda", dtype=torch.bfloat16)
+    offload[valid_rows:] = float("nan")
+    valid_mask = torch.tensor(
+        [True] * valid_rows + [False] * (batch - valid_rows), device="cuda"
+    )
+    zero = torch.zeros(1, device="cuda", dtype=torch.bfloat16)
+    staged = torch.full_like(offload, 7.0)
+
+    torch.where(valid_mask.view(batch, 1, 1, 1), offload, zero, out=staged)
+    torch.cuda.synchronize()
+
+    assert torch.equal(staged[:valid_rows], offload[:valid_rows])
+    assert torch.count_nonzero(staged[valid_rows:].float()).item() == 0
+    assert torch.isfinite(staged.float()).all()
+    # MANDATORY control: the multiply the select replaces does NOT clean it.
+    multiplied = offload * valid_mask.view(batch, 1, 1, 1).to(torch.bfloat16)
+    assert torch.isnan(multiplied[valid_rows:].float()).any()

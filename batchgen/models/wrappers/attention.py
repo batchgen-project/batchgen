@@ -237,6 +237,21 @@ class AttnWrapperBase(BaseModuleWrapper):
     prepack_max_seqlen: ClassVar[Optional[int]] = None
     prepack_num_sequences: ClassVar[Optional[int]] = None
     prepack_seq_lengths: ClassVar[Optional[List[int]]] = None
+    prepack_full_seq_lengths: ClassVar[Optional[List[int]]] = None
+    prepack_compute_cached_tokens: ClassVar[Optional[List[int]]] = None
+    prepack_attached_tokens: ClassVar[Optional[List[int]]] = None
+    prefill_prefix_materialization: ClassVar[Optional[object]] = None
+    # In-wave prefix pool (batchgen/prefix_reuse): the pool, the plan chunk
+    # being run, and each row's Host destination start (row ids in cur_batch).
+    prefill_pool: ClassVar[Optional[object]] = None
+    prefill_pool_batch: ClassVar[Optional[object]] = None
+    prefill_pool_row_starts: ClassVar[Optional[List[int]]] = None
+    # Pseudo Host sequence id of each pooled segment, for KDA state forks.
+    prefill_pool_segment_sids: ClassVar[Optional[dict]] = None
+    # Engine layer -> dense pool row, -1 for a layer the pool does not hold.
+    # The pool holds one row per attention layer it caches, which is NOT the
+    # Host cache's physical layer unless that cache compresses the same axis.
+    prefill_pool_layer_map: ClassVar[Optional[tuple]] = None
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None

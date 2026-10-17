@@ -107,6 +107,18 @@ def create_app(
     async def lifespan(app: FastAPI):
         e2e_start = time.monotonic()
         validate_shared_runtime_capability(server_args)
+        # A previous server process may have died with batches still active in
+        # the shared storage; fail them now so their input files are reusable.
+        storage = StorageManager(server_args.storage_path)
+        # Exclusive cross-process ownership first: recovery must never fail
+        # batches that belong to a live server sharing this path.
+        storage.acquire_storage_ownership()
+        orphaned = storage.fail_orphaned_batches()
+        if orphaned:
+            logger.warning(
+                "Failed %d batch(es) left active by a previous server process: %s",
+                len(orphaned), orphaned,
+            )
         worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
         app.state.server_args = server_args
         app.state.worker = worker
@@ -215,6 +227,7 @@ def create_app(
             "scheduling_pool_active": spool.num_active_slots(),
             "scheduling_pool_free": spool.num_free_slots(),
             "scheduling_pool_capacity": spool.capacity,
+            "trajectory_pool": scheduler._trajectory_pool_info,
             "active_batches": active_batches,
             "pool_mode": scheduler._pool_mode,
         }
@@ -237,7 +250,9 @@ def create_app(
 
         content = await file.read()
         if file_purpose == FilePurpose.BATCH:
-            ok, error_message, _ = parse_batch_file(content)
+            ok, error_message, _ = parse_batch_file(
+                content, served_model=server_args.model
+            )
             if not ok:
                 raise HTTPException(
                     status_code=400,

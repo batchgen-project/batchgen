@@ -19,6 +19,8 @@ from batchgen.worker.prefill import (
     PrefillCandidate,
     PrefillScheduler,
     PrefillSelectionRequest,
+    compute_prefill_host_reservation,
+    host_kv_eviction_enabled,
 )
 
 _PAGE = 64
@@ -37,6 +39,7 @@ def _cand(
     prompt=100,
     budget=100000,
     host_kv_replication_factor=1,
+    cached_prefix_pages=0,
 ):
     return PrefillCandidate(
         uuid=uuid,
@@ -49,6 +52,7 @@ def _cand(
         kv_token_budget=budget,
         page_size=_PAGE,
         host_kv_replication_factor=host_kv_replication_factor,
+        cached_prefix_pages=cached_prefix_pages,
     )
 
 
@@ -83,6 +87,31 @@ def test_empty_candidates_returns_empty():
     assert PrefillScheduler.select_prefill_batch(_req([], [100])) == []
 
 
+def test_selection_reservation_formula_is_shared_with_worker_allocator():
+    pages, tokens = compute_prefill_host_reservation(
+        prompt_length=100,
+        kv_token_budget=100000,
+        page_size=_PAGE,
+        chunk_size=128,
+        initial_gpu_page_buffer=_BUF,
+    )
+    assert (pages, tokens) == (34, 34 * _PAGE)
+    assert PrefillScheduler.select_prefill_batch(
+        _req([_cand("a", prompt=100)], [pages], chunk=128)
+    ) == ["a"]
+
+
+def test_reservation_formula_caps_at_budget_before_rounding():
+    pages, tokens = compute_prefill_host_reservation(
+        prompt_length=100,
+        kv_token_budget=200,
+        page_size=_PAGE,
+        chunk_size=128,
+        initial_gpu_page_buffer=_BUF,
+    )
+    assert (pages, tokens) == (4, 4 * _PAGE)
+
+
 def test_single_candidate_fits_exactly():
     # prompt 100 → 34 pages; node free 34 → fits
     plan = PrefillScheduler.select_prefill_batch(_req([_cand("a", prompt=100)], [34]))
@@ -93,6 +122,48 @@ def test_single_candidate_one_page_short():
     # 34 pages needed, only 33 free → not selected
     plan = PrefillScheduler.select_prefill_batch(_req([_cand("a", prompt=100)], [33]))
     assert plan == []
+
+
+def test_admission_reclaim_target_uses_exact_scheduler_reservation():
+    candidate = _cand("a", prompt=100)
+    request = _req([candidate], [33])
+    required = PrefillScheduler.required_host_pages(candidate, request)
+    assert required == 34
+    assert PrefillScheduler.select_prefill_batch(request) == []
+    assert PrefillScheduler.select_prefill_batch(
+        _req([candidate], [33 + (required - 33)])
+    ) == ["a"]
+
+
+def test_long_cached_prefix_fits_private_pages_without_evicting_its_seed():
+    # H200 16K repro: 455 total pages, 245 retained by seed, 210 free.
+    # A full admission reservation needs 248 pages, but a 245-page hit
+    # needs only 3 private pages. Reclaiming 38 before lookup destroys it.
+    cold = _cand("hit", prompt=15719, budget=15847)
+    warm = _cand(
+        "hit", prompt=15719, budget=15847,
+        cached_prefix_pages=245,
+    )
+    assert PrefillScheduler.required_host_pages(cold, _req([cold], [210])) == 248
+    assert PrefillScheduler.select_prefill_batch(_req([cold], [210])) == []
+    assert PrefillScheduler.required_host_pages(warm, _req([warm], [210])) == 3
+    assert PrefillScheduler.select_prefill_batch(_req([warm], [210])) == ["hit"]
+
+
+def test_cached_pages_reduce_each_replicated_host_reservation():
+    candidate = _cand(
+        "tp", prompt=15719, budget=15847,
+        host_kv_replication_factor=8, cached_prefix_pages=245,
+    )
+    request = _req([candidate], [24])
+    assert PrefillScheduler.required_host_pages(candidate, request) == 24
+    assert PrefillScheduler.select_prefill_batch(request) == ["tp"]
+
+
+def test_cached_pages_cannot_exceed_initial_reservation():
+    candidate = _cand("bad", prompt=100, cached_prefix_pages=35)
+    with pytest.raises(ValueError, match="invalid cached_prefix_pages"):
+        PrefillScheduler.required_host_pages(candidate, _req([candidate], [100]))
 
 
 def test_kv_token_budget_caps_capacity():
@@ -127,6 +198,13 @@ def test_evicted_admitted_before_queueing():
     e = _cand("e", evicted=True, gidx=1, decoded=50, prompt=100)
     plan = PrefillScheduler.select_prefill_batch(_req([q, e], [34]))
     assert plan == ["e"]  # evicted wins the single slot
+
+
+def test_chunked_host_kv_reentry_selects_evicted_without_cli_switch():
+    """Bounded chunking owns eviction; the deprecated switch is irrelevant."""
+    assert host_kv_eviction_enabled(8192)
+    e = _cand("e", evicted=True, gidx=1, decoded=50, prompt=100)
+    assert PrefillScheduler.select_prefill_batch(_req([e], [34])) == ["e"]
 
 
 def test_evicted_ordered_most_decoded_first():

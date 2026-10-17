@@ -190,6 +190,8 @@ class WorkerManager:
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
         self._fatal_ack_event = self._mp_ctx.Event()
+        self.prefix_cache_runtime_config = None
+        self.prefix_cache_coordinator = None
         self._local_world_size: Optional[int] = None
         self._runtime_dir_created = False
         self._runtime_namespace_owned = False
@@ -380,19 +382,30 @@ class WorkerManager:
         _diag("<<< config_torch_module_initializer")
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
-            _diag(">>> allocate_host_kv_cache")
-            result = self.allocate_host_kv_cache(
-                self.args.host_kv_cache_size,
-                self.args.model,
-                primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
-                aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
-                enable_thp=self.args.fast_init,
-            )
-            _diag("<<< allocate_host_kv_cache")
-            if isinstance(result, tuple):
-                self.host_kv_manager, self.host_kv_aux_manager = result
-            else:
-                self.host_kv_manager = result
+            try:
+                _diag(">>> allocate_host_kv_cache")
+                result = self.allocate_host_kv_cache(
+                    self.args.host_kv_cache_size,
+                    self.args.model,
+                    primary_shm_name=self.args.runtime_identity.host_kv_shm_name,
+                    aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+                    enable_thp=self.args.fast_init,
+                )
+                _diag("<<< allocate_host_kv_cache")
+                if isinstance(result, tuple):
+                    self.host_kv_manager, self.host_kv_aux_manager = result
+                else:
+                    self.host_kv_manager = result
+                    self.host_kv_aux_manager = None
+            except Exception as exc:
+                if self.args.enable_prefix_cache:
+                    # Prefix reuse stores shared pages in Host KV; serving
+                    # without it would silently disable the feature.
+                    raise RuntimeError(
+                        "Host KV allocation is required for prefix cache reuse"
+                    ) from exc
+                logger.warning("Host KV cache allocation failed: %s", exc)
+                self.host_kv_manager = None
                 self.host_kv_aux_manager = None
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
@@ -404,20 +417,27 @@ class WorkerManager:
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
 
+        if self.args.enable_prefix_cache:
+            self._initialize_prefix_cache_owner()
+
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
         if self.distributed_weight_daemon is not None:
             _diag(">>> distributed_weight_daemon.wait_ready")
             self.distributed_weight_daemon.wait_ready(600.0)
             _diag("<<< distributed_weight_daemon.wait_ready")
-        self._spawn_workers()
-        _diag("<<< _spawn_workers")
-        _diag(">>> _start_worker_monitor")
-        self._start_worker_monitor()
-        _diag("<<< _start_worker_monitor")
-        _diag(">>> _wait_for_workers_ready")
-        self._wait_for_workers_ready()
-        _diag("<<< _wait_for_workers_ready")
+        try:
+            self._spawn_workers()
+            _diag("<<< _spawn_workers")
+            _diag(">>> _start_worker_monitor")
+            self._start_worker_monitor()
+            _diag("<<< _start_worker_monitor")
+            _diag(">>> _wait_for_workers_ready")
+            self._wait_for_workers_ready()
+            _diag("<<< _wait_for_workers_ready")
+        except Exception:
+            self._shutdown_prefix_cache_owner()
+            raise
         logger.info("[startup] Workers ready in %.2fs",
                     _time.monotonic() - spawn_start)
 
@@ -492,6 +512,11 @@ class WorkerManager:
                 # regions are outside this run's SHM namespace, so they are
                 # released through their C++ owner instead.
                 if worker_teardown_safe:
+                    # Drop the prefix-cache owner (an anonymous memfd) before
+                    # the namespace sweep. Only a real owner has a runtime
+                    # config; isolated test managers have neither.
+                    if getattr(self, "prefix_cache_runtime_config", None) is not None:
+                        self._shutdown_prefix_cache_owner()
                     if self._runtime_namespace_owned:
                         cleanup_shm_files(self.args.runtime_identity.shm_prefix)
                     if self.parameter_server_instance is not None:
@@ -1036,6 +1061,8 @@ class WorkerManager:
                 "host_kv_cache_size_per_rank"
             ),
             global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
+            enable_prefix_cache=self.args.enable_prefix_cache,
+            prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,
@@ -1072,6 +1099,9 @@ class WorkerManager:
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
             max_pool_size=self.args.max_pool_size,
+            input_ids_pool_size_gb=self.args.input_ids_pool_size_gb,
+            prefix_memfd_pid=self._get_prefix_memfd_pid(),
+            prefix_memfd_fd=self._get_prefix_memfd_fd(),
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
@@ -1085,6 +1115,7 @@ class WorkerManager:
             ),
             host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
             host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
+            prefix_cache_shm_name=self.args.runtime_identity.prefix_cache_shm_name,
             query_book_shm_prefix=(
                 self.args.runtime_identity.query_book_shm_prefix
             ),
@@ -1117,6 +1148,18 @@ class WorkerManager:
             join=False,
             daemon=True,
         )
+
+    # The prefix-cache coordinator region is an anonymous memfd owned by this
+    # process, published to the workers like the host-KV regions below.
+    def _get_prefix_memfd_pid(self) -> int:
+        if getattr(self, 'prefix_cache_coordinator', None) is not None:
+            return os.getpid()
+        return -1
+
+    def _get_prefix_memfd_fd(self) -> int:
+        if getattr(self, 'prefix_cache_coordinator', None) is not None:
+            return self.prefix_cache_coordinator.memfd_fd()
+        return -1
 
     # Host KV regions are always anonymous memfds owned by this process, so the
     # creator pid and fds are published to the workers in every mode.
@@ -1614,6 +1657,54 @@ class WorkerManager:
             host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
         host_paged_kv_manager.initialize(True)
         return host_paged_kv_manager
+
+    def _initialize_prefix_cache_owner(self) -> None:
+        from batchgen.prefix_reuse.config import (
+            build_prefix_cache_runtime_config,
+            create_host_prefix_cache_coordinator,
+        )
+
+        from batchgen.kv_cache.dual_host_kv_coordinator import (
+            DualHostKVCoordinator,
+        )
+
+        # Size the index from the same Host-KV split the workers use.
+        host_budget = int(self.args.host_kv_cache_size * (1024**3))
+        identity = self.args.runtime_identity
+        configs = DualHostKVCoordinator.build_host_configs(
+            self.args.model, host_budget,
+            identity.host_kv_shm_name, identity.host_kv_aux_shm_name,
+        )
+        if configs is None:
+            host_config = build_host_kv_config(
+                model_name=self.args.model, host_kv_cache_size=host_budget,
+            )
+            aux_config = None
+        else:
+            host_config, aux_config = configs
+        self.prefix_cache_runtime_config = build_prefix_cache_runtime_config(
+            model_name=self.args.model,
+            kv_dtype=self.args.kv_dtype,
+            host_kv_config=host_config,
+            aux_host_kv_config=aux_config,
+            shm_name=self.args.runtime_identity.prefix_cache_shm_name,
+            debug_stats=self.args.prefix_cache_debug_stats,
+        )
+        self.prefix_cache_coordinator = create_host_prefix_cache_coordinator(
+            core_engine_module=bg_lib,
+            runtime_config=self.prefix_cache_runtime_config,
+            create_region=True,
+        )
+
+    def _shutdown_prefix_cache_owner(self) -> None:
+        if self.prefix_cache_runtime_config is None:
+            return
+        # The region is an anonymous memfd: dropping the owner coordinator
+        # closes the last creator-side reference and the kernel reclaims the
+        # memory once the final worker mapping disappears. Nothing is named,
+        # so there is nothing to unlink.
+        self.prefix_cache_coordinator = None
+        self.prefix_cache_runtime_config = None
 
     @staticmethod
     def _parse_parameter_server_endpoint(endpoint: str) -> tuple[str, int]:

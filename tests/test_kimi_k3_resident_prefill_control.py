@@ -203,6 +203,7 @@ def test_kda_prefill_capacity_is_scoped_to_the_tp8_node():
     )
     manager = type("Manager", (), {})()
     manager._kda_pool_slots = 4
+    manager._kda_segment_slots = 0
     manager._attn_tp_size = 8
     fake_wrapper = type("KDAWrapper", (), {"state_manager": None})
     method = _isolated_method(
@@ -4427,6 +4428,12 @@ def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
     # A streamed decode task would reseed the same queue with a different
     # phase schedule.  Distributed streamed-SP8 therefore requires the
     # resident-EP decode path and fails before set_weight_copy_queue.
+    # The install moved into _install_decode_weight_copy_queue, which both the
+    # first decode build and every later activation of a reused instance call;
+    # its internal structure is unchanged.
+    function = _function(
+        worker_path, "BatchGenWorker", "_install_decode_weight_copy_queue"
+    )
     routed_task = next(
         node
         for node in ast.walk(function)

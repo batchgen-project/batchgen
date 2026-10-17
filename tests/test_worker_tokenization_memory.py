@@ -11,6 +11,7 @@ from typing import List
 
 import pytest
 import torch
+from batchgen.query_book import QueryBook
 
 
 WORKER = Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
@@ -106,6 +107,18 @@ class FakeSequence:
         self.prompt_length = 0
         self.batch_id = None
         self._buffer_slot = -1
+        self.original_prompt_length = 0
+        self.original_max_decode_length = max_decode_length
+        self.kv_token_budget = max_decode_length
+        self.decoded_length = 0
+        self.current_context_length = 0
+
+    def clamp_decode_to_context(self, prompt_len, context_len):
+        max_decode = max(0, min(self.original_max_decode_length, context_len - prompt_len))
+        self.max_decode_length = max_decode
+        self.original_max_decode_length = max_decode
+        self.kv_token_budget = prompt_len + max_decode
+        return self.kv_token_budget
 
 
 class FakeSequenceBatch:
@@ -172,7 +185,12 @@ def make_worker(
         _response_queue=FakeResponseQueue(),
         _max_pool_size=len(texts),
         global_batch=FakeSequenceBatch(sequences),
-        _buffer_pool=FakeBufferPool(len(texts), pool_width, max_decode_length),
+        _buffer_pool=None,
+        _trajectory_book=QueryBook(
+            capacity_bytes=max(1, len(texts) * ((model_context_length + 63) // 64) * 64 * 4),
+            page_tokens=64,
+        ),
+        _publish_trajectory_pool_capacity=lambda: None,
         _ensure_buffer_pool=lambda **kwargs: None,
     )
     uuids = [seq.uuid for seq in sequences]
@@ -238,8 +256,10 @@ def test_gathered_payload_is_cpu_int64_tensors_and_fills_pool(monkeypatch):
         assert seq.original_prompt_length == len(expected)
         assert seq.current_context_length == len(expected)
         assert seq.kv_token_budget == len(expected) + seq.max_decode_length
-        assert seq.input_ids[0, : len(expected)].tolist() == expected
-        assert seq.input_ids[0, len(expected) :].tolist() == [0] * seq.max_decode_length
+        slot = worker._trajectory_book.slot_for(uuid)
+        assert worker._trajectory_book.tokens(slot).tolist() == expected
+        assert seq.input_ids is None
+        assert seq.decoded_tokens is None
     kwargs = worker.tokenizer.kwargs_seen[0]
     assert kwargs["return_tensors"] is None
     assert kwargs["padding"] is False
@@ -273,7 +293,7 @@ def test_multi_rank_gather_preserves_global_ordering(
     assert_compact_payload(sent[0])
     for uuid, text in zip(uuids, texts):
         seq = worker.global_batch.get_sequence(uuid)
-        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+        assert worker._trajectory_book.tokens(worker._trajectory_book.slot_for(uuid)).tolist() == encode(text)
     slots = [worker.global_batch.get_sequence(uuid)._buffer_slot for uuid in uuids]
     assert slots == list(range(len(uuids)))
 
@@ -296,7 +316,7 @@ def test_over_context_sequence_is_rejected_and_others_still_fill(monkeypatch):
     assert errors[0]["error"]["code"] == "context_length_exceeded"
     for uuid, text in ((uuids[0], texts[0]), (uuids[2], texts[2])):
         seq = worker.global_batch.get_sequence(uuid)
-        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+        assert worker._trajectory_book.tokens(worker._trajectory_book.slot_for(uuid)).tolist() == encode(text)
 
 
 def test_tokenizer_lists_are_released_before_collective(monkeypatch):
@@ -389,7 +409,7 @@ def test_large_admission_tokenizes_one_source_rank_at_a_time(
     for uuid, text in zip(uuids, texts):
         seq = worker.global_batch.get_sequence(uuid)
         assert seq.prompt_length == len(text)
-        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+        assert worker._trajectory_book.tokens(worker._trajectory_book.slot_for(uuid)).tolist() == encode(text)
     slots = [worker.global_batch.get_sequence(uuid)._buffer_slot for uuid in uuids]
     assert slots == list(range(len(uuids)))
 
@@ -430,7 +450,7 @@ def test_serialize_gate_is_inclusive_and_scales_with_world_size(
     assert used == (["broadcast"] if expect_serialized else ["all_gather"])
     for uuid, text in zip(uuids, texts):
         seq = worker.global_batch.get_sequence(uuid)
-        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+        assert worker._trajectory_book.tokens(worker._trajectory_book.slot_for(uuid)).tolist() == encode(text)
 
 
 def test_serialized_path_stops_sources_at_sequence_count(monkeypatch):
@@ -460,7 +480,7 @@ def test_serialized_path_stops_sources_at_sequence_count(monkeypatch):
     assert worker.tokenizer.kwargs_seen == []
     for uuid, text in zip(uuids, texts):
         seq = worker.global_batch.get_sequence(uuid)
-        assert seq.input_ids[0, : len(text)].tolist() == encode(text)
+        assert worker._trajectory_book.tokens(worker._trajectory_book.slot_for(uuid)).tolist() == encode(text)
 
 
 def test_tokenizer_lists_are_released_before_broadcast(monkeypatch):
