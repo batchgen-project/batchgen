@@ -45,6 +45,7 @@ from typing import Optional, Tuple
 import torch
 
 from batchgen_kernels.attention.dsa.indexer_k_quant import (
+    FP8_MAX,
     SCALE_BYTES_PER_TOKEN,
     cache_data_dim,
     cache_is_page_split,
@@ -61,6 +62,7 @@ __all__ = [
     "prepare_paged_mqa_inputs_reference",
     "quantize_q_e4m3_reference",
     "require_page_split_aux_cache",
+    "saturate_q_to_e4m3_range",
     "topk_from_logits_reference",
 ]
 
@@ -297,13 +299,30 @@ def check_logits_layout(logits: torch.Tensor, plan: PagedMqaLogitsPlan) -> None:
         )
 
 
+def saturate_q_to_e4m3_range(q: torch.Tensor) -> torch.Tensor:
+    """Clamp ``q`` to the finite e4m3 range ``[-448, 448]`` before the cast.
+
+    The saturation is EXPLICIT because ``Tensor.to(float8_e4m3fn)`` does not
+    define it across torch versions: torch 2.9's CPU cast returns NaN for
+    ``|x| > 448`` (node diagnostic, item-2a N1) where newer builds saturate.
+    Clamping first makes the cast in-range on every build and matches the
+    page-split K writer, whose ``.cu`` conversion is ``__NV_SATFINITE``. bf16
+    represents 448 exactly, so the clamp itself is exact. NaN inputs pass
+    through as NaN (a NaN q is an upstream bug, not a range question).
+    """
+
+    return q.clamp(min=-FP8_MAX, max=FP8_MAX)
+
+
 def quantize_q_e4m3_reference(q: torch.Tensor) -> torch.Tensor:
     """``[batch, num_heads, head_dim]`` bf16 q -> ``[batch, 1, H, D]`` e4m3.
 
     A saturating cast with no scale: ``fp8_paged_mqa_logits`` reads ``q`` as
     plain e4m3 and has no q-scale channel (the per-token fp32 scales in the
-    cache cover K only). This is byte-for-byte what DeepGEMM's own
-    ``test_paged_mqa_logits`` and the item-2a node probe fed the kernel.
+    cache cover K only). In range this is byte-for-byte what DeepGEMM's own
+    ``test_paged_mqa_logits`` and the item-2a node probe fed the kernel; out of
+    range the saturation is explicit (``saturate_q_to_e4m3_range``), and the
+    production q-cast in ``paged_mqa_scorer`` uses the same helper.
 
     A positive per-row rescale would be order-exact (``relu(c * x) ==
     c * relu(x)`` and the top-k is per row), so it stays available if node
@@ -314,7 +333,7 @@ def quantize_q_e4m3_reference(q: torch.Tensor) -> torch.Tensor:
     if q.dim() != 3:
         raise ValueError(f"q must be [batch, num_heads, head_dim], got {tuple(q.shape)}")
     batch, num_heads, head_dim = q.shape
-    return q.to(torch.float8_e4m3fn).reshape(
+    return saturate_q_to_e4m3_range(q).to(torch.float8_e4m3fn).reshape(
         batch, PAGED_MQA_NEXT_N, num_heads, head_dim
     )
 

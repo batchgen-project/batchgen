@@ -261,15 +261,40 @@ def test_quantize_q_e4m3_reference_shape_is_deepgemms_next_n_layout():
     assert q_fp8.is_contiguous()
 
 
-def test_quantize_q_e4m3_reference_is_a_plain_saturating_cast():
-    """No scale channel exists on DeepGEMM's q, so the conversion must be the
-    plain cast its own reference test feeds the kernel."""
-    q = torch.tensor([[[0.5, -0.25, 1000.0, 1e-5]]], dtype=torch.bfloat16)
+def test_quantize_q_e4m3_reference_is_an_explicitly_saturating_cast():
+    """No scale channel exists on DeepGEMM's q, so the conversion is the plain
+    cast its own reference test feeds the kernel -- with the out-of-range
+    behaviour made explicit: a bare ``.to(float8_e4m3fn)`` gives NaN for
+    ``|x| > 448`` on torch 2.9 CPU, so the reference clamps to +-448 first
+    (matching the .cu K writer's SATFINITE) and must never produce NaN/inf."""
+    q = torch.tensor(
+        [[[0.5, -0.25, 1000.0, 1e-5, -1000.0, float("inf"), float("-inf"), 448.0]]],
+        dtype=torch.bfloat16,
+    )
     out = _pm.quantize_q_e4m3_reference(q).float().reshape(-1)
     assert out[0] == 0.5
     assert out[1] == -0.25
-    assert out[2] == 448.0  # saturates, does not become inf
+    assert out[2] == 448.0  # saturates: neither NaN nor inf
     assert out[3] == 0.0  # below the smallest subnormal
+    assert out[4] == -448.0
+    assert out[5] == 448.0
+    assert out[6] == -448.0
+    assert out[7] == 448.0  # the boundary itself is exact
+    assert torch.isfinite(out).all()
+
+
+def test_saturate_q_to_e4m3_range_is_the_shared_production_clamp():
+    """The production q-casts must go through the same helper the reference
+    uses, so the two cannot drift on out-of-range inputs."""
+    src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "batchgen_kernels" / "attention" / "dsa" / "paged_mqa_scorer.py"
+    ).read_text()
+    # Every e4m3 q materialization in the scorer is clamped first: the eager
+    # cast and the graph path's copy into the static buffer.
+    assert src.count("saturate_q_to_e4m3_range(q)") == 2
+    assert "q.to(torch.float8_e4m3fn)" not in src
+    assert ".copy_(q)" not in src
 
 
 # --------------------------------------------------------------------------- #

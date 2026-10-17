@@ -2,8 +2,9 @@
 
 One decode step, one indexer layer, in four launches:
 
-1. a saturating cast of the post-RoPE/Hadamard ``q`` into the static e4m3
-   buffer DeepGEMM reads;
+1. an explicitly saturating cast (clamp to +-448, then cast; see
+   ``paged_mqa_logits.saturate_q_to_e4m3_range``) of the post-RoPE/Hadamard
+   ``q`` into the static e4m3 buffer DeepGEMM reads;
 2. one Triton pass that gathers the aux page table's rows into batch order and
    derives the 2-D ``context_lens`` (DeepGEMM has no slot indirection);
 3. ``fp8_paged_mqa_logits`` straight over the page-split FP8 aux cache -- no
@@ -35,6 +36,7 @@ from batchgen_kernels.attention.dsa.paged_mqa_logits import (
     check_logits_layout,
     plan_paged_mqa_logits,
     require_page_split_aux_cache,
+    saturate_q_to_e4m3_range,
 )
 
 __all__ = [
@@ -341,7 +343,9 @@ def paged_mqa_score_and_topk_out(
             f"top_k_indices must be int32 or int64, got {top_k_indices.dtype}"
         )
 
-    q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(q)
+    q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(
+        saturate_q_to_e4m3_range(q)
+    )
     prepare_paged_mqa_inputs_out(
         aux_page_table,
         aux_slot_indices,
@@ -408,7 +412,12 @@ def paged_mqa_score_and_topk(
             f"block_table rows must be dense, got strides {block_table.stride()}"
         )
 
-    q_fp8 = q.to(torch.float8_e4m3fn).reshape(plan.q_shape).contiguous()
+    q_fp8 = (
+        saturate_q_to_e4m3_range(q)
+        .to(torch.float8_e4m3fn)
+        .reshape(plan.q_shape)
+        .contiguous()
+    )
     context_lens = cache_seqlens.reshape(plan.batch, PAGED_MQA_NEXT_N).contiguous()
     top_k_indices = torch.empty(
         plan.batch, plan.topk, dtype=torch.int32, device=q.device
