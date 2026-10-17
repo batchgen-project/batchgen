@@ -122,6 +122,7 @@ def create_app(
                 fail_in_flight=scheduler.fail_in_flight,
                 generation_ready=scheduler.worker_generation_ready,
                 pool_init_params=scheduler.pool_init_params,
+                retire_channels=scheduler.stop_completion_pump,
             )
             app.state.storage = storage
             app.state.scheduler = scheduler

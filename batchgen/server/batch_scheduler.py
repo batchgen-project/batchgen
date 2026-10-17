@@ -266,6 +266,18 @@ class BatchScheduler:
             self._pump_thread = thread
             thread.start()
 
+    def stop_completion_pump(self) -> None:
+        """Retire the live pump ahead of its channel being abandoned.
+
+        Called (on the restart thread) before WorkerManager closes the old
+        cohort's queues, so the pump treats the resulting read failure as
+        retirement instead of a channel error.  The next generation's pump
+        is started separately by worker_generation_ready().
+        """
+        with self._pump_lock:
+            if self._pump_stop is not None:
+                self._pump_stop.set()
+
     def _completion_pump(
         self,
         generation: int,
@@ -291,6 +303,17 @@ class BatchScheduler:
                 except queue_mod.Empty:
                     continue
                 except Exception as exc:
+                    if stop_event.is_set() or self._stopped.is_set():
+                        # The restart retired this channel before abandoning
+                        # it; the failed read is the expected wake-up, not a
+                        # live generation losing its channel.
+                        logger.info(
+                            "[POOL] Completion pump gen=%d exiting: "
+                            "channel retired (%s)",
+                            generation,
+                            exc,
+                        )
+                        break
                     # The channel of a killed cohort is abandoned rather than
                     # drained, so a read on it can fail once it is closed.
                     # Report it as this generation's terminal item.

@@ -328,6 +328,47 @@ def test_pump_read_failure_persists_active_batches_as_failed(tmp_path):
     asyncio.run(scenario())
 
 
+def test_retired_pump_read_failure_is_benign(tmp_path):
+    """A restart retires the pump before abandoning its channel. The read
+    failure that wakes the blocked pump is then expected: it must exit without
+    reporting a channel error, failing batches, or ending the listener."""
+
+    async def scenario():
+        scheduler = _scheduler(tmp_path)
+        tracker = SimpleNamespace(is_complete=False, is_failed=False, error=None)
+        scheduler._scheduling_pool._batch_trackers["batch-1"] = tracker
+
+        retired = threading.Event()
+
+        class _RetiredQueue:
+            """Blocks like a pump mid-read, then fails once the channel is
+            closed under it."""
+
+            def get(self, timeout: Optional[float] = None):
+                assert retired.wait(5.0)
+                raise OSError("handle is closed")
+
+        scheduler.worker.response_queue = _RetiredQueue()
+        scheduler._ensure_completion_listener()
+        scheduler._start_completion_pump()
+        pump = scheduler._pump_thread
+
+        # The restart's ordering: retire the reader, then close the channel.
+        scheduler.stop_completion_pump()
+        retired.set()
+
+        assert await _await_true(lambda: not pump.is_alive())
+        # No channel error reached the listener: nothing persisted as failed,
+        # no worker fatal, and the listener survives into the next generation.
+        assert scheduler.storage.statuses == []
+        assert scheduler.worker.fatals == []
+        assert not scheduler._completion_listener_task.done()
+
+        await _shutdown(scheduler)
+
+    asyncio.run(scenario())
+
+
 def test_completion_pump_threads_are_daemons_and_do_not_block_exit(tmp_path):
     """A pump blocked on a truncated frame can never return. It must therefore
     be a daemon thread, and a superseded pump must leave on its own."""

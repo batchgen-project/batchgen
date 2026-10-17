@@ -207,6 +207,7 @@ class WorkerManager:
         self._fail_in_flight_hook: Optional[Callable[[str], int]] = None
         self._scheduler_generation_hook: Optional[Callable[[], Any]] = None
         self._pool_init_params_hook: Optional[Callable[[], Dict[str, Any]]] = None
+        self._retire_channels_hook: Optional[Callable[[], Any]] = None
         self._restart_timeout_s = 600.0
 
     def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
@@ -287,12 +288,14 @@ class WorkerManager:
         fail_in_flight: Optional[Callable[[str], int]] = None,
         generation_ready: Optional[Callable[[], Any]] = None,
         pool_init_params: Optional[Callable[[], Dict[str, Any]]] = None,
+        retire_channels: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._quiesce_hook = quiesce
         self._resume_hook = resume
         self._fail_in_flight_hook = fail_in_flight
         self._scheduler_generation_hook = generation_ready
         self._pool_init_params_hook = pool_init_params
+        self._retire_channels_hook = retire_channels
 
     def set_main_thread_dispatcher(
         self,
@@ -833,6 +836,12 @@ class WorkerManager:
             # reaches a worker from here on (the init message below and the
             # queues _spawn_workers hands the children) reads these
             # attributes at call time, so it picks up the new pair.
+            # Tell the scheduler to retire its reader first: a pump still
+            # blocked on the old response queue must see its stop event
+            # before close() makes that read fail, so the failure is an
+            # expected retirement rather than a reported channel error.
+            if self._retire_channels_hook is not None:
+                self._retire_channels_hook()
             self._abandon_worker_channels()
             self._create_worker_channels()
 

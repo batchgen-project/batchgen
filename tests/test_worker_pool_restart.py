@@ -109,6 +109,7 @@ def _manager(monkeypatch):
     manager._pool_init_params_hook = lambda: {
         "max_output_len": 8192, "max_context_length": 65536,
     }
+    manager._retire_channels_hook = None
     manager._restart_timeout_s = 10.0
     manager._monitor_stop_event = threading.Event()
     manager._stopping = False
@@ -207,6 +208,29 @@ def test_restart_rotates_cohort_queues_and_releases_all_after_teardown(monkeypat
     assert init_msg["max_context_length"] == 65536
     assert manager.response_queue.calls == []
     assert manager.response_queue.empty()
+
+
+def test_restart_retires_the_scheduler_reader_before_abandoning_channels(monkeypatch):
+    """The scheduler's pump may be blocked inside a read of the old response
+    queue. Closing that queue under it turns the block into an exception, so
+    the restart must announce the retirement first — otherwise the pump
+    reports a channel error for a channel the restart itself removed."""
+    manager = _manager(monkeypatch)
+    order = []
+    dead_response = manager.response_queue
+
+    original_close = dead_response.close
+
+    def close_recording():
+        order.append("close")
+        original_close()
+
+    dead_response.close = close_recording
+    manager._retire_channels_hook = lambda: order.append("retire")
+
+    manager.restart_workers(timeout_s=1)
+
+    assert order == ["retire", "close"]
 
 
 def test_reconcile_never_reads_the_worker_queues(monkeypatch):
