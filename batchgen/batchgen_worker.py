@@ -325,6 +325,28 @@ ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
+# Batch-level ``batchgen_debug`` keys of the pooled-prefill DIAGNOSTIC probes.
+# Spelled out here, instead of imported from the four probe modules, so that
+# deciding "is any probe armed on this prefill" is a membership test on a dict
+# the worker already holds: a production prefill must not import a probe module
+# or build a merged debug dict to be told that nothing is armed.
+# ``tests/unit/test_pool_probe_debug_seam.py`` pins these against the modules'
+# own constants, so the duplication cannot drift.
+_EPILOGUE_TRACE_DEBUG_FLAG = "prefix_pool_epilogue_trace"
+_EPILOGUE_TRACE_PROBE_TOKEN_FLAG = "prefix_pool_epilogue_probe_token"
+_POOL_OFFLOAD_CHECK_DEBUG_FLAG = "prefix_pool_offload_check"
+_POOL_KERNEL_DUMP_DEBUG_FLAG = "prefix_pool_dump_kernel_args"
+_POOL_KERNEL_DUMP_DIR_FLAG = "prefix_pool_dump_dir"
+_POOL_PAD_POISON_DEBUG_FLAG = "prefix_pool_pad_poison"
+_POOL_PROBE_DEBUG_KEYS = (
+	_EPILOGUE_TRACE_DEBUG_FLAG,
+	_EPILOGUE_TRACE_PROBE_TOKEN_FLAG,
+	_POOL_OFFLOAD_CHECK_DEBUG_FLAG,
+	_POOL_KERNEL_DUMP_DEBUG_FLAG,
+	_POOL_KERNEL_DUMP_DIR_FLAG,
+	_POOL_PAD_POISON_DEBUG_FLAG,
+)
+
 
 class _DualAsyncLoadTask:
 	"""Forwards .wait() to both primary and aux async KV load tasks.
@@ -1030,6 +1052,9 @@ class BatchGenWorker:
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
+		# Edge trigger for the prefix_drain metric: set when the row is
+		# emitted, cleared when admission adds new sequences.
+		self._prefix_drain_metric_emitted = False
 		self._prefix_sequence_states = {}
 		self._active_prefix_materializations = []
 		self._prefill_pool_wave = None
@@ -1646,6 +1671,8 @@ class BatchGenWorker:
 		entries = msg.get("entries", [])
 		if not entries:
 			return
+		# New live work: the next drain is a new edge for the prefix_drain row.
+		self._prefix_drain_metric_emitted = False
 
 		# Determine starting global_idx (continue from existing batch)
 		existing_max_idx = max(
@@ -2631,6 +2658,8 @@ class BatchGenWorker:
 					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
 					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
 				)
+
+		self._maybe_emit_prefix_drain_metric()
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
@@ -8036,6 +8065,11 @@ class BatchGenWorker:
 							device=self.torch_device,
 							reason="end of prefill",
 						)
+						# Every D2H of the wave has retired, and the segment
+						# pseudo sequences still hold their page tables: the
+						# only window where a row's destination Host bytes can
+						# be read back and compared to its source.
+						self._verify_prefill_pool_offload_bytes()
 						self._finish_prefill_pool_wave()
 						self._commit_prefix_cache_for_prefill(
 							local_prefill_indices
@@ -10171,6 +10205,29 @@ class BatchGenWorker:
 			worker_view=self.core_engine.host_paged_kv_worker_view,
 		)
 
+	def _maybe_emit_prefix_drain_metric(self) -> None:
+		"""Emit one prefix_drain row when the live sequence set drains to empty.
+
+		Called from _report_completion, which every completion path runs after
+		the sequence reached COMPLETED and its Host pages and prefix
+		attachments were released, so the row records active_attachments at the
+		drain moment. Live means any status other than COMPLETED: a QUEUEING,
+		IN_PREFILL, PREFILLED, IN_DECODE, ON_HOLD or EVICTED sequence can still
+		hold or regain an attachment. Edge-triggered: one row per drain,
+		re-armed by _admit_sequences_from_message.
+		"""
+		if not (self.enable_prefix_cache and self.prefix_cache_debug_stats):
+			return
+		if self._prefix_drain_metric_emitted:
+			return
+		if not self.global_batch.all_completed():
+			return
+		self._prefix_drain_metric_emitted = True
+		self._emit_prefix_cache_metric(
+			"prefix_drain",
+			**self._prefix_host_resource_fields(),
+		)
+
 	def _close_prefix_materialization(
 		self, materialization, *, empty_cuda_cache: bool
 	) -> None:
@@ -10888,7 +10945,11 @@ class BatchGenWorker:
 				f"{geometry_page_bytes} B"
 			)
 		wave.pool = pool
-		wave.executor = PoolChunkExecutor(wave.plan, wave.prompts, pool)
+		pool.kernel_dump = self._new_pool_kernel_dump_recorder(wave)
+		wave.executor = PoolChunkExecutor(
+			wave.plan, wave.prompts, pool,
+			pad_poison=self._pool_pad_poison_enabled(wave),
+		)
 		free_after, device_total = torch.cuda.mem_get_info(self.local_rank)
 		reserved = torch.cuda.memory_reserved(self.local_rank)
 		self._prefill_pool_base = (
@@ -11058,6 +11119,18 @@ class BatchGenWorker:
 			self.parallel_manager, "gather_prefill_last_token_hidden", None
 		)
 		vocab_parallel_head = getattr(self.model.lm_head, "tp_size", 1) > 1
+		# Batch-level ``prefix_pool_epilogue_trace``: None in production.
+		epilogue_trace = self._new_pool_epilogue_tracer(wave)
+		if epilogue_trace is not None:
+			# The wave boundary is the earliest point this seam can stamp: the
+			# plan and the Host attachment happen in the reservation
+			# transaction, before this method is entered.
+			epilogue_trace.phase(
+				"wave_begin",
+				rows=len(wave.plan.segments) + len(wave.global_ids),
+				tokens=wave.plan.computed_tokens,
+				chunks=len(wave.plan.chunks),
+			)
 		tokens_by_index = {}
 		executed = 0
 		workspace_peak = 0
@@ -11078,11 +11151,23 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_pool_layer_map = (
 			tuple(pool_layout()["layer_map"]) if pool_layout is not None else None
 		)
+		# Always reassigned, never left over: a wave that died before its
+		# verification point cannot leak its records into the next one.
+		AttnWrapperBase.prefill_pool_offload_recorder = (
+			self._new_pool_offload_check_recorder(wave)
+		)
+		offload_recorder_handed_off = False
 		try:
 			start = time.perf_counter()
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
 				rows = wave.executor.build(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_begin(
+						epilogue_trace.chunk + 1,
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				host_ids, host_starts = wave.row_host_targets(rows)
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
@@ -11129,6 +11214,18 @@ class BatchGenWorker:
 						).view(batch_sz, seq_sz, hidden_dim)
 					if gather_last_token_hidden is None:
 						last_hidden = self.model.model.norm(hidden_states[:, rows.tail_rows, :])[0]
+						if epilogue_trace is not None:
+							# No gather exists on this manager, so the rank
+							# holds every row. record_unsharded_gather asserts
+							# that against the manager instead of trusting
+							# this branch: a hand-written single-rank record on
+							# a sharded path would report a broken multi-rank
+							# gather as healthy.
+							self._record_unsharded_epilogue_gather(
+								epilogue_trace,
+								last_hidden,
+								num_global_rows=int(rows.input_ids.numel()),
+							)
 					else:
 						# Streamed-SP8 holds only this rank's row shard, so the
 						# tail rows are reassembled over the group.
@@ -11136,6 +11233,11 @@ class BatchGenWorker:
 							self.model.model.norm(hidden_states),
 							rows.tail_rows,
 							int(rows.input_ids.numel()),
+							**(
+								{"trace": epilogue_trace}
+								if epilogue_trace is not None
+								else {}
+							),
 						)
 					logits = (
 						self.model.lm_head.forward(last_hidden).float()
@@ -11150,12 +11252,36 @@ class BatchGenWorker:
 					)
 					for row, index in enumerate(rows.tail_wave_indices):
 						tokens_by_index[index] = selected[row]
+					if epilogue_trace is not None:
+						# The pairing side of the trace: the row -> wave index
+						# -> uuid -> global id chain, beside the gather-side
+						# facts the recorder already holds.
+						epilogue_trace.emit(
+							table_rows=[
+								row for row, item in enumerate(rows.items)
+								if item.kind == "tail"
+							],
+							tail_rows=rows.tail_rows.tolist(),
+							wave_indices=list(rows.tail_wave_indices),
+							global_ids=list(wave.global_ids),
+							uuids=list(wave.uuids),
+							tokens=[int(token) for token in selected],
+							# The SAME tensor _select_tokens consumed: full
+							# vocabulary in both branches (the vocab-parallel
+							# head all-gathers before returning).
+							logits=logits,
+						)
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
 				block_residual = None
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
+				if epilogue_trace is not None:
+					epilogue_trace.chunk_end(
+						rows=len(rows.items),
+						tokens=int(rows.input_ids.numel()),
+					)
 				# Allocated bytes are what a chunk needs. The allocator's reserve
 				# grows into whatever the pool left free and drops cached blocks
 				# only when a cudaMalloc fails, so it is reported, not checked.
@@ -11174,12 +11300,27 @@ class BatchGenWorker:
 						f"{workspace} B kept beside the prefix pool"
 					)
 			prefill_s = time.perf_counter() - start
+			if epilogue_trace is not None:
+				# The last stamp a rank emits before it leaves the pooled
+				# prefill: comparing wave_end across the two nodes is what
+				# shows whether one group entered decode while the other was
+				# still inside a pooled chunk.
+				epilogue_trace.phase(
+					"wave_end",
+					elapsed_ms=prefill_s * 1e3,
+					tokens=executed,
+					chunks=len(wave.plan.chunks),
+				)
 			if executed != wave.plan.computed_tokens:
 				raise RuntimeError(
 					f"Rank {self.rank}: pool prefill ran {executed} tokens, planned "
 					f"{wave.plan.computed_tokens}"
 				)
 			wave.executor.close()
+			# The wave reached its end, so the offload recorder is handed to
+			# _verify_prefill_pool_offload_bytes - which runs after the D2H has
+			# retired, outside this method - and only it may clear the recorder.
+			offload_recorder_handed_off = True
 		finally:
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
@@ -11187,6 +11328,15 @@ class BatchGenWorker:
 			# has to live across the chunks that continue it, so it is released
 			# here — the wave is over and no later batch carries those ids.
 			self._release_kda_state_slots(list(wave.segment_sids.values()))
+			# Probe recorder teardown, unconditional: a wave that died anywhere
+			# above must not leave its records attached to a class attribute or
+			# to a pool the next wave inherits. The dump recorder is finished
+			# either way - it writes per chunk, nothing consumes it later - and
+			# the offload recorder is dropped UNLESS this wave completed and
+			# handed it to the post-D2H verification step.
+			wave.pool.kernel_dump = None
+			if not offload_recorder_handed_off:
+				AttnWrapperBase.prefill_pool_offload_recorder = None
 			wave.pool.k = wave.pool.v = wave.pool.indexer = None
 			AttnWrapperBase.prefill_pool = None
 			AttnWrapperBase.prefill_pool_batch = None
@@ -11221,6 +11371,287 @@ class BatchGenWorker:
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
+
+	def _pool_probe_debug(self, wave):
+		"""The probe keys this wave armed, or None. Read ONCE per wave.
+
+		The four pooled probes (epilogue trace, offload byte check, kernel dump,
+		pad poison) are armed through the same batch-level seam as
+		``prefix_rank_assignment_mode``: the flag rides on the wave's own
+		sequences, so a batch arms a probe against a server that is already up.
+
+		Off is the production path and has to cost nothing measurable, so this
+		is the ONLY place that walks the wave's sequences, the answer is cached
+		on the wave, and the walk itself allocates nothing: a member whose
+		``batchgen_debug`` is absent costs one attribute read, and the result
+		dict is not created until a probe key is actually found. Each probe's
+		own setup then imports its module only after this returned non-None.
+		"""
+
+		if wave.probe_debug_read:
+			return wave.probe_debug
+		armed = None
+		server_debug = self._batchgen_debug
+		if server_debug:
+			# Server-level ``--batchgen-debug`` wins outright, exactly as
+			# _active_batchgen_debug_for_sequences has it.
+			for key in _POOL_PROBE_DEBUG_KEYS:
+				value = server_debug.get(key)
+				if value is not None:
+					if armed is None:
+						armed = {}
+					armed[key] = value
+		else:
+			for uuid in wave.uuids:
+				seq_debug = getattr(
+					self.global_batch.get_sequence(uuid), "batchgen_debug", None
+				)
+				if not isinstance(seq_debug, dict):
+					continue
+				for key in _POOL_PROBE_DEBUG_KEYS:
+					value = seq_debug.get(key)
+					# First member that names a key wins, as the merge in
+					# _active_batchgen_debug_for_sequences does.
+					if value is None or (armed is not None and key in armed):
+						continue
+					if armed is None:
+						armed = {}
+					armed[key] = value
+		wave.probe_debug = armed
+		wave.probe_debug_read = True
+		return armed
+
+	def _new_pool_epilogue_tracer(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_epilogue_trace``.
+
+		Same seam as ``prefix_pool_offload_check`` and the kernel dump: the
+		flag rides on the wave's own sequences. Traces the only stretch of the
+		pooled path the local oracles and the GPU replays never reached - the
+		tail-row gather, the streamed-SP8 shard reassembly and the row ->
+		wave index -> uuid -> sequence pairing that carries a hidden state to
+		sampling. Returns None when the batch did not ask.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None and this method touches
+		nothing else. A malformed flag value is a diagnostics failure, not a
+		serving failure, so it leaves a ``probe_error`` line and no tracer.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		tracer = run_probe(
+			"epilogue_trace.setup",
+			lambda: tracer_from_debug(debug, rank=self.rank, path="pool"),
+			rank=self.rank,
+		)
+		if tracer is None:
+			return None
+		logging.info(
+			"[EPILOGUE_TRACE] rank=%s armed path=pool: members=%s segments=%s "
+			"chunks=%s probe_token=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			len(wave.plan.chunks),
+			tracer.probe_token,
+		)
+		return tracer
+
+	def _record_unsharded_epilogue_gather(
+		self, tracer, selected, *, num_global_rows
+	) -> None:
+		"""Hand-write the gather record for a path with NO sharded gather.
+
+		Both prefill paths have a branch where the parallel manager exposes no
+		``gather_prefill_last_token_hidden`` at all, so this rank holds every
+		row and the gather-side facts are trivially ``tp=0/1, owned=all``. That
+		is the ONLY record a caller may write itself, and
+		``record_unsharded_gather`` asserts the premise against the manager
+		rather than taking the branch's word for it - the alternative is a
+		trace that reports a broken multi-rank gather as healthy, which is the
+		one failure an acceptance probe must never have.
+
+		Where a gather DOES exist the tracer goes into it (``trace=``) and the
+		record is written from inside, with the real shard and owned mask.
+		"""
+
+		from batchgen.prefix_reuse.epilogue_trace import record_unsharded_gather
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		run_probe(
+			"epilogue_trace.gather_unsharded",
+			lambda: record_unsharded_gather(
+				tracer,
+				selected,
+				num_global_rows=num_global_rows,
+				manager=self.parallel_manager,
+			),
+			rank=self.rank,
+		)
+
+	def _new_pool_kernel_dump_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_dump_kernel_args``.
+
+		Same seam as ``prefix_pool_offload_check``: the flag rides on the
+		wave's own sequences. The value is the mode, ``"sync"`` or
+		``"nosync"`` - with ``sync`` the probe synchronizes before reading the
+		pool back, so a corruption that only survives ``nosync`` is a
+		write->attend ordering race. ``prefix_pool_dump_dir`` names the parent
+		directory (default /dev/shm). Returns None when the batch did not ask.
+
+		The flag check comes BEFORE the import, and the whole setup - mode
+		parse, directory resolution, the recorder's own ``makedirs`` - is
+		guarded: an undumpable directory must cost the dump, not the wave.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.kernel_dump import (
+			DEBUG_FLAG as _POOL_DUMP_FLAG,
+			DUMP_DIR_FLAG as _POOL_DUMP_DIR_FLAG,
+			PoolKernelDumpRecorder,
+			dump_directory,
+			parse_dump_mode,
+		)
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		mode = run_probe(
+			"kernel_dump.setup",
+			lambda: parse_dump_mode(debug.get(_POOL_DUMP_FLAG)),
+			rank=self.rank,
+		)
+		if mode is None:
+			return None
+		directory = run_probe(
+			"kernel_dump.setup",
+			lambda: dump_directory(debug.get(_POOL_DUMP_DIR_FLAG), self.rank),
+			rank=self.rank,
+		)
+		if directory is None:
+			return None
+		logging.info(
+			"[PREFIX_POOL_KERNEL_DUMP] rank=%s mode=%s dir=%s members=%s "
+			"segments=%s page_tokens=%s",
+			self.rank,
+			mode,
+			directory,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		return run_probe(
+			"kernel_dump.setup",
+			lambda: PoolKernelDumpRecorder(
+				rank=self.rank,
+				mode=mode,
+				directory=directory,
+				page_tokens=wave.page_tokens,
+				global_ids=list(wave.global_ids),
+			),
+			rank=self.rank,
+		)
+
+	def _pool_pad_poison_enabled(self, wave) -> bool:
+		"""Batch-level ``batchgen_debug.prefix_pool_pad_poison``.
+
+		Read through the same seam as ``prefix_pool_offload_check``: the flag
+		rides on the wave's own sequences, so a batch arms the probe against a
+		server that is already up. False when the batch did not ask, which
+		leaves the packed page table byte-identical to the default.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return False
+		from batchgen.prefix_reuse.executor import PAD_POISON_DEBUG_FLAG
+
+		if not self._debug_flag_enabled(debug.get(PAD_POISON_DEBUG_FLAG)):
+			return False
+		logging.info(
+			"[PREFIX_POOL_PAD_POISON] rank=%s padding each page-table row "
+			"with its own last page: members=%s segments=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+		)
+		return True
+
+	def _new_pool_offload_check_recorder(self, wave):
+		"""Batch-level ``batchgen_debug.prefix_pool_offload_check``.
+
+		Read through the same seam as ``prefix_rank_assignment_mode``: the flag
+		rides on the wave's own sequences, so a batch arms the check against a
+		server that is already up and no env var exists for it. Returns None
+		when the batch did not ask, which is what keeps the check free.
+
+		The flag check comes BEFORE the import: on a production wave
+		``_pool_probe_debug`` has already answered None.
+		"""
+		debug = self._pool_probe_debug(wave)
+		if debug is None:
+			return None
+		from batchgen.prefix_reuse.offload_check import (
+			DEBUG_FLAG as _POOL_OFFLOAD_CHECK_FLAG,
+			PoolOffloadCheckRecorder,
+		)
+
+		if not self._debug_flag_enabled(debug.get(_POOL_OFFLOAD_CHECK_FLAG)):
+			return None
+		logging.info(
+			"[PREFIX_POOL_OFFLOAD_CHECK] rank=%s arming byte-equality check: "
+			"members=%s segments=%s page_tokens=%s",
+			self.rank,
+			len(wave.uuids),
+			len(wave.plan.segments),
+			wave.page_tokens,
+		)
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		return run_probe(
+			"offload_check.setup",
+			lambda: PoolOffloadCheckRecorder(
+				rank=self.rank, page_tokens=wave.page_tokens
+			),
+			rank=self.rank,
+		)
+
+	def _verify_prefill_pool_offload_bytes(self) -> None:
+		"""Compare every pooled row's Host destination bytes to its source.
+
+		Runs at the one point where that is both meaningful and safe: after the
+		wave's D2H has retired, so the destination pages are written, and before
+		``_finish_prefill_pool_wave`` publishes the segments and drops the
+		pseudo-sequence page tables the check reads back through.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+		from batchgen.prefix_reuse.offload_check import verify_pool_offload_rows
+
+		from batchgen.prefix_reuse.probe_guard import run_probe
+
+		recorder = AttnWrapperBase.prefill_pool_offload_recorder
+		if recorder is None:
+			return
+		# Cleared before the comparison, not after: the recorder is this wave's
+		# and must not survive a failure in the verification of its own rows.
+		AttnWrapperBase.prefill_pool_offload_recorder = None
+		wave = self._prefill_pool_wave
+		wave_tag = (
+			f"m{len(wave.uuids)}s{len(wave.plan.segments)}"
+			if wave is not None
+			else "-"
+		)
+		run_probe(
+			"offload_check.verify",
+			lambda: verify_pool_offload_rows(
+				recorder.rows, logger=logging, wave_tag=wave_tag
+			),
+			rank=self.rank,
+		)
 
 	def _finish_prefill_pool_wave(self) -> None:
 		"""After every D2H retired: publish the segments, pin members to them.
@@ -11763,6 +12194,31 @@ class BatchGenWorker:
 			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
+		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
+		# same keys as the pooled wave, so one armed batch traces whichever
+		# prefill runs (the first batch on a fresh server, or reuse OFF).
+		# None in production: ``prefill_debug`` is read once above for
+		# ``k3_prefill_profile``, and this one membership test on it is the
+		# whole cost of the trace being off - no tracer, no import.
+		unpooled_trace = None
+		if _EPILOGUE_TRACE_DEBUG_FLAG in prefill_debug:
+			from batchgen.prefix_reuse.epilogue_trace import tracer_from_debug
+			from batchgen.prefix_reuse.probe_guard import run_probe
+
+			unpooled_trace = run_probe(
+				"epilogue_trace.setup",
+				lambda: tracer_from_debug(
+					prefill_debug, rank=self.rank, path="unpooled"
+				),
+				rank=self.rank,
+			)
+		if unpooled_trace is not None:
+			logging.info(
+				"[EPILOGUE_TRACE] rank=%s armed path=unpooled: sequences=%s "
+				"micro_batches=%s probe_token=%s",
+				self.rank, len(prefill_sequences), len(micro_batches),
+				unpooled_trace.probe_token,
+			)
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
@@ -12050,11 +12506,34 @@ class BatchGenWorker:
 					last_token_hidden = hidden_states[
 						0, last_token_indices, :
 					]
+					if unpooled_trace is not None:
+						# Genuinely single-rank: this manager has no gather, so
+						# the rank holds every row. Asserted inside, not
+						# assumed - see _record_unsharded_epilogue_gather.
+						unpooled_trace.begin_chunk(batch_idx)
+						self._record_unsharded_epilogue_gather(
+							unpooled_trace,
+							last_token_hidden,
+							num_global_rows=int(hidden_states.shape[1]),
+						)
 				else:
+					# The tracer goes INTO the real gather, exactly as on the
+					# pooled path: under streamed-SP8 this rank holds only a
+					# row shard, and the shard bounds, the owned mask and the
+					# norms either side of the all-reduce are visible only in
+					# there. Writing a tp=0/1 record out here instead would
+					# report a broken multi-rank gather as healthy.
+					if unpooled_trace is not None:
+						unpooled_trace.begin_chunk(batch_idx)
 					last_token_hidden = gather_last_token_hidden(
 						hidden_states,
 						last_token_indices,
 						batch_input_ids_flat.numel(),
+						**(
+							{"trace": unpooled_trace}
+							if unpooled_trace is not None
+							else {}
+						),
 					)
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
@@ -12089,6 +12568,22 @@ class BatchGenWorker:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+					)
+				if unpooled_trace is not None:
+					# One line per sequence, from the SAME logits the token
+					# choice consumed. The gather-side facts were recorded by
+					# the gather itself (or, where no gather exists, by the
+					# asserted single-rank helper), so nothing is hand-written
+					# here: the chunk was opened before the gather so those
+					# records survive to this line.
+					unpooled_trace.emit(
+						table_rows=list(range(batch_num_seqs)),
+						tail_rows=last_token_indices.tolist(),
+						wave_indices=list(range(batch_num_seqs)),
+						global_ids=[int(seq.global_idx) for seq in batch_sequences],
+						uuids=[str(seq.uuid) for seq in batch_sequences],
+						tokens=[int(token) for token in batch_new_tokens],
+						logits=logits,
 					)
 				output_tokens.append(batch_new_tokens)
 
