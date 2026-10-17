@@ -640,6 +640,7 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         [
             "_release_host_kv_pages_for_batch",
             "_release_prefix_cache_attachments",
+            "_release_trajectory_attachments",
             "_release_pool_segment_refs",
             "_owns_host_kv",
             "_decode_attn_tp_size",
@@ -669,6 +670,10 @@ def _release_worker(rank, *, attn_tp_size, views, states, coordinator):
         _prefix_sequence_states=states,
         _pool_member_sids={},
         _pool_sid_members={},
+        # M3 Slice 2: no trajectory flag on this path, so nothing is attached
+        # and the release seam has nothing of its own to drop.
+        _trajectory_attachments={},
+        _trajectory_restorer=None,
         prefix_cache_coordinator=coordinator,
         gpu_paged_kv_cache_manager=None,
         # K3 semantics: ONE prefix group (primary); the indexer-key aux region

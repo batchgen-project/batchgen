@@ -1038,6 +1038,11 @@ class BatchGenWorker:
 		self._pool_member_sids = {}  # global_idx -> pseudo sids of its chain
 		# M3 trajectory frontier: built on first flag-on commit, None otherwise.
 		self._trajectory_frontier_committer = None
+		# M3 Slice 2: built on the first flag-on lookup that finds a committer,
+		# None otherwise. global_idx -> the live TrajectoryAttachment a hit
+		# took; empty whenever the flag is off, so the restore seam is free.
+		self._trajectory_restorer = None
+		self._trajectory_attachments = {}
 		if self.enable_prefix_cache:
 			from batchgen.prefix_reuse.config import (
 				require_prefix_cache_model_support,
@@ -5578,6 +5583,15 @@ class BatchGenWorker:
 					self._replace_prefix_lookup_hits(
 						seqs, prefix_states, [0] * len(seqs)
 					)
+		# M3 Slice 2, SAME batch-level flag as the commit side: one flag
+		# governs the whole trajectory path, so lookups cannot be on while
+		# commits are off. With it off nothing below runs and no attachment
+		# is taken, so the restore seam stays empty and this wave is
+		# byte-identical to a pre-Slice-2 one.
+		if owned and self._trajectory_commit_requested(
+			[self.global_batch.get_sequence(uuid) for uuid in served]
+		):
+			self._lookup_trajectory_frontiers(owned)
 
 	def _reserve_prefill_host_kv(self, prefill_uuids: List[str]) -> bool:
 		"""Atomically reserve host pages before IN_PREFILL is published.
@@ -7726,6 +7740,15 @@ class BatchGenWorker:
 						prefill_start = time.perf_counter()
 						try:
 							with torch.inference_mode():
+								# M3 Slice 2 restore. THE single
+								# pre-suffix-prefill seam: above the
+								# prepack/plain dispatch so both paths get the
+								# restored KDA state, and above every forward
+								# launch of this wave, so the slot write is
+								# ordered before any kernel that reads it.
+								self._restore_trajectory_frontiers(
+									local_prefill_indices
+								)
 								if self.enable_prepack:
 									self.prefill_prepacked(local_prefill_indices)
 								else:
@@ -9850,6 +9873,10 @@ class BatchGenWorker:
 		self._emit_prefix_cache_metric(
 			"prefix_drain",
 			**self._prefix_host_resource_fields(),
+			# M3 Slice 2: live attachments must be zero at the drain, beside
+			# the coordinator's own active_attachments. Absent on a run that
+			# never turned the trajectory flag on.
+			**self._trajectory_restore_fields(),
 		)
 
 	def _close_prefix_materialization(
@@ -11127,6 +11154,12 @@ class BatchGenWorker:
 	) -> None:
 		if not self.enable_prefix_cache:
 			return
+		# M3 Slice 2: a trajectory attachment that never reached its restore
+		# leaves through the SAME seam, so a rejected wave, a rolled back
+		# allocation and a completed row all return the live count to zero.
+		self._release_trajectory_attachments(
+			[int(sequence_id) for sequence_id in global_sequence_ids]
+		)
 		for sequence_id in global_sequence_ids:
 			self._release_pool_segment_refs(int(sequence_id))
 			state = self._prefix_sequence_states.pop(int(sequence_id), None)
@@ -11214,6 +11247,163 @@ class BatchGenWorker:
 		if committer is None:
 			return None
 		return committer.on_prefix_pages_released
+
+	def _get_trajectory_restorer(self):
+		"""M3 Slice 2 restorer, or None when no frontier has been committed.
+
+		Deliberately does NOT construct a committer: with nothing committed on
+		this rank every lookup is a guaranteed miss, so a lookup must not be
+		the thing that builds the commit-side machinery (and must not raise
+		``TrajectoryStateUnavailable`` on a deployment that has no KDA pool).
+		The arena reader shares the committer's negative pseudo-sid namespace
+		(``_next_pool_segment_sid``), so its read row cannot collide with a
+		pool segment or with an arena being written.
+		"""
+		committer = self._trajectory_frontier_committer
+		if committer is None:
+			return None
+		if self._trajectory_restorer is not None:
+			return self._trajectory_restorer
+		from batchgen.models.moonshotai.kimi_linear.wrappers import (
+			KimiLinearKDAWrapper,
+		)
+		from batchgen.prefix_reuse.trajectory_restore import (
+			HostKVSnapshotArenaReader,
+			KDAStateSnapshotWriter,
+			TrajectoryRestorer,
+		)
+
+		self._trajectory_restorer = TrajectoryRestorer(
+			rank=self.rank,
+			committer=committer,
+			arena_reader=HostKVSnapshotArenaReader(
+				host_views_provider=self._host_views_by_group,
+				next_pseudo_sid=self._next_pool_segment_sid,
+			),
+			state_writer=KDAStateSnapshotWriter(
+				state_manager_provider=(
+					lambda: KimiLinearKDAWrapper.state_manager
+				),
+				profile=committer.layout.profile,
+			),
+			attention_group_size=self._decode_attn_tp_size(),
+		)
+		return self._trajectory_restorer
+
+	def _lookup_trajectory_frontiers(self, uuids) -> None:
+		"""M3 Slice 2 admission lookup, beside the prefix-cache lookup.
+
+		Runs on the sequences this rank owns the Host KV for -- the same filter
+		the prefix lookup and the frontier COMMIT use, so a record is only ever
+		probed on the rank whose registry holds it and whose node holds its
+		arena pages. A hit takes a reference immediately; the reference is what
+		keeps the record un-evictable until the restore finishes.
+
+		Group affinity is M2's, not a new mechanism: ``decode_dp_group`` is
+		already stamped and ``_assign_decode_dp_groups`` is idempotent (a
+		sequence that carries a group keeps it), which is exactly how an
+		evicted re-entry stays on the ranks holding its head-sharded KDA state.
+		The restore asserts the record's owning group against that stamp rather
+		than re-deriving an affinity of its own.
+		"""
+		restorer = self._get_trajectory_restorer()
+		if restorer is None:
+			return
+		namespace_digest = self.prefix_cache_runtime_config.namespace_digest
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or not self._owns_host_kv(seq):
+				continue
+			global_id = int(seq.global_idx)
+			if global_id in self._trajectory_attachments:
+				# Back-to-back prefill of the same row: the earlier attachment
+				# is still live, so do not take a second reference for it.
+				continue
+			attachment = restorer.lookup(
+				namespace_digest=namespace_digest,
+				prompt_token_ids=self._trajectory_tokens(
+					seq, length=seq.prompt_length
+				).tolist(),
+				sequence_id=global_id,
+			)
+			if attachment is not None:
+				self._trajectory_attachments[global_id] = attachment
+
+	def _restore_trajectory_frontiers(self, local_indices) -> None:
+		"""Restore every pinned snapshot into its KDA slot before prefill.
+
+		THE ordering guarantee: this runs in the worker's host-side sequence
+		before any suffix-prefill kernel of the wave is launched, and the slot
+		write is a ``copy_`` from pageable host memory on the current stream,
+		so the restored bytes are in the slot before the forward reads it.
+
+		Empty whenever the flag is off -- nothing is attached, so this is a
+		dict lookup and a return.
+		"""
+		if not self._trajectory_attachments:
+			return
+		restorer = self._get_trajectory_restorer()
+		if restorer is None:
+			return
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			seq = (
+				self.global_batch.get_sequence(uuid)
+				if uuid is not None
+				else None
+			)
+			if seq is None:
+				continue
+			attachment = self._trajectory_attachments.pop(
+				int(seq.global_idx), None
+			)
+			if attachment is None:
+				continue
+			state = self._prefix_sequence_states.get(int(seq.global_idx))
+			restorer.restore(
+				attachment,
+				serving_group_id=int(seq.decode_dp_group or 0),
+				# The position the suffix prefill will start at. Absent state
+				# means the whole prompt is recomputed, which the restorer
+				# refuses by name rather than restoring a state the forward
+				# would double-count.
+				compute_cached_tokens=(
+					int(state.compute_cached_tokens) if state is not None else 0
+				),
+			)
+
+	def _release_trajectory_attachments(self, global_sequence_ids) -> None:
+		"""Drop every un-consumed attachment for these rows.
+
+		Joins the prefix-attachment release seam, so a rejected wave, a rolled
+		back allocation and a completed sequence all return the live count to
+		zero through the same call.
+		"""
+		if not self._trajectory_attachments:
+			return
+		restorer = self._trajectory_restorer
+		for sequence_id in global_sequence_ids:
+			attachment = self._trajectory_attachments.pop(
+				int(sequence_id), None
+			)
+			if attachment is None or restorer is None:
+				continue
+			try:
+				restorer.release(attachment)
+			except Exception:
+				logging.exception(
+					"Rank %s: releasing the trajectory attachment of sequence "
+					"%s failed; its frontier stays pinned",
+					self.rank,
+					int(sequence_id),
+				)
+
+	def _trajectory_restore_fields(self) -> dict:
+		"""Drain-counter fields, or empty when the path never ran."""
+		restorer = self._trajectory_restorer
+		if restorer is None:
+			return {}
+		return restorer.counters()
 
 	def _resident_frontier_page_ids(self, *, token_ids, commit_tokens):
 		"""Resident Host pages backing a committed prefix, per KV group.

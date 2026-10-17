@@ -46,6 +46,16 @@ from batchgen.prefix_reuse.trajectory_commit import (
     profile_from_kda_state_config,
     trajectory_commit_enabled,
 )
+from batchgen.prefix_reuse.trajectory_restore import (
+    DECLINE_REASONS,
+    HostKVSnapshotArenaReader,
+    KDAStateSlotsExhausted,
+    KDAStateSnapshotWriter,
+    TrajectoryAttachment,
+    TrajectoryRestorer,
+    TrajectoryRestoreOutcome,
+    trajectory_reuse_enabled,
+)
 
 __all__ = [
     "PrefixCacheRuntimeConfig",
@@ -84,4 +94,12 @@ __all__ = [
     "parse_trajectory_commit_flag",
     "profile_from_kda_state_config",
     "trajectory_commit_enabled",
+    "DECLINE_REASONS",
+    "HostKVSnapshotArenaReader",
+    "KDAStateSlotsExhausted",
+    "KDAStateSnapshotWriter",
+    "TrajectoryAttachment",
+    "TrajectoryRestorer",
+    "TrajectoryRestoreOutcome",
+    "trajectory_reuse_enabled",
 ]
