@@ -102,6 +102,14 @@ class SWAHostPagedKVWorkerView {
     std::size_t page_size_tokens() const { return page_size_tokens_; }
     std::size_t window_size_tokens() const { return window_size_tokens_; }
     std::size_t window_pages() const { return window_pages_; }
+    // SWA narrows the retained window, never the record geometry, so the
+    // region's record accessors forward unchanged.
+    std::size_t expected_k_head_dim() const {
+        return base_view_.expected_k_head_dim();
+    }
+    std::size_t k_element_size_bytes() const {
+        return base_view_.k_element_size_bytes();
+    }
 
     std::string DebugString() const {
         std::ostringstream oss;
