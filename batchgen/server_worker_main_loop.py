@@ -45,6 +45,39 @@ _SHUTDOWN_ABORT_GRACE_S = 5.0
 # is polled rather than waited on.
 _SHUTDOWN_FLAG_POLL_S = 0.25
 
+# How long the watchdog waits for the main loop to retire on its own AFTER the
+# aborts were issued, before it ends this process itself.
+#
+# The abort frees a rank blocked in a collective within milliseconds, but the
+# release is silent: the blocked sync returns normally and, when the collective
+# was captured in a CUDA graph, nothing ever raises.  A freed rank therefore
+# leaves only by testing the cohort flag on its own execution path, and it has a
+# FINITE window in which to do so -- a graph-mode rank measured in the W5 bench
+# resumed for a few hundred replays and then re-wedged permanently with no
+# exception at all.  A rank that misses that window (or was never freed, for
+# example because it is parked in a sync that is not a collective) would
+# otherwise hold the whole teardown until the manager's grace expires and it is
+# SIGKILLed.  Ending the process here instead keeps the worst case bounded at
+# this window rather than that grace, and is the only mechanism proven to end a
+# rank in that state.
+_SHUTDOWN_SELF_EXIT_GRACE_S = 20.0
+
+# Exit status for that self-exit.  It must be distinguishable from every status
+# this worker can otherwise produce, because the manager reports a worker's
+# exitcode verbatim as the reason a cohort went down:
+#   0        the clean pool-shutdown exit (batchgen_worker.py)
+#   1        every fatal path here and in the worker supervisor
+#   128+n    process_utils' signal translation (SIGINT 130, SIGKILL 137, ...)
+#   -n       multiprocessing's own rendering of a signal death (SIGKILL -9)
+# 86 is outside all of those ranges, so a self-exit can never be read back as a
+# fatal error, a clean exit, or a signal.  The manager needs no change to reap
+# it: it interprets no status value specially (it only formats exitcode into its
+# exit reason), proc.join returns on death like any other exit, and a worker
+# that is already dead when the fallback leg runs is filtered out of it before
+# the signal-fallback marker is logged, so that marker correctly does not claim
+# a worker that ended itself.
+_WORKER_SELF_EXIT_CODE = 86
+
 # Exit-path markers.  Every worker that reaches its ordered teardown emits
 # exactly one of these, so a teardown can be read back per worker instead of
 # inferred from timings.  The signal-fallback path has no marker here: a
@@ -52,6 +85,13 @@ _SHUTDOWN_FLAG_POLL_S = 0.25
 _EXIT_PATH_SENTINEL = "ordered-via-sentinel"
 _EXIT_PATH_FLAG = "ordered-via-flag"
 _EXIT_PATH_ABORT = "ordered-via-abort"
+_EXIT_PATH_DECODE_BOUNDARY = "ordered-via-decode-boundary"
+
+# Not an ordered teardown: this worker ended itself rather than let a wedged
+# rank hold the cohort's teardown open.  It is logged by the watchdog thread,
+# which owns the GIL while the main thread is stuck below Python, so unlike the
+# signal fallback this marker CAN come from the worker itself.
+_EXIT_PATH_SELF_EXIT = "self-exit"
 
 # This worker's share of the run's liveness lock.  It is module state, not a
 # local, because it must outlive every function here: the kernel releases the
@@ -281,6 +321,29 @@ def _abort_one_process_group(group: Any) -> None:
 	group.abort()
 
 
+def _flush_worker_logs() -> None:
+	"""Push buffered log records out before an exit that runs no handlers.
+
+	``os._exit`` is the only way out of a process whose main thread is stuck
+	below Python, and it bypasses interpreter shutdown entirely: no atexit
+	hooks, no ``logging.shutdown()``, no stream flush.  Anything still sitting
+	in a handler's buffer at that moment is lost, which would make the
+	self-exit marker -- the one line that attributes the exit -- the most likely
+	record to disappear.  Every flush is individually guarded: this runs on the
+	way out of a failing teardown and must not raise there.
+	"""
+	for handler in list(logging.getLogger().handlers):
+		try:
+			handler.flush()
+		except Exception:
+			pass
+	for stream in (sys.stdout, sys.stderr):
+		try:
+			stream.flush()
+		except Exception:
+			pass
+
+
 def _start_shutdown_abort_watchdog(
 	global_rank: int,
 	shutdown_flag: Optional[Any],
@@ -288,6 +351,7 @@ def _start_shutdown_abort_watchdog(
 	aborted: threading.Event,
 	live_process_groups: Optional[Any] = None,
 	abort_one_group: Optional[Any] = None,
+	exit_process: Optional[Any] = None,
 ) -> Optional[threading.Thread]:
 	"""Let a collective blocked at teardown return instead of hanging.
 
@@ -305,11 +369,18 @@ def _start_shutdown_abort_watchdog(
 	of them.  Fired concurrently, the thread that happens to hold the wedged
 	communicator releases the main thread regardless of what the others are
 	doing, and this watchdog thread exits as soon as they are all launched.
+
+	Having issued the aborts, this thread stays alive for one last job: it waits
+	``_SHUTDOWN_SELF_EXIT_GRACE_S`` for the main loop to retire on its own and,
+	if it has not, ends the process.  That wait is not a join on an abort (the
+	abort never returns in the shape this exists for) -- it is a wait on the
+	main loop's own exit, which is the thing being given a last chance.
 	"""
 	if shutdown_flag is None:
 		return None
 	enumerate_groups = live_process_groups or _live_process_groups
 	abort_group = abort_one_group or _abort_one_process_group
+	self_exit = exit_process or os._exit
 
 	def _abort_entry(group: Any, label: str) -> None:
 		started = time.monotonic()
@@ -381,6 +452,23 @@ def _start_shutdown_abort_watchdog(
 				name=f"worker-shutdown-abort-{global_rank}-{index}",
 				daemon=True,
 			).start()
+		# The aborts are away.  A rank they freed leaves through the decode-step
+		# boundary check or the loop boundary within its working window; a rank
+		# they did not free never will, and holding the teardown open for it
+		# only trades this window for the manager's much longer grace and a
+		# SIGKILL.  So give the loop that window and then end this process.
+		if loop_exited.wait(timeout=_SHUTDOWN_SELF_EXIT_GRACE_S):
+			return
+		logging.error(
+			"[shutdown] worker exit path=%s rank=%s pid=%s",
+			_EXIT_PATH_SELF_EXIT,
+			global_rank,
+			os.getpid(),
+		)
+		# os._exit runs no handler and flushes nothing, so the marker above has
+		# to reach the log first or the exit is unattributable.
+		_flush_worker_logs()
+		self_exit(_WORKER_SELF_EXIT_CODE)
 
 	thread = threading.Thread(
 		target=_watch,
@@ -739,6 +827,22 @@ def _server_worker_main_impl(
 		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
 	worker.set_decode_watchdog(decode_watchdog)
 
+	# 2.7. Let the decode loop see this cohort's teardown.
+	#
+	# The loop boundary below is reached only between batches; a worker inside
+	# generate_persistent() spends its life in the decode loop and would never
+	# test the flag there.  That matters because the abort's release is silent
+	# and finite: the freed rank resumes stepping and then re-wedges, so the
+	# only code that can retire it is the decode loop itself.
+	#
+	# The seam is a zero-argument probe set on the worker, matching the watchdog
+	# setters above, and it is deliberately a callable rather than the flag: the
+	# flag's shape (lock-free shared byte, plain load, no handshake) is this
+	# module's contract with WorkerManager and stays here, while the worker only
+	# ever asks a yes/no question.  Set before the loop and never cleared, so
+	# the probe cannot be missing on any path that reaches decode.
+	worker.set_cohort_shutdown_probe(lambda: _shutdown_requested(shutdown_flag))
+
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
 
@@ -857,6 +961,25 @@ def _server_worker_main_impl(
 					# Let the outer worker boundary publish this rank's exact traceback
 					# through the TCPStore sideband and its node-local response queue.
 					raise
+
+				# The decode-step boundary exit.  A rank freed by the abort
+				# leaves its decode loop through the probe set above and
+				# arrives here with no exception, having issued no further
+				# GPU or collective work -- an ordered exit, and the one the
+				# survivors of a mid-decode cohort death take.  The worker
+				# reports having taken it rather than this being inferred from
+				# the flag: a pool shutdown that merely coincided with teardown
+				# is a different path and must not claim this marker.  The
+				# pool_shutdown sentinel below is skipped: the cohort it would
+				# report to is the one being torn down.
+				if worker.cohort_shutdown_observed:
+					exit_path = _EXIT_PATH_DECODE_BOUNDARY
+					logging.info(
+						"Rank %s: shutdown flag observed at the decode-step "
+						"boundary; running the ordered teardown",
+						global_rank,
+					)
+					break
 
 				# Pool mode exits here — send shutdown sentinel and break
 				if global_rank == 0:

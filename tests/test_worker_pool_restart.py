@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -896,15 +897,20 @@ _WORKER_LOOP_HELPERS = (
     "_shutdown_requested",
     "_live_process_groups",
     "_abort_one_process_group",
+    "_flush_worker_logs",
     "_start_shutdown_abort_watchdog",
     "_resolve_main_loop_exit",
 )
 _WORKER_LOOP_CONSTANTS = (
     "_SHUTDOWN_ABORT_GRACE_S",
     "_SHUTDOWN_FLAG_POLL_S",
+    "_SHUTDOWN_SELF_EXIT_GRACE_S",
+    "_WORKER_SELF_EXIT_CODE",
     "_EXIT_PATH_SENTINEL",
     "_EXIT_PATH_FLAG",
     "_EXIT_PATH_ABORT",
+    "_EXIT_PATH_DECODE_BOUNDARY",
+    "_EXIT_PATH_SELF_EXIT",
 )
 
 
@@ -976,6 +982,13 @@ def _load_worker_loop_helpers() -> Dict[str, Any]:
         "threading": threading,
         "time": time,
         "logging": logging,
+        # The self-exit safety net ends the process through os._exit and flushes
+        # the log streams first, so the lifted helpers need both modules.  Every
+        # test that exercises that path injects its own exit hook, so the real
+        # os._exit here is never reached -- but it must still resolve, or the
+        # watchdog would fail for the wrong reason.
+        "os": os,
+        "sys": sys,
     }
     module = ast.Module(body=constants + functions, type_ignores=[])
     exec(compile(module, str(WORKER_LOOP_PATH), "exec"), namespace)
@@ -1179,6 +1192,7 @@ def test_shutdown_watchdog_aborts_every_group_on_its_own_daemon_thread():
     ns = _load_worker_loop_helpers()
     ns["_SHUTDOWN_ABORT_GRACE_S"] = 0.01
     ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 0.01
     groups = [_Group("0"), _Group("1"), _Group("2")]
     seen: List[Any] = []
     launched = threading.Semaphore(0)
@@ -1193,6 +1207,9 @@ def test_shutdown_watchdog_aborts_every_group_on_its_own_daemon_thread():
         3, flag, threading.Event(), aborted,
         live_process_groups=lambda: list(groups),
         abort_one_group=record,
+        # The loop never retires in this test, so the watchdog reaches its
+        # self-exit net; without a hook it would end the test process.
+        exit_process=lambda code: None,
     )
     flag.value = 1
     watchdog.join(timeout=10)
@@ -1214,6 +1231,7 @@ def test_abort_threads_are_daemons_and_are_never_joined():
     ns = _load_worker_loop_helpers()
     ns["_SHUTDOWN_ABORT_GRACE_S"] = 0.01
     ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 0.01
     wedged = threading.Event()        # released only at the end of the test
     entered = threading.Semaphore(0)
     flag = _Flag(0)
@@ -1227,6 +1245,7 @@ def test_abort_threads_are_daemons_and_are_never_joined():
             0, flag, threading.Event(), threading.Event(),
             live_process_groups=lambda: [_Group("0"), _Group("1")],
             abort_one_group=blocking_abort,
+            exit_process=lambda code: None,
         )
         flag.value = 1
         # Both aborts are in flight...
@@ -1334,6 +1353,7 @@ def test_shutdown_watchdog_survives_a_failing_abort():
     ns = _load_worker_loop_helpers()
     ns["_SHUTDOWN_ABORT_GRACE_S"] = 0.01
     ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 0.01
     reached: List[str] = []
     done = threading.Semaphore(0)
     flag = _Flag(0)
@@ -1347,6 +1367,7 @@ def test_shutdown_watchdog_survives_a_failing_abort():
         1, flag, threading.Event(), threading.Event(),
         live_process_groups=lambda: [_Group("0"), _Group("1")],
         abort_one_group=exploding_abort,
+        exit_process=lambda code: None,
     )
     flag.value = 1
     watchdog.join(timeout=10)
@@ -1586,6 +1607,11 @@ def test_worker_exit_paths_are_all_logged():
     assert source.count('"[shutdown] worker exit path=%s rank=%s"') == 1
     assert "exit_path, global_rank" in source
 
+    # The self-exit marker is a SEPARATE line with its own format, because it
+    # is not an ordered exit and carries the pid: the watchdog thread logs it
+    # while the main thread is still stuck below Python.
+    assert source.count('"[shutdown] worker exit path=%s rank=%s pid=%s"') == 1
+
     # The worker never claims the signal-fallback path: it cannot log it (it is
     # force-killed inside a native collective, so no Python runs in it again),
     # so the manager owns that marker and this module must not contain it as a
@@ -1595,7 +1621,13 @@ def test_worker_exit_paths_are_all_logged():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "signal-fallback" not in literals
-    assert {"ordered-via-sentinel", "ordered-via-flag", "ordered-via-abort"} <= literals
+    assert {
+        "ordered-via-sentinel",
+        "ordered-via-flag",
+        "ordered-via-abort",
+        "ordered-via-decode-boundary",
+        "self-exit",
+    } <= literals
 
     # ...and it IS the manager's, exactly once, with the rank index and pid.
     manager_source = WORKER_MANAGER_PATH.read_text()
@@ -1744,6 +1776,842 @@ def test_abort_watchdog_adds_no_env_vars():
     there is nothing to turn on instead of this watchdog."""
     loop_source = WORKER_LOOP_PATH.read_text()
     helpers = loop_source.split("def _shutdown_requested(", 1)[1]
+    helpers = helpers.split("def _setup_nccl_env(", 1)[0]
+    assert "os.environ" not in helpers
+    assert "getenv" not in helpers
+
+
+def _cohort_flag_probe_child(flag, observed, child_pid, deadline_s):
+    """Worker side of the cohort-flag transport test, in a real spawned child.
+
+    Builds the same zero-argument probe the supervisor installs on the worker
+    and polls it, exactly as the decode loop does, then records whether the
+    manager's store ever became visible here.  Module level and picklable
+    because spawn re-imports this module in the child.
+    """
+    child_pid.value = os.getpid()
+    probe = lambda: flag is not None and bool(flag.value)
+    end = time.monotonic() + deadline_s
+    while time.monotonic() < end:
+        if probe():
+            observed.value = 1
+            return
+        time.sleep(0.01)
+    observed.value = 0
+
+
+# --------------------------------------------------------------------------
+# Attempt 3 (v3 spec): the decode-step boundary exit and the self-exit net.
+#
+# What the W5 bench established and these tests pin:
+#   B3  the abort's release is SILENT -- the wedged sync returns normally and
+#       in graph mode nothing ever raises, so only a flag test on the freed
+#       rank's own execution path can retire it.
+#   B4  that path has a FINITE window (the freed rank resumes, then re-wedges
+#       permanently), so the test must sit on the first code after the sync.
+#   B5  os._exit from a side thread ends a wedged process promptly with the
+#       status as set, which makes a bounded self-exit net viable.
+# --------------------------------------------------------------------------
+
+BATCHGEN_WORKER_PATH = ROOT / "batchgen/batchgen_worker.py"
+
+_worker_tree_cache: Dict[str, ast.Module] = {}
+
+
+def _worker_tree() -> ast.Module:
+    """Parse batchgen_worker.py once; it is ~17.5k lines."""
+    if "tree" not in _worker_tree_cache:
+        _worker_tree_cache["tree"] = ast.parse(BATCHGEN_WORKER_PATH.read_text())
+    return _worker_tree_cache["tree"]
+
+
+def _worker_class() -> ast.ClassDef:
+    return next(
+        node for node in _worker_tree().body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    )
+
+
+def _worker_method(name: str) -> ast.FunctionDef:
+    return next(
+        node for node in _worker_class().body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _decode_loop() -> ast.While:
+    """The decode loop whose per-step sync is the measured production wedge."""
+    return next(
+        node for node in ast.walk(_worker_method("decoding_continuous"))
+        if isinstance(node, ast.While) and ast.unparse(node.test) == "decode_uuids"
+    )
+
+
+def _decode_shutdown_checks() -> List[ast.If]:
+    return [
+        node for node in _decode_loop().body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self._cohort_shutdown_requested()"
+    ]
+
+
+def _generate_outer_loop() -> ast.While:
+    return next(
+        node for node in _worker_method("generate").body
+        if isinstance(node, ast.While)
+        and isinstance(node.test, ast.Constant) and node.test.value is True
+    )
+
+
+def _collective_calls(node: ast.AST) -> List[Any]:
+    """Every call in this subtree that reaches the GPU or a communicator."""
+    found = []
+    for item in ast.walk(node):
+        if not isinstance(item, ast.Call):
+            continue
+        name = ast.unparse(item.func)
+        if (
+            name.startswith("dist.")
+            or name.startswith("torch.cuda.")
+            or "synchronize" in name
+            or "barrier" in name
+            or "all_gather" in name
+            or "all_reduce" in name
+            or "broadcast" in name
+        ):
+            found.append((item.lineno, name))
+    return found
+
+
+def _load_worker_shutdown_seam():
+    """Lift the worker's cohort-shutdown seam out of its source.
+
+    ``batchgen_worker`` cannot be imported on a dev machine, so the three
+    members that make up the seam are compiled into a bare class exactly as
+    ``_load_worker_manager_class`` lifts out WorkerManager.  Taking them from
+    the real source is the point: a renamed probe or a dropped latch fails here.
+    """
+    wanted = {
+        "set_cohort_shutdown_probe",
+        "_cohort_shutdown_requested",
+        "cohort_shutdown_observed",
+    }
+    members = [
+        node for node in _worker_class().body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    assert {node.name for node in members} == wanted, (
+        f"the worker's cohort-shutdown seam changed shape: "
+        f"{sorted(node.name for node in members)}"
+    )
+    cls = ast.ClassDef(
+        name="_Seam",
+        bases=[],
+        keywords=[],
+        body=members,
+        decorator_list=[],
+        type_params=[],
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=[cls], type_ignores=[])
+    )
+    namespace: Dict[str, Any] = {"property": property}
+    exec(compile(module, str(BATCHGEN_WORKER_PATH), "exec"), namespace)
+    seam = namespace["_Seam"]
+
+    def _new():
+        obj = seam()
+        obj._cohort_shutdown_probe = None
+        obj._cohort_shutdown_observed = False
+        return obj
+
+    return _new
+
+
+# ---- B3/B4: the decode-step boundary is where a freed rank is caught -----
+
+def test_decode_loop_tests_the_cohort_flag_at_the_top_of_every_step():
+    """The ordinary case: teardown began between steps, so the step must not
+    start at all.  First statement in the loop, before any work is issued."""
+    loop = _decode_loop()
+    first = loop.body[0]
+    assert isinstance(first, ast.If)
+    assert ast.unparse(first.test) == "self._cohort_shutdown_requested()"
+
+
+def test_decode_loop_tests_the_cohort_flag_right_after_the_token_sync():
+    """B3/B4.  ``_new_tokens_ready.synchronize()`` IS the production wedge
+    point: a rank whose peer died mid-decode sits there, below Python, and the
+    cohort abort releases it by making that call return -- silently, with no
+    exception then or ever in graph mode.  The freed rank has a finite window
+    before it re-wedges, so the flag test must sit as close to that sync as the
+    step's own invariants allow.
+
+    "As close as the invariants allow" is exactly one statement further than
+    the sync: the step's host-KV append drain MUST run first (see
+    test_the_decode_exit_never_strands_in_flight_local_work).  Nothing else may
+    come between.
+    """
+    loop = _decode_loop()
+    sync_index = next(
+        index for index, node in enumerate(loop.body)
+        if isinstance(node, ast.Expr)
+        and ast.unparse(node.value) == "_new_tokens_ready.synchronize()"
+    )
+    checks = [
+        index for index, node in enumerate(loop.body)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self._cohort_shutdown_requested()"
+    ]
+    after_sync = [index for index in checks if index > sync_index]
+    assert after_sync, "no cohort-flag test follows the per-step token sync"
+    check_index = min(after_sync)
+
+    # Between the sync and the test: host-side timing, and the append drain
+    # whose completion the teardown depends on.  Nothing else -- in particular
+    # nothing that issues new GPU or collective work, which a rank that is
+    # already supposed to be stopping must not do.
+    allowed = {
+        "time.perf_counter",
+        "self._wait_pending_kv_append_tasks",
+    }
+    between = loop.body[sync_index + 1:check_index]
+    for node in between:
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call):
+                assert ast.unparse(call.func) in allowed, (
+                    f"{ast.unparse(call.func)} runs between the wedge-point "
+                    "sync and the shutdown test"
+                )
+
+
+def test_the_decode_exit_never_strands_in_flight_local_work():
+    """The decode teardown exit must quiesce what this rank already launched.
+
+    The host-KV appends are std::async threads holding unlocked pointers into
+    the worker view's page table, and an async host->GPU KV load can be in
+    flight too.  The ordered teardown this exit leads to releases those
+    mappings, so returning with either still running is a use-after-free during
+    teardown -- and the existing per-step drain invariant
+    (tests/test_worker_host_kv_append_completion.py) exists because an earlier
+    version of that race corrupted KV pages in production.
+
+    Both exits therefore route through one quiesce helper, and every wait in it
+    is local: a cross-rank drain here would hang on the dead peer, which is the
+    original defect.
+    """
+    checks = _decode_shutdown_checks()
+    assert len(checks) == 2
+    for check in checks:
+        quiesce = [
+            node for node in ast.walk(check)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func)
+            == "self._quiesce_decode_for_cohort_shutdown"
+        ]
+        assert len(quiesce) == 1, (
+            "each decode teardown exit must quiesce in-flight local work"
+        )
+        # It is handed the async load so the helper can wait on it.
+        assert [ast.unparse(arg) for arg in quiesce[0].args] == [
+            "pending_async_task"
+        ]
+
+    helper = _worker_method("_quiesce_decode_for_cohort_shutdown")
+
+    # Local waits only.  No collective may appear here at all.
+    assert not [
+        name for _, name in _collective_calls(helper)
+        if name.startswith("dist.")
+    ], "the decode teardown quiesce must issue no collective"
+
+    # The append drain defers its errors, which is what keeps it off the
+    # cross-rank error sync.
+    drains = [
+        node for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._wait_pending_kv_append_tasks"
+    ]
+    assert len(drains) == 1
+    assert [(kw.arg, ast.unparse(kw.value)) for kw in drains[0].keywords] == [
+        ("defer_errors", "True")
+    ]
+
+    # And it cannot raise: this runs on a path whose purpose is to unwind
+    # normally, so a failed quiesce must not become an escaping exception.
+    handlers = [
+        node for node in ast.walk(helper) if isinstance(node, ast.ExceptHandler)
+    ]
+    assert len(handlers) == 2
+    for handler in handlers:
+        assert isinstance(handler.type, ast.Name)
+        assert handler.type.id == "BaseException"
+        assert not [
+            node for node in ast.walk(handler) if isinstance(node, ast.Raise)
+        ]
+
+
+def test_decode_loop_shutdown_exit_returns_rather_than_breaking():
+    """The exit must RETURN out of decoding_continuous.
+
+    Breaking would fall into this loop's own post-loop cleanup, which drains
+    the KV-append tasks with sync_distributed_errors=True -- i.e. issues a
+    fresh dist.all_gather_object on the communicator that was just aborted.
+    Returning issues no further GPU or collective work at all, which is the
+    entire purpose of stopping at this boundary.
+    """
+    checks = _decode_shutdown_checks()
+    assert len(checks) == 2, f"expected two boundary tests, found {len(checks)}"
+    for check in checks:
+        kinds = [type(node) for node in ast.walk(check)]
+        assert ast.Return in kinds, "the boundary exit must return"
+        assert ast.Break not in kinds, (
+            "a break would run the post-loop cross-rank drain; see the "
+            "sync_distributed_errors hazard this test's docstring names"
+        )
+        assert ast.Raise not in kinds, (
+            "the boundary exit must unwind normally; the release from an "
+            "aborted collective is not an exception (B3)"
+        )
+        # It latches, so the supervisor can name the path this rank took.
+        assert any(
+            isinstance(node, ast.Assign)
+            and ast.unparse(node.targets[0]) == "self._cohort_shutdown_observed"
+            and ast.unparse(node.value) == "True"
+            for node in ast.walk(check)
+        )
+        # And it issues nothing on the way out.
+        assert _collective_calls(check) == []
+
+
+def test_the_post_loop_drain_a_break_would_hit_is_really_a_collective():
+    """Grounds the previous test's reason in the code rather than in prose.
+
+    If this drain ever stops being a cross-rank operation the return-vs-break
+    argument changes, and whoever changes it should see this test.
+    """
+    fn = _worker_method("decoding_continuous")
+    loop = _decode_loop()
+    tail = [node for node in fn.body if node.lineno > loop.end_lineno]
+    drains = [
+        node for node in ast.walk(ast.Module(body=tail, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._wait_pending_kv_append_tasks"
+        and any(
+            keyword.arg == "sync_distributed_errors"
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+    ]
+    assert len(drains) == 1, (
+        "the post-loop cross-rank drain moved; re-derive whether the decode "
+        "boundary may break instead of return"
+    )
+    inner = _worker_method("_wait_pending_kv_append_tasks")
+    assert [
+        name for _, name in _collective_calls(inner)
+        if "all_gather" in name
+    ], "the drain no longer issues a collective"
+
+
+def test_decode_boundary_probe_and_latch_behave_as_a_plain_load():
+    """Executable check of the seam itself, lifted from the worker's source."""
+    make = _load_worker_shutdown_seam()
+
+    unarmed = make()
+    assert unarmed._cohort_shutdown_requested() is False
+    assert unarmed.cohort_shutdown_observed is False
+
+    armed = make()
+    armed.set_cohort_shutdown_probe(lambda: False)
+    assert armed._cohort_shutdown_requested() is False
+    armed.set_cohort_shutdown_probe(lambda: True)
+    assert armed._cohort_shutdown_requested() is True
+
+    # The latch is what the supervisor reads, and it is not the probe: a rank
+    # that never reached the decode boundary must not claim that exit path.
+    assert armed.cohort_shutdown_observed is False
+    armed._cohort_shutdown_observed = True
+    assert armed.cohort_shutdown_observed is True
+
+
+def test_decode_step_costs_one_probe_call_when_no_teardown_is_running():
+    """The healthy path pays a None test, or one shared-byte load, per step --
+    no lock, no allocation, no logging.  Counted on the real lifted seam."""
+    make = _load_worker_shutdown_seam()
+    worker = make()
+    calls = []
+
+    class _Byte:
+        """Stands in for the lock-free shared byte, counting its loads."""
+
+        def __init__(self) -> None:
+            self._v = 0
+
+        @property
+        def value(self):
+            calls.append("load")
+            return self._v
+
+    byte = _Byte()
+    worker.set_cohort_shutdown_probe(lambda: bool(byte.value))
+
+    for _ in range(1000):
+        assert worker._cohort_shutdown_requested() is False
+
+    assert calls == ["load"] * 1000
+
+
+# ---- the unwind out of generate() ----------------------------------------
+
+def test_generate_carries_the_decode_exit_out_before_the_next_collective():
+    """The decode phase's cleanup ends in dist.barrier().  A rank that left the
+    decode loop because of teardown must break BEFORE that barrier, or it
+    issues a fresh collective on an aborted communicator."""
+    outer = _generate_outer_loop()
+    decode_phase = next(
+        node for node in outer.body
+        if isinstance(node, ast.While) and "has_in_decode" in ast.unparse(node.test)
+    )
+    latch_checks = [
+        node for node in decode_phase.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self._cohort_shutdown_observed"
+    ]
+    assert len(latch_checks) == 1
+    check = latch_checks[0]
+    assert [type(node) for node in check.body] == [ast.Break]
+
+    barriers = [
+        lineno for lineno, name in _collective_calls(decode_phase)
+        if name == "dist.barrier"
+    ]
+    assert barriers, "the decode phase no longer issues the cleanup barrier"
+    assert check.lineno < min(barriers), (
+        "the teardown break must precede the decode cleanup barrier"
+    )
+
+
+def test_generate_outer_boundary_tests_the_latch_and_never_the_probe():
+    """Load-bearing distinction, and the reason this is not a flag test.
+
+    An IDLE pool leaves through the queue sentinel a few lines below this
+    check and is counted as ordered-via-sentinel.  The manager sets the cohort
+    flag immediately BEFORE that sentinel, so a probe test here would quietly
+    take over every clean teardown and relabel it.  Only a rank that actually
+    left the decode loop at its boundary may exit here.
+    """
+    outer = _generate_outer_loop()
+    first = outer.body[0]
+    assert isinstance(first, ast.If)
+    assert ast.unparse(first.test) == "self._cohort_shutdown_observed"
+    assert [type(node) for node in first.body] == [ast.Break]
+
+    assert "_cohort_shutdown_requested" not in ast.unparse(first), (
+        "the outer generate() boundary must test the latch, not the probe, or "
+        "a clean idle teardown stops being ordered-via-sentinel"
+    )
+
+
+def test_generate_issues_no_collective_after_its_loop():
+    """Having broken out, the rank must reach its supervisor without touching
+    a communicator again."""
+    fn = _worker_method("generate")
+    outer = _generate_outer_loop()
+    tail = [node for node in fn.body if node.lineno > outer.end_lineno]
+    assert tail, "generate() has no tail after its persistent loop"
+    assert _collective_calls(ast.Module(body=tail, type_ignores=[])) == []
+
+
+# ---- the plumbing seam ---------------------------------------------------
+
+def test_the_supervisor_installs_the_probe_before_the_main_loop():
+    """The seam, and where it is armed.  Set before the loop and never
+    cleared, so it cannot be missing on any path that reaches decode."""
+    impl = _worker_loop_function("_server_worker_main_impl")
+    installs = [
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "worker.set_cohort_shutdown_probe"
+    ]
+    assert len(installs) == 1
+    install = installs[0]
+
+    # It hands down a zero-argument probe over the module's own flag helper,
+    # so the flag's shape stays in the supervisor.
+    assert len(install.args) == 1
+    probe = install.args[0]
+    assert isinstance(probe, ast.Lambda)
+    assert probe.args.args == []
+    assert ast.unparse(probe.body) == "_shutdown_requested(shutdown_flag)"
+
+    guard = _main_loop_guard()
+    assert install.lineno < guard.lineno, (
+        "the probe must be installed before the main loop starts"
+    )
+
+
+def test_the_cohort_flag_reaches_a_spawned_child_as_the_worker_sees_it():
+    """End-to-end transport: the manager's store must be visible through the
+    probe in a real spawned process, which is how workers are started."""
+    ctx = multiprocessing.get_context("spawn")
+    flag = ctx.RawValue("b", 0)
+    observed = ctx.RawValue("b", -1)
+    child_pid = ctx.RawValue("i", 0)
+
+    child = ctx.Process(
+        target=_cohort_flag_probe_child,
+        args=(flag, observed, child_pid, 30.0),
+    )
+    child.start()
+    try:
+        # The child is already polling the flag it was handed; this is the
+        # manager's plain store, from the other side of the spawn boundary.
+        flag.value = 1
+        child.join(timeout=60)
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=10)
+
+    assert child.exitcode == 0
+    # Proof this really crossed a process boundary rather than reading the
+    # parent's own memory: the observation was recorded by another pid.
+    assert child_pid.value not in (0, os.getpid()), (
+        f"the probe did not run in a separate process (pid={child_pid.value})"
+    )
+    assert observed.value == 1, (
+        "a spawned worker did not see the cohort flag the manager stored to"
+    )
+
+
+# ---- B5: the self-exit safety net ---------------------------------------
+
+def test_watchdog_self_exits_when_the_loop_never_leaves(caplog):
+    """B5.  The abort frees a rank in milliseconds but cannot be acknowledged,
+    and a rank it did NOT free will never leave on its own.  Holding the
+    teardown open for it only trades this bounded window for the manager's
+    grace and a SIGKILL, so the watchdog ends the process itself -- and says
+    so first, which it can do because it holds the GIL."""
+    ns = _load_worker_loop_helpers()
+    ns["_SHUTDOWN_ABORT_GRACE_S"] = 0.01
+    ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 0.05
+    exits: List[int] = []
+    flag = _Flag(0)
+
+    with caplog.at_level(logging.ERROR):
+        watchdog = ns["_start_shutdown_abort_watchdog"](
+            6, flag, threading.Event(), threading.Event(),
+            live_process_groups=lambda: [_Group("0")],
+            abort_one_group=lambda group: None,
+            exit_process=exits.append,
+        )
+        flag.value = 1
+        watchdog.join(timeout=30)
+
+    assert not watchdog.is_alive()
+    assert exits == [ns["_WORKER_SELF_EXIT_CODE"]]
+
+    markers = [
+        record.getMessage() for record in caplog.records
+        if "worker exit path=" in record.getMessage()
+    ]
+    assert markers == [
+        f"[shutdown] worker exit path=self-exit rank=6 pid={os.getpid()}"
+    ], markers
+
+
+def test_watchdog_does_not_self_exit_when_the_loop_leaves_in_the_window():
+    """The net is a fallback, not the path.  A rank the abort freed leaves
+    through the decode boundary well inside this window, and must then be
+    allowed to run its ordered teardown -- which releases a large registered
+    mapping and can take minutes."""
+    ns = _load_worker_loop_helpers()
+    ns["_SHUTDOWN_ABORT_GRACE_S"] = 0.01
+    ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 30.0
+    exits: List[int] = []
+    flag = _Flag(0)
+    loop_exited = threading.Event()
+    started = threading.Semaphore(0)
+
+    def abort(group):
+        started.release()
+
+    watchdog = ns["_start_shutdown_abort_watchdog"](
+        7, flag, loop_exited, threading.Event(),
+        live_process_groups=lambda: [_Group("0")],
+        abort_one_group=abort,
+        exit_process=exits.append,
+    )
+    flag.value = 1
+    # The abort went out, so the watchdog is now in its self-exit window...
+    assert started.acquire(timeout=30)
+    # ...and the loop retires inside it.
+    loop_exited.set()
+    watchdog.join(timeout=30)
+
+    assert not watchdog.is_alive()
+    assert exits == []
+
+
+def test_a_clean_teardown_never_arms_the_self_exit():
+    """Zero change to the healthy path: a worker that leaves its loop inside
+    the abort grace is never aborted and never self-exits."""
+    ns = _load_worker_loop_helpers()
+    ns["_SHUTDOWN_FLAG_POLL_S"] = 0.01
+    ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] = 0.01
+    exits: List[int] = []
+    aborts: List[Any] = []
+    flag = _Flag(0)
+    loop_exited = threading.Event()
+
+    watchdog = ns["_start_shutdown_abort_watchdog"](
+        0, flag, loop_exited, threading.Event(),
+        live_process_groups=lambda: [_Group("0")],
+        abort_one_group=aborts.append,
+        exit_process=exits.append,
+    )
+    flag.value = 1
+    loop_exited.set()
+    watchdog.join(timeout=30)
+
+    assert not watchdog.is_alive()
+    assert aborts == []
+    assert exits == []
+
+
+def test_the_self_exit_marker_is_flushed_before_the_process_ends():
+    """``os._exit`` runs no handlers and flushes nothing, so the one line that
+    attributes the exit is the most likely record to be lost."""
+    fn = _worker_loop_function("_start_shutdown_abort_watchdog")
+    flushes = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "_flush_worker_logs"
+    ]
+    exits = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self_exit"
+    ]
+    assert len(flushes) == 1 and len(exits) == 1
+    assert flushes[0].lineno < exits[0].lineno
+
+    marker_logs = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "logging.error"
+    ]
+    assert len(marker_logs) == 1
+    assert marker_logs[0].lineno < flushes[0].lineno
+
+
+def test_the_log_flush_cannot_raise_on_the_way_out():
+    """It runs while a teardown is already failing; raising there would
+    replace a bounded self-exit with an unhandled error in a daemon thread."""
+    ns = _load_worker_loop_helpers()
+
+    class _Hostile(logging.Handler):
+        def emit(self, record):
+            pass
+
+        def flush(self):
+            raise RuntimeError("handler is wedged too")
+
+    handler = _Hostile()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        ns["_flush_worker_logs"]()
+    finally:
+        root.removeHandler(handler)
+
+
+# ---- the exit status, and what the manager does with it ------------------
+
+def test_the_self_exit_status_collides_with_nothing_the_manager_reads():
+    """Grounded choice, not a guess.  The manager reports a worker's exitcode
+    verbatim as the reason a cohort went down, so the self-exit status must be
+    distinguishable from every other status this worker can produce:
+    0 the clean pool exit, 1 every fatal path, 128+n the signal translation in
+    process_utils, and -n multiprocessing's rendering of a signal death.
+    """
+    ns = _load_worker_loop_helpers()
+    code = ns["_WORKER_SELF_EXIT_CODE"]
+
+    assert isinstance(code, int)
+    assert code not in (0, 1), "collides with the clean and fatal exits"
+    assert 1 < code < 128, (
+        "128 and above collide with process_utils' 128+signum translation"
+    )
+
+    # Every other os._exit status this worker can take, from the source.
+    loop_source = WORKER_LOOP_PATH.read_text()
+    worker_source = BATCHGEN_WORKER_PATH.read_text()
+    others = set()
+    for source in (loop_source, worker_source):
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "os._exit"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                others.add(node.args[0].value)
+    assert code not in others, f"{code} is already used as an exit status"
+
+
+def test_the_manager_interprets_no_exit_status_specially():
+    """The manager needs no change to reap a self-exited worker: it compares
+    exitcode only against None (has it exited), never against a value."""
+    tree = _worker_manager_tree()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        parts = [node.left] + node.comparators
+        if not any(
+            isinstance(part, ast.Attribute) and part.attr == "exitcode"
+            for part in parts
+        ):
+            continue
+        rendered = ast.unparse(node)
+        assert all(
+            isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops
+        ), f"the manager branches on an exitcode VALUE: {rendered}"
+        assert all(
+            isinstance(part, ast.Constant) and part.value is None
+            for part in parts[1:]
+        ), f"the manager compares exitcode to a value: {rendered}"
+
+
+def test_the_signal_fallback_marker_skips_a_worker_that_exited_itself(
+    monkeypatch, caplog
+):
+    """A self-exited worker is already dead when the fallback leg runs, so it
+    is filtered out before the markers are logged and is never named as
+    signal-fallback.  That filter is what makes the self-exit honest in the
+    per-cohort marker accounting."""
+    ns = _load_worker_loop_helpers()
+    manager = _manager(monkeypatch)
+
+    class _Proc:
+        def __init__(self, pid: int, exitcode) -> None:
+            self.pid = pid
+            self.exitcode = exitcode
+
+        def join(self, timeout=None) -> None:
+            pass
+
+        def terminate(self) -> None:
+            self.exitcode = -15
+
+        def kill(self) -> None:
+            self.exitcode = -9
+
+    self_exited = _Proc(2001, ns["_WORKER_SELF_EXIT_CODE"])
+    forced = _Proc(2002, None)
+    manager._join_lock = threading.Lock()
+    manager.worker_process = SimpleNamespace(processes=[self_exited, forced])
+    manager.args = SimpleNamespace(runtime_identity=SimpleNamespace(
+        shm_prefix="run.", runtime_dir="/tmp/does-not-matter",
+    ))
+    del manager._stop_workers
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        manager._stop_workers()
+
+    markers = [
+        record.getMessage() for record in caplog.records
+        if "worker exit path=" in record.getMessage()
+    ]
+    assert markers == [
+        "[shutdown] worker exit path=signal-fallback rank-idx=1 pid=2002"
+    ], markers
+    # The self-exited worker was reaped untouched, keeping its own status.
+    assert self_exited.exitcode == ns["_WORKER_SELF_EXIT_CODE"]
+
+
+# ---- marker accounting ---------------------------------------------------
+
+def test_the_decode_boundary_marker_joins_the_exit_path_enumeration():
+    """Per-cohort accounting sums ordered-via-{sentinel,flag,abort,
+    decode-boundary} plus the manager's signal-fallback, so the new marker has
+    to exist as a value and be distinct from the others."""
+    ns = _load_worker_loop_helpers()
+    ordered = [
+        ns["_EXIT_PATH_SENTINEL"],
+        ns["_EXIT_PATH_FLAG"],
+        ns["_EXIT_PATH_ABORT"],
+        ns["_EXIT_PATH_DECODE_BOUNDARY"],
+    ]
+    assert ordered == [
+        "ordered-via-sentinel",
+        "ordered-via-flag",
+        "ordered-via-abort",
+        "ordered-via-decode-boundary",
+    ]
+    assert len(set(ordered)) == 4
+    # Not an ordered exit, and deliberately named so it cannot be summed into
+    # one by mistake.
+    assert ns["_EXIT_PATH_SELF_EXIT"] == "self-exit"
+    assert not ns["_EXIT_PATH_SELF_EXIT"].startswith("ordered-via-")
+
+    literals = {
+        node.value for node in ast.walk(_worker_loop_tree())
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert set(ordered) | {"self-exit"} <= literals
+
+
+def test_the_supervisor_names_the_decode_boundary_exit():
+    """The rank reports having taken that exit; the supervisor does not infer
+    it from the flag.  A pool shutdown that merely coincided with teardown is
+    a different path and must not claim this marker."""
+    impl = _worker_loop_function("_server_worker_main_impl")
+    checks = [
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "worker.cohort_shutdown_observed"
+    ]
+    assert len(checks) == 1
+    check = checks[0]
+
+    assert any(
+        isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "exit_path"
+        and ast.unparse(node.value) == "_EXIT_PATH_DECODE_BOUNDARY"
+        for node in check.body
+    )
+    assert any(isinstance(node, ast.Break) for node in check.body)
+    assert not [node for node in ast.walk(check) if isinstance(node, ast.Raise)]
+
+    # It runs after generate_persistent returns and before the pool_shutdown
+    # sentinel, whose cohort is the one being torn down.
+    persistent = next(
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "worker.generate_persistent"
+    )
+    sentinel = next(
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "response_queue.put"
+        and "pool_shutdown" in ast.unparse(node)
+    )
+    assert persistent.lineno < check.lineno < sentinel.lineno
+
+
+def test_the_self_exit_window_is_bounded_and_needs_no_env_var():
+    ns = _load_worker_loop_helpers()
+    # Long enough for a freed rank to notice the flag and leave on its own
+    # (measured working window after the abort: a few seconds), short enough
+    # that it is not the manager's grace by another name.
+    assert 0 < ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] <= 60
+    assert ns["_SHUTDOWN_SELF_EXIT_GRACE_S"] > ns["_SHUTDOWN_ABORT_GRACE_S"]
+
+    helpers = WORKER_LOOP_PATH.read_text().split("def _shutdown_requested(", 1)[1]
     helpers = helpers.split("def _setup_nccl_env(", 1)[0]
     assert "os.environ" not in helpers
     assert "getenv" not in helpers

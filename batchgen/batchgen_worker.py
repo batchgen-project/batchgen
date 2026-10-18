@@ -869,6 +869,15 @@ class BatchGenWorker:
 		# Decode watchdog: per-decode-step timeout (separate from general watchdog)
 		self._decode_watchdog = None
 
+		# Cohort teardown probe, set by the worker supervisor before the main
+		# loop (see set_cohort_shutdown_probe).  None until then, and on every
+		# path that never serves a pool, so every call site must tolerate it.
+		self._cohort_shutdown_probe = None
+		# Latched by the decode-step boundary check so the supervisor can name
+		# the exit path this rank actually took.  Never cleared: a cohort
+		# teardown is terminal for this process.
+		self._cohort_shutdown_observed = False
+
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
 			logging.info(
@@ -2591,6 +2600,84 @@ class BatchGenWorker:
 		# Start disabled — only enable around actual decode iterations
 		if hasattr(watchdog, '_active'):
 			watchdog._active = False
+
+	def set_cohort_shutdown_probe(self, probe) -> None:
+		"""Install the zero-argument cohort-teardown probe.
+
+		``probe()`` answers one question -- has this cohort's teardown begun --
+		and the supervisor owns what backs it (a plain load from a lock-free
+		shared byte the manager stores to).  Keeping it a callable is what keeps
+		the flag's shape, and the no-handshake contract that goes with it, out
+		of this class.
+		"""
+		self._cohort_shutdown_probe = probe
+
+	def _cohort_shutdown_requested(self) -> bool:
+		"""Has this cohort's teardown begun?
+
+		Called once per decode step on the hot path, so it stays a single
+		attribute load and, when armed, one shared-byte load behind the probe:
+		no lock, no allocation, no logging.  Unarmed (no supervisor, or a code
+		path that never serves a pool) it is a ``None`` test and nothing else.
+		"""
+		probe = self._cohort_shutdown_probe
+		return probe is not None and probe()
+
+	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
+		"""Let LOCAL in-flight decode work finish before the ordered teardown.
+
+		Called on the decode loop's teardown exits.  Everything waited on here
+		is work this rank already launched and that holds raw pointers into
+		mappings the ordered teardown is about to release -- the host-KV append
+		tasks (std::async threads reading the worker view's page table with no
+		lock) and an async host->GPU KV load.  Returning out of decode with
+		either still in flight is a use-after-free during teardown, which is
+		why the exit quiesces instead of just leaving.
+
+		Every wait here is deliberately LOCAL.  ``defer_errors=True`` keeps the
+		append drain off the cross-rank error sync, which is the one thing this
+		exit must never do: the peer whose death started this teardown will
+		never join a collective again, so a guarded one would hang exactly
+		where the unfixed code hung.
+
+		Nothing raises out of here.  This runs on a teardown path whose whole
+		purpose is to unwind normally -- an exception would escape as an error
+		and lose the ordered exit -- so a failed quiesce is logged and the
+		teardown continues; the process is about to drop these mappings anyway.
+		"""
+		try:
+			if self._pending_kv_append_tasks:
+				self._wait_pending_kv_append_tasks(defer_errors=True)
+		except BaseException:
+			logging.warning(
+				"Rank %s: draining host-KV appends at the decode teardown "
+				"boundary failed; continuing the ordered teardown",
+				self.rank,
+				exc_info=True,
+			)
+		try:
+			if pending_async_task is not None:
+				pending_async_task.wait()
+				torch.cuda.synchronize(self.torch_device)
+		except BaseException:
+			logging.warning(
+				"Rank %s: draining the pending async KV load at the decode "
+				"teardown boundary failed; continuing the ordered teardown",
+				self.rank,
+				exc_info=True,
+			)
+		self.disable_decode_watchdog()
+
+	@property
+	def cohort_shutdown_observed(self) -> bool:
+		"""True once the decode-step boundary check retired this rank.
+
+		Read by the worker supervisor to name the exit path.  It is a latch, not
+		a re-read of the probe: the supervisor must be able to tell a rank that
+		left THROUGH the decode boundary from one that merely happened to have
+		the flag set by the time it finished something else.
+		"""
+		return self._cohort_shutdown_observed
 
 	def feed_watchdog(self) -> None:
 		"""Feed the watchdog to prevent timeout during long operations."""
@@ -7490,6 +7577,23 @@ class BatchGenWorker:
 
 		# Persistent loop: continues until all completed AND no more admissions expected
 		while True:
+			# --- Cohort teardown boundary ---
+			# Carries the decode-step exit the rest of the way out.  Without it
+			# the decode phase below is re-entered while its sequences are still
+			# IN_DECODE -- its setup issues collectives before decoding_continuous
+			# returns at its own check again -- so the rank would spin on
+			# aborted communicators instead of leaving.
+			#
+			# This tests the LATCH, deliberately not the probe.  Reading the flag
+			# here would also retire an IDLE pool, which today leaves through the
+			# queue sentinel a few lines below and is counted as
+			# ordered-via-sentinel; the cohort flag is set just before that
+			# sentinel, so a probe test would silently take over every clean
+			# teardown.  Only a rank that actually left the decode loop at its
+			# boundary exits here.
+			if self._cohort_shutdown_observed:
+				break
+
 			# --- ADMISSION CHECK: Poll for new sequences from IntakePool ---
 			if self._admission_queue is not None:
 				admitted = self._poll_admissions()
@@ -8096,6 +8200,16 @@ class BatchGenWorker:
 					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
 				self._mark_phase_end("decode")
 				decoding_time += time.perf_counter() - decode_start
+
+				# The decode loop returned because this cohort is being torn
+				# down.  Stop here: the cleanup immediately below ends in
+				# dist.barrier(), a fresh collective on a communicator that was
+				# very likely just aborted, and the rank that reaches it either
+				# raises or re-wedges.  Leaving both loops instead carries the
+				# rank out of generate() having issued nothing further, which is
+				# what lets the supervisor run the ordered teardown.
+				if self._cohort_shutdown_observed:
+					break
 
 				# D. Cleanup
 				self._finish_decode_interval()
@@ -14985,6 +15099,18 @@ class BatchGenWorker:
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
+			# --- Decode-step teardown boundary (top of step) ---
+			# The second of this loop's two flag tests.  The one after the token
+			# readback below catches a rank the abort just freed; this one
+			# catches the ordinary case where teardown began between steps, so
+			# the step never issues any work at all.  See the post-readback
+			# check for why neither may break out of this loop, and for why the
+			# in-flight local work is quiesced on the way out.
+			if self._cohort_shutdown_requested():
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
+
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
 
@@ -15923,6 +16049,35 @@ class BatchGenWorker:
 			# drain, both of which sync errors across ranks.
 			if self._pending_kv_append_tasks:
 				self._wait_pending_kv_append_tasks(defer_errors=True)
+
+			# --- Decode-step teardown boundary (the measured wedge point) ---
+			# The sync a few lines up is where a rank whose peer died mid-decode
+			# is stuck, far below Python, and where the cohort abort releases it.
+			# The release is SILENT: the sync returns normally and nothing raises
+			# afterwards -- in graph mode nothing ever will -- so this flag test
+			# is the only thing that can retire the freed rank.  It sits as close
+			# to the sync as the step's own invariants allow, because the window
+			# is finite: the rank resumes stepping and then re-wedges
+			# permanently, with no second warning.
+			#
+			# It sits AFTER the drain above, not before it, and that ordering is
+			# a correctness requirement rather than a preference.  The appends
+			# this step launched are std::async threads holding unlocked
+			# pointers into the worker view's page table, and the ordered
+			# teardown this exit leads to releases that mapping.  Returning with
+			# them still in flight is a use-after-free during teardown, so the
+			# step always finishes draining what it started.
+			#
+			# The exit is a RETURN, not a break.  Breaking would fall into this
+			# loop's post-loop cleanup, which drains with
+			# sync_distributed_errors=True and so issues a fresh
+			# dist.all_gather_object on the communicator that was just aborted
+			# -- which the dead peer will never join.
+			if self._cohort_shutdown_requested():
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
+
 			_split_t4 = time.perf_counter()
 			# One host read of this step's sampled tokens for the whole
 			# microbatch, replacing two `.item()` calls per row below.
