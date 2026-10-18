@@ -41,6 +41,16 @@ _K3_H200_PREFILL_GROUPED_CHUNK_ROWS = 32_768
 # the expert-chunk row cap, plus margin; the KDA term scales with the chunk.
 # Provisional until a pool run measures its chunk peak, like the GLM budget.
 _K3_H200_PREFIX_POOL_WORKSPACE_BYTES = 40 * _GIB
+# 48B-family reserve for H20-class TP8 (>= the threshold below, < the H200
+# one). The 48B's pool temporaries are strictly smaller than K3's (same
+# per-head widths, 27 vs 93 layers, resident instead of streamed experts), and
+# its weights leave ~90 GB free per H20 GPU, so a 24 GiB forward reserve holds
+# the measured chunk peaks with margin. Validated live on a 2x8 H20 serve
+# group: full in-wave pool + trajectory materialization matrix, zero OOM and
+# the per-wave token accounting identity exact. K3 itself stays pool-off on
+# H20 (unsized there, and its H20 deployment is prefill-capped anyway).
+_KL48_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
+_KL48_H20_MIN_MEMORY_BYTES = 90 * _GIB
 # KDA state slots held back from admission for pooled prefix segments: each
 # segment row holds one slot for its wave, and a wave that admits the full
 # sequence cap would otherwise leave none and decline the pool; a wave needing
@@ -199,23 +209,28 @@ def k3_resident_prefill_token_cap(
 
 
 def k3_prefill_prefix_pool_workspace_bytes(
-    *, gpu_total_memory_bytes: int | None, attention_group_size: int
+    *, gpu_total_memory_bytes: int | None, attention_group_size: int,
+    is_k3: bool = True,
 ) -> int:
     """Return the forward's reserve under the in-wave prefill prefix pool.
 
-    0 leaves the pool off, which is the answer for every layout but the
-    H200-class TP8 one the reserve above was sized on; K3 prefix reuse has no
-    cross-wave materialization path, so it runs on the pool or not at all.
+    0 leaves the pool off. The H200-class TP8 reserve was sized on K3 and
+    bounds the whole family; the H20-class TP8 reserve is sized for (and
+    restricted to) the 48B, whose temporaries are strictly smaller and whose
+    weights leave the headroom H20 needs. K3 prefix reuse has no cross-wave
+    materialization path, so it runs on the pool or not at all; refusing an
+    unsized layout at admission (the caller's named error) beats guessing.
     """
     group_size = int(attention_group_size)
     if group_size <= 0:
         raise ValueError("attention_group_size must be positive")
-    if (
-        group_size == 8
-        and gpu_total_memory_bytes is not None
-        and int(gpu_total_memory_bytes) >= _K3_H200_MIN_MEMORY_BYTES
-    ):
+    if gpu_total_memory_bytes is None or group_size != 8:
+        return 0
+    memory = int(gpu_total_memory_bytes)
+    if memory >= _K3_H200_MIN_MEMORY_BYTES:
         return _K3_H200_PREFIX_POOL_WORKSPACE_BYTES
+    if not is_k3 and memory >= _KL48_H20_MIN_MEMORY_BYTES:
+        return _KL48_H20_PREFIX_POOL_WORKSPACE_BYTES
     return 0
 
 
@@ -367,15 +382,17 @@ class KimiLinearPlanner(BasePlanner):
         # Modern paged-KV decode path (decoding_continuous), same as K2.5.
         self.config.Basic_Config.attn_mode = 3
 
-        # In-wave prefill prefix pool reserve; 0 leaves the pool off. Family
-        # wide: at G > 1 the 48B runs the same resident head-parallel KDA and
-        # NoPE-MLA seams as K3, with identical per-head widths (192 K, 128 V,
-        # 576 latent), so one reserve gates both. K3's figure bounds the 48B's
-        # strictly smaller temporaries, so reusing it only under-fills the pool.
+        # In-wave prefill prefix pool reserve; 0 leaves the pool off. At G > 1
+        # the 48B runs the same resident head-parallel KDA and NoPE-MLA seams
+        # as K3 with identical per-head widths (192 K, 128 V, 576 latent), so
+        # on H200-class memory one K3-sized reserve gates both (it bounds the
+        # 48B's strictly smaller temporaries). On H20-class memory only the
+        # 48B is sized (is_k3 keys the branch); K3 stays pool-off there.
         self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
             k3_prefill_prefix_pool_workspace_bytes(
                 gpu_total_memory_bytes=self.gpu_total_memory_bytes,
                 attention_group_size=self.attention_group_size,
+                is_k3=self.is_k3,
             )
         )
         pool_segment_slots = (
