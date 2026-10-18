@@ -196,6 +196,7 @@ from batchgen.worker.kv_manager import (
 	TokenBudgetRequest,
 	WatermarkTriggerRequest,
 )
+from batchgen.worker.sampling_residency import DecodeSamplingResidency
 from batchgen.worker.step_timing import (
 	FORWARD_EVENT_RING_SLOTS,
 	ForwardEventRing,
@@ -938,6 +939,15 @@ class BatchGenWorker:
 		self.kv_dtype = args.kv_dtype
 		self.device = args.device
 		self.torch_device = torch.device(f"cuda:{args.device}")
+
+		# Monotone stamp for the ORDERED decode row set: the local-index list
+		# `batch` and the `_local_to_uuid_map` it is resolved through. Decode
+		# keeps per-request sampling-parameter tensors resident on device and
+		# may only reuse them while row set AND row order are unchanged.
+		# `SequenceBatch.composition_epoch` covers the parameter source
+		# (membership); this covers the rows. Keying on membership alone would
+		# silently mis-order the temperature vector after a page boundary.
+		self._decode_row_epoch = 0
 
 		# CUDA graph state
 		self._cuda_graph_manager = None
@@ -2887,8 +2897,29 @@ class BatchGenWorker:
 
 	# ============ End Request Pool Methods ============
 
+	def _bump_decode_row_epoch(self) -> int:
+		"""Stamp a change to the ordered decode row set.
+
+		Call sites are the two places `batch` is rebound (the page boundary
+		planner and the async-load finalizer) and the host-rebalance remap of
+		`_local_to_uuid_map`, which can change which sequence a row resolves to
+		without changing `batch` at all. Anything that holds state keyed to the
+		row order -- today, the resident sampling-parameter tensors -- is
+		invalidated by this.
+		"""
+		self._decode_row_epoch += 1
+		return self._decode_row_epoch
+
 	def _build_sampling_tensors(self, batch_sequences: list) -> tuple:
 		"""Build [B] sampling param tensors for the active decode batch.
+
+		Reference implementation. The steady-state decode step path does NOT
+		call this -- it reads the resident tensors
+		(`batchgen.worker.sampling_residency`) instead, because this function's
+		`torch.tensor(..., device=cuda)` calls are pageable-source H2D copies
+		that block the host until the whole-model graph replay already queued on
+		the stream retires. This stays as the reference the residency is tested
+		against, and as the path every non-decode caller keeps using.
 
 		Returns:
 			(temps, top_ps, top_ks) tensors on the model's device, or (None, None, None)
@@ -2933,7 +2964,13 @@ class BatchGenWorker:
 				return False
 		return True
 
-	def _select_tokens(self, logits: torch.Tensor, batch_sequences: Optional[list] = None) -> torch.Tensor:
+	def _select_tokens(
+		self,
+		logits: torch.Tensor,
+		batch_sequences: Optional[list] = None,
+		residency=None,
+		batch_rows: Optional[list] = None,
+	) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
 		Sampling parameters are per-sequence; a batch without any falls
@@ -2942,11 +2979,31 @@ class BatchGenWorker:
 		Args:
 			logits: [batch_size, vocab_size] logits from model
 			batch_sequences: active decode-batch sequences, or None
+			residency: optional `DecodeSamplingResidency` for the steady-state
+				decode step path. When given, the per-request sampling tensors
+				are read from device-resident buffers instead of being rebuilt
+				and re-uploaded every step, and `sample_tokens` is handed the
+				host-side branch decisions so it stops reducing values the host
+				itself wrote. Every other call site passes nothing and keeps the
+				rebuild path unchanged.
+			batch_rows: the local decode-index list the rows came from, required
+				with `residency` -- it is both the row-order identity the cache
+				keys on and what the fail-loud shape/row checks name.
 
 		Returns:
 			[batch_size, 1] selected token indices
 		"""
 		from batchgen.sampling import sample_tokens
+
+		if residency is not None:
+			if batch_rows is None:
+				raise ValueError(
+					"_select_tokens: batch_rows is required with residency "
+					"(it is the row-order identity the resident tensors key on)"
+				)
+			return self._select_tokens_resident(
+				logits, batch_sequences or [], residency, batch_rows, sample_tokens
+			)
 
 		# Per-sequence sampling path: sampling params ride on the SequenceEntry
 		# objects of the active decode batch.
@@ -2978,6 +3035,54 @@ class BatchGenWorker:
 
 		# No sequence in the batch carries sampling params — greedy decoding.
 		return torch.argmax(logits, dim=-1, keepdim=True)
+
+	def _select_tokens_resident(
+		self,
+		logits: torch.Tensor,
+		batch_sequences: list,
+		residency,
+		batch_rows: list,
+		sample_tokens,
+	) -> torch.Tensor:
+		"""`_select_tokens` over device-resident sampling-parameter tensors.
+
+		Reproduces the three branches of the rebuild path exactly:
+
+		* no row carries `sampling_params` (`None`, not `{}`) -> the plain
+		  `torch.argmax` at the end of `_select_tokens`;
+		* every row is effectively greedy -> `logits.argmax` on the lm_head
+		  dtype, with no parameter tensor built and `sample_tokens` not entered;
+		* otherwise -> `sample_tokens` on the resident tensors.
+
+		The two argmax branches are deliberately distinct calls, as before: they
+		are reached under different conditions and must both stay reachable.
+		"""
+		plan = residency.plan(
+			batch_sequences,
+			logits=logits,
+			membership_epoch=self.global_batch.composition_epoch,
+			row_epoch=self._decode_row_epoch,
+			batch_rows=batch_rows,
+			verify=BATCHGEN_DECODE_ASSERT,
+		)
+		if not plan.has_params:
+			return torch.argmax(logits, dim=-1, keepdim=True)
+		if plan.all_greedy:
+			# argmax directly on the lm_head dtype: an fp32 upcast preserves
+			# bf16 ordering exactly, and the .float() copy was a fresh
+			# [bs, vocab] fp32 allocation on every decode step.
+			return logits.argmax(dim=-1, keepdim=True)
+		if not getattr(self, '_logged_sampling', False) and self.rank == 0:
+			logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
+			self._logged_sampling = True
+		return sample_tokens(
+			logits,
+			temperature=plan.temps,
+			top_p=plan.top_ps,
+			top_k=plan.top_ks,
+			host_decisions=plan.decisions,
+			bad_row_counter=residency.bad_row_counter,
+		)
 
 	def _log_prefill_timing(self):
 		"""Log prefill timing stats if available (GPT-OSS specific)."""
@@ -5335,6 +5440,10 @@ class BatchGenWorker:
 				local_idx = self._uuid_to_local_map.pop(uuid, None)
 				if local_idx is not None:
 					self._local_to_uuid_map.pop(local_idx, None)
+					# A remap can leave `batch` byte-identical while changing
+					# which sequence a row resolves to, so row-keyed state must
+					# be invalidated here and not only where `batch` is rebound.
+					self._bump_decode_row_epoch()
 					self._sequences_with_gpu_kv.discard(uuid)
 					# Remove query_book entry
 					self.query_book.pop(local_idx, None)
@@ -5357,6 +5466,7 @@ class BatchGenWorker:
 
 				self._uuid_to_local_map[uuid] = new_local_idx
 				self._local_to_uuid_map[new_local_idx] = uuid
+				self._bump_decode_row_epoch()
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
 				# Restore trajectory bytes into a destination reservation. The source
@@ -7860,6 +7970,7 @@ class BatchGenWorker:
 		self._uuid_to_local_map = {}
 		self._free_local_indices = set()
 		self._next_local_idx = 0
+		self._bump_decode_row_epoch()
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._rejected_sequences = []
@@ -15964,7 +16075,12 @@ class BatchGenWorker:
 				uuid_to_local[uuid] = idx
 		
 		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
-		
+
+		# This returns a NEW ordered row list, so stamp it here rather than at
+		# each caller: both the page-boundary planner and the decode loop call
+		# this, and a caller that forgets would leave row-keyed state stale.
+		self._bump_decode_row_epoch()
+
 		return updated_uuids, updated_batch
 
 	def _ensure_decode_metadata_capacity(self, batch_size: int) -> None:
@@ -17704,6 +17820,27 @@ class BatchGenWorker:
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 		_new_tokens_ready = torch.cuda.Event()
 
+		# Device-resident per-request sampling parameters. Rebuilding them each
+		# step meant three `torch.tensor(..., device=cuda)` calls, i.e. three
+		# pageable-source H2D copies that block the host until the whole-model
+		# graph replay already queued on this stream retires. Resident, the step
+		# path does one integer compare and three slices instead.
+		#
+		# Local to this decode round for the same reason as the accumulators
+		# above: a hot reload rebinds methods on the live worker, so a device
+		# buffer kept on `self` could outlive a slot-layout change. A new round
+		# starts a new residency.
+		_model_device = next(self.model.parameters()).device
+		if _model_device != self.torch_device:
+			raise RuntimeError(
+				f"Rank {self.rank}: decode device mismatch — model parameters are "
+				f"on {_model_device} but worker torch_device is {self.torch_device}; "
+				"the resident sampling tensors would be allocated on the wrong device"
+			)
+		_sampling_residency = DecodeSamplingResidency(
+			max(max_batch_size, 1), self.torch_device
+		)
+
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
@@ -17751,6 +17888,17 @@ class BatchGenWorker:
 					f"active={len(decode_uuids)} finished={_hb_finished} "
 					f"tok/s={_hb_tokens / _hb_elapsed:.2f}{_split_txt}"
 				)
+				# The sampling fallback count is now accumulated on device so
+				# the step path never reads it back. Drain it here, where the
+				# sampled-token readback has already caught the device up, so an
+				# invalid-probability row still surfaces instead of going silent.
+				_bad_rows = _sampling_residency.drain_bad_rows()
+				if _bad_rows:
+					logging.warning(
+						f"[DECODE] invalid probabilities after filtering for "
+						f"{_bad_rows} row(s) since the last heartbeat; those rows "
+						"fell back to greedy"
+					)
 				_hb_last_time = time.perf_counter()
 				_hb_tokens = 0
 
@@ -17767,6 +17915,10 @@ class BatchGenWorker:
 					pending_async_task, pending_load_uuids,
 					pending_load_local, pending_load_global
 				)
+				# `batch` has been rebound to a new ordered row list; anything
+				# keyed to the previous rows (the resident sampling tensors) is
+				# now stale.
+				self._bump_decode_row_epoch()
 
 				self._cumulative_boundary_ms += timing.total_ms
 				self._cumulative_decode_boundaries += 1
@@ -18548,7 +18700,12 @@ class BatchGenWorker:
 							raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
 						_glm5_skip_graph_kv_offload = True
 					else:
-						new_tokens_out = self._select_tokens(logits, batch_sequences)
+						new_tokens_out = self._select_tokens(
+							logits,
+							batch_sequences,
+							residency=_sampling_residency,
+							batch_rows=batch,
+						)
 
 					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
 						# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
