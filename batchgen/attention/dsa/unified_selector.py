@@ -209,6 +209,25 @@ def _validate_selector_inputs(
             "primary_blocked_k must have shape [num_pages, page_size, num_k_heads, kv_dim], "
             f"got {tuple(primary_blocked_k.shape)}"
         )
+    # NOT migrated to the packed FP8 primary record, and it must not pretend to
+    # be: this selector GATHERS the selected KV into a dense
+    # ``[B, topk, H_KV, kv_dim]`` slab and hands it to dense bf16 FlashMLA. A
+    # packed cache's trailing dim counts BYTES, so the gather would copy 656
+    # bytes per token into 656 bf16 ELEMENTS -- a slab of reinterpreted
+    # quantized bytes, scales and RoPE halves that attends without crashing and
+    # returns silent garbage. The one-byte element type is checked first so the
+    # format is named rather than reported as a generic dtype mismatch. The
+    # migrated readers are `Glm5FullDsaAttnSegment._run_sparse_fp8` (captured)
+    # and `glm5_decode_selector._run_sparse_fp8` (eager).
+    if int(primary_blocked_k.element_size()) == 1:
+        raise TypeError(
+            "the BF16 DSA unified selector cannot gather a packed FP8 primary "
+            f"MLA cache (trailing dim {int(primary_blocked_k.shape[-1])}, "
+            f"{primary_blocked_k.dtype}): its {int(primary_blocked_k.shape[-1])} "
+            "BYTES per token would be gathered as that many bf16 elements. Use "
+            "the sparse FP8 FlashMLA decode path for a packed cache, or run "
+            "with the bf16 profile (glm52_packed_kv off)."
+        )
     if primary_blocked_k.dtype != torch.bfloat16:
         raise TypeError(
             "select_mla_kv_for_flashmla_bf16 expects BF16 primary KV, "

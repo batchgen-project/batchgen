@@ -154,6 +154,15 @@ _DROPPED_FLASHMLA_CALLS = (
     "run_prepared_sparse_flash_mla_decode",
     "prepare_sparse_flash_mla_decode_inputs",
 )
+# The ONE FlashMLA entry the segments may use: the sparse FP8 reader of the
+# packed primary cache. It is not the retired gathered-KV wrapper above, which
+# synthesized pages and took DENSE scheduler metadata; this one takes
+# step-invariant SPARSE metadata and physical token indices, and the pin has
+# no dense FP8 MLA decode kernel to fall back on.
+_ALLOWED_FLASHMLA_CALLS = (
+    "run_sparse_fp8_mla_decode",
+    "prepare_sparse_fp8_mla_metadata",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,13 +200,20 @@ def test_full_dsa_field_lists_exactly_cover_the_buffer_dataclass():
     import time; assert it from source too so a CPU run catches drift."""
     tree = _tree(_SEGMENTS_SRC)
     fields = set(_dataclass_field_names(tree, "_Glm5FullDsaSegmentBuffers"))
-    split = (
-        _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
-        | _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
-    )
-    assert fields ^ split == set()
-    assert "prepared_flashmla" not in _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
-    assert "selected_token_ids" in _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    view = _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    rebuilt = _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
+    shared = _name_set_literal(tree, "_GLM5_DSA_SHARED_FIELDS")
+    assert fields ^ (view | rebuilt | shared) == set()
+    assert "prepared_flashmla" not in rebuilt
+    assert "selected_token_ids" in view
+    # A SHARED field is constant across buckets and must never be sliced: the
+    # zero packed record is one row, so a leading-dim view of it would be
+    # empty for every bucket but the first.
+    assert shared == {"packed_zeros_row"}
+    assert not (shared & view) and not (shared & rebuilt)
+    # ...while the per-bucket packed buffers ARE views, like every other
+    # per-row buffer.
+    assert {"query_packed", "primary_k_packed"} <= view
 
 
 def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
@@ -207,10 +223,15 @@ def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
         _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_PLACEHOLDER_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS")
+        | _name_set_literal(reuse, "_GLM5_REUSE_SHARED_FIELDS")
     )
     assert fields ^ split == set()
     assert _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS") == {"top_k_indices"}
     assert "selected_token_ids" in _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
+    # Mirrors the base split: the zero packed record is shared, not sliced.
+    assert _name_set_literal(reuse, "_GLM5_REUSE_SHARED_FIELDS") == {
+        "packed_zeros_row"
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -236,19 +257,40 @@ def test_full_dsa_initialize_static_inputs_no_longer_builds_metadata():
     "src,class_name",
     [(_SEGMENTS_SRC, "Glm5FullDsaAttnSegment"), (_REUSE_SRC, "Glm5ReuseTopkAttnSegment")],
 )
-def test_segment_forward_has_no_flashmla_metadata(src, class_name):
-    """The FlashMLA scheduler metadata is dead through the whole graph chain:
-    neither forward accepts it, and no FlashMLA kernel is called."""
+def test_segment_forward_has_no_dense_flashmla_scheduler_metadata(src, class_name):
+    """The retired DENSE FlashMLA path is dead through the whole graph chain.
+
+    What died with the FA3 swap was the gathered-KV wrapper: it packed the
+    selected KV into synthetic pages and needed per-step DENSE scheduler
+    metadata threaded in as a graph input. None of that may come back.
+
+    FlashMLA itself is NOT dead -- the packed primary cache's only reader is
+    sparse FP8 FlashMLA, because the pin has no dense FP8 MLA decode kernel
+    (csrc/pybind.cpp:331-357). So the contract is narrower than "no FlashMLA":
+    no metadata on `forward`, none of the retired calls, and the only FlashMLA
+    entries used are the sparse FP8 ones.
+    """
     fwd = _method(_tree(src), class_name, "forward")
     params = {a.arg for a in fwd.args.args + fwd.args.kwonlyargs}
-    assert not {p for p in params if "flashmla" in p}, params
+    assert not {p for p in params if "flashmla" in p.lower()}, params
     assert not any(isinstance(stmt, ast.Delete) for stmt in fwd.body)
-    # No transitional helper, cache, or comment survives on the class either.
-    cls_src = ast.get_source_segment(src.read_text(), _top_level(_tree(src), class_name))
-    assert "flashmla" not in cls_src.lower()
     calls = _call_names(fwd)
     for dropped in _DROPPED_FLASHMLA_CALLS:
         assert dropped not in calls, dropped
+
+    # Whatever FlashMLA the class does reach must be on the allow-list, and
+    # the sparse metadata must be prepared OUTSIDE forward (it is
+    # step-invariant, so recomputing it per step would be pure overhead and
+    # would put an allocation inside the capture).
+    cls = _top_level(_tree(src), class_name)
+    cls_calls = _call_names(cls)
+    reached = {
+        name
+        for name in cls_calls
+        if "flash_mla" in name.lower() or "flashmla" in name.lower()
+    }
+    assert reached <= set(_ALLOWED_FLASHMLA_CALLS), reached
+    assert "prepare_sparse_fp8_mla_metadata" not in calls
 
 
 # --------------------------------------------------------------------------- #
@@ -268,7 +310,78 @@ def test_all_short_is_an_opt_in_constructor_flag(src, class_name):
     "src,class_name",
     [(_SEGMENTS_SRC, "Glm5FullDsaAttnSegment"), (_REUSE_SRC, "Glm5ReuseTopkAttnSegment")],
 )
+def test_packed_cache_takes_the_sparse_branch_before_the_bf16_dispatch(src, class_name):
+    """Three-way dispatch, packed first, and the packed branch is format-wide.
+
+    A packed cache has no dense FP8 decode kernel, so BOTH its short and its
+    selecting rows go through the sparse reader -- `all_short` stops being an
+    attention branch there and stays only a scoring optimization. Asserting
+    the ORDER matters: if `self.all_short` were tested first, an all-short
+    packed capture would reach `_run_all_short_fa3` and hand FA3 a uint8
+    cache.
+    """
+    fwd = _method(_tree(src), class_name, "forward")
+    # `forward` gates on the format TWICE -- once to produce the cache record
+    # (quantize vs plain copy) and once to pick the reader -- so the branches
+    # are enumerated rather than taking the first match.
+    gates = [
+        node
+        for node in ast.walk(fwd)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "self.primary_is_packed"
+    ]
+    assert len(gates) == 2, [ast.unparse(g.test) for g in gates]
+
+    writer = next(
+        g
+        for g in gates
+        if "prepare_primary_mla_kv"
+        in _call_names(ast.Module(body=g.body, type_ignores=[]))
+    )
+    writer_calls = _call_names(ast.Module(body=writer.body, type_ignores=[]))
+    # Produced exactly once, then the invalid rows are selected to the zero
+    # record. A second quantize anywhere would break the byte-equality of the
+    # GPU row, the staged row and the shm page.
+    assert writer_calls["prepare_primary_mla_kv"] == 1
+    assert writer_calls["torch.where"] == 1
+    assert _call_names(fwd)["prepare_primary_mla_kv"] == 1
+
+    packed = next(g for g in gates if g is not writer)
+    packed_calls = _call_names(ast.Module(body=packed.body, type_ignores=[]))
+
+    assert "self._run_sparse_fp8" in packed_calls
+    # The transform runs on the packed path too: for a row inside the
+    # selection budget it emits identity offsets, which is exactly "attend to
+    # every token of this row".
+    assert "transform_selected_positions_out" in packed_calls
+    assert "self._run_all_short_fa3" not in packed_calls
+    assert "self._run_selected_fa3" not in packed_calls
+
+    # The bf16 dispatch is unchanged, and lives entirely in the else-branch.
+    bf16 = ast.Module(body=packed.orelse, type_ignores=[])
+    bf16_calls = _call_names(bf16)
+    assert "self._run_all_short_fa3" in bf16_calls
+    assert "self._run_selected_fa3" in bf16_calls
+    assert "self._run_sparse_fp8" not in bf16_calls
+
+    # The sparse reader is reachable ONLY from the packed branch.
+    total = _call_names(fwd)
+    assert total["self._run_sparse_fp8"] == packed_calls["self._run_sparse_fp8"]
+    assert total["self._run_all_short_fa3"] == bf16_calls["self._run_all_short_fa3"]
+    assert total["self._run_selected_fa3"] == bf16_calls["self._run_selected_fa3"]
+
+
+@pytest.mark.parametrize(
+    "src,class_name",
+    [(_SEGMENTS_SRC, "Glm5FullDsaAttnSegment"), (_REUSE_SRC, "Glm5ReuseTopkAttnSegment")],
+)
 def test_attention_branches_on_all_short(src, class_name):
+    """The bf16 dispatch, unchanged, inside the packed gate's else-branch.
+
+    Scoped to that subtree rather than to the whole `forward`: the packed
+    branch legitimately calls the transform as well, so a whole-function count
+    would no longer isolate the bf16 structure this test exists to pin.
+    """
     fwd = _method(_tree(src), class_name, "forward")
     branch = _branch(fwd, "self.all_short")
     short_calls = _call_names(ast.Module(body=branch.body, type_ignores=[]))
@@ -282,13 +395,15 @@ def test_attention_branches_on_all_short(src, class_name):
     assert "self._run_selected_fa3" in long_calls
     assert "self._run_all_short_fa3" not in long_calls
 
-    # Neither helper may be reachable outside the branch.
+    # Neither FA3 helper may be reachable outside this branch, anywhere in
+    # `forward`, and the bf16 subtree must reach the transform exactly once.
     total = _call_names(fwd)
     assert total["self._run_all_short_fa3"] == short_calls["self._run_all_short_fa3"]
     assert total["self._run_selected_fa3"] == long_calls["self._run_selected_fa3"]
-    assert total["transform_selected_positions_out"] == (
-        long_calls["transform_selected_positions_out"]
+    bf16_subtree = _call_names(
+        ast.Module(body=[branch], type_ignores=[])
     )
+    assert bf16_subtree["transform_selected_positions_out"] == 1
 
 
 def test_all_short_skips_every_scoring_stage():

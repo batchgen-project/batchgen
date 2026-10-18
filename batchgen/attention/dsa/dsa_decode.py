@@ -78,6 +78,27 @@ def dsa_decode_score_and_gather(
 	mla_blocked_k, _, mla_block_table = (
 		gpu_paged_kv_manager.get_layer_kv_with_page_table(layer_idx)
 	)
+	# NOT migrated to the packed FP8 primary record, and it must not pretend to
+	# be: step 4 gathers the selected tokens into a dense
+	# ``[batch, topk, num_k_heads, k_head_dim]`` slab, and
+	# `sparse_gather_from_paged_kv` has no dtype check at all -- it reads the
+	# trailing dim as an element count. A packed cache's trailing dim counts
+	# BYTES (656: e4m3 NoPE, fp32 block scales, bf16 RoPE), so the gather would
+	# produce 656 bf16 "elements" of reinterpreted quantized bytes and the
+	# caller's MLA attention would consume them without crashing. Rejected here
+	# instead, at the first point that touches the primary cache. The migrated
+	# readers are `Glm5FullDsaAttnSegment._run_sparse_fp8` (captured) and
+	# `glm5_decode_selector._run_sparse_fp8` (eager), which attend over the
+	# packed records in place and never gather.
+	if int(mla_blocked_k.element_size()) == 1:
+		raise TypeError(
+			"the legacy DSA decode gather cannot read a packed FP8 primary MLA "
+			f"cache (trailing dim {int(mla_blocked_k.shape[-1])}, "
+			f"{mla_blocked_k.dtype}): its {int(mla_blocked_k.shape[-1])} BYTES "
+			"per token would be gathered as that many bf16 elements. Use the "
+			"sparse FP8 FlashMLA decode path for a packed cache, or run with "
+			"the bf16 profile (glm52_packed_kv off)."
+		)
 	sparse_mla_kv = sparse_gather_from_paged_kv(
 		mla_blocked_k, mla_block_table, top_k_indices, page_size,
 	)

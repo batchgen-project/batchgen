@@ -201,10 +201,28 @@ def test_no_flashmla_token_in_graph_chain_file(path):
     assert hits == []
 
 
-def test_full_dsa_segment_class_has_no_flashmla():
+def test_full_dsa_segment_class_has_no_dense_flashmla_wrapper():
+    """The retired gathered-KV FlashMLA wrapper is gone from the segment.
+
+    Narrower than "no FlashMLA": the packed FP8 primary cache's ONLY decode
+    reader is sparse FlashMLA, because the pin has no dense FP8 MLA decode
+    kernel (references/FlashMLA-1408756/csrc/pybind.cpp:331-357). What must
+    not come back is the wrapper that synthesized pages from gathered bf16 KV
+    and needed per-step dense scheduler metadata.
+    """
     src = _SEGMENTS_SRC.read_text()
     cls = _class(ast.parse(src), "Glm5FullDsaAttnSegment")
-    assert "flashmla" not in ast.get_source_segment(src, cls).lower()
+    cls_src = ast.get_source_segment(src, cls)
+    for retired in (
+        "pack_flashmla_query_out",
+        "select_mla_kv_for_flashmla_bf16_out",
+        "prepare_sparse_flash_mla_decode_inputs",
+        "prepare_sparse_flash_mla_decode_tensor_metadata",
+        "run_prepared_sparse_flash_mla_decode",
+        "prepared_flashmla",
+        "_flashmla_tensor_metadata_specs",
+    ):
+        assert retired not in cls_src, retired
 
 
 def test_worker_replay_and_capture_inputs_carry_no_scheduler_metadata():

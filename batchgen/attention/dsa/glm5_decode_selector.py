@@ -11,6 +11,22 @@ The eager path shares its attention backend with the GLM-5 whole-model graph
 selected KV is never gathered into a padded buffer. Instead the logical
 top-k positions are transformed into physical token IDs that act as an FA3
 page table over a page-size-1 view of the cache.
+
+Both primary MLA KV formats are served here, and -- exactly as in the captured
+graph (`batchgen/models/glm/glm5/cuda_graph_segments.py:1005-1038`) -- the
+format is read off the ALLOCATED cache, never derived from a model name:
+
+* bf16 AoS (GLM-5, 5.1, 5.3), ``kv_lora_rank + qk_rope_head_dim`` elements per
+  token: FA3, split ``q``/``qv`` pair, dense over the real page table for an
+  all-short batch and over the page-size-1 re-view for a selecting one.
+* FlashMLA packed FP8 (GLM-5.2), 656 BYTES per token: sparse FP8 FlashMLA for
+  BOTH batch shapes, because the pin has no dense FP8 MLA decode kernel. The
+  all-short batch is expressed as "select every token of the row", which the
+  transform kernel already produces for a row inside the selection budget.
+
+The writer follows the same discriminator: what is stored into the cache, and
+what is handed to the host append, is the cache's own RECORD, produced exactly
+once by ``prepare_primary_mla_kv``.
 """
 
 from __future__ import annotations
@@ -31,6 +47,19 @@ from batchgen.attention.dsa.aux_indexer_k_writer import write_aux_indexer_k
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
+)
+from batchgen.attention.mla.packed_fp8_sparse_decode import (
+    SparseFp8MlaMetadata,
+    guard_sparse_indices_against_empty_rows,
+    prepare_sparse_fp8_mla_metadata,
+    run_sparse_fp8_mla_decode,
+)
+from batchgen.attention.mla.primary_kv_record import (
+    dequantize_mla_kv_packed,
+    prepare_primary_mla_kv,
+    primary_cache_is_packed_fp8,
+    primary_record_dim,
+    primary_record_dtype,
 )
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 from batchgen.models.glm.glm5.decode_utils import (
@@ -67,6 +96,113 @@ def _slot_indices_override(
             f"{override.shape[0]} < {batch_size}"
         )
     return override[:batch_size].to(device=device, dtype=torch.int32)
+
+
+def _build_primary_kv_record(
+    *,
+    attn,
+    latent_kv: torch.Tensor,
+    primary_blocked_k: torch.Tensor,
+    bsz: int,
+) -> torch.Tensor:
+    """Produce the primary cache's RECORD for this decode step's tokens.
+
+    ``latent_kv`` is the bf16 compressed KV straight out of the fused
+    RMSNorm+RoPE kernel, already viewed as ``[B, 1, 1, source_dim]`` and
+    already resident on the cache's device. The return value is what BOTH the
+    GPU paged store and the host append receive, so the record is produced
+    exactly once and every later hop is a byte copy -- the invariant
+    `batchgen/attention/mla/primary_kv_record.py:10-22` exists to hold.
+
+    The format is discriminated off ``primary_blocked_k``, the cache the KV
+    manager allocated: a bf16 AoS cache's record IS the latent (returned
+    unchanged, so that path keeps its single store and allocates nothing), a
+    packed-FP8 cache's record is 656 quantized bytes. A mis-sized cache is
+    named by ``primary_cache_is_packed_fp8`` rather than written through.
+    """
+
+    source_dim = int(attn.kv_lora_rank + attn.qk_rope_head_dim)
+    if not primary_cache_is_packed_fp8(primary_blocked_k, source_dim):
+        return latent_kv
+
+    # One destination, handed to the store and to the host append. Allocated
+    # from the CACHE's dtype/record dim rather than from constants, so this
+    # cannot disagree with what the paged store's dtype-equality guard accepts
+    # (`primary_kv_record.py:53-63`).
+    record = torch.empty(
+        (bsz, 1, 1, primary_record_dim(primary_blocked_k)),
+        dtype=primary_record_dtype(primary_blocked_k),
+        device=primary_blocked_k.device,
+    )
+    prepare_primary_mla_kv(
+        primary_blocked_k=primary_blocked_k,
+        compressed_kv=latent_kv.view(bsz, -1),
+        out=record,
+        source_dim=source_dim,
+    )
+    return record
+
+
+# Sparse FP8 FlashMLA statics, memoized per (device, batch, topk, q heads).
+#
+# In sparse mode FlashMLA's metadata kernel substitutes ``topk`` for every
+# row's length and never reads ``cache_seqlens``
+# (``csrc/smxx/get_mla_metadata.cu:30``, quoted in
+# `batchgen/attention/mla/packed_fp8_sparse_decode.py:13-21`), so its output
+# depends only on these keys plus arch-fixed quantities: it is step-invariant.
+# Eager decode has no capture to hang it off, so without a cache every layer of
+# every step would pay a metadata launch plus two allocations to rebuild a
+# tensor pair that cannot have changed -- pure overhead.
+#
+# Module level rather than per wrapper, because every layer of a model shares
+# the same head count: one entry serves all layers instead of each building its
+# own identical copy. Sharing is safe because both tensors are READ-ONLY to the
+# consumers -- the kernel only reads the metadata, and
+# ``guard_sparse_indices_against_empty_rows`` writes into ``indices`` while its
+# ``zero_column`` operand is only an operand
+# (`packed_fp8_sparse_decode.py:200`). The device is part of the key so a
+# multi-GPU process cannot hand one rank another rank's buffers.
+_SPARSE_FP8_DECODE_STATICS: dict[
+    tuple[str, int, int, int, int], tuple[SparseFp8MlaMetadata, torch.Tensor]
+] = {}
+
+
+def _sparse_fp8_decode_statics(
+    *,
+    batch_size: int,
+    topk: int,
+    num_heads_q: int,
+    device: torch.device,
+) -> tuple[SparseFp8MlaMetadata, torch.Tensor]:
+    """This step's sparse metadata and empty-row guard column, built once."""
+
+    key = (
+        device.type,
+        -1 if device.index is None else int(device.index),
+        int(batch_size),
+        int(topk),
+        int(num_heads_q),
+    )
+    statics = _SPARSE_FP8_DECODE_STATICS.get(key)
+    if statics is None:
+        statics = (
+            prepare_sparse_fp8_mla_metadata(
+                batch_size=int(batch_size),
+                topk=int(topk),
+                num_heads_q=int(num_heads_q),
+                num_heads_k=1,
+                num_q_tokens_per_q_seq=1,
+                device=device,
+            ),
+            # Column 0 of a padding row is clamped up to this, so the row
+            # attends to physical token 0 and returns a finite, meaningless
+            # value instead of NaN (packed_fp8_sparse_decode note 3). The eager
+            # path has no row mask, so a NaN row would propagate -- which is
+            # why the guard runs here too.
+            torch.zeros(int(batch_size), dtype=torch.int32, device=device),
+        )
+        _SPARSE_FP8_DECODE_STATICS[key] = statics
+    return statics
 
 
 @dataclass(frozen=True)
@@ -106,6 +242,13 @@ class Glm5DsaGraphSegmentInputs:
     positions_expanded: torch.Tensor
     primary_slot_indices: torch.Tensor
     aux_slot_indices: torch.Tensor
+    # What the host append must receive for the primary cache: the cache's own
+    # RECORD, i.e. the bf16 latent for an AoS cache and the 656-byte packed
+    # record for a GLM-5.2 one -- the very bytes the GPU store was given, so
+    # the host page and the cache row are byte-identical. With ``write_kv``
+    # False (the graph/eager compare prologue) no cache is written, nothing
+    # quantizes, and the bf16 source is reported instead; that is the same
+    # deliberate asymmetry the aux tensor documents below.
     primary_k_tensor: torch.Tensor
     # The aux tensors the host append must receive: the bf16 keys for an AoS
     # aux cache, the quantized e4m3 keys plus their fp32 per-token scales for a
@@ -227,6 +370,27 @@ def build_glm5_dsa_graph_segment_inputs(
         k_tensor = k_tensor.to(manager_device)
     if write_kv:
         with (dt.timed("kv_write", li) if dt else nullcontext()):
+            # The ALLOCATED cache is the format discriminator, so it is fetched
+            # before the write. `get_layer_kv_with_page_table` returns exactly
+            # the tensor `update_layer_decode_new_token` stores into -- both
+            # resolve the physical layer and index the same `_k_cache` list
+            # (`batchgen/kv_cache/gpu_paged_kv_manager.py:1756` and `:1845`) --
+            # and only its dtype and record dim are read here, which are
+            # allocation-time invariants. Reading them before the write is
+            # therefore not an observation of stale cache CONTENT.
+            primary_blocked_k, _, _ = (
+                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            )
+            # On a packed cache this is the 656-byte record; on a bf16 AoS
+            # cache it is the latent itself, unchanged. The same tensor is
+            # stored and returned for the host append, so nothing quantizes
+            # twice.
+            k_tensor = _build_primary_kv_record(
+                attn=attn,
+                latent_kv=k_tensor,
+                primary_blocked_k=primary_blocked_k,
+                bsz=bsz,
+            )
             gpu_paged_kv_manager.update_layer_decode_new_token(
                 k_tensor=k_tensor,
                 v_tensor=None,
@@ -424,10 +588,32 @@ def build_glm5_dsa_flashmla_inputs(
             gpu_paged_kv_manager_aux,
         )
 
+    # Fetched BEFORE the write, because the ALLOCATED cache is what decides
+    # what a record is and which decode reader may touch it. This used to sit
+    # just above the attention branch; nothing between here and there mutates
+    # the primary manager (the indexer and selection stages talk only to the
+    # aux manager), so the handles are the same tensors either way, and the
+    # writer below now needs the discriminator.
+    mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+    mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+    primary_is_packed = primary_cache_is_packed_fp8(
+        mla_blocked_k, int(attn.kv_lora_rank + attn.qk_rope_head_dim)
+    )
+
     with (dt.timed("kv_write", li) if dt else nullcontext()):
-        k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
-        if k_tensor.device != manager_device:
-            k_tensor = k_tensor.to(manager_device)
+        latent_kv = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+        if latent_kv.device != manager_device:
+            latent_kv = latent_kv.to(manager_device)
+        # The record, not the latent: on a packed cache the store and the host
+        # append must both receive the 656 quantized bytes, and they must
+        # receive the SAME tensor so the row is quantized once. On a bf16 AoS
+        # cache this returns the latent unchanged.
+        k_tensor = _build_primary_kv_record(
+            attn=attn,
+            latent_kv=latent_kv,
+            primary_blocked_k=mla_blocked_k,
+            bsz=bsz,
+        )
         gpu_paged_kv_manager.update_layer_decode_new_token(
             k_tensor=k_tensor,
             v_tensor=None,
@@ -533,8 +719,6 @@ def build_glm5_dsa_flashmla_inputs(
         q_nope_flat = q_nope.squeeze(2).contiguous()
         absorbed_q = _absorb_q_nope(wrapper, q_nope_flat)
 
-    mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
-    mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
     # Slot semantics, identical to the retired gather: with an active slot
     # override the storage-ordered table is indexed through
     # `primary_slot_indices`; otherwise the table is reordered into batch
@@ -550,12 +734,19 @@ def build_glm5_dsa_flashmla_inputs(
         dtype=torch.int32, device=mla_block_table.device,
     )
 
-    if branch_label == "dense-short-circuit":
+    if branch_label == "dense-short-circuit" and not primary_is_packed:
         # Batch-level all-short fast path: every row's context fits inside
         # index_topk, so attention is dense over the whole context. Read the
         # resident page-`mla_page_size` cache directly — no transform, no
         # selection table, no copy. This is the eager twin of
         # `Glm5FullDsaAttnSegment._run_all_short_fa3`.
+        #
+        # bf16 AoS only. A packed-FP8 cache has no dense FP8 MLA decode kernel
+        # in the pin at all (SM90 refuses dense FP8, SM100 refuses anything
+        # that is not FP8+sparse -- `csrc/pybind.cpp:331-357`), so it takes the
+        # selection path below and expresses "attend to the whole short
+        # context" as "select every token of it". Same cut as the captured
+        # graph (`cuda_graph_segments.py:1874-1906`).
         selected_token_ids = None
         selected_lengths = safe_cache_seqlens
         if verify_indices and wrapper.layer_idx <= 4:
@@ -568,6 +759,7 @@ def build_glm5_dsa_flashmla_inputs(
                 mla_blocked_k,
                 mla_page_size,
                 branch_label,
+                primary_is_packed=primary_is_packed,
             )
         with (dt.timed("sparse_attn", li) if dt else nullcontext()):
             attn_out = _run_all_short_fa3(
@@ -581,6 +773,20 @@ def build_glm5_dsa_flashmla_inputs(
             )
     else:
         with (dt.timed("sparse_select", li) if dt else nullcontext()):
+            if top_k_indices is None:
+                # Reachable only on a PACKED all-short step: that branch skips
+                # the dense index build when no top-k carry needs it
+                # (`_select_glm5_dsa_indices`), but the packed reader runs the
+                # transform on both batch shapes and the transform derives
+                # (batch, index_topk) from this tensor's own shape
+                # (`selected_page_table.py:107`). These are also exactly the
+                # values the kernel re-derives for a row inside the budget --
+                # it substitutes identity offsets whenever
+                # `seqlen <= index_topk` (`selected_page_table.py:52`) -- so
+                # this is the honest input, not a placeholder.
+                top_k_indices = build_clamped_dense_token_indices(
+                    safe_cache_seqlens, index_topk, mla_block_table.device,
+                )
             selected_token_ids = torch.empty(
                 bsz,
                 index_topk,
@@ -609,16 +815,30 @@ def build_glm5_dsa_flashmla_inputs(
                 mla_blocked_k,
                 mla_page_size,
                 branch_label,
+                primary_is_packed=primary_is_packed,
             )
+        # One timer, two backends: the selection above is format-independent
+        # (physical token IDs are physical token IDs), only the reader differs.
         with (dt.timed("sparse_attn", li) if dt else nullcontext()):
-            attn_out = _run_selected_fa3(
-                attn,
-                q_pe,
-                absorbed_q,
-                mla_blocked_k,
-                selected_token_ids,
-                selected_lengths,
-            )
+            if primary_is_packed:
+                attn_out = _run_sparse_fp8(
+                    attn,
+                    q_pe,
+                    absorbed_q,
+                    mla_blocked_k,
+                    selected_token_ids,
+                    selected_lengths,
+                    block_table=mla_block_table[:bsz],
+                )
+            else:
+                attn_out = _run_selected_fa3(
+                    attn,
+                    q_pe,
+                    absorbed_q,
+                    mla_blocked_k,
+                    selected_token_ids,
+                    selected_lengths,
+                )
 
     return Glm5DsaFlashMlaInputs(
         attn_out=attn_out,
@@ -655,7 +875,84 @@ def _absorb_q_nope(wrapper, q_nope_flat: torch.Tensor) -> torch.Tensor:
     return fp8_q_absorb(q_nope_flat, wrapper._fp8_absorb_weights)
 
 
+def _run_sparse_fp8(
+    attn,
+    q_pe: torch.Tensor,
+    absorbed_q: torch.Tensor,
+    mla_blocked_k: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse FP8 FlashMLA decode over the packed cache's physical token IDs.
+
+    The ONE reader of a packed-FP8 primary cache in the eager path, used for
+    both batch shapes. Differences from the FA3 twin, all forced by the kernel:
+
+    * the cache is passed exactly as allocated, NOT re-viewed at page size 1 --
+      each index already encodes ``physical_page * 64 + offset``, and the pin
+      hard-requires a 64-token page with the whole 656-byte record contiguous
+      (`csrc/pybind.cpp:236,249-256`);
+    * ONE 576-wide query replaces FA3's split ``q``/``qv`` pair. The
+      concatenation order IS the record's own order -- 512 absorbed-NoPE dims
+      then 64 RoPE dims -- so `absorbed_q` must come first;
+    * ``block_table`` and ``cache_seqlens`` are shape-checked placeholders the
+      sparse kernel never reads (packed_fp8_sparse_decode note 2). Real
+      tensors are passed anyway, so a pin bump that starts reading them cannot
+      read garbage. ``block_table`` is sliced to the batch because the pin
+      checks ``CHECK_SHAPE(block_table, batch_size, max_pages)``
+      (`csrc/pybind.cpp:258`) and the caller's table has one row per page-table
+      SLOT whenever a slot override is active -- so, exactly as in the captured
+      twin (`cuda_graph_segments.py:1209-1214`), those rows are slot-major
+      rather than batch-major, and a pin bump that starts reading them must
+      re-derive this argument instead of trusting the slice.
+
+    No row masking is added: the eager path relies on the -1 slot sentinel, and
+    the transform already fills a row whose slot is -1 with all -1. The one
+    thing that cannot be left to the sentinel is the softmax denominator, hence
+    the empty-row guard below.
+    """
+
+    # Every key is read off the tensors actually passed to the kernel, never
+    # from config: the metadata fixes how many index blocks are swept and how
+    # the scheduler splits the heads (`packed_fp8_sparse_decode.py:146-153`),
+    # so a key that disagreed with the query or the indices would attend to the
+    # wrong window instead of failing.
+    metadata, zero_column = _sparse_fp8_decode_statics(
+        batch_size=int(selected_token_ids.shape[0]),
+        topk=int(selected_token_ids.shape[1]),
+        num_heads_q=int(absorbed_q.shape[1]),
+        device=selected_token_ids.device,
+    )
+    # A row of only -1 makes the kernel divide 0 by 0 and return NaN
+    # (packed_fp8_sparse_decode note 3). Unlike the captured graph there is no
+    # row mask downstream to swallow it, so this is the only thing standing
+    # between a slot-less row and a NaN that poisons the step.
+    guard_sparse_indices_against_empty_rows(selected_token_ids, zero_column)
+    # [B, H, 512] ++ [B, H, 64] -> [B, H, 576], then [B, 1, H, 576]. A single
+    # concat, unlike the graph's two copies into a static buffer: eager decode
+    # has no capture, so the kernel-output strides that forced the graph to
+    # pre-allocate (`cuda_graph_segments.py:403-409`) are not a constraint
+    # here.
+    query = torch.cat((absorbed_q, q_pe.squeeze(2)), dim=-1)
+    return run_sparse_fp8_mla_decode(
+        query=query.unsqueeze(1),
+        packed_blocked_k=mla_blocked_k,
+        indices=selected_token_ids.unsqueeze(1),
+        block_table=block_table,
+        cache_seqlens=selected_lengths,
+        metadata=metadata,
+        softmax_scale=float(attn.softmax_scale),
+        head_dim_v=int(attn.kv_lora_rank),
+    )
+
+
 def _require_fa3():
+    # Reached only on a bf16 AoS cache: a packed-FP8 cache is read by
+    # `_run_sparse_fp8` and never enters either FA3 runner, so FA3's absence
+    # must not be reported as a GLM-5.2 decode failure. That is the eager twin
+    # of the per-format requirement at `cuda_graph_segments.py:1033-1042`.
     if _fa3_with_kvcache is None:
         raise RuntimeError(
             "GLM-5 DSA eager decode requires flash_attn_interface "
@@ -885,21 +1182,37 @@ def _log_selected_token_bounds(
     mla_blocked_k: torch.Tensor,
     mla_page_size: int,
     branch_label: str,
+    *,
+    primary_is_packed: bool,
 ) -> None:
-    """Validate the FA3 page table that replaced the gather.
+    """Validate the selection table that replaced the gather.
 
     Successor of the retired `_log_gather_bounds`. On the transform path it
-    checks the PHYSICAL token IDs against the page-size-1 cache extent and
-    reports how many slots carry the ``-1`` padding sentinel; on the
-    all-short fast path there is no selection table, so it checks the page
-    table's extent against the longest context instead. Both run only under
-    ``BATCHGEN_GLM5_VERIFY_INDICES=1`` for the first few layers: the
-    reductions below synchronize.
+    checks the PHYSICAL token IDs against the cache's token extent and reports
+    how many slots carry the ``-1`` padding sentinel; on the all-short fast
+    path there is no selection table, so it checks the page table's extent
+    against the longest context instead. Both run only under
+    ``BATCHGEN_GLM5_VERIFY_INDICES=1`` for the first few layers: the reductions
+    below synchronize.
+
+    Format-independent by construction. A physical token ID means
+    ``physical_page * page_size + offset`` for both the FA3 page-size-1 re-view
+    and the sparse FP8 kernel, and the extent it is checked against is
+    ``pages * page_size`` -- derived from the cache's shape, so it is right
+    whether a record is ``source_dim`` bf16 elements or 656 bytes. The record
+    width is the one number that differs between the formats, and nothing here
+    divides by it; it is reported so a log line says which format it describes.
+    On a packed cache the probe below additionally compares VALUES, which needs
+    the debug-only dequantizer.
     """
     rk = AttnWrapperBase.get_rank_safe()
     bt_shape = tuple(mla_block_table.shape)
     bk_shape = tuple(mla_blocked_k.shape)
     total_tokens = bk_shape[0] * mla_page_size
+    record = (
+        f"{bk_shape[-1]}B packed-fp8" if primary_is_packed
+        else f"{bk_shape[-1]}x{mla_blocked_k.dtype} bf16-aos"
+    )
     max_len = int(selected_lengths.max().item())
     if selected_token_ids is None:
         pages_needed = (max_len + mla_page_size - 1) // mla_page_size
@@ -907,6 +1220,7 @@ def _log_selected_token_bounds(
             f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
             f"branch={branch_label} all-short page-{mla_page_size} fast path | "
             f"mla_block_table.shape={bt_shape} mla_blocked_k.shape={bk_shape} "
+            f"record={record} "
             f"total_tokens={total_tokens} max_cache_seqlen={max_len} "
             f"pages_needed={pages_needed} page_table_cols={bt_shape[1]}"
         )
@@ -925,6 +1239,7 @@ def _log_selected_token_bounds(
         f"branch={branch_label} "
         f"selected_token_ids.shape={tuple(selected_token_ids.shape)} | "
         f"mla_block_table.shape={bt_shape} mla_blocked_k.shape={bk_shape} "
+        f"record={record} "
         f"page_size={mla_page_size} total_tokens={total_tokens} "
         f"max_physical_id={max_id} neg_one_slots={padded} "
         f"max_selected_len={max_len}"
@@ -933,5 +1248,42 @@ def _log_selected_token_bounds(
         logging.warning(
             f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx}] "
             f"max_physical_id={max_id} >= total_tokens={total_tokens} — the "
-            "transform produced an out-of-range FA3 page-table entry"
+            "transform produced an out-of-range selection entry"
         )
+    if not primary_is_packed:
+        return
+
+    # Packed cache only: an in-range index set can still be the WRONG index
+    # set, and the bounds above cannot see that. Dequantizing the records row 0
+    # actually selected separates the two failures that matter:
+    #
+    #   all_zero_records > 0 -> the indices point at never-written slots (a
+    #       freshly allocated page is 0x00 bytes with 0.0f scales, which
+    #       dequantizes to exactly 0 -- `mla_kv_packed.py:199-210`), i.e. a
+    #       page-table or slot bug the extent check passes;
+    #   nonfinite > 0 -> the stored bytes themselves are bad, i.e. the write
+    #       path, not the selection.
+    #
+    # DEBUG ONLY, and only under the env gate: `dequantize_mla_kv_packed` is
+    # not called by any decode or prefill path -- the kernel dequantizes
+    # internally -- and this probe synchronizes, like the reductions above.
+    flat_records = mla_blocked_k.reshape(-1, bk_shape[-1])
+    row0 = selected_token_ids[0]
+    valid_row0 = row0[row0 >= 0]
+    if valid_row0.numel() == 0:
+        logging.warning(
+            f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx}] packed probe skipped: "
+            "row 0 selected no valid token (the empty-row guard will clamp it "
+            "to physical token 0 to keep the kernel's denominator non-zero)"
+        )
+        return
+    probe_ids = valid_row0[: min(8, int(valid_row0.numel()))].to(torch.long)
+    probed = dequantize_mla_kv_packed(flat_records.index_select(0, probe_ids))
+    logging.warning(
+        f"[VERIFY-FA3 rank={rk} L{wrapper.layer_idx}] packed probe: "
+        f"records={int(probe_ids.numel())} "
+        f"first_ids={probe_ids[:4].tolist()} "
+        f"absmax={float(probed.abs().amax().item()):.4f} "
+        f"all_zero_records={int((probed == 0).all(dim=-1).sum().item())} "
+        f"nonfinite={int((~torch.isfinite(probed)).sum().item())}"
+    )

@@ -49,6 +49,17 @@ from batchgen.attention.dsa.sparse_decode_mla import (
     run_prepared_sparse_flash_mla_decode,
 )
 from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16_out
+from batchgen.attention.mla.packed_fp8_sparse_decode import (
+    guard_sparse_indices_against_empty_rows,
+    prepare_sparse_fp8_mla_metadata,
+    run_sparse_fp8_mla_decode,
+)
+from batchgen.attention.mla.primary_kv_record import (
+    prepare_primary_mla_kv,
+    primary_cache_is_packed_fp8,
+    primary_record_dim,
+    primary_record_dtype,
+)
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 from batchgen_kernels.attention.dsa.fp8_absorb import (
@@ -154,6 +165,24 @@ class _Glm5FullDsaSegmentBuffers:
     selected_lengths: torch.Tensor
     absorbed_q: torch.Tensor
     attn_heads: torch.Tensor
+    # Packed-FP8 primary cache only (1-element placeholders otherwise, like
+    # the scorer groups above):
+    #   query_packed       [B, H, 576] bf16 -- FlashMLA takes ONE 576-wide
+    #                      query, not FA3's split q / qv pair, so the absorbed
+    #                      NoPE half and the RoPE half are assembled here. The
+    #                      absorb kernel hardcodes a contiguous [B, H, N]
+    #                      output (fp8_absorb.py:244), so this cannot be a
+    #                      strided view of the two halves; see the cost note
+    #                      in forward().
+    #   primary_k_packed   [B, 1, 1, 656] uint8 -- the quantizer's destination,
+    #                      before the invalid-row select.
+    #   packed_zeros_row   [1, 1, 1, 656] uint8 -- the zero record an invalid
+    #                      row is selected to (`valid_rows_zeros` stays bf16:
+    #                      it is also the zero source of the bf16 row-mask
+    #                      select).
+    query_packed: torch.Tensor
+    primary_k_packed: torch.Tensor
+    packed_zeros_row: torch.Tensor
 
 
 @dataclass
@@ -222,6 +251,13 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "selected_lengths",
     "absorbed_q",
     "attn_heads",
+    "query_packed",
+    "primary_k_packed",
+})
+# Constant across buckets, so never a leading-dim view: one zero record that
+# every bucket's invalid-row select reads from.
+_GLM5_DSA_SHARED_FIELDS = frozenset({
+    "packed_zeros_row",
 })
 
 # Fail loudly at import time if the dataclass gains a field this split does
@@ -229,7 +265,11 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
 # allocation or, worse, a wrongly-shaped view.
 _split_delta = (
     set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
-    ^ (_GLM5_DSA_VIEW_FIELDS | _GLM5_DSA_REBUILT_FIELDS)
+    ^ (
+        _GLM5_DSA_VIEW_FIELDS
+        | _GLM5_DSA_REBUILT_FIELDS
+        | _GLM5_DSA_SHARED_FIELDS
+    )
 )
 if _split_delta:
     raise AssertionError(
@@ -343,6 +383,55 @@ def _make_scorer_buffers(
     )
 
 
+def _make_packed_primary_buffers(
+    *,
+    packed: bool,
+    bucket_size: int,
+    num_heads: int,
+    source_dim: int,
+    record_dim: int,
+    record_dtype: torch.dtype,
+    device: torch.device,
+):
+    """The three buffers a packed-FP8 primary cache needs, or placeholders.
+
+    Allocated as a group, like the scorer's two format-specific groups, so a
+    bf16 AoS capture pays nothing for the packed path and a packed capture
+    cannot silently fall back to a half-built buffer set.
+
+    * ``query_packed``: ``[bucket, heads, source_dim]`` bf16, the single
+      576-wide query FlashMLA takes. NOT a view over ``absorbed_q`` and
+      ``q_rope_4d``: the absorb kernel writes a contiguous ``[B, H, N]``
+      output (``fp8_absorb.py:244`` computes ``b*H*N + h*N + n`` with no
+      output strides), so writing the two halves straight into a 576-wide
+      buffer would need that kernel to learn output strides -- a change to a
+      kernel every MLA model shares, deliberately not made here.
+    * ``primary_k_packed``: ``[bucket, 1, 1, record_dim]`` of the cache dtype,
+      the quantizer's destination before invalid rows are selected out.
+    * ``packed_zeros_row``: ``[1, 1, 1, record_dim]`` zeros, the record an
+      invalid row is selected to. An all-zero packed record is a VALID zero
+      token -- scale bits 0.0f, data 0x00 -- which is also what a freshly
+      allocated page holds, so a skipped row and an untouched slot are the
+      same bytes.
+    """
+
+    if not packed:
+        return (
+            torch.empty(bucket_size, 0, dtype=torch.bfloat16, device=device),
+            torch.empty(bucket_size, 0, dtype=record_dtype, device=device),
+            torch.empty(0, dtype=record_dtype, device=device),
+        )
+    return (
+        torch.empty(
+            bucket_size, num_heads, source_dim, dtype=torch.bfloat16, device=device
+        ),
+        torch.empty(
+            bucket_size, 1, 1, record_dim, dtype=record_dtype, device=device
+        ),
+        torch.zeros(1, 1, 1, record_dim, dtype=record_dtype, device=device),
+    )
+
+
 class Glm5DsaAttnSegment:
     """Graph-capturable GLM-5 DSA attention subsegment.
 
@@ -442,6 +531,22 @@ class Glm5DsaAttnSegment:
             tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype],
         ] = {}
 
+        # NOT migrated to the packed FP8 primary record, and it must not
+        # pretend to be: this segment GATHERS the selected KV into a synthetic
+        # page-size-N slab and attends over it with dense bf16 FlashMLA
+        # (`select_mla_kv_for_flashmla_bf16_out` + the gathered-KV wrapper).
+        # A packed cache's 656-byte records would be gathered as if they were
+        # 656 bf16 elements -- a silently wrong slab, not a crash -- so the
+        # format is rejected at construction. The migrated path is
+        # `Glm5FullDsaAttnSegment` / `Glm5ReuseTopkAttnSegment`.
+        if int(primary_blocked_k.element_size()) == 1:
+            raise ValueError(
+                "GLM-5 legacy DSA segment cannot read a packed FP8 primary "
+                f"MLA cache (trailing dim {self.kv_dim}, "
+                f"{primary_blocked_k.dtype}): it gathers bf16 KV into a "
+                "synthetic page slab. Use the full DSA segment for a packed "
+                "cache, or run with the bf16 profile (glm52_packed_kv off)."
+            )
         if self.kv_dim != self.kv_lora_rank + 64:
             raise ValueError(
                 f"GLM-5 DSA selected KV dim must be kv_lora_rank + 64, got {self.kv_dim}"
@@ -896,8 +1001,22 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("primary_blocked_k page size does not match page_size")
         if self.aux_blocked_k.shape[1] != self.aux_page_size:
             raise ValueError("aux_blocked_k page size does not match aux_page_size")
-        if self.primary_blocked_k.shape[3] != self.attn.kv_lora_rank + self.attn.qk_rope_head_dim:
-            raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
+        # Accepts both primary formats and names a mis-sized cache: bf16 AoS
+        # keeps `kv_lora_rank + qk_rope_head_dim` elements per token, FlashMLA's
+        # packed FP8 record keeps 656 BYTES (e4m3 NoPE, fp32 block scales, bf16
+        # RoPE). Read off the allocated cache, never from a model name -- the
+        # same rule the aux cache uses just above.
+        self.primary_source_dim = int(
+            self.attn.kv_lora_rank + self.attn.qk_rope_head_dim
+        )
+        self.primary_is_packed = primary_cache_is_packed_fp8(
+            self.primary_blocked_k, self.primary_source_dim
+        )
+        # Shape/dtype of the record buffers this segment allocates and of the
+        # tensor it hands to the host append; the composing layer segment
+        # declares its own spec from these.
+        self.primary_record_dim = primary_record_dim(self.primary_blocked_k)
+        self.primary_record_dtype = primary_record_dtype(self.primary_blocked_k)
         # Accepts both aux formats and names a mis-sized cache: bf16 AoS keeps
         # `index_head_dim` elements per token, page-split FP8 keeps
         # `index_head_dim + 4` BYTES (the fp32 per-token scale included).
@@ -910,11 +1029,22 @@ class Glm5FullDsaAttnSegment:
         self.aux_host_kv_dtype = (
             torch.float8_e4m3fn if self.aux_is_page_split else torch.bfloat16
         )
-        if _fa3_with_kvcache is None:
+        # A packed-FP8 primary cache is read by sparse FlashMLA on BOTH paths,
+        # so FA3 is not a requirement of this segment; a bf16 AoS cache has no
+        # other reader, so its absence is still fatal. Checked per format
+        # rather than unconditionally: demanding FA3 on the packed path would
+        # make an unrelated missing dependency look like a GLM-5.2 failure.
+        if not self.primary_is_packed and _fa3_with_kvcache is None:
             raise RuntimeError(
                 "GLM-5 DSA graph requires flash_attn_interface "
                 "(FlashAttention-3): flash_attn_with_kvcache is unavailable"
             )
+        # Per-bucket sparse metadata, built once per bucket at setup time and
+        # replayed unchanged: in sparse mode FlashMLA's metadata kernel
+        # substitutes `topk` for every row's length and never reads
+        # cache_seqlens, so its output is step-invariant. See
+        # packed_fp8_sparse_decode note 1.
+        self._sparse_metadata: Dict[int, object] = {}
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -985,6 +1115,90 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
         )
 
+    def _prepare_sparse_metadata(self, bucket_size: int) -> None:
+        """Build this bucket's sparse FP8 metadata once, outside any capture.
+
+        In sparse mode FlashMLA's metadata kernel substitutes ``topk`` for
+        every row's length and never reads ``cache_seqlens``
+        (``csrc/smxx/get_mla_metadata.cu:30``), so the result depends only on
+        (bucket_size, topk) plus arch constants and is identical on every
+        replay. Computing it here keeps a kernel launch AND an allocation out
+        of the captured region, and keeps the metadata off the step's critical
+        path entirely -- it is not recomputed per step the way the dense
+        metadata would have to be.
+        """
+
+        if not self.primary_is_packed:
+            return
+        if bucket_size in self._sparse_metadata:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            # Reached only if a capture entered `forward` without pre-built
+            # statics. Allocating and launching here would bake graph-private
+            # metadata buffers; refuse loudly instead of capturing something
+            # that replays against freed memory.
+            raise RuntimeError(
+                f"GLM-5.2 packed decode: sparse metadata for bucket "
+                f"{bucket_size} was requested DURING capture; build static "
+                "buffers before capture"
+            )
+        self._sparse_metadata[bucket_size] = prepare_sparse_fp8_mla_metadata(
+            batch_size=bucket_size,
+            topk=int(self.index_topk),
+            num_heads_q=int(self.attn.num_heads),
+            num_heads_k=1,
+            num_q_tokens_per_q_seq=1,
+            device=self.primary_blocked_k.device,
+        )
+
+    def _run_sparse_fp8(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Sparse FP8 FlashMLA decode over the packed cache.
+
+        The ONE reader of a packed primary cache, used by both the selected
+        and the all-short path: the pin has no dense FP8 MLA decode kernel, so
+        "attend to the whole short context" is expressed as "select every
+        token of it", which `transform_selected_positions_out` already
+        produces for a row whose length is within the selection budget (it
+        falls back to identity offsets there).
+
+        `query_packed` is the 576-wide concatenation the kernel takes, written
+        in place by the absorb GEMV and the RoPE kernel -- its two halves ARE
+        the absorbed-NoPE and RoPE buffers, so there is no extra copy.
+        """
+
+        metadata = self._sparse_metadata.get(batch_size)
+        if metadata is None:
+            raise RuntimeError(
+                f"GLM-5.2 packed decode: no sparse metadata for bucket "
+                f"{batch_size}; setup_static_buffers must run before capture"
+            )
+        # Keep every row's softmax denominator non-zero. A padding row is all
+        # -1 and would otherwise come back NaN (packed_fp8_sparse_decode
+        # note 3); its output is masked away later, but a NaN must not be
+        # produced in the first place.
+        guard_sparse_indices_against_empty_rows(
+            buffers.selected_token_ids, buffers.safe_slot_zeros
+        )
+        return run_sparse_fp8_mla_decode(
+            query=buffers.query_packed.unsqueeze(1),
+            packed_blocked_k=self.primary_blocked_k,
+            indices=buffers.selected_token_ids.unsqueeze(1),
+            # Shape-checked at the pybind boundary, never read by the sparse
+            # kernel (note 2). A slot-major slice is passed rather than a
+            # dedicated placeholder so the call carries real, correctly-typed
+            # data; a pin bump must re-verify that it stays unread, because
+            # these rows are slot-major, not batch-major.
+            block_table=self.primary_page_table[:batch_size],
+            cache_seqlens=buffers.selected_lengths,
+            metadata=metadata,
+            softmax_scale=float(self.attn.softmax_scale),
+            head_dim_v=int(self.attn.kv_lora_rank),
+        )
+
     def _run_all_short_fa3(
         self,
         buffers: _Glm5FullDsaSegmentBuffers,
@@ -994,6 +1208,8 @@ class Glm5FullDsaAttnSegment:
         Valid only for an ``all_short`` graph: every row attends to its whole
         context, so no selection is needed and the page table / slot indices
         of the real cache are used as-is (no copy, no top-k).
+
+        bf16 AoS caches only -- a packed cache has no dense FP8 reader.
         """
         if _fa3_with_kvcache is None:
             raise RuntimeError("FlashAttention-3 is unavailable")
@@ -1073,8 +1289,8 @@ class Glm5FullDsaAttnSegment:
                 torch.bfloat16,
             ),
             "primary_k_tensor": TensorSpec(
-                ("batch_size", 1, 1, self.primary_blocked_k.shape[3]),
-                torch.bfloat16,
+                ("batch_size", 1, 1, self.primary_record_dim),
+                self.primary_record_dtype,
             ),
             "indexer_k_tensor": TensorSpec(
                 ("batch_size", 1, 1, self.aux_host_kv_dim),
@@ -1093,6 +1309,7 @@ class Glm5FullDsaAttnSegment:
         # align(bucket, 32), so each bucket is its own JIT instantiation and a
         # view-built bucket would otherwise compile during capture.
         self._warm_scorer_jit(bucket_size)
+        self._prepare_sparse_metadata(bucket_size)
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
@@ -1144,6 +1361,19 @@ class Glm5FullDsaAttnSegment:
         )
         selected_lengths = torch.empty(bucket_size, dtype=torch.int32, device=device)
         selected_lengths.fill_(self._padding_selected_length())
+        (
+            query_packed,
+            primary_k_packed,
+            packed_zeros_row,
+        ) = _make_packed_primary_buffers(
+            packed=self.primary_is_packed,
+            bucket_size=bucket_size,
+            num_heads=attn.num_heads,
+            source_dim=self.primary_source_dim,
+            record_dim=self.primary_record_dim,
+            record_dtype=self.primary_record_dtype,
+            device=device,
+        )
         agg_scores, q_index_fp8, aux_block_table, aux_context_lens = (
             _make_scorer_buffers(
                 page_split=self.aux_is_page_split,
@@ -1237,6 +1467,9 @@ class Glm5FullDsaAttnSegment:
             top_k_indices=torch.empty(bucket_size, self.index_topk, dtype=torch.int32, device=device),
             selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
+            query_packed=query_packed,
+            primary_k_packed=primary_k_packed,
+            packed_zeros_row=packed_zeros_row,
             absorbed_q=torch.empty(
                 bucket_size,
                 attn.num_heads,
@@ -1286,6 +1519,10 @@ class Glm5FullDsaAttnSegment:
             q_x_fp8=q_x_fp8,
             q_x_scale=q_x_scale,
             q_tma_desc=q_tma_desc,
+            **{
+                name: getattr(base, name)
+                for name in _GLM5_DSA_SHARED_FIELDS
+            },
             **view_kwargs,
         )
 
@@ -1307,9 +1544,18 @@ class Glm5FullDsaAttnSegment:
             return
         device = self.primary_blocked_k.device
         attn = self.attn
-        kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
         self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
-            primary_k_tensor=torch.empty(bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device),
+            # The record this cache stores, not the latent it came from: this
+            # tensor is BOTH the GPU-cache store source and the tensor the
+            # host append stages, so its shape/dtype must be the cache's.
+            primary_k_tensor=torch.empty(
+                bucket_size,
+                1,
+                1,
+                self.primary_record_dim,
+                dtype=self.primary_record_dtype,
+                device=device,
+            ),
             indexer_k_tensor=torch.empty(
                 bucket_size,
                 1,
@@ -1477,18 +1723,38 @@ class Glm5FullDsaAttnSegment:
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
         )
-        # This copy leaves the segment (the whole-model graph stages it for host
-        # KV offload), so it is the one place an invalid row's bytes would
-        # escape. Select instead of copy: a select costs the same single launch,
-        # writes the exact zeros the pre-mask path produced for invalid rows,
-        # and -- unlike a multiply, where bf16 NaN * 0 is NaN -- it cannot carry
-        # a non-finite stale row through.
-        torch.where(
-            buffers.valid_mask.view(batch_size, 1, 1, 1),
-            offload_kv.view(batch_size, 1, 1, -1),
-            buffers.valid_rows_zeros[:1],
-            out=outputs.primary_k_tensor,
-        )
+        # This tensor leaves the segment (the whole-model graph stages it for
+        # host KV offload) and is also the GPU cache's store source, so it is
+        # the one place an invalid row's bytes would escape -- and the ONE
+        # place the cache's record is produced. Select instead of copy: a
+        # select costs the same single launch, writes the exact zeros the
+        # pre-mask path produced for invalid rows, and -- unlike a multiply,
+        # where bf16 NaN * 0 is NaN -- it cannot carry a non-finite stale row
+        # through.
+        if self.primary_is_packed:
+            # Quantize ONCE, into a scratch, then select invalid rows to the
+            # zero record. Two launches rather than one because the select's
+            # source cannot alias its destination; both move only
+            # batch * 656 bytes.
+            prepare_primary_mla_kv(
+                primary_blocked_k=self.primary_blocked_k,
+                compressed_kv=offload_kv.view(batch_size, -1),
+                out=buffers.primary_k_packed,
+                source_dim=self.primary_source_dim,
+            )
+            torch.where(
+                buffers.valid_mask.view(batch_size, 1, 1, 1),
+                buffers.primary_k_packed,
+                buffers.packed_zeros_row,
+                out=outputs.primary_k_tensor,
+            )
+        else:
+            torch.where(
+                buffers.valid_mask.view(batch_size, 1, 1, 1),
+                offload_kv.view(batch_size, 1, 1, -1),
+                buffers.valid_rows_zeros[:1],
+                out=outputs.primary_k_tensor,
+            )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
@@ -1586,7 +1852,40 @@ class Glm5FullDsaAttnSegment:
             buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
-        if self.all_short:
+        if self.primary_is_packed:
+            # A packed cache has no dense FP8 decode kernel in the pin, so the
+            # all-short path is served by the SAME sparse kernel: it selects
+            # every token of the row, which is exactly what the transform
+            # already produces for a row within the selection budget (it falls
+            # back to identity offsets). The transform therefore runs on both
+            # paths here, unlike the bf16 branch below where all-short skips it.
+            transform_selected_positions_out(
+                self.primary_page_table,
+                buffers.safe_cache_seqlens,
+                buffers.top_k_indices,
+                buffers.selected_token_ids,
+                buffers.selected_lengths,
+                page_size=self.page_size,
+                primary_slot_indices=buffers.safe_primary_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            # FlashMLA takes ONE 576-wide query; FA3 took the split
+            # q/qv pair. Assembled here rather than written in place by the
+            # producing kernels, because the absorb kernel hardcodes a
+            # contiguous [B, H, N] output. Cost: batch * heads * 576 * 2 B
+            # read+written per layer-step -- at TP 8 (heads_local = 8) and
+            # batch 64 that is 0.59 MB/layer, ~46 MB/step, which is well
+            # under the attention time this path is meant to save. Removing it
+            # needs output strides on fp8_q_absorb_out and on the fused
+            # RoPE kernel; deferred (see the slice report).
+            buffers.query_packed[:, :, : attn.kv_lora_rank].copy_(
+                buffers.absorbed_q
+            )
+            buffers.query_packed[:, :, attn.kv_lora_rank :].copy_(
+                buffers.q_rope_4d.squeeze(2)
+            )
+            attn_out = self._run_sparse_fp8(buffers, batch_size)
+        elif self.all_short:
             attn_out = self._run_all_short_fa3(buffers)
         else:
             transform_selected_positions_out(

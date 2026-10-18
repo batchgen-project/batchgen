@@ -40,7 +40,26 @@ class Glm5DecoderLayerGraphSegment:
         self.hidden_size = int(getattr(layer, "hidden_size"))
         self.max_seqlen = int(getattr(dsa_segment, "max_seqlen"))
         self.index_topk = int(getattr(dsa_segment, "index_topk"))
-        self.primary_kv_dim = int(dsa_segment.primary_blocked_k.shape[3])
+        # The primary cache's RECORD, dim AND dtype, both read off the DSA
+        # segment, which resolved the primary format when it was built. The dim
+        # was always derived from the cache; the dtype used to be hardcoded
+        # bf16, which was invisible while the only format was bf16 576 and
+        # becomes a declared-spec/actual-tensor mismatch the moment a profile
+        # stores a byte record (GLM-5.2's packed FP8 MLA: 656 BYTES per token,
+        # uint8). Derived exactly like `aux_kv_dtype` below, for the same
+        # reason.
+        self.primary_kv_dim = int(
+            getattr(
+                dsa_segment,
+                "primary_record_dim",
+                dsa_segment.primary_blocked_k.shape[3],
+            )
+        )
+        self.primary_kv_dtype = getattr(
+            dsa_segment,
+            "primary_record_dtype",
+            dsa_segment.primary_blocked_k.dtype,
+        )
         # Reuse-topk segments (GLM-5.2 skip layers) have no aux/indexer KV;
         # aux_kv_dim=0 marks the layer as producing no indexer_k_tensor.
         # A page-split FP8 aux cache carries BYTES per token in its trailing
@@ -121,7 +140,7 @@ class Glm5DecoderLayerGraphSegment:
             ),
             "primary_k_tensor": TensorSpec(
                 ("batch_size", 1, 1, self.primary_kv_dim),
-                torch.bfloat16,
+                self.primary_kv_dtype,
             ),
         }
         if self.aux_kv_dim > 0:
