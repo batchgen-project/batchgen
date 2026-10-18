@@ -16,6 +16,7 @@
     - --decision-frequency-pages: How often to make scheduling decisions (default: 2)
       Must be <= extension_gpu_page_buffer to ensure sequences don't overflow between decisions.
 """
+import itertools
 from enum import IntEnum
 from typing import Dict, List, Optional, Set
 import torch
@@ -644,8 +645,18 @@ class SequenceEntry:
         )
 
 
+#: Process-wide monotone source for ``SequenceBatch.composition_epoch``. A
+#: per-instance counter starting at 0 would let a freshly constructed batch
+#: collide with a cached epoch taken from the batch it replaced, so the epoch is
+#: unique across instances as well as across mutations.
+_COMPOSITION_EPOCHS = itertools.count(1)
+
+
 class SequenceBatch:
-    __slots__ = ('sequences', '_status_index', '_rank_index', '_gid_index')
+    __slots__ = (
+        'sequences', '_status_index', '_rank_index', '_gid_index',
+        '_composition_epoch',
+    )
 
     def __init__(self):
         self.sequences: Dict[str, SequenceEntry] = {}
@@ -660,6 +671,19 @@ class SequenceBatch:
         # step; without this index that call site rebuilt the whole mapping
         # per step.
         self._gid_index: Dict[int, SequenceEntry] = {}
+        # Monotone membership stamp. Decode keeps per-request sampling-parameter
+        # tensors resident on device and may only reuse them while the ordered
+        # row set is unchanged; `sampling_params` is immutable per sequence, so
+        # the values can change only when membership does. Bumped here and in
+        # the only two methods that mutate `self.sequences`, so no caller can
+        # forget it. Does NOT cover row order -- that is the decode-side row
+        # epoch in `batchgen.worker.sampling_residency`.
+        self._composition_epoch: int = next(_COMPOSITION_EPOCHS)
+
+    @property
+    def composition_epoch(self) -> int:
+        """Stamp that changes whenever batch membership changes."""
+        return self._composition_epoch
 
     def add_sequence(self, sequence: SequenceEntry) -> None:
         # Handle UUID collision: if a sequence with this uuid already exists,
@@ -689,9 +713,15 @@ class SequenceBatch:
         # resolution a dict comprehension over ``self.sequences`` would give
         # (last writer wins) instead of inventing a new failure mode.
         self._gid_index[sequence.global_idx] = sequence
+        self._composition_epoch = next(_COMPOSITION_EPOCHS)
 
     def remove_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         """Remove a sequence from the batch and all indices."""
+        # Bumped unconditionally, before the lookup: a removal that found
+        # nothing changed no membership, but making the stamp depend on the
+        # outcome would turn "this path cannot change membership" into a thing
+        # every future edit has to re-establish.
+        self._composition_epoch = next(_COMPOSITION_EPOCHS)
         seq = self.sequences.pop(uuid, None)
         if seq:
             self._status_index[seq.status].discard(uuid)
@@ -795,6 +825,11 @@ class SequenceBatch:
                     if seq.assigned_rank not in view._rank_index:
                         view._rank_index[seq.assigned_rank] = set()
                     view._rank_index[seq.assigned_rank].add(uuid)
+        # The view is populated by direct index writes rather than through
+        # add_sequence, so stamp it once at the end. A view is never the
+        # worker's `global_batch`, but an epoch that does not describe its own
+        # contents would be a trap for whoever reuses this next.
+        view._composition_epoch = next(_COMPOSITION_EPOCHS)
         return view
 
     # ============ Convenience Status Check Methods ============

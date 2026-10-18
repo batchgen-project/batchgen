@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from batchgen.sampling import sample_tokens
+from batchgen.worker.sampling_residency import host_decisions_from_cast
 
 SEED = 20261017
 GOLDEN_TORCH_VERSION = "2.13.0"
@@ -211,6 +212,72 @@ def test_an_empty_batch_samples_no_tokens():
         tokens = sample_tokens(empty, **kwargs)
         assert tokens.shape == (0, 1)
         assert tokens.dtype == torch.long
+
+
+def _host_decisions_for(kwargs):
+    """The four branch decisions `sample_tokens` would reduce on device.
+
+    The logits in this file are fp32, so `.to(logits.dtype)` is the identity
+    and the fp32 row values are already the cast values. (Where the cast is
+    lossy -- bf16 logits -- the agreement between the host predicate and the
+    device mask is pinned in `test_sampling_residency.py`.)
+    """
+    temps, top_ps, top_ks = [], [], []
+    for row in range(B):
+        temp, p, k = _row_params(kwargs, row)
+        temps.append(temp)
+        top_ps.append(p)
+        top_ks.append(k)
+    return host_decisions_from_cast(temps, top_ps, top_ks)
+
+
+def _reaches_the_branches(kwargs):
+    """False for the scalar greedy short-circuit, which returns before them."""
+    temperature = kwargs.get("temperature")
+    if temperature is None:
+        return False
+    if isinstance(temperature, torch.Tensor):
+        return True
+    return temperature > 0
+
+
+def test_host_decided_branches_reproduce_the_matrix_token_for_token():
+    """The decode step path hands `sample_tokens` host-side branch decisions
+    instead of letting it reduce `greedy_mask`, `sampling_mask`,
+    `s_top_ks.max()` and `(s_top_ps < 1.0)` on device, and selects the
+    invalid-probability fallback on device instead of branching on host. For
+    every case in this matrix that must be the same token vector.
+    """
+    logits = _logits()
+    for name, kwargs in _cases().items():
+        if not _reaches_the_branches(kwargs):
+            continue
+        torch.manual_seed(SEED)
+        expected = sample_tokens(logits, **kwargs).reshape(-1).tolist()
+        torch.manual_seed(SEED)
+        got = sample_tokens(
+            logits, host_decisions=_host_decisions_for(kwargs), **kwargs
+        ).reshape(-1).tolist()
+        assert got == expected, (
+            f"{name}: host-decided {got} != device-reduced {expected}"
+        )
+
+
+def test_the_host_decided_path_agrees_with_the_recorded_pre_slice_tokens():
+    if torch.__version__.split("+")[0] != GOLDEN_TORCH_VERSION:
+        pytest.skip(
+            f"golden tokens were recorded on torch {GOLDEN_TORCH_VERSION}, "
+            f"running {torch.__version__}"
+        )
+    logits = _logits()
+    for name, kwargs in _cases().items():
+        if not _reaches_the_branches(kwargs):
+            continue
+        torch.manual_seed(SEED)
+        got = sample_tokens(
+            logits, host_decisions=_host_decisions_for(kwargs), **kwargs
+        ).reshape(-1).tolist()
+        assert got == GOLDEN[name], name
 
 
 def test_a_single_row_batch_is_sampled_like_its_row_in_a_batch():
