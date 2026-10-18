@@ -763,6 +763,11 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 	enable_prefix_cache: bool = False
 	prefix_cache_debug_stats: bool = False
+	# GLM-5.2 primary MLA KV format, carried from ServerArgs because a worker is
+	# a separate process and must latch the same choice as the server before it
+	# resolves its own KV profile. False (default) = packed FlashMLA FP8 record;
+	# True = the pre-migration bf16 576-element profile.
+	disable_glm52_packed_kv: bool = False
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -997,6 +1002,10 @@ class BatchGenWorker:
 		self._k3_startup_completed = False
 		self._k3_startup_prefill_ready = False
 		self._k3_startup_prefill_mode = None
+		# GLM-5.2 packed-FP8 primary cache: sparse FlashMLA + its metadata
+		# kernel warmed once per process, before any graph capture
+		# (_warmup_packed_fp8_sparse_mla). Stays False for every other model.
+		self._packed_fp8_sparse_mla_warmed = False
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -1004,6 +1013,32 @@ class BatchGenWorker:
 		# 3. Path & Model Configurations
 		self.model_name = args.model_name
 		self.huggingface_ckpt_name = args.model_name
+		# Commit THIS worker process's GLM-5.2 primary KV format before its
+		# first profile resolution. `set_glm52_packed_kv` latches on that first
+		# resolution and raises on a later change, so this call must dominate
+		# every resolution in the worker process; it does:
+		#   * `DualHostKVCoordinator.from_budget` (step 5, below in this same
+		#     __init__) -> `build_host_configs` -> `_resolve_profile`, which is
+		#     the earliest resolution in the process;
+		#   * `build_host_kv_config` / `build_host_kv_worker_view` in the
+		#     non-DSA branch of that same step;
+		#   * `_resolve_profile` in `_init_gpu_kv_with_actual_size`;
+		#   * every `build_gpu_kv_config` call, all of which run per batch.
+		# Nothing between the start of __init__ and here touches a KV profile
+		# (steps 1-4 are rank/device/weights-storage setup), and
+		# `server_worker_main_loop.py` resolves none before constructing the
+		# worker. The RuntimeError from a wrong order is deliberately NOT caught
+		# -- committing the default silently is the failure mode this latch
+		# exists to prevent.
+		# Direct attribute access, not getattr-with-default: an args object that
+		# does not carry the switch must fail loudly rather than quietly serve
+		# the packed default.
+		self.disable_glm52_packed_kv = bool(args.disable_glm52_packed_kv)
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			set_glm52_packed_kv as _set_glm52_packed_kv,
+		)
+
+		_set_glm52_packed_kv(not self.disable_glm52_packed_kv)
 		self.hf_cache_dir = args.hf_cache_dir
 		self.cache_dir = args.cache_dir
 		self.converted_ckpt_dir = args.converted_ckpt_dir
@@ -8296,6 +8331,178 @@ class BatchGenWorker:
 		)
 		torch.cuda.synchronize(device)
 
+	def _primary_mla_cache_is_packed_fp8(self) -> bool:
+		"""True when this model's PAGED primary MLA cache is the packed record.
+
+		Read off the resolved KV profile, which is the same object the GPU
+		paged cache is built from (``_init_gpu_kv_with_actual_size`` resolves it
+		at ``batchgen_worker.py:1456-1457``), so the answer cannot disagree with
+		what was actually allocated. ``packed_mla_fp8`` is a declared field of
+		every profile, so this is False for GLM-5/5.1/5.3 and for every
+		non-MLA model.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import _resolve_profile
+
+		return bool(
+			_resolve_profile(self.huggingface_ckpt_name).packed_mla_fp8
+		)
+
+	def _warmup_packed_fp8_sparse_mla(self) -> None:
+		"""Launch GLM-5.2's sparse-FP8 FlashMLA decode once, outside any capture.
+
+		Why this exists at all: the sparse FP8 kernel and its metadata kernel
+		are the ONLY decode reader of a packed primary cache
+		(``batchgen/attention/mla/packed_fp8_sparse_decode.py:1-8``), and
+		nothing in this process had warmed them. ``_warmup_kimi_k3_flash_mla``
+		warms DENSE bf16 FlashMLA and is reachable only from
+		``prepare_kimi_k3_startup`` (the exact-model gate in
+		``batchgen/server_worker_main_loop.py:557-558``), so it never runs for
+		GLM-5.2; there is no FA3 MLA decode warmup in this file either. First
+		touch would therefore be the first captured decode, where loading the
+		extension and instantiating the kernel happens INSIDE the capture --
+		the first-batch rule. Modelled on the K3 warmup, same shape of call,
+		different kernel.
+
+		Idempotent and best-effort-free: it either launches the real kernel or
+		raises. It is never called while a stream is capturing.
+
+		Every synthetic input below is the minimum the pin accepts:
+
+		* ``q`` bf16 ``[1, 1, num_heads_q, 576]`` -- one 576-wide query
+		  (absorbed NoPE | RoPE), the only query layout the kernel takes.
+		* ``k_cache`` uint8 ``[1, 64, 1, 656]`` -- one page of the packed
+		  record. ``torch.zeros`` is a VALID cache: an all-zero packed record
+		  has scale bits ``0.0f`` and data ``0x00`` and dequantizes to zero,
+		  which is also exactly what a freshly allocated page holds, so the
+		  warmup reads well-defined zeros rather than uninitialized bytes.
+		* ``indices`` int32 ``[1, 1, topk]`` with ``topk % 64 == 0`` (the
+		  kernel's ``FLASH_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0)``), and
+		  with at least ONE valid entry. An all-``-1`` row is the degenerate
+		  input: every lane is masked to -inf, the softmax denominator stays 0
+		  and the epilogue divides by it
+		  (``csrc/sm90/decode/sparse_fp8/components/epilogue.h:34``), so the
+		  row comes back NaN. Same hazard class as the DeepGEMM all-zero-lens
+		  case -- a kernel that is memory-safe on degenerate input but not
+		  numerically defined. The warmup row therefore holds index 0.
+		* ``causal=False`` is forced inside ``run_sparse_fp8_mla_decode``: the
+		  pin asserts causal is False whenever indices are given.
+		* metadata through ``prepare_sparse_fp8_mla_metadata`` (the sparse
+		  form, which passes ``num_heads_q``/``is_fp8_kvcache``/``topk``), NOT
+		  the dense ``get_mla_metadata`` call the K3 warmup uses -- a dense
+		  metadata object does not describe a sparse launch.
+		"""
+		if self._packed_fp8_sparse_mla_warmed:
+			return
+		if not self._primary_mla_cache_is_packed_fp8():
+			return
+		if not torch.cuda.is_available():
+			return
+		if torch.cuda.is_current_stream_capturing():
+			# Warming here would bake graph-private allocations and compile
+			# inside the capture, which is the exact failure this method
+			# exists to prevent. Name it instead of doing it.
+			raise RuntimeError(
+				f"Rank {self.rank}: packed-FP8 sparse MLA warmup was requested "
+				"DURING a CUDA graph capture; it must run before capture"
+			)
+		if self.model is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: packed-FP8 sparse MLA warmup needs the "
+				"built model for its head count, selection budget and softmax "
+				"scale; it must run after the model is resident"
+			)
+
+		from batchgen.attention.mla.packed_fp8_sparse_decode import (
+			TOPK_BLOCK_SIZE,
+			prepare_sparse_fp8_mla_metadata,
+			run_sparse_fp8_mla_decode,
+		)
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			PACKED_MLA_PAGE_SIZE,
+			PACKED_MLA_SOURCE_DIM,
+			PACKED_MLA_TOKEN_BYTES,
+		)
+
+		# The live modules decide the shape, exactly as the whole-model graph
+		# setup does: it reads `index_topk` off the first live indexer rather
+		# than off model_config, because a local-checkpoint config may not
+		# carry the field at all (see _setup_cuda_graphs,
+		# `_first_indexer` / `index_topk_cfg`).
+		attn = None
+		indexer = None
+		for layer in self.model.model.layers:
+			candidate = getattr(layer.self_attn, "module", layer.self_attn)
+			if getattr(candidate, "indexer", None) is None:
+				continue
+			attn, indexer = candidate, candidate.indexer
+			break
+		if attn is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: a packed-FP8 primary cache is read only by "
+				"the sparse DSA decode path, but no attention layer of this "
+				"model owns an indexer"
+			)
+		topk = int(getattr(indexer, "index_topk", 0) or 0)
+		if topk <= 0 or topk % TOPK_BLOCK_SIZE != 0:
+			raise RuntimeError(
+				f"Rank {self.rank}: packed-FP8 sparse MLA needs a positive "
+				f"index_topk that is a multiple of {TOPK_BLOCK_SIZE}, got "
+				f"{topk}"
+			)
+		num_heads_q = int(attn.num_heads)
+		device = torch.device("cuda", torch.cuda.current_device())
+
+		query = torch.zeros(
+			(1, 1, num_heads_q, PACKED_MLA_SOURCE_DIM),
+			dtype=torch.bfloat16,
+			device=device,
+		)
+		packed_blocked_k = torch.zeros(
+			(1, PACKED_MLA_PAGE_SIZE, 1, PACKED_MLA_TOKEN_BYTES),
+			dtype=torch.uint8,
+			device=device,
+		)
+		# One valid index (physical token 0 of page 0), the rest -1: exercises
+		# both the valid and the masked lane while keeping the denominator
+		# non-zero, so the launch cannot come back NaN.
+		indices = torch.full(
+			(1, 1, topk), -1, dtype=torch.int32, device=device
+		)
+		indices[..., 0] = 0
+		# Shape-checked at the pybind boundary and unread by the sparse kernel,
+		# but passed as real, correctly-typed tensors so a future pin that
+		# starts reading them cannot read garbage.
+		block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+		cache_seqlens = torch.full(
+			(1,), topk, dtype=torch.int32, device=device
+		)
+		metadata = prepare_sparse_fp8_mla_metadata(
+			batch_size=1,
+			topk=topk,
+			num_heads_q=num_heads_q,
+			num_heads_k=1,
+			num_q_tokens_per_q_seq=1,
+			device=device,
+		)
+		run_sparse_fp8_mla_decode(
+			query=query,
+			packed_blocked_k=packed_blocked_k,
+			indices=indices,
+			block_table=block_table,
+			cache_seqlens=cache_seqlens,
+			metadata=metadata,
+			softmax_scale=float(attn.softmax_scale),
+			head_dim_v=int(attn.kv_lora_rank),
+		)
+		torch.cuda.synchronize(device)
+		self._packed_fp8_sparse_mla_warmed = True
+		logging.info(
+			"Rank %s: [GLM52_STARTUP] warmed sparse-FP8 FlashMLA decode "
+			"(heads_q=%d, topk=%d, record=%d B, page=%d)",
+			self.rank, num_heads_q, topk, PACKED_MLA_TOKEN_BYTES,
+			PACKED_MLA_PAGE_SIZE,
+		)
+
 	def _group_token_totals(self):
 		"""(sequences, prompt tokens, decoded tokens) of the current batch group."""
 		group = [self.global_batch.get_sequence(u) for u in self._group_uuids]
@@ -8968,6 +9175,16 @@ class BatchGenWorker:
 				)
 				if prewarm_kimi_graphs is not None:
 					prewarm_kimi_graphs(self._get_cuda_graph_gpu_manager())
+
+				# GLM-5.2 packed primary cache: warm sparse FlashMLA and its
+				# metadata kernel before the first decode forward of this
+				# process, whether or not a capture follows. The two capture
+				# entries are already covered (_warmup_cuda_graphs below, and
+				# the startup capture in _build_persistent_phase_instances);
+				# this call is what covers the lane with graphs DISABLED, where
+				# the JIT would otherwise land inside the first measured decode
+				# step. Latched, so every later decode step reads one bool.
+				self._warmup_packed_fp8_sparse_mla()
 
 				# CUDA Graph Warmup (configure-time, one-time for whole-model GLM).
 				# Whole-model graph captures every configured bucket before decode;
@@ -10209,6 +10426,13 @@ class BatchGenWorker:
 		pm.configure_prefill()
 		self._activate_persistent_decode_instance(self.comm)
 		self._init_gpu_kv_with_actual_size()
+		# GLM-5.2's startup path: the model and the paged primary cache are both
+		# resident now and no capture has started, which is the earliest point
+		# the sparse-FP8 kernel can be launched. Done here as well as in
+		# _warmup_cuda_graphs so a deployment with graph capture DISABLED still
+		# pays the JIT at startup instead of inside its first decode step.
+		# No-op for every non-packed model.
+		self._warmup_packed_fp8_sparse_mla()
 		capture = self._glm5_whole_model_graph_requested_for_current_batch()
 		if capture:
 			# No resident rows: every rank captures the way an empty rank does
@@ -11495,7 +11719,6 @@ class BatchGenWorker:
 		are reduced to the group MIN and the plan digest is compared inside the
 		group, so every early return and every chunk is group-identical.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 		from batchgen.prefix_reuse.levels import order_chunk_items_by_level
 		from batchgen.prefix_reuse.pool import scratch_pages_bound
 		from batchgen.prefix_reuse.wave_plan import (
@@ -11525,7 +11748,10 @@ class BatchGenWorker:
 			for seq in seqs
 		]
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		# Same ACTIVATION geometry the pool is allocated from: `_prefill_pool_layout`
+		# cross-checks `geometry.num_layers` against the model's layer count, and
+		# the plan this builds is what `_construct_prefill_pool` then sizes.
+		geometry = self._prefill_pool_geometry(page_tokens)
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		batching = self.engine_config.Module_Batching_Config
 		chunk_tokens = int(batching.prefill_micro_batch_token_cap)
@@ -11696,8 +11922,81 @@ class BatchGenWorker:
 		layout = getattr(self.parallel_manager, "prefill_pool_layout", None)
 		return layout() if layout is not None else None
 
+	def _prefill_pool_geometry(self, page_tokens: int):
+		"""The PAGED geometry re-expressed for the prefill ACTIVATION pool.
+
+		The prefill prefix pool is NOT a copy of the paged cache. It holds
+		FRESH bf16 compressed-KV latents, written by the sparse-prefill layer
+		itself (``batchgen/models/glm/glm5/sparse_prefill.py:797-799``:
+		``latent_flat = latent_pool.view(-1, primary_kv.shape[-1])`` then
+		``latent_flat[pool.slots] = primary_kv``, where ``primary_kv`` is the
+		bf16 ``cat(normed_kv, k_pe)`` of width ``kv_lora_rank +
+		qk_rope_head_dim``), and read back in the SAME wave by descendant
+		prefills through ``latent_pool.view(-1, 1, primary_kv.shape[-1])``
+		(``sparse_prefill.py:858-859``). No page of it is ever a verbatim copy
+		of a host page, in either direction.
+
+		So when GLM-5.2's PAGED primary cache moves to FlashMLA's packed FP8
+		record (uint8, 656 BYTES/token), the pool must NOT move with it:
+		sizing the pool from the paged geometry would allocate uint8/656 rows
+		while the scatter above still writes bf16/576, and the two would
+		disagree on both element type and width. The pool therefore keeps the
+		UNPACKED record the activation actually is -- bf16, ``kv_lora_rank +
+		qk_rope_head_dim`` elements, i.e. ``PACKED_MLA_SOURCE_DIM`` -- which is
+		exactly the pre-migration geometry, so GLM-5/5.1/5.3 and every non-MLA
+		model are untouched by construction (their profile is not packed and
+		this returns the paged geometry unchanged).
+
+		Every pool site goes through this one accessor -- the budget
+		measurement, the pool construction and the wave planner -- so the three
+		cannot each decide for themselves and leave ``page_bytes`` disagreeing
+		with the allocation. Contrast ``_materialized_segment_loader``, which
+		keeps the PAGED geometry on purpose; the comment there says why.
+		"""
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			PACKED_MLA_SOURCE_DIM,
+			PACKED_MLA_TOKEN_BYTES,
+			_resolve_profile,
+			build_gpu_kv_config,
+		)
+
+		geometry = build_gpu_kv_config(
+			self.huggingface_ckpt_name, [int(page_tokens)]
+		)
+		if not _resolve_profile(self.huggingface_ckpt_name).packed_mla_fp8:
+			return geometry
+		# The profile promised the packed record; a geometry that is not the
+		# packed record means the two have drifted apart, and silently
+		# substituting would hand the pool a width nothing writes. Named here.
+		if (
+			geometry.kv_dtype is not torch.uint8
+			or int(geometry.k_head_dim) != PACKED_MLA_TOKEN_BYTES
+			or int(geometry.num_k_heads) != 1
+		):
+			raise RuntimeError(
+				"packed_mla_fp8 profile produced a paged geometry that is not "
+				f"the packed record: dtype={geometry.kv_dtype}, "
+				f"k_head_dim={geometry.k_head_dim}, "
+				f"num_k_heads={geometry.num_k_heads} (expected uint8, "
+				f"{PACKED_MLA_TOKEN_BYTES}, 1)"
+			)
+		# `num_pages` is irrelevant to the pool (the pool's page count is its
+		# own budget) and `page_size_tokens` is shared by both formats, so the
+		# substitution is exactly the record: bf16, 576 elements.
+		return replace(
+			geometry,
+			k_head_dim=PACKED_MLA_SOURCE_DIM,
+			kv_dtype=torch.bfloat16,
+		)
+
 	def _prefill_pool_page_dims(self, geometry) -> tuple:
-		"""(layers, heads, k_head_dim, v_head_dim) of one pool page row."""
+		"""(layers, heads, k_head_dim, v_head_dim) of one pool page row.
+
+		``geometry`` must come from ``_prefill_pool_geometry``: the fallback
+		branch below reads ``k_head_dim`` straight off it, so a paged (packed
+		FP8) geometry would size the pool in BYTES per token instead of bf16
+		latent elements.
+		"""
 		layout = self._prefill_pool_psm_layout()
 		if layout:
 			return (
@@ -11714,10 +12013,12 @@ class BatchGenWorker:
 		)
 
 	def _prefill_pool_page_bytes(self) -> int:
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
-
 		page_tokens = int(self.prefix_cache_runtime_config.group_specs[0].raw_page_tokens)
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [page_tokens])
+		# ACTIVATION geometry, not the paged one: the budget must be sized from
+		# the same bf16 latent rows `_construct_prefill_pool` allocates, or the
+		# `pool.page_bytes != geometry_page_bytes` raise there would fire on
+		# every GLM-5.2 wave.
+		geometry = self._prefill_pool_geometry(page_tokens)
 		element = torch.empty((), dtype=geometry.kv_dtype).element_size()
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		layers, heads, k_head_dim, v_head_dim = self._prefill_pool_page_dims(geometry)
@@ -11788,10 +12089,9 @@ class BatchGenWorker:
 				self.rank, budget, num_pages, required,
 			)
 			num_pages = budget
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config
 
 		geometry_page_bytes = self._prefill_pool_page_bytes()
-		geometry = build_gpu_kv_config(self.huggingface_ckpt_name, [wave.page_tokens])
+		geometry = self._prefill_pool_geometry(wave.page_tokens)
 		with_v, indexer_layers, indexer_dim = self._prefill_pool_layout(geometry)
 		pool_layers, pool_heads, k_head_dim, v_head_dim = (
 			self._prefill_pool_page_dims(geometry)
@@ -12043,6 +12343,21 @@ class BatchGenWorker:
 				f"this model has {len(views)}"
 			)
 		group_id, view = next(iter(sorted(views.items())))
+		# PAGED geometry on purpose -- the opposite choice from the prefill
+		# pool's `_prefill_pool_geometry`, and the easiest contrast to get
+		# wrong. This loader copies HOST pages VERBATIM into a device staging
+		# slab (`prefix_reuse/pool_materialize.py`): the slab is the host
+		# record byte-for-byte, so it must carry the host record's dtype and
+		# width -- uint8 and 656 BYTES/token for a packed GLM-5.2 primary
+		# cache, not the bf16 576 latent the pool holds. The pool, by contrast,
+		# holds freshly computed activations that nothing ever byte-copies.
+		#
+		# NOTE: this path is a no-op for every GLM-5 variant today. The load
+		# needs per-layer `materialize_pool_segment`, and
+		# `_materialized_pool_layers` skips any layer without it
+		# (see the `hasattr(attn, "materialize_pool_segment")` guard there);
+		# no GLM-5 attention wrapper defines it, so GLM-5.2 never reaches a
+		# packed staging slab. Kept correct for the day it does.
 		geometry = build_gpu_kv_config(
 			self.huggingface_ckpt_name, [int(wave.page_tokens)]
 		)
@@ -16216,6 +16531,14 @@ class BatchGenWorker:
 			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
 			return
 
+		# A packed-FP8 primary cache is read ONLY by sparse FlashMLA, and
+		# _setup_cuda_graphs below enters a capture. Warm the kernel and its
+		# metadata kernel here, outside the capture (first-batch rule); no-op
+		# for every other model and for the second call. This is the dominating
+		# pre-capture point: both capture entries -- the startup capture in
+		# _build_persistent_phase_instances and the configure-time capture in
+		# the decode loop -- reach _setup_cuda_graphs only through here.
+		self._warmup_packed_fp8_sparse_mla()
 		self._setup_cuda_graphs(gpu_manager)
 		self._finalize_gpu_kv_pool_after_capture(gpu_manager)
 

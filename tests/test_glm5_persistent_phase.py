@@ -260,6 +260,11 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement():
             ("bind_metadata", rows)
         ),
         _warmup_cuda_graphs=lambda: calls.append("capture_graphs"),
+        # GLM-5.2's packed-FP8 primary cache is read only by sparse FlashMLA,
+        # which must be launched once outside any capture (first-batch rule).
+        # No-op for every other model, but the startup path calls it
+        # unconditionally so a graphs-disabled deployment is covered too.
+        _warmup_packed_fp8_sparse_mla=lambda: calls.append("warm_sparse_fp8"),
         _release_persistent_decode_instance=lambda: calls.append("release_decode"),
     )
 
@@ -267,6 +272,8 @@ def test_persistent_startup_capture_follows_cuda_graph_enablement():
 
     assert "capture_graphs" in calls
     assert "release_decode" in calls
+    assert calls.index("warm_sparse_fp8") < calls.index("capture_graphs")
+    assert calls.index("init_gpu_kv") < calls.index("warm_sparse_fp8")
 
 
 def test_worker_only_calls_worker_methods_that_exist():

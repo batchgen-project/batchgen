@@ -278,9 +278,22 @@ def _seqs():
 
 def _stub_heavy_modules(monkeypatch, *, free_state_slots):
     """Serve the imports whose real modules need the compiled engine/CUDA."""
+    # `_prefill_pool_geometry` asks the profile whether the primary cache is the
+    # packed FlashMLA FP8 record and substitutes the unpacked bf16 latent when
+    # it is. K3 is not packed, so the stub answers False and the pool geometry
+    # stays the Host geometry -- which is what every assertion in this file
+    # assumes. The packed substitution has its own coverage in
+    # tests/test_glm52_packed_kv_worker_plumbing.py.
     monkeypatch.setitem(
         sys.modules, "batchgen.kv_cache.host_kv_mananger_config",
-        SimpleNamespace(build_gpu_kv_config=lambda *args, **kwargs: GEOMETRY),
+        SimpleNamespace(
+            build_gpu_kv_config=lambda *args, **kwargs: GEOMETRY,
+            _resolve_profile=lambda *args, **kwargs: SimpleNamespace(
+                packed_mla_fp8=False
+            ),
+            PACKED_MLA_SOURCE_DIM=576,
+            PACKED_MLA_TOKEN_BYTES=656,
+        ),
     )
     monkeypatch.setitem(
         sys.modules, "batchgen.decode_dp_group",
@@ -313,6 +326,9 @@ def _plan_worker(
             "_check_pool_plan_identical",
             "_prefill_pool_layout",
             "_prefill_pool_psm_layout",
+            # Every pool site takes its geometry from here, so the seam needs
+            # the real accessor rather than a fake.
+            "_prefill_pool_geometry",
             "_prefill_pool_page_dims",
             "_prefill_pool_group",
             "_prefill_pool_free_state_slots",

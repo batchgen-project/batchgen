@@ -141,6 +141,24 @@ class WorkerManager:
         worker_exit_state: Optional[WorkerExitState] = None,
     ):
         self.args = server_args
+        # Commit this PROCESS's GLM-5.2 primary KV format before anything in it
+        # can resolve a KV profile. `set_glm52_packed_kv` latches on the first
+        # resolution and raises on a later change, so this call must dominate
+        # every resolution in the server process; it does:
+        #   * `allocate_host_kv_cache` (worker_manager.py:316, called from
+        #     `_start_impl`) -> `DualHostKVCoordinator.create_managers` /
+        #     `build_host_kv_config`;
+        #   * `_initialize_prefix_cache_owner` (worker_manager.py:350) ->
+        #     `DualHostKVCoordinator.build_host_configs` /
+        #     `build_host_kv_config`;
+        # both reached only through `start()` -> `_start_impl()`, i.e. strictly
+        # after this constructor, and `http_server.py:121` is the only place
+        # that builds a WorkerManager. The RuntimeError from a wrong order is
+        # deliberately NOT caught here -- a silently committed default would be
+        # a cache geometry nobody asked for.
+        from batchgen.kv_cache.host_kv_mananger_config import set_glm52_packed_kv
+
+        set_glm52_packed_kv(not bool(server_args.disable_glm52_packed_kv))
         try:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
@@ -864,6 +882,11 @@ class WorkerManager:
             global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
             enable_prefix_cache=self.args.enable_prefix_cache,
             prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
+            # Workers are separate (spawned) processes, so each one latches its
+            # own copy of the GLM-5.2 primary KV format; the value has to travel
+            # through the worker args or a worker would commit the default while
+            # this process serves the other format.
+            disable_glm52_packed_kv=self.args.disable_glm52_packed_kv,
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,

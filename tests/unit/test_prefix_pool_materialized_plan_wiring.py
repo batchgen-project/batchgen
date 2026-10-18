@@ -73,6 +73,9 @@ METHODS = (
     "_check_pool_plan_identical",
     "_prefill_pool_layout",
     "_prefill_pool_psm_layout",
+    # Every pool site takes its geometry from here (the packed-FP8 primary
+    # cache is unpacked back to the bf16 activation latent for the pool).
+    "_prefill_pool_geometry",
     "_prefill_pool_page_dims",
     "_prefill_pool_group",
     "_prefill_pool_free_state_slots",

@@ -197,6 +197,14 @@ class ServerArgs:
     host_kv_cache_size: Optional[int] = None
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
+    # GLM-5.2 primary MLA KV format kill switch. Default False = the packed
+    # FlashMLA FP8 record (uint8, 656 B/token). Setting it True restores the
+    # PRE-MIGRATION bf16 576-element profile, i.e. exactly what GLM-5/5.1/5.3
+    # still use; it affects no other model. The value must reach every process
+    # that resolves a KV profile BEFORE its first resolution -- see
+    # `set_glm52_packed_kv` in batchgen/kv_cache/host_kv_mananger_config.py,
+    # which latches on the first resolution and raises on a later change.
+    disable_glm52_packed_kv: bool = False
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -413,6 +421,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Log prefix-cache lifecycle statistics",
+    )
+    parser.add_argument(
+        "--disable-glm52-packed-kv",
+        action="store_true",
+        default=False,
+        help="GLM-5.2 only: store the primary MLA KV cache as the "
+        "pre-migration bf16 576-element record instead of FlashMLA's packed "
+        "FP8 656-byte record (default: packed). No effect on other models.",
     )
     parser.add_argument(
         "--gpu-arch", type=str, default=None, help="GPU architecture hint"
@@ -905,6 +921,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_cache_size=parsed.host_kv_cache_size,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
+        disable_glm52_packed_kv=parsed.disable_glm52_packed_kv,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,
