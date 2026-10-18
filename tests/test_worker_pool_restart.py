@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -1814,6 +1815,7 @@ def _cohort_flag_probe_child(flag, observed, child_pid, deadline_s):
 # --------------------------------------------------------------------------
 
 BATCHGEN_WORKER_PATH = ROOT / "batchgen/batchgen_worker.py"
+DUAL_COORDINATOR_PATH = ROOT / "batchgen/kv_cache/dual_host_kv_coordinator.py"
 
 _worker_tree_cache: Dict[str, ast.Module] = {}
 
@@ -2695,10 +2697,20 @@ _WORKER_DECODE_WAIT_MEMBERS = (
     "set_cohort_shutdown_probe",
     "_cohort_shutdown_requested",
     "_wait_decode_tokens",
-    "_await_local_quiesce",
+    "_poll_until",
+    "_pending_kv_appends_done",
+    "_record_quiesce_device_event",
     "_self_exit_on_quiesce_deadline",
     "_quiesce_decode_for_cohort_shutdown",
     "disable_decode_watchdog",
+)
+# The quiesce's own members -- what the "nothing blocking, nothing threaded"
+# structural tests close over.
+_WORKER_QUIESCE_MEMBERS = (
+    "_poll_until",
+    "_pending_kv_appends_done",
+    "_record_quiesce_device_event",
+    "_quiesce_decode_for_cohort_shutdown",
 )
 _WORKER_DECODE_WAIT_CONSTANTS = (
     "_DECODE_EVENT_SPIN_BUDGET_S",
@@ -2706,6 +2718,7 @@ _WORKER_DECODE_WAIT_CONSTANTS = (
     "_DECODE_WAIT_COMPLETED",
     "_DECODE_WAIT_ABANDONED",
     "_COHORT_QUIESCE_DEADLINE_S",
+    "_COHORT_QUIESCE_POLL_INTERVAL_S",
     "_COHORT_QUIESCE_DEADLINE_REASON",
 )
 
@@ -2787,7 +2800,6 @@ def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
 
     namespace: Dict[str, Any] = {
         "time": time,
-        "threading": threading,
         "logging": logging,
         "os": _GuardOs,
         "property": property,
@@ -2823,10 +2835,14 @@ class _FakeEvent:
         self.fires_after = fires_after
         self.queries = 0
         self.synchronized = 0
+        self.recorded = []
 
     def query(self):
         self.queries += 1
         return self.fires_after is not None and self.queries > self.fires_after
+
+    def record(self, stream=None):
+        self.recorded.append(stream)
 
     def synchronize(self):
         self.synchronized += 1
@@ -2835,6 +2851,120 @@ class _FakeEvent:
                 "synchronize() on an event that never fires is the production "
                 "wedge; the armed path must never call it"
             )
+
+
+class _FakeKVTask:
+    """A native ``KVAsyncTask`` stand-in, with the two shapes that matter.
+
+    ``done()`` is the non-blocking ``wait_for(0s)`` status probe the quiesce
+    polls; ``wait()`` is the GIL-holding block it may call only once a probe
+    has proven the task finished.  A task that never completes therefore fails
+    the test the moment anything waits on it -- that call is the measured
+    production wedge (W13).
+
+    ``done_after`` is a number of ``done()`` calls before it reports done;
+    ``None`` means it never does.
+    """
+
+    def __init__(self, done_after=0, name="task", log=None):
+        self.done_after = done_after
+        self.name = name
+        self.log = log if log is not None else []
+        self.done_calls = 0
+        self.waits = 0
+
+    def done(self):
+        self.done_calls += 1
+        return self.done_after is not None and self.done_calls > self.done_after
+
+    def wait(self):
+        self.waits += 1
+        self.log.append((self.name, "wait"))
+        if self.done_after is None:
+            raise AssertionError(
+                f"{self.name}: wait() on a task that never completes is the "
+                "measured GIL wedge; the quiesce must prove done() first"
+            )
+
+
+def _quiesce_torch(event):
+    """A ``torch`` carrying only the names the device probe touches.
+
+    ``synchronize`` exists and fails: replacing that unbounded device sync with
+    an event query is the third of this slice's three probes, so its presence
+    on the teardown path is a regression, not a detail.
+    """
+
+    class _Cuda:
+        @staticmethod
+        def Event():
+            return event
+
+        @staticmethod
+        def current_stream(device):
+            return f"stream:{device}"
+
+        @staticmethod
+        def synchronize(device):
+            raise AssertionError(
+                "the unbounded device sync must not run on the decode teardown "
+                f"path (device {device})"
+            )
+
+    return SimpleNamespace(cuda=_Cuda)
+
+
+def _quiesce_self_exit_env():
+    """The stubs a quiesce test needs to observe the self-exit and survive it.
+
+    Returns ``(os_stub, module_stub, flushes, loop_ns)``: ``os._exit`` raises
+    ``_SelfExited`` instead of ending pytest, the supervisor module the marker
+    helper imports from is replaced by a namespace that records the flush, and
+    ``loop_ns`` carries the supervisor's real exit status and path name.
+    """
+    flushes = []
+
+    class _Os:
+        @staticmethod
+        def getpid():
+            return 4242
+
+        @staticmethod
+        def _exit(status):
+            raise _SelfExited(status)
+
+    loop_ns = _load_worker_loop_helpers()
+    stub = SimpleNamespace(
+        _EXIT_PATH_SELF_EXIT=loop_ns["_EXIT_PATH_SELF_EXIT"],
+        _WORKER_SELF_EXIT_CODE=loop_ns["_WORKER_SELF_EXIT_CODE"],
+        _flush_worker_logs=lambda: flushes.append("flush"),
+    )
+    return _Os, stub, flushes, loop_ns
+
+
+def _run_quiesce_expecting_self_exit(worker, stub, pending_async_task):
+    """Run the quiesce, capture its log records, and return (status, markers)."""
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    previous = sys.modules.get("batchgen.server_worker_main_loop")
+    sys.modules["batchgen.server_worker_main_loop"] = stub
+    try:
+        with pytest.raises(_SelfExited) as raised:
+            worker._quiesce_decode_for_cohort_shutdown(pending_async_task)
+    finally:
+        root.removeHandler(handler)
+        if previous is None:
+            del sys.modules["batchgen.server_worker_main_loop"]
+        else:
+            sys.modules["batchgen.server_worker_main_loop"] = previous
+    return raised.value.status, records
 
 
 class _CountingProbe:
@@ -3003,6 +3133,7 @@ def test_the_decode_wait_and_quiesce_are_tunable_only_by_module_constant():
     assert ns["_DECODE_EVENT_SPIN_BUDGET_S"] == 0.002
     assert ns["_DECODE_EVENT_POLL_INTERVAL_S"] == 1e-4
     assert ns["_COHORT_QUIESCE_DEADLINE_S"] == 5.0
+    assert ns["_COHORT_QUIESCE_POLL_INTERVAL_S"] == 1e-3
     assert ns["_COHORT_QUIESCE_DEADLINE_REASON"] == "quiesce-deadline"
     assert ns["_DECODE_WAIT_COMPLETED"] != ns["_DECODE_WAIT_ABANDONED"]
 
@@ -3095,133 +3226,184 @@ def test_every_decode_teardown_exit_takes_the_same_ordered_route():
 
 # ---- W3: the quiesce is bounded, and a missed bound does not unwind ------
 
-def test_neither_quiesce_wait_accepts_a_timeout_so_the_bound_is_external():
-    """Grounds the thread-based bound in the code rather than in prose: if
-    either wait ever grows a timeout parameter, the simpler form should be
-    used instead."""
+_QUIESCE_BLOCKING_CALLS = (
+    "self._wait_pending_kv_append_tasks",
+    "pending_async_task.wait",
+    "torch.cuda.synchronize",
+)
+
+
+def _called_funcs(node) -> List[str]:
+    return [
+        ast.unparse(call.func) for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    ]
+
+
+def test_the_quiesce_holds_no_thread_and_blocks_only_after_its_probes():
+    """W13, the binding constraint: no thread, and nothing blocking unproven.
+
+    ``.def("wait", &kv::KVAsyncTask::wait)`` carries no
+    ``py::call_guard<py::gil_scoped_release>()``, so an append task parked
+    behind the dead collective blocks in ``std::shared_future::get`` while
+    HOLDING the GIL.  v4 ran that drain on a daemon thread and joined it under
+    a deadline; the main thread then wedged inside ``Thread.start()`` and the
+    deadline, the abort watchdog and the supervisor's self-exit net all starved
+    (MEASURED, 3 of 3 busy restarts).  A GIL-holding wait cannot be bounded
+    from Python on any thread, so this path may contain neither a thread nor a
+    blocking wait that a non-blocking probe has not already proven finished.
+    """
+    worker_source = BATCHGEN_WORKER_PATH.read_text()
+    assert "import threading" not in worker_source, (
+        "the decode teardown path must need no thread at all"
+    )
+    for name in _WORKER_QUIESCE_MEMBERS:
+        source = ast.unparse(_worker_method(name))
+        assert "threading" not in source, name
+        assert "Thread" not in source, name
+
+    helper = _worker_method("_quiesce_decode_for_cohort_shutdown")
+    assert "torch.cuda.synchronize" not in ast.unparse(helper), (
+        "the load drain's unbounded device sync is what the event probe "
+        "replaces; it must not survive on this path"
+    )
+
+    blocking = [
+        index for index, stmt in enumerate(helper.body)
+        if any(call in _called_funcs(stmt) for call in _QUIESCE_BLOCKING_CALLS)
+    ]
+    assert len(blocking) == 1, (
+        f"every blocking wait must sit in ONE guarded unwind block: {blocking}"
+    )
+    probes = [
+        index for index, stmt in enumerate(helper.body)
+        if "self._poll_until" in _called_funcs(stmt)
+    ]
+    assert len(probes) == 3, (
+        "three stages must be proven before anything blocks -- appends, the "
+        f"async load, the device event: {probes}"
+    )
+    assert max(probes) < blocking[0], (
+        "a blocking wait runs before the probes prove it cannot block"
+    )
+    guard = helper.body[blocking[0]]
+    assert isinstance(guard, ast.If)
+    assert ast.unparse(guard.test) == "quiesced"
+    assert not guard.orelse
+
+    # And the drain still has no timeout of its own, which is why readiness has
+    # to be established before calling it rather than around it.
     drain = _worker_method("_wait_pending_kv_append_tasks")
     names = {arg.arg for arg in drain.args.args + drain.args.kwonlyargs}
     assert "timeout" not in names, (
         "the append drain now takes a timeout; bound it directly"
     )
 
-    runner = _worker_method("_await_local_quiesce")
-    threads = [
-        node for node in ast.walk(runner)
-        if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "threading.Thread"
+
+def test_the_append_task_binding_exposes_a_nonblocking_done_and_a_blocking_wait():
+    """Grounds the mechanism in the native source, not in prose.
+
+    The whole design follows from two facts about the installed binding: the
+    wait holds the GIL, and ``done()`` is a zero-timeout status test that
+    cannot.  If either changes, this path should be reconsidered -- a
+    GIL-releasing wait would make a direct timeout bound possible again.
+    """
+    binding = (ROOT / "core/batchgen_Binding.cpp").read_text()
+    view = (ROOT / "core/KV_Storage/host_paged_kv_worker_view.h").read_text()
+
+    assert '.def("done", &kv::KVAsyncTask::done)' in binding
+    (wait_binding,) = [
+        line for line in binding.splitlines()
+        if '.def("wait", &kv::KVAsyncTask::wait)' in line
     ]
-    assert len(threads) == 1
-    assert ("daemon", "True") in [
-        (kw.arg, ast.unparse(kw.value)) for kw in threads[0].keywords
-    ], "a non-daemon quiesce thread would outlive the teardown it bounds"
-    joins = [
-        node for node in ast.walk(runner)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "thread.join"
-    ]
-    assert len(joins) == 1 and len(joins[0].args) == 1, (
-        "the join must be bounded by the remaining deadline"
+    assert "gil" not in wait_binding.lower(), (
+        "the append wait now releases the GIL; the quiesce could bound it "
+        "directly instead of proving readiness first"
+    )
+
+    done_impl = " ".join(
+        view.split("bool done() const", 1)[1]
+        .split("void wait() const", 1)[0]
+        .split()
+    )
+    assert (
+        "future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready"
+        in done_impl
+    ), done_impl
+    assert "future_.get()" not in done_impl, (
+        "done() must not join the future; that is what wait() does"
     )
 
 
 def test_a_quiesce_that_lands_unwinds_in_order_and_never_self_exits():
-    """The healthy case, including D3's busy clean restart: the drains complete
-    in milliseconds, so the deadline is never near and the behavior is exactly
-    d1fe2ab1's -- drain, drain, disable the decode watchdog, return."""
-    seen = []
+    """The healthy case, including D3's busy clean restart: every probe answers
+    done on its first read, so the real drains run once each with every future
+    ready and the ordered unwind is exactly d1fe2ab1's -- drain the appends,
+    wait the load, disable the decode watchdog, return.  The device sync that
+    used to end the load drain is the event probe above it now."""
+    waits = []
+    drained = []
+    event = _FakeEvent(fires_after=0)
+    append = _FakeKVTask(name="append-task", log=waits)
+    load = _FakeKVTask(name="kv-load", log=waits)
 
-    class _Torch:
-        class cuda:
-            @staticmethod
-            def synchronize(device):
-                seen.append(("device-sync", device))
-
-    ns = _load_worker_decode_wait(torch=_Torch)
+    ns = _load_worker_decode_wait(torch=_quiesce_torch(event))
     worker = _decode_wait_worker(ns)
-    worker._pending_kv_append_tasks = ["task"]
-    worker._wait_pending_kv_append_tasks = lambda **kw: seen.append(
-        ("append-drain", kw)
-    )
+    # A None entry is what the real drain skips; the probe must skip it too.
+    worker._pending_kv_append_tasks = [append, None]
+    worker._wait_pending_kv_append_tasks = lambda **kw: drained.append(kw)
     worker._decode_watchdog = SimpleNamespace(_active=True)
-    load = SimpleNamespace(wait=lambda: seen.append(("kv-load", None)))
 
     worker._quiesce_decode_for_cohort_shutdown(load)
 
-    assert seen == [
-        ("append-drain", {"defer_errors": True}),
-        ("kv-load", None),
-        ("device-sync", "cuda:3"),
-    ]
+    # The real drain, once, with the semantics d1fe2ab1 chose.
+    assert drained == [{"defer_errors": True}]
+    # The only blocking wait taken is the load's, and only after its probe.
+    assert waits == [("kv-load", "wait")]
+    assert append.done_calls == 1 and load.done_calls == 1
+    # The device probe is recorded on the worker's own stream and queried, not
+    # synchronized (_quiesce_torch fails the test if anything device-syncs).
+    assert event.recorded == ["stream:cuda:3"]
+    assert event.queries == 1 and event.synchronized == 0
     assert worker._decode_watchdog._active is False
 
 
-def test_a_quiesce_that_misses_its_deadline_self_exits_instead_of_unwinding():
-    """W3.  With the step abandoned, these local waits are parked behind the
+def test_appends_that_never_finish_self_exit_without_ever_blocking():
+    """W3 + W13.  With the step abandoned, the appends are parked behind the
     dead collective.  Unwinding anyway is the use-after-free the whole exit
-    exists to avoid -- the append tasks are std::async threads holding unlocked
-    page-table pointers into mappings the ordered teardown releases -- so the
-    rank ends the process instead, with the reason recorded.
+    exists to avoid -- they are std::async threads holding unlocked page-table
+    pointers into mappings the ordered teardown releases -- and WAITING on them
+    is the GIL deadlock that defeated v4.  So the rank proves nothing, blocks
+    on nothing, and ends the process with the reason recorded.
     """
-    loop_ns = _load_worker_loop_helpers()
-    exits = []
-
-    class _Os:
-        @staticmethod
-        def getpid():
-            return 4242
-
-        @staticmethod
-        def _exit(status):
-            raise _SelfExited(status)
-
-    stub = SimpleNamespace(
-        _EXIT_PATH_SELF_EXIT=loop_ns["_EXIT_PATH_SELF_EXIT"],
-        _WORKER_SELF_EXIT_CODE=loop_ns["_WORKER_SELF_EXIT_CODE"],
-        _flush_worker_logs=lambda: exits.append("flush"),
-    )
+    os_stub, module_stub, flushes, loop_ns = _quiesce_self_exit_env()
+    event = _FakeEvent(fires_after=0)
+    drained = []
+    stuck = _FakeKVTask(done_after=None, name="append-task")
+    load = _FakeKVTask(name="kv-load")
 
     ns = _load_worker_decode_wait(
-        os=_Os,
-        torch=SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda d: None)),
+        os=os_stub,
+        torch=_quiesce_torch(event),
         _COHORT_QUIESCE_DEADLINE_S=0.05,
     )
     worker = _decode_wait_worker(ns)
-    worker._pending_kv_append_tasks = ["task"]
+    worker._pending_kv_append_tasks = [stuck]
+    worker._wait_pending_kv_append_tasks = lambda **kw: drained.append(kw)
     worker._decode_watchdog = SimpleNamespace(_active=True)
 
-    def _never_returns(**kw):
-        time.sleep(2.0)
+    status, records = _run_quiesce_expecting_self_exit(worker, module_stub, load)
 
-    worker._wait_pending_kv_append_tasks = _never_returns
-    second = []
-    load = SimpleNamespace(wait=lambda: second.append("ran"))
-
-    records = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
-
-    handler = _Capture()
-    root = logging.getLogger()
-    root.addHandler(handler)
-    previous = sys.modules.get("batchgen.server_worker_main_loop")
-    sys.modules["batchgen.server_worker_main_loop"] = stub
-    try:
-        with pytest.raises(_SelfExited) as raised:
-            worker._quiesce_decode_for_cohort_shutdown(load)
-    finally:
-        root.removeHandler(handler)
-        if previous is None:
-            del sys.modules["batchgen.server_worker_main_loop"]
-        else:
-            sys.modules["batchgen.server_worker_main_loop"] = previous
-
-    assert raised.value.status == loop_ns["_WORKER_SELF_EXIT_CODE"]
-    assert second == [], (
-        "the second wait must not be started once the budget is gone"
+    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert drained == [], (
+        "the blocking drain must never run while a task is unproven -- that "
+        "call holds the GIL and freezes every escape hatch"
     )
-    assert exits == ["flush"], "the marker must be flushed; os._exit does not"
+    assert load.done_calls == 0 and load.waits == 0, (
+        "the later stages must not start once the budget is gone"
+    )
+    assert stuck.done_calls > 1, "the probe must actually poll"
+    assert flushes == ["flush"], "the marker must be flushed; os._exit does not"
     marker = next(line for line in records if line.startswith("[shutdown]"))
     # The supervisor's own net emits the same grep key, so accounting still
     # sums; the reason is what tells the two causes apart.
@@ -3230,6 +3412,130 @@ def test_a_quiesce_that_misses_its_deadline_self_exits_instead_of_unwinding():
     assert marker.endswith("reason=quiesce-deadline"), marker
     # The watchdog is disabled on the way out either way.
     assert worker._decode_watchdog._active is False
+
+
+def test_a_partially_drained_append_set_is_not_good_enough():
+    """One finished task says nothing about the one still parked, so the
+    partial case takes exactly the never-finished case's route."""
+    os_stub, module_stub, flushes, loop_ns = _quiesce_self_exit_env()
+    drained = []
+    finished = _FakeKVTask(done_after=0, name="finished")
+    stuck = _FakeKVTask(done_after=None, name="stuck")
+
+    ns = _load_worker_decode_wait(
+        os=os_stub,
+        torch=_quiesce_torch(_FakeEvent(fires_after=0)),
+        _COHORT_QUIESCE_DEADLINE_S=0.05,
+    )
+    worker = _decode_wait_worker(ns)
+    worker._pending_kv_append_tasks = [finished, stuck]
+    worker._wait_pending_kv_append_tasks = lambda **kw: drained.append(kw)
+
+    status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
+
+    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert drained == []
+    assert stuck.done_calls > 1
+    assert flushes == ["flush"]
+    assert next(
+        line for line in records if line.startswith("[shutdown]")
+    ).endswith("reason=quiesce-deadline")
+
+
+def test_an_async_load_that_never_finishes_self_exits_before_the_drains():
+    """Stage 2.  The appends proved themselves, but the load did not, and its
+    ``wait()`` is the same GIL-holding native call -- so nothing blocking runs
+    at all, not even the append drain that could now safely complete."""
+    os_stub, module_stub, flushes, loop_ns = _quiesce_self_exit_env()
+    drained = []
+    append = _FakeKVTask(name="append-task")
+    load = _FakeKVTask(done_after=None, name="kv-load")
+
+    ns = _load_worker_decode_wait(
+        os=os_stub,
+        torch=_quiesce_torch(_FakeEvent(fires_after=0)),
+        _COHORT_QUIESCE_DEADLINE_S=0.05,
+    )
+    worker = _decode_wait_worker(ns)
+    worker._pending_kv_append_tasks = [append]
+    worker._wait_pending_kv_append_tasks = lambda **kw: drained.append(kw)
+
+    status, records = _run_quiesce_expecting_self_exit(worker, module_stub, load)
+
+    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert drained == [] and load.waits == 0
+    assert load.done_calls > 1
+    assert flushes == ["flush"]
+    assert next(
+        line for line in records if line.startswith("[shutdown]")
+    ).endswith("reason=quiesce-deadline")
+
+
+def test_the_device_probe_replaces_the_sync_and_respects_the_deadline():
+    """Stage 3, both outcomes.  The sync the load drain used to end in is
+    unbounded: on an abandoned step the device work is parked behind the dead
+    collective, so calling it is the unwakeable state one level down.  A
+    recorded event answers the same question with ``cudaEventQuery``, which is
+    pollable -- and when it never fires, the rank self-exits instead."""
+    # It polls rather than querying once, and completes when the event fires.
+    late = _FakeEvent(fires_after=3)
+    ns = _load_worker_decode_wait(torch=_quiesce_torch(late))
+    worker = _decode_wait_worker(ns)
+    worker._quiesce_decode_for_cohort_shutdown(None)
+    assert late.queries == 4 and late.synchronized == 0
+
+    # And an event that never fires ends the rank inside the budget.
+    os_stub, module_stub, flushes, loop_ns = _quiesce_self_exit_env()
+    never = _FakeEvent(fires_after=None)
+    drained = []
+    ns = _load_worker_decode_wait(
+        os=os_stub,
+        torch=_quiesce_torch(never),
+        _COHORT_QUIESCE_DEADLINE_S=0.05,
+    )
+    worker = _decode_wait_worker(ns)
+    worker._pending_kv_append_tasks = [_FakeKVTask()]
+    worker._wait_pending_kv_append_tasks = lambda **kw: drained.append(kw)
+
+    started = time.perf_counter()
+    status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
+    elapsed = time.perf_counter() - started
+
+    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert drained == []
+    assert never.queries > 1 and never.synchronized == 0
+    assert elapsed < 2.0, f"the device probe was not bounded ({elapsed:.3f}s)"
+    assert flushes == ["flush"]
+    assert next(
+        line for line in records if line.startswith("[shutdown]")
+    ).endswith("reason=quiesce-deadline")
+
+
+def test_a_device_probe_that_cannot_be_recorded_is_not_proof():
+    """If the event cannot even be created, the device state is unknown, and
+    "unknown" during teardown means end the process rather than unwind over
+    readers that may still be live."""
+    os_stub, module_stub, flushes, loop_ns = _quiesce_self_exit_env()
+
+    class _Cuda:
+        @staticmethod
+        def Event():
+            raise RuntimeError("no CUDA context")
+
+    ns = _load_worker_decode_wait(
+        os=os_stub,
+        torch=SimpleNamespace(cuda=_Cuda),
+        _COHORT_QUIESCE_DEADLINE_S=0.05,
+    )
+    worker = _decode_wait_worker(ns)
+
+    status, records = _run_quiesce_expecting_self_exit(worker, module_stub, None)
+
+    assert status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert flushes == ["flush"]
+    assert next(
+        line for line in records if line.startswith("[shutdown]")
+    ).endswith("reason=quiesce-deadline")
 
 
 def test_the_quiesce_deadline_marker_extends_the_supervisor_s_marker():
@@ -3281,23 +3587,115 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
     assert order == ["logging.error", "_flush_worker_logs", "os._exit"]
 
 
-def test_the_bounded_quiesce_runner_cannot_raise_into_the_teardown():
+def test_the_quiesce_probe_runner_cannot_raise_into_the_teardown():
     """Same reason the quiesce itself cannot raise: an exception here would
-    escape as an error and lose the ordered exit.  A failure to bound the wait
-    is reported as not-quiesced, which self-exits -- the conservative answer
-    when the local readers cannot be proven done."""
+    escape as an error and lose the ordered exit.  A probe that fails -- a task
+    type with no non-blocking ``done()``, say -- is reported as not-quiesced,
+    which self-exits: the conservative answer when the local readers cannot be
+    proven done.  Readiness, though, beats the clock: a probe that answers True
+    is proof even if the budget is spent, and throwing away a clean unwind over
+    an expired stopwatch would be strictly worse."""
     ns = _load_worker_decode_wait()
     worker = _decode_wait_worker(ns)
 
-    def _unstartable(*args, **kwargs):
-        raise RuntimeError("can't start new thread")
+    def _no_done():
+        raise AttributeError("'object' has no attribute 'done'")
 
-    ns["threading"] = SimpleNamespace(Thread=_unstartable)
-    assert worker._await_local_quiesce(lambda: None, time.perf_counter() + 1.0) is False
+    assert worker._poll_until(_no_done, time.perf_counter() + 1.0) is False
+    assert worker._poll_until(lambda: True, time.perf_counter() - 1.0) is True
+    assert worker._poll_until(lambda: False, time.perf_counter() - 1.0) is False
 
-    ns["threading"] = threading
-    assert worker._await_local_quiesce(lambda: None, time.perf_counter() - 1.0) is False
-    assert worker._await_local_quiesce(lambda: None, time.perf_counter() + 1.0) is True
-    assert worker._await_local_quiesce(
-        lambda: time.sleep(2.0), time.perf_counter() + 0.05
-    ) is False
+    late = {"calls": 0}
+
+    def _ready_on_third():
+        late["calls"] += 1
+        return late["calls"] >= 3
+
+    assert worker._poll_until(_ready_on_third, time.perf_counter() + 1.0) is True
+    assert late["calls"] == 3
+
+    started = time.perf_counter()
+    assert worker._poll_until(lambda: False, time.perf_counter() + 0.05) is False
+    assert time.perf_counter() - started < 2.0
+
+
+def test_the_append_probe_skips_nothing_that_matters():
+    """The probe must answer for exactly the set the real drain waits on: every
+    non-None task, and a worker that never created the list has nothing in
+    flight (the drain's own ``hasattr`` guard admits that case)."""
+    ns = _load_worker_decode_wait()
+    worker = _decode_wait_worker(ns)
+
+    worker._pending_kv_append_tasks = []
+    assert worker._pending_kv_appends_done() is True
+
+    done, pending = _FakeKVTask(done_after=0), _FakeKVTask(done_after=1)
+    worker._pending_kv_append_tasks = [done, None, pending]
+    assert worker._pending_kv_appends_done() is False
+    assert worker._pending_kv_appends_done() is True
+    assert done.waits == 0 and pending.waits == 0
+
+    del worker._pending_kv_append_tasks
+    assert worker._pending_kv_appends_done() is True
+
+
+# ---- the dual coordinator's composite task answers the same probe --------
+
+def _load_dual_async_kv_task():
+    """Lift ``DualAsyncKVTask`` out of the coordinator source.
+
+    Importing the module would pull in the native ``core_engine``, which no dev
+    machine has, so the class is compiled on its own exactly as the worker's
+    quiesce seam is.
+    """
+    tree = ast.parse(DUAL_COORDINATOR_PATH.read_text())
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DualAsyncKVTask"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    namespace: Dict[str, Any] = {"dataclass": dataclass, "Any": Any}
+    exec(compile(module, str(DUAL_COORDINATOR_PATH), "exec"), namespace)
+    return namespace["DualAsyncKVTask"], cls
+
+
+def test_the_dual_kv_task_reports_done_for_both_halves_without_waiting():
+    """The DSA models' async load is one Python object wrapping two native
+    tasks, so the teardown probe needs the same non-blocking answer from it.
+    False until both halves are finished, True after, and never a wait: a
+    ``wait()`` here is the GIL-holding native call the quiesce exists to avoid.
+    """
+    task_cls, node = _load_dual_async_kv_task()
+    primary = _FakeKVTask(done_after=1, name="primary")
+    aux = _FakeKVTask(done_after=1, name="aux")
+    task = task_cls(primary, aux)
+
+    assert task.done() is False, "primary not finished yet"
+    assert task.done() is False, "primary finished, auxiliary not"
+    assert task.done() is True
+    assert primary.waits == 0 and aux.waits == 0
+    assert primary.done_calls == 3 and aux.done_calls == 2
+
+    # Structural: the probe delegates to its members' done() and to nothing
+    # that can block.
+    done_method = next(
+        child for child in node.body
+        if isinstance(child, ast.FunctionDef) and child.name == "done"
+    )
+    assert [ast.unparse(call.func) for call in ast.walk(done_method)
+            if isinstance(call, ast.Call)] == [
+        "bool", "self.primary_task.done", "self.aux_task.done",
+    ]
+
+
+def test_the_dual_kv_task_still_waits_on_both_halves_when_asked():
+    """The probe is an addition, not a replacement: the composite's error
+    aggregation across both halves is what the ordered unwind still calls."""
+    task_cls, _ = _load_dual_async_kv_task()
+    waits = []
+    primary = _FakeKVTask(name="primary", log=waits)
+    aux = _FakeKVTask(name="aux", log=waits)
+
+    task_cls(primary, aux).wait()
+
+    assert waits == [("primary", "wait"), ("aux", "wait")]

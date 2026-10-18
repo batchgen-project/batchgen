@@ -11,7 +11,6 @@ import math
 import os
 import socket
 import sys
-import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
 
@@ -74,10 +73,23 @@ _DECODE_WAIT_COMPLETED = "completed"
 _DECODE_WAIT_ABANDONED = "abandoned"
 # Total budget for the LOCAL quiesce on a decode teardown exit.  An abandoned
 # step leaves its host-KV appends and its async KV load parked behind device
-# work the dead collective will never let finish, and neither wait takes a
-# timeout, so the quiesce bounds them itself (see _await_local_quiesce) and
-# self-exits rather than unwind while they still hold page-table pointers.
+# work the dead collective will never let finish, so the quiesce bounds them
+# itself (see _quiesce_decode_for_cohort_shutdown) and self-exits rather than
+# unwind while they still hold page-table pointers.
+#
+# The bound is established by NON-BLOCKING probes only -- never by running a
+# blocking wait under a timeout, on this thread or any other.  MEASURED: the
+# append task's wait is bound as `.def("wait", &kv::KVAsyncTask::wait)`
+# (core/batchgen_Binding.cpp:968) with no `py::call_guard<gil_scoped_release>`,
+# so a task parked behind the dead collective blocks in
+# `std::shared_future::get` HOLDING THE GIL.  No other Python can then run --
+# not the deadline, not the abort watchdog, not the supervisor's self-exit net
+# -- so the rank burns the whole grace window.  `KVAsyncTask::done()`
+# (core/KV_Storage/host_paged_kv_worker_view.h:93-99) is a `wait_for(0s)` status
+# test, and a CUDA event query is the same class of probe for device work; both
+# are safe to call under the GIL because neither can wait.
 _COHORT_QUIESCE_DEADLINE_S = 5.0
+_COHORT_QUIESCE_POLL_INTERVAL_S = 1e-3
 _COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
 
 
@@ -2701,44 +2713,87 @@ class BatchGenWorker:
 				return _DECODE_WAIT_COMPLETED
 			time.sleep(_DECODE_EVENT_POLL_INTERVAL_S)
 
-	def _await_local_quiesce(self, wait, deadline) -> bool:
-		"""Run one local quiesce wait, bounded by a shared deadline.
+	def _poll_until(self, ready, deadline) -> bool:
+		"""Poll one NON-BLOCKING readiness probe until the shared deadline.
 
-		Neither underlying wait accepts a timeout -- ``_wait_pending_kv_append_tasks``
-		takes only ``sync_distributed_errors``/``defer_errors`` and the async KV
-		task's ``wait()`` takes no arguments at all -- so the bound has to come
-		from outside the call.  The wait runs on a throwaway daemon thread that
-		is joined for the remaining budget and never joined again: if it is
-		parked behind device work the dead collective will never release, the
-		caller self-exits and the thread dies with the process.
+		``ready()`` must answer "is this work finished?" without waiting:
+		``KVAsyncTask.done()`` (a ``wait_for(0s)`` status test) and
+		``cudaEventQuery`` behind ``torch.cuda.Event.query()`` are the two
+		shapes used here.  That is the whole point of this helper.  The waits
+		themselves may NOT be bounded this way, nor on a helper thread: the
+		append task's ``wait`` holds the GIL while it blocks, so one such call
+		anywhere in the process freezes the deadline that is supposed to bound
+		it, the abort watchdog and the supervisor's self-exit net along with it.
 
-		Returns True only if the wait actually finished.  Anything else,
-		including a failure to start the thread at all, is reported as
-		not-quiesced: this runs during teardown, and the caller's safe answer to
-		"I cannot prove the local readers are done" is to end the process rather
-		than unwind.  It never raises, for the same reason the quiesce itself
-		never raises.
+		The probe is read once before the clock, so work that is already
+		finished proves itself even if the budget is gone -- readiness is
+		readiness, and self-exiting a rank whose readers have all returned would
+		throw away a perfectly ordered unwind.
+
+		Returns True only if the probe answered True.  Anything else, including
+		a probe that raises (a task type with no non-blocking ``done()``), is
+		reported as not-quiesced: this runs during teardown, and the caller's
+		safe answer to "I cannot prove the local readers are done" is to end the
+		process rather than unwind.  It never raises, for the same reason the
+		quiesce itself never raises.
 		"""
 		try:
-			remaining = deadline - time.perf_counter()
-			if remaining <= 0.0:
-				return False
-			thread = threading.Thread(
-				target=wait,
-				name=f"decode-quiesce-{self.rank}",
-				daemon=True,
-			)
-			thread.start()
-			thread.join(remaining)
-			return not thread.is_alive()
+			while True:
+				if ready():
+					return True
+				if time.perf_counter() >= deadline:
+					return False
+				time.sleep(_COHORT_QUIESCE_POLL_INTERVAL_S)
 		except BaseException:
 			logging.warning(
-				"Rank %s: bounding a decode teardown quiesce wait failed; "
+				"Rank %s: probing a decode teardown quiesce wait failed; "
 				"treating it as not quiesced",
 				self.rank,
 				exc_info=True,
 			)
 			return False
+
+	def _pending_kv_appends_done(self) -> bool:
+		"""Has every pending host-KV append task finished?  Never waits.
+
+		``done()`` is ``future_.wait_for(0s) == ready`` in the native task
+		(``core/KV_Storage/host_paged_kv_worker_view.h:93-99``, bound at
+		``core/batchgen_Binding.cpp:969``), so this is a status read per task and
+		nothing else.  ``None`` entries are skipped exactly as the real drain
+		skips them, and a worker that never created the list (the drain's own
+		``hasattr`` guard admits that case) has nothing in flight.
+		"""
+		for task in getattr(self, "_pending_kv_append_tasks", ()):
+			if task is not None and not task.done():
+				return False
+		return True
+
+	def _record_quiesce_device_event(self):
+		"""A non-blocking probe for the device work this rank already queued.
+
+		This replaces the ``torch.cuda.synchronize(self.torch_device)`` the load
+		drain used to end in: on an abandoned step that sync is unbounded, and
+		it is the last thing standing between the teardown and the unwakeable
+		state one level down.  An event recorded on the worker's current stream
+		(the stream the decode step records its token event on) is ready exactly
+		once the work queued ahead of it has run, and ``query()`` reads that
+		with ``cudaEventQuery`` -- no wait, no GIL hazard.
+
+		Returns the event, or ``None`` if it could not even be recorded, which
+		the caller treats as "the device state cannot be proven" and self-exits.
+		"""
+		try:
+			event = torch.cuda.Event()
+			event.record(torch.cuda.current_stream(self.torch_device))
+			return event
+		except BaseException:
+			logging.warning(
+				"Rank %s: recording the decode teardown quiesce device probe "
+				"failed; treating it as not quiesced",
+				self.rank,
+				exc_info=True,
+			)
+			return None
 
 	def _self_exit_on_quiesce_deadline(self) -> None:
 		"""End this process instead of unwinding past a quiesce that did not land.
@@ -2797,19 +2852,42 @@ class BatchGenWorker:
 		and lose the ordered exit -- so a failed quiesce is logged and the
 		teardown continues; the process is about to drop these mappings anyway.
 
-		Both waits are BOUNDED, by one shared ``_COHORT_QUIESCE_DEADLINE_S``
-		budget.  On the exit taken when the step's token event was ABANDONED the
-		step's device work is parked behind the dead collective, and these waits
-		end in a task join and a device sync behind it, so unbounded they are
-		the same unwakeable state one level down.  Meeting the deadline unwinds
-		exactly as before; missing it is the one case that may not unwind at all
-		(the readers are still live, holding page-table pointers), so it
-		self-exits with the reason recorded.  On the healthy clean-restart exits
-		these drains complete in milliseconds and the deadline is never near.
+		The quiesce is BOUNDED, by one shared ``_COHORT_QUIESCE_DEADLINE_S``
+		budget, and the bound is established by NON-BLOCKING PROBES ONLY.  On
+		the exit taken when the step's token event was ABANDONED the step's
+		device work is parked behind the dead collective, so every wait here is
+		parked with it -- and MEASURED, the append task's ``wait`` blocks while
+		HOLDING THE GIL (no ``gil_scoped_release`` in its binding), which
+		freezes the deadline meant to bound it, the abort watchdog and the
+		supervisor's self-exit net.  A blocking wait therefore may not be
+		called, on this thread or any other, until something non-blocking has
+		proven it cannot block:
+
+		  1. every pending host-KV append task reports ``done()``;
+		  2. the async KV load task reports ``done()`` (the dual coordinator's
+		     composite task answers for both of its halves);
+		  3. the device-work probe recorded at entry reports ``query()``, which
+		     is what the load drain's unbounded device sync became.
+
+		All three inside the budget: the real drains then run with every future
+		ready and the ordered unwind proceeds exactly as before.  Any of them
+		expiring is the one case that may not unwind at all (the readers are
+		still live, holding page-table pointers), so it self-exits with the
+		reason recorded, inside ~5 s instead of the supervisor's grace window.
+		On the healthy clean-restart exits all three probes answer immediately.
 		"""
 		deadline = time.perf_counter() + _COHORT_QUIESCE_DEADLINE_S
+		device_event = self._record_quiesce_device_event()
 
-		def _drain_host_kv_appends() -> None:
+		quiesced = self._poll_until(self._pending_kv_appends_done, deadline)
+		if quiesced and pending_async_task is not None:
+			quiesced = self._poll_until(lambda: pending_async_task.done(), deadline)
+		if quiesced:
+			quiesced = device_event is not None and self._poll_until(
+				device_event.query, deadline
+			)
+
+		if quiesced:
 			try:
 				if self._pending_kv_append_tasks:
 					self._wait_pending_kv_append_tasks(defer_errors=True)
@@ -2820,12 +2898,9 @@ class BatchGenWorker:
 					self.rank,
 					exc_info=True,
 				)
-
-		def _drain_pending_kv_load() -> None:
 			try:
 				if pending_async_task is not None:
 					pending_async_task.wait()
-					torch.cuda.synchronize(self.torch_device)
 			except BaseException:
 				logging.warning(
 					"Rank %s: draining the pending async KV load at the decode "
@@ -2834,9 +2909,6 @@ class BatchGenWorker:
 					exc_info=True,
 				)
 
-		quiesced = self._await_local_quiesce(_drain_host_kv_appends, deadline)
-		if quiesced:
-			quiesced = self._await_local_quiesce(_drain_pending_kv_load, deadline)
 		self.disable_decode_watchdog()
 		if not quiesced:
 			self._self_exit_on_quiesce_deadline()
