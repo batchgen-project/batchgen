@@ -63,7 +63,14 @@ def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
 
     flush = _single(body, lambda s: _stmt_calls(s, "self._flush_deferred_kv_to_host"),
                     "host-KV append launch")
-    readback = _single(body, lambda s: _stmt_calls(s, "_new_tokens_ready.synchronize"),
+    # The readback is now a bounded, pollable wait on the same event instead of
+    # a blocking `_new_tokens_ready.synchronize()`: a rank whose peer died
+    # mid-decode blocks in that sync below Python and never reaches the drain
+    # below at all. `_wait_decode_tokens` still performs exactly that sync when
+    # no cohort teardown probe is armed, and still returns only once the event
+    # has fired on every path that reports COMPLETED, so the drain's ordering
+    # requirement is unchanged.
+    readback = _single(body, lambda s: _stmt_calls(s, "self._wait_decode_tokens"),
                        "sampled-token readback")
     # The per-step drain is an `if` whose own body is the wait. The boundary
     # block's watermark wait is nested deeper and is a different drain.
@@ -95,8 +102,28 @@ def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
         ("defer_errors", "True")
     ]
 
-    # Nothing between the launch and the drain can skip the drain.
+    # Nothing between the launch and the drain can skip the drain -- with one
+    # exception, and only because it drains by another route. When the token
+    # wait above reports ABANDONED the step's device work is parked behind a
+    # collective whose peer is dead, so this unbounded drain (a task join
+    # ending in a device sync) would never return: it IS the wedge, one level
+    # down. That exit returns, and runs the same `defer_errors=True` drain
+    # inside `_quiesce_decode_for_cohort_shutdown` under a deadline, which
+    # self-exits rather than unwind with appends still in flight. So the
+    # invariant this test defends -- never leave the step with unlocked
+    # page-table readers running while teardown releases the mapping -- is
+    # still enforced on every path out of here.
     between = body[flush + 1:drain]
-    for node in (n for s in between for n in ast.walk(s)):
-        assert not isinstance(node, (ast.Break, ast.Continue, ast.Return)), (
-            ast.dump(node))
+    for stmt in between:
+        exits = [n for n in ast.walk(stmt)
+                 if isinstance(n, (ast.Break, ast.Continue, ast.Return))]
+        if not exits:
+            continue
+        assert len(exits) == 1 and isinstance(exits[0], ast.Return), ast.dump(stmt)
+        quiesces = [n for n in ast.walk(stmt)
+                    if isinstance(n, ast.Call)
+                    and ast.unparse(n.func)
+                    == "self._quiesce_decode_for_cohort_shutdown"]
+        assert len(quiesces) == 1, (
+            "an exit between the append launch and the per-step drain must "
+            "drain through the bounded quiesce instead: " + ast.unparse(stmt))

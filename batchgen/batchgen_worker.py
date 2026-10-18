@@ -11,6 +11,7 @@ import math
 import os
 import socket
 import sys
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
 
@@ -48,6 +49,37 @@ _TOKENIZER_TRIM_TOKENS_PER_RANK = 1 << 20
 # 4M chars/rank sits below the roughly 4.8M chars/rank measured in both the
 # 32x256K and 8x1M repro; it is not a universal character/token conversion.
 _TOKENIZER_SERIALIZE_CHARS_PER_RANK = 4_000_000
+
+# --- Bounded decode-step token wait (see _wait_decode_tokens) --------------
+# A rank whose peer died mid-decode blocks in the per-step token-event sync far
+# below Python, where no flag check can retire it, and aborting the dead
+# communicator does not reliably release it: the survivors then burn the
+# supervisor's whole grace window.  The wait is therefore a poll.  It costs
+# the same class of CPU as the blocking call it replaces: torch creates its CUDA
+# events with ``blocking=False`` by default (torch/cuda/streams.py Event.__new__)
+# and only a blocking event carries ``cudaEventBlockingSync``
+# (torch/csrc/jit/cuda/cuda.h), so cudaEventSynchronize already busy-spins in
+# the driver rather than parking the thread.
+#
+# The spin budget keeps the healthy fast path flat -- a decode step's readback
+# lands well inside it, so the common case is a handful of cudaEventQuery calls
+# and no sleep, no probe read at all.
+_DECODE_EVENT_SPIN_BUDGET_S = 0.002
+_DECODE_EVENT_POLL_INTERVAL_S = 1e-4
+# ``_wait_decode_tokens``' two outcomes.  COMPLETED is exactly what
+# ``synchronize()`` guarantees: the step's device work is done and its readback
+# buffers hold this step's tokens.  ABANDONED means the cohort is being torn
+# down and the event may never fire, so none of the step's outputs may be read.
+_DECODE_WAIT_COMPLETED = "completed"
+_DECODE_WAIT_ABANDONED = "abandoned"
+# Total budget for the LOCAL quiesce on a decode teardown exit.  An abandoned
+# step leaves its host-KV appends and its async KV load parked behind device
+# work the dead collective will never let finish, and neither wait takes a
+# timeout, so the quiesce bounds them itself (see _await_local_quiesce) and
+# self-exits rather than unwind while they still hold page-table pointers.
+_COHORT_QUIESCE_DEADLINE_S = 5.0
+_COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
+
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
@@ -2623,6 +2655,126 @@ class BatchGenWorker:
 		probe = self._cohort_shutdown_probe
 		return probe is not None and probe()
 
+	def _wait_decode_tokens(self, event) -> str:
+		"""Wait for a decode step's sampled-token readback, pollably.
+
+		This replaces the per-step ``event.synchronize()`` that is the measured
+		wedge point.  A rank whose peer died mid-decode blocks there forever: it
+		runs no Python, so the decode-step teardown boundary a few lines below
+		it is unreachable, and aborting the dead communicator does not reliably
+		release it.  Polling is the only way the main thread can see the
+		teardown flag at all.
+
+		Unarmed -- ``_cohort_shutdown_probe is None``, i.e. every path that
+		never serves a worker pool -- this IS the legacy call and nothing else.
+		There is no poll, no clock read and no behavior to regress.
+
+		Armed, the wait has two phases.  First a bare query spin bounded by
+		``_DECODE_EVENT_SPIN_BUDGET_S``: a healthy decode step's readback lands
+		inside it, so the hot path stays a few cudaEventQuery calls with no
+		sleep and no probe read.  Then the poll proper, which reads the probe
+		BEFORE the event every iteration.  That order is deliberate: the event
+		may never fire, so a teardown that is already requested must not be made
+		to wait for it.  Returning ABANDONED is how a wedged rank gets to leave.
+
+		Returns ``_DECODE_WAIT_COMPLETED`` -- identical semantics to
+		``synchronize()`` returning -- or ``_DECODE_WAIT_ABANDONED``.  The caller
+		must read none of the step's outputs on ABANDONED.
+
+		No logging and no allocation happen in either loop; the only names
+		touched are module constants and the two bound callables.
+		"""
+		probe = self._cohort_shutdown_probe
+		if probe is None:
+			event.synchronize()
+			return _DECODE_WAIT_COMPLETED
+		spin_until = time.perf_counter() + _DECODE_EVENT_SPIN_BUDGET_S
+		while True:
+			if event.query():
+				return _DECODE_WAIT_COMPLETED
+			if time.perf_counter() >= spin_until:
+				break
+		while True:
+			if probe():
+				return _DECODE_WAIT_ABANDONED
+			if event.query():
+				return _DECODE_WAIT_COMPLETED
+			time.sleep(_DECODE_EVENT_POLL_INTERVAL_S)
+
+	def _await_local_quiesce(self, wait, deadline) -> bool:
+		"""Run one local quiesce wait, bounded by a shared deadline.
+
+		Neither underlying wait accepts a timeout -- ``_wait_pending_kv_append_tasks``
+		takes only ``sync_distributed_errors``/``defer_errors`` and the async KV
+		task's ``wait()`` takes no arguments at all -- so the bound has to come
+		from outside the call.  The wait runs on a throwaway daemon thread that
+		is joined for the remaining budget and never joined again: if it is
+		parked behind device work the dead collective will never release, the
+		caller self-exits and the thread dies with the process.
+
+		Returns True only if the wait actually finished.  Anything else,
+		including a failure to start the thread at all, is reported as
+		not-quiesced: this runs during teardown, and the caller's safe answer to
+		"I cannot prove the local readers are done" is to end the process rather
+		than unwind.  It never raises, for the same reason the quiesce itself
+		never raises.
+		"""
+		try:
+			remaining = deadline - time.perf_counter()
+			if remaining <= 0.0:
+				return False
+			thread = threading.Thread(
+				target=wait,
+				name=f"decode-quiesce-{self.rank}",
+				daemon=True,
+			)
+			thread.start()
+			thread.join(remaining)
+			return not thread.is_alive()
+		except BaseException:
+			logging.warning(
+				"Rank %s: bounding a decode teardown quiesce wait failed; "
+				"treating it as not quiesced",
+				self.rank,
+				exc_info=True,
+			)
+			return False
+
+	def _self_exit_on_quiesce_deadline(self) -> None:
+		"""End this process instead of unwinding past a quiesce that did not land.
+
+		The ordered teardown releases the very mappings the parked waits hold
+		raw pointers into -- the host-KV appends are std::async threads reading
+		the worker view's page table unlocked -- so an unwind that cannot prove
+		they finished is a use-after-free during teardown.  That is the one
+		hazard this whole exit path exists to avoid, so when the bound expires
+		the rank takes the supervisor's own bounded outcome directly.
+
+		The marker keeps the ``path=self-exit`` grep key the supervisor's safety
+		net emits, so marker accounting still sums, and adds a reason so the two
+		causes stay distinguishable in the logs.  ``os._exit`` runs no atexit
+		hook and no stream flush, so the marker is flushed first or it is lost.
+
+		The import is local because ``server_worker_main_loop`` imports this
+		module; by the time any rank can reach here that module is loaded, since
+		it is what arms the probe this path depends on.
+		"""
+		from batchgen.server_worker_main_loop import (
+			_EXIT_PATH_SELF_EXIT,
+			_WORKER_SELF_EXIT_CODE,
+			_flush_worker_logs,
+		)
+
+		logging.error(
+			"[shutdown] worker exit path=%s rank=%s pid=%s reason=%s",
+			_EXIT_PATH_SELF_EXIT,
+			self.rank,
+			os.getpid(),
+			_COHORT_QUIESCE_DEADLINE_REASON,
+		)
+		_flush_worker_logs()
+		os._exit(_WORKER_SELF_EXIT_CODE)
+
 	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
 		"""Let LOCAL in-flight decode work finish before the ordered teardown.
 
@@ -2644,29 +2796,50 @@ class BatchGenWorker:
 		purpose is to unwind normally -- an exception would escape as an error
 		and lose the ordered exit -- so a failed quiesce is logged and the
 		teardown continues; the process is about to drop these mappings anyway.
+
+		Both waits are BOUNDED, by one shared ``_COHORT_QUIESCE_DEADLINE_S``
+		budget.  On the exit taken when the step's token event was ABANDONED the
+		step's device work is parked behind the dead collective, and these waits
+		end in a task join and a device sync behind it, so unbounded they are
+		the same unwakeable state one level down.  Meeting the deadline unwinds
+		exactly as before; missing it is the one case that may not unwind at all
+		(the readers are still live, holding page-table pointers), so it
+		self-exits with the reason recorded.  On the healthy clean-restart exits
+		these drains complete in milliseconds and the deadline is never near.
 		"""
-		try:
-			if self._pending_kv_append_tasks:
-				self._wait_pending_kv_append_tasks(defer_errors=True)
-		except BaseException:
-			logging.warning(
-				"Rank %s: draining host-KV appends at the decode teardown "
-				"boundary failed; continuing the ordered teardown",
-				self.rank,
-				exc_info=True,
-			)
-		try:
-			if pending_async_task is not None:
-				pending_async_task.wait()
-				torch.cuda.synchronize(self.torch_device)
-		except BaseException:
-			logging.warning(
-				"Rank %s: draining the pending async KV load at the decode "
-				"teardown boundary failed; continuing the ordered teardown",
-				self.rank,
-				exc_info=True,
-			)
+		deadline = time.perf_counter() + _COHORT_QUIESCE_DEADLINE_S
+
+		def _drain_host_kv_appends() -> None:
+			try:
+				if self._pending_kv_append_tasks:
+					self._wait_pending_kv_append_tasks(defer_errors=True)
+			except BaseException:
+				logging.warning(
+					"Rank %s: draining host-KV appends at the decode teardown "
+					"boundary failed; continuing the ordered teardown",
+					self.rank,
+					exc_info=True,
+				)
+
+		def _drain_pending_kv_load() -> None:
+			try:
+				if pending_async_task is not None:
+					pending_async_task.wait()
+					torch.cuda.synchronize(self.torch_device)
+			except BaseException:
+				logging.warning(
+					"Rank %s: draining the pending async KV load at the decode "
+					"teardown boundary failed; continuing the ordered teardown",
+					self.rank,
+					exc_info=True,
+				)
+
+		quiesced = self._await_local_quiesce(_drain_host_kv_appends, deadline)
+		if quiesced:
+			quiesced = self._await_local_quiesce(_drain_pending_kv_load, deadline)
 		self.disable_decode_watchdog()
+		if not quiesced:
+			self._self_exit_on_quiesce_deadline()
 
 	@property
 	def cohort_shutdown_observed(self) -> bool:
@@ -16027,8 +16200,37 @@ class BatchGenWorker:
 			# then drains the append tasks below.
 			self._flush_deferred_kv_to_host()
 			_split_t2 = time.perf_counter()
-			_new_tokens_ready.synchronize()
+			# --- The measured production wedge point, made pollable ---
+			# This was a blocking `_new_tokens_ready.synchronize()`.  A rank
+			# whose peer died mid-decode blocks there below Python and runs
+			# nothing again: the teardown boundary below is unreachable, and
+			# aborting the dead communicator does not free it.
+			# _wait_decode_tokens keeps
+			# that exact call, byte for byte, whenever the shutdown probe is
+			# unarmed, and otherwise polls the event so the flag can be seen.
+			_decode_wait = self._wait_decode_tokens(_new_tokens_ready)
 			_split_t3 = time.perf_counter()
+
+			# --- Decode-step teardown boundary (the abandoned token wait) ---
+			# The wait gave up on an event that may never fire, so NOTHING this
+			# step produced may be read: the sampled tokens are not in the
+			# pinned buffer, and the step's host-KV appends are parked behind
+			# the same dead device work.  That is why this exit sits BEFORE the
+			# per-step drain below rather than after it -- that drain is
+			# unbounded and ends in a device sync, i.e. the same unwakeable
+			# state one level down.  The D1 invariant it exists for is kept
+			# instead by _quiesce_decode_for_cohort_shutdown, which runs the
+			# same local drain under a deadline and self-exits rather than
+			# unwind with those unlocked page-table readers still live.
+			#
+			# As with the two flag checks, the exit RETURNS (a break would run
+			# the post-loop drain, which syncs errors across ranks on the
+			# aborted communicator) and latches, so the supervisor names this
+			# ordered-via-decode-boundary.
+			if _decode_wait == _DECODE_WAIT_ABANDONED:
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
 
 			# [KV_APPEND_DRAIN] Complete this step's host appends before the
 			# next step. Each task is a std::async thread that reads the worker

@@ -1939,25 +1939,78 @@ def test_decode_loop_tests_the_cohort_flag_at_the_top_of_every_step():
     assert ast.unparse(first.test) == "self._cohort_shutdown_requested()"
 
 
-def test_decode_loop_tests_the_cohort_flag_right_after_the_token_sync():
-    """B3/B4.  ``_new_tokens_ready.synchronize()`` IS the production wedge
-    point: a rank whose peer died mid-decode sits there, below Python, and the
-    cohort abort releases it by making that call return -- silently, with no
-    exception then or ever in graph mode.  The freed rank has a finite window
-    before it re-wedges, so the flag test must sit as close to that sync as the
-    step's own invariants allow.
+def _decode_token_wait_index(loop: ast.While) -> int:
+    """Index of the per-step token wait -- the measured production wedge point.
 
-    "As close as the invariants allow" is exactly one statement further than
-    the sync: the step's host-KV append drain MUST run first (see
-    test_the_decode_exit_never_strands_in_flight_local_work).  Nothing else may
-    come between.
+    It used to be a bare ``_new_tokens_ready.synchronize()``.  Attempts 1-3
+    proved a rank that blocks there is unreachable: it runs no Python, so no
+    flag check retires it, and a per-group communicator abort freed 0 of 15
+    production ranks (every survivor timed out at exactly +20.000 s).  The wait
+    is now ``self._wait_decode_tokens(...)``, which performs that same
+    ``synchronize()`` when no probe is armed and otherwise polls the event.
+    """
+    return _single_index(
+        loop.body,
+        lambda node: isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "self._wait_decode_tokens",
+        "per-step token wait",
+    )
+
+
+def _single_index(body, predicate, what: str) -> int:
+    hits = [index for index, node in enumerate(body) if predicate(node)]
+    assert len(hits) == 1, f"expected exactly one {what}, got {hits}"
+    return hits[0]
+
+
+def _decode_abandoned_exit(loop: ast.While) -> ast.If:
+    """The exit taken when the token wait gave up on the event."""
+    return loop.body[
+        _single_index(
+            loop.body,
+            lambda node: isinstance(node, ast.If)
+            and ast.unparse(node.test) == "_decode_wait == _DECODE_WAIT_ABANDONED",
+            "abandoned-wait teardown exit",
+        )
+    ]
+
+
+def test_the_abandoned_wait_exit_is_the_first_thing_after_the_token_wait():
+    """The ABANDONED exit must not be made to wait for anything.
+
+    The wait returned ABANDONED because the event may never fire.  Everything
+    the step would do next is therefore either invalid (its outputs are not in
+    the pinned buffer) or unbounded (its host-KV append drain ends in a device
+    sync behind the same dead collective).  So only the host-side timing read
+    may sit between the wait and the exit.
     """
     loop = _decode_loop()
-    sync_index = next(
-        index for index, node in enumerate(loop.body)
-        if isinstance(node, ast.Expr)
-        and ast.unparse(node.value) == "_new_tokens_ready.synchronize()"
-    )
+    wait_index = _decode_token_wait_index(loop)
+    exit_index = loop.body.index(_decode_abandoned_exit(loop))
+    assert exit_index > wait_index
+    for node in loop.body[wait_index + 1:exit_index]:
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call):
+                assert ast.unparse(call.func) == "time.perf_counter", (
+                    f"{ast.unparse(call.func)} runs between the abandoned "
+                    "token wait and its exit"
+                )
+
+
+def test_decode_loop_tests_the_cohort_flag_right_after_the_token_sync():
+    """B3/B4.  The post-wait flag test retires a rank whose wait COMPLETED
+    while teardown was already requested -- the case where the event did fire,
+    so the step's outputs are valid and its own invariants still apply.
+
+    That exit stays exactly one statement further than the wait: the step's
+    host-KV append drain MUST run first (see
+    test_the_decode_exit_never_strands_in_flight_local_work).  Nothing else may
+    come between, and in particular nothing that issues new GPU or collective
+    work, which a rank that is already supposed to be stopping must not do.
+    """
+    loop = _decode_loop()
+    sync_index = _decode_token_wait_index(loop)
     checks = [
         index for index, node in enumerate(loop.body)
         if isinstance(node, ast.If)
@@ -1967,13 +2020,13 @@ def test_decode_loop_tests_the_cohort_flag_right_after_the_token_sync():
     assert after_sync, "no cohort-flag test follows the per-step token sync"
     check_index = min(after_sync)
 
-    # Between the sync and the test: host-side timing, and the append drain
-    # whose completion the teardown depends on.  Nothing else -- in particular
-    # nothing that issues new GPU or collective work, which a rank that is
-    # already supposed to be stopping must not do.
+    # Between the wait and the test: host-side timing, the abandoned-wait exit
+    # (which leaves before any of this), and the append drain whose completion
+    # the teardown depends on.  Nothing else.
     allowed = {
         "time.perf_counter",
         "self._wait_pending_kv_append_tasks",
+        "self._quiesce_decode_for_cohort_shutdown",
     }
     between = loop.body[sync_index + 1:check_index]
     for node in between:
@@ -2615,3 +2668,636 @@ def test_the_self_exit_window_is_bounded_and_needs_no_env_var():
     helpers = helpers.split("def _setup_nccl_env(", 1)[0]
     assert "os.environ" not in helpers
     assert "getenv" not in helpers
+
+
+# ==========================================================================
+# The bounded, pollable decode-step token wait
+# --------------------------------------------------------------------------
+# Attempts 1-3 all tried to rescue a rank AFTER it blocked in the per-step
+# token-event sync.  Nothing frees it: a per-group ProcessGroup.abort() freed
+# 0 of 15 production ranks (two rounds, every survivor timing out at exactly
+# +20.000 s after its own "aborting process group" line), and a blocked rank
+# runs no Python, so the decode-step boundary check cannot run at all.
+#
+# So the wait itself must be interruptible.  Three measured facts bind these
+# tests:
+#   W1  torch creates CUDA events with blocking=False by default, and only a
+#       blocking event carries cudaEventBlockingSync, so cudaEventSynchronize
+#       already busy-spins in the driver -- a query poll is CPU-comparable.
+#   W2  the event may NEVER fire on a wedged rank, so a requested teardown
+#       must never be made to wait for it.
+#   W3  with the step abandoned, the local drains the ordered exit depends on
+#       are themselves parked behind the dead collective, so they need their
+#       own bound or the unwakeable state just moves one level down.
+# ==========================================================================
+
+_WORKER_DECODE_WAIT_MEMBERS = (
+    "set_cohort_shutdown_probe",
+    "_cohort_shutdown_requested",
+    "_wait_decode_tokens",
+    "_await_local_quiesce",
+    "_self_exit_on_quiesce_deadline",
+    "_quiesce_decode_for_cohort_shutdown",
+    "disable_decode_watchdog",
+)
+_WORKER_DECODE_WAIT_CONSTANTS = (
+    "_DECODE_EVENT_SPIN_BUDGET_S",
+    "_DECODE_EVENT_POLL_INTERVAL_S",
+    "_DECODE_WAIT_COMPLETED",
+    "_DECODE_WAIT_ABANDONED",
+    "_COHORT_QUIESCE_DEADLINE_S",
+    "_COHORT_QUIESCE_DEADLINE_REASON",
+)
+
+
+class _SelfExited(BaseException):
+    """What the real os._exit does to control flow, in a form a test can see.
+
+    os._exit never returns, so a stub that returned would let the test observe
+    code the production process can never reach.
+    """
+
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
+def _load_worker_decode_wait(**overrides) -> Dict[str, Any]:
+    """Lift the bounded token wait and the bounded quiesce out of the source.
+
+    ``batchgen_worker`` imports the whole engine, so the members are compiled
+    into a bare class exactly as ``_load_worker_shutdown_seam`` lifts the
+    probe seam.  The module constants come from the same source, so a changed
+    spin budget, poll interval or quiesce deadline cannot pass unnoticed.
+
+    ``overrides`` replaces names in the executed namespace -- a fake ``torch``
+    (there is no CUDA on a dev machine), a fake ``os`` whose ``_exit`` raises
+    instead of ending pytest, and a shortened deadline where waiting out the
+    real 5 s would only make the suite slow.
+    """
+    tree = _worker_tree()
+    constants = [
+        node for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id in _WORKER_DECODE_WAIT_CONSTANTS
+            for target in node.targets
+        )
+    ]
+    assert len(constants) == len(_WORKER_DECODE_WAIT_CONSTANTS), (
+        "a decode-wait module constant was renamed or removed: "
+        f"{[ast.unparse(node.targets[0]) for node in constants]}"
+    )
+    members = [
+        node for node in _worker_class().body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in _WORKER_DECODE_WAIT_MEMBERS
+    ]
+    assert {node.name for node in members} == set(_WORKER_DECODE_WAIT_MEMBERS), (
+        "the decode wait/quiesce seam changed shape: "
+        f"{sorted(node.name for node in members)}"
+    )
+    cls = ast.ClassDef(
+        name="_DecodeWait",
+        bases=[],
+        keywords=[],
+        body=members,
+        decorator_list=[],
+        type_params=[],
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=constants + [cls], type_ignores=[])
+    )
+    class _GuardOs:
+        """`os` for the tests that must never reach the self-exit.
+
+        A real `os._exit` here would end pytest with status 86 and no summary,
+        which is exactly how attempt 2's tests failed once the net existed.
+        """
+
+        getpid = staticmethod(os.getpid)
+        environ = os.environ
+
+        @staticmethod
+        def _exit(status):
+            raise AssertionError(
+                f"this path must not self-exit (status {status})"
+            )
+
+    namespace: Dict[str, Any] = {
+        "time": time,
+        "threading": threading,
+        "logging": logging,
+        "os": _GuardOs,
+        "property": property,
+    }
+    exec(compile(module, str(BATCHGEN_WORKER_PATH), "exec"), namespace)
+    # After the exec, so an override of a module constant is not overwritten by
+    # the real value the exec just assigned.
+    namespace.update(overrides)
+    return namespace
+
+
+def _decode_wait_worker(namespace: Dict[str, Any], **attrs):
+    worker = namespace["_DecodeWait"]()
+    worker._cohort_shutdown_probe = None
+    worker._cohort_shutdown_observed = False
+    worker._decode_watchdog = None
+    worker._pending_kv_append_tasks = []
+    worker.rank = 3
+    worker.torch_device = "cuda:3"
+    for name, value in attrs.items():
+        setattr(worker, name, value)
+    return worker
+
+
+class _FakeEvent:
+    """A CUDA event stand-in that records how it was waited on.
+
+    ``fires_after`` is a number of ``query()`` calls; ``None`` means the event
+    never fires, which is exactly the wedged rank's case.
+    """
+
+    def __init__(self, fires_after=0):
+        self.fires_after = fires_after
+        self.queries = 0
+        self.synchronized = 0
+
+    def query(self):
+        self.queries += 1
+        return self.fires_after is not None and self.queries > self.fires_after
+
+    def synchronize(self):
+        self.synchronized += 1
+        if self.fires_after is None:
+            raise AssertionError(
+                "synchronize() on an event that never fires is the production "
+                "wedge; the armed path must never call it"
+            )
+
+
+class _CountingProbe:
+    def __init__(self, value=False):
+        self.value = value
+        self.reads = 0
+
+    def __call__(self):
+        self.reads += 1
+        return self.value
+
+
+# ---- W1: the unarmed wait is the legacy call, byte for byte --------------
+
+def test_the_unarmed_token_wait_is_the_legacy_blocking_sync():
+    """Every path that never serves a worker pool keeps the old behavior.
+
+    Structural, because the point is that there is no poll, no clock read and
+    no probe on that path -- only the call this change replaced.
+    """
+    fn = _worker_method("_wait_decode_tokens")
+    guard = next(node for node in fn.body if isinstance(node, ast.If))
+    assert ast.unparse(guard.test) == "probe is None"
+    assert [ast.unparse(stmt) for stmt in guard.body] == [
+        "event.synchronize()",
+        "return _DECODE_WAIT_COMPLETED",
+    ]
+    assert not guard.orelse
+
+
+def test_the_unarmed_token_wait_never_polls_the_event():
+    ns = _load_worker_decode_wait()
+    worker = _decode_wait_worker(ns)
+    event = _FakeEvent(fires_after=0)
+
+    assert worker._wait_decode_tokens(event) == ns["_DECODE_WAIT_COMPLETED"]
+    assert event.synchronized == 1
+    assert event.queries == 0, "the unarmed path must not change shape at all"
+
+
+# ---- the armed fast path: a healthy step pays a spin and nothing else ----
+
+def test_an_armed_wait_whose_event_fires_completes_without_reading_the_flag():
+    """The hot path.  The spin budget exists so a healthy decode step's
+    readback lands inside it: no sleep, no probe read, and the same outcome
+    synchronize() would have produced."""
+    ns = _load_worker_decode_wait()
+    probe = _CountingProbe(value=False)
+    worker = _decode_wait_worker(ns)
+    worker.set_cohort_shutdown_probe(probe)
+    event = _FakeEvent(fires_after=0)
+
+    assert worker._wait_decode_tokens(event) == ns["_DECODE_WAIT_COMPLETED"]
+    assert event.synchronized == 0
+    assert event.queries == 1
+    assert probe.reads == 0
+    # The wait itself never latches; only the call site does, on ABANDONED.
+    assert worker._cohort_shutdown_observed is False
+
+
+def test_an_armed_wait_completes_from_the_poll_loop_when_the_event_is_late():
+    """A late event is still a COMPLETED step: the semantics must match
+    synchronize() exactly, or the step's outputs would be read early."""
+    ns = _load_worker_decode_wait()
+    probe = _CountingProbe(value=False)
+    worker = _decode_wait_worker(ns)
+    worker.set_cohort_shutdown_probe(probe)
+    event = _FakeEvent(fires_after=None)
+
+    # Fires only once the probe has been read, i.e. only from the poll loop.
+    # Deterministic rather than clock-dependent: the spin phase never reads the
+    # probe, so this cannot complete before the budget lapses.
+    event.query = lambda: probe.reads >= 1
+
+    assert worker._wait_decode_tokens(event) == ns["_DECODE_WAIT_COMPLETED"]
+    assert probe.reads == 1, "the poll loop must consult the flag"
+    assert event.synchronized == 0
+    assert worker._cohort_shutdown_observed is False
+
+
+# ---- W2: the flag wins, and the never-firing event is never waited on ----
+
+def test_an_armed_wait_abandons_an_event_that_may_never_fire():
+    """The whole point.  The event never fires -- the wedged rank's case -- so
+    the wait must return on the flag alone, promptly, and must never fall back
+    to the blocking sync."""
+    ns = _load_worker_decode_wait()
+    probe = _CountingProbe(value=True)
+    worker = _decode_wait_worker(ns)
+    worker.set_cohort_shutdown_probe(probe)
+    event = _FakeEvent(fires_after=None)
+
+    started = time.perf_counter()
+    result = worker._wait_decode_tokens(event)
+    elapsed = time.perf_counter() - started
+
+    assert result == ns["_DECODE_WAIT_ABANDONED"]
+    assert event.synchronized == 0
+    assert probe.reads == 1
+    # Bounded by the spin budget plus one poll iteration, not by the event.
+    assert elapsed < 1.0, elapsed
+
+
+def test_the_poll_loop_reads_the_flag_before_the_event():
+    """Order matters once the spin budget has lapsed: a teardown that is
+    already requested must not be made to wait for an event at all, even one
+    that happens to be ready in the same iteration.  A busy clean restart
+    therefore leaves through this exit too, which is still an ordered
+    decode-boundary exit (D3)."""
+    ns = _load_worker_decode_wait()
+    worker = _decode_wait_worker(ns)
+    event = _FakeEvent(fires_after=None)
+    ready = {"event": False, "probe_reads": 0}
+
+    def _query():
+        event.queries += 1
+        return ready["event"]
+
+    def _probe():
+        # From this moment the event IS ready -- and the flag still wins.
+        ready["probe_reads"] += 1
+        ready["event"] = True
+        return True
+
+    event.query = _query
+    worker.set_cohort_shutdown_probe(_probe)
+
+    assert worker._wait_decode_tokens(event) == ns["_DECODE_WAIT_ABANDONED"]
+    assert ready["probe_reads"] == 1
+    assert event.synchronized == 0
+
+
+def test_the_token_wait_polls_without_logging_or_allocating():
+    """Per-step hot path.  Nothing in either loop may log, format or build an
+    object; the only calls allowed are the event query, the probe and the two
+    clock/sleep primitives."""
+    fn = _worker_method("_wait_decode_tokens")
+    loops = [node for node in ast.walk(fn) if isinstance(node, ast.While)]
+    assert len(loops) == 2, "the spin phase and the poll phase"
+    allowed = {"event.query", "time.perf_counter", "probe", "time.sleep"}
+    for loop in loops:
+        for node in ast.walk(loop):
+            if isinstance(node, ast.Call):
+                assert ast.unparse(node.func) in allowed, (
+                    f"{ast.unparse(node.func)} runs inside the per-step poll"
+                )
+            assert not isinstance(
+                node,
+                (
+                    ast.JoinedStr,
+                    ast.ListComp,
+                    ast.DictComp,
+                    ast.SetComp,
+                    ast.GeneratorExp,
+                    ast.List,
+                    ast.Dict,
+                    ast.Set,
+                ),
+            ), f"the per-step poll allocates: {ast.dump(node)}"
+
+
+def test_the_decode_wait_and_quiesce_are_tunable_only_by_module_constant():
+    """No env var, no per-batch flag: this is the engine's hottest sync and a
+    teardown path, and both must behave identically everywhere."""
+    ns = _load_worker_decode_wait()
+    assert ns["_DECODE_EVENT_SPIN_BUDGET_S"] == 0.002
+    assert ns["_DECODE_EVENT_POLL_INTERVAL_S"] == 1e-4
+    assert ns["_COHORT_QUIESCE_DEADLINE_S"] == 5.0
+    assert ns["_COHORT_QUIESCE_DEADLINE_REASON"] == "quiesce-deadline"
+    assert ns["_DECODE_WAIT_COMPLETED"] != ns["_DECODE_WAIT_ABANDONED"]
+
+    for name in _WORKER_DECODE_WAIT_MEMBERS:
+        source = ast.unparse(_worker_method(name))
+        assert "os.environ" not in source, name
+        assert "getenv" not in source, name
+        assert "batchgen_debug" not in source, name
+
+
+# ---- the call site: the abandoned step's outputs are never read ----------
+
+def test_the_abandoned_exit_latches_returns_and_issues_nothing():
+    """Same contract as the two flag checks: latch so the supervisor can name
+    the path, RETURN (a break would run the post-loop cross-rank drain on the
+    aborted communicator), raise nothing, and issue no GPU or collective work
+    on the way out."""
+    check = _decode_abandoned_exit(_decode_loop())
+    kinds = [type(node) for node in ast.walk(check)]
+    assert ast.Return in kinds
+    assert ast.Break not in kinds
+    assert ast.Raise not in kinds
+    assert any(
+        isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "self._cohort_shutdown_observed"
+        and ast.unparse(node.value) == "True"
+        for node in ast.walk(check)
+    )
+    assert _collective_calls(check) == []
+    quiesce = [
+        node for node in ast.walk(check)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._quiesce_decode_for_cohort_shutdown"
+    ]
+    assert len(quiesce) == 1
+    assert [ast.unparse(arg) for arg in quiesce[0].args] == ["pending_async_task"]
+    (returned,) = [node for node in ast.walk(check) if isinstance(node, ast.Return)]
+    assert ast.unparse(returned.value) == "(decode_uuids, batch)"
+
+
+def test_the_abandoned_exit_reads_none_of_the_abandoned_step_s_outputs():
+    """The event never fired, so this step's tokens are NOT in the pinned
+    buffer and its device-side results do not exist.  Reading them would be a
+    read of whatever the previous step left there, silently mixed into a
+    sequence's output.  Everything that touches the step's results must
+    therefore sit after this exit.
+    """
+    loop = _decode_loop()
+    exit_index = loop.body.index(_decode_abandoned_exit(loop))
+    outputs = ("_new_tokens_pinned", "new_token_ids", "new_tokens_out")
+
+    for name in outputs:
+        assert name not in ast.unparse(loop.body[exit_index]), (
+            f"the abandoned exit reads {name}"
+        )
+
+    # And every statement that does read them is downstream of the exit.
+    for index, node in enumerate(loop.body):
+        source = ast.unparse(node)
+        for name in ("_new_tokens_pinned[", "new_token_ids"):
+            if name in source and "_new_tokens_pinned[:bs].copy_" not in source:
+                assert index > exit_index, (
+                    f"{name} is read at loop statement {index}, before the "
+                    f"abandoned exit at {exit_index}"
+                )
+
+
+def test_every_decode_teardown_exit_takes_the_same_ordered_route():
+    """There are now three exits out of the decode loop at teardown -- top of
+    step, abandoned wait, and post-drain flag -- and all three must be the same
+    ordered exit, or marker accounting and the D3 clean-restart behavior would
+    depend on which one fired."""
+    loop = _decode_loop()
+    exits = _decode_shutdown_checks() + [_decode_abandoned_exit(loop)]
+    assert len(exits) == 3
+    for check in exits:
+        # The body only -- the `if` test itself differs between the three.
+        body = ast.Module(body=check.body, type_ignores=[])
+        assert [ast.unparse(stmt) for stmt in check.body] == [
+            "self._cohort_shutdown_observed = True",
+            "self._quiesce_decode_for_cohort_shutdown(pending_async_task)",
+            "return (decode_uuids, batch)",
+        ]
+        assert not check.orelse
+        assert [
+            ast.unparse(node.func) for node in ast.walk(body)
+            if isinstance(node, ast.Call)
+        ] == ["self._quiesce_decode_for_cohort_shutdown"]
+
+
+# ---- W3: the quiesce is bounded, and a missed bound does not unwind ------
+
+def test_neither_quiesce_wait_accepts_a_timeout_so_the_bound_is_external():
+    """Grounds the thread-based bound in the code rather than in prose: if
+    either wait ever grows a timeout parameter, the simpler form should be
+    used instead."""
+    drain = _worker_method("_wait_pending_kv_append_tasks")
+    names = {arg.arg for arg in drain.args.args + drain.args.kwonlyargs}
+    assert "timeout" not in names, (
+        "the append drain now takes a timeout; bound it directly"
+    )
+
+    runner = _worker_method("_await_local_quiesce")
+    threads = [
+        node for node in ast.walk(runner)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "threading.Thread"
+    ]
+    assert len(threads) == 1
+    assert ("daemon", "True") in [
+        (kw.arg, ast.unparse(kw.value)) for kw in threads[0].keywords
+    ], "a non-daemon quiesce thread would outlive the teardown it bounds"
+    joins = [
+        node for node in ast.walk(runner)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "thread.join"
+    ]
+    assert len(joins) == 1 and len(joins[0].args) == 1, (
+        "the join must be bounded by the remaining deadline"
+    )
+
+
+def test_a_quiesce_that_lands_unwinds_in_order_and_never_self_exits():
+    """The healthy case, including D3's busy clean restart: the drains complete
+    in milliseconds, so the deadline is never near and the behavior is exactly
+    d1fe2ab1's -- drain, drain, disable the decode watchdog, return."""
+    seen = []
+
+    class _Torch:
+        class cuda:
+            @staticmethod
+            def synchronize(device):
+                seen.append(("device-sync", device))
+
+    ns = _load_worker_decode_wait(torch=_Torch)
+    worker = _decode_wait_worker(ns)
+    worker._pending_kv_append_tasks = ["task"]
+    worker._wait_pending_kv_append_tasks = lambda **kw: seen.append(
+        ("append-drain", kw)
+    )
+    worker._decode_watchdog = SimpleNamespace(_active=True)
+    load = SimpleNamespace(wait=lambda: seen.append(("kv-load", None)))
+
+    worker._quiesce_decode_for_cohort_shutdown(load)
+
+    assert seen == [
+        ("append-drain", {"defer_errors": True}),
+        ("kv-load", None),
+        ("device-sync", "cuda:3"),
+    ]
+    assert worker._decode_watchdog._active is False
+
+
+def test_a_quiesce_that_misses_its_deadline_self_exits_instead_of_unwinding():
+    """W3.  With the step abandoned, these local waits are parked behind the
+    dead collective.  Unwinding anyway is the use-after-free the whole exit
+    exists to avoid -- the append tasks are std::async threads holding unlocked
+    page-table pointers into mappings the ordered teardown releases -- so the
+    rank ends the process instead, with the reason recorded.
+    """
+    loop_ns = _load_worker_loop_helpers()
+    exits = []
+
+    class _Os:
+        @staticmethod
+        def getpid():
+            return 4242
+
+        @staticmethod
+        def _exit(status):
+            raise _SelfExited(status)
+
+    stub = SimpleNamespace(
+        _EXIT_PATH_SELF_EXIT=loop_ns["_EXIT_PATH_SELF_EXIT"],
+        _WORKER_SELF_EXIT_CODE=loop_ns["_WORKER_SELF_EXIT_CODE"],
+        _flush_worker_logs=lambda: exits.append("flush"),
+    )
+
+    ns = _load_worker_decode_wait(
+        os=_Os,
+        torch=SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda d: None)),
+        _COHORT_QUIESCE_DEADLINE_S=0.05,
+    )
+    worker = _decode_wait_worker(ns)
+    worker._pending_kv_append_tasks = ["task"]
+    worker._decode_watchdog = SimpleNamespace(_active=True)
+
+    def _never_returns(**kw):
+        time.sleep(2.0)
+
+    worker._wait_pending_kv_append_tasks = _never_returns
+    second = []
+    load = SimpleNamespace(wait=lambda: second.append("ran"))
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    previous = sys.modules.get("batchgen.server_worker_main_loop")
+    sys.modules["batchgen.server_worker_main_loop"] = stub
+    try:
+        with pytest.raises(_SelfExited) as raised:
+            worker._quiesce_decode_for_cohort_shutdown(load)
+    finally:
+        root.removeHandler(handler)
+        if previous is None:
+            del sys.modules["batchgen.server_worker_main_loop"]
+        else:
+            sys.modules["batchgen.server_worker_main_loop"] = previous
+
+    assert raised.value.status == loop_ns["_WORKER_SELF_EXIT_CODE"]
+    assert second == [], (
+        "the second wait must not be started once the budget is gone"
+    )
+    assert exits == ["flush"], "the marker must be flushed; os._exit does not"
+    marker = next(line for line in records if line.startswith("[shutdown]"))
+    # The supervisor's own net emits the same grep key, so accounting still
+    # sums; the reason is what tells the two causes apart.
+    assert "path=self-exit" in marker
+    assert "rank=3" in marker and "pid=4242" in marker
+    assert marker.endswith("reason=quiesce-deadline"), marker
+    # The watchdog is disabled on the way out either way.
+    assert worker._decode_watchdog._active is False
+
+
+def test_the_quiesce_deadline_marker_extends_the_supervisor_s_marker():
+    """Static companion to the test above: the two self-exit markers must stay
+    greppable by one key, so marker accounting across a teardown stays a sum
+    over `path=self-exit` regardless of which side emitted the line."""
+    loop_source = WORKER_LOOP_PATH.read_text()
+    assert '"[shutdown] worker exit path=%s rank=%s pid=%s"' in loop_source
+
+    fn = _worker_method("_self_exit_on_quiesce_deadline")
+    formats = [
+        node.args[0].value for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.startswith("[shutdown]")
+    ]
+    assert len(formats) == 1
+    assert formats[0] == (
+        "[shutdown] worker exit path=%s rank=%s pid=%s reason=%s"
+    )
+    assert formats[0].startswith("[shutdown] worker exit path=%s rank=%s pid=%s")
+
+
+def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
+    """No second exit status and no second path name: both come from the
+    supervisor's module, so the manager's reaping argument (it branches on no
+    exitcode value) and the marker vocabulary stay as grounded in attempt 3."""
+    fn = _worker_method("_self_exit_on_quiesce_deadline")
+    imports = [node for node in ast.walk(fn) if isinstance(node, ast.ImportFrom)]
+    assert len(imports) == 1
+    assert imports[0].module == "batchgen.server_worker_main_loop"
+    assert {alias.name for alias in imports[0].names} == {
+        "_EXIT_PATH_SELF_EXIT",
+        "_WORKER_SELF_EXIT_CODE",
+        "_flush_worker_logs",
+    }
+    (exit_call,) = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "os._exit"
+    ]
+    assert ast.unparse(exit_call.args[0]) == "_WORKER_SELF_EXIT_CODE"
+    # Log, then flush, then exit -- os._exit runs no handler and no flush.
+    order = [
+        ast.unparse(node.value.func) for node in fn.body
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+    ]
+    assert order == ["logging.error", "_flush_worker_logs", "os._exit"]
+
+
+def test_the_bounded_quiesce_runner_cannot_raise_into_the_teardown():
+    """Same reason the quiesce itself cannot raise: an exception here would
+    escape as an error and lose the ordered exit.  A failure to bound the wait
+    is reported as not-quiesced, which self-exits -- the conservative answer
+    when the local readers cannot be proven done."""
+    ns = _load_worker_decode_wait()
+    worker = _decode_wait_worker(ns)
+
+    def _unstartable(*args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    ns["threading"] = SimpleNamespace(Thread=_unstartable)
+    assert worker._await_local_quiesce(lambda: None, time.perf_counter() + 1.0) is False
+
+    ns["threading"] = threading
+    assert worker._await_local_quiesce(lambda: None, time.perf_counter() - 1.0) is False
+    assert worker._await_local_quiesce(lambda: None, time.perf_counter() + 1.0) is True
+    assert worker._await_local_quiesce(
+        lambda: time.sleep(2.0), time.perf_counter() + 0.05
+    ) is False
