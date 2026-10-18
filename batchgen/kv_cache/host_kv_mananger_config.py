@@ -20,6 +20,32 @@ PAGE_FORMAT_CONTIGUOUS_AOS = "contiguous_aos"
 PAGE_FORMAT_FP8_PAGE_SPLIT = "page_split_fp8_scale"
 PAGE_SPLIT_SCALE_BYTES_PER_TOKEN = 4
 
+# FlashMLA's packed FP8 MLA token record, used by the GLM-5.2 PRIMARY cache.
+# Contract: references/FlashMLA-1408756/csrc/pybind.cpp:249-256 and
+# README.md:117-121 -- one token is 656 contiguous bytes,
+#
+#   [   0, 512)  512 x float8_e4m3  quantized NoPE (compressed KV latent)
+#   [ 512, 528)    4 x float32      one scale per 128-element NoPE block
+#   [ 528, 656)   64 x bfloat16     RoPE, NOT quantized
+#
+# and the page block size is hard-required to be 64 (pybind.cpp:236) with the
+# whole block contiguous (`kcache.stride(1) == 656`). The record is token-major
+# inside the page, so this is the ordinary contiguous-AoS page format with a
+# 656-BYTE token; nothing about the host page geometry is special. `is_fp8` is
+# an explicit kernel flag rather than inferred from the tensor dtype
+# (pybind.cpp:180 accepts kUInt8), which is why a plain uint8 carrier is legal.
+PACKED_MLA_NOPE_DIM = 512
+PACKED_MLA_ROPE_DIM = 64
+PACKED_MLA_QUANT_TILE = 128
+PACKED_MLA_NUM_SCALES = PACKED_MLA_NOPE_DIM // PACKED_MLA_QUANT_TILE
+PACKED_MLA_SCALE_BYTES = PACKED_MLA_NUM_SCALES * 4
+PACKED_MLA_TOKEN_BYTES = (
+	PACKED_MLA_NOPE_DIM + PACKED_MLA_SCALE_BYTES + PACKED_MLA_ROPE_DIM * 2
+)
+PACKED_MLA_PAGE_SIZE = 64
+# The unpacked compressed-KV dim this record encodes (512 NoPE + 64 RoPE).
+PACKED_MLA_SOURCE_DIM = PACKED_MLA_NOPE_DIM + PACKED_MLA_ROPE_DIM
+
 __all__ = [
 	"build_host_kv_config",
 	"build_host_kv_worker_view",
@@ -28,6 +54,16 @@ __all__ = [
 	"PAGE_FORMAT_CONTIGUOUS_AOS",
 	"PAGE_FORMAT_FP8_PAGE_SPLIT",
 	"PAGE_SPLIT_SCALE_BYTES_PER_TOKEN",
+	"PACKED_MLA_NOPE_DIM",
+	"PACKED_MLA_ROPE_DIM",
+	"PACKED_MLA_QUANT_TILE",
+	"PACKED_MLA_NUM_SCALES",
+	"PACKED_MLA_SCALE_BYTES",
+	"PACKED_MLA_TOKEN_BYTES",
+	"PACKED_MLA_PAGE_SIZE",
+	"PACKED_MLA_SOURCE_DIM",
+	"glm52_packed_kv_enabled",
+	"set_glm52_packed_kv",
 ]
 
 
@@ -41,6 +77,10 @@ def _dtype_size_bytes(dtype: str) -> int:
 		return 4
 	if normalized in {"float8_e4m3fn", "float8_e5m2"}:
 		return 1
+	# Opaque byte carrier; k_head_dim counts BYTES per token. Mirrors
+	# ResolveElementSizeBytes in core/KV_Storage/host_paged_kv_config_utils.h.
+	if normalized == "uint8":
+		return 1
 	raise ValueError(f"Unsupported kv dtype '{dtype}'")
 
 
@@ -51,6 +91,7 @@ def _torch_dtype_from_string(dtype: str) -> torch.dtype:
 		"bfloat16": torch.bfloat16,
 		"float8_e4m3fn": torch.float8_e4m3fn,
 		"float8_e5m2": torch.float8_e5m2,
+		"uint8": torch.uint8,
 	}
 	key = dtype.strip().lower()
 	if key not in mapping:
@@ -71,8 +112,16 @@ class _HostKVModelProfile:
 	alignment_bytes: int = 64
 	logical_to_physical_layer: tuple[int, ...] | None = None
 	page_format: str = PAGE_FORMAT_CONTIGUOUS_AOS
+	# True only for the FlashMLA packed FP8 MLA record. The page geometry IS
+	# contiguous AoS (token-major 656-byte records), so no new page format is
+	# needed; this flag exists so the exact byte layout the kernel hard-checks
+	# is asserted where the profile is declared instead of first failing inside
+	# a CUDA graph capture.
+	packed_mla_fp8: bool = False
 
 	def __post_init__(self) -> None:
+		if self.packed_mla_fp8:
+			self._validate_packed_mla_fp8()
 		if self.page_format == PAGE_FORMAT_CONTIGUOUS_AOS:
 			return
 		if self.page_format != PAGE_FORMAT_FP8_PAGE_SPLIT:
@@ -96,6 +145,48 @@ class _HostKVModelProfile:
 				f"{PAGE_FORMAT_FP8_PAGE_SPLIT} requires k_head_dim to be the "
 				"per-token byte count (a positive multiple of 16, plus 4 "
 				f"scale bytes), got {self.k_head_dim}"
+			)
+
+	def _validate_packed_mla_fp8(self) -> None:
+		"""Every geometry FlashMLA's FP8 path hard-checks, checked up front.
+
+		``csrc/pybind.cpp:249-256`` requires a ``[blocks, 64, 1, 656]`` uint8
+		cache with the whole block contiguous, and ``:236`` requires
+		``page_block_size == 64``. A profile that satisfies all of it cannot
+		produce a cache the kernel rejects; one that does not is named here,
+		at declaration time, rather than at the first decode step.
+		"""
+
+		if self.page_format != PAGE_FORMAT_CONTIGUOUS_AOS:
+			raise ValueError(
+				"packed_mla_fp8 is token-major and therefore requires "
+				f"page_format='{PAGE_FORMAT_CONTIGUOUS_AOS}', got "
+				f"'{self.page_format}'"
+			)
+		if self.kv_dtype != "uint8":
+			raise ValueError(
+				"packed_mla_fp8 mixes e4m3 data, fp32 scales and bf16 RoPE in "
+				"one record, so its carrier must be kv_dtype='uint8', got "
+				f"'{self.kv_dtype}'"
+			)
+		if self.k_head_dim != PACKED_MLA_TOKEN_BYTES:
+			raise ValueError(
+				"packed_mla_fp8 requires k_head_dim == "
+				f"{PACKED_MLA_TOKEN_BYTES} bytes per token "
+				f"({PACKED_MLA_NOPE_DIM} e4m3 + {PACKED_MLA_SCALE_BYTES} "
+				f"scale + {PACKED_MLA_ROPE_DIM * 2} bf16 RoPE), got "
+				f"{self.k_head_dim}"
+			)
+		if self.page_size != PACKED_MLA_PAGE_SIZE:
+			raise ValueError(
+				"packed_mla_fp8 requires page_size == "
+				f"{PACKED_MLA_PAGE_SIZE} (FlashMLA hard requirement), got "
+				f"{self.page_size}"
+			)
+		if self.num_k_heads != 1 or self.num_v_heads != 0:
+			raise ValueError(
+				"packed_mla_fp8 requires num_k_heads == 1 and "
+				f"num_v_heads == 0, got {self.num_k_heads}/{self.num_v_heads}"
 			)
 
 	@property
@@ -192,6 +283,24 @@ _GLM5_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GLM-5.2 primary MLA cache in FlashMLA's packed FP8 record (656 B/token vs
+# 1,152 B for bf16 576). Same 78 layers and same page size 64; only a token's
+# bytes change, and they change identically in the GPU pool, the host region,
+# every staging buffer and every prefix-reuse span -- the format is produced
+# once, at the writer, and byte-copied everywhere after. GLM-5, GLM-5.1 and
+# GLM-5.3 keep `glm5_mla` (bf16 576); only the glm-5.2 aliases move here, and
+# only while `glm52_packed_kv_enabled()` is true.
+_GLM5_2_MLA_PACKED_PROFILE = _HostKVModelProfile(
+	num_layers=78,
+	num_k_heads=1,
+	k_head_dim=PACKED_MLA_TOKEN_BYTES,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="uint8",
+	page_size=PACKED_MLA_PAGE_SIZE,
+	packed_mla_fp8=True,
+)
+
 # GLM-5 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128)
 _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=78,
@@ -276,6 +385,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 	"glm5_mla": _GLM5_MLA_PROFILE,
+	"glm5_2_mla_packed": _GLM5_2_MLA_PACKED_PROFILE,
 	"glm5_indexer": _GLM5_INDEXER_PROFILE,
 	"glm5_2_indexer": _GLM5_2_INDEXER_PROFILE,
 	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
@@ -432,14 +542,78 @@ def apply_page_format(config: Any, page_format: str) -> None:
 	)
 
 
+# GLM-5.2's primary MLA cache moves to FlashMLA's packed FP8 record. The move
+# is expressed as an OVERRIDE applied inside `_resolve_profile`, not as an edit
+# to `_PROFILE_ALIASES`: with the kill-switch off, resolution is byte-for-byte
+# the pre-migration mapping (bf16 576 via `glm5_mla`), which is what makes the
+# rollback claim structural rather than a promise.
+_PACKED_PRIMARY_PROFILE_ALIASES: Dict[str, str] = {
+	alias: "glm5_2_mla_packed"
+	for alias in (
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
+		"glm-5.2-fp8",
+		"glm-5.2",
+	)
+}
+
+# Process-wide resolution switch for the packed GLM-5.2 primary cache.
+#
+# The primary profile is read by ~12 independent call sites across the server
+# process, every worker process, the prefix-cache coordinator and three model
+# initializers, and the GPU pool, the host shm region, the staging buffers and
+# the prefix-reuse spans must ALL agree on the format or pages silently
+# mis-decode. Threading a parameter through every signature makes a single
+# missed site a silent corruption, so the switch is process state that every
+# resolution reads, and it LATCHES: once a profile has been resolved, changing
+# it raises instead of handing out two different geometries in one process.
+_GLM5_2_PACKED_KV_DEFAULT = True
+_glm52_packed_kv: bool = _GLM5_2_PACKED_KV_DEFAULT
+_glm52_packed_kv_locked: bool = False
+
+
+def glm52_packed_kv_enabled() -> bool:
+	"""Whether GLM-5.2's primary MLA cache uses the packed FP8 record."""
+
+	return _glm52_packed_kv
+
+
+def set_glm52_packed_kv(enabled: bool) -> None:
+	"""Select the GLM-5.2 primary KV format for this process.
+
+	Must be called before the first primary-profile resolution. Re-selecting
+	the value already in force is a no-op (initializers may set it more than
+	once); changing it after any resolution raises, because the caches already
+	sized from the old profile cannot be re-laid out.
+	"""
+
+	global _glm52_packed_kv
+	enabled = bool(enabled)
+	if enabled == _glm52_packed_kv:
+		return
+	if _glm52_packed_kv_locked:
+		raise RuntimeError(
+			"glm52_packed_kv cannot change after a host/GPU KV profile has "
+			"been resolved in this process: the primary cache geometry is "
+			f"already committed to packed={_glm52_packed_kv}. Set it before "
+			"any KV cache is built."
+		)
+	_glm52_packed_kv = enabled
+
+
 def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 	"""Maps a user supplied model name to a cached profile."""
+
+	global _glm52_packed_kv_locked
 
 	if not isinstance(model_name, str):
 		raise ValueError("model_name must be a string")
 	alias = model_name.strip().lower()
 	if alias not in _PROFILE_ALIASES:
 		raise ValueError(f"Unsupported model '{model_name}' for host KV cache")
+	_glm52_packed_kv_locked = True
+	if _glm52_packed_kv and alias in _PACKED_PRIMARY_PROFILE_ALIASES:
+		return _PROFILE_REGISTRY[_PACKED_PRIMARY_PROFILE_ALIASES[alias]]
 	return _PROFILE_REGISTRY[_PROFILE_ALIASES[alias]]
 
 
