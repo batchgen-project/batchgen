@@ -61,6 +61,11 @@ _WORKER_SENTINEL_GRACE_S = 180.0
 # previous budget, leaving no usable margin, so the budget now covers
 # several times the time such a teardown is expected to need.
 _WORKER_KILL_REAP_TIMEOUT_S = 900.0
+# A worker that needed SIGTERM/SIGKILL cannot name its own exit path: it is
+# force-killed while a native collective holds its thread, so no Python runs in
+# it again.  The marker is therefore emitted here, by the only process that
+# knows a signal replaced an ordered exit.
+_WORKER_EXIT_PATH_SIGNAL = "signal-fallback"
 
 
 def _resolve_local_world_size(
@@ -166,6 +171,8 @@ class WorkerManager:
         self._mp_ctx = mp.get_context("spawn")
         self.request_queue: Optional[mp.Queue] = None
         self.response_queue: Optional[mp.Queue] = None
+        # Cohort-scoped teardown flag; bound with the channels below.
+        self._cohort_shutdown_flag: Optional[Any] = None
         self._create_worker_channels()
         self.worker_process = None
         self.started = False
@@ -613,6 +620,24 @@ class WorkerManager:
                 # registrations and mappings before the signal fallback uses
                 # os._exit().  Workers blocked in NCCL or otherwise unable to
                 # consume the sentinel still follow the existing pidfd path.
+                #
+                # The out-of-band flag goes first, before the sentinel: a rank
+                # blocked in a collective consumes neither the sentinel (only
+                # rank 0 reads the queue) nor the status broadcast (itself a
+                # collective), so the flag is the only signal that reaches it.
+                # Its watchdog gives the graceful path a short window and then
+                # aborts this worker's communicators, which frees the blocked
+                # collective so the rank can leave its loop and run the same
+                # ordered teardown.  The grace and signal fallback below are
+                # unchanged and remain the safety net.
+                #
+                # This is a plain store into lock-free shared memory, so it
+                # cannot block.  That matters because this runs under
+                # _teardown_lock: anything that could block here would strand
+                # the teardown owner, which is exactly how the Event-based
+                # version of this signal failed.
+                if self._cohort_shutdown_flag is not None:
+                    self._cohort_shutdown_flag.value = 1
                 sentinel_sent = False
                 try:
                     self.request_queue.put(None)
@@ -633,6 +658,19 @@ class WorkerManager:
                 # teardown, so this shutdown is abnormal and what it leaves
                 # behind has to be named in the log.
                 signal_fallback_used = bool(remaining)
+                # Name the exit path per worker here rather than in the worker.
+                # A force-killed worker is stopped while a native collective
+                # owns its thread, so it never runs Python again and can never
+                # log its own marker; this process is the only one that knows a
+                # signal replaced an ordered exit, and for which rank.
+                positions = {id(proc): index for index, proc in enumerate(processes)}
+                for proc, _ in remaining:
+                    logging.getLogger("uvicorn.error").info(
+                        "[shutdown] worker exit path=%s rank-idx=%s pid=%s",
+                        _WORKER_EXIT_PATH_SIGNAL,
+                        positions.get(id(proc), "unknown"),
+                        proc.pid,
+                    )
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGTERM)
 
@@ -750,9 +788,26 @@ class WorkerManager:
 
         The channels are cohort-scoped: every worker generation gets its own
         pair, so nothing a previous cohort wrote is ever read again.
+
+        The cohort's shutdown flag is bound here for the same reason.  It is
+        the out-of-band teardown signal: the queue sentinel below reaches only
+        rank 0, and the status tensor the other ranks learn shutdown from is
+        itself a collective, so a rank blocked in NCCL is reachable by
+        neither.  The flag reaches every local rank directly, and rotating it
+        with the cohort keeps a new generation from ever starting up already
+        holding the previous teardown's flag.
+
+        It is deliberately a ``RawValue``, i.e. shared memory with NO lock and
+        NO wake handshake.  ``multiprocessing.Event`` cannot be used here: its
+        ``set()`` goes through ``Condition.notify``, which blocks on
+        ``_woken_count`` while any registered waiter is a dead process, so the
+        teardown owner itself would deadlock on the very failure this signal
+        exists for.  Setting this flag is a plain store that cannot block, and
+        the worker side polls it.
         """
         self.request_queue = self._mp_ctx.Queue()
         self.response_queue = self._mp_ctx.Queue()
+        self._cohort_shutdown_flag = self._mp_ctx.RawValue("b", 0)
 
     def _abandon_worker_channels(self) -> None:
         """Release the previous cohort's queues WITHOUT reading them.
@@ -790,6 +845,9 @@ class WorkerManager:
                     )
         self.request_queue = None
         self.response_queue = None
+        # The flag belongs to the cohort that was just torn down; the next one
+        # is created with its channels.
+        self._cohort_shutdown_flag = None
 
     def _release_host_kv_sequences(self) -> None:
         for manager in (self.host_kv_manager, self.host_kv_aux_manager):
@@ -1185,6 +1243,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
                 self._fatal_ack_event,
+                self._cohort_shutdown_flag,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
