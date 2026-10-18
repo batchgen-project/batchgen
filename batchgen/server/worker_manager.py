@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.multiprocessing as mp
@@ -48,8 +48,24 @@ PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 # A sentinel reaches the worker's ordered C++/Python teardown path.  That path
 # must be allowed to finish before the signal fallback can invoke os._exit and
 # skip the destructors it exists to run.  The bound still keeps a blocked
-# worker from holding server shutdown indefinitely.
-_WORKER_SENTINEL_GRACE_S = 20.0
+# worker from holding server shutdown indefinitely.  Releasing a large
+# cudaHostRegister'd weight footprint takes on the order of minutes, so the
+# grace must cover that or the fallback kills workers mid-unpin into
+# uninterruptible D state.
+_WORKER_SENTINEL_GRACE_S = 180.0
+# A SIGKILL'd worker still cannot be reaped until the kernel finishes
+# unpinning its registered pages, which again takes minutes for a large
+# cohort.  Proceeding while an owned PID is alive is never safe, so the
+# reap wait is long and loud rather than short and fatal.  Observed
+# teardowns of a large pinned footprint finished only just inside the
+# previous budget, leaving no usable margin, so the budget now covers
+# several times the time such a teardown is expected to need.
+_WORKER_KILL_REAP_TIMEOUT_S = 900.0
+# A worker that needed SIGTERM/SIGKILL cannot name its own exit path: it is
+# force-killed while a native collective holds its thread, so no Python runs in
+# it again.  The marker is therefore emitted here, by the only process that
+# knows a signal replaced an ordered exit.
+_WORKER_EXIT_PATH_SIGNAL = "signal-fallback"
 
 
 def _resolve_local_world_size(
@@ -123,6 +139,12 @@ class WorkerExitState:
     def is_failed(self) -> bool:
         return self._event.is_set()
 
+    def clear(self) -> None:
+        with self._lock:
+            self._reason = None
+            self._exception = None
+            self._event.clear()
+
     @property
     def reason(self) -> Optional[str]:
         return self._reason
@@ -147,8 +169,11 @@ class WorkerManager:
             # Start method may already be set by the parent process.
             pass
         self._mp_ctx = mp.get_context("spawn")
-        self.request_queue: mp.Queue = self._mp_ctx.Queue()
-        self.response_queue: mp.Queue = self._mp_ctx.Queue()
+        self.request_queue: Optional[mp.Queue] = None
+        self.response_queue: Optional[mp.Queue] = None
+        # Cohort-scoped teardown flag; bound with the channels below.
+        self._cohort_shutdown_flag: Optional[Any] = None
+        self._create_worker_channels()
         self.worker_process = None
         self.started = False
         self.model_info: Dict[str, Any] = {}
@@ -168,6 +193,8 @@ class WorkerManager:
         self._monitor_stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._join_lock = threading.Lock()
+        # One owner per cohort teardown: see _handle_worker_failure.
+        self._teardown_lock = threading.Lock()
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
@@ -181,6 +208,18 @@ class WorkerManager:
         self._lane_lease: Optional[LaneLease] = None
         # Held LOCK_SH for this process's whole life; see hold_run_lock.
         self._run_lock = None
+        self._state = "serving"
+        self._generation = 0
+        self._first_ready = False
+        self._reconciled_failure = False
+        self._main_thread_dispatcher: Optional[Callable[[Callable[[], Any], float], Any]] = None
+        self._quiesce_hook: Optional[Callable[[], Any]] = None
+        self._resume_hook: Optional[Callable[[], Any]] = None
+        self._fail_in_flight_hook: Optional[Callable[[str], int]] = None
+        self._scheduler_generation_hook: Optional[Callable[[], Any]] = None
+        self._pool_init_params_hook: Optional[Callable[[], Dict[str, Any]]] = None
+        self._retire_channels_hook: Optional[Callable[[], Any]] = None
+        self._restart_timeout_s = 600.0
 
     def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
         """Serialize the skeleton state dict into an anonymous memfd.
@@ -242,6 +281,47 @@ class WorkerManager:
         self._runtime_namespace_owned = True
 
     # ---------------------- Public API ----------------------
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def set_lifecycle_hooks(
+        self,
+        *,
+        quiesce: Optional[Callable[[], Any]] = None,
+        resume: Optional[Callable[[], Any]] = None,
+        fail_in_flight: Optional[Callable[[str], int]] = None,
+        generation_ready: Optional[Callable[[], Any]] = None,
+        pool_init_params: Optional[Callable[[], Dict[str, Any]]] = None,
+        retire_channels: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        self._quiesce_hook = quiesce
+        self._resume_hook = resume
+        self._fail_in_flight_hook = fail_in_flight
+        self._scheduler_generation_hook = generation_ready
+        self._pool_init_params_hook = pool_init_params
+        self._retire_channels_hook = retire_channels
+
+    def set_main_thread_dispatcher(
+        self,
+        dispatcher: Optional[Callable[[Callable[[], Any], float], Any]],
+    ) -> None:
+        """Install the event-loop bridge used when restart starts off-main-thread."""
+        self._main_thread_dispatcher = dispatcher
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "generation": self.generation,
+            "workers": len(getattr(self.worker_process, "processes", ()) or ()),
+        }
+
     def _acquire_runtime_admission(self) -> None:
         if self._runtime_locks is not None:
             return
@@ -371,6 +451,11 @@ class WorkerManager:
                     _time.monotonic() - spawn_start)
 
         self.started = True
+        with self._lock:
+            self._generation += 1
+            self._state = "serving"
+            self._first_ready = True
+            self._reconciled_failure = False
         logger.info(
             "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
             _time.monotonic() - startup_start,
@@ -535,6 +620,24 @@ class WorkerManager:
                 # registrations and mappings before the signal fallback uses
                 # os._exit().  Workers blocked in NCCL or otherwise unable to
                 # consume the sentinel still follow the existing pidfd path.
+                #
+                # The out-of-band flag goes first, before the sentinel: a rank
+                # blocked in a collective consumes neither the sentinel (only
+                # rank 0 reads the queue) nor the status broadcast (itself a
+                # collective), so the flag is the only signal that reaches it.
+                # Its watchdog gives the graceful path a short window and then
+                # aborts this worker's communicators, which frees the blocked
+                # collective so the rank can leave its loop and run the same
+                # ordered teardown.  The grace and signal fallback below are
+                # unchanged and remain the safety net.
+                #
+                # This is a plain store into lock-free shared memory, so it
+                # cannot block.  That matters because this runs under
+                # _teardown_lock: anything that could block here would strand
+                # the teardown owner, which is exactly how the Event-based
+                # version of this signal failed.
+                if self._cohort_shutdown_flag is not None:
+                    self._cohort_shutdown_flag.value = 1
                 sentinel_sent = False
                 try:
                     self.request_queue.put(None)
@@ -555,6 +658,19 @@ class WorkerManager:
                 # teardown, so this shutdown is abnormal and what it leaves
                 # behind has to be named in the log.
                 signal_fallback_used = bool(remaining)
+                # Name the exit path per worker here rather than in the worker.
+                # A force-killed worker is stopped while a native collective
+                # owns its thread, so it never runs Python again and can never
+                # log its own marker; this process is the only one that knows a
+                # signal replaced an ordered exit, and for which rank.
+                positions = {id(proc): index for index, proc in enumerate(processes)}
+                for proc, _ in remaining:
+                    logging.getLogger("uvicorn.error").info(
+                        "[shutdown] worker exit path=%s rank-idx=%s pid=%s",
+                        _WORKER_EXIT_PATH_SIGNAL,
+                        positions.get(id(proc), "unknown"),
+                        proc.pid,
+                    )
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGTERM)
 
@@ -579,9 +695,23 @@ class WorkerManager:
                     logger.warning("Workers did not exit gracefully, force-killing...")
                 for proc, pidfd in remaining:
                     send(proc, pidfd, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-                for proc, _ in remaining:
-                    proc.join(timeout=max(0, deadline - time.monotonic()))
+                deadline = time.monotonic() + _WORKER_KILL_REAP_TIMEOUT_S
+                next_progress_log = time.monotonic() + 30
+                while remaining and time.monotonic() < deadline:
+                    for proc, _ in remaining:
+                        proc.join(timeout=1)
+                    remaining = [
+                        (proc, fd) for proc, fd in remaining if proc.exitcode is None
+                    ]
+                    if remaining and time.monotonic() >= next_progress_log:
+                        next_progress_log = time.monotonic() + 30
+                        logging.getLogger("uvicorn.error").info(
+                            "[shutdown] waiting for SIGKILL'd workers to be "
+                            "reaped (page unpin in progress) elapsed=%.3fs "
+                            "remaining=%d",
+                            time.monotonic() - stop_start,
+                            len(remaining),
+                        )
                 logging.getLogger("uvicorn.error").info(
                     "[shutdown] worker SIGKILL/reap elapsed=%.3fs remaining=%d",
                     time.monotonic() - stop_start,
@@ -630,94 +760,263 @@ class WorkerManager:
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
 
-    def report_worker_fatal(self, reason: str) -> None:
-        """Acknowledge a persisted worker fatal, then stop the server."""
+    def report_worker_fatal(self, reason: str, *, persisted: bool = False) -> None:
+        """Enter workers_down after the existing pool_shutdown fatal path."""
         self._fatal_ack_event.set()
+        if persisted:
+            self._reconciled_failure = True
         self._handle_worker_failure(reason, None)
 
-    def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
-        """Send hot-reload command via the main loop's sync RPC path.
-
-        Used before the worker enters generate_persistent(), while the main
-        loop still answers one request with one response on
-        request_queue/response_queue. Once pool mode is running, use
-        send_pool_reload() instead — pool mode never returns to the main loop.
-        """
-        import queue as _queue
+    def _set_state(self, expected: str, new: str) -> None:
         with self._lock:
-            self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
-            try:
-                return self.response_queue.get(timeout=timeout)
-            except _queue.Empty:
-                return {"status": "reload_timeout", "timeout_s": timeout}
+            if self._state != expected:
+                raise RuntimeError(
+                    f"invalid worker state transition {self._state!r} -> {new!r}; "
+                    f"expected {expected!r}"
+                )
+            self._state = new
 
-    def send_pool_reload(self, reload_deps: bool = True, timeout: float = 30.0,
-                         expected_ranks: Optional[int] = None) -> dict:
-        """Send hot-reload to pool-mode workers via fire-and-forget queue +
-        status file polling.
+    def _call_spawn_on_main_thread(self, fn: Callable[[], Any], timeout_s: float) -> Any:
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        if self._main_thread_dispatcher is None:
+            raise RuntimeError("worker respawn requires a main-thread dispatcher")
+        return self._main_thread_dispatcher(fn, timeout_s)
 
-        Pool-mode workers (generate_persistent loop) read the reload command
-        from request_queue and write per-rank status below this run's private
-        runtime directory. This method polls those files for up to `timeout`
-        seconds, returning aggregated status.
+    def _create_worker_channels(self) -> None:
+        """Bind a fresh request/response queue pair for the next cohort.
 
-        Why not response_queue: pool mode admission queue and response_queue
-        are designed for batched async I/O (per-completion notifications via
-        OutputWriter), not sync RPC. Putting reload results on response_queue
-        deadlocks the FastAPI event loop.
+        The channels are cohort-scoped: every worker generation gets its own
+        pair, so nothing a previous cohort wrote is ever read again.
+
+        The cohort's shutdown flag is bound here for the same reason.  It is
+        the out-of-band teardown signal: the queue sentinel below reaches only
+        rank 0, and the status tensor the other ranks learn shutdown from is
+        itself a collective, so a rank blocked in NCCL is reachable by
+        neither.  The flag reaches every local rank directly, and rotating it
+        with the cohort keeps a new generation from ever starting up already
+        holding the previous teardown's flag.
+
+        It is deliberately a ``RawValue``, i.e. shared memory with NO lock and
+        NO wake handshake.  ``multiprocessing.Event`` cannot be used here: its
+        ``set()`` goes through ``Condition.notify``, which blocks on
+        ``_woken_count`` while any registered waiter is a dead process, so the
+        teardown owner itself would deadlock on the very failure this signal
+        exists for.  Setting this flag is a plain store that cannot block, and
+        the worker side polls it.
         """
-        import json
-        import os
-        import shutil
-        import time as _time
+        self.request_queue = self._mp_ctx.Queue()
+        self.response_queue = self._mp_ctx.Queue()
+        self._cohort_shutdown_flag = self._mp_ctx.RawValue("b", 0)
 
-        status_dir = str(self.args.runtime_identity.reload_status_dir)
-        # Clear stale status files from previous reloads
-        if os.path.isdir(status_dir):
-            try:
-                shutil.rmtree(status_dir)
-            except OSError:
-                pass
-        os.makedirs(status_dir, exist_ok=True)
+    def _abandon_worker_channels(self) -> None:
+        """Release the previous cohort's queues WITHOUT reading them.
 
-        # Send the command (no lock — pool admission queue is fire-and-forget)
-        self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+        A worker killed mid-write leaves a frame whose length header is
+        readable but whose payload never arrives.  Any later read of that
+        queue -- including a nominally non-blocking ``get_nowait()``, which
+        polls the pipe and only then reads it -- therefore blocks forever
+        inside ``recv_bytes()``, with no timeout and no exception.  Teardown
+        force-kills the cohort, so a partial frame is an expected outcome and
+        the only safe handling is to abandon the channel unread.
 
-        # Poll for status files
-        if expected_ranks is None:
-            expected_ranks = self.args.world_size if self.args.world_size else 1
-        deadline = _time.monotonic() + timeout
-        results: List[dict] = []
-        seen_ranks: set = set()
-        while _time.monotonic() < deadline:
-            try:
-                for entry in os.listdir(status_dir):
-                    if not entry.startswith("rank_") or not entry.endswith(".json"):
-                        continue
-                    rank_str = entry[len("rank_"):-len(".json")]
-                    if rank_str in seen_ranks:
-                        continue
-                    path = os.path.join(status_dir, entry)
-                    try:
-                        with open(path, "r") as f:
-                            results.append(json.load(f))
-                        seen_ranks.add(rank_str)
-                    except (OSError, json.JSONDecodeError):
-                        continue
-                if len(seen_ranks) >= expected_ranks:
-                    break
-            except OSError:
-                pass
-            _time.sleep(0.1)
+        The feeder thread may already be broken, so both steps are advisory:
+        ``cancel_join_thread()`` keeps a half-written buffer from blocking
+        this process, and ``close()`` releases the descriptors.
+        """
+        for label, channel in (
+            ("request", self.request_queue),
+            ("response", self.response_queue),
+        ):
+            if channel is None:
+                continue
+            for step in ("cancel_join_thread", "close"):
+                action = getattr(channel, step, None)
+                if action is None:
+                    continue
+                try:
+                    action()
+                except Exception:
+                    logger.warning(
+                        "Abandoning the %s channel: %s failed",
+                        label,
+                        step,
+                        exc_info=True,
+                    )
+        self.request_queue = None
+        self.response_queue = None
+        # The flag belongs to the cohort that was just torn down; the next one
+        # is created with its channels.
+        self._cohort_shutdown_flag = None
 
-        # Aggregate
-        all_success = all(r.get("status") == "reload_success" for r in results)
+    def _release_host_kv_sequences(self) -> None:
+        for manager in (self.host_kv_manager, self.host_kv_aux_manager):
+            if manager is None:
+                continue
+            release_all = getattr(manager, "release_all_sequences", None)
+            if release_all is None:
+                raise RuntimeError("host-KV manager lacks release_all_sequences")
+            release_all()
+
+    def _reconcile(self, reason: str, *, fail_in_flight: bool) -> Dict[str, Any]:
+        failed_batches = 0
+        if fail_in_flight and not self._reconciled_failure:
+            if self._fail_in_flight_hook is not None:
+                failed_batches = int(self._fail_in_flight_hook(reason) or 0)
+            self._reconciled_failure = True
+        self._release_host_kv_sequences()
+        # Reconciliation never reads the worker queues.  The cohort it cleans
+        # up after was force-killed, so a read could block forever on a
+        # truncated frame; the channels are abandoned unread instead, see
+        # _abandon_worker_channels.
+        # The run prefix covers named QueryBook and token-store objects.  Host
+        # KV, weights, tensor metadata, and skeleton state are server-owned
+        # memfds and therefore intentionally remain open across this cleanup.
+        cleanup_shm_files(self.args.runtime_identity.shm_prefix)
+        return {"failed_batches": failed_batches}
+
+    def _abort_restart_if_stopping(self) -> None:
+        """Raise when server shutdown has begun or already finished.
+
+        ``stop()`` sets ``_stopping`` first and clears it again when it
+        returns, while ``started`` stays False from then on; checking both
+        covers a restart phase that outlasted the whole of ``stop()``.
+        """
+        if self._stopping or not self.started:
+            raise RuntimeError("worker restart aborted: server is stopping")
+
+    def restart_workers(self, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        """Replace one worker cohort while retaining server-owned resources.
+
+        The restart runs on a worker thread (``asyncio.to_thread``), which
+        neither request cancellation nor server shutdown can interrupt.  It
+        therefore checks for shutdown at its phase boundaries -- on entry,
+        after teardown, and immediately before the respawn -- and aborts to
+        ``workers_down`` there, so it never spawns a cohort once ``stop()``
+        has begun.  Residual window: a phase already in flight when shutdown
+        begins (a teardown, or a spawn already dispatched) runs to completion
+        before the next boundary sees the shutdown; ``stop()`` tears down
+        whatever cohort is live when it reaches the worker processes.
+        """
+        timeout_s = self._restart_timeout_s if timeout_s is None else float(timeout_s)
+        started_at = time.monotonic()
+        with self._lock:
+            if self._state not in {"serving", "workers_down"}:
+                raise RuntimeError(f"worker restart conflict: state={self._state}")
+            self._state = "restarting"
+
+        # Every phase runs inside one recovery scope: a restart that fails at
+        # ANY point leaves the manager in the retryable workers_down state,
+        # never stuck in "restarting".
+        teardown_owned = False
+        try:
+            self._abort_restart_if_stopping()
+            quiesce_start = time.monotonic()
+            if self._quiesce_hook is not None:
+                self._quiesce_hook()
+            quiesce_s = time.monotonic() - quiesce_start
+            teardown_start = time.monotonic()
+            # Teardown of a cohort has one owner at a time: a monitor that
+            # claimed a failure holds this lock through its reconcile, and a
+            # restart from workers_down waits for it here rather than tearing
+            # down beside it.  Held through the channel rotation below.
+            self._teardown_lock.acquire()
+            teardown_owned = True
+            self._monitor_stop_event.set()
+            monitor = self._monitor_thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(timeout=5)
+                self._monitor_thread = None
+            if self.worker_process is not None:
+                self._stop_workers()
+                self.worker_process = None
+            teardown_s = time.monotonic() - teardown_start
+            self._abort_restart_if_stopping()
+
+            reconcile_start = time.monotonic()
+            # In-flight batches are persisted as failed exactly once:
+            # _reconciled_failure stays True from the fatal path until a
+            # restart succeeds, while a restart that failed before reaching
+            # reconcile leaves it False so the retry still persists them.
+            reconciliation = self._reconcile(
+                "Worker pool restarted; in-flight batches were failed.",
+                fail_in_flight=True,
+            )
+            reconcile_s = time.monotonic() - reconcile_start
+
+            # The cohort that owned the previous channels has been killed, so
+            # those queues can never be read again -- a partial frame left by
+            # a killed writer makes any read block forever.  Abandon them
+            # unread and give the next cohort a fresh pair.  Everything that
+            # reaches a worker from here on (the init message below and the
+            # queues _spawn_workers hands the children) reads these
+            # attributes at call time, so it picks up the new pair.
+            # Tell the scheduler to retire its reader first: a pump still
+            # blocked on the old response queue must see its stop event
+            # before close() makes that read fail, so the failure is an
+            # expected retirement rather than a reported channel error.
+            if self._retire_channels_hook is not None:
+                self._retire_channels_hook()
+            self._abandon_worker_channels()
+            self._create_worker_channels()
+            teardown_owned = False
+            self._teardown_lock.release()
+
+            spawn_start = time.monotonic()
+            self._monitor_stop_event.clear()
+            self._ready_event.clear()
+            self._fatal_ack_event.clear()
+            # The previous cohort's fatal is fully handled by this point; a
+            # stale failure reason must not abort the readiness wait of the
+            # cohort spawned below.
+            self._worker_exit_state.clear()
+            self._abort_restart_if_stopping()
+            self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
+            self._start_worker_monitor()
+            self._wait_for_workers_ready(timeout_s=timeout_s)
+            # Pool capacity params live with the scheduler (it accumulated them
+            # across batch submissions); re-init with the same values, never
+            # with hardcoded defaults.
+            if self._pool_init_params_hook is None:
+                raise RuntimeError("worker restart requires a pool_init_params hook")
+            init_params = self._pool_init_params_hook()
+            self.request_queue.put({
+                "type": "init",
+                "max_output_len": init_params.get("max_output_len", 4096),
+                "max_context_length": init_params.get("max_context_length"),
+            })
+            spawn_to_ready_s = time.monotonic() - spawn_start
+            # The scheduler side of the new generation (completion pump,
+            # listener re-arm, then resume) is part of the restart: neither
+            # hook needs the serving state, and if either fails the restart
+            # failed, so it must end in workers_down rather than in a serving
+            # state with a quiesced scheduler or no completion consumer.
+            if self._scheduler_generation_hook is not None:
+                self._scheduler_generation_hook()
+            if self._resume_hook is not None:
+                self._resume_hook()
+        except BaseException:
+            if teardown_owned:
+                self._teardown_lock.release()
+            with self._lock:
+                self._state = "workers_down"
+            raise
+        with self._lock:
+            self._generation += 1
+            self._state = "serving"
+            self._first_ready = True
+            self._worker_exit_state.clear()
+            self._reconciled_failure = False
         return {
-            "status": "reload_success" if all_success and len(results) >= expected_ranks else "reload_partial",
-            "ranks_reported": len(results),
-            "ranks_expected": expected_ranks,
-            "elapsed_s": timeout - max(0, deadline - _time.monotonic()),
-            "per_rank": results,
+            "generation": self.generation,
+            "failed_batches": reconciliation["failed_batches"],
+            "elapsed_s": time.monotonic() - started_at,
+            "phase_timings": {
+                "quiesce_s": quiesce_s,
+                "teardown_s": teardown_s,
+                "reconcile_s": reconcile_s,
+                "spawn_to_ready_s": spawn_to_ready_s,
+            },
         }
 
     # ---------------------- Startup helpers ----------------------
@@ -920,9 +1219,7 @@ class WorkerManager:
             query_book_shm_prefix=(
                 self.args.runtime_identity.query_book_shm_prefix
             ),
-            reload_status_dir=str(
-                self.args.runtime_identity.reload_status_dir
-            ),
+            runtime_dir=str(self.args.runtime_identity.runtime_dir),
             pynccl_port_base=self.args.pynccl_port_base,
             pynccl_port_span=self.args.pynccl_port_span,
         )
@@ -946,6 +1243,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
                 self._fatal_ack_event,
+                self._cohort_shutdown_flag,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
@@ -1007,10 +1305,13 @@ class WorkerManager:
             return ps.parameter_server.tensor_meta_memfd_fd()
         return -1
 
-    def _wait_for_workers_ready(self) -> None:
+    def _wait_for_workers_ready(self, timeout_s: Optional[float] = None) -> None:
         if self.worker_process is None:
             return
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while not self._ready_event.wait(timeout=self._monitor_interval_s):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("worker cohort did not become ready before restart timeout")
             if self._worker_exit_state.is_failed():
                 reason = (
                     self._worker_exit_state.reason
@@ -1033,6 +1334,12 @@ class WorkerManager:
         self._monitor_thread.start()
 
     def _monitor_worker_processes(self) -> None:
+        # A failure is handed to _handle_worker_failure on every poll until
+        # this monitor is stopped or the cohort is gone, not just once: the
+        # handler declines while a restart owns the pool, and a cohort that
+        # dies just before that restart flips to serving must still be caught
+        # on the first poll after the flip.  Each reason is logged once.
+        reported = None
         while not self._monitor_stop_event.is_set():
             if self.worker_process is None:
                 return
@@ -1043,20 +1350,22 @@ class WorkerManager:
             except Exception as exc:
                 if self._stopping:
                     return
-                logger.exception("Worker process join failed")
-                self._handle_worker_failure(
-                    f"Worker process crashed: {exc}", exc
-                )
-                return
-            if self._monitor_stop_event.is_set():
-                return
-            exit_reason = self._collect_worker_exit_reason()
-            if exit_reason:
-                if self._stopping:
+                reason = f"Worker process crashed: {exc}"
+                if reason != reported:
+                    logger.exception("Worker process join failed")
+                    reported = reason
+                self._handle_worker_failure(reason, exc)
+            else:
+                if self._monitor_stop_event.is_set():
                     return
-                logger.error(exit_reason)
-                self._handle_worker_failure(exit_reason, None)
-                return
+                exit_reason = self._collect_worker_exit_reason()
+                if exit_reason:
+                    if self._stopping:
+                        return
+                    if exit_reason != reported:
+                        logger.error(exit_reason)
+                        reported = exit_reason
+                    self._handle_worker_failure(exit_reason, None)
             self._monitor_stop_event.wait(self._monitor_interval_s)
 
     def _collect_worker_exit_reason(self) -> Optional[str]:
@@ -1088,13 +1397,64 @@ class WorkerManager:
     ) -> None:
         if self._stopping:
             return
-        if self._worker_exit_state.set_failure(reason, exc):
-            logging.getLogger("uvicorn.error").error(
-                "[shutdown] worker failure detected epoch=%.6f: %s",
-                time.time(),
-                reason,
-            )
-            self._request_server_shutdown()
+        # Teardown and reconciliation of a cohort have exactly one owner.  The
+        # ownership check and the transition that claims it share one critical
+        # section, so an explicit restart cannot take the cohort between them:
+        # a restart that already set "restarting" owns the teardown (its own
+        # reap and reconcile cover the dead cohort), and a cohort already in
+        # "workers_down" is owned by whoever entered that state or by the
+        # next restart.  The claim also takes the teardown lock, held through
+        # the end of this reconcile: a restart requested from workers_down
+        # waits on it instead of racing this teardown and its SHM cleanup.
+        # Only a restart (state "restarting") or a claimed failure (state
+        # "workers_down") ever holds that lock, so it is free whenever the
+        # state is "serving".
+        with self._lock:
+            if self._state != "serving":
+                return
+            startup = not self._first_ready
+            if not startup:
+                if not self._teardown_lock.acquire(blocking=False):
+                    logger.error(
+                        "Worker failure not claimed: the cohort teardown is "
+                        "already owned while the pool is serving (%s)",
+                        reason,
+                    )
+                    return
+                if not self._worker_exit_state.set_failure(reason, exc):
+                    self._teardown_lock.release()
+                    return
+                self._state = "workers_down"
+        if startup:
+            if self._worker_exit_state.set_failure(reason, exc):
+                logging.getLogger("uvicorn.error").error(
+                    "[shutdown] worker failure during startup epoch=%.6f: %s",
+                    time.time(),
+                    reason,
+                )
+                self._request_server_shutdown()
+            return
+        logging.getLogger("uvicorn.error").error(
+            "Worker cohort failed after readiness; entering workers_down: %s",
+            reason,
+        )
+        try:
+            if self._quiesce_hook is not None:
+                self._quiesce_hook()
+            self._monitor_stop_event.set()
+            monitor = self._monitor_thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(timeout=5)
+                self._monitor_thread = None
+            try:
+                if self.worker_process is not None:
+                    self._stop_workers()
+                    self.worker_process = None
+                self._reconcile(reason, fail_in_flight=True)
+            except Exception:
+                logger.exception("Worker failure reconciliation failed")
+        finally:
+            self._teardown_lock.release()
 
     @staticmethod
     def _request_server_shutdown() -> None:

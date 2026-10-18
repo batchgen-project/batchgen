@@ -211,16 +211,35 @@ def test_decode_waits_only_for_token_event_after_host_kv_launch():
         for node in calls
         if ast.unparse(node.func) == "self._flush_deferred_kv_to_host"
     )
+    # The wait on the token event is now delegated to `_wait_decode_tokens`,
+    # which performs the same `synchronize()` when no cohort-teardown probe is
+    # armed and otherwise polls the same event with `query()`. The step still
+    # waits for that one event and nothing wider; the assertions below check
+    # both halves, here and inside the helper.
     token_wait = next(
         node
         for node in calls
-        if ast.unparse(node.func) == "_new_tokens_ready.synchronize"
+        if ast.unparse(node.func) == "self._wait_decode_tokens"
     )
+    assert [ast.unparse(arg) for arg in token_wait.args] == ["_new_tokens_ready"]
 
     assert token_copy.lineno < token_record.lineno < kv_launch.lineno < token_wait.lineno
     hot_path = "\n".join(source.splitlines()[token_copy.lineno - 1 : token_wait.end_lineno])
     assert "torch.cuda.synchronize" not in hot_path
     assert "current_stream(self.torch_device).synchronize" not in hot_path
+
+    # The helper waits for the event it was handed and for nothing else: no
+    # device-wide sync, no stream sync, no other event.
+    helper = _worker_method("_wait_decode_tokens")
+    waits = sorted(
+        ast.unparse(node.func)
+        for node in ast.walk(ast.parse(helper))
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func).endswith((".synchronize", ".query"))
+    )
+    assert waits == ["event.query", "event.query", "event.synchronize"]
+    assert "torch.cuda" not in helper
+    assert "current_stream" not in helper
 
 
 def test_cpp_host_kv_tasks_make_no_device_allocations_or_pageable_copies():

@@ -301,6 +301,13 @@ class HostPagedKVBackend {
 
     void ReleaseSequences(const std::vector<std::int64_t>& sequence_ids);
 
+    // Release every live sequence by walking only the shared sequence table,
+    // then rebuild the allocator's free state from page ownership so pages
+    // stranded by a killed writer are recovered. Requires that no worker is
+    // attached (the server's cohort reconcile). This intentionally never
+    // writes the host-KV data region.
+    void ReleaseAllSequences();
+
     std::vector<std::int32_t> ReleaseSequencePrefixPages(
         std::int64_t sequence_id, std::size_t num_pages);
 

@@ -49,6 +49,50 @@ _TOKENIZER_TRIM_TOKENS_PER_RANK = 1 << 20
 # 32x256K and 8x1M repro; it is not a universal character/token conversion.
 _TOKENIZER_SERIALIZE_CHARS_PER_RANK = 4_000_000
 
+# --- Bounded decode-step token wait (see _wait_decode_tokens) --------------
+# A rank whose peer died mid-decode blocks in the per-step token-event sync far
+# below Python, where no flag check can retire it, and aborting the dead
+# communicator does not reliably release it: the survivors then burn the
+# supervisor's whole grace window.  The wait is therefore a poll.  It costs
+# the same class of CPU as the blocking call it replaces: torch creates its CUDA
+# events with ``blocking=False`` by default (torch/cuda/streams.py Event.__new__)
+# and only a blocking event carries ``cudaEventBlockingSync``
+# (torch/csrc/jit/cuda/cuda.h), so cudaEventSynchronize already busy-spins in
+# the driver rather than parking the thread.
+#
+# The spin budget keeps the healthy fast path flat -- a decode step's readback
+# lands well inside it, so the common case is a handful of cudaEventQuery calls
+# and no sleep, no probe read at all.
+_DECODE_EVENT_SPIN_BUDGET_S = 0.002
+_DECODE_EVENT_POLL_INTERVAL_S = 1e-4
+# ``_wait_decode_tokens``' two outcomes.  COMPLETED is exactly what
+# ``synchronize()`` guarantees: the step's device work is done and its readback
+# buffers hold this step's tokens.  ABANDONED means the cohort is being torn
+# down and the event may never fire, so none of the step's outputs may be read.
+_DECODE_WAIT_COMPLETED = "completed"
+_DECODE_WAIT_ABANDONED = "abandoned"
+# Total budget for the LOCAL quiesce on a decode teardown exit.  An abandoned
+# step leaves its host-KV appends and its async KV load parked behind device
+# work the dead collective will never let finish, so the quiesce bounds them
+# itself (see _quiesce_decode_for_cohort_shutdown) and self-exits rather than
+# unwind while they still hold page-table pointers.
+#
+# The bound is established by NON-BLOCKING probes only -- never by running a
+# blocking wait under a timeout, on this thread or any other.  MEASURED: the
+# append task's wait is bound as `.def("wait", &kv::KVAsyncTask::wait)`
+# (core/batchgen_Binding.cpp:968) with no `py::call_guard<gil_scoped_release>`,
+# so a task parked behind the dead collective blocks in
+# `std::shared_future::get` HOLDING THE GIL.  No other Python can then run --
+# not the deadline, not the abort watchdog, not the supervisor's self-exit net
+# -- so the rank burns the whole grace window.  `KVAsyncTask::done()`
+# (core/KV_Storage/host_paged_kv_worker_view.h:93-99) is a `wait_for(0s)` status
+# test, and a CUDA event query is the same class of probe for device work; both
+# are safe to call under the GIL because neither can wait.
+_COHORT_QUIESCE_DEADLINE_S = 5.0
+_COHORT_QUIESCE_POLL_INTERVAL_S = 1e-3
+_COHORT_QUIESCE_DEADLINE_REASON = "quiesce-deadline"
+
+
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
                               min_count: int = 32) -> bool:
@@ -377,7 +421,7 @@ class _DualAsyncLoadTask:
 	"""Forwards .wait() to both primary and aux async KV load tasks.
 
 	Either side may be None (non-DSA model or aux-disabled diagnostic mode);
-	.wait() skips None. Used by mid-decode reload paths where we must ensure
+	.wait() skips None. Used by mid-decode paths where we must ensure
 	both caches are on-GPU before the next decode step reads them.
 	"""
 	__slots__ = ("_primary", "_aux")
@@ -826,7 +870,7 @@ class BatchGenWorkerArgs:
 	host_kv_aux_shm_name: str = "batchgen_host_kv_cache_aux"
 	prefix_cache_shm_name: str = "batchgen_prefix_cache"
 	query_book_shm_prefix: str = "batchgen_input_ids"
-	reload_status_dir: str = "/tmp/batchgen_reload_status"
+	runtime_dir: str = "/tmp"
 	pynccl_port_base: int = 20003
 	pynccl_port_span: int = 100
 
@@ -915,6 +959,15 @@ class BatchGenWorker:
 		self._watchdog = None
 		# Decode watchdog: per-decode-step timeout (separate from general watchdog)
 		self._decode_watchdog = None
+
+		# Cohort teardown probe, set by the worker supervisor before the main
+		# loop (see set_cohort_shutdown_probe).  None until then, and on every
+		# path that never serves a pool, so every call site must tolerate it.
+		self._cohort_shutdown_probe = None
+		# Latched by the decode-step boundary check so the supervisor can name
+		# the exit path this rank actually took.  Never cleared: a cohort
+		# teardown is terminal for this process.
+		self._cohort_shutdown_observed = False
 
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
@@ -1308,7 +1361,6 @@ class BatchGenWorker:
 		self._prompt_tensors: Dict[str, torch.Tensor] = {}
 		self._buffer_pool_generation = 0
 		self._query_book_shm_prefix = args.query_book_shm_prefix
-		self._reload_status_dir = args.reload_status_dir
 		# Superseded pools stay mapped for the process lifetime (see
 		# _retire_buffer_pool).
 		self._retired_buffer_pools: List[QueryBookBufferPool] = []
@@ -1706,8 +1758,7 @@ class BatchGenWorker:
 					# 410 and WorkerManager.infer is gone), so reaching this line
 					# means some other producer is putting legacy payloads on the
 					# queue: fail loudly rather than park. Deliberately NOT a
-					# catch-all for unknown messages -- {"command": "reload"} also
-					# lands here and must keep its current handling.
+					# Unknown messages must fail loudly rather than being swallowed.
 					raise LegacyInferenceDeprecated()
 			except queue_mod.Empty:
 				pass
@@ -3123,6 +3174,285 @@ class BatchGenWorker:
 		if hasattr(watchdog, '_active'):
 			watchdog._active = False
 
+	def set_cohort_shutdown_probe(self, probe) -> None:
+		"""Install the zero-argument cohort-teardown probe.
+
+		``probe()`` answers one question -- has this cohort's teardown begun --
+		and the supervisor owns what backs it (a plain load from a lock-free
+		shared byte the manager stores to).  Keeping it a callable is what keeps
+		the flag's shape, and the no-handshake contract that goes with it, out
+		of this class.
+		"""
+		self._cohort_shutdown_probe = probe
+
+	def _cohort_shutdown_requested(self) -> bool:
+		"""Has this cohort's teardown begun?
+
+		Called once per decode step on the hot path, so it stays a single
+		attribute load and, when armed, one shared-byte load behind the probe:
+		no lock, no allocation, no logging.  Unarmed (no supervisor, or a code
+		path that never serves a pool) it is a ``None`` test and nothing else.
+		"""
+		probe = self._cohort_shutdown_probe
+		return probe is not None and probe()
+
+	def _wait_decode_tokens(self, event) -> str:
+		"""Wait for a decode step's sampled-token readback, pollably.
+
+		This replaces the per-step ``event.synchronize()`` that is the measured
+		wedge point.  A rank whose peer died mid-decode blocks there forever: it
+		runs no Python, so the decode-step teardown boundary a few lines below
+		it is unreachable, and aborting the dead communicator does not reliably
+		release it.  Polling is the only way the main thread can see the
+		teardown flag at all.
+
+		Unarmed -- ``_cohort_shutdown_probe is None``, i.e. every path that
+		never serves a worker pool -- this IS the legacy call and nothing else.
+		There is no poll, no clock read and no behavior to regress.
+
+		Armed, the wait has two phases.  First a bare query spin bounded by
+		``_DECODE_EVENT_SPIN_BUDGET_S``: a healthy decode step's readback lands
+		inside it, so the hot path stays a few cudaEventQuery calls with no
+		sleep and no probe read.  Then the poll proper, which reads the probe
+		BEFORE the event every iteration.  That order is deliberate: the event
+		may never fire, so a teardown that is already requested must not be made
+		to wait for it.  Returning ABANDONED is how a wedged rank gets to leave.
+
+		Returns ``_DECODE_WAIT_COMPLETED`` -- identical semantics to
+		``synchronize()`` returning -- or ``_DECODE_WAIT_ABANDONED``.  The caller
+		must read none of the step's outputs on ABANDONED.
+
+		No logging and no allocation happen in either loop; the only names
+		touched are module constants and the two bound callables.
+		"""
+		probe = self._cohort_shutdown_probe
+		if probe is None:
+			event.synchronize()
+			return _DECODE_WAIT_COMPLETED
+		spin_until = time.perf_counter() + _DECODE_EVENT_SPIN_BUDGET_S
+		while True:
+			if event.query():
+				return _DECODE_WAIT_COMPLETED
+			if time.perf_counter() >= spin_until:
+				break
+		while True:
+			if probe():
+				return _DECODE_WAIT_ABANDONED
+			if event.query():
+				return _DECODE_WAIT_COMPLETED
+			time.sleep(_DECODE_EVENT_POLL_INTERVAL_S)
+
+	def _poll_until(self, ready, deadline) -> bool:
+		"""Poll one NON-BLOCKING readiness probe until the shared deadline.
+
+		``ready()`` must answer "is this work finished?" without waiting:
+		``KVAsyncTask.done()`` (a ``wait_for(0s)`` status test) and
+		``cudaEventQuery`` behind ``torch.cuda.Event.query()`` are the two
+		shapes used here.  That is the whole point of this helper.  The waits
+		themselves may NOT be bounded this way, nor on a helper thread: the
+		append task's ``wait`` holds the GIL while it blocks, so one such call
+		anywhere in the process freezes the deadline that is supposed to bound
+		it, the abort watchdog and the supervisor's self-exit net along with it.
+
+		The probe is read once before the clock, so work that is already
+		finished proves itself even if the budget is gone -- readiness is
+		readiness, and self-exiting a rank whose readers have all returned would
+		throw away a perfectly ordered unwind.
+
+		Returns True only if the probe answered True.  Anything else, including
+		a probe that raises (a task type with no non-blocking ``done()``), is
+		reported as not-quiesced: this runs during teardown, and the caller's
+		safe answer to "I cannot prove the local readers are done" is to end the
+		process rather than unwind.  It never raises, for the same reason the
+		quiesce itself never raises.
+		"""
+		try:
+			while True:
+				if ready():
+					return True
+				if time.perf_counter() >= deadline:
+					return False
+				time.sleep(_COHORT_QUIESCE_POLL_INTERVAL_S)
+		except BaseException:
+			logging.warning(
+				"Rank %s: probing a decode teardown quiesce wait failed; "
+				"treating it as not quiesced",
+				self.rank,
+				exc_info=True,
+			)
+			return False
+
+	def _pending_kv_appends_done(self) -> bool:
+		"""Has every pending host-KV append task finished?  Never waits.
+
+		``done()`` is ``future_.wait_for(0s) == ready`` in the native task
+		(``core/KV_Storage/host_paged_kv_worker_view.h:93-99``, bound at
+		``core/batchgen_Binding.cpp:969``), so this is a status read per task and
+		nothing else.  ``None`` entries are skipped exactly as the real drain
+		skips them, and a worker that never created the list (the drain's own
+		``hasattr`` guard admits that case) has nothing in flight.
+		"""
+		for task in getattr(self, "_pending_kv_append_tasks", ()):
+			if task is not None and not task.done():
+				return False
+		return True
+
+	def _record_quiesce_device_event(self):
+		"""A non-blocking probe for the device work this rank already queued.
+
+		This replaces the ``torch.cuda.synchronize(self.torch_device)`` the load
+		drain used to end in: on an abandoned step that sync is unbounded, and
+		it is the last thing standing between the teardown and the unwakeable
+		state one level down.  An event recorded on the worker's current stream
+		(the stream the decode step records its token event on) is ready exactly
+		once the work queued ahead of it has run, and ``query()`` reads that
+		with ``cudaEventQuery`` -- no wait, no GIL hazard.
+
+		Returns the event, or ``None`` if it could not even be recorded, which
+		the caller treats as "the device state cannot be proven" and self-exits.
+		"""
+		try:
+			event = torch.cuda.Event()
+			event.record(torch.cuda.current_stream(self.torch_device))
+			return event
+		except BaseException:
+			logging.warning(
+				"Rank %s: recording the decode teardown quiesce device probe "
+				"failed; treating it as not quiesced",
+				self.rank,
+				exc_info=True,
+			)
+			return None
+
+	def _self_exit_on_quiesce_deadline(self) -> None:
+		"""End this process instead of unwinding past a quiesce that did not land.
+
+		The ordered teardown releases the very mappings the parked waits hold
+		raw pointers into -- the host-KV appends are std::async threads reading
+		the worker view's page table unlocked -- so an unwind that cannot prove
+		they finished is a use-after-free during teardown.  That is the one
+		hazard this whole exit path exists to avoid, so when the bound expires
+		the rank takes the supervisor's own bounded outcome directly.
+
+		The marker keeps the ``path=self-exit`` grep key the supervisor's safety
+		net emits, so marker accounting still sums, and adds a reason so the two
+		causes stay distinguishable in the logs.  ``os._exit`` runs no atexit
+		hook and no stream flush, so the marker is flushed first or it is lost.
+
+		The import is local because ``server_worker_main_loop`` imports this
+		module; by the time any rank can reach here that module is loaded, since
+		it is what arms the probe this path depends on.
+		"""
+		from batchgen.server_worker_main_loop import (
+			_EXIT_PATH_SELF_EXIT,
+			_WORKER_SELF_EXIT_CODE,
+			_flush_worker_logs,
+		)
+
+		logging.error(
+			"[shutdown] worker exit path=%s rank=%s pid=%s reason=%s",
+			_EXIT_PATH_SELF_EXIT,
+			self.rank,
+			os.getpid(),
+			_COHORT_QUIESCE_DEADLINE_REASON,
+		)
+		_flush_worker_logs()
+		os._exit(_WORKER_SELF_EXIT_CODE)
+
+	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
+		"""Let LOCAL in-flight decode work finish before the ordered teardown.
+
+		Called on the decode loop's teardown exits.  Everything waited on here
+		is work this rank already launched and that holds raw pointers into
+		mappings the ordered teardown is about to release -- the host-KV append
+		tasks (std::async threads reading the worker view's page table with no
+		lock) and an async host->GPU KV load.  Returning out of decode with
+		either still in flight is a use-after-free during teardown, which is
+		why the exit quiesces instead of just leaving.
+
+		Every wait here is deliberately LOCAL.  ``defer_errors=True`` keeps the
+		append drain off the cross-rank error sync, which is the one thing this
+		exit must never do: the peer whose death started this teardown will
+		never join a collective again, so a guarded one would hang exactly
+		where the unfixed code hung.
+
+		Nothing raises out of here.  This runs on a teardown path whose whole
+		purpose is to unwind normally -- an exception would escape as an error
+		and lose the ordered exit -- so a failed quiesce is logged and the
+		teardown continues; the process is about to drop these mappings anyway.
+
+		The quiesce is BOUNDED, by one shared ``_COHORT_QUIESCE_DEADLINE_S``
+		budget, and the bound is established by NON-BLOCKING PROBES ONLY.  On
+		the exit taken when the step's token event was ABANDONED the step's
+		device work is parked behind the dead collective, so every wait here is
+		parked with it -- and MEASURED, the append task's ``wait`` blocks while
+		HOLDING THE GIL (no ``gil_scoped_release`` in its binding), which
+		freezes the deadline meant to bound it, the abort watchdog and the
+		supervisor's self-exit net.  A blocking wait therefore may not be
+		called, on this thread or any other, until something non-blocking has
+		proven it cannot block:
+
+		  1. every pending host-KV append task reports ``done()``;
+		  2. the async KV load task reports ``done()`` (the dual coordinator's
+		     composite task answers for both of its halves);
+		  3. the device-work probe recorded at entry reports ``query()``, which
+		     is what the load drain's unbounded device sync became.
+
+		All three inside the budget: the real drains then run with every future
+		ready and the ordered unwind proceeds exactly as before.  Any of them
+		expiring is the one case that may not unwind at all (the readers are
+		still live, holding page-table pointers), so it self-exits with the
+		reason recorded, inside ~5 s instead of the supervisor's grace window.
+		On the healthy clean-restart exits all three probes answer immediately.
+		"""
+		deadline = time.perf_counter() + _COHORT_QUIESCE_DEADLINE_S
+		device_event = self._record_quiesce_device_event()
+
+		quiesced = self._poll_until(self._pending_kv_appends_done, deadline)
+		if quiesced and pending_async_task is not None:
+			quiesced = self._poll_until(lambda: pending_async_task.done(), deadline)
+		if quiesced:
+			quiesced = device_event is not None and self._poll_until(
+				device_event.query, deadline
+			)
+
+		if quiesced:
+			try:
+				if self._pending_kv_append_tasks:
+					self._wait_pending_kv_append_tasks(defer_errors=True)
+			except BaseException:
+				logging.warning(
+					"Rank %s: draining host-KV appends at the decode teardown "
+					"boundary failed; continuing the ordered teardown",
+					self.rank,
+					exc_info=True,
+				)
+			try:
+				if pending_async_task is not None:
+					pending_async_task.wait()
+			except BaseException:
+				logging.warning(
+					"Rank %s: draining the pending async KV load at the decode "
+					"teardown boundary failed; continuing the ordered teardown",
+					self.rank,
+					exc_info=True,
+				)
+
+		self.disable_decode_watchdog()
+		if not quiesced:
+			self._self_exit_on_quiesce_deadline()
+
+	@property
+	def cohort_shutdown_observed(self) -> bool:
+		"""True once the decode-step boundary check retired this rank.
+
+		Read by the worker supervisor to name the exit path.  It is a latch, not
+		a re-read of the probe: the supervisor must be able to tell a rank that
+		left THROUGH the decode boundary from one that merely happened to have
+		the flag set by the time it finished something else.
+		"""
+		return self._cohort_shutdown_observed
+
 	def feed_watchdog(self) -> None:
 		"""Feed the watchdog to prevent timeout during long operations."""
 		if self._watchdog is not None:
@@ -4398,9 +4728,9 @@ class BatchGenWorker:
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
 		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
 
-		Why: mid-decode reload paths at lines 7688, 9201, 9370 load primary KV
+		Why: mid-decode paths at lines 7688, 9201, 9370 load primary KV
 		only. For DSA models, aux pages are allocated (coordinator mirrors
-		allocate/grow/free) but never filled on reload, so the indexer reads
+		allocate/grow/free) but never filled after a worker generation change, so the indexer reads
 		stale or zeroed K vectors and produces garbage top-K. This helper
 		mirrors the primary load under the same rebuilt-page-table state.
 
@@ -7389,7 +7719,7 @@ class BatchGenWorker:
 
 		# Update sequence status and reset GPU allocation
 		# NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
-		# ON_HOLD sequences are continuing decode when reloaded, so they should
+		# ON_HOLD sequences are continuing decode when resumed, so they should
 		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8459,6 +8789,23 @@ class BatchGenWorker:
 
 		# Persistent loop: continues until all completed AND no more admissions expected
 		while True:
+			# --- Cohort teardown boundary ---
+			# Carries the decode-step exit the rest of the way out.  Without it
+			# the decode phase below is re-entered while its sequences are still
+			# IN_DECODE -- its setup issues collectives before decoding_continuous
+			# returns at its own check again -- so the rank would spin on
+			# aborted communicators instead of leaving.
+			#
+			# This tests the LATCH, deliberately not the probe.  Reading the flag
+			# here would also retire an IDLE pool, which today leaves through the
+			# queue sentinel a few lines below and is counted as
+			# ordered-via-sentinel; the cohort flag is set just before that
+			# sentinel, so a probe test would silently take over every clean
+			# teardown.  Only a rank that actually left the decode loop at its
+			# boundary exits here.
+			if self._cohort_shutdown_observed:
+				break
+
 			# --- ADMISSION CHECK: Poll for new sequences from IntakePool ---
 			if self._admission_queue is not None:
 				admitted = self._poll_admissions()
@@ -8488,18 +8835,18 @@ class BatchGenWorker:
 				if self._shutdown_requested:
 					break  # Pool mode: shutdown requested and all done
 				# Pool mode: wait briefly for more work before exiting
-				# status tensor encoding: [has_new_work, shutdown, reload]
+				# status tensor encoding: [has_new_work, shutdown]
 				import queue as queue_mod
 				if self.rank == 0:
 					try:
 						msg = self._admission_queue.get(timeout=1.0)
 						if msg is None:
 							self._shutdown_requested = True
-							status = torch.tensor([0, 1, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 						elif isinstance(msg, dict) and msg.get("type") == "admit":
 							# Broadcast that we got new work
-							status = torch.tensor([1, 0, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
@@ -8512,18 +8859,6 @@ class BatchGenWorker:
 							generation_start_time = time.perf_counter()
 							self._timing_logged = False
 							# Continue loop — new sequences will be picked up
-						elif isinstance(msg, dict) and msg.get("command") == "reload":
-							# Hot-reload command — broadcast to all ranks then handle.
-							# Result is written below this run's reload-status directory
-							# inside _handle_hot_reload (via _write_reload_status), NOT
-							# put on response_queue. Putting on response_queue would
-							# deadlock the FastAPI event loop because the sync HTTP
-							# handler can't drain mp.Queue while blocking.
-							status = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.torch_device)
-							dist.broadcast(status, src=0)
-							container = [msg]
-							dist.broadcast_object_list(container, src=0)
-							self._handle_hot_reload(msg)
 						elif isinstance(msg, dict) and "prompts" in msg:
 							# Legacy /v1/inference payload -- see the matching
 							# guard in _poll_admissions. The `else` below would
@@ -8531,20 +8866,19 @@ class BatchGenWorker:
 							# completion off the shared response queue.
 							raise LegacyInferenceDeprecated()
 						else:
-							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
-						status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 						dist.broadcast(status, src=0)
 						continue  # Try again
 				else:
 					# Non-rank-0: wait for rank 0's broadcast
-					status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
+					status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
 					dist.broadcast(status, src=0)
 					has_new = status[0].item() == 1
 					is_shutdown = status[1].item() == 1
-					is_reload = status[2].item() == 1
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
@@ -8555,10 +8889,6 @@ class BatchGenWorker:
 						decoding_time = 0.0
 						generation_start_time = time.perf_counter()
 						self._timing_logged = False
-					elif is_reload:
-						container = [None]
-						dist.broadcast_object_list(container, src=0)
-						self._handle_hot_reload(container[0])
 					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
@@ -9125,6 +9455,16 @@ class BatchGenWorker:
 				self._mark_phase_end("decode")
 				decoding_time += time.perf_counter() - decode_start
 
+				# The decode loop returned because this cohort is being torn
+				# down.  Stop here: the cleanup immediately below ends in
+				# dist.barrier(), a fresh collective on a communicator that was
+				# very likely just aborted, and the rank that reaches it either
+				# raises or re-wedges.  Leaving both loops instead carries the
+				# rank out of generate() having issued nothing further, which is
+				# what lets the supervisor run the ordered teardown.
+				if self._cohort_shutdown_observed:
+					break
+
 				# D. Cleanup
 				self._finish_decode_interval()
 				dist.barrier()
@@ -9140,7 +9480,7 @@ class BatchGenWorker:
 				# Check if there are queued sequences waiting for prefill AND
 				# host KV has enough free capacity to make prefill worthwhile.
 				# Without the watermark check, decode oscillates: breaks every
-				# DECISION_INTERVAL, puts all seqs ON_HOLD (~12s reload), prefills
+				# DECISION_INTERVAL, puts all seqs ON_HOLD during a phase transition, prefills
 				# only a handful of sequences, then resumes — destroying throughput.
 				has_pending = self.global_batch.has_queueing() or (
 					self.enable_host_kv_eviction and self.global_batch.has_evicted()
@@ -16608,7 +16948,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
 		# Phase B: also drop the adapter's reference to the captured segment so
-		# the next /v1/reload + recapture starts from a clean adapter context.
+		# the next worker generation starts from a clean adapter context.
 		if self._cuda_graph_adapter is not None:
 			try:
 				self._cuda_graph_adapter.release_all(manager=None)
@@ -17865,6 +18205,18 @@ class BatchGenWorker:
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
+			# --- Decode-step teardown boundary (top of step) ---
+			# The second of this loop's two flag tests.  The one after the token
+			# readback below catches a rank the abort just freed; this one
+			# catches the ordinary case where teardown began between steps, so
+			# the step never issues any work at all.  See the post-readback
+			# check for why neither may break out of this loop, and for why the
+			# in-flight local work is quiesced on the way out.
+			if self._cohort_shutdown_requested():
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
+
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
 
@@ -18816,8 +19168,37 @@ class BatchGenWorker:
 			# then drains the append tasks below.
 			self._flush_deferred_kv_to_host()
 			_split_t2 = time.perf_counter()
-			_new_tokens_ready.synchronize()
+			# --- The measured production wedge point, made pollable ---
+			# This was a blocking `_new_tokens_ready.synchronize()`.  A rank
+			# whose peer died mid-decode blocks there below Python and runs
+			# nothing again: the teardown boundary below is unreachable, and
+			# aborting the dead communicator does not free it.
+			# _wait_decode_tokens keeps
+			# that exact call, byte for byte, whenever the shutdown probe is
+			# unarmed, and otherwise polls the event so the flag can be seen.
+			_decode_wait = self._wait_decode_tokens(_new_tokens_ready)
 			_split_t3 = time.perf_counter()
+
+			# --- Decode-step teardown boundary (the abandoned token wait) ---
+			# The wait gave up on an event that may never fire, so NOTHING this
+			# step produced may be read: the sampled tokens are not in the
+			# pinned buffer, and the step's host-KV appends are parked behind
+			# the same dead device work.  That is why this exit sits BEFORE the
+			# per-step drain below rather than after it -- that drain is
+			# unbounded and ends in a device sync, i.e. the same unwakeable
+			# state one level down.  The D1 invariant it exists for is kept
+			# instead by _quiesce_decode_for_cohort_shutdown, which runs the
+			# same local drain under a deadline and self-exits rather than
+			# unwind with those unlocked page-table readers still live.
+			#
+			# As with the two flag checks, the exit RETURNS (a break would run
+			# the post-loop drain, which syncs errors across ranks on the
+			# aborted communicator) and latches, so the supervisor names this
+			# ordered-via-decode-boundary.
+			if _decode_wait == _DECODE_WAIT_ABANDONED:
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
 
 			# [KV_APPEND_DRAIN] Complete this step's host appends before the
 			# next step. Each task is a std::async thread that reads the worker
@@ -18838,6 +19219,35 @@ class BatchGenWorker:
 			# drain, both of which sync errors across ranks.
 			if self._pending_kv_append_tasks:
 				self._wait_pending_kv_append_tasks(defer_errors=True)
+
+			# --- Decode-step teardown boundary (the measured wedge point) ---
+			# The sync a few lines up is where a rank whose peer died mid-decode
+			# is stuck, far below Python, and where the cohort abort releases it.
+			# The release is SILENT: the sync returns normally and nothing raises
+			# afterwards -- in graph mode nothing ever will -- so this flag test
+			# is the only thing that can retire the freed rank.  It sits as close
+			# to the sync as the step's own invariants allow, because the window
+			# is finite: the rank resumes stepping and then re-wedges
+			# permanently, with no second warning.
+			#
+			# It sits AFTER the drain above, not before it, and that ordering is
+			# a correctness requirement rather than a preference.  The appends
+			# this step launched are std::async threads holding unlocked
+			# pointers into the worker view's page table, and the ordered
+			# teardown this exit leads to releases that mapping.  Returning with
+			# them still in flight is a use-after-free during teardown, so the
+			# step always finishes draining what it started.
+			#
+			# The exit is a RETURN, not a break.  Breaking would fall into this
+			# loop's post-loop cleanup, which drains with
+			# sync_distributed_errors=True and so issues a fresh
+			# dist.all_gather_object on the communicator that was just aborted
+			# -- which the dead peer will never join.
+			if self._cohort_shutdown_requested():
+				self._cohort_shutdown_observed = True
+				self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+				return decode_uuids, batch
+
 			_split_t4 = time.perf_counter()
 			# One host read of this step's sampled tokens for the whole
 			# microbatch, replacing two `.item()` calls per row below.
@@ -20308,126 +20718,6 @@ class BatchGenWorker:
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
 				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
 					self.model.model.layers[layer_idx].mlp.cleanup()
-
-	def _handle_hot_reload(self, msg: dict) -> dict:
-		"""Hot-reload batchgen_worker module and rebind methods on this instance.
-
-		Called from inside generate_persistent() admission loop. Both rank 0
-		and other ranks must call this so all ranks reload in lockstep.
-
-		Returns: dict with status, rebound count, skipped count, missing attrs.
-		"""
-		import importlib
-		import inspect
-		import re
-		import sys
-		import logging as _log
-		try:
-			reload_deps = msg.get("reload_deps", True) if isinstance(msg, dict) else True
-
-			# Reload commonly-changed dependent modules first
-			if reload_deps:
-				dep_modules = [
-					"batchgen.server.batch_scheduler",
-					"batchgen.server.intake_pool",
-					"batchgen.server.scheduling_pool",
-					"batchgen.kv_cache.gpu_paged_kv_manager",
-					"batchgen.attention.dsa.glm5_decode_selector",
-				]
-				for mod_name in dep_modules:
-					if mod_name in sys.modules:
-						importlib.reload(sys.modules[mod_name])
-						_log.info(f"Rank {self.rank}: Reloaded dependency {mod_name}")
-
-			# Reload the worker module itself
-			import batchgen.batchgen_worker as worker_module
-			importlib.reload(worker_module)
-			NewClass = worker_module.BatchGenWorker
-
-			# Validate: warn if new __init__ adds attrs missing on this instance
-			missing = []
-			try:
-				new_init_src = inspect.getsource(NewClass.__init__)
-				old_init_src = inspect.getsource(type(self).__init__)
-				if new_init_src != old_init_src:
-					new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
-					missing = sorted([a for a in new_attrs if not hasattr(self, a)])
-					if missing:
-						_log.warning(
-							f"Rank {self.rank}: RELOAD WARNING — new __init__ has "
-							f"{len(missing)} attrs missing on existing worker: {missing[:10]}"
-						)
-			except (OSError, TypeError):
-				pass
-
-			# Rebind methods (skip __init__ and dunders). Preserve descriptor
-			# semantics so hot reload does not turn staticmethods into bound
-			# instance methods.
-			rebound = 0
-			skipped = 0
-			for name, descriptor in NewClass.__dict__.items():
-				if name == "__init__":
-					skipped += 1
-					continue
-				if name.startswith("__") and name.endswith("__"):
-					continue
-				try:
-					if isinstance(descriptor, staticmethod):
-						setattr(self, name, descriptor.__func__)
-					elif isinstance(descriptor, classmethod):
-						setattr(self, name, descriptor.__func__.__get__(type(self), type(self)))
-					elif inspect.isfunction(descriptor):
-						setattr(self, name, descriptor.__get__(self, type(self)))
-					else:
-						continue
-					rebound += 1
-				except Exception:
-					skipped += 1
-
-			_log.info(
-				f"Rank {self.rank}: Hot reload SUCCESS — "
-				f"rebound {rebound} methods, skipped {skipped}"
-				+ (f", {len(missing)} missing attrs" if missing else "")
-			)
-			result = {
-				"status": "reload_success",
-				"rank": self.rank,
-				"rebound": rebound,
-				"skipped": skipped,
-				"missing_attrs": missing,
-			}
-			self._write_reload_status(result)
-			return result
-		except Exception as e:
-			_log.error(f"Rank {self.rank}: Hot reload FAILED: {e}", exc_info=True)
-			result = {"status": "reload_failed", "rank": self.rank, "error": str(e)}
-			self._write_reload_status(result)
-			return result
-
-	def _write_reload_status(self, result: dict) -> None:
-		"""Write reload status atomically to this run's status directory.
-
-		The HTTP server polls these files instead of waiting on a queue,
-		which avoids deadlocks when the FastAPI event loop is blocked.
-		"""
-		import json
-		import os
-		import tempfile
-		import time as _time
-		try:
-			result_with_time = dict(result)
-			result_with_time["timestamp"] = _time.time()
-			status_dir = self._reload_status_dir
-			os.makedirs(status_dir, exist_ok=True)
-			# Write to temp then atomic rename
-			fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")
-			with os.fdopen(fd, "w") as f:
-				json.dump(result_with_time, f)
-			final_path = os.path.join(status_dir, f"rank_{self.rank}.json")
-			os.rename(tmp_path, final_path)
-		except Exception as e:
-			import logging as _log
-			_log.warning(f"Rank {self.rank}: Failed to write reload status: {e}")
 
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.

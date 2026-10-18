@@ -96,6 +96,7 @@ void BindHostPagedManager(py::module& m, const char* name) {
            py::arg("sequence_id"))
        .def("free_sequences", &Manager::FreeSequences,
            py::arg("sequence_ids"))
+        .def("release_all_sequences", &Manager::ReleaseAllSequences)
         .def("build_page_table", &Manager::BuildPageTable,
              py::arg("sequence_ids"))
         .def("get_stats", &Manager::GetStats)

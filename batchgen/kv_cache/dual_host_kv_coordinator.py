@@ -39,6 +39,26 @@ class DualAsyncKVTask:
 				"DualAsyncKVTask requires both primary and auxiliary tasks"
 			)
 
+	def done(self) -> bool:
+		"""Have both halves finished?  Never waits.
+
+		The composite exists so one Python object can stand in for a single
+		native ``KVAsyncTask``, and the teardown quiesce needs the same
+		non-blocking completion probe from either shape: the native task's
+		``done()`` is a zero-timeout future status test, so this is a status
+		read per half and nothing else.  It must stay non-blocking --
+		``KVAsyncTask.wait`` is bound without releasing the GIL, so a wait taken
+		on a teardown path freezes every escape hatch in the worker, which is
+		exactly what the quiesce's probes exist to avoid.
+
+		No guard and no fallback: a half that cannot answer without blocking
+		raises, and the one caller that must not fail during teardown
+		(``BatchGenWorker._quiesce_decode_for_cohort_shutdown``) treats a
+		raising probe as "not proven done" and ends the process instead of
+		unwinding over live readers.
+		"""
+		return bool(self.primary_task.done() and self.aux_task.done())
+
 	def wait(self) -> None:
 		errors = []
 		for name, task in (
@@ -419,6 +439,11 @@ class DualHostKVCoordinator:
 	def release_sequence_pages(self, sequence_ids) -> None:
 		self.primary.release_sequence_pages(sequence_ids)
 		self.require_auxiliary("release_sequence_pages").release_sequence_pages(sequence_ids)
+
+	def release_all_sequences(self) -> None:
+		"""Release every host-KV sequence in both mirrored managers."""
+		self.primary.release_all_sequences()
+		self.require_auxiliary("release_all_sequences").release_all_sequences()
 
 	def unregister_sequences(self, sequence_ids) -> None:
 		self.primary.unregister_sequences(sequence_ids)

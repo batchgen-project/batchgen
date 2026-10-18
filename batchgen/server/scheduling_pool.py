@@ -249,6 +249,14 @@ class SchedulingPool:
             }
             return tracker
 
+    def clear_active_slots(self) -> int:
+        """Return every worker-owned slot to the free pool after a fatal stop."""
+        with self._lock:
+            count = len(self._active_slots)
+            self._free_slots.extend(self._active_slots.values())
+            self._active_slots.clear()
+            return count
+
     # -------------------- Intake Selection --------------------
 
     def select_from_intake(

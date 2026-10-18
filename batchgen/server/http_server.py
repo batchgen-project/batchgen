@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -127,6 +128,14 @@ def create_app(
             worker._acquire_runtime_admission()
             storage = StorageManager(server_args.storage_path)
             scheduler = BatchScheduler(storage, worker, server_args)
+            worker.set_lifecycle_hooks(
+                quiesce=scheduler.quiesce,
+                resume=scheduler.resume,
+                fail_in_flight=scheduler.fail_in_flight,
+                generation_ready=scheduler.worker_generation_ready,
+                pool_init_params=scheduler.pool_init_params,
+                retire_channels=scheduler.stop_completion_pump,
+            )
             app.state.storage = storage
             app.state.scheduler = scheduler
 
@@ -356,6 +365,23 @@ def create_app(
     async def create_batch(request: Request, body: CreateBatchRequest):
         storage: StorageManager = request.app.state.storage
         scheduler: BatchScheduler = request.app.state.scheduler
+        worker_manager: WorkerManager = request.app.state.worker
+
+        # Admission control: a batch may only be created while the worker pool
+        # is serving. Accepting one during a restart or while the pool is down
+        # hands the client a success receipt for work the server knows it
+        # cannot start, and the batch can never run.
+        pool_state = worker_manager.state
+        if pool_state != "serving":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Worker pool is not serving (state={pool_state}). "
+                    "Batch creation is unavailable until the pool is serving "
+                    "again. Retry later."
+                ),
+                headers={"Retry-After": "30"},
+            )
 
         # Admission control: reject early if intake pool is near capacity (>90%)
         if scheduler.intake_pool_usage_pct() > 0.9:
@@ -484,56 +510,76 @@ def create_app(
             },
         )
 
-    @app.post("/v1/reload")
-    async def reload_worker(request: Request):
-        """Hot-reload worker code without restarting the server.
-
-        Reloads batchgen_worker module and dependent modules, then rebinds
-        all methods on the existing worker instance. Host KV, weights, and
-        NCCL stay alive.
-
-        Body (optional):
-            {"reload_deps": true}    — also reload batch_scheduler, intake_pool, etc.
-            {"timeout": 30}          — timeout in seconds for collecting per-rank status
-            {"pool_mode": true|false} — override pool-mode detection
-        """
+    @app.post("/v1/workers/restart")
+    async def restart_workers(request: Request):
         worker_manager: WorkerManager = request.app.state.worker
         try:
             body = await request.json()
         except Exception:
             body = {}
-        reload_deps = body.get("reload_deps", True)
-        timeout = float(body.get("timeout", 30.0))
+        timeout = float(body.get("timeout", 600.0))
+        loop = asyncio.get_running_loop()
 
-        # Pool mode is detected via the scheduler. If a BatchScheduler is
-        # active and the worker has been initialized into pool mode, use
-        # send_pool_reload (file-polling). Otherwise use legacy sync RPC.
-        pool_mode = body.get("pool_mode")
-        if pool_mode is None:
-            # Auto-detect: pool mode means the worker main loop has handed
-            # off to generate_persistent and is no longer servicing the
-            # request_queue/response_queue sync path.
-            scheduler = getattr(request.app.state, "scheduler", None)
-            pool_mode = bool(getattr(scheduler, "_pool_initialized", False)) if scheduler else False
+        def dispatch_on_main_thread(fn, dispatch_timeout):
+            done = threading.Event()
+            result = []
 
-        if pool_mode:
-            result = await asyncio.to_thread(
-                worker_manager.send_pool_reload,
-                reload_deps=reload_deps,
+            def invoke():
+                try:
+                    result.append((True, fn()))
+                except BaseException as exc:
+                    result.append((False, exc))
+                finally:
+                    done.set()
+
+            loop.call_soon_threadsafe(invoke)
+            if not done.wait(dispatch_timeout):
+                raise TimeoutError("main-thread worker spawn dispatch timed out")
+            ok, value = result[0]
+            if not ok:
+                raise value
+            return value
+
+        worker_manager.set_main_thread_dispatcher(dispatch_on_main_thread)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(worker_manager.restart_workers, timeout_s=timeout),
                 timeout=timeout,
             )
-        else:
-            result = await asyncio.to_thread(
-                worker_manager.send_reload_command,
-                reload_deps=reload_deps,
-                timeout=timeout,
+        except RuntimeError as exc:
+            if "restart conflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "state": worker_manager.state,
+                    "generation": worker_manager.generation,
+                    "error": str(exc),
+                    "partial": True,
+                },
             )
-        return result
+
+    @app.get("/v1/workers/status")
+    async def workers_status(request: Request):
+        return request.app.state.worker.status()
 
     @app.get("/health")
     async def health_check(request: Request):
         health: ServerHealthState = request.app.state.health
         worker_exit: WorkerExitState = request.app.state.worker_exit_state
+        worker_manager: WorkerManager = request.app.state.worker
+
+        if worker_manager.state in {"workers_down", "restarting"}:
+            if worker_manager.state == "restarting":
+                reason = worker_exit.reason or "Worker restart in progress."
+            else:
+                reason = worker_exit.reason or "Worker pool is down."
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unhealthy", "reason": reason},
+            )
 
         if worker_exit.is_failed():
             return JSONResponse(

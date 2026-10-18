@@ -142,6 +142,17 @@ class IntakePool:
             logger.info(f"[INTAKE] Drained {len(result)} entries (remaining: {remaining}/{self._max_capacity})")
         return result
 
+    def requeue(self, entry: IntakeEntry) -> None:
+        """Put one selected entry back when quiesce wins the send race."""
+        with self._lock:
+            info = self._batch_info.get(entry.batch_id)
+            if info is not None:
+                info.remaining_in_intake += 1
+            if entry.priority == Priority.HIGH:
+                self._high.appendleft(entry)
+            else:
+                self._normal.appendleft(entry)
+
     def is_empty(self) -> bool:
         with self._lock:
             return len(self._high) == 0 and len(self._normal) == 0
@@ -164,6 +175,25 @@ class IntakePool:
         """Clean up batch tracking info after batch is finalized."""
         with self._lock:
             self._batch_info.pop(batch_id, None)
+
+    def remove_batch_entries(self, batch_id: str) -> int:
+        """Drop every queued entry of *batch_id*; return how many were dropped.
+
+        A batch that has been persisted as failed must never send another
+        request to a worker, so its still-queued entries are discarded rather
+        than left for the drain to admit to a later worker generation.
+        """
+        with self._lock:
+            removed = 0
+            for name in ("_high", "_normal"):
+                entries: Deque[IntakeEntry] = getattr(self, name)
+                kept = deque(e for e in entries if e.batch_id != batch_id)
+                removed += len(entries) - len(kept)
+                setattr(self, name, kept)
+            info = self._batch_info.get(batch_id)
+            if info is not None:
+                info.remaining_in_intake = 0
+            return removed
 
     # -------------------- Internal --------------------
 
