@@ -257,10 +257,22 @@ class SequenceEntry:
         """Reject inconsistent per-sequence metadata at module boundaries.
 
         A sampled EOS/length-capped token can advance the logical context by
-        one after the last KV row has been written.  Boundary code releases
-        that sequence before another forward, so it may validate the scalar
-        state while allowing only this terminal host/GPU capacity gap.  All
-        structural invariants and positive allocation checks remain strict.
+        one after the last KV row has been written, so boundary code may
+        validate the scalar state while allowing only this terminal host/GPU
+        capacity gap.  All structural invariants and positive allocation
+        checks remain strict.
+
+        The gap is terminal in the sense that the context stops there, not
+        that no further forward happens: a retired row stays in the decode
+        row list until the next boundary and keeps being forwarded at its
+        frozen terminal context, which is why
+        ``gpu_pages_allocated * PAGE_SIZE >= current_context_length`` is
+        checked with ``>=`` -- an aligned ``kv_token_budget`` fills its last
+        page exactly.  One-step lookahead
+        (``batchgen.worker.decode_lookahead``) reaches that same terminal
+        context one step earlier and never advances past it: the extra token
+        a retired row computes is discarded, not accepted, so the reservation
+        this check validates is unchanged by it.
         """
         prefix = f"{context}: sequence {self.uuid} gid={self.global_idx}"
 

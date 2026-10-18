@@ -241,8 +241,11 @@ def test_many_steps_conserve_slots():
 
 
 def test_step_split_layout_and_accumulation():
+    # One-step lookahead reordered the step: the host bookkeeps the previous
+    # step's tokens BEFORE draining this step's KV appends, because the drain
+    # is the first call that waits on this step's device work.
     assert DECODE_STEP_SPLIT_SEGMENTS == (
-        "setup", "fwd_launch", "kv_launch", "readback", "kv_drain", "bookkeeping",
+        "setup", "fwd_launch", "kv_launch", "readback", "bookkeeping", "kv_drain",
     )
     assert DECODE_STEP_SPLIT_SLOTS == 8
     split = new_decode_step_split()
@@ -254,7 +257,7 @@ def test_step_split_layout_and_accumulation():
     assert split[1:] == pytest.approx([26.0, 2.0, 4.0, 2.0, 12.0, 4.0, 2.0])
     assert format_decode_step_split(split) == (
         "step_ms=13.0 (setup 1.0, fwd_launch 2.0, kv_launch 1.0, readback 6.0, "
-        "kv_drain 2.0, bookkeeping 1.0)"
+        "bookkeeping 2.0, kv_drain 1.0)"
     )
 
 

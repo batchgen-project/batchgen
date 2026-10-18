@@ -204,23 +204,34 @@ def test_decode_waits_only_for_token_event_after_host_kv_launch():
     token_record = next(
         node
         for node in calls
-        if ast.unparse(node.func) == "_new_tokens_ready.record"
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record"
+        and ast.unparse(node.func.value).startswith("_new_tokens_ready[")
     )
     kv_launch = next(
         node
         for node in calls
         if ast.unparse(node.func) == "self._flush_deferred_kv_to_host"
     )
+    # One-step lookahead: the only token wait on the step path belongs to the
+    # PREVIOUS step and happens inside the pending-step apply, after this
+    # step's forward and KV copies are already launched.
     token_wait = next(
         node
         for node in calls
-        if ast.unparse(node.func) == "_new_tokens_ready.synchronize"
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_apply_pending_decode_tokens"
     )
 
     assert token_copy.lineno < token_record.lineno < kv_launch.lineno < token_wait.lineno
     hot_path = "\n".join(source.splitlines()[token_copy.lineno - 1 : token_wait.end_lineno])
     assert "torch.cuda.synchronize" not in hot_path
     assert "current_stream(self.torch_device).synchronize" not in hot_path
+
+    # The apply's own wait is a single event wait, not a device-wide one.
+    apply_src = _worker_method("_apply_pending_decode_tokens")
+    assert "torch.cuda.synchronize" not in apply_src
+    assert "event_ring[pending.slot].synchronize()" in apply_src
 
 
 def test_cpp_host_kv_tasks_make_no_device_allocations_or_pageable_copies():

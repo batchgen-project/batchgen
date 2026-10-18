@@ -93,7 +93,15 @@ def test_forward_event_pair_brackets_forward_and_sample():
     )
     t1 = _index(body, _assigns("_split_t1"), "_split_t1")
     end = _index(body, _calls("_fwd_ring.end"), "_fwd_ring.end")
-    token_copy = _index(body, _calls("_new_tokens_pinned[:bs].copy_"), "token copy")
+    # The copy targets this step's slot of the lookahead ring; the previous
+    # step's tokens are still unread in the other slot.
+    token_copy = _index(
+        body, _calls("_new_tokens_pinned[_la_slot][:bs].copy_"), "token copy"
+    )
+    event_record = _index(
+        body, _calls("_new_tokens_ready[_la_slot].record"), "token readback event"
+    )
+    assert token_copy < event_record
 
     assert begin == t0 + 1 and begin < forward < t1 < end < token_copy
     # The end marker is recorded on the stream that produced the tokens.

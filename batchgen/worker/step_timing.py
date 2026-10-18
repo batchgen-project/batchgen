@@ -33,12 +33,17 @@ DECODE_STEP_SPLIT_SEGMENTS: Tuple[str, ...] = (
     "fwd_launch",
     # sampled-token D2H copy launch + host-KV D2H append-task launch
     "kv_launch",
-    # host wait for the sampled-token copy
+    # host wait for the sampled-token copy of the step being bookkept. Under
+    # one-step lookahead that is the PREVIOUS step's copy, which completed
+    # while this step's forward was being launched, so the wait is nominal.
     "readback",
+    # per-sequence token / EOS / repetition updates for that step. It sits
+    # before kv_drain because it is pure host work that must overlap the
+    # forward just launched; the drain below is the first call that waits on
+    # this step's device work.
+    "bookkeeping",
     # host wait for this step's host-KV append tasks
     "kv_drain",
-    # per-sequence token / EOS / repetition updates
-    "bookkeeping",
 )
 DECODE_STEP_SPLIT_SLOTS = 2 + len(DECODE_STEP_SPLIT_SEGMENTS)
 

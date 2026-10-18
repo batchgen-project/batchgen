@@ -197,6 +197,10 @@ from batchgen.worker.kv_manager import (
 	WatermarkTriggerRequest,
 )
 from batchgen.worker.sampling_residency import DecodeSamplingResidency
+from batchgen.worker.decode_lookahead import (
+	DecodeLookaheadState,
+	effective_cache_seqlens,
+)
 from batchgen.worker.step_timing import (
 	FORWARD_EVENT_RING_SLOTS,
 	ForwardEventRing,
@@ -17688,6 +17692,126 @@ class BatchGenWorker:
 					f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
 				)
 
+	def _apply_pending_decode_tokens(
+		self,
+		lookahead: DecodeLookaheadState,
+		pinned_ring: List[torch.Tensor],
+		event_ring: List[object],
+		local_iteration: int,
+		readback_mark: Optional[List[float]] = None,
+	) -> int:
+		"""Bookkeep one in-flight decode step's sampled tokens.
+
+		This is the host half of a decode step: the readback wait, the one
+		``tolist()`` for the whole microbatch, the trajectory append and the
+		termination decisions (EOS/stop, max-length, repetition).  Under
+		one-step lookahead it runs during the *next* step, after that step's
+		forward and KV-append copies are already launched, so the wait and
+		the bookkeeping overlap GPU work instead of standing between two
+		forwards.
+
+		Returns the number of rows that accepted a token.  A no-op when
+		nothing is in flight, which is what makes it safe to call at every
+		flush point (page boundary, eager/compare step, loop exit).
+
+		The GPU is untouched here: the lookahead reorders *when* the host
+		reads, never *what* the device computed.
+		"""
+		if not lookahead.is_armed:
+			return 0
+
+		pending = lookahead.take()
+		bs = pending.num_rows
+		# The readback event of the step being applied.  In the steady state
+		# it completed long ago -- the forward launched after it has already
+		# been queued -- so this is a formality rather than a stall.
+		event_ring[pending.slot].synchronize()
+		if readback_mark is not None:
+			# Boundary between the ``readback`` and ``bookkeeping`` buckets of
+			# the step split; the caller owns the surrounding marks.
+			readback_mark.append(time.perf_counter())
+		# One host read of that step's sampled tokens for the whole
+		# microbatch, instead of two `.item()` calls per row below.
+		new_token_ids = pinned_ring[pending.slot][:bs].reshape(-1).tolist()
+		if len(new_token_ids) < bs:
+			raise RuntimeError(
+				f"decode sampled {len(new_token_ids)} tokens for {bs} rows"
+			)
+
+		# [COMPLETED_ROW_SKIP] A row that was already retired when this step
+		# was launched must not receive a trajectory token and must not be
+		# advanced; losing this skip writes a token into a retired row's
+		# book.  ``pending.active`` was evaluated exactly once, at arm time,
+		# from each row's own fields -- which is also why a row retired by
+		# the *previous* step's token is already excluded here: that token
+		# was applied before this step was armed.  Its computed token is
+		# discarded, exactly as the synchronous path discards the token of a
+		# row it keeps forwarding until the next boundary.
+		_row_active = pending.active
+		# One batched QueryBook append for the step, over the live rows only,
+		# instead of one pybind call per row.
+		self._append_trajectory_tokens(
+			[seq for seq, live in zip(pending.sequences, _row_active) if live],
+			[tok for tok, live in zip(new_token_ids, _row_active) if live],
+		)
+
+		applied = 0
+		for i, seq in enumerate(pending.sequences):
+			if not _row_active[i]:
+				continue
+			applied += 1
+
+			seq.decoded_length += 1
+			seq.current_context_length = (
+				seq.original_prompt_length + seq.decoded_length
+			)
+
+			# Already on the host from this step's single tolist()
+			token_id = new_token_ids[i]
+
+			# DIAG: Log first 3 tokens for first 10 seqs in each decode group
+			if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
+				logging.info(
+					f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
+					f"decoded_len={seq.decoded_length} token={token_id}"
+				)
+			if self._should_stop_at_eos(token_id, seq):
+				seq.eos_reached = True
+
+			if seq.decoded_length >= seq.max_decode_length:
+				seq.eos_reached = True
+
+			# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
+			if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
+				if token_id == seq._rep_last_token:
+					seq._rep_count += 1
+					if seq._rep_count >= 32:
+						seq._rep_detected = True
+						seq.eos_reached = True
+						seq.log_event(SeqEvent.REPETITION, self.rank,
+							f"token={token_id}, count={seq._rep_count}")
+						lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+							seq._lifespan_log, "REPETITION")
+						logging.warning(
+							f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
+							f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+						)
+				else:
+					seq._rep_last_token = token_id
+					seq._rep_count = 1
+				# Variable-length N-gram pattern check (every 64 tokens)
+				if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
+					_dl = seq.decoded_length
+					_tokens = self._trajectory_decoded_tokens(seq)
+					if _check_repeating_pattern(_tokens, _dl):
+						seq._rep_detected = True
+						seq.eos_reached = True
+						logging.warning(
+							f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
+							f"gid={seq.global_idx} at decoded_len={_dl}"
+						)
+		return applied
+
 	def decoding_continuous(
 		self,
 		new_tokens: torch.Tensor,
@@ -17815,10 +17939,27 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate pinned memory and one reusable completion event for the
+		# P0: Pre-allocate pinned memory and reusable completion events for the
 		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
-		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
-		_new_tokens_ready = torch.cuda.Event()
+		#
+		# R4: two slots, not one. With one-step lookahead, step N's tokens are
+		# still unread when step N+1 launches its own readback, so a single
+		# buffer would be overwritten before it was consumed. The ring is
+		# indexed by step parity; each slot grows independently so growing the
+		# slot being written can never disturb the slot holding pending tokens.
+		_NEW_TOKENS_SLOTS = 2
+		_new_tokens_pinned = [
+			torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
+			for _ in range(_NEW_TOKENS_SLOTS)
+		]
+		_new_tokens_ready = [torch.cuda.Event() for _ in range(_NEW_TOKENS_SLOTS)]
+		# R4: one-step lookahead. Step N's sampled-token readback and host
+		# bookkeeping run during step N+1, after that step's forward and KV
+		# appends are launched. The state object owns the row identity and the
+		# per-row accept mask of the in-flight step, and fails loud if the row
+		# set moves while a step is pending. Local to this decode round for the
+		# same reason as the accumulators above.
+		_lookahead = DecodeLookaheadState()
 
 		# Device-resident per-request sampling parameters. Rebuilding them each
 		# step meant three `torch.tensor(..., device=cuda)` calls, i.e. three
@@ -17890,8 +18031,12 @@ class BatchGenWorker:
 				)
 				# The sampling fallback count is now accumulated on device so
 				# the step path never reads it back. Drain it here, where the
-				# sampled-token readback has already caught the device up, so an
-				# invalid-probability row still surfaces instead of going silent.
+				# sampled-token readback of the step before last has already
+				# caught the device up (one-step lookahead), so an
+				# invalid-probability row still surfaces instead of going
+				# silent; the count is cumulative, so a one-step lag only
+				# shifts which heartbeat reports a row, never whether it is
+				# reported.
 				_bad_rows = _sampling_residency.drain_bad_rows()
 				if _bad_rows:
 					logging.warning(
@@ -17904,6 +18049,18 @@ class BatchGenWorker:
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				# R4 flush: the boundary decides completion, admission and
+				# retirement from host sequence state, rebinds the ordered row
+				# list and runs collectives over it. None of that may see a
+				# step whose tokens have not been bookkept, so the pipeline is
+				# drained before the boundary rather than across it. The flush
+				# condition is rank-identical (``force_host_boundary`` comes
+				# from a collective, ``local_iteration`` advances in lockstep),
+				# so every rank carries the same lag at every boundary.
+				self._apply_pending_decode_tokens(
+					_lookahead, _new_tokens_pinned, _new_tokens_ready,
+					local_iteration,
+				)
 				last_boundary = local_iteration
 				force_host_boundary = False
 
@@ -18096,22 +18253,37 @@ class BatchGenWorker:
 
 			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
 
+			# R4: per-row +1 for a row whose produced token has not been bookkept
+			# yet, so this step's vectors are the ones the synchronous path
+			# would have built. All zeros when nothing is in flight (first step
+			# of a round, and every step after a flush). Raises if the ordered
+			# row set moved while a step was pending -- a lost flush, not a
+			# recoverable condition.
+			_lookahead_offsets = _lookahead.context_offsets(batch) if batch else ()
+			# Only the steady-state whole-model-graph path defers its readback.
+			# The branches below that need this step's tokens on the host turn
+			# this off and keep the synchronous order.
+			_lookahead_eligible = True
+
 			# Invariant check: cache_seqlens must not exceed allocated pages.
 			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
+			# Checked on the EFFECTIVE context (host + pending), because that is
+			# what the forward below passes as cache_seqlens.
 			if BATCHGEN_DECODE_ASSERT and batch:
-				for seq in batch_sequences:
+				for seq, _la_off in zip(batch_sequences, _lookahead_offsets):
 					max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
-					if seq.current_context_length > max_tokens:
+					if seq.current_context_length + _la_off > max_tokens:
 						logging.error(
 							f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
-							f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
+							f"ctx={seq.current_context_length + _la_off} > max_tokens={max_tokens} "
 							f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
 							f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
 							f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
 							f"status={seq.status})"
 						)
 						raise RuntimeError(
-							f"cache_seqlens overrun: ctx={seq.current_context_length} > "
+							f"cache_seqlens overrun: ctx={seq.current_context_length + _la_off} "
+							f"(host={seq.current_context_length}, lookahead=+{_la_off}) > "
 							f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
 							f"{max_tokens} for {seq.uuid[:8]}"
 						)
@@ -18124,7 +18296,12 @@ class BatchGenWorker:
 				if batch:
 					# Collect context lengths with invariant validation
 					# ALWAYS: current_context_length == original_prompt_length + decoded_length
-					cache_seqlens = []
+					#
+					# The invariant is checked on the HOST value, which counts
+					# only tokens this row has accepted. R4's pending token is
+					# added afterwards, as a per-row offset, so the scalar state
+					# is never written speculatively and never rolled back.
+					_host_ctx = []
 					for seq in batch_sequences:
 						ctx_len = seq.current_context_length
 						expected = seq.original_prompt_length + seq.decoded_length
@@ -18139,7 +18316,15 @@ class BatchGenWorker:
 							lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
 							seq.current_context_length = expected
 							ctx_len = expected
-						cache_seqlens.append(ctx_len)
+						_host_ctx.append(ctx_len)
+
+					# This step's cache_seqlens: accepted tokens + the one
+					# in-flight token per live row. Identical to the
+					# synchronous build, which is what keeps the sampled
+					# tokens bit-identical.
+					cache_seqlens = effective_cache_seqlens(
+						_host_ctx, _lookahead_offsets
+					)
 
 					max_ctx = max(cache_seqlens)
 
@@ -18266,11 +18451,18 @@ class BatchGenWorker:
 					# inside a step, so re-resolving every row through
 					# _local_to_uuid_map + get_sequence here was pure
 					# duplication.
+					# The host mirror writes this step's token at index
+					# ``cache_seqlens - 1`` -- the same slot the device writes
+					# (``q_position_ids = cache_seqlens - 1``). It must therefore
+					# use the EFFECTIVE context, including R4's in-flight token,
+					# or the host copy would overwrite the previous token.
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
-					for seq in batch_sequences:
+					for seq, _la_off in zip(batch_sequences, _lookahead_offsets):
 						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
+						_kv_seq_lengths.append(
+							seq.current_context_length + _la_off - 1
+						)
 					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
 					self._deferred_kv_entries = []
 					self._deferred_kv_entries_aux = []
@@ -18660,6 +18852,10 @@ class BatchGenWorker:
 							) * 1000.0
 						eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
 						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
+						# Graph-vs-eager compare keeps the synchronous form: it
+						# already syncs the device to time the eager replay, and
+						# its whole purpose is to inspect this step's tokens.
+						_lookahead_eligible = False
 						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 							compare_glm5_whole_model_graph_logits,
 						)
@@ -18794,6 +18990,10 @@ class BatchGenWorker:
 					# causing RoPE to be applied at position 0 instead of the actual token position.
 					outputs = self._glm5_decode_model_forward(new_tokens)
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+					# Per-layer-graph / eager forward keeps the synchronous form:
+					# it is not the steady-state path R4 targets, and it does not
+					# go through the resident sampling tensors either.
+					_lookahead_eligible = False
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
@@ -18804,20 +19004,65 @@ class BatchGenWorker:
 			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
 			# exact token-readback boundary before launching host-KV copies on their
 			# independent D2H stream.
+			#
+			# R4: the copy goes to this step's ring slot and the host does NOT
+			# wait for it here. It is consumed one step later, by which time the
+			# event has long completed.
 			bs = new_tokens.shape[0]
-			if bs > _new_tokens_pinned.shape[0]:
-				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
-			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
-			_new_tokens_ready.record(torch.cuda.current_stream(self.torch_device))
+			if bs < len(batch):
+				# The row count is checked HERE, against the tensor actually
+				# copied, because the pending apply reads the slot one step
+				# later by row count alone: a short copy would otherwise hand
+				# a stale token to the last rows instead of raising.
+				raise RuntimeError(
+					f"decode sampled {bs} tokens for {len(batch)} rows"
+				)
+			_la_slot = local_iteration % _NEW_TOKENS_SLOTS
+			if bs > _new_tokens_pinned[_la_slot].shape[0]:
+				# Grow this slot only: the other slot may hold tokens that have
+				# not been bookkept yet.
+				_new_tokens_pinned[_la_slot] = torch.empty(
+					bs, 1, dtype=torch.long, pin_memory=True
+				)
+			_new_tokens_pinned[_la_slot][:bs].copy_(new_tokens[:bs], non_blocking=True)
+			_new_tokens_ready[_la_slot].record(torch.cuda.current_stream(self.torch_device))
 
 			# Host-KV offload orders its own stream with a device-side event, so
-			# launching it needs no host wait. The host first waits for the
-			# sampled-token readback (needed for exact EOS and output bookkeeping),
-			# then drains the append tasks below.
+			# launching it needs no host wait.
 			self._flush_deferred_kv_to_host()
 			_split_t2 = time.perf_counter()
-			_new_tokens_ready.synchronize()
-			_split_t3 = time.perf_counter()
+
+			# R4: bookkeep the PREVIOUS step now. Its readback event completed
+			# while the forward above was being launched, so this is host work
+			# overlapping GPU work instead of a wait between two forwards. A
+			# no-op on the first step of a round and after any flush.
+			_readback_mark: List[float] = []
+			self._apply_pending_decode_tokens(
+				_lookahead, _new_tokens_pinned, _new_tokens_ready,
+				local_iteration, readback_mark=_readback_mark,
+			)
+			_split_t3 = _readback_mark[0] if _readback_mark else time.perf_counter()
+			# Arm this step. ``active`` is evaluated exactly once per row, here,
+			# after the previous step's retirements have been applied -- so a row
+			# retired by the previous token is already excluded and the token it
+			# is about to produce will be discarded rather than appended. Rows
+			# with nothing to bookkeep (empty local batch) are not armed, which
+			# keeps the row-identity check below meaningful.
+			if batch:
+				_lookahead.arm(
+					batch,
+					batch_sequences,
+					[not self._is_sequence_completed(seq) for seq in batch_sequences],
+					_la_slot,
+				)
+				if not _lookahead_eligible:
+					# Paths that need this step's tokens on the host keep the
+					# synchronous order: apply immediately instead of deferring.
+					self._apply_pending_decode_tokens(
+						_lookahead, _new_tokens_pinned, _new_tokens_ready,
+						local_iteration,
+					)
+			_split_t4 = time.perf_counter()
 
 			# [KV_APPEND_DRAIN] Complete this step's host appends before the
 			# next step. Each task is a std::async thread that reads the worker
@@ -18828,101 +19073,42 @@ class BatchGenWorker:
 			# that now belongs to a freshly prefilled sequence. Measured on the
 			# 512x4096 K3 contract: every victim was in a wave after the first
 			# and collapsed at its 2nd or ~28th token, while the first wave (no
-			# page-table mutation in flight) was clean. The drain sits after the
-			# token readback only so its wait (which ends in a full device sync)
-			# gets its own split slot instead of being charged to the copy
-			# launch; nothing between the launch above and here touches a page
-			# table. defer_errors=True keeps it a purely local wait (a guarded
-			# collective would deadlock when only some ranks have tasks); the
-			# deferred errors surface at the next boundary PHASE 0 or loop-exit
-			# drain, both of which sync errors across ranks.
+			# page-table mutation in flight) was clean. The drain sits last in
+			# the step because it is the first call that waits on this step's
+			# device work: the copies are ordered behind the forward on their
+			# own stream, so this wait absorbs the tail of the forward. Nothing
+			# between the launch above and here touches a page table, and the
+			# lookahead bookkeeping in between mutates only per-sequence scalars
+			# and the trajectory book. defer_errors=True keeps it a purely local
+			# wait (a guarded collective would deadlock when only some ranks
+			# have tasks); the deferred errors surface at the next boundary
+			# PHASE 0 or loop-exit drain, both of which sync errors across
+			# ranks.
+			#
+			# R5: device_sync=False. The task's own completion already implies
+			# its copies are done -- every append task lambda ends with
+			# SynchronizeWithEvent on its copy stream
+			# (core/KV_Storage/host_paged_kv_worker_view.h:1177 and :1372, helper
+			# at :3019-3023), which records an event after the enqueued copies
+			# and blocks the task thread on it. So task.wait() means "this
+			# task's D2H reads have completed", not merely "producer->copy was
+			# ordered". The extra full-device sync therefore added nothing for
+			# the append copies; what it did add was a host block until the
+			# whole graph replay retired, every step. Page free/reuse and
+			# page-table mutation are boundary-rate, and those drains keep the
+			# device sync.
 			if self._pending_kv_append_tasks:
-				self._wait_pending_kv_append_tasks(defer_errors=True)
-			_split_t4 = time.perf_counter()
-			# One host read of this step's sampled tokens for the whole
-			# microbatch, replacing two `.item()` calls per row below.
-			new_token_ids = _new_tokens_pinned[:bs].reshape(-1).tolist()
-			if len(new_token_ids) < len(batch_sequences):
-				raise RuntimeError(
-					f"decode sampled {len(new_token_ids)} tokens for "
-					f"{len(batch_sequences)} rows"
+				self._wait_pending_kv_append_tasks(
+					defer_errors=True, device_sync=False
 				)
-
-			# [COMPLETED_ROW_SKIP] A row that is already retired must not
-			# receive a trajectory token and must not be advanced below;
-			# losing this skip writes a token into a retired row's book.
-			# The predicate is still evaluated exactly once per row, and it
-			# reads only that row's own fields, so deciding every row before
-			# the appends cannot change any row's answer.
-			_row_active = [
-				not self._is_sequence_completed(seq) for seq in batch_sequences
-			]
-			# One batched QueryBook append for the step, over the live rows
-			# only, instead of one pybind call per row.
-			self._append_trajectory_tokens(
-				[seq for seq, live in zip(batch_sequences, _row_active) if live],
-				[tok for tok, live in zip(new_token_ids, _row_active) if live],
-			)
-
-			# Update sequences (reuse batch_sequences from forward pass setup)
-			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if not _row_active[i]:
-					continue
-
-				seq.decoded_length += 1
-				seq.current_context_length = (
-					seq.original_prompt_length + seq.decoded_length
-				)
-
-				# Already on the host from this step's single tolist()
-				token_id = new_token_ids[i]
-
-				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
-				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
-					logging.info(
-						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
-						f"decoded_len={seq.decoded_length} token={token_id}"
-					)
-				if self._should_stop_at_eos(token_id, seq):
-					seq.eos_reached = True
-
-				if seq.decoded_length >= seq.max_decode_length:
-					seq.eos_reached = True
-
-				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
-					if token_id == seq._rep_last_token:
-						seq._rep_count += 1
-						if seq._rep_count >= 32:
-							seq._rep_detected = True
-							seq.eos_reached = True
-							seq.log_event(SeqEvent.REPETITION, self.rank,
-								f"token={token_id}, count={seq._rep_count}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-								seq._lifespan_log, "REPETITION")
-							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
-								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
-							)
-					else:
-						seq._rep_last_token = token_id
-						seq._rep_count = 1
-					# Variable-length N-gram pattern check (every 64 tokens)
-					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
-						_dl = seq.decoded_length
-						_tokens = self._trajectory_decoded_tokens(seq)
-						if _check_repeating_pattern(_tokens, _dl):
-							seq._rep_detected = True
-							seq.eos_reached = True
-							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
-								f"gid={seq.global_idx} at decoded_len={_dl}"
-							)
-
 			_split_t5 = time.perf_counter()
 			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
 			# Per-step CPU wall split (setup, fwd_launch, kv_launch, readback,
-			# kv_drain, bookkeeping), without adding any device sync of its own.
+			# bookkeeping, kv_drain), without adding any device sync of its own.
+			# ``readback`` and ``bookkeeping`` now measure the PREVIOUS step's
+			# token wait and host updates, which is where R4 moved them; the
+			# segment order follows the step, so the pre-R4 split is comparable
+			# bucket-for-bucket only after accounting for that swap.
 			accumulate_decode_step_split(
 				_step_split,
 				(forward_start, _split_t0, _split_t1, _split_t2, _split_t3, _split_t4, _split_t5),
@@ -18939,6 +19125,13 @@ class BatchGenWorker:
 				_dt.reset()
 
 		# Cleanup
+		# R4: a step may still be in flight if the loop exited between a
+		# forward and its bookkeeping. Dropping it would lose one token per
+		# row, so the flush is unconditional here rather than relying on the
+		# exit paths (all of which currently flush at their boundary).
+		self._apply_pending_decode_tokens(
+			_lookahead, _new_tokens_pinned, _new_tokens_ready, local_iteration,
+		)
 		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		if pending_async_task is not None:
 			pending_async_task.wait()
@@ -19006,14 +19199,31 @@ class BatchGenWorker:
 		*,
 		sync_distributed_errors: bool = False,
 		defer_errors: bool = False,
+		device_sync: bool = True,
 	) -> int:
 		"""
 		Wait for all pending KV append tasks at page boundary.
 		Returns the number of tasks that were waited for.
-		
-		CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
-		Without this, KV data may not be fully written to host memory when
-		sequences are later resumed, causing KV corruption.
+
+		``task.wait()`` alone already implies that task's D2H copies have
+		completed: every append task lambda ends with ``SynchronizeWithEvent``
+		on its copy stream, which records an event after the enqueued copies
+		and blocks the task thread on it
+		(``core/KV_Storage/host_paged_kv_worker_view.h:1177`` and ``:1372``,
+		helper at ``:3019-3023``).  The thread join in the loop below is also
+		what guards the host-side page-table race the ``[KV_APPEND_DRAIN]``
+		comment in ``decoding_continuous`` records: that race is between the
+		task threads and this thread's register/allocate, and no device sync
+		can fix it.
+
+		``device_sync`` adds a full device synchronize on top.  It covers
+		neither of those two concerns; what it covers is every OTHER stream,
+		including the main stream's in-flight graph replay, before a caller
+		frees or re-assigns GPU pages.  Page free/reuse and page-table
+		mutation are boundary-rate, so boundary, watermark, loop-exit and
+		throttle drains keep it, and the steady-state step path passes
+		``device_sync=False`` to stop blocking the host on the replay once
+		per token.
 		"""
 		deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
 		if not hasattr(self, '_pending_kv_append_tasks'):
@@ -19048,12 +19258,12 @@ class BatchGenWorker:
 				except Exception as e:
 					wait_errors.append(f"{type(e).__name__}: {e}")
 		
-		# CRITICAL FIX: Sync CUDA after waiting for tasks
-		# The async tasks use a separate CUDA stream for D2H copies.
-		# Even though each task internally syncs its stream via cudaEventSynchronize,
-		# we need a full device sync to ensure ALL pending operations complete
-		# before we allow GPU pages to be freed/reused.
-		if num_tasks > 0 and not wait_errors:
+		# Sync CUDA after waiting for tasks, for callers that are about to free
+		# or re-assign GPU pages: each task has already drained its own copy
+		# stream (see the docstring), so what this adds is the rest of the
+		# device, the main stream's replay above all. Boundary-rate callers
+		# keep it; the per-step drain does not need it and must not pay it.
+		if device_sync and num_tasks > 0 and not wait_errors:
 			try:
 				torch.cuda.synchronize(self.torch_device)
 			except Exception as e:

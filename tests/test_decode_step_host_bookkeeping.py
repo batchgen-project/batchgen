@@ -72,8 +72,10 @@ def test_decode_step_resolves_host_kv_metadata_from_batch_sequences():
         n for n in ast.walk(fn)
         if isinstance(n, ast.For) and any(_names(n, "_kv_seq_ids"))
     )
-    assert ast.unparse(loop.iter) == "batch_sequences"
-    assert ast.unparse(loop.target) == "seq"
+    # One-step lookahead pairs each row with its pending-token offset, because
+    # the host mirror writes at the same index as the device.
+    assert ast.unparse(loop.iter) == "zip(batch_sequences, _lookahead_offsets)"
+    assert ast.unparse(loop.target) == "(seq, _la_off)"
     assert not _attributes(loop, "_local_to_uuid_map")
     assert not _calls(loop, "self.global_batch.get_sequence")
 
@@ -81,42 +83,66 @@ def test_decode_step_resolves_host_kv_metadata_from_batch_sequences():
 # -------------------------------------------------- batched trajectory append
 
 def test_decode_step_reads_the_sampled_tokens_once_per_step():
-    fn = _method("decoding_continuous")
-    assert len(_calls(fn, "_new_tokens_pinned[:bs].reshape(-1).tolist")) == 1
-    # No per-row readback of the sampled tokens survives in the step loop.
+    # The read moved into the pending-step apply, which is where a step's
+    # tokens are bookkept from (next step, boundary flush or loop exit).
+    fn = _method("_apply_pending_decode_tokens")
+    assert len(
+        _calls(fn, "pinned_ring[pending.slot][:bs].reshape(-1).tolist")
+    ) == 1
+    # No per-row readback of the sampled tokens survives anywhere.
     assert not _calls(fn, "new_tokens_cpu[i].item")
     assert not _names(fn, "new_tokens_cpu")
+    loop_fn = _method("decoding_continuous")
+    assert not _names(loop_fn, "new_tokens_cpu")
+    assert not _calls(loop_fn, "_new_tokens_pinned[:bs].reshape(-1).tolist")
 
 
 def test_decode_step_appends_trajectory_tokens_in_one_batched_call():
-    fn = _method("decoding_continuous")
+    fn = _method("_apply_pending_decode_tokens")
     batched = _calls(fn, "self._append_trajectory_tokens")
     assert len(batched) == 1, "the decode step must append once per step"
     assert not _calls(fn, "self._append_trajectory_token"), (
         "a per-row trajectory append is back in the decode step"
     )
+    # and the loop body must not append a second time
+    assert not _calls(
+        _method("decoding_continuous"), "self._append_trajectory_tokens"
+    )
 
 
 def test_decode_step_decides_each_row_once_and_keeps_the_completed_row_skip():
+    # The mask is decided in the loop, when the step is armed -- after the
+    # previous step's retirements have been applied -- and consumed by the
+    # apply. Deciding it at apply time instead would classify a row by state
+    # that its own token has already changed.
     fn = _method("decoding_continuous")
     completed = _calls(fn, "self._is_sequence_completed")
     assert len(completed) == 1, (
         "the completion predicate must be evaluated once per row, in the "
         "row-active mask"
     )
+    mask = next(
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.ListComp)
+        and ast.unparse(n.elt) == "not self._is_sequence_completed(seq)"
+    )
+    assert ast.unparse(mask.generators[0].iter) == "batch_sequences"
+    arm = _calls(fn, "_lookahead.arm")
+    assert len(arm) == 1
+    assert any(a is mask for a in arm[0].args), (
+        "the mask must be handed to arm(), so the step carries the decision "
+        "it was launched with"
+    )
 
-    mask = _assign_to(fn, "_row_active")
-    assert len(mask) == 1
-    value = mask[0].value
-    assert isinstance(value, ast.ListComp)
-    assert isinstance(value.elt, ast.UnaryOp)
-    assert isinstance(value.elt.op, ast.Not)
-    assert ast.unparse(value.elt.operand) == "self._is_sequence_completed(seq)"
-    assert ast.unparse(value.generators[0].iter) == "batch_sequences"
+    apply_fn = _method("_apply_pending_decode_tokens")
+    assert not _calls(apply_fn, "self._is_sequence_completed")
+    reuse = _assign_to(apply_fn, "_row_active")
+    assert len(reuse) == 1
+    assert ast.unparse(reuse[0].value) == "pending.active"
 
 
 def test_the_batched_append_receives_only_the_live_rows():
-    fn = _method("decoding_continuous")
+    fn = _method("_apply_pending_decode_tokens")
     call = _calls(fn, "self._append_trajectory_tokens")[0]
     mask = _assign_to(fn, "_row_active")[0]
     assert mask.lineno < call.lineno, (
@@ -134,11 +160,11 @@ def test_the_batched_append_receives_only_the_live_rows():
 
 
 def test_the_per_row_update_loop_still_skips_retired_rows():
-    fn = _method("decoding_continuous")
+    fn = _method("_apply_pending_decode_tokens")
     loop = next(
         n for n in ast.walk(fn)
         if isinstance(n, ast.For)
-        and ast.unparse(n.iter) == "enumerate(zip(batch, batch_sequences))"
+        and ast.unparse(n.iter) == "enumerate(pending.sequences)"
     )
     guard = loop.body[0]
     assert isinstance(guard, ast.If)
