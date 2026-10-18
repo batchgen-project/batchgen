@@ -47,6 +47,185 @@ def _quantize_indexer_k_pagesplit(
     k_fp8, scales = quantize_indexer_k_fp8(k_tensor)
     return k_fp8.contiguous(), scales.contiguous()
 
+
+# --------------------------------------------------------------------------- #
+#  Primary MLA host record: produced ONCE, at the host boundary
+# --------------------------------------------------------------------------- #
+#
+# GLM-5, GLM-5.1 and GLM-5.3 store the primary MLA latent as bf16 token-major
+# records (`source_dim` = kv_lora_rank + qk_rope_head_dim = 576 elements);
+# GLM-5.2 stores FlashMLA's packed FP8 record, 656 BYTES per token
+# (512 e4m3 NoPE | 16 B of fp32 block-128 scales | 128 B of bf16 RoPE) -- see
+# `batchgen_kernels/attention/mla_kv_packed.py` for the byte geometry and
+# `batchgen/attention/mla/primary_kv_record.py` for the single producer.
+#
+# WHICH SOURCE OF TRUTH.  Prefill's primary offload writes into the HOST paged
+# region, so the host region is the authority on which of the two records it
+# holds: the same discriminate-on-the-allocated-store rule the decode graph
+# applies to the GPU pool, moved to the store this writer actually targets.
+# Two alternatives were rejected:
+#
+#   * the GPU primary pool.  Not allocated yet.  It is created "once at the
+#     start of decoding" (`batchgen/batchgen_worker.py`,
+#     `_initialize_gpu_kv_manager_fixed_size`) and bound onto
+#     `AttnWrapperBase.gpu_paged_kv_manager` inside the decode loop
+#     (`batchgen/batchgen_worker.py:17624`), so during the first prefill wave
+#     there is no allocated GPU cache to read.  A discriminator that only
+#     works from wave 2 on is worse than none.
+#   * the model name / `model_type`.  The format is a property of the cache
+#     that was allocated, not of a name: `host_kv_mananger_config.py` selects
+#     `_GLM5_2_MLA_PACKED_PROFILE` only for the glm-5.2 aliases AND only while
+#     `glm52_packed_kv_enabled()`, and that pair is exactly what a name-based
+#     check would get wrong when the switch is off.
+#
+# The region publishes its geometry as `k_head_dim` (the trailing dim an
+# incoming K tensor must declare) and `k_element_size_bytes` -- the two values
+# `core/KV_Storage/host_paged_kv_worker_view.h` validates every offload
+# against (`ValidatePackedKTensorShape`, ~:2886-2898, and
+# `ValidateKTensorShape`, ~:2808-2822).  Reading the same two fields the C++
+# gate reads is what makes a Python-side mismatch impossible rather than
+# merely unlikely.
+
+_PRIMARY_HOST_RECORD_GEOMETRY_ATTRS = ("k_head_dim", "k_element_size_bytes")
+
+
+def _primary_host_record_geometry(primary_view) -> Optional[Tuple[int, int]]:
+    """``(record_dim, record_element_bytes)`` of this region, or ``None``.
+
+    ``None`` means this core_engine build's worker view does not publish its
+    record geometry to Python; see `_prepare_primary_host_record` for what
+    that implies.  The values are deliberately NOT defaulted: a defaulted
+    bf16/576 would be the silent coercion this whole change exists to remove.
+    """
+
+    values = []
+    for attr in _PRIMARY_HOST_RECORD_GEOMETRY_ATTRS:
+        value = getattr(primary_view, attr, None)
+        if value is None:
+            return None
+        values.append(int(value))
+    return values[0], values[1]
+
+
+def _primary_host_record_is_packed(
+    record_dim: int, record_element_bytes: int, source_dim: int
+) -> bool:
+    """True when this host region holds FlashMLA's packed FP8 MLA record.
+
+    The mirror of `batchgen_kernels.attention.mla_kv_packed.cache_is_packed_fp8`
+    for a region described by numbers rather than by an allocated tensor, so
+    the host boundary and the GPU cache cannot drift into two different
+    answers.  Anything that is neither layout is a mis-sized region and is
+    named here instead of being written through.
+    """
+
+    from batchgen_kernels.attention.mla_kv_packed import (
+        NOPE_DIM,
+        ROPE_BYTES,
+        SCALE_BYTES,
+        SOURCE_DIM,
+        TOKEN_BYTES,
+    )
+
+    if record_element_bytes == 1:
+        if source_dim != SOURCE_DIM:
+            raise RuntimeError(
+                "GLM-5 primary host KV region is a byte carrier, but the "
+                f"packed FP8 MLA record encodes a {SOURCE_DIM}-element latent "
+                f"and this model's latent is {source_dim} elements"
+            )
+        if record_dim != TOKEN_BYTES:
+            raise RuntimeError(
+                "GLM-5 primary host KV region is a byte carrier, so it must "
+                f"hold FlashMLA's packed FP8 record of {TOKEN_BYTES} bytes "
+                f"per token ({NOPE_DIM} e4m3 + {SCALE_BYTES} scale + "
+                f"{ROPE_BYTES} bf16 RoPE), got k_head_dim={record_dim}"
+            )
+        return True
+    if record_element_bytes != 2 or record_dim != source_dim:
+        raise RuntimeError(
+            "GLM-5 primary host KV region must hold either bf16 AoS records "
+            f"({source_dim} elements x 2 bytes) or the packed FP8 record "
+            f"({TOKEN_BYTES} x 1 byte), got k_head_dim={record_dim} with "
+            f"k_element_size_bytes={record_element_bytes}"
+        )
+    return False
+
+
+def _prepare_primary_host_record(
+    kv: torch.Tensor,
+    *,
+    primary_view,
+    source_dim: int,
+) -> torch.Tensor:
+    """``[tokens, record_dim]`` of this region's record dtype, produced once.
+
+    ``kv`` is the bf16 ``[tokens, source_dim]`` compressed KV the prefill
+    attention just produced.  For a bf16 AoS region the record IS the latent,
+    so ``kv`` is returned untouched and the caller's existing reshape/contiguous
+    is byte-identical to before this change.  For a packed region ONE Triton
+    launch writes the 656-byte records, and the tensor returned is the only
+    copy of them: the host enqueue that follows is a byte copy, so the
+    "produced exactly once" invariant holds across prefill the same way
+    `batchgen/attention/mla/primary_kv_record.py` holds it across decode.
+
+    Raises when the region publishes no geometry AND cannot be served in bf16.
+    """
+
+    if kv.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "GLM-5 prefill primary host offload expects the bf16 compressed "
+            f"KV its attention produced, got {kv.dtype}"
+        )
+    if int(kv.shape[-1]) != int(source_dim):
+        raise RuntimeError(
+            "GLM-5 prefill primary host offload expects a "
+            f"[tokens, {source_dim}] latent, got trailing dim "
+            f"{int(kv.shape[-1])}"
+        )
+
+    geometry = _primary_host_record_geometry(primary_view)
+    if geometry is None:
+        # Reachable only against a core_engine built BEFORE the worker view
+        # published `k_head_dim` / `k_element_size_bytes` (the two
+        # def_property_readonly entries in `core/batchgen_Binding.cpp`, beside
+        # `is_page_split`). Nothing else can stand in for them here: a packed
+        # region is ordinary contiguous-AoS -- `_GLM5_2_MLA_PACKED_PROFILE`
+        # keeps `page_format='contiguous_aos'` because the 656-byte record is
+        # token-major -- so `page_format` cannot tell the two formats apart,
+        # and the GPU primary pool that the DECODE paths discriminate on does
+        # not exist yet during prefill (`batchgen_worker.py` binds
+        # `AttnWrapperBase.gpu_paged_kv_manager` inside the decode loop).
+        # A GLM-5.2 run therefore needs the core_engine rebuild the node
+        # battery performs; this branch exists so a stale build fails at the
+        # C++ gate with a shape message instead of corrupting a page.
+        #
+        # Returning the bf16 latent keeps GLM-5/5.1/5.3 byte-identical.  It is
+        # NOT a silent fallback for GLM-5.2: a bf16 576-element tensor handed
+        # to a packed region is rejected by the C++ gate before any byte moves
+        # ("Packed K tensor head dimensions do not match configuration" /
+        # "element size does not match configuration",
+        # `core/KV_Storage/host_paged_kv_worker_view.h:2886-2898`).
+        return kv
+
+    record_dim, record_element_bytes = geometry
+    if not _primary_host_record_is_packed(
+        record_dim, record_element_bytes, source_dim
+    ):
+        return kv
+
+    # Imported lazily: Triton is absent on CPU-only machines, and the bf16 AoS
+    # path above must stay importable there.
+    from batchgen_kernels.triton.mla_kv_packed import quantize_mla_kv_packed
+
+    tokens = int(kv.shape[0])
+    out = torch.empty(
+        (tokens, record_dim), dtype=torch.uint8, device=kv.device
+    )
+    quantize_mla_kv_packed(kv.reshape(tokens, source_dim).contiguous(), out=out)
+    return out
+
+
 # Try importing FP8 absorb kernels (WP5)
 try:
     from batchgen_kernels.attention.dsa.fp8_absorb import (
@@ -1060,7 +1239,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
         sequence_ids = self.cur_batch
         if len(bounds) - 1 != len(sequence_ids) or len(starts) != len(sequence_ids):
             raise RuntimeError("GLM-5 prefix-pool row metadata size mismatch")
-        targets = [(primary_view, primary_kv, False)]
+        # The primary record is produced ONCE for the whole wave, before the
+        # row loop, and every row is then a slice of those bytes.  Quantizing
+        # per row would both multiply the launches and -- worse -- make each
+        # row its own production point, which is exactly the invariant this
+        # migration exists to protect: one producer, byte copies after it.
+        # Row slices stay contiguous because only dim 0 is sliced.
+        primary_record = _prepare_primary_host_record(
+            primary_kv,
+            primary_view=primary_view,
+            source_dim=self._primary_mla_source_dim,
+        )
+        # `quantize=False` for primary in BOTH formats: the packed record
+        # carries its fp32 block scales inside the token's 656 bytes, so the
+        # region has no separate scale section and must receive
+        # `scale_tensor=None` (`PrepareScaleTensor`,
+        # `core/KV_Storage/host_paged_kv_worker_view.h:2831-2845`, rejects
+        # scales for a non-page-split region).  Only the aux/indexer region
+        # splits keys and scales into two page sections.
+        targets = [(primary_view, primary_record, False)]
         if indexer_kv is not None:
             # A page-split aux region stores e4m3 keys plus one fp32 scale per
             # token, so the host write quantizes here, at the offload
@@ -1124,6 +1321,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
             AttnWrapperBase.pin_prefill_offload_tensor(scale_tensor, self.layer_idx)
         AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
+    @property
+    def _primary_mla_source_dim(self) -> int:
+        """``kv_lora_rank + qk_rope_head_dim``: the UNPACKED latent width.
+
+        The packed record's discriminator needs the latent's element count, not
+        the cache's trailing dim, so it is taken from the module that produced
+        the latent (`batchgen/models/glm/glm5/model.py:872-877`).  This is the
+        model's own dimension and is NOT the record format -- the format comes
+        from the store, see `_prepare_primary_host_record`.
+        """
+
+        attn = self.module
+        return int(attn.kv_lora_rank) + int(attn.qk_rope_head_dim)
+
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload packed primary KV with one asynchronous task per layer."""
         sequence_lengths = list(self.prepack_seq_lengths)
@@ -1133,8 +1344,28 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if sum(sequence_lengths) != offload_kv.shape[0]:
             raise RuntimeError("GLM-5 packed primary KV token count mismatch")
 
-        packed_kv = offload_kv.unsqueeze(1).contiguous()
-        task = self.core_engine.host_paged_kv_worker_view.async_offload_packed_layer_kv_to_host(
+        view = self.core_engine.host_paged_kv_worker_view
+        primary_view = getattr(view, "primary", view)
+        # The record is produced here and nowhere else on this path; everything
+        # after is a byte copy.  `[tokens, record_dim]` -> `[T, H=1, D]`, which
+        # is the 3-D shape `ValidatePackedKTensorShape`
+        # (`core/KV_Storage/host_paged_kv_worker_view.h:2878-2898`) requires,
+        # with `D == geometry_.ExpectedKHeadDim()` and
+        # `element_size() == config_.k_element_size_bytes` -- 656/1 for a
+        # packed region, 576/2 for bf16 AoS.
+        record = _prepare_primary_host_record(
+            offload_kv,
+            primary_view=primary_view,
+            source_dim=self._primary_mla_source_dim,
+        )
+        packed_kv = record.unsqueeze(1).contiguous()
+        # No `scale_tensor`, for either format.  Unlike the aux/indexer cache's
+        # page-split layout, the packed MLA record carries its four fp32
+        # block-128 scales INSIDE the token's 656 bytes, so the region has no
+        # separate scale section and `PrepareScaleTensor`
+        # (`host_paged_kv_worker_view.h:2831-2845`) rejects scales for a
+        # non-page-split region.  One tensor, one enqueue -- unchanged.
+        task = primary_view.async_offload_packed_layer_kv_to_host(
             layer_idx=self.layer_idx,
             sequence_ids=global_sequence_ids,
             k_tensor=packed_kv,
@@ -1179,6 +1410,32 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
             # Dense-MLA path (use_dense_mla=True, indexer not constructed).
             # Uses the shared eager MLA page-KV backend already used by Kimi.
+            #
+            # This path writes the latent as bf16 -- `decoding_attn_mode_3_bf16`
+            # returns bf16 `k_tensor` and the paged update stores it verbatim --
+            # so it cannot serve a packed FP8 primary cache.  It is unreachable
+            # for GLM-5.2 (the packed format's only user): reaching here needs
+            # `hasattr(self.module, 'indexer')` to be False, which happens only
+            # when `config.use_dense_mla` is True
+            # (`batchgen/models/glm/glm5/model.py:915-916` skips setting the
+            # attribute entirely), and a GLM-5.2 config never sets that flag.
+            # The assertion is kept rather than assumed: a latent bf16 writer
+            # into a byte-carrier cache is precisely the failure this migration
+            # removes, so an unexpected combination is NAMED here instead of
+            # requantizing a page per element.  The cache's own allocation
+            # config is the discriminator, never the model name.
+            primary_kv_dtype = getattr(
+                getattr(gpu_paged_kv_manager, "config", None), "kv_dtype", None
+            )
+            if primary_kv_dtype is not None and primary_kv_dtype == torch.uint8:
+                raise RuntimeError(
+                    f"[layer {self.layer_idx}] GLM-5 dense-MLA decode writes a "
+                    "bf16 latent, but the allocated primary KV cache is a "
+                    "byte carrier (packed FP8 MLA records). Dense MLA "
+                    "(config.use_dense_mla) and the packed primary cache are "
+                    "mutually exclusive; run dense MLA on a bf16 primary "
+                    "profile."
+                )
             attn_output, k_tensor = self.module.decoding_attn_mode_3_bf16(
                 hidden_states,
                 position_ids,

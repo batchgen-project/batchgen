@@ -46,6 +46,8 @@ class Glm5WholeModelSegment:
         compare_probe_layers: Iterable[int] | None = None,
         layer_segments: Iterable[object] | None = None,
         aux_kv_staging_dtype: torch.dtype = torch.bfloat16,
+        primary_kv_dim: int | None = None,
+        primary_kv_staging_dtype: torch.dtype | None = None,
     ) -> None:
         if not include_embedding:
             raise NotImplementedError(
@@ -106,9 +108,25 @@ class Glm5WholeModelSegment:
         indexer0 = getattr(attn0, "indexer", None)
         if indexer0 is None:
             raise ValueError("GLM-5 whole-model graph requires DSA indexer modules")
-        self.primary_kv_dim = int(attn0.kv_lora_rank + attn0.qk_rope_head_dim)
         self.aux_kv_dim = int(indexer0.index_head_dim)
         self.index_topk = int(indexer0.index_topk)
+        # The PRIMARY staging record. `kv_lora_rank + qk_rope_head_dim` is the
+        # model's latent width (576); it is the record width only for a bf16
+        # AoS cache. GLM-5.2's packed FP8 cache stores 656 BYTES per token, so
+        # the staging buffer's dim AND dtype have to come from the same place
+        # the graph segment's record comes from -- the ALLOCATED cache -- or
+        # the buffer stages something that is neither the producer's bytes nor
+        # the host region's layout. See `_resolve_primary_record` below.
+        (
+            self.primary_kv_dim,
+            self.primary_kv_staging_dtype,
+        ) = self._resolve_primary_record(
+            model_source_dim=int(attn0.kv_lora_rank + attn0.qk_rope_head_dim),
+            layer_segments=self.layer_segments,
+            explicit_dim=primary_kv_dim,
+            explicit_dtype=primary_kv_staging_dtype,
+        )
+        self.primary_kv_is_packed = self.primary_kv_staging_dtype is torch.uint8
         # The aux KV stream need not share the primary's element type: GLM-5.2
         # stages its indexer keys as e4m3 bytes (one fp32 scale per token
         # alongside), everything else stages bf16. Staging the FP8 stream in
@@ -208,7 +226,12 @@ class Glm5WholeModelSegment:
                 1,
                 1,
                 self.primary_kv_dim,
-                dtype=torch.bfloat16,
+                # Resolved from the allocated primary cache, not from the
+                # model's latent width: bf16 x 576 elements, or uint8 x 656
+                # bytes for FlashMLA's packed FP8 record. A hardcoded bf16
+                # here would make `_copy_primary_kv`'s `.copy_()` requantize
+                # a packed record per element.
+                dtype=self.primary_kv_staging_dtype,
                 device=self.device,
             )
             self._aux_kv_key_buffer = torch.zeros(
@@ -297,9 +320,30 @@ class Glm5WholeModelSegment:
         return specs
 
     def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor, _v_tensor=None) -> None:
+        """Stage one layer's primary MLA record for host offload.
+
+        Bound as ``AttnWrapperBase.kv_append_callback`` from three places --
+        the in-graph layer loop in `run_model_with_probes`, the eager
+        save/restore window in `forward`, and
+        `batchgen/models/glm/glm5/cuda_graph_adapter.py:572` -- and all three
+        hand over the same tensor: the DSA segment's ``primary_k_tensor``
+        static output, whose spec is declared from the cache's record geometry
+        at `batchgen/models/glm/glm5/cuda_graph_segments.py:1311-1312`.
+
+        ``copy_()`` CONVERTS dtypes. A bf16 record copied into a uint8 staging
+        buffer would be requantized per element and the staged page would be
+        neither the producer's bytes nor the layout FlashMLA reads, so the
+        dtype is asserted first -- the same guard
+        `batchgen_kernels/triton/kv_cache.py:12-28`
+        (``_require_matching_cache_dtype``) applies to the paged-KV update for
+        exactly this reason.
+        """
+
         if self._kv_buffers is None:
             raise RuntimeError("GLM-5 whole-model graph KV buffers are not initialized")
-        k_tensor = self._normalize_k_tensor(k_tensor, self.primary_kv_dim)
+        k_tensor = self._normalize_k_tensor(
+            k_tensor, self.primary_kv_dim, self.primary_kv_staging_dtype
+        )
         self._kv_buffers[int(layer_idx)]["key"][: k_tensor.shape[0]].copy_(k_tensor)
 
     def _copy_aux_kv(
@@ -318,7 +362,9 @@ class Glm5WholeModelSegment:
 
         if self._aux_kv_buffers is None:
             raise RuntimeError("GLM-5 whole-model graph aux KV buffers are not initialized")
-        k_tensor = self._normalize_k_tensor(k_tensor, self.aux_kv_dim)
+        k_tensor = self._normalize_k_tensor(
+            k_tensor, self.aux_kv_dim, self.aux_kv_staging_dtype
+        )
         self._aux_kv_buffers[int(layer_idx)]["key"][: k_tensor.shape[0]].copy_(k_tensor)
         scale_buffer = self._aux_kv_buffers[int(layer_idx)].get("scale")
         if (scale_tensor is None) != (scale_buffer is None):
@@ -333,7 +379,21 @@ class Glm5WholeModelSegment:
             scale_buffer[: scale_flat.shape[0]].copy_(scale_flat)
 
     @staticmethod
-    def _normalize_k_tensor(k_tensor: torch.Tensor, expected_dim: int) -> torch.Tensor:
+    def _normalize_k_tensor(
+        k_tensor: torch.Tensor,
+        expected_dim: int,
+        expected_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Shape- and dtype-check one staged KV stream's incoming tensor.
+
+        ``expected_dtype`` is a parameter rather than a constant because the
+        primary and aux streams legitimately differ: GLM-5.2 stages packed
+        uint8 primary records beside e4m3 indexer keys, GLM-5 stages bf16 for
+        both. The dtype check is what turns a format mismatch into a named
+        error instead of a silent per-element conversion inside the caller's
+        ``copy_()``.
+        """
+
         if k_tensor.dim() == 3:
             k_tensor = k_tensor.unsqueeze(2)
         if k_tensor.dim() != 4:
@@ -345,7 +405,152 @@ class Glm5WholeModelSegment:
                 f"GLM-5 whole-model graph KV dim mismatch: got {k_tensor.shape[-1]}, "
                 f"expected {expected_dim}"
             )
+        if k_tensor.dtype != expected_dtype:
+            raise RuntimeError(
+                "GLM-5 whole-model graph KV staging dtype mismatch: got "
+                f"{k_tensor.dtype}, expected {expected_dtype}. The KV record "
+                "is produced once, at the writer, and every hop after it is a "
+                "byte copy; copying across dtypes here would requantize the "
+                "record per element."
+            )
         return k_tensor
+
+    @staticmethod
+    def _resolve_primary_record(
+        *,
+        model_source_dim: int,
+        layer_segments: list,
+        explicit_dim: int | None,
+        explicit_dtype: torch.dtype | None,
+    ) -> tuple[int, torch.dtype]:
+        """``(record_dim, record_dtype)`` of the PRIMARY staging buffer.
+
+        Resolution order, strongest authority first:
+
+        1. The allocated primary cache, reached through the layer segments.
+           A layer segment declares the record of the ``primary_k_tensor`` it
+           will actually hand to ``_copy_primary_kv`` as
+           ``primary_kv_dim`` / ``primary_kv_dtype``
+           (`batchgen/models/glm/glm5/layer_cuda_graph_segments.py:51-63`,
+           used for its output spec at :141-144), and its DSA segment
+           independently publishes ``primary_record_dim`` /
+           ``primary_record_dtype`` read off ``primary_blocked_k``
+           (`batchgen/models/glm/glm5/cuda_graph_segments.py:1018-1019`).
+           Both are read here and must agree -- they are two derivations of
+           one cache (``shape[3]`` and ``shape[-1]`` of the same 4-D
+           ``[pages, page_size, 1, record_dim]`` tensor), so a disagreement
+           means one of them has drifted and is named rather than picked
+           between. All layers must agree too: one cache, one record.
+        2. An explicit ``primary_kv_dim`` / ``primary_kv_staging_dtype``, which
+           a caller that holds the GPU KV manager but builds no layer segments
+           can pass. When BOTH sources are present they must match; the
+           disagreement is named rather than silently resolved in favour of
+           one.
+        3. The model's own latent width in bf16 -- the pre-migration behaviour,
+           and correct for every bf16 AoS cache (GLM-5 / 5.1 / 5.3). It is NOT
+           a silent fallback for a packed cache: ``_copy_primary_kv``'s dtype
+           guard rejects the uint8 record this buffer could not hold, naming
+           the mismatch before any byte is converted.
+        """
+
+        derived: tuple[int, torch.dtype] | None = None
+        for index, layer_segment in enumerate(layer_segments):
+            candidates = []
+            for holder, dim_attr, dtype_attr in (
+                (layer_segment, "primary_kv_dim", "primary_kv_dtype"),
+                (
+                    getattr(layer_segment, "dsa_segment", None),
+                    "primary_record_dim",
+                    "primary_record_dtype",
+                ),
+            ):
+                if holder is None:
+                    continue
+                record_dim = getattr(holder, dim_attr, None)
+                record_dtype = getattr(holder, dtype_attr, None)
+                if record_dim is None or record_dtype is None:
+                    continue
+                candidates.append((int(record_dim), record_dtype))
+            if len(candidates) == 2 and candidates[0] != candidates[1]:
+                raise ValueError(
+                    f"GLM-5 whole-model graph layer {index} declares primary "
+                    f"KV record {candidates[0]} but its DSA segment declares "
+                    f"{candidates[1]}; both derive from one allocated cache"
+                )
+            if not candidates:
+                continue
+            candidate = candidates[0]
+            if derived is None:
+                derived = candidate
+            elif derived != candidate:
+                raise ValueError(
+                    "GLM-5 whole-model graph primary KV record disagrees "
+                    f"between layer segments: layer 0 declares {derived}, "
+                    f"layer {index} declares {candidate}; one primary cache "
+                    "has one record format"
+                )
+
+        explicit: tuple[int, torch.dtype] | None = None
+        if (explicit_dim is None) != (explicit_dtype is None):
+            raise ValueError(
+                "GLM-5 whole-model graph primary KV record must be given as a "
+                "dim AND a dtype or neither (got dim="
+                f"{explicit_dim}, dtype={explicit_dtype}); a dim without its "
+                "dtype is how a packed record ends up staged in bf16"
+            )
+        if explicit_dim is not None:
+            explicit = (int(explicit_dim), explicit_dtype)
+
+        if derived is not None and explicit is not None and derived != explicit:
+            raise ValueError(
+                "GLM-5 whole-model graph primary KV record mismatch: the "
+                f"allocated cache declares {derived} but the caller passed "
+                f"{explicit}"
+            )
+        resolved = derived or explicit
+        if resolved is None:
+            resolved = (int(model_source_dim), torch.bfloat16)
+
+        record_dim, record_dtype = resolved
+        if record_dim <= 0:
+            raise ValueError(
+                f"GLM-5 whole-model graph primary KV record dim must be > 0, "
+                f"got {record_dim}"
+            )
+        if record_dtype not in (torch.bfloat16, torch.uint8):
+            raise ValueError(
+                "GLM-5 whole-model graph primary KV record must be bf16 AoS "
+                "or a uint8 packed byte carrier, got "
+                f"{record_dtype}"
+            )
+        if record_dtype is torch.uint8:
+            # Mirrors the cache-side discriminator
+            # (`batchgen_kernels/attention/mla_kv_packed.cache_is_packed_fp8`):
+            # a byte carrier must be FlashMLA's exact 656-byte record, and the
+            # latent it encodes must be the 576-element one.
+            from batchgen_kernels.attention.mla_kv_packed import (
+                SOURCE_DIM,
+                TOKEN_BYTES,
+            )
+
+            if int(model_source_dim) != SOURCE_DIM:
+                raise ValueError(
+                    "the packed FP8 MLA record encodes a "
+                    f"{SOURCE_DIM}-element latent, but this model's latent is "
+                    f"{model_source_dim} elements"
+                )
+            if record_dim != TOKEN_BYTES:
+                raise ValueError(
+                    "a uint8 primary KV record must be FlashMLA's packed FP8 "
+                    f"record of {TOKEN_BYTES} bytes per token, got "
+                    f"{record_dim}"
+                )
+        elif record_dim != int(model_source_dim):
+            raise ValueError(
+                "a bf16 AoS primary KV record carries the model's "
+                f"{model_source_dim}-element latent, got {record_dim}"
+            )
+        return record_dim, record_dtype
 
     def _set_moe_bucket_state(self, bucket_size: int, rank_token_counts: torch.Tensor) -> None:
         from batchgen.models.glm.glm5.model import Glm5MoE

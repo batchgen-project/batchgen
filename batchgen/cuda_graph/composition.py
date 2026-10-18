@@ -240,9 +240,18 @@ def resolve_kv_staging_dtypes(
     """Per-stream staging dtypes, with no stream silently taking another's.
 
     A hybrid model's KV streams need not share an element type: GLM-5.2 stages
-    its primary latent in bf16 while its indexer (aux) keys are e4m3 bytes. A
-    single dtype for every stream would quietly requantize the aux stream on
-    the clone, so a mapping is accepted and must name EVERY stream exactly.
+    its primary MLA records as uint8 bytes (FlashMLA's packed FP8 record, 656
+    BYTES per token) and its indexer (aux) keys as e4m3 bytes, while
+    GLM-5/5.1/5.3 stage both in bf16. A single dtype for every stream would
+    quietly requantize a stream on the clone, so a mapping is accepted and
+    must name EVERY stream exactly.
+
+    The broadcast form (one dtype, every stream) is kept only for the
+    uniform-format case, and is REFUSED for an opaque byte carrier across more
+    than one stream: a byte-carrier stream's ``kv_staging_dim`` counts BYTES
+    per token while an element-typed stream's counts ELEMENTS, so one dtype
+    cannot describe both and the dims would be reinterpreted silently. A
+    mixed-format model therefore has to name its streams.
     """
 
     if isinstance(dtype, Mapping):
@@ -254,6 +263,14 @@ def resolve_kv_staging_dtypes(
                 f"(missing={missing}, unexpected={extra})"
             )
         return {name: dtype[name] for name in kv_staging_dim}
+    if dtype is torch.uint8 and len(kv_staging_dim) > 1:
+        raise ValueError(
+            "kv staging dtype torch.uint8 is an opaque byte carrier, so its "
+            "kv_staging_dim counts BYTES per token; it cannot be broadcast "
+            f"across the {len(kv_staging_dim)} streams "
+            f"{sorted(kv_staging_dim)}, whose dims may count elements. Name "
+            "each stream's dtype."
+        )
     return {name: dtype for name in kv_staging_dim}
 
 
@@ -271,10 +288,22 @@ def allocate_kv_staging(
     contiguous `[num_layers, max_bucket, 1, 1, kv_dim]` tensor per kv stream
     so the worker can clone all layers once per step instead of per-layer.
 
+    A stream's `kv_dim` is the trailing size of ONE cache record, in the units
+    of that stream's dtype: ELEMENTS for an element type, BYTES for the uint8
+    byte carrier. The dim and the dtype are therefore one declaration and must
+    come from the same source -- the allocated cache -- which is why `dtype`
+    is a required argument with no default. A defaulted bf16 is how a packed
+    record gets staged in the wrong format.
+
     Args:
-        kv_staging_dim: name -> kv-dim, e.g. {"primary": 576, "aux": 128}.
+        kv_staging_dim: name -> kv-dim, e.g. `{"primary": 576, "aux": 128}`
+            for a bf16 MLA + bf16 indexer model, or
+            `{"primary": 656, "aux": 128}` for GLM-5.2, whose primary records
+            are FlashMLA's packed FP8 record (656 BYTES per token) and whose
+            indexer keys are e4m3 bytes.
         dtype: one dtype for every stream, or name -> dtype when the streams
-            differ (e.g. {"primary": bf16, "aux": float8_e4m3fn}).
+            differ (e.g. `{"primary": uint8, "aux": float8_e4m3fn}`). Required;
+            see `resolve_kv_staging_dtypes` for the broadcast restrictions.
 
     Returns mapping `stream_name -> tensor` with shape
     `[num_layers, max_bucket, 1, 1, kv_dim]`.
@@ -327,11 +356,17 @@ def compose_whole_model(
         embed, final_norm, lm_head: real modules called at the segment
             boundaries; not captured as separate segments because they have
             no per-layer KV interaction.
-        kv_staging_dim: per-stream KV dim (e.g. {"primary": 576} for MLA, or
-            {"primary": kv_dim, "aux": aux_dim} for hybrid attention).
+        kv_staging_dim: per-stream trailing record size, in the units of that
+            stream's dtype (elements for an element type, BYTES for uint8):
+            e.g. {"primary": 576} for bf16 MLA, {"primary": 656} for GLM-5.2's
+            packed FP8 MLA record, or {"primary": kv_dim, "aux": aux_dim} for
+            hybrid attention.
         kv_staging_dtype: one dtype for every stream, or name -> dtype when
-            the streams differ (an FP8 aux stream must not be staged in the
-            primary's bf16).
+            the streams differ (an FP8 aux stream must not be staged in bf16,
+            and a packed uint8 primary stream must not be staged in bf16
+            either -- `copy_()` would requantize the record per element).
+            Required: it and `kv_staging_dim` describe the same allocated
+            cache and must be read off it together.
         forward_fn: `(layer_segments, embed, final_norm, lm_head, kv_staging,
             **inputs) -> Dict[str, Tensor]`. Implements embed -> layers ->
             final_norm -> lm_head.
