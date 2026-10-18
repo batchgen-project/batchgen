@@ -12,9 +12,21 @@ hope, and it is why the cache store stays the existing dtype-agnostic bare-copy
 kernel rather than gaining a second quantize.
 
 The byte layout, the numerics, and the one deliberate divergence from SGLang's
-shipped quantizer all live in
-``batchgen_kernels.attention.mla_kv_packed``, which is torch-only and is the
-byte-exactness reference this kernel is tested against.
+shipped quantizer all live in ``batchgen_kernels.attention.mla_kv_packed``,
+which is torch-only and is the byte-exactness reference this kernel is tested
+against.
+
+That byte contract is SAME-DEVICE: this kernel is pinned byte-for-byte to the
+reference evaluated on the SAME GPU, not to the reference evaluated on the
+host. ``scale = fp32_amax / 448`` rounds differently on host and device, and a
+1-ULP scale difference flips payload bytes wherever a rescaled element lands
+on an e4m3 rounding boundary -- measured on the node, kernel vs GPU reference
+is 0 differing bytes across 1..1024 tokens while CPU vs GPU reference differs
+in up to 2495 bytes at 1024 tokens, most of them scale bytes. So the CPU
+reference is the dev-measurable description of the RECORD (geometry, layout,
+dequant semantics, the zero-block divergence -- all of
+``tests/test_glm52_packed_mla_kv_record.py``, which compares CPU against CPU),
+and it is NOT a cross-device byte oracle for this kernel.
 """
 
 from __future__ import annotations

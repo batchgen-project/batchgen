@@ -228,9 +228,18 @@ def quantize_mla_kv_packed_reference(
 ) -> torch.Tensor:
     """Pack ``[tokens, 576]`` bf16 compressed KV into ``[tokens, 656]`` uint8.
 
-    The byte-exactness reference for the Triton kernel of the same name. Runs
-    on CPU, which is what makes the packed contract a dev-measurable test
-    rather than a node-only one.
+    The byte-exactness reference for the Triton kernel of the same name. It is
+    device-agnostic torch, so it runs on CPU -- which is what makes the
+    RECORD's contract (geometry, field layout, dequant semantics, the
+    zero-block divergence) a dev-measurable test rather than a node-only one.
+
+    The kernel comparison it anchors is SAME-DEVICE, though: byte-exactness
+    holds against this reference evaluated on the kernel's own device, not
+    against a host evaluation of it. ``amax / FP8_MAX`` rounds differently on
+    host and device and a 1-ULP scale shift flips payload bytes at e4m3
+    rounding boundaries, so a CPU-vs-GPU byte comparison measures the division,
+    not the kernel. The dev-side tests of this module compare CPU against CPU
+    and are unaffected.
     """
 
     if out is None:
