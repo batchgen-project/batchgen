@@ -359,6 +359,24 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             },
             "True when this region stores pages as [e4m3 K bytes][fp32 "
             "scales], i.e. every write must carry its per-token scales.")
+        .def_property_readonly(
+            "k_head_dim",
+            [](const WorkerView& self) {
+                return self.expected_k_head_dim();
+            },
+            "Trailing dim an incoming K tensor must declare for THIS region. "
+            "Read it off the region rather than re-deriving it from a model "
+            "profile: it is the value the C++ shape gate validates against, "
+            "and for a byte-carrier region (GLM-5.2's packed FP8 MLA record) "
+            "it counts BYTES per token, not elements.")
+        .def_property_readonly(
+            "k_element_size_bytes",
+            [](const WorkerView& self) {
+                return self.k_element_size_bytes();
+            },
+            "Byte width of one K element in THIS region. With k_head_dim it "
+            "is the whole record a writer must produce, and the pair the C++ "
+            "gate rejects a mismatch against.")
         .def_property_readonly_static(
             "has_v_cache",
             [](py::object /* cls */) { return WorkerView::kHasVCache; })

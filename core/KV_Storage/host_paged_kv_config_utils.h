@@ -35,6 +35,15 @@ inline std::size_t ResolveElementSizeBytes(std::string_view kv_dtype) {
     if (dtype == "float8_e4m3fn" || dtype == "float8_e5m2") {
         return 1;
     }
+    // A raw byte carrier: the page holds an opaque per-token record whose
+    // internal field types the host never interprets (FlashMLA's packed FP8
+    // MLA token is e4m3 data + fp32 scales + bf16 RoPE in one 656-byte
+    // record). k_head_dim then counts BYTES per token, exactly as it counts
+    // elements for a typed dtype, so every page/layer/budget size stays a
+    // plain product and every copy path stays a byte move.
+    if (dtype == "uint8") {
+        return 1;
+    }
     std::ostringstream oss;
     oss << "Unsupported kv_dtype='" << dtype << "'";
     throw std::invalid_argument(oss.str());

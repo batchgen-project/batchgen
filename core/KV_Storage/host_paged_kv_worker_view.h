@@ -685,6 +685,25 @@ class HostPagedKVWorkerView : private LayerMapper {
     }
 
     const HostPagedKVConfig& config() const { return config_; }
+
+    // The trailing dim an incoming K tensor must declare for THIS region, and
+    // the byte width of one of its elements. Together they are the record a
+    // writer has to produce, and they are the exact pair ValidateKTensorShape
+    // / ValidatePackedKTensorShape reject a mismatch against -- so a Python
+    // writer that reads these two cannot build a tensor the gate refuses.
+    //
+    // Exposed because the GLM-5.2 PREFILL offloads write the host region
+    // before any GPU KV pool exists, so the allocated GPU cache -- which the
+    // decode paths discriminate on -- is not yet available to them. Without
+    // this seam a prefill writer would have to re-derive the format from a
+    // model name, which is wrong whenever the packed profile is switched off.
+    std::size_t expected_k_head_dim() const {
+        return geometry_.ExpectedKHeadDim();
+    }
+    std::size_t k_element_size_bytes() const {
+        return config_.k_element_size_bytes;
+    }
+
     const Layout& layout() const { return layout_; }
     HostPagedKVStats GetStats() const { return backend_.CollectStats(); }
     int device_index() const { return device_index_; }
