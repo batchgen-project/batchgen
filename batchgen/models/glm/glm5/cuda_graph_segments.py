@@ -1468,6 +1468,16 @@ class Glm5FullDsaAttnSegment:
             out=buffers.valid_rows_bf16,
         )
 
+    def attn_output_row_mask(self, bucket_size: int) -> torch.Tensor:
+        """The row-validity mask a caller must apply if it defers the mask.
+
+        bf16, one entry per row, exactly 1.0 for a valid row and 0.0 otherwise.
+        A consumer must treat it as a PREDICATE, not a factor -- see the
+        invariant note at the ``attn_output`` mask in ``forward``.
+        """
+
+        return self._row_validity_buffers(bucket_size).valid_rows_bf16
+
     def forward(
         self,
         *,
@@ -1478,6 +1488,7 @@ class Glm5FullDsaAttnSegment:
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
         row_validity_ready: bool = False,
+        attn_output_mask_deferred: bool = False,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
         indexer = attn.indexer
@@ -1553,7 +1564,14 @@ class Glm5FullDsaAttnSegment:
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
 
-        offload_kv = _fused_rmsnorm_rope(
+        # The processed KV leaves the segment (the whole-model graph stages it
+        # for host KV offload), so it is the one place an invalid row's bytes
+        # would escape. The gate is FOLDED INTO the producing kernel: it writes
+        # straight into the static output buffer and selects exact zeros for
+        # invalid rows, so the separate `torch.where` launch this used to need
+        # is gone. It remains a SELECT, not a multiply -- bf16 NaN * 0 is NaN,
+        # so a multiply could carry a non-finite stale row through.
+        _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
             self.cos_table,
@@ -1563,18 +1581,8 @@ class Glm5FullDsaAttnSegment:
             attn.kv_lora_rank,
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
-        )
-        # This copy leaves the segment (the whole-model graph stages it for host
-        # KV offload), so it is the one place an invalid row's bytes would
-        # escape. Select instead of copy: a select costs the same single launch,
-        # writes the exact zeros the pre-mask path produced for invalid rows,
-        # and -- unlike a multiply, where bf16 NaN * 0 is NaN -- it cannot carry
-        # a non-finite stale row through.
-        torch.where(
-            buffers.valid_mask.view(batch_size, 1, 1, 1),
-            offload_kv.view(batch_size, 1, 1, -1),
-            buffers.valid_rows_zeros[:1],
-            out=outputs.primary_k_tensor,
+            out=outputs.primary_k_tensor.view(batch_size, 1, -1),
+            row_valid_mask=buffers.valid_mask,
         )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
@@ -1717,7 +1725,14 @@ class Glm5FullDsaAttnSegment:
         # num_valid_tokens but have no cache slot -- the masked GEMMs compute
         # those rows, so no num_valid_tokens gate zeroes them, and `valid_mask`
         # is what makes them inert.
-        outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+        #
+        # A layer-composed caller absorbs this mask into the residual add that
+        # immediately consumes `attn_output` (one fused launch instead of two),
+        # and then it is that caller's obligation to apply
+        # `attn_output_row_mask`. The standalone per-layer DSA graph has no such
+        # consumer inside the segment, so it masks here.
+        if not attn_output_mask_deferred:
+            outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 
         graph_outputs = {
             "attn_output": outputs.attn_output.view(batch_size, 1, attn.hidden_size),
