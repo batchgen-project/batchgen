@@ -124,7 +124,9 @@ class _Glm5FullDsaSegmentBuffers:
     q_a: torch.Tensor
     q_a_normed: torch.Tensor
     q_flat: torch.Tensor
-    q_nope: torch.Tensor
+    # The NoPE half has no buffer: the absorb GEMV reads it straight out of
+    # `q_flat` with a head stride. `q_rope_4d` stays, as the fused rmsnorm+RoPE
+    # kernel's contiguous destination and FA3's query.
     q_rope_4d: torch.Tensor
     new_compressed_kv: torch.Tensor
     indexer_k_raw: torch.Tensor
@@ -205,7 +207,6 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "q_a",
     "q_a_normed",
     "q_flat",
-    "q_nope",
     "q_rope_4d",
     "new_compressed_kv",
     "indexer_k_raw",
@@ -1198,13 +1199,6 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            q_nope=torch.empty(
-                bucket_size,
-                attn.num_heads,
-                attn.qk_nope_head_dim,
-                dtype=torch.bfloat16,
-                device=device,
-            ),
             q_rope_4d=torch.empty(
                 bucket_size,
                 attn.num_heads,
@@ -1560,9 +1554,26 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
             expected_m=batch_size,
         )
-        q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-        buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
-        buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
+        # The NoPE/RoPE split is FOLDED INTO THE CONSUMERS. `q_flat` is the
+        # q_b_proj output, [batch, num_heads * q_head_dim] and contiguous, so
+        # each head's NoPE and RoPE slice is already addressable with a plain
+        # (row, head) stride pair and a unit-stride innermost axis. Both
+        # consumers now read it that way, so the two strided gathers that used
+        # to materialize `q_nope` / `q_rope_4d` -- and the device copies that
+        # followed them into the static buffers -- are gone from the captured
+        # graph:
+        #   NoPE -> the absorb GEMV, which is already handed x's batch and
+        #           head strides and only requires its K axis contiguous.
+        #   RoPE -> the fused rmsnorm+RoPE kernel below, as `q_pe_src`. It
+        #           reads the strided source and stores the rotated pair into
+        #           the SAME contiguous `q_rope_4d` as before, which is what
+        #           FA3 consumes; the rotation arithmetic and the bytes landing
+        #           in that buffer are unchanged, only the gather is gone.
+        # `q_nope` is no longer a buffer at all: a static tensor nothing writes
+        # is exactly how a removed copy creeps back in.
+        q_heads = buffers.q_flat.view(batch_size, attn.num_heads, attn.q_head_dim)
+        q_nope_strided = q_heads[..., : attn.qk_nope_head_dim]
+        q_rope_strided = q_heads[..., attn.qk_nope_head_dim :].unsqueeze(2)
 
         # The processed KV leaves the segment (the whole-model graph stages it
         # for host KV offload), so it is the one place an invalid row's bytes
@@ -1583,6 +1594,7 @@ class Glm5FullDsaAttnSegment:
             eps=attn.kv_a_layernorm.eps,
             out=outputs.primary_k_tensor.view(batch_size, 1, -1),
             row_valid_mask=buffers.valid_mask,
+            q_pe_src=q_rope_strided,
         )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
@@ -1676,7 +1688,7 @@ class Glm5FullDsaAttnSegment:
             )
 
         fp8_q_absorb_out(
-            buffers.q_nope,
+            q_nope_strided,
             self.absorb_weights,
             buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,

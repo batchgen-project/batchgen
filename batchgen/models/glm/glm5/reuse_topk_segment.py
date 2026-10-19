@@ -73,7 +73,6 @@ _GLM5_REUSE_VIEW_FIELDS = frozenset({
     "q_a",
     "q_a_normed",
     "q_flat",
-    "q_nope",
     "q_rope_4d",
     "new_compressed_kv",
     "selected_token_ids",
@@ -321,10 +320,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 bucket_size, attn.num_heads * attn.q_head_dim,
                 dtype=torch.bfloat16, device=device,
             ),
-            q_nope=torch.empty(
-                bucket_size, attn.num_heads, attn.qk_nope_head_dim,
-                dtype=torch.bfloat16, device=device,
-            ),
             q_rope_4d=torch.empty(
                 bucket_size, attn.num_heads, 1, attn.qk_rope_head_dim,
                 dtype=torch.bfloat16, device=device,
@@ -478,9 +473,14 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
             out=buffers.q_flat, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
-        q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-        buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
-        buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
+        # NoPE/RoPE split folded into the consumers -- see the matching comment
+        # in cuda_graph_segments.py. Both halves are read out of the single
+        # q_b_proj output with strides, so neither gather nor its device copy
+        # is launched here either; the 57 skip layers and the 21 indexer layers
+        # must stay on the same stride contract or they diverge.
+        q_heads = buffers.q_flat.view(batch_size, attn.num_heads, attn.q_head_dim)
+        q_nope_strided = q_heads[..., : attn.qk_nope_head_dim]
+        q_rope_strided = q_heads[..., attn.qk_nope_head_dim :].unsqueeze(2)
 
         # Gate folded into the producing kernel -- see the matching comment in
         # cuda_graph_segments.py. Still a SELECT (exact zeros for invalid rows),
@@ -497,6 +497,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             eps=attn.kv_a_layernorm.eps,
             out=outputs.primary_k_tensor.view(batch_size, 1, -1),
             row_valid_mask=buffers.valid_mask,
+            q_pe_src=q_rope_strided,
         )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
@@ -510,7 +511,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         )
 
         fp8_q_absorb_out(
-            buffers.q_nope, self.absorb_weights, buffers.absorbed_q,
+            q_nope_strided, self.absorb_weights, buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
         if self.all_short:

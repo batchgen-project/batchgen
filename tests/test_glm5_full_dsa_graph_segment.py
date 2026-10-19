@@ -514,14 +514,30 @@ def _patch_full_dsa_dependencies(
         out.copy_(result)
         return out
 
-    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps, out=None, row_valid_mask=None):
+    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps, out=None, row_valid_mask=None, q_pe_src=None):
         # Stands in for `fused_rmsnorm_rope_with_q_native`, so it has to honour
-        # the same `out=` / `row_valid_mask=` contract: the segment now has the
-        # kernel write `primary_k_tensor` directly, under a row gate applied as
-        # a SELECT (exact zeros for an invalid row -- bf16 NaN * 0 is NaN). A
+        # the same `out=` / `row_valid_mask=` / `q_pe_src=` contract: the
+        # segment has the kernel write `primary_k_tensor` directly, under a row
+        # gate applied as a SELECT (exact zeros for an invalid row -- bf16
+        # NaN * 0 is NaN), and it hands the kernel the RoPE half of the packed
+        # q projection as a strided `q_pe_src` instead of gathering it first. A
         # stub that ignored `out=` would make these tests pass while asserting
-        # nothing about the buffer the segment actually reads.
+        # nothing about the buffer the segment actually reads, and one that did
+        # not accept `q_pe_src` would raise on binding before comparing a
+        # single number.
         del cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps
+        if q_pe_src is not None:
+            # The real kernel READS the strided source and WRITES `q_rope`; it
+            # does not rotate `q_rope`'s prior contents. Mirror that, including
+            # the contract that the source's innermost axis is contiguous and
+            # that every element of the destination is written.
+            assert q_pe_src.shape == q_rope.shape, (
+                f"q_pe_src {tuple(q_pe_src.shape)} != q_rope {tuple(q_rope.shape)}"
+            )
+            assert q_pe_src.stride(-1) == 1, (
+                f"q_pe_src head_dim axis must be contiguous, got {tuple(q_pe_src.stride())}"
+            )
+            q_rope.copy_(q_pe_src)
         q_rope.add_(0.0625)
         processed = new_compressed_kv + 0.25
         if out is None:
@@ -620,6 +636,15 @@ def _patch_full_dsa_dependencies(
 
     def fake_q_absorb(q_nope, weights, absorbed_q, num_valid_tokens=None):
         del weights, num_valid_tokens
+        # The segment hands this the NoPE half of the packed q projection as a
+        # head-strided view, which is exactly what the real kernel accepts (it
+        # is passed x's batch and head strides and needs only K contiguous). A
+        # stub that silently worked on a contiguous copy would hide a caller
+        # that reintroduced the gather.
+        assert q_nope.dim() == 3, f"expected [B, H, K], got {tuple(q_nope.shape)}"
+        assert q_nope.stride(-1) == 1, (
+            f"NoPE K axis must be contiguous, got strides {tuple(q_nope.stride())}"
+        )
         absorbed_q.copy_(q_nope[..., : absorbed_q.shape[-1]])
         return absorbed_q
 
