@@ -249,6 +249,42 @@ def per_token_blocked_quantize_bf16_to_fp8_flat(
 
 
 @triton.jit
+def _blocked_scale_and_quantize(q_float):
+    """Shared scale + FP8 payload math for the per-token blocked quantizers.
+
+    `q_float` is an fp32 tile whose axis 1 spans the BLOCK_SIZE k-axis of ONE
+    fp8 scale block. Axis 0 is whatever the caller parallelises over: the
+    k-blocks of a single token (`_per_token_blocked_quantize_1d_kernel`) or the
+    tokens of a single k-block (`_per_token_blocked_quantize_mn_major_kernel`).
+
+    The reduction SET behind each output scale is therefore the same in both
+    callers, and `tl.max` is order-independent for finite inputs, so both
+    kernels emit bit-identical scales and bit-identical fp8 bytes. This is the
+    single source of truth for that math — do not inline a second copy, or the
+    two layouts can silently diverge in value instead of only in address.
+    """
+    FP8_SAFE_MAX: tl.constexpr = 448.0
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+
+    # Per-block amax via axis-1 reduction — one reduction call reduces every
+    # axis-0 row simultaneously (masked-out rows reduce to 0).
+    amax = tl.max(tl.abs(q_float), axis=1)
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    # scale = amax * (1 / 448). Matches the 3D-grid kernel and the CUDA kernel.
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
+
+    # Quantize — broadcast scale across the BLOCK_SIZE axis.
+    q_scaled = q_float / scale[:, None]
+    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
+    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
+    is_finite = tl.abs(q_scaled) < 1e30
+    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+    return scale, q_scaled
+
+
+@triton.jit
 def _per_token_blocked_quantize_1d_kernel(
     q_ptr, scale_ptr, out_ptr,
     num_valid_tokens_ptr,
@@ -271,10 +307,13 @@ def _per_token_blocked_quantize_1d_kernel(
     the (M * num_blocks)-grid flat variant 3× slower at large M.
 
     Grid cap: M ≤ 2^31-1 on CUDA CC ≥ 3.0 (H20 = 9.0). No grid-Y used.
+
+    SCALE LAYOUT: the per-CTA scale store is `NUM_BLOCKS` elements at
+    `scale_stride_b`. That is one contiguous run for a row-major
+    `[M, num_blocks]` scale (stride_b == 1) and `NUM_BLOCKS` scattered 4-byte
+    stores for an MN-major TMA-aligned scale (stride_b == align(M, 4)). Use
+    `_per_token_blocked_quantize_mn_major_kernel` for the MN-major layout.
     """
-    FP8_SAFE_MAX: tl.constexpr = 448.0
-    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
-    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
 
     pid_m = tl.program_id(0).to(tl.int64)
@@ -310,24 +349,109 @@ def _per_token_blocked_quantize_1d_kernel(
     q_bf16 = tl.load(q_ptr + q_offsets, mask=col_mask, other=0.0)
     q_float = q_bf16.to(tl.float32)
 
-    # Per-block amax via axis-1 reduction — one reduction call reduces
-    # NUM_BLOCKS_P2 rows simultaneously (padded rows reduce to 0).
-    amax = tl.max(tl.abs(q_float), axis=1)
-    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    # SGLang formula: scale = amax * (1 / 448). Matches the 3D-grid kernel.
-    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)   # [NUM_BLOCKS_P2]
-
-    # Quantize — broadcast scale across the BLOCK_SIZE axis.
-    q_scaled = q_float / scale[:, None]
-    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
-    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
-    is_finite = tl.abs(q_scaled) < 1e30
-    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+    # scale: [NUM_BLOCKS_P2]; q_scaled: [NUM_BLOCKS_P2, BLOCK_SIZE]
+    scale, q_scaled = _blocked_scale_and_quantize(q_float)
 
     tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
 
     # Store scales, masking padded block rows.
     tl.store(scale_ptr + scale_offsets, scale, mask=block_valid)
+
+
+# Contiguous scale bytes written per program by the MN-major kernel is
+# TILE_M * 4. 32 rows => 128 B => four fully-covered 32-B sectors, which is the
+# point of the whole kernel; smaller M just shrinks the tile to the next pow-2.
+MN_MAJOR_MAX_TILE_M = 32
+
+
+def mn_major_scale_tile_m(M: int) -> int:
+    """Rows of `M` handled by one `_per_token_blocked_quantize_mn_major_kernel`
+    program. Power of two (Triton tile-dim requirement), capped at
+    `MN_MAJOR_MAX_TILE_M`, and never larger than the next pow-2 above `M` so a
+    tiny batch does not launch a mostly-masked CTA.
+    """
+    if M <= 0:
+        raise ValueError(f"M must be positive, got {M}")
+    tile = 1
+    while tile < M and tile < MN_MAJOR_MAX_TILE_M:
+        tile *= 2
+    return tile
+
+
+@triton.jit
+def _per_token_blocked_quantize_mn_major_kernel(
+    q_ptr, scale_ptr, out_ptr,
+    num_valid_tokens_ptr,
+    M,
+    dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,       # 128 — fp8 blockwise scale block
+    TILE_M: tl.constexpr,           # tokens per program (pow-2, see mn_major_scale_tile_m)
+    q_stride_m, q_stride_d,
+    scale_stride_m, scale_stride_b,
+    out_stride_m, out_stride_d,
+    HAS_VALID_TOKENS: tl.constexpr,
+):
+    """Same quantization as `_per_token_blocked_quantize_1d_kernel`, partitioned
+    so the MN-major scale store is COALESCED.
+
+    Grid is (ceil(M / TILE_M), NUM_BLOCKS): one program owns TILE_M consecutive
+    tokens of ONE k-block, so its scale output is `TILE_M` elements along the
+    token axis — the stride-1 axis of the MN-major TMA-aligned scale
+    (`strides == (1, align(M, 4))`). The store is therefore one contiguous
+    TILE_M * 4-byte run instead of NUM_BLOCKS scattered 4-byte stores strided by
+    the aligned leading dimension.
+
+    The fp8 payload store is unchanged in total traffic: each program writes a
+    [TILE_M, BLOCK_SIZE] tile whose rows are BLOCK_SIZE contiguous bytes, and
+    the NUM_BLOCKS programs of a token tile together cover exactly the same
+    bytes the 1-CTA-per-token kernel writes in one run.
+
+    Values are produced by `_blocked_scale_and_quantize`, shared with the
+    row-major kernel, over the same per-(token, k-block) reduction set, so both
+    layouts hold bit-identical scales and bit-identical fp8 bytes.
+    """
+    EPSILON: tl.constexpr = 1e-12
+
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_b = tl.program_id(1).to(tl.int64)
+
+    rows = pid_t * TILE_M + tl.arange(0, TILE_M).to(tl.int64)     # [TILE_M]
+    row_in_range = rows < M
+
+    cols = pid_b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)   # [BLOCK_SIZE]
+    col_in_range = cols < dim
+
+    # int64 offsets: rows * q_stride_m can exceed 2^31 when M * dim > 2B.
+    q_stride_m_i64 = tl.cast(q_stride_m, tl.int64)
+    out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
+    scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
+
+    tile_mask = row_in_range[:, None] & col_in_range[None, :]
+
+    q_offsets = rows[:, None] * q_stride_m_i64 + cols[None, :] * q_stride_d
+    q_bf16 = tl.load(q_ptr + q_offsets, mask=tile_mask, other=0.0)
+    q_float = q_bf16.to(tl.float32)
+
+    # scale: [TILE_M]; q_scaled: [TILE_M, BLOCK_SIZE]
+    scale, q_scaled = _blocked_scale_and_quantize(q_float)
+
+    if HAS_VALID_TOKENS:
+        # Rows past num_valid_tokens are poisoned deterministically: fp8 bytes
+        # 0x00 and scale exactly EPSILON, matching the row-major kernel's
+        # early-return branch. Select rather than branch, because a TILE_M tile
+        # can straddle the num_valid_tokens boundary.
+        num_valid_tokens = tl.load(num_valid_tokens_ptr)
+        row_valid = rows < num_valid_tokens
+        scale = tl.where(row_valid, scale, EPSILON)
+        q_scaled = tl.where(row_valid[:, None], q_scaled, 0.0)
+
+    out_offsets = rows[:, None] * out_stride_m_i64 + cols[None, :] * out_stride_d
+    tl.store(out_ptr + out_offsets, q_scaled, mask=tile_mask)
+
+    # Coalesced: scale_stride_m == 1 for the MN-major layout, so these are
+    # TILE_M consecutive fp32 words.
+    scale_offsets = rows * scale_stride_m_i64 + pid_b * scale_stride_b
+    tl.store(scale_ptr + scale_offsets, scale, mask=row_in_range)
 
 
 def per_token_blocked_quantize_bf16_to_fp8_1d(
@@ -340,6 +464,22 @@ def per_token_blocked_quantize_bf16_to_fp8_1d(
     act_quant_3d kernel's partitioning). At M=100k, K=6144 this is ~3× faster
     than `per_token_blocked_quantize_bf16_to_fp8_flat` (which uses 1 CTA per
     (token, K-block), running 48× more CTAs).
+
+    `scale_tma_aligned` only changes where the fp32 scale ELEMENTS land; the
+    logical `[M, num_blocks]` contents and the fp8 payload are identical either
+    way. The two layouts put their contiguous axis in opposite places, so they
+    need opposite program partitionings to keep the scale store coalesced:
+
+      row-major  [M, num_blocks], strides (num_blocks, 1)
+          -> 1 program per token, NUM_BLOCKS contiguous scales per store
+             (`_per_token_blocked_quantize_1d_kernel`)
+      MN-major   [M, num_blocks], strides (1, align(M, 4))
+          -> 1 program per (token tile, k-block), TILE_M contiguous scales
+             per store (`_per_token_blocked_quantize_mn_major_kernel`)
+
+    Running the row-major partitioning on the MN-major layout is what made the
+    scale store uncoalesced: each program then issued NUM_BLOCKS separate
+    4-byte stores strided by the aligned leading dimension.
 
     Returns:
         out:   [M, dim]          dtype=float8_e4m3fn
@@ -373,8 +513,26 @@ def per_token_blocked_quantize_bf16_to_fp8_1d(
             device=x.device,
             dtype=torch.float32,
         ).transpose(0, 1)[:M, :]
-    else:
-        scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
+        # DeepGEMM's early-return predicate (smxx_layout.hpp:117-119) and the
+        # coalesced store below both depend on this exact stride signature.
+        assert scale.stride(0) == 1 and scale.stride(1) == aligned_m, (
+            f"MN-major scale must have strides (1, {aligned_m}), got {scale.stride()}"
+        )
+        tile_m = mn_major_scale_tile_m(M)
+        grid = ((M + tile_m - 1) // tile_m, num_blocks)
+        _per_token_blocked_quantize_mn_major_kernel[grid](
+            x, scale, out,
+            num_valid_tokens if num_valid_tokens is not None else scale,
+            M, dim, block_size, tile_m,
+            x.stride(0), x.stride(1),
+            scale.stride(0), scale.stride(1),
+            out.stride(0), out.stride(1),
+            HAS_VALID_TOKENS=num_valid_tokens is not None,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        return out, scale
+
+    scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
 
     grid = (M,)
     _per_token_blocked_quantize_1d_kernel[grid](
