@@ -18111,7 +18111,13 @@ class BatchGenWorker:
 		# Async state
 		self._pending_kv_append_tasks = []
 		self._pending_kv_append_tensors = []
-		
+		# Per-step append-drain path counts, reset with the round that owns
+		# them: how often this rank's appends were already complete when the
+		# host reached the drain (fast path, device sync skipped) versus still
+		# in flight (today's join + device sync).
+		self._kv_drain_ready_fast = 0
+		self._kv_drain_ready_slow = 0
+
 		pending_async_task = None
 		pending_load_uuids = []
 		pending_load_local = []
@@ -18235,6 +18241,15 @@ class BatchGenWorker:
 					_split_txt = " " + format_decode_step_split(_step_split)
 					_step_split = new_decode_step_split()
 				_split_txt += _fwd_ring.take_summary()
+				# Whether the append drain's ready fast path fires at all is a
+				# property of the deployment, not of the code, so it is reported
+				# rather than assumed: kv_drain=fast/total over this interval.
+				_drain_fast = self._kv_drain_ready_fast
+				_drain_total = _drain_fast + self._kv_drain_ready_slow
+				self._kv_drain_ready_fast = 0
+				self._kv_drain_ready_slow = 0
+				if _drain_total:
+					_split_txt += f" kv_drain_ready={_drain_fast}/{_drain_total}"
 				logging.info(
 					f"[DECODE] step={self._cumulative_decode_iterations} "
 					f"active={len(decode_uuids)} finished={_hb_finished} "
@@ -19210,15 +19225,33 @@ class BatchGenWorker:
 			# 512x4096 K3 contract: every victim was in a wave after the first
 			# and collapsed at its 2nd or ~28th token, while the first wave (no
 			# page-table mutation in flight) was clean. The drain sits after the
-			# token readback only so its wait (which ends in a full device sync)
-			# gets its own split slot instead of being charged to the copy
-			# launch; nothing between the launch above and here touches a page
-			# table. defer_errors=True keeps it a purely local wait (a guarded
-			# collective would deadlock when only some ranks have tasks); the
-			# deferred errors surface at the next boundary PHASE 0 or loop-exit
-			# drain, both of which sync errors across ranks.
+			# token readback only so its wait gets its own split slot instead of
+			# being charged to the copy launch; nothing between the launch above
+			# and here touches a page table. defer_errors=True keeps it a purely
+			# local wait (a guarded collective would deadlock when only some
+			# ranks have tasks); the deferred errors surface at the next boundary
+			# PHASE 0 or loop-exit drain, both of which sync errors across ranks.
+			#
+			# ready_fast_path=True: before joining, the drain reads whether every
+			# append task's future is ALREADY ready. If so the joins are no-ops
+			# -- a future becomes ready only after its lambda's closing
+			# SynchronizeWithEvent, i.e. after that task's own copies completed
+			# -- and the full device sync is skipped, because this step frees no
+			# GPU page and mutates no page table, so whole-device quiet buys it
+			# nothing. If ANY task is still in flight the drain falls back to
+			# today's exact behaviour (join all, then device sync), so the
+			# unbounded GIL-holding wait and the device sync happen on precisely
+			# the path they happen on today. The teardown-boundary argument
+			# below is therefore unchanged: that drain is still "a task join
+			# ending in a device sync" whenever it is still the wedge, and the
+			# fast path, which cannot block, is taken only when there is
+			# nothing left to wedge on. Every page-free/reuse caller (boundary
+			# PHASE 0, watermark ON_HOLD, pre-config flush, the 256-task
+			# throttle, loop exit, the bounded quiesce) keeps the default.
 			if self._pending_kv_append_tasks:
-				self._wait_pending_kv_append_tasks(defer_errors=True)
+				self._wait_pending_kv_append_tasks(
+					defer_errors=True, ready_fast_path=True
+				)
 
 			# --- Decode-step teardown boundary (the measured wedge point) ---
 			# The sync a few lines up is where a rank whose peer died mid-decode
@@ -19416,14 +19449,45 @@ class BatchGenWorker:
 		*,
 		sync_distributed_errors: bool = False,
 		defer_errors: bool = False,
+		ready_fast_path: bool = False,
 	) -> int:
 		"""
 		Wait for all pending KV append tasks at page boundary.
 		Returns the number of tasks that were waited for.
-		
+
 		CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
 		Without this, KV data may not be fully written to host memory when
 		sequences are later resumed, causing KV corruption.
+
+		``ready_fast_path`` lets a caller skip that device sync in the ONE case
+		where it is provably redundant: every pending task's future is already
+		ready before any join.  A task's future becomes ready only after its
+		lambda's last statement, ``SynchronizeWithEvent(cuda_stream)``, which
+		records an event on its copy stream and blocks the task thread on it
+		(``core/KV_Storage/host_paged_kv_worker_view.h:1177`` and ``:1372``,
+		helper at ``:3019-3023``).  So "future ready" already means "this
+		task's D2H copies have completed", and the joins below are no-ops.
+		Readiness is read through ``_pending_kv_appends_done`` -- per task,
+		``future_.wait_for(0s) == ready`` -- and must be read BEFORE the joins,
+		since afterwards every future is trivially ready.
+
+		It is opt-in, and only the steady-state per-step decode drain passes
+		it.  Every other caller is about to free or re-assign GPU pages, mutate
+		a page table, or unwind, and for those the device sync means something
+		the per-task events do not: that the REST of the device -- the main
+		stream's in-flight graph replay above all -- is also quiet.  Those
+		callers keep it unconditionally.
+
+		Fallback is today's code path, unchanged: when any task is still in
+		flight the joins block (holding the GIL -- ``KVAsyncTask::wait`` is
+		bound without ``gil_scoped_release`` at
+		``core/batchgen_Binding.cpp:1067``) and the device sync runs.  The
+		cohort-abort release argument therefore still holds wherever it held
+		before: the wedge, and the release of it, stay on exactly the path
+		that wedges today.  The probe itself cannot wedge -- it is a status
+		read per task -- so there is no deadline to honour around it and no
+		teardown flag to poll inside it; the abandoned-token exit that already
+		sits ahead of the per-step drain keeps covering the unwakeable case.
 		"""
 		deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
 		if not hasattr(self, '_pending_kv_append_tasks'):
@@ -19451,6 +19515,28 @@ class BatchGenWorker:
 		wait_errors = list(deferred_errors)
 		if deferred_errors and hasattr(self, "_deferred_kv_append_wait_errors"):
 			self._deferred_kv_append_wait_errors.clear()
+		# Read readiness before the joins: afterwards every future is ready and
+		# the probe would always answer yes.  One status read per task, never a
+		# wait.
+		drain_ready = bool(
+			ready_fast_path and num_tasks > 0 and self._pending_kv_appends_done()
+		)
+		if ready_fast_path and num_tasks > 0:
+			# Whether the fast path actually fires is a per-deployment question
+			# (it needs this step's D2H copies to have retired by the time the
+			# host gets here), so the two paths are counted and reported in the
+			# rank-0 decode heartbeat instead of being assumed.
+			# getattr-based, like the deferred-error list above: the counters are
+			# reset per decode round, and a drain must not depend on having run
+			# inside one.
+			if drain_ready:
+				self._kv_drain_ready_fast = (
+					getattr(self, "_kv_drain_ready_fast", 0) + 1
+				)
+			else:
+				self._kv_drain_ready_slow = (
+					getattr(self, "_kv_drain_ready_slow", 0) + 1
+				)
 		for task in self._pending_kv_append_tasks:
 			if task is not None:
 				try:
@@ -19463,7 +19549,10 @@ class BatchGenWorker:
 		# Even though each task internally syncs its stream via cudaEventSynchronize,
 		# we need a full device sync to ensure ALL pending operations complete
 		# before we allow GPU pages to be freed/reused.
-		if num_tasks > 0 and not wait_errors:
+		# Skipped only on the proven-ready fast path (see the docstring): there
+		# the per-task events have already fired, so for a caller that frees no
+		# pages this sync has nothing left to establish.
+		if num_tasks > 0 and not wait_errors and not drain_ready:
 			try:
 				torch.cuda.synchronize(self.torch_device)
 			except Exception as e:

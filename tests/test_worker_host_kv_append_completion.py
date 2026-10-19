@@ -98,9 +98,12 @@ def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
     (wait_stmt,) = stmt.body
     wait = wait_stmt.value
     assert _is_wait_call(wait)
-    assert [(k.arg, ast.unparse(k.value)) for k in wait.keywords] == [
-        ("defer_errors", "True")
-    ]
+    # The drain stays a purely local wait, and it is the one caller allowed to
+    # skip the device sync when its appends are already complete. Anything
+    # else appearing here changes what the step waits for.
+    assert sorted(
+        (k.arg, ast.unparse(k.value)) for k in wait.keywords
+    ) == [("defer_errors", "True"), ("ready_fast_path", "True")]
 
     # Nothing between the launch and the drain can skip the drain -- with one
     # exception, and only because it drains by another route. When the token
@@ -112,7 +115,10 @@ def test_decode_step_drains_appends_after_readback_without_a_count_threshold():
     # self-exits rather than unwind with appends still in flight. So the
     # invariant this test defends -- never leave the step with unlocked
     # page-table readers running while teardown releases the mapping -- is
-    # still enforced on every path out of here.
+    # still enforced on every path out of here. The ready fast path cannot
+    # weaken that: in exactly that state the appends are parked behind the
+    # dead device work, so their futures are not ready, the probe says so, and
+    # the drain is the same unbounded join-plus-device-sync it is today.
     between = body[flush + 1:drain]
     for stmt in between:
         exits = [n for n in ast.walk(stmt)
