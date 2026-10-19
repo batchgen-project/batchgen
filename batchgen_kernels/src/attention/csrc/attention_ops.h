@@ -11,12 +11,16 @@ torch::Tensor rmsnorm_forward(
 
 // Fused Add + RMSNorm: residual += hidden, normed = rmsnorm(residual)
 // Returns (normed, residual_updated)
+// row_valid_mask: optional [num_rows] tensor, residual dtype. Rows whose entry
+// is exactly zero contribute 0 instead of `hidden`. It is a PREDICATE, not a
+// multiplicative factor, so a non-finite `hidden` row cannot leak through.
 std::vector<torch::Tensor> add_rmsnorm_forward(
     torch::Tensor residual, // [*, hidden_size] modified in-place
     torch::Tensor hidden,   // [*, hidden_size]
     torch::Tensor weight,   // [hidden_size]
     float eps,
-    c10::optional<torch::Tensor> num_valid_tokens = c10::nullopt);
+    c10::optional<torch::Tensor> num_valid_tokens = c10::nullopt,
+    c10::optional<torch::Tensor> row_valid_mask = c10::nullopt);
 
 // Fused RoPE for Q and K (YaRN half-dim rotation)
 // Returns (q_rot, k_rot)

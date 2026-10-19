@@ -137,10 +137,19 @@ __global__ void add_rmsnorm_bf16_6144_kernel(
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ normed_out,
     float eps,
-    const int* __restrict__ num_valid_ptr)
+    const int* __restrict__ num_valid_ptr,
+    const __nv_bfloat16* __restrict__ row_valid_ptr)
 {
     int row = blockIdx.x;
     if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
+    // Row-select gate on `hidden`. The mask entry is read as a PREDICATE and
+    // the invalid branch stores the literal 0.0f -- it is never multiplied in.
+    // A multiply would be wrong, not merely slower: `hidden` rows that the
+    // caller marks invalid may hold non-finite bytes, and bf16 NaN * 0 is NaN,
+    // so a masked row would keep polluting the residual stream.
+    const bool row_valid =
+        (row_valid_ptr == nullptr) || (__bfloat162float(row_valid_ptr[row]) != 0.0f);
 
     __shared__ float warp_sums[kVectorWarps];
     __shared__ float s_inv_rms;
@@ -162,8 +171,8 @@ __global__ void add_rmsnorm_bf16_6144_kernel(
     float sum_sq = 0.0f;
     #pragma unroll
     for (int i = 0; i < kVectorWidth; ++i) {
-        float sum = __bfloat162float(residual_vector.values[i])
-                  + __bfloat162float(hidden_vector.values[i]);
+        float h = row_valid ? __bfloat162float(hidden_vector.values[i]) : 0.0f;
+        float sum = __bfloat162float(residual_vector.values[i]) + h;
         rounded_sum.values[i] = __float2bfloat16_rn(sum);
         sum_sq = fmaf(sum, sum, sum_sq);
     }
@@ -249,11 +258,16 @@ __global__ void add_rmsnorm_kernel(
     T* __restrict__ normed_out,
     int hidden_size,
     float eps,
-    const int* __restrict__ num_valid_ptr)
+    const int* __restrict__ num_valid_ptr,
+    const T* __restrict__ row_valid_ptr)
 {
     int row = blockIdx.x;
     // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
     if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
+    // See the comment in add_rmsnorm_bf16_6144_kernel: predicate, not factor.
+    const bool row_valid =
+        (row_valid_ptr == nullptr) || (static_cast<float>(row_valid_ptr[row]) != 0.0f);
 
     const int64_t offset = static_cast<int64_t>(row) * hidden_size;
     T* r_row = residual + offset;
@@ -264,7 +278,7 @@ __global__ void add_rmsnorm_kernel(
     float sum_sq = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float r = static_cast<float>(r_row[i]);
-        float h = static_cast<float>(h_row[i]);
+        float h = row_valid ? static_cast<float>(h_row[i]) : 0.0f;
         float s = r + h;
         // Store updated residual
         r_row[i] = static_cast<T>(s);
@@ -373,7 +387,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
     torch::Tensor hidden,
     torch::Tensor weight,
     float eps,
-    c10::optional<torch::Tensor> num_valid_tokens)
+    c10::optional<torch::Tensor> num_valid_tokens,
+    c10::optional<torch::Tensor> row_valid_mask)
 {
     TORCH_CHECK(residual.is_cuda(), "residual must be CUDA");
     TORCH_CHECK(hidden.is_cuda(), "hidden must be CUDA");
@@ -396,6 +411,25 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
         num_valid_ptr = num_valid_tokens->data_ptr<int>();
     }
 
+    // `row_valid_mask` folds a caller's per-row gate on `hidden` into this
+    // kernel. It is validated hard rather than silently ignored: a dropped
+    // mask would let invalid rows into the residual stream, which is exactly
+    // the failure this argument exists to prevent.
+    bool has_row_mask = row_valid_mask.has_value() && row_valid_mask->defined();
+    torch::Tensor row_mask;
+    if (has_row_mask) {
+        row_mask = *row_valid_mask;
+        TORCH_CHECK(row_mask.is_cuda(), "row_valid_mask must be CUDA");
+        TORCH_CHECK(
+            row_mask.scalar_type() == residual.scalar_type(),
+            "row_valid_mask dtype must match residual dtype");
+        TORCH_CHECK(
+            row_mask.numel() == num_rows,
+            "row_valid_mask must have one entry per row (expected ", num_rows,
+            ", got ", row_mask.numel(), ")");
+        row_mask = row_mask.contiguous();
+    }
+
     const int threads = 256;
     const int blocks = num_rows;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -404,6 +438,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
         "add_rmsnorm_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
             [&] {
+                const at::BFloat16* row_mask_ptr =
+                    has_row_mask ? row_mask.data_ptr<at::BFloat16>() : nullptr;
                 bool vector_aligned = is_aligned_16(residual.data_ptr<at::BFloat16>())
                                    && is_aligned_16(hidden.data_ptr<at::BFloat16>())
                                    && is_aligned_16(weight.data_ptr<at::BFloat16>())
@@ -419,7 +455,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
                             weight.data_ptr<at::BFloat16>()),
                         reinterpret_cast<__nv_bfloat16*>(
                             normed_out.data_ptr<at::BFloat16>()),
-                        eps, num_valid_ptr);
+                        eps, num_valid_ptr,
+                        reinterpret_cast<const __nv_bfloat16*>(row_mask_ptr));
                 } else {
                     if (hidden_size == kVectorHiddenSize && !vector_aligned) {
                         TORCH_WARN_ONCE(
@@ -431,7 +468,7 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
                         hidden.data_ptr<at::BFloat16>(),
                         weight.data_ptr<at::BFloat16>(),
                         normed_out.data_ptr<at::BFloat16>(),
-                        hidden_size, eps, num_valid_ptr);
+                        hidden_size, eps, num_valid_ptr, row_mask_ptr);
                 }
             })
         AT_DISPATCH_CASE(at::ScalarType::Half,
@@ -440,14 +477,16 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
                 hidden.data_ptr<at::Half>(),
                 weight.data_ptr<at::Half>(),
                 normed_out.data_ptr<at::Half>(),
-                hidden_size, eps, num_valid_ptr); })
+                hidden_size, eps, num_valid_ptr,
+                has_row_mask ? row_mask.data_ptr<at::Half>() : nullptr); })
         AT_DISPATCH_CASE(at::ScalarType::Float,
             [&] { add_rmsnorm_kernel<float><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<float>(),
                 hidden.data_ptr<float>(),
                 weight.data_ptr<float>(),
                 normed_out.data_ptr<float>(),
-                hidden_size, eps, num_valid_ptr); })
+                hidden_size, eps, num_valid_ptr,
+                has_row_mask ? row_mask.data_ptr<float>() : nullptr); })
     );
 
     return {normed_out, residual};
