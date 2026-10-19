@@ -358,10 +358,16 @@ def _per_token_blocked_quantize_1d_kernel(
     tl.store(scale_ptr + scale_offsets, scale, mask=block_valid)
 
 
-# Contiguous scale bytes written per program by the MN-major kernel is
-# TILE_M * 4. 32 rows => 128 B => four fully-covered 32-B sectors, which is the
-# point of the whole kernel; smaller M just shrinks the tile to the next pow-2.
-MN_MAJOR_MAX_TILE_M = 32
+# Tokens one MN-major program owns. 16 is MEASURED, not reasoned: an isolated
+# device-timed sweep of TILE_M in {16, 32, 64} over the three real decode
+# shapes, and over the batch sizes they run at, put 16 ahead at every cell.
+# The lever is CTA COUNT, not store width -- these launches sit far below one
+# wave of the GPU, so the extra programs a smaller tile creates are worth more
+# than a wider contiguous store. 16 still writes TILE_M * 4 = 64 contiguous
+# scale bytes, i.e. whole 32-B sectors, so the store stays coalesced; it is the
+# parallelism, not the sector count, that decided the constant. Smaller M just
+# shrinks the tile to the next pow-2.
+MN_MAJOR_MAX_TILE_M = 16
 
 
 def mn_major_scale_tile_m(M: int) -> int:

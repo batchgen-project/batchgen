@@ -225,7 +225,12 @@ def test_launcher_asserts_the_deepgemm_stride_signature():
 
 
 # ---------------------------------------------------------------------------
-# Tile-size helper.
+# Tile-size helper. The cap is MEASURED, not reasoned: an isolated device-timed
+# sweep of TILE_M in {16, 32, 64} over the three real decode shapes, and over
+# the batch sizes they run at, put 16 ahead at every cell -- below one wave the
+# lever is CTA count, not store width. The expectations below therefore pin the
+# measured constant: raising the cap back to 32 on sector-width reasoning must
+# fail here.
 # ---------------------------------------------------------------------------
 
 
@@ -240,11 +245,11 @@ def test_launcher_asserts_the_deepgemm_stride_signature():
         (8, 8),
         (9, 16),
         (16, 16),
-        (17, 32),
-        (32, 32),
-        (33, 32),
-        (64, 32),
-        (100_000, 32),
+        (17, 16),
+        (32, 16),
+        (33, 16),
+        (64, 16),
+        (100_000, 16),
     ],
 )
 def test_mn_major_scale_tile_m(M, expected):
