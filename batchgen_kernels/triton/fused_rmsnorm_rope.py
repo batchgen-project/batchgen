@@ -801,6 +801,22 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     # False and no address is ever formed from this argument.
     row_valid_ptr=0,
     HAS_ROW_MASK: tl.constexpr = False,
+    # APPENDED AFTER `HAS_ROW_MASK` for exactly the reason above: every
+    # parameter before this point is one some existing caller already fills,
+    # positionally or by keyword, so nothing may be inserted ahead of it.
+    # These three are the OPTIONAL SPLIT SOURCE for q_pe: when `HAS_SPLIT_Q`
+    # is set the rotated pair is READ from `q_pe_in_ptr` at an arbitrary
+    # (row, head) stride pair and WRITTEN to `q_pe_ptr`, instead of being
+    # read and written in place through `q_pe_ptr`. That lets a caller hand
+    # the kernel the q projection's own packed [nope|rope] output and get the
+    # rope half rotated straight into its own contiguous buffer, with no
+    # gather launch in between. `HAS_SPLIT_Q` is a constexpr, so with the
+    # default the loads below are statically the in-place ones and no address
+    # is ever formed from `q_pe_in_ptr`.
+    q_pe_in_ptr=0,
+    q_in_row_stride=0,
+    q_in_head_stride=0,
+    HAS_SPLIT_Q: tl.constexpr = False,
 ):
     """Fused RMSNorm + RoPE kernel with NATIVE INTERLEAVED output layout.
 
@@ -830,7 +846,17 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     ``[kv_lora_rank + qk_rope_head_dim]`` slice.  This is a ``tl.where``
     SELECT on the value, never a multiply -- the caller's rows can hold
     non-finite stale bytes, and bf16 ``NaN * 0`` is ``NaN``.  ``q_pe`` is
-    NOT gated: it is rotated in place and stays row-local.
+    NOT gated: it is row-local and leaves the segment only through attention.
+
+    ``HAS_SPLIT_Q`` changes where the q pairs are READ from, never what is
+    computed or where it is stored.  With it, lane ``>= 1`` loads head
+    ``h``'s pair ``i`` from ``q_pe_in_ptr + b * q_in_row_stride +
+    h * q_in_head_stride + {2i, 2i+1}`` and stores the rotated pair to the
+    same ``q_pe_ptr`` offsets as the in-place form.  The innermost axis is
+    still addressed at unit stride, so the source's rope slice must be
+    contiguous within a head; only the row and head strides are free.  Every
+    ``[b, h, 0, :]`` element of ``q_pe_ptr`` is written in both forms, so the
+    destination carries no residue from a previous replay.
     """
     batch_idx = tl.program_id(0)
     lane_idx = tl.program_id(1)
@@ -949,8 +975,28 @@ def fused_rmsnorm_rope_with_q_native_kernel(
             + odd_indices[None, :]
         )
 
-        q_even = tl.load(q_pe_ptr + q_even_offsets, mask=tile_mask, other=0.0)
-        q_odd = tl.load(q_pe_ptr + q_odd_offsets, mask=tile_mask, other=0.0)
+        # Same reassign-inside-a-constexpr-if shape as `row_valid` above: with
+        # the default the source IS the destination and this is the in-place
+        # rotation the kernel has always done.
+        q_src_ptr = q_pe_ptr
+        q_src_even_offsets = q_even_offsets
+        q_src_odd_offsets = q_odd_offsets
+        if HAS_SPLIT_Q:
+            q_src_ptr = q_pe_in_ptr
+            q_src_row_offset = batch_idx * q_in_row_stride
+            q_src_even_offsets = (
+                q_src_row_offset
+                + head_offsets[:, None] * q_in_head_stride
+                + even_indices[None, :]
+            )
+            q_src_odd_offsets = (
+                q_src_row_offset
+                + head_offsets[:, None] * q_in_head_stride
+                + odd_indices[None, :]
+            )
+
+        q_even = tl.load(q_src_ptr + q_src_even_offsets, mask=tile_mask, other=0.0)
+        q_odd = tl.load(q_src_ptr + q_src_odd_offsets, mask=tile_mask, other=0.0)
 
         q_rot_even = q_even * cos_i[None, :] - q_odd * sin_i[None, :]
         q_rot_odd = q_even * sin_i[None, :] + q_odd * cos_i[None, :]
@@ -971,6 +1017,7 @@ def fused_rmsnorm_rope_with_q_native(
     eps: float = 1e-6,
     out: torch.Tensor | None = None,
     row_valid_mask: torch.Tensor | None = None,
+    q_pe_src: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native-interleaved variant of ``fused_rmsnorm_rope_with_q``.
 
@@ -991,16 +1038,55 @@ def fused_rmsnorm_rope_with_q_native(
     stale bytes and bf16 ``NaN * 0`` is ``NaN``, so a multiply would defeat the
     gate. It requires ``out``, because masking a freshly allocated buffer the
     caller then ignores would be a silent no-op.
+
+    ``q_pe_src`` is an optional SEPARATE SOURCE for the q pairs, same shape as
+    ``q_pe`` but free to carry any row and head stride (its innermost axis
+    must still be contiguous). With it, ``q_pe`` is WRITE-ONLY: the pairs are
+    read from ``q_pe_src``, rotated, and stored into ``q_pe``, which lets a
+    caller rotate the rope half of a packed ``[nope|rope]`` q projection
+    straight into its own contiguous buffer instead of gathering it first.
+    Without it the kernel rotates ``q_pe`` in place, exactly as before. The
+    arithmetic and the stored bytes are identical in both forms -- only the
+    load addresses differ -- and every element of ``q_pe`` is written either
+    way, so the destination never keeps residue from an earlier call.
     """
     bsz, q_len, total_dim = new_compressed_kv.shape
     assert q_len == 1, "This kernel assumes q_len = 1 for decoding"
     assert total_dim == kv_lora_rank + qk_rope_head_dim
     assert qk_rope_head_dim % 2 == 0
+    # Still required, and now specifically as the DESTINATION: the store
+    # offsets below are the dense [bsz, num_heads, 1, qk_rope_head_dim] ones
+    # in both the in-place and the split-source form.
     assert q_pe.is_contiguous(), "q_pe must be contiguous"
     assert position_ids.shape == (bsz, 1)
 
     num_heads = q_pe.shape[1]
     assert q_pe.shape == (bsz, num_heads, 1, qk_rope_head_dim)
+
+    if q_pe_src is not None:
+        if tuple(q_pe_src.shape) != (bsz, num_heads, 1, qk_rope_head_dim):
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: q_pe_src must have q_pe's "
+                f"shape {(bsz, num_heads, 1, qk_rope_head_dim)}, got "
+                f"{tuple(q_pe_src.shape)}"
+            )
+        if q_pe_src.dtype != q_pe.dtype:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: q_pe_src dtype "
+                f"{q_pe_src.dtype} != q_pe dtype {q_pe.dtype}"
+            )
+        if q_pe_src.device != q_pe.device:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: q_pe_src device "
+                f"{q_pe_src.device} != q_pe device {q_pe.device}"
+            )
+        if q_pe_src.stride(-1) != 1:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: q_pe_src's head_dim axis "
+                "must be contiguous (stride 1); the kernel addresses the "
+                f"rotated pair at unit stride, got strides "
+                f"{tuple(q_pe_src.stride())}"
+            )
 
     if out is None:
         if row_valid_mask is not None:
@@ -1060,6 +1146,19 @@ def fused_rmsnorm_rope_with_q_native(
         if row_valid_mask is not None
         else {}
     )
+    # Same discipline: last in the signature, passed by keyword, and omitted
+    # entirely when there is no split source, so the no-split launch keeps the
+    # exact argument list it had before this parameter existed.
+    split_kwargs = (
+        {
+            "q_pe_in_ptr": q_pe_src,
+            "q_in_row_stride": q_pe_src.stride(0),
+            "q_in_head_stride": q_pe_src.stride(1),
+            "HAS_SPLIT_Q": True,
+        }
+        if q_pe_src is not None
+        else {}
+    )
 
     fused_rmsnorm_rope_with_q_native_kernel[grid](
         new_compressed_kv,
@@ -1079,6 +1178,7 @@ def fused_rmsnorm_rope_with_q_native(
         BLOCK_H=block_h,
         BLOCK_PAIRS=block_pairs,
         **mask_kwargs,
+        **split_kwargs,
         # Matches the previous launch's default so the kv-lora sum of squares
         # keeps the same reduction tree, and with it the exact inv_rms bits.
         num_warps=4,

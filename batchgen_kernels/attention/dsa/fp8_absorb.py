@@ -124,7 +124,8 @@ def triton_absorb_gemv(
 
 @triton.jit
 def _absorb_fp8_wgmma_kernel(
-    X_ptr,       # [B, H, K] BF16 — input activations
+    X_ptr,       # [B, H, K] BF16 — input activations; stride_xb/stride_xh are
+                 # passed in, so only the K axis must be contiguous
     W_ptr,       # [H, N, K] FP8 E4M3 — pre-quantized weight (row-major: each row is K)
     W_scale_ptr, # [H, N_scale_blocks, K_scale_blocks] FP32 — per-block weight scales
     OUT_ptr,     # [B, H, N] BF16 — output
@@ -346,9 +347,28 @@ def triton_absorb_fp8_out(
     out: torch.Tensor,
     num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Out-buffer Triton FP8 WGMMA absorb for CUDA graph capture."""
-    if not x_bhk.is_contiguous():
-        raise ValueError("x_bhk must be contiguous for graph-captured FP8 absorb")
+    """Out-buffer Triton FP8 WGMMA absorb for CUDA graph capture.
+
+    ``x_bhk`` must be 3D with a CONTIGUOUS K AXIS; its batch and head strides
+    are free. That is the kernel's actual requirement, stated exactly: it is
+    handed ``stride(0)`` and ``stride(1)`` and loads each ``[BLOCK_B,
+    BLOCK_K]`` activation tile as consecutive elements along K. A caller can
+    therefore pass a head-strided slice of a packed projection output -- e.g.
+    the NoPE half of a ``[B, H * (nope + rope)]`` q projection -- without
+    first materializing it, which is one gather launch less inside a captured
+    graph. A K-strided view (a transpose) is still refused by name.
+    """
+    if x_bhk.dim() != 3:
+        raise ValueError(
+            "x_bhk must be 3D [B, H, K] for graph-captured FP8 absorb, got "
+            f"shape {tuple(x_bhk.shape)}"
+        )
+    if x_bhk.stride(-1) != 1:
+        raise ValueError(
+            "x_bhk's K axis must be contiguous (stride 1) for graph-captured "
+            f"FP8 absorb, got strides {tuple(x_bhk.stride())}; only the batch "
+            "and head strides are passed to the kernel"
+        )
     B, H, K = x_bhk.shape
     N = w_fp8.shape[1]
     if out.shape != (B, H, N) or out.dtype != torch.bfloat16:
