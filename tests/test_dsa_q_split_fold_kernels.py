@@ -190,15 +190,19 @@ def test_head_strided_q_pe_src_passes_validation_and_reaches_the_launch():
     assert src.stride(-1) == 1
     assert src.stride(1) == nope + rope_dim
     assert not src.is_contiguous()
-    # The CPU box has no Triton runtime, so the launch itself cannot execute;
-    # what this pins is that NONE of the wrapper's guards reject this layout.
-    # The numeric half is the CUDA test below.
+    # The launch itself is not what this pins: on a CPU-only box there is no
+    # Triton runtime, and where there IS one the launcher rejects a CPU tensor
+    # with a ValueError of its own -- which is indistinguishable from a guard
+    # rejection if we discriminate on the exception TYPE. Discriminate on the
+    # guard's message prefix instead (the three sibling cases above pin those
+    # exact prefixes) and treat any other failure as "no guard rejected this
+    # layout", which is what this case exists to prove. The numeric half is
+    # the CUDA test below.
     try:
         _call_rope(src, num_heads=heads, rope_dim=rope_dim)
-    except ValueError as exc:  # pragma: no cover - would be a guard regression
-        pytest.fail(f"a head-strided q_pe_src must be accepted, got: {exc}")
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - see the comment above
+        if "fused_rmsnorm_rope_with_q_native:" in str(exc):
+            pytest.fail(f"a head-strided q_pe_src must be accepted, got: {exc}")
 
 
 # --------------------------------------------------------------------------- #
