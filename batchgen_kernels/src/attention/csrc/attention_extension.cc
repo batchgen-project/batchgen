@@ -15,7 +15,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("hidden"),
           py::arg("weight"),
           py::arg("eps"),
-          py::arg("num_valid_tokens") = c10::nullopt);
+          py::arg("num_valid_tokens") = c10::nullopt,
+          py::arg("row_valid_mask") = c10::nullopt);
 
     m.def("rope_forward", &rope_forward,
           "Fused RoPE for Q+K forward (CUDA)",
