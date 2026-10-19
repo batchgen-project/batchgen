@@ -2394,11 +2394,18 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
             raise AssertionError("whole-model graph should use layer segments directly")
 
     class FakeLayerSegment:
-        def __init__(self, value):
+        # All fake layers share one buffer set per variant, exactly as the
+        # worker's shared_dsa_buffers / shared_reuse_buffers do, so the hoisted
+        # row-validity prologue must run once per variant, not once per layer.
+        def __init__(self, value, variant="full", buffers_id=0):
             self.value = value
             self.calls = 0
             self.setup_bucket = None
             self.release_bucket = None
+            self.variant = variant
+            self.buffers_id = buffers_id
+            self.prologue_calls = []
+            self.row_validity_ready = []
 
         def setup_static_buffers(self, bucket_size):
             self.setup_bucket = bucket_size
@@ -2406,7 +2413,14 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         def release_static_buffers(self, bucket_size):
             self.release_bucket = bucket_size
 
-        def forward(self, *, hidden_states, **kwargs):
+        def row_validity_prologue_key(self, bucket_size):
+            return (self.variant, self.buffers_id)
+
+        def run_row_validity_prologue(self, bucket_size, **kwargs):
+            self.prologue_calls.append((bucket_size, kwargs))
+
+        def forward(self, *, hidden_states, row_validity_ready=False, **kwargs):
+            self.row_validity_ready.append(row_validity_ready)
             self.calls += 1
             rows = hidden_states.shape[0]
             return {
@@ -2463,6 +2477,19 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
 
     assert [layer_segment.calls for layer_segment in layer_segments] == [1, 1]
     assert [layer_segment.setup_bucket for layer_segment in layer_segments] == [2, 2]
+    # Both fake layers share one buffer set, so the hoisted row-validity
+    # prologue runs on the FIRST layer only, and both layers then run with
+    # row_validity_ready=True.
+    assert [len(ls.prologue_calls) for ls in layer_segments] == [1, 0]
+    assert [ls.row_validity_ready for ls in layer_segments] == [[True], [True]]
+    prologue_bucket, prologue_kwargs = layer_segments[0].prologue_calls[0]
+    assert prologue_bucket == 2
+    assert sorted(prologue_kwargs) == [
+        "aux_slot_indices",
+        "cache_seqlens",
+        "num_valid_tokens",
+        "primary_slot_indices",
+    ]
     assert outputs["logits"][0, :hidden_size].tolist() == [4.0, 4.0, 4.0, 4.0]
     assert outputs["logits"][1, :hidden_size].tolist() == [5.0, 5.0, 5.0, 5.0]
     assert segment.primary_kv_offload_buffers[1]["key"][0, 0, 0, 0].item() == 2.0

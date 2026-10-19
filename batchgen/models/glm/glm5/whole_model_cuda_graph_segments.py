@@ -360,6 +360,70 @@ class Glm5WholeModelSegment:
     def _probe_output_name(layer_idx: int) -> str:
         return f"probe_layer_{int(layer_idx):03d}_hidden"
 
+    def _run_row_validity_prologues(
+        self,
+        bucket_size: int,
+        *,
+        cache_seqlens: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        num_valid_tokens: torch.Tensor | None,
+    ) -> tuple[tuple, ...]:
+        """Compute the layer-invariant row-validity statics ONCE per step.
+
+        Each attention segment used to derive the validity mask and its safe
+        index/seqlen buffers itself, from inputs this method hands every layer
+        unchanged -- so the identical values were recomputed once per layer.
+        The layers of a variant already SHARE one buffer set, so the values
+        land in the same tensors either way; running the prologue here, before
+        the layer loop and inside the captured region, removes the repeats
+        without changing a single value.
+
+        Deduplicated by ``row_validity_prologue_key`` = (variant, buffer-set
+        identity). One buffer set must never be claimed by two variants: the
+        full and skip masks differ on the aux slot, so a shared set would mean
+        the second prologue silently overwrote the first variant's statics.
+        """
+
+        ran: dict[tuple, int] = {}
+        variant_of_buffers: dict[int, tuple[str, int]] = {}
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            key_fn = getattr(layer_segment, "row_validity_prologue_key", None)
+            run_fn = getattr(layer_segment, "run_row_validity_prologue", None)
+            if key_fn is None or run_fn is None:
+                raise RuntimeError(
+                    "GLM-5 whole-model layer-composed graph hoists the "
+                    "row-validity prologue to one step-level call, so every "
+                    "layer segment must expose row_validity_prologue_key and "
+                    "run_row_validity_prologue; layer "
+                    f"{layer_idx} ({type(layer_segment).__name__}) exposes "
+                    f"key={key_fn is not None} run={run_fn is not None}"
+                )
+            key = key_fn(bucket_size)
+            variant, buffers_id = key
+            claimed = variant_of_buffers.setdefault(buffers_id, (variant, layer_idx))
+            if claimed[0] != variant:
+                raise RuntimeError(
+                    "GLM-5 whole-model row-validity prologue: layer "
+                    f"{layer_idx} claims variant {variant!r} for the buffer "
+                    f"set layer {claimed[1]} already claims as "
+                    f"{claimed[0]!r}. The variants' masks differ on the aux "
+                    "slot, so one prologue would overwrite the other's "
+                    "statics; the full and skip segments must not share a "
+                    "buffer set"
+                )
+            if key in ran:
+                continue
+            run_fn(
+                bucket_size,
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            ran[key] = layer_idx
+        return tuple(ran)
+
     def run_model_with_probes(
         self,
         *,
@@ -389,6 +453,15 @@ class Glm5WholeModelSegment:
                     "GLM-5 whole-model layer-composed graph missing inputs: "
                     f"{missing}"
                 )
+            # ONE prologue per step instead of one per layer: its inputs are
+            # the step-level statics below, passed unchanged to every layer.
+            self._run_row_validity_prologues(
+                int(input_ids.shape[0]),
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
             for layer_idx, layer_segment in enumerate(self.layer_segments):
                 graph_out = layer_segment.forward(
                     hidden_states=hidden_states,
@@ -398,6 +471,7 @@ class Glm5WholeModelSegment:
                     aux_slot_indices=aux_slot_indices,
                     num_valid_tokens=num_valid_tokens,
                     rank_token_counts=rank_token_counts,
+                    row_validity_ready=True,
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
