@@ -202,11 +202,51 @@ class Glm5DecoderLayerGraphSegment:
         num_valid_tokens: torch.Tensor,
         rank_token_counts: torch.Tensor,
         row_validity_ready: bool = False,
+        residual: Optional[torch.Tensor] = None,
+        defer_residual_add: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        """Run one decoder layer.
+
+        ``residual`` / ``defer_residual_add`` let a driver chain the layers in
+        the fused-add form. With ``defer_residual_add`` the layer does NOT
+        materialize ``residual + mlp_output``; it returns the two halves and the
+        NEXT layer's ``input_layernorm`` becomes the fused add+RMSNorm that was
+        going to run anyway, so the standalone add disappears from the graph.
+        ``residual`` is the previous layer's carried residual and is ``None``
+        only for the first layer, whose input comes straight from the
+        embedding. The driver owes the final add after the last layer.
+
+        Mixing the two conventions mid-chain would drop a residual, so
+        ``residual`` without ``defer_residual_add`` is a hard error rather than
+        a silent fallback.
+        """
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
-        residual = hidden_states
-        attn_input = self.layer.input_layernorm(hidden_states)
+        if residual is not None and not defer_residual_add:
+            raise ValueError(
+                "Glm5DecoderLayerGraphSegment.forward: residual was carried in "
+                "but defer_residual_add is False, which would materialize this "
+                "layer's add while the previous layer's add is still pending; "
+                "a driver must use one convention for the whole layer chain"
+            )
+
+        batch_size = int(hidden_states.shape[0])
+
+        if residual is None:
+            # First layer of the chain: its input IS the residual stream.
+            residual = hidden_states
+            attn_input = self.layer.input_layernorm(hidden_states)
+        else:
+            # The previous layer's deferred `residual + mlp_output` happens
+            # HERE, inside the input-norm launch. `hidden_states` is that
+            # layer's mlp_output.
+            attn_input, residual = cuda_add_rmsnorm(
+                residual,
+                hidden_states,
+                self.layer.input_layernorm.weight,
+                self.layer.input_layernorm.eps,
+            )
+
         dsa_out = self.dsa_segment.forward(
             hidden_states=attn_input,
             position_ids=position_ids,
@@ -215,18 +255,21 @@ class Glm5DecoderLayerGraphSegment:
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
             row_validity_ready=row_validity_ready,
+            # This layer absorbs the segment's `attn_output` row mask into the
+            # add below, so the segment must not spend a launch on it.
+            attn_output_mask_deferred=True,
         )
         hidden_states, residual = cuda_add_rmsnorm(
             residual,
             dsa_out["attn_output"],
             self.layer.post_attention_layernorm.weight,
             self.layer.post_attention_layernorm.eps,
+            row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
         )
 
         if self.moe_segment is None:
             mlp_output = self.layer.mlp(hidden_states)
         else:
-            batch_size = int(hidden_states.shape[0])
             flat_hidden = hidden_states.view(batch_size, self.hidden_size)
             moe_output = self.moe_segment.forward(
                 padded=flat_hidden,
@@ -234,10 +277,22 @@ class Glm5DecoderLayerGraphSegment:
             )["moe_output"]
             mlp_output = moe_output.view(batch_size, 1, self.hidden_size)
 
-        out = {
-            "hidden_states": residual + mlp_output,
-            "primary_k_tensor": dsa_out["primary_k_tensor"],
-        }
+        if defer_residual_add:
+            # `mlp_output` may be the MoE pool's shared static buffer, which
+            # the NEXT layer's MoE block overwrites. That is safe only because
+            # the next layer's add+norm READS it to produce the input its own
+            # MoE block consumes, so the overwrite is downstream of the read by
+            # a true data dependency, not by launch-order luck.
+            out = {
+                "hidden_states": mlp_output,
+                "residual": residual,
+                "primary_k_tensor": dsa_out["primary_k_tensor"],
+            }
+        else:
+            out = {
+                "hidden_states": residual + mlp_output,
+                "primary_k_tensor": dsa_out["primary_k_tensor"],
+            }
         if "indexer_k_tensor" in dsa_out:
             out["indexer_k_tensor"] = dsa_out["indexer_k_tensor"]
         if "indexer_k_scale" in dsa_out:

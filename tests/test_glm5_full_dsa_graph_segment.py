@@ -514,10 +514,29 @@ def _patch_full_dsa_dependencies(
         out.copy_(result)
         return out
 
-    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps):
+    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps, out=None, row_valid_mask=None):
+        # Stands in for `fused_rmsnorm_rope_with_q_native`, so it has to honour
+        # the same `out=` / `row_valid_mask=` contract: the segment now has the
+        # kernel write `primary_k_tensor` directly, under a row gate applied as
+        # a SELECT (exact zeros for an invalid row -- bf16 NaN * 0 is NaN). A
+        # stub that ignored `out=` would make these tests pass while asserting
+        # nothing about the buffer the segment actually reads.
         del cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps
         q_rope.add_(0.0625)
-        return new_compressed_kv + 0.25
+        processed = new_compressed_kv + 0.25
+        if out is None:
+            if row_valid_mask is not None:
+                raise ValueError(
+                    "fake_rmsnorm_rope: row_valid_mask requires out, exactly "
+                    "as the kernel this stands in for does"
+                )
+            return processed
+        processed = processed.reshape(out.shape)
+        if row_valid_mask is not None:
+            keep = row_valid_mask.reshape(out.shape[0], *([1] * (out.dim() - 1)))
+            processed = torch.where(keep, processed, torch.zeros_like(processed))
+        out.copy_(processed)
+        return out
 
     def fake_rmsnorm(x, weight, eps, out=None):
         del weight, eps

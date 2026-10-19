@@ -2406,6 +2406,8 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
             self.buffers_id = buffers_id
             self.prologue_calls = []
             self.row_validity_ready = []
+            self.residual_in = []
+            self.defer_flags = []
 
         def setup_static_buffers(self, bucket_size):
             self.setup_bucket = bucket_size
@@ -2419,12 +2421,43 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         def run_row_validity_prologue(self, bucket_size, **kwargs):
             self.prologue_calls.append((bucket_size, kwargs))
 
-        def forward(self, *, hidden_states, row_validity_ready=False, **kwargs):
+        def forward(
+            self,
+            *,
+            hidden_states,
+            row_validity_ready=False,
+            residual=None,
+            defer_residual_add=False,
+            **kwargs,
+        ):
+            # The per-layer segment composition contract: the driver chains the
+            # layers in the DEFERRED-ADD form. Each layer is handed the carried
+            # residual (``None`` only for the first layer, whose input is the
+            # embedding) and hands back ``residual`` and ``hidden_states``
+            # unsummed, so the next layer's input_layernorm absorbs the add and
+            # the driver owes exactly one standalone add after the last layer.
+            # Mixing conventions mid-chain would drop a residual, so a fake
+            # layer that silently accepted either form would let the driver
+            # regress to a per-layer add with every assertion still green.
+            assert defer_residual_add is True, (
+                "the whole-model driver must defer every layer's residual add; "
+                f"layer with value {self.value} got defer_residual_add="
+                f"{defer_residual_add!r}"
+            )
             self.row_validity_ready.append(row_validity_ready)
+            self.defer_flags.append(defer_residual_add)
+            self.residual_in.append(None if residual is None else residual.clone())
             self.calls += 1
             rows = hidden_states.shape[0]
+            # ``hidden_states`` is the previous layer's mlp_output when a
+            # residual is carried, so this layer's own residual stream is the
+            # sum the real layer forms inside its input-norm launch.
+            stream = hidden_states if residual is None else residual + hidden_states
             return {
-                "hidden_states": hidden_states + self.value,
+                # The unsummed halves, exactly as the real segment returns them
+                # under ``defer_residual_add``.
+                "hidden_states": torch.full_like(stream, self.value),
+                "residual": stream,
                 "primary_k_tensor": torch.full(
                     (rows, 1, 1, 3),
                     self.value,
@@ -2482,6 +2515,17 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
     # row_validity_ready=True.
     assert [len(ls.prologue_calls) for ls in layer_segments] == [1, 0]
     assert [ls.row_validity_ready for ls in layer_segments] == [[True], [True]]
+    # Every layer runs in the deferred-add form; layer 0 opens the chain with
+    # no carried residual and layer 1 is handed layer 0's residual (the
+    # embedding, 1 and 2) rather than a pre-summed hidden state. The logits
+    # below then pin the ONE standalone add the driver still owes after the
+    # last layer: without it they would read the bare mlp_output.
+    assert [ls.defer_flags for ls in layer_segments] == [[True], [True]]
+    assert layer_segments[0].residual_in == [None]
+    assert layer_segments[1].residual_in[0].squeeze(1).tolist() == [
+        [1.0] * hidden_size,
+        [2.0] * hidden_size,
+    ]
     prologue_bucket, prologue_kwargs = layer_segments[0].prologue_calls[0]
     assert prologue_bucket == 2
     assert sorted(prologue_kwargs) == [

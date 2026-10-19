@@ -462,6 +462,12 @@ class Glm5WholeModelSegment:
                 aux_slot_indices=aux_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
+            # Residual carried in the fused-add form: each layer hands back
+            # (residual, mlp_output) unsummed and the NEXT layer's
+            # input_layernorm performs the add as part of its own launch. The
+            # standalone per-layer `residual + mlp_output` therefore survives
+            # only ONCE, after the last layer, instead of once per layer.
+            residual = None
             for layer_idx, layer_segment in enumerate(self.layer_segments):
                 graph_out = layer_segment.forward(
                     hidden_states=hidden_states,
@@ -472,8 +478,11 @@ class Glm5WholeModelSegment:
                     num_valid_tokens=num_valid_tokens,
                     rank_token_counts=rank_token_counts,
                     row_validity_ready=True,
+                    residual=residual,
+                    defer_residual_add=True,
                 )
                 hidden_states = graph_out["hidden_states"]
+                residual = graph_out["residual"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
                 # GLM-5.2 skip layers have no indexer KV (reuse-topk segments
                 # return no indexer_k_tensor).
@@ -486,7 +495,17 @@ class Glm5WholeModelSegment:
                         graph_out.get("indexer_k_scale"),
                     )
                 if layer_idx in self._compare_probe_layer_set:
-                    outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
+                    # The probe wants this layer's OUTPUT hidden state, which is
+                    # exactly the add the chain defers, so a probed layer pays
+                    # for materializing it. Probes are a debug path
+                    # (BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS), off by
+                    # default, so this never costs a production launch.
+                    outputs[self._probe_output_name(layer_idx)] = (
+                        residual + hidden_states
+                    )[:, -1, :]
+            # The one surviving standalone add: the last layer has no successor
+            # whose input norm could absorb it.
+            hidden_states = residual + hidden_states
         else:
             for layer_idx, layer in enumerate(self.model.model.layers):
                 hidden_states, _, _ = layer(
