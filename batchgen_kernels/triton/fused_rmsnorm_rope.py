@@ -777,6 +777,7 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     sin_ptr,
     position_ids_ptr,
     norm_weight_ptr,
+    row_valid_ptr,
     input_batch_stride,
     bsz,
     num_heads,
@@ -786,6 +787,7 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_PAIRS: tl.constexpr,
+    HAS_ROW_MASK: tl.constexpr,
 ):
     """Fused RMSNorm + RoPE kernel with NATIVE INTERLEAVED output layout.
 
@@ -809,9 +811,20 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     round trips to memory, and with one program per row there were no other
     CTAs resident to hide them behind.  Tiling the heads turns that serial
     latency chain into one wide, coalesced load/store pair per program.
+
+    ``HAS_ROW_MASK`` gates ``processed_kv`` on ``row_valid_ptr[batch_idx]``:
+    a row whose entry is zero gets EXACT ZEROS written for its whole
+    ``[kv_lora_rank + qk_rope_head_dim]`` slice.  This is a ``tl.where``
+    SELECT on the value, never a multiply -- the caller's rows can hold
+    non-finite stale bytes, and bf16 ``NaN * 0`` is ``NaN``.  ``q_pe`` is
+    NOT gated: it is rotated in place and stays row-local.
     """
     batch_idx = tl.program_id(0)
     lane_idx = tl.program_id(1)
+
+    row_valid = True
+    if HAS_ROW_MASK:
+        row_valid = tl.load(row_valid_ptr + batch_idx) != 0
 
     total_dim = kv_lora_rank + qk_rope_head_dim
     half_dim = qk_rope_head_dim // 2
@@ -860,9 +873,15 @@ def fused_rmsnorm_rope_with_q_native_kernel(
             weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=1.0)
             data_fp32 = data_bf16.to(tl.float32)
             normalized_fp32 = data_fp32 * inv_rms * weight.to(tl.float32)
+            normalized_out = normalized_fp32.to(data_bf16.dtype)
+            if HAS_ROW_MASK:
+                # SELECT, not a multiply: an invalid row gets the literal 0.0
+                # even if `data_bf16` was NaN. Same form as the fp8 quantizer's
+                # `tl.where(is_finite, q_scaled, 0.0)`.
+                normalized_out = tl.where(row_valid, normalized_out, 0.0)
             tl.store(
                 processed_kv_ptr + output_offset + offsets,
-                normalized_fp32.to(data_bf16.dtype),
+                normalized_out,
                 mask=mask,
             )
 
@@ -882,6 +901,10 @@ def fused_rmsnorm_rope_with_q_native_kernel(
 
         kv_rot_even = kv_even * cos_i - kv_odd * sin_i
         kv_rot_odd = kv_even * sin_i + kv_odd * cos_i
+
+        if HAS_ROW_MASK:
+            kv_rot_even = tl.where(row_valid, kv_rot_even, 0.0)
+            kv_rot_odd = tl.where(row_valid, kv_rot_odd, 0.0)
 
         # Store at the ORIGINAL interleaved positions (2i, 2i+1), NOT in the
         # split-half layout that the legacy kernel uses.
@@ -933,6 +956,8 @@ def fused_rmsnorm_rope_with_q_native(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     eps: float = 1e-6,
+    out: torch.Tensor | None = None,
+    row_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native-interleaved variant of ``fused_rmsnorm_rope_with_q``.
 
@@ -941,6 +966,18 @@ def fused_rmsnorm_rope_with_q_native(
     Pair this with ``rotary_pos_emb_interleaved_native`` in the prefill path
     to keep the k_pe cache layout consistent across prefill writes and
     per-token decode writes.
+
+    ``out`` writes the processed KV into a caller-owned buffer instead of a
+    fresh allocation (required under CUDA-graph capture, where the consumer is
+    a static output tensor) and is returned as-is.
+
+    ``row_valid_mask`` is an optional ``[bsz]`` device tensor. Rows whose entry
+    is zero get EXACT ZEROS for their whole processed-KV slice, which folds a
+    caller-side ``torch.where`` gate into this launch. The mask is applied as a
+    ``tl.where`` SELECT, never as a multiply: a gated row may hold non-finite
+    stale bytes and bf16 ``NaN * 0`` is ``NaN``, so a multiply would defeat the
+    gate. It requires ``out``, because masking a freshly allocated buffer the
+    caller then ignores would be a silent no-op.
     """
     bsz, q_len, total_dim = new_compressed_kv.shape
     assert q_len == 1, "This kernel assumes q_len = 1 for decoding"
@@ -952,11 +989,46 @@ def fused_rmsnorm_rope_with_q_native(
     num_heads = q_pe.shape[1]
     assert q_pe.shape == (bsz, num_heads, 1, qk_rope_head_dim)
 
-    processed_kv = torch.empty(
-        new_compressed_kv.shape,
-        dtype=new_compressed_kv.dtype,
-        device=new_compressed_kv.device,
-    )
+    if out is None:
+        if row_valid_mask is not None:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: row_valid_mask requires out; "
+                "masking a buffer this call allocates and the caller discards "
+                "would silently drop the row gate"
+            )
+        processed_kv = torch.empty(
+            new_compressed_kv.shape,
+            dtype=new_compressed_kv.dtype,
+            device=new_compressed_kv.device,
+        )
+    else:
+        if out.numel() != bsz * total_dim:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: out must hold "
+                f"{bsz * total_dim} elements, got {out.numel()}"
+            )
+        if out.dtype != new_compressed_kv.dtype:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: out dtype "
+                f"{out.dtype} != new_compressed_kv dtype {new_compressed_kv.dtype}"
+            )
+        if not out.is_contiguous():
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: out must be contiguous; the "
+                "kernel addresses it as a dense [bsz, total_dim] block"
+            )
+        processed_kv = out
+
+    if row_valid_mask is not None:
+        if row_valid_mask.numel() != bsz:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: row_valid_mask must have "
+                f"{bsz} entries, got {row_valid_mask.numel()}"
+            )
+        if not row_valid_mask.is_contiguous():
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: row_valid_mask must be contiguous"
+            )
 
     block_h, block_pairs, num_head_tiles = select_q_rope_tiling(
         bsz,
@@ -973,6 +1045,9 @@ def fused_rmsnorm_rope_with_q_native(
         sin,
         position_ids,
         norm_weight,
+        # Dummy pointer when unmasked, matching the house pattern in
+        # triton/kv_cache.py: HAS_ROW_MASK=False never dereferences it.
+        row_valid_mask if row_valid_mask is not None else position_ids,
         new_compressed_kv.stride(0),
         bsz,
         num_heads,
@@ -982,6 +1057,7 @@ def fused_rmsnorm_rope_with_q_native(
         BLOCK_SIZE=64,
         BLOCK_H=block_h,
         BLOCK_PAIRS=block_pairs,
+        HAS_ROW_MASK=row_valid_mask is not None,
         # Matches the previous launch's default so the kv-lora sum of squares
         # keeps the same reduction tree, and with it the exact inv_rms bits.
         num_warps=4,
