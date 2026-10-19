@@ -30,8 +30,17 @@ namespace batchgen::kv {
 
 namespace {
 
+// The magic doubles as the version of the region's metadata layout
+// (SharedHeader, the free stack, page owners/links, SequenceEntry). Neither
+// layout_fingerprint nor config_hash covers that layout, and a header that
+// grows shifts every array behind it while leaving the data offset (2 MiB
+// aligned) and every validated field where they were, so a creator and an
+// attacher built from different layouts would pass validation and corrupt the
+// allocator. Change the magic whenever any of those layouts changes.
+//   "HOSTKVMG": the original layout.
+//   "HOSTKVM2": SharedHeader gained the three lifetime counters.
 constexpr std::uint64_t kSharedMemoryMagic =
-    0x484f53544b564d47ULL;  // "HOSTKVMG"
+    0x484f53544b564d32ULL;  // "HOSTKVM2"
 constexpr std::int32_t kInvalidPageIndex = -1;
 constexpr std::int64_t kEmptySequenceId =
     std::numeric_limits<std::int64_t>::min();
@@ -123,9 +132,31 @@ struct SharedHeader {
     std::uint32_t has_v_cache = 0;
     std::atomic<std::uint32_t> free_stack_top{0};
     std::atomic<std::uint32_t> active_sequences{0};
+    // Lifetime counters of the region (see HostPagedKVStats). They live here,
+    // not in a process, because they describe the shared region across every
+    // attached process and every worker restart; ReleaseAllSequences keeps
+    // them. Placed before the mutexes so their offsets do not depend on
+    // sizeof(pthread_mutex_t).
+    std::atomic<std::uint64_t> sequences_inserted{0};
+    std::atomic<std::uint64_t> sequences_released{0};
+    std::atomic<std::uint64_t> acquire_failures{0};
     pthread_mutex_t allocation_mutex{};
     pthread_mutex_t sequence_mutex{};
 };
+
+// Shared across processes, so every atomic must be address-free (lock-free).
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+// Out-of-process readers (the read-only host-KV header probe and the native
+// release-all tests) address these fields by offset. Moving one is a layout
+// change: bump kSharedMemoryMagic and update those readers.
+static_assert(offsetof(SharedHeader, magic) == 8);
+static_assert(offsetof(SharedHeader, num_pages) == 40);
+static_assert(offsetof(SharedHeader, free_stack_top) == 84);
+static_assert(offsetof(SharedHeader, active_sequences) == 88);
+static_assert(offsetof(SharedHeader, sequences_inserted) == 96);
+static_assert(offsetof(SharedHeader, sequences_released) == 104);
+static_assert(offsetof(SharedHeader, acquire_failures) == 112);
 
 std::size_t SafeHardwareConcurrency() {
     const unsigned int hint = std::thread::hardware_concurrency() / 4;
@@ -239,6 +270,7 @@ struct HostPagedKVBackend::SharedState {
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
     HostPagedKVStats CollectStats() const;
+    HostPagedKVStats CollectAuditedStats() const;
 
     std::byte* DataBase() { return data_base; }
     const std::byte* DataBase() const { return data_base; }
@@ -353,6 +385,9 @@ void HostPagedKVBackend::SharedState::ConstructSharedState() {
     header->free_stack_top.store(static_cast<std::uint32_t>(config.num_pages),
                                  std::memory_order_relaxed);
     header->active_sequences.store(0, std::memory_order_relaxed);
+    header->sequences_inserted.store(0, std::memory_order_relaxed);
+    header->sequences_released.store(0, std::memory_order_relaxed);
+    header->acquire_failures.store(0, std::memory_order_relaxed);
 
     for (std::size_t i = 0; i < config.num_pages; ++i) {
         free_stack[i] = static_cast<std::int32_t>(config.num_pages - 1 - i);
@@ -420,7 +455,9 @@ void HostPagedKVBackend::SharedState::ValidateSharedState() const {
     if (header->magic != kSharedMemoryMagic) {
         std::ostringstream oss;
         oss << "Shared memory magic mismatch (expected=" << kSharedMemoryMagic
-            << ", found=" << header->magic << ")";
+            << ", found=" << header->magic
+            << "); the magic versions the metadata layout, so the region's "
+               "creator runs a build with a different host-KV layout";
         throw std::runtime_error(oss.str());
     }
     if (header->layout_fingerprint != layout_fingerprint) {
@@ -644,6 +681,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
         const std::uint32_t top =
             header->free_stack_top.load(std::memory_order_relaxed);
         if (top < num_pages) {
+            header->acquire_failures.fetch_add(1, std::memory_order_relaxed);
             throw std::runtime_error(
                 "Insufficient free pages available for sequence " +
                 std::to_string(sequence_id) +
@@ -667,6 +705,8 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
             FindOrInsertSequenceEntryLocked(sequence_id, &is_new);
         if (is_new) {
             header->active_sequences.fetch_add(1, std::memory_order_relaxed);
+            header->sequences_inserted.fetch_add(1,
+                                                 std::memory_order_relaxed);
         }
         for (std::size_t i = 0; i < num_pages; ++i) {
             const std::int32_t page = pages[i];
@@ -697,6 +737,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
             free_stack[top++] = page;
         }
         header->free_stack_top.store(top, std::memory_order_relaxed);
+        header->acquire_failures.fetch_add(1, std::memory_order_relaxed);
         throw;
     }
     return pages;
@@ -760,6 +801,7 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequences(
     const std::uint32_t old_top =
         header->free_stack_top.load(std::memory_order_relaxed);
     if (total_required > old_top) {
+        header->acquire_failures.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error(
             "Insufficient free pages available for prefill batch "
             "(requested=" + std::to_string(total_required) +
@@ -784,6 +826,9 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequences(
     previous_entries.reserve(sequence_ids.size());
     newly_inserted.reserve(sequence_ids.size());
     previous_tail_links.reserve(sequence_ids.size());
+    // Counted once the whole wave has committed: the rollback below turns the
+    // wave's new entries back into tombstones, and those were never inserted.
+    std::uint64_t inserted = 0;
     try {
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             bool is_new = false;
@@ -811,6 +856,7 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequences(
             if (is_new) {
                 header->active_sequences.fetch_add(1,
                                                    std::memory_order_relaxed);
+                ++inserted;
             }
         }
     } catch (...) {
@@ -839,8 +885,10 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequences(
             }
         }
         header->free_stack_top.store(old_top, std::memory_order_relaxed);
+        header->acquire_failures.fetch_add(1, std::memory_order_relaxed);
         throw;
     }
+    header->sequences_inserted.fetch_add(inserted, std::memory_order_relaxed);
     return allocations;
 }
 
@@ -869,6 +917,7 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
         entry->head_page = kInvalidPageIndex;
         entry->tail_page = kInvalidPageIndex;
         header->active_sequences.fetch_sub(1, std::memory_order_relaxed);
+        header->sequences_released.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (!pages.empty()) {
@@ -1172,6 +1221,51 @@ HostPagedKVStats HostPagedKVBackend::SharedState::CollectStats() const {
         header->active_sequences.load(std::memory_order_relaxed);
     stats.sequence_table_capacity = sequence_capacity;
     stats.total_bytes = total_bytes;
+    stats.sequences_inserted =
+        header->sequences_inserted.load(std::memory_order_relaxed);
+    stats.sequences_released =
+        header->sequences_released.load(std::memory_order_relaxed);
+    stats.acquire_failures =
+        header->acquire_failures.load(std::memory_order_relaxed);
+    return stats;
+}
+
+// Cost: one pass over the sequence table (sequence_capacity entries of
+// sizeof(SequenceEntry) bytes) and one over page_owners (num_pages int64s),
+// holding both mutexes, so every acquire and release on the region waits for
+// it. Both locks are needed for the snapshot to be self-consistent:
+// free_stack_top changes under allocation_mutex and the table and page owners
+// under sequence_mutex. A process that has popped pages and not yet attached
+// them (AcquirePages), or detached them and not yet pushed them back (the
+// release paths), sits between its two critical sections, outside both locks;
+// its pages count as used and appear in no entry, which is the transient the
+// delta documents.
+HostPagedKVStats HostPagedKVBackend::SharedState::CollectAuditedStats() const {
+    ScopedMutexLock allocation_lock(&header->allocation_mutex);
+    ScopedMutexLock sequence_lock(&header->sequence_mutex);
+    HostPagedKVStats stats = CollectStats();
+    HostPagedKVSequenceAudit audit;
+    for (std::size_t i = 0; i < sequence_capacity; ++i) {
+        const SequenceEntry& entry = sequence_table[i];
+        if (entry.sequence_id == kEmptySequenceId) {
+            ++audit.empty_entries;
+        } else if (entry.sequence_id == kTombstoneSequenceId) {
+            ++audit.tombstone_entries;
+        } else {
+            ++audit.live_entries;
+            audit.live_sequence_pages += entry.num_pages;
+        }
+    }
+    for (std::size_t page = 0; page < config.num_pages; ++page) {
+        if (page_owners[page] == kPrefixResidentSequenceId) {
+            ++audit.prefix_resident_pages;
+        }
+    }
+    audit.page_identity_delta =
+        static_cast<std::int64_t>(stats.num_used_pages) -
+        static_cast<std::int64_t>(audit.live_sequence_pages +
+                                  audit.prefix_resident_pages);
+    stats.audit = audit;
     return stats;
 }
 
@@ -1268,6 +1362,10 @@ std::vector<std::int32_t> HostPagedKVBackend::SequencePages(
 
 HostPagedKVStats HostPagedKVBackend::CollectStats() const {
     return state_->CollectStats();
+}
+
+HostPagedKVStats HostPagedKVBackend::CollectAuditedStats() const {
+    return state_->CollectAuditedStats();
 }
 
 std::byte* HostPagedKVBackend::DataBase() { return state_->DataBase(); }

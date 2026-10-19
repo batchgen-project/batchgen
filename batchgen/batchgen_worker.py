@@ -257,6 +257,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
+from batchgen.kv_cache.host_kv_health import format_host_kv_health
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import (
 	prepack_sequences,
@@ -5140,6 +5141,32 @@ class BatchGenWorker:
 			'num_prefilled': len(status_counts[SequenceStatus.PREFILLED]),
 			'num_valid_sequences': len(valid_sequences),
 		}
+
+	def _log_host_kv_health(self) -> None:
+		"""Log the audited health of this node's host-KV region(s).
+
+		One line per region: the used-page identity, the sequence-table
+		occupancy, and the region's lifetime counters (see
+		``batchgen.kv_cache.host_kv_health``). ``get_audited_stats()`` is
+		O(table + pages) under both region locks; call this only from the
+		periodic heartbeat.
+		"""
+		view = getattr(self, "host_paged_kv_worker_view", None)
+		if view is None:
+			return
+		if isinstance(view, DualHostKVCoordinator):
+			regions = (
+				("primary", view.primary),
+				("aux", view.require_auxiliary("host-KV health")),
+			)
+		else:
+			regions = (("host", view),)
+		node_id = self.rank // self.local_world_size
+		for name, region_view in regions:
+			logging.info(
+				f"[HOST_KV] node={node_id} "
+				f"{format_host_kv_health(name, region_view.get_audited_stats())}"
+			)
 
 	def _gather_host_kv_stats_by_node(self, worker_view: Optional[object]) -> List[Dict[str, int]]:
 		"""Gather one host-KV pool stat record per node.
@@ -18184,6 +18211,8 @@ class BatchGenWorker:
 		# Heartbeat state for the rate-limited [DECODE] progress line below
 		_hb_last_time = time.perf_counter()
 		_hb_tokens = 0
+		# Host-KV health line: same cadence, one per node (see _log_host_kv_health)
+		_hkv_last_time = time.perf_counter()
 
 		# Per-step CPU wall split, averaged into the rank-0 heartbeat. Local to
 		# this decode round: a hot reload rebinds methods on the live worker,
@@ -18253,6 +18282,13 @@ class BatchGenWorker:
 					)
 				_hb_last_time = time.perf_counter()
 				_hb_tokens = 0
+
+			# Host KV is shared per node, so local rank 0 of every node reports
+			# its own regions; the audit walks the region under its locks, which
+			# is why it rides this ~30 s cadence and never runs per step.
+			if self.local_rank == 0 and time.perf_counter() - _hkv_last_time >= 30.0:
+				self._log_host_kv_health()
+				_hkv_last_time = time.perf_counter()
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:

@@ -104,3 +104,57 @@ def test_full_sequence_table_returns_the_pages_it_popped():
         assert manager.get_stats().num_free_pages == before.num_free_pages
     finally:
         del manager
+
+
+def test_audit_tracks_tombstones_and_lifetime_counters_across_churn():
+    """The monitoring view of the same churn: tombstones accumulate, empty
+    slots only ever fall, the page identity holds, and the lifetime counters
+    match the operations performed."""
+    iterations = 6 * SEQUENCE_TABLE_CAPACITY
+    manager = bg.MLAHostPagedKVManager(_make_config(num_pages=64))
+    try:
+        manager.initialize(True)
+        assert manager.get_stats().audit is None  # the O(1) path never walks
+        previous_empty = SEQUENCE_TABLE_CAPACITY
+        for i in range(iterations):
+            sequence_id = 3000 + i
+            manager.allocate_pages(sequence_id, 1)
+            manager.free_sequence(sequence_id)
+
+            stats = manager.get_audited_stats()
+            audit = stats.audit
+            assert (
+                audit.live_entries + audit.tombstone_entries + audit.empty_entries
+                == SEQUENCE_TABLE_CAPACITY
+            ), i
+            assert audit.empty_entries <= previous_empty, i
+            previous_empty = audit.empty_entries
+            assert audit.page_identity_delta == 0, i
+            assert stats.sequences_inserted == i + 1, i
+            assert stats.sequences_released == i + 1, i
+        assert audit.live_entries == 0
+        assert audit.tombstone_entries > 0
+        assert audit.empty_entries < SEQUENCE_TABLE_CAPACITY
+        assert stats.acquire_failures == 0
+    finally:
+        del manager
+
+
+def test_a_refused_acquire_is_counted_and_leaves_the_identity_intact():
+    manager = bg.MLAHostPagedKVManager(_make_config(num_pages=16))
+    try:
+        manager.initialize(True)
+        for i in range(SEQUENCE_TABLE_CAPACITY):
+            manager.allocate_pages(8000 + i, 1)
+        with pytest.raises(RuntimeError, match="Sequence table is full"):
+            manager.allocate_pages(99999, 2 * PAGE_SIZE_TOKENS)
+
+        stats = manager.get_audited_stats()
+        assert stats.acquire_failures == 1
+        assert stats.sequences_inserted == SEQUENCE_TABLE_CAPACITY
+        assert stats.audit.live_entries == SEQUENCE_TABLE_CAPACITY
+        assert stats.audit.empty_entries == 0
+        assert stats.audit.live_sequence_pages == SEQUENCE_TABLE_CAPACITY
+        assert stats.audit.page_identity_delta == 0
+    finally:
+        del manager

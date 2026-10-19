@@ -220,6 +220,10 @@ class HostPagedKVManager {
     }
 
     HostPagedKVStats GetStats() const { return backend_.CollectStats(); }
+    // O(table) walk under both region locks; see CollectAuditedStats.
+    HostPagedKVStats GetAuditedStats() const {
+        return backend_.CollectAuditedStats();
+    }
 
     void* MutableKPage(std::size_t layer_idx, std::int32_t page_idx) {
         geometry_.EnsureLayerBounds(layer_idx,
