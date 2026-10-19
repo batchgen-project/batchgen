@@ -341,12 +341,16 @@ def test_forward_no_longer_recomputes_row_validity(file_name, class_name):
             f"{class_name}.forward still calls {dead}; the row-validity mask "
             "is step-level and must not be rebuilt per layer"
         )
-    # The ONE torch.where left in the layer path is the primary_k_tensor
-    # select -- the deliberate select-not-multiply that keeps a stale bf16 row
-    # from leaving the segment as NaN.
-    assert _where_out_targets(node) == ["outputs.primary_k_tensor"], (
-        f"{class_name}.forward must keep exactly the primary_k_tensor select "
-        f"and no prologue where, got {_where_out_targets(node)}"
+    # No prologue `where` may leak back into the layer path. The
+    # primary_k_tensor select used to be the one legitimate exception here;
+    # it has since been folded into the epilogue of the kernel that produces
+    # the value (same select-not-multiply semantics, one launch fewer), so the
+    # layer path must now contain NO torch.where at all. The fold itself is
+    # pinned by tests/test_glm5_fold_elementwise_into_neighbours.py.
+    assert _where_out_targets(node) == [], (
+        f"{class_name}.forward must contain no torch.where: the prologue is "
+        f"hoisted and the primary_k_tensor select lives in its producer, got "
+        f"{_where_out_targets(node)}"
     )
     assert any(
         isinstance(sub, ast.Call)

@@ -416,6 +416,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
         row_validity_ready: bool = False,
+        attn_output_mask_deferred: bool = False,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
         batch_size = hidden_states.shape[0]
@@ -481,7 +482,10 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
 
-        offload_kv = _fused_rmsnorm_rope(
+        # Gate folded into the producing kernel -- see the matching comment in
+        # cuda_graph_segments.py. Still a SELECT (exact zeros for invalid rows),
+        # never a multiply: bf16 NaN * 0 is NaN.
+        _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
             self.cos_table,
@@ -491,18 +495,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             attn.kv_lora_rank,
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
-        )
-        # This copy leaves the segment (the whole-model graph stages it for host
-        # KV offload), so it is the one place an invalid row's bytes would
-        # escape. Select instead of copy: a select costs the same single launch,
-        # writes the exact zeros the pre-mask path produced for invalid rows,
-        # and -- unlike a multiply, where bf16 NaN * 0 is NaN -- it cannot carry
-        # a non-finite stale row through.
-        torch.where(
-            buffers.valid_mask.view(batch_size, 1, 1, 1),
-            offload_kv.view(batch_size, 1, 1, -1),
-            buffers.valid_rows_zeros[:1],
-            out=outputs.primary_k_tensor,
+            out=outputs.primary_k_tensor.view(batch_size, 1, -1),
+            row_valid_mask=buffers.valid_mask,
         )
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
@@ -562,7 +556,11 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         # num_valid_tokens but have no cache slot -- the masked GEMMs compute
         # those rows, so no num_valid_tokens gate zeroes them, and `valid_mask`
         # is what makes them inert.
-        outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+        #
+        # Deferred when the caller folds it into the residual add that consumes
+        # `attn_output`; see cuda_graph_segments.py for the full note.
+        if not attn_output_mask_deferred:
+            outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 
         return {
             "attn_output": outputs.attn_output.view(batch_size, 1, attn.hidden_size),
