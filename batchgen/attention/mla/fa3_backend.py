@@ -331,6 +331,7 @@ def act_quant_kernel_2d(
     scale_ptr,
     num_valid_tokens_ptr,
     M, N,
+    scale_stride_m, scale_stride_b,
     eps: tl.constexpr,
     fp8_max: tl.constexpr,
     HAS_VALID_TOKENS: tl.constexpr,
@@ -339,6 +340,12 @@ def act_quant_kernel_2d(
     """
     2D Block Quantization Kernel.
     Treats input as (Rows, Cols) -> Quantizes row segments of size BLOCK_SIZE.
+
+    The scale store is driven by the caller-supplied `scale_stride_m` /
+    `scale_stride_b`, so the same kernel serves both the row-major
+    `[M, num_blocks]` scale and the MN-major TMA-aligned
+    `[num_blocks, align(M, 4)].T[:M]` scale. Hard-coding `pid_m * num_blocks`
+    here would silently mis-place every scale element of the aligned layout.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -349,13 +356,13 @@ def act_quant_kernel_2d(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
 
+    scale_offset = pid_m * scale_stride_m + pid_n * scale_stride_b
+
     if HAS_VALID_TOKENS:
         num_valid_tokens = tl.load(num_valid_tokens_ptr)
         if pid_m >= num_valid_tokens:
             y_row_start = y_ptr + pid_m * N
             tl.store(y_row_start + offsets, tl.zeros([BLOCK_SIZE], dtype=tl.float32), mask=mask)
-            num_blocks_n = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
-            scale_offset = pid_m * num_blocks_n + pid_n
             tl.store(scale_ptr + scale_offset, eps)
             return
     
@@ -376,10 +383,8 @@ def act_quant_kernel_2d(
     y_row_start = y_ptr + pid_m * N
     tl.store(y_row_start + offsets, y, mask=mask)
     
-    # Store Scale
-    # Layout: (Rows, NumBlocks)
-    num_blocks_n = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
-    scale_offset = pid_m * num_blocks_n + pid_n
+    # Store Scale — logical layout is always (Rows, NumBlocks); the physical
+    # placement comes from the caller's strides (see the docstring).
     tl.store(scale_ptr + scale_offset, scale)
 
 # Maximum rows per kernel launch to avoid CUDA grid dimension limits
@@ -462,6 +467,7 @@ def act_quant(
             x_flat, y, scale,
             num_valid_tokens if num_valid_tokens is not None else scale,
             M, N,
+            scale.stride(0), scale.stride(1),
             eps=eps,
             fp8_max=fp8_max,
             HAS_VALID_TOKENS=num_valid_tokens is not None,
@@ -485,6 +491,7 @@ def act_quant(
                 x_chunk, y_chunk, scale_chunk,
                 scale_chunk,
                 chunk_size, N,
+                scale_chunk.stride(0), scale_chunk.stride(1),
                 eps=eps,
                 fp8_max=fp8_max,
                 HAS_VALID_TOKENS=False,
@@ -617,7 +624,19 @@ def w8a16_gemm(
 
 	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
 	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
-	x_fp8 = act_quant(x)
+	#
+	# scale_tma_aligned=True makes the quantizer store the [m, k/128] fp32
+	# activation scale MN-major with a TMA-aligned leading dimension
+	# (align(m, 16/4) = align(m, 4)), i.e. strides (1, align(m, 4)). That is
+	# exactly the layout DeepGEMM's `get_mn_major_tma_aligned_tensor` would
+	# otherwise produce for us: its early-return predicate
+	# (csrc/jit_kernels/impls/smxx_layout.hpp:117-119) accepts a 2-D scale whose
+	# stride(-2) == 1 and stride(-1) == get_tma_aligned_size(mn, 4), and returns
+	# it untouched instead of launching a `transpose_fp32` kernel. Producing the
+	# layout in the quantizer is free (the store addresses change, the values do
+	# not), so this removes one transpose launch per w8a16_gemm call. `x` is
+	# always 2-D here (viewed above), which is what the aligned path requires.
+	x_fp8 = act_quant(x, scale_tma_aligned=True)
 	# disable_ue8m0_cast removed — on Hopper (SM90) the flag is a no-op
 	# (layout.hpp:22 early-exits for arch_major==9 regardless), and omitting
 	# lets DeepGEMM's default handling apply (same as SGLang). This also
