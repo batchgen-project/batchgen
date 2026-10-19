@@ -489,6 +489,14 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
     std::int64_t sequence_id, bool* is_new) {
     std::size_t index = HashSequenceId(sequence_id);
     SequenceEntry* first_tombstone = nullptr;
+    const auto claim = [&](SequenceEntry* target) {
+        *target = SequenceEntry();
+        target->sequence_id = sequence_id;
+        if (is_new != nullptr) {
+            *is_new = true;
+        }
+        return target;
+    };
     for (std::size_t probe = 0; probe < sequence_capacity; ++probe) {
         SequenceEntry* entry = &sequence_table[index];
         if (entry->sequence_id == sequence_id) {
@@ -498,22 +506,26 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
             return entry;
         }
         if (entry->sequence_id == kEmptySequenceId) {
-            SequenceEntry* target =
-                first_tombstone != nullptr ? first_tombstone : entry;
-            if (target->sequence_id != sequence_id) {
-                *target = SequenceEntry();
-                target->sequence_id = sequence_id;
-            }
-            if (is_new != nullptr) {
-                *is_new = true;
-            }
-            return target;
+            // An empty slot terminates the probe chain: no live entry for
+            // sequence_id can exist past it, so the search is complete. Prefer
+            // the earliest tombstone seen, which keeps future chains short.
+            return claim(first_tombstone != nullptr ? first_tombstone : entry);
         }
         if (entry->sequence_id == kTombstoneSequenceId &&
             first_tombstone == nullptr) {
             first_tombstone = entry;
         }
         index = (index + 1) % sequence_capacity;
+    }
+    // Every slot was examined and none was empty, so the probe never hit a
+    // chain terminator: the table holds only live entries and tombstones.
+    // ReleaseSequence turns a slot into a tombstone and nothing turns it back
+    // into kEmptySequenceId, so without this a table that has merely been
+    // churned once over refuses every insert while every tombstone is
+    // reusable. Overwriting a tombstone never shortens another sequence's
+    // chain, because a tombstone does not terminate a probe either.
+    if (first_tombstone != nullptr) {
+        return claim(first_tombstone);
     }
     throw std::runtime_error("Sequence table is full (capacity=" +
                              std::to_string(sequence_capacity) + ")");
@@ -645,9 +657,12 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
         header->free_stack_top.store(new_top, std::memory_order_relaxed);
     }
 
-    {
+    try {
         ScopedMutexLock lock(&header->sequence_mutex);
         bool is_new = false;
+        // The only operation in this scope that can throw. It runs before any
+        // page is attached, so a failure leaves nothing but the pop above to
+        // undo.
         SequenceEntry* entry =
             FindOrInsertSequenceEntryLocked(sequence_id, &is_new);
         if (is_new) {
@@ -666,6 +681,23 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
             }
             ++entry->num_pages;
         }
+    } catch (...) {
+        // The pages were already popped off the free stack, so propagating the
+        // error without returning them leaks the whole request permanently.
+        // The sequence_mutex scope above has been unwound before this handler
+        // runs, so the restore takes allocation_mutex alone: the file's
+        // allocation -> sequence order is never inverted and no lock nests.
+        // Pushing at the current top (rather than restoring the old top) is
+        // what ReleaseSequence does and is the only correct choice here,
+        // because another process may have popped pages in the meantime.
+        ScopedMutexLock lock(&header->allocation_mutex);
+        std::uint32_t top =
+            header->free_stack_top.load(std::memory_order_relaxed);
+        for (const std::int32_t page : pages) {
+            free_stack[top++] = page;
+        }
+        header->free_stack_top.store(top, std::memory_order_relaxed);
+        throw;
     }
     return pages;
 }
