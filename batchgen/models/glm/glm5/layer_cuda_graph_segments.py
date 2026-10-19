@@ -160,6 +160,28 @@ class Glm5DecoderLayerGraphSegment:
         else:
             static_inputs["rank_token_counts"].fill_(1)
 
+    def row_validity_prologue_key(self, bucket_size: int) -> tuple:
+        """Delegate: identity of the DSA buffer set the prologue writes."""
+        return self.dsa_segment.row_validity_prologue_key(bucket_size)
+
+    def run_row_validity_prologue(
+        self,
+        bucket_size: int,
+        *,
+        cache_seqlens: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Delegate: run the hoisted step-level row-validity prologue once."""
+        self.dsa_segment.run_row_validity_prologue(
+            bucket_size,
+            cache_seqlens=cache_seqlens,
+            primary_slot_indices=primary_slot_indices,
+            aux_slot_indices=aux_slot_indices,
+            num_valid_tokens=num_valid_tokens,
+        )
+
     def release_static_buffers(self, bucket_size: int) -> None:
         release = getattr(self.dsa_segment, "release_static_buffers", None)
         if release is not None:
@@ -179,6 +201,7 @@ class Glm5DecoderLayerGraphSegment:
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: torch.Tensor,
         rank_token_counts: torch.Tensor,
+        row_validity_ready: bool = False,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
@@ -191,6 +214,7 @@ class Glm5DecoderLayerGraphSegment:
             primary_slot_indices=primary_slot_indices,
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
+            row_validity_ready=row_validity_ready,
         )
         hidden_states, residual = cuda_add_rmsnorm(
             residual,
