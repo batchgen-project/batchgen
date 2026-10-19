@@ -834,6 +834,14 @@ class Glm5DsaAttnSegment:
 class Glm5FullDsaAttnSegment:
     """Graph-capturable GLM-5 DSA attention from hidden states through o_proj."""
 
+    # Which row-validity mask this segment's shared buffer set carries. An
+    # indexer layer writes and scores the AUX cache, so its mask also requires
+    # a valid aux slot; a skip layer never touches aux and deliberately does
+    # not (reuse_topk_segment.py). The two masks are therefore NOT
+    # interchangeable, and the step-level prologue is computed once per
+    # variant, not once per model.
+    ROW_VALIDITY_VARIANT = "full"
+
     def __init__(
         self,
         *,
@@ -1348,27 +1356,72 @@ class Glm5FullDsaAttnSegment:
         self._buffers.pop(bucket_size, None)
         self._outputs.pop(bucket_size, None)
 
-    def forward(
+    def _row_validity_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
+        buffers = self._buffers.get(bucket_size)
+        if buffers is None:
+            self.setup_static_buffers(bucket_size)
+            buffers = self._buffers[bucket_size]
+        return buffers
+
+    def row_validity_prologue_key(self, bucket_size: int) -> tuple:
+        """Identity of the buffer set this segment's row-validity prologue writes.
+
+        Every indexer layer shares ONE ``_Glm5FullDsaSegmentBuffers`` per
+        bucket (the worker's ``shared_dsa_buffers``) and every skip layer
+        shares its own, so ``compute_row_validity`` writes the same tensors for
+        every layer of a variant. The key lets the whole-model driver run the
+        prologue once per distinct buffer set instead of once per layer.
+        """
+
+        return (
+            self.ROW_VALIDITY_VARIANT,
+            id(self._row_validity_buffers(bucket_size)),
+        )
+
+    def run_row_validity_prologue(
         self,
+        bucket_size: int,
         *,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        attn = self.attn
-        indexer = attn.indexer
-        batch_size = hidden_states.shape[0]
-        buffers = self._buffers.get(batch_size)
-        if buffers is None:
-            self.setup_static_buffers(batch_size)
-            buffers = self._buffers[batch_size]
-        outputs = self._outputs.get(batch_size)
-        if outputs is None:
-            self._setup_static_output_buffers(batch_size)
-            outputs = self._outputs[batch_size]
+    ) -> None:
+        """Step-level entry point for the hoisted prologue (see ``compute_row_validity``)."""
+
+        self.compute_row_validity(
+            self._row_validity_buffers(bucket_size),
+            cache_seqlens=cache_seqlens,
+            primary_slot_indices=primary_slot_indices,
+            aux_slot_indices=aux_slot_indices,
+            num_valid_tokens=num_valid_tokens,
+        )
+
+    def compute_row_validity(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        cache_seqlens: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Derive the row-validity mask and its five safe index/seqlen buffers.
+
+        STEP-LEVEL, not layer-level: every input is a static whole-model graph
+        input handed unchanged to all 78 layers
+        (whole_model_cuda_graph_segments.py), no layer writes any of them, and
+        no layer writes the derived buffers after this block -- the consumers
+        (the paged KV update, the scorer, the selected-page-table transform,
+        FA3, the ``attn_output`` mask) only read them. Combined with the shared
+        buffer set, that makes this block layer-invariant, so the whole-model
+        driver computes it ONCE per step ahead of the layer loop and every
+        layer's ``forward`` then runs with ``row_validity_ready=True``.
+
+        Kept here, rather than inlined in the driver, so the per-layer graph
+        path and any direct caller still get the same values from the same
+        ops in the same order -- the hoist is a launch-count change only.
+        """
 
         if num_valid_tokens is None:
             torch.ge(primary_slot_indices, 0, out=buffers.valid_mask)
@@ -1414,6 +1467,40 @@ class Glm5FullDsaAttnSegment:
             buffers.valid_rows_zeros,
             out=buffers.valid_rows_bf16,
         )
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+        row_validity_ready: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        attn = self.attn
+        indexer = attn.indexer
+        batch_size = hidden_states.shape[0]
+        buffers = self._buffers.get(batch_size)
+        if buffers is None:
+            self.setup_static_buffers(batch_size)
+            buffers = self._buffers[batch_size]
+        outputs = self._outputs.get(batch_size)
+        if outputs is None:
+            self._setup_static_output_buffers(batch_size)
+            outputs = self._outputs[batch_size]
+
+        # Layer-invariant, so the whole-model driver already ran it once for
+        # this step and for this shared buffer set (see compute_row_validity).
+        if not row_validity_ready:
+            self.compute_row_validity(
+                buffers,
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(
