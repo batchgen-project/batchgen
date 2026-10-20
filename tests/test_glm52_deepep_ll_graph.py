@@ -17,10 +17,12 @@ graph segment captures. Contract under test:
   one rank's rows, not the all-gathered space — and reads its range from the
   kernel policy rather than from literals repeated here;
 * M-independence — stale rows past ``recv_count[e]`` cannot reach the output;
-* the shared-expert side-stream overlap — the fork opens before the exchange is
-  touched, the join closes after the combine, the accumulate consumes the
-  pool-owned staging buffer, and the stream/event are process-lifetime
-  resources that are never minted inside a capture.
+* the shared-expert side-stream overlap — the fork opens right after the router
+  GEMM (before the top-k and the exchange), the join closes after the combine,
+  the accumulate consumes the pool-owned staging buffer, and the stream/event
+  are process-lifetime resources that are never minted inside a capture;
+* the exchange runs split into send and receive launches (``split_phases``) for
+  both dispatch and combine.
 """
 import contextlib
 import inspect
@@ -77,6 +79,9 @@ class _FakeExchange:
         self._routes = None
         self.dispatch_calls = 0
         self.combine_calls = 0
+        # ``split_phases`` of every call, in call order
+        self.dispatch_split = []
+        self.combine_split = []
 
     @property
     def expert_stride(self):
@@ -86,12 +91,13 @@ class _FakeExchange:
     def recv_rows(self):
         return self.num_local_experts * self.expert_stride
 
-    def dispatch_fp8(self, x, topk_idx):
+    def dispatch_fp8(self, x, topk_idx, *, split_phases=False):
         assert x.dtype == torch.bfloat16, x.dtype
         assert topk_idx.dtype == torch.int64, topk_idx.dtype
         assert x.shape[1] == self.hidden
         assert x.shape[0] <= self.max_tokens_per_rank
         self.dispatch_calls += 1
+        self.dispatch_split.append(bool(split_phases))
         stride, e, h = self.expert_stride, self.num_local_experts, self.hidden
         recv = torch.zeros(e, stride, h, dtype=torch.float8_e4m3fn)
         # DeepEP allocates [e, h/128, stride] contiguous, then hands back the
@@ -117,11 +123,13 @@ class _FakeExchange:
         self.scales_base = scales_base
         return recv, scales_base.transpose(1, 2), counts, ("handle",)
 
-    def combine(self, x, topk_idx, topk_weights, handle, out):
+    def combine(self, x, topk_idx, topk_weights, handle, out, *,
+                split_phases=False):
         assert handle == ("handle",)
         assert x.shape == (self.num_local_experts, self.expert_stride,
                            self.hidden), x.shape
         self.combine_calls += 1
+        self.combine_split.append(bool(split_phases))
         acc = torch.zeros(out.shape, dtype=torch.float32)
         # only the live rows named by the handle are read -- this is what makes
         # the padded extent inert
@@ -878,3 +886,47 @@ def test_bucket_switch_reuses_one_receive_space(monkeypatch):
     assert small.expert_out.data_ptr() == pool._base["expert_out"].data_ptr()
     assert small.ll_x_scale.data_ptr() == pool._base["ll_x_scale"].data_ptr()
     assert pool.deepep.max_tokens_per_rank == BUCKET
+
+
+def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypatch):
+    """Placement: the fork is issued after the router GEMM and before the
+    top-k, the earliest point its input (``padded``) allows past the router,
+    and nothing joins it before the combine."""
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
+    order = calls["order"]
+    real_router = segment.router_context.router_forward
+    real_gate = glm5_moe_graph.gate_sigmoid_topk_cuda
+    real_s1 = glm5_moe_graph.grouped_fp8_blockwise_fused_s1
+
+    def traced_router(*a, **kw):
+        order.append("router_gemm")
+        return real_router(*a, **kw)
+
+    def traced_gate(*a, **kw):
+        order.append("topk")
+        return real_gate(*a, **kw)
+
+    def traced_s1(*a, **kw):
+        order.append("s1")
+        return real_s1(*a, **kw)
+
+    segment.router_context.router_forward = traced_router
+    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_cuda", traced_gate)
+    monkeypatch.setattr(
+        glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", traced_s1)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+    assert order == [
+        "router_gemm", "fork_enter", "shared_expert", "fork_exit", "topk",
+        "dispatch", "s1", "combine", "join",
+    ]
+
+
+def test_dispatch_and_combine_run_split_into_send_and_receive(monkeypatch):
+    """Both exchanges ask for the send / receive split, once per layer."""
+    segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
+    padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
+    segment.forward(padded=padded, rank_token_counts=rank_counts)
+    assert pool.deepep.dispatch_split == [True]
+    assert pool.deepep.combine_split == [True]
+

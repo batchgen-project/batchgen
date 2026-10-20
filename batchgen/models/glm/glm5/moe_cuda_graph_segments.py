@@ -936,13 +936,17 @@ class Glm5MoEGraphSegment:
           and writes this rank's rows.
 
         The shared expert is additionally forked onto a side stream for the
-        span of the routed chain (fork after the gate, join before the
-        accumulate). It reads only ``padded``, so the exchange and the grouped
-        GEMMs never wait on it, and the dispatch -- a comm kernel that mostly
-        waits on peers -- stops being time in which this rank's SMs do nothing.
-        The arithmetic, the operand values and the order of writes are
-        unchanged; only the stream the shared expert is issued on moves, so the
-        output is expected bitwise-identical to the in-line version.
+        span of the routed chain: fork right after the router GEMM (before the
+        top-k), join before the accumulate, after the combine. It reads only
+        ``padded``, so the exchange and the grouped GEMMs never wait on it.
+        Dispatch and combine each launch as a send kernel and a separate
+        receive kernel on the main stream (``split_phases=True``), so the
+        shared expert, issued first, runs against the top-k, the id copy and
+        the dispatch send instead of contending with one exchange kernel that
+        spans the whole round trip. The arithmetic, the operand values and the
+        order of writes are unchanged; only the stream the shared expert is
+        issued on and the exchange's kernel decomposition move, so the output
+        is expected bitwise-identical to the in-line version.
 
         M-independence (padded rows stay inert): DeepEP leaves rows at or
         beyond ``recv_count[e]`` holding whatever the previous step left in the
@@ -986,21 +990,14 @@ class Glm5MoEGraphSegment:
             self.router_context.router_forward(
                 padded, logits=bufs.router_logits
             )
-        gate_sigmoid_topk_cuda(
-            bufs.router_logits,
-            self.gate_bias_fp32,
-            k=self.num_experts_per_tok,
-            routed_scaling_factor=self.routed_scaling_factor,
-            topk_indices=bufs.topk_indices,
-            topk_weights=bufs.topk_weights,
-            rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
-            rows_per_rank=bucket_size,
-        )
 
-        # FORK. The shared expert consumes ``padded`` and its own weights, and
-        # nothing the exchange produces, so from here it is independent of the
-        # whole routed chain below. On the side stream it runs against the
-        # dispatch, both grouped GEMMs and the combine instead of after them.
+        # FORK, right after the router GEMM and before the top-k: the shared
+        # expert consumes ``padded`` and its own weights only, so from here it
+        # is independent of everything routed. Issued this early it runs
+        # against the top-k, the id copy and the dispatch SEND kernel; the
+        # dispatch RECEIVE kernel is a separate launch (``split_phases``
+        # below), so the routed chain does not hold the SMs across the whole
+        # exchange round trip while the shared expert is in flight.
         with self._shared_overlap.fork():
             shared_out = self.moe.shared_expert_forward(padded)
             if (shared_out.shape != bufs.shared_out.shape
@@ -1019,11 +1016,26 @@ class Glm5MoEGraphSegment:
             # ``add_(shared_expert_forward(padded))`` read, bit for bit.
             bufs.shared_out.copy_(shared_out)
 
+        gate_sigmoid_topk_cuda(
+            bufs.router_logits,
+            self.gate_bias_fp32,
+            k=self.num_experts_per_tok,
+            routed_scaling_factor=self.routed_scaling_factor,
+            topk_indices=bufs.topk_indices,
+            topk_weights=bufs.topk_weights,
+            rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
+            rows_per_rank=bucket_size,
+        )
+
         # DeepEP reads int64 expert ids; -1 padding rows stay unrouted.
         bufs.ll_topk_idx.copy_(bufs.topk_indices)
 
+        # Dispatch and combine each run as a SEND kernel followed by a separate
+        # RECEIVE kernel, both on this stream (``split_phases``; DeepEP's
+        # ``return_recv_hook=True`` with the hook issued at once). Same bytes,
+        # same reduction order as the single-kernel exchange.
         recv_x, recv_scales, recv_count, handle = exchange.dispatch_fp8(
-            padded, bufs.ll_topk_idx
+            padded, bufs.ll_topk_idx, split_phases=True
         )
         # recv_x [e, stride, h] fp8 -> the uniform-stride activation the
         # grouped GEMM takes, expert i's rows at [i * stride, ...).
@@ -1075,10 +1087,13 @@ class Glm5MoEGraphSegment:
             bufs.topk_weights,
             handle,
             out=bufs.local_moe_output,
+            split_phases=True,
         )
 
         # JOIN, at the first point that reads the shared output -- the combine
-        # above is the last main-stream work the fork can hide behind.
+        # above is the last main-stream work the fork can hide behind. There
+        # is no earlier cross-stream edge: the shared expert and the routed
+        # GEMMs are ordered only by when they are issued.
         self._shared_overlap.join()
         bufs.local_moe_output.add_(bufs.shared_out)
         return {"moe_output": bufs.local_moe_output}
