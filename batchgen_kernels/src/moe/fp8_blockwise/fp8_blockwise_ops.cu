@@ -7,6 +7,7 @@
 // 2. silu_mul_3d        — SiLU(gate) × up (vectorized BF16)
 // 3. fused_silu_quant_3d — SiLU(gate) × up + FP8 quantization (fuses S1 epilogue + S3 input)
 // 4. act_quant_ragged   — act_quant_3d arithmetic on compact ragged [max_rows, K] rows
+// 5. deepep_ll_scale_repack — DeepEP LL scale blocks -> grouped-GEMM scale matrix
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -674,6 +675,122 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
     return std::make_tuple(y, scale);
 }
 
+// ============================================================================
+// Kernel 5: deepep_ll_scale_repack — DeepEP low-latency FP8 activation scales
+// into the grouped GEMM's single transposed scale matrix, live span only.
+//
+// DeepEP LL (use_fp8=True) hands back the scales as a contiguous
+// [E, KB, S] fp32 block (S = per-expert row stride, KB = hidden/128; the
+// exchange exposes it as the [E, S, KB] view with strides (KB*S, 1, S)). The
+// grouped FP8 GEMM reads ONE [KB, E*S] matrix with expert e at column e*S.
+//
+// What the GEMM reads: its x-scale TMA descriptor is the static [KB, E*S]
+// matrix with a (1, TileM) box, addressed at column cu_seqlens[e] + itile_m *
+// TileM for itile_m < ceil(recv_count[e] / TileM) only (tiles[] from
+// update_expert_tma*). Per expert that is columns
+//   [e*S, e*S + ceil(recv_count[e] / span_align) * span_align)
+// for every k-block when span_align is the TileM the GEMM runs with. Exactly
+// that span is copied, bit for bit; the columns beyond it keep whatever the
+// buffer held, which no tile can address.
+//
+// Grid (E, kRepackChunksPerExpert), kRepackThreads threads; each expert's
+// [KB, span] block is flattened into float4 units and grid-strided, so the
+// launch is a fixed 256 CTAs regardless of load and the copy shrinks with
+// recv_count instead of moving the whole E*KB*S block every step.
+// ============================================================================
+constexpr int kRepackThreads = 128;
+constexpr int kRepackChunksPerExpert = 8;
+
+__global__ void __launch_bounds__(kRepackThreads)
+deepep_ll_scale_repack_kernel(
+    const float* __restrict__ src,          // [E, KB, S] contiguous
+    const int32_t* __restrict__ recv_count, // [E]
+    float* __restrict__ dst,                // [KB, E * S] contiguous
+    int E, int KB, int S, int span_align
+) {
+    const int e = blockIdx.x;
+    const int rc = recv_count[e];
+    if (rc < 0 || rc > S) {
+        // A count the receive layout cannot hold: the GEMM would trap on the
+        // same value (load_xscale_tile_base); fail here, loudly, first.
+        asm volatile("trap;");
+    }
+    const int span = (rc + span_align - 1) / span_align * span_align;
+    const int vec_per_row = span / 4;           // span_align % 4 == 0 (host)
+    const int total = KB * vec_per_row;
+    const float* src_e = src + (int64_t)e * KB * S;
+    float* dst_e = dst + (int64_t)e * S;
+    const int64_t dst_row_stride = (int64_t)E * S;
+    for (int i = blockIdx.y * kRepackThreads + threadIdx.x; i < total;
+         i += kRepackChunksPerExpert * kRepackThreads) {
+        const int kb = i / vec_per_row;
+        const int c = (i - kb * vec_per_row) * 4;
+        const float4 v =
+            *reinterpret_cast<const float4*>(src_e + (int64_t)kb * S + c);
+        *reinterpret_cast<float4*>(dst_e + (int64_t)kb * dst_row_stride + c) = v;
+    }
+}
+
+// recv_scales: the exchange's [E, S, KB] fp32 view (strides (KB*S, 1, S));
+// recv_count: [E] int32; out: [KB, E*S] fp32 contiguous; span_align: the
+// TileM the consuming grouped GEMM runs with. No allocations; recv_count is
+// never read on the host.
+torch::Tensor deepep_ll_scale_repack(
+    torch::Tensor recv_scales,
+    torch::Tensor recv_count,
+    torch::Tensor out,
+    int64_t span_align
+) {
+    constexpr int64_t kInt32Max = 2147483647;
+    TORCH_CHECK(recv_scales.defined() && recv_scales.is_cuda(),
+                "recv_scales must be a CUDA tensor");
+    const auto device = recv_scales.device();
+    check_ragged_cuda_tensor(recv_count, device, "recv_count");
+    check_ragged_cuda_tensor(out, device, "out");
+    TORCH_CHECK(recv_scales.dim() == 3 && recv_scales.scalar_type() == torch::kFloat32,
+                "recv_scales must be float32 [E, S, hidden/128]");
+    const int64_t E = recv_scales.size(0);
+    const int64_t S = recv_scales.size(1);
+    const int64_t KB = recv_scales.size(2);
+    TORCH_CHECK(E > 0 && S > 0 && KB > 0, "recv_scales must be non-empty");
+    TORCH_CHECK(recv_scales.stride(0) == KB * S && recv_scales.stride(1) == 1 &&
+                    recv_scales.stride(2) == S,
+                "recv_scales must be the (1, 2)-transposed view of a contiguous "
+                "[E, hidden/128, S] block, i.e. strides (", KB * S, ", 1, ", S,
+                "); got (", recv_scales.stride(0), ", ", recv_scales.stride(1), ", ",
+                recv_scales.stride(2), ")");
+    TORCH_CHECK(E * KB * S <= kInt32Max, "recv_scales too large for int32 indexing");
+    TORCH_CHECK(recv_count.dim() == 1 && recv_count.scalar_type() == torch::kInt32 &&
+                    recv_count.size(0) == E,
+                "recv_count must be int32 [E]");
+    TORCH_CHECK(out.dim() == 2 && out.scalar_type() == torch::kFloat32 &&
+                    out.size(0) == KB && out.size(1) == E * S,
+                "out must be float32 [hidden/128, E * S] = [", KB, ", ", E * S, "]");
+    TORCH_CHECK(span_align > 0 && span_align % 4 == 0 && S % span_align == 0,
+                "span_align (", span_align, ") must be a positive multiple of 4 "
+                "dividing the expert stride ", S);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(recv_scales.data_ptr()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
+                "recv_scales and out must be 16-byte aligned");
+    const auto src_lo = reinterpret_cast<uintptr_t>(recv_scales.data_ptr());
+    const auto dst_lo = reinterpret_cast<uintptr_t>(out.data_ptr());
+    const auto bytes = static_cast<uintptr_t>(E * KB * S * sizeof(float));
+    TORCH_CHECK(src_lo + bytes <= dst_lo || dst_lo + bytes <= src_lo,
+                "recv_scales and out must not overlap");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    deepep_ll_scale_repack_kernel<<<dim3(static_cast<unsigned>(E), kRepackChunksPerExpert),
+                                    kRepackThreads, 0, stream>>>(
+        recv_scales.data_ptr<float>(),
+        recv_count.data_ptr<int32_t>(),
+        out.data_ptr<float>(),
+        static_cast<int>(E), static_cast<int>(KB), static_cast<int>(S),
+        static_cast<int>(span_align));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("act_quant_3d", &act_quant_3d,
           "FP8 blockwise quantization on 3D [E, mtp, K] layout");
@@ -683,4 +800,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SiLU(gate) * up on 3D [E, mtp, N] layout");
     m.def("fused_silu_quant_3d", &fused_silu_quant_3d,
           "Fused SiLU(gate) * up + FP8 quantization on 3D layout");
+    m.def("deepep_ll_scale_repack", &deepep_ll_scale_repack,
+          "DeepEP LL FP8 activation scales -> grouped-GEMM [hidden/128, E*S] matrix, "
+          "copying only each expert's recv_count span rounded up to span_align",
+          pybind11::arg("recv_scales"), pybind11::arg("recv_count"), pybind11::arg("out"),
+          pybind11::arg("span_align"));
 }

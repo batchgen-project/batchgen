@@ -103,11 +103,21 @@ struct Fp8BlockwiseGemmConfig {
   using CopyBoxWS =
       decltype(make_layout(make_shape(Int<1>{}, Int<4>{}), make_stride(Int<4>{}, Int<1>{})));
 
+  // The X / Y prototypes alone: the per-expert descriptor patch
+  // (update_expert_tma*) only re-targets these two, so a launch that prepares
+  // descriptors for a GEMM it does not run builds them here, from the same
+  // calls get_tma makes.
+  template <typename TX, typename TY>
+  auto get_tma_xy(TX x, TY y) {
+    auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, x, take<0, 2>(SLayoutX{}));
+    auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{});
+    return std::make_tuple(tma_x, tma_y);
+  }
+
   template <typename TX, typename TW, typename TY, typename TXS, typename TWS>
   auto get_tma(TX x, TW w, TY y, TXS xs, TWS ws) {
-    auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, x, take<0, 2>(SLayoutX{}));
+    auto [tma_x, tma_y] = get_tma_xy(x, y);
     auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));
-    auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{});
     auto tma_xs = make_tma_copy(SM90_TMA_LOAD{}, xs, CopyBoxXS{});
     auto tma_ws = make_tma_copy(SM90_TMA_LOAD{}, ws, CopyBoxWS{});
     return std::make_tuple(tma_x, tma_w, tma_y, tma_xs, tma_ws);
