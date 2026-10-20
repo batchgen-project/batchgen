@@ -29,6 +29,7 @@ from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
 from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
+    prepare_grouped_fp8_s1_s3_tma,
 )
 from batchgen.moe.routing import (
     GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS,
@@ -41,6 +42,7 @@ from .moe_ragged import (
     ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged,
+    deepep_ll_scale_repack,
     dispatch_scatter_ragged,
     make_quant_buffers,
     ragged_row_capacity,
@@ -215,6 +217,17 @@ class _Glm5MoEGraphBuffers:
     ll_topk_idx: torch.Tensor
     ll_x_scale: torch.Tensor
     ll_cu_seqlens: torch.Tensor
+    # DeepEP low-latency mode only: the per-expert X/Y TMA descriptors of the
+    # fused S1 and of the S3 GEMM ([2 * E_local, 128] bytes each) and their one
+    # shared tile table, all written by ONE prepare launch per layer
+    # (prepare_grouped_fp8_s1_s3_tma) and read by both GEMMs later on the same
+    # stream. One set for every MoE layer and bucket: layers run in stream
+    # order and each layer's S3 has read them before the next layer's prepare
+    # rewrites them. Empty on the NCCL path.
+    ll_s1_tma: torch.Tensor
+    ll_s3_tma: torch.Tensor
+    ll_tiles: torch.Tensor
+    ll_cu_tiles: torch.Tensor
     # DeepEP low-latency mode only: the shared expert's output, produced on the
     # side stream and consumed by the accumulate on the main stream. A pool
     # buffer rather than a side-stream temporary because the consumer is a
@@ -271,6 +284,10 @@ _MOE_SHARED_FIELDS = (
     # which does not scale with the bucket, so both are bucket-independent.
     "ll_x_scale",
     "ll_cu_seqlens",
+    "ll_s1_tma",
+    "ll_s3_tma",
+    "ll_tiles",
+    "ll_cu_tiles",
 )
 
 _MOE_REBUILT_FIELDS = (
@@ -427,6 +444,10 @@ class Glm5MoEGraphBufferPool:
         b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
         b["ll_x_scale"] = torch.empty(h // 128, 0, dtype=torch.float32, device=d)
         b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_s1_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
+        b["ll_s3_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
+        b["ll_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_cu_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
         # The shared expert stays on the one stream here, so it keeps writing
         # the tensor it allocates and this buffer is never read.
         b["shared_out"] = torch.empty(0, h, dtype=torch.bfloat16, device=d)
@@ -525,9 +546,17 @@ class Glm5MoEGraphBufferPool:
         b["cu_seqlens"] = b["ll_cu_seqlens"]
         # Activation scales: DeepEP returns one contiguous [h/128, stride]
         # block per local expert, the GEMM wants a single [h/128, rows]
-        # tensor, so the dispatch output is repacked into this buffer.
+        # tensor, so the dispatch output is repacked into this buffer -- per
+        # expert only the columns the GEMM's tiles can load
+        # (deepep_ll_scale_repack); the rest keep whatever they held.
         _, ll_x_scale = make_quant_buffers(rows, h, d)
         b["ll_x_scale"] = ll_x_scale
+        # Both GEMMs' descriptors + their shared tile table, written by one
+        # prepare launch per layer (see _Glm5MoEGraphBuffers.ll_s1_tma).
+        b["ll_s1_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
+        b["ll_s3_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
+        b["ll_tiles"] = torch.empty(e, dtype=torch.int32, device=d)
+        b["ll_cu_tiles"] = torch.empty(e + 1, dtype=torch.int32, device=d)
         _, inter_scale = make_quant_buffers(rows, n, d)
         b["inter_scale"] = inter_scale
         empty_h = torch.empty(0, h, dtype=torch.bfloat16, device=d)
@@ -576,6 +605,10 @@ class Glm5MoEGraphBufferPool:
             cu_seqlens=b["ll_cu_seqlens"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
             ll_x_scale=b["ll_x_scale"],
+            ll_s1_tma=b["ll_s1_tma"],
+            ll_s3_tma=b["ll_s3_tma"],
+            ll_tiles=b["ll_tiles"],
+            ll_cu_tiles=b["ll_cu_tiles"],
             x_scale=b["ll_x_scale"],
             inter_scale=b["inter_scale"],
             capacity=rows,
@@ -634,6 +667,10 @@ class Glm5MoEGraphBufferPool:
             cu_seqlens=b["cu_seqlens"],
             ll_x_scale=b["ll_x_scale"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
+            ll_s1_tma=b["ll_s1_tma"],
+            ll_s3_tma=b["ll_s3_tma"],
+            ll_tiles=b["ll_tiles"],
+            ll_cu_tiles=b["ll_cu_tiles"],
             x_scale=x_scale,
             inter_scale=inter_scale,
             capacity=capacity,
@@ -987,7 +1024,12 @@ class Glm5MoEGraphSegment:
         reads only the rows named by the dispatch handle's ``src_info`` /
         ``layout_range``. Stale rows therefore cannot reach the output, and the
         captured graph's result depends only on the live row count, never on
-        the padded extent.
+        the padded extent. The x-scale matrix follows the same rule at tile
+        granularity: S1 loads, per expert, the scale columns of its
+        ``ceil(recv_count[e] / TileM)`` row tiles (the partial last tile's
+        extra columns only scale rows whose X loads are zero-filled and whose
+        Y stores are clipped), the repack copies exactly those columns, and
+        every column past them keeps a stale value no tile addresses.
 
         The side-stream staging buffer does not weaken that: it is one process
         buffer sliced to the bucket, the shared expert rewrites every row of
@@ -1078,20 +1120,41 @@ class Glm5MoEGraphSegment:
         # recv_x [e, stride, h] fp8 -> the uniform-stride activation the
         # grouped GEMM takes, expert i's rows at [i * stride, ...).
         x_fp8 = recv_x.view(e * stride, self.hidden_size)
-        # recv_scales is logically [e, stride, h/128] but its last two
-        # dimensions are a transposed view of a contiguous [e, h/128, stride]
-        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
-        # The GEMM wants ONE contiguous [h/128, e * stride], so transpose back
-        # and repack: the only kernel this path adds.
-        bufs.ll_x_scale.view(self.hidden_size // 128, e, stride).copy_(
-            recv_scales.transpose(1, 2).permute(1, 0, 2)
-        )
+        inter_fp8 = bufs.inter_fp8.view(torch.float8_e4m3fn)
 
         avg = _glm5_gemm_tilem_avg(
             global_rows,
             self.num_experts_per_tok,
             self.num_local_experts * self.world_size,
         )
+        # ONE launch prepares both grouped GEMMs of this layer: their only
+        # per-step input is recv_count (as the per-expert row extent of the
+        # X/Y descriptors and as the tile counts), which S1 and S3 share, as
+        # they share cu_seqlens and avg (=> TileM). S3 reads its descriptors
+        # three launches later on this same stream.
+        tma_plan = prepare_grouped_fp8_s1_s3_tma(
+            x_fp8,
+            bufs.intermediate,
+            inter_fp8,
+            bufs.expert_out,
+            recv_count,
+            bufs.ll_cu_seqlens,
+            avg,
+            s1_tma_desc=bufs.ll_s1_tma,
+            s3_tma_desc=bufs.ll_s3_tma,
+            tiles=bufs.ll_tiles,
+            cu_tiles=bufs.ll_cu_tiles,
+        )
+        # recv_scales is logically [e, stride, h/128] but its last two
+        # dimensions are a transposed view of a contiguous [e, h/128, stride]
+        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
+        # The GEMM wants ONE contiguous [h/128, e * stride]. Its x-scale tiles
+        # load, per expert, columns [0, ceil(recv_count[e] / TileM) * TileM)
+        # of that expert's block and nothing else, so exactly that span is
+        # repacked; columns past it are never addressed and keep stale values.
+        deepep_ll_scale_repack(
+            recv_scales, recv_count, bufs.ll_x_scale, tma_plan.tile_m)
+
         s1_result = grouped_fp8_blockwise_fused_s1(
             x_fp8,
             bufs.ll_x_scale,
@@ -1103,13 +1166,14 @@ class Glm5MoEGraphSegment:
             bufs.ll_cu_seqlens,
             avg,
             output=bufs.intermediate,
+            tma_plan=tma_plan,
         )
         act_quant_ragged(
             s1_result, recv_count, bufs.ll_cu_seqlens,
             bufs.inter_fp8, bufs.inter_scale,
         )
         grouped_fp8_blockwise_s3(
-            bufs.inter_fp8.view(torch.float8_e4m3fn),
+            inter_fp8,
             bufs.inter_scale,
             self.moe.fp8_down_w3d.view(torch.float8_e4m3fn),
             self.moe.fp8_down_ws3d,
@@ -1117,6 +1181,7 @@ class Glm5MoEGraphSegment:
             bufs.ll_cu_seqlens,
             avg,
             output=bufs.expert_out,
+            tma_plan=tma_plan,
         )
 
         exchange.combine(
