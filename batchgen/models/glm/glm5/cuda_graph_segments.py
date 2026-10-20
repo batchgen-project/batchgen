@@ -22,6 +22,7 @@ preconditions should fast-fail before replay rather than silently falling back.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from dataclasses import dataclass, fields
@@ -237,6 +238,96 @@ if _split_delta:
         f"_Glm5FullDsaSegmentBuffers fields not covered by (or extraneous in) "
         f"the view/rebuild split: {sorted(_split_delta)}"
     )
+
+
+# One indexer-K side stream per CUDA device for the life of the process. The
+# graph pool is torn down and rebuilt around a mid-run prefill wave, and the
+# segments with it; a stream minted per segment would leak one handle per
+# rebuild. One stream is enough: the full-indexer layers run strictly in order
+# and each joins its K path before the next layer forks.
+_INDEXER_K_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def _glm5_indexer_k_stream(device: torch.device) -> torch.cuda.Stream:
+    if device.type != "cuda":
+        raise RuntimeError(
+            "GLM-5 DSA indexer K-path overlap requires a CUDA device, got "
+            f"{device!r}")
+    index = torch.cuda.current_device() if device.index is None else int(device.index)
+    stream = _INDEXER_K_STREAMS.get(index)
+    if stream is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "GLM-5 DSA indexer K-path side stream must exist before CUDA "
+                "graph capture; it is being created inside a capture, which "
+                "means a segment was constructed under torch.cuda.graph")
+        stream = torch.cuda.Stream(device=index)
+        _INDEXER_K_STREAMS[index] = stream
+    return stream
+
+
+class _IndexerKPathOverlap:
+    """One full-indexer layer's fork/join pair for the indexer K path.
+
+    The same capture-safe pattern as the MoE shared-expert fork
+    (``moe_cuda_graph_segments._SharedExpertOverlap``): the stream and the
+    per-layer event are created at segment construction, before warmup and
+    capture; only the two dependency edges are issued per forward, so inside a
+    capture they become graph edges and the replay reproduces the topology.
+    One event per layer, so within one capture each event carries exactly one
+    record/wait pair.
+
+    Deliberately not capture-gated: the warmup forwards the graph manager runs
+    before each capture execute the same fork, which is what JIT-compiles and
+    first-touches every K-path kernel on the side stream before capture.
+    """
+
+    def __init__(self, device: torch.device, layer_idx: int) -> None:
+        self.stream = _glm5_indexer_k_stream(device)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"Layer {layer_idx}: GLM-5 DSA indexer K-path overlap event "
+                "must be created before CUDA graph capture")
+        self.event = torch.cuda.Event()
+        self.layer_idx = int(layer_idx)
+
+    @contextlib.contextmanager
+    def fork(self):
+        main = torch.cuda.current_stream()
+        # One ``wait_stream`` orders the side stream after everything already
+        # issued on the main stream, which covers both directions it needs:
+        #   RAW: this layer's ``hidden_states`` (the input norm), the hoisted
+        #        ``token_indices`` cast and the step-level row-validity
+        #        prologue (``kv_aux_slot_indices``) were all produced there;
+        #   WAR: the PREVIOUS full-indexer layer's scorer read the shared
+        #        ``buffers.head_gates`` there, so this layer's K path cannot
+        #        overwrite it early. The shared wk scratch
+        #        (``indexer_k_x_fp8`` / ``indexer_k_x_scale`` /
+        #        ``indexer_k_raw``) is only ever touched by K paths, i.e. by
+        #        this stream, in layer order.
+        self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            yield
+        self.event.record(self.stream)
+
+    def join(self) -> None:
+        torch.cuda.current_stream().wait_event(self.event)
+
+
+class _InlineIndexerKPath:
+    """No-stream stand-in: the K path runs in place, on the one stream.
+
+    Reachable only where there is no CUDA stream to fork onto (a segment built
+    on CPU tensors in the contract tests). Same kernels, same buffers, same
+    order of writes as the side-stream path; only the topology is absent.
+    """
+
+    @contextlib.contextmanager
+    def fork(self):
+        yield
+
+    def join(self) -> None:
+        return
 
 
 def _warm_paged_mqa_scorer(
@@ -924,6 +1015,16 @@ class Glm5FullDsaAttnSegment:
                 "GLM-5 DSA graph requires flash_attn_interface "
                 "(FlashAttention-3): flash_attn_with_kvcache is unavailable"
             )
+        # The indexer K path (wk quant + GEMM, k LayerNorm, K RoPE+Hadamard,
+        # aux K write, head gates) depends only on this layer's hidden states,
+        # so it runs on a side stream concurrently with the Q path. Built here,
+        # before warmup and capture, like the MoE shared-expert fork.
+        device = self.primary_blocked_k.device
+        self._indexer_k_overlap = (
+            _IndexerKPathOverlap(device, self.layer_idx)
+            if device.type == "cuda"
+            else _InlineIndexerKPath()
+        )
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -1507,18 +1608,95 @@ class Glm5FullDsaAttnSegment:
                 num_valid_tokens=num_valid_tokens,
             )
 
-        hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
-        hidden_fp8, hidden_scale = act_quant(
-            hidden_flat,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
         fused_qkv_a_weight = getattr(self.wrapper, "_fp8_qkv_a_proj", None)
         fused_qkv_a_scale = getattr(self.wrapper, "_fp8_qkv_a_scale", None)
         if fused_qkv_a_weight is None or fused_qkv_a_scale is None:
             raise RuntimeError(
                 f"Layer {self.layer_idx}: GLM-5 graph requires fused Q-A/KV-A weights"
             )
+        hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
+        # Read by both streams: the primary KV update below and the aux K
+        # write on the side stream. Issued before the fork so the side stream's
+        # ``wait_stream`` covers it.
+        token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
+
+        # ---- Indexer K path, on the side stream --------------------------
+        # Same kernels in the same order as the serial path; only the stream
+        # changes. Reads: ``hidden_flat``, ``position_ids``, ``token_indices``,
+        # ``buffers.kv_aux_slot_indices`` (step-level prologue), the aux page
+        # table and weights -- nothing the main stream writes before the join
+        # below (``hidden_flat`` and ``token_indices`` stay referenced until
+        # this method returns, after the join, so their memory cannot be
+        # recycled under the side stream). Writes, and their first readers:
+        #   buffers.indexer_k_x_fp8 / indexer_k_x_scale / indexer_k_raw -- the
+        #       next stage of this same K path only;
+        #   self.aux_blocked_k (this token's K)  -> ``_score_and_topk`` (main,
+        #       after the join);
+        #   buffers.head_gates                   -> ``_score_and_topk`` (main,
+        #       after the join);
+        #   outputs.indexer_k_tensor / indexer_k_scale -> the whole-model host
+        #       KV staging, after this method returns (after the join).
+        k_path = self._indexer_k_overlap
+        with k_path.fork():
+            cuda_wk_proj_gemm_only_out(
+                hidden_flat,
+                self.wrapper._indexer_cuda_weights,
+                self.cuda_module,
+                buffers.indexer_k_x_fp8,
+                buffers.indexer_k_x_scale,
+                buffers.indexer_k_tma_desc,
+                buffers.indexer_k_raw,
+                num_valid_tokens=num_valid_tokens,
+            )
+            k_normed = indexer.k_norm(buffers.indexer_k_raw)
+            indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
+                k_normed.unsqueeze(1),
+                position_ids.view(batch_size),
+                max_seqlen=self.max_seqlen,
+            ).unsqueeze(2)
+            # Page-split aux cache: ONE launch quantizes the keys, writes the
+            # page's e4m3 K region and fp32 scale region, and fills the two
+            # static host staging buffers with the same bytes (no extra copy,
+            # no second quantization). A bf16 AoS cache keeps the copy +
+            # paged update pair.
+            if self.aux_is_page_split:
+                write_aux_indexer_k(
+                    aux_blocked_k=self.aux_blocked_k,
+                    indexer_k=indexer_k_tensor,
+                    page_table=self.aux_page_table,
+                    slot_indices=buffers.kv_aux_slot_indices,
+                    token_indices=token_indices,
+                    page_size_tokens=self.aux_page_size,
+                    k_fp8_out=outputs.indexer_k_tensor,
+                    scales_out=outputs.indexer_k_scale,
+                    num_valid_tokens=num_valid_tokens,
+                )
+            else:
+                outputs.indexer_k_tensor.copy_(indexer_k_tensor)
+                write_aux_indexer_k(
+                    aux_blocked_k=self.aux_blocked_k,
+                    indexer_k=outputs.indexer_k_tensor,
+                    page_table=self.aux_page_table,
+                    slot_indices=buffers.kv_aux_slot_indices,
+                    token_indices=token_indices,
+                    page_size_tokens=self.aux_page_size,
+                    num_valid_tokens=num_valid_tokens,
+                )
+            if not self.all_short:
+                head_gates_out(
+                    hidden_flat,
+                    indexer.weights_proj.weight.data,
+                    buffers.head_gates,
+                    scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
+                    num_valid_tokens=num_valid_tokens,
+                )
+
+        # ---- Q path / MLA spine, on the main stream ----------------------
+        hidden_fp8, hidden_scale = act_quant(
+            hidden_flat,
+            num_valid_tokens=num_valid_tokens,
+            scale_tma_aligned=num_valid_tokens is not None,
+        )
         w8a8_deepgemm(
             hidden_fp8,
             hidden_scale,
@@ -1596,7 +1774,6 @@ class Glm5FullDsaAttnSegment:
             row_valid_mask=buffers.valid_mask,
             q_pe_src=q_rope_strided,
         )
-        token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
             k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
@@ -1607,58 +1784,7 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
         )
 
-        cuda_wk_proj_gemm_only_out(
-            hidden_flat,
-            self.wrapper._indexer_cuda_weights,
-            self.cuda_module,
-            buffers.indexer_k_x_fp8,
-            buffers.indexer_k_x_scale,
-            buffers.indexer_k_tma_desc,
-            buffers.indexer_k_raw,
-            num_valid_tokens=num_valid_tokens,
-        )
-        k_normed = indexer.k_norm(buffers.indexer_k_raw)
-        indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
-            k_normed.unsqueeze(1),
-            position_ids.view(batch_size),
-            max_seqlen=self.max_seqlen,
-        ).unsqueeze(2)
-        # Page-split aux cache: ONE launch quantizes the keys, writes the page's
-        # e4m3 K region and fp32 scale region, and fills the two static host
-        # staging buffers with the same bytes (no extra copy, no second
-        # quantization). A bf16 AoS cache keeps the copy + paged update pair.
-        if self.aux_is_page_split:
-            write_aux_indexer_k(
-                aux_blocked_k=self.aux_blocked_k,
-                indexer_k=indexer_k_tensor,
-                page_table=self.aux_page_table,
-                slot_indices=buffers.kv_aux_slot_indices,
-                token_indices=token_indices,
-                page_size_tokens=self.aux_page_size,
-                k_fp8_out=outputs.indexer_k_tensor,
-                scales_out=outputs.indexer_k_scale,
-                num_valid_tokens=num_valid_tokens,
-            )
-        else:
-            outputs.indexer_k_tensor.copy_(indexer_k_tensor)
-            write_aux_indexer_k(
-                aux_blocked_k=self.aux_blocked_k,
-                indexer_k=outputs.indexer_k_tensor,
-                page_table=self.aux_page_table,
-                slot_indices=buffers.kv_aux_slot_indices,
-                token_indices=token_indices,
-                page_size_tokens=self.aux_page_size,
-                num_valid_tokens=num_valid_tokens,
-            )
-
         if not self.all_short:
-            head_gates_out(
-                hidden_flat,
-                indexer.weights_proj.weight.data,
-                buffers.head_gates,
-                scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
-                num_valid_tokens=num_valid_tokens,
-            )
             buffers.positions_expanded.copy_(
                 position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
             )
@@ -1679,6 +1805,11 @@ class Glm5FullDsaAttnSegment:
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
             )
+            # JOIN (scoring graphs). The scorer is the first main-stream
+            # reader of the K path's writes: it scores the aux cache, whose
+            # slot for this token the side stream just wrote, with the
+            # side-stream ``head_gates``.
+            k_path.join()
             self._score_and_topk(
                 buffers,
                 aux_slot_indices=buffers.safe_aux_slot_indices,
@@ -1745,6 +1876,14 @@ class Glm5FullDsaAttnSegment:
         # consumer inside the segment, so it masks here.
         if not attn_output_mask_deferred:
             outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+
+        if self.all_short:
+            # JOIN (all_short graphs). Nothing in this segment reads the K
+            # path's writes -- there is no scorer -- so the side stream is
+            # collected as late as possible: before the K outputs leave the
+            # segment for the host KV staging, and before the caller may
+            # recycle ``hidden_states``. Exactly one join per forward.
+            k_path.join()
 
         graph_outputs = {
             "attn_output": outputs.attn_output.view(batch_size, 1, attn.hidden_size),
