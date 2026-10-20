@@ -149,8 +149,9 @@ created by name in `/dev/shm` or a hugetlbfs mount. The kernel frees each region
 when the last process using it exits, however the processes stop, and workers
 are killed when their server process dies. After an abnormal exit, the only
 BatchGen objects that can remain are the per-run runtime directory under the
-temp directory and, if the whole process group was killed at once, Python's
-`sem.mp-*` semaphores. The next
+temp directory, a staged distributed weight store (see
+`--distributed-weight-config`; the next start reuses or removes it) and, if the
+whole process group was killed at once, Python's `sem.mp-*` semaphores. The next
 start of the same instance removes a previous run's runtime directory once its
 run lock proves every process of that run has exited, and refuses to start while
 one is still alive. The temp directory must be local to each node.
@@ -408,7 +409,7 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 |------|---------|-------------|
 | `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
 | `--enable-deepep` | `false` | Enable the DeepEP low-latency expert-parallel exchange for the decode graph (default off = NCCL all-gather + reduce-scatter). Requires the DeepEP build and **fails fast** at startup if it is unavailable (no silent NCCL fallback). Generic across EP models; on Kimi-K3 it also needs H200 TP8 and the K3 DeepEP build. |
-| `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. |
+| `--distributed-weight-config` | None | Path to a node-local distributed host-weight source config (JSON). When set, the server skips the replicated parameter server and workers map the compact per-node store it describes. When the config sets `store_residency` (`run` or `resident`, written by the store builder's `--store-residency`), the server first stages the store into a directory it owns under `store_staging_dir` (default `/dev/shm/batchgen-weight-stores`, a tmpfs; `huge=within_size` or `huge=always` under `--fast-init`) and maps that copy; `run` removes the copy when the server stops, `resident` keeps it for the next start. Without `store_residency` the store is mapped where it was built. |
 | `--max-pool-size` | `10240` | Deprecated positive compatibility flag. It no longer sizes QueryBook or persistent scheduling; capacity is derived from `--input-ids-pool-size-gb` and the model context. The server rejects non-positive values. |
 | `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
 | `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |

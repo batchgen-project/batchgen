@@ -124,6 +124,7 @@ def _validate_distributed_weight_source(args: "ServerArgs") -> None:
         )
     from batchgen.models.moonshotai.kimi_linear.store_builder import (
         K3StoreManifestError,
+        complete_staged_store,
         rebuild_command,
         verify_published_store,
     )
@@ -135,6 +136,7 @@ def _validate_distributed_weight_source(args: "ServerArgs") -> None:
         cache_dir=args.cache_dir,
         node_rank=args.node_rank,
         num_nodes=args.nnodes,
+        spot_check_store_path=complete_staged_store(args.distributed_weight_config),
     )
     config = verified["config"]
     if (config["node_rank"], config["num_nodes"]) != (args.node_rank, args.nnodes):

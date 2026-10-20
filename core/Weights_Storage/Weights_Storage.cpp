@@ -349,6 +349,10 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
             "mmap compact weight store failed: " +
             std::string(strerror(errno)));
     }
+    // A staged store lives on a tmpfs mounted huge=within_size|always; ask
+    // for huge pages on this mapping too. Failure (an old kernel, a non-tmpfs
+    // legacy store) only loses the huge pages, so it is ignored.
+    madvise(this->compact_ptr_, this->compact_bytes_, MADV_HUGEPAGE);
     // The full mapping stays in every worker because get_tensor hands pageable
     // views of the local modules to Torch. Only the DMA pinning below is
     // narrowed, and only for hierarchical_gdr.

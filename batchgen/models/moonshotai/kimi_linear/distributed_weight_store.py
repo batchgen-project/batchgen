@@ -25,6 +25,20 @@ DISTRIBUTED_NODE_COUNTS = (2, 4)
 #: these for fleets whose HCA numbering differs (for example H200 uses 0..7).
 DEFAULT_RAIL_DEVICES = tuple(f"mlx5_bond_{index}:1" for index in range(1, 9))
 
+#: Lifetime of the server's staged copy of the store.
+#:
+#: ``run`` -- the server copies ``store_path`` into ``store_staging_dir`` at
+#: start and removes the copy when it stops, like every other run resource.
+#: ``resident`` -- the copy stays for the next start, which maps it without
+#: copying the source again.
+#: Absent -- legacy: the server maps ``store_path`` itself and stages nothing.
+STORE_RESIDENCIES = ("run", "resident")
+
+#: Managed tmpfs directory for staged copies. The name deliberately lacks the
+#: ``batchgen_`` run prefix, so run-leftover reclamation never treats a staged
+#: store as residue of a dead run.
+DEFAULT_STORE_STAGING_DIR = "/dev/shm/batchgen-weight-stores"
+
 
 def load_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     """Validate a node config AND the published store it describes.
@@ -123,6 +137,33 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
             "non-empty strings"
         )
     config["rail_devices"] = rail_devices
+    # Optional; a config without `store_residency` keeps the legacy direct
+    # mapping of `store_path`. Both keys are normalized into the returned
+    # dict (None when legacy) so every caller can read them unconditionally.
+    residency = config.get("store_residency")
+    if residency is not None and residency not in STORE_RESIDENCIES:
+        raise ValueError(
+            f"distributed weight store_residency must be one of "
+            f"{STORE_RESIDENCIES}; got {residency!r}"
+        )
+    staging_dir = config.get("store_staging_dir")
+    if residency is None:
+        if staging_dir is not None:
+            raise ValueError(
+                "distributed weight store_staging_dir is set but "
+                "store_residency is not; set store_residency to "
+                f"{' or '.join(STORE_RESIDENCIES)} or drop store_staging_dir"
+            )
+    else:
+        if staging_dir is None:
+            staging_dir = DEFAULT_STORE_STAGING_DIR
+        if not isinstance(staging_dir, str) or not Path(staging_dir).is_absolute():
+            raise ValueError(
+                "distributed weight store_staging_dir must be an absolute "
+                f"path; got {staging_dir!r}"
+            )
+    config["store_residency"] = residency
+    config["store_staging_dir"] = staging_dir
     # The store and metadata files themselves are judged by the completion
     # manifest check in load_distributed_weight_config, which also names the
     # rebuild command when they are missing, truncated, or foreign.

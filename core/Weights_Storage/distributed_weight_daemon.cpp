@@ -663,6 +663,9 @@ struct DistributedWeightDaemon::Impl {
             fail("compact store mmap failed: " +
                  std::string(strerror(errno)));
         }
+        // Huge pages for the staged tmpfs store, as for the staging ring
+        // below; failure only loses them.
+        madvise(store, store_bytes, MADV_HUGEPAGE);
 
         staging_fd = static_cast<int>(
             syscall(SYS_memfd_create, "k3_roce_staging", 0));

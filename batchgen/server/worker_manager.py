@@ -189,6 +189,11 @@ class WorkerManager:
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
         self.distributed_weight_config = None
+        # The server-owned staged copy of the distributed weight store, and
+        # the config the daemon and every worker receive: the effective
+        # config naming that copy, or the builder's config when it is legacy.
+        self._staged_weight_store = None
+        self._distributed_weight_config_path: Optional[Path] = None
         self.skeleton_state_dict = None
         # The skeleton state dict lives in an anonymous memfd this process
         # holds open; workers read it back through /proc/<our pid>/fd/<N>.
@@ -381,6 +386,7 @@ class WorkerManager:
             self._compact_memory()
 
         if self.args.distributed_weight_config is not None:
+            self._stage_distributed_weight_store()
             self._start_distributed_weight_daemon()
 
         if self.args.enable_hugetlbfs:
@@ -482,6 +488,7 @@ class WorkerManager:
                 self._run_lock is not None,
                 self.worker_process is not None,
                 self.distributed_weight_daemon is not None,
+                getattr(self, "_staged_weight_store", None) is not None,
                 bool(self.model_info.get("shm_name")),
                 bool(self.model_info.get("tensor_meta_shm_name")),
                 self.skeleton_state_dict_file is not None,
@@ -549,6 +556,7 @@ class WorkerManager:
                     self.model_info.pop("tensor_meta_shm_name", None)
 
                     self._close_skeleton_memfd()
+                    self._release_staged_weight_store()
                     runtime_dir = self.args.runtime_identity.runtime_dir
                     # Last holder of this run's liveness lock, and the lock file
                     # lives in the directory removed next.
@@ -1228,7 +1236,7 @@ class WorkerManager:
             weights_memfd_fd=self._get_weights_memfd_fd(),
             tensor_meta_memfd_fd=self._get_tensor_meta_memfd_fd(),
             distributed_weight_config=(
-                str(self.args.distributed_weight_config)
+                str(self._distributed_weight_config_path)
                 if self.args.distributed_weight_config is not None
                 else None
             ),
@@ -1540,6 +1548,48 @@ class WorkerManager:
         return report
 
     # ---------------------- Model loading helpers ----------------------
+    def _stage_distributed_weight_store(self) -> None:
+        """Map a server-owned tmpfs copy of the store when the config sets
+        ``store_residency``; a legacy config maps ``store_path`` directly.
+
+        Runs before the daemon starts, so the daemon and every worker of
+        every cohort receive the same effective config. Released by
+        :meth:`_release_staged_weight_store` once both are gone; a worker
+        restart never touches it.
+        """
+        from batchgen.server.weight_store_staging import (
+            stage_distributed_weight_store,
+        )
+
+        staged = stage_distributed_weight_store(
+            self.args.distributed_weight_config,
+            self.args.runtime_identity.runtime_dir,
+            fast_init=self.args.fast_init,
+        )
+        self._staged_weight_store = staged
+        self._distributed_weight_config_path = (
+            staged.effective_config_path
+            if staged is not None
+            else Path(self.args.distributed_weight_config)
+        )
+
+    def _release_staged_weight_store(self) -> None:
+        """Drop this server's hold on the staged store (removing a ``run``
+        copy). Only after the daemon is stopped and the workers are reaped:
+        until then something still maps it, so an incomplete stop keeps the
+        hold until this process exits."""
+        staged = getattr(self, "_staged_weight_store", None)
+        if staged is None or self.distributed_weight_daemon is not None:
+            return
+        self._staged_weight_store = None
+        try:
+            staged.release()
+        except Exception:
+            logger.exception(
+                "Releasing the staged distributed weight store %s failed",
+                staged.directory,
+            )
+
     def _start_distributed_weight_daemon(self) -> None:
         if "kimi-k3" not in self.args.model.lower():
             raise ValueError(
@@ -1549,7 +1599,7 @@ class WorkerManager:
             load_distributed_weight_config,
         )
 
-        config_path = Path(self.args.distributed_weight_config)
+        config_path = self._distributed_weight_config_path
         config = load_distributed_weight_config(config_path)
         if int(config["num_nodes"]) != int(self.args.nnodes):
             raise ValueError(
