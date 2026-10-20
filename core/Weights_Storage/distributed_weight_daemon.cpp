@@ -329,7 +329,8 @@ const char* cohort_state_name(CohortState state) {
 }
 
 // One worker control connection. The accept thread creates it and starts its
-// thread; only FinishCohortSwap or Stop joins that thread and closes the fd.
+// thread; only FinishCohortSwap or Stop joins that thread. They also close the
+// fd, unless CloseUnadmitted already did and left fd == -1.
 // epoch/worker_id are written by the connection's own thread when its hello
 // is admitted, and read by others only after joining that thread.
 struct ClientConnection {
@@ -1178,6 +1179,7 @@ struct DistributedWeightDaemon::Impl {
                 Response response;
                 set_error(&response, refusal);
                 send_exact(fd, &response, sizeof(response));
+                CloseUnadmitted(connection);
                 return;
             }
             admitted = true;
@@ -1235,6 +1237,24 @@ struct DistributedWeightDaemon::Impl {
             } else if (!refused) {
                 RecordRejectedHello("hello failed: " +
                                     std::string(error.what()));
+            }
+            if (!admitted) {
+                CloseUnadmitted(connection);
+            }
+        }
+    }
+
+    // A refused or failed hello never joins a cohort, so its socket is closed
+    // now instead of lingering until the next swap or Stop. Only while the
+    // connection is still listed: once FinishCohortSwap or Stop has taken it,
+    // they own the fd, and closing it here could hit a reused fd number.
+    void CloseUnadmitted(ClientConnection* connection) {
+        std::lock_guard<std::mutex> lock(client_mutex);
+        for (const auto& listed : clients) {
+            if (listed.get() == connection && connection->fd >= 0) {
+                close(connection->fd);
+                connection->fd = -1;
+                return;
             }
         }
     }
@@ -1841,16 +1861,22 @@ struct DistributedWeightDaemon::Impl {
             retired.swap(clients);
         }
         for (const auto& connection : retired) {
-            shutdown(connection->fd, SHUT_RDWR);
+            if (connection->fd >= 0) {
+                shutdown(connection->fd, SHUT_RDWR);
+            }
         }
         WakeWaiters();
         std::uint64_t cohort_connections = 0;
         std::uint64_t other_connections = 0;
+        std::uint64_t closed_fds = 0;
         for (const auto& connection : retired) {
             if (connection->thread.joinable()) {
                 connection->thread.join();
             }
-            close(connection->fd);
+            if (connection->fd >= 0) {
+                close(connection->fd);
+                ++closed_fds;
+            }
             if (connection->epoch == retiring) {
                 ++cohort_connections;
             } else {
@@ -1873,7 +1899,7 @@ struct DistributedWeightDaemon::Impl {
             std::lock_guard<std::mutex> lock(cohort_mutex);
             report["from_cohort"] = retiring;
             report["to_cohort"] = retiring + 1;
-            report["closed_fds"] = retired.size();
+            report["closed_fds"] = closed_fds;
             report["joined_cohort_connections"] = cohort_connections;
             report["joined_refused_connections"] = other_connections;
             report["expected_disconnects"] = cohort_expected_disconnects;
@@ -1931,7 +1957,9 @@ struct DistributedWeightDaemon::Impl {
         {
             std::lock_guard<std::mutex> lock(client_mutex);
             for (const auto& connection : clients) {
-                shutdown(connection->fd, SHUT_RDWR);
+                if (connection->fd >= 0) {
+                    shutdown(connection->fd, SHUT_RDWR);
+                }
             }
         }
         if (prefetch_thread.joinable()) {
@@ -1960,7 +1988,9 @@ struct DistributedWeightDaemon::Impl {
                 if (connection->thread.joinable()) {
                     connection->thread.join();
                 }
-                close(connection->fd);
+                if (connection->fd >= 0) {
+                    close(connection->fd);
+                }
             }
         }
         if (summary_thread.joinable()) {
