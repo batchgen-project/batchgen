@@ -162,6 +162,13 @@ int recv_fd_with_response(int fd, Response* response) {
             return received_fd;
         }
     }
+    // A refused hello carries the daemon's reason and no descriptor.
+    if (response->status != 0) {
+        throw std::runtime_error(
+            "distributed weights daemon refused the hello: " +
+            std::string(response->error,
+                        strnlen(response->error, sizeof(response->error))));
+    }
     throw std::runtime_error(
         "distributed weights daemon did not pass the staging memfd");
 }
@@ -262,7 +269,13 @@ Weights_Storage::~Weights_Storage() {
     }
 };
 
-void Weights_Storage::InitDistributed(const std::string& config_path) {
+void Weights_Storage::InitDistributed(const std::string& config_path,
+                                      uint64_t cohort_epoch) {
+    if (cohort_epoch == 0) {
+        throw std::runtime_error(
+            "distributed weights require the worker cohort epoch the "
+            "daemon admits; got 0");
+    }
     CUDA_CHECK(cudaSetDevice(this->device_id_));
     std::ifstream config_handle(config_path);
     if (!config_handle) {
@@ -526,11 +539,18 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
     hello.operation =
         static_cast<uint32_t>(Operation::kHello);
     hello.worker_id = static_cast<uint32_t>(this->device_id_);
+    hello.generation = cohort_epoch;
     send_exact(this->daemon_socket_, &hello, sizeof(hello));
     Response response{};
     this->staging_fd_ =
         recv_fd_with_response(this->daemon_socket_, &response);
     validate_response(response);
+    if (response.generation != cohort_epoch) {
+        throw std::runtime_error(
+            "distributed weights daemon admitted cohort " +
+            std::to_string(response.generation) + ", expected " +
+            std::to_string(cohort_epoch));
+    }
     this->staging_bytes_ =
         static_cast<int64_t>(response.staging_bytes);
     if (response.module_bytes !=

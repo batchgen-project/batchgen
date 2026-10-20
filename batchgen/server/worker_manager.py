@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import pickle
@@ -156,6 +157,11 @@ class WorkerExitState:
 
 class WorkerManager:
     """Starts GPU workers and exposes a thread-safe inference API."""
+
+    # Bound on draining the distributed-weight daemon's in-flight remote
+    # fetches during a cohort swap. A fetch that does not land within it is a
+    # stalled transport, which the daemon latches as fatal.
+    _DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S = 120.0
 
     def __init__(
         self,
@@ -927,6 +933,10 @@ class WorkerManager:
             if monitor is not None and monitor is not threading.current_thread():
                 monitor.join(timeout=5)
                 self._monitor_thread = None
+            # The teardown below closes every worker's control socket to the
+            # distributed-weight daemon; open the cohort swap first so those
+            # disconnects are expected rather than a failure.
+            self._begin_distributed_weight_swap()
             if self.worker_process is not None:
                 self._stop_workers()
                 self.worker_process = None
@@ -943,6 +953,13 @@ class WorkerManager:
                 fail_in_flight=True,
             )
             reconcile_s = time.monotonic() - reconcile_start
+
+            # The old cohort is reaped and reconciled: release what it held in
+            # the daemon and admit the next cohort's epoch. A transport failure
+            # raises here, before anything is spawned.
+            weight_swap_start = time.monotonic()
+            weight_swap = self._finish_distributed_weight_swap()
+            weight_swap_s = time.monotonic() - weight_swap_start
 
             # The cohort that owned the previous channels has been killed, so
             # those queues can never be read again -- a partial frame left by
@@ -1015,8 +1032,10 @@ class WorkerManager:
                 "quiesce_s": quiesce_s,
                 "teardown_s": teardown_s,
                 "reconcile_s": reconcile_s,
+                "weight_swap_s": weight_swap_s,
                 "spawn_to_ready_s": spawn_to_ready_s,
             },
+            "distributed_weight_swap": weight_swap,
         }
 
     # ---------------------- Startup helpers ----------------------
@@ -1213,6 +1232,7 @@ class WorkerManager:
                 if self.args.distributed_weight_config is not None
                 else None
             ),
+            distributed_weight_cohort=self._distributed_weight_cohort(),
             host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
             host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
             prefix_cache_shm_name=self.args.runtime_identity.prefix_cache_shm_name,
@@ -1446,6 +1466,16 @@ class WorkerManager:
             if monitor is not None and monitor is not threading.current_thread():
                 monitor.join(timeout=5)
                 self._monitor_thread = None
+            # As in restart_workers: the surviving workers' sockets close in
+            # the teardown, which is part of this cohort's swap. Failing to
+            # open it must not skip the teardown and reconcile below; those
+            # disconnects then only mark this already-failed cohort failed.
+            try:
+                self._begin_distributed_weight_swap()
+            except Exception:
+                logger.exception(
+                    "Could not begin the distributed weight cohort swap"
+                )
             try:
                 if self.worker_process is not None:
                     self._stop_workers()
@@ -1453,6 +1483,18 @@ class WorkerManager:
                 self._reconcile(reason, fail_in_flight=True)
             except Exception:
                 logger.exception("Worker failure reconciliation failed")
+            else:
+                # The dead cohort is reaped: clear the latch its failure set in
+                # the daemon now, so the next restart starts from a clean
+                # cohort. If this fails the swap stays open and that restart
+                # retries it.
+                try:
+                    self._finish_distributed_weight_swap()
+                except Exception:
+                    logger.exception(
+                        "Distributed weight cohort swap after the worker "
+                        "failure did not complete; the next restart retries it"
+                    )
         finally:
             self._teardown_lock.release()
 
@@ -1462,6 +1504,40 @@ class WorkerManager:
             os.kill(os.getpid(), signal.SIGINT)
         except Exception:
             logger.error("Failed to signal server shutdown", exc_info=True)
+
+    # ---------------------- Distributed-weight cohort swap ----------------------
+    # The daemon outlives worker cohorts. Every path that tears a cohort down
+    # while the server keeps running (restart_workers and the monitor's
+    # failure path) brackets that teardown with a swap: begin before the
+    # workers' sockets close, finish once they are reaped. stop() instead
+    # tears the daemon down with the cohort (prepare_stop, then stop).
+    def _distributed_weight_cohort(self) -> int:
+        """The cohort epoch the next spawned workers must name in their hello."""
+        if self.distributed_weight_daemon is None:
+            return 0
+        return int(self.distributed_weight_daemon.cohort_epoch())
+
+    def _begin_distributed_weight_swap(self) -> None:
+        if self.distributed_weight_daemon is None:
+            return
+        epoch = int(self.distributed_weight_daemon.begin_cohort_swap())
+        logging.getLogger("uvicorn.error").info(
+            "[restart] distributed weight cohort swap begun: cohort=%d", epoch
+        )
+
+    def _finish_distributed_weight_swap(self) -> Optional[Dict[str, Any]]:
+        if self.distributed_weight_daemon is None:
+            return None
+        report = json.loads(
+            self.distributed_weight_daemon.finish_cohort_swap(
+                self._DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S
+            )
+        )
+        logging.getLogger("uvicorn.error").info(
+            "[restart] distributed weight cohort swap finished: %s",
+            json.dumps(report, sort_keys=True),
+        )
+        return report
 
     # ---------------------- Model loading helpers ----------------------
     def _start_distributed_weight_daemon(self) -> None:

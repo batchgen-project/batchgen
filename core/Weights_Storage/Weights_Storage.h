@@ -79,7 +79,10 @@ class Weights_Storage {
                 bool enable_thp = false, int memfd_creator_pid = -1,
                 int memfd_fd = -1, int tensor_meta_memfd_fd = -1);
 
-    void InitDistributed(const std::string& config_path);
+    // cohort_epoch is the worker cohort the server spawned this worker
+    // into; the daemon refuses a hello that names any other cohort.
+    void InitDistributed(const std::string& config_path,
+                         uint64_t cohort_epoch);
                   
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);

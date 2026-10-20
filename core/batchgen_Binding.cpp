@@ -693,7 +693,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("memfd_fd") = -1,
             py::arg("tensor_meta_memfd_fd") = -1)
         .def("InitDistributed", &Weights_Storage::InitDistributed,
-            py::arg("config_path"))
+            py::arg("config_path"), py::arg("cohort_epoch"))
         .def("get_tensor", &Weights_Storage::get_tensor,
             py::arg("module_key"));
 
@@ -702,6 +702,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("start", &DistributedWeightDaemon::Start)
         .def("wait_ready", &DistributedWeightDaemon::WaitReady,
              py::arg("timeout_seconds"))
+        .def("cohort_epoch", &DistributedWeightDaemon::CohortEpoch)
+        .def("begin_cohort_swap", &DistributedWeightDaemon::BeginCohortSwap,
+             py::call_guard<py::gil_scoped_release>())
+        .def("finish_cohort_swap",
+             &DistributedWeightDaemon::FinishCohortSwap,
+             py::arg("timeout_seconds"),
+             py::call_guard<py::gil_scoped_release>())
         .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
         .def("stop", &DistributedWeightDaemon::Stop);
     

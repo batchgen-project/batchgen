@@ -6,7 +6,9 @@
 namespace batchgen::distributed_weights {
 
 constexpr std::uint64_t kProtocolMagic = 0x4b33523457454947ULL;
-constexpr std::uint32_t kProtocolVersion = 1;
+// Version 2: a kHello carries the worker cohort epoch in Request::generation;
+// the daemon admits only the epoch it currently serves.
+constexpr std::uint32_t kProtocolVersion = 2;
 constexpr std::size_t kModuleKeyBytes = 64;
 constexpr std::size_t kErrorBytes = 192;
 
