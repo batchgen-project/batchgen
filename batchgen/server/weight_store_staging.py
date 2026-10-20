@@ -38,6 +38,7 @@ import shutil
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, ContextManager, Iterator, List, Optional, Tuple
@@ -48,6 +49,7 @@ from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
     read_distributed_weight_config,
 )
 from batchgen.models.moonshotai.kimi_linear.store_builder import (
+    DEFAULT_HASH_WORKERS,
     DEFAULT_READ_BUFFER_BYTES,
     METADATA_FILE_NAME,
     MANIFEST_FILE_NAME,
@@ -204,8 +206,9 @@ def interleave_all_nodes() -> Iterator[None]:
 
     The policy is per thread, so the staged copy's tmpfs pages, allocated
     when this thread writes them, are spread across every NUMA node instead
-    of landing on the copying thread's node. ``MPOL_DEFAULT`` is restored on
-    exit. Without NUMA syscalls (not Linux, an unknown architecture) or with
+    of landing on the copying thread's node. A thread started inside the
+    body inherits the policy (the kernel copies it on clone), which is how
+    the copy threads get it. ``MPOL_DEFAULT`` is restored on exit. Without NUMA syscalls (not Linux, an unknown architecture) or with
     a single node there is nothing to interleave and the body runs as is.
     """
     number = _SYS_SET_MEMPOLICY.get(platform.machine())
@@ -392,6 +395,7 @@ class _Stager:
         runtime_dir: Path,
         *,
         read_buffer_bytes: int,
+        copy_workers: int,
         free_bytes_of: Callable[[Path], int],
         interleave: Callable[[], ContextManager[None]],
     ) -> None:
@@ -402,6 +406,7 @@ class _Stager:
         self.staging_dir = Path(self.config["store_staging_dir"])
         self.runtime_dir = runtime_dir
         self.read_buffer_bytes = read_buffer_bytes
+        self.copy_workers = copy_workers
         self.free_bytes_of = free_bytes_of
         self.interleave = interleave
         self.manifest_bytes = self._read_source_manifest()
@@ -459,6 +464,27 @@ class _Stager:
         if current != self.residency:
             _write_atomic(path, (self.residency + "\n").encode())
 
+    def _check_copied_segment(
+        self, index, segment, future, source_path, partial, manifest
+    ) -> None:
+        try:
+            digest = future.result()
+        except (OSError, EOFError) as error:
+            raise WeightStoreStagingError(
+                f"cannot copy segment {index} of {source_path} "
+                f"into {partial}: {error}"
+            ) from error
+        if digest != segment["digest"]:
+            begin = int(segment["offset"])
+            raise WeightStoreStagingError(
+                f"segment {index} of the source weight store "
+                f"{source_path} ([{begin}, "
+                f"{begin + int(segment['bytes'])})) does not hash "
+                "to its completion manifest: the source changed "
+                "after the build published it. Rebuild it with: "
+                + rebuild_command(self.config_path, self.config, manifest=manifest)
+            )
+
     def copy(self) -> None:
         """Copy and verify the source into this id's directory (``LOCK_EX``
         held). Leaves ``COMPLETE`` absent on any failure."""
@@ -500,10 +526,11 @@ class _Stager:
         partial = self.directory / PARTIAL_STORE_NAME
         segments = manifest["store"]["segments"]
         logger.info(
-            "staging weight store %s (%d B, %d segments) into %s",
+            "staging weight store %s (%d B, %d segments, %d copy threads) into %s",
             source_path,
             store_bytes,
             len(segments),
+            self.copy_workers,
             self.directory,
         )
         started = time.monotonic()
@@ -520,30 +547,38 @@ class _Stager:
                 )
                 try:
                     os.ftruncate(sink, store_bytes)
-                    for index, (segment, spans) in enumerate(
-                        zip(segments, segment_spans)
-                    ):
+                    # One thread hashes at a fraction of what the source disk
+                    # and tmpfs sustain, so segments are copied concurrently;
+                    # pread/pwrite at explicit offsets keep the threads
+                    # independent. Results are checked in segment order, so a
+                    # refusal names the first bad segment whatever finished
+                    # first. The threads start inside interleave() and so
+                    # inherit its mempolicy.
+                    with ThreadPoolExecutor(
+                        max_workers=self.copy_workers,
+                        thread_name_prefix="weight-store-copy",
+                    ) as pool:
+                        pending = [
+                            pool.submit(
+                                hash_store_segment,
+                                source,
+                                spans,
+                                self.read_buffer_bytes,
+                                sink,
+                            )
+                            for spans in segment_spans
+                        ]
                         try:
-                            digest = hash_store_segment(
-                                source, spans, self.read_buffer_bytes, sink
-                            )
-                        except (OSError, EOFError) as error:
-                            raise WeightStoreStagingError(
-                                f"cannot copy segment {index} of {source_path} "
-                                f"into {partial}: {error}"
-                            ) from error
-                        if digest != segment["digest"]:
-                            begin = int(segment["offset"])
-                            raise WeightStoreStagingError(
-                                f"segment {index} of the source weight store "
-                                f"{source_path} ([{begin}, "
-                                f"{begin + int(segment['bytes'])})) does not hash "
-                                "to its completion manifest: the source changed "
-                                "after the build published it. Rebuild it with: "
-                                + rebuild_command(
-                                    self.config_path, self.config, manifest=manifest
+                            for index, (segment, future) in enumerate(
+                                zip(segments, pending)
+                            ):
+                                self._check_copied_segment(
+                                    index, segment, future, source_path, partial, manifest
                                 )
-                            )
+                        except BaseException:
+                            for future in pending:
+                                future.cancel()
+                            raise
                 finally:
                     os.close(sink)
             finally:
@@ -578,6 +613,7 @@ def stage_distributed_weight_store(
     free_bytes_of: Callable[[Path], int] = free_bytes,
     interleave: Callable[[], ContextManager[None]] = interleave_all_nodes,
     read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    copy_workers: int = DEFAULT_HASH_WORKERS,
 ) -> Optional[StagedWeightStore]:
     """Stage the store ``config_path`` names; None for a legacy config.
 
@@ -595,6 +631,7 @@ def stage_distributed_weight_store(
         config,
         Path(runtime_dir),
         read_buffer_bytes=read_buffer_bytes,
+        copy_workers=copy_workers,
         free_bytes_of=free_bytes_of,
         interleave=interleave,
     )

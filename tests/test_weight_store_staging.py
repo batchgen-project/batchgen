@@ -8,6 +8,7 @@ table, and real ``flock`` holders in child processes. No GPU, no tmpfs.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
 import json
 import os
@@ -616,6 +617,89 @@ def test_corrupted_source_segment_is_refused_with_no_complete(tmp_path, monkeypa
     assert f"--output-dir {deployment.output} " in message
     assert list(deployment.staging_dir.iterdir()) == []
     assert not list(deployment.staging_dir.rglob(st.COMPLETE_FILE_NAME))
+
+
+def _corrupt_segment(deployment, index):
+    manifest = json.loads((deployment.output / sb.MANIFEST_FILE_NAME).read_text())
+    segment = manifest["store"]["segments"][index]
+    with open(deployment.output / sb.STORE_FILE_NAME, "r+b") as handle:
+        handle.seek(segment["offset"] + 1)
+        byte = handle.read(1)
+        handle.seek(segment["offset"] + 1)
+        handle.write(bytes([byte[0] ^ 0xFF]))
+
+
+def test_refusal_names_the_first_bad_segment_whatever_finishes_first(
+    tmp_path, monkeypatch
+):
+    deployment = Deployment(tmp_path, monkeypatch)
+    _corrupt_segment(deployment, 1)
+    _corrupt_segment(deployment, 3)
+    import threading
+    import time as _time
+
+    real = st.hash_store_segment
+    lock = threading.Lock()
+    started = []
+    segment_3_done = threading.Event()
+
+    def slow_low_segments(descriptor, spans, *args):
+        # Workers take segments in submission order: the second call is
+        # segment 1, and it finishes only after segment 3 has hashed (badly).
+        with lock:
+            started.append(None)
+            call = len(started)
+        if call == 2:
+            assert segment_3_done.wait(10)
+            _time.sleep(0.05)
+        digest = real(descriptor, spans, *args)
+        if call == 4:
+            segment_3_done.set()
+        return digest
+
+    monkeypatch.setattr(st, "hash_store_segment", slow_low_segments)
+    with pytest.raises(st.WeightStoreStagingError) as excinfo:
+        deployment.stage(copy_workers=4)
+    assert "segment 1 of the source weight store" in str(excinfo.value)
+    assert not list(deployment.staging_dir.rglob(st.COMPLETE_FILE_NAME))
+
+
+def test_copy_threads_run_inside_the_interleave_policy(tmp_path, monkeypatch):
+    import threading
+
+    deployment = Deployment(tmp_path, monkeypatch)
+    inside = threading.Event()
+
+    @contextlib.contextmanager
+    def interleave():
+        inside.set()
+        try:
+            yield
+        finally:
+            inside.clear()
+
+    real = st.hash_store_segment
+    calls = []
+
+    def recording(descriptor, spans, *args):
+        calls.append((threading.current_thread().name, inside.is_set()))
+        return real(descriptor, spans, *args)
+
+    monkeypatch.setattr(st, "hash_store_segment", recording)
+    staged = deployment.stage(interleave=interleave, copy_workers=4)
+    try:
+        segments = json.loads(
+            (deployment.output / sb.MANIFEST_FILE_NAME).read_text()
+        )["store"]["segments"]
+        assert len(calls) == len(segments) > 4
+        assert all(within for _, within in calls)
+        names = {name for name, _ in calls}
+        assert all(name.startswith("weight-store-copy") for name in names)
+        assert 1 < len(names) <= 4
+        staged_bytes = (staged.directory / sb.STORE_FILE_NAME).read_bytes()
+        assert staged_bytes == (deployment.output / sb.STORE_FILE_NAME).read_bytes()
+    finally:
+        staged.release()
 
 
 def test_free_space_shortfall_is_refused_before_copying(tmp_path, monkeypatch):
