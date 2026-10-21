@@ -29,6 +29,7 @@ __all__ = [
     "aux_cache_is_page_split",
     "aux_cache_data_dim",
     "write_aux_indexer_k",
+    "write_aux_indexer_k_norm_rope",
 ]
 
 
@@ -100,3 +101,69 @@ def write_aux_indexer_k(
         num_valid_tokens=num_valid_tokens,
     )
     return indexer_k, None
+
+
+def write_aux_indexer_k_norm_rope(
+    *,
+    aux_blocked_k: torch.Tensor,
+    k_raw: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    ln_eps: float,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    page_table: torch.Tensor,
+    slot_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    page_size_tokens: int,
+    apply_hadamard: bool,
+    k_fp8_out: torch.Tensor,
+    scales_out: torch.Tensor,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize, rope, rotate, quantize and page-write this step's keys.
+
+    The page-split-only counterpart of ``write_aux_indexer_k``: it takes the
+    UNNORMALIZED ``wk`` output and owns the whole K tail in one launch
+    (``fused_indexer_k_norm_rope_write_fp8``), instead of the ATen LayerNorm +
+    fused RoPE/Hadamard + fused quantize/write triple.
+
+    A bf16 AoS cache has no fused path -- its records are not quantized -- so
+    an AoS cache fails loud here rather than silently reverting to the triple.
+
+    Returns the ``(k_fp8, scales)`` pair the aux host-append path requires.
+    """
+
+    data_dim = int(k_raw.shape[-1])
+    if not aux_cache_is_page_split(aux_blocked_k, data_dim):
+        raise ValueError(
+            "write_aux_indexer_k_norm_rope needs a page-split FP8 aux indexer "
+            "cache; a bf16 AoS cache stores unquantized records and must use "
+            "write_aux_indexer_k with the separate LayerNorm and RoPE passes"
+        )
+
+    # Imported lazily: the indexer package JIT-loads its CUDA extensions at
+    # import time, which only a CUDA host can do.
+    from batchgen_kernels.attention.dsa.indexer.indexer_k_norm_rope_write_fp8 import (
+        fused_indexer_k_norm_rope_write_fp8,
+    )
+
+    return fused_indexer_k_norm_rope_write_fp8(
+        aux_cache=aux_blocked_k,
+        k_raw=k_raw,
+        ln_weight=ln_weight,
+        ln_bias=ln_bias,
+        ln_eps=float(ln_eps),
+        cos_cache=cos_cache,
+        sin_cache=sin_cache,
+        positions=positions,
+        page_table=page_table,
+        slot_indices=slot_indices,
+        token_indices=token_indices,
+        page_size_tokens=int(page_size_tokens),
+        apply_hadamard=bool(apply_hadamard),
+        k_fp8_out=k_fp8_out,
+        scales_out=scales_out,
+        num_valid_tokens=num_valid_tokens,
+    )

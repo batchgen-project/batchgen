@@ -51,6 +51,13 @@ from batchgen_kernels.attention.dsa.indexer.indexer_k_write_fp8 import (  # noqa
     page_split_write_plan,
 )
 
+# Same AOT/lazy arrangement for the fused LayerNorm + RoPE + Hadamard +
+# quantize + write kernel that replaces the three-launch K tail.
+from batchgen_kernels.attention.dsa.indexer.indexer_k_norm_rope_write_fp8 import (  # noqa: E402
+    fused_indexer_k_norm_rope_write_fp8,
+    norm_rope_write_plan,
+)
+
 
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return _hadamard_cuda.fast_hadamard_transform(x, scale)
