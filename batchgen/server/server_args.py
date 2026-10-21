@@ -193,6 +193,9 @@ class ServerArgs:
     enable_hugetlbfs: bool = False
     fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
+    # host:port of the server-level restart control store node 0 hosts. Only
+    # meaningful with --nnodes > 1; derived from dist_init_addr when unset.
+    restart_control_addr: Optional[str] = None
     pynccl_port_base: int = 20003
     pynccl_port_span: int = 100
     kv_dtype: str = "bfloat16"
@@ -264,6 +267,17 @@ class ServerArgs:
             self.instance_id,
             mode=self.runtime_mode,
         )
+        if self.restart_control_addr is None:
+            # The control store rides beside the rendezvous: node 0's host,
+            # the next port. A malformed dist_init_addr is left for
+            # validate_server_args to report, rather than failing here with a
+            # complaint about a derived address the operator never typed.
+            try:
+                host, port = parse_host_port(self.dist_init_addr)
+            except ValueError:
+                pass
+            else:
+                self.restart_control_addr = f"{host}:{port + 1}"
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
         # Default incremental output dir: {storage_path}/incremental/
@@ -382,6 +396,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="localhost:12355",
         help="torch.distributed init addr",
+    )
+    parser.add_argument(
+        "--restart-control-addr",
+        type=str,
+        default=None,
+        help="Address (host:port) of the restart control store node 0 hosts "
+             "for coordinated worker-pool restarts; only used with "
+             "--nnodes > 1. Default: --dist-init-addr host, port + 1",
     )
     parser.add_argument(
         "--pynccl-port-base",
@@ -713,8 +735,33 @@ def validate_server_args(args: ServerArgs) -> None:
     if pynccl_port_end > 65536:
         raise ValueError("PyNccl port range must end at or before 65535")
 
+    if args.nnodes > 1:
+        # A restart is coordinated over this store, so a port that collides
+        # with the rendezvous, the API, or the PyNccl range breaks the recovery
+        # path only once a restart is attempted -- long after launch.
+        if not args.restart_control_addr:
+            raise ValueError(
+                "--nnodes > 1 requires a restart_control_addr (host:port)"
+            )
+        _, control_port = parse_host_port(args.restart_control_addr)
+        _validate_port_range(
+            "restart_control_addr port (default: the dist_init_addr port + 1)",
+            control_port,
+        )
+        if control_port in (args.listen_port, dist_port):
+            raise ValueError(
+                "restart_control_addr port must differ from the listen port "
+                "and the dist_init_addr port"
+            )
+        if control_port in range(args.pynccl_port_base, pynccl_port_end):
+            raise ValueError(
+                "restart_control_addr port must not fall inside "
+                "[pynccl_port_base, pynccl_port_base + pynccl_port_span)"
+            )
+
     if args.nnodes > 1 and args.node_rank == 0:
         _ensure_local_port_free(dist_port, "dist_init_addr")
+        _ensure_local_port_free(control_port, "restart_control_addr")
     if args.world_size > 1 and args.node_rank == 0:
         _ensure_local_port_free(args.pynccl_port_base, "PyNccl")
 
@@ -901,6 +948,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
+        restart_control_addr=parsed.restart_control_addr,
         pynccl_port_base=parsed.pynccl_port_base,
         pynccl_port_span=parsed.pynccl_port_span,
         kv_dtype=parsed.kv_dtype,

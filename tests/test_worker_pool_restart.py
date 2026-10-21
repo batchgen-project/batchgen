@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import gc
+import importlib.util
 import inspect
 import json
 import logging
@@ -25,15 +26,32 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 WORKER_MANAGER_PATH = ROOT / "batchgen/server/worker_manager.py"
+RESTART_COORDINATOR_PATH = ROOT / "batchgen/server/restart_coordinator.py"
 
 # Module constants the real _stop_workers reads.  They are lifted from the
 # module itself so a test exercising teardown uses the real values rather than
 # a copy that can drift.
 _MANAGER_CONSTANTS = (
     "_WORKER_SENTINEL_GRACE_S",
+    "_PRE_RENDEZVOUS_SENTINEL_GRACE_S",
     "_WORKER_KILL_REAP_TIMEOUT_S",
     "_WORKER_EXIT_PATH_SIGNAL",
 )
+
+
+def load_restart_coordinator():
+    """Import restart_coordinator alone (batchgen/__init__ pulls kernels)."""
+    spec = importlib.util.spec_from_file_location(
+        "_batchgen_restart_coordinator", RESTART_COORDINATOR_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    # @dataclass resolves annotations through sys.modules[cls.__module__].
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+restart_coordinator = load_restart_coordinator()
 
 
 def _worker_manager_tree() -> ast.Module:
@@ -74,6 +92,9 @@ def _load_worker_manager_class():
         "json": json,
         "gc": gc,
         "release_run_lock": lambda file_obj: None,
+        # Named in a method annotation, which this lifted module evaluates
+        # (the real module defers annotations through __future__).
+        "RestartCoordinator": restart_coordinator.RestartCoordinator,
     }
     module = ast.Module(body=constants + [node], type_ignores=[])
     exec(compile(module, str(WORKER_MANAGER_PATH), "exec"), namespace)
@@ -151,6 +172,13 @@ class _CohortQueueContext:
         return flag
 
 
+def _single_node_coordinator():
+    """The real coordinator, inert: nnodes=1 opens no store at all."""
+    return restart_coordinator.RestartCoordinator(
+        nnodes=1, node_rank=0, host="", port=0
+    )
+
+
 def _manager(monkeypatch):
     cls = _load_worker_manager_class()
     manager = object.__new__(cls)
@@ -169,6 +197,11 @@ def _manager(monkeypatch):
     }
     manager._retire_channels_hook = None
     manager._restart_timeout_s = 10.0
+    # Single node: the real coordinator is built, and every call through it
+    # must be a no-op, so these tests also pin the unchanged local path.
+    manager._restart_coordinator = _single_node_coordinator()
+    manager._last_restart_error = None
+    manager._coordinated_phase = None
     manager._monitor_stop_event = threading.Event()
     manager._stopping = False
     manager._teardown_lock = threading.Lock()
@@ -179,14 +212,23 @@ def _manager(monkeypatch):
     manager._worker_exit_state = SimpleNamespace(clear=lambda: None)
     manager._mp_ctx = _CohortQueueContext()
     manager._create_worker_channels()
+    # A serving cohort is past its rendezvous, so the teardown budget under
+    # test is the full sentinel grace.
+    manager._cohort_rendezvous_flag.value = 1
     manager.worker_process = SimpleNamespace(processes=[])
     manager.host_kv_manager = SimpleNamespace(release_all_sequences=lambda: None)
     manager.host_kv_aux_manager = SimpleNamespace(release_all_sequences=lambda: None)
-    manager.args = SimpleNamespace(runtime_identity=SimpleNamespace(shm_prefix="run."))
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(shm_prefix="run."),
+        nnodes=1,
+        node_rank=0,
+    )
     manager._stop_workers = lambda: None
     manager._spawn_workers = lambda: None
     manager._start_worker_monitor = lambda: None
-    manager._wait_for_workers_ready = lambda timeout_s=None: None
+    manager._wait_for_workers_ready = (
+        lambda timeout_s=None, peer_check=None: None
+    )
     manager.distributed_weight_daemon = None
     return manager
 
@@ -1778,6 +1820,110 @@ def test_sentinel_grace_is_unchanged_by_the_abort_watchdog():
     source = WORKER_MANAGER_PATH.read_text()
     assert "_WORKER_SENTINEL_GRACE_S = 180.0" in source
     assert "_WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0" in source
+
+
+def test_a_cohort_parked_before_its_rendezvous_gets_the_short_grace(monkeypatch):
+    """A rank still inside init_process_group has built no engine and mapped no
+    weights -- BatchGenWorker is constructed afterwards -- so there is nothing
+    for an ordered exit to release, and the rank is not reading the queue the
+    sentinel goes into either. Waiting the full grace there costs minutes per
+    abort and buys nothing."""
+    manager = _manager(monkeypatch)
+    waits: List[float] = []
+
+    class _Proc:
+        pid = 2001
+        exitcode = None
+
+        def join(self, timeout=None):
+            waits.append(timeout)
+            self.exitcode = 0
+
+        def terminate(self):
+            self.exitcode = -15
+
+        def kill(self):
+            self.exitcode = -9
+
+    manager._join_lock = threading.Lock()
+    manager.worker_process = SimpleNamespace(processes=[_Proc()])
+    manager.args = SimpleNamespace(runtime_identity=SimpleNamespace(
+        shm_prefix="run.", runtime_dir="/tmp/does-not-matter",
+    ))
+    del manager._stop_workers
+
+    manager._cohort_rendezvous_flag.value = 0
+    manager._stop_workers()
+    pre_rendezvous = waits[0]
+
+    waits.clear()
+    manager.worker_process = SimpleNamespace(processes=[_Proc()])
+    manager._cohort_rendezvous_flag.value = 1
+    manager._stop_workers()
+    post_rendezvous = waits[0]
+
+    source = WORKER_MANAGER_PATH.read_text()
+    assert "_PRE_RENDEZVOUS_SENTINEL_GRACE_S = 5.0" in source
+    assert pre_rendezvous == pytest.approx(5.0, abs=0.5)
+    assert post_rendezvous == pytest.approx(180.0, abs=0.5)
+
+
+def test_the_rendezvous_flag_is_cohort_scoped_and_lock_free(monkeypatch):
+    """The teardown owner LOADS this flag under _teardown_lock while ranks may
+    already be dead, so it must be the same plain shared byte as the shutdown
+    flag: mp.Event.is_set() takes the Event's condition lock, which a rank
+    killed inside set() can still hold (C1, in the other direction)."""
+    manager = _manager(monkeypatch)
+    retired = manager._cohort_rendezvous_flag
+    for forbidden in ("get_lock", "acquire", "release", "set", "wait", "is_set"):
+        assert not hasattr(retired, forbidden)
+
+    manager.restart_workers(timeout_s=1)
+
+    fresh = manager._cohort_rendezvous_flag
+    assert fresh is not retired
+    # A new cohort has not rendezvoused yet, whatever the old one reached.
+    assert fresh.value == 0
+
+    create = next(
+        node for node in ast.walk(_worker_manager_tree())
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_create_worker_channels"
+    )
+    sources = [
+        ast.unparse(node.value) for node in ast.walk(create)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_cohort_rendezvous_flag"
+            for target in node.targets
+        )
+    ]
+    assert sources == ["self._mp_ctx.RawValue('b', 0)"]
+
+
+def test_spawn_hands_the_rendezvous_flag_to_every_worker():
+    """Every local rank stores into it, so it travels as a spawn arg beside
+    the cohort shutdown flag."""
+    source = WORKER_MANAGER_PATH.read_text()
+    spawn_args = source.split("self.worker_process = mp.spawn(", 1)[1]
+    spawn_args = spawn_args.split("nprocs=", 1)[0]
+    assert "self._cohort_rendezvous_flag" in spawn_args
+
+    loop_source = WORKER_LOOP_PATH.read_text()
+    for name in ("server_worker_main", "_server_worker_main_impl"):
+        signature = loop_source.split(f"def {name}(", 1)[1].split("):", 1)[0]
+        assert "rendezvous_flag" in signature
+
+    # Stored immediately after the rendezvous returns, and before the engine
+    # the shortened grace is only safe without.
+    impl = loop_source.split("def _server_worker_main_impl(", 1)[1]
+    assert impl.index("rendezvous_flag.value = 1") > impl.index(
+        "dist.init_process_group(**pg_kwargs)"
+    )
+    assert impl.index("rendezvous_flag.value = 1") < impl.index(
+        "worker = BatchGenWorker(args)"
+    )
 
 
 def test_abort_watchdog_adds_no_env_vars():

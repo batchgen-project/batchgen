@@ -56,12 +56,38 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 | `--nnodes` | `1` | Number of nodes in the cluster |
 | `--node-rank` | `0` | Rank of this node (0-indexed, master node is 0) |
 | `--dist-init-addr` | `localhost:12355` | Address for torch.distributed initialization (`host:port`) |
+| `--restart-control-addr` | `--dist-init-addr` host, port + 1 | Address (`host:port`) of the restart control store node 0 hosts for coordinated worker-pool restarts. Only used with `--nnodes > 1`; pass the same value on every node. |
 | `--pynccl-port-base` | `20003` | First port in this runtime's bounded PyNccl range |
 | `--pynccl-port-span` | `100` | Number of ports reserved for PyNccl initialization and recovery |
 
 `--world-size` must divide evenly by `--nnodes`. The derived local world size
 is passed explicitly to every worker; PyNccl initialization and recovery never
 scan outside `[pynccl-port-base, pynccl-port-base + pynccl-port-span)`.
+
+### Coordinated worker-pool restart
+
+A worker cohort is one `torch.distributed` world spanning every node, so
+`POST /v1/workers/restart` is accepted only on node 0 (any other node answers
+`409` naming node 0). Node 0 publishes the restart over the control store and
+every node runs the same phases, leaving each one only after every node has
+acknowledged it: the cohort is quiesced and armed, the old ranks are reaped,
+then the new cohort becomes ready. A node that fails publishes the failure, so
+the others abort instead of waiting out the request timeout, and all of them
+end in the retryable `workers_down` state. `GET /v1/workers/status` reports
+`node_rank`, `nnodes`, `restart_epoch`, `last_restart_error`,
+`coordinator_error`, and on node 0 the per-node phase acknowledgements.
+
+`--restart-control-addr` must name a port that is free on node 0 and differs
+from `--listen-port`, the `--dist-init-addr` port, and the PyNccl range. A
+single-node server opens no control store and never binds this port.
+
+A worker cohort that fails after it was ready on any node takes every node to
+`workers_down`, and `/health` on each node names the node that failed; one
+restart sent to node 0 then brings every node back. Each node other than node 0
+waits a bounded time at startup for node 0's control store, so start node 0
+first or together with the others. The control store
+lives as long as node 0's server: if node 0 is relaunched, relaunch every node
+(a fresh node 0 cannot form a cohort with the old peers' workers anyway).
 
 ### Shared-host admission
 
