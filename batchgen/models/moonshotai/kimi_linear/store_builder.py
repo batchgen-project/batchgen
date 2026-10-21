@@ -123,7 +123,9 @@ from typing import (
 )
 
 from .distributed_weight_store import (
+    DEFAULT_STORE_STAGING_DIR,
     DISTRIBUTED_NODE_COUNTS,
+    STORE_RESIDENCIES,
     WEIGHT_TRANSPORTS,
     DistributedMetadataError,
     read_distributed_metadata,
@@ -214,6 +216,9 @@ MANIFEST_FORMAT_VERSION = 1
 STORE_FILE_NAME = "store.bin"
 METADATA_FILE_NAME = "metadata.tsv"
 MANIFEST_FILE_NAME = "store_manifest.json"
+#: Written last into a server-staged copy (``batchgen.server.weight_store_staging``)
+#: once every segment of the copy hashed to the manifest.
+STAGED_COMPLETE_FILE_NAME = "COMPLETE"
 STAGING_PREFIX = ".k3-store-build-"
 LOCK_FILE_NAME = ".k3-store-build.lock"
 HASH_ALGORITHM = "blake2b-128"
@@ -933,11 +938,15 @@ def node_config(
     base_port: int,
     transport: str,
     rail_devices: Sequence[str],
+    store_residency: str = STORE_RESIDENCIES[0],
+    store_staging_dir: str = DEFAULT_STORE_STAGING_DIR,
 ) -> Dict[str, object]:
     """The per-node config JSON. Keys are the loader's required set plus the
     optional ones the daemon reads (``distributed_weight_store.py:32-44``,
-    ``distributed_weight_daemon.cpp:324-344``) plus ``manifest_path``, which
-    only the Python loader reads."""
+    ``distributed_weight_daemon.cpp:324-344``) plus ``manifest_path``,
+    ``store_residency`` and ``store_staging_dir``, which only the Python side
+    reads (the server stages ``store_path`` into the staging directory and
+    hands the daemon and workers the staged copy)."""
     return {
         "node_rank": plan.node_rank,
         "num_nodes": plan.num_nodes,
@@ -955,6 +964,8 @@ def node_config(
         "base_port": base_port,
         "transport": transport,
         "rail_devices": list(rail_devices),
+        "store_residency": store_residency,
+        "store_staging_dir": store_staging_dir,
     }
 
 
@@ -1148,8 +1159,16 @@ def segment_spans(
 
 
 def _read_span_digests(
-    descriptor: int, spans: Sequence[Span], read_buffer_bytes: int
+    descriptor: int,
+    spans: Sequence[Span],
+    read_buffer_bytes: int,
+    sink: Optional[int] = None,
 ) -> List[bytes]:
+    """Per-tensor digests of ``spans`` read from ``descriptor``.
+
+    With ``sink``, every chunk is also written to that descriptor at the same
+    offset, so a copy is hashed from exactly the bytes it wrote.
+    """
     out = []
     for row, offset, byte_size in spans:
         hasher = _digest()
@@ -1163,9 +1182,29 @@ def _read_span_digests(
                     f"store ends at {position} B inside metadata row {row}"
                 )
             hasher.update(chunk)
+            if sink is not None:
+                view = memoryview(chunk)
+                written = 0
+                while written < len(chunk):
+                    written += os.pwrite(sink, view[written:], position + written)
             position += len(chunk)
         out.append(hasher.digest())
     return out
+
+
+def hash_store_segment(
+    descriptor: int,
+    spans: Sequence[Span],
+    read_buffer_bytes: int = DEFAULT_READ_BUFFER_BYTES,
+    sink: Optional[int] = None,
+) -> str:
+    """One manifest segment's digest: the rollup of its tensors' digests.
+
+    ``spans`` are the segment's spans from :func:`manifest_segment_spans`.
+    With ``sink``, the segment is also copied into that descriptor at the
+    same offsets. Raises ``OSError`` or ``EOFError``.
+    """
+    return _rollup(_read_span_digests(descriptor, spans, read_buffer_bytes, sink))
 
 
 def verify_store(
@@ -1309,6 +1348,8 @@ def _builder_argv(
         ("summary_path", "--summary-path"),
         ("base_port", "--base-port"),
         ("transport", "--transport"),
+        ("store_residency", "--store-residency"),
+        ("store_staging_dir", "--store-staging-dir"),
     ):
         if key in config:
             argv += [flag, str(config[key])]
@@ -1355,7 +1396,11 @@ def rebuild_command(
             if cache_dir is not None
             else recorded_cache_dir or "<hf-checkpoint-dir>"
         ),
-        output_dir=os.path.dirname(os.path.abspath(config_path)),
+        # A server-written effective config names the builder's config it was
+        # staged from; the store is rebuilt there, not in the run directory.
+        output_dir=os.path.dirname(
+            os.path.abspath(config.get("staged_from") or config_path)
+        ),
         num_nodes=config.get("num_nodes", num_nodes if num_nodes is not None else "<num-nodes>"),
         node_rank=config.get("node_rank", node_rank if node_rank is not None else "<node-rank>"),
         node_ips=config.get("node_ips") or "<node-ips>",
@@ -1496,6 +1541,51 @@ def spot_check_store(
     :class:`K3StoreBuilderError` or
     :class:`~.distributed_weight_store.DistributedMetadataError`.
     """
+    segments = manifest["store"]["segments"]
+    spans_by_segment = manifest_segment_spans(config, manifest)
+    chosen = sorted({0, len(segments) // 2, len(segments) - 1})[: max(samples, 0)]
+    store_path = str(config["store_path"])
+    try:
+        descriptor = os.open(store_path, os.O_RDONLY)
+    except OSError as error:
+        raise K3StoreBuilderError(f"cannot open {store_path}: {error}") from error
+    try:
+        for index in chosen:
+            segment = segments[index]
+            begin, length = int(segment["offset"]), int(segment["bytes"])
+            try:
+                digest = hash_store_segment(
+                    descriptor, spans_by_segment[index], read_buffer_bytes
+                )
+            except (OSError, EOFError) as error:
+                raise K3StoreBuilderError(
+                    f"cannot read segment {index} of {store_path}: {error}"
+                ) from error
+            if digest != segment["digest"]:
+                raise K3StoreBuilderError(
+                    f"segment {index} of {store_path} ([{begin}, "
+                    f"{begin + length})) does not hash to the manifest: the "
+                    "store bytes changed after the build published them"
+                )
+    finally:
+        os.close(descriptor)
+    return chosen
+
+
+def manifest_segment_spans(
+    config: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> List[List[Span]]:
+    """This node's tensor spans grouped into the manifest's store segments.
+
+    Reads ``metadata.tsv`` under the engine's row contract, requires this
+    node's rows to tile the store exactly, and requires every manifest
+    segment to start on a row and cover a whole number of rows. A segment's
+    manifest digest is the rollup of its spans' tensor digests in this order
+    (:func:`verify_store`), so these spans are what any re-hash of the store
+    -- :func:`spot_check_store`, or a staging copy -- must hash. Raises
+    :class:`K3StoreBuilderError` or
+    :class:`~.distributed_weight_store.DistributedMetadataError`.
+    """
     node_rank = int(config["node_rank"])
     store_bytes = int(config["store_bytes"])
     rows = read_distributed_metadata(
@@ -1529,52 +1619,30 @@ def spot_check_store(
     segments = manifest["store"]["segments"]
     if not segments:
         raise K3StoreBuilderError("the manifest records no store segments")
-    chosen = sorted({0, len(segments) // 2, len(segments) - 1})[: max(samples, 0)]
     starts = [span[1] for span in local]
-    store_path = str(config["store_path"])
-    try:
-        descriptor = os.open(store_path, os.O_RDONLY)
-    except OSError as error:
-        raise K3StoreBuilderError(f"cannot open {store_path}: {error}") from error
-    try:
-        for index in chosen:
-            segment = segments[index]
-            begin, length = int(segment["offset"]), int(segment["bytes"])
-            first = _bisect_left(starts, begin)
-            spans: List[Span] = []
-            covered = 0
-            for span in local[first:]:
-                if covered >= length:
-                    break
-                spans.append(span)
-                covered += span[2]
-            if (
-                not spans
-                or spans[0][1] != begin
-                or covered != length
-                or len(spans) != int(segment["tensors"])
-            ):
-                raise K3StoreBuilderError(
-                    f"manifest segment {index} [{begin}, {begin + length}) does "
-                    "not align with this node's metadata rows"
-                )
-            try:
-                digest = _rollup(
-                    _read_span_digests(descriptor, spans, read_buffer_bytes)
-                )
-            except (OSError, EOFError) as error:
-                raise K3StoreBuilderError(
-                    f"cannot read segment {index} of {store_path}: {error}"
-                ) from error
-            if digest != segment["digest"]:
-                raise K3StoreBuilderError(
-                    f"segment {index} of {store_path} ([{begin}, "
-                    f"{begin + length})) does not hash to the manifest: the "
-                    "store bytes changed after the build published them"
-                )
-    finally:
-        os.close(descriptor)
-    return chosen
+    out: List[List[Span]] = []
+    for index, segment in enumerate(segments):
+        begin, length = int(segment["offset"]), int(segment["bytes"])
+        first = _bisect_left(starts, begin)
+        spans: List[Span] = []
+        covered = 0
+        for span in local[first:]:
+            if covered >= length:
+                break
+            spans.append(span)
+            covered += span[2]
+        if (
+            not spans
+            or spans[0][1] != begin
+            or covered != length
+            or len(spans) != int(segment["tensors"])
+        ):
+            raise K3StoreBuilderError(
+                f"manifest segment {index} [{begin}, {begin + length}) does "
+                "not align with this node's metadata rows"
+            )
+        out.append(spans)
+    return out
 
 
 def _bisect_left(values: Sequence[int], target: int) -> int:
@@ -1607,6 +1675,7 @@ def verify_published_store(
     node_rank: Optional[int] = None,
     num_nodes: Optional[int] = None,
     spot_check_segments: int = PREFLIGHT_SPOT_CHECK_SEGMENTS,
+    spot_check_store_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Launch preflight for a distributed store.
 
@@ -1616,6 +1685,10 @@ def verify_published_store(
     when it names one, and a sample of its segments still hashes to the
     manifest. Every refusal is a :class:`K3StoreManifestError` ending in the
     exact rebuild command.
+
+    ``spot_check_store_path`` samples another copy of the same build instead
+    of ``store_path``: the complete staged copy the server is about to map,
+    so a resident restart reads nothing from the source.
     """
     config_path = Path(config_path)
 
@@ -1680,11 +1753,53 @@ def verify_published_store(
                 f"{launch_config['path']} is not the config.json the store was "
                 f"built from ({(source.get('model_config') or {}).get('path')})"
             )
+    sampled = config
+    if spot_check_store_path is not None:
+        sampled = {**config, "store_path": str(spot_check_store_path)}
     try:
-        checked = spot_check_store(config, manifest, samples=spot_check_segments)
+        checked = spot_check_store(sampled, manifest, samples=spot_check_segments)
     except (K3StoreBuilderError, DistributedMetadataError) as error:
+        if spot_check_store_path is not None:
+            # A corrupt staged copy is not fixed by rebuilding the source.
+            raise K3StoreManifestError(
+                f"the staged copy {spot_check_store_path} of {config_path} "
+                f"fails its spot check: {error}. Stop every server mapping it "
+                f"and remove {Path(spot_check_store_path).parent}; the next "
+                "start stages it again from the source"
+            ) from error
         refuse(str(error), error)
     return {"config": config, "manifest": manifest, "spot_checked_segments": checked}
+
+
+def staged_store_id(node_rank: int, manifest_bytes: bytes) -> str:
+    return f"node{int(node_rank)}-{hashlib.sha256(manifest_bytes).hexdigest()[:16]}"
+
+
+def complete_staged_store(config_path: Path | str) -> Optional[Path]:
+    """The ``store.bin`` of this config's ``COMPLETE`` staged copy, if one
+    exists; None for a legacy config, an unreadable manifest, or no copy.
+
+    Lets the launch preflight sample the copy the server will map instead of
+    re-reading the source on a resident restart. It takes no lock: staging
+    re-checks the copy under ``use.lock`` before mapping it. An unreadable
+    config is left to the preflight, which names the rebuild command.
+    """
+    try:
+        config = read_distributed_weight_config(config_path)
+    except (OSError, ValueError):
+        return None
+    if config["store_residency"] is None:
+        return None
+    try:
+        manifest_bytes = Path(str(config.get("manifest_path"))).read_bytes()
+    except OSError:
+        return None
+    directory = Path(config["store_staging_dir"]) / staged_store_id(
+        config["node_rank"], manifest_bytes
+    )
+    if not (directory / STAGED_COMPLETE_FILE_NAME).is_file():
+        return None
+    return directory / STORE_FILE_NAME
 
 
 # --------------------------------------------------------------------------- #
@@ -1866,6 +1981,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--rail-devices", type=_parse_csv, default=list(H200_RAIL_DEVICES)
     )
     parser.add_argument(
+        "--store-residency",
+        choices=STORE_RESIDENCIES,
+        default=STORE_RESIDENCIES[0],
+        help=(
+            "Lifetime of the server's staged tmpfs copy of store.bin: 'run' "
+            "removes it when the server stops; 'resident' keeps it so the "
+            "next start maps it without copying this output again. The "
+            "output written here is the source either way and is never "
+            "deleted by the server."
+        ),
+    )
+    parser.add_argument(
+        "--store-staging-dir",
+        default=DEFAULT_STORE_STAGING_DIR,
+        help=(
+            "Absolute tmpfs directory the server stages the store into "
+            f"(default {DEFAULT_STORE_STAGING_DIR})."
+        ),
+    )
+    parser.add_argument(
         "--read-buffer-bytes", type=int, default=DEFAULT_READ_BUFFER_BYTES
     )
     parser.add_argument(
@@ -1923,6 +2058,11 @@ def build(
         raise K3StoreBuilderError("--read-buffer-bytes must be positive")
     if args.hash_workers <= 0:
         raise K3StoreBuilderError("--hash-workers must be positive")
+    if not os.path.isabs(args.store_staging_dir):
+        raise K3StoreBuilderError(
+            f"--store-staging-dir must be an absolute path; got "
+            f"{args.store_staging_dir!r}"
+        )
 
     output_dir = Path(os.path.abspath(args.output_dir))
     converted_ckpt = Path(os.path.abspath(args.converted_ckpt))
@@ -1959,6 +2099,8 @@ def build(
         base_port=args.base_port,
         transport=args.transport,
         rail_devices=args.rail_devices,
+        store_residency=args.store_residency,
+        store_staging_dir=args.store_staging_dir,
     )
     metadata = metadata_bytes(plan)
     command = shlex.join(

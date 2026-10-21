@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import pickle
@@ -157,6 +158,11 @@ class WorkerExitState:
 class WorkerManager:
     """Starts GPU workers and exposes a thread-safe inference API."""
 
+    # Bound on draining the distributed-weight daemon's in-flight remote
+    # fetches during a cohort swap. A fetch that does not land within it is a
+    # stalled transport, which the daemon latches as fatal.
+    _DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S = 120.0
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -183,6 +189,11 @@ class WorkerManager:
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
         self.distributed_weight_config = None
+        # The server-owned staged copy of the distributed weight store, and
+        # the config the daemon and every worker receive: the effective
+        # config naming that copy, or the builder's config when it is legacy.
+        self._staged_weight_store = None
+        self._distributed_weight_config_path: Optional[Path] = None
         self.skeleton_state_dict = None
         # The skeleton state dict lives in an anonymous memfd this process
         # holds open; workers read it back through /proc/<our pid>/fd/<N>.
@@ -375,6 +386,7 @@ class WorkerManager:
             self._compact_memory()
 
         if self.args.distributed_weight_config is not None:
+            self._stage_distributed_weight_store()
             self._start_distributed_weight_daemon()
 
         if self.args.enable_hugetlbfs:
@@ -476,6 +488,7 @@ class WorkerManager:
                 self._run_lock is not None,
                 self.worker_process is not None,
                 self.distributed_weight_daemon is not None,
+                getattr(self, "_staged_weight_store", None) is not None,
                 bool(self.model_info.get("shm_name")),
                 bool(self.model_info.get("tensor_meta_shm_name")),
                 self.skeleton_state_dict_file is not None,
@@ -543,6 +556,7 @@ class WorkerManager:
                     self.model_info.pop("tensor_meta_shm_name", None)
 
                     self._close_skeleton_memfd()
+                    self._release_staged_weight_store()
                     runtime_dir = self.args.runtime_identity.runtime_dir
                     # Last holder of this run's liveness lock, and the lock file
                     # lives in the directory removed next.
@@ -927,6 +941,10 @@ class WorkerManager:
             if monitor is not None and monitor is not threading.current_thread():
                 monitor.join(timeout=5)
                 self._monitor_thread = None
+            # The teardown below closes every worker's control socket to the
+            # distributed-weight daemon; open the cohort swap first so those
+            # disconnects are expected rather than a failure.
+            self._begin_distributed_weight_swap()
             if self.worker_process is not None:
                 self._stop_workers()
                 self.worker_process = None
@@ -943,6 +961,13 @@ class WorkerManager:
                 fail_in_flight=True,
             )
             reconcile_s = time.monotonic() - reconcile_start
+
+            # The old cohort is reaped and reconciled: release what it held in
+            # the daemon and admit the next cohort's epoch. A transport failure
+            # raises here, before anything is spawned.
+            weight_swap_start = time.monotonic()
+            weight_swap = self._finish_distributed_weight_swap()
+            weight_swap_s = time.monotonic() - weight_swap_start
 
             # The cohort that owned the previous channels has been killed, so
             # those queues can never be read again -- a partial frame left by
@@ -1015,8 +1040,10 @@ class WorkerManager:
                 "quiesce_s": quiesce_s,
                 "teardown_s": teardown_s,
                 "reconcile_s": reconcile_s,
+                "weight_swap_s": weight_swap_s,
                 "spawn_to_ready_s": spawn_to_ready_s,
             },
+            "distributed_weight_swap": weight_swap,
         }
 
     # ---------------------- Startup helpers ----------------------
@@ -1209,10 +1236,11 @@ class WorkerManager:
             weights_memfd_fd=self._get_weights_memfd_fd(),
             tensor_meta_memfd_fd=self._get_tensor_meta_memfd_fd(),
             distributed_weight_config=(
-                str(self.args.distributed_weight_config)
+                str(self._distributed_weight_config_path)
                 if self.args.distributed_weight_config is not None
                 else None
             ),
+            distributed_weight_cohort=self._distributed_weight_cohort(),
             host_kv_shm_name=self.args.runtime_identity.host_kv_shm_name,
             host_kv_aux_shm_name=self.args.runtime_identity.host_kv_aux_shm_name,
             prefix_cache_shm_name=self.args.runtime_identity.prefix_cache_shm_name,
@@ -1446,6 +1474,16 @@ class WorkerManager:
             if monitor is not None and monitor is not threading.current_thread():
                 monitor.join(timeout=5)
                 self._monitor_thread = None
+            # As in restart_workers: the surviving workers' sockets close in
+            # the teardown, which is part of this cohort's swap. Failing to
+            # open it must not skip the teardown and reconcile below; those
+            # disconnects then only mark this already-failed cohort failed.
+            try:
+                self._begin_distributed_weight_swap()
+            except Exception:
+                logger.exception(
+                    "Could not begin the distributed weight cohort swap"
+                )
             try:
                 if self.worker_process is not None:
                     self._stop_workers()
@@ -1453,6 +1491,18 @@ class WorkerManager:
                 self._reconcile(reason, fail_in_flight=True)
             except Exception:
                 logger.exception("Worker failure reconciliation failed")
+            else:
+                # The dead cohort is reaped: clear the latch its failure set in
+                # the daemon now, so the next restart starts from a clean
+                # cohort. If this fails the swap stays open and that restart
+                # retries it.
+                try:
+                    self._finish_distributed_weight_swap()
+                except Exception:
+                    logger.exception(
+                        "Distributed weight cohort swap after the worker "
+                        "failure did not complete; the next restart retries it"
+                    )
         finally:
             self._teardown_lock.release()
 
@@ -1463,7 +1513,83 @@ class WorkerManager:
         except Exception:
             logger.error("Failed to signal server shutdown", exc_info=True)
 
+    # ---------------------- Distributed-weight cohort swap ----------------------
+    # The daemon outlives worker cohorts. Every path that tears a cohort down
+    # while the server keeps running (restart_workers and the monitor's
+    # failure path) brackets that teardown with a swap: begin before the
+    # workers' sockets close, finish once they are reaped. stop() instead
+    # tears the daemon down with the cohort (prepare_stop, then stop).
+    def _distributed_weight_cohort(self) -> int:
+        """The cohort epoch the next spawned workers must name in their hello."""
+        if self.distributed_weight_daemon is None:
+            return 0
+        return int(self.distributed_weight_daemon.cohort_epoch())
+
+    def _begin_distributed_weight_swap(self) -> None:
+        if self.distributed_weight_daemon is None:
+            return
+        epoch = int(self.distributed_weight_daemon.begin_cohort_swap())
+        logging.getLogger("uvicorn.error").info(
+            "[restart] distributed weight cohort swap begun: cohort=%d", epoch
+        )
+
+    def _finish_distributed_weight_swap(self) -> Optional[Dict[str, Any]]:
+        if self.distributed_weight_daemon is None:
+            return None
+        report = json.loads(
+            self.distributed_weight_daemon.finish_cohort_swap(
+                self._DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S
+            )
+        )
+        logging.getLogger("uvicorn.error").info(
+            "[restart] distributed weight cohort swap finished: %s",
+            json.dumps(report, sort_keys=True),
+        )
+        return report
+
     # ---------------------- Model loading helpers ----------------------
+    def _stage_distributed_weight_store(self) -> None:
+        """Map a server-owned tmpfs copy of the store when the config sets
+        ``store_residency``; a legacy config maps ``store_path`` directly.
+
+        Runs before the daemon starts, so the daemon and every worker of
+        every cohort receive the same effective config. Released by
+        :meth:`_release_staged_weight_store` once both are gone; a worker
+        restart never touches it.
+        """
+        from batchgen.server.weight_store_staging import (
+            stage_distributed_weight_store,
+        )
+
+        staged = stage_distributed_weight_store(
+            self.args.distributed_weight_config,
+            self.args.runtime_identity.runtime_dir,
+            fast_init=self.args.fast_init,
+        )
+        self._staged_weight_store = staged
+        self._distributed_weight_config_path = (
+            staged.effective_config_path
+            if staged is not None
+            else Path(self.args.distributed_weight_config)
+        )
+
+    def _release_staged_weight_store(self) -> None:
+        """Drop this server's hold on the staged store (removing a ``run``
+        copy). Only after the daemon is stopped and the workers are reaped:
+        until then something still maps it, so an incomplete stop keeps the
+        hold until this process exits."""
+        staged = getattr(self, "_staged_weight_store", None)
+        if staged is None or self.distributed_weight_daemon is not None:
+            return
+        self._staged_weight_store = None
+        try:
+            staged.release()
+        except Exception:
+            logger.exception(
+                "Releasing the staged distributed weight store %s failed",
+                staged.directory,
+            )
+
     def _start_distributed_weight_daemon(self) -> None:
         if "kimi-k3" not in self.args.model.lower():
             raise ValueError(
@@ -1473,7 +1599,7 @@ class WorkerManager:
             load_distributed_weight_config,
         )
 
-        config_path = Path(self.args.distributed_weight_config)
+        config_path = self._distributed_weight_config_path
         config = load_distributed_weight_config(config_path)
         if int(config["num_nodes"]) != int(self.args.nnodes):
             raise ValueError(

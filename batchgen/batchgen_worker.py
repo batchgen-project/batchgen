@@ -863,6 +863,8 @@ class BatchGenWorkerArgs:
 	weights_memfd_fd: int = -1
 	tensor_meta_memfd_fd: int = -1
 	distributed_weight_config: Optional[str] = None
+	# Worker cohort epoch the distributed-weight daemon admits for this spawn.
+	distributed_weight_cohort: int = 0
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Deprecated compatibility field.
 	input_ids_pool_size_gb: float = 50.0  # Fixed node-shared int32 token budget.
@@ -1107,7 +1109,8 @@ class BatchGenWorker:
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
 		if args.distributed_weight_config:
 			self.weights_storage.InitDistributed(
-				args.distributed_weight_config
+				args.distributed_weight_config,
+				args.distributed_weight_cohort,
 			)
 			self.skeleton_state_dict = self.weights_storage.get_tensor(
 				"__skeleton__"

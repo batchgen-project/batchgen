@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -51,6 +53,8 @@ constexpr int kRails = 8;
 constexpr int kLayers = 92;
 constexpr int kExperts = 896;
 constexpr int kDefaultWorkers = 8;
+// The summary keeps the most recent cohort swaps only.
+constexpr size_t kSwapLogEntries = 32;
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -311,6 +315,42 @@ struct Chunk {
     Clock::time_point posted;
 };
 
+// A worker cohort is one generation of the server's worker pool. The daemon
+// admits hellos for exactly one cohort epoch at a time. Draining is the window
+// between BeginCohortSwap and FinishCohortSwap: the cohort is being torn down,
+// so its disconnects are expected and nothing new is admitted.
+enum class CohortState {
+    kAdmitting,
+    kDraining,
+};
+
+const char* cohort_state_name(CohortState state) {
+    return state == CohortState::kAdmitting ? "admitting" : "draining";
+}
+
+// One worker control connection. The accept thread creates it and starts its
+// thread; only FinishCohortSwap or Stop joins that thread. They also close the
+// fd, unless CloseUnadmitted already did and left fd == -1.
+// epoch/worker_id are written by the connection's own thread when its hello
+// is admitted, and read by others only after joining that thread.
+struct ClientConnection {
+    int fd = -1;
+    std::thread thread;
+    std::uint64_t epoch = 0;  // 0 until the hello is admitted
+    int worker_id = -1;
+};
+
+// What a ring reset found and released. Built under ring_mutex.
+struct RingResetReport {
+    std::uint64_t outstanding_leases = 0;  // (slot, worker) acquires never released
+    std::uint64_t leased_slots = 0;
+    std::uint64_t discarded_ready = 0;  // fetched, never acquired
+    std::uint64_t drained_fetches = 0;  // modules in flight at the reset
+    std::uint64_t schedule_cursor = 0;  // prefetch position rewound to 0
+    int ring_tail = 0;                  // ring position rewound to 0
+    bool prefetch_handshake = false;    // reset done by the prefetch thread
+};
+
 }  // namespace
 
 struct DistributedWeightDaemon::Impl {
@@ -456,9 +496,31 @@ struct DistributedWeightDaemon::Impl {
     std::thread prefetch_thread;
     std::thread summary_thread;
     std::array<std::thread, kRails> progress_threads;
-    std::vector<std::thread> client_threads;
-    std::vector<int> client_fds;
+    std::vector<std::unique_ptr<ClientConnection>> clients;
     std::mutex client_mutex;
+
+    // Lock order, outermost first. No path holds two of these at once except
+    // where listed, and none is held across a thread join or WriteSummary:
+    //   summary_mutex -> cohort_mutex (snapshot), then
+    //   summary_mutex -> stats_mutex -> failure_mutex
+    //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop)
+    //   ready_mutex -> failure_mutex (WaitReady)
+    //   client_mutex, cohort_mutex: leaves
+    // cohort_closed mirrors (cohort_state == kDraining || cohort_faulted) so
+    // the ring and ready predicates can read it without taking cohort_mutex;
+    // every writer stores it and then calls WakeWaiters().
+    std::mutex cohort_mutex;
+    std::uint64_t cohort_epoch = 1;
+    CohortState cohort_state = CohortState::kAdmitting;
+    std::uint32_t cohort_admitted_mask = 0;
+    bool cohort_faulted = false;
+    std::string cohort_fault;
+    std::uint64_t cohort_expected_disconnects = 0;
+    std::uint64_t rejected_hellos = 0;
+    std::string last_rejected_hello;
+    std::uint64_t completed_swaps = 0;
+    nlohmann::json swap_log = nlohmann::json::array();
+    std::atomic<bool> cohort_closed{false};
 
     std::mutex ring_mutex;
     std::condition_variable ring_cv;
@@ -466,6 +528,17 @@ struct DistributedWeightDaemon::Impl {
     std::unordered_map<std::string, int> module_to_slot;
     std::uint64_t next_generation = 1;
     int staging_hwm = 0;
+    // Completed fetches, so an acquire timeout can tell a stalled transport
+    // (no completion while slots are fetching) from a cohort that never
+    // consumed what the ring holds. Under ring_mutex.
+    std::uint64_t ring_completions = 0;
+    // Ring reset handshake. Once prefetch_owns_ring is set, only the prefetch
+    // thread resets slots, at a point where it has no fetch in flight. All
+    // under ring_mutex.
+    bool prefetch_owns_ring = false;
+    std::uint64_t ring_reset_requested = 0;
+    std::uint64_t ring_reset_completed = 0;
+    RingResetReport last_ring_reset;
 
     std::mutex stats_mutex;
     std::mutex summary_mutex;
@@ -481,6 +554,20 @@ struct DistributedWeightDaemon::Impl {
     std::array<double, kDefaultWorkers> worker_wait_seconds{};
     std::vector<double> ready_latency_ms;
 
+    // Wake every condition waiter after a flag its predicate reads changed.
+    // Taking each mutex once orders that store before the waiter's next
+    // predicate check, so a waiter between its check and its sleep cannot
+    // miss the wakeup. The caller must hold neither mutex.
+    void WakeWaiters() {
+        { std::lock_guard<std::mutex> lock(ring_mutex); }
+        ring_cv.notify_all();
+        { std::lock_guard<std::mutex> lock(ready_mutex); }
+        ready_cv.notify_all();
+    }
+
+    // Transport-fatal: the daemon's own cross-node state (bootstrap, UCX
+    // fetches, ring bookkeeping) is broken. This latch is permanent; no
+    // cohort swap clears it. Worker-side failures go to RecordWorkerLoss.
     void RecordFailure(const std::string& message) {
         {
             std::lock_guard<std::mutex> lock(failure_mutex);
@@ -489,9 +576,67 @@ struct DistributedWeightDaemon::Impl {
             }
         }
         stop.store(true);
-        ready_cv.notify_all();
-        ring_cv.notify_all();
+        WakeWaiters();
         WriteSummary();
+    }
+
+    std::string TransportFatalMessage() {
+        return "distributed weights transport failure is not recoverable "
+               "by a worker restart (cold restart required): " +
+               FailureMessage();
+    }
+
+    // Cohort-recoverable: one admitted worker's control connection ended.
+    // While a swap drains that cohort this is the expected teardown. Outside
+    // a swap it fails the cohort (its other workers' acquires fail fast and no
+    // hello of that epoch is admitted again) but leaves the transport, the
+    // accept loop and the prefetch ring running for the next cohort.
+    void RecordWorkerLoss(std::uint64_t epoch, int worker_id,
+                          const std::string& message) {
+        if (stop.load() || failed.load()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            if (epoch != cohort_epoch) {
+                // FinishCohortSwap joins a cohort's connections before it
+                // advances the epoch, so this cannot happen.
+                return;
+            }
+            if (cohort_state == CohortState::kDraining) {
+                ++cohort_expected_disconnects;
+                return;
+            }
+            if (!cohort_faulted) {
+                cohort_faulted = true;
+                cohort_fault = "worker " + std::to_string(worker_id) +
+                               " control connection failed: " + message;
+            }
+            cohort_closed.store(true);
+        }
+        WakeWaiters();
+        WriteSummary();
+    }
+
+    void RecordRejectedHello(const std::string& message) {
+        std::lock_guard<std::mutex> lock(cohort_mutex);
+        ++rejected_hellos;
+        last_rejected_hello = message;
+    }
+
+    std::string CohortClosedMessage() {
+        std::lock_guard<std::mutex> lock(cohort_mutex);
+        if (cohort_state == CohortState::kDraining) {
+            return "worker cohort " + std::to_string(cohort_epoch) +
+                   " is being swapped out";
+        }
+        if (cohort_faulted) {
+            return "worker cohort " + std::to_string(cohort_epoch) +
+                   " failed (cohort-recoverable, needs a worker restart): " +
+                   cohort_fault;
+        }
+        return "worker cohort " + std::to_string(cohort_epoch) +
+               " is closed";
     }
 
     std::string FailureMessage() {
@@ -518,6 +663,9 @@ struct DistributedWeightDaemon::Impl {
             fail("compact store mmap failed: " +
                  std::string(strerror(errno)));
         }
+        // Huge pages for the staged tmpfs store, as for the staging ring
+        // below; failure only loses them.
+        madvise(store, store_bytes, MADV_HUGEPAGE);
 
         staging_fd = static_cast<int>(
             syscall(SYS_memfd_create, "k3_roce_staging", 0));
@@ -880,6 +1028,12 @@ struct DistributedWeightDaemon::Impl {
                 }
             });
         }
+        {
+            // From here on only the prefetch thread may reset ring slots: it
+            // is the one that knows which fetches are still in flight.
+            std::lock_guard<std::mutex> lock(ring_mutex);
+            prefetch_owns_ring = true;
+        }
         network_ready.store(true);
         ready_cv.notify_all();
         prefetch_thread = std::thread([this]() {
@@ -922,31 +1076,123 @@ struct DistributedWeightDaemon::Impl {
             }
             {
                 std::lock_guard<std::mutex> lock(client_mutex);
-                client_fds.push_back(fd);
-                client_threads.emplace_back(
-                    [this, fd]() { HandleWorker(fd); });
+                auto connection = std::make_unique<ClientConnection>();
+                connection->fd = fd;
+                ClientConnection* handle = connection.get();
+                clients.push_back(std::move(connection));
+                handle->thread = std::thread(
+                    [this, handle]() { HandleWorker(handle); });
             }
         }
     }
 
-    void HandleWorker(int fd) {
+    // Admit a hello into the current cohort, or say why not. A refused hello
+    // never joins the cohort, so refusing it is not a failure of anything.
+    std::string AdmitWorker(const Request& request,
+                            ClientConnection* connection) {
+        if (request.magic !=
+                batchgen::distributed_weights::kProtocolMagic ||
+            request.version !=
+                batchgen::distributed_weights::kProtocolVersion ||
+            request.operation !=
+                static_cast<std::uint32_t>(Operation::kHello) ||
+            request.worker_id >= static_cast<std::uint32_t>(workers)) {
+            return "invalid distributed weights worker hello (protocol "
+                   "version " +
+                   std::to_string(request.version) + ", expected " +
+                   std::to_string(
+                       batchgen::distributed_weights::kProtocolVersion) +
+                   ")";
+        }
+        if (failed.load()) {
+            return TransportFatalMessage();
+        }
+        if (stop.load()) {
+            return "distributed weights daemon is stopping";
+        }
+        std::lock_guard<std::mutex> lock(cohort_mutex);
+        const std::string worker =
+            "worker " + std::to_string(request.worker_id);
+        if (cohort_state == CohortState::kDraining) {
+            return worker + " hello refused: worker cohort " +
+                   std::to_string(cohort_epoch) + " is being swapped out";
+        }
+        if (request.generation != cohort_epoch) {
+            return worker + " hello names worker cohort " +
+                   std::to_string(request.generation) +
+                   " but the daemon admits cohort " +
+                   std::to_string(cohort_epoch) +
+                   " (a stale or misconfigured worker)";
+        }
+        if (cohort_faulted) {
+            return worker + " hello refused: worker cohort " +
+                   std::to_string(cohort_epoch) + " already failed (" +
+                   cohort_fault + "); a worker restart is required";
+        }
+        const std::uint32_t bit = static_cast<std::uint32_t>(1)
+                                  << request.worker_id;
+        if ((cohort_admitted_mask & bit) != 0) {
+            return worker + " is already connected in worker cohort " +
+                   std::to_string(cohort_epoch);
+        }
+        cohort_admitted_mask |= bit;
+        connection->epoch = cohort_epoch;
+        connection->worker_id = static_cast<int>(request.worker_id);
+        return "";
+    }
+
+    // WaitReady for a connection: also returns once the worker's cohort is
+    // closed, so a swap never has to wait out the network timeout to join it.
+    void WaitReadyForWorker(double timeout_seconds) {
+        std::unique_lock<std::mutex> lock(ready_mutex);
+        const bool done = ready_cv.wait_for(
+            lock, std::chrono::duration<double>(timeout_seconds),
+            [this]() {
+                return network_ready.load() || failed.load() ||
+                       stop.load() || cohort_closed.load();
+            });
+        lock.unlock();
+        if (!done) {
+            fail("timed out waiting for distributed weights network");
+        }
+        if (failed.load()) {
+            fail("distributed weights daemon failed: " + FailureMessage());
+        }
+        if (stop.load()) {
+            fail("distributed weights daemon is stopping");
+        }
+        if (!network_ready.load()) {
+            fail(CohortClosedMessage());
+        }
+    }
+
+    void HandleWorker(ClientConnection* connection) {
+        const int fd = connection->fd;
+        bool admitted = false;
+        bool refused = false;
+        std::uint64_t epoch = 0;
+        int worker_id = -1;
         try {
             Request request{};
             recv_exact(fd, &request, sizeof(request));
-            if (request.magic !=
-                    batchgen::distributed_weights::kProtocolMagic ||
-                request.version !=
-                    batchgen::distributed_weights::kProtocolVersion ||
-                request.operation !=
-                    static_cast<std::uint32_t>(Operation::kHello) ||
-                request.worker_id >=
-                    static_cast<std::uint32_t>(workers)) {
-                fail("invalid distributed weights worker hello");
+            const std::string refusal = AdmitWorker(request, connection);
+            if (!refusal.empty()) {
+                refused = true;
+                RecordRejectedHello(refusal);
+                Response response;
+                set_error(&response, refusal);
+                send_exact(fd, &response, sizeof(response));
+                CloseUnadmitted(connection);
+                return;
             }
-            WaitReady(600.0);
+            admitted = true;
+            epoch = connection->epoch;
+            worker_id = connection->worker_id;
+            WaitReadyForWorker(600.0);
             Response hello;
             hello.staging_bytes = staging_bytes;
             hello.module_bytes = module_bytes;
+            hello.generation = epoch;
             send_response_with_fd(fd, hello, staging_fd);
 
             while (!stop.load()) {
@@ -968,14 +1214,11 @@ struct DistributedWeightDaemon::Impl {
                     if (operation.operation ==
                         static_cast<std::uint32_t>(
                             Operation::kAcquire)) {
-                        Acquire(module_key,
-                                static_cast<int>(request.worker_id),
-                                &response);
+                        Acquire(module_key, worker_id, &response);
                     } else if (operation.operation ==
                                static_cast<std::uint32_t>(
                                    Operation::kRelease)) {
-                        Release(module_key,
-                                static_cast<int>(request.worker_id),
+                        Release(module_key, worker_id,
                                 operation.generation, &response);
                     } else {
                         fail("unknown distributed weight operation");
@@ -989,10 +1232,32 @@ struct DistributedWeightDaemon::Impl {
                 }
             }
         } catch (const std::exception& error) {
-            if (!stop.load()) {
-                RecordFailure(
-                    "worker control connection failed: " +
-                    std::string(error.what()));
+            // A transport failure was already latched by whoever detected it
+            // (RecordFailure); everything that ends an admitted connection
+            // here is a cohort event.
+            if (admitted) {
+                RecordWorkerLoss(epoch, worker_id, error.what());
+            } else if (!refused) {
+                RecordRejectedHello("hello failed: " +
+                                    std::string(error.what()));
+            }
+            if (!admitted) {
+                CloseUnadmitted(connection);
+            }
+        }
+    }
+
+    // A refused or failed hello never joins a cohort, so its socket is closed
+    // now instead of lingering until the next swap or Stop. Only while the
+    // connection is still listed: once FinishCohortSwap or Stop has taken it,
+    // they own the fd, and closing it here could hit a reused fd number.
+    void CloseUnadmitted(ClientConnection* connection) {
+        std::lock_guard<std::mutex> lock(client_mutex);
+        for (const auto& listed : clients) {
+            if (listed.get() == connection && connection->fd >= 0) {
+                close(connection->fd);
+                connection->fd = -1;
+                return;
             }
         }
     }
@@ -1019,9 +1284,10 @@ struct DistributedWeightDaemon::Impl {
         }
         const Clock::time_point begin = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex);
+        const std::uint64_t completions_at_start = ring_completions;
         const bool available = ring_cv.wait_for(
             lock, std::chrono::seconds(300), [&]() {
-            if (failed.load() || stop.load()) {
+            if (failed.load() || stop.load() || cohort_closed.load()) {
                 return true;
             }
             const auto found = module_to_slot.find(module_key);
@@ -1030,13 +1296,37 @@ struct DistributedWeightDaemon::Impl {
                        SlotState::kReady;
         });
         if (!available) {
-            fail("timed out waiting for remote module: " + module_key);
+            int fetching = 0;
+            int ready = 0;
+            for (const Slot& slot : slots) {
+                fetching += slot.state == SlotState::kFetching;
+                ready += slot.state == SlotState::kReady;
+            }
+            const bool progressed = ring_completions != completions_at_start;
+            lock.unlock();
+            if (fetching > 0 && !progressed) {
+                // Fetches were posted and none completed in 300 s: the
+                // transport, not the cohort, stopped moving.
+                const std::string message =
+                    "remote fetch stalled: no fetch completed in 300 s "
+                    "with " + std::to_string(fetching) +
+                    " slots fetching (waiting for " + module_key + ")";
+                RecordFailure(message);
+                fail(message);
+            }
+            fail("timed out waiting for remote module " + module_key +
+                 ": the ring holds " + std::to_string(ready) +
+                 " ready modules this cohort did not consume");
         }
         if (failed.load()) {
             fail(FailureMessage());
         }
         if (stop.load()) {
             fail("distributed weights daemon is stopping");
+        }
+        if (cohort_closed.load()) {
+            lock.unlock();
+            fail(CohortClosedMessage());
         }
         auto found = module_to_slot.find(module_key);
         if (found == module_to_slot.end()) {
@@ -1196,6 +1486,7 @@ struct DistributedWeightDaemon::Impl {
                          slot.module_key);
                 }
             }
+            ring_completions += chunk.count;
             ring_cv.notify_all();
         }
         std::lock_guard<std::mutex> stats_lock(stats_mutex);
@@ -1207,6 +1498,60 @@ struct DistributedWeightDaemon::Impl {
         }
     }
 
+    // Free every slot and forget every module, as at daemon start. Counts what
+    // the retired cohort still held. Caller holds ring_mutex and guarantees no
+    // fetch is in flight into any slot.
+    RingResetReport ResetSlotsLocked() {
+        RingResetReport report;
+        for (Slot& slot : slots) {
+            const std::uint32_t outstanding =
+                slot.acquired_mask & ~slot.released_mask;
+            if (outstanding != 0) {
+                ++report.leased_slots;
+                report.outstanding_leases +=
+                    std::bitset<32>(outstanding).count();
+            }
+            if (slot.state == SlotState::kReady && slot.acquired_mask == 0) {
+                ++report.discarded_ready;
+            }
+            slot = Slot{};
+        }
+        module_to_slot.clear();
+        return report;
+    }
+
+    // Wait for every in-flight fetch to land, without publishing any of
+    // them. Returns the number of modules drained, or stops early once the
+    // daemon stops. A failed completion throws, which the prefetch thread
+    // records as a transport failure.
+    std::uint64_t DrainForReset(std::deque<Chunk>* chunks) {
+        std::uint64_t drained = 0;
+        for (Chunk& chunk : *chunks) {
+            if (chunk.request != nullptr) {
+                if (UCS_PTR_IS_ERR(chunk.request)) {
+                    check_ucs(UCS_PTR_STATUS(chunk.request),
+                              "ucp_get_nbx");
+                }
+                ucs_status_t status = UCS_INPROGRESS;
+                while (!stop.load() &&
+                       (status = ucp_request_check_status(
+                            chunk.request)) == UCS_INPROGRESS) {
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(20));
+                }
+                if (status == UCS_INPROGRESS) {
+                    return drained;
+                }
+                check_ucs(status, "ucp_get_nbx completion during reset");
+                ucp_request_free(chunk.request);
+                chunk.request = nullptr;
+            }
+            drained += static_cast<std::uint64_t>(chunk.count);
+        }
+        chunks->clear();
+        return drained;
+    }
+
     void PrefetchLoop() {
         const std::vector<std::string> schedule = BuildSchedule();
         size_t next = 0;
@@ -1214,6 +1559,39 @@ struct DistributedWeightDaemon::Impl {
         std::deque<Chunk> chunks;
 
         while (!stop.load()) {
+            // A cohort swap rewinds the ring to its start-of-day state: the
+            // next cohort begins at the first module of the schedule, exactly
+            // like the first cohort did.
+            std::uint64_t reset_request = 0;
+            {
+                std::lock_guard<std::mutex> lock(ring_mutex);
+                if (ring_reset_requested != ring_reset_completed) {
+                    reset_request = ring_reset_requested;
+                }
+            }
+            if (reset_request != 0) {
+                const std::uint64_t drained = DrainForReset(&chunks);
+                if (stop.load()) {
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ring_mutex);
+                    RingResetReport report = ResetSlotsLocked();
+                    report.drained_fetches = drained;
+                    report.schedule_cursor = next;
+                    report.ring_tail = tail;
+                    report.prefetch_handshake = true;
+                    last_ring_reset = report;
+                    ring_reset_completed = reset_request;
+                }
+                ring_cv.notify_all();
+                next = 0;
+                tail = 0;
+                std::fill(owner_rail_cursor.begin(),
+                          owner_rail_cursor.end(), 0);
+                continue;
+            }
+
             for (auto iterator = chunks.begin();
                  iterator != chunks.end();) {
                 if (iterator->request == nullptr) {
@@ -1339,6 +1717,23 @@ struct DistributedWeightDaemon::Impl {
         }
         std::lock_guard<std::mutex> summary_lock(summary_mutex);
         nlohmann::json summary;
+        nlohmann::json cohort;
+        nlohmann::json swaps;
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            cohort["epoch"] = cohort_epoch;
+            cohort["state"] = cohort_state_name(cohort_state);
+            cohort["admitted_workers_mask"] = cohort_admitted_mask;
+            cohort["faulted"] = cohort_faulted;
+            cohort["fault"] = cohort_fault;
+            cohort["fault_class"] =
+                cohort_faulted ? "cohort_recoverable" : "none";
+            cohort["expected_disconnects"] = cohort_expected_disconnects;
+            cohort["rejected_hellos"] = rejected_hellos;
+            cohort["last_rejected_hello"] = last_rejected_hello;
+            cohort["completed_swaps"] = completed_swaps;
+            swaps = swap_log;
+        }
         {
             std::lock_guard<std::mutex> lock(stats_mutex);
             summary["schema"] = "k3-distributed-weights/1";
@@ -1346,6 +1741,10 @@ struct DistributedWeightDaemon::Impl {
             summary["network_ready"] = network_ready.load();
             summary["failed"] = failed.load();
             summary["failure"] = FailureMessage();
+            summary["failure_class"] =
+                failed.load() ? "transport_fatal" : "none";
+            summary["cohort"] = cohort;
+            summary["cohort_swaps"] = swaps;
             summary["depth"] = depth;
             summary["superchunk"] = superchunk;
             summary["outstanding"] = outstanding;
@@ -1378,13 +1777,167 @@ struct DistributedWeightDaemon::Impl {
         rename(temporary.c_str(), summary_path.c_str());
     }
 
+    std::uint64_t CohortEpoch() {
+        std::lock_guard<std::mutex> lock(cohort_mutex);
+        return cohort_epoch;
+    }
+
+    std::uint64_t BeginCohortSwap() {
+        if (!started.load()) {
+            fail("distributed weights daemon is not started");
+        }
+        std::uint64_t epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            epoch = cohort_epoch;
+            if (cohort_state == CohortState::kDraining) {
+                return epoch;
+            }
+            cohort_state = CohortState::kDraining;
+            cohort_closed.store(true);
+        }
+        // Pending acquires and hello waits of this cohort return now.
+        WakeWaiters();
+        WriteSummary();
+        return epoch;
+    }
+
+    // Rewind the ring to its start-of-day state. With host RDMA the prefetch
+    // thread does it, after draining its in-flight fetches; before that
+    // thread exists (and always for hierarchical_gdr, which has none) no
+    // fetch can be in flight, so it is done here.
+    RingResetReport ResetRing(Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(ring_mutex);
+        if (!prefetch_owns_ring) {
+            return ResetSlotsLocked();
+        }
+        const std::uint64_t request = ++ring_reset_requested;
+        ring_cv.notify_all();
+        ring_cv.wait_until(lock, deadline, [&]() {
+            return ring_reset_completed >= request || failed.load() ||
+                   stop.load();
+        });
+        if (ring_reset_completed >= request) {
+            return last_ring_reset;
+        }
+        lock.unlock();
+        if (failed.load()) {
+            fail(TransportFatalMessage());
+        }
+        if (stop.load()) {
+            fail("distributed weights daemon is stopping");
+        }
+        const std::string message =
+            "worker cohort swap: in-flight remote fetches did not drain "
+            "before the swap deadline";
+        RecordFailure(message);
+        fail(TransportFatalMessage());
+    }
+
+    std::string FinishCohortSwap(double timeout_seconds) {
+        if (!started.load()) {
+            fail("distributed weights daemon is not started");
+        }
+        const Clock::time_point begin = Clock::now();
+        std::uint64_t retiring = 0;
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            if (cohort_state != CohortState::kDraining) {
+                fail("FinishCohortSwap called without BeginCohortSwap");
+            }
+            retiring = cohort_epoch;
+        }
+        if (failed.load()) {
+            fail(TransportFatalMessage());
+        }
+        if (stop.load()) {
+            fail("distributed weights daemon is stopping");
+        }
+
+        // 1. Retire every connection accepted so far: the old cohort's and
+        // any hello refused while draining. The cohort is reaped, so its
+        // sockets are dead; shutdown() also frees a thread in recv/send, and
+        // cohort_closed (set by Begin) frees one in an acquire or hello wait.
+        std::vector<std::unique_ptr<ClientConnection>> retired;
+        {
+            std::lock_guard<std::mutex> lock(client_mutex);
+            retired.swap(clients);
+        }
+        for (const auto& connection : retired) {
+            if (connection->fd >= 0) {
+                shutdown(connection->fd, SHUT_RDWR);
+            }
+        }
+        WakeWaiters();
+        std::uint64_t cohort_connections = 0;
+        std::uint64_t other_connections = 0;
+        std::uint64_t closed_fds = 0;
+        for (const auto& connection : retired) {
+            if (connection->thread.joinable()) {
+                connection->thread.join();
+            }
+            if (connection->fd >= 0) {
+                close(connection->fd);
+                ++closed_fds;
+            }
+            if (connection->epoch == retiring) {
+                ++cohort_connections;
+            } else {
+                ++other_connections;
+            }
+        }
+
+        // 2. No thread of the retired cohort exists any more, and none of the
+        // next one is admitted yet: slots can be released safely.
+        // The timeout bounds the drain of in-flight fetches only; the joins
+        // above are bounded by construction.
+        const RingResetReport ring = ResetRing(
+            Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                               std::chrono::duration<double>(
+                                   timeout_seconds)));
+
+        // 3. Admit the next cohort.
+        nlohmann::json report;
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            report["from_cohort"] = retiring;
+            report["to_cohort"] = retiring + 1;
+            report["closed_fds"] = closed_fds;
+            report["joined_cohort_connections"] = cohort_connections;
+            report["joined_refused_connections"] = other_connections;
+            report["expected_disconnects"] = cohort_expected_disconnects;
+            report["released_leases"] = ring.outstanding_leases;
+            report["released_leased_slots"] = ring.leased_slots;
+            report["discarded_ready_modules"] = ring.discarded_ready;
+            report["drained_inflight_modules"] = ring.drained_fetches;
+            report["prefetch_cursor_rewound_from"] = ring.schedule_cursor;
+            report["ring_tail_rewound_from"] = ring.ring_tail;
+            report["reset_by_prefetch_thread"] = ring.prefetch_handshake;
+            report["cleared_cohort_fault"] = cohort_fault;
+            report["elapsed_ms"] = elapsed_seconds(begin) * 1000.0;
+            cohort_faulted = false;
+            cohort_fault.clear();
+            cohort_admitted_mask = 0;
+            cohort_expected_disconnects = 0;
+            cohort_epoch = retiring + 1;
+            cohort_state = CohortState::kAdmitting;
+            ++completed_swaps;
+            swap_log.push_back(report);
+            if (swap_log.size() > kSwapLogEntries) {
+                swap_log.erase(swap_log.begin());
+            }
+            cohort_closed.store(false);
+        }
+        WriteSummary();
+        return report.dump();
+    }
+
     void PrepareStop() {
         if (!started.load()) {
             return;
         }
         stop.store(true);
-        ready_cv.notify_all();
-        ring_cv.notify_all();
+        WakeWaiters();
     }
 
     void Stop() {
@@ -1406,8 +1959,10 @@ struct DistributedWeightDaemon::Impl {
         }
         {
             std::lock_guard<std::mutex> lock(client_mutex);
-            for (int fd : client_fds) {
-                shutdown(fd, SHUT_RDWR);
+            for (const auto& connection : clients) {
+                if (connection->fd >= 0) {
+                    shutdown(connection->fd, SHUT_RDWR);
+                }
             }
         }
         if (prefetch_thread.joinable()) {
@@ -1425,16 +1980,21 @@ struct DistributedWeightDaemon::Impl {
             }
         }
         {
-            std::lock_guard<std::mutex> lock(client_mutex);
-            for (std::thread& thread : client_threads) {
-                if (thread.joinable()) {
-                    thread.join();
+            // Joined outside client_mutex: a concurrent FinishCohortSwap only
+            // takes the lock to swap the list out, and joins its own share.
+            std::vector<std::unique_ptr<ClientConnection>> remaining;
+            {
+                std::lock_guard<std::mutex> lock(client_mutex);
+                remaining.swap(clients);
+            }
+            for (const auto& connection : remaining) {
+                if (connection->thread.joinable()) {
+                    connection->thread.join();
+                }
+                if (connection->fd >= 0) {
+                    close(connection->fd);
                 }
             }
-            for (int fd : client_fds) {
-                close(fd);
-            }
-            client_fds.clear();
         }
         if (summary_thread.joinable()) {
             summary_thread.join();
@@ -1497,6 +2057,19 @@ void DistributedWeightDaemon::Start() { impl_->Start(); }
 
 void DistributedWeightDaemon::WaitReady(double timeout_seconds) {
     impl_->WaitReady(timeout_seconds);
+}
+
+std::uint64_t DistributedWeightDaemon::CohortEpoch() {
+    return impl_->CohortEpoch();
+}
+
+std::uint64_t DistributedWeightDaemon::BeginCohortSwap() {
+    return impl_->BeginCohortSwap();
+}
+
+std::string DistributedWeightDaemon::FinishCohortSwap(
+    double timeout_seconds) {
+    return impl_->FinishCohortSwap(timeout_seconds);
 }
 
 void DistributedWeightDaemon::PrepareStop() { impl_->PrepareStop(); }

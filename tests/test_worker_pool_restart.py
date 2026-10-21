@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import gc
 import inspect
+import json
 import logging
 import multiprocessing
 import os
@@ -68,6 +70,10 @@ def _load_worker_manager_class():
         "os": os,
         "signal": signal,
         "list_run_named_objects": lambda prefix, runtime_dir: [],
+        # Distributed-weight cohort swap reports, and stop()'s teardown.
+        "json": json,
+        "gc": gc,
+        "release_run_lock": lambda file_obj: None,
     }
     module = ast.Module(body=constants + [node], type_ignores=[])
     exec(compile(module, str(WORKER_MANAGER_PATH), "exec"), namespace)
@@ -181,6 +187,7 @@ def _manager(monkeypatch):
     manager._spawn_workers = lambda: None
     manager._start_worker_monitor = lambda: None
     manager._wait_for_workers_ready = lambda timeout_s=None: None
+    manager.distributed_weight_daemon = None
     return manager
 
 
@@ -814,8 +821,11 @@ def test_restart_result_reports_all_phase_timings(monkeypatch):
     manager = _manager(monkeypatch)
     result = manager.restart_workers(timeout_s=1)
     assert set(result["phase_timings"]) == {
-        "quiesce_s", "teardown_s", "reconcile_s", "spawn_to_ready_s",
+        "quiesce_s", "teardown_s", "reconcile_s", "weight_swap_s",
+        "spawn_to_ready_s",
     }
+    # Replicated weights: there is no daemon, so there is no swap to report.
+    assert result["distributed_weight_swap"] is None
 
 
 def test_teardown_budgets_cover_pinned_page_release():
@@ -3699,3 +3709,310 @@ def test_the_dual_kv_task_still_waits_on_both_halves_when_asked():
     task_cls(primary, aux).wait()
 
     assert waits == [("primary", "wait"), ("aux", "wait")]
+
+
+# ---------------------------------------------------------------------------
+# Distributed-weight cohort swap wiring.
+#
+# The daemon outlives worker cohorts.  Every teardown of a cohort while the
+# server keeps running must open a swap before the workers' control sockets
+# close and finish it once they are reaped; stop() keeps prepare_stop/stop.
+# The fake enforces the daemon's own protocol: finish without begin raises,
+# begin is idempotent while a swap is open, and finish advances the epoch.
+
+
+class _FakeWeightDaemon:
+    def __init__(self, order, *, begin_error=None, finish_error=None):
+        self.order = order
+        self.epoch = 1
+        self.draining = False
+        self.begin_error = begin_error
+        self.finish_error = finish_error
+
+    def cohort_epoch(self):
+        return self.epoch
+
+    def begin_cohort_swap(self):
+        self.order.append("begin")
+        if self.begin_error is not None:
+            raise self.begin_error
+        self.draining = True
+        return self.epoch
+
+    def finish_cohort_swap(self, timeout_seconds):
+        self.order.append("finish")
+        assert timeout_seconds > 0
+        if not self.draining:
+            raise RuntimeError("FinishCohortSwap called without BeginCohortSwap")
+        if self.finish_error is not None:
+            raise self.finish_error
+        self.draining = False
+        self.epoch += 1
+        return json.dumps({
+            "from_cohort": self.epoch - 1,
+            "to_cohort": self.epoch,
+            "released_leases": 4,
+        })
+
+    def prepare_stop(self):
+        self.order.append("prepare_stop")
+
+    def stop(self):
+        self.order.append("daemon_stop")
+
+
+def _swap_manager(monkeypatch, order, **daemon_kwargs):
+    manager = _manager(monkeypatch)
+    manager.distributed_weight_daemon = _FakeWeightDaemon(order, **daemon_kwargs)
+    manager._quiesce_hook = lambda: order.append("quiesce")
+    manager._resume_hook = lambda: order.append("resume")
+    manager._stop_workers = lambda: order.append("teardown")
+    manager._spawn_workers = lambda: order.append(
+        f"spawn(cohort={manager._distributed_weight_cohort()})"
+    )
+    original_reconcile = manager._reconcile
+
+    def reconcile(reason, *, fail_in_flight):
+        order.append("reconcile")
+        return original_reconcile(reason, fail_in_flight=fail_in_flight)
+
+    manager._reconcile = reconcile
+    return manager
+
+
+def test_restart_brackets_teardown_with_a_distributed_weight_swap(monkeypatch):
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+
+    result = manager.restart_workers(timeout_s=1)
+
+    assert order == [
+        "quiesce", "begin", "teardown", "reconcile", "finish",
+        "spawn(cohort=2)", "resume",
+    ]
+    assert result["distributed_weight_swap"] == {
+        "from_cohort": 1, "to_cohort": 2, "released_leases": 4,
+    }
+    assert "weight_swap_s" in result["phase_timings"]
+    assert manager.state == "serving"
+
+
+def test_restart_opens_the_swap_even_without_a_live_cohort(monkeypatch):
+    """A restart from workers_down whose cohort the monitor already reaped
+    still swaps, so the next cohort gets a fresh epoch and a fresh ring."""
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+    manager._state = "workers_down"
+    manager.worker_process = None
+
+    manager.restart_workers(timeout_s=1)
+
+    assert order == [
+        "quiesce", "begin", "reconcile", "finish", "spawn(cohort=2)", "resume",
+    ]
+
+
+def test_transport_fatal_swap_fails_the_restart_before_any_spawn(monkeypatch):
+    order = []
+    manager = _swap_manager(
+        monkeypatch,
+        order,
+        finish_error=RuntimeError(
+            "distributed weights transport failure is not recoverable by a "
+            "worker restart (cold restart required): ucp_get_nbx completion"
+        ),
+    )
+    persisted = []
+    manager._fail_in_flight_hook = lambda reason: persisted.append(reason) or 3
+
+    with pytest.raises(RuntimeError, match="cold restart required"):
+        manager.restart_workers(timeout_s=1)
+
+    assert manager.state == "workers_down"
+    assert manager.generation == 3
+    assert not any(step.startswith("spawn") for step in order)
+    # The in-flight batches were still failed, exactly once, before the swap.
+    assert order == ["quiesce", "begin", "teardown", "reconcile", "finish"]
+    assert len(persisted) == 1
+    # The teardown lock is not stranded: a later restart can take it.
+    assert manager._teardown_lock.acquire(blocking=False)
+    manager._teardown_lock.release()
+
+
+def test_monitor_failure_brackets_its_teardown_with_a_swap(monkeypatch):
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+
+    class ExitState:
+        reason = None
+
+        def set_failure(self, reason, exc):
+            self.reason = reason
+            return True
+
+    manager._worker_exit_state = ExitState()
+
+    manager._handle_worker_failure("worker 5 exited", None)
+
+    assert manager.state == "workers_down"
+    assert order == ["quiesce", "begin", "teardown", "reconcile", "finish"]
+    # The worker-caused latch is cleared: the daemon admits the next epoch.
+    assert manager.distributed_weight_daemon.epoch == 2
+    assert not manager.distributed_weight_daemon.draining
+
+
+def test_monitor_then_restart_recovers_a_dead_worker(monkeypatch):
+    """A single worker death is recoverable by the restart that follows."""
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+
+    class ExitState:
+        reason = None
+
+        def set_failure(self, reason, exc):
+            self.reason = reason
+            return True
+
+        def clear(self):
+            self.reason = None
+
+        def is_failed(self):
+            return self.reason is not None
+
+    manager._worker_exit_state = ExitState()
+    manager._handle_worker_failure("worker 5 exited", None)
+    manager.worker_process = None
+    order.clear()
+
+    manager.restart_workers(timeout_s=1)
+
+    assert manager.state == "serving"
+    assert order == [
+        "quiesce", "begin", "reconcile", "finish", "spawn(cohort=3)", "resume",
+    ]
+
+
+def test_monitor_failed_teardown_leaves_the_swap_open_for_the_restart(monkeypatch):
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+
+    class ExitState:
+        reason = None
+
+        def set_failure(self, reason, exc):
+            self.reason = reason
+            return True
+
+        def clear(self):
+            self.reason = None
+
+    manager._worker_exit_state = ExitState()
+
+    def failing_teardown():
+        order.append("teardown")
+        raise RuntimeError("worker teardown left live owned PIDs")
+
+    manager._stop_workers = failing_teardown
+    manager._handle_worker_failure("worker 5 exited", None)
+
+    # Never finished over a cohort that may still be alive.
+    assert order == ["quiesce", "begin", "teardown"]
+    assert manager.distributed_weight_daemon.draining
+
+    order.clear()
+    manager._stop_workers = lambda: order.append("teardown")
+    manager.restart_workers(timeout_s=1)
+    assert order == [
+        "quiesce", "begin", "teardown", "reconcile", "finish",
+        "spawn(cohort=2)", "resume",
+    ]
+    assert manager.state == "serving"
+
+
+def test_monitor_failure_still_reconciles_when_the_swap_cannot_begin(monkeypatch):
+    order = []
+    manager = _swap_manager(
+        monkeypatch, order, begin_error=RuntimeError("daemon is not started")
+    )
+
+    class ExitState:
+        reason = None
+
+        def set_failure(self, reason, exc):
+            self.reason = reason
+            return True
+
+    manager._worker_exit_state = ExitState()
+
+    manager._handle_worker_failure("worker 5 exited", None)
+
+    # Teardown and reconcile are never skipped; finish refuses (no swap open)
+    # and is logged, and the next restart opens the swap itself.
+    assert order == ["quiesce", "begin", "teardown", "reconcile", "finish"]
+    assert manager.state == "workers_down"
+
+
+def test_stop_keeps_prepare_stop_and_never_swaps(monkeypatch, tmp_path):
+    order = []
+    manager = _swap_manager(monkeypatch, order)
+    manager.args = SimpleNamespace(
+        runtime_identity=SimpleNamespace(
+            shm_prefix="run.", runtime_dir=tmp_path / "unused"
+        )
+    )
+    manager.worker_process = SimpleNamespace(processes=[])
+    manager._runtime_dir_created = False
+    manager._runtime_namespace_owned = False
+    manager._runtime_locks = None
+    manager._lane_lease = None
+    manager._run_lock = None
+    manager.parameter_server_instance = None
+    manager.model_info = {}
+    manager.skeleton_state_dict_file = None
+    manager.prefix_cache_runtime_config = None
+    manager._close_skeleton_memfd = lambda: None
+
+    manager.stop()
+
+    assert order == ["prepare_stop", "teardown", "daemon_stop"]
+    assert manager.distributed_weight_daemon is None
+
+
+def test_spawn_hands_workers_the_admitted_cohort_epoch():
+    tree = _worker_manager_tree()
+    spawn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_spawn_workers"
+    )
+    args_call = next(
+        node for node in ast.walk(spawn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "BatchGenWorkerArgs"
+    )
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in args_call.keywords}
+    assert keywords["distributed_weight_cohort"] == (
+        "self._distributed_weight_cohort()"
+    )
+
+    worker = (ROOT / "batchgen/batchgen_worker.py").read_text()
+    worker_tree = ast.parse(worker)
+    init_calls = [
+        node for node in ast.walk(worker_tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func).endswith("weights_storage.InitDistributed")
+    ]
+    assert len(init_calls) == 1
+    assert [ast.unparse(arg) for arg in init_calls[0].args] == [
+        "args.distributed_weight_config", "args.distributed_weight_cohort",
+    ]
+    binding = (ROOT / "core/batchgen_Binding.cpp").read_text()
+    assert 'py::arg("config_path"), py::arg("cohort_epoch"))' in binding
+    for name in ("cohort_epoch", "begin_cohort_swap", "finish_cohort_swap"):
+        assert f'.def("{name}"' in binding
+
+
+def test_cohort_epoch_is_zero_without_a_daemon(monkeypatch):
+    manager = _manager(monkeypatch)
+    assert manager._distributed_weight_cohort() == 0
+    manager.distributed_weight_daemon = _FakeWeightDaemon([])
+    assert manager._distributed_weight_cohort() == 1

@@ -196,15 +196,18 @@ commands in §4 reach the replicated parameter server only because they pass `--
   practical path on **2 TB-RAM nodes** where the replicated store does not fit with headroom. Pass
   the config file for the matching node rank.
 
-  Build each node's store with the store builder, one `--output-dir` per node:
+  Build each node's store with the store builder, one `--output-dir` per node, on persistent
+  storage (a local disk or the shared FS). The builder output is the **source**: the server never
+  maps it directly and never deletes it.
 
   ```bash
   python -m batchgen.models.moonshotai.kimi_linear.store_builder \
       --converted-ckpt /shared/models/Kimi-K3/converted_ckpt \
       --cache-dir /shared/models/Kimi-K3 \
-      --output-dir /dev/shm/k3-store \
+      --output-dir /shared/k3-stores/node${RANK} \
       --num-nodes 2 --node-rank ${RANK} \
-      --node-ips node0-ip,node1-ip
+      --node-ips node0-ip,node1-ip \
+      --store-residency run           # or: resident
   ```
 
   The builder checks the converted checkpoint against the full Kimi-K3 tensor map from
@@ -245,20 +248,35 @@ commands in §4 reach the replicated parameter server only because they pass `--
   > network`. The replicated parameter server (the default in §4) does not use UCX and has no such
   > requirement.
 
-  > **For repeatable fast bring-up, stage the store on tmpfs.** The daemon mmaps the store and
-  > registers it with the NIC (`ibv_reg_mr` → `mlx5_core_create_mkey`). A store on a **shared /
-  > network FS** stays on 4 KB pages — `--fast-init`'s hugepage path (`MADV_HUGEPAGE`) covers
-  > anonymous / tmpfs (shmem) mappings but **not** network-FS file mmaps — so ~838 GiB / 4 KB ≈ 200M
-  > page-table entries per memory region × (daemon + 8 workers) makes NIC key registration, not disk,
-  > dominate startup. Copy each node's store to a large-enough **tmpfs** and point `store_path` at it:
+  **Staged copy and its lifetime.** At start the server copies `store.bin` (with its metadata and
+  manifest) into a directory it owns under `store_staging_dir` (default
+  `/dev/shm/batchgen-weight-stores`, which must be a tmpfs), verifying every manifest segment as
+  it copies, and the daemon and every worker map that copy. Do **not** copy the store into
+  `/dev/shm` by hand and do **not** delete staged copies by hand. `--store-residency` (written
+  into `node${RANK}.json`) chooses how long the copy lives:
+
+  - `run` (default) — the copy is removed when the server stops, like every other run resource.
+    A copy left by a killed server is reused by the next start of the same build or removed by
+    the next start of another build.
+  - `resident` — the copy stays in the tmpfs after the server stops, so the next start of the
+    same build maps it without copying the source again (a fast cold restart). It still uses
+    tmpfs memory between runs.
+
+  A worker-pool restart never touches the staged copy. Each start removes idle copies of other
+  builds whatever their residency, so switching builds never strands one; a copy another server
+  is still using is never removed. A config written before these keys existed keeps mapping
+  `store_path` directly. The staging tmpfs needs room for the whole store; if it is too small the
+  server refuses before copying and names the shortfall
+  (`sudo mount -o remount,size=<bytes> /dev/shm`).
+
+  > **`--fast-init` requires a huge-page tmpfs.** The daemon and the workers advise the staged
+  > mapping with `MADV_HUGEPAGE`, but a tmpfs backs files with transparent huge pages only when it
+  > is mounted with `huge=within_size` or `huge=always`. Without that the store stays on 4 KB pages
+  > and NIC key registration (`ibv_reg_mr`) dominates startup, so under `--fast-init` the server
+  > refuses to start and prints the remount command for the staging mount:
   >
   > ```bash
-  > sudo mount -o remount,size=2048G /dev/shm
-  > cp /shared/.../node${RANK}_store.bin /dev/shm/node${RANK}_store.bin   # then set store_path to it
+  > sudo mount -o remount,huge=within_size /dev/shm
   > ```
   >
-  > The launch check verifies the copy against the manifest by content, so a relocated store passes
-  > and a partial copy is refused. Building with `--output-dir` on the tmpfs avoids the copy.
-  >
-  > This is the same reason the single-node path (store on local/tmpfs) loads fast. On 2 TB-RAM nodes
-  > the ~838 GiB tmpfs store still leaves ~1.1 TB for the workers.
+  > Without `--fast-init` any tmpfs is accepted.

@@ -134,6 +134,36 @@ def test_a_valid_store_passes_the_launch_preflight(env, tmp_path):
     assert args.distributed_weight_config == config
 
 
+def test_a_resident_restart_samples_the_staged_copy_not_the_source(
+    env, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sb, "SEGMENT_TARGET_BYTES", 64)
+    output = tmp_path / "store0"
+    staging_dir = tmp_path / "shm" / "batchgen-weight-stores"
+    argv = env.argv(output, 0) + [
+        "--store-residency", "resident", "--store-staging-dir", str(staging_dir),
+    ]
+    sb.build(argv, expected_topology=TOPOLOGY)
+    config = output / "node0.json"
+    source = output / sb.STORE_FILE_NAME
+    copy = staging_dir / sb.staged_store_id(
+        0, (output / sb.MANIFEST_FILE_NAME).read_bytes()
+    )
+    copy.mkdir(parents=True)
+    (copy / sb.STORE_FILE_NAME).write_bytes(source.read_bytes())
+
+    source.chmod(0)  # same size, bytes unreadable
+    try:
+        # A copy without COMPLETE is not trusted: the source is sampled.
+        with pytest.raises(sb.K3StoreManifestError):
+            launch(tmp_path, *store_flags(env, config))
+        (copy / sb.STAGED_COMPLETE_FILE_NAME).write_text("done\n")
+        args = launch(tmp_path, *store_flags(env, config))
+        assert args.distributed_weight_config == config
+    finally:
+        source.chmod(0o644)
+
+
 def test_a_four_node_store_passes_for_its_own_rank(env, tmp_path):
     config = build_store(env, tmp_path / "store3", node_rank=3, num_nodes=4)
     args = launch(tmp_path, *store_flags(env, config), nnodes=4, node_rank=3)
