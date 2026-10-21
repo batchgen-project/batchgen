@@ -585,6 +585,7 @@ def server_worker_main(
 	ready_event: Optional[mp.Event] = None,
 	fatal_ack_event: Optional[mp.Event] = None,
 	shutdown_flag: Optional[Any] = None,
+	rendezvous_flag: Optional[Any] = None,
 ):
 	try:
 		_server_worker_main_impl(
@@ -595,6 +596,7 @@ def server_worker_main(
 			ready_event,
 			fatal_ack_event,
 			shutdown_flag,
+			rendezvous_flag,
 		)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
@@ -643,6 +645,7 @@ def _server_worker_main_impl(
 	ready_event: Optional[mp.Event] = None,
 	fatal_ack_event: Optional[mp.Event] = None,
 	shutdown_flag: Optional[Any] = None,
+	rendezvous_flag: Optional[Any] = None,
 ):
 	"""
 	The main loop for the GPU workers.
@@ -725,6 +728,15 @@ def _server_worker_main_impl(
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
+	# Tell the server this cohort is past its rendezvous.  Until this point a
+	# rank has built no engine and mapped no weights -- BatchGenWorker is
+	# constructed further down -- so a teardown here needs no ordered exit and
+	# cannot be reached by the queue sentinel anyway.  The rendezvous completes
+	# for all ranks together, so one store speaks for the cohort; it is a plain
+	# store into lock-free shared memory, which the teardown owner can read
+	# without ever blocking on a dead rank's lock.
+	if rendezvous_flag is not None:
+		rendezvous_flag.value = 1
 	_start_worker_fatal_monitor(
 		args.global_rank,
 		response_queue,

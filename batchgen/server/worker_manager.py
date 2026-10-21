@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -37,8 +37,10 @@ from batchgen.server.runtime_locks import (
     release_run_lock,
 )
 from batchgen.server.runtime_lease import LaneLease
+from batchgen.server.restart_coordinator import RestartCoordinator
 from batchgen.server.server_args import (
     ServerArgs,
+    parse_host_port,
     validate_shared_runtime_capability,
 )
 from batchgen.utils import config_torch_module_initializer
@@ -54,6 +56,13 @@ PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 # grace must cover that or the fallback kills workers mid-unpin into
 # uninterruptible D state.
 _WORKER_SENTINEL_GRACE_S = 180.0
+# A cohort still parked in its rendezvous has built no engine and mapped no
+# weights -- BatchGenWorker is constructed only after the process group and the
+# NCCL warmup are done -- so there is nothing for an ordered teardown to
+# release and nothing the sentinel can reach: the ranks are inside
+# init_process_group, not reading the queue.  Waiting the full grace there buys
+# nothing and makes every peer-failure abort cost minutes.
+_PRE_RENDEZVOUS_SENTINEL_GRACE_S = 5.0
 # A SIGKILL'd worker still cannot be reaped until the kernel finishes
 # unpinning its registered pages, which again takes minutes for a large
 # cohort.  Proceeding while an owned PID is alive is never safe, so the
@@ -163,6 +172,16 @@ class WorkerManager:
     # stalled transport, which the daemon latches as fatal.
     _DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S = 120.0
 
+    # Phases of the coordinated restart, named as in restart_coordinator. Every
+    # node runs them in this order and leaves each one only once every peer has
+    # acked it: P0 the cohort is quiesced and armed for teardown, P1 the old
+    # cohort is reaped and the daemon swap is closed, P2 the new cohort is
+    # ready. No node may spawn before P1 is global, or the fresh ranks would
+    # rendezvous with a world that still contains a peer's dying ranks.
+    _RESTART_PHASE_ARMED = "P0"
+    _RESTART_PHASE_TORN_DOWN = "P1"
+    _RESTART_PHASE_READY = "P2"
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -231,6 +250,25 @@ class WorkerManager:
         self._pool_init_params_hook: Optional[Callable[[], Dict[str, Any]]] = None
         self._retire_channels_hook: Optional[Callable[[], Any]] = None
         self._restart_timeout_s = 600.0
+        self._last_restart_error: Optional[str] = None
+        # (epoch, phase) of the coordinated restart this node is inside, so a
+        # shutdown can tell the peers before it drops the control store.
+        self._coordinated_phase: Optional[Tuple[int, str]] = None
+        self._restart_coordinator = self._build_restart_coordinator()
+
+    def _build_restart_coordinator(self) -> RestartCoordinator:
+        """One coordinator per server, inert on a single-node launch.
+
+        The address is only ever read with ``nnodes > 1``; a single-node
+        coordinator opens no store, so a server that will never coordinate
+        anything also never binds a port for it.
+        """
+        host, port = "", 0
+        if self.args.nnodes > 1:
+            host, port = parse_host_port(self.args.restart_control_addr)
+        return RestartCoordinator(
+            self.args.nnodes, self.args.node_rank, host, port
+        )
 
     def _store_skeleton_state_dict(self, skeleton_state_dict: Dict[str, Any]) -> None:
         """Serialize the skeleton state dict into an anonymous memfd.
@@ -327,11 +365,28 @@ class WorkerManager:
         self._main_thread_dispatcher = dispatcher
 
     def status(self) -> Dict[str, Any]:
-        return {
+        coordinator = self._restart_coordinator
+        status = {
             "state": self.state,
             "generation": self.generation,
             "workers": len(getattr(self.worker_process, "processes", ()) or ()),
+            "node_rank": self.args.node_rank,
+            "nnodes": self.args.nnodes,
+            "restart_epoch": coordinator.epoch if coordinator is not None else 0,
+            "last_restart_error": self._last_restart_error,
+            "coordinator_error": (
+                coordinator.control_error if coordinator is not None else None
+            ),
         }
+        # Only node 0 drives the phases, so only there does a per-node ack view
+        # describe anything a reader can act on.
+        if (
+            coordinator is not None
+            and coordinator.enabled
+            and self.args.node_rank == 0
+        ):
+            status["peers"] = coordinator.peer_acks()
+        return status
 
     def _acquire_runtime_admission(self) -> None:
         if self._runtime_locks is not None:
@@ -380,6 +435,11 @@ class WorkerManager:
         self._ready_event.clear()
         self._fatal_ack_event.clear()
         self._prepare_runtime_dir()
+
+        # Opened before the long model-loading phases: a peer connects to node
+        # 0's store as soon as its own process starts, and every node spends
+        # minutes loading weights before it would otherwise be reachable.
+        self._restart_coordinator.start()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -468,6 +528,9 @@ class WorkerManager:
             self._state = "serving"
             self._first_ready = True
             self._reconciled_failure = False
+        # Only now: the follower may start a coordinated restart or react to a
+        # peer's cohort failure, and both need a pool that is already serving.
+        self._start_restart_follower()
         logger.info(
             "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
             _time.monotonic() - startup_start,
@@ -502,6 +565,13 @@ class WorkerManager:
         shutdown_start = time.monotonic()
         try:
             self._monitor_stop_event.set()
+            # A coordinated restart in flight here would otherwise leave every
+            # peer waiting at its next barrier until the shared deadline.
+            self._publish_restart_stopping()
+            # Before any teardown: the follower must not start a coordinated
+            # restart, or report a peer's cohort as down, while this node is
+            # shutting down. Also releases node 0's hold on the control port.
+            self._restart_coordinator.close()
             logger.info("Stopping WorkerManager...")
 
             # Stop the monitor thread
@@ -597,6 +667,44 @@ class WorkerManager:
                     artifacts_cleaned,
                 )
 
+    def _publish_restart_stopping(self) -> None:
+        """Fail this node's remaining phases of the restart it is inside.
+
+        The current phase's ack may already be ``ok`` (written on entering
+        its barrier, which ``fail_phase`` never overwrites), so every later
+        phase is failed too: the peers then stop at their very next barrier
+        instead of waiting for an ack this node will never write.
+        """
+        current = self._coordinated_phase
+        if current is None:
+            return
+        epoch, phase = current
+        phases = (
+            self._RESTART_PHASE_ARMED,
+            self._RESTART_PHASE_TORN_DOWN,
+            self._RESTART_PHASE_READY,
+        )
+        for remaining in phases[phases.index(phase):]:
+            try:
+                self._restart_coordinator.fail_phase(epoch, remaining, "stopping")
+            except Exception:
+                logger.warning(
+                    "Could not publish the shutdown to restart peers",
+                    exc_info=True,
+                )
+                return
+
+    def _cohort_past_rendezvous(self) -> bool:
+        """Whether this cohort's ranks completed their process-group join.
+
+        The rendezvous completes for all ranks at once, so the first rank to
+        store the flag speaks for the whole cohort.  An absent flag (a manager
+        with no cohort bound) is treated as past it, which keeps the long,
+        safe grace.
+        """
+        flag = self._cohort_rendezvous_flag
+        return flag is None or flag.value != 0
+
     def _stop_workers(self) -> None:
         """Signal only the original child processes, never a reused numeric PID."""
         stop_start = time.monotonic()
@@ -659,9 +767,15 @@ class WorkerManager:
                 except Exception:
                     logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-                deadline = time.monotonic() + (
-                    _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
-                )
+                grace_s = _WORKER_SENTINEL_GRACE_S if sentinel_sent else 0.0
+                # A cohort that never got past its rendezvous holds nothing an
+                # ordered exit has to release, and no rank is reading the
+                # queue, so the sentinel cannot be consumed at all.  See
+                # _PRE_RENDEZVOUS_SENTINEL_GRACE_S; the post-rendezvous grace
+                # above is unchanged.
+                if sentinel_sent and not self._cohort_past_rendezvous():
+                    grace_s = _PRE_RENDEZVOUS_SENTINEL_GRACE_S
+                deadline = time.monotonic() + grace_s
                 for proc in processes:
                     proc.join(timeout=max(0, deadline - time.monotonic()))
 
@@ -818,10 +932,19 @@ class WorkerManager:
         teardown owner itself would deadlock on the very failure this signal
         exists for.  Setting this flag is a plain store that cannot block, and
         the worker side polls it.
+
+        The cohort's rendezvous flag is bound here for the same reasons, in the
+        opposite direction: each rank stores 1 once its ``init_process_group``
+        returns, and the teardown owner LOADS it to size the sentinel grace.
+        That load happens under ``_teardown_lock`` while ranks may already be
+        dead, so it must not be an ``mp.Event`` either -- ``is_set()`` takes the
+        Event's condition lock, which a rank killed inside ``set()`` can still
+        hold.
         """
         self.request_queue = self._mp_ctx.Queue()
         self.response_queue = self._mp_ctx.Queue()
         self._cohort_shutdown_flag = self._mp_ctx.RawValue("b", 0)
+        self._cohort_rendezvous_flag = self._mp_ctx.RawValue("b", 0)
 
     def _abandon_worker_channels(self) -> None:
         """Release the previous cohort's queues WITHOUT reading them.
@@ -859,9 +982,10 @@ class WorkerManager:
                     )
         self.request_queue = None
         self.response_queue = None
-        # The flag belongs to the cohort that was just torn down; the next one
-        # is created with its channels.
+        # The flags belong to the cohort that was just torn down; the next
+        # one's are created with its channels.
         self._cohort_shutdown_flag = None
+        self._cohort_rendezvous_flag = None
 
     def _release_host_kv_sequences(self) -> None:
         for manager in (self.host_kv_manager, self.host_kv_aux_manager):
@@ -899,7 +1023,71 @@ class WorkerManager:
         if self._stopping or not self.started:
             raise RuntimeError("worker restart aborted: server is stopping")
 
-    def restart_workers(self, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _restart_failure_reason(exc: BaseException) -> str:
+        """What the peers are told about a local failure.
+
+        A shutdown abort is named by the single word the peers can act on:
+        this node is going away, so no retry of this epoch can succeed.
+        """
+        text = str(exc) or type(exc).__name__
+        if "server is stopping" in text:
+            return "stopping"
+        return text
+
+    def _spawn_unless_stopping(self) -> None:
+        """Spawn the next cohort on the main thread unless shutdown has begun.
+
+        The restart thread checks for shutdown before dispatching, but the
+        spawn runs later on the event loop, which may by then be running the
+        lifespan shutdown (a SIGTERM cancels the open restart request after
+        the graceful-shutdown bound). Checking again here, on the thread that
+        runs ``stop()``, means no cohort is ever spawned once ``stop()`` has
+        begun.
+        """
+        self._abort_restart_if_stopping()
+        self._spawn_workers()
+
+    def _start_restart_follower(self) -> None:
+        self._restart_coordinator.start_follower(
+            state=lambda: self.state,
+            generation=lambda: self.generation,
+            on_peer_restart=self._run_followed_restart,
+            on_peer_down=self._handle_peer_cohort_down,
+        )
+
+    def _run_followed_restart(self, request: Any) -> None:
+        """Run node 0's restart epoch here, under node 0's shared deadline."""
+        logging.getLogger("uvicorn.error").info(
+            "[restart] node %d following restart epoch %d",
+            self.args.node_rank,
+            request.epoch,
+        )
+        self.restart_workers(
+            timeout_s=request.timeout_s,
+            epoch=request.epoch,
+            deadline=request.deadline,
+        )
+
+    def _handle_peer_cohort_down(self, node: int, reason: str) -> None:
+        """A peer's cohort is gone, so this node's ranks cannot serve either.
+
+        Publishing this node's own down key here would only echo a failure the
+        store already names, so the reaction stays silent on the store.
+        """
+        self._handle_worker_failure(
+            f"peer node {node} worker cohort failed: {reason}",
+            None,
+            publish_down=False,
+        )
+
+    def restart_workers(
+        self,
+        timeout_s: Optional[float] = None,
+        *,
+        epoch: Optional[int] = None,
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Replace one worker cohort while retaining server-owned resources.
 
         The restart runs on a worker thread (``asyncio.to_thread``), which
@@ -911,19 +1099,47 @@ class WorkerManager:
         begins (a teardown, or a spawn already dispatched) runs to completion
         before the next boundary sees the shutdown; ``stop()`` tears down
         whatever cohort is live when it reaches the worker processes.
+
+        On a multi-node server the same function runs on every node: node 0
+        reaches it from the HTTP route and claims the epoch, the peers reach it
+        from the coordinator's follower with that ``epoch`` and ``deadline``.
+        The local phases are unchanged; each one additionally waits for every
+        peer's ack before the next begins, and any local failure is published
+        so the peers abort instead of waiting out the deadline.
         """
         timeout_s = self._restart_timeout_s if timeout_s is None else float(timeout_s)
         started_at = time.monotonic()
+        coordinator = self._restart_coordinator
+        coordinated = coordinator is not None and coordinator.enabled
+        following = epoch is not None
+        conflict: Optional[str] = None
         with self._lock:
             if self._state not in {"serving", "workers_down"}:
-                raise RuntimeError(f"worker restart conflict: state={self._state}")
-            self._state = "restarting"
+                conflict = f"worker restart conflict: state={self._state}"
+            else:
+                self._state = "restarting"
+        if conflict is not None:
+            # A follower has no caller to report the conflict to while node 0
+            # waits on this node's ack, so it publishes it rather than
+            # skipping the epoch silently -- outside _lock, which /health and
+            # the monitor also take.
+            if coordinated and following:
+                coordinator.fail_phase(epoch, self._RESTART_PHASE_ARMED, conflict)
+            raise RuntimeError(conflict)
 
         # Every phase runs inside one recovery scope: a restart that fails at
         # ANY point leaves the manager in the retryable workers_down state,
         # never stuck in "restarting".
         teardown_owned = False
+        ready_everywhere = False
+        phase = self._RESTART_PHASE_ARMED
         try:
+            if coordinated and not following:
+                request = coordinator.begin_restart(timeout_s)
+                epoch = request.epoch
+                deadline = request.deadline
+            if coordinated:
+                self._coordinated_phase = (epoch, phase)
             self._abort_restart_if_stopping()
             quiesce_start = time.monotonic()
             if self._quiesce_hook is not None:
@@ -945,11 +1161,30 @@ class WorkerManager:
             # distributed-weight daemon; open the cohort swap first so those
             # disconnects are expected rather than a failure.
             self._begin_distributed_weight_swap()
+
+            # P0 is global from here: every node has quiesced and is about to
+            # reap its ranks.
+            armed_failure: Optional[BaseException] = None
+            if coordinated:
+                try:
+                    coordinator.barrier(
+                        epoch, self._RESTART_PHASE_ARMED, deadline
+                    )
+                except BaseException as exc:
+                    # Ranks cannot serve without their peers, so a cohort whose
+                    # peers are not arming is dead either way: tear it down
+                    # locally rather than leave it holding GPUs, then fail.
+                    armed_failure = exc
+            phase = self._RESTART_PHASE_TORN_DOWN
+            if coordinated:
+                self._coordinated_phase = (epoch, phase)
+
             if self.worker_process is not None:
                 self._stop_workers()
                 self.worker_process = None
             teardown_s = time.monotonic() - teardown_start
-            self._abort_restart_if_stopping()
+            if armed_failure is None:
+                self._abort_restart_if_stopping()
 
             reconcile_start = time.monotonic()
             # In-flight batches are persisted as failed exactly once:
@@ -987,6 +1222,19 @@ class WorkerManager:
             teardown_owned = False
             self._teardown_lock.release()
 
+            # The local side is fully reconciled and retryable, which is the
+            # most a node whose peers never armed can reach.
+            if armed_failure is not None:
+                raise armed_failure
+            # P1 is global from here: no node spawns before every node's old
+            # cohort is reaped and its daemon swap is closed, or the fresh
+            # ranks would rendezvous into a world that still holds dying ones.
+            if coordinated:
+                coordinator.barrier(epoch, self._RESTART_PHASE_TORN_DOWN, deadline)
+            phase = self._RESTART_PHASE_READY
+            if coordinated:
+                self._coordinated_phase = (epoch, phase)
+
             spawn_start = time.monotonic()
             self._monitor_stop_event.clear()
             self._ready_event.clear()
@@ -996,9 +1244,20 @@ class WorkerManager:
             # cohort spawned below.
             self._worker_exit_state.clear()
             self._abort_restart_if_stopping()
-            self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
+            self._call_spawn_on_main_thread(self._spawn_unless_stopping, timeout_s)
             self._start_worker_monitor()
-            self._wait_for_workers_ready(timeout_s=timeout_s)
+            if coordinated:
+                # A peer that failed to spawn leaves this node's ranks waiting
+                # for a rendezvous that can never complete, so the readiness
+                # wait watches for that instead of waiting out its timeout.
+                self._wait_for_workers_ready(
+                    timeout_s=timeout_s,
+                    peer_check=lambda: coordinator.raise_if_peer_failed(
+                        epoch, self._RESTART_PHASE_READY
+                    ),
+                )
+            else:
+                self._wait_for_workers_ready(timeout_s=timeout_s)
             # Pool capacity params live with the scheduler (it accumulated them
             # across batch submissions); re-init with the same values, never
             # with hardcoded defaults.
@@ -1011,6 +1270,13 @@ class WorkerManager:
                 "max_context_length": init_params.get("max_context_length"),
             })
             spawn_to_ready_s = time.monotonic() - spawn_start
+            if coordinated:
+                # P2 is the last ack, taken before the node-local scheduler
+                # hooks: a peer that fails here must not leave this node with
+                # a resumed scheduler under a workers_down state its monitor
+                # then ignores.
+                coordinator.barrier(epoch, self._RESTART_PHASE_READY, deadline)
+                ready_everywhere = True
             # The scheduler side of the new generation (completion pump,
             # listener re-arm, then resume) is part of the restart: neither
             # hook needs the serving state, and if either fails the restart
@@ -1020,19 +1286,47 @@ class WorkerManager:
                 self._scheduler_generation_hook()
             if self._resume_hook is not None:
                 self._resume_hook()
-        except BaseException:
+        except BaseException as exc:
+            reason = self._restart_failure_reason(exc)
+            self._last_restart_error = reason
+            self._coordinated_phase = None
             if teardown_owned:
                 self._teardown_lock.release()
             with self._lock:
                 self._state = "workers_down"
+            # Published so the peers abort at their next barrier instead of
+            # waiting out the deadline. Best effort: the control store may be
+            # the very thing that failed, and the local recovery above must
+            # never depend on it.
+            if coordinated and epoch is not None:
+                try:
+                    coordinator.fail_phase(epoch, phase, reason)
+                    if not following:
+                        coordinator.publish_result(
+                            epoch, {"state": "workers_down", "error": reason}
+                        )
+                    # Past P2 every peer is about to serve the new generation
+                    # (it bumps to generation + 1 on success), so the failure
+                    # must reach them as that cohort's down key, not as a
+                    # phase ack nobody is waiting on any more.
+                    if ready_everywhere:
+                        coordinator.publish_down(self.generation + 1, reason)
+                except Exception:
+                    logger.warning(
+                        "Could not publish restart epoch %s failure to peers",
+                        epoch,
+                        exc_info=True,
+                    )
             raise
+        self._coordinated_phase = None
         with self._lock:
             self._generation += 1
             self._state = "serving"
             self._first_ready = True
             self._worker_exit_state.clear()
             self._reconciled_failure = False
-        return {
+            self._last_restart_error = None
+        result = {
             "generation": self.generation,
             "failed_batches": reconciliation["failed_batches"],
             "elapsed_s": time.monotonic() - started_at,
@@ -1044,7 +1338,24 @@ class WorkerManager:
                 "spawn_to_ready_s": spawn_to_ready_s,
             },
             "distributed_weight_swap": weight_swap,
+            "epoch": epoch if epoch is not None else 0,
         }
+        if coordinated and not following:
+            result["nodes"] = coordinator.nnodes
+            # Every node already acked P2, so the restart succeeded whatever
+            # happens to this informational record.
+            try:
+                coordinator.publish_result(epoch, {
+                    "state": "serving",
+                    "generation": result["generation"],
+                    "elapsed_s": result["elapsed_s"],
+                })
+            except Exception:
+                logger.warning(
+                    "Could not publish restart epoch %s result", epoch,
+                    exc_info=True,
+                )
+        return result
 
     # ---------------------- Startup helpers ----------------------
     def _compact_memory(self) -> None:
@@ -1272,6 +1583,7 @@ class WorkerManager:
                 self._ready_event,
                 self._fatal_ack_event,
                 self._cohort_shutdown_flag,
+                self._cohort_rendezvous_flag,
             ),
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
@@ -1333,11 +1645,20 @@ class WorkerManager:
             return ps.parameter_server.tensor_meta_memfd_fd()
         return -1
 
-    def _wait_for_workers_ready(self, timeout_s: Optional[float] = None) -> None:
+    def _wait_for_workers_ready(
+        self,
+        timeout_s: Optional[float] = None,
+        peer_check: Optional[Callable[[], None]] = None,
+    ) -> None:
         if self.worker_process is None:
             return
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while not self._ready_event.wait(timeout=self._monitor_interval_s):
+            # A local rank blocked in a rendezvous its peers will never join
+            # shows no failure of its own, so the peers' verdict is polled
+            # beside the local one rather than waited out.
+            if peer_check is not None:
+                peer_check()
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("worker cohort did not become ready before restart timeout")
             if self._worker_exit_state.is_failed():
@@ -1421,7 +1742,11 @@ class WorkerManager:
         return "Detected worker process exit: " + ", ".join(exited)
 
     def _handle_worker_failure(
-        self, reason: str, exc: Optional[BaseException]
+        self,
+        reason: str,
+        exc: Optional[BaseException],
+        *,
+        publish_down: bool = True,
     ) -> None:
         if self._stopping:
             return
@@ -1441,6 +1766,10 @@ class WorkerManager:
             if self._state != "serving":
                 return
             startup = not self._first_ready
+            # The cohort this failure belongs to, named while the state lock
+            # still pins it: the down key is keyed by generation so a peer
+            # cannot mistake it for a later cohort's failure.
+            failed_generation = self._generation
             if not startup:
                 if not self._teardown_lock.acquire(blocking=False):
                     logger.error(
@@ -1466,6 +1795,11 @@ class WorkerManager:
             "Worker cohort failed after readiness; entering workers_down: %s",
             reason,
         )
+        # The cohort spans every node, so a peer that is still serving is
+        # serving into a broken world. Published right after the claim, before
+        # the teardown that takes minutes, so the peers quiesce early.
+        if publish_down and self._restart_coordinator is not None:
+            self._restart_coordinator.publish_down(failed_generation, reason)
         try:
             if self._quiesce_hook is not None:
                 self._quiesce_hook()

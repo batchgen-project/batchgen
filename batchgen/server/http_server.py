@@ -46,6 +46,7 @@ from batchgen.deprecation import (
     LEGACY_INFERENCE_MESSAGE,
 )
 from batchgen.server.health import ServerHealthState
+from batchgen.server.restart_coordinator import PeerRestartError
 from batchgen.server.server_args import (
     ServerArgs,
     validate_shared_runtime_capability,
@@ -54,6 +55,11 @@ from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerExitState, WorkerManager
 
 logger = logging.getLogger(__name__)
+
+# How long a shutdown waits for open requests before cancelling them. Every
+# request but a worker restart is short; a restart is cancelled here and
+# aborted by WorkerManager.stop() at its next phase boundary.
+_GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
 
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
@@ -93,6 +99,39 @@ class QuietAccessLogMiddleware(BaseHTTPMiddleware):
 
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
+def make_main_thread_dispatcher(loop):
+    """Bridge from a restart thread back onto the loop's main thread.
+
+    Workers arm PR_SET_PDEATHSIG, which the kernel delivers when the thread
+    that spawned them exits, so every respawn has to run on the main thread.
+    A restart can start without a request behind it -- a peer node follows
+    node 0 from the coordinator's thread -- so the bridge is installed for the
+    server's whole life, not only per request.
+    """
+
+    def dispatch_on_main_thread(fn, dispatch_timeout):
+        done = threading.Event()
+        result = []
+
+        def invoke():
+            try:
+                result.append((True, fn()))
+            except BaseException as exc:
+                result.append((False, exc))
+            finally:
+                done.set()
+
+        loop.call_soon_threadsafe(invoke)
+        if not done.wait(dispatch_timeout):
+            raise TimeoutError("main-thread worker spawn dispatch timed out")
+        ok, value = result[0]
+        if not ok:
+            raise value
+        return value
+
+    return dispatch_on_main_thread
 
 
 def create_app(
@@ -159,6 +198,12 @@ def create_app(
                 max_context_length=model_config.max_position_embeddings,
             )
 
+            # Installed before the pool exists: worker.start() arms the
+            # coordinator's follower, which may begin a coordinated restart as
+            # soon as node 0 asks for one, with no request to carry a bridge.
+            worker.set_main_thread_dispatcher(
+                make_main_thread_dispatcher(asyncio.get_running_loop())
+            )
             worker.start()
             await scheduler.start()
             scheduler_started = True
@@ -513,38 +558,45 @@ def create_app(
     @app.post("/v1/workers/restart")
     async def restart_workers(request: Request):
         worker_manager: WorkerManager = request.app.state.worker
+        server: ServerArgs = request.app.state.server_args
+        if server.node_rank > 0:
+            # Only node 0 may claim a restart epoch: a cohort spans every node,
+            # so two entry points would tear the same world down twice.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "worker restart is coordinated by node 0; send it there"
+                    ),
+                    "coordinator_node": 0,
+                },
+            )
         try:
             body = await request.json()
         except Exception:
             body = {}
         timeout = float(body.get("timeout", 600.0))
-        loop = asyncio.get_running_loop()
-
-        def dispatch_on_main_thread(fn, dispatch_timeout):
-            done = threading.Event()
-            result = []
-
-            def invoke():
-                try:
-                    result.append((True, fn()))
-                except BaseException as exc:
-                    result.append((False, exc))
-                finally:
-                    done.set()
-
-            loop.call_soon_threadsafe(invoke)
-            if not done.wait(dispatch_timeout):
-                raise TimeoutError("main-thread worker spawn dispatch timed out")
-            ok, value = result[0]
-            if not ok:
-                raise value
-            return value
-
-        worker_manager.set_main_thread_dispatcher(dispatch_on_main_thread)
+        worker_manager.set_main_thread_dispatcher(
+            make_main_thread_dispatcher(asyncio.get_running_loop())
+        )
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(worker_manager.restart_workers, timeout_s=timeout),
                 timeout=timeout,
+            )
+        except PeerRestartError as exc:
+            # A peer's failure is the restart's outcome, not an internal error
+            # of this node, so the node and phase that failed are named.
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "state": worker_manager.state,
+                    "generation": worker_manager.generation,
+                    "epoch": worker_manager.status().get("restart_epoch"),
+                    "error": str(exc),
+                    "failed_node": exc.node,
+                    "failed_phase": exc.phase,
+                },
             )
         except RuntimeError as exc:
             if "restart conflict" in str(exc):
@@ -664,6 +716,12 @@ def launch_server(server_args: ServerArgs) -> None:
             log_level="info",
             access_log=False,  # Use custom QuietAccessLogMiddleware instead
             timeout_keep_alive=1000,
+            # Without a bound uvicorn waits for every open request before the
+            # lifespan shutdown runs, and POST /v1/workers/restart stays open
+            # for the whole restart: a SIGTERM would wait out the restart
+            # timeout before WorkerManager.stop() could tell the restart peers
+            # and tear the cohort down.
+            timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
             loop="uvloop",
         )
     except KeyboardInterrupt:
