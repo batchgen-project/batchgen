@@ -2,6 +2,7 @@ import torch
 from math import ceil
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 _FP8_MAX = 448.0
 def compressed_kv_bf16_to_fp8_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -385,6 +386,141 @@ def per_token_blocked_quantize_bf16_to_fp8_1d(
         scale.stride(0), scale.stride(1),
         out.stride(0), out.stride(1),
         HAS_VALID_TOKENS=num_valid_tokens is not None,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out, scale
+
+
+@triton.jit
+def _silu_mul_per_token_blocked_quantize_1d_kernel(
+    gate_up_ptr, scale_ptr, out_ptr,
+    M,
+    dim: tl.constexpr,               # I: width of one half (gate / up) and of the output
+    BLOCK_SIZE: tl.constexpr,        # 128 -- fp8 blockwise scale block
+    NUM_BLOCKS: tl.constexpr,        # ceil(dim / BLOCK_SIZE)
+    NUM_BLOCKS_P2: tl.constexpr,     # pow-2 pad of NUM_BLOCKS
+    gate_up_stride_m, gate_up_stride_d,
+    scale_stride_m, scale_stride_b,
+    out_stride_m, out_stride_d,
+):
+    """SiLU(gate) * up, then the per-token 128-block FP8 cast, in one pass.
+
+    ``gate_up`` is one row-major [M, 2 * dim] bf16 tensor: gate in columns
+    [0, dim), up in [dim, 2 * dim) -- the output of ONE fused gate/up GEMM.
+
+    The bf16 values it quantizes are, bit for bit, the ones the unfused
+    ``F.silu(gate) * up`` produces before ``_per_token_blocked_quantize_1d``:
+      * SiLU in fp32 as ``x / (1 + exp(-x))`` with libdevice ``exp`` and a
+        round-to-nearest division (PyTorch's CUDA SiLU formula and precision),
+        rounded to bf16 -- the activation tensor's dtype;
+      * the product in fp32 of the two bf16 operands, rounded to bf16 -- the
+        multiply's output dtype.
+    The quantization below is ``_per_token_blocked_quantize_1d_kernel``'s,
+    statement for statement, so FP8 bytes and scales match that kernel on the
+    same bf16 input. One CTA per token, as there.
+    """
+    FP8_SAFE_MAX: tl.constexpr = 448.0
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+
+    pid_m = tl.program_id(0).to(tl.int64)
+
+    block_ids = tl.arange(0, NUM_BLOCKS_P2)
+    col_in_block = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    cols_2d = block_ids[:, None].to(tl.int64) * BLOCK_SIZE + col_in_block[None, :]
+    col_mask = cols_2d < dim
+
+    gate_up_stride_m_i64 = tl.cast(gate_up_stride_m, tl.int64)
+    out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
+    scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
+
+    gate_offsets = pid_m * gate_up_stride_m_i64 + cols_2d * gate_up_stride_d
+    up_offsets = gate_offsets + dim * gate_up_stride_d
+    gate = tl.load(gate_up_ptr + gate_offsets, mask=col_mask, other=0.0).to(tl.float32)
+    up = tl.load(gate_up_ptr + up_offsets, mask=col_mask, other=0.0).to(tl.float32)
+
+    act = tl.math.div_rn(gate, 1.0 + libdevice.exp(-gate))
+    act = act.to(tl.bfloat16).to(tl.float32)
+    q_float = (act * up).to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.max(tl.abs(q_float), axis=1)
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
+
+    q_scaled = q_float / scale[:, None]
+    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
+    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
+    is_finite = tl.abs(q_scaled) < 1e30
+    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+
+    out_offsets = pid_m * out_stride_m_i64 + cols_2d * out_stride_d
+    tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
+
+    block_valid = block_ids < NUM_BLOCKS
+    scale_offsets = pid_m * scale_stride_m_i64 + block_ids.to(tl.int64) * scale_stride_b
+    tl.store(scale_ptr + scale_offsets, scale, mask=block_valid)
+
+
+def silu_mul_per_token_blocked_quantize_bf16_to_fp8_1d(
+    gate_up: torch.Tensor, block_size: int = 128,
+    num_warps: int = 4, num_stages: int = 2,
+    scale_tma_aligned: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``SiLU(gate_up[:, :I]) * gate_up[:, I:]`` cast to blockwise FP8.
+
+    Fuses the activation, the multiply and the per-token quantization that
+    feed a down-projection GEMM into one launch. Values are bit-identical to
+    ``per_token_blocked_quantize_bf16_to_fp8_1d(F.silu(g) * u)`` on the same
+    bf16 halves (see the kernel docstring for why).
+
+    Returns:
+        out:   [M, I]            dtype=float8_e4m3fn
+        scale: [M, I / block]    dtype=float32; with ``scale_tma_aligned`` a
+               view of an MN-major, TMA-aligned [num_blocks, align4(M)]
+               allocation, i.e. the layout DeepGEMM consumes without a
+               transpose.
+    """
+    if gate_up.dtype != torch.bfloat16:
+        raise TypeError(f"gate_up must be bfloat16, got {gate_up.dtype}")
+    if gate_up.dim() != 2:
+        raise ValueError(
+            f"gate_up must be 2D [M, 2 * I], got shape {tuple(gate_up.shape)}")
+    if not gate_up.is_contiguous():
+        raise ValueError("gate_up must be contiguous")
+    M, width = gate_up.shape
+    if width % 2 != 0:
+        raise ValueError(f"gate_up width must be even (gate | up), got {width}")
+    dim = width // 2
+    if dim % block_size != 0:
+        raise ValueError(
+            f"half width {dim} must be a multiple of the scale block {block_size}: "
+            "a block straddling gate and up would quantize across both halves")
+    if M == 0:
+        raise ValueError("silu_mul quantize needs at least one row")
+
+    num_blocks = dim // block_size
+    num_blocks_p2 = 1
+    while num_blocks_p2 < num_blocks:
+        num_blocks_p2 *= 2
+
+    out = torch.empty((M, dim), device=gate_up.device, dtype=torch.float8_e4m3fn)
+    if scale_tma_aligned:
+        aligned_m = ((M + 3) // 4) * 4
+        scale = torch.empty(
+            (num_blocks, aligned_m),
+            device=gate_up.device,
+            dtype=torch.float32,
+        ).transpose(0, 1)[:M, :]
+    else:
+        scale = torch.empty((M, num_blocks), device=gate_up.device, dtype=torch.float32)
+
+    _silu_mul_per_token_blocked_quantize_1d_kernel[(M,)](
+        gate_up, scale, out,
+        M, dim, block_size, num_blocks, num_blocks_p2,
+        gate_up.stride(0), gate_up.stride(1),
+        scale.stride(0), scale.stride(1),
+        out.stride(0), out.stride(1),
         num_warps=num_warps, num_stages=num_stages,
     )
     return out, scale
