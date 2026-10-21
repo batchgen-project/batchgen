@@ -30,7 +30,12 @@ from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
 )
-from batchgen.moe.routing import FusedGateContext, gate_sigmoid_topk_cuda
+from batchgen.moe.routing import (
+    GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS,
+    FusedGateContext,
+    gate_sigmoid_topk_cuda,
+    gate_sigmoid_topk_warp_cuda,
+)
 
 from .moe_ragged import (
     ROW_ALIGN,
@@ -202,8 +207,9 @@ class _Glm5MoEGraphBuffers:
     cu_seqlens: torch.Tensor
     capacity: int
     # DeepEP low-latency mode only (``Glm5MoEGraphBufferPool.configure_deepep``).
-    # ``ll_topk_idx`` is the int64 copy of the gate's int32 indices the exchange
-    # requires; ``ll_x_scale`` is the repacked activation scale the grouped GEMM
+    # ``ll_topk_idx`` holds the int64 expert ids the exchange requires, written
+    # by the gate directly (``topk_indices`` is then an empty tensor);
+    # ``ll_x_scale`` is the repacked activation scale the grouped GEMM
     # requires; ``ll_cu_seqlens`` is the constant uniform-stride segment table.
     # All three are empty tensors on the NCCL path.
     ll_topk_idx: torch.Tensor
@@ -495,7 +501,8 @@ class Glm5MoEGraphBufferPool:
         # Router on LOCAL rows only: world_size x less gate work than the
         # all-gathered row space the NCCL path routes.
         b["router_logits"] = torch.empty(max_bucket, 256, dtype=torch.float32, device=d)
-        b["topk_indices"] = torch.empty(max_bucket, k, dtype=torch.int32, device=d)
+        # The gate writes DeepEP's int64 ids directly (``ll_topk_idx``); there
+        # is no int32 index buffer on this path.
         b["topk_weights"] = torch.empty(max_bucket, k, dtype=torch.float32, device=d)
         b["ll_topk_idx"] = torch.empty(max_bucket, k, dtype=torch.int64, device=d)
         b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
@@ -527,6 +534,7 @@ class Glm5MoEGraphBufferPool:
         b["_unused_bf16_h"] = empty_h
         b["_unused_u8_h"] = torch.empty(0, h, dtype=torch.uint8, device=d)
         b["_unused_i32"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["_unused_i32_k"] = torch.empty(0, k, dtype=torch.int32, device=d)
 
         for bucket_size in self.bucket_sizes:
             self._create_view_deepep(bucket_size, rows)
@@ -551,7 +559,7 @@ class Glm5MoEGraphBufferPool:
             # The router reads the local rows; there is no all-gathered space.
             all_tokens=b["padded"][:bucket_size],
             router_logits=b["router_logits"][:bucket_size],
-            topk_indices=b["topk_indices"][:bucket_size],
+            topk_indices=b["_unused_i32_k"],
             topk_weights=b["topk_weights"][:bucket_size],
             topk_pos=b["_unused_i32"],
             dispatched_x=b["_unused_bf16_h"],
@@ -774,6 +782,17 @@ class Glm5MoEGraphSegment:
             raise RuntimeError(
                 f"Layer {moe.layer_idx}: --enable-deepep and EP expert "
                 "offloading are mutually exclusive for GLM-5 decode")
+        # The DeepEP path routes with the one-warp-per-row gate, which holds a
+        # row's experts in registers.
+        if num_experts_global > GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the DeepEP decode gate handles at most "
+                f"{GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS} routed experts, this model "
+                f"has {num_experts_global}")
+        if self.num_experts_per_tok not in (2, 4, 8, 16):
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the DeepEP decode gate supports top-k "
+                f"2, 4, 8 or 16, got {self.num_experts_per_tok}")
         import torch.distributed as dist
 
         if not dist.is_initialized():
@@ -1029,19 +1048,25 @@ class Glm5MoEGraphSegment:
                     "the accumulate would read a buffer the side stream never "
                     "wrote.")
 
-        gate_sigmoid_topk_cuda(
+        # The top-k runs on this stream while the shared expert's x quant and
+        # gate/up GEMM run on the side stream. A GEMM CTA is not placed on an
+        # SM that a top-k CTA still occupies, so the top-k has to be FINISHED
+        # by the time the x quant releases the GEMM. The one-warp-per-row
+        # gate is built for that: one 32-thread CTA per row, one memory round
+        # trip, a programmatic dependent launch right behind the router GEMM,
+        # and the int64 ids DeepEP reads written straight into the exchange's
+        # buffer (no int32 -> int64 copy launch). Same bytes as the
+        # block-per-row gate; -1 padding rows stay unrouted.
+        gate_sigmoid_topk_warp_cuda(
             bufs.router_logits,
             self.gate_bias_fp32,
             k=self.num_experts_per_tok,
             routed_scaling_factor=self.routed_scaling_factor,
-            topk_indices=bufs.topk_indices,
+            topk_indices=bufs.ll_topk_idx,
             topk_weights=bufs.topk_weights,
             rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
             rows_per_rank=bucket_size,
         )
-
-        # DeepEP reads int64 expert ids; -1 padding rows stay unrouted.
-        bufs.ll_topk_idx.copy_(bufs.topk_indices)
 
         # Dispatch and combine each run as a SEND kernel followed by a separate
         # RECEIVE kernel, both on this stream (``split_phases``; DeepEP's

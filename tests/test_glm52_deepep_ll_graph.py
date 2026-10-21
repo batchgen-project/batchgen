@@ -22,7 +22,9 @@ graph segment captures. Contract under test:
   the accumulate consumes the pool-owned staging buffer, and the stream/event
   are process-lifetime resources that are never minted inside a capture;
 * the exchange runs split into send and receive launches (``split_phases``) for
-  both dispatch and combine.
+  both dispatch and combine;
+* the top-k is the one-warp-per-row gate writing the exchange's int64 ids
+  straight into ``ll_topk_idx`` -- no int32 index buffer and no copy kernel.
 """
 import contextlib
 import inspect
@@ -227,7 +229,8 @@ def test_pool_allocates_the_expert_major_receive_space(monkeypatch):
     assert bufs.ll_x_scale.is_contiguous() and bufs.inter_scale.is_contiguous()
     # the router runs on LOCAL rows, not the all-gathered row space
     assert bufs.router_logits.shape == (BUCKET, 256)
-    assert bufs.topk_indices.shape == (BUCKET, TOPK)
+    # the gate writes int64 ids into ll_topk_idx; no int32 index buffer exists
+    assert bufs.topk_indices.numel() == 0
     assert bufs.ll_topk_idx.shape == (BUCKET, TOPK)
     assert bufs.ll_topk_idx.dtype == torch.int64
     assert bufs.local_moe_output.shape == (BUCKET, H)
@@ -432,10 +435,14 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
     segment._shared_overlap = overlap
 
     # The gate writes global expert ids: every live row picks this rank's two
-    # local experts plus two remote ones; row `valid` onwards is padding.
+    # local experts plus two remote ones; row `valid` onwards is padding. It
+    # writes the exchange's int64 buffer itself -- there is no int32 result to
+    # copy.
     def fake_gate(logits, bias, *, k, routed_scaling_factor, topk_indices,
                   topk_weights, rank_token_counts=None, rows_per_rank=None,
                   num_valid_tokens=None):
+        assert topk_indices is bufs.ll_topk_idx
+        assert topk_indices.dtype == torch.int64
         assert rank_token_counts is not None and rank_token_counts.numel() == 1
         assert rows_per_rank == bucket
         assert num_valid_tokens is None
@@ -475,7 +482,9 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
         raise AssertionError(
             "the DeepEP path must not run the NCCL-era MoE kernels")
 
-    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_cuda", fake_gate)
+    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_warp_cuda", fake_gate)
+    # the DeepEP path routes with the one-warp-per-row gate only
+    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_cuda", refuse)
     monkeypatch.setattr(
         glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", fake_s1)
     monkeypatch.setattr(glm5_moe_graph, "grouped_fp8_blockwise_s3", fake_s3)
@@ -499,7 +508,7 @@ def test_forward_runs_the_exchange_and_skips_the_nccl_pair(monkeypatch):
 
     assert out["moe_output"].shape == (BUCKET, H)
     assert pool.deepep.dispatch_calls == 1 and pool.deepep.combine_calls == 1
-    # the gate's int32 ids reach the exchange as int64, padding rows unrouted
+    # the gate's int64 ids reach the exchange as written, padding rows unrouted
     assert bufs.ll_topk_idx.dtype == torch.int64
     assert torch.equal(bufs.ll_topk_idx[:valid, 0],
                        torch.full((valid,), segment.expert_start,
@@ -752,6 +761,17 @@ def test_the_shared_expert_writes_straight_into_the_staging_buffer():
     assert "bufs.shared_out.copy_(" not in deepep
 
 
+def test_the_gate_writes_the_exchange_ids_without_a_copy():
+    """The int32 -> int64 copy kernel is gone: the DeepEP forward hands the
+    one-warp-per-row gate the exchange's int64 buffer and never copies into
+    it."""
+    deepep = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
+    assert "gate_sigmoid_topk_warp_cuda(" in deepep
+    assert "topk_indices=bufs.ll_topk_idx" in deepep
+    assert "ll_topk_idx.copy_(" not in deepep
+    assert "gate_sigmoid_topk_cuda(" not in deepep
+
+
 # --- the stream/event resources themselves -------------------------------
 class _FakeStream:
     def __init__(self, device):
@@ -872,6 +892,23 @@ def test_segment_gate_requires_the_rank_aligned_expert_window(monkeypatch):
         segment._validate_deepep_graph_safe()
 
 
+@pytest.mark.parametrize("field,value,match", [
+    ("num_local_experts", 65, "at most 256 routed experts"),
+    ("num_experts_per_tok", 6, "top-k 2, 4, 8 or 16"),
+])
+def test_segment_gate_fences_shapes_the_warp_gate_cannot_route(
+        monkeypatch, field, value, match):
+    """The DeepEP gate holds a row's experts in one warp's registers; a model
+    outside that shape fails at validation, not inside a capture."""
+    segment = _validation_segment(monkeypatch)
+    setattr(segment, field, value)
+    segment.expert_start = segment.rank * segment.num_local_experts
+    monkeypatch.setattr(
+        deepep_ll, "deepep_unavailable_reason", lambda **kw: None)
+    with pytest.raises(RuntimeError, match=match):
+        segment._validate_deepep_graph_safe()
+
+
 def test_segment_gate_fences_expert_offloading(monkeypatch):
     segment = _validation_segment(monkeypatch, offloading=True)
     monkeypatch.setattr(
@@ -911,7 +948,7 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
     order = calls["order"]
     real_router = segment.router_context.router_forward
-    real_gate = glm5_moe_graph.gate_sigmoid_topk_cuda
+    real_gate = glm5_moe_graph.gate_sigmoid_topk_warp_cuda
     real_s1 = glm5_moe_graph.grouped_fp8_blockwise_fused_s1
 
     def traced_router(*a, **kw):
@@ -927,7 +964,7 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
         return real_s1(*a, **kw)
 
     segment.router_context.router_forward = traced_router
-    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_cuda", traced_gate)
+    monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_warp_cuda", traced_gate)
     monkeypatch.setattr(
         glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", traced_s1)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
