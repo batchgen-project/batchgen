@@ -1323,3 +1323,23 @@ def test_a_barrier_on_a_closed_coordinator_fails_at_once_not_at_the_deadline():
         node0.barrier(1, PHASE_ARMED, time.time() + 30)
 
     assert time.monotonic() - started < 1.0
+
+
+def test_a_shutdown_does_not_wait_out_an_open_restart_request():
+    """uvicorn's graceful shutdown waits for open requests before the lifespan
+    shutdown runs WorkerManager.stop(); an open POST /v1/workers/restart would
+    defer every SIGTERM until the restart itself ended."""
+    tree = _http_tree()
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "uvicorn.run"
+    ]
+    assert len(calls) == 1
+    keywords = {kw.arg: kw.value for kw in calls[0].keywords}
+    assert "timeout_graceful_shutdown" in keywords
+    constant = next(
+        node.value.value for node in tree.body
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == ast.unparse(keywords["timeout_graceful_shutdown"])
+    )
+    assert 0 < constant <= 30

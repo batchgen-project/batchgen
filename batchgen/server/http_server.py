@@ -56,6 +56,11 @@ from batchgen.server.worker_manager import WorkerExitState, WorkerManager
 
 logger = logging.getLogger(__name__)
 
+# How long a shutdown waits for open requests before cancelling them. Every
+# request but a worker restart is short; a restart is cancelled here and
+# aborted by WorkerManager.stop() at its next phase boundary.
+_GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
+
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
 QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /v1/models|^GET /health$")
@@ -711,6 +716,12 @@ def launch_server(server_args: ServerArgs) -> None:
             log_level="info",
             access_log=False,  # Use custom QuietAccessLogMiddleware instead
             timeout_keep_alive=1000,
+            # Without a bound uvicorn waits for every open request before the
+            # lifespan shutdown runs, and POST /v1/workers/restart stays open
+            # for the whole restart: a SIGTERM would wait out the restart
+            # timeout before WorkerManager.stop() could tell the restart peers
+            # and tear the cohort down.
+            timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
             loop="uvloop",
         )
     except KeyboardInterrupt:
