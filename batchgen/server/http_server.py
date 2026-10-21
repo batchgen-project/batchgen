@@ -61,6 +61,32 @@ logger = logging.getLogger(__name__)
 # aborted by WorkerManager.stop() at its next phase boundary.
 _GRACEFUL_SHUTDOWN_TIMEOUT_S = 5
 
+# Routes that read or change batch state. Only global rank 0, which runs on node
+# 0, reads the request queue, so a batch accepted by any other node's server is
+# stored and then never run.
+_COORDINATOR_ONLY_PREFIXES = ("/v1/files", "/v1/batches")
+
+
+def coordinator_only_rejection(
+    node_rank: int, path: str
+) -> Optional[JSONResponse]:
+    """The 409 a node other than node 0 answers for a batch-state route."""
+    if node_rank == 0:
+        return None
+    if not any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in _COORDINATOR_ONLY_PREFIXES
+    ):
+        return None
+    return JSONResponse(
+        status_code=409,
+        content={"detail": {
+            "message": "batches and files are served by node 0; send them there",
+            "coordinator_node": 0,
+        }},
+    )
+
+
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
 QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /v1/models|^GET /health$")
@@ -149,15 +175,22 @@ def create_app(
         # A previous server process may have died with batches still active in
         # the shared storage; fail them now so their input files are reusable.
         storage = StorageManager(server_args.storage_path)
-        # Exclusive cross-process ownership first: recovery must never fail
-        # batches that belong to a live server sharing this path.
-        storage.acquire_storage_ownership()
-        orphaned = storage.fail_orphaned_batches()
-        if orphaned:
-            logger.warning(
-                "Failed %d batch(es) left active by a previous server process: %s",
-                len(orphaned), orphaned,
-            )
+        # Only node 0 owns batch state: every other node refuses the batch
+        # routes, so it never writes a batch. Its recovery sweep would instead
+        # fail node 0's live batches whenever the nodes share a storage path,
+        # and the ownership flock does not exclude across nodes on a network
+        # filesystem.
+        if server_args.node_rank == 0:
+            # Exclusive cross-process ownership first: recovery must never
+            # fail batches that belong to a live server sharing this path.
+            storage.acquire_storage_ownership()
+            orphaned = storage.fail_orphaned_batches()
+            if orphaned:
+                logger.warning(
+                    "Failed %d batch(es) left active by a previous server "
+                    "process: %s",
+                    len(orphaned), orphaned,
+                )
         worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
         app.state.server_args = server_args
         app.state.worker = worker
@@ -240,6 +273,16 @@ def create_app(
 
     # Add custom access logging middleware (replaces uvicorn's default)
     app.add_middleware(QuietAccessLogMiddleware)
+
+    if server_args.node_rank > 0:
+        @app.middleware("http")
+        async def refuse_batch_routes_off_node_zero(request: Request, call_next):
+            rejection = coordinator_only_rejection(
+                server_args.node_rank, request.url.path
+            )
+            if rejection is not None:
+                return rejection
+            return await call_next(request)
 
     # ==================== Model Endpoints ====================
 
