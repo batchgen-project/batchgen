@@ -26,15 +26,37 @@ run over RDMA, so the same **IB-enabled UCX** prerequisite applies — see the U
 §6 of that guide (the `libucx-cu12` wheel is CUDA/TCP-only; build one with the InfiniBand
 transport and set `UCX_IB_GID_INDEX` / `NCCL_IB_GID_INDEX` for a routed RoCE fabric).
 
+If you load that UCX build ahead of the wheel (for example with `LD_PRELOAD` of its
+`libucm`/`libucs`/`libuct`/`libucp`) instead of replacing the wheel's libraries, also put its
+`lib/` directory on `LD_LIBRARY_PATH` and set `RAPIDS_LIBUCX_PREFER_SYSTEM_LIBRARY=true`. The
+wheel's `libucx.load_library()`, which a dependency calls at import, otherwise opens the
+wheel's own `libucs.so` by path and puts a **second** UCX in the process; the daemon then
+crashes with a segmentation fault inside `ucp_init` (no Python traceback). On a RoCE fabric
+whose routes live in policy-routing tables, also set `UCX_IB_ROCE_REACHABILITY_MODE=all`, or
+UCX finds no route to the peer GIDs and the daemon fails with `ucp_ep_create: Destination is
+unreachable`.
+
+Pick `--listen-port`, the `--dist-init-addr` port and the store's `--base-port` (the
+daemon listens on `base_port + node_rank * 8 + rail`) **below** the nodes'
+`net.ipv4.ip_local_port_range`, or add them to `ip_local_reserved_ports`. Any outbound
+connection can otherwise hold one of them as its ephemeral source port, and the launch fails
+with `Listen port ... is not available` or `bind ...: Address already in use`.
+
 ## 2. Prepare the Distributed-Weight Store
 
 The replicated parameter server does not fit H20's smaller host/GPU budget, so the 4-node
 path uses the **compact per-node distributed-weight store** (`--distributed-weight-config`).
 Each node maps only its own shard. Generate one `node{rank}.json` per node (ranks 0–3) on
 shared storage; each declares its `store_path`, `store_bytes`, the peer node IPs, and the
-RDMA rail devices. Stage each node's store on a local **tmpfs** (`/dev/shm`, remounted large
-enough) so the store mmap is transparent-hugepage-backed and NIC memory-key registration
-does not read over the network — the same reasoning as the H200 guide's tmpfs note.
+RDMA rail devices (`--rail-devices`; the default names the H200 rails, so pass this
+fabric's RDMA device names). Write the store to **persistent storage** (local disk or shared
+storage): it is built once per checkpoint and node layout and is never deleted by the server.
+At start each server copies its node's store into a tmpfs directory it owns (default
+`/dev/shm/batchgen-weight-stores`, mounted `huge=within_size` so the copy is
+transparent-hugepage-backed for NIC memory registration), verifying every segment as it
+copies; `--store-residency resident` keeps that copy for the next start. See the
+"Staged copy and its lifetime" note in the [H200 guide](deploy-kimi-k3-h200.md). Do not copy
+the store into `/dev/shm` by hand.
 
 On **all four** nodes, before launch, lower the kernel memory watermark (fleet images that
 ship `vm.watermark_scale_factor=1000` reserve a large high-watermark that starves the
