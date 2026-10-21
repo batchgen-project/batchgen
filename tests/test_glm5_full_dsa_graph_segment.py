@@ -617,10 +617,15 @@ def _patch_full_dsa_dependencies(
         out.copy_(q_a_normed[:, :1].expand_as(out) + 0.25)
         return out
 
-    def fake_rope_hadamard_q(q_flat, cos, sin, positions, out):
+    def fake_rope_hadamard_q(q_flat, cos, sin, positions, out, out_fp8=None):
         del cos, sin, positions
         calls["scoring"].append("rope_hadamard_q_out")
         out.copy_(q_flat + 0.03125)
+        if out_fp8 is not None:
+            # The real epilogue also emits the saturating e4m3 copy of `out`.
+            out_fp8.view(out.shape).copy_(
+                out.clamp(min=-448.0, max=448.0).to(torch.float8_e4m3fn)
+            )
         return out
 
     def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):

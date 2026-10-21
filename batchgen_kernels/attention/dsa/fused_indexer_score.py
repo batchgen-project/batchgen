@@ -853,11 +853,19 @@ def rope_hadamard_q_out(
     sin_table: torch.Tensor,
     positions_expanded: torch.Tensor,
     out: torch.Tensor,
+    out_fp8: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """Out-buffer CUDA RoPE + Hadamard for graph capture.
 
     ``positions_expanded`` must already have shape ``[B * n_heads]`` to avoid
     allocating inside the captured segment.
+
+    ``out_fp8``, when given, receives the saturating e4m3 copy of ``out`` from
+    the same kernel epilogue. The scorer reads q as plain e4m3 with no scale
+    channel, so the epilogue needs no extra state: it clamps to the finite
+    e4m3 range (+/-448, exact in bf16) and casts round-to-nearest-even, which
+    is byte for byte what the ``clamp`` + ``copy_`` ATen pair produced. Passing
+    it lets ``paged_mqa_score_and_topk_out`` skip both of those launches.
     """
     B, n_heads, head_dim = q.shape
     if head_dim != 128:
@@ -871,6 +879,16 @@ def rope_hadamard_q_out(
             f"positions_expanded must be int64 with shape {(B * n_heads,)}, "
             f"got {positions_expanded.shape} {positions_expanded.dtype}"
         )
+    if out_fp8 is not None:
+        if out_fp8.dtype != torch.float8_e4m3fn:
+            raise TypeError(f"out_fp8 must be float8_e4m3fn, got {out_fp8.dtype}")
+        if out_fp8.numel() != q.numel():
+            raise ValueError(
+                f"out_fp8 must hold {q.numel()} elements to mirror q, "
+                f"got {out_fp8.numel()}"
+            )
+        if not out_fp8.is_contiguous():
+            raise ValueError("out_fp8 must be contiguous")
     return _cuda_fused_rope_hadamard_out(
         q.reshape(B * n_heads, head_dim),
         cos_table,
@@ -878,6 +896,7 @@ def rope_hadamard_q_out(
         positions_expanded,
         out.reshape(B * n_heads, head_dim),
         128 ** -0.5,
+        out_fp8,
     )
 
 

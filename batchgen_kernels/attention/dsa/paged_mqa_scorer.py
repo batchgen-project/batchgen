@@ -445,6 +445,7 @@ def paged_mqa_score_and_topk_prepared_out(
     index_head_dim: int,
     page_size: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
+    q_prequantized: bool = False,
 ) -> torch.Tensor:
     """The PER-LAYER half: this layer's ``q`` cast, logits and top-k.
 
@@ -456,6 +457,12 @@ def paged_mqa_score_and_topk_prepared_out(
     ``context_lens`` is the TRUE per-row lengths and bounds the top-k;
     ``deep_gemm_context_lens`` is the guarded copy and is the only form
     DeepGEMM is handed.
+
+    ``q_prequantized`` says ``q_fp8`` was already filled by the producer of
+    ``q`` -- the RoPE+Hadamard epilogue writes the same saturating e4m3 bytes
+    this function would otherwise spend a ``clamp`` and a bf16 -> e4m3 ``copy_``
+    launch on. ``q`` is still required and still shape-checked, so the plan and
+    every downstream contract stay derived from it.
     """
 
     plan = plan_paged_mqa_logits(
@@ -509,9 +516,10 @@ def paged_mqa_score_and_topk_prepared_out(
             "paged_mqa_logits_schedule_meta) from THESE guarded lengths"
         )
 
-    q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(
-        saturate_q_to_e4m3_range(q)
-    )
+    if not q_prequantized:
+        q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(
+            saturate_q_to_e4m3_range(q)
+        )
     logits = deep_gemm_paged_mqa_logits(
         q_fp8,
         aux_blocked_k,
@@ -543,6 +551,7 @@ def paged_mqa_score_and_topk_out(
     index_head_dim: int,
     page_size: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
+    q_prequantized: bool = False,
 ) -> torch.Tensor:
     """Graph-capturable scorer: every buffer read across steps is the caller's.
 
@@ -585,6 +594,7 @@ def paged_mqa_score_and_topk_out(
         index_head_dim=index_head_dim,
         page_size=page_size,
         num_valid_tokens=num_valid_tokens,
+        q_prequantized=q_prequantized,
     )
 
 

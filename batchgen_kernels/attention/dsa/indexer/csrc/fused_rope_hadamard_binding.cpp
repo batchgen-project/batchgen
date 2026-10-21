@@ -7,11 +7,14 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <optional>
+
 // Forward declaration (defined in fused_rope_hadamard.cu)
 struct FusedRopeHadamardParams {
     using index_t = int64_t;
     void *__restrict__ x_ptr;
     void *__restrict__ out_ptr;
+    void *__restrict__ out_fp8_ptr;
     const float *__restrict__ cos_ptr;
     const float *__restrict__ sin_ptr;
     const int64_t *__restrict__ pos_ptr;
@@ -71,7 +74,8 @@ void fused_rope_hadamard_out(
     at::Tensor &sin_cache,  // [max_seq, 64] float32
     at::Tensor &positions,  // [batch] int64
     at::Tensor &out,        // [batch, 128] bf16
-    float scale             // 1/sqrt(128)
+    float scale,            // 1/sqrt(128)
+    std::optional<at::Tensor> out_fp8 = std::nullopt  // [batch, 128] e4m3
 ) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16);
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::ScalarType::BFloat16);
@@ -95,6 +99,16 @@ void fused_rope_hadamard_out(
     memset(&params, 0, sizeof(params));
     params.x_ptr = x_2d.data_ptr();
     params.out_ptr = out_2d.data_ptr();
+    if (out_fp8.has_value()) {
+        const at::Tensor &q_fp8 = out_fp8.value();
+        TORCH_CHECK(q_fp8.is_cuda(), "out_fp8 must be a CUDA tensor");
+        TORCH_CHECK(q_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                    "out_fp8 must be float8_e4m3fn");
+        TORCH_CHECK(q_fp8.is_contiguous(), "out_fp8 must be contiguous");
+        TORCH_CHECK(q_fp8.numel() == x_2d.numel(),
+                    "out_fp8 must hold exactly as many elements as x");
+        params.out_fp8_ptr = q_fp8.data_ptr();
+    }
     params.cos_ptr = cos_cache.data_ptr<float>();
     params.sin_ptr = sin_cache.data_ptr<float>();
     params.pos_ptr = positions.data_ptr<int64_t>();
@@ -111,5 +125,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_rope_hadamard", &fused_rope_hadamard,
           "Fused interleaved RoPE + Hadamard transform (dim=128, bf16)");
     m.def("fused_rope_hadamard_out", &fused_rope_hadamard_out,
-          "Out-buffer fused interleaved RoPE + Hadamard transform (dim=128, bf16)");
+          "Out-buffer fused interleaved RoPE + Hadamard transform (dim=128, bf16)",
+          pybind11::arg("x"), pybind11::arg("cos_cache"), pybind11::arg("sin_cache"),
+          pybind11::arg("positions"), pybind11::arg("out"), pybind11::arg("scale"),
+          pybind11::arg("out_fp8") = std::nullopt);
 }

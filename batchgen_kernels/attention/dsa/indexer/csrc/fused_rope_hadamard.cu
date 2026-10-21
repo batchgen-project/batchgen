@@ -11,8 +11,13 @@
 #include <c10/util/BFloat16.h>
 #include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp8.h>
 
 #include "fast_hadamard_transform_common.h"
+
+// Finite maximum of e4m3. bf16 represents it exactly, so clamping a bf16 value
+// to it is lossless and the subsequent cast is always in range.
+constexpr float kQFp8Max = 448.0f;
 
 // dim=128, bf16: kNThreads=16, kNElts=8, kNChunks=1
 // log2(8)=3 thread-level stages, log2(16)=4 warp-level stages = 7 total = log2(128)
@@ -22,6 +27,7 @@ struct FusedRopeHadamardParams {
     using index_t = int64_t;
     void *__restrict__ x_ptr;       // [batch, 128] input (after LayerNorm), bf16
     void *__restrict__ out_ptr;     // [batch, 128] output, bf16
+    void *__restrict__ out_fp8_ptr; // [batch, 128] optional e4m3 output, may be null
     const float *__restrict__ cos_ptr; // [max_seq, 64] cos cache (first 32 used)
     const float *__restrict__ sin_ptr; // [max_seq, 64] sin cache (first 32 used)
     const int64_t *__restrict__ pos_ptr; // [batch] position indices
@@ -29,6 +35,75 @@ struct FusedRopeHadamardParams {
     int cos_stride;     // stride of cos dim-0 (= 64)
     float scale;        // 1/sqrt(128)
 };
+
+// Saturating bf16 -> e4m3 cast that reproduces, byte for byte, the two ATen
+// launches the Q scorer used to make: ``Tensor.clamp(-448, 448)`` on the bf16
+// RoPE+Hadamard output, then ``copy_`` into a float8_e4m3fn tensor.
+//
+//   * finite inputs: the clamp pins |v| <= 448, so the cast is strictly in
+//     range and both torch's ``fp8e4m3fn_from_fp32_value`` and SATFINITE round
+//     to nearest even on the same value -> identical byte.
+//   * +/-Inf and huge magnitudes: the clamp maps them to +/-448 first, which is
+//     exactly representable, so neither path can reach torch's out-of-range
+//     NaN encoding.
+//   * NaN: ATen's clamp passes NaN through untouched (it special-cases NaN
+//     rather than using min/max), and torch's cast then emits
+//     ``sign | 0x7f``. SATFINITE drops the sign on a NaN, so the sign bit is
+//     reattached here instead of relying on the hardware convert.
+//
+// There is no Q scale channel to apply: fp8_paged_mqa_logits reads q as plain
+// e4m3 (the per-token fp32 scales in the paged cache cover K only).
+__device__ __forceinline__ uint8_t clamped_bf16_to_e4m3(float v) {
+    if (v != v) {
+        return static_cast<uint8_t>(((__float_as_uint(v) >> 24) & 0x80u) | 0x7fu);
+    }
+    v = fminf(fmaxf(v, -kQFp8Max), kQFp8Max);
+    return static_cast<uint8_t>(__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
+}
+
+// bf16 store identical to ``store_output``, plus the optional e4m3 store. The
+// e4m3 value is derived from the ROUNDED bf16 result, not from the fp32
+// accumulator, because the ATen pair it replaces read the bf16 output tensor.
+template <int kNChunks, int kNElts>
+inline __device__ void store_output_bf16_and_e4m3(
+    at::BFloat16 *out,
+    uint8_t *out_fp8,
+    float out_vals[kNChunks][kNElts],
+    int dim,
+    float scale
+) {
+    using vec_t = typename BytesToType<sizeof(at::BFloat16) * kNElts>::Type;
+    using fp8_vec_t = typename BytesToType<sizeof(uint8_t) * kNElts>::Type;
+    at::BFloat16 out_vals_store[kNChunks][kNElts];
+    #pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+        #pragma unroll
+        for (int i = 0; i < kNElts; ++i) { out_vals_store[c][i] = out_vals[c][i] * scale; }
+    }
+    #pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+        if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+            reinterpret_cast<vec_t *>(out)[c * blockDim.x + threadIdx.x] =
+                reinterpret_cast<const vec_t *>(out_vals_store)[c];
+        }
+    }
+    if (out_fp8 == nullptr) { return; }
+    uint8_t fp8_store[kNChunks][kNElts];
+    #pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+        #pragma unroll
+        for (int i = 0; i < kNElts; ++i) {
+            fp8_store[c][i] = clamped_bf16_to_e4m3(float(out_vals_store[c][i]));
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+        if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+            reinterpret_cast<fp8_vec_t *>(out_fp8)[c * blockDim.x + threadIdx.x] =
+                reinterpret_cast<const fp8_vec_t *>(fp8_store)[c];
+        }
+    }
+}
 
 __global__ __launch_bounds__(16)
 void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
@@ -42,6 +117,9 @@ void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
     const int batch_id = blockIdx.x;
     input_t *x = reinterpret_cast<input_t *>(params.x_ptr) + batch_id * 128;
     input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * 128;
+    uint8_t *out_fp8 = params.out_fp8_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<uint8_t *>(params.out_fp8_ptr) + batch_id * 128;
     const int tid = threadIdx.x;
 
     // 1. Load 8 bf16 elements -> float
@@ -71,8 +149,8 @@ void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
     hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
     // kNWarps=1, kNChunks=1: no smem exchange, no transposed stage
 
-    // 4. Scale and store
-    store_output<kNChunks, kNElts, input_t>(out, x_vals, 128, params.scale);
+    // 4. Scale and store (bf16, plus the saturating e4m3 copy when requested)
+    store_output_bf16_and_e4m3<kNChunks, kNElts>(out, out_fp8, x_vals, 128, params.scale);
 }
 
 void fused_rope_hadamard_launch(FusedRopeHadamardParams &params, cudaStream_t stream) {

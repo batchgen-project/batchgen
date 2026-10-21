@@ -820,6 +820,7 @@ class Glm5DsaAttnSegment:
                 index_head_dim=self.index_head_dim,
                 page_size=self.aux_page_size,
                 num_valid_tokens=num_valid_tokens,
+                q_prequantized=True,
             )
         return fused_paged_score_and_topk_with_slots_out(
             buffers.q_index,
@@ -909,6 +910,7 @@ class Glm5DsaAttnSegment:
             self.sin_table,
             positions_expanded.view(-1),
             buffers.q_index,
+            out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
         )
         self._score_and_topk(
             buffers,
@@ -1146,6 +1148,7 @@ class Glm5FullDsaAttnSegment:
                 index_head_dim=self.attn.indexer.index_head_dim,
                 page_size=self.aux_page_size,
                 num_valid_tokens=num_valid_tokens,
+                q_prequantized=True,
             )
         return fused_paged_score_and_topk_with_slots_out(
             buffers.q_index,
@@ -1984,6 +1987,7 @@ class Glm5FullDsaAttnSegment:
                 self.sin_table,
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
+                out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
             )
             # JOIN (scoring graphs). The scorer is the first main-stream
             # reader of the K path's writes: it scores the aux cache, whose
