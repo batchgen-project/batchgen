@@ -9,8 +9,11 @@ graph segment captures. Contract under test:
 * the uniform-stride segment table replaces the device-written ragged one, and
   the GEMMs' live row counts come from DeepEP's ``recv_count``;
 * the FP8 cast is folded into the dispatch, and the per-expert column-major
-  scale blocks are repacked into the single ``[hidden/128, rows]`` tensor the
-  GEMM requires, element for element;
+  scale blocks reach the masked GEMM as delivered — the MN-major form it loads
+  needs no repack, so this path has no scale-preparation launch at all;
+* the routed chain is DeepGEMM's masked m-grouped GEMMs on pool buffers: R1
+  gate, R1 up, the masked activation, R2, all four driven by ``recv_count`` on
+  the device and by a host-constant ``expected_m``;
 * the LL combine applies the top-k weights and writes this rank's rows, so
   ``reduce_weighted_scatter`` and the NCCL pair never run;
 * the router kernel dispatch is resolved on the row count THIS path routes —
@@ -36,12 +39,17 @@ import torch
 
 import batchgen.moe.deepep_ll as deepep_ll
 import batchgen.models.glm.glm5.moe_cuda_graph_segments as glm5_moe_graph
+import batchgen.models.glm.glm5.moe_deepgemm_masked as dg_masked
 import torch.distributed as dist
 from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
     Glm5MoEGraphBufferPool,
     Glm5MoEGraphSegment,
 )
-from batchgen.moe.grouped_fp8_blockwise_moe import grouped_fp8_tile_m
+from batchgen.models.glm.glm5.moe_deepgemm_masked import (
+    DeepGemmMaskedExpertWeights,
+    expected_m_per_expert,
+    is_mn_major_tma_aligned,
+)
 
 H = 256          # hidden (multiple of 128 for the scale blocks)
 N_INTER = 128
@@ -59,6 +67,19 @@ class _FakeGroup:
 
     def size(self):
         return self._size
+
+
+def _masked_weights(e=E_LOCAL, h=H, i=N_INTER):
+    """The routed stacks in the masked GEMM's ``nt`` layout, as loaded."""
+    fp8 = torch.float8_e4m3fn
+    return DeepGemmMaskedExpertWeights(
+        gate_w=torch.zeros(e, i, h, dtype=torch.uint8).view(fp8),
+        gate_scale=torch.ones(e, i // 128, h // 128),
+        up_w=torch.zeros(e, i, h, dtype=torch.uint8).view(fp8),
+        up_scale=torch.ones(e, i // 128, h // 128),
+        down_w=torch.zeros(e, h, i, dtype=torch.uint8).view(fp8),
+        down_scale=torch.ones(e, h // 128, i // 128),
+    )
 
 
 class _FakeExchange:
@@ -224,10 +245,17 @@ def test_pool_allocates_the_expert_major_receive_space(monkeypatch):
     assert bufs.intermediate.shape == (ROWS, N_INTER)
     assert bufs.expert_out.shape == (ROWS, H)
     assert bufs.inter_fp8.shape == (ROWS, N_INTER)
-    # scales are the transposed [dim/128, rows] the grouped GEMM takes
-    assert bufs.ll_x_scale.shape == (H // 128, ROWS)
-    assert bufs.inter_scale.shape == (N_INTER // 128, ROWS)
-    assert bufs.ll_x_scale.is_contiguous() and bufs.inter_scale.is_contiguous()
+    # R1 writes gate into intermediate and up into ll_up_out
+    assert bufs.ll_up_out.shape == (ROWS, N_INTER)
+    # the down-projection A-scales are the masked GEMM's MN-major form: a
+    # contiguous [E, I/128, stride] block handed over as its (1, 2) transpose
+    assert bufs.ll_act_scale.shape == (E_LOCAL, STRIDE, N_INTER // 128)
+    assert bufs.ll_act_scale.stride() == (
+        STRIDE * (N_INTER // 128), 1, STRIDE)
+    assert is_mn_major_tma_aligned(bufs.ll_act_scale)
+    # the CuTe scale matrices of the NCCL path have no reader here
+    assert bufs.x_scale.shape == (H // 128, 0)
+    assert bufs.inter_scale.shape == (N_INTER // 128, 0)
     # the router runs on LOCAL rows, not the all-gathered row space
     assert bufs.router_logits.shape == (BUCKET, 256)
     # the gate writes int64 ids into ll_topk_idx; no int32 index buffer exists
@@ -262,7 +290,8 @@ def test_receive_space_is_bucket_independent(monkeypatch):
         assert pool.ll_stride == stride
         assert bufs.capacity == E_LOCAL * stride
         assert bufs.expert_out.shape == (E_LOCAL * stride, H)
-        assert bufs.ll_x_scale.shape == (H // 128, E_LOCAL * stride)
+        assert bufs.ll_up_out.shape == (E_LOCAL * stride, N_INTER)
+        assert bufs.ll_act_scale.shape == (E_LOCAL, stride, N_INTER // 128)
         # only the per-rank row space follows the bucket
         assert bufs.padded.shape == (bucket, H)
         assert bufs.ll_topk_idx.shape == (bucket, TOPK)
@@ -417,9 +446,10 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
         layer_idx=5,
         fp8_gate_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
         fp8_up_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
-        fp8_gate_ws3d=torch.zeros(1), fp8_up_ws3d=torch.zeros(1),
+        fp8_gate_ws3d=torch.ones(E_LOCAL, N_INTER // 128, H // 128),
+        fp8_up_ws3d=torch.ones(E_LOCAL, N_INTER // 128, H // 128),
         fp8_down_w3d=torch.zeros(E_LOCAL, H, N_INTER, dtype=torch.uint8),
-        fp8_down_ws3d=torch.zeros(1),
+        fp8_down_ws3d=torch.ones(E_LOCAL, H // 128, N_INTER // 128),
         shared_expert_forward=fake_shared_expert,
     )
 
@@ -460,55 +490,41 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
         topk_weights[live:] = 0.0
         return topk_indices, topk_weights
 
+    segment.masked_weights = _masked_weights()
+
     calls = {}
     # Launch order of the routed chain's local kernels (the exchange/overlap
     # order above is asserted separately and stays free of these).
     chain = []
+    # Every masked GEMM call, in call order, with the operands it was handed.
+    gemms = []
+    act = {}
 
-    def fake_prepare(s1_x, s1_output, s3_x, s3_output, seqlens, cu_seqlens,
-                     avg, *, s1_tma_desc, s3_tma_desc, tiles, cu_tiles):
-        chain.append("prepare")
-        plan = SimpleNamespace(
-            tile_m=grouped_fp8_tile_m(avg), s1_tma_desc=s1_tma_desc,
-            s3_tma_desc=s3_tma_desc, tiles=tiles, cu_tiles=cu_tiles)
-        calls["prepare"] = dict(
-            s1_x=s1_x, s1_output=s1_output, s3_x=s3_x, s3_output=s3_output,
-            seqlens=seqlens, cu_seqlens=cu_seqlens, avg=avg, plan=plan)
-        return plan
+    def fake_masked_gemm(a, b, d, masked_m, expected_m):
+        """Stands in for ``deep_gemm.fp8_m_grouped_gemm_nt_masked``.
 
-    def fake_repack(recv_scales, recv_count, out, span_align):
-        """The kernel's contract on CPU: per expert, copy exactly the
-        span_align-rounded live columns of DeepEP's block; leave the rest."""
-        chain.append("repack")
-        calls["repack"] = dict(recv_scales=recv_scales, recv_count=recv_count,
-                               out=out, span_align=span_align)
-        e_, s_, kb_ = recv_scales.shape
-        blocks = recv_scales.transpose(1, 2)        # [e, kb, s] contiguous
-        for i in range(e_):
-            rc = int(recv_count[i])
-            span = -(-rc // span_align) * span_align
-            out[:, i * s_:i * s_ + span] = blocks[i, :, :span]
+        Records the full operand tuple so the call contract (A / A-scale /
+        B / B-scale / D extents, the device row counts and the host
+        ``expected_m``) is pinned here rather than only on the node. The R2
+        call makes the experts the identity so the combine's arithmetic stays
+        checkable: it hands back the rows the dispatch delivered.
+        """
+        x, x_scales = a
+        w, w_scale = b
+        label = "r2" if w.shape[1] == H else (
+            "r1_gate" if not gemms else "r1_up")
+        chain.append(label)
+        gemms.append(dict(label=label, x=x, x_scales=x_scales, w=w,
+                          w_scale=w_scale, out=d, masked_m=masked_m,
+                          expected_m=expected_m))
+        if label == "r2":
+            d.copy_(gemms[0]["x"].to(torch.bfloat16))
+        return None
 
-    def fake_s1(x_fp8, x_scale, gate_w, up_w, gate_ws, up_ws, seqlens,
-                cu_seqlens, avg, output=None, tma_plan=None):
-        chain.append("s1")
-        calls["s1"] = dict(x_fp8=x_fp8, x_scale=x_scale, seqlens=seqlens,
-                           cu_seqlens=cu_seqlens, avg=avg, output=output,
-                           tma_plan=tma_plan)
-        return output
-
-    def fake_quant(x, seqlens, cu_seqlens, out, scale):
-        chain.append("quant")
-        calls["quant"] = dict(x=x, seqlens=seqlens, cu_seqlens=cu_seqlens)
-
-    def fake_s3(x_fp8, x_scale, down_w, down_ws, seqlens, cu_seqlens, avg,
-                output=None, tma_plan=None):
-        chain.append("s3")
-        calls["s3"] = dict(x_fp8=x_fp8, seqlens=seqlens, cu_seqlens=cu_seqlens,
-                           avg=avg, output=output, tma_plan=tma_plan)
-        # identity experts: hand back the rows the dispatch delivered
-        output.copy_(calls["s1"]["x_fp8"].to(torch.bfloat16))
-        return output
+    def fake_act(gate, up, out, out_scale, masked_m, *, group_size=128):
+        chain.append("act")
+        act.update(dict(gate=gate, up=up, out=out, out_scale=out_scale,
+                        masked_m=masked_m, group_size=group_size))
 
     def refuse(*a, **kw):
         raise AssertionError(
@@ -517,19 +533,21 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
     monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_warp_cuda", fake_gate)
     # the DeepEP path routes with the one-warp-per-row gate only
     monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_cuda", refuse)
+    monkeypatch.setattr(dg_masked, "masked_gemm_fn", lambda: fake_masked_gemm)
+    monkeypatch.setattr(dg_masked, "masked_act_quant_fn", lambda: fake_act)
+    # the CuTe pair and the ragged staging kernels belong to the other paths
     monkeypatch.setattr(
-        glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", fake_s1)
-    monkeypatch.setattr(glm5_moe_graph, "grouped_fp8_blockwise_s3", fake_s3)
-    monkeypatch.setattr(glm5_moe_graph, "act_quant_ragged", fake_quant)
-    monkeypatch.setattr(
-        glm5_moe_graph, "prepare_grouped_fp8_s1_s3_tma", fake_prepare)
-    monkeypatch.setattr(glm5_moe_graph, "deepep_ll_scale_repack", fake_repack)
+        glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", refuse)
+    monkeypatch.setattr(glm5_moe_graph, "grouped_fp8_blockwise_s3", refuse)
+    monkeypatch.setattr(glm5_moe_graph, "act_quant_ragged", refuse)
     monkeypatch.setattr(glm5_moe_graph, "dispatch_scatter_ragged", refuse)
     monkeypatch.setattr(glm5_moe_graph, "reduce_weighted_scatter", refuse)
 
     calls["router"] = router_calls
     calls["order"] = order
     calls["chain"] = chain
+    calls["gemms"] = gemms
+    calls["act"] = act
     calls["overlap"] = overlap
     rank_counts = torch.full((WORLD,), bucket, dtype=torch.int64)
     rank_counts[rank] = valid
@@ -551,58 +569,91 @@ def test_forward_runs_the_exchange_and_skips_the_nccl_pair(monkeypatch):
                                   dtype=torch.int64))
     assert torch.all(bufs.ll_topk_idx[valid:] == -1)
 
-    # both GEMMs are driven by DeepEP's recv_count on the uniform table
-    for stage in ("s1", "s3", "quant"):
-        assert calls[stage]["cu_seqlens"] is bufs.ll_cu_seqlens
-        assert calls[stage]["seqlens"].tolist() == [valid, valid]
-    assert calls["s1"]["x_fp8"].shape == (ROWS, H)
-    assert calls["s1"]["x_scale"] is bufs.ll_x_scale
-    assert calls["s1"]["output"] is bufs.intermediate
-    assert calls["s3"]["output"] is bufs.expert_out
+    # every masked launch, and the activation, is driven by DeepEP's own
+    # recv_count tensor -- there is no second row-count buffer on this path
+    counts = [g["masked_m"] for g in calls["gemms"]] + [calls["act"]["masked_m"]]
+    assert all(c is counts[0] for c in counts)
+    assert counts[0].tolist() == [valid, valid]
+    assert counts[0].dtype == torch.int32
+    # the dispatch's rows reach R1 as delivered: expert-major, uniform stride
+    assert calls["gemms"][0]["x"].shape == (E_LOCAL, STRIDE, H)
+    assert calls["gemms"][0]["x"].dtype == torch.float8_e4m3fn
+    # and the three outputs are the pool's buffers, viewed expert-major
+    assert (calls["gemms"][0]["out"].data_ptr()
+            == bufs.intermediate.data_ptr())
+    assert calls["gemms"][1]["out"].data_ptr() == bufs.ll_up_out.data_ptr()
+    assert calls["gemms"][2]["out"].data_ptr() == bufs.expert_out.data_ptr()
 
 
-def test_one_prepare_launch_serves_both_grouped_gemms(monkeypatch):
-    """U1: the S1 and S3 descriptor/tile preparation is ONE launch per layer,
-    issued before either GEMM, for exactly the buffers, counts, segment table
-    and TileM hint both GEMMs then run with; both consume the same plan."""
+def test_the_routed_chain_is_four_masked_launches(monkeypatch):
+    """The routed layer is R1 gate, R1 up, the masked activation, R2 -- and
+    nothing else. No descriptor preparation and no scale repack: the two
+    launches the CuTe pair needed are gone, and the two masked A-scale
+    operands are the dispatch's own layout and the activation's own output.
+
+    The gate and up projections take a launch each because the routed stacks
+    stay per-projection; both read the SAME A operand.
+    """
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
     segment.forward(padded=padded, rank_token_counts=rank_counts)
 
-    assert calls["chain"] == ["prepare", "repack", "s1", "quant", "s3"]
-    prep = calls["prepare"]
-    plan = prep["plan"]
-    assert calls["s1"]["tma_plan"] is plan and calls["s3"]["tma_plan"] is plan
-    # the plan describes the very tensors each GEMM is handed
-    assert prep["s1_x"].data_ptr() == calls["s1"]["x_fp8"].data_ptr()
-    assert prep["s1_output"] is calls["s1"]["output"] is bufs.intermediate
-    assert prep["s3_x"].data_ptr() == calls["s3"]["x_fp8"].data_ptr()
-    assert prep["s3_x"].data_ptr() == bufs.inter_fp8.data_ptr()
-    assert prep["s3_output"] is calls["s3"]["output"] is bufs.expert_out
-    for stage in ("s1", "s3"):
-        assert calls[stage]["seqlens"] is prep["seqlens"]
-        assert calls[stage]["cu_seqlens"] is prep["cu_seqlens"]
-        assert calls[stage]["avg"] == prep["avg"]
-    # into the pool's one descriptor/tile set, never a per-call allocation
-    assert plan.s1_tma_desc is bufs.ll_s1_tma and plan.s3_tma_desc is bufs.ll_s3_tma
-    assert plan.tiles is bufs.ll_tiles and plan.cu_tiles is bufs.ll_cu_tiles
+    assert calls["chain"] == ["r1_gate", "r1_up", "act", "r2"]
+    gate, up, down = calls["gemms"]
+    assert gate["x"] is up["x"] and gate["x_scales"] is up["x_scales"]
+    # B operands are the layer's own stacks, in [E, N, K] / [E, N/128, K/128]
+    w = segment.masked_weights
+    assert gate["w"] is w.gate_w and gate["w_scale"] is w.gate_scale
+    assert up["w"] is w.up_w and up["w_scale"] is w.up_scale
+    assert down["w"] is w.down_w and down["w_scale"] is w.down_scale
+    assert gate["w"].shape == (E_LOCAL, N_INTER, H)
+    assert down["w"].shape == (E_LOCAL, H, N_INTER)
+    # the activation reads both halves of R1 and writes R2's A operand
+    act = calls["act"]
+    assert act["gate"] is gate["out"] and act["up"] is up["out"]
+    assert act["out"].data_ptr() == bufs.inter_fp8.data_ptr()
+    assert act["out"].dtype == torch.float8_e4m3fn
+    assert act["out_scale"] is bufs.ll_act_scale
+    assert act["group_size"] == 128
+    assert down["x"] is act["out"] and down["x_scales"] is act["out_scale"]
 
 
-def test_the_descriptor_buffers_are_pool_owned_and_layer_shared(monkeypatch):
+def test_expected_m_is_a_host_constant_per_bucket(monkeypatch):
+    """``expected_m`` is the masked kernel's row-count hint: the mean routed
+    rows per GLOBAL expert at this bucket. It must be a host int (a captured
+    constant), the same for all three masked launches of the layer, and it
+    must follow the bucket."""
+    for bucket in (BUCKET, 2 * BUCKET):
+        segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+            monkeypatch, bucket=bucket)
+        padded = torch.ones(bucket, H, dtype=torch.bfloat16)
+        segment.forward(padded=padded, rank_token_counts=rank_counts)
+        want = expected_m_per_expert(
+            local_rows=bucket, world_size=WORLD, topk=TOPK,
+            num_experts_global=WORLD * E_LOCAL)
+        seen = [g["expected_m"] for g in calls["gemms"]]
+        assert seen == [want, want, want]
+        assert all(type(v) is int for v in seen)
+    # the formula itself: (rows * ranks * topk + E) // E, rounded up
+    assert expected_m_per_expert(
+        local_rows=64, world_size=8, topk=8, num_experts_global=256) == 17
+
+
+def test_the_chain_buffers_are_pool_owned_and_layer_shared(monkeypatch):
     pool = _make_pool(monkeypatch, buckets=(4, 8, 16))
     pool.setup()
+    stride = 4 * 16
     for name, shape, dtype in (
-            ("ll_s1_tma", (2 * E_LOCAL, 128), torch.uint8),
-            ("ll_s3_tma", (2 * E_LOCAL, 128), torch.uint8),
-            ("ll_tiles", (E_LOCAL,), torch.int32),
-            ("ll_cu_tiles", (E_LOCAL + 1,), torch.int32)):
+            ("ll_up_out", (E_LOCAL * stride, N_INTER), torch.bfloat16),
+            ("ll_act_scale", (E_LOCAL, stride, N_INTER // 128),
+             torch.float32)):
         base = pool._base[name]
         assert tuple(base.shape) == shape and base.dtype == dtype, name
         for bucket in (4, 8, 16):
             assert getattr(pool.get(bucket), name) is base, (name, bucket)
     nccl = _make_pool(monkeypatch, configure=False)
     nccl.setup()
-    for name in ("ll_s1_tma", "ll_s3_tma", "ll_tiles", "ll_cu_tiles"):
+    for name in ("ll_up_out", "ll_act_scale"):
         assert nccl._base[name].shape[0] == 0, name
 
 
@@ -675,40 +726,39 @@ def test_the_router_dispatch_reads_the_kernel_policy_bounds(monkeypatch):
     assert select(201) is None
 
 
-def test_dispatch_scale_repack_is_elementwise_exact(monkeypatch):
-    """R1: per expert, exactly the columns of the GEMM's ceil(count / TileM)
-    row tiles are repacked from DeepEP's block, element for element; every
-    column past them keeps what the buffer held (here a sentinel)."""
+def test_dispatch_scales_reach_the_masked_gemm_unrepacked(monkeypatch):
+    """The dispatch's scales ARE the masked GEMM's A-scale operand.
+
+    DeepEP allocates [e, h/128, stride] contiguous and returns its (1, 2)
+    transpose, which is exactly the MN-major, 4-float-aligned form the masked
+    kernel loads. So the segment must hand that tensor straight to R1 -- same
+    storage, same strides, no repack buffer and no preparation launch -- and
+    the same must hold for the activation's own scales.
+    """
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
-    sentinel = -7.5
-    bufs.ll_x_scale.fill_(sentinel)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
     segment.forward(padded=padded, rank_token_counts=rank_counts)
 
-    rep = calls["repack"]
-    plan = calls["prepare"]["plan"]
-    # the exchange's own view, its counts, the GEMM's buffer and TileM
-    assert rep["out"] is bufs.ll_x_scale is calls["s1"]["x_scale"]
-    assert rep["recv_count"] is calls["s1"]["seqlens"]
-    assert rep["recv_scales"].stride() == (STRIDE * (H // 128), 1, STRIDE)
-    assert rep["span_align"] == plan.tile_m == grouped_fp8_tile_m(
-        calls["s1"]["avg"])
-    span = -(-valid // plan.tile_m) * plan.tile_m
-    assert valid < span < STRIDE, "the geometry must leave columns uncopied"
-
-    # DeepEP's contiguous allocation is [e, h/128, stride]; the GEMM needs one
-    # [h/128, e * stride] tensor with expert e's columns at e * stride.
-    base = pool.deepep.scales_base
-    expected = torch.full((H // 128, ROWS), sentinel, dtype=torch.float32)
-    for e in range(E_LOCAL):
-        expected[:, e * STRIDE:e * STRIDE + span] = base[e][:, :span]
-    assert torch.equal(bufs.ll_x_scale, expected)
-    # spot-check the encoding so a transposed repack cannot pass
+    a_scales = calls["gemms"][0]["x_scales"]
+    base = pool.deepep.scales_base                   # [e, h/128, stride]
+    assert a_scales.data_ptr() == base.data_ptr()
+    assert a_scales.shape == (E_LOCAL, STRIDE, H // 128)
+    assert a_scales.stride() == (STRIDE * (H // 128), 1, STRIDE)
+    assert is_mn_major_tma_aligned(a_scales)
+    # element for element, with the (expert, row, block) encoding intact, so a
+    # transposed hand-off cannot pass
     for e in range(E_LOCAL):
         for pos in range(valid):
             for blk in range(H // 128):
-                assert bufs.ll_x_scale[blk, e * STRIDE + pos].item() == (
+                assert a_scales[e, pos, blk].item() == (
                     1000 * (e + 1) + 10 * pos + blk)
+    # the down-projection operand is the pool's MN-major block, likewise
+    assert is_mn_major_tma_aligned(calls["gemms"][2]["x_scales"])
+    assert calls["gemms"][2]["x_scales"] is bufs.ll_act_scale
+    # the repack and descriptor-prep kernels are not merely unused here: the
+    # segment module no longer binds them at all
+    assert not hasattr(glm5_moe_graph, "deepep_ll_scale_repack")
+    assert not hasattr(glm5_moe_graph, "prepare_grouped_fp8_s1_s3_tma")
 
 
 def test_combine_applies_topk_weights_on_the_owning_rank(monkeypatch):
@@ -726,21 +776,23 @@ def test_combine_applies_topk_weights_on_the_owning_rank(monkeypatch):
 
 def test_padded_rows_stay_inert(monkeypatch):
     """M-independence: rows at or beyond recv_count[e] hold whatever the last
-    step left behind. Neither GEMM writes them (both are seqlens-driven) and
-    the combine reads only the handle's live rows, so the output must not move
-    when they are poisoned."""
+    step left behind. No masked launch writes them (all three and the
+    activation are recv_count-driven) and the combine reads only the handle's
+    live rows, so the output must not move when they are poisoned."""
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
     clean = segment.forward(
         padded=padded, rank_token_counts=rank_counts)["moe_output"].clone()
 
-    # poison every row the live counts do not cover, in both GEMM outputs
+    # poison every row the live counts do not cover, in all three GEMM outputs
+    # and in the activation's scale block
     for e in range(E_LOCAL):
         lo = e * STRIDE + valid
         hi = (e + 1) * STRIDE
         bufs.expert_out[lo:hi] = -999.0
         bufs.intermediate[lo:hi] = -999.0
-        bufs.ll_x_scale[:, lo:hi] = float("nan")
+        bufs.ll_up_out[lo:hi] = -999.0
+        bufs.ll_act_scale[e, valid:] = float("nan")
     # ...and the shared-expert staging buffer, which the overlap added. It is a
     # process-lifetime buffer now rather than a tensor minted per step, so it
     # must carry no state between steps: the forked shared expert rewrites
@@ -1034,7 +1086,8 @@ def test_bucket_switch_reuses_one_receive_space(monkeypatch):
         monkeypatch, bucket=BUCKET)
     small = pool.get(BUCKET)
     assert small.expert_out.data_ptr() == pool._base["expert_out"].data_ptr()
-    assert small.ll_x_scale.data_ptr() == pool._base["ll_x_scale"].data_ptr()
+    assert small.ll_up_out.data_ptr() == pool._base["ll_up_out"].data_ptr()
+    assert small.ll_act_scale.data_ptr() == pool._base["ll_act_scale"].data_ptr()
     assert pool.deepep.max_tokens_per_rank == BUCKET
 
 
@@ -1046,7 +1099,7 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
     order = calls["order"]
     real_router = segment.router_context.router_forward
     real_gate = glm5_moe_graph.gate_sigmoid_topk_warp_cuda
-    real_s1 = glm5_moe_graph.grouped_fp8_blockwise_fused_s1
+    real_masked = dg_masked.masked_gemm_fn()
 
     def traced_router(*a, **kw):
         order.append("router_gemm")
@@ -1056,19 +1109,19 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
         order.append("topk")
         return real_gate(*a, **kw)
 
-    def traced_s1(*a, **kw):
-        order.append("s1")
-        return real_s1(*a, **kw)
+    def traced_masked(*a, **kw):
+        order.append("masked_gemm")
+        return real_masked(*a, **kw)
 
     segment.router_context.router_forward = traced_router
     monkeypatch.setattr(glm5_moe_graph, "gate_sigmoid_topk_warp_cuda", traced_gate)
-    monkeypatch.setattr(
-        glm5_moe_graph, "grouped_fp8_blockwise_fused_s1", traced_s1)
+    monkeypatch.setattr(dg_masked, "masked_gemm_fn", lambda: traced_masked)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
     segment.forward(padded=padded, rank_token_counts=rank_counts)
     assert order == [
         "router_gemm", "fork_enter", "shared_expert", "fork_exit", "topk",
-        "dispatch", "s1", "combine", "join",
+        "dispatch", "masked_gemm", "masked_gemm", "masked_gemm", "combine",
+        "join",
     ]
 
 

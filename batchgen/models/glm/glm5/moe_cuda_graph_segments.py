@@ -6,6 +6,14 @@ The GLM-5 MoE graph captures the full decode MoE module boundary:
       -> dispatch_scatter_ragged -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
       -> reduce_scatter -> local slice + shared expert
 
+With ``--enable-deepep`` the same boundary is captured over the DeepEP
+low-latency exchange instead, and the routed GEMMs are DeepGEMM's masked
+m-grouped FP8 kernels (``moe_deepgemm_masked``):
+
+    padded local tokens -> router -> rank padding mask -> LL dispatch
+      -> masked R1 gate / R1 up -> masked SiLU*up + group quant -> masked R2
+      -> LL combine + shared expert
+
 The decoder-layer residual add remains eager in the caller because it is owned
 by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
 
@@ -29,7 +37,6 @@ from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
 from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
-    prepare_grouped_fp8_s1_s3_tma,
 )
 from batchgen.moe.routing import (
     GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS,
@@ -38,11 +45,19 @@ from batchgen.moe.routing import (
     gate_sigmoid_topk_warp_cuda,
 )
 
+from .moe_deepgemm_masked import (
+    MASKED_BLOCK_M,
+    SCALE_BLOCK,
+    DeepGemmMaskedExpertWeights,
+    expected_m_per_expert,
+    masked_gemm_fn,
+    require_mn_major_tma_aligned,
+    run_deepgemm_masked_moe,
+)
 from .moe_ragged import (
     ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged,
-    deepep_ll_scale_repack,
     dispatch_scatter_ragged,
     make_quant_buffers,
     ragged_row_capacity,
@@ -211,23 +226,25 @@ class _Glm5MoEGraphBuffers:
     # DeepEP low-latency mode only (``Glm5MoEGraphBufferPool.configure_deepep``).
     # ``ll_topk_idx`` holds the int64 expert ids the exchange requires, written
     # by the gate directly (``topk_indices`` is then an empty tensor);
-    # ``ll_x_scale`` is the repacked activation scale the grouped GEMM
-    # requires; ``ll_cu_seqlens`` is the constant uniform-stride segment table.
-    # All three are empty tensors on the NCCL path.
+    # ``ll_cu_seqlens`` is the constant uniform-stride segment table, kept for
+    # the row-space identity the buffers are built on. Both are empty tensors
+    # on the NCCL path.
     ll_topk_idx: torch.Tensor
-    ll_x_scale: torch.Tensor
     ll_cu_seqlens: torch.Tensor
-    # DeepEP low-latency mode only: the per-expert X/Y TMA descriptors of the
-    # fused S1 and of the S3 GEMM ([2 * E_local, 128] bytes each) and their one
-    # shared tile table, all written by ONE prepare launch per layer
-    # (prepare_grouped_fp8_s1_s3_tma) and read by both GEMMs later on the same
-    # stream. One set for every MoE layer and bucket: layers run in stream
-    # order and each layer's S3 has read them before the next layer's prepare
-    # rewrites them. Empty on the NCCL path.
-    ll_s1_tma: torch.Tensor
-    ll_s3_tma: torch.Tensor
-    ll_tiles: torch.Tensor
-    ll_cu_tiles: torch.Tensor
+    # DeepEP low-latency mode only: the second half of the masked R1. The gate
+    # projection lands in ``intermediate`` and the up projection here, and the
+    # masked activation reads both and writes ``inter_fp8`` / ``ll_act_scale``.
+    # One pair for every MoE layer and bucket, like every other routed buffer:
+    # layers run in stream order and each layer's activation has consumed them
+    # before the next layer's R1 rewrites them. Empty on the NCCL path.
+    ll_up_out: torch.Tensor
+    # DeepEP low-latency mode only: the down projection's A-scales, in the
+    # masked GEMM's MN-major form -- shape [E_local, stride, I // 128] over a
+    # contiguous [E_local, I // 128, stride] block, which is the same form the
+    # dispatch hands back for the activation scales, so neither operand needs a
+    # preparation launch. Empty on the NCCL path, whose CuTe S3 takes the
+    # transposed ``inter_scale`` matrix instead.
+    ll_act_scale: torch.Tensor
     # DeepEP low-latency mode only: the shared expert's output, produced on the
     # side stream and consumed by the accumulate on the main stream. A pool
     # buffer rather than a side-stream temporary because the consumer is a
@@ -281,13 +298,11 @@ _MOE_SHARED_FIELDS = (
     "expert_counters",
     "cu_seqlens",
     # DeepEP mode: the receive row space is E_local * num_ranks * tokens/rank,
-    # which does not scale with the bucket, so both are bucket-independent.
-    "ll_x_scale",
+    # which does not scale with the bucket, so all of these are
+    # bucket-independent.
     "ll_cu_seqlens",
-    "ll_s1_tma",
-    "ll_s3_tma",
-    "ll_tiles",
-    "ll_cu_tiles",
+    "ll_up_out",
+    "ll_act_scale",
 )
 
 _MOE_REBUILT_FIELDS = (
@@ -442,12 +457,10 @@ class Glm5MoEGraphBufferPool:
         # DeepEP-only fields: empty on the NCCL path so the dataclass stays
         # total and every consumer fails on a shape, never on a None.
         b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
-        b["ll_x_scale"] = torch.empty(h // 128, 0, dtype=torch.float32, device=d)
         b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
-        b["ll_s1_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
-        b["ll_s3_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
-        b["ll_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
-        b["ll_cu_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_up_out"] = torch.empty(0, n, dtype=torch.bfloat16, device=d)
+        b["ll_act_scale"] = torch.empty(
+            0, 0, n // 128, dtype=torch.float32, device=d)
         # The shared expert stays on the one stream here, so it keeps writing
         # the tensor it allocates and this buffer is never read.
         b["shared_out"] = torch.empty(0, h, dtype=torch.bfloat16, device=d)
@@ -507,12 +520,18 @@ class Glm5MoEGraphBufferPool:
             num_local_experts=e,
         )
         stride = int(self.deepep.expert_stride)
+        if ROW_ALIGN % MASKED_BLOCK_M != 0:
+            raise RuntimeError(
+                f"DeepEP row alignment {ROW_ALIGN} does not cover the masked "
+                f"GEMM's m-block {MASKED_BLOCK_M}")
         if stride % ROW_ALIGN != 0:
             raise RuntimeError(
                 f"DeepEP expert stride {stride} (num_ranks "
                 f"{self.deepep.num_ranks} x {max_tokens_per_rank} tokens/rank) "
-                f"is not a multiple of {ROW_ALIGN}; the grouped FP8 GEMM "
-                "requires TileM-aligned segment starts")
+                f"is not a multiple of {ROW_ALIGN}; the masked m-grouped GEMM "
+                f"schedules {MASKED_BLOCK_M}-row blocks inside each expert's "
+                "slab and its A-scale TMA load needs a 4-float-aligned row "
+                "extent")
         rows = e * stride
         self.ll_stride = stride
 
@@ -526,7 +545,10 @@ class Glm5MoEGraphBufferPool:
         # is no int32 index buffer on this path.
         b["topk_weights"] = torch.empty(max_bucket, k, dtype=torch.float32, device=d)
         b["ll_topk_idx"] = torch.empty(max_bucket, k, dtype=torch.int64, device=d)
+        # R1 writes the gate projection into ``intermediate`` and the up
+        # projection into ``ll_up_out``; the masked activation reads both.
         b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
+        b["ll_up_out"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
         b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
         b["inter_fp8"] = torch.empty(rows, n, dtype=torch.uint8, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
@@ -544,21 +566,24 @@ class Glm5MoEGraphBufferPool:
             torch.arange(e + 1, dtype=torch.int32, device=d) * stride
         ).contiguous()
         b["cu_seqlens"] = b["ll_cu_seqlens"]
-        # Activation scales: DeepEP returns one contiguous [h/128, stride]
-        # block per local expert, the GEMM wants a single [h/128, rows]
-        # tensor, so the dispatch output is repacked into this buffer -- per
-        # expert only the columns the GEMM's tiles can load
-        # (deepep_ll_scale_repack); the rest keep whatever they held.
-        _, ll_x_scale = make_quant_buffers(rows, h, d)
-        b["ll_x_scale"] = ll_x_scale
-        # Both GEMMs' descriptors + their shared tile table, written by one
-        # prepare launch per layer (see _Glm5MoEGraphBuffers.ll_s1_tma).
-        b["ll_s1_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
-        b["ll_s3_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
-        b["ll_tiles"] = torch.empty(e, dtype=torch.int32, device=d)
-        b["ll_cu_tiles"] = torch.empty(e + 1, dtype=torch.int32, device=d)
-        _, inter_scale = make_quant_buffers(rows, n, d)
-        b["inter_scale"] = inter_scale
+        # Down-projection A-scales in the masked GEMM's MN-major form: one
+        # contiguous [E_local, n/128, stride] block, handed over as its (1, 2)
+        # transpose, which is exactly the form the dispatch returns for the
+        # activation scales. The masked activation writes it directly, so this
+        # path has NO scale-preparation launch -- neither the descriptor prep
+        # nor the bounded repack the CuTe pair required.
+        # Only the transpose is kept: it owns the contiguous block it views,
+        # and it is the tensor every reader wants.
+        b["ll_act_scale"] = torch.empty(
+            e, n // SCALE_BLOCK, stride, dtype=torch.float32, device=d
+        ).transpose(1, 2)
+        require_mn_major_tma_aligned(
+            b["ll_act_scale"], "down-projection input scales")
+        # The CuTe scale matrices of the NCCL path have no reader here.
+        b["x_scale"] = torch.empty(
+            h // SCALE_BLOCK, 0, dtype=torch.float32, device=d)
+        b["inter_scale"] = torch.empty(
+            n // SCALE_BLOCK, 0, dtype=torch.float32, device=d)
         empty_h = torch.empty(0, h, dtype=torch.bfloat16, device=d)
         b["_unused_bf16_h"] = empty_h
         b["_unused_u8_h"] = torch.empty(0, h, dtype=torch.uint8, device=d)
@@ -604,12 +629,9 @@ class Glm5MoEGraphBufferPool:
             expert_counters=b["expert_counters"],
             cu_seqlens=b["ll_cu_seqlens"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
-            ll_x_scale=b["ll_x_scale"],
-            ll_s1_tma=b["ll_s1_tma"],
-            ll_s3_tma=b["ll_s3_tma"],
-            ll_tiles=b["ll_tiles"],
-            ll_cu_tiles=b["ll_cu_tiles"],
-            x_scale=b["ll_x_scale"],
+            ll_up_out=b["ll_up_out"],
+            ll_act_scale=b["ll_act_scale"],
+            x_scale=b["x_scale"],
             inter_scale=b["inter_scale"],
             capacity=rows,
         )
@@ -665,12 +687,9 @@ class Glm5MoEGraphBufferPool:
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
             cu_seqlens=b["cu_seqlens"],
-            ll_x_scale=b["ll_x_scale"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
-            ll_s1_tma=b["ll_s1_tma"],
-            ll_s3_tma=b["ll_s3_tma"],
-            ll_tiles=b["ll_tiles"],
-            ll_cu_tiles=b["ll_cu_tiles"],
+            ll_up_out=b["ll_up_out"],
+            ll_act_scale=b["ll_act_scale"],
             x_scale=x_scale,
             inter_scale=inter_scale,
             capacity=capacity,
@@ -721,8 +740,15 @@ class Glm5MoEGraphSegment:
         # from the server's --enable-deepep; absent or False keeps the NCCL
         # all_gather / reduce_scatter path, which stays the default.
         self.deepep_ll = bool(getattr(moe, "glm5_deepep_ll", False))
+        # The routed weights of the masked m-grouped GEMM chain, bound once:
+        # the stacks are process-lifetime after ``_init_fp8_blockwise_weights``
+        # (the PSM's preallocated stacks keep their addresses across a
+        # prefill -> decode switch), so the views are built and checked here
+        # instead of inside warmup or capture. ``None`` on the NCCL path.
+        self.masked_weights = None
         if self.deepep_ll:
             self._validate_deepep_graph_safe()
+            self.masked_weights = self._bind_masked_gemm_weights()
 
         # Shared-expert fork/join, DeepEP path only: the NCCL path is the
         # default and the merged baseline, and a side stream there would be a
@@ -842,6 +868,35 @@ class Glm5MoEGraphSegment:
                 f"torch.distributed world ({dist.get_world_size()}) to equal "
                 f"the EP world ({self.world_size})")
 
+    def _bind_masked_gemm_weights(self) -> DeepGemmMaskedExpertWeights:
+        """Bind this layer's routed stacks as the masked GEMM's B operands.
+
+        The stacks are already ``[E, N, K]`` FP8 blocks with ``[E, N / 128,
+        K / 128]`` f32 scales for their own projection -- the masked GEMM's
+        ``nt`` layout -- so there is no conversion and no second resident copy;
+        only the e4m3 dtype view the stacks carry as ``uint8`` is applied.
+        ``validate`` is the whole contract (shape, dtype, contiguity, and that
+        the scale stacks' trailing block axis is not CuTe-padded), checked here
+        so a layout drift fails at construction rather than inside a capture.
+        ``masked_gemm_fn`` resolves the kernel for the same reason.
+        """
+        moe = self.moe
+        masked_gemm_fn()
+        weights = DeepGemmMaskedExpertWeights(
+            gate_w=moe.fp8_gate_w3d.view(torch.float8_e4m3fn),
+            gate_scale=moe.fp8_gate_ws3d,
+            up_w=moe.fp8_up_w3d.view(torch.float8_e4m3fn),
+            up_scale=moe.fp8_up_ws3d,
+            down_w=moe.fp8_down_w3d.view(torch.float8_e4m3fn),
+            down_scale=moe.fp8_down_ws3d,
+        )
+        weights.validate(
+            num_experts=self.num_local_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+        )
+        return weights
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
@@ -893,7 +948,6 @@ class Glm5MoEGraphSegment:
                 rank_token_counts=rank_token_counts,
                 bufs=bufs,
                 bucket_size=bucket_size,
-                global_rows=global_rows,
             )
 
         with self.comm.change_state(enable=True):
@@ -981,7 +1035,6 @@ class Glm5MoEGraphSegment:
         rank_token_counts: torch.Tensor,
         bufs: _Glm5MoEGraphBuffers,
         bucket_size: int,
-        global_rows: int,
     ) -> Dict[str, torch.Tensor]:
         """Route-based decode MoE over the DeepEP low-latency exchange.
 
@@ -992,13 +1045,25 @@ class Glm5MoEGraphSegment:
         * no all_gather    -- the router runs on this rank's ``bucket_size``
           rows instead of ``world_size * bucket_size``;
         * no dispatch_scatter_ragged -- the exchange delivers expert-major
-          rows directly in the grouped GEMM's uniform-stride layout;
+          rows directly in the masked GEMM's uniform-stride layout;
         * no act_quant_ragged on the activations -- the per-token 128-block
           FP8 cast is folded into the dispatch (``use_fp8=True``), which also
           halves the bytes on the wire;
         * no reduce_weighted_scatter and no reduce_scatter -- the LL combine
           performs the fp32-accumulated top-k weighted sum on the owning rank
           and writes this rank's rows.
+
+        The routed GEMMs are DeepGEMM's masked m-grouped FP8 kernels
+        (``moe_deepgemm_masked``), not our persistent CuTe S1/S3: our pair
+        schedules a 16-row tile per 16 rows an expert received, so a layer's
+        cost tracks the occupied tile count and amplifies routing skew into the
+        combine's waiting time, while the masked kernel works a fixed 64-row
+        block per expert. Two preparation launches go away with the swap -- the
+        shared S1/S3 descriptor prep and the bounded x-scale repack -- because
+        both masked A-scale operands are already in the kernel's MN-major form
+        (the dispatch's own layout, and the activation writes the same form);
+        one launch comes back, since the gate and up projections stay separate
+        stacks and so take a masked launch each.
 
         The shared expert is additionally forked onto a side stream for the
         span of the routed chain: fork right after the router GEMM (before the
@@ -1019,17 +1084,19 @@ class Glm5MoEGraphSegment:
 
         M-independence (padded rows stay inert): DeepEP leaves rows at or
         beyond ``recv_count[e]`` holding whatever the previous step left in the
-        receive buffer. Both grouped GEMMs take their per-expert row count from
-        ``recv_count``, so they neither read nor write those rows; the combine
-        reads only the rows named by the dispatch handle's ``src_info`` /
-        ``layout_range``. Stale rows therefore cannot reach the output, and the
-        captured graph's result depends only on the live row count, never on
-        the padded extent. The x-scale matrix follows the same rule at tile
-        granularity: S1 loads, per expert, the scale columns of its
-        ``ceil(recv_count[e] / TileM)`` row tiles (the partial last tile's
-        extra columns only scale rows whose X loads are zero-filled and whose
-        Y stores are clipped), the repack copies exactly those columns, and
-        every column past them keeps a stale value no tile addresses.
+        receive buffer. All three masked GEMMs and the masked activation take
+        their per-expert row count from ``recv_count``, so they neither read
+        nor write those rows; the combine reads only the rows named by the
+        dispatch handle's ``src_info`` / ``layout_range``. Stale rows therefore
+        cannot reach the output, and the captured graph's result depends only
+        on the live row count, never on the padded extent. "Neither reads nor
+        writes" is exact for the stores and row-wise for the loads: the masked
+        kernel's last 64-row block of an expert does load the stale rows above
+        ``recv_count[e]`` together with the live ones, but a block-scaled GEMM
+        accumulates each output row from that row's own A values and A-scales
+        alone, and the epilogue stores only the rows below the count -- so no
+        stale row, and no stale group scale, can reach a written row. The same
+        holds for the activation's outputs, which it writes per live row.
 
         The side-stream staging buffer does not weaken that: it is one process
         buffer sliced to the bucket, the shared expert rewrites every row of
@@ -1044,6 +1111,11 @@ class Glm5MoEGraphSegment:
             raise RuntimeError(
                 f"Layer {self.moe.layer_idx}: DeepEP decode path selected but "
                 "the pool holds no exchange")
+        if self.masked_weights is None:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: DeepEP decode path selected but "
+                "the masked GEMM's routed weights were never bound "
+                "(_bind_masked_gemm_weights runs at construction)")
         stride = self.pool.ll_stride
         e = self.num_local_experts
 
@@ -1117,71 +1189,33 @@ class Glm5MoEGraphSegment:
         recv_x, recv_scales, recv_count, handle = exchange.dispatch_fp8(
             padded, bufs.ll_topk_idx, split_phases=True
         )
-        # recv_x [e, stride, h] fp8 -> the uniform-stride activation the
-        # grouped GEMM takes, expert i's rows at [i * stride, ...).
-        x_fp8 = recv_x.view(e * stride, self.hidden_size)
-        inter_fp8 = bufs.inter_fp8.view(torch.float8_e4m3fn)
-
-        avg = _glm5_gemm_tilem_avg(
-            global_rows,
-            self.num_experts_per_tok,
-            self.num_local_experts * self.world_size,
-        )
-        # ONE launch prepares both grouped GEMMs of this layer: their only
-        # per-step input is recv_count (as the per-expert row extent of the
-        # X/Y descriptors and as the tile counts), which S1 and S3 share, as
-        # they share cu_seqlens and avg (=> TileM). S3 reads its descriptors
-        # three launches later on this same stream.
-        tma_plan = prepare_grouped_fp8_s1_s3_tma(
-            x_fp8,
-            bufs.intermediate,
-            inter_fp8,
-            bufs.expert_out,
-            recv_count,
-            bufs.ll_cu_seqlens,
-            avg,
-            s1_tma_desc=bufs.ll_s1_tma,
-            s3_tma_desc=bufs.ll_s3_tma,
-            tiles=bufs.ll_tiles,
-            cu_tiles=bufs.ll_cu_tiles,
-        )
-        # recv_scales is logically [e, stride, h/128] but its last two
-        # dimensions are a transposed view of a contiguous [e, h/128, stride]
-        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
-        # The GEMM wants ONE contiguous [h/128, e * stride]. Its x-scale tiles
-        # load, per expert, columns [0, ceil(recv_count[e] / TileM) * TileM)
-        # of that expert's block and nothing else, so exactly that span is
-        # repacked; columns past it are never addressed and keep stale values.
-        deepep_ll_scale_repack(
-            recv_scales, recv_count, bufs.ll_x_scale, tma_plan.tile_m)
-
-        s1_result = grouped_fp8_blockwise_fused_s1(
-            x_fp8,
-            bufs.ll_x_scale,
-            self.moe.fp8_gate_w3d.view(torch.float8_e4m3fn),
-            self.moe.fp8_up_w3d.view(torch.float8_e4m3fn),
-            self.moe.fp8_gate_ws3d,
-            self.moe.fp8_up_ws3d,
-            recv_count,
-            bufs.ll_cu_seqlens,
-            avg,
-            output=bufs.intermediate,
-            tma_plan=tma_plan,
-        )
-        act_quant_ragged(
-            s1_result, recv_count, bufs.ll_cu_seqlens,
-            bufs.inter_fp8, bufs.inter_scale,
-        )
-        grouped_fp8_blockwise_s3(
-            inter_fp8,
-            bufs.inter_scale,
-            self.moe.fp8_down_w3d.view(torch.float8_e4m3fn),
-            self.moe.fp8_down_ws3d,
-            recv_count,
-            bufs.ll_cu_seqlens,
-            avg,
-            output=bufs.expert_out,
-            tma_plan=tma_plan,
+        # recv_x [e, stride, h] fp8 and recv_scales [e, stride, h/128] f32 are
+        # the masked GEMM's A operands AS DELIVERED: the values are already
+        # expert-major on a uniform stride, and the scales are already the
+        # MN-major view of a contiguous [e, h/128, stride] block
+        # (csrc/deep_ep.cpp packs them column-major for TMA), which is the one
+        # form the masked kernel loads without a repack. Nothing between the
+        # dispatch and R1 touches either.
+        inter = self.intermediate_size
+        run_deepgemm_masked_moe(
+            x_fp8=recv_x,
+            x_scales=recv_scales,
+            weights=self.masked_weights,
+            masked_m=recv_count,
+            # Host constant per captured bucket: the mean routed rows per
+            # global expert at this bucket's global row count.
+            expected_m=expected_m_per_expert(
+                local_rows=bucket_size,
+                world_size=self.world_size,
+                topk=self.num_experts_per_tok,
+                num_experts_global=e * self.world_size,
+            ),
+            gate_out=bufs.intermediate.view(e, stride, inter),
+            up_out=bufs.ll_up_out.view(e, stride, inter),
+            act_fp8=bufs.inter_fp8.view(torch.float8_e4m3fn)
+                                  .view(e, stride, inter),
+            act_scales=bufs.ll_act_scale,
+            out=bufs.expert_out.view(e, stride, self.hidden_size),
         )
 
         exchange.combine(
