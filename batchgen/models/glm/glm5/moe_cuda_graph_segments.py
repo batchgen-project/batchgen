@@ -727,6 +727,15 @@ class Glm5MoEGraphSegment:
                     f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires cached "
                     f"shared expert FP8 weights; missing {missing}"
                 )
+            # The DeepEP path hands the shared expert its staging buffer as
+            # ``out=``, which only the fused gate/up chain accepts. Checked
+            # here, before warmup and capture, instead of failing inside them.
+            if getattr(shared, "cached_gate_up", None) is None:
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires the "
+                    "shared expert's fused gate/up FP8 weight binding "
+                    "(GLM5ExpertWrapper._bind_fused_gate_up)"
+                )
 
     def _validate_deepep_graph_safe(self) -> None:
         """Fail loudly before capture for every assumption the DeepEP decode
@@ -943,10 +952,14 @@ class Glm5MoEGraphSegment:
         receive kernel on the main stream (``split_phases=True``), so the
         shared expert, issued first, runs against the top-k, the id copy and
         the dispatch send instead of contending with one exchange kernel that
-        spans the whole round trip. The arithmetic, the operand values and the
-        order of writes are unchanged; only the stream the shared expert is
-        issued on and the exchange's kernel decomposition move, so the output
-        is expected bitwise-identical to the in-line version.
+        spans the whole round trip. The shared expert itself is the fused
+        four-launch chain (one gate/up GEMM, SiLU*up fused into the down
+        input's quantization, no scale transposes) writing straight into the
+        staging buffer, so it fits inside the dispatch window. The operand
+        values and the order of writes are unchanged; only the stream the
+        shared expert is issued on, its kernel decomposition and the
+        exchange's kernel decomposition move, so the output is expected
+        bitwise-identical to the in-line version.
 
         M-independence (padded rows stay inert): DeepEP leaves rows at or
         beyond ``recv_count[e]`` holding whatever the previous step left in the
@@ -999,22 +1012,22 @@ class Glm5MoEGraphSegment:
         # below), so the routed chain does not hold the SMs across the whole
         # exchange round trip while the shared expert is in flight.
         with self._shared_overlap.fork():
-            shared_out = self.moe.shared_expert_forward(padded)
-            if (shared_out.shape != bufs.shared_out.shape
-                    or shared_out.dtype != bufs.shared_out.dtype):
+            # The down projection writes straight into the pool's staging
+            # buffer (no staging copy): the chain is quantize, ONE gate/up
+            # GEMM, fused SiLU*up + quantize, down GEMM -- four launches on
+            # the side stream. The bytes the accumulate reads are the ones the
+            # GEMM produced, i.e. exactly what a separate bf16 -> bf16 copy of
+            # the same shape would have delivered.
+            shared_out = self.moe.shared_expert_forward(
+                padded, out=bufs.shared_out)
+            if shared_out is not bufs.shared_out:
                 raise RuntimeError(
-                    f"Layer {self.moe.layer_idx}: shared expert returned "
-                    f"{tuple(shared_out.shape)}/{shared_out.dtype}, but the "
-                    f"overlap buffer is {tuple(bufs.shared_out.shape)}/"
-                    f"{bufs.shared_out.dtype}. Staging through the buffer is "
-                    "only value-preserving while both agree: a narrowing copy "
-                    "would round here instead of inside the accumulate.")
-            # Staged on the SIDE stream, so the copy is hidden behind the
-            # dispatch exactly like the arithmetic above it and costs the
-            # critical path nothing. bf16 -> bf16 of the same shape, so the
-            # value the accumulate reads is the value the old in-line
-            # ``add_(shared_expert_forward(padded))`` read, bit for bit.
-            bufs.shared_out.copy_(shared_out)
+                    f"Layer {self.moe.layer_idx}: shared expert returned a "
+                    f"tensor other than the staging buffer it was given "
+                    f"({tuple(shared_out.shape)}/{shared_out.dtype} vs "
+                    f"{tuple(bufs.shared_out.shape)}/{bufs.shared_out.dtype}); "
+                    "the accumulate would read a buffer the side stream never "
+                    "wrote.")
 
         gate_sigmoid_topk_cuda(
             bufs.router_logits,

@@ -807,13 +807,33 @@ class GLM5ParallelStrategyManager:
             attn.o_proj.weight.data = tensors["o_proj.weight"].to(device)
 
     def _load_shared_expert_module(self):
-        """Load shared expert FP8 weights for decode (persistent on GPU)."""
+        """Load shared expert FP8 weights for decode (persistent on GPU).
+
+        Gate and up land as the two row halves of ONE [2I, K] device
+        allocation, ``shared.gate_up_weight``; ``gate_proj`` / ``up_proj`` bind
+        views of it. The decode shared expert then runs gate and up as a single
+        GEMM over the same bytes (GLM5ExpertWrapper._bind_fused_gate_up checks
+        the aliasing), and no weight is stored twice: the footprint equals the
+        two separate allocations it replaces.
+        """
         device = self.engine_config.Basic_Config.device_torch
         for layer_idx in range(self.FIRST_K_DENSE, len(self.model.model.layers)):
             tensors = self.core_engine.get_tensor(f"shared_expert_{layer_idx}")
             shared = self.model.model.layers[layer_idx].mlp.shared_experts
-            shared.gate_proj.weight.data = tensors["gate_proj.weight"].to(device)
-            shared.up_proj.weight.data = tensors["up_proj.weight"].to(device)
+            gate, up = tensors["gate_proj.weight"], tensors["up_proj.weight"]
+            if gate.shape != up.shape or gate.dtype != up.dtype or gate.dim() != 2:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: shared expert gate {tuple(gate.shape)}/"
+                    f"{gate.dtype} and up {tuple(up.shape)}/{up.dtype} must be "
+                    "same-shape 2D weights to share one gate/up allocation")
+            inter = gate.shape[0]
+            gate_up = torch.empty(
+                (2 * inter, gate.shape[1]), dtype=gate.dtype, device=device)
+            gate_up[:inter].copy_(gate)
+            gate_up[inter:].copy_(up)
+            shared.gate_up_weight = gate_up
+            shared.gate_proj.weight.data = gate_up[:inter]
+            shared.up_proj.weight.data = gate_up[inter:]
             shared.down_proj.weight.data = tensors["down_proj.weight"].to(device)
 
     def _load_local_routed_experts(self):

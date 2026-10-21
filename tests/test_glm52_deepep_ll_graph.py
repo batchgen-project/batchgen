@@ -339,7 +339,7 @@ def test_exchange_is_process_lifetime(monkeypatch):
 # --------------------------------------------------------------------------
 def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
                    split_k_rows=(), shared_value=0.0, shared_dtype=None,
-                   shared_rows=None):
+                   shared_rows=None, shared_foreign=False):
     pool = _make_pool(monkeypatch, buckets=(bucket,))
     pool.setup()
     bufs = pool.get(bucket)
@@ -395,8 +395,16 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
     # correctly: the shared expert, the exchange, and the join.
     order = []
 
-    def fake_shared_expert(x):
+    # The real shared expert writes its down projection into the ``out=``
+    # staging buffer and returns it. ``shared_dtype`` / ``shared_rows`` /
+    # ``shared_foreign`` instead return a tensor of its own, which the segment
+    # must refuse: the accumulate would read a buffer nothing wrote.
+    def fake_shared_expert(x, out=None):
         order.append("shared_expert")
+        assert out is not None, "the DeepEP path must pass the staging buffer"
+        if shared_dtype is None and shared_rows is None and not shared_foreign:
+            out.fill_(shared_value)
+            return out
         rows = x.shape[0] if shared_rows is None else shared_rows
         return torch.full((rows, H), shared_value,
                           dtype=shared_dtype or torch.bfloat16)
@@ -720,20 +728,28 @@ def test_the_nccl_forward_keeps_the_shared_expert_in_line():
     assert "_shared_overlap.join()" in deepep
 
 
-def test_a_shared_output_the_staging_buffer_cannot_hold_fails_loud(monkeypatch):
-    """Staging is only value-preserving while the shared output and the buffer
-    agree on shape and dtype; a narrowing copy would round in the copy instead
-    of inside the accumulate, which is a silent change of the result."""
-    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
-        monkeypatch, shared_dtype=torch.float32)
+def test_a_shared_output_outside_the_staging_buffer_fails_loud(monkeypatch):
+    """The shared expert writes its output INTO the staging buffer (no staging
+    copy), so any other returned tensor -- wrong dtype, wrong rows, or even a
+    same-shaped stranger -- means the accumulate would read a buffer the side
+    stream never wrote. That must raise, not be copied or ignored."""
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="shared expert returned"):
-        segment.forward(padded=padded, rank_token_counts=rank_counts)
+    for kw in (dict(shared_dtype=torch.float32), dict(shared_rows=BUCKET - 1),
+               dict(shared_foreign=True)):
+        segment, pool, bufs, calls, rank_counts, valid = _build_segment(
+            monkeypatch, **kw)
+        with pytest.raises(RuntimeError, match="shared expert returned"):
+            segment.forward(padded=padded, rank_token_counts=rank_counts)
 
-    segment, pool, bufs, calls, rank_counts, valid = _build_segment(
-        monkeypatch, shared_rows=BUCKET - 1)
-    with pytest.raises(RuntimeError, match="shared expert returned"):
-        segment.forward(padded=padded, rank_token_counts=rank_counts)
+
+def test_the_shared_expert_writes_straight_into_the_staging_buffer():
+    """The staging copy is gone from the side stream: the segment passes the
+    pool buffer as ``out=`` and checks identity, and no ``copy_`` into it is
+    left in the DeepEP forward."""
+    deepep = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
+    assert "out=bufs.shared_out)" in deepep
+    assert "shared_out is not bufs.shared_out" in deepep
+    assert "bufs.shared_out.copy_(" not in deepep
 
 
 # --- the stream/event resources themselves -------------------------------

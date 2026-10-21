@@ -353,6 +353,11 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         self.cached_gate = None
         self.cached_up = None
         self.cached_down = None
+        # Fused gate/up binding (persistent shared expert only, see
+        # ``_bind_fused_gate_up``): one [2I, K] FP8 weight whose two row halves
+        # ARE ``cached_gate`` / ``cached_up``, and its [2I/128, K/128] scale.
+        self.cached_gate_up = None
+        self.cached_gate_up_scale = None
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
@@ -387,11 +392,73 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             self.cached_gate = self.module.gate_proj.weight.data
             self.cached_up = self.module.up_proj.weight.data
             self.cached_down = self.module.down_proj.weight.data
+            # FP8 only: the fused chain is a DeepGEMM FP8 chain, and a BF16
+            # checkpoint keeps the per-projection path it always ran.
+            gate_up = getattr(self.module, "gate_up_weight", None)
+            if gate_up is not None and self.is_fp8:
+                self._bind_fused_gate_up(gate_up)
 
     def _unregister_fp8_weights(self):
         self.cached_gate = None
         self.cached_up = None
         self.cached_down = None
+        self.cached_gate_up = None
+        self.cached_gate_up_scale = None
+
+    def _bind_fused_gate_up(self, gate_up: torch.Tensor) -> None:
+        """Bind the fused [gate; up] weight the loader allocated.
+
+        The loader stores gate and up as the two row halves of ONE [2I, K]
+        allocation (``Glm5ParallelStrategyManager._load_shared_expert_module``),
+        so the fused GEMM reads exactly the bytes the separate gate and up
+        GEMMs read -- no second copy of either weight exists. Every assumption
+        that makes ``[gate; up] @ x`` equal to the two separate products is
+        checked here, once, rather than trusted at every forward:
+          * the halves alias the fused rows (same storage, same order);
+          * I is a whole number of 128-row scale blocks, so the stacked block
+            scales ``[gate_scale; up_scale]`` are the fused weight's own
+            block scales (no block straddles the gate/up boundary).
+        The stacked scale is a new [2I/128, K/128] fp32 tensor (6 KiB per layer
+        at GLM-5.2 shapes); the per-half scales stay bound for the unfused path.
+        """
+        if not self.is_fp8:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: fused gate/up binding requires FP8 weights")
+        gate, up = self.cached_gate, self.cached_up
+        inter, hidden = gate.shape
+        if (gate_up.dim() != 2 or tuple(gate_up.shape) != (2 * inter, hidden)
+                or tuple(up.shape) != (inter, hidden) or not gate_up.is_contiguous()):
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: fused gate/up weight must be a contiguous "
+                f"[2I, K] = {(2 * inter, hidden)} tensor over gate {tuple(gate.shape)} "
+                f"and up {tuple(up.shape)}, got {tuple(gate_up.shape)}")
+        if (gate.data_ptr() != gate_up.data_ptr()
+                or up.data_ptr() != gate_up[inter:].data_ptr()):
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: gate/up weights are not the row halves of "
+                "the fused gate/up allocation; the fused GEMM would read different "
+                "bytes than the per-projection GEMMs")
+        block = 128
+        if inter % block != 0 or hidden % block != 0:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: fused gate/up needs I={inter} and K={hidden} "
+                f"to be multiples of the {block}-wide FP8 scale block")
+        gate_scale = self.weight_dequant_scale.get("gate_proj.weight_scale_inv")
+        up_scale = self.weight_dequant_scale.get("up_proj.weight_scale_inv")
+        want = (inter // block, hidden // block)
+        if (gate_scale is None or up_scale is None
+                or tuple(gate_scale.shape) != want or tuple(up_scale.shape) != want
+                or gate_scale.dtype != torch.float32 or up_scale.dtype != torch.float32):
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: fused gate/up needs fp32 gate and up block "
+                f"scales of shape {want}, got "
+                f"{None if gate_scale is None else (tuple(gate_scale.shape), gate_scale.dtype)} / "
+                f"{None if up_scale is None else (tuple(up_scale.shape), up_scale.dtype)}")
+        if gate_scale.device != gate_up.device or up_scale.device != gate_up.device:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: fused gate/up weight and scales must share a device")
+        self.cached_gate_up = gate_up
+        self.cached_gate_up_scale = torch.cat([gate_scale, up_scale], dim=0).contiguous()
 
     def load_weights_pinned(self) -> Dict[str, torch.Tensor]:
         """Wait without the single-expert sliding-window eviction policy.
@@ -401,8 +468,27 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         """
         return self.core_engine.get_weights_pinned(self.module_key)
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """FP8 forward using cached weight tensors directly (no nn.Module delegation)."""
+    def _forward_impl(
+        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """FP8 forward using cached weight tensors directly (no nn.Module delegation).
+
+        With the fused gate/up binding this is the four-launch chain of
+        ``_forward_fused_gate_up``; otherwise three ``w8a16_gemm`` calls. ``out``
+        (the down projection's destination) is only accepted by the fused chain,
+        which is the one that can write into a caller's buffer without a copy.
+        """
+        if self.cached_gate_up is not None:
+            return self._forward_fused_gate_up(hidden_states, out)
+        if out is not None:
+            raise ValueError(
+                f"Layer {self.layer_idx}: out= requires the fused gate/up binding")
+        return self._forward_unfused(hidden_states)
+
+    def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-projection chain: gate, up and down each quantize their own
+        input and run their own GEMM (routed single-expert / non-persistent
+        experts, and the reference the fused chain is pinned against)."""
         from batchgen.attention.mla.fa3_backend import w8a16_gemm
         gate = w8a16_gemm(
             self.cached_gate, self.weight_dequant_scale.get('gate_proj.weight_scale_inv'), hidden_states
@@ -415,14 +501,84 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             self.cached_down, self.weight_dequant_scale.get('down_proj.weight_scale_inv'), intermediate
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_fused_gate_up(
+        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Shared-expert chain in four launches, none of them a layout fix-up:
+
+            quantize(x)            -> x_fp8, MN-major TMA-aligned x scales
+            fp8 GEMM [gate; up]    -> gate_up [T, 2I] bf16      (one DeepGEMM)
+            SiLU(gate) * up + quantize -> h_fp8, aligned h scales (one Triton)
+            fp8 GEMM down          -> out [T, H] bf16           (one DeepGEMM)
+
+        against the unfused chain's quantize/transpose/GEMM x2 for gate and up,
+        a SiLU, a multiply, a quantize/transpose/GEMM for down and a staging
+        copy. Operand values are the unfused chain's: the x quantization is the
+        same kernel (the two unfused gate/up quantizations of x were identical);
+        scales are only written in the layout DeepGEMM would otherwise
+        transpose them into; the fused GEMM's gate and up columns are the two
+        separate products (same K order and block scales); and the fused
+        activation/quantize reproduces ``F.silu(g) * u`` in bf16 before the
+        same quantization. Bit-identity is asserted on GPU by
+        tests/test_glm5_shared_expert_fused_gate_up.py.
+        """
+        import deep_gemm
+        from batchgen_kernels.triton.fp8_quantize import (
+            per_token_blocked_quantize_bf16_to_fp8_1d,
+            silu_mul_per_token_blocked_quantize_bf16_to_fp8_1d,
+        )
+
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                f"Layer {self.layer_idx}: fused shared expert takes bf16 input, "
+                f"got {hidden_states.dtype}")
+        x = hidden_states.view(-1, hidden_states.size(-1))
+        rows = x.shape[0]
+        n_out = self.cached_down.shape[0]
+        if out is None:
+            out = torch.empty((rows, n_out), dtype=torch.bfloat16, device=x.device)
+        elif (tuple(out.shape) != (rows, n_out) or out.dtype != torch.bfloat16
+              or not out.is_contiguous() or out.device != x.device):
+            raise ValueError(
+                f"Layer {self.layer_idx}: shared-expert out must be a contiguous "
+                f"bf16 [{rows}, {n_out}] tensor on {x.device}, got "
+                f"{tuple(out.shape)}/{out.dtype}/contiguous={out.is_contiguous()}")
+        if rows == 0:
+            return out if hidden_states.dim() == 2 else out.view(
+                *hidden_states.shape[:-1], n_out)
+
+        x_fp8, x_scale = per_token_blocked_quantize_bf16_to_fp8_1d(
+            x, scale_tma_aligned=True)
+        gate_up = torch.empty(
+            (rows, self.cached_gate_up.shape[0]), dtype=torch.bfloat16, device=x.device)
+        deep_gemm.fp8_gemm_nt(
+            (x_fp8, x_scale),
+            (self.cached_gate_up, self.cached_gate_up_scale),
+            gate_up,
+        )
+        h_fp8, h_scale = silu_mul_per_token_blocked_quantize_bf16_to_fp8_1d(
+            gate_up, scale_tma_aligned=True)
+        deep_gemm.fp8_gemm_nt(
+            (h_fp8, h_scale),
+            (self.cached_down, self.weight_dequant_scale.get("down_proj.weight_scale_inv")),
+            out,
+        )
+        return out if hidden_states.dim() == 2 else out.view(
+            *hidden_states.shape[:-1], n_out)
+
+    def forward(
+        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.persistent:
+            if out is not None:
+                raise ValueError(
+                    f"Layer {self.layer_idx}: out= requires a persistent expert")
             weights = self.load_weights(self.module_key)
             self.cached_gate = weights["gate_proj.weight"]
             self.cached_up = weights["up_proj.weight"]
             self.cached_down = weights["down_proj.weight"]
 
-        result = self._forward_impl(hidden_states)
+        result = self._forward_impl(hidden_states, out)
 
         if not self.persistent:
             torch.cuda.current_stream().synchronize()
