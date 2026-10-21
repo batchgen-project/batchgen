@@ -52,10 +52,13 @@ _KL48_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
 _KL48_H20_MIN_MEMORY_BYTES = 90 * _GIB
 # K3 reserve for H20-class TP8. H20 caps a K3 prefill micro-batch at
 # _K3_H20_PREFILL_TOKEN_CAP tokens with _K3_H20_PREFILL_GROUPED_CHUNK_ROWS-row
-# grouped MoE chunks, so the dominant FP32-output and chunk_kda scratch terms
-# of the H200 figure shrink by the token-cap ratio. Provisional until a pool
-# run on an H20 lane measures workspace_peak_bytes; the final value is that
-# peak with margin.
+# grouped MoE chunks, so the forward's pool-side temporaries stop growing once
+# a wave spans more than one capped micro-batch (the peak is per-pass). Sized
+# from a measured full in-wave pool matrix on a 4-node TP8 serve group
+# (3,424 rank-waves, prefix_pool prefill METRICS): workspace_peak_bytes
+# plateaus just under 13.5 GiB at and beyond the token cap, and the per-wave
+# token accounting identity was exact with zero OOM. This value keeps the
+# measured peak with >= 1.5x margin.
 _K3_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
 # KDA state slots held back from admission for pooled prefix segments: each
 # segment row holds one slot for its wave, and a wave that admits the full
@@ -411,7 +414,9 @@ class KimiLinearPlanner(BasePlanner):
         self.config.GPU_Buffer_Config.kda_prefix_segment_slots = pool_segment_slots
 
         # Kimi-Linear context: model_max_length=1048576. The TP8 K3 path
-        # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB).
+        # keeps only four persistent KDA state slots on H20 (each slot is
+        # ~428.6 MiB unsharded; the distributed TP8-KDA path shards it to
+        # 53.57 MiB/rank, see the budget note below).
         # The admission scheduler enforces that persistent sequence limit;
         # this token cap is a separate bound on temporary prefill scratch and
         # must not be mistaken for a KDA-slot limit.
