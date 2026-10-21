@@ -47,10 +47,19 @@ _K3_H200_PREFIX_POOL_WORKSPACE_BYTES = 40 * _GIB
 # its weights leave ~90 GB free per H20 GPU, so a 24 GiB forward reserve holds
 # the measured chunk peaks with margin. Validated live on a 2x8 H20 serve
 # group: full in-wave pool + trajectory materialization matrix, zero OOM and
-# the per-wave token accounting identity exact. K3 itself stays pool-off on
-# H20 (unsized there, and its H20 deployment is prefill-capped anyway).
+# the per-wave token accounting identity exact.
 _KL48_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
 _KL48_H20_MIN_MEMORY_BYTES = 90 * _GIB
+# K3 reserve for H20-class TP8. H20 caps a K3 prefill micro-batch at
+# _K3_H20_PREFILL_TOKEN_CAP tokens with _K3_H20_PREFILL_GROUPED_CHUNK_ROWS-row
+# grouped MoE chunks, so the forward's pool-side temporaries stop growing once
+# a wave spans more than one capped micro-batch (the peak is per-pass). Sized
+# from a measured full in-wave pool matrix on a 4-node TP8 serve group
+# (3,424 rank-waves, prefix_pool prefill METRICS): workspace_peak_bytes
+# plateaus just under 13.5 GiB at and beyond the token cap, and the per-wave
+# token accounting identity was exact with zero OOM. This value keeps the
+# measured peak with >= 1.5x margin.
+_K3_H20_PREFIX_POOL_WORKSPACE_BYTES = 24 * _GIB
 # KDA state slots held back from admission for pooled prefix segments: each
 # segment row holds one slot for its wave, and a wave that admits the full
 # sequence cap would otherwise leave none and decline the pool; a wave needing
@@ -215,11 +224,11 @@ def k3_prefill_prefix_pool_workspace_bytes(
     """Return the forward's reserve under the in-wave prefill prefix pool.
 
     0 leaves the pool off. The H200-class TP8 reserve was sized on K3 and
-    bounds the whole family; the H20-class TP8 reserve is sized for (and
-    restricted to) the 48B, whose temporaries are strictly smaller and whose
-    weights leave the headroom H20 needs. K3 prefix reuse has no cross-wave
-    materialization path, so it runs on the pool or not at all; refusing an
-    unsized layout at admission (the caller's named error) beats guessing.
+    bounds the whole family. H20-class TP8 has one row per family: the 48B's
+    and K3's own, which is sized under K3's H20 prefill token cap. K3 prefix
+    reuse has no cross-wave materialization path, so it runs on the pool or
+    not at all; refusing an unsized layout at admission (the caller's named
+    error) beats guessing.
     """
     group_size = int(attention_group_size)
     if group_size <= 0:
@@ -229,7 +238,9 @@ def k3_prefill_prefix_pool_workspace_bytes(
     memory = int(gpu_total_memory_bytes)
     if memory >= _K3_H200_MIN_MEMORY_BYTES:
         return _K3_H200_PREFIX_POOL_WORKSPACE_BYTES
-    if not is_k3 and memory >= _KL48_H20_MIN_MEMORY_BYTES:
+    if memory >= _KL48_H20_MIN_MEMORY_BYTES:
+        if is_k3:
+            return _K3_H20_PREFIX_POOL_WORKSPACE_BYTES
         return _KL48_H20_PREFIX_POOL_WORKSPACE_BYTES
     return 0
 
@@ -386,8 +397,8 @@ class KimiLinearPlanner(BasePlanner):
         # the 48B runs the same resident head-parallel KDA and NoPE-MLA seams
         # as K3 with identical per-head widths (192 K, 128 V, 576 latent), so
         # on H200-class memory one K3-sized reserve gates both (it bounds the
-        # 48B's strictly smaller temporaries). On H20-class memory only the
-        # 48B is sized (is_k3 keys the branch); K3 stays pool-off there.
+        # 48B's strictly smaller temporaries). On H20-class memory each family
+        # has its own row (is_k3 keys the branch).
         self.config.Module_Batching_Config.prefill_prefix_pool_workspace_bytes = (
             k3_prefill_prefix_pool_workspace_bytes(
                 gpu_total_memory_bytes=self.gpu_total_memory_bytes,
@@ -403,7 +414,9 @@ class KimiLinearPlanner(BasePlanner):
         self.config.GPU_Buffer_Config.kda_prefix_segment_slots = pool_segment_slots
 
         # Kimi-Linear context: model_max_length=1048576. The TP8 K3 path
-        # keeps only four KDA state slots on H20 (each slot is ~428.6 MiB).
+        # keeps only four persistent KDA state slots on H20 (each slot is
+        # ~428.6 MiB unsharded; the distributed TP8-KDA path shards it to
+        # 53.57 MiB/rank, see the budget note below).
         # The admission scheduler enforces that persistent sequence limit;
         # this token cap is a separate bound on temporary prefill scratch and
         # must not be mistaken for a KDA-slot limit.
