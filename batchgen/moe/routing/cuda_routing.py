@@ -66,6 +66,28 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
     return result[0], result[1]
 
 
+def _check_gate_padding_args(num_valid_tokens, rank_token_counts, rows_per_rank):
+    """Padding-shape argument policy shared by both sigmoid top-k gates."""
+    if rank_token_counts is not None:
+        if num_valid_tokens is not None:
+            raise ValueError(
+                "rank_token_counts and num_valid_tokens are mutually exclusive "
+                "padding descriptions; pass exactly one"
+            )
+        if rows_per_rank is None:
+            raise ValueError(
+                "rows_per_rank is required when rank_token_counts is given"
+            )
+        if int(rows_per_rank) <= 0:
+            raise ValueError(
+                f"rows_per_rank must be positive, got {rows_per_rank}"
+            )
+    elif rows_per_rank is not None:
+        raise ValueError(
+            "rows_per_rank is only meaningful together with rank_token_counts"
+        )
+
+
 def gate_sigmoid_topk_cuda(
     router_logits, e_score_correction,
     k=8, routed_scaling_factor=2.5,
@@ -122,24 +144,7 @@ def gate_sigmoid_topk_cuda(
     """
     # Argument-shape policy is enforced before the extension loads so a caller
     # mistake is a named Python error, not a CUDA-side abort mid-capture.
-    if rank_token_counts is not None:
-        if num_valid_tokens is not None:
-            raise ValueError(
-                "rank_token_counts and num_valid_tokens are mutually exclusive "
-                "padding descriptions; pass exactly one"
-            )
-        if rows_per_rank is None:
-            raise ValueError(
-                "rows_per_rank is required when rank_token_counts is given"
-            )
-        if int(rows_per_rank) <= 0:
-            raise ValueError(
-                f"rows_per_rank must be positive, got {rows_per_rank}"
-            )
-    elif rows_per_rank is not None:
-        raise ValueError(
-            "rows_per_rank is only meaningful together with rank_token_counts"
-        )
+    _check_gate_padding_args(num_valid_tokens, rank_token_counts, rows_per_rank)
     if latent_out is not None and latent_offset is None:
         raise ValueError("latent_offset is required when latent_out is given")
 
@@ -178,6 +183,91 @@ def gate_sigmoid_topk_cuda(
         opts["rank_token_counts"] = rank_token_counts
         opts["rows_per_rank"] = int(rows_per_rank)
     result = ext.gate_sigmoid_topk(*args, **opts)
+    return result[0], result[1]
+
+
+# Largest expert count the one-warp-per-row gate holds in registers.
+GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS = 256
+
+
+def gate_sigmoid_topk_warp_cuda(
+    router_logits, e_score_correction,
+    k=8, routed_scaling_factor=2.5,
+    topk_indices=None, topk_weights=None,
+    num_valid_tokens=None,
+    rank_token_counts=None, rows_per_rank=None,
+):
+    """One-warp-per-row sigmoid top-k gate (E <= 256), byte-identical to
+    :func:`gate_sigmoid_topk_cuda`.
+
+    Same selection (biased sigmoid scores, larger value first, equal values to
+    the lower expert id), same raw-score weights normalized in route order and
+    scaled, and the same padding-row output (id -1, weight 0) for both padding
+    descriptions. What differs is the launch, built for latency: one 32-thread
+    CTA per row (at most 64 registers per thread, no shared memory) instead
+    of eight warps per row, all of a row's inputs fetched in one memory round
+    trip, and a programmatic dependent launch -- the grid may become resident
+    while the preceding kernel drains and waits for it in-kernel before
+    touching memory, so the result is the same as a plain launch's, and the
+    attribute survives CUDA-graph capture as a programmatic edge.
+
+    ``topk_indices`` may be int32 or int64; the int64 form is the layout the
+    DeepEP exchange reads, so a caller feeding the exchange writes it directly
+    instead of copying an int32 result.
+
+    Args:
+        router_logits: [N, E] FP32, E <= 256 (row stride may exceed E)
+        e_score_correction: [E] FP32
+        k: top-k (supported 2, 4, 8, 16)
+        routed_scaling_factor: scaling factor
+        topk_indices: [N, k] int32 or int64, contiguous (optional; int32 if
+            omitted)
+        topk_weights: [N, k] FP32, contiguous (optional)
+        num_valid_tokens / rank_token_counts / rows_per_rank: the padding
+            descriptions of :func:`gate_sigmoid_topk_cuda`, same rules.
+
+    Returns:
+        topk_indices, topk_weights
+    """
+    _check_gate_padding_args(num_valid_tokens, rank_token_counts, rows_per_rank)
+    if router_logits.dtype != torch.float32:
+        raise TypeError(
+            f"gate_sigmoid_topk_warp_cuda takes FP32 router_logits, got "
+            f"{router_logits.dtype}")
+    if e_score_correction.dtype != torch.float32:
+        raise TypeError(
+            f"gate_sigmoid_topk_warp_cuda takes an FP32 e_score_correction, got "
+            f"{e_score_correction.dtype}")
+    if router_logits.dim() != 2 or router_logits.shape[1] > GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS:
+        raise ValueError(
+            f"gate_sigmoid_topk_warp_cuda handles [N, E <= "
+            f"{GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS}] logits, got "
+            f"{tuple(router_logits.shape)}; use gate_sigmoid_topk_cuda")
+    if topk_indices is not None and topk_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"topk_indices must be int32 or int64, got {topk_indices.dtype}")
+
+    ext = _get_ext()
+    if not hasattr(ext, "gate_sigmoid_topk_warp"):
+        raise RuntimeError(
+            "the loaded batchgen_kernels.moe._C_routing has no gate_sigmoid_topk_warp; "
+            "it was built from older sources, rebuild batchgen_kernels")
+    N = router_logits.shape[0]
+    device = router_logits.device
+    if topk_indices is None:
+        topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
+    if topk_weights is None:
+        topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
+    opts = {}
+    if num_valid_tokens is not None:
+        opts["num_valid_tokens"] = num_valid_tokens
+    if rank_token_counts is not None:
+        opts["rank_token_counts"] = rank_token_counts
+        opts["rows_per_rank"] = int(rows_per_rank)
+    result = ext.gate_sigmoid_topk_warp(
+        router_logits, e_score_correction, k, routed_scaling_factor,
+        topk_indices, topk_weights, **opts,
+    )
     return result[0], result[1]
 
 

@@ -75,6 +75,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("rank_token_counts") = c10::nullopt,
           py::arg("rows_per_rank") = c10::nullopt);
 
+    m.def("gate_sigmoid_topk_warp",
+          [](torch::Tensor router_logits,
+             torch::Tensor e_score_correction,
+             int k,
+             float routed_scaling_factor,
+             torch::Tensor topk_indices,
+             torch::Tensor topk_weights,
+             c10::optional<torch::Tensor> num_valid_tokens,
+             c10::optional<torch::Tensor> rank_token_counts,
+             c10::optional<int64_t> rows_per_rank) {
+              return gate_sigmoid_topk_warp_cuda(
+                  router_logits, e_score_correction, k, routed_scaling_factor,
+                  topk_indices, topk_weights,
+                  num_valid_tokens.value_or(torch::Tensor()),
+                  rank_token_counts.value_or(torch::Tensor()),
+                  rows_per_rank.value_or(0));
+          },
+          "Gate, one warp per token (E <= 256): byte-identical to gate_sigmoid_topk, "
+          "int32 or int64 ids (CUDA)",
+          py::arg("router_logits"),
+          py::arg("e_score_correction"),
+          py::arg("k"),
+          py::arg("routed_scaling_factor"),
+          py::arg("topk_indices"),
+          py::arg("topk_weights"),
+          py::arg("num_valid_tokens") = c10::nullopt,
+          py::arg("rank_token_counts") = c10::nullopt,
+          py::arg("rows_per_rank") = c10::nullopt);
+
     m.def("router_bias_cast", &router_bias_cast_cuda,
           "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",
           py::arg("logits"),
