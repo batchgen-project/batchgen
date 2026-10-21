@@ -183,7 +183,10 @@ def _plan_k3(gpu_memory_bytes):
 def test_h20_plan_adds_graph_scratch_without_reducing_user_capacity():
     config = _plan_k3(96 * GIB)
 
-    assert config.GPU_Buffer_Config.kda_state_slots == 5
+    # 4 user slots + 1 graph scratch + the prefix-pool segment reserve, which
+    # prefill_sequence_limits holds back so admission still sees exactly 4.
+    assert config.GPU_Buffer_Config.kda_prefix_segment_slots == 16
+    assert config.GPU_Buffer_Config.kda_state_slots == 5 + 16
     assert config.Module_Batching_Config.MoE_decoding_micro_batch_size == 4
     assert config.Basic_Config.decode_graph_buckets == [1, 2, 4]
     # H20 keeps the validated eager decode path
