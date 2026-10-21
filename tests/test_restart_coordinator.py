@@ -375,16 +375,33 @@ def test_peer_failed_polls_without_waiting_for_the_missing_acks():
         node0.raise_if_peer_failed(1, PHASE_READY)
 
 
-def test_a_store_error_fails_the_barrier_at_the_deadline_and_is_reported():
-    store, (node0, _node1) = _cluster()
-    request = coordinator_module.RestartRequest(
-        epoch=1, timeout_s=0.05, requested_at=time.time()
-    )
-    store.error = RuntimeError("control store is gone")
+def test_a_store_error_fails_the_barrier_at_once_and_is_reported():
+    """A TCPStore client never reconnects, so a failed call means node 0's
+    store is gone; retrying until the deadline would only hold every peer in
+    ``restarting`` for the whole restart timeout."""
+    store, (node0, node1) = _cluster()
+    deadline = time.time() + 30
+    store.error = RuntimeError("Broken pipe")
 
+    started = time.monotonic()
     with pytest.raises(RuntimeError, match="could not be coordinated"):
-        node0.barrier(request.epoch, PHASE_ARMED, request.deadline)
-    assert "coordinator unreachable" in node0.control_error
+        node0.barrier(1, PHASE_ARMED, deadline)
+    with pytest.raises(PeerRestartError) as caught:
+        node1.barrier(1, PHASE_ARMED, deadline)
+    assert time.monotonic() - started < 1.0
+    assert caught.value.node == 0
+    assert "restart coordinator unreachable" in caught.value.reason
+    assert "coordinator unreachable" in node1.control_error
+
+
+def test_a_lost_coordinator_fails_the_readiness_poll_naming_node_zero():
+    store, (_node0, node1) = _cluster()
+    store.error = RuntimeError("Broken pipe")
+
+    failure = node1.peer_failed(1, PHASE_READY)
+
+    assert isinstance(failure, PeerRestartError)
+    assert failure.node == 0
 
 
 # ------------------------------------------------------------- down-key fanout

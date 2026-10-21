@@ -294,7 +294,6 @@ class RestartCoordinator:
         pending = {node for node in range(self._nnodes) if node != self._node_rank}
         acked = False
         while True:
-            store_error: Optional[BaseException] = None
             try:
                 if not acked:
                     self._write_ack(epoch, phase, _ACK_OK)
@@ -311,25 +310,11 @@ class RestartCoordinator:
             except PeerRestartError:
                 raise
             except Exception as exc:
-                # A closed coordinator means this server is stopping: nothing
-                # can be coordinated any more, so waiting out the deadline
-                # would only delay the restart's own shutdown abort.
-                if self._store is None:
-                    raise RuntimeError(
-                        f"restart phase {phase} aborted: the restart control "
-                        "store is closed"
-                    ) from exc
-                self._record_control_error(exc)
-                store_error = exc
-            if not pending and acked and store_error is None:
+                raise self._store_failure(phase, exc) from exc
+            if not pending and acked:
                 return
             remaining = deadline - time.time()
             if remaining <= 0:
-                if store_error is not None or not acked:
-                    raise RuntimeError(
-                        f"restart phase {phase} could not be coordinated: "
-                        f"{self._control_error}"
-                    )
                 raise PeerRestartError(
                     min(pending), phase, "no phase ack before the restart deadline"
                 )
@@ -349,8 +334,31 @@ class RestartCoordinator:
                         node, phase, value[len(_ACK_FAILED_PREFIX):]
                     )
         except Exception as exc:
-            self._record_control_error(exc)
+            return self._store_failure(phase, exc)
         return None
+
+    def _store_failure(self, phase: str, exc: BaseException) -> RuntimeError:
+        """The error a restart phase raises when the control store fails.
+
+        Never retried: the store lives in node 0's server and a TCPStore
+        client does not reconnect, so a failed call means node 0 stopped or
+        died (or, on node 0, that this server is stopping). Waiting out the
+        deadline would only hold every peer in ``restarting`` for the whole
+        restart timeout.
+        """
+        self._record_control_error(exc)
+        if self._store is None:
+            return RuntimeError(
+                f"restart phase {phase} aborted: the restart control store is "
+                "closed"
+            )
+        if self._node_rank != 0:
+            return PeerRestartError(
+                0, phase, f"restart coordinator unreachable: {exc}"
+            )
+        return RuntimeError(
+            f"restart phase {phase} could not be coordinated: {exc}"
+        )
 
     def raise_if_peer_failed(self, epoch: int, phase: str) -> None:
         failure = self.peer_failed(epoch, phase)
