@@ -394,6 +394,37 @@ def test_a_store_error_fails_the_barrier_at_once_and_is_reported():
     assert "coordinator unreachable" in node1.control_error
 
 
+def test_a_store_lost_after_the_ack_still_fails_the_barrier_at_once(monkeypatch):
+    """The usual peer path: this node's ack is written, then node 0's store
+    goes away while the barrier polls for the others."""
+    store, (_node0, node1) = _cluster()
+    real_check = store.check
+
+    def lost_check(keys):
+        store.error = RuntimeError("Broken pipe")
+        return real_check(keys)
+
+    monkeypatch.setattr(store, "check", lost_check)
+    started = time.monotonic()
+    with pytest.raises(PeerRestartError) as caught:
+        node1.barrier(1, PHASE_ARMED, time.time() + 30)
+
+    assert time.monotonic() - started < 1.0
+    assert caught.value.node == 0
+    store.error = None
+    assert store.snapshot()[f"restart/1/{PHASE_ARMED}/node1"] == "ok"
+
+
+def test_node_zero_never_names_itself_unreachable():
+    store, (node0, _node1) = _cluster()
+    store.error = RuntimeError("Broken pipe")
+
+    failure = node0.peer_failed(1, PHASE_READY)
+
+    assert not isinstance(failure, PeerRestartError)
+    assert isinstance(failure, RuntimeError)
+
+
 def test_a_lost_coordinator_fails_the_readiness_poll_naming_node_zero():
     store, (_node0, node1) = _cluster()
     store.error = RuntimeError("Broken pipe")

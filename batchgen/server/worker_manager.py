@@ -1035,6 +1035,19 @@ class WorkerManager:
             return "stopping"
         return text
 
+    def _spawn_unless_stopping(self) -> None:
+        """Spawn the next cohort on the main thread unless shutdown has begun.
+
+        The restart thread checks for shutdown before dispatching, but the
+        spawn runs later on the event loop, which may by then be running the
+        lifespan shutdown (a SIGTERM cancels the open restart request after
+        the graceful-shutdown bound). Checking again here, on the thread that
+        runs ``stop()``, means no cohort is ever spawned once ``stop()`` has
+        begun.
+        """
+        self._abort_restart_if_stopping()
+        self._spawn_workers()
+
     def _start_restart_follower(self) -> None:
         self._restart_coordinator.start_follower(
             state=lambda: self.state,
@@ -1231,7 +1244,7 @@ class WorkerManager:
             # cohort spawned below.
             self._worker_exit_state.clear()
             self._abort_restart_if_stopping()
-            self._call_spawn_on_main_thread(self._spawn_workers, timeout_s)
+            self._call_spawn_on_main_thread(self._spawn_unless_stopping, timeout_s)
             self._start_worker_monitor()
             if coordinated:
                 # A peer that failed to spawn leaves this node's ranks waiting

@@ -811,6 +811,42 @@ def test_scheduler_hooks_run_before_the_serving_flip(monkeypatch):
     assert manager.generation == 4
 
 
+def test_a_shutdown_that_begins_while_the_spawn_is_queued_spawns_nothing(
+    monkeypatch,
+):
+    """The restart thread checks for shutdown, then queues the spawn onto the
+    event loop. A SIGTERM cancels the open restart request after the graceful
+    bound and the loop runs the lifespan shutdown, so stop() can begin between
+    that check and the queued spawn. The check is repeated on the main thread,
+    so the queued spawn never starts a cohort once stop() has begun."""
+    manager = _manager(monkeypatch)
+    spawned = []
+    manager._spawn_workers = lambda: spawned.append("spawn")
+
+    def dispatcher(fn, timeout):
+        manager._stopping = True  # stop() began while the spawn was queued
+        return fn()
+
+    manager.set_main_thread_dispatcher(dispatcher)
+    outcome = []
+
+    def run():
+        # Off the main thread, as in production (asyncio.to_thread), so the
+        # spawn goes through the dispatcher.
+        try:
+            manager.restart_workers(timeout_s=1)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(10)
+
+    assert len(outcome) == 1 and "server is stopping" in str(outcome[0])
+    assert spawned == []
+    assert manager.state == "workers_down"
+
+
 @pytest.mark.parametrize("stop_phase", ["entry", "after_teardown", "before_spawn"])
 def test_restart_aborts_to_workers_down_once_shutdown_begins(monkeypatch, stop_phase):
     """SIGINT cannot cancel the restart thread, so the restart checks for
