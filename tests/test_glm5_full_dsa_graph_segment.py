@@ -195,10 +195,22 @@ def test_full_dsa_field_lists_exactly_cover_the_buffer_dataclass():
     split = (
         _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
         | _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
+        | _name_set_literal(tree, "_GLM5_DSA_PER_STEP_FIELDS")
     )
     assert fields ^ split == set()
     assert "prepared_flashmla" not in _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
     assert "selected_token_ids" in _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    # The step prologue's own outputs. The two length buffers are per-row and
+    # slice like any other view; the DeepGEMM schedule is neither a buffer the
+    # segment allocates nor sliceable, so it must NOT be a view -- a smaller
+    # bucket inheriting the base bucket's schedule would hand DeepGEMM a
+    # schedule built for the wrong row count.
+    views = _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    assert "token_indices" in views
+    assert "aux_deep_gemm_context_lens" in views
+    assert _name_set_literal(tree, "_GLM5_DSA_PER_STEP_FIELDS") == {
+        "aux_schedule_meta"
+    }
 
 
 def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
@@ -208,10 +220,20 @@ def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
         _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_PLACEHOLDER_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS")
+        | _name_set_literal(reuse, "_GLM5_REUSE_PER_STEP_FIELDS")
     )
     assert fields ^ split == set()
     assert _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS") == {"top_k_indices"}
     assert "selected_token_ids" in _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
+    # A skip layer narrows ``position_ids`` like any other layer, so its
+    # ``token_indices`` is a real per-row view; it never scores, so both
+    # DeepGEMM-only fields stay placeholders.
+    assert "token_indices" in _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
+    placeholders = _name_set_literal(reuse, "_GLM5_REUSE_PLACEHOLDER_FIELDS")
+    assert "aux_deep_gemm_context_lens" in placeholders
+    assert _name_set_literal(reuse, "_GLM5_REUSE_PER_STEP_FIELDS") == {
+        "aux_schedule_meta"
+    }
 
 
 # --------------------------------------------------------------------------- #

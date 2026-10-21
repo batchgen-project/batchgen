@@ -275,14 +275,55 @@ def _positional_calls(fn, callee: str) -> list[list[str]]:
 def test_graph_scorer_hands_deepgemm_the_guarded_lens_and_the_topk_the_true_ones():
     """The all-zero-context_lens guard (DeepGEMM sm90 metadata OOB): the
     Triton pass writes BOTH lengths in one launch; DeepGEMM reads only the
-    guarded one, the top-k only the true one."""
-    fn = _top_level(_tree(_SCORER_SRC), "paged_mqa_score_and_topk_out")
-    prep = _call_kwargs(fn, "prepare_paged_mqa_inputs_out")
+    guarded one, the top-k only the true one.
+
+    The graph scorer is split in two -- a step-level prologue and the
+    per-layer half -- so the guard spans both halves and each is pinned where
+    it now lives.
+    """
+    tree = _tree(_SCORER_SRC)
+    prologue = _top_level(tree, "paged_mqa_step_prologue_out")
+    prep = _call_kwargs(prologue, "prepare_paged_mqa_inputs_out")
     assert prep["deep_gemm_context_lens_out"] == "deep_gemm_context_lens"
-    (dg_args,) = _positional_calls(fn, "deep_gemm_paged_mqa_logits")
+    # The schedule is derived from the GUARDED lengths, never the true ones.
+    (meta_args,) = _positional_calls(prologue, "paged_mqa_logits_schedule_meta")
+    assert meta_args == ["deep_gemm_context_lens"]
+
+    per_layer = _top_level(tree, "paged_mqa_score_and_topk_prepared_out")
+    (dg_args,) = _positional_calls(per_layer, "deep_gemm_paged_mqa_logits")
     assert dg_args[3] == "deep_gemm_context_lens"
-    (topk_args,) = _positional_calls(fn, "_topk_from_logits")
+    (topk_args,) = _positional_calls(per_layer, "_topk_from_logits")
     assert topk_args[1] == "context_lens"
+
+
+def test_the_whole_layer_scorer_is_the_prologue_plus_the_per_layer_half():
+    """``paged_mqa_score_and_topk_out`` must stay exactly the composition of
+    the two halves, so a single-indexer-layer caller and a 21-layer caller
+    cannot drift apart."""
+    fn = _top_level(_tree(_SCORER_SRC), "paged_mqa_score_and_topk_out")
+    prologue = _call_kwargs(fn, "paged_mqa_step_prologue_out")
+    per_layer = _call_kwargs(fn, "paged_mqa_score_and_topk_prepared_out")
+    # The guarded lengths are this call's own, and the same tensor is written
+    # by the prologue and read by the per-layer half.
+    src = ast.unparse(fn)
+    assert "deep_gemm_context_lens = torch.empty_like(context_lens)" in src
+    assert prologue["deep_gemm_context_lens"] == "deep_gemm_context_lens"
+    assert per_layer["deep_gemm_context_lens"] == "deep_gemm_context_lens"
+    assert per_layer["schedule_meta"] == "schedule_meta"
+    for shared in ("block_table", "context_lens", "cache_seqlens"):
+        assert prologue[shared] == shared
+        assert per_layer[shared] == shared
+    # No prep or metadata launch may survive in the per-layer half (names in
+    # its docstring and its named errors are fine -- CALLS are not).
+    called = _call_names(
+        _top_level(_tree(_SCORER_SRC), "paged_mqa_score_and_topk_prepared_out")
+    )
+    for hoisted in (
+        "prepare_paged_mqa_inputs_out",
+        "paged_mqa_logits_schedule_meta",
+        "paged_mqa_step_prologue_out",
+    ):
+        assert hoisted not in called, hoisted
 
 
 def test_eager_scorer_hands_deepgemm_the_guarded_lens_and_the_topk_the_true_ones():
@@ -307,12 +348,39 @@ def test_every_deepgemm_launch_gets_guarded_or_positive_lengths():
             for args in _positional_calls(node, "deep_gemm_paged_mqa_logits"):
                 sites[node.name] = args[3]
     assert sites == {
-        "paged_mqa_score_and_topk_out": "deep_gemm_context_lens",
+        "paged_mqa_score_and_topk_prepared_out": "deep_gemm_context_lens",
         "paged_mqa_score_and_topk": "deep_gemm_context_lens",
         "warm_paged_mqa_logits": "context_lens",
     }
     warm = ast.unparse(_top_level(tree, "warm_paged_mqa_logits"))
     assert "min(int(page_size), int(max_seqlen))" in warm
+
+
+def test_every_schedule_metadata_launch_gets_guarded_or_positive_lengths():
+    """Same rule for the metadata kernel, which is the one that faults: it is
+    derived ONLY from lengths that are already guarded or a positive fill."""
+    tree = _tree(_SCORER_SRC)
+    sites = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            for args in _positional_calls(node, "paged_mqa_logits_schedule_meta"):
+                sites[node.name] = args[0]
+    assert sites == {
+        "paged_mqa_step_prologue_out": "deep_gemm_context_lens",
+        "paged_mqa_score_and_topk": "deep_gemm_context_lens",
+        "warm_paged_mqa_logits": "context_lens",
+    }
+    # And the raw DeepGEMM entry point is CALLED from exactly one place.
+    raw = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            name.endswith("get_paged_mqa_logits_metadata")
+            for name in _call_names(node)
+        )
+    ]
+    assert raw == ["paged_mqa_logits_schedule_meta"]
 
 
 def test_triton_prepare_fuses_the_row0_guard():
@@ -329,15 +397,23 @@ def test_triton_prepare_fuses_the_row0_guard():
 
 
 def test_deepgemm_call_names_the_upstream_defect():
-    """A future DeepGEMM pin bump must find WHY the guard exists at the call."""
+    """A future DeepGEMM pin bump must find WHY the guard exists at the call.
+
+    The call that faults is the metadata one, so the note lives with it.
+    """
     src = _SCORER_SRC.read_text()
     fn = ast.get_source_segment(
-        src, _top_level(_tree(_SCORER_SRC), "deep_gemm_paged_mqa_logits")
+        src, _top_level(_tree(_SCORER_SRC), "paged_mqa_logits_schedule_meta")
     )
     assert "0.1.5.post3" in fn
     assert "sm90_fp8_mqa_logits.hpp:188" in fn
     assert "batch % 32 == 0" in fn
     assert "2026-10-17" in fn
+    # And the logits call still states which form of the lengths it takes.
+    logits = ast.get_source_segment(
+        src, _top_level(_tree(_SCORER_SRC), "deep_gemm_paged_mqa_logits")
+    )
+    assert "GUARDED form" in logits
 
 
 def test_scorer_reinterprets_the_cache_as_bytes_without_copying():

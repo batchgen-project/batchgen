@@ -171,6 +171,7 @@ class Glm5DecoderLayerGraphSegment:
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        position_ids: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> None:
         """Delegate: run the hoisted step-level row-validity prologue once."""
@@ -179,8 +180,41 @@ class Glm5DecoderLayerGraphSegment:
             cache_seqlens=cache_seqlens,
             primary_slot_indices=primary_slot_indices,
             aux_slot_indices=aux_slot_indices,
+            position_ids=position_ids,
             num_valid_tokens=num_valid_tokens,
         )
+
+    def paged_mqa_prep_key(self, bucket_size: int) -> Optional[tuple]:
+        """Delegate: identity of the step-level paged-MQA inputs, or None."""
+        return self.dsa_segment.paged_mqa_prep_key(bucket_size)
+
+    def run_paged_mqa_prep(
+        self,
+        bucket_size: int,
+        *,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Delegate: run the hoisted step-level paged-MQA preparation once."""
+        self.dsa_segment.run_paged_mqa_prep(
+            bucket_size,
+            num_valid_tokens=num_valid_tokens,
+        )
+
+    @property
+    def selects_top_k(self) -> bool:
+        """Whether this layer runs the indexer and writes the shared top-k."""
+        return bool(self.dsa_segment.SELECTS_TOP_K)
+
+    def selected_positions_key(self, bucket_size: int) -> Optional[tuple]:
+        """Delegate: identity of the selected-position transform's tensors.
+
+        ``None`` for a layer that selects its own top-k, whose transform is
+        never shareable with another layer's.
+        """
+        key_fn = getattr(self.dsa_segment, "selected_positions_key", None)
+        if key_fn is None:
+            return None
+        return key_fn(bucket_size)
 
     def release_static_buffers(self, bucket_size: int) -> None:
         release = getattr(self.dsa_segment, "release_static_buffers", None)
@@ -202,6 +236,8 @@ class Glm5DecoderLayerGraphSegment:
         num_valid_tokens: torch.Tensor,
         rank_token_counts: torch.Tensor,
         row_validity_ready: bool = False,
+        paged_mqa_prep_ready: bool = False,
+        selected_positions_ready: bool = False,
         residual: Optional[torch.Tensor] = None,
         defer_residual_add: bool = False,
     ) -> Dict[str, torch.Tensor]:
@@ -255,6 +291,12 @@ class Glm5DecoderLayerGraphSegment:
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
             row_validity_ready=row_validity_ready,
+            # Both say "the driver already recorded this step-level work":
+            # the shared paged-MQA preparation, and (for a layer that reuses
+            # another's top-k) the selected-page-table transform the first
+            # layer of this reuse run already ran.
+            paged_mqa_prep_ready=paged_mqa_prep_ready,
+            selected_positions_ready=selected_positions_ready,
             # This layer absorbs the segment's `attn_output` row mask into the
             # add below, so the segment must not spend a launch on it.
             attn_output_mask_deferred=True,
