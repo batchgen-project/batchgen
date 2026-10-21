@@ -64,6 +64,11 @@ For multi-node deployments. See [Deployment Guide](deploy-deepseek-r1-h20.md) fo
 is passed explicitly to every worker; PyNccl initialization and recovery never
 scan outside `[pynccl-port-base, pynccl-port-base + pynccl-port-span)`.
 
+Every node runs a server, but only node 0 serves batches: on any other node the
+`/v1/files` and `/v1/batches` routes answer `409` naming node 0, and the server
+neither takes ownership of nor recovers the batch store at startup. Send batches
+and files to node 0; `/health` and `/v1/workers/status` are served on every node.
+
 ### Coordinated worker-pool restart
 
 A worker cohort is one `torch.distributed` world spanning every node, so
