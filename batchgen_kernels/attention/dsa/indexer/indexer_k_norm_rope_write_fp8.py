@@ -110,9 +110,10 @@ def fused_indexer_k_norm_rope_write_fp8(
         positions: ``[N]`` int32/int64 absolute position of each token.
         page_table / slot_indices / token_indices / page_size_tokens: the GPU
             page-table lookup, identical to the un-fused writer's.
-        apply_hadamard: run the normalized 128-point Hadamard rotation. True
-            is BatchGen's model semantics (the Q path rotates); upstream's
-            v3.2 kernel is the False instantiation on both q and k.
+        apply_hadamard: run the normalized 128-point Hadamard rotation.
+            Callers pass ``cache_applies_hadamard(aux_cache, data_dim)``:
+            False on this page-split FP8 route (upstream v3.2 semantics,
+            dropped on both q and k), True for a bf16 AoS indexer.
         k_fp8_out / scales_out: optional pre-allocated host-append sources (a
             captured graph MUST pass its static buffers).
         num_valid_tokens: optional ``[1]`` int32 device tensor; rows at or

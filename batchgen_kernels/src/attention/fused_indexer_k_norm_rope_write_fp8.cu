@@ -33,9 +33,13 @@
 //   1. Upstream's v3.2 kernel has NO Hadamard: it is instantiated with
 //      kHadamard=false on BOTH q and k, which is logit-preserving in exact
 //      arithmetic (H orthonormal, applied to both operands) and only trades
-//      fp8 quantization accuracy. BatchGen's Q path rotates, so the K path
-//      must too; `apply_hadamard` selects the rotation and is True in the
-//      model. The False instantiation is what a Q-side change would pair with.
+//      fp8 quantization accuracy. BatchGen now follows that on this
+//      page-split FP8 route, so `apply_hadamard` is False in the model and
+//      the Q index path drops the rotation with it. Both instantiations stay
+//      compiled: the bf16 AoS indexer profiles (GLM-5/5.1/5.3) still rotate,
+//      and the caller resolves which arm it needs from the cache it writes
+//      (`cache_applies_hadamard` in
+//      batchgen_kernels/attention/dsa/indexer_k_quant.py).
 //   2. Upstream addresses the cache with a flat `out_cache_loc` (page =
 //      loc >> page_bits). BatchGen resolves the physical page through the GPU
 //      page table, with the same row gating as

@@ -23,14 +23,16 @@ struct FusedRopeHadamardParams {
     float scale;
 };
 
-void fused_rope_hadamard_launch(FusedRopeHadamardParams &params, cudaStream_t stream);
+void fused_rope_hadamard_launch(FusedRopeHadamardParams &params,
+                               bool apply_hadamard, cudaStream_t stream);
 
 at::Tensor fused_rope_hadamard(
     at::Tensor &x,          // [batch, 128] bf16, after LayerNorm
     at::Tensor &cos_cache,  // [max_seq, 64] float32
     at::Tensor &sin_cache,  // [max_seq, 64] float32
     at::Tensor &positions,  // [batch] int64
-    float scale             // 1/sqrt(128)
+    float scale,            // 1/sqrt(128)
+    bool apply_hadamard = true
 ) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16);
     TORCH_CHECK(x.size(-1) == 128, "fused_rope_hadamard requires dim=128");
@@ -63,7 +65,7 @@ at::Tensor fused_rope_hadamard(
 
     at::cuda::CUDAGuard device_guard{(char)x.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fused_rope_hadamard_launch(params, stream);
+    fused_rope_hadamard_launch(params, apply_hadamard, stream);
 
     return out.reshape(shapes_og);
 }
@@ -75,7 +77,8 @@ void fused_rope_hadamard_out(
     at::Tensor &positions,  // [batch] int64
     at::Tensor &out,        // [batch, 128] bf16
     float scale,            // 1/sqrt(128)
-    std::optional<at::Tensor> out_fp8 = std::nullopt  // [batch, 128] e4m3
+    std::optional<at::Tensor> out_fp8 = std::nullopt,  // [batch, 128] e4m3
+    bool apply_hadamard = true
 ) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16);
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::ScalarType::BFloat16);
@@ -118,15 +121,19 @@ void fused_rope_hadamard_out(
 
     at::cuda::CUDAGuard device_guard{(char)x.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fused_rope_hadamard_launch(params, stream);
+    fused_rope_hadamard_launch(params, apply_hadamard, stream);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_rope_hadamard", &fused_rope_hadamard,
-          "Fused interleaved RoPE + Hadamard transform (dim=128, bf16)");
+          "Fused interleaved RoPE + optional Hadamard transform (dim=128, bf16)",
+          pybind11::arg("x"), pybind11::arg("cos_cache"), pybind11::arg("sin_cache"),
+          pybind11::arg("positions"), pybind11::arg("scale"),
+          pybind11::arg("apply_hadamard") = true);
     m.def("fused_rope_hadamard_out", &fused_rope_hadamard_out,
           "Out-buffer fused interleaved RoPE + Hadamard transform (dim=128, bf16)",
           pybind11::arg("x"), pybind11::arg("cos_cache"), pybind11::arg("sin_cache"),
           pybind11::arg("positions"), pybind11::arg("out"), pybind11::arg("scale"),
-          pybind11::arg("out_fp8") = std::nullopt);
+          pybind11::arg("out_fp8") = std::nullopt,
+          pybind11::arg("apply_hadamard") = true);
 }
