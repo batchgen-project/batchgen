@@ -35,7 +35,15 @@ from batchgen.models.glm.glm5.moe_deepgemm_masked import (
     SCALE_BLOCK,
 )
 
-E, H, I = 2, 256, 128
+# H is chosen so that K // 128 is itself a multiple of 4: the CuTe scale stacks
+# pad that trailing block axis to 4, while the masked GEMM needs the EXACT
+# extent, so the fused layout is only legal where the pad is the identity.
+# H = 512 -> k_blocks = 4 = pad4. GLM-5.2's real K = 6144 -> 48, likewise.
+# A geometry where they disagree must be REFUSED, which
+# ``test_the_fused_layout_refuses_a_geometry_whose_scale_axis_is_padded``
+# pins directly -- H = 256 (k_blocks 2 -> pad4 4) is that case.
+E, H, I = 2, 512, 128
+H_PADDED_SCALE_AXIS = 256
 FP8 = torch.float8_e4m3fn
 
 
@@ -47,21 +55,23 @@ class _FakeWrapper:
         self.cached_down = None
 
 
-def _stub_moe(deepep: bool, prealloc=None):
+def _stub_moe(deepep: bool, prealloc=None, h=None, i=None):
     """The minimum ``Glm5MoE`` surface ``_init_fp8_blockwise_weights`` touches."""
-    nb_n, nb_k = I // SCALE_BLOCK, H // SCALE_BLOCK
+    h = H if h is None else h
+    i = I if i is None else i
+    nb_n, nb_k = i // SCALE_BLOCK, h // SCALE_BLOCK
     moe = SimpleNamespace(
         experts_per_rank=E,
-        hidden_size=H,
-        config=SimpleNamespace(moe_intermediate_size=I),
+        hidden_size=h,
+        config=SimpleNamespace(moe_intermediate_size=i),
         device=torch.device("cpu"),
         layer_idx=3,
         routed_expert_start_idx=0,
         glm5_deepep_ll=deepep,
         experts=[_FakeWrapper() for _ in range(E)],
-        gate_list=[torch.zeros(I, H, dtype=torch.uint8) for _ in range(E)],
-        up_list=[torch.ones(I, H, dtype=torch.uint8) for _ in range(E)],
-        down_list=[torch.zeros(H, I, dtype=torch.uint8) for _ in range(E)],
+        gate_list=[torch.zeros(i, h, dtype=torch.uint8) for _ in range(E)],
+        up_list=[torch.ones(i, h, dtype=torch.uint8) for _ in range(E)],
+        down_list=[torch.zeros(h, i, dtype=torch.uint8) for _ in range(E)],
         gate_scale_list=[torch.full((nb_n, nb_k), 2.0) for _ in range(E)],
         up_scale_list=[torch.full((nb_n, nb_k), 3.0) for _ in range(E)],
         down_scale_list=[torch.full((nb_k, nb_n), 4.0) for _ in range(E)],
@@ -120,6 +130,35 @@ def test_deepep_on_fuses_gate_and_up_into_one_block():
     # must fail loudly rather than read this block at half the group stride
     assert moe.fp8_gate_w3d is None and moe.fp8_up_w3d is None
     assert moe.fp8_gate_ws3d is None and moe.fp8_up_ws3d is None
+
+
+def test_the_fused_layout_refuses_a_geometry_whose_scale_axis_is_padded():
+    """The fused layout is only legal where ``pad4`` is the identity.
+
+    The CuTe stacks pad a weight-scale stack's trailing block axis up to 4
+    floats; the masked m-grouped GEMM reads the EXACT ``K // 128`` extent and
+    cannot see past it (``DeepGemmMaskedExpertWeights.validate`` says so). So on
+    a geometry where ``K // 128`` is not already a multiple of 4, fusing would
+    hand the masked GEMM a padded scale stack it misreads -- and the loader must
+    refuse at load time with the padding named, not produce it.
+
+    This is pinned on its own because it is the one branch that fires only on
+    geometries the production model never uses: GLM-5.2's K = 6144 gives 48,
+    which divides by 4, so nothing else in this file reaches it.
+    """
+    k_blocks = H_PADDED_SCALE_AXIS // SCALE_BLOCK
+    assert (k_blocks + 3) // 4 * 4 != k_blocks, (
+        "this test needs a geometry whose scale axis really is padded")
+    moe = _stub_moe(deepep=True, h=H_PADDED_SCALE_AXIS)
+    with pytest.raises(RuntimeError, match=r"exact K//128 trailing extent"):
+        _stack(moe)
+
+    # ... and the same geometry is fine with the fused layout off, because the
+    # CuTe kernels are the ones the padding was for.
+    ok = _stack(_stub_moe(deepep=False, h=H_PADDED_SCALE_AXIS))
+    assert ok.fp8_gate_up_w3d is None
+    assert tuple(ok.fp8_gate_ws3d.shape) == (
+        E, I // SCALE_BLOCK, (k_blocks + 3) // 4 * 4)
 
 
 def test_the_fused_halves_carry_the_values_of_their_own_projection():
