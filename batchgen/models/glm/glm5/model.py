@@ -2054,11 +2054,24 @@ class Glm5MoE(nn.Module):
         self._fp8_blockwise_ready = True
 
         if not getattr(Glm5MoE, '_warned_weights_stacked', False):
+            # Layout-aware: under the fused layout the per-projection stacks are
+            # deliberately None, so this summary must read the stack that
+            # actually exists. Reporting the layout as well, because "which
+            # layout did this process load" is the first thing anyone debugging
+            # the DeepEP decode path needs from the log.
+            if self.fp8_gate_up_fused:
+                layout = "fused gate/up [E, 2I, H]"
+                gate_shape = list(self.fp8_gate_up_w3d.shape)
+                gate_scale_shape = list(self.fp8_gate_up_ws3d.shape)
+            else:
+                layout = "per-projection [E, I, H]"
+                gate_shape = list(self.fp8_gate_w3d.shape)
+                gate_scale_shape = list(self.fp8_gate_ws3d.shape)
             logging.info(
-                f"[Glm5MoE] FP8 blockwise 3D weights ready: "
-                f"gate={list(self.fp8_gate_w3d.shape)}, "
+                f"[Glm5MoE] FP8 blockwise 3D weights ready ({layout}): "
+                f"gate={gate_shape}, "
                 f"down={list(self.fp8_down_w3d.shape)}, "
-                f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
+                f"gate_scale={gate_scale_shape}"
             )
             Glm5MoE._warned_weights_stacked = True
 

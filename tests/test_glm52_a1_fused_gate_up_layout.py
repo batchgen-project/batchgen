@@ -93,6 +93,13 @@ def _stack(moe):
         "triton", reason="glm5.model imports triton at module scope")
     from batchgen.models.glm.glm5.model import Glm5MoE
 
+    # The loader ends with a one-time summary log guarded by the CLASS attribute
+    # ``_warned_weights_stacked``. Leaving it set means the first test to run the
+    # loader permanently disables that block for every later test -- which is
+    # exactly how a crash in it reached a GPU host: the fused tests ran the
+    # loader and passed while never executing the log line at all. Reset it so
+    # every loader test covers the summary path for its own layout.
+    Glm5MoE._warned_weights_stacked = False
     Glm5MoE._init_fp8_blockwise_weights(moe)
     return moe
 
@@ -476,3 +483,30 @@ def test_the_captured_forward_does_not_read_the_histogram_back():
     setup_src = inspect.getsource(
         seg.Glm5MoEGraphSegment.setup_static_buffers)
     assert "format_recv_count_histogram" in setup_src
+
+
+def test_the_ready_summary_log_reads_the_stack_that_exists(caplog):
+    """The loader's one-time summary must not dereference a None stack.
+
+    Under the fused layout ``fp8_gate_w3d`` is deliberately None, so a summary
+    that reads it unconditionally raises AttributeError on EVERY rank at decode
+    configure. That is not a cosmetic bug: it killed all 8 workers on the node
+    before a single cell ran. It also survived the suite, because the summary is
+    guarded by a class-level once-flag that an earlier test had already
+    consumed -- so this test asserts the log for BOTH layouts explicitly.
+    """
+    import logging
+
+    for deepep, want in ((True, "fused gate/up"), (False, "per-projection")):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            moe = _stack(_stub_moe(deepep=deepep))
+        assert moe.fp8_gate_up_fused is deepep
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "FP8 blockwise 3D weights ready" in text, text
+        assert want in text, text
+        # and it reported the stack that actually exists
+        if deepep:
+            assert str(list(moe.fp8_gate_up_w3d.shape)) in text, text
+        else:
+            assert str(list(moe.fp8_gate_w3d.shape)) in text, text
