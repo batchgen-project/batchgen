@@ -218,26 +218,45 @@ def test_q_wrapper_takes_out_fp8_and_checks_its_dtype_and_size():
 
 
 def test_scorer_only_casts_q_when_it_was_not_prequantized():
+    # After the step-prologue hoist split the scorer into halves, the cast
+    # lives in the PER-LAYER half and the one-shot entry point is a thin
+    # wrapper. Pin the property at both: the guard (with the clamp and the
+    # copy inside it) sits in the per-layer half, and the wrapper FORWARDS
+    # q_prequantized so a prequantized one-shot call skips the cast too.
     tree = _tree(_SCORER_SRC)
-    fn = _top_level(tree, "paged_mqa_score_and_topk_out")
-    assert "q_prequantized" in [a.arg for a in fn.args.kwonlyargs]
 
+    inner = _top_level(tree, "paged_mqa_score_and_topk_prepared_out")
+    assert "q_prequantized" in [a.arg for a in inner.args.kwonlyargs]
     guards = [
         node
-        for node in ast.walk(fn)
+        for node in ast.walk(inner)
         if isinstance(node, ast.If) and ast.unparse(node.test) == "not q_prequantized"
     ]
     assert len(guards) == 1, "expected one `if not q_prequantized:` guard"
     assert _calls(guards[0], "saturate_q_to_e4m3_range"), (
         "the clamp must be the thing the guard removes"
     )
-    # The guard is the ONLY place this scorer entry point casts q, so a
-    # prequantized call issues neither the clamp nor the copy. Both launches
-    # are inside it: the clamp builds the temporary, the copy_ narrows it.
     copy_callee = "q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_"
-    assert len(_calls(fn, "saturate_q_to_e4m3_range")) == 1
-    assert len(_calls(fn, copy_callee)) == 1
+    assert len(_calls(inner, "saturate_q_to_e4m3_range")) == 1
+    assert len(_calls(inner, copy_callee)) == 1
     assert len(_calls(guards[0], copy_callee)) == 1
+
+    wrapper = _top_level(tree, "paged_mqa_score_and_topk_out")
+    assert "q_prequantized" in [a.arg for a in wrapper.args.kwonlyargs]
+    assert not _calls(wrapper, "saturate_q_to_e4m3_range"), (
+        "the one-shot wrapper must not cast; the per-layer half owns the guard"
+    )
+    forwards = [
+        kw
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "q_prequantized"
+        and ast.unparse(kw.value) == "q_prequantized"
+    ]
+    assert len(forwards) == 1, (
+        "the one-shot wrapper must forward q_prequantized to the per-layer half"
+    )
 
     # The eager entry point is untouched and still casts for itself.
     eager = _top_level(tree, "paged_mqa_score_and_topk")
