@@ -57,10 +57,14 @@ from .moe_deepgemm_masked import (
 from .moe_ragged import (
     ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
+    accumulate_recv_count_histogram,
     act_quant_ragged,
     dispatch_scatter_ragged,
+    format_recv_count_histogram,
     make_quant_buffers,
     ragged_row_capacity,
+    recv_count_histogram_enabled,
+    recv_count_histogram_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,12 +235,24 @@ class _Glm5MoEGraphBuffers:
     # on the NCCL path.
     ll_topk_idx: torch.Tensor
     ll_cu_seqlens: torch.Tensor
-    # DeepEP low-latency mode only: the second half of the masked R1. The gate
-    # projection lands in ``intermediate`` and the up projection here, and the
-    # masked activation reads both and writes ``inter_fp8`` / ``ll_act_scale``.
-    # One pair for every MoE layer and bucket, like every other routed buffer:
-    # layers run in stream order and each layer's activation has consumed them
-    # before the next layer's R1 rewrites them. Empty on the NCCL path.
+    # DeepEP low-latency mode only: the whole masked R1, gate in columns
+    # ``[0, I)`` and up in ``[I, 2I)`` of one ``[rows, 2I]`` block, because R1
+    # is a single masked launch over the fused ``[E, 2I, H]`` gate/up stack.
+    # The masked activation reads the two halves as strided views and writes
+    # ``inter_fp8`` / ``ll_act_scale``. One buffer for every MoE layer and
+    # bucket, like every other routed buffer: layers run in stream order and
+    # each layer's activation has consumed it before the next layer's R1
+    # rewrites it. Empty on the NCCL path.
+    ll_gate_up_out: torch.Tensor
+    # Cumulative per-expert recv-count histogram, for the batch-level
+    # ``glm52_recv_count_hist`` diagnostic only. Always allocated (a few
+    # hundred bytes) so the buffer contract is static, but only written when
+    # the diagnostic is on at capture time -- see
+    # ``moe_ragged.recv_count_histogram_enabled``.
+    ll_recv_hist: torch.Tensor
+    # Superseded by ``ll_gate_up_out``: R1 no longer writes a separate up
+    # projection. Kept as a zero-size placeholder so the buffer contract and
+    # its NCCL-path emptiness check are unchanged.
     ll_up_out: torch.Tensor
     # DeepEP low-latency mode only: the down projection's A-scales, in the
     # masked GEMM's MN-major form -- shape [E_local, stride, I // 128] over a
@@ -301,6 +317,8 @@ _MOE_SHARED_FIELDS = (
     # which does not scale with the bucket, so all of these are
     # bucket-independent.
     "ll_cu_seqlens",
+    "ll_gate_up_out",
+    "ll_recv_hist",
     "ll_up_out",
     "ll_act_scale",
 )
@@ -458,6 +476,9 @@ class Glm5MoEGraphBufferPool:
         # total and every consumer fails on a shape, never on a None.
         b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
         b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_gate_up_out"] = torch.empty(
+            0, 2 * n, dtype=torch.bfloat16, device=d)
+        b["ll_recv_hist"] = torch.zeros(1, dtype=torch.int64, device=d)
         b["ll_up_out"] = torch.empty(0, n, dtype=torch.bfloat16, device=d)
         b["ll_act_scale"] = torch.empty(
             0, 0, n // 128, dtype=torch.float32, device=d)
@@ -545,10 +566,24 @@ class Glm5MoEGraphBufferPool:
         # is no int32 index buffer on this path.
         b["topk_weights"] = torch.empty(max_bucket, k, dtype=torch.float32, device=d)
         b["ll_topk_idx"] = torch.empty(max_bucket, k, dtype=torch.int64, device=d)
-        # R1 writes the gate projection into ``intermediate`` and the up
-        # projection into ``ll_up_out``; the masked activation reads both.
+        # A1: R1 is ONE masked launch over the fused [E, 2I, H] gate/up stack,
+        # so it writes both projections into one [rows, 2n] block -- gate in
+        # columns [0, n), up in [n, 2n). The masked activation reads the two
+        # halves as strided views (it takes gate and up as separate pointers
+        # with separate strides and needs only a contiguous last dim), so the
+        # split costs no copy and no compaction pass.
+        #
+        # ``intermediate`` stays allocated at [rows, n]: it is the output of
+        # ``_fp8_blockwise_gemm_3d``, which is a different code path with its
+        # own contiguity requirement. ``ll_up_out`` has no reader left and
+        # shrinks to a placeholder rather than holding rows x n for nothing.
+        b["ll_gate_up_out"] = torch.empty(
+            rows, 2 * n, dtype=torch.bfloat16, device=d)
+        b["ll_recv_hist"] = torch.zeros(
+            recv_count_histogram_width(stride, MASKED_BLOCK_M),
+            dtype=torch.int64, device=d)
         b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
-        b["ll_up_out"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
+        b["ll_up_out"] = torch.empty(0, n, dtype=torch.bfloat16, device=d)
         b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
         b["inter_fp8"] = torch.empty(rows, n, dtype=torch.uint8, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
@@ -629,6 +664,8 @@ class Glm5MoEGraphBufferPool:
             expert_counters=b["expert_counters"],
             cu_seqlens=b["ll_cu_seqlens"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
+            ll_gate_up_out=b["ll_gate_up_out"],
+            ll_recv_hist=b["ll_recv_hist"],
             ll_up_out=b["ll_up_out"],
             ll_act_scale=b["ll_act_scale"],
             x_scale=b["x_scale"],
@@ -688,6 +725,8 @@ class Glm5MoEGraphBufferPool:
             expert_counters=b["expert_counters"],
             cu_seqlens=b["cu_seqlens"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
+            ll_gate_up_out=b["ll_gate_up_out"],
+            ll_recv_hist=b["ll_recv_hist"],
             ll_up_out=b["ll_up_out"],
             ll_act_scale=b["ll_act_scale"],
             x_scale=x_scale,
@@ -882,11 +921,23 @@ class Glm5MoEGraphSegment:
         """
         moe = self.moe
         masked_gemm_fn()
+        if not getattr(moe, "fp8_gate_up_fused", False):
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the DeepEP decode path runs gate+up "
+                "as ONE masked GEMM over the fused [E, 2I, H] stack, but this "
+                "layer's weights were loaded in the per-projection layout. The "
+                "layout is chosen from enable_deepep in "
+                "Glm5MoE._init_fp8_blockwise_weights; a mismatch here would "
+                "otherwise read a half-sized stack at the wrong group stride."
+            )
+        if moe.fp8_gate_up_w3d is None or moe.fp8_gate_up_ws3d is None:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the fused gate/up stack is missing "
+                "despite fp8_gate_up_fused being set"
+            )
         weights = DeepGemmMaskedExpertWeights(
-            gate_w=moe.fp8_gate_w3d.view(torch.float8_e4m3fn),
-            gate_scale=moe.fp8_gate_ws3d,
-            up_w=moe.fp8_up_w3d.view(torch.float8_e4m3fn),
-            up_scale=moe.fp8_up_ws3d,
+            gate_up_w=moe.fp8_gate_up_w3d.view(torch.float8_e4m3fn),
+            gate_up_scale=moe.fp8_gate_up_ws3d,
             down_w=moe.fp8_down_w3d.view(torch.float8_e4m3fn),
             down_scale=moe.fp8_down_ws3d,
         )
@@ -898,6 +949,21 @@ class Glm5MoEGraphSegment:
         return weights
 
     def setup_static_buffers(self, bucket_size: int) -> None:
+        # The recv-count diagnostic's ONLY readback point. The graph manager
+        # runs this before each round's warmup and capture, so it is host code
+        # outside every capture region -- which the readback requires, since it
+        # is a D2H copy. Reporting here, before ``pool.setup()`` may rebuild the
+        # buffers, prints the accumulation of the round that just ended; the
+        # histogram is cumulative because nothing in the captured accumulate
+        # zeroes it.
+        if recv_count_histogram_enabled():
+            hist = self.pool._base.get("ll_recv_hist")
+            if hist is not None and hist.numel() > 1:
+                logger.info(
+                    "Layer %d: %s",
+                    self.moe.layer_idx,
+                    format_recv_count_histogram(hist, MASKED_BLOCK_M),
+                )
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
         if self.deepep_ll and not self.pool.deepep_enabled:
@@ -1196,6 +1262,24 @@ class Glm5MoEGraphSegment:
         # (csrc/deep_ep.cpp packs them column-major for TMA), which is the one
         # form the masked kernel loads without a repack. Nothing between the
         # dispatch and R1 touches either.
+        #
+        # Batch-level diagnostic only: fold this layer's recv_count into the
+        # cumulative tile histogram. This body runs INSIDE the capture, so the
+        # only thing that may happen here is the device-side accumulate -- a
+        # pure index_add_ that replay reproduces. The readback that turns the
+        # histogram into a log line is a D2H copy and is therefore ILLEGAL
+        # here; it lives in ``setup_static_buffers``, which the graph manager
+        # runs before each round's capture, and
+        # ``format_recv_count_histogram`` refuses to run under a capture so
+        # this cannot regress silently.
+        #
+        # The flag itself is read on the host, which executes at capture and
+        # not per replay, so with the diagnostic off the measured path gains no
+        # device work at all.
+        if recv_count_histogram_enabled():
+            accumulate_recv_count_histogram(
+                bufs.ll_recv_hist, recv_count, MASKED_BLOCK_M
+            )
         inter = self.intermediate_size
         run_deepgemm_masked_moe(
             x_fp8=recv_x,
@@ -1210,8 +1294,7 @@ class Glm5MoEGraphSegment:
                 topk=self.num_experts_per_tok,
                 num_experts_global=e * self.world_size,
             ),
-            gate_out=bufs.intermediate.view(e, stride, inter),
-            up_out=bufs.ll_up_out.view(e, stride, inter),
+            gate_up_out=bufs.ll_gate_up_out.view(e, stride, 2 * inter),
             act_fp8=bufs.inter_fp8.view(torch.float8_e4m3fn)
                                   .view(e, stride, inter),
             act_scales=bufs.ll_act_scale,

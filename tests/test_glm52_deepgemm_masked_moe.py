@@ -60,13 +60,12 @@ def _mn_major(groups, rows, blocks, *, device="cpu"):
 
 
 def _weights(e=E, h=H, i=I, device="cpu"):
+    """The fused gate/up stack: gate rows [0, I), up rows [I, 2I)."""
     return DeepGemmMaskedExpertWeights(
-        gate_w=torch.zeros(e, i, h, dtype=torch.uint8, device=device).view(FP8),
-        gate_scale=torch.ones(
-            e, i // SCALE_BLOCK, h // SCALE_BLOCK, device=device),
-        up_w=torch.zeros(e, i, h, dtype=torch.uint8, device=device).view(FP8),
-        up_scale=torch.ones(
-            e, i // SCALE_BLOCK, h // SCALE_BLOCK, device=device),
+        gate_up_w=torch.zeros(
+            e, 2 * i, h, dtype=torch.uint8, device=device).view(FP8),
+        gate_up_scale=torch.ones(
+            e, (2 * i) // SCALE_BLOCK, h // SCALE_BLOCK, device=device),
         down_w=torch.zeros(e, h, i, dtype=torch.uint8, device=device).view(FP8),
         down_scale=torch.ones(
             e, h // SCALE_BLOCK, i // SCALE_BLOCK, device=device),
@@ -171,10 +170,8 @@ def test_the_glm52_routed_stacks_are_already_the_masked_nt_layout():
         return torch.empty(*shape, dtype=dtype, device="meta")
 
     weights = DeepGemmMaskedExpertWeights(
-        gate_w=meta(e, i, h, dtype=torch.uint8).view(FP8),
-        gate_scale=meta(e, n_blocks, pad4(k_blocks)),
-        up_w=meta(e, i, h, dtype=torch.uint8).view(FP8),
-        up_scale=meta(e, n_blocks, pad4(k_blocks)),
+        gate_up_w=meta(e, 2 * i, h, dtype=torch.uint8).view(FP8),
+        gate_up_scale=meta(e, 2 * n_blocks, pad4(k_blocks)),
         down_w=meta(e, h, i, dtype=torch.uint8).view(FP8),
         down_scale=meta(e, k_blocks, pad4(n_blocks)),
     )
@@ -189,10 +186,8 @@ def test_a_cute_padded_scale_stack_is_refused_not_mis_strided():
     k_blocks = h // SCALE_BLOCK
     assert (k_blocks + 3) // 4 * 4 != k_blocks
     weights = DeepGemmMaskedExpertWeights(
-        gate_w=torch.zeros(e, i, h, dtype=torch.uint8).view(FP8),
-        gate_scale=torch.ones(e, i // SCALE_BLOCK, 4),
-        up_w=torch.zeros(e, i, h, dtype=torch.uint8).view(FP8),
-        up_scale=torch.ones(e, i // SCALE_BLOCK, 4),
+        gate_up_w=torch.zeros(e, 2 * i, h, dtype=torch.uint8).view(FP8),
+        gate_up_scale=torch.ones(e, (2 * i) // SCALE_BLOCK, 4),
         down_w=torch.zeros(e, h, i, dtype=torch.uint8).view(FP8),
         down_scale=torch.ones(e, k_blocks, i // SCALE_BLOCK),
     )
@@ -206,20 +201,30 @@ def test_weight_validation_fences_dtype_shape_and_contiguity():
     base.validate(**good)
 
     bf16 = DeepGemmMaskedExpertWeights(
-        **{**base.__dict__, "gate_w": torch.zeros(E, I, H, dtype=torch.bfloat16)})
+        **{**base.__dict__,
+           "gate_up_w": torch.zeros(E, 2 * I, H, dtype=torch.bfloat16)})
     with pytest.raises(RuntimeError, match="float8_e4m3fn weights"):
         bf16.validate(**good)
 
+    # A half-sized gate/up stack is the per-projection layout reaching the
+    # fused contract: it must be named, not silently read at half the stride.
+    halved = DeepGemmMaskedExpertWeights(
+        **{**base.__dict__,
+           "gate_up_w": torch.zeros(E, I, H, dtype=torch.uint8).view(FP8)})
+    with pytest.raises(RuntimeError, match=r"gate_up_w.*\[E, N, K\]"):
+        halved.validate(**good)
+
     swapped = DeepGemmMaskedExpertWeights(
-        **{**base.__dict__, "down_w": base.gate_w})
+        **{**base.__dict__, "down_w": base.gate_up_w})
     with pytest.raises(RuntimeError, match=r"down_w.*\[E, N, K\]"):
         swapped.validate(**good)
 
     strided = DeepGemmMaskedExpertWeights(
         **{**base.__dict__,
-           "up_w": torch.zeros(E, 2 * I, H, dtype=torch.uint8)
-                        .view(FP8)[:, :I, :]})
-    with pytest.raises(RuntimeError, match="up_w: the masked GEMM takes a contiguous"):
+           "gate_up_w": torch.zeros(E, 4 * I, H, dtype=torch.uint8)
+                             .view(FP8)[:, :2 * I, :]})
+    with pytest.raises(
+            RuntimeError, match="gate_up_w: the masked GEMM takes a contiguous"):
         strided.validate(**good)
 
     with pytest.raises(RuntimeError, match="block-scaled"):
@@ -271,8 +276,8 @@ def _runner_buffers(device="cpu"):
     return dict(
         x_fp8=torch.zeros(E, S, H, dtype=torch.uint8, device=device).view(FP8),
         x_scales=_mn_major(E, S, H // SCALE_BLOCK, device=device),
-        gate_out=torch.zeros(E, S, I, dtype=torch.bfloat16, device=device),
-        up_out=torch.zeros(E, S, I, dtype=torch.bfloat16, device=device),
+        gate_up_out=torch.zeros(
+            E, S, 2 * I, dtype=torch.bfloat16, device=device),
         act_fp8=torch.zeros(E, S, I, dtype=torch.uint8, device=device).view(FP8),
         act_scales=_mn_major(E, S, I // SCALE_BLOCK, device=device),
         out=torch.zeros(E, S, H, dtype=torch.bfloat16, device=device),
@@ -304,19 +309,27 @@ def test_the_runner_threads_the_full_masked_call_contract(
         weights=weights, masked_m=masked_m, expected_m=17, **bufs)
 
     assert returned is bufs["out"]
-    gate, up, down = fake_deep_gemm.calls
+    # A1: gate+up are ONE masked launch over the fused stack, so the chain is
+    # two GEMMs, not three.
+    assert len(fake_deep_gemm.calls) == 2, fake_deep_gemm.calls
+    gate_up, down = fake_deep_gemm.calls
     assert len(acts) == 1
     act = acts[0]
 
-    # R1: both projections read the SAME A operand, as delivered
-    for call, (w, s) in ((gate, (weights.gate_w, weights.gate_scale)),
-                         (up, (weights.up_w, weights.up_scale))):
-        assert call.a[0] is bufs["x_fp8"] and call.a[1] is bufs["x_scales"]
-        assert call.b == (w, s)
-    assert gate.d is bufs["gate_out"] and up.d is bufs["up_out"]
+    # R1: the fused gate/up stack, reading the A operand as delivered
+    assert gate_up.a[0] is bufs["x_fp8"] and gate_up.a[1] is bufs["x_scales"]
+    assert gate_up.b == (weights.gate_up_w, weights.gate_up_scale)
+    assert gate_up.d is bufs["gate_up_out"]
 
-    # act: reads both halves of R1, writes R2's A operand pair
-    assert act.gate is bufs["gate_out"] and act.up is bufs["up_out"]
+    # act: reads the two halves of R1 as strided views of the one buffer --
+    # same storage, column offset 0 and I, contiguous last dim so the kernel's
+    # stride arguments are all it needs.
+    fused = bufs["gate_up_out"]
+    for half, offset in ((act.gate, 0), (act.up, I)):
+        assert half.data_ptr() == fused[:, :, offset:].data_ptr()
+        assert tuple(half.shape) == (E, S, I)
+        assert half.stride() == fused.stride()
+        assert half.stride(-1) == 1
     assert act.out is bufs["act_fp8"] and act.out_scale is bufs["act_scales"]
     assert act.group_size == SCALE_BLOCK
 
@@ -326,7 +339,7 @@ def test_the_runner_threads_the_full_masked_call_contract(
     assert down.d is bufs["out"]
 
     # masked_m is the SAME device tensor everywhere, never a copy or a host int
-    for call in (gate, up, down):
+    for call in (gate_up, down):
         assert call.masked_m is masked_m
         assert call.expected_m == 17 and type(call.expected_m) is int
     assert act.masked_m is masked_m

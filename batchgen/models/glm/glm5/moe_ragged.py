@@ -49,6 +49,121 @@ def _tilem_avg_override():
     return parsed if parsed > 0 else None
 
 
+def recv_count_histogram_width(stride: int, block_m: int) -> int:
+    """Accumulator width for :func:`accumulate_recv_count_histogram`.
+
+    Slot 0 counts accumulated layer-steps, slot 1 the routed rows, and slots
+    ``2 + t`` the expert-slots that needed ``t`` m-tiles. ``t`` cannot exceed
+    ``ceil(stride / block_m)`` because an expert's rows are bounded by the
+    receive stride.
+    """
+    if int(stride) <= 0 or int(block_m) <= 0:
+        raise ValueError(
+            f"recv-count histogram needs positive stride/block_m; got "
+            f"{stride}/{block_m}"
+        )
+    return 2 + (int(stride) + int(block_m) - 1) // int(block_m) + 1
+
+
+def recv_count_histogram_enabled() -> bool:
+    """Batch-level diagnostic `batchgen_debug.glm52_recv_count_hist` (bool).
+
+    Read on the host where the decode graph is built, exactly like
+    :func:`_tilem_avg_override`: graphs are re-captured every decode round, so
+    setting it takes effect on the next round's capture. It is read ONCE per
+    capture and never per replay, so a disabled histogram costs nothing at all
+    -- no buffer traffic and no extra launch on the measured path.
+    """
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return False
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    if not isinstance(debug, dict):
+        return False
+    return bool(debug.get("glm52_recv_count_hist", False))
+
+
+def accumulate_recv_count_histogram(hist, recv_count, block_m: int) -> None:
+    """Fold one layer's ``recv_count`` into ``hist``, on device, no sync.
+
+    Capture-safe: static shapes, integer arithmetic, and an ``index_add_``;
+    nothing reads a device value on the host. Called once per routed layer
+    while the diagnostic is on, so the accumulation is cumulative over every
+    replay of the captured graph -- which is what makes the readback a
+    distribution rather than a single step's snapshot.
+    """
+    import torch
+
+    if hist.dtype != torch.int64:
+        raise RuntimeError(
+            f"recv-count histogram must be int64; got {hist.dtype}"
+        )
+    if recv_count.dim() != 1:
+        raise RuntimeError(
+            "recv_count must be the per-expert [E] row counts; got "
+            f"{tuple(recv_count.shape)}"
+        )
+    counts = recv_count.to(torch.int64)
+    tiles = torch.div(
+        counts + (int(block_m) - 1), int(block_m), rounding_mode="floor"
+    )
+    tiles = torch.clamp(tiles, 0, hist.numel() - 3) + 2
+    hist.index_add_(0, tiles, torch.ones_like(tiles))
+    hist[0] += 1
+    hist[1] += counts.sum()
+
+
+def format_recv_count_histogram(hist, block_m: int) -> str:
+    """One host readback of the cumulative histogram, for a log line.
+
+    The only host-visible synchronization in this diagnostic. ``hist.tolist()``
+    is a device-to-host copy, so it must run OUTSIDE every CUDA graph capture
+    region: issuing it during a capture fails the capture outright
+    (``cudaErrorStreamCaptureUnsupported``), and it would fail only with the
+    diagnostic ON, i.e. exactly in the one configuration that uses it.
+
+    The caller is ``Glm5MoEGraphSegment.setup_static_buffers``, which the graph
+    manager runs before each round's warmup and capture. The accumulate half
+    (:func:`accumulate_recv_count_histogram`) is the opposite: it is pure
+    device work and belongs inside the capture.
+
+    The capture check below locks that split into the contract rather than
+    leaving it to the call site, in the same style as this package's
+    side-stream and event guards.
+    """
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "format_recv_count_histogram reads the histogram back to the host "
+            "and must not be called inside a CUDA graph capture; call it from "
+            "a pre-capture host path (setup_static_buffers) and leave only "
+            "accumulate_recv_count_histogram inside the captured forward"
+        )
+    # gpu-sync: allow diagnostic readback, proven outside any capture region by
+    # the guard above (batch-level glm52_recv_count_hist only; never on the
+    # measured replay path)
+    vals = [int(v) for v in hist.tolist()]
+    layer_steps, rows = vals[0], vals[1]
+    buckets = vals[2:]
+    slots = sum(buckets)
+    if slots == 0:
+        return "recv-count histogram: no accumulation yet"
+    over = sum(buckets[2:])
+    parts = " ".join(
+        f"{t}t={c}({100.0 * c / slots:.2f}%)"
+        for t, c in enumerate(buckets)
+        if c
+    )
+    return (
+        f"recv-count histogram (block_m={block_m}): layer-steps={layer_steps} "
+        f"expert-slots={slots} rows={rows} "
+        f"mean_rows_per_slot={rows / slots:.2f} "
+        f"over_one_tile={over}({100.0 * over / slots:.3f}%) | {parts}"
+    )
+
+
 def gemm_tilem_avg_effective(
     global_rows: int, topk: int, num_global_experts: int
 ) -> int:

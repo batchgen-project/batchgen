@@ -70,13 +70,12 @@ class _FakeGroup:
 
 
 def _masked_weights(e=E_LOCAL, h=H, i=N_INTER):
-    """The routed stacks in the masked GEMM's ``nt`` layout, as loaded."""
+    """The routed stacks in the masked GEMM's ``nt`` layout, as loaded: gate
+    and up fused per expert into one [E, 2I, H] block."""
     fp8 = torch.float8_e4m3fn
     return DeepGemmMaskedExpertWeights(
-        gate_w=torch.zeros(e, i, h, dtype=torch.uint8).view(fp8),
-        gate_scale=torch.ones(e, i // 128, h // 128),
-        up_w=torch.zeros(e, i, h, dtype=torch.uint8).view(fp8),
-        up_scale=torch.ones(e, i // 128, h // 128),
+        gate_up_w=torch.zeros(e, 2 * i, h, dtype=torch.uint8).view(fp8),
+        gate_up_scale=torch.ones(e, (2 * i) // 128, h // 128),
         down_w=torch.zeros(e, h, i, dtype=torch.uint8).view(fp8),
         down_scale=torch.ones(e, h // 128, i // 128),
     )
@@ -245,8 +244,10 @@ def test_pool_allocates_the_expert_major_receive_space(monkeypatch):
     assert bufs.intermediate.shape == (ROWS, N_INTER)
     assert bufs.expert_out.shape == (ROWS, H)
     assert bufs.inter_fp8.shape == (ROWS, N_INTER)
-    # R1 writes gate into intermediate and up into ll_up_out
-    assert bufs.ll_up_out.shape == (ROWS, N_INTER)
+    # R1 is ONE masked launch over the fused stack: gate in columns [0, I),
+    # up in [I, 2I) of one block. ll_up_out has no reader left.
+    assert bufs.ll_gate_up_out.shape == (ROWS, 2 * N_INTER)
+    assert bufs.ll_up_out.shape == (0, N_INTER)
     # the down-projection A-scales are the masked GEMM's MN-major form: a
     # contiguous [E, I/128, stride] block handed over as its (1, 2) transpose
     assert bufs.ll_act_scale.shape == (E_LOCAL, STRIDE, N_INTER // 128)
@@ -290,7 +291,7 @@ def test_receive_space_is_bucket_independent(monkeypatch):
         assert pool.ll_stride == stride
         assert bufs.capacity == E_LOCAL * stride
         assert bufs.expert_out.shape == (E_LOCAL * stride, H)
-        assert bufs.ll_up_out.shape == (E_LOCAL * stride, N_INTER)
+        assert bufs.ll_gate_up_out.shape == (E_LOCAL * stride, 2 * N_INTER)
         assert bufs.ll_act_scale.shape == (E_LOCAL, stride, N_INTER // 128)
         # only the per-rank row space follows the bucket
         assert bufs.padded.shape == (bucket, H)
@@ -444,10 +445,17 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
 
     segment.moe = SimpleNamespace(
         layer_idx=5,
-        fp8_gate_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
-        fp8_up_w3d=torch.zeros(E_LOCAL, N_INTER, H, dtype=torch.uint8),
-        fp8_gate_ws3d=torch.ones(E_LOCAL, N_INTER // 128, H // 128),
-        fp8_up_ws3d=torch.ones(E_LOCAL, N_INTER // 128, H // 128),
+        # The DeepEP configuration loads gate+up fused; the per-projection
+        # stacks are None there on purpose, so a contiguous-stack reader fails
+        # loudly instead of striding a half-sized block.
+        fp8_gate_up_fused=True,
+        fp8_gate_up_w3d=torch.zeros(E_LOCAL, 2 * N_INTER, H, dtype=torch.uint8),
+        fp8_gate_up_ws3d=torch.ones(
+            E_LOCAL, (2 * N_INTER) // 128, H // 128),
+        fp8_gate_w3d=None,
+        fp8_up_w3d=None,
+        fp8_gate_ws3d=None,
+        fp8_up_ws3d=None,
         fp8_down_w3d=torch.zeros(E_LOCAL, H, N_INTER, dtype=torch.uint8),
         fp8_down_ws3d=torch.ones(E_LOCAL, H // 128, N_INTER // 128),
         shared_expert_forward=fake_shared_expert,
@@ -511,8 +519,7 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
         """
         x, x_scales = a
         w, w_scale = b
-        label = "r2" if w.shape[1] == H else (
-            "r1_gate" if not gemms else "r1_up")
+        label = "r2" if w.shape[2] == N_INTER else "r1_gate_up"
         chain.append(label)
         gemms.append(dict(label=label, x=x, x_scales=x_scales, w=w,
                           w_scale=w_scale, out=d, masked_m=masked_m,
@@ -578,39 +585,42 @@ def test_forward_runs_the_exchange_and_skips_the_nccl_pair(monkeypatch):
     # the dispatch's rows reach R1 as delivered: expert-major, uniform stride
     assert calls["gemms"][0]["x"].shape == (E_LOCAL, STRIDE, H)
     assert calls["gemms"][0]["x"].dtype == torch.float8_e4m3fn
-    # and the three outputs are the pool's buffers, viewed expert-major
+    # and both outputs are the pool's buffers, viewed expert-major
+    assert len(calls["gemms"]) == 2, calls["gemms"]
     assert (calls["gemms"][0]["out"].data_ptr()
-            == bufs.intermediate.data_ptr())
-    assert calls["gemms"][1]["out"].data_ptr() == bufs.ll_up_out.data_ptr()
-    assert calls["gemms"][2]["out"].data_ptr() == bufs.expert_out.data_ptr()
+            == bufs.ll_gate_up_out.data_ptr())
+    assert calls["gemms"][1]["out"].data_ptr() == bufs.expert_out.data_ptr()
 
 
-def test_the_routed_chain_is_four_masked_launches(monkeypatch):
-    """The routed layer is R1 gate, R1 up, the masked activation, R2 -- and
-    nothing else. No descriptor preparation and no scale repack: the two
+def test_the_routed_chain_is_three_masked_launches(monkeypatch):
+    """The routed layer is R1 (gate+up fused), the masked activation, R2 --
+    and nothing else. No descriptor preparation and no scale repack: the two
     launches the CuTe pair needed are gone, and the two masked A-scale
     operands are the dispatch's own layout and the activation's own output.
 
-    The gate and up projections take a launch each because the routed stacks
-    stay per-projection; both read the SAME A operand.
+    Gate and up are ONE launch over the fused [E, 2I, H] stack, which is the
+    A1 change: the second R1 launch is gone.
     """
     segment, pool, bufs, calls, rank_counts, valid = _build_segment(monkeypatch)
     padded = torch.ones(BUCKET, H, dtype=torch.bfloat16)
     segment.forward(padded=padded, rank_token_counts=rank_counts)
 
-    assert calls["chain"] == ["r1_gate", "r1_up", "act", "r2"]
-    gate, up, down = calls["gemms"]
-    assert gate["x"] is up["x"] and gate["x_scales"] is up["x_scales"]
+    assert calls["chain"] == ["r1_gate_up", "act", "r2"]
+    gate_up, down = calls["gemms"]
     # B operands are the layer's own stacks, in [E, N, K] / [E, N/128, K/128]
     w = segment.masked_weights
-    assert gate["w"] is w.gate_w and gate["w_scale"] is w.gate_scale
-    assert up["w"] is w.up_w and up["w_scale"] is w.up_scale
+    assert gate_up["w"] is w.gate_up_w
+    assert gate_up["w_scale"] is w.gate_up_scale
     assert down["w"] is w.down_w and down["w_scale"] is w.down_scale
-    assert gate["w"].shape == (E_LOCAL, N_INTER, H)
+    assert gate_up["w"].shape == (E_LOCAL, 2 * N_INTER, H)
     assert down["w"].shape == (E_LOCAL, H, N_INTER)
-    # the activation reads both halves of R1 and writes R2's A operand
+    # the activation reads the two halves of R1's single output as strided
+    # views of one buffer and writes R2's A operand
     act = calls["act"]
-    assert act["gate"] is gate["out"] and act["up"] is up["out"]
+    fused = gate_up["out"]
+    assert act["gate"].data_ptr() == fused.data_ptr()
+    assert act["up"].data_ptr() == fused[:, :, N_INTER:].data_ptr()
+    assert act["gate"].stride() == act["up"].stride() == fused.stride()
     assert act["out"].data_ptr() == bufs.inter_fp8.data_ptr()
     assert act["out"].dtype == torch.float8_e4m3fn
     assert act["out_scale"] is bufs.ll_act_scale
@@ -621,8 +631,8 @@ def test_the_routed_chain_is_four_masked_launches(monkeypatch):
 def test_expected_m_is_a_host_constant_per_bucket(monkeypatch):
     """``expected_m`` is the masked kernel's row-count hint: the mean routed
     rows per GLOBAL expert at this bucket. It must be a host int (a captured
-    constant), the same for all three masked launches of the layer, and it
-    must follow the bucket."""
+    constant), the same for both masked launches of the layer, and it must
+    follow the bucket."""
     for bucket in (BUCKET, 2 * BUCKET):
         segment, pool, bufs, calls, rank_counts, valid = _build_segment(
             monkeypatch, bucket=bucket)
@@ -632,7 +642,7 @@ def test_expected_m_is_a_host_constant_per_bucket(monkeypatch):
             local_rows=bucket, world_size=WORLD, topk=TOPK,
             num_experts_global=WORLD * E_LOCAL)
         seen = [g["expected_m"] for g in calls["gemms"]]
-        assert seen == [want, want, want]
+        assert seen == [want, want]
         assert all(type(v) is int for v in seen)
     # the formula itself: (rows * ranks * topk + E) // E, rounded up
     assert expected_m_per_expert(
@@ -644,7 +654,8 @@ def test_the_chain_buffers_are_pool_owned_and_layer_shared(monkeypatch):
     pool.setup()
     stride = 4 * 16
     for name, shape, dtype in (
-            ("ll_up_out", (E_LOCAL * stride, N_INTER), torch.bfloat16),
+            ("ll_gate_up_out", (E_LOCAL * stride, 2 * N_INTER),
+             torch.bfloat16),
             ("ll_act_scale", (E_LOCAL, stride, N_INTER // 128),
              torch.float32)):
         base = pool._base[name]
@@ -653,7 +664,7 @@ def test_the_chain_buffers_are_pool_owned_and_layer_shared(monkeypatch):
             assert getattr(pool.get(bucket), name) is base, (name, bucket)
     nccl = _make_pool(monkeypatch, configure=False)
     nccl.setup()
-    for name in ("ll_up_out", "ll_act_scale"):
+    for name in ("ll_gate_up_out", "ll_up_out", "ll_act_scale"):
         assert nccl._base[name].shape[0] == 0, name
 
 
@@ -753,8 +764,8 @@ def test_dispatch_scales_reach_the_masked_gemm_unrepacked(monkeypatch):
                 assert a_scales[e, pos, blk].item() == (
                     1000 * (e + 1) + 10 * pos + blk)
     # the down-projection operand is the pool's MN-major block, likewise
-    assert is_mn_major_tma_aligned(calls["gemms"][2]["x_scales"])
-    assert calls["gemms"][2]["x_scales"] is bufs.ll_act_scale
+    assert is_mn_major_tma_aligned(calls["gemms"][1]["x_scales"])
+    assert calls["gemms"][1]["x_scales"] is bufs.ll_act_scale
     # the repack and descriptor-prep kernels are not merely unused here: the
     # segment module no longer binds them at all
     assert not hasattr(glm5_moe_graph, "deepep_ll_scale_repack")
@@ -791,7 +802,7 @@ def test_padded_rows_stay_inert(monkeypatch):
         hi = (e + 1) * STRIDE
         bufs.expert_out[lo:hi] = -999.0
         bufs.intermediate[lo:hi] = -999.0
-        bufs.ll_up_out[lo:hi] = -999.0
+        bufs.ll_gate_up_out[lo:hi] = -999.0
         bufs.ll_act_scale[e, valid:] = float("nan")
     # ...and the shared-expert staging buffer, which the overlap added. It is a
     # process-lifetime buffer now rather than a tensor minted per step, so it
@@ -1120,7 +1131,7 @@ def test_the_shared_expert_forks_between_the_router_gemm_and_the_top_k(monkeypat
     segment.forward(padded=padded, rank_token_counts=rank_counts)
     assert order == [
         "router_gemm", "fork_enter", "shared_expert", "fork_exit", "topk",
-        "dispatch", "masked_gemm", "masked_gemm", "masked_gemm", "combine",
+        "dispatch", "masked_gemm", "masked_gemm", "combine",
         "join",
     ]
 

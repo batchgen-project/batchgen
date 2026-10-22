@@ -160,12 +160,23 @@ def fixture_layer():
         return torch.randn(*shape, generator=gen, device=device,
                            dtype=torch.float32) * 0.1
 
-    gate_q, gate_s = quant_weight(rand(e, i, h))
-    up_q, up_s = quant_weight(rand(e, i, h))
+    # One fused [E, 2I, H] stack: gate rows [0, I), up rows [I, 2I). Quantize
+    # the two projections as before and then lay them out fused, so the values
+    # are identical to the per-projection reference and only the layout moves.
+    gate_ref, up_ref = rand(e, i, h), rand(e, i, h)
+    gate_q, gate_s = quant_weight(gate_ref)
+    up_q, up_s = quant_weight(up_ref)
     down_q, down_s = quant_weight(rand(e, h, i))
+    gate_up_q = torch.empty(e, 2 * i, h, dtype=gate_q.dtype, device=device)
+    gate_up_q[:, :i, :] = gate_q
+    gate_up_q[:, i:, :] = up_q
+    gate_up_s = torch.empty(
+        e, (2 * i) // SCALE_BLOCK, h // SCALE_BLOCK,
+        dtype=gate_s.dtype, device=device)
+    gate_up_s[:, : i // SCALE_BLOCK, :] = gate_s
+    gate_up_s[:, i // SCALE_BLOCK:, :] = up_s
     weights = DeepGemmMaskedExpertWeights(
-        gate_w=gate_q, gate_scale=gate_s,
-        up_w=up_q, up_scale=up_s,
+        gate_up_w=gate_up_q, gate_up_scale=gate_up_s,
         down_w=down_q, down_scale=down_s,
     )
     weights.validate(num_experts=e, hidden_size=h, intermediate_size=i)
@@ -180,8 +191,8 @@ def fixture_layer():
     buffers = dict(
         x_fp8=x_fp8,
         x_scales=x_scales,
-        gate_out=torch.zeros(e, s, i, dtype=torch.bfloat16, device=device),
-        up_out=torch.zeros(e, s, i, dtype=torch.bfloat16, device=device),
+        gate_up_out=torch.zeros(
+            e, s, 2 * i, dtype=torch.bfloat16, device=device),
         act_fp8=torch.zeros(e, s, i, dtype=FP8, device=device),
         act_scales=mn_major(e, s, i // SCALE_BLOCK, device),
         out=torch.zeros(e, s, h, dtype=torch.bfloat16, device=device),
@@ -205,6 +216,24 @@ def _counts(vector, device):
     return torch.tensor(vector, dtype=torch.int32, device=device)
 
 
+def _halves(weights, buffers):
+    """The gate/up views of the fused stack and of R1's fused output.
+
+    Strided views, never copies: the whole point of the fused layout is that
+    the halves are addressable in place.
+    """
+    i = buffers["gate_up_out"].shape[2] // 2
+    nb = i // SCALE_BLOCK
+    return dict(
+        gate_w=weights.gate_up_w[:, :i, :],
+        gate_s=weights.gate_up_scale[:, :nb, :],
+        up_w=weights.gate_up_w[:, i:, :],
+        up_s=weights.gate_up_scale[:, nb:, :],
+        gate_out=buffers["gate_up_out"][:, :, :i],
+        up_out=buffers["gate_up_out"][:, :, i:],
+    )
+
+
 @pytest.mark.parametrize("rows", EDGE_COUNTS)
 def test_r1_matches_the_dequantized_reference_at_every_tile_edge(
         fixture_layer, rows):
@@ -214,9 +243,10 @@ def test_r1_matches_the_dequantized_reference_at_every_tile_edge(
     masked_m = _counts([rows] * E_LOCAL, device)
     _run(weights, buffers, masked_m)
 
+    hv = _halves(weights, buffers)
     for name, w, s, got in (
-        ("gate", weights.gate_w, weights.gate_scale, buffers["gate_out"]),
-        ("up", weights.up_w, weights.up_scale, buffers["up_out"]),
+        ("gate", hv["gate_w"], hv["gate_s"], hv["gate_out"]),
+        ("up", hv["up_w"], hv["up_s"], hv["up_out"]),
     ):
         ref = masked_reference(buffers["x_fp8"], x_s, w, s, masked_m)
         live = _live_mask(masked_m, got.shape[1], device)
@@ -237,8 +267,8 @@ def test_the_masked_activation_matches_its_reference(fixture_layer, rows):
     masked_m = _counts([rows] * E_LOCAL, device)
     _run(weights, buffers, masked_m)
 
-    ref_q, ref_s = act_reference(
-        buffers["gate_out"], buffers["up_out"], masked_m)
+    hv = _halves(weights, buffers)
+    ref_q, ref_s = act_reference(hv["gate_out"], hv["up_out"], masked_m)
     live = _live_mask(masked_m, buffers["act_fp8"].shape[1], device)
     got_q = buffers["act_fp8"].float()[live]
     exp_q = ref_q.float()[live]
@@ -289,16 +319,17 @@ def test_the_chain_matches_the_reference_on_a_ragged_mix(
     _run(weights, buffers, masked_m)
 
     live = _live_mask(masked_m, buffers["out"].shape[1], device)
+    hv = _halves(weights, buffers)
     gate_ref = masked_reference(
-        buffers["x_fp8"], x_s, weights.gate_w, weights.gate_scale, masked_m)
+        buffers["x_fp8"], x_s, hv["gate_w"], hv["gate_s"], masked_m)
     up_ref = masked_reference(
-        buffers["x_fp8"], x_s, weights.up_w, weights.up_scale, masked_m)
+        buffers["x_fp8"], x_s, hv["up_w"], hv["up_s"], masked_m)
     down_ref = masked_reference(
         buffers["act_fp8"], buffers["act_scales"],
         weights.down_w, weights.down_scale, masked_m)
     diffs = {
-        "gate": calc_diff(buffers["gate_out"].float()[live], gate_ref[live]),
-        "up": calc_diff(buffers["up_out"].float()[live], up_ref[live]),
+        "gate": calc_diff(hv["gate_out"].float()[live], gate_ref[live]),
+        "up": calc_diff(hv["up_out"].float()[live], up_ref[live]),
         "down": calc_diff(buffers["out"].float()[live], down_ref[live]),
     }
     print(f"RAGGED {vector} " +
@@ -319,7 +350,7 @@ def test_the_live_output_is_independent_of_the_padded_rows(fixture_layer):
     _run(weights, buffers, masked_m)
     live = _live_mask(masked_m, buffers["out"].shape[1], device)
     clean = {k: buffers[k].clone() for k in
-             ("gate_out", "up_out", "act_fp8", "act_scales", "out")}
+             ("gate_up_out", "act_fp8", "act_scales", "out")}
     # the module-scoped A operand is restored below, so the order of the tests
     # in this file carries no state
     x_backup = (buffers["x_fp8"].clone(), buffers["x_scales"].clone())
@@ -329,8 +360,7 @@ def test_the_live_output_is_independent_of_the_padded_rows(fixture_layer):
         buffers["x_fp8"][i, rows:] = torch.full_like(
             buffers["x_fp8"][i, rows:], FP8_MAX)
         buffers["x_scales"][i, rows:] = nan
-        buffers["gate_out"][i, rows:] = nan
-        buffers["up_out"][i, rows:] = nan
+        buffers["gate_up_out"][i, rows:] = nan
         buffers["act_scales"][i, rows:] = nan
         buffers["out"][i, rows:] = nan
     _run(weights, buffers, masked_m)
@@ -357,9 +387,9 @@ def test_the_activation_leaves_the_padded_rows_untouched(fixture_layer):
     sentinel_q = torch.full_like(buffers["act_fp8"].view(torch.uint8), 0x5A)
     buffers["act_fp8"].view(torch.uint8).copy_(sentinel_q)
     buffers["act_scales"].fill_(-7.5)
-    buffers["gate_out"].normal_()
-    buffers["up_out"].normal_()
-    act(buffers["gate_out"], buffers["up_out"], buffers["act_fp8"],
+    buffers["gate_up_out"].normal_()
+    hv = _halves(weights, buffers)
+    act(hv["gate_out"], hv["up_out"], buffers["act_fp8"],
         buffers["act_scales"], masked_m, group_size=SCALE_BLOCK)
     torch.cuda.synchronize()
 

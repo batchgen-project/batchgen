@@ -479,18 +479,23 @@ def test_blockwise_init_adopts_preallocated_stacks_without_recopying():
     assert "torch.empty" not in adopt
     assert ".copy_(" not in adopt
     # Structural, not textual: ast.unparse parenthesises tuple targets on
-    # Python 3.9 but not on 3.11 (the CI interpreter).
-    adopts = [
-        node
-        for node in branch.body
+    # Python 3.9 but not on 3.11 (the CI interpreter). ``ast.walk`` rather than
+    # ``branch.body`` because A1 made the adoption layout-conditional: the
+    # DeepEP configuration adopts a fused (gate_up, down) carve and every other
+    # configuration the (gate, up, down) one. Both must still be adoptions --
+    # the no-allocate / no-copy assertions above cover the whole branch.
+    adopts = {
+        tuple(ast.unparse(t) for t in node.targets[0].elts)
+        for node in ast.walk(branch)
         if isinstance(node, ast.Assign)
         and isinstance(node.value, ast.Name)
         and node.value.id == "prealloc"
         and isinstance(node.targets[0], ast.Tuple)
-        and [ast.unparse(t) for t in node.targets[0].elts]
-        == ["self.fp8_gate_w3d", "self.fp8_up_w3d", "self.fp8_down_w3d"]
-    ]
-    assert len(adopts) == 1
+    }
+    assert adopts == {
+        ("self.fp8_gate_w3d", "self.fp8_up_w3d", "self.fp8_down_w3d"),
+        ("self.fp8_gate_up_w3d", "self.fp8_down_w3d"),
+    }, adopts
     # The allocate-and-copy code remains, for the partially resident path.
     assert "torch.empty" in ast.unparse(branch.orelse)
 

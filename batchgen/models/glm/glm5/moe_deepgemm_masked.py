@@ -16,22 +16,32 @@ rows/expert and the skew stops being amplified.
 
 Chain, per routed layer
 -----------------------
-    R1_gate : masked( (x, x_scales), (W_gate, S_gate) ) -> gate   [E, S, I]
-    R1_up   : masked( (x, x_scales), (W_up,   S_up)   ) -> up     [E, S, I]
-    act     : quant(silu(gate) * up)                   -> (a, a_scales)
-    R2      : masked( (a, a_scales), (W_down, S_down) ) -> out    [E, S, H]
+    R1      : masked( (x, x_scales), (W_gate_up, S_gate_up) ) -> gu [E, S, 2I]
+    act     : quant(silu(gu[..., :I]) * gu[..., I:])          -> (a, a_scales)
+    R2      : masked( (a, a_scales), (W_down, S_down) )       -> out [E, S, H]
 
-The reference runner issues ONE R1 over a per-expert-fused ``[E, 2I, H]``
-gate/up weight. We keep the two projections separate because our routed-expert
-stacks are per-projection ``[E, N, K]`` blocks whose expert stride the CuTe
-kernels hardcode as ``N * K``: handing those kernels halves of a fused
-``[E, 2I, H]`` buffer would silently stride them wrong, and holding a fused
-copy ON TOP of the per-projection stacks would double the routed-expert
-footprint. Two masked launches read the same weight bytes and the same number
-of output tiles as one fused launch; the cost is one extra launch per routed
-layer, against the two launches (descriptor prep + bounded scale repack) this
-path drops. A fused ``[E, 2I, H]`` load-time layout is a follow-up that has to
-move the preallocated expert stacks with it.
+Gate and up are ONE masked launch over a per-expert-fused ``[E, 2I, H]`` weight,
+the form the reference runner uses. The fused layout is built at load time, not
+copied here: there is no second resident copy and the routed-expert footprint is
+unchanged (the same bytes, one stack instead of two).
+
+Why the layout is conditional on ``enable_deepep``
+--------------------------------------------------
+The CuTe grouped kernels hardcode a routed-expert stack's group stride as
+``N * K`` (``fp8_blockwise_gemm.cu:60`` for the weights, ``:67`` for the
+scales, and again inside the device-side ``update_expert_tma*`` kernels), so
+handing THEM the halves of a fused ``[E, 2I, H]`` buffer would stride them
+wrong. That limitation is unchanged. The resolution is that the fused layout is
+chosen at load time only when ``enable_deepep`` is set, and the one remaining
+CuTe consumer on that configuration -- the ragged/prefill S1 -- is given the
+per-expert POINTER form (``grouped_fp8_blockwise_fused_s1_ptrs``), which takes
+each expert's address explicitly and so is immune to the hardcoded stride.
+With ``enable_deepep`` off, the stacks stay per-projection and every code path
+is byte-for-byte what it was.
+
+``run_deepgemm_masked_moe`` therefore asserts the fused layout once, so a
+configuration that disagrees with its layout fails loudly instead of reading a
+half-sized stack at the wrong stride.
 
 Layout contract
 ---------------
@@ -179,16 +189,15 @@ def require_mn_major_tma_aligned(scales: torch.Tensor, name: str) -> None:
 class DeepGemmMaskedExpertWeights:
     """One routed layer's weights in the masked GEMM's ``nt`` layout.
 
-    ``gate_w`` / ``up_w`` are ``[E, I, H]`` and ``down_w`` is ``[E, H, I]``:
-    both are already ``[E, N, K]`` for their own GEMM, so the routed-expert
-    stacks are handed over as they are loaded — no conversion, no second
-    resident copy.
+    ``gate_up_w`` is the per-expert-fused ``[E, 2I, H]`` gate/up stack (gate in
+    rows ``[0, I)`` of each expert, up in ``[I, 2I)``) and ``down_w`` is
+    ``[E, H, I]``: both are already ``[E, N, K]`` for their own GEMM, so the
+    routed-expert stacks are handed over as they are loaded — no conversion, no
+    second resident copy.
     """
 
-    gate_w: torch.Tensor
-    gate_scale: torch.Tensor
-    up_w: torch.Tensor
-    up_scale: torch.Tensor
+    gate_up_w: torch.Tensor
+    gate_up_scale: torch.Tensor
     down_w: torch.Tensor
     down_scale: torch.Tensor
 
@@ -203,8 +212,7 @@ class DeepGemmMaskedExpertWeights:
                 f"{SCALE_BLOCK}"
             )
         for name, weight, shape in (
-            ("gate_w", self.gate_w, (e, i, h)),
-            ("up_w", self.up_w, (e, i, h)),
+            ("gate_up_w", self.gate_up_w, (e, 2 * i, h)),
             ("down_w", self.down_w, (e, h, i)),
         ):
             if tuple(weight.shape) != shape:
@@ -223,8 +231,11 @@ class DeepGemmMaskedExpertWeights:
                     f"block; got strides {tuple(weight.stride())}"
                 )
         for name, scale, shape in (
-            ("gate_scale", self.gate_scale, (e, i // SCALE_BLOCK, h // SCALE_BLOCK)),
-            ("up_scale", self.up_scale, (e, i // SCALE_BLOCK, h // SCALE_BLOCK)),
+            (
+                "gate_up_scale",
+                self.gate_up_scale,
+                (e, (2 * i) // SCALE_BLOCK, h // SCALE_BLOCK),
+            ),
             ("down_scale", self.down_scale, (e, h // SCALE_BLOCK, i // SCALE_BLOCK)),
         ):
             if tuple(scale.shape) != shape:
@@ -254,8 +265,7 @@ def run_deepgemm_masked_moe(
     weights: DeepGemmMaskedExpertWeights,
     masked_m: torch.Tensor,
     expected_m: int,
-    gate_out: torch.Tensor,
-    up_out: torch.Tensor,
+    gate_up_out: torch.Tensor,
     act_fp8: torch.Tensor,
     act_scales: torch.Tensor,
     out: torch.Tensor,
@@ -266,11 +276,39 @@ def run_deepgemm_masked_moe(
     from ``masked_m`` on the device, so the whole chain captures. ``masked_m``
     is the dispatch's ``recv_count``; ``expected_m`` is a host constant from
     :func:`expected_m_per_expert`.
+
+    Gate and up are one masked launch into ``gate_up_out`` ``[E, S, 2I]``. The
+    activation then reads the two halves as strided views: the masked
+    activation kernel takes gate and up as separate pointers with separate
+    strides and requires only a contiguous last dim, which a column slice of a
+    row-major ``[E, S, 2I]`` buffer satisfies, so no copy and no compaction is
+    needed to split them.
     """
     if not isinstance(expected_m, int):
         raise RuntimeError(
             "expected_m must be a host int (it is a captured constant); got "
             f"{type(expected_m).__name__}"
+        )
+    inter2 = int(weights.gate_up_w.shape[1])
+    if inter2 % 2:
+        raise RuntimeError(
+            "the fused gate/up stack must have an even row extent "
+            f"[E, 2I, H]; got {tuple(weights.gate_up_w.shape)}"
+        )
+    inter = inter2 // 2
+    if tuple(gate_up_out.shape[:2]) != tuple(x_fp8.shape[:2]) or (
+        int(gate_up_out.shape[2]) != inter2
+    ):
+        raise RuntimeError(
+            "the fused gate/up output must be [E, S, 2I] for this layer's "
+            f"stack: expected {(x_fp8.shape[0], x_fp8.shape[1], inter2)}, got "
+            f"{tuple(gate_up_out.shape)}"
+        )
+    if gate_up_out.stride(-1) != 1:
+        raise RuntimeError(
+            "the fused gate/up output needs a contiguous last dim so its gate "
+            "and up halves are valid strided views; got strides "
+            f"{tuple(gate_up_out.stride())}"
         )
     require_mn_major_tma_aligned(x_scales, "dispatch activation scales")
     require_mn_major_tma_aligned(act_scales, "down-projection input scales")
@@ -279,21 +317,19 @@ def run_deepgemm_masked_moe(
 
     masked_gemm(
         (x_fp8, x_scales),
-        (weights.gate_w, weights.gate_scale),
-        gate_out,
-        masked_m,
-        expected_m,
-    )
-    masked_gemm(
-        (x_fp8, x_scales),
-        (weights.up_w, weights.up_scale),
-        up_out,
+        (weights.gate_up_w, weights.gate_up_scale),
+        gate_up_out,
         masked_m,
         expected_m,
     )
 
     act_quant(
-        gate_out, up_out, act_fp8, act_scales, masked_m, group_size=SCALE_BLOCK
+        gate_up_out[:, :, :inter],
+        gate_up_out[:, :, inter:],
+        act_fp8,
+        act_scales,
+        masked_m,
+        group_size=SCALE_BLOCK,
     )
 
     masked_gemm(
