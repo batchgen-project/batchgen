@@ -24,10 +24,15 @@ from typing import Optional, Tuple
 import math
 
 try:
-	from batchgen_kernels.attention.dsa import FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb
+	from batchgen_kernels.attention.dsa.bf16_absorb import (
+		absorb_out,
+		absorb_q,
+	)
+	from batchgen_kernels.attention.dsa.fp8_absorb import FP8AbsorbWeights
 	_HAS_FP8_ABSORB = True
 except (ImportError, Exception):
 	_HAS_FP8_ABSORB = False
+
 
 def quant_per_token(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 	"""
@@ -706,7 +711,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	if _HAS_FP8_ABSORB:
 		# FP8 WGMMA q_absorb: [B, H, 192] → [B, H, 512]
 		q_nope_3d = q_nope.view(bsz, self.num_heads, self.qk_nope_head_dim)
-		q_absorbed = fp8_q_absorb(q_nope_3d, self._fp8_absorb_weights)
+		q_absorbed = absorb_q(q_nope_3d, self._fp8_absorb_weights)
 
 		qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
 		query_states = torch.empty(
@@ -768,7 +773,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 
 	if _HAS_FP8_ABSORB:
 		# FP8 WGMMA out_absorb: [B, 1, H, 512] → [B, 1, H, 256] → transpose to [B, H, 1, 256]
-		attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+		attn_output = absorb_out(attn_out, self._fp8_absorb_weights)
 		attn_output = attn_output.transpose(1, 2)
 	else:
 		attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)

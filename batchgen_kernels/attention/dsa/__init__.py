@@ -6,6 +6,24 @@ All kernels use runtime CUDA compilation (load_inline) or Triton JIT.
 
 __all__ = []
 
+# BF16 strided-batched absorb + container dispatch (slice 2c-2). No Triton
+# dependency, so this import is not guarded: the dispatch must exist even where
+# the Triton FP8 kernel cannot be built.
+from batchgen_kernels.attention.dsa.bf16_absorb import (
+    BF16AbsorbWeights,
+    absorb_out,
+    absorb_out_out,
+    absorb_q,
+    absorb_q_out,
+)
+__all__ += [
+    "BF16AbsorbWeights",
+    "absorb_q",
+    "absorb_q_out",
+    "absorb_out",
+    "absorb_out_out",
+]
+
 # WP3: Fused paged gather (Triton)
 try:
     from batchgen_kernels.attention.dsa.fused_paged_gather import (
