@@ -510,3 +510,46 @@ def test_the_ready_summary_log_reads_the_stack_that_exists(caplog):
             assert str(list(moe.fp8_gate_up_w3d.shape)) in text, text
         else:
             assert str(list(moe.fp8_gate_w3d.shape)) in text, text
+
+
+def test_the_histogram_is_flushed_at_release_before_the_buffers_go():
+    """The last round's accumulation must not be dropped.
+
+    ``setup_static_buffers`` reports the round that just ended, which covers
+    every round that has a successor. The FINAL round has none, so without a
+    readback at release the last accumulation dies with the buffer -- which is
+    what happened on the A1 lifetime, where the histogram cell ran last,
+    accumulated correctly, and produced no output at all.
+
+    Ordering is the real assertion: a readback placed after ``pool.release()``
+    would read a freed buffer, so the format call must precede the release.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from batchgen.models.glm.glm5 import moe_cuda_graph_segments as seg
+
+    src = textwrap.dedent(
+        inspect.getsource(seg.Glm5MoEGraphSegment.release_static_buffers))
+    tree = ast.parse(src)
+
+    fmt_line = release_line = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "format_recv_count_histogram":
+            fmt_line = node.lineno
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "release":
+            release_line = node.lineno
+
+    assert fmt_line is not None, (
+        "release_static_buffers must flush the recv-count histogram; without it "
+        "the final round's accumulation is lost when the buffer is freed")
+    assert release_line is not None, "release_static_buffers must still release the pool"
+    assert fmt_line < release_line, (
+        f"the readback (line {fmt_line}) must come BEFORE pool.release() "
+        f"(line {release_line}); afterwards the histogram buffer is gone")
+
+    # and it stays gated on the batch-level flag, so a normal run pays nothing
+    assert "recv_count_histogram_enabled" in src

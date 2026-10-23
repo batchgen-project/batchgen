@@ -982,6 +982,25 @@ class Glm5MoEGraphSegment:
             else self.pool._base["all_tokens"])
 
     def release_static_buffers(self, bucket_size: int) -> None:
+        # FINAL flush of the recv-count diagnostic, at the end of the buffers'
+        # own lifecycle. ``setup_static_buffers`` reports the accumulation of the
+        # round that just ended, which is enough while rounds keep coming -- but
+        # the LAST round has no successor, so without this the final round's
+        # accumulation is dropped when ``release`` frees the buffer. That is
+        # exactly what happened on the A1 lifetime: the histogram cell ran last,
+        # accumulated correctly, and its data was never read back.
+        #
+        # Host path, outside every capture region, like the readback in
+        # setup_static_buffers; ``format_recv_count_histogram`` asserts that
+        # itself, so a future caller cannot move it inside a capture unnoticed.
+        if recv_count_histogram_enabled():
+            hist = self.pool._base.get("ll_recv_hist")
+            if hist is not None and hist.numel() > 1:
+                logger.info(
+                    "Layer %d (final): %s",
+                    self.moe.layer_idx,
+                    format_recv_count_histogram(hist, MASKED_BLOCK_M),
+                )
         self.pool.release()
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
