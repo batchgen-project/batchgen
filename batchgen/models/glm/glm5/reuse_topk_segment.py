@@ -46,7 +46,6 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
     _fa3_with_kvcache,
-    run_paged_kv_token_update_fused,
     transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
@@ -566,6 +565,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         # Gate folded into the producing kernel -- see the matching comment in
         # cuda_graph_segments.py. Still a SELECT (exact zeros for invalid rows),
         # never a multiply: bf16 NaN * 0 is NaN.
+        # The paged-cache store is FOLDED INTO the producing kernel (the
+        # separate `run_paged_kv_token_update_fused` launch is gone): lane 0
+        # stores the row it just computed straight to the page-table
+        # destination, gated on the already-gated slot sentinel (the -1 rows
+        # of `kv_primary_slot_indices` carry both the num_valid_tokens cutoff
+        # and the row mask) and on `row_valid_mask`.
         _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
@@ -579,17 +584,11 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             out=outputs.primary_k_tensor.view(batch_size, 1, -1),
             row_valid_mask=buffers.valid_mask,
             q_pe_src=q_rope_strided,
-        )
-        run_paged_kv_token_update_fused(
-            k_cache=self.primary_blocked_k,
-            k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
+            cache_tensor=self.primary_blocked_k,
             page_table=self.primary_page_table,
             slot_indices=buffers.kv_primary_slot_indices,
-            # Step-level (see compute_step_statics): the int32 narrowing of
-            # ``position_ids`` used to be re-launched by every layer.
             token_indices=buffers.token_indices,
             page_size_tokens=self.page_size,
-            num_valid_tokens=num_valid_tokens,
         )
 
         # num_valid_tokens is forwarded but the BF16 container IGNORES it:
