@@ -818,6 +818,10 @@ class BatchGenWorkerArgs:
 
 	# Prepack optimization (default: enabled, recommended always on)
 	enable_prepack: bool = True
+	# DIAGNOSTIC (glm52 memcpy32_post A/B): capture the GLM-5 whole-model
+	# decode graph without the per-layer host-KV staging copies. Decode tokens
+	# are then never appended to host KV, so this must stay off in production.
+	glm5_disable_decode_host_kv_staging: bool = False
 	# Host KV watermark percentage (default: 70% free = underutilized threshold)
 	host_kv_watermark: int = 70
 	# Decode preemption: interrupt decode for prefill when host KV is underutilized (default: enabled)
@@ -1092,6 +1096,12 @@ class BatchGenWorker:
 
 		# Prepack and decode preemption configuration from args
 		self.enable_prepack = args.enable_prepack
+		self.glm5_disable_decode_host_kv_staging = args.glm5_disable_decode_host_kv_staging
+		if self.glm5_disable_decode_host_kv_staging:
+			logging.warning(
+				"GLM-5 decode host-KV staging DISABLED (diagnostic A/B): "
+				"decode tokens will NOT be appended to host KV"
+			)
 		self.host_kv_watermark = args.host_kv_watermark
 		self.enable_decode_preemption = args.enable_decode_preemption
 		self.detokenization_include_special_tokens = getattr(args, 'detokenization_include_special_tokens', False)
@@ -17852,6 +17862,7 @@ class BatchGenWorker:
 				# e4m3 for a page-split FP8 indexer pool, bf16 for AoS: the aux
 				# staging clone must not requantize the stream.
 				aux_kv_staging_dtype=aux_manager.config.kv_dtype,
+				stage_kv_for_offload=not self.glm5_disable_decode_host_kv_staging,
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
 			manager.register_segment(segment_name, whole_seg)

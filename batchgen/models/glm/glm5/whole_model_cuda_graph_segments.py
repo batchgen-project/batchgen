@@ -46,6 +46,7 @@ class Glm5WholeModelSegment:
         compare_probe_layers: Iterable[int] | None = None,
         layer_segments: Iterable[object] | None = None,
         aux_kv_staging_dtype: torch.dtype = torch.bfloat16,
+        stage_kv_for_offload: bool = True,
     ) -> None:
         if not include_embedding:
             raise NotImplementedError(
@@ -121,6 +122,11 @@ class Glm5WholeModelSegment:
             )
         self.aux_kv_staging_dtype = aux_kv_staging_dtype
         self.aux_kv_is_page_split = aux_kv_staging_dtype is torch.float8_e4m3fn
+        # Diagnostic switch: with staging off, capture installs no KV append
+        # callbacks and no staging buffers exist, so decode tokens are never
+        # appended to host KV. Features reading decode-token host KV
+        # (migration, recovery) must not run with this off.
+        self.stage_kv_for_offload = bool(stage_kv_for_offload)
 
         self._kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._aux_kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
@@ -200,7 +206,9 @@ class Glm5WholeModelSegment:
             raise ValueError(
                 f"bucket_size {bucket_size} exceeds max_bucket_size {self.max_bucket_size}"
             )
-        if self._kv_buffers is None or self._aux_kv_buffers is None:
+        if self.stage_kv_for_offload and (
+            self._kv_buffers is None or self._aux_kv_buffers is None
+        ):
             alloc_size = self.max_bucket_size
             self._kv_key_buffer = torch.zeros(
                 self.num_layers,
@@ -652,8 +660,12 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.cache_seqlens = cache_seqlens
             AttnWrapperBase.position_ids = position_ids
             AttnWrapperBase.max_seqlen = self.max_seqlen
-            AttnWrapperBase.kv_append_callback = self._copy_primary_kv
-            AttnWrapperBase.kv_append_callback_aux = self._copy_aux_kv
+            AttnWrapperBase.kv_append_callback = (
+                self._copy_primary_kv if self.stage_kv_for_offload else None
+            )
+            AttnWrapperBase.kv_append_callback_aux = (
+                self._copy_aux_kv if self.stage_kv_for_offload else None
+            )
             GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
             GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
             GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
