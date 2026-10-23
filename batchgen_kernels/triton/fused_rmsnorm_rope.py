@@ -1160,6 +1160,16 @@ def fused_rmsnorm_rope_with_q_native(
         else {}
     )
 
+    # Single pass over the kv-lora slice whenever it fits one block (512 for
+    # GLM-5): the lane-0 program then does ONE masked load per phase instead
+    # of a kv_lora_rank/BLOCK_SIZE-iteration serial loop. The fp32
+    # sum-of-squares reduction tree changes with the block width, so inv_rms
+    # may differ from the old 64-wide launch in its last fp32 bits; the bf16
+    # STORED output is unchanged for the shapes in production (verified
+    # exactly 0 diff at kv_lora_rank=512), and this launch makes no
+    # bit-compatibility promise across BLOCK_SIZE values.
+    norm_block = min(512, triton.next_power_of_2(kv_lora_rank))
+
     fused_rmsnorm_rope_with_q_native_kernel[grid](
         new_compressed_kv,
         processed_kv,
@@ -1174,13 +1184,11 @@ def fused_rmsnorm_rope_with_q_native(
         kv_lora_rank,
         qk_rope_head_dim,
         eps,
-        BLOCK_SIZE=64,
+        BLOCK_SIZE=norm_block,
         BLOCK_H=block_h,
         BLOCK_PAIRS=block_pairs,
         **mask_kwargs,
         **split_kwargs,
-        # Matches the previous launch's default so the kv-lora sum of squares
-        # keeps the same reduction tree, and with it the exact inv_rms bits.
         num_warps=4,
     )
 
