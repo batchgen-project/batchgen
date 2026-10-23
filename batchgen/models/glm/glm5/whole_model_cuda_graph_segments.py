@@ -594,17 +594,21 @@ class Glm5WholeModelSegment:
                 )
                 hidden_states = graph_out["hidden_states"]
                 residual = graph_out["residual"]
-                self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
-                # GLM-5.2 skip layers have no indexer KV (reuse-topk segments
-                # return no indexer_k_tensor).
-                _indexer_k = graph_out.get("indexer_k_tensor")
-                if _indexer_k is not None:
-                    self._copy_aux_kv(
-                        layer_idx,
-                        _indexer_k,
-                        None,
-                        graph_out.get("indexer_k_scale"),
-                    )
+                # The layer-segment composition path stages directly, not via
+                # the kv_append_callback indirection, so the staging switch
+                # must gate it here too.
+                if self.stage_kv_for_offload:
+                    self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
+                    # GLM-5.2 skip layers have no indexer KV (reuse-topk
+                    # segments return no indexer_k_tensor).
+                    _indexer_k = graph_out.get("indexer_k_tensor")
+                    if _indexer_k is not None:
+                        self._copy_aux_kv(
+                            layer_idx,
+                            _indexer_k,
+                            None,
+                            graph_out.get("indexer_k_scale"),
+                        )
                 if layer_idx in self._compare_probe_layer_set:
                     # The probe wants this layer's OUTPUT hidden state, which is
                     # exactly the add the chain defers, so a probed layer pays

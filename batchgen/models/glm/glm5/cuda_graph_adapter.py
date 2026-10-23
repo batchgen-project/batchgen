@@ -569,8 +569,16 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "cache_seqlens": replay_inputs.get("cache_seqlens"),
             "position_ids": replay_inputs.get("position_ids"),
             "max_seqlen": int(self._ctx.max_seqlen_cap),
-            "kv_append_callback": getattr(seg, "_copy_primary_kv", None) if seg is not None else None,
-            "kv_append_callback_aux": getattr(seg, "_copy_aux_kv", None) if seg is not None else None,
+            "kv_append_callback": (
+                getattr(seg, "_copy_primary_kv", None)
+                if seg is not None and getattr(seg, "stage_kv_for_offload", True)
+                else None
+            ),
+            "kv_append_callback_aux": (
+                getattr(seg, "_copy_aux_kv", None)
+                if seg is not None and getattr(seg, "stage_kv_for_offload", True)
+                else None
+            ),
             "_dsa_short_count": getattr(seg, "_capture_dsa_short_count", None) if seg is not None else None,
             "glm5_decode_primary_slot_indices": replay_inputs.get("primary_slot_indices"),
             "glm5_decode_aux_slot_indices": replay_inputs.get("aux_slot_indices"),
