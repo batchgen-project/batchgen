@@ -157,7 +157,7 @@ int create_listener(const std::string& ip, int port) {
     return fd;
 }
 
-int connect_retry(const std::string& ip, int port,
+int connect_retry(const std::string& ip, int port, int timeout_s,
                   const std::atomic<bool>& stop) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -165,7 +165,12 @@ int connect_retry(const std::string& ip, int port,
     if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1) {
         fail("invalid peer IP " + ip);
     }
-    for (int attempt = 0; attempt < 1800 && !stop.load(); ++attempt) {
+    // One attempt per 100 ms; the budget comes from the config's
+    // bootstrap_timeout_s so slow-starting peers (a long host store
+    // populate before the listener opens) can be given more than the
+    // former hard-coded 180 s.
+    const int max_attempts = timeout_s * 10;
+    for (int attempt = 0; attempt < max_attempts && !stop.load(); ++attempt) {
         const int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             fail("socket: " + std::string(strerror(errno)));
@@ -376,6 +381,10 @@ struct DistributedWeightDaemon::Impl {
         replicated_bytes =
             config.at("replicated_bytes").get<std::uint64_t>();
         base_port = config.value("base_port", 26000);
+        bootstrap_timeout_s = config.value("bootstrap_timeout_s", 180);
+        if (bootstrap_timeout_s <= 0) {
+            fail("distributed weight bootstrap_timeout_s must be positive");
+        }
         depth = config.value("depth", 32);
         superchunk = config.value("superchunk", 8);
         outstanding = config.value("outstanding", 8);
@@ -452,6 +461,7 @@ struct DistributedWeightDaemon::Impl {
     std::uint64_t replicated_bytes = 0;
     std::uint64_t staging_bytes = 0;
     int base_port = 26000;
+    int bootstrap_timeout_s = 180;
     int depth = 32;
     int superchunk = 8;
     int outstanding = 8;
@@ -940,7 +950,8 @@ struct DistributedWeightDaemon::Impl {
                     }
                     const int fd = connect_retry(
                         node_ips[owner],
-                        base_port + owner * kRails + rail, stop);
+                        base_port + owner * kRails + rail,
+                        bootstrap_timeout_s, stop);
                     const std::uint64_t address_bytes =
                         rails[rail].address_bytes;
                     send_exact(fd, &address_bytes,
