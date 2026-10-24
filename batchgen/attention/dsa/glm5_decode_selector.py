@@ -687,6 +687,17 @@ def _require_fa3():
     return _fa3_with_kvcache
 
 
+# Split policy for the SPARSE selected-token FA3 decode (here and in the
+# captured segment). FA3 v2.8.2's auto-split (0) over-splits heterogeneous
+# decode batches: at production per-row selected lengths it adds a
+# FlashAttnFwdCombine pass per layer while the main kernel is no faster, and
+# the parameter is effectively boolean in this build (2/3/4/8 behave like 0).
+# 1 = no split, measured bitwise-identical outputs. The dense all_short path
+# keeps auto-split: its geometry (page-size-N, whole-context rows) was not
+# covered by the measurement, so it is deliberately not changed.
+GLM5_SPARSE_FA3_NUM_SPLITS = 1
+
+
 def _run_all_short_fa3(
     attn,
     q_pe: torch.Tensor,
@@ -740,7 +751,7 @@ def _run_selected_fa3(
         cache_seqlens=selected_lengths,
         softmax_scale=float(attn.softmax_scale),
         causal=True,
-        num_splits=0,
+        num_splits=GLM5_SPARSE_FA3_NUM_SPLITS,
         return_softmax_lse=False,
     )
 
