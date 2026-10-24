@@ -205,6 +205,47 @@ class Glm5DecoderLayerGraphSegment:
         """Whether this layer runs the indexer and writes the shared top-k."""
         return bool(self.dsa_segment.SELECTS_TOP_K)
 
+    @property
+    def WRITES_AUX_HOST_KV(self) -> bool:
+        """Delegate: does the inner attention segment produce aux host-KV rows?
+
+        Reflected rather than redeclared: the answer is a property of the
+        attention segment this layer composes (True for a full-DSA indexer
+        layer, False for a reuse-topk skip layer), and the whole-model driver
+        reads it off the LAYER segment to decide whether to hand over aux
+        staging slices. A hardcoded value here would silently disagree with
+        the inner segment on one of the two layer kinds.
+        """
+        return bool(getattr(self.dsa_segment, "WRITES_AUX_HOST_KV", False))
+
+    def set_host_kv_staging(
+        self,
+        *,
+        key: Optional[torch.Tensor],
+        aux_key: Optional[torch.Tensor] = None,
+        aux_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Delegate: bind the inner segment's host-append outputs to staging.
+
+        The whole-model segment composes LAYER segments, so it installs decode
+        host-KV staging here, but the buffers belong to the attention segment's
+        producing kernels. ``release_static_buffers`` deliberately does not
+        undo this: the whole-model release loop calls this method with
+        ``key=None`` itself, so uninstalling here too would be a second,
+        redundant clear.
+        """
+
+        install = getattr(self.dsa_segment, "set_host_kv_staging", None)
+        if install is None:
+            raise RuntimeError(
+                "GLM-5 whole-model decode host-KV staging binds each layer's "
+                "host-append outputs to its staging slice, so layer "
+                f"{self.layer_idx}'s attention segment "
+                f"({type(self.dsa_segment).__name__}) must expose "
+                "set_host_kv_staging"
+            )
+        install(key=key, aux_key=aux_key, aux_scale=aux_scale)
+
     def selected_positions_key(self, bucket_size: int) -> Optional[tuple]:
         """Delegate: identity of the selected-position transform's tensors.
 

@@ -19,6 +19,9 @@ import torch
 
 from batchgen.models.glm.glm5 import cuda_graph_segments as dsa
 from batchgen.models.glm.glm5 import reuse_topk_segment as reuse
+from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
+    Glm5DecoderLayerGraphSegment,
+)
 from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
     Glm5WholeModelSegment,
 )
@@ -284,6 +287,8 @@ def _bare_full_segment(*, page_split=True):
     seg.aux_host_kv_dtype = torch.float8_e4m3fn if page_split else torch.bfloat16
     seg.aux_is_page_split = page_split
     seg._outputs = {}
+    seg._buffers = {}
+    seg._attn_head_outputs = {}
     seg._host_kv_staging = None
     return seg
 
@@ -297,6 +302,8 @@ def _bare_reuse_segment():
     )
     seg.primary_blocked_k = torch.zeros(1, 1, 1, PRIMARY_KV_DIM)
     seg._outputs = {}
+    seg._buffers = {}
+    seg._attn_head_outputs = {}
     seg._host_kv_staging = None
     return seg
 
@@ -507,3 +514,165 @@ def test_aux_slices_without_a_primary_slice_fail_loud():
     seg = _bare_full_segment()
     with pytest.raises(ValueError, match="as a whole"):
         seg.set_host_kv_staging(key=None, aux_key=aux_key[li], aux_scale=aux_scale[li])
+
+
+# -- the REAL layer wrapper, not a fake -------------------------------------
+#
+# The whole-model segment composes `Glm5DecoderLayerGraphSegment`, not the
+# attention segment, so the staging install lands on the WRAPPER. The tests
+# above drive it with `_FakeLayerSegment`, whose own `set_host_kv_staging`
+# masked the fact that the real wrapper had none -- capture died on the node
+# at layer 0. Everything below pins the real classes.
+
+
+class _RecordingInnerSegment:
+    """Minimal stand-in for an attention segment, recording the forwarded call."""
+
+    WRITES_AUX_HOST_KV = True
+    SELECTS_TOP_K = True
+    max_seqlen = 128
+    index_topk = 64
+
+    def __init__(self):
+        self.primary_blocked_k = torch.zeros(1, 1, 1, PRIMARY_KV_DIM)
+        self.aux_blocked_k = torch.zeros(1, 1, 1, AUX_KV_DIM)
+        self.aux_is_page_split = True
+        self.aux_host_kv_dim = AUX_KV_DIM
+        self.aux_host_kv_dtype = torch.float8_e4m3fn
+        self.calls = []
+
+    def set_host_kv_staging(self, *, key, aux_key=None, aux_scale=None):
+        self.calls.append({"key": key, "aux_key": aux_key, "aux_scale": aux_scale})
+
+
+def _wrap(inner, layer_idx=0):
+    return Glm5DecoderLayerGraphSegment(
+        layer=SimpleNamespace(layer_idx=layer_idx, hidden_size=HIDDEN_SIZE),
+        dsa_segment=inner,
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=1,
+    )
+
+
+def test_real_layer_wrapper_exposes_the_staging_setter():
+    """Anti-regression for the node capture failure.
+
+    `_install_layer_host_kv_staging` requires this method on whatever sits in
+    `layer_segments`, which in production is the layer wrapper. A fake that
+    implements it cannot prove the real class does.
+    """
+
+    assert hasattr(Glm5DecoderLayerGraphSegment, "set_host_kv_staging")
+    assert hasattr(Glm5DecoderLayerGraphSegment, "WRITES_AUX_HOST_KV")
+
+
+def test_real_layer_wrapper_forwards_staging_to_its_attention_segment():
+    inner = _RecordingInnerSegment()
+    layer = _wrap(inner)
+    key, aux_key, aux_scale, li = _staging_rows()
+    # Bound once: the slices must arrive unsubstituted, so identity is the
+    # assertion and a re-derived view would not test forwarding.
+    key_row, aux_key_row, aux_scale_row = key[li], aux_key[li], aux_scale[li]
+
+    layer.set_host_kv_staging(
+        key=key_row, aux_key=aux_key_row, aux_scale=aux_scale_row
+    )
+
+    assert len(inner.calls) == 1
+    call = inner.calls[0]
+    assert call["key"] is key_row
+    assert call["aux_key"] is aux_key_row
+    assert call["aux_scale"] is aux_scale_row
+
+
+def test_real_layer_wrapper_forwards_the_uninstall():
+    inner = _RecordingInnerSegment()
+    layer = _wrap(inner)
+    layer.set_host_kv_staging(key=None)
+    assert inner.calls == [{"key": None, "aux_key": None, "aux_scale": None}]
+
+
+class _InnerWithoutSetter:
+    """An attention segment that cannot take staging slices at all."""
+
+    SELECTS_TOP_K = True
+    max_seqlen = 128
+    index_topk = 64
+
+    def __init__(self):
+        self.primary_blocked_k = torch.zeros(1, 1, 1, PRIMARY_KV_DIM)
+
+
+def test_real_layer_wrapper_fails_loud_naming_the_inner_segment():
+    layer = _wrap(_InnerWithoutSetter())
+    with pytest.raises(RuntimeError, match="_InnerWithoutSetter"):
+        layer.set_host_kv_staging(key=torch.zeros(1, 1, 1, PRIMARY_KV_DIM))
+
+
+def test_real_layer_wrapper_reflects_writes_aux_from_a_full_dsa_segment():
+    inner = _bare_full_segment()
+    inner.max_seqlen = 128
+    inner.index_topk = 64
+    inner.aux_blocked_k = torch.zeros(1, 1, 1, AUX_KV_DIM)
+    assert _wrap(inner).WRITES_AUX_HOST_KV is True
+
+
+def test_real_layer_wrapper_reflects_writes_aux_from_a_reuse_segment():
+    inner = _bare_reuse_segment()
+    inner.max_seqlen = 128
+    inner.index_topk = 64
+    # A skip layer has no aux cache at all, which is what marks it.
+    assert getattr(inner, "aux_blocked_k", None) is None
+    assert _wrap(inner).WRITES_AUX_HOST_KV is False
+
+
+def test_whole_model_stages_through_real_layer_wrappers():
+    """End-to-end over the production composition shape.
+
+    Real `Glm5DecoderLayerGraphSegment` wrappers around real attention
+    segments: the install must reach each inner segment's output buffers, with
+    aux slices going only to the indexer layers. This is the arrangement the
+    node ran, so it is the arrangement the pin uses.
+    """
+
+    inners = []
+    layers = []
+    for layer_idx in range(NUM_LAYERS):
+        if layer_idx in AUX_LAYERS:
+            inner = _bare_full_segment()
+            inner.aux_blocked_k = torch.zeros(1, 1, 1, AUX_KV_DIM)
+        else:
+            inner = _bare_reuse_segment()
+        inner.max_seqlen = 128
+        inner.index_topk = 64
+        # Only the output-buffer binding is under test; real buffer setup
+        # needs the scorer JIT and a GPU.
+        inner.setup_static_buffers = inner._setup_static_output_buffers
+        inners.append(inner)
+        layers.append(_wrap(inner, layer_idx=layer_idx))
+
+    seg = _make_segment(layer_segments=layers)
+    seg.setup_static_buffers(MAX_BUCKET)
+
+    for layer_idx, inner in enumerate(inners):
+        outputs = inner._outputs[MAX_BUCKET]
+        assert outputs.primary_k_tensor.data_ptr() == (
+            seg._kv_key_buffer[layer_idx].data_ptr()
+        ), f"layer {layer_idx} primary rows are not the staging slice"
+        if layer_idx in AUX_LAYERS:
+            assert outputs.indexer_k_tensor.data_ptr() == (
+                seg._aux_kv_key_buffer[layer_idx].data_ptr()
+            )
+            assert outputs.indexer_k_scale.data_ptr() == (
+                seg._aux_kv_scale_buffer[layer_idx].data_ptr()
+            )
+        else:
+            # Skip layers keep their 1-element aux placeholder.
+            assert outputs.indexer_k_tensor.numel() == 1
+
+    # Release must reach the inner segments through the wrapper, exactly once.
+    seg.release_static_buffers(MAX_BUCKET)
+    for inner in inners:
+        assert inner._host_kv_staging is None
+        assert inner._outputs == {}
