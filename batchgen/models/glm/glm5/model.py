@@ -699,12 +699,18 @@ class Glm5Indexer(nn.Module):
         page_size: int = 64,
         positions: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        q_index_raw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score cached tokens from paged cache and select top-K.
 
         Gathers indexer K from paged cache into contiguous tensor using
         cached gather indices (reused across layers within a decode step),
         then delegates to score_and_select.
+
+        ``q_index_raw`` ([batch, index_n_heads, index_head_dim]) is the wq_b
+        projection when the caller already computed it inside the merged
+        ``[q_b | wq_b]`` GEMM (GLM5_QB_WQB_MERGE); the scorer then skips its
+        own wq_b GEMM. ``None`` keeps the original path unchanged.
 
         Args:
             q_a: [batch, 1, q_lora_rank] — q_a intermediate from main attention
@@ -746,6 +752,7 @@ class Glm5Indexer(nn.Module):
                 page_size=page_size,
                 positions=positions,
                 max_seqlen=max_seqlen,
+                q_index_raw=q_index_raw,
             )
 
         # Non-migrated (bf16 AoS) indexer profiles -- GLM-5, GLM-5.1, GLM-5.3 --
@@ -787,6 +794,7 @@ class Glm5Indexer(nn.Module):
             head_dim=self.index_head_dim,
             rope_dim=self.rope_head_dim,
             topk=min(self.index_topk, max_seqlen),
+            q_index_raw=q_index_raw,
         )
         return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
 
@@ -801,6 +809,7 @@ class Glm5Indexer(nn.Module):
         page_size: int,
         positions: Optional[torch.Tensor],
         max_seqlen: int,
+        q_index_raw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Eager ReLU-gated scoring straight out of the page-split FP8 cache.
 
@@ -838,9 +847,20 @@ class Glm5Indexer(nn.Module):
         # float32 tables). The retired eager path round-tripped them through
         # bf16; keeping fp32 here removes an eager-vs-graph divergence.
         cos, sin = self.rotary_emb(hidden_states, int(max_seqlen))
-        q = cuda_wq_b_proj(
-            q_a.squeeze(1), self._fused_score_weights, self._fused_score_module
-        ).view(batch_size, self.index_n_heads, self.index_head_dim)
+        if q_index_raw is not None:
+            # The merged [q_b | wq_b] GEMM already produced wq_b; same
+            # checkpoint-byte numerics as the captured merged segment.
+            expected = (batch_size, self.index_n_heads, self.index_head_dim)
+            if tuple(q_index_raw.shape) != expected:
+                raise ValueError(
+                    f"[layer {self.layer_idx}] q_index_raw must be {expected}, "
+                    f"got {tuple(q_index_raw.shape)}"
+                )
+            q = q_index_raw
+        else:
+            q = cuda_wq_b_proj(
+                q_a.squeeze(1), self._fused_score_weights, self._fused_score_module
+            ).view(batch_size, self.index_n_heads, self.index_head_dim)
         # Read the rotation off the cache this q is about to be scored
         # against, so eager and the captured graph cannot land in different
         # spaces. False here: a page-split FP8 cache is the no-rotation route.

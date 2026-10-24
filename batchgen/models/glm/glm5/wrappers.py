@@ -92,6 +92,12 @@ except Exception as _e:
     _FUSED_SCORE_IMPORT_ERROR = _e
     logging.debug(f"[WP4] Fused scoring import failed: {_e}")
 
+# Merged [q_b | wq_b] decode GEMM (kernel version management): the switch
+# decides whether initialize_fused_kernels builds the merged operand; the
+# construction itself is torch-only and fails loud on a misaligned member.
+from batchgen.models.glm.glm5.q_b_wq_b_merge import build_q_b_wq_b_merged
+from batchgen.models.glm.glm5.qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
+
 
 def _required_dsa_kernel_import_failures():
     """Return unavailable production DSA kernels and their import errors."""
@@ -676,6 +682,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # WP4: Fused scoring pipeline
         self._fused_wqb_weights = None
         self._fused_score_module = None
+        # Merged [q_b | wq_b] decode GEMM operand (GLM5_QB_WQB_MERGE). Non-None
+        # only on a registered persistent indexer layer with the switch on; the
+        # WP4 container above stays built either way (prefill and the
+        # separate version read it), so the old version stays selectable.
+        self._fp8_q_b_wq_b_proj = None
+        self._fp8_q_b_wq_b_scale = None
         # Fallback warning guards
         self._warned_fp8_absorb_fallback = False
         self._warned_indexer_kv_fallback = False
@@ -733,6 +745,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_o_proj = None
         self._fp8_qkv_a_proj = None
         self._fp8_qkv_a_scale = None
+        self._fp8_q_b_wq_b_proj = None
+        self._fp8_q_b_wq_b_scale = None
 
     def initialize_decode_absorb(self):
         """Pre-compute absorbed projections from FP8 kv_b_proj weight.
@@ -859,6 +873,74 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] WP4 init failed: {e}"
                 )
                 self._fused_wqb_weights = None
+
+        # Merged [q_b | wq_b] decode GEMM. Built here, and only on layers that
+        # reach this line -- the ones WITH an indexer -- because wq_b exists
+        # only there and indexer.wq_b_scale is attached by _setup_fp8_scales
+        # before this runs (the ordering contract asserted above). No
+        # try/except: with the switch on the decode graph cannot run without
+        # this operand, and a warn-and-None would be a silent fallback to the
+        # other version's numerics.
+        if glm5_qb_wqb_merge_enabled():
+            self._register_q_b_wq_b_merged(indexer)
+
+    def _register_q_b_wq_b_merged(self, indexer) -> None:
+        """Concatenate ``[q_b_proj | indexer.wq_b]`` into one DeepGEMM operand.
+
+        Both weights are the checkpoint's own e4m3 bytes with its 128x128
+        block scales, so the merged GEMM's q_b slice reads exactly the bytes
+        the separate q_b GEMM read, and the wq_b slice replaces the WP4
+        container's dequantize -> re-quantize round trip.
+
+        Aliasing: ``q_b_proj`` is a phase-managed weight, so it is re-pointed
+        at its slice of the merged buffer (no second resident copy), with its
+        scale entry re-pointed the same way -- the ``_register_fp8_weights``
+        discipline. ``indexer.wq_b`` is NOT re-pointed: indexer parameters are
+        bound to the shared device skeleton that the prefill and decode
+        instances both alias, and rebinding one would trip
+        ``_assert_skeleton_still_shared``. The merged buffer therefore holds a
+        COPY of the wq_b rows (index_n_heads * index_head_dim x q_lora_rank
+        e4m3 per indexer layer); the skeleton tensor stays the authority for
+        every other reader.
+        """
+        if self.fp8_q_b_proj is None:
+            # No registered resident q_b (a streaming prefill wrapper binds
+            # its weights per forward): nothing to merge, and nothing on this
+            # wrapper reads the merged operand. Every decode consumer fails
+            # loud if it is absent where it is required.
+            self._fp8_q_b_wq_b_proj = None
+            self._fp8_q_b_wq_b_scale = None
+            return
+        wq_b_scale = getattr(indexer, "wq_b_scale", None)
+        if wq_b_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM5_QB_WQB_MERGE needs "
+                "indexer.wq_b_scale (the checkpoint's wq_b weight_scale_inv), "
+                "but _setup_fp8_scales did not attach it"
+            )
+        q_b_scale = self.weight_dequant_scale.get("q_b_proj.weight_scale_inv")
+        if q_b_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM5_QB_WQB_MERGE needs the "
+                "q_b_proj.weight_scale_inv FP8 scale"
+            )
+        merged = build_q_b_wq_b_merged(
+            self.module.q_b_proj.weight.data,
+            q_b_scale,
+            indexer.wq_b.weight.data,
+            wq_b_scale,
+        )
+        self._fp8_q_b_wq_b_proj = merged.weight
+        self._fp8_q_b_wq_b_scale = merged.scale
+        self.module.q_b_proj.weight.data = merged.weight[: merged.q_b_rows]
+        self.weight_dequant_scale["q_b_proj.weight_scale_inv"] = (
+            merged.scale[: merged.q_b_scale_rows]
+        )
+        self.fp8_q_b_proj = self.module.q_b_proj.weight.data
+        logging.debug(
+            f"[layer {self.layer_idx}] merged [q_b | wq_b] operand "
+            f"{tuple(merged.weight.shape)} / scale {tuple(merged.scale.shape)}"
+        )
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]

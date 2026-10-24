@@ -160,11 +160,21 @@ def test_both_halves_are_strided_views_of_the_single_projection_output(
     segment, class_name
 ):
     fwd = _method(_tree(segment), class_name, "forward")
-    assert _assigned(fwd, "q_heads") == (
-        "buffers.q_flat.view(batch_size, attn.num_heads, attn.q_head_dim)"
-    ), (
-        f"{segment}: the head view must come straight off the contiguous "
-        f"q_b_proj output, so each head's slice is one (row, head) stride pair"
+    # The indexer-layer segment's q_flat may be a column slice of the merged
+    # [q_b | wq_b] output; `.unflatten` splits only the unit-stride last axis,
+    # the one reshape that is a view on both versions. The skip layer keeps
+    # its own contiguous q_flat and its original `.view`.
+    expected = {
+        "Glm5FullDsaAttnSegment": (
+            "buffers.q_flat.unflatten(-1, (attn.num_heads, attn.q_head_dim))"
+        ),
+        "Glm5ReuseTopkAttnSegment": (
+            "buffers.q_flat.view(batch_size, attn.num_heads, attn.q_head_dim)"
+        ),
+    }[class_name]
+    assert _assigned(fwd, "q_heads") == expected, (
+        f"{segment}: the head view must come straight off the q_b_proj "
+        f"output, so each head's slice is one (row, head) stride pair"
     )
     assert _assigned(fwd, "q_nope_strided") == "q_heads[..., :attn.qk_nope_head_dim]"
     assert _assigned(fwd, "q_rope_strided") == (

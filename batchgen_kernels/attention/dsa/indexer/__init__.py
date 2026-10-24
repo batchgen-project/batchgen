@@ -123,3 +123,37 @@ def fused_rope_hadamard_out(
         apply_hadamard,
     )
     return out
+
+
+def fused_rope_hadamard_strided_out(
+    x: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    x_row_stride: int,
+    scale: float = 128 ** -0.5,
+    out_fp8: Optional[torch.Tensor] = None,
+    apply_hadamard: bool = True,
+) -> torch.Tensor:
+    """``fused_rope_hadamard_out`` over a STRIDED ``[rows, heads, 128]`` source.
+
+    ``x`` keeps its heads packed (stride 128) but its rows ``x_row_stride``
+    elements apart -- the trailing column slice of the merged ``[q_b | wq_b]``
+    GEMM output -- and the kernel reads it in place, so no reshape copy is
+    made. ``out`` (and ``out_fp8``) are contiguous ``[rows, heads, 128]``.
+    A separate entry point (kernel version management): the contiguous one
+    above is unchanged.
+    """
+    _fused_rope_hadamard_cuda.fused_rope_hadamard_strided_out(
+        x,
+        cos_cache,
+        sin_cache,
+        positions,
+        out,
+        x_row_stride,
+        scale,
+        out_fp8,
+        apply_hadamard,
+    )
+    return out
