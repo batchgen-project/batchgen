@@ -882,8 +882,9 @@ def test_a_clean_batch_is_bitwise_identical_in_both_fallback_formulations():
     """With no bad row, the device-selected form must match the branched form.
 
     This is the common case, so it is the one that must not move: the filled
-    tensor equals `probs` element-for-element and multinomial consumes one
-    uniform per row regardless of values.
+    tensor equals `probs` element-for-element and the one-sample draw (an
+    `exponential_` over the whole tensor) consumes the same random numbers at
+    the same positions regardless of values.
     """
     logits = torch.randn(6, V, generator=torch.Generator().manual_seed(11))
     temps = torch.tensor([1.0, 0.0, 0.8, 1.2, 0.0, 1.0])

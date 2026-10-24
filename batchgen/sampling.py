@@ -20,6 +20,75 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
+# The one-sample draw on the host-decided (decode step) path
+# --------------------------------------------------------------------------
+#
+# True: the sampled rows are drawn with `_draw_one_per_row` below, which
+# launches the same kernels as `torch.multinomial(probs, 1)` without its two
+# device->host validity readbacks. False: `torch.multinomial` exactly as
+# before (byte-identical behaviour, including its RuntimeError on an invalid
+# distribution). Read at call time, so it can be flipped on the module. Only
+# the host-decided path consults it; the reference path (`host_decisions`
+# None) syncs on `bad_rows.any()` anyway and keeps `torch.multinomial` as
+# the oracle the switch is tested against.
+SAMPLED_DRAW_SYNC_FREE = True
+
+
+def _draw_one_per_row(probs: torch.Tensor) -> torch.Tensor:
+	"""`torch.multinomial(probs, 1)` minus its host syncs; token-identical.
+
+	For `n_sample == 1` ATen's multinomial is itself the exponential race
+	(Gumbel-max with the exp applied): it checks
+	`((max < inf) & (min >= 0)).item()` and `(sum(1) == 0).sum().item()` --
+	two cudaStreamSynchronize per call -- and then runs exactly
+
+	    q = empty_like(self).exponential_(1, gen)
+	    div_out(q, self, q)
+	    argmax_out(result, q, -1, keepdim=True)
+
+	This is that tail, statement for statement: same allocation shape, dtype
+	and layout, same default generator, same single `exponential_` over
+	`probs.numel()` elements -- so the Philox (CUDA) / mt19937 (CPU) stream
+	consumed, the values drawn, and the generator state left behind are the
+	ones `torch.multinomial` would produce. Nothing else in `sample_tokens`
+	touches the RNG, so the surrounding order is unchanged too.
+
+	It does NOT validate. On an invalid row the race returns garbage silently
+	(argmax picks the first NaN; an all-zero row yields token 0; an +inf entry
+	always wins; negative entries never do), so the caller must route every
+	row multinomial would have rejected to its fallback BEFORE trusting the
+	draw -- see `_invalid_draw_rows`.
+	"""
+	q = torch.empty_like(probs).exponential_(1)
+	torch.div(probs, q, out=q)
+	return q.argmax(dim=-1, keepdim=True)
+
+
+def _invalid_draw_rows(probs: torch.Tensor, bad_rows: torch.Tensor) -> torch.Tensor:
+	"""Per-row form of multinomial's validity check, on device, no readback.
+
+	`torch.multinomial` refuses a distribution with a NaN, an inf, a negative
+	entry, or a zero row sum. Per row, that is exactly
+	`~((min >= 0) & (max < inf) & (max > 0))`: `aminmax` propagates NaN, so
+	both comparisons are False on a NaN row; and once every entry is finite
+	and non-negative the row sum is zero iff the max is zero (a sum of
+	non-negative floats cannot round to 0 unless every term is 0). One fused
+	pass replaces multinomial's separate global max, min and row sum.
+
+	`bad_rows` (NaN or sum < 1e-10) already covers NaN and zero sum, and a
+	softmax output cannot hold inf or negatives, so for today's caller the
+	result equals `bad_rows`. The full check is kept anyway so that the draw
+	can never silently consume a distribution multinomial would have raised
+	on: such a row now takes the deterministic greedy fallback and is counted
+	in `bad_row_counter` (drained and reported by the caller), instead of
+	raising -- raising is the one thing that needs a sync.
+	"""
+	row_min, row_max = torch.aminmax(probs, dim=-1)
+	valid = (row_min >= 0) & (row_max < float("inf")) & (row_max > 0)
+	return bad_rows | ~valid
+
+
+# --------------------------------------------------------------------------
 # The greedy/sampling row split
 # --------------------------------------------------------------------------
 #
@@ -336,12 +405,14 @@ def sample_tokens(
 		# `probs`, so it cannot be answered host-side -- it has to stop being
 		# asked. Draw over all B_s rows and select, which keeps the common
 		# (no bad row) case bitwise identical to the branched form: the filled
-		# tensor equals `probs` element-for-element, and multinomial consumes
-		# one uniform per row regardless of that row's values.
+		# tensor equals `probs` element-for-element, and the one-sample draw
+		# (an `exponential_` over the whole [B_s, V] tensor, with either
+		# switch setting) consumes the same random numbers at the same
+		# positions regardless of the rows' values.
 		#
 		# When a bad row IS present the good rows' draws differ from the
 		# branched form, because that form compacts the good rows into a
-		# smaller tensor and so shifts which uniform each row consumes. The
+		# smaller tensor and so shifts which random numbers each row consumes. The
 		# fallback rows themselves are bit-identical (same unscaled argmax) and
 		# the good rows are still correct draws from their own distributions;
 		# only the branched form's incidental row-to-uniform mapping is lost,
@@ -349,10 +420,19 @@ def sample_tokens(
 		bad_col = bad_rows.unsqueeze(-1)
 		# In place: `probs` is a fresh softmax output with no other reader, so
 		# this adds no allocation over the branched form. Bad rows become
-		# uniform-over-vocab purely so multinomial has a valid distribution;
+		# uniform-over-vocab purely so the draw has a valid distribution;
 		# their draw is discarded by the select below.
 		probs = probs.masked_fill_(bad_col, 1.0)
-		sampled = torch.multinomial(probs, num_samples=1)
+		if SAMPLED_DRAW_SYNC_FREE:
+			# Same draw as multinomial, without its validity readbacks. The
+			# check it skipped is re-done per row on the filled tensor (what
+			# the draw actually consumes), and every row it would have
+			# rejected is selected away from the unvalidated draw below.
+			bad_rows = _invalid_draw_rows(probs, bad_rows)
+			bad_col = bad_rows.unsqueeze(-1)
+			sampled = _draw_one_per_row(probs)
+		else:
+			sampled = torch.multinomial(probs, num_samples=1)
 		sampled = torch.where(bad_col, fallback_tokens_all, sampled)
 		if bad_row_counter is not None:
 			# The host can no longer see this count without the readback this

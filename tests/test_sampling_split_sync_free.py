@@ -19,12 +19,13 @@ What is pinned here:
   reference (device-mask) path under the same seed.
 * **No sync op on the split** -- an aten-level dispatch trace of the
   host-decided path contains no `_local_scalar_dense` / `item` /
-  `is_nonzero` / `nonzero` / `masked_select`, and no gather/scatter with a
-  boolean index. The same trace of the reference path is the negative control
-  that proves the detector sees those ops. Syncs that live inside the sampled
-  path proper (`torch.multinomial`'s validity check, the boolean index_put_ in
-  the top-k / top-p filters) are out of scope here and are enumerated
-  explicitly, so a new one cannot slip in unseen.
+  `is_nonzero` / `nonzero` / `masked_select` / `multinomial`, and no
+  gather/scatter with a boolean index. The same trace of the reference path
+  is the negative control that proves the detector sees those ops. Syncs that
+  live inside the sampled path proper (the boolean index_put_ in the top-k /
+  top-p filters) are out of scope here and are enumerated explicitly, so a new
+  one cannot slip in unseen. The sync-free one-sample draw that replaced
+  `torch.multinomial` is pinned in `test_sampling_draw_sync_free.py`.
 * **Rebuild correctness** -- across composition changes the residency
   republishes the row partition and its device index tensors, keeps them in
   its resident buffers (no per-step allocation), and the tokens stay equal to
@@ -191,8 +192,11 @@ def test_the_aliasing_invariant_holds_on_the_unsplit_path():
 
 #: aten ops that read a device value back to the host (or, for nonzero /
 #: masked_select / argwhere, size an output from device data) and therefore
-#: block on CUDA.
+#: block on CUDA. `multinomial` is listed as an op because its two validity
+#: `.item()` readbacks run inside its kernel, below the dispatcher, where a
+#: dispatch mode cannot see them -- the op itself is the only visible marker.
 _SYNC_OPS = (
+    "aten.multinomial",
     "aten._local_scalar_dense",
     "aten.item",
     "aten.is_nonzero",
@@ -251,8 +255,8 @@ def _trace(name, host):
 #: scope for the split: the boolean index_put_ in the top-k filter
 #: (`effective_k[effective_k <= 0] = V`, `sorted_logits[topk_mask] = -inf`)
 #: and in the top-p filter (`sorted_mask[no_filter...] = False`).
-#: `torch.multinomial` also syncs internally on CUDA (its validity check), but
-#: that happens below the dispatcher and is not visible in this trace.
+#: `torch.multinomial` is gone from this path (SAMPLED_DRAW_SYNC_FREE), so it
+#: must not appear here.
 _KNOWN_SAMPLED_PATH_SYNCS = {
     "all_greedy": [],
     "m1_all_sampled": [],
@@ -276,15 +280,17 @@ def test_the_host_decided_path_has_no_split_sync(name):
     )
 
 
-def test_the_measured_workload_shape_has_no_sync_op_but_multinomial():
+def test_the_measured_workload_shape_has_no_sync_op():
     """The decode workload the stall was measured on (all rows sampled,
-    top_p=1, top_k=0) must reach `multinomial` with no syncing op before it
-    and none after it, and must not split the batch at all."""
+    top_p=1, top_k=0) must draw with no syncing op at all -- the draw is the
+    launch-only exponential race, not `multinomial` -- and must not split the
+    batch."""
     trace = _trace("m1_all_sampled", host=True)
     assert trace.syncing() == []
     assert "aten.index_select.default" not in trace.ops
     assert "aten.index_copy_.default" not in trace.ops
-    assert trace.ops.count("aten.multinomial.default") == 1
+    assert trace.ops.count("aten.multinomial.default") == 0
+    assert trace.ops.count("aten.exponential_.default") == 1
 
 
 def test_a_mixed_batch_splits_by_index_not_by_mask():
