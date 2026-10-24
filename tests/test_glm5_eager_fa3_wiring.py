@@ -240,7 +240,7 @@ def test_selected_fa3_call_matches_the_graph_segment_shape() -> None:
     kw = _kwargs(calls[0])
     assert kw["page_table"] == "selected_token_ids"
     assert kw["cache_seqlens"] == "selected_lengths"
-    assert kw["num_splits"] == "0"
+    assert kw["num_splits"] == "GLM5_SPARSE_FA3_NUM_SPLITS"
     assert kw["causal"] == "True"
     assert kw["return_softmax_lse"] == "False"
     assert kw["softmax_scale"] == "float(attn.softmax_scale)"
