@@ -42,7 +42,8 @@ def test_host_resource_fields_are_scalar_snapshots():
             lookup_misses=8,
             evicted_nodes=9,
             eviction_protected_skips=10,
-        )
+        ),
+        count_releasable_pages=lambda group_id: 11,
     )
     worker = SimpleNamespace(
         get_stats=lambda: SimpleNamespace(
@@ -60,4 +61,5 @@ def test_host_resource_fields_are_scalar_snapshots():
     assert fields["used_page_handles"] == 6
     assert fields["evicted_nodes_total"] == 9
     assert fields["host_kv_used_pages"] == 40
+    assert fields["releasable_pages"] == 11
     assert all(isinstance(value, int) for value in fields.values())

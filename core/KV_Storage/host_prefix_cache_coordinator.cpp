@@ -25,6 +25,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace batchgen::kv {
@@ -379,6 +380,7 @@ struct HostPrefixCacheCoordinator::SharedState {
         std::uint32_t max_scan_nodes);
     PrefixEvictionResult ClearUnprotected();
     PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
+    std::uint64_t CountReleasablePages(std::uint32_t group_id) const;
     HostPrefixCacheStats GetStats() const;
 
     HostPrefixCacheConfig config;
@@ -1964,6 +1966,55 @@ HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
     return result;
 }
 
+std::uint64_t HostPrefixCacheCoordinator::SharedState::CountReleasablePages(
+    std::uint32_t group_id) const {
+    // Page refs come only from resident nodes' group entries, so a page is
+    // freed exactly when no resident node keeps a ref on it
+    // (AppendEvictedPagesLocked / DecrementPageRefLocked). Counting handles
+    // would over-state the supply wherever two nodes share a physical page,
+    // and a budget short by that much turns the reserve-time reclaim
+    // deterministically insufficient. So: distinct pages of the unprotected
+    // nodes, minus those a protected node still holds. Process-local sets,
+    // never shared state.
+    std::unordered_set<std::uint32_t> unprotected_pages;
+    std::unordered_set<std::uint32_t> protected_pages;
+
+    ScopedPthreadMutexLock lock(&header->mutex);
+
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        std::unordered_set<std::uint32_t>& target =
+            NodeIsProtectedLocked(node) ? protected_pages : unprotected_pages;
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state !=
+                    static_cast<std::uint32_t>(EntryState::kResident) ||
+                entry.group_id != group_id) {
+                continue;
+            }
+            for (std::uint32_t page_idx = 0; page_idx < entry.page_handle_count;
+                 ++page_idx) {
+                target.insert(
+                    page_handles[entry.first_page_handle + page_idx].page_id);
+            }
+        }
+    }
+
+    std::uint64_t releasable_pages = 0;
+    for (std::uint32_t page_id : unprotected_pages) {
+        if (protected_pages.find(page_id) == protected_pages.end()) {
+            ++releasable_pages;
+        }
+    }
+    return releasable_pages;
+}
+
 PrefixEvictionResult
 HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
     PrefixEvictionResult result;
@@ -2177,6 +2228,11 @@ PrefixEvictionResult HostPrefixCacheCoordinator::ClearUnprotected() {
 PrefixEvictionResult HostPrefixCacheCoordinator::ClearNamespace(
     PrefixDigest namespace_digest) {
     return state_->ClearNamespace(namespace_digest);
+}
+
+std::uint64_t HostPrefixCacheCoordinator::CountReleasablePages(
+    std::uint32_t group_id) const {
+    return state_->CountReleasablePages(group_id);
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::GetStats() const {

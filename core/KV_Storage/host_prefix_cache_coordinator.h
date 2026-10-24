@@ -147,6 +147,11 @@ class HostPrefixCacheCoordinator {
     PrefixEvictionResult ClearUnprotected();
     PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
 
+    // Pages an eviction of every unprotected node would actually free for
+    // `group_id` right now: same resident/unprotected predicate as the
+    // reclaim, each physical page counted once, no mutation.
+    std::uint64_t CountReleasablePages(std::uint32_t group_id) const;
+
     HostPrefixCacheStats GetStats() const;
 
     std::uint32_t hash_block_tokens() const { return hash_block_tokens_; }

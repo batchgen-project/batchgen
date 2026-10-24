@@ -618,3 +618,117 @@ def test_host_prefix_cache_compacts_lazily_when_arena_tail_is_full():
     finally:
         # Anonymous memfd region: nothing named exists to unlink.
         pass
+
+
+def test_host_prefix_cache_counts_releasable_pages_without_mutating():
+    """The admission-budget counter mirrors the reclaim's own predicate."""
+    shm_name = _random_shm_name()
+    namespace = [501, 502, 503, 504]
+    token_ids = list(range(16))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            16,
+            [
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
+            ],
+        )
+
+        # Two resident nodes, nothing attached: every page is releasable, per
+        # group, exactly as the group entries hold them.
+        assert coordinator.count_releasable_pages(0) == 4
+        assert coordinator.count_releasable_pages(1) == 2
+
+        # An attachment protects its nodes, so their pages leave the budget --
+        # the same NodeIsProtectedLocked predicate the reclaim skips on.
+        attached = coordinator.lookup_and_attach(namespace, token_ids[:8])
+        assert attached.common_cached_tokens == 8
+        assert coordinator.count_releasable_pages(0) == 2
+        assert coordinator.count_releasable_pages(1) == 1
+        # Read-only: the protected nodes are untouched and nothing was evicted.
+        stats = coordinator.get_stats()
+        assert stats.resident_nodes == 2
+        assert stats.evicted_nodes == 0
+        assert stats.eviction_protected_skips == 0
+
+        coordinator.release_attachment(attached.attachment_handle)
+        assert coordinator.count_releasable_pages(0) == 4
+
+        evicted = coordinator.evict_until_releasable_pages(
+            [_requirement(0, 1)],
+            0,
+        )
+        assert evicted.evicted_nodes == 1
+        assert coordinator.count_releasable_pages(0) == 2
+        assert coordinator.count_releasable_pages(1) == 1
+
+        # A group nothing was committed under has no releasable pages.
+        assert coordinator.count_releasable_pages(7) == 0
+    finally:
+        # Anonymous memfd region: nothing named exists to unlink.
+        pass
+
+
+def test_host_prefix_cache_counts_a_shared_page_once_and_not_when_pinned():
+    """Two namespaces over one physical page: the budget holds it once.
+
+    Counting group-entry handles would report 4 group-0 pages here while an
+    eviction of both nodes frees only 3, and a budget that over-states supply
+    makes the reserve-time reclaim deterministically short.
+    """
+    shm_name = _random_shm_name()
+    namespace_a = [601, 602, 603, 604]
+    namespace_b = [701, 702, 703, 704]
+    token_ids = list(range(8))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace_a,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(42), _page(43)]),
+                _group_pages(1, [_page(7)]),
+            ],
+        )
+        coordinator.commit_prefix_pages(
+            namespace_b,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(42), _page(44)]),
+                _group_pages(1, [_page(7)]),
+            ],
+        )
+
+        # Distinct pages 42, 43, 44 -- not the 4 handles the two nodes hold.
+        assert coordinator.count_releasable_pages(0) == 3
+        assert coordinator.count_releasable_pages(1) == 1
+
+        # Pinning namespace_a takes 42 out of the budget too: node A keeps a
+        # ref, so evicting node B cannot free it.
+        attached = coordinator.lookup_and_attach(namespace_a, token_ids)
+        assert attached.common_cached_tokens == 8
+        assert coordinator.count_releasable_pages(0) == 1
+        assert coordinator.count_releasable_pages(1) == 0
+
+        # What the counter promised is exactly what evicting every unprotected
+        # node actually frees: page 44, never the shared 42.
+        cleared = coordinator.clear_unprotected()
+        assert [
+            [page.page_id for page in pages.pages]
+            for pages in cleared.evicted_group_pages
+        ] == [[44]]
+        assert coordinator.count_releasable_pages(0) == 0
+
+        coordinator.release_attachment(attached.attachment_handle)
+        assert coordinator.count_releasable_pages(0) == 2
+        assert coordinator.count_releasable_pages(1) == 1
+    finally:
+        # Anonymous memfd region: nothing named exists to unlink.
+        pass

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 
 def host_kv_eviction_enabled(host_kv_chunk_size: int) -> bool:
@@ -126,6 +126,13 @@ class PrefillSelectionRequest:
     # rank/node vectors rather than one caller-local scalar.
     per_rank_sequence_free: Optional[Tuple[int, ...]] = None
     per_node_sequence_free: Optional[Tuple[int, ...]] = None
+    # Retained prefix pages a node can reclaim right now (resident, no
+    # attachment, no pending load), indexed by node id. They join the host
+    # budget because a retained prefix either gets attached -- dropping demand
+    # and supply by the same page count -- or stays evictable for the
+    # reserve-time reclaim. ``None`` means "do not count them" and keeps every
+    # non-prefix caller on physical free pages alone.
+    per_node_host_reclaimable: Optional[Tuple[int, ...]] = None
 
 
 class PrefillScheduler:
@@ -240,8 +247,24 @@ class PrefillScheduler:
                 )
             if any(value < 0 for value in req.per_node_sequence_free):
                 raise ValueError("per_node_sequence_free values must be >= 0")
+        if req.per_node_host_reclaimable is not None:
+            if len(req.per_node_host_reclaimable) != req.num_nodes:
+                raise ValueError(
+                    "per_node_host_reclaimable must have one value per node"
+                )
+            if any(value < 0 for value in req.per_node_host_reclaimable):
+                raise ValueError(
+                    "per_node_host_reclaimable values must be >= 0"
+                )
 
         per_node_effective_free = list(req.per_node_host_free)
+        if bound_by_host_pages and req.per_node_host_reclaimable is not None:
+            per_node_effective_free = [
+                free + reclaimable
+                for free, reclaimable in zip(
+                    per_node_effective_free, req.per_node_host_reclaimable
+                )
+            ]
         node_pages_used = [0] * req.num_nodes
         rank_sequences_used: dict[int, int] = {}
         node_sequences_used = [0] * req.num_nodes
@@ -342,6 +365,35 @@ def prefill_reclaim_target_pages(
 		return 0, 0
 	required = sum(head)
 	return required, max(0, required - int(free_pages))
+
+
+def prefill_host_reserve_page_deficit(
+    node_rows: Mapping[int, Tuple[int, int]],
+    node_id: int,
+) -> int:
+	"""Return the Host pages one node is short of the wave's gathered demand.
+
+	``node_rows`` maps node id to the ``(need, free)`` pair the reservation
+	capacity collective gathered. The deficit is what the reserve-time reclaim
+	has to release on this node for the SAME wave to pass the collective a
+	second time; it is exactly the part of the admission budget that was
+	reclaimable rather than free.
+
+	Zero means this node is not the short one -- it then evicts nothing and the
+	second collective decides on whichever node is. A missing or negative row
+	is a broken snapshot, not a zero deficit, so it is named here instead of
+	silently reclaiming nothing.
+	"""
+	row = node_rows.get(int(node_id))
+	if row is None:
+		raise ValueError(f"no gathered host-KV capacity row for node {node_id}")
+	need, free = int(row[0]), int(row[1])
+	if need < 0 or free < 0:
+		raise ValueError(
+			f"invalid host-KV capacity row for node {node_id}: "
+			f"need={need}, free={free}"
+		)
+	return max(0, need - free)
 
 
 class PrefillAdmissionStalled(RuntimeError):

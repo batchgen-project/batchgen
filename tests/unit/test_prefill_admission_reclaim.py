@@ -17,6 +17,7 @@ import copy
 import dataclasses
 import hashlib
 import logging
+import math
 import random
 import types
 from pathlib import Path
@@ -49,6 +50,7 @@ from batchgen.worker.prefill import (
     PrefillScheduler,
     PrefillSelectionRequest,
     describe_prefill_blockers,
+    prefill_host_reserve_page_deficit,
     prefill_reclaim_target_pages,
 )
 
@@ -60,6 +62,11 @@ NAMESPACE = (1, 2, 3, 4)
 METHODS = (
     "_prepare_prefill_batch",
     "_make_prefill_selection_request",
+    # The reserve-time seam: selection admits against free + reclaimable, so
+    # this is where the reclaimable part is actually released.
+    "_collective_prefill_host_capacity_ok",
+    "_retry_prefill_host_capacity_after_reclaim",
+    "_prefill_pool_segment_host_pages",
     "_prefill_sequence_limits",
     "_trajectory_frontier_eviction_hook",
     "_describe_prefill_admission_blockers",
@@ -94,7 +101,7 @@ def _worker_methods(dist):
     module = ast.fix_missing_locations(ast.Module(body=wanted, type_ignores=[]))
     namespace = {
         "List": List, "Optional": Optional, "Sequence": Sequence,
-        "Dict": Dict, "Tuple": Tuple, "hashlib": hashlib,
+        "Dict": Dict, "Tuple": Tuple, "hashlib": hashlib, "math": math,
         "logging": logging, "replace": dataclasses.replace, "torch": torch,
         "dist": dist, "core_engine": FakeCoreEngineModule,
         "PrefillScheduler": PrefillScheduler,
@@ -104,6 +111,7 @@ def _worker_methods(dist):
         "PrefillAdmissionStateDivergence": PrefillAdmissionStateDivergence,
         "describe_prefill_blockers": describe_prefill_blockers,
         "prefill_reclaim_target_pages": prefill_reclaim_target_pages,
+        "prefill_host_reserve_page_deficit": prefill_host_reserve_page_deficit,
         "release_local_query_slot": release_local_query_slot,
         "SequenceStatus": SequenceStatus,
     }
@@ -221,6 +229,19 @@ class FakePrefixCoordinator:
             pending_load_entries=self.pending_load_entries,
             pending_load_refs=0,
         )
+
+    def count_releasable_pages(self, group_id):
+        """Mirror of the native ``CountReleasablePages``: no mutation, and each
+        physical page counted once -- a page a protected node also references
+        cannot be released, so it is not in the budget."""
+        if int(group_id) != 0:
+            return 0
+        protected: set[int] = set()
+        unprotected: set[int] = set()
+        for node in self.nodes.values():
+            target = protected if node["active_refs"] else unprotected
+            target.update(int(page) for page in node["pages"])
+        return len(unprotected - protected)
 
     def evict_until_releasable_pages(self, requirements, max_scan_nodes):
         required = {int(r.group_id): int(r.min_pages) for r in requirements}
@@ -360,6 +381,8 @@ def _seq(uuid, idx, prompt, status=SequenceStatus.QUEUEING):
 
 
 class FakeWorker:
+    PAGE_SIZE = PAGE_TOKENS
+
     def __init__(
         self, *, pool, coordinator, sequences, slot_limit=None, pool_mode=True,
         committer=None, rank=0, local_rank=0, world_size=1, local_world_size=1,
@@ -384,6 +407,9 @@ class FakeWorker:
         self._prefill_admission_totals = None
         self._prefill_admission_live = False
         self._prefill_reservation_outcome = None
+        # No pooled segments in these fakes: _prefill_pool_segment_host_pages
+        # is compiled from the real source and reads it.
+        self._prefill_pool_wave = None
         # Request-lifecycle surfaces a per-request rejection has to release.
         self._trajectory_book = trajectory_book
         self._uuid_to_local_map = {}
@@ -506,7 +532,15 @@ def _full_pool_with_frontiers(*, total, protect_newest=False):
 # --------------------------------------------------------------------------- #
 
 
-def test_slot_limited_admission_reclaims_lru_retained_prefixes_and_admits():
+def test_slot_limited_admission_admits_from_the_reclaimable_budget():
+    """The wave fits once evictable retained pages count, so nothing is evicted.
+
+    The livelock is gone without any admission-time eviction: the budget is
+    free + reclaimable, the candidate is admitted against it, and the pages it
+    needs are released later by the reserve-time reclaim, after the wave's
+    attachments have pinned whatever it HIT. Before the budget change this
+    wave was admitted only after evicting the LRU retained prefixes here.
+    """
     pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
         total=400
     )
@@ -516,57 +550,76 @@ def test_slot_limited_admission_reclaims_lru_retained_prefixes_and_admits():
     )
     nodes_before = len(coordinator.nodes)
     free_before = pool.get_stats().num_free_pages
+    # The free pages alone cannot hold the candidate; free + reclaimable can.
+    assert free_before < NEED <= free_before + coordinator.count_releasable_pages(0)
 
     batch = worker._prepare_prefill_batch()
 
-    # Before the fix this returned [] with the coordinator never called.
     assert batch == ["q0"]
-    # One reclaim, sized to the shortfall, then one re-selection.
-    assert coordinator.calls == [({0: NEED - free_before}, 0)]
-    assert worker.dist.calls == ["all_gather", "all_reduce", "all_gather_object", "all_gather"]
-    # LRU-first: exactly the oldest nodes went, in order, and no newer one.
-    evicted = nodes_before - len(coordinator.nodes)
-    assert evicted == coordinator.evicted_nodes_total > 0
-    assert sorted(coordinator.nodes) == list(range(evicted, nodes_before))
-    # Their frontier records retired with them, arena pages back in the pool.
-    retired = {o.session_key for o in outcomes[:evicted]}
-    surviving = {o.session_key for o in outcomes[evicted:]}
-    assert set(committer.registry.session_keys) == surviving
-    assert not retired & set(committer.registry.session_keys)
-    assert len(allocator.releases) == evicted
-    for outcome in outcomes[:evicted]:
-        assert committer.arena_for(outcome.arena.storage_handle) is None
+    # No reclaim at admission, so no extra collective either.
+    assert coordinator.calls == []
+    assert coordinator.evicted_nodes_total == 0
+    assert worker.dist.calls == ["all_gather"]
+    # Every retained prefix, frontier record and arena page is still there.
+    assert len(coordinator.nodes) == nodes_before
+    assert set(committer.registry.session_keys) == {
+        outcome.session_key for outcome in outcomes
+    }
+    assert allocator.releases == []
+    assert pool.get_stats().num_free_pages == free_before
     committer.registry.check_invariants()
-    # The re-selection saw the reclaimed pages: the candidate now fits.
-    assert pool.get_stats().num_free_pages >= NEED
-    assert worker._prefill_admission_state[0] == (pool.get_stats().num_free_pages,)
 
 
-def test_reclaim_skips_attached_prefixes_and_their_frontiers_survive():
+def test_admission_reclaim_still_fires_when_free_plus_reclaimable_is_short():
+    """The trigger boundary: reclaim at admission only below free+reclaimable.
+
+    Pinned prefixes are not in the budget, so pinning all but a few retained
+    nodes puts the wave below free + reclaimable -- the one case the
+    admission-time reclaim still owns, and it behaves exactly as before:
+    target = shortfall against FREE pages, LRU order, protected nodes skipped
+    and counted, their frontier records and arenas untouched.
+    """
     pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
         total=400
     )
-    # Pin the two OLDEST nodes the way a live attachment does: the native
-    # coordinator protects them, and a restore attachment holds the record.
-    coordinator.nodes[0]["active_refs"] = 1
-    coordinator.nodes[1]["active_refs"] = 1
+    # Pin every retained node but the three newest, the way a live attachment
+    # does: the native coordinator protects them and a restore attachment holds
+    # the record.
+    nodes_before = len(coordinator.nodes)
+    unprotected = sorted(coordinator.nodes)[-3:]
+    for node_id, node in coordinator.nodes.items():
+        if node_id not in unprotected:
+            node["active_refs"] = 1
     pinned = committer.registry.get(outcomes[0].session_key)
     pinned.acquire()
     worker = FakeWorker(
         pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
         sequences=[_seq("q0", 0, PROMPT)],
     )
+    free_before = pool.get_stats().num_free_pages
+    assert free_before + coordinator.count_releasable_pages(0) < NEED
 
     assert worker._prepare_prefill_batch() == ["q0"]
 
-    assert coordinator.eviction_protected_skips_total == 2
-    assert 0 in coordinator.nodes and 1 in coordinator.nodes
+    # One reclaim, sized to the shortfall against free pages, then one
+    # re-selection -- the pre-budget-change contract, unchanged.
+    assert coordinator.calls == [({0: NEED - free_before}, 0)]
+    assert worker.dist.calls == [
+        "all_gather", "all_reduce", "all_gather_object", "all_gather",
+    ]
+    assert coordinator.evicted_nodes_total == 3
+    assert coordinator.eviction_protected_skips_total == nodes_before - 3
+    assert sorted(coordinator.nodes) == sorted(
+        node for node in range(nodes_before) if node not in unprotected
+    )
+    # The pinned prefixes and their frontier records survived the reclaim; the
+    # evicted ones took their arena pages back to the pool.
     keys = set(committer.registry.session_keys)
     assert outcomes[0].session_key in keys and outcomes[1].session_key in keys
     assert pinned.refcount == 2
     assert committer.arena_for(outcomes[0].arena.storage_handle) is not None
-    # The unprotected LRU node after them was the first to go.
-    assert 2 not in coordinator.nodes
+    assert len(allocator.releases) == 3
+    assert pool.get_stats().num_free_pages >= NEED
     committer.registry.check_invariants()
 
 
@@ -677,7 +730,8 @@ def test_full_sequence_slots_reclaim_nothing():
     assert allocator.releases == []
 
 
-def test_reclaim_targets_only_slot_admissible_candidates():
+def test_sequence_slot_limits_cap_the_wave_without_any_admission_eviction():
+    """Slots, not Host pages, are the binding limit once the budget covers."""
     pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
         total=400
     )
@@ -686,18 +740,29 @@ def test_reclaim_targets_only_slot_admissible_candidates():
         pool=pool, coordinator=coordinator, committer=committer, slot_limit=2,
         sequences=[_seq(f"q{i}", i, PROMPT) for i in range(6)],
     )
+    assert 2 * NEED <= free + coordinator.count_releasable_pages(0)
+
     batch = worker._prepare_prefill_batch()
-    # Minimal progress: the target covers the head of the priority order, not
-    # the whole slot-admissible set (which would be 2 * NEED), and never the
-    # six candidates the slots exclude anyway.
-    assert coordinator.calls[0][0] == {0: NEED - free}
-    assert batch[:1] == ["q0"]
+
+    # Exactly the two slots allow, and the four the slots exclude never make
+    # the wave evict for them.
+    assert batch == ["q0", "q1"]
+    assert coordinator.calls == []
+    assert coordinator.evicted_nodes_total == 0
 
 
 @pytest.mark.parametrize("slot_limit", [None, 4])
-def test_reclaim_is_bounded_to_the_head_of_the_priority_order(slot_limit):
-    """The target admits the first candidate, not the sum over all of them."""
-    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+def test_no_retained_prefix_is_evicted_at_admission_when_the_budget_covers(
+    slot_limit,
+):
+    """Every evicted prefix is a hot prefix a later prompt must recompute.
+
+    With the evictable pages in the budget the whole wave is admitted and not
+    one retained page is dropped at admission; the reserve-time reclaim then
+    releases only what the wave actually fails to find free, after its hits
+    are pinned.
+    """
+    pool, coordinator, committer, allocator, _ = _full_pool_with_frontiers(
         total=400
     )
     free = pool.get_stats().num_free_pages
@@ -709,28 +774,27 @@ def test_reclaim_is_bounded_to_the_head_of_the_priority_order(slot_limit):
         slot_limit=slot_limit,
         sequences=[_seq(f"q{i}", i, PROMPT) for i in range(3)],
     )
+    assert free < NEED
+    assert 3 * NEED <= free + coordinator.count_releasable_pages(0)
 
     batch = worker._prepare_prefill_batch()
 
-    assert coordinator.calls[0][0] == {0: NEED - free}
-    assert batch, "the reclaim has to admit at least the head candidate"
-    retained_after = sum(
+    assert batch == ["q0", "q1", "q2"]
+    assert coordinator.calls == []
+    assert sum(
         len(node["pages"]) for node in coordinator.nodes.values()
-    )
-    evicted_prefix_pages = retained_before - retained_after
-    # Bounded by what ONE candidate needs (plus the LRU node granularity the
-    # coordinator evicts in), nowhere near the 3 * NEED the old sum targeted.
-    assert 0 < evicted_prefix_pages < 3 * NEED - free
+    ) == retained_before
+    assert allocator.releases == []
 
 
-def test_pool_mode_admits_the_first_candidate_without_evicting_for_the_set():
-    """Partial admission must not evict for sequences already in the wave.
+def test_pool_mode_admits_the_whole_wave_from_the_reclaimable_budget():
+    """Pool mode no longer shatters a wave into one-candidate slices.
 
-    The pool has room for exactly one candidate of three. The old target was
-    the SUM over the whole slot-admissible set, so it evicted retained
-    prefixes worth two more candidates before a wave that could only take
-    one; the minimal-progress target is the next UNADMITTED candidate, which
-    the free pages already cover, so nothing is evicted at all.
+    The pool holds exactly one candidate's reservation free, with 80 retained
+    prefixes behind it. That is the measured shatter: the wave used to be cut
+    to the one candidate the free pages covered. The evictable pages belong to
+    the budget, so the whole slot-admissible set goes in one wave and nothing
+    is evicted for it at admission.
     """
     pool = FakeHostPool(400)
     coordinator = FakePrefixCoordinator(pool)
@@ -747,11 +811,10 @@ def test_pool_mode_admits_the_first_candidate_without_evicting_for_the_set():
         pool=pool, coordinator=coordinator, slot_limit=3,
         sequences=[_seq(f"q{i}", i, PROMPT) for i in range(3)],
     )
+    assert 3 * NEED <= NEED + coordinator.count_releasable_pages(0)
 
-    assert worker._prepare_prefill_batch() == ["q0"]
+    assert worker._prepare_prefill_batch() == ["q0", "q1", "q2"]
 
-    # The reclaim ran (the trigger fired on 1 < 3) with a zero page target, so
-    # the coordinator was never asked to evict anything.
     assert coordinator.calls == []
     assert coordinator.evicted_nodes_total == 0
     assert len(coordinator.nodes) == retained
@@ -783,7 +846,13 @@ def test_reclaim_target_is_pure_and_skips_what_can_never_fit():
         )
 
 
-def test_reclaim_without_a_committer_releases_prefix_pages_only():
+def test_admission_without_a_committer_admits_without_touching_retained_pages():
+    """A worker with no trajectory committer takes the same budget path.
+
+    The frontier hook is ``None`` here; the reserve-time reclaim covers the
+    no-committer release path
+    (``test_reserve_reclaim_without_a_committer_releases_prefix_pages_only``).
+    """
     pool = FakeHostPool(400)
     coordinator = FakePrefixCoordinator(pool)
     for node in range(90):
@@ -792,8 +861,179 @@ def test_reclaim_without_a_committer_releases_prefix_pages_only():
         pool=pool, coordinator=coordinator, slot_limit=8,
         sequences=[_seq("q0", 0, PROMPT)],
     )
+    free_before = pool.get_stats().num_free_pages
+    assert free_before < NEED
+
     assert worker._prepare_prefill_batch() == ["q0"]
+
+    assert coordinator.calls == []
+    assert coordinator.evicted_nodes_total == 0
+    assert pool.get_stats().num_free_pages == free_before
+
+
+# --------------------------------------------------------------------------- #
+#  Reserve-time reclaim: where the reclaimable part of the budget is released
+# --------------------------------------------------------------------------- #
+
+
+def _owner_requests(count):
+    """``count`` owner demands of exactly one candidate's reservation each."""
+    return [(f"q{index}", NEED * PAGE_TOKENS) for index in range(count)]
+
+
+def test_reserve_reclaim_releases_the_deficit_and_passes_the_second_snapshot():
+    pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    free_before = pool.get_stats().num_free_pages
+    assert free_before < NEED
+
+    assert worker._retry_prefill_host_capacity_after_reclaim(
+        _owner_requests(1), {0: (NEED, free_before)}
+    ) is True
+
+    # Targeted at the node deficit, not at the whole pool.
+    assert coordinator.calls == [({0: NEED - free_before}, 0)]
     assert coordinator.evicted_nodes_total > 0
+    assert pool.get_stats().num_free_pages >= NEED
+    # Frontier records retired with the prefixes their pages belonged to.
+    assert len(allocator.releases) == coordinator.evicted_nodes_total
+    assert len(set(committer.registry.session_keys)) == (
+        len(outcomes) - coordinator.evicted_nodes_total
+    )
+    committer.registry.check_invariants()
+
+
+def test_reserve_reclaim_retries_once_and_rejects_a_partial_reclaim():
+    """One attempt only: a still-short second snapshot is today's rejection."""
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    # All but the newest retained node is pinned, so the reclaim can free far
+    # less than the deficit.
+    unprotected = sorted(coordinator.nodes)[-1:]
+    for node_id, node in coordinator.nodes.items():
+        if node_id not in unprotected:
+            node["active_refs"] = 1
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    free_before = pool.get_stats().num_free_pages
+    reclaimable = coordinator.count_releasable_pages(0)
+    assert free_before + reclaimable < NEED
+
+    assert worker._retry_prefill_host_capacity_after_reclaim(
+        _owner_requests(1), {0: (NEED, free_before)}
+    ) is False
+
+    # Exactly one reclaim and one re-check; the caller owns the rejection, so
+    # the retry leaves its outcome untouched.
+    assert len(coordinator.calls) == 1
+    assert coordinator.evicted_nodes_total == len(unprotected)
+    assert worker._prefill_reservation_outcome is None
+    assert pool.get_stats().num_free_pages < NEED
+
+
+def test_reserve_reclaim_spares_pinned_prefixes_and_their_frontiers():
+    """The wave's own hits are pinned here, which is what makes this safe."""
+    pool, coordinator, committer, allocator, outcomes = _full_pool_with_frontiers(
+        total=400
+    )
+    # Pin the two OLDEST nodes the way the wave's attachments do: the native
+    # coordinator protects them, and a restore attachment holds the record.
+    oldest = sorted(coordinator.nodes)[:2]
+    for node_id in oldest:
+        coordinator.nodes[node_id]["active_refs"] = 1
+    pinned = committer.registry.get(outcomes[0].session_key)
+    pinned.acquire()
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    free_before = pool.get_stats().num_free_pages
+
+    assert worker._retry_prefill_host_capacity_after_reclaim(
+        _owner_requests(1), {0: (NEED, free_before)}
+    ) is True
+
+    assert coordinator.eviction_protected_skips_total == len(oldest)
+    assert all(node_id in coordinator.nodes for node_id in oldest)
+    keys = set(committer.registry.session_keys)
+    assert outcomes[0].session_key in keys and outcomes[1].session_key in keys
+    assert pinned.refcount == 2
+    assert committer.arena_for(outcomes[0].arena.storage_handle) is not None
+    # The unprotected LRU node after them was the first to go.
+    assert oldest[-1] + 1 not in coordinator.nodes
+    assert allocator.releases
+    committer.registry.check_invariants()
+
+
+def test_reserve_reclaim_without_a_committer_releases_prefix_pages_only():
+    pool = FakeHostPool(400)
+    coordinator = FakePrefixCoordinator(pool)
+    for node in range(90):
+        coordinator.retain(node, pages=pool.take(4), last_access=node)
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    free_before = pool.get_stats().num_free_pages
+    assert free_before < NEED
+
+    assert worker._retry_prefill_host_capacity_after_reclaim(
+        _owner_requests(1), {0: (NEED, free_before)}
+    ) is True
+
+    assert coordinator.evicted_nodes_total > 0
+    assert pool.get_stats().num_free_pages >= NEED
+
+
+def test_reserve_reclaim_evicts_nothing_on_a_node_that_is_not_short():
+    """A peer node is the short one: this node has nothing to reclaim for."""
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+    free_before = pool.get_stats().num_free_pages
+    nodes_before = len(coordinator.nodes)
+
+    # Zero demand on this node, so zero deficit -- and the fresh snapshot the
+    # retry re-runs agrees, because nothing is being reserved here.
+    assert worker._retry_prefill_host_capacity_after_reclaim(
+        [], {0: (0, free_before)}
+    ) is True
+
+    assert coordinator.calls == []
+    assert coordinator.evicted_nodes_total == 0
+    assert len(coordinator.nodes) == nodes_before
+    assert pool.get_stats().num_free_pages == free_before
+
+
+def test_reserve_reclaim_deficit_rows_must_cover_this_node():
+    pool, coordinator, committer, _allocator, _ = _full_pool_with_frontiers(
+        total=400
+    )
+    worker = FakeWorker(
+        pool=pool, coordinator=coordinator, committer=committer, slot_limit=8,
+        sequences=[_seq("q0", 0, PROMPT)],
+    )
+
+    # A row for another node only: a missing row is a broken snapshot, and the
+    # leader's failure becomes the named collective error, never a silent
+    # zero-page reclaim.
+    with pytest.raises(RuntimeError, match="reserve eviction failed"):
+        worker._retry_prefill_host_capacity_after_reclaim(
+            _owner_requests(1), {1: (NEED, 0)}
+        )
+    assert coordinator.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,8 +1359,12 @@ def test_prepare_resets_the_reservation_outcome_each_iteration():
 
 
 def _dead_wave_peer(*, free, total, live, slot_free):
-    """Rank 0's report in the admission gather: leader of node 0."""
-    return [0, free, 2, slot_free, total, int(live), None, 0, 0, 0]
+    """Rank 0's report in the admission gather: leader of node 0.
+
+    The trailing 0 is the node's reclaimable retained prefix pages: a dead wave
+    is dead because nothing can be freed, so the budget here is the free count.
+    """
+    return [0, free, 2, slot_free, total, int(live), None, 0, 0, 0, 0]
 
 
 @pytest.mark.parametrize("peer_live", [True, False])
@@ -1257,16 +1501,18 @@ def test_a_non_leader_rank_retires_its_frontiers_on_the_leaders_reclaim():
     free = pool.get_stats().num_free_pages
     assert free >= NEED
     peers = {
-        # 0: free/slot/total/live/digest/pressure gather -- the leader reports a
-        # node pool short of NEED but large enough to hold it, no live
-        # sequence, and (None) the same candidate digest as this rank.
-        0: {0: [0, NEED - 1, 2, 8, 400, 0, None, 0, 0, 0]},
+        # 0: free/slot/total/live/digest/pressure/reclaimable gather -- the
+        # leader reports a node pool short of NEED but large enough to hold it,
+        # no live sequence, (None) the same candidate digest as this rank, and
+        # no reclaimable pages in the admission budget, so the wave is short at
+        # selection and the admission reclaim runs.
+        0: {0: [0, NEED - 1, 2, 8, 400, 0, None, 0, 0, 0, 0]},
         # 1: failure/reclaimed-pages MAX -- the leader reclaimed victim_pages.
         1: {0: [0, len(victim_pages)]},
         # 2: the leader's reclaimed map.
         2: {0: (0, {0: list(victim_pages)})},
-        # 3: updated free -- the leader's post-reclaim count.
-        3: {0: [0, NEED + 3, 0]},
+        # 3: updated free and post-reclaim reclaimable -- the leader's counts.
+        3: {0: [0, NEED + 3, 0, 0]},
     }
     dist = FakeDist(rank=1, world_size=2, peers=peers)
     seq = _seq("q0", 0, PROMPT)

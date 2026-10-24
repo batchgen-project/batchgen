@@ -47,4 +47,7 @@ def host_resource_fields(*, coordinator: object, worker_view: object) -> dict[st
         "host_kv_total_pages": int(host.num_total_pages),
         "host_kv_free_pages": int(host.num_free_pages),
         "host_kv_used_pages": int(host.num_used_pages),
+        # Group 0 is the group the host admission budget and the reclaim both
+        # account in: the pages admission may count on top of the free ones.
+        "releasable_pages": int(coordinator.count_releasable_pages(0)),
     }
