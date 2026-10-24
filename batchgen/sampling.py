@@ -13,9 +13,136 @@ import torch.nn.functional as F
 from batchgen.worker.sampling_residency import (
 	SamplingHostDecisions,
 	SamplingResidencyShapeError,
+	SamplingRowIndexError,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# The greedy/sampling row split
+# --------------------------------------------------------------------------
+#
+# `sample_tokens` handles greedy and sampled rows separately. How the two
+# halves are gathered and written back is the only thing that differs between
+# the reference path and the host-decided decode step path, so it lives in
+# these three small objects:
+#
+# * `_MaskSplit` -- reference path. The split is decided on device from the
+#   cast temperatures. Every boolean-mask gather/scatter is an implicit
+#   `nonzero`, i.e. a cudaStreamSynchronize; acceptable off the step path, and
+#   kept as the oracle the other two are tested against.
+# * `_WholeSplit` -- host-decided, uniform batch. Only one half exists and it
+#   is the whole batch, so there is nothing to gather.
+# * `_IndexSplit` -- host-decided, mixed batch. Gathers and scatters with int64
+#   row-index tensors that were built on device once per row-set change
+#   (`SamplingHostDecisions.greedy_index` / `.sampling_index`). index_select /
+#   index_copy_ take their sizes from tensor metadata, so neither syncs.
+#
+# Boolean indexing gathers rows in ascending row order; the index tensors hold
+# the same rows in the same ascending order, so all three produce
+# element-identical half-batches.
+
+
+class _MaskSplit:
+	__slots__ = ("greedy_mask", "sampling_mask")
+
+	def __init__(self, greedy_mask: torch.Tensor):
+		self.greedy_mask = greedy_mask
+		self.sampling_mask = ~greedy_mask
+
+	def greedy(self, t: torch.Tensor) -> torch.Tensor:
+		return t[self.greedy_mask]
+
+	def sampling(self, t: torch.Tensor) -> torch.Tensor:
+		return t[self.sampling_mask]
+
+	def write_greedy(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out[self.greedy_mask] = values
+
+	def write_sampling(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out[self.sampling_mask] = values
+
+
+class _WholeSplit:
+	__slots__ = ()
+
+	def greedy(self, t: torch.Tensor) -> torch.Tensor:
+		return t
+
+	def sampling(self, t: torch.Tensor) -> torch.Tensor:
+		return t
+
+	def write_greedy(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out.copy_(values)
+
+	def write_sampling(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out.copy_(values)
+
+
+class _IndexSplit:
+	__slots__ = ("greedy_index", "sampling_index")
+
+	def __init__(self, greedy_index: torch.Tensor, sampling_index: torch.Tensor):
+		self.greedy_index = greedy_index
+		self.sampling_index = sampling_index
+
+	def greedy(self, t: torch.Tensor) -> torch.Tensor:
+		return t.index_select(0, self.greedy_index)
+
+	def sampling(self, t: torch.Tensor) -> torch.Tensor:
+		return t.index_select(0, self.sampling_index)
+
+	def write_greedy(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out.index_copy_(0, self.greedy_index, values)
+
+	def write_sampling(self, out: torch.Tensor, values: torch.Tensor) -> None:
+		out.index_copy_(0, self.sampling_index, values)
+
+
+_WHOLE_SPLIT = _WholeSplit()
+
+
+def _host_split(
+	decisions: SamplingHostDecisions, rows: int, device: torch.device
+) -> Union[_WholeSplit, _IndexSplit]:
+	"""The row split for a host-decided batch; fail-loud, never a mask fallback.
+
+	Every check reads tensor metadata only (shape, dtype, device), so none of
+	them touches the device.
+	"""
+	if not decisions.mixed:
+		return _WHOLE_SPLIT
+	gi = decisions.greedy_index
+	si = decisions.sampling_index
+	if gi is None or si is None:
+		raise SamplingRowIndexError(
+			f"mixed greedy/sampling batch of {rows} rows "
+			f"({len(decisions.greedy_rows)} greedy, {len(decisions.sampling_rows)} "
+			"sampled) reached sample_tokens without its row-index tensors; build "
+			"them once per row-set change (DecodeSamplingResidency, or "
+			"attach_row_index off the step path)"
+		)
+	for name, index, host_rows in (
+		("greedy_index", gi, decisions.greedy_rows),
+		("sampling_index", si, decisions.sampling_rows),
+	):
+		if index.dim() != 1 or index.dtype != torch.int64 or index.device != device:
+			raise SamplingRowIndexError(
+				f"{name} must be a 1-D int64 tensor on {device}, got "
+				f"shape={tuple(index.shape)} dtype={index.dtype} device={index.device}"
+			)
+		if index.numel() != len(host_rows):
+			raise SamplingRowIndexError(
+				f"{name} holds {index.numel()} rows, the host decision lists "
+				f"{len(host_rows)}"
+			)
+	if gi.numel() + si.numel() != rows:
+		raise SamplingRowIndexError(
+			f"greedy ({gi.numel()}) + sampled ({si.numel()}) rows do not "
+			f"partition the {rows}-row batch"
+		)
+	return _IndexSplit(gi, si)
 
 
 def greedy_decode(logits: torch.Tensor) -> torch.Tensor:
@@ -56,8 +183,12 @@ def sample_tokens(
 			from `batchgen.worker.sampling_residency`. When given, the four
 			device->host reductions that only re-derive what the host itself
 			wrote (`greedy_mask.any()`, `sampling_mask.any()`,
-			`s_top_ks.max().item()`, `(s_top_ps < 1.0).any()`) are skipped, and
-			the invalid-probability fallback is selected on device instead of
+			`s_top_ks.max().item()`, `(s_top_ps < 1.0).any()`) are skipped,
+			the greedy/sampling split is taken from the host decision instead
+			of from a device boolean mask (a uniform batch is not split at
+			all; a mixed batch is split with its per-batch row-index tensors,
+			and refused with `SamplingRowIndexError` without them), and the
+			invalid-probability fallback is selected on device instead of
 			being branched on host. Every decision must be derived from the
 			*cast* parameter values (see that module) or a row can take the
 			wrong branch. When None, every branch is decided on device exactly
@@ -104,33 +235,35 @@ def sample_tokens(
 		top_ks = top_k.to(device=logits.device, dtype=torch.int64)
 
 	# --- Split greedy vs sampling ---
-	greedy_mask = temps <= 0
-	sampling_mask = ~greedy_mask
-
-	result = torch.empty(B, 1, dtype=torch.long, device=logits.device)
-
-	# `greedy_mask`/`sampling_mask` are derived from values the host wrote, so
-	# reducing them on device just reads the host's own decision back through a
-	# stall. When the caller already knows the answer, use it.
+	# The split is derived from values the host wrote, so deciding it on device
+	# just reads the host's own decision back through a stall -- twice: once
+	# in `.any()`, and once in every boolean-mask gather/scatter below (an
+	# implicit `nonzero`). When the caller already knows the answer, use it.
 	if host_decisions is None:
-		any_greedy = bool(greedy_mask.any())
-		any_sampling = bool(sampling_mask.any())
+		split = _MaskSplit(temps <= 0)
+		any_greedy = bool(split.greedy_mask.any())
+		any_sampling = bool(split.sampling_mask.any())
 	else:
+		split = _host_split(host_decisions, B, logits.device)
 		any_greedy = host_decisions.any_greedy
 		any_sampling = host_decisions.any_sampling
 
+	result = torch.empty(B, 1, dtype=torch.long, device=logits.device)
+
 	# Handle greedy sequences
 	if any_greedy:
-		result[greedy_mask] = logits[greedy_mask].float().argmax(dim=-1, keepdim=True)
+		split.write_greedy(
+			result, split.greedy(logits).float().argmax(dim=-1, keepdim=True)
+		)
 
 	# Handle sampling sequences
 	if not any_sampling:
 		return result
 
-	s_raw_logits = logits[sampling_mask]  # [B_s, V]
-	s_temps = temps[sampling_mask]    # [B_s]
-	s_top_ps = top_ps[sampling_mask]  # [B_s]
-	s_top_ks = top_ks[sampling_mask]  # [B_s]
+	s_raw_logits = split.sampling(logits)  # [B_s, V]
+	s_temps = split.sampling(temps)    # [B_s]
+	s_top_ps = split.sampling(top_ps)  # [B_s]
+	s_top_ks = split.sampling(top_ks)  # [B_s]
 	B_s = s_raw_logits.shape[0]
 
 	# The invalid-probability fallback below is an argmax over the UNSCALED
@@ -226,7 +359,7 @@ def sample_tokens(
 			# path exists to remove, so accumulate on device and let the
 			# caller drain it where the device is already caught up.
 			bad_row_counter.add_(bad_rows.sum())
-		result[sampling_mask] = sampled
+		split.write_sampling(result, sampled)
 		return result
 
 	if bad_rows.any():
@@ -235,7 +368,7 @@ def sample_tokens(
 			"falling back to greedy for those"
 		)
 		# Fix bad rows with uniform over original logits
-		fallback_tokens = logits[sampling_mask][bad_rows].argmax(dim=-1, keepdim=True)
+		fallback_tokens = split.sampling(logits)[bad_rows].argmax(dim=-1, keepdim=True)
 		# Sample good rows
 		good_rows = ~bad_rows
 		sampled = torch.empty(B_s, 1, dtype=torch.long, device=logits.device)
@@ -245,7 +378,7 @@ def sample_tokens(
 	else:
 		sampled = torch.multinomial(probs, num_samples=1)
 
-	result[sampling_mask] = sampled
+	split.write_sampling(result, sampled)
 	return result
 
 
