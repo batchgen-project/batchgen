@@ -100,6 +100,16 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     # Normalized so every caller can read `config["num_nodes"]` instead of
     # re-deriving the topology from the IP list.
     config["num_nodes"] = num_nodes
+    # Optional peer-connect budget for the daemon bootstrap; the daemon and
+    # the server-side readiness wait must share one deadline, so both read
+    # this field. Default matches the daemon's built-in 180 s.
+    bootstrap_timeout_s = config.get("bootstrap_timeout_s", 180)
+    if not isinstance(bootstrap_timeout_s, int) or bootstrap_timeout_s <= 0:
+        raise ValueError(
+            "distributed weight bootstrap_timeout_s must be a positive "
+            f"integer; got {bootstrap_timeout_s!r}"
+        )
+    config["bootstrap_timeout_s"] = bootstrap_timeout_s
     if int(config["node_rank"]) not in range(num_nodes):
         raise ValueError(
             f"distributed weight node_rank must be in [0, {num_nodes})"

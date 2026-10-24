@@ -284,3 +284,42 @@ def test_initializer_publishes_the_selected_transport_without_env_vars():
     assert "load_distributed_weight_config" in source
     assert "TRANSPORT" not in source
     assert 'self.distributed_weight_transport = "host_rdma"' in source
+
+
+def test_bootstrap_timeout_defaults_and_accepts_an_override(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    # Backward compatibility: configs written before the key exists keep the
+    # daemon's historical 180 s budget, normalized in so the server-side
+    # readiness wait can always read it.
+    legacy = read_distributed_weight_config(_write_store_config(tmp_path))
+    assert legacy["bootstrap_timeout_s"] == 180
+
+    widened = read_distributed_weight_config(
+        _write_store_config(tmp_path / "wide", bootstrap_timeout_s=600)
+    )
+    assert widened["bootstrap_timeout_s"] == 600
+
+
+@pytest.mark.parametrize("bad", [0, -5, "180", 1.5, None])
+def test_bootstrap_timeout_rejects_non_positive_or_non_integer(tmp_path, bad):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    with pytest.raises(ValueError, match="bootstrap_timeout_s"):
+        read_distributed_weight_config(
+            _write_store_config(tmp_path, bootstrap_timeout_s=bad)
+        )
+
+
+def test_server_readiness_wait_derives_from_the_bootstrap_timeout():
+    """wait_ready must share the daemon's deadline: timeout + the 420 s margin
+    the former constants encoded (600 = 180 + 420)."""
+    manager_path = ROOT / "batchgen" / "server" / "worker_manager.py"
+    source = manager_path.read_text()
+    assert "wait_ready(600.0)" not in source
+    assert 'get(\n                    "bootstrap_timeout_s", 180' in source
+    assert "float(bootstrap_timeout_s + 420)" in source

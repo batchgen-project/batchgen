@@ -505,7 +505,17 @@ class WorkerManager:
         _diag(">>> _spawn_workers")
         if self.distributed_weight_daemon is not None:
             _diag(">>> distributed_weight_daemon.wait_ready")
-            self.distributed_weight_daemon.wait_ready(600.0)
+            # Shared deadline with the daemon's peer-connect budget: the
+            # Python wait must outlast bootstrap_timeout_s by the same margin
+            # the former constants had (600 = 180 + 420).
+            bootstrap_timeout_s = int(
+                (self.distributed_weight_config or {}).get(
+                    "bootstrap_timeout_s", 180
+                )
+            )
+            self.distributed_weight_daemon.wait_ready(
+                float(bootstrap_timeout_s + 420)
+            )
             _diag("<<< distributed_weight_daemon.wait_ready")
         try:
             self._spawn_workers()
