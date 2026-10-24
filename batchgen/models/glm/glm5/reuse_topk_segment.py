@@ -137,6 +137,10 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
     # driver hoist the transform to the first layer of each run.
     SELECTS_TOP_K = False
 
+    # A skip layer never writes the aux cache, so it takes only the primary
+    # host-KV staging slice and keeps its 1-element aux placeholder.
+    WRITES_AUX_HOST_KV = False
+
     def __init__(
         self,
         *,
@@ -185,6 +189,9 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             shared_buffers if shared_buffers is not None else {}
         )
         self._outputs: Dict[int, object] = {}
+        # Primary-only host-KV staging slice for this layer; see
+        # Glm5FullDsaAttnSegment.set_host_kv_staging.
+        self._host_kv_staging: Optional[Dict[str, Optional[torch.Tensor]]] = None
 
     # -- capture-plumbing overrides ------------------------------------------
     # No super() here: the parent's specs/output methods deref aux_blocked_k /
@@ -215,28 +222,40 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         from batchgen.models.glm.glm5.cuda_graph_segments import (
             _Glm5FullDsaSegmentOutputs,
         )
-        if self._outputs and bucket_size < max(self._outputs):
-            base = self._outputs[max(self._outputs)]
-            self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
-                primary_k_tensor=base.primary_k_tensor[:bucket_size],
-                # 1-element placeholder passes through unsliced.
-                indexer_k_tensor=base.indexer_k_tensor,
-                attn_output=base.attn_output[:bucket_size],
-            )
-            return
         device = self.primary_blocked_k.device
         attn = self.attn
         kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-        self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
-            primary_k_tensor=torch.empty(
-                bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device,
-            ),
+        staging = self._host_kv_staging
+        base = (
+            self._outputs[max(self._outputs)]
+            if self._outputs and bucket_size < max(self._outputs)
+            else None
+        )
+        if base is not None:
+            attn_output = base.attn_output[:bucket_size]
+            # 1-element placeholder passes through unsliced.
+            indexer_k_tensor = base.indexer_k_tensor
+        else:
+            attn_output = torch.empty(
+                bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device,
+            )
             # Never written on this path; 1-element placeholder satisfies the
             # dataclass without allocating per-bucket aux storage.
-            indexer_k_tensor=torch.empty(1, dtype=torch.bfloat16, device=device),
-            attn_output=torch.empty(
-                bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device,
-            ),
+            indexer_k_tensor = torch.empty(1, dtype=torch.bfloat16, device=device)
+        if staging is not None:
+            # Staged: the fused norm+rope launch writes the host-append source
+            # straight into the composing segment's slice for this layer.
+            primary_k_tensor = staging["key"][:bucket_size]
+        elif base is not None:
+            primary_k_tensor = base.primary_k_tensor[:bucket_size]
+        else:
+            primary_k_tensor = torch.empty(
+                bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device,
+            )
+        self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+            primary_k_tensor=primary_k_tensor,
+            indexer_k_tensor=indexer_k_tensor,
+            attn_output=attn_output,
         )
 
     def _make_bucket_view_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:

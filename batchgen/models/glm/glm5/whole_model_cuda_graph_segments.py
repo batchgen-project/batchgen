@@ -256,16 +256,63 @@ class Glm5WholeModelSegment:
             ]
             self.primary_kv_offload_buffers = self._kv_buffers
             self.aux_kv_offload_buffers = self._aux_kv_buffers
+            # Must precede every layer segment's own static setup below: the
+            # segments bind their host-append output buffers there, and the
+            # whole point is that they bind THESE slices instead of private
+            # ones, so the fresh rows are already staged when the graph ends.
+            self._install_layer_host_kv_staging()
         for layer_segment in self.layer_segments:
             setup = getattr(layer_segment, "setup_static_buffers", None)
             if setup is not None:
                 setup(bucket_size)
+
+    def _install_layer_host_kv_staging(self) -> None:
+        """Hand each layer segment its row of the staging buffers.
+
+        The producing kernels already write every fresh decode row to a static
+        address -- the primary rows through the fused norm+rope launch's ``out=``
+        target, a page-split layer's aux rows through the fused writer's
+        ``k_fp8_out``/``scales_out``. Pointing those targets at the staging
+        buffers makes the staging copies that used to follow them pure
+        self-copies, so the captured graph loses them entirely and the bytes
+        ``stage_post_graph_kv`` reads are identical by construction.
+
+        A layer segment that cannot take the slices would keep its private
+        buffers and leave its staging rows permanently stale, which the offload
+        path cannot distinguish from real decode KV, so it fails loud here
+        rather than shipping a layer's worth of stale host KV.
+        """
+
+        if self._kv_buffers is None:
+            raise RuntimeError("GLM-5 whole-model graph KV buffers are not initialized")
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            install = getattr(layer_segment, "set_host_kv_staging", None)
+            if install is None:
+                raise RuntimeError(
+                    "GLM-5 whole-model graph stages decode host KV by binding "
+                    "each layer segment's host-append outputs to its staging "
+                    f"slice, so layer {layer_idx} "
+                    f"({type(layer_segment).__name__}) must expose "
+                    "set_host_kv_staging"
+                )
+            writes_aux = bool(getattr(layer_segment, "WRITES_AUX_HOST_KV", False))
+            aux_buffers = self._aux_kv_buffers[layer_idx] if writes_aux else None
+            install(
+                key=self._kv_buffers[layer_idx]["key"],
+                aux_key=None if aux_buffers is None else aux_buffers["key"],
+                aux_scale=None if aux_buffers is None else aux_buffers.get("scale"),
+            )
 
     def release_static_buffers(self, bucket_size: int) -> None:
         for layer_segment in self.layer_segments:
             release = getattr(layer_segment, "release_static_buffers", None)
             if release is not None:
                 release(bucket_size)
+            # Drop the staging references too, or the layer segments pin the
+            # buffers this method is about to release.
+            uninstall = getattr(layer_segment, "set_host_kv_staging", None)
+            if uninstall is not None:
+                uninstall(key=None)
         self._kv_buffers = None
         self._aux_kv_buffers = None
         self._kv_key_buffer = None
@@ -594,21 +641,11 @@ class Glm5WholeModelSegment:
                 )
                 hidden_states = graph_out["hidden_states"]
                 residual = graph_out["residual"]
-                # The layer-segment composition path stages directly, not via
-                # the kv_append_callback indirection, so the staging switch
-                # must gate it here too.
-                if self.stage_kv_for_offload:
-                    self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
-                    # GLM-5.2 skip layers have no indexer KV (reuse-topk
-                    # segments return no indexer_k_tensor).
-                    _indexer_k = graph_out.get("indexer_k_tensor")
-                    if _indexer_k is not None:
-                        self._copy_aux_kv(
-                            layer_idx,
-                            _indexer_k,
-                            None,
-                            graph_out.get("indexer_k_scale"),
-                        )
+                # No staging copy here: `_install_layer_host_kv_staging` bound
+                # this layer's host-append outputs to the staging slices, so
+                # `graph_out["primary_k_tensor"]` (and a page-split layer's
+                # indexer pair) ARE those slices and the rows are already in
+                # place. Copying them would be a self-copy.
                 if layer_idx in self._compare_probe_layer_set:
                     # The probe wants this layer's OUTPUT hidden state, which is
                     # exactly the add the chain defers, so a probed layer pays
@@ -664,6 +701,11 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.cache_seqlens = cache_seqlens
             AttnWrapperBase.position_ids = position_ids
             AttnWrapperBase.max_seqlen = self.max_seqlen
+            # Serves ONLY a build with no layer segments, where the decode
+            # wrappers run and stage through this callback indirection. The
+            # production path composes layer segments, which stage by writing
+            # their host-append outputs straight into the staging slices
+            # (`_install_layer_host_kv_staging`) and never reach these.
             AttnWrapperBase.kv_append_callback = (
                 self._copy_primary_kv if self.stage_kv_for_offload else None
             )

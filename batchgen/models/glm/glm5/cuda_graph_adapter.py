@@ -569,6 +569,13 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "cache_seqlens": replay_inputs.get("cache_seqlens"),
             "position_ids": replay_inputs.get("position_ids"),
             "max_seqlen": int(self._ctx.max_seqlen_cap),
+            # These two serve ONLY a segment built without layer segments,
+            # whose decode wrappers stage through the callback indirection. The
+            # production path composes layer segments, which stage by writing
+            # their host-append outputs into the whole-model staging slices and
+            # never invoke these. `stage_post_graph_kv` is unaffected either
+            # way: it runs after the capture window closes, so it reads the
+            # worker's real host-append callbacks, not these.
             "kv_append_callback": (
                 getattr(seg, "_copy_primary_kv", None)
                 if seg is not None and getattr(seg, "stage_kv_for_offload", True)

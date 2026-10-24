@@ -983,6 +983,11 @@ class Glm5FullDsaAttnSegment:
     # exactly where a selecting layer sits.
     SELECTS_TOP_K = True
 
+    # This segment produces the aux (indexer K) host-append sources, so a
+    # composing segment may hand it aux staging slices to write into. A skip
+    # layer never touches the aux cache and takes only the primary slice.
+    WRITES_AUX_HOST_KV = True
+
     def __init__(
         self,
         *,
@@ -1028,6 +1033,13 @@ class Glm5FullDsaAttnSegment:
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
+        # Whole-model host-KV staging slices for THIS layer, installed by the
+        # composing segment before capture (``set_host_kv_staging``). When set,
+        # the producing kernels write their host-append sources straight into
+        # those slices instead of this segment's private buffers, so the
+        # whole-model driver needs no per-layer staging copy at all. None =
+        # private buffers (the staging switch is off, or no composing segment).
+        self._host_kv_staging: Optional[Dict[str, Optional[torch.Tensor]]] = None
 
         if self.primary_blocked_k.ndim != 4 or self.primary_blocked_k.shape[2] != 1:
             raise ValueError(
@@ -1489,41 +1501,205 @@ class Glm5FullDsaAttnSegment:
             **view_kwargs,
         )
 
+    def set_host_kv_staging(
+        self,
+        *,
+        key: Optional[torch.Tensor],
+        aux_key: Optional[torch.Tensor] = None,
+        aux_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Point this layer's host-append sources at a composing segment's slices.
+
+        ``key`` / ``aux_key`` / ``aux_scale`` are this layer's rows of the
+        whole-model staging buffers, each ``[alloc_size, ...]``; the per-bucket
+        output buffers become their leading-dim prefixes, so the producing
+        kernels write the staged bytes directly and no staging copy survives.
+        Passing ``key=None`` restores this segment's private buffers, which is
+        what the host-KV staging switch being off must look like.
+
+        Validated here rather than at first use: a shape or format disagreement
+        between the pool that allocated the cache and the pool that sized the
+        staging buffer would otherwise surface as a wrong page days later.
+        """
+
+        if key is None:
+            if aux_key is not None or aux_scale is not None:
+                raise ValueError(
+                    "GLM-5 DSA segment host-KV staging: aux slices were passed "
+                    "without a primary slice; staging is installed as a whole "
+                    "or not at all"
+                )
+            if self._host_kv_staging is None:
+                return
+            self._host_kv_staging = None
+            self._outputs.clear()
+            return
+
+        kv_dim = self.attn.kv_lora_rank + self.attn.qk_rope_head_dim
+        if key.dtype is not torch.bfloat16 or int(key.shape[-1]) != kv_dim:
+            raise ValueError(
+                "GLM-5 DSA segment primary host-KV staging slice must be "
+                f"bfloat16 with {kv_dim} trailing elements, got {key.dtype} "
+                f"{tuple(key.shape)}"
+            )
+        if not self.WRITES_AUX_HOST_KV:
+            if aux_key is not None or aux_scale is not None:
+                raise ValueError(
+                    "GLM-5 DSA segment host-KV staging: this layer does not "
+                    "write the aux cache, so it must not be given aux slices"
+                )
+        else:
+            if aux_key is None:
+                raise ValueError(
+                    "GLM-5 DSA segment host-KV staging: an indexer layer needs "
+                    "an aux key slice to write its host-append source into"
+                )
+            if (
+                aux_key.dtype is not self.aux_host_kv_dtype
+                or int(aux_key.shape[-1]) != self.aux_host_kv_dim
+            ):
+                raise ValueError(
+                    "GLM-5 DSA segment aux host-KV staging slice must be "
+                    f"{self.aux_host_kv_dtype} with {self.aux_host_kv_dim} "
+                    f"trailing elements, got {aux_key.dtype} "
+                    f"{tuple(aux_key.shape)}"
+                )
+            # The host region takes a page-split stream's keys and its fp32
+            # per-token scales together or neither, so the staging buffer set
+            # must agree with the format this segment's cache was allocated in.
+            if (aux_scale is None) == self.aux_is_page_split:
+                raise ValueError(
+                    "GLM-5 DSA segment aux host-KV staging expects per-token "
+                    "scale slices exactly when the aux cache is page-split FP8 "
+                    f"(got scales={aux_scale is not None}, "
+                    f"page_split={self.aux_is_page_split})"
+                )
+            if aux_scale is not None and aux_scale.dtype is not torch.float32:
+                raise ValueError(
+                    "GLM-5 DSA segment aux host-KV staging scale slice must be "
+                    f"float32, got {aux_scale.dtype}"
+                )
+        if self._host_kv_staging_is(key, aux_key, aux_scale):
+            return
+        self._host_kv_staging = {
+            "key": key,
+            "aux_key": aux_key,
+            "aux_scale": aux_scale,
+        }
+        # Any buffer set built before the install still points at the private
+        # buffers, so it must be rebuilt against the staging slices.
+        self._outputs.clear()
+
+    @staticmethod
+    def _same_staging_region(
+        a: Optional[torch.Tensor], b: Optional[torch.Tensor]
+    ) -> bool:
+        """Do these two tensors name the same bytes?
+
+        Compared by region, not by object identity: a caller that re-derives
+        its slices (``buffer[layer_idx]`` builds a fresh view each time) hands
+        over equal-but-not-identical tensors, and treating those as a change
+        would defeat the no-op guard below.
+        """
+
+        if a is b:
+            return True
+        if a is None or b is None:
+            return False
+        return (
+            a.data_ptr() == b.data_ptr()
+            and a.shape == b.shape
+            and a.stride() == b.stride()
+            and a.dtype == b.dtype
+        )
+
+    def _host_kv_staging_is(
+        self,
+        key: Optional[torch.Tensor],
+        aux_key: Optional[torch.Tensor],
+        aux_scale: Optional[torch.Tensor],
+    ) -> bool:
+        """Is the installed staging already these same regions?
+
+        Re-installing would clear ``_outputs``, which drops the largest-bucket
+        base every smaller bucket's ``attn_output`` is a view of, so a repeated
+        install must be a no-op rather than a quiet footprint regression.
+        """
+
+        current = self._host_kv_staging
+        if current is None:
+            return key is None
+        return (
+            self._same_staging_region(current["key"], key)
+            and self._same_staging_region(current["aux_key"], aux_key)
+            and self._same_staging_region(current["aux_scale"], aux_scale)
+        )
+
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._outputs:
-            return
-        if self._outputs and bucket_size < max(self._outputs):
-            base = self._outputs[max(self._outputs)]
-            self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
-                primary_k_tensor=base.primary_k_tensor[:bucket_size],
-                indexer_k_tensor=base.indexer_k_tensor[:bucket_size],
-                attn_output=base.attn_output[:bucket_size],
-                indexer_k_scale=(
-                    None
-                    if base.indexer_k_scale is None
-                    else base.indexer_k_scale[:bucket_size]
-                ),
-            )
             return
         device = self.primary_blocked_k.device
         attn = self.attn
         kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-        self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
-            primary_k_tensor=torch.empty(bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device),
-            indexer_k_tensor=torch.empty(
+        staging = self._host_kv_staging
+        # Capture runs largest-first, so a smaller bucket is a leading-dim view
+        # of the largest bucket's base rather than its own allocation.
+        base = (
+            self._outputs[max(self._outputs)]
+            if self._outputs and bucket_size < max(self._outputs)
+            else None
+        )
+        # `attn_output` is this segment's own value, never a host-append
+        # source, so it keeps that base + view footprint either way.
+        attn_output = (
+            base.attn_output[:bucket_size]
+            if base is not None
+            else torch.empty(
+                bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device
+            )
+        )
+        if staging is None and base is not None:
+            primary_k_tensor = base.primary_k_tensor[:bucket_size]
+            indexer_k_tensor = base.indexer_k_tensor[:bucket_size]
+            indexer_k_scale = (
+                None
+                if base.indexer_k_scale is None
+                else base.indexer_k_scale[:bucket_size]
+            )
+        elif staging is None:
+            primary_k_tensor = torch.empty(
+                bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device
+            )
+            indexer_k_tensor = torch.empty(
                 bucket_size,
                 1,
                 1,
                 self.aux_host_kv_dim,
                 dtype=self.aux_host_kv_dtype,
                 device=device,
-            ),
-            attn_output=torch.empty(bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device),
-            indexer_k_scale=(
+            )
+            indexer_k_scale = (
                 torch.empty(bucket_size, dtype=torch.float32, device=device)
                 if self.aux_is_page_split
                 else None
-            ),
+            )
+        else:
+            # Leading-dim prefixes of the composing segment's staging rows: a
+            # contiguous slice of a contiguous buffer, which is what the fused
+            # page-split writer's `[N, data_dim]` view and its native
+            # numel/contiguity checks require.
+            primary_k_tensor = staging["key"][:bucket_size]
+            indexer_k_tensor = staging["aux_key"][:bucket_size]
+            indexer_k_scale = (
+                None
+                if staging["aux_scale"] is None
+                else staging["aux_scale"][:bucket_size]
+            )
+        self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+            primary_k_tensor=primary_k_tensor,
+            indexer_k_tensor=indexer_k_tensor,
+            attn_output=attn_output,
+            indexer_k_scale=indexer_k_scale,
         )
 
     def initialize_static_inputs(
