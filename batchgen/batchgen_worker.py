@@ -21,6 +21,7 @@ from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.gemm.deepgemm_pdl_policy import apply_deepgemm_pdl
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
@@ -1101,6 +1102,11 @@ class BatchGenWorker:
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
+
+		# Process-global DeepGEMM PDL toggle; must precede every deep_gemm
+		# call (CUDA graph capture records the launch attribute).
+		if apply_deepgemm_pdl() and self.rank == 0:
+			logging.info("DeepGEMM PDL enabled for this worker process")
 
 		# 3. Path & Model Configurations
 		self.model_name = args.model_name
