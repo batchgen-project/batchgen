@@ -126,6 +126,17 @@ def get_registry():
                 "--threads", "4",
             ] + _SM80_GENCODE,
         },
+        # NEW version beside _C_fused_ops' add_rmsnorm_bf16_6144_kernel (which
+        # stays compiled and selectable). Flags mirror _C_fused_ops exactly:
+        # the BF16 half is that kernel verbatim and must keep its bytes.
+        "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant": {
+            "sources": ["src/attention/csrc/add_rmsnorm_fp8_quant.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads", "4",
+            ] + _SM80_GENCODE,
+        },
         "batchgen_kernels.conv1d._C_causal_conv1d": {
             "sources": ["src/conv1d/causal_conv1d.cu"],
             "nvcc_flags": [

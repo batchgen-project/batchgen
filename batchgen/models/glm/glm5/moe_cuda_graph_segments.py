@@ -54,6 +54,7 @@ from .moe_deepgemm_masked import (
     require_mn_major_tma_aligned,
     run_deepgemm_masked_moe,
 )
+from .norm_quant_fuse_policy import glm5_norm_quant_fuse_site_enabled
 from .moe_ragged import (
     ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
@@ -806,6 +807,37 @@ class Glm5MoEGraphSegment:
             else _InlineSharedExpert()
         )
 
+        # Whether the shared expert's blocked-FP8 cast of ``padded`` is emitted
+        # by the norm that produced ``padded`` -- the LAYER's
+        # post_attention_layernorm, one level up -- instead of being its own
+        # launch inside ``_forward_fused_gate_up``. Decided ONCE here: the
+        # capture records whichever kernels this forward issues. See
+        # norm_quant_fuse_policy.py.
+        #
+        # STREAM PLACEMENT, the one thing this site changes: today the x
+        # quantize is the first of the shared expert's four launches, and on
+        # the DeepEP path those run on the side stream. Emitting it from the
+        # norm moves it to the main stream, BEFORE the fork. That is ordered
+        # correctly -- the fork's ``wait_stream`` covers every main-stream
+        # write that precedes it, which is the same argument the hoisted qkv_a
+        # quantize already relies on -- but it does move work off the
+        # overlapped stream, so it is the site to disable first
+        # (GLM5_NORM_QUANT_FUSE_DISABLED_SITES) if the step gets slower.
+        self._fuse_shared_expert_norm_quant = glm5_norm_quant_fuse_site_enabled(
+            "shared_expert"
+        )
+        if self._fuse_shared_expert_norm_quant:
+            shared = self.moe.shared_experts
+            if getattr(shared, "cached_gate_up", None) is None:
+                raise RuntimeError(
+                    f"Layer {moe.layer_idx}: GLM5_NORM_QUANT_FUSE selects the "
+                    "norm-emitted shared-expert activation, but this shared "
+                    "expert has no fused gate/up binding (cached_gate_up is "
+                    "None). Only the four-launch fused chain takes a "
+                    "pre-quantized x; the unfused w8a16_gemm chain quantizes "
+                    "inside each GEMM and has no seam to hand it to."
+                )
+
         self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
         self.router_context = FusedGateContext(
@@ -813,6 +845,81 @@ class Glm5MoEGraphSegment:
             router_bias=None,
             topk=self.num_experts_per_tok,
         )
+
+    @property
+    def consumes_fused_padded_fp8(self) -> bool:
+        """Whether ``forward`` requires ``padded_fp8``/``padded_scale``.
+
+        The layer segment reads this to decide whether its
+        ``post_attention_layernorm`` runs the fused add+RMSNorm+FP8 kernel. One
+        source of truth: a layer that fused while this segment did not would
+        launch both quantizes, and the reverse would hand the shared expert's
+        gate/up GEMM nothing.
+        """
+        return self._fuse_shared_expert_norm_quant
+
+    def _shared_expert_fused_x(
+        self,
+        padded: torch.Tensor,
+        padded_fp8,
+        padded_scale,
+    ) -> dict:
+        """Validate and package the FP8 pair the fused norm handed down.
+
+        Host-side only (warmup/capture, never a replay). Returns the kwargs for
+        ``shared_expert_forward``: empty when this site is not fused, so the
+        shared expert's own quantize runs exactly as before.
+        """
+        if not self._fuse_shared_expert_norm_quant:
+            if padded_fp8 is not None or padded_scale is not None:
+                raise ValueError(
+                    f"Layer {self.moe.layer_idx}: padded_fp8/padded_scale were "
+                    "passed in, but the shared expert quantizes its own input; "
+                    "one of the two would be a dead launch"
+                )
+            return {}
+        if padded_fp8 is None or padded_scale is None:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: GLM5_NORM_QUANT_FUSE selects the "
+                "norm-emitted shared-expert activation, but the caller passed "
+                "no padded_fp8/padded_scale; the layer segment must run the "
+                "fused add+RMSNorm+FP8 post_attention_layernorm (it reads "
+                "consumes_fused_padded_fp8 to decide)"
+            )
+        rows, hidden = int(padded.shape[0]), int(padded.shape[-1])
+        want_blocks = hidden // SCALE_BLOCK
+        if padded_fp8.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                f"Layer {self.moe.layer_idx}: fused padded_fp8 must be "
+                f"float8_e4m3fn, got {padded_fp8.dtype}"
+            )
+        if tuple(padded_fp8.shape) != (rows, hidden):
+            raise ValueError(
+                f"Layer {self.moe.layer_idx}: fused padded_fp8 must be "
+                f"({rows}, {hidden}), got {tuple(padded_fp8.shape)}"
+            )
+        if padded_scale.dtype != torch.float32:
+            raise TypeError(
+                f"Layer {self.moe.layer_idx}: fused padded_scale must be fp32, "
+                f"got {padded_scale.dtype}"
+            )
+        if tuple(padded_scale.shape) != (rows, want_blocks):
+            raise ValueError(
+                f"Layer {self.moe.layer_idx}: fused padded_scale must be "
+                f"({rows}, {want_blocks}), got {tuple(padded_scale.shape)}"
+            )
+        # The shared expert's own quantize used ``scale_tma_aligned=True``, so
+        # the fused producer owes DeepGEMM the same MN-major layout: a
+        # [blocks, align4(rows)] contiguous block viewed as [rows, blocks].
+        # A contiguous scale here would be silently reinterpreted.
+        aligned_rows = ((rows + 3) // 4) * 4
+        if padded_scale.stride() != (1, aligned_rows):
+            raise ValueError(
+                f"Layer {self.moe.layer_idx}: fused padded_scale must carry the "
+                f"TMA-aligned MN-major layout (stride (1, {aligned_rows})), got "
+                f"{padded_scale.stride()}"
+            )
+        return {"x_fp8": padded_fp8, "x_scale": padded_scale}
 
     def _validate_shared_expert_graph_safe(self) -> None:
         shared = getattr(self.moe, "shared_experts", None)
@@ -1022,10 +1129,17 @@ class Glm5MoEGraphSegment:
         *,
         padded: torch.Tensor,
         rank_token_counts: torch.Tensor,
+        padded_fp8: "torch.Tensor | None" = None,
+        padded_scale: "torch.Tensor | None" = None,
     ) -> Dict[str, torch.Tensor]:
         bucket_size = padded.shape[0]
         bufs = self.pool.get(bucket_size)
         global_rows = self.world_size * bucket_size
+
+        # The shared expert's x quantize, in one of its two versions (selected
+        # once in __init__). Empty dict => the shared expert quantizes its own
+        # input, exactly as before.
+        shared_x = self._shared_expert_fused_x(padded, padded_fp8, padded_scale)
 
         if self.deepep_ll:
             return self._forward_deepep(
@@ -1033,6 +1147,7 @@ class Glm5MoEGraphSegment:
                 rank_token_counts=rank_token_counts,
                 bufs=bufs,
                 bucket_size=bucket_size,
+                shared_x=shared_x,
             )
 
         with self.comm.change_state(enable=True):
@@ -1110,7 +1225,9 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+        bufs.local_moe_output.add_(
+            self.moe.shared_expert_forward(padded, **shared_x)
+        )
         return {"moe_output": bufs.local_moe_output}
 
     def _forward_deepep(
@@ -1120,6 +1237,7 @@ class Glm5MoEGraphSegment:
         rank_token_counts: torch.Tensor,
         bufs: _Glm5MoEGraphBuffers,
         bucket_size: int,
+        shared_x: dict,
     ) -> Dict[str, torch.Tensor]:
         """Route-based decode MoE over the DeepEP low-latency exchange.
 
@@ -1237,7 +1355,7 @@ class Glm5MoEGraphSegment:
             # GEMM produced, i.e. exactly what a separate bf16 -> bf16 copy of
             # the same shape would have delivered.
             shared_out = self.moe.shared_expert_forward(
-                padded, out=bufs.shared_out)
+                padded, out=bufs.shared_out, **shared_x)
             if shared_out is not bufs.shared_out:
                 raise RuntimeError(
                     f"Layer {self.moe.layer_idx}: shared expert returned a "
