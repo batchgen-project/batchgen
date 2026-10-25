@@ -50,7 +50,7 @@ _DECODE_TIMING = _decode_timing_enabled()
 DecodeTimingStats.set_model_name("MiniMax-M25")
 
 try:
-    from batchgen.attention.mla.fa3_backend import w8a16_gemm
+    from batchgen.attention.mla.fa3_backend import w8a16_gemm, w8a16_gemm_act_quant
     _HAS_W8A16 = True
 except ImportError:
     _HAS_W8A16 = False
@@ -276,8 +276,11 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
         down_scale = down_scale.float()
 
         # w8a16: FP8 weight × BF16 activation
-        gate = w8a16_gemm(fp8_gate, gate_scale, hidden_states)
-        up = w8a16_gemm(fp8_up, up_scale, hidden_states)
+        # gate and up read the SAME hidden_states: quantize once, reuse the
+        # pair. intermediate is a different tensor and keeps its own quantize.
+        x_fp8 = w8a16_gemm_act_quant(hidden_states)
+        gate = w8a16_gemm(fp8_gate, gate_scale, hidden_states, x_fp8=x_fp8)
+        up = w8a16_gemm(fp8_up, up_scale, hidden_states, x_fp8=x_fp8)
         intermediate = F.silu(gate) * up
         result = w8a16_gemm(fp8_down, down_scale, intermediate)
 

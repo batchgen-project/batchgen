@@ -594,7 +594,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	return q_embed, k_embed
 
 from ....moe.fused_dequant_gemm import fused_fp8_bf16_gemm
-from ....attention.mla.fa3_backend import w8a16_gemm
+from ....attention.mla.fa3_backend import w8a16_gemm, w8a16_gemm_act_quant
 
 class DeepseekV3MLP(nn.Module):
 	def __init__(self, config, hidden_size=None, intermediate_size=None):
@@ -628,8 +628,10 @@ class DeepseekV3MLP(nn.Module):
 	
 	@torch.inference_mode
 	def deepgemm_forward(self, x, scale):
-		up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x)
-		gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
+		# up and gate read the SAME x: quantize once, reuse the pair.
+		x_fp8 = w8a16_gemm_act_quant(x)
+		up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x, x_fp8=x_fp8)
+		gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x, x_fp8=x_fp8)
 		intermediate = self.act_fn(gate) * up
 		return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 		# x_fp8, x_scale = act_quant(x)
@@ -3457,15 +3459,19 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
 
 			"""
+			# up and gate read the SAME expert_tokens: quantize once, reuse.
+			expert_tokens_fp8 = w8a16_gemm_act_quant(expert_tokens)
 			up = w8a16_gemm(
 				self.experts[expert_id].fp8_up,
 				self.experts[expert_id].weight_dequant_scale['up_proj.weight_scale_inv'],
-				expert_tokens
+				expert_tokens,
+				x_fp8=expert_tokens_fp8,
 			)
 			gate = w8a16_gemm(
 				self.experts[expert_id].fp8_gate,
 				self.experts[expert_id].weight_dequant_scale['gate_proj.weight_scale_inv'],
-				expert_tokens
+				expert_tokens,
+				x_fp8=expert_tokens_fp8,
 			)
 			intermediate = self.act_fn(gate) * up
 			expert_output = w8a16_gemm(

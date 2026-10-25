@@ -594,15 +594,139 @@ def act_quant(
 #     return y, scale
 
 # from batchgen.quantization.block_quantization import act_quant_transposed_scale
+W8A16_GEMM_BLOCK_SIZE = 128
+
+
+def w8a16_gemm_act_quant(
+	activation_bf16: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Quantize an activation EXACTLY as ``w8a16_gemm`` does internally.
+
+	Returns the ``(fp8, scale)`` pair to hand back to one or more
+	``w8a16_gemm`` calls through their ``x_fp8=`` parameter, so an activation
+	consumed by several GEMMs is quantized once instead of once per GEMM
+	(``Glm5MLP._forward_slice``'s gate and up read the same ``x``).
+
+	This is the single definition of what ``w8a16_gemm`` quantizes: the body
+	is the same two statements the GEMM runs on its own activation, so a
+	hoisted quantize cannot drift from the in-GEMM one.
+	"""
+	if activation_bf16.dim() not in (2, 3):
+		raise ValueError(
+			"w8a16_gemm_act_quant expects a 2D [m, k] or 3D [n_group, l, k] "
+			f"activation, got {activation_bf16.dim()}D "
+			f"{tuple(activation_bf16.shape)}"
+		)
+	x = activation_bf16.view(-1, activation_bf16.size(-1))
+	return act_quant(x)
+
+
+def _w8a16_gemm_check_act_quant_pair(
+	x_fp8: object,
+	m: int,
+	k: int,
+	device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Validate a caller-supplied ``(fp8, scale)`` pair against this GEMM's x.
+
+	Fail-loud: a pair that does not match the activation this call was given
+	would silently compute a different GEMM, so every mismatch raises instead
+	of being reshaped, re-quantized, or ignored.
+	"""
+	if not isinstance(x_fp8, (tuple, list)) or len(x_fp8) != 2:
+		raise TypeError(
+			"w8a16_gemm x_fp8 must be the 2-tuple (fp8, scale) returned by "
+			f"w8a16_gemm_act_quant / act_quant, got {type(x_fp8).__name__}"
+			+ (f" of length {len(x_fp8)}" if isinstance(x_fp8, (tuple, list)) else "")
+		)
+	quantized, scale = x_fp8
+	if not isinstance(quantized, torch.Tensor) or not isinstance(scale, torch.Tensor):
+		raise TypeError(
+			"w8a16_gemm x_fp8 must be a pair of tensors, got "
+			f"({type(quantized).__name__}, {type(scale).__name__})"
+		)
+	if quantized.dtype != torch.float8_e4m3fn:
+		raise TypeError(
+			f"w8a16_gemm x_fp8[0] must be float8_e4m3fn, got {quantized.dtype}"
+		)
+	if scale.dtype != torch.float32:
+		raise TypeError(
+			f"w8a16_gemm x_fp8[1] must be float32, got {scale.dtype}"
+		)
+	if quantized.device != device or scale.device != device:
+		raise ValueError(
+			"w8a16_gemm x_fp8 must be on the activation's device "
+			f"{device}, got ({quantized.device}, {scale.device})"
+		)
+
+	num_blocks = (k + W8A16_GEMM_BLOCK_SIZE - 1) // W8A16_GEMM_BLOCK_SIZE
+	quantized = _w8a16_gemm_as_2d(quantized, (m, k), "x_fp8[0]")
+	scale = _w8a16_gemm_as_2d(scale, (m, num_blocks), "x_fp8[1]")
+	return quantized, scale
+
+
+def _w8a16_gemm_as_2d(
+	tensor: torch.Tensor,
+	expected: tuple[int, int],
+	what: str,
+) -> torch.Tensor:
+	"""Return ``tensor`` shaped ``expected``, without copying or re-laying out.
+
+	A tensor already at ``expected`` is passed through untouched, so a pair
+	built by ``w8a16_gemm_act_quant`` reaches DeepGEMM bit-for-bit as that
+	helper produced it. A pair built from the un-flattened 3D activation is
+	only ever ``view``-ed (never ``reshape``-d), so a layout that cannot be
+	viewed raises rather than silently materializing a copy.
+	"""
+	if tuple(tensor.shape) == expected:
+		return tensor
+	if tensor.numel() != expected[0] * expected[1]:
+		raise ValueError(
+			f"w8a16_gemm {what} has {tensor.numel()} elements, expected "
+			f"{expected[0] * expected[1]} for shape {expected}; the pair was "
+			"quantized from a different activation than this GEMM was given"
+		)
+	try:
+		return tensor.view(expected)
+	except RuntimeError as exc:
+		raise ValueError(
+			f"w8a16_gemm {what} with shape {tuple(tensor.shape)} and strides "
+			f"{tuple(tensor.stride())} cannot be viewed as {expected}: {exc}"
+		) from exc
+
+
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
 	weight_scale_inv_fp32: torch.Tensor,
 	activation_bf16: torch.Tensor,
+	x_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-	"""
-		activation_bf16: [n_group, m, k]
-		weight_data_fp8: [m, n]
-		weight_scale_inv_fp32: [m, n]
+	"""Blockwise-FP8 GEMM: FP8 weight x FP8-quantized activation.
+
+	NAMING (deliberate, do not "fix" in place): despite ``w8a16`` this helper
+	quantizes the activation to FP8 and runs ``deep_gemm.fp8_gemm_nt``, i.e.
+	it is **w8a8**. The true W8A16 (FP8 weight dequantized to BF16, activation
+	left in BF16) is ``w8a16_gemm_dequant`` directly below. The name is kept
+	because it is referenced from many model call sites; renaming belongs in a
+	separate mechanical cleanup, not in a behavior change.
+
+	Args:
+		weight_data_fp8: [n, k] FP8 weight.
+		weight_scale_inv_fp32: blockwise inverse scales for the weight.
+		activation_bf16: [m, k] or [n_group, l, k] BF16 activation.
+		x_fp8: optional pre-quantized activation, the ``(fp8, scale)`` pair
+			from ``w8a16_gemm_act_quant`` (equivalently ``act_quant``) applied
+			to ``activation_bf16``. Pass it when ONE activation feeds several
+			``w8a16_gemm`` calls, so it is quantized once instead of once per
+			GEMM. ``None`` quantizes internally, exactly as before.
+
+	Byte-identity of the ``x_fp8`` path: ``w8a16_gemm_act_quant`` runs the
+	same ``act_quant(activation.view(-1, k))`` this function runs when
+	``x_fp8 is None``, and ``act_quant`` is deterministic, so a reused pair
+	holds the same bytes a second internal quantize would have produced.
+	Validation only checks and (at most) ``view``s the pair, never copies or
+	re-quantizes it, so DeepGEMM receives identical inputs either way. There
+	is therefore no switch to fall back on: the two paths are the same GEMM.
 	"""
 	assert weight_data_fp8.dim() == 2
 	assert activation_bf16.dim() == 3 or activation_bf16.dim() == 2
@@ -615,9 +739,12 @@ def w8a16_gemm(
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
 
-	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
-	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
-	x_fp8 = act_quant(x)
+	if x_fp8 is None:
+		# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
+		# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
+		x_fp8 = act_quant(x)
+	else:
+		x_fp8 = _w8a16_gemm_check_act_quant_pair(x_fp8, m, k, x.device)
 	# disable_ue8m0_cast removed — on Hopper (SM90) the flag is a no-op
 	# (layout.hpp:22 early-exits for arch_major==9 regardless), and omitting
 	# lets DeepGEMM's default handling apply (same as SGLang). This also

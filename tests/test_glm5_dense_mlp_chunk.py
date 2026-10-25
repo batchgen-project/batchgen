@@ -21,7 +21,14 @@ def test_dense_mlp_long_prefill_matches_full_forward(monkeypatch, fp8_path):
         monkeypatch.setattr(
             fa3_backend,
             "w8a16_gemm",
-            lambda weight, _scale, activation: F.linear(activation, weight),
+            lambda weight, _scale, activation, x_fp8=None: F.linear(activation, weight),
+        )
+        # _forward_slice hoists the gate/up quantize out of the two GEMMs; the
+        # real act_quant needs a CUDA/Triton launch, so stub the hoisted pair.
+        monkeypatch.setattr(
+            fa3_backend,
+            "w8a16_gemm_act_quant",
+            lambda activation: ("x_fp8", "x_scale"),
         )
 
     expected = mlp._forward_slice(x)

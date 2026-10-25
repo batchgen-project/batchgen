@@ -60,7 +60,11 @@ except ImportError:
 try:
     from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
     from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma
-    from batchgen.attention.mla.fa3_backend import act_quant, w8a16_gemm
+    from batchgen.attention.mla.fa3_backend import (
+        act_quant,
+        w8a16_gemm,
+        w8a16_gemm_act_quant,
+    )
     from batchgen_kernels.common.mgn import compact_expert_data, fused_moe_token_dispatch
     _HAS_FP8_GROUPED = True
 except ImportError:
@@ -593,8 +597,10 @@ class MiniMaxM25Expert(nn.Module):
     @torch.inference_mode()
     def deepgemm_forward(self, x, scale):
         """Forward using deep_gemm FP8 GEMM (w8a16: FP8 weight × BF16 activation)."""
-        up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x)
-        gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
+        # up and gate read the SAME x: quantize once, reuse the pair.
+        x_fp8 = w8a16_gemm_act_quant(x)
+        up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x, x_fp8=x_fp8)
+        gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x, x_fp8=x_fp8)
         intermediate = F.silu(gate) * up
         return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 
