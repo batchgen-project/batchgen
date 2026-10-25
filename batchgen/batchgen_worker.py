@@ -12846,16 +12846,23 @@ class BatchGenWorker:
 		offload_recorder_handed_off = False
 		try:
 			start = time.perf_counter()
+			# Per-wave split of the chunk loop, to localize growth that tracks
+			# the retained-prefix count rather than the wave's own work.
+			build_s = rows_s = mat_s = layers_s = tail_s = 0.0
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
+				_t0 = time.perf_counter()
 				rows = wave.executor.build(chunk)
+				build_s += time.perf_counter() - _t0
 				if epilogue_trace is not None:
 					epilogue_trace.chunk_begin(
 						epilogue_trace.chunk + 1,
 						rows=len(rows.items),
 						tokens=int(rows.input_ids.numel()),
 					)
+				_t0 = time.perf_counter()
 				host_ids, host_starts = wave.row_host_targets(rows)
+				rows_s += time.perf_counter() - _t0
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
 				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
@@ -12868,9 +12875,12 @@ class BatchGenWorker:
 				# Before the forward, never during it: every layer's pool row
 				# holds the committed prefix by the time any row attends over
 				# it, and a failure here has not yet touched the forward.
+				_t0 = time.perf_counter()
 				materialized_tokens += self._load_materialized_segments(
 					wave, rows, materialized_loader
 				)
+				mat_s += time.perf_counter() - _t0
+				_t0 = time.perf_counter()
 				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
 				block_residual = (
 					self.model.model._new_block_residual(hidden_states)
@@ -12896,6 +12906,8 @@ class BatchGenWorker:
 							output_attentions=False,
 							use_cache=False,
 						)[0]
+				layers_s += time.perf_counter() - _t0
+				_t0 = time.perf_counter()
 				if rows.tail_wave_indices:
 					if use_attn_res:
 						# Mix-then-norm over every row: the depth mix needs each
@@ -12964,6 +12976,7 @@ class BatchGenWorker:
 							# head all-gathers before returning).
 							logits=logits,
 						)
+				tail_s += time.perf_counter() - _t0
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
@@ -13066,6 +13079,11 @@ class BatchGenWorker:
 			"workspace_peak_bytes": workspace_peak,
 			"reserved_peak_bytes": reserved_peak,
 			"prefill_s": prefill_s,
+			"build_s": build_s,
+			"rows_s": rows_s,
+			"mat_s": mat_s,
+			"layers_s": layers_s,
+			"tail_s": tail_s,
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
