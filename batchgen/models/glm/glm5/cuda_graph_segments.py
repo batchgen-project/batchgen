@@ -68,6 +68,10 @@ from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
     cuda_wk_proj_gemm_only_out,
     make_fp8_activation_scratch,
 )
+from batchgen_kernels.attention.dsa.indexer_wk_proj_deepgemm import (
+    indexer_wk_proj_deepgemm_out,
+)
+from batchgen.models.glm.glm5.indexer_wk_backend import glm5_indexer_wk_is_deepgemm
 from batchgen_kernels.attention.dsa.fused_indexer_score import (
     FP8WqbWeightsCUDA,
     cuda_wq_b_proj_out,
@@ -345,8 +349,10 @@ class _IndexerKPathOverlap:
         # One ``wait_stream`` orders the side stream after everything already
         # issued on the main stream, which covers both directions it needs:
         #   RAW: this layer's ``hidden_states`` (the input norm), the hoisted
-        #        ``token_indices`` cast and the step-level row-validity
-        #        prologue (``kv_aux_slot_indices``) were all produced there;
+        #        ``token_indices`` cast, the step-level row-validity
+        #        prologue (``kv_aux_slot_indices``) and -- on the DeepGEMM wk
+        #        version only -- the hoisted blocked-FP8 ``hidden_fp8`` /
+        #        ``hidden_scale`` quantize were all produced there;
         #   WAR: the PREVIOUS full-indexer layer's scorer read the shared
         #        ``buffers.head_gates`` there, so this layer's K path cannot
         #        overwrite it early. The shared wk scratch
@@ -1195,6 +1201,26 @@ class Glm5FullDsaAttnSegment:
                 )
             self._q_b_wq_b_weight = weight
             self._q_b_wq_b_scale = scale
+
+        # Which version computes the indexer wk projection, decided ONCE here
+        # -- before warmup and capture -- and then fixed for the life of this
+        # capture: the graph records whichever kernels this forward issues, so
+        # the choice cannot be a per-step decision. See
+        # indexer_wk_backend.py; `forward` reads only this attribute.
+        self._indexer_wk_deepgemm = glm5_indexer_wk_is_deepgemm()
+        if self._indexer_wk_deepgemm:
+            self._indexer_wk_dg_weights = getattr(
+                self.wrapper, "_indexer_wk_deepgemm_weights", None
+            )
+            if self._indexer_wk_dg_weights is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx}: GLM5_INDEXER_WK_BACKEND selects "
+                    "the DeepGEMM indexer wk projection, but the wrapper has no "
+                    "_indexer_wk_deepgemm_weights (initialize_fused_kernels did "
+                    "not run, or ran under a different backend)"
+                )
+        else:
+            self._indexer_wk_dg_weights = None
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -2147,14 +2173,42 @@ class Glm5FullDsaAttnSegment:
         # it.
         token_indices = buffers.token_indices
 
+        hidden_fp8 = hidden_scale = None
+        if self._indexer_wk_deepgemm:
+            # HOISTED PRODUCER. This is the layer's ONE blocked-FP8 cast of
+            # ``hidden_flat``; the qkv_a GEMM below consumes it on the main
+            # stream exactly as before, and the indexer's wk GEMM now consumes
+            # the SAME fp8 bytes and scales on the side stream instead of
+            # re-quantizing the same hidden per-row for itself.
+            #
+            # It is issued BEFORE the fork for the same reason
+            # ``token_indices`` is: the side stream reads its VALUE, so the
+            # write has to be on the main stream's timeline when the fork's
+            # ``wait_stream`` runs. The two tensors stay referenced by these
+            # locals until this method returns -- after the join -- so the
+            # allocator cannot recycle their memory under the side stream.
+            #
+            # On the ``fused_cuda`` backend this does not run here at all: the
+            # custom kernel quantizes inside the fork, and the main-stream
+            # quantize stays where it was, after the fork, so that version's
+            # stream ordering is untouched.
+            hidden_fp8, hidden_scale = act_quant(
+                hidden_flat,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
+
         # ---- Indexer K path, on the side stream --------------------------
         # Same kernels in the same order as the serial path; only the stream
         # changes. Reads: ``hidden_flat``, ``position_ids``, ``token_indices``,
         # ``buffers.kv_aux_slot_indices`` (step-level prologue), the aux page
-        # table and weights -- nothing the main stream writes before the join
-        # below (``hidden_flat`` and ``token_indices`` stay referenced until
-        # this method returns, after the join, so their memory cannot be
-        # recycled under the side stream). Writes, and their first readers:
+        # table and weights -- plus, on the DeepGEMM wk version, the hoisted
+        # ``hidden_fp8`` / ``hidden_scale`` written just above. Nothing the main
+        # stream writes AFTER the fork and before the join below
+        # (``hidden_flat``, ``token_indices`` and the hoisted FP8 pair stay
+        # referenced until this method returns, after the join, so their memory
+        # cannot be recycled under the side stream). Writes, and their first
+        # readers:
         #   buffers.indexer_k_x_fp8 / indexer_k_x_scale / indexer_k_raw -- the
         #       next stage of this same K path only;
         #   self.aux_blocked_k (this token's K)  -> ``_score_and_topk`` (main,
@@ -2165,16 +2219,38 @@ class Glm5FullDsaAttnSegment:
         #       KV staging, after this method returns (after the join).
         k_path = self._indexer_k_overlap
         with k_path.fork():
-            cuda_wk_proj_gemm_only_out(
-                hidden_flat,
-                self.wrapper._indexer_cuda_weights,
-                self.cuda_module,
-                buffers.indexer_k_x_fp8,
-                buffers.indexer_k_x_scale,
-                buffers.indexer_k_tma_desc,
-                buffers.indexer_k_raw,
-                num_valid_tokens=num_valid_tokens,
-            )
+            # The wk projection, in one of its two versions (selected once in
+            # __init__). Both write the SAME static ``indexer_k_raw`` buffer,
+            # bf16 [batch, index_head_dim], which the K tail below reads.
+            #
+            # ``deepgemm``: one dense FP8 GEMM over the hoisted shared
+            #   activation. It computes every row of the bucket, including the
+            #   rows at or past ``num_valid_tokens``; those rows are exact
+            #   zeros because ``act_quant`` stored exact zeros into their FP8
+            #   bytes, which is also what the custom kernel's ``valid_m``
+            #   epilogue wrote there, and the K tail and head gates below are
+            #   gated on ``num_valid_tokens`` regardless.
+            # ``fused_cuda``: the original call, byte for byte -- its own
+            #   per-row quantize into ``indexer_k_x_fp8`` / ``indexer_k_x_scale``
+            #   and its own TMA descriptor, then the custom WGMMA GEMM.
+            if self._indexer_wk_deepgemm:
+                indexer_wk_proj_deepgemm_out(
+                    hidden_fp8,
+                    hidden_scale,
+                    self._indexer_wk_dg_weights,
+                    buffers.indexer_k_raw,
+                )
+            else:
+                cuda_wk_proj_gemm_only_out(
+                    hidden_flat,
+                    self.wrapper._indexer_cuda_weights,
+                    self.cuda_module,
+                    buffers.indexer_k_x_fp8,
+                    buffers.indexer_k_x_scale,
+                    buffers.indexer_k_tma_desc,
+                    buffers.indexer_k_raw,
+                    num_valid_tokens=num_valid_tokens,
+                )
             # Page-split aux cache: ONE launch owns the whole K tail -- the
             # ``k_norm`` LayerNorm, the interleaved RoPE, the Hadamard
             # rotation, the e4m3 quantization, the page's K and fp32 scale
@@ -2233,11 +2309,15 @@ class Glm5FullDsaAttnSegment:
                 )
 
         # ---- Q path / MLA spine, on the main stream ----------------------
-        hidden_fp8, hidden_scale = act_quant(
-            hidden_flat,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
+        if not self._indexer_wk_deepgemm:
+            # Unhoisted position: exactly where this quantize sat before the
+            # DeepGEMM wk version existed, so the ``fused_cuda`` backend issues
+            # the same kernels in the same order on the same streams as before.
+            hidden_fp8, hidden_scale = act_quant(
+                hidden_flat,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
         w8a8_deepgemm(
             hidden_fp8,
             hidden_scale,

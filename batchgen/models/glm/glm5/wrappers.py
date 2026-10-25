@@ -79,6 +79,12 @@ except Exception as _e:
     _FUSED_INDEXER_KV_IMPORT_ERROR = _e
     logging.debug(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
+# The DeepGEMM version of the same wk projection (WP2 kernel version
+# management) is selected by this switch; its weights are built in
+# initialize_fused_kernels, where a missing DeepGEMM fails loud instead of
+# falling back silently.
+from batchgen.models.glm.glm5.indexer_wk_backend import glm5_indexer_wk_is_deepgemm
+
 # Try importing fused scoring pipeline (WP4)
 try:
     from batchgen_kernels.attention.dsa.fused_indexer_score import (
@@ -679,6 +685,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # WP2: Fused indexer KV proj (CUDA WGMMA)
         self._indexer_cuda_module = None
         self._indexer_cuda_weights = None
+        # WP2 (DeepGEMM version of the same wk projection). Non-None only when
+        # GLM5_INDEXER_WK_BACKEND selects it; the custom kernel's weights above
+        # stay built either way, so the old version stays selectable.
+        self._indexer_wk_deepgemm_weights = None
         # WP4: Fused scoring pipeline
         self._fused_wqb_weights = None
         self._fused_score_module = None
@@ -851,6 +861,30 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
                 self._indexer_cuda_module = None
                 self._indexer_cuda_weights = None
+
+        # WP2, DeepGEMM version: the SAME wk projection, run as a dense FP8
+        # GEMM over the blocked-FP8 hidden the layer's qkv_a projection already
+        # produces. The checkpoint's own FP8 weight and its [1, K/128] block
+        # scales are DeepGEMM's NT operand layout as loaded, so there is no
+        # dequantize/requantize round trip here (unlike the custom kernel,
+        # which re-quantizes a dequantized BF16 copy for its TMA path).
+        #
+        # No try/except: with this backend selected the DSA graph cannot run
+        # without these weights, and a warn-and-None would be a silent
+        # fallback to the other version's numerics.
+        if glm5_indexer_wk_is_deepgemm():
+            from batchgen_kernels.attention.dsa.indexer_wk_proj_deepgemm import (
+                IndexerWkDeepGemmWeights,
+            )
+
+            self._indexer_wk_deepgemm_weights = IndexerWkDeepGemmWeights(
+                indexer.wk.weight.data,
+                indexer.wk_scale,
+            )
+            logging.debug(
+                f"[layer {self.layer_idx}] WP2 DeepGEMM indexer wk weights "
+                f"initialized ({tuple(indexer.wk.weight.data.shape)})"
+            )
 
         # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
         if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
