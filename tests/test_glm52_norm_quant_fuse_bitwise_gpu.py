@@ -31,7 +31,17 @@ Falsifiers this file is designed to catch
    BF16-rounded value (would differ on many bytes).
 2. ``1.0f / 448.0f`` instead of ``static_cast<float>(1.0 / 448.0)`` for the
    scale constant (one-ULP scale differences on some rows).
-3. A reciprocal-multiply division from fast-math (scattered one-ULP bytes).
+3. The quantize divide using an IEEE divide (``__fdiv_rn`` / ``div.rn.f32``)
+   or an approximate one (``__fdividef`` / ``div.approx.f32``) instead of the
+   ``div.full.f32`` the reference Triton kernel emits. This one is not
+   hypothetical: the first version of the fused CUDA kernel used ``__fdiv_rn``
+   and this gate failed 4 of 74 cases, each a SINGLE e4m3 byte, every one a
+   quotient sitting on the subnormal rounding boundary 3.5*2^-9 -- where
+   ``div.full.f32``'s <=2 ULP (deterministic, but not correctly rounded) result
+   lands on the other side of a representable fp8 value. A more accurate
+   divide is still a failure here: the reference's bytes are the contract.
+   The Triton kernel's own divide must not be "fixed" to match the CUDA one
+   either; the old kernel is the ground truth and stays untouched.
 4. The Triton launch picking a tuned ``num_warps`` (changes the sum tree, so
    the BF16 norm moves and every FP8 byte derived from it moves with it).
 5. The padding-row branch writing something other than 0x00 / 1e-12.

@@ -23,6 +23,7 @@ a later edit would break silently.
 
 import ast
 import pathlib
+import re
 
 import pytest
 import torch
@@ -115,6 +116,16 @@ def _calls_with_guards(func_node: ast.AST, call_name: str):
 
     walk(func_node.body, [])
     return found
+
+
+def _strip_cxx_comments(text: str) -> str:
+    """Drop `//` and `/* */` comments, so a "must not appear" pin reads CODE.
+
+    The fused kernel's comments deliberately name the instructions that were
+    tried and rejected; a naive substring check would read those as the code.
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
 
 
 def _cu_function_body(path: pathlib.Path, signature_fragment: str) -> str:
@@ -426,7 +437,25 @@ def test_the_fused_cuda_quantize_pins_every_constant_and_operation():
     # The operations, in the quantize's order.
     assert "amax = fmaxf(amax, kFp8MinNormal);" in text
     assert "fmaxf(__fmul_rn(amax, kFp8SafeMaxInv), kEpsilon)" in text
-    assert "__fdiv_rn(normed[i], scale)" in text
+    # The divide is `div.full.f32`, the instruction the reference Triton kernel
+    # actually emits (PTX-verified on the node, 2026-10-25) -- NOT the IEEE
+    # `div.rn.f32`. It was `__fdiv_rn` first and the bitwise gate failed on 4 of
+    # 74 cases, each a single e4m3 byte at the 3.5*2^-9 subnormal boundary where
+    # a <=2 ULP quotient difference crosses a representable fp8 value.
+    assert "div_full_f32(normed[i], scale)" in text
+    assert 'asm("div.full.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));' in text
+    # CODE only: the comments above both of those deliberately NAME __fdiv_rn to
+    # record what was tried and why it failed.
+    code = _strip_cxx_comments(text)
+    assert "__fdiv_rn" not in code, (
+        "the quantize divide was changed back to an IEEE divide; the reference "
+        "kernel emits div.full.f32 and the byte gate fails on the subnormal "
+        "rounding boundary 3.5*2^-9"
+    )
+    assert "__fdividef" not in code, (
+        "__fdividef is div.approx.f32, a third and even less accurate "
+        "instruction -- not the reference's div.full.f32"
+    )
     assert "q = fminf(q, kFp8SafeMax);" in text
     assert "q = fmaxf(q, -kFp8SafeMax);" in text
     assert "fabsf(q) < kFiniteBound" in text

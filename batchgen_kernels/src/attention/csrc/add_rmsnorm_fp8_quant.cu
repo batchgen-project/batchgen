@@ -50,7 +50,8 @@
 //       amax = tl.maximum(amax, 1.52587890625e-05)  | fmaxf(amax, kFp8MinNormal)
 //       scale = tl.maximum(amax * (1/448), 1e-12)   | fmaxf(__fmul_rn(amax,
 //                                                   |   kFp8SafeMaxInv), kEpsilon)
-//       q = q_float / scale                         | __fdiv_rn(q, scale)
+//       q = q_float / scale                         | div_full_f32(q, scale)
+//         (Triton: div.full.f32 -- measured)        |   (inline div.full.f32)
 //       q = tl.minimum(q, 448.0)                    | fminf(q, 448.0f)
 //       q = tl.maximum(q, -448.0)                   | fmaxf(q, -448.0f)
 //       q = where(|q| < 1e30, q, 0.0)               | (fabsf(q) < 1e30f) ? q : 0
@@ -80,11 +81,26 @@
 //       Triton materializes the `tl.constexpr` `1.0 / 448.0` written in Python.
 //       `1.0f / 448.0f` would be a single-precision divide and is not
 //       guaranteed to be the same float.
-//     * `__fdiv_rn` / `__fmul_rn` pin IEEE round-to-nearest for the two
-//       operations whose result a compiler flag could otherwise change
-//       (`--use_fast_math` turns `/` into a reciprocal multiply). Triton emits
-//       `div.rn.f32` / `mul.f32` here. Pinning them keeps this kernel
-//       byte-identical even if someone later adds fast-math to its flags.
+//     * THE DIVIDE IS `div.full.f32`, NOT AN IEEE DIVIDE. This is a MEASURED
+//       fact, and it overturned this file's first guess. Inspecting the
+//       reference kernel's PTX on the node (2026-10-25) shows Triton lowers
+//       `q_float / scale` to `div.full.f32` -- the fast full-range divide,
+//       accurate to <=2 ULP rather than correctly rounded, but a deterministic
+//       function of its two operands. This file originally used `__fdiv_rn`
+//       (`div.rn.f32`, correctly rounded) on the assumption that Triton emitted
+//       the IEEE form; the two agree almost everywhere, and the bitwise gate
+//       caught the almost: 4 of 74 cases differed by ONE e4m3 byte, every one of
+//       them a quotient sitting on the subnormal rounding boundary 3.5*2^-9,
+//       where a <=2 ULP difference in the quotient crosses a representable fp8
+//       value. `div_full_f32` below therefore emits `div.full.f32` as inline
+//       PTX. A more accurate divide is not the goal here; reproducing the
+//       reference's bytes is, and the reference is the ground truth for the
+//       OFF-arm identity this slice rests on.
+//     * `__fmul_rn` pins IEEE round-to-nearest for the scale multiply, whose
+//       result a compiler flag could otherwise change (`--use_fast_math` turns
+//       `/` into a reciprocal multiply and relaxes `*`). The node's PTX shows
+//       Triton emits `mul.f32` there, which is the same instruction, and the
+//       scales came out bit-identical in the gate.
 //     * The clamps are `fminf`/`fmaxf`, which lower to `min.f32`/`max.f32`,
 //       the same instructions `tl.minimum`/`tl.maximum` lower to -- including
 //       the "return the non-NaN operand" behaviour the `|q| < 1e30` guard
@@ -190,6 +206,26 @@ __device__ __forceinline__ float block_reduce_sum_24(
     }
     __syncthreads();
     return warp_sums[0];
+}
+
+// `q_float / scale`, as the reference Triton kernel actually computes it.
+//
+// Triton lowers an fp32 divide to `div.full.f32` (verified in the reference
+// kernel's PTX on the node, 2026-10-25), not to the IEEE `div.rn.f32`. That is
+// the fast full-range divide: accurate to <=2 ULP instead of correctly rounded,
+// but a deterministic function of its operands, so reproducing it reproduces
+// the reference's bytes exactly. Written as inline PTX because there is no CUDA
+// intrinsic for it -- `__fdividef` is `div.approx.f32` (a different, less
+// accurate instruction) and plain `/` is `div.rn.f32` without fast-math.
+//
+// Do NOT "improve" this to `__fdiv_rn`. It was `__fdiv_rn` first, and the
+// bitwise gate failed on 4 of 74 cases: single e4m3 bytes, every one at the
+// subnormal rounding boundary 3.5*2^-9, where a <=2 ULP quotient difference
+// lands on the other side of a representable fp8 value.
+__device__ __forceinline__ float div_full_f32(float a, float b) {
+    float result;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+    return result;
 }
 
 // Per-128-block amax across the 16 lanes that cover that block. XOR offsets
@@ -331,7 +367,10 @@ __global__ void add_rmsnorm_bf16_6144_fp8_quant_kernel(
     Fp8x8 quantized;
     #pragma unroll
     for (int i = 0; i < kVectorWidth; ++i) {
-        float q = __fdiv_rn(normed[i], scale);
+        // `div.full.f32`, the instruction the reference kernel's PTX uses --
+        // see div_full_f32's comment; an IEEE divide here differs by one e4m3
+        // byte on quotients at the 3.5*2^-9 subnormal boundary.
+        float q = div_full_f32(normed[i], scale);
         q = fminf(q, kFp8SafeMax);
         q = fmaxf(q, -kFp8SafeMax);
         const bool is_finite = fabsf(q) < kFiniteBound;
