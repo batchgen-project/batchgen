@@ -13089,6 +13089,25 @@ class BatchGenWorker:
 			"offload_s": AttnWrapperBase.pool_offload_s,
 			"retire_s": AttnWrapperBase.pool_retire_s,
 		}, separators=(",", ":")))
+		# Batch-level ``batchgen_debug.k3_prefill_profile`` on the POOLED path:
+		# the weight-stream counters are reset per wave by the pipeline install,
+		# but only the unpooled path emitted them; mirror that emission here.
+		_pool_debug = self._active_batchgen_debug_for_sequences(
+			[self.global_batch.get_sequence(u) for u in wave.uuids]
+		) or {}
+		if self._debug_flag_enabled(_pool_debug.get("k3_prefill_profile")):
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer
+			logging.info("[METRICS] " + json.dumps({
+				"component": "k3_prefill_profile_pool",
+				"rank": self.rank,
+				"prefill_s": prefill_s,
+				"weight_stream": self.core_engine.get_weight_stream_profile(),
+				"expert_consumer": KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot(),
+				"streamed_sp8": StreamedSP8MXFP4MoELayer.prefill_profile_snapshot(),
+			}, separators=(",", ":"), default=str))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
 
