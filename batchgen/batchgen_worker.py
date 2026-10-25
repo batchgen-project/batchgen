@@ -12849,6 +12849,8 @@ class BatchGenWorker:
 			# Per-wave split of the chunk loop, to localize growth that tracks
 			# the retained-prefix count rather than the wave's own work.
 			build_s = rows_s = mat_s = layers_s = tail_s = 0.0
+			AttnWrapperBase.pool_offload_s = 0.0
+			AttnWrapperBase.pool_retire_s = 0.0
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
 				_t0 = time.perf_counter()
@@ -13084,6 +13086,8 @@ class BatchGenWorker:
 			"mat_s": mat_s,
 			"layers_s": layers_s,
 			"tail_s": tail_s,
+			"offload_s": AttnWrapperBase.pool_offload_s,
+			"retire_s": AttnWrapperBase.pool_retire_s,
 		}, separators=(",", ":")))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)

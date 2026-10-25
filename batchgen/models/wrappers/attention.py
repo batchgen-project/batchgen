@@ -270,6 +270,13 @@ class AttnWrapperBase(BaseModuleWrapper):
     # -- is the entire cost of the check being off.
     prefill_pool_offload_recorder: ClassVar[Optional[object]] = None
 
+    # Per-wave accumulators for the pooled-prefill offload path, reset by the
+    # worker before each wave's chunk loop and emitted with the prefix_pool
+    # prefill metric: time spent in the per-row offload loop (enqueue + wait)
+    # and in the per-layer retire of the previous layer's offload tasks.
+    pool_offload_s: ClassVar[float] = 0.0
+    pool_retire_s: ClassVar[float] = 0.0
+
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None
     past_value_states: ClassVar[Optional[List[torch.Tensor]]] = None

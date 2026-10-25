@@ -27,6 +27,7 @@ KDA state lifecycle (M5.1 unified):
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -395,10 +396,12 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         # Retire the PREVIOUS MLA layer's async KV offloads before this layer
         # allocates: the d2h memcpy must land before the caching allocator can
         # hand its source storage to this layer's K/V (expandable_segments).
+        _retire_t0 = time.perf_counter()
         AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
             self.layer_idx,
             device=hidden_states.device,
         )
+        AttnWrapperBase.pool_retire_s += time.perf_counter() - _retire_t0
         # Prepack (varlen) prefill: hidden_states is [1, total_tokens, H].
         if not getattr(AttnWrapperBase, "prepack_mode", False):
             raise RuntimeError(
@@ -544,6 +547,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
         packed path above does: the group replicates the rows and writes the
         same bytes to the same mirrored pages.
         """
+        _offload_t0 = time.perf_counter()
         view = self.core_engine.host_paged_kv_worker_view
         bounds = AttnWrapperBase.prefill_pool_batch.row_bounds
         starts = AttnWrapperBase.prefill_pool_row_starts
@@ -584,6 +588,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             AttnWrapperBase.pin_prefill_offload_tensor(row_kv, self.layer_idx)
             AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
             task.wait()
+        AttnWrapperBase.pool_offload_s += time.perf_counter() - _offload_t0
 
     def _forward_decode(self, hidden_states, **kwargs):
         position_ids = AttnWrapperBase.position_ids
