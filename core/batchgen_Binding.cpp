@@ -1006,6 +1006,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clear_namespace",
              &kv::HostPrefixCacheCoordinator::ClearNamespace,
              py::arg("namespace_digest"))
+        .def("count_releasable_pages",
+             &kv::HostPrefixCacheCoordinator::CountReleasablePages,
+             py::arg("group_id"))
         .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
         .def_property_readonly(
             "hash_block_tokens",

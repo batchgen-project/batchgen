@@ -214,6 +214,7 @@ from batchgen.worker.prefill import (
 	compute_prefill_host_reservation,
 	describe_prefill_blockers,
 	host_kv_eviction_enabled,
+	prefill_host_reserve_page_deficit,
 	prefill_reclaim_target_pages,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
@@ -6328,7 +6329,7 @@ class BatchGenWorker:
 		self,
 		owner_requests: List[Tuple[str, int]],
 		local_error: bool = False,
-	) -> bool:
+	) -> Tuple[bool, Optional[Dict[int, Tuple[int, int]]]]:
 		"""Check a fresh per-node host-KV snapshot before any mutation.
 
 		Every rank reports its owner demand.  Only the node leader reports the
@@ -6336,6 +6337,14 @@ class BatchGenWorker:
 		comparing against that one live snapshot prevents one rank from making a
 		decision from stale local state.  The final MIN reduction makes the
 		decision explicit even when a rank's stats call fails.
+
+		Returns ``(ok, rows)``, where ``rows`` maps node id to the gathered
+		``(need, free)`` pair the reserve-time reclaim computes its deficit
+		from. ``rows`` is ``None`` when the snapshot itself is unusable (a
+		rank's stats call failed, a node reported no capacity at all, or two
+		ranks of one node disagreed): a deficit derived from it would be
+		meaningless, so the caller must not retry on it. Both verdicts are
+		reduced, hence rank-uniform -- the retry branch is collective.
 		"""
 		local_need = sum(
 			math.ceil(int(tokens) / self.PAGE_SIZE)
@@ -6379,8 +6388,9 @@ class BatchGenWorker:
 		)
 		if self.world_size == 1:
 			if snapshot_error:
-				return False
-			return 0 <= local_need <= local_free and local_need <= local_total
+				return False, None
+			ok = 0 <= local_need <= local_free and local_need <= local_total
+			return ok, {node_id: (local_need, local_free)}
 		if not dist.is_initialized():
 			raise RuntimeError(
 				"distributed process group is required for host-KV prefill admission"
@@ -6391,6 +6401,9 @@ class BatchGenWorker:
 		node_needs: Dict[int, int] = {}
 		node_capacity: Dict[int, Tuple[int, int]] = {}
 		ok = True
+		# A rejection that is merely "short of pages" is retryable by reclaim; a
+		# broken snapshot is not, and the two must not be confused.
+		rows_usable = True
 		for item in gathered:
 			reported_node = int(item[0].item())
 			node_needs[reported_node] = node_needs.get(reported_node, 0) + int(
@@ -6398,26 +6411,150 @@ class BatchGenWorker:
 			)
 			if int(item[4].item()) != 0:
 				ok = False
+				rows_usable = False
 			if int(item[2].item()) >= 0:
 				capacity = (int(item[2].item()), int(item[3].item()))
 				previous = node_capacity.get(reported_node)
 				if previous is not None and previous != capacity:
 					ok = False
+					rows_usable = False
 				node_capacity[reported_node] = capacity
 		for node, needed in node_needs.items():
 			free_total = node_capacity.get(node)
 			if free_total is None:
 				ok = False
+				rows_usable = False
 				continue
 			free_pages, total_pages = free_total
 			if needed < 0 or needed > free_pages or needed > total_pages:
 				ok = False
 
 		decision = torch.tensor(
-			[1 if ok else 0], dtype=torch.int32, device=self.torch_device
+			[1 if ok else 0, 1 if rows_usable else 0],
+			dtype=torch.int32, device=self.torch_device,
 		)
 		dist.all_reduce(decision, op=dist.ReduceOp.MIN)
-		return bool(int(decision.item()))
+		if not int(decision[1].item()):
+			return bool(int(decision[0].item())), None
+		return bool(int(decision[0].item())), {
+			node: (needed, node_capacity[node][0])
+			for node, needed in node_needs.items()
+		}
+
+	def _retry_prefill_host_capacity_after_reclaim(
+		self,
+		owner_requests: List[Tuple[str, int]],
+		capacity_rows: Dict[int, Tuple[int, int]],
+	) -> bool:
+		"""Reclaim this node's host-page deficit once, then re-check capacity.
+
+		Exactly one attempt: a wave sized against free + reclaimable pages can
+		be short only by what is retained, and this releases it. A second
+		shortfall is a real capacity change (a concurrent decode grew, a peer
+		node is the short one and has nothing cold left), which the caller
+		rejects exactly as before.
+
+		Safe by construction: the wave's prefix attachments are already held,
+		so every prefix this wave HIT is pinned and ``NodeIsProtectedLocked``
+		keeps it -- only cold retained pages go, which is precisely the supply
+		the admission budget counted.
+
+		Collective discipline (same as the admission reclaim): every rank
+		reaches every collective, a leader-side failure becomes a MAX-reduced
+		flag, and no rank raises before that flag is reduced.
+		"""
+		from batchgen.prefix_reuse.eviction import (
+			EvictedPageRecorder,
+			reclaim_prefix_pages_for_host_admission,
+			retire_node_frontiers,
+		)
+		node_id = self.rank // self.local_world_size
+		failure = 0
+		local_frontier_hook = self._trajectory_frontier_eviction_hook()
+		reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
+		if self.local_rank == 0:
+			try:
+				page_target = prefill_host_reserve_page_deficit(
+					capacity_rows, node_id
+				)
+				if page_target:
+					released = reclaim_prefix_pages_for_host_admission(
+						core_engine_module=core_engine,
+						coordinator=self.prefix_cache_coordinator,
+						worker_views_by_group=self._host_views_by_group(),
+						group_id=0,
+						page_target=page_target,
+						max_scan_nodes=self.prefix_cache_runtime_config.max_nodes,
+						frontier_hook=reclaimed_pages,
+					)
+					logging.info(
+						"[PREFIX_CACHE] reserve reclaimed %s Host pages on node %s "
+						"(free=%s, target=%s)",
+						released, node_id, self._get_host_kv_free_pages(),
+						page_target,
+					)
+					if self.prefix_cache_debug_stats:
+						self._emit_prefix_cache_metric(
+							"prefix_reclaim",
+							reason="host_reserve",
+							node=int(node_id),
+							page_target=int(page_target),
+							released_pages=int(released),
+							**self._prefix_host_resource_fields(),
+						)
+			except Exception:
+				logging.exception("[PREFIX_CACHE] reserve eviction failed")
+				failure = 1
+		reclaimed_page_count = reclaimed_pages.page_count
+		if self.world_size > 1:
+			failed = torch.tensor(
+				[failure, reclaimed_page_count],
+				dtype=torch.int64, device=self.torch_device,
+			)
+			dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+			failure = int(failed[0].item())
+			reclaimed_page_count = int(failed[1].item())
+		if failure != 0:
+			raise RuntimeError("prefix cache reserve eviction failed on a worker")
+		# The leader already retired its own frontiers inside the release. Any
+		# other rank of the node may own frontier records standing on the
+		# reclaimed pages (G=1, or several serve groups per node), so every rank
+		# runs its own hook on its node's reclaimed map.
+		if self.world_size > 1 and reclaimed_page_count != 0:
+			frontier_failure = 0
+			gathered_reclaims = [None] * self.world_size
+			dist.all_gather_object(
+				gathered_reclaims,
+				(
+					node_id,
+					reclaimed_pages.pages_by_group
+					if self.local_rank == 0 else None,
+				),
+			)
+			if self.local_rank != 0:
+				try:
+					retire_node_frontiers(
+						gathered=gathered_reclaims,
+						node_id=node_id,
+						frontier_hook=local_frontier_hook,
+					)
+				except Exception:
+					logging.exception(
+						"[PREFIX_CACHE] frontier retirement after reserve reclaim "
+						"failed"
+					)
+					frontier_failure = 1
+			retired = torch.tensor(
+				[frontier_failure], dtype=torch.int64, device=self.torch_device
+			)
+			dist.all_reduce(retired, op=dist.ReduceOp.MAX)
+			if int(retired.item()) != 0:
+				raise RuntimeError(
+					"trajectory frontier retirement after reserve reclaim failed "
+					"on a worker"
+				)
+		capacity_ok, _ = self._collective_prefill_host_capacity_ok(owner_requests)
+		return capacity_ok
 
 	def _attach_prefix_cache_for_prefill(self, prefill_uuids: List[str]) -> None:
 		"""Attach page-aligned cached prefixes for sequences this rank owns.
@@ -6549,7 +6686,7 @@ class BatchGenWorker:
 				"host-KV capacity collective",
 				self.rank,
 			)
-		capacity_ok = self._collective_prefill_host_capacity_ok(
+		capacity_ok, capacity_rows = self._collective_prefill_host_capacity_ok(
 			owner_requests, local_error=plan_error
 		)
 		if plan_error:
@@ -6559,6 +6696,20 @@ class BatchGenWorker:
 			raise RuntimeError(
 				f"Rank {self.rank}: host-KV prefill plan failed; the wave was "
 				"rejected collectively before any allocator mutation"
+			)
+		if (
+			not capacity_ok and capacity_rows is not None
+			and self.enable_prefix_cache
+		):
+			# Selection sized this wave against free PLUS reclaimable pages, so
+			# a shortfall here is the part of the budget that is still retained
+			# rather than free. Release it once and re-decide, instead of
+			# rejecting a wave the budget was right about (and re-selecting the
+			# same wave on the next iteration). Entered on the rank-uniform
+			# (verdict, rows) pair, so every rank reaches the retry's
+			# collectives and the second capacity collective.
+			capacity_ok = self._retry_prefill_host_capacity_after_reclaim(
+				owner_requests, capacity_rows
 			)
 		if not capacity_ok:
 			# Record the KIND of outcome (never a counter) for the no-progress
@@ -6904,6 +7055,24 @@ class BatchGenWorker:
 			if self.local_rank == 0 and not local_live
 			else (-1, -1, -1)
 		)
+		# Retained prefix pages this node can reclaim right now (resident, no
+		# attachment, no pending load). They join the admission budget below: a
+		# retained prefix either gets attached at config time, dropping the
+		# wave's demand and the evictable supply by the same page count, or
+		# stays evictable for the reserve-time reclaim to release. Either way
+		# demand <= free + reclaimable holds, so full-charge stays. Node-leader
+		# only (one shared region per node); one O(max_nodes) scan under the
+		# coordinator lock, same order as the pressure scan above, and unlike it
+		# taken on every iteration -- which is why it mutates nothing.
+		report_releasable = (
+			self.prefix_cache_coordinator.count_releasable_pages(0)
+			if (
+				self.local_rank == 0
+				and self.enable_prefix_cache
+				and self.prefix_cache_coordinator is not None
+			)
+			else -1
+		)
 
 		# Step 2: Gather host KV plus persistent sequence capacity. Host KV is
 		# one shared region per node, so only the node leader reports it --
@@ -6931,11 +7100,14 @@ class BatchGenWorker:
 		#   [7..9] prefix-cache pressure of the node (resident nodes, active
 		#       attachments, pending loads; node leader with nothing live
 		#       only), so the guard tells an in-flight wait from a stall
+		#   [10] reclaimable retained prefix pages of the node (node leader
+		#       with the prefix cache only): joins the host admission budget
 		free_tensor = torch.tensor(
 			[
 				report_node, report_host_free, limit_scope, local_sequence_free,
 				report_host_total, int(local_live), candidate_digest,
 				prefix_pressure[0], prefix_pressure[1], prefix_pressure[2],
+				report_releasable,
 			],
 			dtype=torch.int64,
 			device=self.torch_device,
@@ -6961,6 +7133,7 @@ class BatchGenWorker:
 		reports_by_node = {}
 		totals_by_node = {}
 		pressure_by_node = {}
+		reclaimable_by_node = {}
 		for item in gathered:
 			node_id = int(item[0].item())
 			host_free = int(item[1].item())
@@ -6970,11 +7143,16 @@ class BatchGenWorker:
 				pressure_by_node[node_id] = (
 					int(item[7].item()), int(item[8].item()), int(item[9].item())
 				)
+				# -1 is "this leader runs no prefix cache", i.e. no reclaimable
+				# supply -- never a negative budget contribution.
+				reclaimable_by_node[node_id] = max(0, int(item[10].item()))
 		per_node_host_free = []
 		per_node_host_total = []
 		per_node_prefix_pressure = []
+		per_node_host_reclaimable = []
 		for node in range(num_nodes):
 			per_node_host_free.append(reports_by_node.get(node, 0))
+			per_node_host_reclaimable.append(reclaimable_by_node.get(node, 0))
 			# -1 means "no leader report": an unknown total must not be read as
 			# a zero-page pool that can never fit anything.
 			per_node_host_total.append(totals_by_node.get(node, -1))
@@ -7050,6 +7228,7 @@ class BatchGenWorker:
 			chunk_size,
 			per_rank_sequence_free=per_rank_sequence_free,
 			per_node_sequence_free=per_node_sequence_free,
+			per_node_host_reclaimable=per_node_host_reclaimable,
 		)
 		# One reservation per candidate, reused by the rejection below, the
 		# reclaim target and the guard state. Independent of free pages, so it
@@ -7206,6 +7385,9 @@ class BatchGenWorker:
 			)
 			failure = 0
 			updated_local_free = -1
+			# A reclaim moves pages from reclaimable to free. Re-report BOTH, or
+			# the refreshed budget below counts the released pages twice.
+			updated_local_releasable = -1
 			local_frontier_hook = self._trajectory_frontier_eviction_hook()
 			reclaimed_pages = EvictedPageRecorder(local_frontier_hook)
 			if self.local_rank == 0:
@@ -7228,6 +7410,9 @@ class BatchGenWorker:
 							frontier_hook=reclaimed_pages,
 						)
 						updated_local_free = self._get_host_kv_free_pages()
+						updated_local_releasable = (
+							self.prefix_cache_coordinator.count_releasable_pages(0)
+						)
 						logging.info(
 							"[PREFIX_CACHE] admission reclaimed %s Host pages on node %s "
 							"(free=%s, target=%s)",
@@ -7283,7 +7468,10 @@ class BatchGenWorker:
 						)
 						frontier_failure = 1
 			updated = torch.tensor(
-				[report_node, updated_local_free, frontier_failure],
+				[
+					report_node, updated_local_free, frontier_failure,
+					updated_local_releasable,
+				],
 				dtype=torch.int64, device=self.torch_device,
 			)
 			gathered = [torch.zeros_like(updated) for _ in range(self.world_size)]
@@ -7297,7 +7485,14 @@ class BatchGenWorker:
 				node, free = int(item[0].item()), int(item[1].item())
 				if free >= 0:
 					per_node_host_free[node] = free
-			selection = replace(selection, per_node_host_free=tuple(per_node_host_free))
+				releasable = int(item[3].item())
+				if releasable >= 0:
+					per_node_host_reclaimable[node] = releasable
+			selection = replace(
+				selection,
+				per_node_host_free=tuple(per_node_host_free),
+				per_node_host_reclaimable=tuple(per_node_host_reclaimable),
+			)
 			prefill_batch = PrefillScheduler.select_prefill_batch(selection)
 			if not prefill_batch and not self._prefill_admission_live:
 				# Nothing is live on ANY rank, so nothing will decode, complete, or
@@ -7624,6 +7819,7 @@ class BatchGenWorker:
 		self, all_candidates: List[str], per_node_host_free: List[int],
 		num_nodes: int, chunk_size: int, *,
 		per_rank_sequence_free=None, per_node_sequence_free=None,
+		per_node_host_reclaimable=None,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
@@ -7677,6 +7873,10 @@ class BatchGenWorker:
 			per_node_sequence_free=(
 				tuple(per_node_sequence_free)
 				if per_node_sequence_free is not None else None
+			),
+			per_node_host_reclaimable=(
+				tuple(per_node_host_reclaimable)
+				if per_node_host_reclaimable is not None else None
 			),
 		)
 

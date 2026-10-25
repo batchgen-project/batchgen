@@ -21,6 +21,7 @@ from batchgen.worker.prefill import (
     PrefillSelectionRequest,
     compute_prefill_host_reservation,
     host_kv_eviction_enabled,
+    prefill_host_reserve_page_deficit,
 )
 
 _PAGE = 64
@@ -64,6 +65,7 @@ def _req(
     gpus_per_node=_GPN,
     per_rank_sequence_free=None,
     per_node_sequence_free=None,
+    per_node_host_reclaimable=None,
 ):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
@@ -79,6 +81,10 @@ def _req(
         per_node_sequence_free=(
             tuple(per_node_sequence_free)
             if per_node_sequence_free is not None else None
+        ),
+        per_node_host_reclaimable=(
+            tuple(per_node_host_reclaimable)
+            if per_node_host_reclaimable is not None else None
         ),
     )
 
@@ -357,6 +363,122 @@ def test_persistent_kda_limits_cannot_have_two_scopes():
                 per_node_sequence_free=[1],
             )
         )
+
+
+# --------------------------------------------------------------------------- #
+#  Evictable retained prefix pages in the admission budget
+# --------------------------------------------------------------------------- #
+
+
+def test_reclaimable_pages_admit_beyond_physical_free():
+    # 34 pages needed, 10 physically free, 24 retained but evictable.
+    candidate = _cand("a", prompt=100)
+    assert PrefillScheduler.select_prefill_batch(
+        _req([candidate], [10])
+    ) == []
+    assert PrefillScheduler.select_prefill_batch(
+        _req([candidate], [10], per_node_host_reclaimable=[24])
+    ) == ["a"]
+
+
+def test_reclaimable_pages_are_still_a_bound_not_a_bypass():
+    # One page short of the reservation stays one page short.
+    assert PrefillScheduler.select_prefill_batch(
+        _req([_cand("a", prompt=100)], [10], per_node_host_reclaimable=[23])
+    ) == []
+
+
+def test_reclaimable_none_reproduces_the_free_only_selection():
+    cands = [_cand(f"q{i}", gidx=i) for i in range(3)]
+    free_only = PrefillScheduler.select_prefill_batch(_req(cands, [70]))
+    assert free_only == ["q0", "q1"]
+    assert PrefillScheduler.select_prefill_batch(
+        _req(cands, [70], per_node_host_reclaimable=[0])
+    ) == free_only
+
+
+def test_reclaimable_budget_is_charged_per_node():
+    cands = [
+        _cand("n0", rank=0, node=0, gidx=0),
+        _cand("n1", rank=0, node=1, gidx=1),
+    ]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(cands, [0, 0], per_node_host_reclaimable=[34, 0])
+    )
+    assert plan == ["n0"]
+
+
+def test_reclaimable_budget_does_not_lift_sequence_slot_limits():
+    cands = [_cand(f"q{i}", gidx=i) for i in range(3)]
+    plan = PrefillScheduler.select_prefill_batch(
+        _req(
+            cands, [0],
+            per_node_sequence_free=[1],
+            per_node_host_reclaimable=[10 * 34],
+        )
+    )
+    assert plan == ["q0"]
+
+
+def test_reclaimable_budget_leaves_the_slot_admissible_walk_unbounded():
+    # slot_admissible_candidates lifts the host-page bound entirely, so the
+    # reclaimable vector must not change what it returns.
+    cands = [_cand(f"q{i}", gidx=i) for i in range(3)]
+    expected = ["q0", "q1", "q2"]
+    assert [
+        c.uuid for c in PrefillScheduler.slot_admissible_candidates(
+            _req(cands, [0])
+        )
+    ] == expected
+    assert [
+        c.uuid for c in PrefillScheduler.slot_admissible_candidates(
+            _req(cands, [0], per_node_host_reclaimable=[34])
+        )
+    ] == expected
+
+
+def test_reclaimable_pages_do_not_discount_the_reservation():
+    # Full-charge stays: the budget grows, the per-candidate demand does not.
+    candidate = _cand("a", prompt=100)
+    assert PrefillScheduler.required_host_pages(
+        candidate, _req([candidate], [10], per_node_host_reclaimable=[24])
+    ) == 34
+
+
+def test_reclaimable_vector_must_have_one_value_per_node():
+    with pytest.raises(ValueError, match="one value per node"):
+        PrefillScheduler.select_prefill_batch(
+            _req([_cand("a")], [34, 34], per_node_host_reclaimable=[0])
+        )
+
+
+def test_reclaimable_values_must_be_non_negative():
+    with pytest.raises(ValueError, match="per_node_host_reclaimable values"):
+        PrefillScheduler.select_prefill_batch(
+            _req([_cand("a")], [34], per_node_host_reclaimable=[-1])
+        )
+
+
+# --------------------------------------------------------------------------- #
+#  Reserve-time reclaim deficit
+# --------------------------------------------------------------------------- #
+
+
+def test_reserve_deficit_is_the_gathered_need_above_free():
+    assert prefill_host_reserve_page_deficit({0: (40, 10), 1: (0, 5)}, 0) == 30
+    # The short node is not this one: nothing to reclaim here.
+    assert prefill_host_reserve_page_deficit({0: (40, 10), 1: (0, 5)}, 1) == 0
+    assert prefill_host_reserve_page_deficit({0: (10, 40)}, 0) == 0
+    assert prefill_host_reserve_page_deficit({0: (0, 0)}, 0) == 0
+
+
+def test_reserve_deficit_names_a_broken_snapshot():
+    with pytest.raises(ValueError, match="no gathered host-KV capacity row"):
+        prefill_host_reserve_page_deficit({0: (40, 10)}, 1)
+    with pytest.raises(ValueError, match="invalid host-KV capacity row"):
+        prefill_host_reserve_page_deficit({0: (40, -1)}, 0)
+    with pytest.raises(ValueError, match="invalid host-KV capacity row"):
+        prefill_host_reserve_page_deficit({0: (-1, 10)}, 0)
 
 
 def test_request_and_candidate_are_frozen():
