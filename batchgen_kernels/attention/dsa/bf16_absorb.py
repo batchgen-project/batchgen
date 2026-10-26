@@ -8,38 +8,30 @@ modified by this slice at all.
 
 Why bf16 ``torch.bmm`` replaces the Triton FP8 WGMMA absorb
 -----------------------------------------------------------
-Measured 2026-10-23 under CUDA-graph replay, B=64, H=64, both production
-shapes, four arms in one probe:
+Two independent reasons, both verified on the target hardware:
 
-    arm                                  q 192->512   out 512->256   calc_diff
-    Triton fp8 (what this replaces)        14.048 us     17.952 us    ~6.6e-04
-    bmm with .contiguous() permutes        17.952 us     21.072 us     0.00e+00
-    bmm on transposed VIEWS  <-- this      10.912 us     14.528 us     0.00e+00
-    bmm, pre-staged [H,B,*] (a floor)      10.752 us     14.304 us     0.00e+00
+* **Layout, not arithmetic.** A bf16 ``bmm`` that reads the absorb weights as
+  transposed VIEWS is faster than the fp8 WGMMA kernel it replaces, while the
+  same ``bmm`` forced through ``.contiguous()`` permutes is SLOWER than that
+  kernel. The permutes, not the matmul, decide the outcome -- see "The layout
+  IS the win" below.
+* **Exactness.** ``calc_diff`` is 0 against a bf16 reference, where the fp8
+  kernel carries a quantisation error, so this also removes an fp8 error
+  source from the attention critical path. That is an independent benefit,
+  not a rounding detail.
 
-Expected production effect **-0.372 ms/step**, obtained by scaling these
-ratios onto the 2026-10-17 A/B harness baseline (23.21 us/layer for q+out =
-1.810 ms/step). Two earlier figures for this slice, 0.678 and 0.512 ms/step,
-are superseded and must not be requoted: the first came from reading a
-permute-free *floor* as achievable, the second from this probe's absolute
-numbers, which run hot because it builds fresh weights per shape with no
-cold-weight pooling.
-
-It is also numerically EXACT (``calc_diff`` 0 against a bf16 reference, versus
-~6.6e-04 for the fp8 kernel), so it removes an fp8 quantisation error source
-from the attention critical path. That is an independent benefit, not a
-rounding detail.
-
-Cost: bf16 absorb weights are twice the fp8 ones. Once the fp8 copies stop
-being built, the net change is **+14.68 MB/layer = +1.15 GB/GPU**, which
-competes with the KV cache. That trade is the slice's one open question and is
-settled by the paired cold M1 plus the HBM/KV-pool readings, not here.
+Cost: bf16 absorb weights are twice the size of the fp8 ones, so once the fp8
+copies stop being built the resident absorb weights grow (the increment is
+fixed by the weight shapes: bf16 is 2 bytes per element against 1 for fp8).
+That memory competes with the KV cache, which is the slice's one open
+question; it is settled by the paired acceptance run and the HBM/KV-pool
+readings recorded with it, not here.
 
 The layout IS the win
 ---------------------
-Note the second row above: a bf16 bmm that pays ``.contiguous()`` permutes is
-**1.17-1.28x slower than the Triton kernel it would replace**. The entire gain
-comes from not permuting, which needs two things:
+As noted above, a bf16 bmm that pays ``.contiguous()`` permutes is SLOWER
+than the Triton kernel it would replace. The entire gain comes from not
+permuting, which needs two things:
 
 * the weights pre-stored ONCE at load as ``[H, K, N]`` (free, done here);
 * the activation and the output passed as transposed VIEWS at runtime.
