@@ -25,10 +25,10 @@ import math
 
 try:
 	from batchgen_kernels.attention.dsa.bf16_absorb import (
+		BF16AbsorbWeights,
 		absorb_out,
 		absorb_q,
 	)
-	from batchgen_kernels.attention.dsa.fp8_absorb import FP8AbsorbWeights
 	_HAS_FP8_ABSORB = True
 except (ImportError, Exception):
 	_HAS_FP8_ABSORB = False
@@ -706,7 +706,13 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 		).view(self.num_heads, -1, self.kv_lora_rank)
 		q_absorb_w = kv_b_proj_bf16[:, : self.qk_nope_head_dim, :]
 		out_absorb_w = kv_b_proj_bf16[:, self.qk_nope_head_dim :, :]
-		self._fp8_absorb_weights = FP8AbsorbWeights(q_absorb_w, out_absorb_w)
+		# Slice 2c-2: bf16 strided-batched bmm container. There is no runtime
+		# switch on purpose -- a selectable container would let this backend and
+		# `wrappers.py` build different ones, and the eager DSA route and the
+		# graph route would then run different numerics for the same layer.
+		# The Triton FP8 path stays in the tree, reachable only by passing an
+		# FP8AbsorbWeights to the same dispatch.
+		self._fp8_absorb_weights = BF16AbsorbWeights(q_absorb_w, out_absorb_w)
 
 	if _HAS_FP8_ABSORB:
 		# FP8 WGMMA q_absorb: [B, H, 192] → [B, H, 512]
