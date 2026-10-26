@@ -200,6 +200,11 @@ class ServerArgs:
     pynccl_port_span: int = 100
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
+    # DIAGNOSTIC (glm52 memcpy32_post A/B): capture GLM-5 whole-model decode
+    # graphs without per-layer host-KV staging; decode tokens are then never
+    # appended to host KV. Launch-scoped because graphs are captured once per
+    # server lifetime, so a batch-level batchgen_debug flag cannot express it.
+    glm5_disable_decode_host_kv_staging: bool = False
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
     gpu_arch: Optional[str] = None
@@ -605,6 +610,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable CUDA graph capture for decode attention (enabled by default for supported models)",
     )
     parser.add_argument(
+        "--glm5-disable-decode-host-kv-staging",
+        action="store_true",
+        default=False,
+        help="DIAGNOSTIC: capture GLM-5 whole-model decode graphs without the "
+        "per-layer host-KV staging copies. Decode tokens are never appended to "
+        "host KV, so migration/recovery of decode tails is broken; benchmark "
+        "A/B use only.",
+    )
+    parser.add_argument(
         "--cuda-graph-max-bucket-size",
         type=int,
         default=128,
@@ -953,6 +967,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         pynccl_port_span=parsed.pynccl_port_span,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
+        glm5_disable_decode_host_kv_staging=parsed.glm5_disable_decode_host_kv_staging,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
         gpu_arch=parsed.gpu_arch,

@@ -132,8 +132,16 @@ def test_glm5_whole_model_segment_allocates_primary_and_aux_offload_buffers():
 
 def test_glm5_whole_model_segment_sets_up_children_for_each_bucket():
     class _FakeLayerSegment:
+        # An indexer layer: it writes aux host-KV rows, so it takes aux
+        # staging slices as well as the primary one.
+        WRITES_AUX_HOST_KV = True
+
         def __init__(self):
             self.setup_calls = []
+            self.staging = None
+
+        def set_host_kv_staging(self, *, key, aux_key=None, aux_scale=None):
+            self.staging = None if key is None else (key, aux_key, aux_scale)
 
         def setup_static_buffers(self, bucket_size):
             self.setup_calls.append(bucket_size)
@@ -147,6 +155,12 @@ def test_glm5_whole_model_segment_sets_up_children_for_each_bucket():
 
     assert segment._kv_key_buffer is kv_buffer
     assert [layer.setup_calls for layer in layers] == [[1, 2], [1, 2]]
+    # Each child is bound to its own staging rows; the whole-model driver no
+    # longer copies KV into them after the layer runs.
+    for layer_idx, layer in enumerate(layers):
+        assert layer.staging is not None
+        assert layer.staging[0] is segment._kv_buffers[layer_idx]["key"]
+        assert layer.staging[1] is segment._aux_kv_buffers[layer_idx]["key"]
 
 
 def test_glm5_whole_model_segment_accepts_padded_capture_inputs():

@@ -1521,6 +1521,7 @@ class WorkerManager:
             watchdog_heartbeat_interval=self.args.watchdog_heartbeat_interval,
             decode_step_timeout=self.args.decode_step_timeout,
             enable_prepack=self.args.enable_prepack,
+            glm5_disable_decode_host_kv_staging=self.args.glm5_disable_decode_host_kv_staging,
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,
             gpu_memory_frac=self.args.gpu_memory_frac,
