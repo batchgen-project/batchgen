@@ -199,8 +199,9 @@ def test_binding_validates_the_fp8_buffer_it_is_handed():
 def test_indexer_out_wrapper_forwards_out_fp8():
     fn = _top_level(_tree(_INDEXER_INIT), "fused_rope_hadamard_out")
     args = [a.arg for a in fn.args.args]
-    assert args[-1] == "out_fp8"
-    assert fn.args.defaults and ast.unparse(fn.args.defaults[-1]) == "None"
+    assert "out_fp8" in args
+    defaults = dict(zip(args[len(args) - len(fn.args.defaults):], fn.args.defaults))
+    assert ast.unparse(defaults["out_fp8"]) == "None"
     forwarded = ast.unparse(
         _one_call(fn, "_fused_rope_hadamard_cuda.fused_rope_hadamard_out")
     )
@@ -210,7 +211,9 @@ def test_indexer_out_wrapper_forwards_out_fp8():
 def test_q_wrapper_takes_out_fp8_and_checks_its_dtype_and_size():
     fn = _top_level(_tree(_SCORE_SRC), "rope_hadamard_q_out")
     args = [a.arg for a in fn.args.args]
-    assert args[-1] == "out_fp8"
+    assert "out_fp8" in args
+    defaults = dict(zip(args[len(args) - len(fn.args.defaults):], fn.args.defaults))
+    assert ast.unparse(defaults["out_fp8"]) == "None"
     src = ast.unparse(fn)
     assert "torch.float8_e4m3fn" in src
     assert "out_fp8.numel() != q.numel()" in src
