@@ -17,7 +17,12 @@ the numeric gate from ``knowledge/agent-memory/rules/kernel-validation.md``:
 
 1. the fp8 keys and fp32 scales agree with the oracle's quantization of the
    oracle's keys, DeepGEMM-style (``calc_diff < 1e-3``), over the production
-   decode buckets 1/8/32/64/128 and with and without the rotation;
+   decode buckets 1/8/32/64/128 and in BOTH rotation arms. The PRODUCTION arm
+   is now ``apply_hadamard=False``: GLM-5.2's page-split FP8 route follows
+   upstream V3.2 and drops the Hadamard incoherence rotation on both q and k
+   (logit-preserving, H orthonormal). The rotation arm stays as a secondary
+   case, because the bf16 AoS indexer profiles still use it and both kernel
+   instantiations must keep working;
 2. the page bytes, the row gating and the host-append sources are the SAME
    bytes the un-fused writer produces -- that part of the contract is shared
    layout code, not a re-derivation, so only e4m3 rounding ties may differ;
@@ -77,6 +82,14 @@ quantize_indexer_k_fp8 = _quant.quantize_indexer_k_fp8
 PAGE_SIZE = 64
 MAX_SEQ = 256
 LN_EPS = 1e-5
+
+# The GLM-5.2 page-split FP8 route does NOT rotate (upstream V3.2 semantics,
+# `indexer_applies_hadamard`), so that is the arm the fixed-arm cases below
+# exercise. SECONDARY is the bf16 AoS indexer's arm, kept so the other
+# instantiation stays covered.
+PRODUCTION_HADAMARD = False
+SECONDARY_HADAMARD = True
+BOTH_ARMS = (PRODUCTION_HADAMARD, SECONDARY_HADAMARD)
 
 
 def _rope_tables(generator: torch.Generator) -> tuple:
@@ -154,7 +167,7 @@ def _run_fused(case: dict, *, slots, token_indices, page_table_rows,
     return cache, k_fp8, scales
 
 
-@pytest.mark.parametrize("apply_hadamard", (True, False))
+@pytest.mark.parametrize("apply_hadamard", BOTH_ARMS)
 @pytest.mark.parametrize("batch", (1, 8, 32, 64, 128))
 def test_cuda_fused_keys_and_scales_match_the_oracle(batch, apply_hadamard):
     device = torch.device("cuda")
@@ -185,7 +198,7 @@ def test_cuda_fused_keys_and_scales_match_the_oracle(batch, apply_hadamard):
     )
 
 
-@pytest.mark.parametrize("apply_hadamard", (True, False))
+@pytest.mark.parametrize("apply_hadamard", BOTH_ARMS)
 def test_cuda_dequantized_keys_match_the_oracle(apply_hadamard):
     """Dequantize the kernel's own bytes (keys * scale) and compare against
     the oracle dequantized the same way, at the full production bucket."""
@@ -213,7 +226,8 @@ def test_cuda_dequantized_keys_match_the_oracle(apply_hadamard):
     assert diff < 1e-3, f"dequantized keys calc_diff {diff:.3e}"
 
 
-def test_cuda_fused_pages_match_the_unfused_writer_byte_for_byte():
+@pytest.mark.parametrize("apply_hadamard", BOTH_ARMS)
+def test_cuda_fused_pages_match_the_unfused_writer_byte_for_byte(apply_hadamard):
     """Same page bytes, same row gating, same host-append sources.
 
     Feeds the un-fused writer the oracle's bf16 keys and the fused kernel the
@@ -239,7 +253,7 @@ def test_cuda_fused_pages_match_the_unfused_writer_byte_for_byte():
 
     want_keys = indexer_k_norm_rope_reference(
         case["k_raw"], case["ln_weight"], case["ln_bias"], LN_EPS,
-        case["cos"], case["sin"], case["positions"], apply_hadamard=True,
+        case["cos"], case["sin"], case["positions"], apply_hadamard,
     )
 
     unfused_cache = torch.zeros(
@@ -262,7 +276,7 @@ def test_cuda_fused_pages_match_the_unfused_writer_byte_for_byte():
         token_indices=token_indices,
         page_table_rows=page_table_rows,
         num_valid=num_valid,
-        apply_hadamard=True,
+        apply_hadamard=apply_hadamard,
     )
 
     fused_bytes = fused_cache.view(torch.uint8).cpu()
@@ -304,7 +318,7 @@ def test_cuda_adversarial_rows_do_not_cross_tokens():
         token_indices=list(range(batch)),
         page_table_rows=[[0, 1]],
         num_valid=batch,
-        apply_hadamard=True,
+        apply_hadamard=PRODUCTION_HADAMARD,
     )
     clean_rows = [0, 1, 5, 6, 7]
     clean = _device_case(batch, 41, device)
@@ -316,13 +330,53 @@ def test_cuda_adversarial_rows_do_not_cross_tokens():
         token_indices=list(range(len(clean_rows))),
         page_table_rows=[[0, 1]],
         num_valid=len(clean_rows),
-        apply_hadamard=True,
+        apply_hadamard=PRODUCTION_HADAMARD,
     )
     torch.testing.assert_close(
         scales[clean_rows].cpu(), clean_scales.cpu(), atol=0.0, rtol=0.0
     )
-    # The all-zero row takes the amax floor, not a NaN or an infinity.
-    assert scales[4].item() == pytest.approx(AMAX_FLOOR / FP8_MAX, rel=1e-6)
+    # The all-zero row must be finite and must not inherit its neighbours'
+    # NaN / 1e4. It does NOT take the amax floor: an all-zero INPUT row is not
+    # an all-zero row after LayerNorm, because mean 0 / var 0 leaves
+    # ``0 * weight + bias`` and the production params carry a non-zero bias;
+    # RoPE and the Hadamard are rotations, so the row's amax is the bias row's,
+    # orders of magnitude above AMAX_FLOOR. The invariant is therefore agreement
+    # with the reference chain for that row, not a hand-derived constant.
+    # (The floor itself is exercised by the post-norm-zero test below.)
+    assert torch.isfinite(scales[4].cpu()).all()
+    zero_keys = indexer_k_norm_rope_reference(
+        case["k_raw"][4:5], case["ln_weight"], case["ln_bias"], LN_EPS,
+        # MUST be the arm the fused call above ran, or the two chains rotate
+        # differently and the scales cannot match.
+        case["cos"], case["sin"], case["positions"][4:5], PRODUCTION_HADAMARD,
+    )
+    _, zero_scale = quantize_indexer_k_fp8(zero_keys)
+    torch.testing.assert_close(
+        scales[4:5].cpu(), zero_scale, atol=0.0, rtol=2 ** -7
+    )
+
+
+def test_cuda_a_post_norm_zero_row_takes_the_amax_floor():
+    """AMAX_FLOOR binds only when the row is zero AFTER LayerNorm and RoPE.
+
+    That needs a zero LayerNorm bias: with the production bias an all-zero
+    input row still carries the bias through, which is why the adversarial
+    case above cannot reach the floor. This is the case that can.
+    """
+
+    device = torch.device("cuda")
+    case = _device_case(1, 97, device)
+    case["k_raw"] = torch.zeros_like(case["k_raw"])
+    case["ln_bias"] = torch.zeros_like(case["ln_bias"])
+    _, _, scales = _run_fused(
+        case,
+        slots=[0],
+        token_indices=[0],
+        page_table_rows=[[0, 1]],
+        num_valid=1,
+        apply_hadamard=PRODUCTION_HADAMARD,
+    )
+    assert scales[0].item() == pytest.approx(AMAX_FLOOR / FP8_MAX, rel=1e-6)
 
 
 @pytest.mark.parametrize("batch", (8, 32, 64, 128))
@@ -340,7 +394,7 @@ def test_cuda_bucket_padding_rows_write_no_page_bytes(batch):
         token_indices=list(range(batch)),
         page_table_rows=[[0, 1, 2, 3]],
         num_valid=num_valid,
-        apply_hadamard=True,
+        apply_hadamard=PRODUCTION_HADAMARD,
     )
     pages = cache.view(torch.uint8).cpu()
     # Page 0 holds the valid prefix; the scale tail of a padded offset stays 0.

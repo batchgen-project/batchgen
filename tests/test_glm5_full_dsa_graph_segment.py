@@ -461,8 +461,10 @@ def _build_fake_wrapper(device):
             ).view(index_n_heads, hidden_size).mul_(0.01)
         )
 
-    def _fused_rope_hadamard_or_fallback(k_normed, positions, max_seqlen):
-        del positions, max_seqlen
+    def _fused_rope_hadamard_or_fallback(
+        k_normed, positions, max_seqlen, apply_hadamard=True
+    ):
+        del positions, max_seqlen, apply_hadamard
         return k_normed + 0.125
 
     indexer._fused_rope_hadamard_or_fallback = _fused_rope_hadamard_or_fallback
@@ -617,9 +619,12 @@ def _patch_full_dsa_dependencies(
         out.copy_(q_a_normed[:, :1].expand_as(out) + 0.25)
         return out
 
-    def fake_rope_hadamard_q(q_flat, cos, sin, positions, out, out_fp8=None):
+    def fake_rope_hadamard_q(
+        q_flat, cos, sin, positions, out, out_fp8=None, apply_hadamard=True
+    ):
         del cos, sin, positions
         calls["scoring"].append("rope_hadamard_q_out")
+        calls.setdefault("q_apply_hadamard", []).append(apply_hadamard)
         out.copy_(q_flat + 0.03125)
         if out_fp8 is not None:
             # The real epilogue also emits the saturating e4m3 copy of `out`.
