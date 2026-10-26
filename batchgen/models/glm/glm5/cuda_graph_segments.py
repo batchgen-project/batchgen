@@ -84,7 +84,6 @@ from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
 from batchgen_kernels.attention.dsa.selected_page_table import (
     transform_selected_positions_out,
 )
-from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
 
 
@@ -1979,6 +1978,12 @@ class Glm5FullDsaAttnSegment:
         # invalid rows, so the separate `torch.where` launch this used to need
         # is gone. It remains a SELECT, not a multiply -- bf16 NaN * 0 is NaN,
         # so a multiply could carry a non-finite stale row through.
+        # The paged-cache store is FOLDED INTO the producing kernel (the
+        # separate `run_paged_kv_token_update_fused` launch is gone): lane 0
+        # stores the row it just computed straight to the page-table
+        # destination, gated on the already-gated slot sentinel (the -1 rows
+        # of `kv_primary_slot_indices` carry both the num_valid_tokens cutoff
+        # and the row mask) and on `row_valid_mask`.
         _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
@@ -1992,15 +1997,11 @@ class Glm5FullDsaAttnSegment:
             out=outputs.primary_k_tensor.view(batch_size, 1, -1),
             row_valid_mask=buffers.valid_mask,
             q_pe_src=q_rope_strided,
-        )
-        run_paged_kv_token_update_fused(
-            k_cache=self.primary_blocked_k,
-            k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
+            cache_tensor=self.primary_blocked_k,
             page_table=self.primary_page_table,
             slot_indices=buffers.kv_primary_slot_indices,
             token_indices=token_indices,
             page_size_tokens=self.page_size,
-            num_valid_tokens=num_valid_tokens,
         )
 
         if not self.all_short:

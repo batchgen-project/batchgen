@@ -547,7 +547,7 @@ def _patch_full_dsa_dependencies(
         out.copy_(result)
         return out
 
-    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps, out=None, row_valid_mask=None, q_pe_src=None):
+    def fake_rmsnorm_rope(new_compressed_kv, q_rope, cos, sin, position_ids, weight, kv_lora_rank, qk_rope_head_dim, eps, out=None, row_valid_mask=None, q_pe_src=None, cache_tensor=None, page_table=None, slot_indices=None, token_indices=None, page_size_tokens=None):
         # Stands in for `fused_rmsnorm_rope_with_q_native`, so it has to honour
         # the same `out=` / `row_valid_mask=` / `q_pe_src=` contract: the
         # segment has the kernel write `primary_k_tensor` directly, under a row
@@ -585,6 +585,33 @@ def _patch_full_dsa_dependencies(
             keep = row_valid_mask.reshape(out.shape[0], *([1] * (out.dim() - 1)))
             processed = torch.where(keep, processed, torch.zeros_like(processed))
         out.copy_(processed)
+        if cache_tensor is not None:
+            # 1b-iii: the real kernel ALSO stores the processed row into the
+            # paged cache at the page-table destination, gated on the slot
+            # sentinel (and the row mask, already folded into `processed`
+            # above). The separate update launch is gone from the segment, so
+            # a stub that skipped this would make the KV-write assertions
+            # vacuous. Mirror the addressing with CAPTURE-SAFE tensor ops
+            # only (no .item()/nonzero: this stub runs inside graph capture):
+            # invalid rows clamp to page 0/offset 0 and write back the value
+            # just read there, which is a no-op by construction.
+            rows = out.shape[0]
+            flat = processed.reshape(rows, -1)
+            slots = slot_indices[:rows].long()
+            toks = token_indices[:rows].long()
+            valid = slots >= 0
+            if row_valid_mask is not None:
+                valid = valid & row_valid_mask[:rows].bool()
+            pages = page_table[slots.clamp(min=0), toks // page_size_tokens]
+            pages = pages.long().clamp(min=0)
+            offs = toks % page_size_tokens
+            dest_view = cache_tensor.view(
+                cache_tensor.shape[0], cache_tensor.shape[1], -1
+            )
+            current = dest_view[pages, offs, : flat.shape[1]]
+            dest_view[pages, offs, : flat.shape[1]] = torch.where(
+                valid.view(-1, 1), flat, current
+            )
         return out
 
     def fake_rmsnorm(x, weight, eps, out=None):
