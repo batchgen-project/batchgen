@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - resolved by the node's FA3 install
     _fa3_with_kvcache = None
 
 from batchgen.attention.mla.fa3_backend import act_quant
+from batchgen.attention.dsa.fa3_split_policy import GLM5_SPARSE_FA3_NUM_SPLITS
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
 )
@@ -1254,7 +1255,7 @@ class Glm5FullDsaAttnSegment:
             cache_seqlens=buffers.selected_lengths,
             softmax_scale=float(attn.softmax_scale),
             causal=True,
-            num_splits=0,
+            num_splits=GLM5_SPARSE_FA3_NUM_SPLITS,
             return_softmax_lse=False,
         )
 

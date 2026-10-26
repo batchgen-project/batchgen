@@ -196,8 +196,14 @@ def test_full_dsa_field_lists_exactly_cover_the_buffer_dataclass():
         _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
         | _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
         | _name_set_literal(tree, "_GLM5_DSA_PER_STEP_FIELDS")
+        | _name_set_literal(tree, "_GLM5_DSA_OPTIONAL_VIEW_FIELDS")
     )
     assert fields ^ split == set()
+    # The merged [q_b | wq_b] output exists in one version's buffer set only;
+    # it is a leading-dim view where present and None elsewhere.
+    assert _name_set_literal(tree, "_GLM5_DSA_OPTIONAL_VIEW_FIELDS") == {
+        "q_flat_merged"
+    }
     assert "prepared_flashmla" not in _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
     assert "selected_token_ids" in _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
     # The step prologue's own outputs. The two length buffers are per-row and
@@ -351,7 +357,9 @@ def test_selected_fa3_call_shape_is_page_size_one_over_selected_token_ids():
     assert kwargs["k_cache"] == "flat_kv[..., attn.kv_lora_rank:]"
     assert kwargs["v_cache"] == "flat_kv[..., :attn.kv_lora_rank]"
     assert kwargs["causal"] == "True"
-    assert kwargs["num_splits"] == "0"
+    # The sparse selected-token call pins the no-split policy constant; the
+    # dense all_short call below keeps auto-split ("0").
+    assert kwargs["num_splits"] == "GLM5_SPARSE_FA3_NUM_SPLITS"
     assert kwargs["return_softmax_lse"] == "False"
     assert kwargs["softmax_scale"] == "float(attn.softmax_scale)"
     assert "self.primary_blocked_k.view(-1, 1, 1, self.primary_blocked_k.shape[-1])" in (
@@ -505,6 +513,10 @@ def _build_fake_wrapper(device):
         "kv_a_proj_with_mqa.weight_scale_inv": torch.ones(1, device=device, dtype=torch.float32),
         "o_proj.weight_scale_inv": torch.ones(1, device=device, dtype=torch.float32),
     }
+    # The merged [q_b | wq_b] operand initialize_fused_kernels builds when
+    # GLM5_QB_WQB_MERGE is on (the segment fails loud without it); with the
+    # switch off the segment ignores it.
+    wq_b_weight = _fake_linear_weight(index_n_heads * index_head_dim, q_lora_rank, device)
     return types.SimpleNamespace(
         module=attn,
         layer_idx=0,
@@ -514,6 +526,10 @@ def _build_fake_wrapper(device):
             dim=0,
         ).contiguous(),
         _fp8_qkv_a_scale=torch.ones(1, device=device, dtype=torch.float32),
+        _fp8_q_b_wq_b_proj=torch.cat(
+            (attn.q_b_proj.weight, wq_b_weight), dim=0
+        ).contiguous(),
+        _fp8_q_b_wq_b_scale=torch.ones(1, device=device, dtype=torch.float32),
         _indexer_cuda_weights=object(),
         _indexer_cuda_module=object(),
     )
@@ -647,9 +663,17 @@ def _patch_full_dsa_dependencies(
         return out
 
     def fake_rope_hadamard_q(
-        q_flat, cos, sin, positions, out, out_fp8=None, apply_hadamard=True
+        q_flat, cos, sin, positions, out, out_fp8=None, apply_hadamard=True,
+        q_row_stride=None,
     ):
         del cos, sin, positions
+        # Same entry-point contract as the real wrapper: None = contiguous q,
+        # an int = q read in place with that row stride (the merged
+        # [q_b | wq_b] output's wq_b slice).
+        if q_row_stride is None:
+            assert q_flat.is_contiguous(), tuple(q_flat.stride())
+        else:
+            assert tuple(q_flat.stride()) == (q_row_stride, q_flat.shape[-1], 1)
         calls["scoring"].append("rope_hadamard_q_out")
         calls.setdefault("q_apply_hadamard", []).append(apply_hadamard)
         out.copy_(q_flat + 0.03125)
@@ -946,8 +970,16 @@ def test_full_dsa_smaller_buckets_are_views_of_largest(monkeypatch):
         assert small_t.data_ptr() == base_t.data_ptr(), name
         assert small_t.shape[0] == 2, name
     # Rebuilt fields: fresh scratch tensors only; there is no prepared
-    # FlashMLA handle to rebuild any more.
-    assert small.q_x_fp8.data_ptr() != base.q_x_fp8.data_ptr()
+    # FlashMLA handle to rebuild any more. On the merged [q_b | wq_b] version
+    # the private wq_b scratch is a placeholder nothing reads, passed through.
+    if segment._q_b_wq_b_merged:
+        assert small.q_x_fp8 is base.q_x_fp8
+        assert small.q_flat_merged.data_ptr() == base.q_flat_merged.data_ptr()
+        assert small.q_flat_merged.shape[0] == 2
+        assert small.q_flat.data_ptr() == small.q_flat_merged.data_ptr()
+    else:
+        assert small.q_x_fp8.data_ptr() != base.q_x_fp8.data_ptr()
+        assert base.q_flat_merged is None and small.q_flat_merged is None
     assert small.indexer_k_x_fp8.data_ptr() != base.indexer_k_x_fp8.data_ptr()
     assert not hasattr(base, "prepared_flashmla")
     assert small.selected_token_ids.data_ptr() == base.selected_token_ids.data_ptr()
@@ -1117,9 +1149,11 @@ def test_selected_branch_fa3_kwargs(monkeypatch):
     torch.cuda.synchronize()
     buffers = shared_buffers[bsz]
 
+    # The merged [q_b | wq_b] version computes wq_b inside the q_b GEMM, so
+    # the custom wq_b launch is absent there and present on the separate one.
     assert [stage for stage in recorder["scoring"]] == [
         "head_gates_out",
-        "cuda_wq_b_proj_out",
+        *(() if segment._q_b_wq_b_merged else ("cuda_wq_b_proj_out",)),
         "rope_hadamard_q_out",
         "fused_paged_score_and_topk_with_slots_out",
     ]

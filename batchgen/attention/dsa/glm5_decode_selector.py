@@ -687,6 +687,9 @@ def _require_fa3():
     return _fa3_with_kvcache
 
 
+from batchgen.attention.dsa.fa3_split_policy import GLM5_SPARSE_FA3_NUM_SPLITS
+
+
 def _run_all_short_fa3(
     attn,
     q_pe: torch.Tensor,
@@ -740,7 +743,7 @@ def _run_selected_fa3(
         cache_seqlens=selected_lengths,
         softmax_scale=float(attn.softmax_scale),
         causal=True,
-        num_splits=0,
+        num_splits=GLM5_SPARSE_FA3_NUM_SPLITS,
         return_softmax_lse=False,
     )
 
