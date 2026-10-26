@@ -92,6 +92,11 @@ _COMMON_EXTENSIONS = (
     "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
 )
 
+_GLM_DSA_EXTENSIONS = (
+    "batchgen_kernels.attention.dsa.indexer.batchgen_dsa_fast_hadamard_transform_cuda",
+    "batchgen_kernels.attention.dsa.indexer.batchgen_dsa_fused_rope_hadamard_cuda",
+)
+
 # These are exact model-type contracts, not family-wide fallback rules.  A new
 # model type must be added here before it can enter the production server path.
 _CONTRACTS: dict[str, RuntimeContract] = {
@@ -102,17 +107,17 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "glm_moe_dsa": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_2": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "deepseek_v2": RuntimeContract(
