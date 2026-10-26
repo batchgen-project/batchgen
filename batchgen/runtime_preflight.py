@@ -92,6 +92,14 @@ _COMMON_EXTENSIONS = (
     "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
 )
 
+# AOT extensions the GLM-5 DSA decode path loads on top of the common set.
+# They are listed per contract rather than in _COMMON_EXTENSIONS because a
+# model that never takes the DSA decode path must not be refused for them.
+_GLM5_DSA_EXTENSIONS = (
+    "batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+    "batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
+)
+
 # These are exact model-type contracts, not family-wide fallback rules.  A new
 # model type must be added here before it can enter the production server path.
 _CONTRACTS: dict[str, RuntimeContract] = {
@@ -102,17 +110,17 @@ _CONTRACTS: dict[str, RuntimeContract] = {
     ),
     "glm_moe_dsa": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_2": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "glm_moe_dsa_5_3": RuntimeContract(
         modules=("flash_attn_interface", "flash_mla", "libucx"),
-        extensions=_COMMON_EXTENSIONS,
+        extensions=_COMMON_EXTENSIONS + _GLM5_DSA_EXTENSIONS,
         require_deepgemm=True,
     ),
     "deepseek_v2": RuntimeContract(

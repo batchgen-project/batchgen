@@ -256,3 +256,27 @@ def test_wgmma_decode_selected_only_on_h20(monkeypatch, capability, sm_count, ex
 
     preflight.run_runtime_preflight(SimpleNamespace(model="openai/gpt-oss-120b"))
     assert ("batchgen_kernels.attention.decode" in imported) == expect_wgmma
+
+
+def test_glm5_dsa_contracts_cover_the_decode_extensions():
+    """Every GLM-5 DSA contract must import the extensions its decode loads.
+
+    The AOT build makes these extensions available; nothing else in the start
+    path imports them, so if they are missing from the contract a partial
+    kernel build passes preflight and the failure moves into decode.
+    """
+    for model_type in ("glm_moe_dsa", "glm_moe_dsa_5_2", "glm_moe_dsa_5_3"):
+        extensions = preflight._CONTRACTS[model_type].extensions
+        for name in preflight._GLM5_DSA_EXTENSIONS:
+            assert name in extensions, f"{model_type} does not check {name}"
+
+
+def test_non_dsa_contracts_do_not_require_the_dsa_extensions():
+    """A model that never takes the DSA decode path must not be refused."""
+    for model_type, contract in preflight._CONTRACTS.items():
+        if model_type.startswith("glm_moe_dsa"):
+            continue
+        for name in preflight._GLM5_DSA_EXTENSIONS:
+            assert name not in contract.extensions, (
+                f"{model_type} should not require {name}"
+            )
