@@ -1,6 +1,6 @@
 # DeepGEMM programmatic dependent launch (PDL).
 #
-# The installed sgl-fork DeepGEMM ships PDL support behind a process-global
+# The installed DeepGEMM build ships PDL support behind a process-global
 # toggle (set_pdl/get_pdl, default off). With PDL on, a DeepGEMM kernel launch
 # may begin while the tail of the previous kernel is still draining; the
 # kernels carry their own cudaGridDependencySynchronize() so reads of the
