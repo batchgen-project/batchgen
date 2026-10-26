@@ -459,8 +459,14 @@ class Glm5Indexer(nn.Module):
 
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
+        apply_hadamard: bool = True,
     ) -> torch.Tensor:
-        """Run the required fused interleaved RoPE + Hadamard kernel."""
+        """Run the required fused interleaved RoPE (+ optional Hadamard) kernel.
+
+        ``apply_hadamard`` must be the index-K cache's own rotation predicate
+        (``cache_applies_hadamard``): a page-split FP8 cache is written and
+        scored without the rotation, a bf16 AoS cache with it.
+        """
         if _fused_rope_hadamard_fn is None:
             raise RuntimeError(
                 "GLM-5 DSA requires fused RoPE+Hadamard; separate-op fallback "
@@ -471,11 +477,12 @@ class Glm5Indexer(nn.Module):
         return _fused_rope_hadamard_fn(
             k.to(torch.bfloat16), cos.float(), sin.float(),
             positions.reshape(-1), scale=k.shape[-1] ** -0.5,
+            apply_hadamard=apply_hadamard,
         )
 
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
+        max_seqlen: Optional[int] = None, apply_hadamard: bool = True,
     ) -> torch.Tensor:
         """Compute indexer K for cache storage.
 
@@ -486,6 +493,10 @@ class Glm5Indexer(nn.Module):
             positions: [batch, seq_len] or [seq_len] — token positions for RoPE.
                        If None, RoPE and Hadamard are skipped (backwards compat).
             max_seqlen: max sequence length (int) to avoid CPU-GPU sync in RoPE.
+            apply_hadamard: the index-K cache's rotation predicate. The caller
+                       resolves it from the aux cache/host view it is about to
+                       write, so prefill stores keys in the space decode's Q
+                       path scores them in.
 
         Returns:
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
@@ -499,7 +510,10 @@ class Glm5Indexer(nn.Module):
         k = self.k_norm(k)
 
         if positions is not None and self.rotary_emb is not None:
-            k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
+            k = self._fused_rope_hadamard_or_fallback(
+                k, positions, max_seqlen=max_seqlen,
+                apply_hadamard=apply_hadamard,
+            )
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
@@ -808,6 +822,9 @@ class Glm5Indexer(nn.Module):
             cuda_wq_b_proj,
             rope_hadamard_q,
         )
+        from batchgen_kernels.attention.dsa.indexer_k_quant import (
+            cache_applies_hadamard,
+        )
         from batchgen_kernels.attention.dsa.paged_mqa_scorer import (
             paged_mqa_score_and_topk,
         )
@@ -824,7 +841,15 @@ class Glm5Indexer(nn.Module):
         q = cuda_wq_b_proj(
             q_a.squeeze(1), self._fused_score_weights, self._fused_score_module
         ).view(batch_size, self.index_n_heads, self.index_head_dim)
-        q = rope_hadamard_q(q, cos, sin, positions, self.rope_head_dim)
+        # Read the rotation off the cache this q is about to be scored
+        # against, so eager and the captured graph cannot land in different
+        # spaces. False here: a page-split FP8 cache is the no-rotation route.
+        q = rope_hadamard_q(
+            q, cos, sin, positions, self.rope_head_dim,
+            apply_hadamard=cache_applies_hadamard(
+                indexer_blocked_k, self.index_head_dim
+            ),
+        )
         head_gates = compute_head_gates(
             hidden_states.squeeze(1),
             self.weights_proj.weight.data,

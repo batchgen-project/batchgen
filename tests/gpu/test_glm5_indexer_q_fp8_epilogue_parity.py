@@ -13,7 +13,15 @@ two launches that used to follow. So the parity claim is self-contained: no
 checkout of the pre-fold commit is needed to prove it, and that also means this
 file keeps proving it after the old code is gone.
 
-Three things are checked:
+The file also carries the rotation-arm parity for the same kernel. GLM-5.2's
+page-split FP8 route follows upstream V3.2 and drops the Hadamard incoherence
+rotation on BOTH q and k (``indexer_applies_hadamard``), which is the
+``apply_hadamard=False`` instantiation; the bf16 AoS indexer profiles keep the
+rotation. Both arms are proven here against an INDEPENDENT fp32 reference --
+interleaved RoPE over the leading 64 dims, then the normalized Sylvester
+Hadamard or nothing -- so neither arm can quietly become the other.
+
+Three things are checked for the fp8 fold:
 
 1. the bf16 output is unchanged when the fp8 epilogue is switched on -- the
    fold must not perturb the path it rides along with;
@@ -76,7 +84,7 @@ def _random_rope_tables(max_pos: int, device: torch.device, seed: int = 0):
     return angles.cos().to(device), angles.sin().to(device)
 
 
-def _run(x, cos, sin, positions, *, with_fp8):
+def _run(x, cos, sin, positions, *, with_fp8, apply_hadamard=True):
     """Return (bf16 out, fp8 out or None) for one kernel launch."""
     fused_rope_hadamard_out, _ = _kernels()
     out = torch.empty_like(x)
@@ -86,9 +94,47 @@ def _run(x, cos, sin, positions, *, with_fp8):
         else None
     )
     fused_rope_hadamard_out(
-        x, cos, sin, positions, out, _HADAMARD_SCALE, out_fp8=out_fp8
+        x, cos, sin, positions, out, _HADAMARD_SCALE, out_fp8=out_fp8,
+        apply_hadamard=apply_hadamard,
     )
     return out, out_fp8
+
+
+def _sylvester_hadamard_128(device: torch.device) -> torch.Tensor:
+    """``H[e, f] = (-1) ** popcount(e & f)``, built here and not imported, so
+    the reference stays independent of the kernel's own helpers."""
+    idx = torch.arange(128, dtype=torch.int64, device=device)
+    bits = idx[:, None] & idx[None, :]
+    parity = torch.zeros_like(bits)
+    for shift in range(7):
+        parity = parity ^ ((bits >> shift) & 1)
+    return torch.where(
+        parity.bool(),
+        torch.full_like(parity, -1, dtype=torch.float32),
+        torch.ones_like(parity, dtype=torch.float32),
+    )
+
+
+def _reference_rope_then_maybe_rotate(x, cos, sin, positions, *, apply_hadamard):
+    """Independent fp32 chain: interleaved RoPE on dims 0..63, then H/sqrt(128).
+
+    Returns bf16, the dtype the kernel stores. The 1/sqrt(128) factor is part
+    of the normalized Hadamard, so the no-rotation arm applies no scale at all.
+    """
+    rows = x.reshape(-1, _HEAD_DIM).float()
+    pos = positions.reshape(-1).long()
+    cos_rows = cos.index_select(0, pos)[:, : _HEAD_DIM // 4].float()
+    sin_rows = sin.index_select(0, pos)[:, : _HEAD_DIM // 4].float()
+
+    out = rows.clone()
+    even = rows[:, :64:2]
+    odd = rows[:, 1:64:2]
+    out[:, :64:2] = even * cos_rows - odd * sin_rows
+    out[:, 1:64:2] = odd * cos_rows + even * sin_rows
+
+    if apply_hadamard:
+        out = (out @ _sylvester_hadamard_128(x.device)) * _HADAMARD_SCALE
+    return out.to(torch.bfloat16).reshape(x.shape)
 
 
 def _aten_reference_bytes(out_bf16):
@@ -262,6 +308,109 @@ def test_inf_is_clamped_not_turned_into_nan():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# The rotation arms: upstream V3.2 drops the Hadamard on both q and k
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("apply_hadamard", (False, True))
+@pytest.mark.parametrize("bucket", _BUCKETS)
+def test_each_rotation_arm_matches_the_independent_reference(bucket, apply_hadamard):
+    """``apply_hadamard=False`` is the GLM-5.2 production arm; True is the bf16
+    AoS indexer's. Both instantiations must compute what they claim."""
+    device = torch.device("cuda")
+    rows = bucket * _NUM_INDEX_HEADS
+    gen = torch.Generator(device="cpu").manual_seed(4242 + bucket)
+    x = (
+        torch.randn(rows, _HEAD_DIM, generator=gen, dtype=torch.float32)
+        / math.sqrt(_HEAD_DIM)
+    ).to(device=device, dtype=torch.bfloat16)
+    cos, sin = _random_rope_tables(1024, device, seed=7 + bucket)
+    positions = torch.randint(
+        0, 1024, (rows,), generator=gen, dtype=torch.int64
+    ).to(device)
+
+    out, _ = _run(x, cos, sin, positions, with_fp8=False,
+                  apply_hadamard=apply_hadamard)
+    want = _reference_rope_then_maybe_rotate(
+        x, cos, sin, positions, apply_hadamard=apply_hadamard
+    )
+    # bf16 has 8 mantissa bits; the kernel sums the 7 butterfly stages in a
+    # different fp32 order than the matmul, so this is a value check, not bytes.
+    torch.testing.assert_close(
+        out.float(), want.float(), atol=4e-2, rtol=4e-2
+    )
+
+
+@pytest.mark.parametrize("bucket", _BUCKETS)
+def test_the_two_rotation_arms_are_actually_different(bucket):
+    """Guards against the switch degenerating into a no-op: a build where both
+    arms agree would pass every other test here and still be wrong."""
+    device = torch.device("cuda")
+    rows = bucket * _NUM_INDEX_HEADS
+    gen = torch.Generator(device="cpu").manual_seed(99 + bucket)
+    x = (
+        torch.randn(rows, _HEAD_DIM, generator=gen, dtype=torch.float32)
+        / math.sqrt(_HEAD_DIM)
+    ).to(device=device, dtype=torch.bfloat16)
+    cos, sin = _random_rope_tables(1024, device, seed=5)
+    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+
+    rotated, _ = _run(x, cos, sin, positions, with_fp8=False, apply_hadamard=True)
+    plain, _ = _run(x, cos, sin, positions, with_fp8=False, apply_hadamard=False)
+    assert not torch.allclose(rotated.float(), plain.float(), atol=1e-3), (
+        "the rotation-off instantiation returns the rotated values"
+    )
+
+
+@pytest.mark.parametrize("bucket", _BUCKETS)
+def test_the_fp8_epilogue_still_matches_the_aten_pair_without_rotation(bucket):
+    """The fold and the rotation switch are independent: the e4m3 bytes of the
+    no-rotation arm must still be the clamp+copy_ bytes of its own bf16 out."""
+    device = torch.device("cuda")
+    rows = bucket * _NUM_INDEX_HEADS
+    gen = torch.Generator(device="cpu").manual_seed(777 + bucket)
+    x = (
+        torch.randn(rows, _HEAD_DIM, generator=gen, dtype=torch.float32)
+        / math.sqrt(_HEAD_DIM)
+    ).to(device=device, dtype=torch.bfloat16)
+    cos, sin = _random_rope_tables(1024, device, seed=11)
+    positions = torch.randint(
+        0, 1024, (rows,), generator=gen, dtype=torch.int64
+    ).to(device)
+
+    out, out_fp8 = _run(
+        x, cos, sin, positions, with_fp8=True, apply_hadamard=False
+    )
+    _assert_fp8_matches_aten(out, out_fp8, f"no-rotation bucket {bucket}")
+
+
+def test_the_q_wrapper_passes_the_rotation_through():
+    """``rope_hadamard_q_out`` is what the captured segments call."""
+    from batchgen_kernels.attention.dsa.fused_indexer_score import (
+        rope_hadamard_q_out,
+    )
+
+    device = torch.device("cuda")
+    batch = 8
+    gen = torch.Generator(device="cpu").manual_seed(2024)
+    q = torch.randn(
+        batch, _NUM_INDEX_HEADS, _HEAD_DIM, generator=gen, dtype=torch.bfloat16
+    ).to(device)
+    cos, sin = _random_rope_tables(1024, device, seed=3)
+    positions = torch.randint(
+        0, 1024, (batch * _NUM_INDEX_HEADS,), generator=gen, dtype=torch.int64
+    ).to(device)
+
+    plain = torch.empty_like(q)
+    rope_hadamard_q_out(q, cos, sin, positions, plain, apply_hadamard=False)
+    want = _reference_rope_then_maybe_rotate(
+        q, cos, sin, positions, apply_hadamard=False
+    )
+    torch.testing.assert_close(
+        plain.float(), want.float(), atol=4e-2, rtol=4e-2
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # The buffer contract
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -427,8 +576,25 @@ def test_scorer_logits_and_topk_are_identical_either_way(bucket, length):
     assert torch.equal(
         q_fp8_self.view(torch.uint8), q_fp8_folded.view(torch.uint8)
     ), "the two q quantizations differ, so the scorer comparison is moot"
-    assert torch.equal(picked_self, picked_folded), (
-        f"bucket {bucket} L={length}: top-k selection moved -- "
-        f"{int((picked_self != picked_folded).sum())} of {picked_self.numel()} "
-        "indices differ"
+    # The production top-k's OUTPUT ORDER is nondeterministic (sub-project
+    # glm52-dsa-topk-order-nondeterminism): running ONE route twice, with
+    # byte-identical q_fp8, already disagrees positionally on ~92% of entries
+    # at L=4096 (measured: same-route 15194/16384, cross-route 15024/16384 --
+    # cross-route is no worse than same-route), while the sorted rows are equal
+    # in every case. So compare the SELECTED SET, which is the claim this test
+    # is actually making ("the selected page ids must not move"); a positional
+    # torch.equal here pins the kernel's tie-break order, not the fold.
+    assert torch.equal(
+        picked_self.sort(dim=-1).values, picked_folded.sort(dim=-1).values
+    ), (
+        f"bucket {bucket} L={length}: the selected SET moved -- "
+        f"{int((picked_self.sort(dim=-1).values != picked_folded.sort(dim=-1).values).sum())}"
+        f" of {picked_self.numel()} sorted entries differ"
     )
+    # Every selected id must be a real in-range page slot, so a set comparison
+    # cannot pass on two equally-corrupt selections.
+    for name, picked in (("self", picked_self), ("folded", picked_folded)):
+        assert int(picked.min()) >= 0, f"{name}: unfilled top-k slot"
+        assert int(picked.max()) < length, (
+            f"{name}: selected index {int(picked.max())} is outside L={length}"
+        )

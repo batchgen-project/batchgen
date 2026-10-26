@@ -793,7 +793,9 @@ def test_glm5_dsa_graph_segment_inputs_expose_rotated_q_rope(monkeypatch):
         def k_norm(self, x):
             return x
 
-        def _fused_rope_hadamard_or_fallback(self, x, positions, *, max_seqlen):
+        def _fused_rope_hadamard_or_fallback(
+            self, x, positions, *, max_seqlen, apply_hadamard=True
+        ):
             return x
 
     class FakeAttn:
@@ -819,6 +821,21 @@ def test_glm5_dsa_graph_segment_inputs_expose_rotated_q_rope(monkeypatch):
     class FakeManager:
         device = torch.device("cpu")
         _gpu_page_table_manager = FakePageTableManager()
+        # ``aux_manager_applies_hadamard`` resolves the indexer rotation from
+        # the two config facts that allocated the aux cache -- it builds a
+        # zero-element meta probe of this element type and carrier and asks the
+        # page-split discriminator. This segment's synthetic indexer head dim
+        # is 4, so a 1-byte page-split carrier is 4 K bytes + 4 scale bytes =
+        # 8, and the route resolves to rotation OFF.
+        config = type(
+            "Config",
+            (),
+            {
+                "page_size_tokens": 4,
+                "k_head_dim": 8,
+                "kv_dtype": torch.float8_e4m3fn,
+            },
+        )()
 
         def update_layer_decode_new_token(self, *args, **kwargs):
             raise AssertionError("write_kv=False should not update caches")
@@ -2421,6 +2438,20 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         def run_row_validity_prologue(self, bucket_size, **kwargs):
             self.prologue_calls.append((bucket_size, kwargs))
 
+        # The paged-MQA step-prologue hoist (same driver contract as the
+        # row-validity hoist above): a fake layer never scores, so its key is
+        # ``None`` and the driver skips it -- but the attributes must exist,
+        # because the driver fails closed on segments that lack them.
+        selects_top_k = True
+
+        def paged_mqa_prep_key(self, bucket_size):
+            return None
+
+        def run_paged_mqa_prep(self, bucket_size, **kwargs):
+            raise AssertionError(
+                "run_paged_mqa_prep must not be called for a None key"
+            )
+
         def forward(
             self,
             *,
@@ -2532,6 +2563,7 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
         "aux_slot_indices",
         "cache_seqlens",
         "num_valid_tokens",
+        "position_ids",
         "primary_slot_indices",
     ]
     assert outputs["logits"][0, :hidden_size].tolist() == [4.0, 4.0, 4.0, 4.0]
@@ -2576,11 +2608,17 @@ def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
     wrapper.prepack_num_sequences = 1
     wrapper.weight_dequant_scale = None
 
+    seen = {}
+
     class FakeIndexer:
-        def compute_indexer_kv(self, hidden_states, *, positions, max_seqlen=None):
+        def compute_indexer_kv(
+            self, hidden_states, *, positions, max_seqlen=None,
+            apply_hadamard=True,
+        ):
             assert hidden_states.shape == (1, 3, 4)
             assert positions.tolist() == [[0, 1, 2]]
             assert max_seqlen is None
+            seen["apply_hadamard"] = apply_hadamard
             return torch.zeros(1, 3, 1, 128)
 
     class FakeModule:
@@ -2599,12 +2637,20 @@ def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
             return torch.zeros_like(hidden_states_2d), torch.zeros(3, 1, 576)
 
     wrapper.module = FakeModule()
+    # Prefill resolves the indexer Hadamard off the aux host view's page
+    # format; a bf16 AoS indexer profile keeps the rotation.
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "host_paged_kv_worker_view_aux",
+        types.SimpleNamespace(is_page_split=False),
+    )
     monkeypatch.setattr(GLM5AttnWrapper, "_offload_prepacked_indexer_kv", lambda self, kv: None)
     monkeypatch.setattr(GLM5AttnWrapper, "_offload_prepacked_kv", lambda self, kv: None)
 
     attn_output, _, _ = wrapper._forward_prefill(torch.ones(1, 3, 4))
 
     assert attn_output.shape == (1, 3, 4)
+    assert seen["apply_hadamard"] is True
 
 
 def test_glm5_prefill_requires_indexer_and_prepack_mode():

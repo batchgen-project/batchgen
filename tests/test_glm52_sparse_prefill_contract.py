@@ -86,13 +86,14 @@ def test_rope_hadamard_q_uses_corrected_kernel_and_repeats_positions(monkeypatch
     calls = {}
     module = types.ModuleType("batchgen.other_kernels.hadamard_transform")
 
-    def fused_rope_hadamard(x, cos, sin, positions, scale):
+    def fused_rope_hadamard(x, cos, sin, positions, scale, apply_hadamard=True):
         calls.update(
             x=x,
             cos=cos,
             sin=sin,
             positions=positions,
             scale=scale,
+            apply_hadamard=apply_hadamard,
         )
         return x
 
@@ -119,19 +120,26 @@ def test_rope_hadamard_q_uses_corrected_kernel_and_repeats_positions(monkeypatch
     assert calls["sin"].dtype == torch.float32
     assert calls["positions"].tolist() == [3] * 32 + [9] * 32
     assert calls["scale"] == 128**-0.5
+    # The AoS indexer profiles keep the rotation, so the default is True.
+    assert calls["apply_hadamard"] is True
+
+    # GLM-5.2's page-split FP8 route drops it; the flag reaches the kernel.
+    _fused_rope_hadamard_q(q, cos, sin, positions, apply_hadamard=False)
+    assert calls["apply_hadamard"] is False
 
 
 def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
     calls = {}
     module = types.ModuleType("batchgen.other_kernels.hadamard_transform")
 
-    def fused_rope_hadamard(x, cos, sin, positions, scale):
+    def fused_rope_hadamard(x, cos, sin, positions, scale, apply_hadamard=True):
         calls.update(
             x=x,
             cos=cos,
             sin=sin,
             positions=positions,
             scale=scale,
+            apply_hadamard=apply_hadamard,
         )
         return x
 
@@ -160,14 +168,18 @@ def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
     )
     positions = torch.tensor([[0, 1, 2]], dtype=torch.int64)
 
-    output = _compute_indexer_kv_from_quantized_hidden(
-        indexer=indexer,
-        hidden_fp8=torch.empty(3, 4),
-        hidden_scale=torch.empty(3, 1),
-        position_ids=positions,
-        max_seqlen=16,
-        timed=lambda _name: nullcontext(),
-    )
+    def _run(apply_hadamard):
+        return _compute_indexer_kv_from_quantized_hidden(
+            indexer=indexer,
+            hidden_fp8=torch.empty(3, 4),
+            hidden_scale=torch.empty(3, 1),
+            position_ids=positions,
+            max_seqlen=16,
+            apply_hadamard=apply_hadamard,
+            timed=lambda _name: nullcontext(),
+        )
+
+    output = _run(True)
 
     assert output.shape == (1, 3, 1, 128)
     assert calls["x"].shape == (3, 128)
@@ -176,6 +188,12 @@ def test_compute_indexer_kv_uses_corrected_kernel_contract(monkeypatch):
     assert calls["sin"].dtype == torch.float32
     assert calls["positions"].tolist() == [0, 1, 2]
     assert calls["scale"] == 128**-0.5
+    assert calls["apply_hadamard"] is True
+
+    # GLM-5.2's page-split FP8 indexer: the rotation comes off the K chain
+    # too, and this is the caller-supplied predicate reaching the kernel.
+    _run(False)
+    assert calls["apply_hadamard"] is False
 
 
 def test_indexer_score_weights_match_deepgemm_contract(monkeypatch):
@@ -219,7 +237,10 @@ def test_indexer_score_weights_match_deepgemm_contract(monkeypatch):
     monkeypatch.setattr(
         sparse_prefill,
         "_fused_rope_hadamard_q",
-        lambda q, _cos, _sin, _positions: q,
+        # The scorer now forwards the rotation predicate to the Q kernel, so
+        # the stub has to accept it (it is passed by keyword). A stub that
+        # swallowed it silently would hide a dropped predicate.
+        lambda q, _cos, _sin, _positions, apply_hadamard=True: q,
     )
     monkeypatch.setattr(
         sparse_prefill.torch,
@@ -277,6 +298,9 @@ def test_indexer_score_weights_match_deepgemm_contract(monkeypatch):
         causal_starts=torch.tensor([0, 0], dtype=torch.int32),
         causal_ends=torch.tensor([1, 2], dtype=torch.int32),
         max_seqlen=2,
+        # GLM-5.2's page-split FP8 indexer route: rotation OFF (upstream V3.2).
+        # The scorer takes the predicate explicitly so it can never default.
+        apply_hadamard=False,
     )
 
     expected_gates = hidden_states @ gate_weight.t()
@@ -473,6 +497,18 @@ def test_glm52_prefill_reuses_one_topk_buffer_across_shared_layers(monkeypatch):
         AttnWrapperBase,
         "retire_pending_prefill_offloads_before_layer",
         lambda *_args, **_kwargs: None,
+    )
+    # Prefill resolves the indexer rotation from the aux indexer host-KV view
+    # (``_indexer_applies_hadamard``), and refuses by name when that view is
+    # missing rather than defaulting -- a default would risk writing the
+    # index-K cache with a rotation decode does not read back. The worker
+    # binds this in production (batchgen_worker.py), so the fixture must too;
+    # ``is_page_split=True`` is GLM-5.2's FP8 indexer, i.e. rotation OFF.
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "host_paged_kv_worker_view_aux",
+        types.SimpleNamespace(is_page_split=True),
+        raising=False,
     )
     monkeypatch.setattr(
         GLM5AttnWrapper,
@@ -826,6 +862,10 @@ def test_sparse_absorbed_layer_matches_dense_attention(monkeypatch):
         max_seqlen=tokens,
         weight_scale=scales,
         indexer=None,
+        # Prefill must write the index-K cache with DECODE's rotation; for
+        # GLM-5.2's page-split FP8 indexer that is OFF (upstream V3.2). The
+        # parameter is required so no call site can silently default.
+        indexer_applies_hadamard=False,
         carried_topk_indices=indices,
         reusable_topk_indices=None,
         causal_starts=None,

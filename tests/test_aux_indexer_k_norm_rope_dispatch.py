@@ -141,7 +141,12 @@ def test_an_aos_cache_is_refused_by_name(monkeypatch):
 def test_a_mis_sized_page_split_cache_is_refused_by_name(monkeypatch):
     _install_stub(monkeypatch, {})
     wrong = torch.zeros(4, PAGE_SIZE, 1, DATA_DIM, dtype=torch.float8_e4m3fn)
-    with pytest.raises(ValueError, match="needs a page-split FP8 aux indexer"):
+    # The refusal is ``cache_is_page_split``'s, which predates this stack
+    # (bc125a95) and names the required carrier and the trailing dim it got.
+    with pytest.raises(
+        ValueError,
+        match=r"1-byte indexer cache must be page-split.*got a trailing dim of 128",
+    ):
         aux_indexer_k_writer.write_aux_indexer_k_norm_rope(**_kwargs(wrong))
 
 

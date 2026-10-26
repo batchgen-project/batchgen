@@ -25,6 +25,7 @@ _K_PATH_CALLS = (
     "indexer.k_norm",
     "indexer._fused_rope_hadamard_or_fallback",
     "write_aux_indexer_k",
+    "write_aux_indexer_k_norm_rope",
     "outputs.indexer_k_tensor.copy_",
     "head_gates_out",
 )
@@ -96,8 +97,11 @@ def test_every_k_path_kernel_is_issued_inside_the_fork_and_nowhere_else():
         inside, total = len(_calls(fork, name)), len(_calls(fwd, name))
         assert inside >= 1, f"{name} is not on the side stream"
         assert inside == total, f"{name} is also issued outside the fork"
-    # Both aux-cache formats write through the one writer, on the side stream.
-    assert len(_calls(fork, "write_aux_indexer_k")) == 2
+    # One writer per aux-cache format, both on the side stream: a page-split
+    # FP8 cache takes the fused norm+rope+quantize+write launch, a bf16 AoS
+    # cache the LayerNorm/RoPE pair plus the plain paged update.
+    assert len(_calls(fork, "write_aux_indexer_k_norm_rope")) == 1
+    assert len(_calls(fork, "write_aux_indexer_k")) == 1
 
 
 def test_no_main_path_kernel_is_pulled_onto_the_side_stream():
