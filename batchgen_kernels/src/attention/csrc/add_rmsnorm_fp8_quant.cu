@@ -361,7 +361,7 @@ __global__ void add_rmsnorm_bf16_6144_fp8_quant_kernel(
     }
     amax = quant_block_amax(amax);
     amax = fmaxf(amax, kFp8MinNormal);
-    // SGLang formula: scale = amax * (1 / 448).
+    // e4m3 block-scale convention: scale = amax * (1 / 448).
     const float scale = fmaxf(__fmul_rn(amax, kFp8SafeMaxInv), kEpsilon);
 
     Fp8x8 quantized;
