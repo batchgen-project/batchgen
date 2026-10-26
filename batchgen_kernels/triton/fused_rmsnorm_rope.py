@@ -817,6 +817,29 @@ def fused_rmsnorm_rope_with_q_native_kernel(
     q_in_row_stride=0,
     q_in_head_stride=0,
     HAS_SPLIT_Q: tl.constexpr = False,
+    # APPENDED AFTER `HAS_SPLIT_Q`, same positional-contract rule as above.
+    # These eight are the OPTIONAL PAGED-CACHE STORE: with `HAS_CACHE_STORE`
+    # set, lane 0 ALSO stores the processed KV row (normed kv-lora slice and
+    # rotated k_pe) into the paged KV cache at the page-table destination,
+    # which replaces the separate `_paged_cache_update_with_page_table_kernel`
+    # launch that used to read this row back from `processed_kv_ptr`. The
+    # store is gated on `slot_indices_ptr[row] >= 0`; callers hand in the
+    # ALREADY-GATED slot tensor (`kv_primary_slot_indices` is
+    # `where(valid_mask, slot, -1)`, so the -1 sentinel subsumes both the
+    # num_valid_tokens cutoff and the row mask). The row-mask gate is applied
+    # AS WELL when HAS_ROW_MASK is set, so a masked row never writes the
+    # cache even if a caller hands an ungated slot tensor. With the default
+    # the branches below are statically dead and no address is formed from
+    # any of these arguments.
+    cache_ptr=0,
+    page_table_ptr=0,
+    slot_indices_ptr=0,
+    token_indices_ptr=0,
+    cache_page_stride=0,
+    cache_token_stride=0,
+    cache_page_size=0,
+    page_table_cols=0,
+    HAS_CACHE_STORE: tl.constexpr = False,
 ):
     """Fused RMSNorm + RoPE kernel with NATIVE INTERLEAVED output layout.
 
@@ -886,6 +909,31 @@ def fused_rmsnorm_rope_with_q_native_kernel(
         input_offset = batch_idx * input_batch_stride
         output_offset = batch_idx * total_dim
 
+        # Paged-cache destination, hoisted once per row. `do_cache` folds the
+        # slot sentinel (callers hand the already-gated slot tensor) and the
+        # row mask; the page-table load itself is masked on it so a sentinel
+        # row never forms a page address.
+        do_cache = False
+        cache_dest_base = cache_ptr
+        if HAS_CACHE_STORE:
+            cslot = tl.load(slot_indices_ptr + batch_idx)
+            do_cache = cslot >= 0
+            if HAS_ROW_MASK:
+                do_cache = do_cache & row_valid
+            ctok = tl.load(token_indices_ptr + batch_idx)
+            cpage_slot = ctok // cache_page_size
+            cpage_off = ctok - cpage_slot * cache_page_size
+            cpage = tl.load(
+                page_table_ptr + cslot * page_table_cols + cpage_slot,
+                mask=do_cache,
+                other=0,
+            )
+            cache_dest_base = (
+                cache_ptr
+                + cpage * cache_page_stride
+                + cpage_off * cache_token_stride
+            )
+
         sum_sq_fp32 = 0.0
         for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -923,6 +971,15 @@ def fused_rmsnorm_rope_with_q_native_kernel(
                 normalized_out,
                 mask=mask,
             )
+            if HAS_CACHE_STORE:
+                if do_cache:
+                    # Same registers, second destination: replaces the separate
+                    # cache-update kernel's read-back of this row.
+                    tl.store(
+                        cache_dest_base + offsets,
+                        normalized_out,
+                        mask=mask,
+                    )
 
         input_rope_offset = input_offset + kv_lora_rank
         processed_rope_offset = output_offset + kv_lora_rank
@@ -957,6 +1014,18 @@ def fused_rmsnorm_rope_with_q_native_kernel(
             kv_rot_odd,
             mask=pair_mask,
         )
+        if HAS_CACHE_STORE:
+            if do_cache:
+                tl.store(
+                    cache_dest_base + kv_lora_rank + even_indices,
+                    kv_rot_even,
+                    mask=pair_mask,
+                )
+                tl.store(
+                    cache_dest_base + kv_lora_rank + odd_indices,
+                    kv_rot_odd,
+                    mask=pair_mask,
+                )
     else:
         # ============ RoPE on one tile of q heads ============
         head_offsets = (lane_idx - 1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -1018,6 +1087,11 @@ def fused_rmsnorm_rope_with_q_native(
     out: torch.Tensor | None = None,
     row_valid_mask: torch.Tensor | None = None,
     q_pe_src: torch.Tensor | None = None,
+    cache_tensor: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    slot_indices: torch.Tensor | None = None,
+    token_indices: torch.Tensor | None = None,
+    page_size_tokens: int | None = None,
 ) -> torch.Tensor:
     """Native-interleaved variant of ``fused_rmsnorm_rope_with_q``.
 
@@ -1049,6 +1123,17 @@ def fused_rmsnorm_rope_with_q_native(
     arithmetic and the stored bytes are identical in both forms -- only the
     load addresses differ -- and every element of ``q_pe`` is written either
     way, so the destination never keeps residue from an earlier call.
+
+    ``cache_tensor``/``page_table``/``slot_indices``/``token_indices``/
+    ``page_size_tokens`` are the OPTIONAL PAGED-CACHE STORE: all five together
+    or none. With them, lane 0 also stores the processed KV row into the paged
+    cache at the page-table destination, replacing the separate
+    ``_paged_cache_update_with_page_table_kernel`` launch that read this row
+    back from ``processed_kv``. The store is gated on
+    ``slot_indices[row] >= 0`` (callers hand the already-gated slot tensor,
+    whose -1 sentinel subsumes the ``num_valid_tokens`` cutoff) AND on
+    ``row_valid_mask`` when one is given. Bytes written are identical to the
+    separate kernel's.
     """
     bsz, q_len, total_dim = new_compressed_kv.shape
     assert q_len == 1, "This kernel assumes q_len = 1 for decoding"
@@ -1129,6 +1214,56 @@ def fused_rmsnorm_rope_with_q_native(
                 "fused_rmsnorm_rope_with_q_native: row_valid_mask must be contiguous"
             )
 
+    cache_args = (cache_tensor, page_table, slot_indices, token_indices,
+                  page_size_tokens)
+    has_cache = cache_tensor is not None
+    if any(a is not None for a in cache_args) and not all(
+        a is not None for a in cache_args
+    ):
+        raise ValueError(
+            "fused_rmsnorm_rope_with_q_native: the paged-cache store takes "
+            "cache_tensor, page_table, slot_indices, token_indices and "
+            "page_size_tokens together, or none of them"
+        )
+    if has_cache:
+        if cache_tensor.dtype != new_compressed_kv.dtype:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: cache_tensor dtype "
+                f"{cache_tensor.dtype} != input dtype {new_compressed_kv.dtype}"
+            )
+        if cache_tensor.ndim < 2:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: cache_tensor must have at "
+                "least two dimensions (pages, tokens, ...)"
+            )
+        if page_table.dtype != torch.int32 or page_table.ndim != 2:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: page_table must be a 2-D "
+                "int32 tensor"
+            )
+        for name, t in (("slot_indices", slot_indices),
+                        ("token_indices", token_indices)):
+            if t.dtype != torch.int32:
+                raise ValueError(
+                    f"fused_rmsnorm_rope_with_q_native: {name} must be int32"
+                )
+            if t.numel() < bsz:
+                raise ValueError(
+                    f"fused_rmsnorm_rope_with_q_native: {name} must cover "
+                    f"{bsz} rows, got {t.numel()}"
+                )
+        if int(page_size_tokens) <= 0:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: page_size_tokens must be "
+                "positive"
+            )
+        if cache_tensor.stride(1) < total_dim:
+            raise ValueError(
+                "fused_rmsnorm_rope_with_q_native: cache token stride "
+                f"{cache_tensor.stride(1)} cannot hold a {total_dim}-element "
+                "row"
+            )
+
     block_h, block_pairs, num_head_tiles = select_q_rope_tiling(
         bsz,
         num_heads,
@@ -1160,6 +1295,16 @@ def fused_rmsnorm_rope_with_q_native(
         else {}
     )
 
+    # Single pass over the kv-lora slice whenever it fits one block (512 for
+    # GLM-5): the lane-0 program then does ONE masked load per phase instead
+    # of a kv_lora_rank/BLOCK_SIZE-iteration serial loop. The fp32
+    # sum-of-squares reduction tree changes with the block width, so inv_rms
+    # may differ from the old 64-wide launch in its last fp32 bits; the bf16
+    # STORED output is unchanged for the shapes in production (verified
+    # exactly 0 diff at kv_lora_rank=512), and this launch makes no
+    # bit-compatibility promise across BLOCK_SIZE values.
+    norm_block = min(512, triton.next_power_of_2(kv_lora_rank))
+
     fused_rmsnorm_rope_with_q_native_kernel[grid](
         new_compressed_kv,
         processed_kv,
@@ -1174,13 +1319,26 @@ def fused_rmsnorm_rope_with_q_native(
         kv_lora_rank,
         qk_rope_head_dim,
         eps,
-        BLOCK_SIZE=64,
+        BLOCK_SIZE=norm_block,
         BLOCK_H=block_h,
         BLOCK_PAIRS=block_pairs,
         **mask_kwargs,
         **split_kwargs,
-        # Matches the previous launch's default so the kv-lora sum of squares
-        # keeps the same reduction tree, and with it the exact inv_rms bits.
+        **(
+            {
+                "cache_ptr": cache_tensor,
+                "page_table_ptr": page_table,
+                "slot_indices_ptr": slot_indices,
+                "token_indices_ptr": token_indices,
+                "cache_page_stride": cache_tensor.stride(0),
+                "cache_token_stride": cache_tensor.stride(1),
+                "cache_page_size": int(page_size_tokens),
+                "page_table_cols": page_table.shape[1],
+                "HAS_CACHE_STORE": True,
+            }
+            if has_cache
+            else {}
+        ),
         num_warps=4,
     )
 

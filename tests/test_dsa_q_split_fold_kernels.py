@@ -76,6 +76,21 @@ _SPLIT_ROPE_PARAMS = [
     "q_in_head_stride",
     "HAS_SPLIT_Q",
 ]
+# Slice 1b-iii appended the paged-cache store group AFTER the split-q group,
+# following the same positional-contract rule these tests pin. The exhaustive
+# equality below stays exhaustive on purpose: any future parameter must be
+# appended here too, never inserted.
+_CACHE_STORE_PARAMS = [
+    "cache_ptr",
+    "page_table_ptr",
+    "slot_indices_ptr",
+    "token_indices_ptr",
+    "cache_page_stride",
+    "cache_token_stride",
+    "cache_page_size",
+    "page_table_cols",
+    "HAS_CACHE_STORE",
+]
 
 
 def test_split_source_params_are_appended_after_every_existing_parameter():
@@ -86,7 +101,13 @@ def test_split_source_params_are_appended_after_every_existing_parameter():
         "parameters carry defaults, it fails silently with a wrong value in "
         "the shifted slot instead of raising"
     )
-    assert params == _PRE_EXISTING_ROPE_PARAMS + _SPLIT_ROPE_PARAMS
+    assert (
+        params[: len(_PRE_EXISTING_ROPE_PARAMS) + len(_SPLIT_ROPE_PARAMS)]
+        == _PRE_EXISTING_ROPE_PARAMS + _SPLIT_ROPE_PARAMS
+    ), "a parameter was inserted ahead of the split-q group"
+    assert params == (
+        _PRE_EXISTING_ROPE_PARAMS + _SPLIT_ROPE_PARAMS + _CACHE_STORE_PARAMS
+    )
 
 
 def test_split_source_kernel_params_default_to_the_in_place_form():
@@ -109,10 +130,27 @@ def test_wrapper_q_pe_src_is_appended_and_optional():
         ).parameters.items()
     )
     names = [name for name, _ in params]
-    assert names[-1] == "q_pe_src", (
-        "q_pe_src must be last so a caller that predates it binds unchanged"
+    # q_pe_src used to be last; slice 1b-iii appended the five-argument
+    # paged-cache group AFTER it. The invariant this pins is unchanged in
+    # spirit: nothing may be inserted ahead of q_pe_src, and everything after
+    # it is the cache group in fixed order, all defaulted, so a caller that
+    # predates any of this binds exactly as before.
+    cache_group = [
+        "cache_tensor",
+        "page_table",
+        "slot_indices",
+        "token_indices",
+        "page_size_tokens",
+    ]
+    q_idx = names.index("q_pe_src")
+    assert names[q_idx + 1 :] == cache_group, (
+        "only the fixed-order paged-cache group may follow q_pe_src"
     )
-    assert params[-1][1].default is None
+    assert dict(params)["q_pe_src"].default is None
+    for name in cache_group:
+        assert dict(params)[name].default is None, (
+            f"{name} must default to None so pre-1b-iii callers bind unchanged"
+        )
     assert names[:9] == [
         "new_compressed_kv",
         "q_pe",

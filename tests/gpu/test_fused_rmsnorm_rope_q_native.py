@@ -17,9 +17,21 @@ grid.  That is a pure repartitioning: every output element is still produced
 by one program, from the same inputs, with the same expression in the same
 dtypes, so the requirement here is **bitwise** equality with the pre-change
 kernel -- not a tolerance.  ``_reference_native`` below is a frozen,
-verbatim copy of the pre-change kernel and its launch (``grid = (bsz,)``,
-``BLOCK_SIZE=64``, default ``num_warps``), kept in the test so the oracle
-cannot drift with the production file.
+verbatim copy of the pre-change kernel (``grid = (bsz,)``, default
+``num_warps``), kept in the test so the oracle cannot drift with the
+production file.
+
+The production launch later widened the kv-lora reduction from the original
+``BLOCK_SIZE=64`` serial loop to a single pass (``min(512,
+next_pow2(kv_lora_rank))``).  The ORACLE KERNEL CODE is unchanged by that:
+its value is pinning the arithmetic, so ``_reference_native`` now launches
+the frozen code at the SAME block width as production (``_mirror_block``),
+which keeps every bitwise assertion meaningful -- identical arithmetic at
+identical width must agree exactly.  The one place the old 64-wide launch is
+still compared directly is ``test_glm52_shape_new_width_matches_old_64wide``,
+which pins the measured property that at GLM-5.2 geometry the bf16 STORED
+output is unchanged by the width change (fp32 inv_rms reassociation is
+absorbed by bf16 rounding there).
 
 What this file pins:
 
@@ -39,11 +51,10 @@ What this file pins:
   F  CUDA-graph capture/replay reproduces the eager result bitwise.
 
 Why bitwise and not a ULP band: the RoPE arithmetic is element-wise, and the
-RMSNorm reduction keeps the pre-change shape exactly (same ``BLOCK_SIZE=64``
-blocked ``tl.sum`` accumulated in the same order, same ``num_warps``), so
-``inv_rms`` is computed by the same instruction sequence.  A mismatch here is
-a real finding, not reassociation noise, and should be reported rather than
-absorbed into a tolerance.
+RMSNorm reduction is compared at the SAME block width on both sides (oracle
+launch mirrors the production width), so ``inv_rms`` is computed by the same
+instruction sequence.  A mismatch here is a real finding, not reassociation
+noise, and should be reported rather than absorbed into a tolerance.
 """
 
 from __future__ import annotations
@@ -207,6 +218,12 @@ def _reference_native_kernel(
             )
 
 
+def _mirror_block(kv_lora_rank: int) -> int:
+    """The production launch's kv-lora reduction width (keep in step with
+    ``fused_rmsnorm_rope_with_q_native``)."""
+    return min(512, triton.next_power_of_2(kv_lora_rank))
+
+
 def _reference_native(
     new_compressed_kv,
     q_pe,
@@ -217,8 +234,14 @@ def _reference_native(
     kv_lora_rank,
     qk_rope_head_dim,
     eps=1e-6,
+    block_size=None,
 ):
-    """Frozen pre-change wrapper: one program per row, default num_warps."""
+    """Frozen pre-change wrapper: one program per row, default num_warps.
+
+    ``block_size`` defaults to the production launch's width so bitwise
+    comparison stays width-matched; pass 64 explicitly to reproduce the
+    original pre-change launch.
+    """
     bsz, q_len, total_dim = new_compressed_kv.shape
     assert q_len == 1
     assert total_dim == kv_lora_rank + qk_rope_head_dim
@@ -243,7 +266,7 @@ def _reference_native(
         kv_lora_rank,
         qk_rope_head_dim,
         eps,
-        BLOCK_SIZE=64,
+        BLOCK_SIZE=_mirror_block(kv_lora_rank) if block_size is None else block_size,
     )
     return processed_kv
 
@@ -328,6 +351,36 @@ def test_bitwise_against_pre_change_kernel_glm52(production, bsz):
         GLM52_KV_LORA_RANK, GLM52_ROPE_DIM,
     )
     _assert_bitwise(kv_new, q_new, kv_ref, q_ref, f"glm5.2 bucket bsz={bsz}")
+
+
+# --------------------------------------------------------------------------- #
+#  A2  The width change itself: bf16 output unchanged at GLM-5.2 geometry
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("bsz", [64, 512])
+def test_glm52_shape_new_width_matches_old_64wide(production, bsz):
+    """Production (single-pass reduction) vs the ORIGINAL 64-wide launch.
+
+    fp32 ``inv_rms`` reassociation from the wider block is absorbed by bf16
+    rounding at this geometry (probe 2026-10-23 measured exactly 0 diff);
+    this pins that property so a future input/geometry drift that breaks it
+    is a reported finding, not a silent numerics shift.
+    """
+    kv, q_pe, cos, sin, positions, weight = _inputs(bsz)
+    q_new = q_pe.clone()
+    q_old = q_pe.clone()
+    kv_new = production(
+        kv, q_new, cos, sin, positions, weight,
+        GLM52_KV_LORA_RANK, GLM52_ROPE_DIM, eps=EPS,
+    )
+    kv_old = _reference_native(
+        kv, q_old, cos, sin, positions, weight,
+        GLM52_KV_LORA_RANK, GLM52_ROPE_DIM, eps=EPS, block_size=64,
+    )
+    torch.cuda.synchronize()
+    _assert_bitwise(
+        kv_new, q_new, kv_old, q_old,
+        f"glm5.2 bsz={bsz}: single-pass width vs original 64-wide launch",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -450,7 +503,7 @@ def test_every_legal_block_h_gives_identical_bits():
             kv, out, q_run, cos, sin, positions, weight,
             kv.stride(0), bsz, num_heads, kv_lora_rank, rope_dim,
             EPS,
-            BLOCK_SIZE=64,
+            BLOCK_SIZE=_mirror_block(kv_lora_rank),
             BLOCK_H=block_h,
             BLOCK_PAIRS=block_pairs,
             num_warps=4,
