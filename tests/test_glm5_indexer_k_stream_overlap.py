@@ -114,7 +114,12 @@ def test_the_fork_precedes_every_main_stream_launch():
     for name in _MAIN_PATH_CALLS:
         for call in _calls(fwd, name):
             assert _top_level_index(fwd, call) > fork_at, f"{name} precedes the fork"
-    # token_indices is read by both streams: one assignment, before the fork.
+    # token_indices is read by both streams, so its VALUE must already exist
+    # when the side stream's wait_stream runs. It is now a step-level static
+    # the prologue writes before the layer loop (compute_step_statics), so
+    # this forward only binds the buffer -- once, and before the fork, which
+    # keeps the binding on the main stream's timeline and leaves no
+    # per-layer narrowing launch anywhere in the method.
     assigns = [
         (i, stmt) for i, stmt in enumerate(fwd.body)
         if isinstance(stmt, ast.Assign)
@@ -122,7 +127,11 @@ def test_the_fork_precedes_every_main_stream_launch():
     ]
     assert len(assigns) == 1
     assert assigns[0][0] < fork_at
-    assert "position_ids.view(batch_size).to(dtype=torch.int32)" in ast.unparse(assigns[0][1])
+    assert ast.unparse(assigns[0][1]) == "token_indices = buffers.token_indices"
+    assert "position_ids.view(batch_size).to(" not in ast.unparse(fwd), (
+        "the int32 narrowing of position_ids is step-level; a per-layer "
+        "launch must not come back into forward"
+    )
     hidden = [
         i for i, stmt in enumerate(fwd.body)
         if isinstance(stmt, ast.Assign)

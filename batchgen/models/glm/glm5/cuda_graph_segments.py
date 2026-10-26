@@ -71,6 +71,8 @@ from batchgen_kernels.attention.dsa.head_gates import head_gates_out
 from batchgen_kernels.attention.dsa.paged_mqa_logits import PAGED_MQA_NEXT_N
 from batchgen_kernels.attention.dsa.paged_mqa_scorer import (
     paged_mqa_score_and_topk_out,
+    paged_mqa_score_and_topk_prepared_out,
+    paged_mqa_step_prologue_out,
     warm_paged_mqa_logits,
 )
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
@@ -121,6 +123,10 @@ class _Glm5FullDsaSegmentBuffers:
     safe_primary_slot_indices: torch.Tensor
     safe_aux_slot_indices: torch.Tensor
     safe_cache_seqlens: torch.Tensor
+    # ``position_ids`` as int32, which is what the two paged cache updates
+    # take. Step-level like the validity statics above: ``position_ids`` is a
+    # whole-model graph input no layer writes.
+    token_indices: torch.Tensor
     qkv_a: torch.Tensor
     q_a: torch.Tensor
     q_a_normed: torch.Tensor
@@ -149,6 +155,11 @@ class _Glm5FullDsaSegmentBuffers:
     q_index_fp8: torch.Tensor
     aux_block_table: torch.Tensor
     aux_context_lens: torch.Tensor
+    # The guarded copy of ``aux_context_lens`` DeepGEMM is handed (row 0
+    # ``>= 1``). Written by the same preparation launch, so it is as
+    # step-level as the two above; it was a per-layer ``torch.empty_like``
+    # while the preparation pass itself still ran per layer.
+    aux_deep_gemm_context_lens: torch.Tensor
     top_k_indices: torch.Tensor
     # Physical page-size-1 token IDs consumed as the FA3 ``page_table``; the
     # BF16 selected-KV slab (``selected_mla_kv``) and the FlashMLA query pack
@@ -157,6 +168,12 @@ class _Glm5FullDsaSegmentBuffers:
     selected_lengths: torch.Tensor
     absorbed_q: torch.Tensor
     attn_heads: torch.Tensor
+    # DeepGEMM's paged-MQA work schedule for this bucket's step, allocated by
+    # DeepGEMM (no ``out=`` form) in the step prologue and read by every
+    # indexer layer's logits call. Not a per-row buffer and not sliceable, so
+    # each bucket derives its own; ``None`` until the prologue runs, and it
+    # stays ``None`` for a bucket whose segments never score.
+    aux_schedule_meta: object = None
 
 
 @dataclass
@@ -181,6 +198,12 @@ class _Glm5FullDsaSegmentOutputs:
 #   - FP8 activation scratch: its TMA descriptor bakes pointer + global rows.
 # (The former ``prepared_flashmla`` rebuild is gone with the FlashMLA call:
 # FA3 takes its inputs directly, so nothing bakes shapes at setup time.)
+# One field is neither: ``aux_schedule_meta`` is not a buffer the segment
+# allocates at all, but the step prologue's DeepGEMM-owned schedule for this
+# bucket. It starts at its ``None`` default in every set -- carrying the base
+# bucket's schedule into a smaller bucket's view would hand DeepGEMM a
+# schedule built for the wrong row count.
+_GLM5_DSA_PER_STEP_FIELDS = frozenset({"aux_schedule_meta"})
 _GLM5_DSA_REBUILT_FIELDS = frozenset({
     "indexer_k_x_fp8",
     "indexer_k_x_scale",
@@ -204,6 +227,7 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "safe_primary_slot_indices",
     "safe_aux_slot_indices",
     "safe_cache_seqlens",
+    "token_indices",
     "qkv_a",
     "q_a",
     "q_a_normed",
@@ -219,6 +243,7 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "q_index_fp8",
     "aux_block_table",
     "aux_context_lens",
+    "aux_deep_gemm_context_lens",
     "top_k_indices",
     "selected_token_ids",
     "selected_lengths",
@@ -231,7 +256,11 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
 # allocation or, worse, a wrongly-shaped view.
 _split_delta = (
     set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
-    ^ (_GLM5_DSA_VIEW_FIELDS | _GLM5_DSA_REBUILT_FIELDS)
+    ^ (
+        _GLM5_DSA_VIEW_FIELDS
+        | _GLM5_DSA_REBUILT_FIELDS
+        | _GLM5_DSA_PER_STEP_FIELDS
+    )
 )
 if _split_delta:
     raise AssertionError(
@@ -791,6 +820,7 @@ class Glm5DsaAttnSegment:
                 index_head_dim=self.index_head_dim,
                 page_size=self.aux_page_size,
                 num_valid_tokens=num_valid_tokens,
+                q_prequantized=True,
             )
         return fused_paged_score_and_topk_with_slots_out(
             buffers.q_index,
@@ -880,6 +910,7 @@ class Glm5DsaAttnSegment:
             self.sin_table,
             positions_expanded.view(-1),
             buffers.q_index,
+            out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
         )
         self._score_and_topk(
             buffers,
@@ -933,6 +964,13 @@ class Glm5FullDsaAttnSegment:
     # interchangeable, and the step-level prologue is computed once per
     # variant, not once per model.
     ROW_VALIDITY_VARIANT = "full"
+
+    # This segment RUNS the indexer, so it overwrites the shared
+    # ``top_k_indices`` buffer every skip layer after it reads. A driver that
+    # hoists the selected-page-table transform out of a run of skip layers
+    # uses this to find the run boundaries: the transform's inputs change
+    # exactly where a selecting layer sits.
+    SELECTS_TOP_K = True
 
     def __init__(
         self,
@@ -1050,6 +1088,7 @@ class Glm5FullDsaAttnSegment:
         head_gates: torch.Tensor,
         cache_seqlens: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
+        paged_mqa_prep_ready: bool = False,
     ) -> torch.Tensor:
         """Score the aux cache and select top-k, dispatching on CACHE FORMAT.
 
@@ -1060,9 +1099,39 @@ class Glm5FullDsaAttnSegment:
         formulation those profiles were qualified with. Neither kernel can read
         the other's cache, so there is no fallback edge: a mis-sized cache is
         named by the format discriminator at construction.
+
+        ``paged_mqa_prep_ready`` says the driver already ran this step's
+        shared paged-MQA preparation (``run_paged_mqa_prep``), so this layer
+        runs only its own half.
         """
 
         if self.aux_is_page_split:
+            if paged_mqa_prep_ready:
+                if buffers.aux_schedule_meta is None:
+                    raise RuntimeError(
+                        f"Layer {self.layer_idx}: paged_mqa_prep_ready is set "
+                        "but this bucket's shared buffer set carries no "
+                        "paged-MQA schedule; the driver must call "
+                        "run_paged_mqa_prep for this step before the layer "
+                        "loop"
+                    )
+                return paged_mqa_score_and_topk_prepared_out(
+                    q=buffers.q_index,
+                    aux_blocked_k=self.aux_blocked_k,
+                    head_gates=head_gates,
+                    cache_seqlens=cache_seqlens,
+                    q_fp8=buffers.q_index_fp8,
+                    block_table=buffers.aux_block_table,
+                    context_lens=buffers.aux_context_lens,
+                    deep_gemm_context_lens=buffers.aux_deep_gemm_context_lens,
+                    schedule_meta=buffers.aux_schedule_meta,
+                    top_k_indices=buffers.top_k_indices,
+                    topk=self.index_topk,
+                    max_seqlen=self.max_seqlen,
+                    index_head_dim=self.attn.indexer.index_head_dim,
+                    page_size=self.aux_page_size,
+                    num_valid_tokens=num_valid_tokens,
+                )
             return paged_mqa_score_and_topk_out(
                 q=buffers.q_index,
                 aux_blocked_k=self.aux_blocked_k,
@@ -1079,6 +1148,7 @@ class Glm5FullDsaAttnSegment:
                 index_head_dim=self.attn.indexer.index_head_dim,
                 page_size=self.aux_page_size,
                 num_valid_tokens=num_valid_tokens,
+                q_prequantized=True,
             )
         return fused_paged_score_and_topk_with_slots_out(
             buffers.q_index,
@@ -1265,6 +1335,10 @@ class Glm5FullDsaAttnSegment:
                 device=device,
             )
         )
+        # Same shape/dtype/device as the TRUE lengths by construction (and the
+        # same zero-extent placeholder for a bf16 AoS cache), which is the
+        # contract the preparation launch checks.
+        aux_deep_gemm_context_lens = torch.empty_like(aux_context_lens)
         qkv_a = torch.empty(
             bucket_size,
             attn.q_lora_rank + kv_dim,
@@ -1286,6 +1360,7 @@ class Glm5FullDsaAttnSegment:
             safe_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_aux_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_cache_seqlens=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            token_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             qkv_a=qkv_a,
             q_a=qkv_a[:, : attn.q_lora_rank],
             q_a_normed=torch.empty(
@@ -1337,6 +1412,7 @@ class Glm5FullDsaAttnSegment:
             q_index_fp8=q_index_fp8,
             aux_block_table=aux_block_table,
             aux_context_lens=aux_context_lens,
+            aux_deep_gemm_context_lens=aux_deep_gemm_context_lens,
             top_k_indices=torch.empty(bucket_size, self.index_topk, dtype=torch.int32, device=device),
             selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
@@ -1480,17 +1556,110 @@ class Glm5FullDsaAttnSegment:
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        position_ids: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> None:
-        """Step-level entry point for the hoisted prologue (see ``compute_row_validity``)."""
+        """Step-level entry point for the hoisted prologue.
 
+        Two blocks, both layer-invariant and both writing the shared buffer
+        set this key dedupes on: the row-validity statics
+        (``compute_row_validity``) and the step's derived position tensors
+        (``compute_step_statics``).
+        """
+
+        buffers = self._row_validity_buffers(bucket_size)
         self.compute_row_validity(
-            self._row_validity_buffers(bucket_size),
+            buffers,
             cache_seqlens=cache_seqlens,
             primary_slot_indices=primary_slot_indices,
             aux_slot_indices=aux_slot_indices,
             num_valid_tokens=num_valid_tokens,
         )
+        self.compute_step_statics(buffers, position_ids=position_ids)
+
+    def paged_mqa_prep_key(self, bucket_size: int) -> Optional[tuple]:
+        """Identity of the paged-MQA inputs this segment's step prologue writes.
+
+        ``None`` when this segment never runs the DeepGEMM scorer -- a bf16
+        AoS aux cache goes to the Triton scorer, which needs no preparation
+        pass, and an ``all_short`` graph never scores at all. Otherwise the
+        key is the identity of the three shared output buffers, so a driver
+        runs the preparation once per distinct buffer set instead of once per
+        indexer layer.
+        """
+
+        if not self.aux_is_page_split or self.all_short:
+            return None
+        buffers = self._row_validity_buffers(bucket_size)
+        return (
+            id(buffers.aux_block_table),
+            id(buffers.aux_context_lens),
+            id(buffers.aux_deep_gemm_context_lens),
+        )
+
+    def run_paged_mqa_prep(
+        self,
+        bucket_size: int,
+        *,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run the step-level paged-MQA preparation and keep its schedule.
+
+        Reads the row-validity prologue's ``safe_aux_slot_indices`` /
+        ``safe_cache_seqlens``, so it must run AFTER
+        ``run_row_validity_prologue`` for this buffer set.
+
+        The schedule DeepGEMM allocates lands on the shared buffer set, which
+        is how all 21 indexer layers see the one schedule and how the
+        reference stays alive for the whole layer loop: dropping it would let
+        the graph-private pool hand the block to the next allocation while the
+        captured logits kernels still read that address.
+        """
+
+        buffers = self._row_validity_buffers(bucket_size)
+        buffers.aux_schedule_meta = paged_mqa_step_prologue_out(
+            aux_page_table=self.aux_page_table,
+            aux_slot_indices=buffers.safe_aux_slot_indices,
+            cache_seqlens=buffers.safe_cache_seqlens,
+            block_table=buffers.aux_block_table,
+            context_lens=buffers.aux_context_lens,
+            deep_gemm_context_lens=buffers.aux_deep_gemm_context_lens,
+            num_valid_tokens=num_valid_tokens,
+        )
+
+    def compute_step_statics(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        position_ids: torch.Tensor,
+    ) -> None:
+        """Derive the step's position tensors: int32 token indices, and the
+        per-index-head position broadcast the indexer's RoPE reads.
+
+        STEP-LEVEL for the same reason as ``compute_row_validity``:
+        ``position_ids`` is a static whole-model graph input handed unchanged
+        to all 78 layers, no layer writes it, and no layer writes these
+        derived buffers after this block -- the consumers (the two paged cache
+        updates, the indexer Q RoPE/Hadamard) only read them. The whole-model
+        driver therefore runs it once per step per buffer set and the layers
+        run with ``row_validity_ready=True``.
+
+        ``positions_expanded`` is skipped for an ``all_short`` graph, which
+        has no indexer Q path to read it.
+        """
+
+        batch_size = int(buffers.token_indices.shape[0])
+        # ONE launch: a cross-dtype ``copy_`` casts inside the copy kernel, so
+        # this is the same int64 -> int32 narrowing the per-layer
+        # ``position_ids.view(batch).to(torch.int32)`` did, without its
+        # per-layer allocation.
+        buffers.token_indices.copy_(position_ids.view(batch_size))
+        if not self.all_short:
+            buffers.positions_expanded.copy_(
+                position_ids.view(batch_size, 1).expand(
+                    batch_size, buffers.positions_expanded.shape[1]
+                )
+            )
 
     def compute_row_validity(
         self,
@@ -1583,8 +1752,19 @@ class Glm5FullDsaAttnSegment:
         aux_slot_indices: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
         row_validity_ready: bool = False,
+        paged_mqa_prep_ready: bool = False,
+        selected_positions_ready: bool = False,
         attn_output_mask_deferred: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        if selected_positions_ready:
+            # This layer SELECTS the top-k, so the selected-page-table
+            # transform's input changes here by definition and its output
+            # cannot have been produced by an earlier layer.
+            raise ValueError(
+                f"Layer {self.layer_idx}: selected_positions_ready is only "
+                "for layers that reuse another layer's top-k; an indexer "
+                "layer must always run its own transform"
+            )
         attn = self.attn
         indexer = attn.indexer
         batch_size = hidden_states.shape[0]
@@ -1597,8 +1777,9 @@ class Glm5FullDsaAttnSegment:
             self._setup_static_output_buffers(batch_size)
             outputs = self._outputs[batch_size]
 
-        # Layer-invariant, so the whole-model driver already ran it once for
-        # this step and for this shared buffer set (see compute_row_validity).
+        # Layer-invariant, so the whole-model driver already ran them once for
+        # this step and for this shared buffer set (see compute_row_validity
+        # and compute_step_statics).
         if not row_validity_ready:
             self.compute_row_validity(
                 buffers,
@@ -1607,6 +1788,7 @@ class Glm5FullDsaAttnSegment:
                 aux_slot_indices=aux_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
+            self.compute_step_statics(buffers, position_ids=position_ids)
 
         fused_qkv_a_weight = getattr(self.wrapper, "_fp8_qkv_a_proj", None)
         fused_qkv_a_scale = getattr(self.wrapper, "_fp8_qkv_a_scale", None)
@@ -1616,9 +1798,10 @@ class Glm5FullDsaAttnSegment:
             )
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         # Read by both streams: the primary KV update below and the aux K
-        # write on the side stream. Issued before the fork so the side stream's
-        # ``wait_stream`` covers it.
-        token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
+        # write on the side stream. Step-level (see compute_step_statics), and
+        # written before the fork, so the side stream's ``wait_stream`` covers
+        # it.
+        token_indices = buffers.token_indices
 
         # ---- Indexer K path, on the side stream --------------------------
         # Same kernels in the same order as the serial path; only the stream
@@ -1785,9 +1968,9 @@ class Glm5FullDsaAttnSegment:
         )
 
         if not self.all_short:
-            buffers.positions_expanded.copy_(
-                position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
-            )
+            # ``positions_expanded`` is step-level and already written (see
+            # compute_step_statics); the broadcast used to be re-launched here
+            # by every indexer layer from the same ``position_ids``.
             cuda_wq_b_proj_out(
                 q_a_normed,
                 self.wq_b_weights,
@@ -1804,6 +1987,7 @@ class Glm5FullDsaAttnSegment:
                 self.sin_table,
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
+                out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
             )
             # JOIN (scoring graphs). The scorer is the first main-stream
             # reader of the K path's writes: it scores the aux cache, whose
@@ -1816,6 +2000,7 @@ class Glm5FullDsaAttnSegment:
                 head_gates=buffers.head_gates,
                 cache_seqlens=buffers.safe_cache_seqlens,
                 num_valid_tokens=num_valid_tokens,
+                paged_mqa_prep_ready=paged_mqa_prep_ready,
             )
 
         fp8_q_absorb_out(

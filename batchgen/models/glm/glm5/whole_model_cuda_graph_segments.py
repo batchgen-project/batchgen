@@ -367,6 +367,7 @@ class Glm5WholeModelSegment:
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        position_ids: torch.Tensor,
         num_valid_tokens: torch.Tensor | None,
     ) -> tuple[tuple, ...]:
         """Compute the layer-invariant row-validity statics ONCE per step.
@@ -419,10 +420,98 @@ class Glm5WholeModelSegment:
                 cache_seqlens=cache_seqlens,
                 primary_slot_indices=primary_slot_indices,
                 aux_slot_indices=aux_slot_indices,
+                position_ids=position_ids,
                 num_valid_tokens=num_valid_tokens,
             )
             ran[key] = layer_idx
         return tuple(ran)
+
+    def _run_paged_mqa_preps(
+        self,
+        bucket_size: int,
+        *,
+        num_valid_tokens: torch.Tensor | None,
+    ) -> tuple[tuple, ...]:
+        """Compute the shared paged-MQA scorer inputs ONCE per step.
+
+        The DeepGEMM indexer scorer needs the aux page table gathered into
+        batch order, both forms of the per-row context lengths, and a work
+        schedule derived from the guarded ones. All four depend only on the
+        step's statics -- the aux page table plus the row-validity prologue's
+        safe slot/seqlen buffers -- and all four land in buffers the indexer
+        layers already SHARE, so every one of GLM-5.2's 21 indexer layers was
+        recomputing identical values into the same tensors.
+
+        Runs AFTER ``_run_row_validity_prologues``, whose outputs it reads,
+        and inside the captured region, like that prologue: its inputs are
+        graph-internal derived buffers, not host values.
+
+        Deduplicated by ``paged_mqa_prep_key`` = the identity of the three
+        output buffers. A segment that never scores (a skip layer, a bf16 AoS
+        aux cache, an ``all_short`` graph) returns ``None`` and is skipped.
+        """
+
+        ran: dict[tuple, int] = {}
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            key_fn = getattr(layer_segment, "paged_mqa_prep_key", None)
+            run_fn = getattr(layer_segment, "run_paged_mqa_prep", None)
+            if key_fn is None or run_fn is None:
+                raise RuntimeError(
+                    "GLM-5 whole-model layer-composed graph hoists the "
+                    "paged-MQA scorer preparation to one step-level call, so "
+                    "every layer segment must expose paged_mqa_prep_key and "
+                    "run_paged_mqa_prep; layer "
+                    f"{layer_idx} ({type(layer_segment).__name__}) exposes "
+                    f"key={key_fn is not None} run={run_fn is not None}"
+                )
+            key = key_fn(bucket_size)
+            if key is None or key in ran:
+                continue
+            run_fn(bucket_size, num_valid_tokens=num_valid_tokens)
+            ran[key] = layer_idx
+        return tuple(ran)
+
+    def _selected_positions_ready(self, bucket_size: int) -> tuple[bool, ...]:
+        """Per layer: may it skip the selected-page-table transform?
+
+        GLM-5.2 runs the indexer on 21 of 78 layers; each of the other 57
+        reuses the most recent selection. Within one RUN of reusing layers
+        nothing writes the shared top-k and nothing writes the transform's
+        other inputs, so the run's first layer's output is bit-identical to
+        what every later layer in the run would recompute into the same
+        buffers -- 57 launches collapse to 21.
+
+        The run boundary is a layer that SELECTS: it overwrites the shared
+        top-k buffer, so the next reusing layer must transform again. A
+        selecting layer never skips its own transform either, because its own
+        row-validity mask differs from the reusing layers' (it requires a
+        valid aux slot), which makes its output a different value in a
+        different buffer rather than a shareable one.
+
+        The key is checked as well as the run structure: a reusing layer
+        skips only if it would read and write exactly the tensors the
+        previous layer just did.
+        """
+
+        flags: list[bool] = []
+        previous_key: tuple | None = None
+        for layer_idx, layer_segment in enumerate(self.layer_segments):
+            selects = getattr(layer_segment, "selects_top_k", None)
+            if selects is None:
+                raise RuntimeError(
+                    "GLM-5 whole-model layer-composed graph hoists the "
+                    "selected-page-table transform out of each reuse run, so "
+                    "every layer segment must expose selects_top_k; layer "
+                    f"{layer_idx} ({type(layer_segment).__name__}) does not"
+                )
+            key = (
+                None
+                if selects
+                else layer_segment.selected_positions_key(bucket_size)
+            )
+            flags.append(key is not None and key == previous_key)
+            previous_key = key
+        return tuple(flags)
 
     def run_model_with_probes(
         self,
@@ -455,13 +544,25 @@ class Glm5WholeModelSegment:
                 )
             # ONE prologue per step instead of one per layer: its inputs are
             # the step-level statics below, passed unchanged to every layer.
+            bucket_size = int(input_ids.shape[0])
             self._run_row_validity_prologues(
-                int(input_ids.shape[0]),
+                bucket_size,
                 cache_seqlens=cache_seqlens,
                 primary_slot_indices=primary_slot_indices,
                 aux_slot_indices=aux_slot_indices,
+                position_ids=position_ids,
                 num_valid_tokens=num_valid_tokens,
             )
+            # Second step-level prologue: the indexer scorer's shared paged
+            # inputs and work schedule. Reads the first prologue's safe
+            # slot/seqlen buffers, so it must follow it.
+            self._run_paged_mqa_preps(
+                bucket_size,
+                num_valid_tokens=num_valid_tokens,
+            )
+            # Which layers may skip the selected-page-table transform because
+            # the first layer of their reuse run already recorded it.
+            selected_positions_ready = self._selected_positions_ready(bucket_size)
             # Residual carried in the fused-add form: each layer hands back
             # (residual, mlp_output) unsummed and the NEXT layer's
             # input_layernorm performs the add as part of its own launch. The
@@ -478,6 +579,8 @@ class Glm5WholeModelSegment:
                     num_valid_tokens=num_valid_tokens,
                     rank_token_counts=rank_token_counts,
                     row_validity_ready=True,
+                    paged_mqa_prep_ready=True,
+                    selected_positions_ready=selected_positions_ready[layer_idx],
                     residual=residual,
                     defer_residual_add=True,
                 )

@@ -69,6 +69,7 @@ _GLM5_REUSE_VIEW_FIELDS = frozenset({
     "safe_primary_slot_indices",
     "safe_aux_slot_indices",
     "safe_cache_seqlens",
+    "token_indices",
     "qkv_a",
     "q_a",
     "q_a_normed",
@@ -98,15 +99,19 @@ _GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
     "q_index_fp8",
     "aux_block_table",
     "aux_context_lens",
+    "aux_deep_gemm_context_lens",
 })
 # Rebuilt per bucket: top_k_indices is borrowed from the producing full
 # segment's buffer set FOR THIS BUCKET, never sliced from our own base.
 _GLM5_REUSE_SPECIAL_FIELDS = frozenset({"top_k_indices"})
+# Left at its None default: the DeepGEMM paged-MQA schedule belongs to the
+# indexer layers' prologue, and a skip layer never scores.
+_GLM5_REUSE_PER_STEP_FIELDS = frozenset({"aux_schedule_meta"})
 
 _split_delta = (
     set(f.name for f in fields(_Glm5FullDsaSegmentBuffers))
     ^ (_GLM5_REUSE_VIEW_FIELDS | _GLM5_REUSE_PLACEHOLDER_FIELDS
-       | _GLM5_REUSE_SPECIAL_FIELDS)
+       | _GLM5_REUSE_SPECIAL_FIELDS | _GLM5_REUSE_PER_STEP_FIELDS)
 )
 if _split_delta:
     raise AssertionError(
@@ -123,6 +128,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
     # segment's. Distinct variant => distinct hoisted prologue, and the
     # whole-model driver rejects a buffer set claimed by both variants.
     ROW_VALIDITY_VARIANT = "reuse"
+
+    # This segment does NOT run the indexer: it reads the shared
+    # ``top_k_indices`` the preceding indexer layer wrote. A run of these
+    # layers therefore transforms the SAME selection, which is what lets a
+    # driver hoist the transform to the first layer of each run.
+    SELECTS_TOP_K = False
 
     def __init__(
         self,
@@ -308,6 +319,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             safe_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_aux_slot_indices=torch.zeros(bucket_size, dtype=torch.int32, device=device),
             safe_cache_seqlens=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            token_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             qkv_a=qkv_a,
             q_a=qkv_a[:, : attn.q_lora_rank],
             q_a_normed=torch.empty(
@@ -344,6 +356,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             q_index_fp8=one_bf16,
             aux_block_table=one_i32,
             aux_context_lens=one_i32,
+            aux_deep_gemm_context_lens=one_i32,
             # THE handoff: the producing full segment's static top-k buffer.
             top_k_indices=source_buffers.top_k_indices,
             selected_token_ids=selected_token_ids,
@@ -401,6 +414,67 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             out=buffers.valid_rows_bf16,
         )
 
+    def compute_step_statics(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        position_ids: torch.Tensor,
+    ) -> None:
+        """The step's position tensors for a skip layer: token indices only.
+
+        Deliberately NOT the parent's block: ``positions_expanded`` feeds the
+        indexer Q RoPE, which this layer does not run, so its slot in this
+        buffer set is a 1-element placeholder and must stay unwritten.
+        Hoisting is otherwise identical -- one step-level input, one shared
+        output, so the whole-model driver runs this once per step.
+        """
+
+        batch_size = int(buffers.token_indices.shape[0])
+        buffers.token_indices.copy_(position_ids.view(batch_size))
+
+    def paged_mqa_prep_key(self, bucket_size: int) -> None:
+        """No paged-MQA preparation: a skip layer never scores the aux cache."""
+        return None
+
+    def run_paged_mqa_prep(self, bucket_size: int, **kwargs) -> None:
+        """Never callable: the key above is ``None``, so a driver skips this.
+
+        Overridden to name the mistake instead of inheriting the parent's
+        body, which would dereference an aux page table this segment has no
+        field for.
+        """
+        raise RuntimeError(
+            f"Layer {self.layer_idx}: a GLM-5.2 skip layer has no aux "
+            "indexer cache and never scores, so it has no paged-MQA "
+            "preparation to run; paged_mqa_prep_key returns None and the "
+            "driver must skip it"
+        )
+
+    def selected_positions_key(self, bucket_size: int) -> tuple:
+        """Identity of every tensor this layer's selected-position transform touches.
+
+        Two consecutive skip layers with the same key, and no selecting layer
+        between them, transform identical inputs into the same buffers, so the
+        second one's launch is pure repetition. Any difference -- a different
+        borrowed top-k, a different buffer set, a different page table --
+        changes the key and the transform runs again.
+        """
+
+        buffers = self._buffers.get(bucket_size)
+        if buffers is None:
+            self.setup_static_buffers(bucket_size)
+            buffers = self._buffers[bucket_size]
+        return (
+            id(self.primary_page_table),
+            id(buffers.top_k_indices),
+            id(buffers.safe_cache_seqlens),
+            id(buffers.safe_primary_slot_indices),
+            id(buffers.selected_token_ids),
+            id(buffers.selected_lengths),
+            int(self.page_size),
+            int(self.index_topk),
+        )
+
     def forward(
         self,
         *,
@@ -411,6 +485,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
         row_validity_ready: bool = False,
+        paged_mqa_prep_ready: bool = False,  # accepted, ignored: never scores
+        selected_positions_ready: bool = False,
         attn_output_mask_deferred: bool = False,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
@@ -424,8 +500,9 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             self._setup_static_output_buffers(batch_size)
             outputs = self._outputs[batch_size]
 
-        # Layer-invariant: the whole-model driver ran it once for this step
-        # over the skip layers' shared buffer set (see compute_row_validity).
+        # Layer-invariant: the whole-model driver ran them once for this step
+        # over the skip layers' shared buffer set (see compute_row_validity
+        # and compute_step_statics).
         if not row_validity_ready:
             self.compute_row_validity(
                 buffers,
@@ -434,6 +511,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 aux_slot_indices=aux_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
+            self.compute_step_statics(buffers, position_ids=position_ids)
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(
@@ -499,13 +577,14 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             row_valid_mask=buffers.valid_mask,
             q_pe_src=q_rope_strided,
         )
-        token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
             k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
             page_table=self.primary_page_table,
             slot_indices=buffers.kv_primary_slot_indices,
-            token_indices=token_indices,
+            # Step-level (see compute_step_statics): the int32 narrowing of
+            # ``position_ids`` used to be re-launched by every layer.
+            token_indices=buffers.token_indices,
             page_size_tokens=self.page_size,
             num_valid_tokens=num_valid_tokens,
         )
@@ -521,16 +600,27 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             # (cheap, B*index_topk int32 writes) logical->physical transform.
             # Row mode (dense vs top-k) is decided inside the transform from
             # ``cache_seqlens > index_topk``, so no row_modes buffer is needed.
-            transform_selected_positions_out(
-                self.primary_page_table,
-                buffers.safe_cache_seqlens,
-                buffers.top_k_indices,           # borrowed from the producer
-                buffers.selected_token_ids,
-                buffers.selected_lengths,
-                page_size=self.page_size,
-                primary_slot_indices=buffers.safe_primary_slot_indices,
-                num_valid_tokens=num_valid_tokens,
-            )
+            #
+            # RUN-level, not layer-level: every input below is step-level
+            # except ``top_k_indices``, which only a selecting layer writes,
+            # and the outputs are this variant's shared buffers. So for a run
+            # of consecutive skip layers the transform produces the same bytes
+            # every time, and the driver runs it on the run's FIRST layer only
+            # (``selected_positions_ready`` on the rest). It is NOT shareable
+            # with the preceding indexer layer's transform: that one is
+            # computed from the FULL variant's row-validity mask, which
+            # differs on the aux slot.
+            if not selected_positions_ready:
+                transform_selected_positions_out(
+                    self.primary_page_table,
+                    buffers.safe_cache_seqlens,
+                    buffers.top_k_indices,           # borrowed from the producer
+                    buffers.selected_token_ids,
+                    buffers.selected_lengths,
+                    page_size=self.page_size,
+                    primary_slot_indices=buffers.safe_primary_slot_indices,
+                    num_valid_tokens=num_valid_tokens,
+                )
             attn_out = self._run_selected_fa3(buffers)
         fp8_out_absorb_out(
             attn_out, self.absorb_weights, buffers.attn_heads,

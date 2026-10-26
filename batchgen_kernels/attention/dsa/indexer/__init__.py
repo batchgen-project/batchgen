@@ -1,5 +1,6 @@
 import torch
 from torch.utils.cpp_extension import load
+from typing import Optional
 import os
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -84,8 +85,14 @@ def fused_rope_hadamard_out(
     positions: torch.Tensor,
     out: torch.Tensor,
     scale: float = 128 ** -0.5,
+    out_fp8: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Out-buffer fused interleaved RoPE + Hadamard transform for graph capture."""
+    """Out-buffer fused interleaved RoPE + Hadamard transform for graph capture.
+
+    When ``out_fp8`` is given the kernel epilogue also writes the saturating
+    e4m3 copy of the bf16 result, replacing the separate ``clamp`` and bf16 ->
+    float8_e4m3fn ATen launches the indexer-Q scorer used to make.
+    """
     _fused_rope_hadamard_cuda.fused_rope_hadamard_out(
         x,
         cos_cache,
@@ -93,5 +100,6 @@ def fused_rope_hadamard_out(
         positions,
         out,
         scale,
+        out_fp8,
     )
     return out

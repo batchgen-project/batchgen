@@ -195,10 +195,22 @@ def test_full_dsa_field_lists_exactly_cover_the_buffer_dataclass():
     split = (
         _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
         | _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
+        | _name_set_literal(tree, "_GLM5_DSA_PER_STEP_FIELDS")
     )
     assert fields ^ split == set()
     assert "prepared_flashmla" not in _name_set_literal(tree, "_GLM5_DSA_REBUILT_FIELDS")
     assert "selected_token_ids" in _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    # The step prologue's own outputs. The two length buffers are per-row and
+    # slice like any other view; the DeepGEMM schedule is neither a buffer the
+    # segment allocates nor sliceable, so it must NOT be a view -- a smaller
+    # bucket inheriting the base bucket's schedule would hand DeepGEMM a
+    # schedule built for the wrong row count.
+    views = _name_set_literal(tree, "_GLM5_DSA_VIEW_FIELDS")
+    assert "token_indices" in views
+    assert "aux_deep_gemm_context_lens" in views
+    assert _name_set_literal(tree, "_GLM5_DSA_PER_STEP_FIELDS") == {
+        "aux_schedule_meta"
+    }
 
 
 def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
@@ -208,10 +220,20 @@ def test_reuse_field_lists_exactly_cover_the_buffer_dataclass():
         _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_PLACEHOLDER_FIELDS")
         | _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS")
+        | _name_set_literal(reuse, "_GLM5_REUSE_PER_STEP_FIELDS")
     )
     assert fields ^ split == set()
     assert _name_set_literal(reuse, "_GLM5_REUSE_SPECIAL_FIELDS") == {"top_k_indices"}
     assert "selected_token_ids" in _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
+    # A skip layer narrows ``position_ids`` like any other layer, so its
+    # ``token_indices`` is a real per-row view; it never scores, so both
+    # DeepGEMM-only fields stay placeholders.
+    assert "token_indices" in _name_set_literal(reuse, "_GLM5_REUSE_VIEW_FIELDS")
+    placeholders = _name_set_literal(reuse, "_GLM5_REUSE_PLACEHOLDER_FIELDS")
+    assert "aux_deep_gemm_context_lens" in placeholders
+    assert _name_set_literal(reuse, "_GLM5_REUSE_PER_STEP_FIELDS") == {
+        "aux_schedule_meta"
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -595,10 +617,15 @@ def _patch_full_dsa_dependencies(
         out.copy_(q_a_normed[:, :1].expand_as(out) + 0.25)
         return out
 
-    def fake_rope_hadamard_q(q_flat, cos, sin, positions, out):
+    def fake_rope_hadamard_q(q_flat, cos, sin, positions, out, out_fp8=None):
         del cos, sin, positions
         calls["scoring"].append("rope_hadamard_q_out")
         out.copy_(q_flat + 0.03125)
+        if out_fp8 is not None:
+            # The real epilogue also emits the saturating e4m3 copy of `out`.
+            out_fp8.view(out.shape).copy_(
+                out.clamp(min=-448.0, max=448.0).to(torch.float8_e4m3fn)
+            )
         return out
 
     def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):

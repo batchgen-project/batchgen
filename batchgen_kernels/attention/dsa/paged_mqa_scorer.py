@@ -16,6 +16,20 @@ One decode step, one indexer layer, in four launches:
 4. the existing production top-k, which owns the masking by the TRUE lengths
    (see ``paged_mqa_logits.topk_from_logits_reference``).
 
+Of those four, steps 2 and 3's work SCHEDULE are STEP-level, not layer-level:
+the preparation pass reads only the aux page table and the step's
+slot/seqlen statics, and DeepGEMM's ``schedule_meta`` is a pure function of
+the guarded lengths that pass writes. A model that puts an indexer on many
+layers (GLM-5.2: 21) therefore splits into
+
+  * ``paged_mqa_step_prologue_out`` -- the preparation pass plus the schedule
+    metadata, ONCE per step, into buffers every indexer layer shares;
+  * ``paged_mqa_score_and_topk_prepared_out`` -- the genuinely per-layer half
+    (the ``q`` cast, the logits, the top-k).
+
+``paged_mqa_score_and_topk_out`` is the two of them back to back, for a
+caller with one indexer layer per graph and nothing to share.
+
 The contract, the row-stride trap and the torch references live in the
 torch-only module ``paged_mqa_logits``; this module is the GPU half.
 """
@@ -46,8 +60,11 @@ from batchgen_kernels.attention.dsa.paged_mqa_logits import (
 
 __all__ = [
     "deep_gemm_paged_mqa_logits",
+    "paged_mqa_logits_schedule_meta",
     "paged_mqa_score_and_topk",
     "paged_mqa_score_and_topk_out",
+    "paged_mqa_score_and_topk_prepared_out",
+    "paged_mqa_step_prologue_out",
     "prepare_paged_mqa_inputs_out",
     "warm_paged_mqa_logits",
 ]
@@ -250,6 +267,40 @@ def prepare_paged_mqa_inputs_out(
 # The DeepGEMM call
 # --------------------------------------------------------------------------- #
 
+def paged_mqa_logits_schedule_meta(
+    deep_gemm_context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """DeepGEMM's paged-MQA work schedule for one set of context lengths.
+
+    STEP-LEVEL: the schedule is a pure function of the guarded lengths, so a
+    model with many indexer layers derives it once per step from the shared
+    lengths and hands the same tensor to every layer's logits call.
+
+    ``deep_gemm_context_lens`` must be the GUARDED form -- this is the call
+    that faults on the unguarded one.
+
+    DeepGEMM allocates the result (it has no ``out=`` form). Under capture it
+    comes from the graph-private pool at a fixed address, so a caller that
+    keeps the returned tensor alive for the whole layer loop keeps that
+    address reserved for the schedule; a caller that drops it hands the block
+    back for reuse by the next allocation.
+    """
+
+    deep_gemm = _deep_gemm()
+    # UPSTREAM DEFECT -- why the lengths are guarded: sgl deep_gemm
+    # 0.1.5.post3, sm90_fp8_mqa_logits.hpp:188 (the sm90 non-varlen paged MQA
+    # metadata scheduler) reads its shared-memory prefix sum out of bounds when
+    # EVERY context_len is 0 and batch % 32 == 0 -> CUDA_ERROR_ILLEGAL_ADDRESS
+    # (item-2a node repro 2026-10-17: batch 32/96/128 fail, 127 passes, one
+    # non-zero row passes). The caller's guard keeps row 0 >= 1 so the total is
+    # never zero. Re-test that repro before dropping the guard on a pin bump.
+    return deep_gemm.get_paged_mqa_logits_metadata(
+        deep_gemm_context_lens,
+        PAGED_MQA_BLOCK_KV,
+        deep_gemm.get_num_sms(),
+    )
+
+
 def deep_gemm_paged_mqa_logits(
     q_fp8: torch.Tensor,
     aux_blocked_k: torch.Tensor,
@@ -257,6 +308,7 @@ def deep_gemm_paged_mqa_logits(
     deep_gemm_context_lens: torch.Tensor,
     block_table: torch.Tensor,
     plan: PagedMqaLogitsPlan,
+    schedule_meta: torch.Tensor,
 ) -> torch.Tensor:
     """``logits[b, t] = sum_h head_gates[b, h] * relu(q[b, h] . k[b, t])``.
 
@@ -269,26 +321,16 @@ def deep_gemm_paged_mqa_logits(
     It must be the GUARDED form (row 0 ``>= 1``): either the preparation
     pass's ``deep_gemm_context_lens_out`` or
     ``guard_deep_gemm_context_lens(...)``. Never pass the true lengths here.
+    ``schedule_meta`` must have been derived from THESE lengths, by
+    ``paged_mqa_logits_schedule_meta``.
 
-    Both the ``schedule_meta`` and the ``logits`` tensors are allocated by
-    DeepGEMM (it has no ``out=`` form). Under capture they come from the
-    graph-private pool at fixed addresses and the logits block is freed once
-    the top-k has consumed it, so every indexer layer reuses the same block.
+    The ``logits`` tensor is allocated by DeepGEMM (it has no ``out=`` form).
+    Under capture it comes from the graph-private pool at a fixed address and
+    the block is freed once the top-k has consumed it, so every indexer layer
+    reuses the same block.
     """
 
     deep_gemm = _deep_gemm()
-    # UPSTREAM DEFECT -- why the lengths are guarded: sgl deep_gemm
-    # 0.1.5.post3, sm90_fp8_mqa_logits.hpp:188 (the sm90 non-varlen paged MQA
-    # metadata scheduler) reads its shared-memory prefix sum out of bounds when
-    # EVERY context_len is 0 and batch % 32 == 0 -> CUDA_ERROR_ILLEGAL_ADDRESS
-    # (item-2a node repro 2026-10-17: batch 32/96/128 fail, 127 passes, one
-    # non-zero row passes). The caller's guard keeps row 0 >= 1 so the total is
-    # never zero. Re-test that repro before dropping the guard on a pin bump.
-    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-        deep_gemm_context_lens,
-        PAGED_MQA_BLOCK_KV,
-        deep_gemm.get_num_sms(),
-    )
     logits = deep_gemm.fp8_paged_mqa_logits(
         q_fp8,
         # DeepGEMM asserts a kByte cache and re-views it as (e4m3 values, fp32
@@ -348,29 +390,79 @@ def _topk_from_logits(
     return top_k_indices
 
 
-def paged_mqa_score_and_topk_out(
+def paged_mqa_step_prologue_out(
+    *,
+    aux_page_table: torch.Tensor,
+    aux_slot_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    deep_gemm_context_lens: torch.Tensor,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The STEP-level half of the scorer: paged inputs + the work schedule.
+
+    Every input is a step-level static -- the aux page table and the step's
+    safe slot/seqlen buffers -- and every output is a buffer the indexer
+    layers SHARE, so a model with N indexer layers runs this once per step
+    instead of N times. Nothing here reads ``q``, ``head_gates`` or anything
+    else a layer produces.
+
+    Writes ``block_table``, ``context_lens`` (TRUE lengths) and
+    ``deep_gemm_context_lens`` (the guarded copy) in one launch, and returns
+    the ``schedule_meta`` derived from the guarded lengths. The caller must
+    keep that tensor alive for as long as any layer still has to score, and
+    must hand it to every ``paged_mqa_score_and_topk_prepared_out`` call of
+    the same step.
+    """
+
+    prepare_paged_mqa_inputs_out(
+        aux_page_table,
+        aux_slot_indices,
+        cache_seqlens,
+        block_table,
+        context_lens,
+        num_valid_tokens=num_valid_tokens,
+        deep_gemm_context_lens_out=deep_gemm_context_lens,
+    )
+    return paged_mqa_logits_schedule_meta(deep_gemm_context_lens)
+
+
+def paged_mqa_score_and_topk_prepared_out(
     *,
     q: torch.Tensor,
     aux_blocked_k: torch.Tensor,
-    aux_page_table: torch.Tensor,
-    aux_slot_indices: torch.Tensor,
     head_gates: torch.Tensor,
     cache_seqlens: torch.Tensor,
     q_fp8: torch.Tensor,
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
+    deep_gemm_context_lens: torch.Tensor,
+    schedule_meta: torch.Tensor,
     top_k_indices: torch.Tensor,
     topk: int,
     max_seqlen: int,
     index_head_dim: int,
     page_size: int,
     num_valid_tokens: Optional[torch.Tensor] = None,
+    q_prequantized: bool = False,
 ) -> torch.Tensor:
-    """Graph-capturable scorer: every buffer read across steps is the caller's.
+    """The PER-LAYER half: this layer's ``q`` cast, logits and top-k.
 
-    ``context_lens`` receives the TRUE per-row lengths and bounds the top-k.
-    The guarded copy DeepGEMM reads is derived from the same inputs inside
-    this call by the same launch, so it carries no state between replays.
+    ``block_table``, ``context_lens``, ``deep_gemm_context_lens`` and
+    ``schedule_meta`` must come from ``paged_mqa_step_prologue_out`` for THIS
+    step. They are read, never written, so any number of layers may run
+    against one prologue.
+
+    ``context_lens`` is the TRUE per-row lengths and bounds the top-k;
+    ``deep_gemm_context_lens`` is the guarded copy and is the only form
+    DeepGEMM is handed.
+
+    ``q_prequantized`` says ``q_fp8`` was already filled by the producer of
+    ``q`` -- the RoPE+Hadamard epilogue writes the same saturating e4m3 bytes
+    this function would otherwise spend a ``clamp`` and a bf16 -> e4m3 ``copy_``
+    launch on. ``q`` is still required and still shape-checked, so the plan and
+    every downstream contract stay derived from it.
     """
 
     plan = plan_paged_mqa_logits(
@@ -378,7 +470,10 @@ def paged_mqa_score_and_topk_out(
         aux_blocked_k=aux_blocked_k,
         head_gates=head_gates,
         cache_seqlens=cache_seqlens,
-        max_pages_per_seq=int(aux_page_table.shape[1]),
+        # The prologue wrote ``block_table`` with one row per batch row and
+        # one column per aux page, from the page table it was handed, so its
+        # trailing dim IS that table's ``max_pages_per_seq``.
+        max_pages_per_seq=int(block_table.shape[1]),
         topk=topk,
         max_seqlen=max_seqlen,
         index_head_dim=index_head_dim,
@@ -403,23 +498,28 @@ def paged_mqa_score_and_topk_out(
             f"top_k_indices must be int32 or int64, got {top_k_indices.dtype}"
         )
 
-    q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(
-        saturate_q_to_e4m3_range(q)
-    )
-    # The guarded lengths are produced and consumed inside this call (and so
-    # inside the captured graph), exactly like DeepGEMM's own schedule_meta and
-    # logits, so a graph-private allocation is replay-safe here: nothing
-    # outside the graph writes or reads it.
-    deep_gemm_context_lens = torch.empty_like(context_lens)
-    prepare_paged_mqa_inputs_out(
-        aux_page_table,
-        aux_slot_indices,
-        cache_seqlens,
-        block_table,
-        context_lens,
-        num_valid_tokens=num_valid_tokens,
-        deep_gemm_context_lens_out=deep_gemm_context_lens,
-    )
+    if tuple(deep_gemm_context_lens.shape) != tuple(context_lens.shape):
+        raise ValueError(
+            "deep_gemm_context_lens must have the same shape as context_lens "
+            f"{tuple(context_lens.shape)}, got "
+            f"{tuple(deep_gemm_context_lens.shape)}"
+        )
+    if deep_gemm_context_lens.data_ptr() == context_lens.data_ptr():
+        raise ValueError(
+            "deep_gemm_context_lens must not alias context_lens: the top-k "
+            "masks by the TRUE lengths, DeepGEMM reads the guarded ones"
+        )
+    if schedule_meta is None:
+        raise ValueError(
+            "schedule_meta is required: derive it once per step with "
+            "paged_mqa_step_prologue_out (or "
+            "paged_mqa_logits_schedule_meta) from THESE guarded lengths"
+        )
+
+    if not q_prequantized:
+        q_fp8.view(plan.batch, plan.num_heads, plan.head_dim).copy_(
+            saturate_q_to_e4m3_range(q)
+        )
     logits = deep_gemm_paged_mqa_logits(
         q_fp8,
         aux_blocked_k,
@@ -427,9 +527,74 @@ def paged_mqa_score_and_topk_out(
         deep_gemm_context_lens,
         block_table,
         plan,
+        schedule_meta,
     )
     return _topk_from_logits(
         logits, context_lens, top_k_indices, plan, num_valid_tokens
+    )
+
+
+def paged_mqa_score_and_topk_out(
+    *,
+    q: torch.Tensor,
+    aux_blocked_k: torch.Tensor,
+    aux_page_table: torch.Tensor,
+    aux_slot_indices: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    q_fp8: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    topk: int,
+    max_seqlen: int,
+    index_head_dim: int,
+    page_size: int,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+    q_prequantized: bool = False,
+) -> torch.Tensor:
+    """Graph-capturable scorer: every buffer read across steps is the caller's.
+
+    One indexer layer, start to finish: the step prologue followed by this
+    layer's half. For a caller whose graph holds MANY indexer layers, the
+    prologue belongs once per step ahead of the layer loop -- call
+    ``paged_mqa_step_prologue_out`` and
+    ``paged_mqa_score_and_topk_prepared_out`` instead of this.
+
+    ``context_lens`` receives the TRUE per-row lengths and bounds the top-k.
+    The guarded copy DeepGEMM reads is derived from the same inputs inside
+    this call by the same launch, so it carries no state between replays: like
+    DeepGEMM's own schedule_meta and logits, a graph-private allocation is
+    replay-safe here because nothing outside the graph writes or reads it.
+    """
+
+    deep_gemm_context_lens = torch.empty_like(context_lens)
+    schedule_meta = paged_mqa_step_prologue_out(
+        aux_page_table=aux_page_table,
+        aux_slot_indices=aux_slot_indices,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        context_lens=context_lens,
+        deep_gemm_context_lens=deep_gemm_context_lens,
+        num_valid_tokens=num_valid_tokens,
+    )
+    return paged_mqa_score_and_topk_prepared_out(
+        q=q,
+        aux_blocked_k=aux_blocked_k,
+        head_gates=head_gates,
+        cache_seqlens=cache_seqlens,
+        q_fp8=q_fp8,
+        block_table=block_table,
+        context_lens=context_lens,
+        deep_gemm_context_lens=deep_gemm_context_lens,
+        schedule_meta=schedule_meta,
+        top_k_indices=top_k_indices,
+        topk=topk,
+        max_seqlen=max_seqlen,
+        index_head_dim=index_head_dim,
+        page_size=page_size,
+        num_valid_tokens=num_valid_tokens,
+        q_prequantized=q_prequantized,
     )
 
 
@@ -496,7 +661,13 @@ def paged_mqa_score_and_topk(
         plan.batch, plan.topk, dtype=torch.int32, device=q.device
     )
     logits = deep_gemm_paged_mqa_logits(
-        q_fp8, aux_blocked_k, head_gates, deep_gemm_context_lens, block_table, plan
+        q_fp8,
+        aux_blocked_k,
+        head_gates,
+        deep_gemm_context_lens,
+        block_table,
+        plan,
+        paged_mqa_logits_schedule_meta(deep_gemm_context_lens),
     )
     return _topk_from_logits(logits, context_lens, top_k_indices, plan, None)
 
@@ -569,7 +740,15 @@ def warm_paged_mqa_logits(
         max_seqlen=int(max_seqlen),
         max_context_len=align_context_len(int(max_seqlen)),
     )
+    # Warming the metadata kernel is the point of the per-bucket key, so the
+    # schedule comes from the same helper the production path uses.
     deep_gemm_paged_mqa_logits(
-        q_fp8, aux_blocked_k, head_gates, context_lens, block_table, plan
+        q_fp8,
+        aux_blocked_k,
+        head_gates,
+        context_lens,
+        block_table,
+        plan,
+        paged_mqa_logits_schedule_meta(context_lens),
     )
     _WARMED.add(key)

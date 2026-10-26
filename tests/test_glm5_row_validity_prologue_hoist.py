@@ -446,6 +446,9 @@ def _prologue_kwargs(bucket_size=4):
         cache_seqlens=torch.zeros(bucket_size, dtype=torch.int32),
         primary_slot_indices=torch.zeros(bucket_size, dtype=torch.int32),
         aux_slot_indices=torch.zeros(bucket_size, dtype=torch.int32),
+        # The prologue also derives the step's position tensors, so
+        # ``position_ids`` is one of its inputs (compute_step_statics).
+        position_ids=torch.zeros(bucket_size, 1, dtype=torch.int64),
         num_valid_tokens=torch.tensor([bucket_size], dtype=torch.int32),
     )
 
@@ -459,11 +462,19 @@ def test_prologue_runs_once_per_shared_buffer_set_not_once_per_layer():
                       full[2], reuse[3], reuse[4]]
     driver = _driver(layer_segments)
 
-    ran = driver._run_row_validity_prologues(4, **_prologue_kwargs())
+    kwargs = _prologue_kwargs()
+    ran = driver._run_row_validity_prologues(4, **kwargs)
 
     assert ran == (("full", 1), ("reuse", 2))
     assert [len(ls.runs) for ls in layer_segments] == [1, 1, 0, 0, 0, 0, 0, 0]
     assert sum(len(ls.runs) for ls in layer_segments) == 2
+    # Every input reaches the prologue unchanged, position_ids included: the
+    # step's derived position tensors are hoisted with the validity statics.
+    for segment in (full[0], reuse[0]):
+        (_bucket, got), = segment.runs
+        assert set(got) == set(kwargs)
+        for name, value in kwargs.items():
+            assert got[name] is value, name
 
 
 def test_prologue_rejects_one_buffer_set_claimed_by_both_variants():
