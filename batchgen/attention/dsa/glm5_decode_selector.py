@@ -665,13 +665,17 @@ def _absorb_q_nope(wrapper, q_nope_flat: torch.Tensor) -> torch.Tensor:
     """
     if wrapper._fp8_absorb_weights is None:
         raise RuntimeError(
-            f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP5 FP8 "
-            "q_absorb; PyTorch/BF16 fallback is disabled"
+            f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires absorb "
+            "weights; no PyTorch fallback is kept"
         )
 
-    from batchgen_kernels.attention.dsa.fp8_absorb import fp8_q_absorb
+    # Dispatches on the container: BF16AbsorbWeights -> strided-batched bmm,
+    # FP8AbsorbWeights -> the Triton WGMMA kernel. The attribute keeps its
+    # historical `_fp8_` name so the core scaffolding that reads it is
+    # untouched; it no longer implies the fp8 container.
+    from batchgen_kernels.attention.dsa.bf16_absorb import absorb_q
 
-    return fp8_q_absorb(q_nope_flat, wrapper._fp8_absorb_weights)
+    return absorb_q(q_nope_flat, wrapper._fp8_absorb_weights)
 
 
 def _require_fa3():
