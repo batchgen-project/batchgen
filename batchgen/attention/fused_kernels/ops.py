@@ -41,11 +41,19 @@ def cuda_add_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-5,
     num_valid_tokens: Optional[torch.Tensor] = None,
+    row_valid_mask: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Fused residual add + RMSNorm. Residual modified in-place.
     Returns (normed, residual).
-    num_valid_tokens: optional 1-element int32 device tensor to skip padding rows."""
-    results = _get_ext().add_rmsnorm_forward(residual, hidden, weight, eps, num_valid_tokens)
+    num_valid_tokens: optional 1-element int32 device tensor to skip padding rows.
+    row_valid_mask: optional [num_rows] tensor in `residual`'s dtype. A row whose
+        entry is exactly zero contributes 0 instead of its `hidden` row, which
+        folds a caller-side row gate into this launch. The entry is used as a
+        PREDICATE, never as a multiplicative factor, so a masked-out `hidden`
+        row holding non-finite bytes cannot propagate (bf16 NaN * 0 is NaN)."""
+    results = _get_ext().add_rmsnorm_forward(
+        residual, hidden, weight, eps, num_valid_tokens, row_valid_mask
+    )
     return results[0], results[1]
 
 
