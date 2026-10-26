@@ -476,11 +476,15 @@ install_deepgemm() {
 batchgen_kernels_contract_ok() {
     # Importing the namespace package is not sufficient: a source checkout or an
     # incomplete wheel can satisfy that check while the first GPT-OSS request
-    # later fails when it lazily imports the fused attention extension.
-    in_neutral_dir python - <<'PY' &>/dev/null
+    # later fails when it lazily imports the fused attention extension. The
+    # list of extensions to import is read from the runtime contract file so
+    # the installer and startup preflight cannot disagree.
+    in_neutral_dir python - "$BATCHGEN_DIR" <<'PY' &>/dev/null
+import ast
 import importlib
 import os
 import site
+import sys
 import sysconfig
 
 import batchgen_kernels
@@ -499,10 +503,26 @@ if not module_path or not any(
         f"({module_path!r}); refusing an editable/source shadow"
     )
 
-for module_name in (
-    "batchgen_kernels.attention._C_fused_ops",
-    "batchgen_kernels.attention._C_gqa_mha_decode_bf16",
-):
+# The extension names come from the runtime contract file in the checked-out
+# tree, read with ast so nothing in batchgen has to be importable yet. A
+# hand-copied list here silently drifts from the contract, which is how a
+# partial build passed this check and failed later in decode.
+contract = os.path.join(sys.argv[1], "batchgen", "runtime_preflight.py")
+tree = ast.parse(open(contract).read())
+declared = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign) and isinstance(node.value, ast.Tuple):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id.endswith("_EXTENSIONS"):
+                declared[target.id] = [
+                    element.value
+                    for element in node.value.elts
+                    if isinstance(element, ast.Constant)
+                ]
+if not declared:
+    raise ImportError(f"no extension tuples declared in {contract}")
+
+for module_name in sorted({name for names in declared.values() for name in names}):
     importlib.import_module(module_name)
 PY
 }
