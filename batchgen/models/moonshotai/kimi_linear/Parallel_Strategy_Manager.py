@@ -253,6 +253,138 @@ class KimiLinearParallelStrategyManager:
             "streamed_sp8" if self._distributed_weight_sharded else "streamed"
         )
         self._decode_graph = None
+        # Worker phase-instance reuse protocol (default lifecycle). The worker
+        # sets ``reuse_phase_instances``; ``_instances_are_reused`` decides
+        # whether this manager honours it and publishes the instance tuples.
+        self.reuse_phase_instances = False
+        self.prefill_instance = None
+        self.decode_instance = None
+        # "prefill" / "decode" once a phase has been entered on the model.
+        self._active_phase = None
+
+    # ------------------------------------------------------------------ #
+    #  Phase-instance reuse protocol                                     #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def persistent_phase_instances(self):
+        """Always False: ``--persistent-phase-instances`` is not supported.
+
+        The worker's flag gate admits any manager with ``activate_decoding``
+        and then writes True here, so the refusal has to live in the setter
+        to stay at startup instead of surfacing at the first phase switch.
+        """
+        return False
+
+    @persistent_phase_instances.setter
+    def persistent_phase_instances(self, value):
+        if value:
+            raise RuntimeError(
+                "Kimi-K3 does not support --persistent-phase-instances; it "
+                "uses the default phase-instance reuse lifecycle"
+            )
+
+    @property
+    def _instances_are_reused(self):
+        """Whether the worker's reuse request is honoured for this deployment.
+
+        Honoured only with resident-EP decode and no resident-EP prefill
+        handoff. Streamed decode keeps a non-empty routed-expert decode task,
+        which the reuse activation refuses. A positive
+        ``k3_resident_prefill_token_cap`` selects the handoff, whose worker
+        branch sits after the reuse branch: publishing ``decode_instance``
+        there would release the resident shard every wave and rebuild it from
+        the node store for the resident prefill. Those deployments decline
+        and keep the rebuild lifecycle. Remove the handoff decline once the
+        resident shard lives at fixed addresses and the handoff is integrated
+        into this protocol.
+        """
+        if not self.reuse_phase_instances:
+            return False
+        if self._decode_moe_mode() != "resident_ep":
+            return False
+        resident_token_cap = int(getattr(
+            self.engine_config.Module_Batching_Config,
+            "k3_resident_prefill_token_cap", 0,
+        ) or 0)
+        return resident_token_cap <= 0
+
+    @property
+    def decode_experts_resident(self):
+        """Whether the decode instance's routed experts are resident AND active.
+
+        The worker treats a resident decode instance as the active one
+        (``_decode_instance_is_active``) and skips the prefill->decode switch.
+        A resident-EP prefill also builds the shard, so the shard alone would
+        keep the model in prefill mode through decode.
+        """
+        return bool(self._resident_ep_built and self._active_phase == "decode")
+
+    def release_decode_routed_experts(self):
+        """Release the decode graph and then this rank's resident EP shard."""
+        self._release_resident_ep_decode()
+
+    def _publish_prefill_instance(self):
+        if self._instances_are_reused:
+            self.prefill_instance = (self.model, self.weight_copy_task)
+        return self.model, self.weight_copy_task
+
+    def _publish_decode_instance(self):
+        if self._instances_are_reused:
+            self.decode_instance = (self.model, self.weight_copy_task)
+        return self.model, self.weight_copy_task
+
+    def _require_built_model(self, phase):
+        if self.model is None:
+            raise RuntimeError(
+                f"Kimi-K3 activate_{phase} found no model: phase activation "
+                "never builds one, so the instance was dropped (for example "
+                "by deep_free_model_memory) while the worker still treated "
+                "it as reusable"
+            )
+
+    def activate_prefill(self):
+        """Switch the built model into the selected prefill mode."""
+        self._require_built_model("prefill")
+        start = time.perf_counter()
+        stages = self._enter_prefill()
+        self._log_phase_activation("prefill", start, stages)
+        return self._publish_prefill_instance()
+
+    def activate_decoding(self):
+        """Switch the built model into decode: resident shard and decode graph."""
+        self._require_built_model("decoding")
+        start = time.perf_counter()
+        stages = self._enter_decoding()
+        self._log_phase_activation("decoding", start, stages)
+        return self._publish_decode_instance()
+
+    def _log_phase_activation(self, phase, start, stages):
+        # Every rank: the resident shard is rebuilt on each switch into decode,
+        # and a slow node is only visible in its own ranks' timings.
+        total = time.perf_counter() - start
+        memory = ""
+        if torch.cuda.is_available():
+            free, device_total = torch.cuda.mem_get_info(
+                self.engine_config.Basic_Config.device_torch
+            )
+            memory = " free=%.2fGiB total=%.2fGiB" % (
+                free / (1024 ** 3), device_total / (1024 ** 3)
+            )
+        logging.info(
+            "[K3_PHASE] rank %s activate_%s total=%.3fs %s prefill_moe_mode=%s "
+            "resident_ep_built=%s%s",
+            self.global_rank,
+            phase,
+            total,
+            " ".join(
+                "%s=%.3fs" % (name, seconds)
+                for name, seconds in stages.items()
+            ),
+            self._prefill_moe_mode,
+            self._resident_ep_built,
+            memory,
+        )
 
     # ------------------------------------------------------------------ #
     #  Phase configuration                                                #
@@ -684,6 +816,11 @@ class KimiLinearParallelStrategyManager:
         """
         self._resident_ep_built = False
         self._streamed_sp8_buffer = None
+        # The instance tuples hold the dead model; publishing them again is
+        # the next configure's job.
+        self.prefill_instance = None
+        self.decode_instance = None
+        self._active_phase = None
         # Restores the old model's forwards and drops its captured buckets;
         # None-safe, so the first build is a no-op.
         self.release_decode_graph()
@@ -966,13 +1103,26 @@ class KimiLinearParallelStrategyManager:
         return task
 
     def configure_prefill(self):
-        """Build the model and switch to streamed or resident-EP prefill."""
+        """Build the model if needed and switch to the selected prefill mode."""
+        if self.model is None:
+            self._build_model()
+        self._enter_prefill()
+        return self._publish_prefill_instance()
+
+    def _enter_prefill(self):
+        """Switch the built model to streamed, streamed-SP8 or resident-EP prefill.
+
+        Re-entrant on the same model: a live streamed-SP8 buffer is kept and
+        the weight-copy task is rebuilt deterministically, so the worker's
+        installed H2D schedule fingerprint still matches. Returns stage
+        timings in seconds.
+        """
+        start = time.perf_counter()
+        self._active_phase = "prefill"
         self.loaded_model_config.phase = "prefill"
         self.loaded_model_config.ep_size = (
             self.world_size if self.prefill_uses_resident_ep() else 1
         )
-        if self.model is None:
-            self._build_model()
         AttnWrapperBase.phase = "prefill"
         KimiLinearExpertWrapper.phase = "prefill"
         # block_residual never outlives one decoder pass; drop anything a
@@ -980,6 +1130,7 @@ class KimiLinearParallelStrategyManager:
         # this phase starts from the seeded-at-layer-0 state.
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
+        copy_task_done = time.perf_counter()
         if self.prefill_uses_resident_ep():
             self._release_streamed_sp8_prefill()
             if self._stream_all_modules or self._attn_tp_size <= 1:
@@ -1016,10 +1167,13 @@ class KimiLinearParallelStrategyManager:
         else:
             self._release_streamed_sp8_prefill()
             self._set_resident_ep_prefill_enabled(False)
-        return self.model, self.weight_copy_task
+        return {
+            "copy_task": copy_task_done - start,
+            "moe_mode": time.perf_counter() - copy_task_done,
+        }
 
     def configure_decoding(self, padding_bsz=None, comm=None):
-        """Switch to decode phase (model already built).
+        """Build the model if needed and switch to decode phase.
 
         decode_moe_mode="resident_ep" (default, set by the planner):
         materialize the stacked EP shard once and return an EMPTY
@@ -1052,18 +1206,45 @@ class KimiLinearParallelStrategyManager:
                 "(max_tokens=1 still enters decode today — see PREFILL_PLAN "
                 "C4) or turn the flag off."
             )
-        self.loaded_model_config.phase = "decode"
+        if comm is not None:
+            self._comm = comm
+        build_seconds = 0.0
+        if self.model is None:
+            # The rebuild drops the streamed-SP8 buffer reference without
+            # closing it, so close it first.
+            self._release_streamed_sp8_prefill()
+            build_start = time.perf_counter()
+            self._build_model()
+            build_seconds = time.perf_counter() - build_start
+        stages = self._enter_decoding()
         # Stage timings on every rank: r29 (2x8 H200) showed node 1 reaching
         # the resident shard build 36 s after entering configure_decoding
         # (node 0: 7 s) with nothing logged in between.
+        logging.info(
+            "[K3] configure_decoding rank %s: release_streamed=%.1fs "
+            "build/copy_task=%.1fs resident_ep=%.1fs decode_graph=%.1fs",
+            self.global_rank,
+            stages["release_streamed"],
+            build_seconds + stages["copy_task"],
+            stages["resident_ep"],
+            stages["decode_graph"],
+        )
+        return self._publish_decode_instance()
+
+    def _enter_decoding(self):
+        """Switch the built model to decode.
+
+        Releases the streamed-SP8 prefill state, materializes the resident EP
+        shard when it is not built, and installs a fresh decode graph adapter
+        (the previous one was released with the shard whose addresses it
+        bakes). Returns stage timings in seconds.
+        """
+        self._active_phase = "decode"
+        self.loaded_model_config.phase = "decode"
         _t0 = time.perf_counter()
         self._release_streamed_sp8_prefill()
         _t1 = time.perf_counter()
         self._set_resident_ep_prefill_enabled(False)
-        if comm is not None:
-            self._comm = comm
-        if self.model is None:
-            self._build_model()
         AttnWrapperBase.phase = "decode"
         KimiLinearExpertWrapper.phase = "decode"
         BlockResidualCarrier.reset()
@@ -1076,13 +1257,12 @@ class KimiLinearParallelStrategyManager:
             self.weight_copy_task["routed_expert"] = []
         _t3 = time.perf_counter()
         self._init_decode_graph()
-        logging.info(
-            "[K3] configure_decoding rank %s: release_streamed=%.1fs "
-            "build/copy_task=%.1fs resident_ep=%.1fs decode_graph=%.1fs",
-            self.global_rank, _t1 - _t0, _t2 - _t1, _t3 - _t2,
-            time.perf_counter() - _t3,
-        )
-        return self.model, self.weight_copy_task
+        return {
+            "release_streamed": _t1 - _t0,
+            "copy_task": _t2 - _t1,
+            "resident_ep": _t3 - _t2,
+            "decode_graph": time.perf_counter() - _t3,
+        }
 
     def _decode_moe_mode(self):
         """Planner-set decode MoE execution mode (config-driven, no env vars):
