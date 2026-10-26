@@ -173,7 +173,8 @@ def _rmsnorm_fp8_quant_kernel(
 
     amax = tl.max(tl.abs(q_float), axis=1)
     amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    # SGLang formula: scale = amax * (1 / 448). Matches the 3D-grid kernel.
+    # e4m3 block-scale convention: scale = amax * (1 / 448). Matches the
+    # 3D-grid kernel.
     scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
 
     q_scaled = q_float / scale[:, None]
