@@ -2496,8 +2496,14 @@ class Glm5MoE(nn.Module):
         )
         return global_results.to(torch.bfloat16)
 
-    def shared_expert_forward(self, identity: torch.Tensor) -> torch.Tensor:
-        return self.shared_experts(identity)
+    def shared_expert_forward(
+        self, identity: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``out``: write the down projection straight into a caller buffer
+        (persistent FP8 shared expert with the fused gate/up binding only)."""
+        if out is None:
+            return self.shared_experts(identity)
+        return self.shared_experts(identity, out=out)
 
     def _prefill_prepare_weights(self) -> None:
         """Acquire one full FP8 expert layer from the async core-engine ring."""

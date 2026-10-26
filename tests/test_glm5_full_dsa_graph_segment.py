@@ -13,6 +13,7 @@ Two tiers live in this file:
 
 import ast
 import collections
+import contextlib
 import pathlib
 import types
 
@@ -293,7 +294,15 @@ def test_attention_branches_on_all_short(src, class_name):
 
 def test_all_short_skips_every_scoring_stage():
     fwd = _method(_tree(_SEGMENTS_SRC), "Glm5FullDsaAttnSegment", "forward")
-    guarded = _branch(fwd, "not self.all_short")
+    # The scoring stages are guarded in TWO places: the head gates ride the
+    # indexer K path on the side stream, the query side stays on the main
+    # stream. Every `if not self.all_short:` guard counts.
+    guards = [
+        node for node in ast.walk(fwd)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "not self.all_short"
+    ]
+    assert len(guards) == 2, len(guards)
+    guarded = ast.Module(body=guards, type_ignores=[])
     guarded_calls = _call_names(guarded)
     total_calls = _call_names(fwd)
     for stage in _SCORING_CALLS:
@@ -1162,3 +1171,167 @@ def test_glm5_registers_fused_qkv_a_storage_views():
         wrapper.module.kv_a_proj_with_mqa.weight.data.untyped_storage().data_ptr()
         == wrapper._fp8_qkv_a_proj.untyped_storage().data_ptr()
     )
+
+
+# --------------------------------------------------------------------------- #
+# Indexer K path on the side stream: every reader runs after the join
+# --------------------------------------------------------------------------- #
+
+# Long enough that a reader issued without the join would certainly run before
+# the K path's writes land (the stubbed main-stream work takes microseconds).
+_K_PATH_SPIN_CYCLES = 200_000_000
+
+
+def _make_k_path_slow_and_observable(monkeypatch):
+    """Delay the whole K path on whichever stream issues it, and make the
+    scorer's output a function of what the K path wrote (this token's aux K
+    and the head gates), so the result changes if the scorer reads early."""
+    stub_wk = segments.cuda_wk_proj_gemm_only_out
+
+    def slow_wk_proj(*args, **kwargs):
+        torch.cuda._sleep(_K_PATH_SPIN_CYCLES)
+        return stub_wk(*args, **kwargs)
+
+    def observing_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):
+        del q_index, aux_page_table, aux_slot_indices, cache_seqlens, agg_scores
+        del topk, page_size, max_seqlen, num_valid_tokens
+        gate = head_gates.sum(dim=1, keepdim=True)
+        k_mass = aux_blocked_k.float().sum()
+        code = (gate * 8.0 + k_mass).round().clamp(-1000, 1000).to(torch.int32)
+        top_k_indices.copy_(code.expand_as(top_k_indices))
+        return top_k_indices
+
+    monkeypatch.setattr(segments, "cuda_wk_proj_gemm_only_out", slow_wk_proj)
+    monkeypatch.setattr(
+        segments, "fused_paged_score_and_topk_with_slots_out", observing_score_topk
+    )
+
+
+class _TimedKPath:
+    """The real fork/join with GPU timestamps around both edges.
+
+    ``main_at_join`` is stamped on the main stream immediately before the join
+    and ``side_done`` on the side stream immediately after the K path. A side
+    stream that finishes long after the main stream reached the join proves
+    that a reader issued without the join would have read the poison -- the
+    race the join closes is real in this test, so the equality check above it
+    is not vacuous. (Actually dropping the join is not a usable mutant: the
+    main stream then returns and recycles ``token_indices`` while the side
+    stream still reads it, which is an illegal-address fault, not a value
+    difference.)
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.side_done = torch.cuda.Event(enable_timing=True)
+        self.main_at_join = torch.cuda.Event(enable_timing=True)
+        self.main_after_join = torch.cuda.Event(enable_timing=True)
+        self.forks = 0
+        self.joins = 0
+
+    @contextlib.contextmanager
+    def fork(self):
+        self.forks += 1
+        with self._real.fork():
+            yield
+        self.side_done.record(self._real.stream)
+
+    def join(self):
+        self.joins += 1
+        self.main_at_join.record(torch.cuda.current_stream())
+        self._real.join()
+        self.main_after_join.record(torch.cuda.current_stream())
+
+
+def _k_path_inputs(attn, device):
+    gen = torch.Generator(device="cpu").manual_seed(20261020)
+    return {
+        "hidden_states": torch.randn(2, 1, attn.hidden_size, generator=gen)
+        .to(torch.bfloat16)
+        .to(device),
+        "position_ids": torch.tensor([[1], [2]], dtype=torch.int64, device=device),
+        "cache_seqlens": torch.tensor([2, 3], dtype=torch.int32, device=device),
+        "primary_slot_indices": torch.tensor([0, 1], dtype=torch.int32, device=device),
+        "aux_slot_indices": torch.tensor([0, 1], dtype=torch.int32, device=device),
+    }
+
+
+@requires_cuda
+@pytest.mark.parametrize("all_short", [False, True])
+def test_indexer_k_path_side_stream_is_joined_before_every_reader(monkeypatch, all_short):
+    device = torch.device("cuda")
+    shared_buffers = {}
+    segment, primary_cache, aux_cache = _build_full_segment(
+        monkeypatch, device, shared_buffers, all_short=all_short
+    )
+    side = segment._indexer_k_overlap
+    assert isinstance(side, segments._IndexerKPathOverlap)
+    assert side.stream != torch.cuda.current_stream()
+    _make_k_path_slow_and_observable(monkeypatch)
+    attn = segment.attn
+    inputs = _k_path_inputs(attn, device)
+    num_valid_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+
+    def poison():
+        # A reader that runs before the side stream sees these, not the
+        # K path's values.
+        if 2 in shared_buffers:
+            shared_buffers[2].head_gates.fill_(-100.0)
+            segment._outputs[2].indexer_k_tensor.fill_(-7.0)
+
+    def snapshot(out):
+        # Cloned on the MAIN stream with no host synchronization in between:
+        # the contract under test is stream order, not host order.
+        snap = {k: v.clone() for k, v in out.items()}
+        snap["aux_cache"] = aux_cache.clone()
+        snap["primary_cache"] = primary_cache.clone()
+        torch.cuda.synchronize()
+        return snap
+
+    def run_eager(overlap):
+        segment._indexer_k_overlap = overlap
+        torch.cuda.synchronize()
+        primary_cache.zero_()
+        aux_cache.zero_()
+        poison()
+        out = segment.forward(num_valid_tokens=num_valid_tokens, **inputs)
+        return snapshot(out)
+
+    serial = segments._InlineIndexerKPath()
+    run_eager(serial)  # allocates the bucket's static buffers
+    reference = run_eager(serial)
+    forked = run_eager(side)
+    for key, value in reference.items():
+        assert torch.equal(forked[key], value), key
+
+    # Non-vacuity: the side stream really was still running when the main
+    # stream reached the join, and the join really held the main stream.
+    timed = _TimedKPath(side)
+    timed_run = run_eager(timed)
+    assert timed.forks == 1 and timed.joins == 1
+    for key, value in reference.items():
+        assert torch.equal(timed_run[key], value), key
+    lag_ms = timed.main_at_join.elapsed_time(timed.side_done)
+    assert lag_ms > 20.0, (
+        f"the K path finished {lag_ms:.3f} ms after the main stream reached the "
+        "join; without that gap the test cannot see a missing join"
+    )
+    assert timed.side_done.elapsed_time(timed.main_after_join) > -0.05
+
+    # The same contract under capture: fork/join become graph edges.
+    segment._indexer_k_overlap = side
+    manager = CUDAGraphManager(BatchSizeBucketing([4]), device=device)
+    manager.WARMUP_ITERATIONS = 1
+    name = make_glm5_full_dsa_graph_segment_name(0)
+    manager.register_segment(name, segment)
+    manager.warmup_and_capture_buckets([4])
+    for _ in range(3):
+        torch.cuda.synchronize()
+        primary_cache.zero_()
+        aux_cache.zero_()
+        shared_buffers[4].head_gates.fill_(-100.0)
+        segment._outputs[4].indexer_k_tensor.fill_(-7.0)
+        out = manager.replay(name, 2, **inputs)
+        replayed = snapshot({k: v[:2] for k, v in out.items()})
+        for key, value in reference.items():
+            assert torch.equal(replayed[key], value), key

@@ -175,6 +175,30 @@ def act_quant_ragged(
     )
 
 
+def deepep_ll_scale_repack(
+    recv_scales: torch.Tensor,
+    recv_count: torch.Tensor,
+    out: torch.Tensor,
+    span_align: int,
+) -> None:
+    """Repack DeepEP LL activation scales into the grouped GEMM's scale matrix.
+
+    ``recv_scales`` is the exchange's [E, stride, hidden/128] view of its
+    contiguous [E, hidden/128, stride] block; ``out`` is the [hidden/128,
+    E * stride] matrix the grouped GEMM reads, expert e at column e * stride.
+    Per expert only columns [0, ceil(recv_count[e] / span_align) * span_align)
+    are copied -- with ``span_align`` = the GEMM's TileM that is exactly the
+    set of columns its tiles load -- and the rest of ``out`` is left as is.
+    """
+    kernel = getattr(_require_ops_module(), "deepep_ll_scale_repack", None)
+    if kernel is None:
+        raise RuntimeError(
+            "batchgen_kernels.moe._C_fp8_blockwise_ops has no "
+            "deepep_ll_scale_repack; rebuild batchgen_kernels"
+        )
+    kernel(recv_scales, recv_count, out, int(span_align))
+
+
 def reduce_weighted_scatter_bf16_ordered(
     expert_output: torch.Tensor,
     topk_pos: torch.Tensor,

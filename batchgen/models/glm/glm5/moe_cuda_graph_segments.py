@@ -29,13 +29,20 @@ from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
 from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
+    prepare_grouped_fp8_s1_s3_tma,
 )
-from batchgen.moe.routing import FusedGateContext, gate_sigmoid_topk_cuda
+from batchgen.moe.routing import (
+    GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS,
+    FusedGateContext,
+    gate_sigmoid_topk_cuda,
+    gate_sigmoid_topk_warp_cuda,
+)
 
 from .moe_ragged import (
     ROW_ALIGN,
     gemm_tilem_avg_effective as _glm5_gemm_tilem_avg,
     act_quant_ragged,
+    deepep_ll_scale_repack,
     dispatch_scatter_ragged,
     make_quant_buffers,
     ragged_row_capacity,
@@ -202,13 +209,25 @@ class _Glm5MoEGraphBuffers:
     cu_seqlens: torch.Tensor
     capacity: int
     # DeepEP low-latency mode only (``Glm5MoEGraphBufferPool.configure_deepep``).
-    # ``ll_topk_idx`` is the int64 copy of the gate's int32 indices the exchange
-    # requires; ``ll_x_scale`` is the repacked activation scale the grouped GEMM
+    # ``ll_topk_idx`` holds the int64 expert ids the exchange requires, written
+    # by the gate directly (``topk_indices`` is then an empty tensor);
+    # ``ll_x_scale`` is the repacked activation scale the grouped GEMM
     # requires; ``ll_cu_seqlens`` is the constant uniform-stride segment table.
     # All three are empty tensors on the NCCL path.
     ll_topk_idx: torch.Tensor
     ll_x_scale: torch.Tensor
     ll_cu_seqlens: torch.Tensor
+    # DeepEP low-latency mode only: the per-expert X/Y TMA descriptors of the
+    # fused S1 and of the S3 GEMM ([2 * E_local, 128] bytes each) and their one
+    # shared tile table, all written by ONE prepare launch per layer
+    # (prepare_grouped_fp8_s1_s3_tma) and read by both GEMMs later on the same
+    # stream. One set for every MoE layer and bucket: layers run in stream
+    # order and each layer's S3 has read them before the next layer's prepare
+    # rewrites them. Empty on the NCCL path.
+    ll_s1_tma: torch.Tensor
+    ll_s3_tma: torch.Tensor
+    ll_tiles: torch.Tensor
+    ll_cu_tiles: torch.Tensor
     # DeepEP low-latency mode only: the shared expert's output, produced on the
     # side stream and consumed by the accumulate on the main stream. A pool
     # buffer rather than a side-stream temporary because the consumer is a
@@ -265,6 +284,10 @@ _MOE_SHARED_FIELDS = (
     # which does not scale with the bucket, so both are bucket-independent.
     "ll_x_scale",
     "ll_cu_seqlens",
+    "ll_s1_tma",
+    "ll_s3_tma",
+    "ll_tiles",
+    "ll_cu_tiles",
 )
 
 _MOE_REBUILT_FIELDS = (
@@ -421,6 +444,10 @@ class Glm5MoEGraphBufferPool:
         b["ll_topk_idx"] = torch.empty(0, k, dtype=torch.int64, device=d)
         b["ll_x_scale"] = torch.empty(h // 128, 0, dtype=torch.float32, device=d)
         b["ll_cu_seqlens"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_s1_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
+        b["ll_s3_tma"] = torch.empty(0, 128, dtype=torch.uint8, device=d)
+        b["ll_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["ll_cu_tiles"] = torch.empty(0, dtype=torch.int32, device=d)
         # The shared expert stays on the one stream here, so it keeps writing
         # the tensor it allocates and this buffer is never read.
         b["shared_out"] = torch.empty(0, h, dtype=torch.bfloat16, device=d)
@@ -495,7 +522,8 @@ class Glm5MoEGraphBufferPool:
         # Router on LOCAL rows only: world_size x less gate work than the
         # all-gathered row space the NCCL path routes.
         b["router_logits"] = torch.empty(max_bucket, 256, dtype=torch.float32, device=d)
-        b["topk_indices"] = torch.empty(max_bucket, k, dtype=torch.int32, device=d)
+        # The gate writes DeepEP's int64 ids directly (``ll_topk_idx``); there
+        # is no int32 index buffer on this path.
         b["topk_weights"] = torch.empty(max_bucket, k, dtype=torch.float32, device=d)
         b["ll_topk_idx"] = torch.empty(max_bucket, k, dtype=torch.int64, device=d)
         b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
@@ -518,15 +546,24 @@ class Glm5MoEGraphBufferPool:
         b["cu_seqlens"] = b["ll_cu_seqlens"]
         # Activation scales: DeepEP returns one contiguous [h/128, stride]
         # block per local expert, the GEMM wants a single [h/128, rows]
-        # tensor, so the dispatch output is repacked into this buffer.
+        # tensor, so the dispatch output is repacked into this buffer -- per
+        # expert only the columns the GEMM's tiles can load
+        # (deepep_ll_scale_repack); the rest keep whatever they held.
         _, ll_x_scale = make_quant_buffers(rows, h, d)
         b["ll_x_scale"] = ll_x_scale
+        # Both GEMMs' descriptors + their shared tile table, written by one
+        # prepare launch per layer (see _Glm5MoEGraphBuffers.ll_s1_tma).
+        b["ll_s1_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
+        b["ll_s3_tma"] = torch.empty(2 * e, 128, dtype=torch.uint8, device=d)
+        b["ll_tiles"] = torch.empty(e, dtype=torch.int32, device=d)
+        b["ll_cu_tiles"] = torch.empty(e + 1, dtype=torch.int32, device=d)
         _, inter_scale = make_quant_buffers(rows, n, d)
         b["inter_scale"] = inter_scale
         empty_h = torch.empty(0, h, dtype=torch.bfloat16, device=d)
         b["_unused_bf16_h"] = empty_h
         b["_unused_u8_h"] = torch.empty(0, h, dtype=torch.uint8, device=d)
         b["_unused_i32"] = torch.empty(0, dtype=torch.int32, device=d)
+        b["_unused_i32_k"] = torch.empty(0, k, dtype=torch.int32, device=d)
 
         for bucket_size in self.bucket_sizes:
             self._create_view_deepep(bucket_size, rows)
@@ -551,7 +588,7 @@ class Glm5MoEGraphBufferPool:
             # The router reads the local rows; there is no all-gathered space.
             all_tokens=b["padded"][:bucket_size],
             router_logits=b["router_logits"][:bucket_size],
-            topk_indices=b["topk_indices"][:bucket_size],
+            topk_indices=b["_unused_i32_k"],
             topk_weights=b["topk_weights"][:bucket_size],
             topk_pos=b["_unused_i32"],
             dispatched_x=b["_unused_bf16_h"],
@@ -568,6 +605,10 @@ class Glm5MoEGraphBufferPool:
             cu_seqlens=b["ll_cu_seqlens"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
             ll_x_scale=b["ll_x_scale"],
+            ll_s1_tma=b["ll_s1_tma"],
+            ll_s3_tma=b["ll_s3_tma"],
+            ll_tiles=b["ll_tiles"],
+            ll_cu_tiles=b["ll_cu_tiles"],
             x_scale=b["ll_x_scale"],
             inter_scale=b["inter_scale"],
             capacity=rows,
@@ -626,6 +667,10 @@ class Glm5MoEGraphBufferPool:
             cu_seqlens=b["cu_seqlens"],
             ll_x_scale=b["ll_x_scale"],
             ll_cu_seqlens=b["ll_cu_seqlens"],
+            ll_s1_tma=b["ll_s1_tma"],
+            ll_s3_tma=b["ll_s3_tma"],
+            ll_tiles=b["ll_tiles"],
+            ll_cu_tiles=b["ll_cu_tiles"],
             x_scale=x_scale,
             inter_scale=inter_scale,
             capacity=capacity,
@@ -727,6 +772,15 @@ class Glm5MoEGraphSegment:
                     f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires cached "
                     f"shared expert FP8 weights; missing {missing}"
                 )
+            # The DeepEP path hands the shared expert its staging buffer as
+            # ``out=``, which only the fused gate/up chain accepts. Checked
+            # here, before warmup and capture, instead of failing inside them.
+            if getattr(shared, "cached_gate_up", None) is None:
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires the "
+                    "shared expert's fused gate/up FP8 weight binding "
+                    "(GLM5ExpertWrapper._bind_fused_gate_up)"
+                )
 
     def _validate_deepep_graph_safe(self) -> None:
         """Fail loudly before capture for every assumption the DeepEP decode
@@ -765,6 +819,17 @@ class Glm5MoEGraphSegment:
             raise RuntimeError(
                 f"Layer {moe.layer_idx}: --enable-deepep and EP expert "
                 "offloading are mutually exclusive for GLM-5 decode")
+        # The DeepEP path routes with the one-warp-per-row gate, which holds a
+        # row's experts in registers.
+        if num_experts_global > GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the DeepEP decode gate handles at most "
+                f"{GATE_SIGMOID_TOPK_WARP_MAX_EXPERTS} routed experts, this model "
+                f"has {num_experts_global}")
+        if self.num_experts_per_tok not in (2, 4, 8, 16):
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: the DeepEP decode gate supports top-k "
+                f"2, 4, 8 or 16, got {self.num_experts_per_tok}")
         import torch.distributed as dist
 
         if not dist.is_initialized():
@@ -936,13 +1001,21 @@ class Glm5MoEGraphSegment:
           and writes this rank's rows.
 
         The shared expert is additionally forked onto a side stream for the
-        span of the routed chain (fork after the gate, join before the
-        accumulate). It reads only ``padded``, so the exchange and the grouped
-        GEMMs never wait on it, and the dispatch -- a comm kernel that mostly
-        waits on peers -- stops being time in which this rank's SMs do nothing.
-        The arithmetic, the operand values and the order of writes are
-        unchanged; only the stream the shared expert is issued on moves, so the
-        output is expected bitwise-identical to the in-line version.
+        span of the routed chain: fork right after the router GEMM (before the
+        top-k), join before the accumulate, after the combine. It reads only
+        ``padded``, so the exchange and the grouped GEMMs never wait on it.
+        Dispatch and combine each launch as a send kernel and a separate
+        receive kernel on the main stream (``split_phases=True``), so the
+        shared expert, issued first, runs against the top-k, the id copy and
+        the dispatch send instead of contending with one exchange kernel that
+        spans the whole round trip. The shared expert itself is the fused
+        four-launch chain (one gate/up GEMM, SiLU*up fused into the down
+        input's quantization, no scale transposes) writing straight into the
+        staging buffer, so it fits inside the dispatch window. The operand
+        values and the order of writes are unchanged; only the stream the
+        shared expert is issued on, its kernel decomposition and the
+        exchange's kernel decomposition move, so the output is expected
+        bitwise-identical to the in-line version.
 
         M-independence (padded rows stay inert): DeepEP leaves rows at or
         beyond ``recv_count[e]`` holding whatever the previous step left in the
@@ -951,7 +1024,12 @@ class Glm5MoEGraphSegment:
         reads only the rows named by the dispatch handle's ``src_info`` /
         ``layout_range``. Stale rows therefore cannot reach the output, and the
         captured graph's result depends only on the live row count, never on
-        the padded extent.
+        the padded extent. The x-scale matrix follows the same rule at tile
+        granularity: S1 loads, per expert, the scale columns of its
+        ``ceil(recv_count[e] / TileM)`` row tiles (the partial last tile's
+        extra columns only scale rows whose X loads are zero-filled and whose
+        Y stores are clipped), the repack copies exactly those columns, and
+        every column past them keeps a stale value no tile addresses.
 
         The side-stream staging buffer does not weaken that: it is one process
         buffer sliced to the bucket, the shared expert rewrites every row of
@@ -986,62 +1064,97 @@ class Glm5MoEGraphSegment:
             self.router_context.router_forward(
                 padded, logits=bufs.router_logits
             )
-        gate_sigmoid_topk_cuda(
+
+        # FORK, right after the router GEMM and before the top-k: the shared
+        # expert consumes ``padded`` and its own weights only, so from here it
+        # is independent of everything routed. Issued this early it runs
+        # against the top-k, the id copy and the dispatch SEND kernel; the
+        # dispatch RECEIVE kernel is a separate launch (``split_phases``
+        # below), so the routed chain does not hold the SMs across the whole
+        # exchange round trip while the shared expert is in flight.
+        with self._shared_overlap.fork():
+            # The down projection writes straight into the pool's staging
+            # buffer (no staging copy): the chain is quantize, ONE gate/up
+            # GEMM, fused SiLU*up + quantize, down GEMM -- four launches on
+            # the side stream. The bytes the accumulate reads are the ones the
+            # GEMM produced, i.e. exactly what a separate bf16 -> bf16 copy of
+            # the same shape would have delivered.
+            shared_out = self.moe.shared_expert_forward(
+                padded, out=bufs.shared_out)
+            if shared_out is not bufs.shared_out:
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: shared expert returned a "
+                    f"tensor other than the staging buffer it was given "
+                    f"({tuple(shared_out.shape)}/{shared_out.dtype} vs "
+                    f"{tuple(bufs.shared_out.shape)}/{bufs.shared_out.dtype}); "
+                    "the accumulate would read a buffer the side stream never "
+                    "wrote.")
+
+        # The top-k runs on this stream while the shared expert's x quant and
+        # gate/up GEMM run on the side stream. A GEMM CTA is not placed on an
+        # SM that a top-k CTA still occupies, so the top-k has to be FINISHED
+        # by the time the x quant releases the GEMM. The one-warp-per-row
+        # gate is built for that: one 32-thread CTA per row, one memory round
+        # trip, a programmatic dependent launch right behind the router GEMM,
+        # and the int64 ids DeepEP reads written straight into the exchange's
+        # buffer (no int32 -> int64 copy launch). Same bytes as the
+        # block-per-row gate; -1 padding rows stay unrouted.
+        gate_sigmoid_topk_warp_cuda(
             bufs.router_logits,
             self.gate_bias_fp32,
             k=self.num_experts_per_tok,
             routed_scaling_factor=self.routed_scaling_factor,
-            topk_indices=bufs.topk_indices,
+            topk_indices=bufs.ll_topk_idx,
             topk_weights=bufs.topk_weights,
             rank_token_counts=rank_token_counts[self.rank : self.rank + 1],
             rows_per_rank=bucket_size,
         )
 
-        # FORK. The shared expert consumes ``padded`` and its own weights, and
-        # nothing the exchange produces, so from here it is independent of the
-        # whole routed chain below. On the side stream it runs against the
-        # dispatch, both grouped GEMMs and the combine instead of after them.
-        with self._shared_overlap.fork():
-            shared_out = self.moe.shared_expert_forward(padded)
-            if (shared_out.shape != bufs.shared_out.shape
-                    or shared_out.dtype != bufs.shared_out.dtype):
-                raise RuntimeError(
-                    f"Layer {self.moe.layer_idx}: shared expert returned "
-                    f"{tuple(shared_out.shape)}/{shared_out.dtype}, but the "
-                    f"overlap buffer is {tuple(bufs.shared_out.shape)}/"
-                    f"{bufs.shared_out.dtype}. Staging through the buffer is "
-                    "only value-preserving while both agree: a narrowing copy "
-                    "would round here instead of inside the accumulate.")
-            # Staged on the SIDE stream, so the copy is hidden behind the
-            # dispatch exactly like the arithmetic above it and costs the
-            # critical path nothing. bf16 -> bf16 of the same shape, so the
-            # value the accumulate reads is the value the old in-line
-            # ``add_(shared_expert_forward(padded))`` read, bit for bit.
-            bufs.shared_out.copy_(shared_out)
-
-        # DeepEP reads int64 expert ids; -1 padding rows stay unrouted.
-        bufs.ll_topk_idx.copy_(bufs.topk_indices)
-
+        # Dispatch and combine each run as a SEND kernel followed by a separate
+        # RECEIVE kernel, both on this stream (``split_phases``; DeepEP's
+        # ``return_recv_hook=True`` with the hook issued at once). Same bytes,
+        # same reduction order as the single-kernel exchange.
         recv_x, recv_scales, recv_count, handle = exchange.dispatch_fp8(
-            padded, bufs.ll_topk_idx
+            padded, bufs.ll_topk_idx, split_phases=True
         )
         # recv_x [e, stride, h] fp8 -> the uniform-stride activation the
         # grouped GEMM takes, expert i's rows at [i * stride, ...).
         x_fp8 = recv_x.view(e * stride, self.hidden_size)
-        # recv_scales is logically [e, stride, h/128] but its last two
-        # dimensions are a transposed view of a contiguous [e, h/128, stride]
-        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
-        # The GEMM wants ONE contiguous [h/128, e * stride], so transpose back
-        # and repack: the only kernel this path adds.
-        bufs.ll_x_scale.view(self.hidden_size // 128, e, stride).copy_(
-            recv_scales.transpose(1, 2).permute(1, 0, 2)
-        )
+        inter_fp8 = bufs.inter_fp8.view(torch.float8_e4m3fn)
 
         avg = _glm5_gemm_tilem_avg(
             global_rows,
             self.num_experts_per_tok,
             self.num_local_experts * self.world_size,
         )
+        # ONE launch prepares both grouped GEMMs of this layer: their only
+        # per-step input is recv_count (as the per-expert row extent of the
+        # X/Y descriptors and as the tile counts), which S1 and S3 share, as
+        # they share cu_seqlens and avg (=> TileM). S3 reads its descriptors
+        # three launches later on this same stream.
+        tma_plan = prepare_grouped_fp8_s1_s3_tma(
+            x_fp8,
+            bufs.intermediate,
+            inter_fp8,
+            bufs.expert_out,
+            recv_count,
+            bufs.ll_cu_seqlens,
+            avg,
+            s1_tma_desc=bufs.ll_s1_tma,
+            s3_tma_desc=bufs.ll_s3_tma,
+            tiles=bufs.ll_tiles,
+            cu_tiles=bufs.ll_cu_tiles,
+        )
+        # recv_scales is logically [e, stride, h/128] but its last two
+        # dimensions are a transposed view of a contiguous [e, h/128, stride]
+        # allocation (csrc/deep_ep.cpp packs scales column-major for TMA).
+        # The GEMM wants ONE contiguous [h/128, e * stride]. Its x-scale tiles
+        # load, per expert, columns [0, ceil(recv_count[e] / TileM) * TileM)
+        # of that expert's block and nothing else, so exactly that span is
+        # repacked; columns past it are never addressed and keep stale values.
+        deepep_ll_scale_repack(
+            recv_scales, recv_count, bufs.ll_x_scale, tma_plan.tile_m)
+
         s1_result = grouped_fp8_blockwise_fused_s1(
             x_fp8,
             bufs.ll_x_scale,
@@ -1053,13 +1166,14 @@ class Glm5MoEGraphSegment:
             bufs.ll_cu_seqlens,
             avg,
             output=bufs.intermediate,
+            tma_plan=tma_plan,
         )
         act_quant_ragged(
             s1_result, recv_count, bufs.ll_cu_seqlens,
             bufs.inter_fp8, bufs.inter_scale,
         )
         grouped_fp8_blockwise_s3(
-            bufs.inter_fp8.view(torch.float8_e4m3fn),
+            inter_fp8,
             bufs.inter_scale,
             self.moe.fp8_down_w3d.view(torch.float8_e4m3fn),
             self.moe.fp8_down_ws3d,
@@ -1067,6 +1181,7 @@ class Glm5MoEGraphSegment:
             bufs.ll_cu_seqlens,
             avg,
             output=bufs.expert_out,
+            tma_plan=tma_plan,
         )
 
         exchange.combine(
@@ -1075,10 +1190,13 @@ class Glm5MoEGraphSegment:
             bufs.topk_weights,
             handle,
             out=bufs.local_moe_output,
+            split_phases=True,
         )
 
         # JOIN, at the first point that reads the shared output -- the combine
-        # above is the last main-stream work the fork can hide behind.
+        # above is the last main-stream work the fork can hide behind. There
+        # is no earlier cross-stream edge: the shared expert and the routed
+        # GEMMs are ordered only by when they are issued.
         self._shared_overlap.join()
         bufs.local_moe_output.add_(bufs.shared_out)
         return {"moe_output": bufs.local_moe_output}
