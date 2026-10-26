@@ -146,6 +146,14 @@ def test_glm52_routes_to_dedicated_template_and_renders_reasoning_directive():
     )
 
 
+def test_glm53_routes_to_dedicated_tokenizer_through_the_registry():
+    registry, tokenizer_module = _bootstrap_glm52_tokenizer()
+
+    tokenizer = registry.load_tokenizer("zai-org/GLM-5.3-FP8")
+    assert isinstance(tokenizer, tokenizer_module.GLM53Tokenizer)
+    assert tokenizer.CHAT_TEMPLATE_FILENAME == "chat_template_5_3.jinja"
+
+
 def test_glm53_parse_thinking_handles_template_primed_completion():
     _, tokenizer_module = _bootstrap_glm52_tokenizer()
     tokenizer = object.__new__(tokenizer_module.GLM53Tokenizer)
