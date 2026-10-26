@@ -34,6 +34,8 @@ __all__ = [
     "page_split_cache_pages",
     "cache_is_page_split",
     "cache_data_dim",
+    "indexer_applies_hadamard",
+    "cache_applies_hadamard",
     "PageSplitWritePlan",
     "plan_page_split_write",
     "NORM_ROPE_HEAD_DIM",
@@ -166,6 +168,46 @@ def cache_data_dim(blocked_kv: torch.Tensor) -> int:
     if int(blocked_kv.element_size()) == 1:
         return carrier - SCALE_BYTES_PER_TOKEN
     return carrier
+
+
+def indexer_applies_hadamard(*, page_split: bool) -> bool:
+    """Whether the DSA indexer rotates q and k before fp8 quantization.
+
+    THE predicate for the Hadamard incoherence rotation, stated once so every
+    producer of the fp8 index-K cache and every producer of the Q index vector
+    agree. ``H`` is orthonormal, so rotating BOTH operands leaves the indexer
+    logit ``q @ k.T`` unchanged in exact arithmetic -- the rotation only
+    redistributes fp8 quantization error across the 128 dims. Rotating one
+    side and not the other does NOT preserve the logit, which is why this is
+    one function and not a per-call-site flag.
+
+    Upstream DeepSeek-V3.2 drops the rotation wherever its fused indexer
+    writers are on (``_maybe_rotate`` in ``dsa_indexer.py``, ``kHadamard``
+    false on both the q and k kernels). BatchGen follows that on the
+    page-split FP8 route -- the route those fused writers serve, and the only
+    one that quantizes indexer records. The bf16 AoS indexer profiles
+    (GLM-5, GLM-5.1, GLM-5.3) store unquantized records, have no fused writer
+    and keep the rotation.
+
+    This is a MODEL-SEMANTICS switch, not a numerics tweak: a cache written
+    under one setting must never be read under the other.
+    """
+
+    return not bool(page_split)
+
+
+def cache_applies_hadamard(blocked_kv: torch.Tensor, data_dim: int) -> bool:
+    """``indexer_applies_hadamard`` resolved from the cache that was allocated.
+
+    Reads the page-split fact off the same cache ``cache_is_page_split``
+    dispatches the writer on, so the rotation cannot drift from the layout. A
+    mis-sized cache is named by ``cache_is_page_split`` rather than silently
+    picking a rotation.
+    """
+
+    return indexer_applies_hadamard(
+        page_split=cache_is_page_split(blocked_kv, data_dim)
+    )
 
 
 def page_split_cache_pages(blocked_kv: torch.Tensor) -> torch.Tensor:

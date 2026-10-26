@@ -27,7 +27,10 @@ try:
 except ImportError:  # pragma: no cover - resolved by the node's FA3 install
     _fa3_with_kvcache = None
 
-from batchgen.attention.dsa.aux_indexer_k_writer import write_aux_indexer_k
+from batchgen.attention.dsa.aux_indexer_k_writer import (
+    aux_manager_applies_hadamard,
+    write_aux_indexer_k,
+)
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -251,8 +254,18 @@ def build_glm5_dsa_graph_segment_inputs(
             wrapper._indexer_cuda_module,
         )
         k_normed = indexer.k_norm(k_raw)
+        # The aux cache's page format decides whether this chain rotates at
+        # all: the page-split FP8 route drops the Hadamard on both q and k
+        # (upstream v3.2), the bf16 AoS route keeps it. Writing the cache in
+        # the other space would make every later decode score a wrong logit.
+        # Taken from the manager config, because the rotation is needed here --
+        # before the page table is resolved, and in the write_kv=False compare
+        # prologue there is no page table to resolve.
         indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
             k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
+            apply_hadamard=aux_manager_applies_hadamard(
+                gpu_paged_kv_manager_aux, indexer.index_head_dim
+            ),
         ).unsqueeze(2)
         seq_lengths_i32_aux = (
             seq_lengths_i32
@@ -456,8 +469,14 @@ def build_glm5_dsa_flashmla_inputs(
                     wrapper._indexer_cuda_module,
                 )
                 k_normed = indexer.k_norm(k_raw)
+                # Same predicate as the graph prologue, from the same place:
+                # the aux page format owns the rotation, and it is needed
+                # before the page table is resolved below.
                 indexer_kv = indexer._fused_rope_hadamard_or_fallback(
                     k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
+                    apply_hadamard=aux_manager_applies_hadamard(
+                        gpu_paged_kv_manager_aux, indexer.index_head_dim
+                    ),
                 ).unsqueeze(2)
             else:
                 raise RuntimeError(

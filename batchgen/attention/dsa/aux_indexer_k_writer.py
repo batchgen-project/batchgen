@@ -6,6 +6,12 @@ K bytes, then one fp32 scale per token). The same decode code serves all of
 them, so the format is read off the CACHE the KV manager allocated rather than
 re-derived from a model name, and anything that is neither layout fails loud.
 
+The format also decides the Hadamard incoherence rotation
+(``aux_cache_applies_hadamard``): the page-split FP8 route follows upstream
+V3.2 and drops it on BOTH the Q index vector and every index-K producer, while
+the bf16 AoS route keeps it. Rotating only one side would not preserve the
+indexer logit, so the flag is read off the cache rather than passed per site.
+
 Both the eager decode selector and the captured DSA graph segment call
 ``write_aux_indexer_k``, so the two paths cannot drift apart: a page-split
 cache gets one fused quantize+write launch that also produces the
@@ -20,17 +26,41 @@ from typing import Optional, Tuple
 import torch
 
 from batchgen_kernels.attention.dsa.indexer_k_quant import (
+    cache_applies_hadamard as aux_cache_applies_hadamard,
     cache_data_dim as aux_cache_data_dim,
     cache_is_page_split as aux_cache_is_page_split,
 )
 from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
 __all__ = [
+    "aux_cache_applies_hadamard",
+    "aux_manager_applies_hadamard",
     "aux_cache_is_page_split",
     "aux_cache_data_dim",
     "write_aux_indexer_k",
     "write_aux_indexer_k_norm_rope",
 ]
+
+
+def aux_manager_applies_hadamard(manager, data_dim: int) -> bool:
+    """``aux_cache_applies_hadamard`` resolved from the aux KV manager config.
+
+    Some call sites must know the rotation BEFORE they hold a layer cache: the
+    eager selector ropes and rotates indexer K before it resolves the page
+    table, and its graph/eager compare prologue runs with no page table at all.
+    ``config.kv_dtype`` and ``config.k_head_dim`` are the two facts that
+    allocated the cache, so this builds a zero-element meta probe with exactly
+    that element type and carrier and asks the SAME discriminator. No second
+    rule: a mis-sized configuration still fails loud here.
+    """
+
+    config = manager.config
+    probe = torch.empty(
+        (0, 0, 0, int(config.k_head_dim)),
+        dtype=config.kv_dtype,
+        device="meta",
+    )
+    return aux_cache_applies_hadamard(probe, data_dim)
 
 
 def write_aux_indexer_k(
