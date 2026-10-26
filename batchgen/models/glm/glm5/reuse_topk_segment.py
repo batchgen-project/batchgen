@@ -119,6 +119,12 @@ if _split_delta:
 class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
     """Skip-layer segment: MLA spine with a borrowed top-k buffer."""
 
+    # A skip layer never reads or writes the aux cache, so its row-validity
+    # mask deliberately does NOT require a valid aux slot -- unlike the full
+    # segment's. Distinct variant => distinct hoisted prologue, and the
+    # whole-model driver rejects a buffer set claimed by both variants.
+    ROW_VALIDITY_VARIANT = "reuse"
+
     def __init__(
         self,
         *,
@@ -358,26 +364,24 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         )
         self._setup_static_output_buffers(bucket_size)
 
-    def forward(
+    def compute_row_validity(
         self,
+        buffers: _Glm5FullDsaSegmentBuffers,
         *,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         primary_slot_indices: torch.Tensor,
-        num_valid_tokens: Optional[torch.Tensor] = None,
         aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
-    ) -> Dict[str, torch.Tensor]:
-        attn = self.attn
-        batch_size = hidden_states.shape[0]
-        buffers = self._buffers.get(batch_size)
-        if buffers is None:
-            self.setup_static_buffers(batch_size)
-            buffers = self._buffers[batch_size]
-        outputs = self._outputs.get(batch_size)
-        if outputs is None:
-            self._setup_static_output_buffers(batch_size)
-            outputs = self._outputs[batch_size]
+        num_valid_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Row-validity statics for a skip layer: no aux slot, no aux buffers.
+
+        Deliberately NOT the parent's block. This layer never reads or writes
+        the aux cache, so an invalid aux slot must not invalidate the row, and
+        ``kv_aux_slot_indices`` / ``safe_aux_slot_indices`` are never read on
+        this path. Hoisting is otherwise identical: the inputs are the same
+        step-level statics and the outputs are the skip layers' own shared
+        buffer set, so the whole-model driver runs this once per step.
+        """
 
         if num_valid_tokens is None:
             torch.ge(primary_slot_indices, 0, out=buffers.valid_mask)
@@ -401,6 +405,39 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             buffers.valid_mask, buffers.valid_rows_ones, buffers.valid_rows_zeros,
             out=buffers.valid_rows_bf16,
         )
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
+        aux_slot_indices: Optional[torch.Tensor] = None,  # accepted, ignored
+        row_validity_ready: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        attn = self.attn
+        batch_size = hidden_states.shape[0]
+        buffers = self._buffers.get(batch_size)
+        if buffers is None:
+            self.setup_static_buffers(batch_size)
+            buffers = self._buffers[batch_size]
+        outputs = self._outputs.get(batch_size)
+        if outputs is None:
+            self._setup_static_output_buffers(batch_size)
+            outputs = self._outputs[batch_size]
+
+        # Layer-invariant: the whole-model driver ran it once for this step
+        # over the skip layers' shared buffer set (see compute_row_validity).
+        if not row_validity_ready:
+            self.compute_row_validity(
+                buffers,
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(
