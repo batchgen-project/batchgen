@@ -12844,6 +12844,19 @@ class BatchGenWorker:
 		materialized_loader = self._materialized_segment_loader(wave)
 		materialized_tokens = 0
 		offload_recorder_handed_off = False
+		# Batch-level ``batchgen_debug.prefill_disable_gc``: hold off cyclic GC
+		# for the span of the chunk loop. Diagnostic for the weight-stream
+		# launch stalls: gc_collect_main tensor teardown takes the CUDA driver
+		# lock and queues behind it every cudaMemcpyAsync launch of the wave.
+		_wave_debug = self._active_batchgen_debug_for_sequences(
+			[self.global_batch.get_sequence(u) for u in wave.uuids]
+		) or {}
+		_gc_held = False
+		if self._debug_flag_enabled(_wave_debug.get("prefill_disable_gc")):
+			import gc as _gc
+			if _gc.isenabled():
+				_gc.disable()
+				_gc_held = True
 		try:
 			start = time.perf_counter()
 			# Per-wave split of the chunk loop, to localize growth that tracks
@@ -13030,6 +13043,9 @@ class BatchGenWorker:
 			# retired, outside this method - and only it may clear the recorder.
 			offload_recorder_handed_off = True
 		finally:
+			if _gc_held:
+				import gc as _gc
+				_gc.enable()
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
 			# A segment's recurrent state is keyed by its pseudo sequence id and
