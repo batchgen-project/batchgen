@@ -1329,6 +1329,9 @@ class BatchGenWorker:
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
+		# Set once by _bind_gpu_paged_kv_manager and never cleared: whether
+		# this process has ever created a GPU KV pool.
+		self._gpu_kv_pool_created = False
 		# Set by _release_prefill_weight_ring and consumed by the
 		# prefill->decode switch invariant.
 		self._prefill_ring_released_for_switch = False
@@ -4874,6 +4877,7 @@ class BatchGenWorker:
 		bound to gpu_paged_kv_manager_aux slots.
 		"""
 		self.gpu_paged_kv_cache_manager = manager
+		self._gpu_kv_pool_created = True
 		if isinstance(manager, DualKVCacheCoordinator):
 			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
 				self.core_engine.gpu_paged_kv_manager = manager.primary
@@ -10781,13 +10785,23 @@ class BatchGenWorker:
 		Called from inside the activation so the pool is live before the
 		capacity snapshot, before decode admission allocates a page and before
 		a captured graph dereferences a pool pointer.
+
+		A decode instance can be built before readiness (Kimi-K3's startup
+		pass), so its first activation precedes the first pool sizing. With no
+		pool ever created in this process there is nothing to remap, and
+		``_init_gpu_kv_with_actual_size()``, which the caller runs next from
+		the decode phase, sizes it. A pool that existed and is gone is a
+		lifecycle bug and still fails here.
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
+			if not self._gpu_kv_pool_created:
+				return
 			raise RuntimeError(
 				f"Rank {self.rank}: prefill->decode activated a reused decode "
-				"instance with no GPU KV manager; the instance's first build "
-				"sizes the pool, so one must exist by this point"
+				"instance with no GPU KV manager although this process already "
+				"created a GPU KV pool; the reserved pool must survive every "
+				"phase switch"
 			)
 		self._assert_kv_pool_addresses_are_fixed("prefill->decode")
 		if manager.pool_is_mapped:
@@ -10830,8 +10844,15 @@ class BatchGenWorker:
 		Decode admission reads live all-rank capacity through it (#424) and the
 		decode graphs bake its pointers, so the activation maps the pool back
 		before either can run.
+
+		The one exception is a process that has never created a pool: a decode
+		instance built before readiness is activated before the first sizing,
+		which ``_init_gpu_kv_with_actual_size()`` performs right after this
+		check, before admission or capture can read it.
 		"""
 		manager = self.gpu_paged_kv_cache_manager
+		if manager is None and not self._gpu_kv_pool_created:
+			return
 		if manager is None or not manager.is_initialized:
 			raise RuntimeError(
 				f"Rank {self.rank}: {context} switch left the GPU KV region "
