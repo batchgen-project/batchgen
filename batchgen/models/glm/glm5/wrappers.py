@@ -752,10 +752,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
         # Slice 2c-2: these BF16 matrices are now the ONES WE KEEP. They used
         # to be quantizer input, freed immediately; the decode absorb is now a
-        # bf16 strided-batched bmm, which is both faster (-0.372 ms/step
-        # measured) and numerically EXACT (calc_diff 0 against a bf16
-        # reference, versus ~6.6e-04 for the FP8 WGMMA kernel), so it removes
-        # an fp8 error source from the attention critical path.
+        # bf16 strided-batched bmm, which is both faster than the FP8 WGMMA
+        # kernel it replaces and numerically exact against a bf16 reference
+        # (the fp8 kernel is not), so it also removes an fp8 error source
+        # from the attention critical path.
         #
         # HBM accounting, per rank: bf16 q_absorb [H,192,512] 12.58 MB +
         # out_absorb [H,256,512] 16.78 MB = 29.36 MB/layer kept, against the
