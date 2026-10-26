@@ -1024,6 +1024,30 @@ class GLM5AttnWrapper(AttnWrapperBase):
         GLM5AttnWrapper._dsa_prefill_causal_ends = None
         GLM5AttnWrapper._dsa_prefill_pool = None
 
+    def _indexer_applies_hadamard(self) -> bool:
+        """Whether this run's DSA indexer rotates q and k before fp8 quant.
+
+        Prefill writes the index-K cache decode later scores, so it must use
+        decode's rotation. The aux indexer host-KV view carries the same
+        page-split fact the GPU aux cache does, and
+        ``indexer_applies_hadamard`` turns that one fact into the predicate --
+        False for GLM-5.2's page-split FP8 indexer (upstream v3.2 semantics,
+        dropped on both q and k), True for a bf16 AoS indexer.
+        """
+        from batchgen_kernels.attention.dsa.indexer_k_quant import (
+            indexer_applies_hadamard,
+        )
+
+        aux_view = AttnWrapperBase.host_paged_kv_worker_view_aux
+        if aux_view is None:
+            raise RuntimeError(
+                "GLM-5 DSA prefill requires the auxiliary indexer host KV "
+                "view to resolve the indexer Hadamard semantics"
+            )
+        return indexer_applies_hadamard(
+            page_split=bool(getattr(aux_view, "is_page_split", False))
+        )
+
     def _glm52_sparse_prefill_active(self) -> bool:
         from . import sparse_prefill
 
@@ -1101,6 +1125,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             max_seqlen=self.prepack_max_seqlen,
             weight_scale=self.weight_dequant_scale,
             indexer=indexer,
+            indexer_applies_hadamard=self._indexer_applies_hadamard(),
             carried_topk_indices=None if indexer is not None else carried,
             reusable_topk_indices=carried if indexer is not None else None,
             causal_starts=GLM5AttnWrapper._dsa_prefill_causal_starts,
@@ -1177,6 +1202,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer_kv = self.module.indexer.compute_indexer_kv(
                     hidden_states_2d.unsqueeze(0),
                     positions=self.position_ids.to(hidden_states_2d.device),
+                    apply_hadamard=self._indexer_applies_hadamard(),
                 )
                 if indexer_kv is None:
                     raise RuntimeError(

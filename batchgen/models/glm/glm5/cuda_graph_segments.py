@@ -40,9 +40,11 @@ from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
 )
 from batchgen.attention.dsa.aux_indexer_k_writer import (
+    aux_cache_applies_hadamard,
     aux_cache_data_dim,
     aux_cache_is_page_split,
     write_aux_indexer_k,
+    write_aux_indexer_k_norm_rope,
 )
 from batchgen.attention.dsa.sparse_decode_mla import (
     prepare_sparse_flash_mla_decode_tensor_metadata,
@@ -576,6 +578,12 @@ class Glm5DsaAttnSegment:
         self.aux_is_page_split = aux_cache_is_page_split(
             aux_blocked_k, self.index_head_dim
         )
+        # One predicate for the whole segment: the Hadamard rotation must come
+        # off BOTH the Q index vector and every producer of the index-K cache
+        # together, or the indexer logit is not preserved.
+        self.aux_applies_hadamard = aux_cache_applies_hadamard(
+            aux_blocked_k, self.index_head_dim
+        )
         if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
             raise TypeError("cos_table and sin_table must be float32 for graph capture")
         if not cos_table.is_contiguous() or not sin_table.is_contiguous():
@@ -911,6 +919,7 @@ class Glm5DsaAttnSegment:
             positions_expanded.view(-1),
             buffers.q_index,
             out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
+            apply_hadamard=self.aux_applies_hadamard,
         )
         self._score_and_topk(
             buffers,
@@ -1042,6 +1051,12 @@ class Glm5FullDsaAttnSegment:
         self.aux_is_page_split = aux_cache_is_page_split(
             self.aux_blocked_k, self.attn.indexer.index_head_dim
         )
+        # One predicate for the whole segment: the Hadamard rotation must come
+        # off BOTH the Q index vector and every producer of the index-K cache
+        # together, or the indexer logit is not preserved.
+        self.aux_applies_hadamard = aux_cache_applies_hadamard(
+            self.aux_blocked_k, self.attn.indexer.index_head_dim
+        )
         # Shape/dtype of the aux tensor this segment hands to the host append;
         # the composing layer segment declares its own spec from these.
         self.aux_host_kv_dim = aux_cache_data_dim(self.aux_blocked_k)
@@ -1131,6 +1146,10 @@ class Glm5FullDsaAttnSegment:
                     index_head_dim=self.attn.indexer.index_head_dim,
                     page_size=self.aux_page_size,
                     num_valid_tokens=num_valid_tokens,
+                    # The RoPE epilogue on this branch already wrote q_fp8's
+                    # saturating e4m3 bytes (the R4 fold), same as the
+                    # one-shot path below.
+                    q_prequantized=True,
                 )
             return paged_mqa_score_and_topk_out(
                 q=buffers.q_index,
@@ -1831,30 +1850,44 @@ class Glm5FullDsaAttnSegment:
                 buffers.indexer_k_raw,
                 num_valid_tokens=num_valid_tokens,
             )
-            k_normed = indexer.k_norm(buffers.indexer_k_raw)
-            indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
-                k_normed.unsqueeze(1),
-                position_ids.view(batch_size),
-                max_seqlen=self.max_seqlen,
-            ).unsqueeze(2)
-            # Page-split aux cache: ONE launch quantizes the keys, writes the
-            # page's e4m3 K region and fp32 scale region, and fills the two
-            # static host staging buffers with the same bytes (no extra copy,
-            # no second quantization). A bf16 AoS cache keeps the copy +
-            # paged update pair.
+            # Page-split aux cache: ONE launch owns the whole K tail -- the
+            # ``k_norm`` LayerNorm, the interleaved RoPE, the Hadamard
+            # rotation, the e4m3 quantization, the page's K and fp32 scale
+            # regions and both static host staging buffers (no intermediate
+            # bf16 tensor, no extra copy, no second quantization). A bf16 AoS
+            # cache keeps the LayerNorm + RoPE/Hadamard + copy + paged update
+            # chain, because its records are not quantized.
             if self.aux_is_page_split:
-                write_aux_indexer_k(
+                write_aux_indexer_k_norm_rope(
                     aux_blocked_k=self.aux_blocked_k,
-                    indexer_k=indexer_k_tensor,
+                    k_raw=buffers.indexer_k_raw,
+                    ln_weight=indexer.k_norm.weight,
+                    ln_bias=indexer.k_norm.bias,
+                    ln_eps=indexer.k_norm.eps,
+                    cos_cache=self.cos_table,
+                    sin_cache=self.sin_table,
+                    positions=position_ids.view(batch_size),
                     page_table=self.aux_page_table,
                     slot_indices=buffers.kv_aux_slot_indices,
                     token_indices=token_indices,
                     page_size_tokens=self.aux_page_size,
+                    # The same predicate the Q path above rotates (or does not
+                    # rotate) by. False on this page-split FP8 route: upstream
+                    # v3.2 drops the rotation on BOTH q and k, which preserves
+                    # the indexer logit and only moves fp8 quantization error.
+                    apply_hadamard=self.aux_applies_hadamard,
                     k_fp8_out=outputs.indexer_k_tensor,
                     scales_out=outputs.indexer_k_scale,
                     num_valid_tokens=num_valid_tokens,
                 )
             else:
+                k_normed = indexer.k_norm(buffers.indexer_k_raw)
+                indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
+                    k_normed.unsqueeze(1),
+                    position_ids.view(batch_size),
+                    max_seqlen=self.max_seqlen,
+                    apply_hadamard=self.aux_applies_hadamard,
+                ).unsqueeze(2)
                 outputs.indexer_k_tensor.copy_(indexer_k_tensor)
                 write_aux_indexer_k(
                     aux_blocked_k=self.aux_blocked_k,
@@ -1988,6 +2021,7 @@ class Glm5FullDsaAttnSegment:
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
                 out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
+                apply_hadamard=self.aux_applies_hadamard,
             )
             # JOIN (scoring graphs). The scorer is the first main-stream
             # reader of the K path's writes: it scores the aux cache, whose

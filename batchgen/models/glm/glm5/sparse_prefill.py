@@ -287,8 +287,13 @@ def _fused_rope_hadamard_q(
     cos: torch.Tensor,
     sin: torch.Tensor,
     position_ids: torch.Tensor,
+    apply_hadamard: bool = True,
 ) -> torch.Tensor:
-    """Apply the corrected fused RoPE/Hadamard kernel to multi-head Q."""
+    """Apply the corrected fused RoPE/Hadamard kernel to multi-head Q.
+
+    ``apply_hadamard`` must equal the one this layer's indexer K was produced
+    with, or the rotation does not cancel out of the indexer logit.
+    """
 
     from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard
 
@@ -300,6 +305,7 @@ def _fused_rope_hadamard_q(
         sin.float(),
         positions_expanded,
         scale=head_dim**-0.5,
+        apply_hadamard=apply_hadamard,
     ).reshape(batch_size, num_heads, head_dim)
 
 
@@ -310,6 +316,7 @@ def _compute_indexer_kv_from_quantized_hidden(
     hidden_scale: torch.Tensor,
     position_ids: torch.Tensor,
     max_seqlen: int,
+    apply_hadamard: bool,
     timed,
 ) -> torch.Tensor:
     if not hasattr(indexer, "wk_scale"):
@@ -337,6 +344,7 @@ def _compute_indexer_kv_from_quantized_hidden(
             sin.float(),
             position_ids.reshape(-1),
             scale=indexer.index_head_dim**-0.5,
+            apply_hadamard=apply_hadamard,
         )
     return k.unsqueeze(0).unsqueeze(2)
 
@@ -352,9 +360,15 @@ def select_packed_glm52_topk(
     causal_starts: torch.Tensor,
     causal_ends: torch.Tensor,
     max_seqlen: int,
+    apply_hadamard: bool,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run GLM-5.2's causal FP8 indexer over packed prompt tokens."""
+    """Run GLM-5.2's causal FP8 indexer over packed prompt tokens.
+
+    ``apply_hadamard`` is the indexer's rotation predicate and must be the one
+    ``indexer_kv`` was produced with: this scorer quantizes ``indexer_kv``
+    itself, and the same keys also land in the index-K cache decode reads.
+    """
 
     import deep_gemm
 
@@ -416,6 +430,7 @@ def select_packed_glm52_topk(
             cos,
             sin,
             position_ids[start:end],
+            apply_hadamard=apply_hadamard,
         )
         q_fp8, q_scale = act_quant(q)
         head_gates = torch.mm(
@@ -486,8 +501,13 @@ def _reference_rope_hadamard(
     sin: torch.Tensor,
     position_ids: torch.Tensor,
     scale: float,
+    apply_hadamard: bool = True,
 ) -> torch.Tensor:
-    """Small independent reference used only by the startup smoke gate."""
+    """Small independent reference used only by the startup smoke gate.
+
+    With ``apply_hadamard`` False this is interleaved RoPE alone and ``scale``
+    is unused, because the 1/sqrt(128) factor normalizes H.
+    """
 
     original_shape = x.shape
     transformed = x.reshape(-1, 128).float().clone()
@@ -498,6 +518,9 @@ def _reference_rope_hadamard(
     odd = transformed[:, 1:64:2].clone()
     transformed[:, :64:2] = even * cos_rows - odd * sin_rows
     transformed[:, 1:64:2] = odd * cos_rows + even * sin_rows
+
+    if not apply_hadamard:
+        return transformed.to(x.dtype).reshape(original_shape)
 
     stride = 1
     while stride < 128:
@@ -561,35 +584,42 @@ def validate_glm52_sparse_prefill_runtime() -> None:
         .to(torch.bfloat16)
     )
     rope_positions = torch.tensor([0, 3], dtype=torch.int64, device=device)
-    rope_out = fused_rope_hadamard(
-        rope_input,
-        cos,
-        sin,
-        rope_positions,
-    )
-    rope_reference = _reference_rope_hadamard(
-        rope_input,
-        cos,
-        sin,
-        rope_positions,
-        128**-0.5,
-    )
-    if (
-        rope_out.shape != rope_input.shape
-        or rope_out.dtype != torch.bfloat16
-        or not rope_out.is_contiguous()
-        or not torch.allclose(
-            rope_out.float(),
-            rope_reference.float(),
-            atol=2e-2,
-            rtol=2e-2,
+    # BOTH instantiations are gated: GLM-5.2's page-split FP8 indexer runs the
+    # rotation-off arm (upstream v3.2), GLM-5.3's bf16 AoS indexer the
+    # rotation-on arm, and one build serves both model types here.
+    for apply_hadamard in (True, False):
+        rope_out = fused_rope_hadamard(
+            rope_input,
+            cos,
+            sin,
+            rope_positions,
+            apply_hadamard=apply_hadamard,
         )
-    ):
-        raise RuntimeError(
-            "fused_rope_hadamard failed its nonzero numerical smoke gate: "
-            f"shape={tuple(rope_out.shape)}, dtype={rope_out.dtype}, "
-            f"contiguous={rope_out.is_contiguous()}"
+        rope_reference = _reference_rope_hadamard(
+            rope_input,
+            cos,
+            sin,
+            rope_positions,
+            128**-0.5,
+            apply_hadamard=apply_hadamard,
         )
+        if (
+            rope_out.shape != rope_input.shape
+            or rope_out.dtype != torch.bfloat16
+            or not rope_out.is_contiguous()
+            or not torch.allclose(
+                rope_out.float(),
+                rope_reference.float(),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        ):
+            raise RuntimeError(
+                "fused_rope_hadamard failed its nonzero numerical smoke gate "
+                f"with apply_hadamard={apply_hadamard}: "
+                f"shape={tuple(rope_out.shape)}, dtype={rope_out.dtype}, "
+                f"contiguous={rope_out.is_contiguous()}"
+            )
     q_input = (
         torch.arange(
             2 * 32 * 128,
@@ -603,35 +633,39 @@ def validate_glm52_sparse_prefill_runtime() -> None:
         .to(torch.bfloat16)
     )
     q_positions = torch.tensor([1, 3], dtype=torch.int64, device=device)
-    q_rope_out = _fused_rope_hadamard_q(
-        q_input,
-        cos,
-        sin,
-        q_positions,
-    )
-    q_reference = _reference_rope_hadamard(
-        q_input,
-        cos,
-        sin,
-        q_positions.repeat_interleave(32),
-        128**-0.5,
-    )
-    if (
-        q_rope_out.shape != q_input.shape
-        or q_rope_out.dtype != torch.bfloat16
-        or not q_rope_out.is_contiguous()
-        or not torch.allclose(
-            q_rope_out.float(),
-            q_reference.float(),
-            atol=2e-2,
-            rtol=2e-2,
+    for apply_hadamard in (True, False):
+        q_rope_out = _fused_rope_hadamard_q(
+            q_input,
+            cos,
+            sin,
+            q_positions,
+            apply_hadamard=apply_hadamard,
         )
-    ):
-        raise RuntimeError(
-            "multi-head fused_rope_hadamard failed its nonzero numerical smoke "
-            f"gate: shape={tuple(q_rope_out.shape)}, dtype={q_rope_out.dtype}, "
-            f"contiguous={q_rope_out.is_contiguous()}"
+        q_reference = _reference_rope_hadamard(
+            q_input,
+            cos,
+            sin,
+            q_positions.repeat_interleave(32),
+            128**-0.5,
+            apply_hadamard=apply_hadamard,
         )
+        if (
+            q_rope_out.shape != q_input.shape
+            or q_rope_out.dtype != torch.bfloat16
+            or not q_rope_out.is_contiguous()
+            or not torch.allclose(
+                q_rope_out.float(),
+                q_reference.float(),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        ):
+            raise RuntimeError(
+                "multi-head fused_rope_hadamard failed its nonzero numerical "
+                f"smoke gate with apply_hadamard={apply_hadamard}: "
+                f"shape={tuple(q_rope_out.shape)}, dtype={q_rope_out.dtype}, "
+                f"contiguous={q_rope_out.is_contiguous()}"
+            )
 
     score = torch.zeros(1, 2048, dtype=torch.float32, device=device)
     lengths = torch.ones(1, dtype=torch.int32, device=device)
@@ -702,6 +736,7 @@ def glm52_sparse_prefill_prepacked(
     max_seqlen: int,
     weight_scale: dict[str, torch.Tensor],
     indexer,
+    indexer_applies_hadamard: bool,
     carried_topk_indices: torch.Tensor | None,
     reusable_topk_indices: torch.Tensor | None,
     causal_starts: torch.Tensor | None,
@@ -716,6 +751,12 @@ def glm52_sparse_prefill_prepacked(
     pool: this layer's latent and indexer keys are written to their pool slots
     first, the indexer scores each row's pooled keys, and attention reads the
     latent pool (``latent_pool``, this layer) through slot indices.
+
+    ``indexer_applies_hadamard`` is the aux indexer cache's rotation predicate,
+    resolved by the caller: GLM-5.2's page-split FP8 indexer is False (upstream
+    v3.2 semantics, dropped on both q and k), GLM-5.3's bf16 AoS indexer is
+    True. It must match what decode uses -- these keys ARE the cache decode
+    reads back.
     """
 
     try:
@@ -810,6 +851,7 @@ def glm52_sparse_prefill_prepacked(
             hidden_scale=hidden_scale,
             position_ids=position_ids,
             max_seqlen=rope_seqlen,
+            apply_hadamard=indexer_applies_hadamard,
             timed=timed,
         )
         score_kv = indexer_kv
@@ -827,6 +869,7 @@ def glm52_sparse_prefill_prepacked(
                 q_a_scale=q_a_scale,
                 indexer_kv=score_kv,
                 position_ids=position_ids,
+                apply_hadamard=indexer_applies_hadamard,
                 causal_starts=causal_starts,
                 causal_ends=causal_ends,
                 max_seqlen=rope_seqlen,
