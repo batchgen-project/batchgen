@@ -833,6 +833,7 @@ class BatchGenWorkerArgs:
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+	weight_copy_mode: str = "memcpy"  # HtoD weight stream: "memcpy" (per tensor) or "module_flat" (one copy per module)
 	enable_deepep: bool = False  # Enable DeepEP low-latency EP exchange for decode (default: NCCL)
 	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
@@ -4337,6 +4338,12 @@ class BatchGenWorker:
 		self.input_arguments = InputArguments(**input_arguments)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
 		self.initializer = self.initializer(self.input_arguments)
+		# Must land before Init(): the core engine snapshots Basic_Config when
+		# it is constructed there (parse_basic_config), unlike the cuda-graph
+		# flags below that Python consumes later.
+		weight_copy_mode = getattr(self.args, "weight_copy_mode", "memcpy")
+		if weight_copy_mode != "memcpy":
+			self.initializer.engine_config.Basic_Config.weight_copy_mode = weight_copy_mode
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)

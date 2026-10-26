@@ -227,6 +227,7 @@ class ServerArgs:
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+    weight_copy_mode: str = "memcpy"  # HtoD weight stream: "memcpy" (per tensor) or "module_flat" (one copy per module)
     parse_thinking: bool = False  # Extract reasoning_content from model output
     parse_tool_call: bool = False  # Extract tool_calls from model output
     enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
@@ -576,6 +577,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected.",
+    )
+    parser.add_argument(
+        "--weight-copy-mode",
+        type=str,
+        choices=["memcpy", "module_flat"],
+        default="memcpy",
+        help="HtoD weight stream copy granularity: memcpy issues one cudaMemcpyAsync per tensor; module_flat copies a whole module into a flat GPU slot with one, when the host layout is contiguous (falls back per type/module otherwise).",
     )
     parser.add_argument(
         "--parse-thinking",
@@ -976,6 +984,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_thinking=parsed.parse_thinking,
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
+        weight_copy_mode=parsed.weight_copy_mode,
         enable_deepep=parsed.enable_deepep,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,

@@ -1530,6 +1530,7 @@ class WorkerManager:
             enable_ep_with_offloading=self.args.enable_ep_with_offloading,
             ep_offloading_ratio=self.args.ep_offloading_ratio,
             pre_dequantize_weights=self.args.pre_dequantize_weights,
+            weight_copy_mode=getattr(self.args, "weight_copy_mode", "memcpy"),
             enable_deepep=getattr(self.args, "enable_deepep", False),
             enable_cuda_graph=self.args.enable_cuda_graph,
             disable_cuda_graphs=self.args.disable_cuda_graphs,
