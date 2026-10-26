@@ -15,6 +15,13 @@ dtypes, ranks, non-contiguous tensors, and shapes before any launch.
 Architecture: persistent 3-WG CuTe kernel, adaptive TileM (16/32/64),
 TileN=128, TileK=128, 8-stage TMA pipeline, FastDivmod tile scheduling.
 
+Each GEMM launch is normally preceded by its own ``update_expert_tma`` launch
+that re-targets the per-expert X/Y TMA descriptors and writes the tile prefix
+sum. A fused S1 + S3 pair that shares seqlens / cu_seqlens / TileM can instead
+call :func:`prepare_grouped_fp8_s1_s3_tma` once and hand the returned
+:class:`GroupedFp8TmaPlan` to both GEMMs (``tma_plan=``), which then skip their
+own preparation launch.
+
 Usage:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
         grouped_fp8_blockwise_s1_silu,
@@ -23,6 +30,8 @@ Usage:
 """
 
 import logging
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor
 from typing import Optional
@@ -131,6 +140,155 @@ def require_grouped_fp8_blockwise_ptr_kernels():
     return grouped, fused_s1
 
 
+def grouped_fp8_tile_m(num_seq_per_group_avg: int) -> int:
+    """TileM the compiled grouped GEMM / fused S1 dispatch selects for ``avg``.
+
+    Mirrors ``fp8_blockwise_grouped_gemm_async`` / ``fp8_blockwise_fused_s1_async``
+    (<=16 -> 16, <=32 -> 32, else 64; the wrappers' 33..48 -> 64 remap lands in
+    the same bucket).
+    """
+    avg = int(num_seq_per_group_avg)
+    if avg <= 16:
+        return 16
+    if avg <= 32:
+        return 32
+    return 64
+
+
+@dataclass(frozen=True)
+class GroupedFp8TmaPlan:
+    """Descriptors and tile tables one prepare launch wrote for an S1/S3 pair.
+
+    The descriptors encode the base addresses and row extents of the exact
+    buffers they were prepared for, so a GEMM may consume the plan only with
+    those buffers, the same seqlens / cu_seqlens tensors and the same TileM;
+    :func:`grouped_fp8_blockwise_fused_s1` and :func:`grouped_fp8_blockwise_s3`
+    check all of it on host metadata before launching.
+    """
+
+    s1_tma_desc: Tensor
+    s3_tma_desc: Tensor
+    tiles: Tensor
+    cu_tiles: Tensor
+    tile_m: int
+    seqlens_ptr: int
+    cu_seqlens_ptr: int
+    s1_x_ptr: int
+    s1_output_ptr: int
+    s3_x_ptr: int
+    s3_output_ptr: int
+    m: int
+    s1_k: int
+    s1_n: int
+    s3_k: int
+    s3_n: int
+
+
+def _get_prepare_s1_s3_kernel():
+    module = _get_module()
+    kernel = getattr(module, "fp8_blockwise_prepare_s1_s3_tma", None)
+    if kernel is None:
+        raise RuntimeError(
+            f"{_MODULE_NAME} has no fp8_blockwise_prepare_s1_s3_tma; rebuild "
+            "batchgen_kernels (the shared S1/S3 TMA plan needs it)"
+        )
+    return kernel
+
+
+def prepare_grouped_fp8_s1_s3_tma(
+    s1_x: Tensor,
+    s1_output: Tensor,
+    s3_x: Tensor,
+    s3_output: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    *,
+    s1_tma_desc: Tensor,
+    s3_tma_desc: Tensor,
+    tiles: Tensor,
+    cu_tiles: Tensor,
+) -> GroupedFp8TmaPlan:
+    """One launch preparing the fused S1 AND the S3 grouped GEMM of a layer.
+
+    Writes, on the current stream, the per-expert X/Y TMA descriptors of both
+    GEMMs into the caller-owned ``s1_tma_desc`` / ``s3_tma_desc`` ([2*E, 128]
+    bytes each) and one ``tiles`` / ``cu_tiles`` both GEMMs read. The bytes are
+    the ones each GEMM's own ``update_expert_tma`` launch would write. The
+    consumers must run later on the same stream (stream order is the
+    producer -> consumer edge; each GEMM acquires the descriptors at entry).
+
+    Args:
+        s1_x / s1_output: the fused S1's activations [M, K1] fp8 and output
+            [M, N1] bf16.
+        s3_x / s3_output: the S3's activations [M, K3] fp8 and output [M, N3]
+            bf16; same row space M.
+        seqlens, cu_seqlens: the [E] / [E+1] int32 tensors BOTH GEMMs take.
+        num_seq_per_group_avg: the TileM hint BOTH GEMMs take.
+    """
+    kernel = _get_prepare_s1_s3_kernel()
+    kernel(
+        s1_x, s1_output, s3_x, s3_output, seqlens, cu_seqlens,
+        int(num_seq_per_group_avg), s1_tma_desc, s3_tma_desc, tiles, cu_tiles,
+    )
+    return GroupedFp8TmaPlan(
+        s1_tma_desc=s1_tma_desc,
+        s3_tma_desc=s3_tma_desc,
+        tiles=tiles,
+        cu_tiles=cu_tiles,
+        tile_m=grouped_fp8_tile_m(num_seq_per_group_avg),
+        seqlens_ptr=seqlens.data_ptr(),
+        cu_seqlens_ptr=cu_seqlens.data_ptr(),
+        s1_x_ptr=s1_x.data_ptr(),
+        s1_output_ptr=s1_output.data_ptr(),
+        s3_x_ptr=s3_x.data_ptr(),
+        s3_output_ptr=s3_output.data_ptr(),
+        m=int(s1_x.shape[0]),
+        s1_k=int(s1_x.shape[1]),
+        s1_n=int(s1_output.shape[1]),
+        s3_k=int(s3_x.shape[1]),
+        s3_n=int(s3_output.shape[1]),
+    )
+
+
+def _check_plan(plan: GroupedFp8TmaPlan, stage: str, x_fp8: Tensor,
+                output: Optional[Tensor], seqlens: Tensor, cu_seqlens: Tensor,
+                num_seq_per_group_avg: int) -> None:
+    """Refuse a plan prepared for other buffers, counts or TileM.
+
+    A mismatch here would not fail on device: the GEMM would silently load and
+    store through descriptors aimed at the prepared buffers.
+    """
+    if stage == "s1":
+        want = (plan.s1_x_ptr, plan.s1_output_ptr, plan.s1_k, plan.s1_n)
+    else:
+        want = (plan.s3_x_ptr, plan.s3_output_ptr, plan.s3_k, plan.s3_n)
+    if output is None:
+        raise ValueError(
+            f"grouped FP8 {stage}: a tma_plan needs the output buffer it was "
+            "prepared for; output=None would allocate a different one")
+    got = (x_fp8.data_ptr(), output.data_ptr(), int(x_fp8.shape[1]),
+           int(output.shape[1]))
+    problems = []
+    if got != want:
+        problems.append(f"(x, output, K, N) {got} != prepared {want}")
+    if int(x_fp8.shape[0]) != plan.m or int(output.shape[0]) != plan.m:
+        problems.append(
+            f"rows {int(x_fp8.shape[0])}/{int(output.shape[0])} != prepared {plan.m}")
+    if (seqlens.data_ptr(), cu_seqlens.data_ptr()) != (
+            plan.seqlens_ptr, plan.cu_seqlens_ptr):
+        problems.append("seqlens / cu_seqlens are not the tensors the plan was "
+                        "prepared from")
+    tile_m = grouped_fp8_tile_m(num_seq_per_group_avg)
+    if tile_m != plan.tile_m:
+        problems.append(f"TileM {tile_m} (avg {num_seq_per_group_avg}) != "
+                        f"prepared {plan.tile_m}")
+    if problems:
+        raise ValueError(
+            f"grouped FP8 {stage}: tma_plan does not match this call: "
+            + "; ".join(problems))
+
+
 def grouped_fp8_blockwise_gemm(
     x_fp8: Tensor,
     weight_3d: Tensor,
@@ -141,6 +299,7 @@ def grouped_fp8_blockwise_gemm(
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
     tma_desc: Optional[Tensor] = None,
+    tma_plan: Optional[GroupedFp8TmaPlan] = None,
 ) -> Tensor:
     """Single FP8 blockwise grouped GEMM.
 
@@ -158,6 +317,10 @@ def grouped_fp8_blockwise_gemm(
         output:     [M, N] bf16 — pre-allocated output (optional)
         tma_desc:   caller-owned 64-byte-aligned TMA scratch [2*E, 128]
                     (optional; descriptors are refreshed for current offsets)
+        tma_plan:   the S3 half of a :func:`prepare_grouped_fp8_s1_s3_tma`
+                    plan for exactly these buffers (optional; the GEMM then
+                    skips its own descriptor preparation launch). Exclusive
+                    with ``tma_desc``.
 
     Returns:
         [M, N] bf16 output
@@ -172,6 +335,19 @@ def grouped_fp8_blockwise_gemm(
     # TileM=48 not supported (mtp multiple of 64 not divisible by 48)
     if 33 <= num_seq_per_group_avg <= 48:
         num_seq_per_group_avg = 64
+
+    if tma_plan is not None:
+        if tma_desc is not None:
+            raise ValueError("grouped FP8 s3: pass tma_desc or tma_plan, not both")
+        _check_plan(tma_plan, "s3", x_fp8, output, seqlens, cu_seqlens,
+                    num_seq_per_group_avg)
+        return kernel(
+            x_fp8, weight_3d, seqlens, cu_seqlens,
+            x_scale, w_scale_3d,
+            num_seq_per_group_avg,
+            output, tma_plan.s3_tma_desc, tma_plan.tiles, tma_plan.cu_tiles,
+            False,
+        )
 
     return kernel(
         x_fp8, weight_3d, seqlens, cu_seqlens,
@@ -288,6 +464,7 @@ def grouped_fp8_blockwise_fused_s1(
     cu_seqlens: Tensor,
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
+    tma_plan: Optional[GroupedFp8TmaPlan] = None,
 ) -> Tensor:
     """Fused S1: gate GEMM + up GEMM + SiLU in single kernel launch.
 
@@ -311,11 +488,31 @@ def grouped_fp8_blockwise_fused_s1(
         cu_seqlens: [E+1] int32
         num_seq_per_group_avg: int
         output:     [E*mtp, N] bf16 — pre-allocated (optional)
+        tma_plan:   the S1 half of a :func:`prepare_grouped_fp8_s1_s3_tma`
+                    plan for exactly these buffers (optional; the kernel then
+                    skips its own descriptor preparation launch). Requires the
+                    fused kernel: the 2x GEMM fallback has no plan path.
 
     Returns:
         [E*mtp, N] bf16 — silu(gate) * up
     """
     kernel = _get_fused_s1_kernel()
+    if tma_plan is not None:
+        if kernel is None:
+            raise RuntimeError(
+                "FP8 fused S1 kernel (fp8_blockwise_fused_s1) not available in "
+                f"{_MODULE_NAME}, but a tma_plan was supplied; rebuild "
+                "batchgen_kernels with the fused S1 kernel.")
+        _check_plan(tma_plan, "s1", x_fp8, output, seqlens, cu_seqlens,
+                    num_seq_per_group_avg)
+        return kernel(
+            x_fp8, gate_w3d, up_w3d,
+            seqlens, cu_seqlens, x_scale,
+            gate_ws3d, up_ws3d,
+            num_seq_per_group_avg,
+            output, tma_plan.s1_tma_desc, tma_plan.tiles, tma_plan.cu_tiles,
+            False,
+        )
     if kernel is not None:
         return kernel(
             x_fp8, gate_w3d, up_w3d,
@@ -397,6 +594,7 @@ def grouped_fp8_blockwise_s3(
     cu_seqlens: Tensor,
     num_seq_per_group_avg: int,
     output: Optional[Tensor] = None,
+    tma_plan: Optional[GroupedFp8TmaPlan] = None,
 ) -> Tensor:
     """S3: down projection.
 
@@ -411,6 +609,8 @@ def grouped_fp8_blockwise_s3(
         cu_seqlens: [E+1] int32
         num_seq_per_group_avg: int
         output:     [E*mtp, K] bf16 — pre-allocated (optional)
+        tma_plan:   the S3 half of a :func:`prepare_grouped_fp8_s1_s3_tma`
+                    plan for exactly these buffers (optional)
 
     Returns:
         [E*mtp, K] bf16
@@ -418,7 +618,7 @@ def grouped_fp8_blockwise_s3(
     return grouped_fp8_blockwise_gemm(
         x_fp8, down_w3d, seqlens, cu_seqlens,
         x_scale, down_ws3d, num_seq_per_group_avg,
-        output=output,
+        output=output, tma_plan=tma_plan,
     )
 
 

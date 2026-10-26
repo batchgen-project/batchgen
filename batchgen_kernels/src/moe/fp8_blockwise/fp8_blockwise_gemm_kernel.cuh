@@ -87,6 +87,43 @@ __device__ __forceinline__ void get_next_tile_vert(const int *cu_tiles_ptr, int 
 }
 
 // ============================================================================
+// Tile counts + exclusive prefix sum, run by the last block of a descriptor
+// preparation launch: tiles[e] = ceil(seqlens[e] / TileM), cu_tiles = scan.
+// ============================================================================
+template <int kTileM, int kGroupPerThread, int kThreadPerBlock>
+__device__ __forceinline__ void write_expert_tile_prefix(const int *seqlens_ptr, int *tiles_ptr,
+                                                         int *cu_tiles_ptr, int num_group) {
+  int idx = threadIdx.x;
+  int tiles[kGroupPerThread];
+#pragma unroll
+  for (int i = 0; i < kGroupPerThread; i++) {
+    int ig = idx * kGroupPerThread + i;
+    if (ig < num_group) {
+      tiles[i] = (seqlens_ptr[ig] + kTileM - 1) / kTileM;
+      tiles_ptr[ig] = tiles[i];
+    } else {
+      tiles[i] = 0;
+    }
+  }
+
+  using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+  int block_aggregate;
+  BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
+
+#pragma unroll
+  for (int i = 0; i < kGroupPerThread; i++) {
+    int ig = idx * kGroupPerThread + i;
+    if (ig < num_group) {
+      cu_tiles_ptr[ig] = tiles[i];
+    }
+  }
+  if (idx == 0) {
+    cu_tiles_ptr[num_group] = block_aggregate;
+  }
+}
+
+// ============================================================================
 // Pre-launch kernel: update per-expert TMA descriptors + compute tile counts
 // ============================================================================
 template <typename Tin, typename Tout, typename TmaX, typename TmaY, int kTileM,
@@ -103,34 +140,8 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 
   if (igroup == num_group) {
     // Last block: compute tile counts + prefix sum
-    int tiles[kGroupPerThread];
-#pragma unroll
-    for (int i = 0; i < kGroupPerThread; i++) {
-      int ig = idx * kGroupPerThread + i;
-      if (ig < num_group) {
-        tiles[i] = (seqlens_ptr[ig] + kTileM - 1) / kTileM;
-        tiles_ptr[ig] = tiles[i];
-      } else {
-        tiles[i] = 0;
-      }
-    }
-
-    using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-    int block_aggregate;
-    BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
-
-#pragma unroll
-    for (int i = 0; i < kGroupPerThread; i++) {
-      int ig = idx * kGroupPerThread + i;
-      if (ig < num_group) {
-        cu_tiles_ptr[ig] = tiles[i];
-      }
-    }
-    if (idx == 0) {
-      cu_tiles_ptr[num_group] = block_aggregate;
-    }
-
+    write_expert_tile_prefix<kTileM, kGroupPerThread, kThreadPerBlock>(seqlens_ptr, tiles_ptr,
+                                                                       cu_tiles_ptr, num_group);
   } else {
     // Per-expert blocks: update TMA descriptors for X and Y
     __shared__ cute::TmaDescriptor smem_tma_desc[2];
@@ -168,6 +179,76 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
       }
       tma_descriptor_cp_fence_release(tma_xy + igroup * 2 + i, smem_tma_desc[i]);
     }
+  }
+}
+
+// Both GEMMs of one MoE layer in ONE launch: the fused S1 (X = activations,
+// Y = intermediate) and the S3 down GEMM (X = quantized intermediate, Y =
+// expert output) share the row space, seqlens, cu_seqlens and TileM, so their
+// per-expert X/Y descriptors differ only in base pointer and K/N, and their
+// tiles / cu_tiles are the same numbers. Each descriptor is produced by the
+// same prototype copy + update_tma_gtensor + cp_fence_release sequence
+// update_expert_tma runs, so the bytes published to tma_s1 / tma_s3 equal what
+// two separate update_expert_tma launches would publish; the last block writes
+// tiles / cu_tiles once for both GEMMs.
+//   td_proto = {S1 X, S1 Y, S3 X, S3 Y} host prototypes.
+template <typename Tin, typename Tout, typename TmaX1, typename TmaY1, typename TmaX3,
+          typename TmaY3, int kTileM, int kGroupPerThread, int kThreadPerBlock>
+__global__ void update_expert_tma_s1_s3(const vec_t<cute::TmaDescriptor, 4> td_proto,
+                                        cute::TmaDescriptor *tma_s1, cute::TmaDescriptor *tma_s3,
+                                        const Tin *x1_ptr, const Tout *y1_ptr, const Tin *x3_ptr,
+                                        const Tout *y3_ptr, const int *seqlens_ptr,
+                                        const int *cu_seqlens_ptr, int *tiles_ptr,
+                                        int *cu_tiles_ptr, int num_group, int n1, int k1, int n3,
+                                        int k3) {
+  using namespace cute;  // NOLINT
+
+  int idx = threadIdx.x;
+  int igroup = blockIdx.x;
+
+  if (igroup == num_group) {
+    write_expert_tile_prefix<kTileM, kGroupPerThread, kThreadPerBlock>(seqlens_ptr, tiles_ptr,
+                                                                       cu_tiles_ptr, num_group);
+    return;
+  }
+
+  __shared__ cute::TmaDescriptor smem_tma_desc[4];
+
+  int num_seq = seqlens_ptr[igroup];
+  int cu_seqlen = cu_seqlens_ptr[igroup];
+
+  if (idx < 4) {
+    smem_tma_desc[idx] = td_proto[idx];
+  }
+  __syncwarp();
+
+  if (idx == 0) {
+    auto gX = make_tensor(make_gmem_ptr(x1_ptr + (int64_t)cu_seqlen * k1),
+                          make_shape(num_seq, k1), make_stride(k1, Int<1>{}));
+    update_tma_gtensor<TmaX1>(smem_tma_desc[0], gX);
+  } else if (idx == 1) {
+    auto gY = make_tensor(make_gmem_ptr(y1_ptr + (int64_t)cu_seqlen * n1),
+                          make_shape(n1, num_seq), make_stride(Int<1>{}, n1));
+    update_tma_gtensor<TmaY1>(smem_tma_desc[1], gY);
+  } else if (idx == 2) {
+    auto gX = make_tensor(make_gmem_ptr(x3_ptr + (int64_t)cu_seqlen * k3),
+                          make_shape(num_seq, k3), make_stride(k3, Int<1>{}));
+    update_tma_gtensor<TmaX3>(smem_tma_desc[2], gX);
+  } else if (idx == 3) {
+    auto gY = make_tensor(make_gmem_ptr(y3_ptr + (int64_t)cu_seqlen * n3),
+                          make_shape(n3, num_seq), make_stride(Int<1>{}, n3));
+    update_tma_gtensor<TmaY3>(smem_tma_desc[3], gY);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    __syncwarp();
+    if (cute::elect_one_sync()) {
+      cute::tma_desc_commit_group();
+      cute::tma_desc_wait_group();
+    }
+    cute::TmaDescriptor *dst = (i < 2 ? tma_s1 : tma_s3) + igroup * 2 + (i & 1);
+    tma_descriptor_cp_fence_release(dst, smem_tma_desc[i]);
   }
 }
 

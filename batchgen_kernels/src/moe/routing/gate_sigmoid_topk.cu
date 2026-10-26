@@ -10,6 +10,8 @@
  *   6. scale: topk_weight *= routed_scaling_factor
  *
  * One block per token, 256 threads. Iterative argmax with warp-shuffle reduction.
+ * ``gate_sigmoid_topk_warp_cuda`` (E <= 256) produces the same bytes from one
+ * 32-thread CTA per token and can write int64 ids directly (see the warp kernel).
  *
  * Input:  router_logits [N, E] FP32 (row stride may exceed E), e_score_correction [E] FP32
  * Output: topk_indices [N, K] int32, topk_weights [N, K] FP32
@@ -44,6 +46,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <float.h>
 
 #define WARP_SIZE_GST 32
@@ -248,12 +251,297 @@ void launch_gate_sigmoid_topk(
 #undef GST_LAUNCH
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Small-footprint variant: one warp per row (E <= 256)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Same routing as gate_sigmoid_topk_kernel, bit for bit, from one 32-thread
+// CTA per row instead of eight warps per row.  A row's (at most 256) experts sit
+// in registers, eight per lane, so there is no shared memory and no block-wide
+// barrier per round; each round is a lane-local scan plus one warp butterfly.
+// __launch_bounds__ caps the kernel at 64 registers per thread.
+//
+// Why latency, not footprint: on the GLM-5.2 DeepEP decode path this kernel
+// runs on the main stream while the shared expert's x quant and gate/up
+// GEMM (a persistent DeepGEMM) run on a side stream.  Observed: a GEMM CTA is
+// not placed on an SM where a CTA of this kernel is still resident, whatever
+// this kernel's register or thread count, so the gate must FINISH before
+// the GEMM's CTAs are placed (the GEMM waits for the x quant), not merely be
+// small.  Hence: one memory round trip for all of a row's inputs, a short
+// per-round dependency chain, a programmatic dependent launch (PDL) so the
+// grid is resident as soon as the router GEMM drains, and int64 ids written
+// directly, which removes the separate int32 -> int64 copy launch.
+//
+// Bit-identity with the block-per-row kernel:
+//   * scores and biased scores are computed by the same expressions in the
+//     same translation unit (same compiler flags);
+//   * each argmax round reduces with the same comparison -- larger value wins,
+//     equal values go to the lower expert id -- which defines a unique winner
+//     for every set of candidates, so the reduction tree (8 values per lane
+//     then a butterfly, vs. per-thread strides then two warp levels) cannot
+//     change which expert is selected; the winner is then retired to
+//     -FLT_MAX exactly as the block kernel does;
+//   * the weights gather the raw (unbiased) score of each winner, sum them in
+//     route order k = 0..K-1 starting from 0.0f, and apply
+//     raw * (1 / (sum + 1e-20)) * scale in that order.
+// The only intended differences are the launch (PDL, see above) and the index
+// type: the caller can ask for int64 ids directly (the DeepEP exchange's
+// layout), which removes the int32 -> int64 copy kernel.
+//
+// Rows whose candidate set runs dry before K rounds (all remaining biased
+// scores NaN or <= -FLT_MAX, which needs a NaN logit or a -inf bias) make the
+// block kernel index its shared arrays at -1.  This kernel instead writes id -1
+// with a 0 raw weight for those routes; finite inputs never reach that case.
+
+#define MAX_EXPERTS_WARP_GST 256
+#define VPT_WARP_GST (MAX_EXPERTS_WARP_GST / WARP_SIZE_GST)   // values per lane
+
+__device__ __forceinline__ bool gst_better(float v, int i, float best, int best_idx) {
+    return v > best || (v == best && i < best_idx);
+}
+
+template <int K, typename IdxT>
+__global__ void __launch_bounds__(WARP_SIZE_GST, 32) gate_sigmoid_topk_warp_kernel(
+    const float* __restrict__ router_logits,       // [N, E] FP32, row stride logits_stride
+    const float* __restrict__ e_score_correction,  // [E] FP32 bias for selection
+    IdxT* __restrict__ topk_indices,               // [N, K] output (int32 or int64)
+    float* __restrict__ topk_weights,              // [N, K] output
+    const int32_t* __restrict__ num_valid_tokens,  // device scalar, or nullptr for "all N"
+    const int64_t* __restrict__ rank_token_counts, // [R] per-rank live prefix, or nullptr
+    float routed_scaling_factor,
+    int N, int E, int logits_stride,
+    int rows_per_rank
+) {
+    static_assert(K <= WARP_SIZE_GST, "one lane holds one route");
+    constexpr unsigned kFull = 0xffffffffu;
+    const int token_id = blockIdx.x;
+    if (token_id >= N) return;
+    const int lane = threadIdx.x;
+
+    // Programmatic dependent launch: the host launches this grid with
+    // programmatic stream serialization, so it may become resident while the
+    // preceding kernel (the router GEMM) is still finishing.  Nothing is read
+    // or written before this wait, which returns once that kernel has
+    // completed and its writes are visible; without the launch attribute it
+    // returns at once.  (griddepcontrol.wait == cudaGridDependencySynchronize,
+    // sm_90+; this extension is built for sm_90a only.)
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+
+    // Every global read of the row is issued before the padding decision, so
+    // the row's logits, the bias and the live-row count arrive in ONE memory
+    // round trip instead of the count first and the row after it.  A padding
+    // row's logits are in bounds (token_id < N) and simply go unused.
+    const float* token_logits = router_logits + (size_t)token_id * logits_stride;
+    float score[VPT_WARP_GST];
+    float biased[VPT_WARP_GST];
+    #pragma unroll
+    for (int j = 0; j < VPT_WARP_GST; j++) {
+        const int i = lane + j * WARP_SIZE_GST;
+        if (i < E) {
+            float logit = token_logits[i];
+            float s = 1.0f / (1.0f + expf(-logit));  // sigmoid
+            score[j] = s;
+            biased[j] = s + e_score_correction[i];
+        } else {
+            score[j] = 0.0f;
+            biased[j] = -FLT_MAX;
+        }
+    }
+
+    // Padding shape: identical to gate_sigmoid_topk_kernel.
+    bool row_is_padding = false;
+    if (num_valid_tokens != nullptr) {
+        row_is_padding = token_id >= *num_valid_tokens;
+    } else if (rank_token_counts != nullptr) {
+        const int rank = token_id / rows_per_rank;
+        const int local_pos = token_id - rank * rows_per_rank;
+        row_is_padding = static_cast<int64_t>(local_pos) >= rank_token_counts[rank];
+    }
+    IdxT* out_idx = topk_indices + (size_t)token_id * K;
+    float* out_w = topk_weights + (size_t)token_id * K;
+    if (row_is_padding) {
+        if (lane < K) {
+            out_idx[lane] = static_cast<IdxT>(-1);
+            out_w[lane] = 0.0f;
+        }
+        return;
+    }
+
+    // Lane k (< K) ends up holding route k: its expert id and raw score.
+    int my_idx = -1;
+    float my_raw = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        float best = -FLT_MAX;
+        int best_idx = -1;
+        #pragma unroll
+        for (int j = 0; j < VPT_WARP_GST; j++) {
+            const int i = lane + j * WARP_SIZE_GST;
+            if (i < E && gst_better(biased[j], i, best, best_idx)) {
+                best = biased[j];
+                best_idx = i;
+            }
+        }
+        // Butterfly: every lane ends with the same (unique) winner.
+        #pragma unroll
+        for (int offset = WARP_SIZE_GST / 2; offset > 0; offset /= 2) {
+            const float other_val = __shfl_xor_sync(kFull, best, offset);
+            const int other_idx = __shfl_xor_sync(kFull, best_idx, offset);
+            if (gst_better(other_val, other_idx, best, best_idx)) {
+                best = other_val;
+                best_idx = other_idx;
+            }
+        }
+        // The owning lane retires the winner and publishes its raw score.
+        float raw = 0.0f;
+        if (best_idx >= 0 && (best_idx % WARP_SIZE_GST) == lane) {
+            const int slot = best_idx / WARP_SIZE_GST;
+            #pragma unroll
+            for (int j = 0; j < VPT_WARP_GST; j++) {
+                if (j == slot) {
+                    raw = score[j];
+                    biased[j] = -FLT_MAX;  // mask out selected
+                }
+            }
+        }
+        raw = __shfl_sync(kFull, raw, best_idx >= 0 ? (best_idx % WARP_SIZE_GST) : 0);
+        if (lane == k) {
+            my_idx = best_idx;
+            my_raw = raw;
+        }
+    }
+
+    // Normalize in route order, exactly as the block kernel's thread 0 does.
+    float sum_w = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        sum_w += __shfl_sync(kFull, my_raw, k);
+    }
+    float inv_sum = 1.0f / (sum_w + 1e-20f);
+    if (lane < K) {
+        out_idx[lane] = static_cast<IdxT>(my_idx);
+        out_w[lane] = my_raw * inv_sum * routed_scaling_factor;
+    }
+}
+
+template <typename IdxT>
+void launch_gate_sigmoid_topk_warp(
+    int k,
+    const float* router_logits,
+    const float* e_score_correction,
+    IdxT* topk_indices,
+    float* topk_weights,
+    const int32_t* num_valid_tokens,
+    const int64_t* rank_token_counts,
+    float routed_scaling_factor,
+    int N, int E, int logits_stride,
+    int rows_per_rank,
+    cudaStream_t stream
+) {
+    // Programmatic stream serialization (PDL): the grid may launch while the
+    // previous kernel on the stream drains; the kernel's first statement waits
+    // for that kernel's completion, so results are those of a plain launch.
+    // Under CUDA-graph stream capture the attribute becomes a programmatic
+    // edge, so replays keep the early start.
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(N);
+    cfg.blockDim = dim3(WARP_SIZE_GST);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+
+#define GSTW_LAUNCH(KK)                                                      \
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, gate_sigmoid_topk_warp_kernel<KK, IdxT>, \
+        router_logits, e_score_correction, topk_indices, topk_weights,        \
+        num_valid_tokens, rank_token_counts, routed_scaling_factor,           \
+        N, E, logits_stride, rows_per_rank))
+
+    switch (k) {
+        case 2:  GSTW_LAUNCH(2);  break;
+        case 4:  GSTW_LAUNCH(4);  break;
+        case 8:  GSTW_LAUNCH(8);  break;
+        case 16: GSTW_LAUNCH(16); break;
+        default:
+            TORCH_CHECK(false, "Unsupported k=", k, ". Supported: 2, 4, 8, 16");
+    }
+#undef GSTW_LAUNCH
+}
+
 }  // anonymous namespace
 
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Python wrapper
+// Python wrappers
 // ──────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Device-resident description of which rows are live (shared by both kernels).
+struct GstPaddingShape {
+    const int32_t* valid_ptr = nullptr;
+    const int64_t* rank_counts_ptr = nullptr;
+    int rows_per_rank = 0;
+};
+
+GstPaddingShape resolve_gst_padding_shape(
+    int N,
+    const c10::Device& device,
+    const torch::Tensor& num_valid_tokens,
+    const torch::Tensor& rank_token_counts,
+    int64_t rows_per_rank
+) {
+    GstPaddingShape pad;
+    // A device-resident scalar keeps the live row count off the host, so one
+    // captured graph can be replayed at different valid-token counts.
+    if (num_valid_tokens.defined() && num_valid_tokens.numel() > 0) {
+        TORCH_CHECK(num_valid_tokens.is_cuda(), "num_valid_tokens must be a CUDA tensor");
+        TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32,
+                    "num_valid_tokens must be int32");
+        TORCH_CHECK(num_valid_tokens.numel() == 1,
+                    "num_valid_tokens must contain one element");
+        TORCH_CHECK(num_valid_tokens.device() == device,
+                    "num_valid_tokens must be on the router_logits device");
+        pad.valid_ptr = num_valid_tokens.data_ptr<int32_t>();
+    }
+
+    // EP all-gathered padding shape: R contiguous blocks of ``rows_per_rank``
+    // rows, block r live only up to ``rank_token_counts[r]``.  The live rows are
+    // not a prefix of N, so this cannot be folded into ``num_valid_tokens``;
+    // passing both is a caller bug rather than something to silently resolve.
+    if (rank_token_counts.defined() && rank_token_counts.numel() > 0) {
+        TORCH_CHECK(pad.valid_ptr == nullptr,
+                    "rank_token_counts and num_valid_tokens are mutually exclusive "
+                    "padding descriptions; pass exactly one");
+        TORCH_CHECK(rank_token_counts.is_cuda(), "rank_token_counts must be a CUDA tensor");
+        TORCH_CHECK(rank_token_counts.dtype() == torch::kInt64,
+                    "rank_token_counts must be int64");
+        TORCH_CHECK(rank_token_counts.dim() == 1, "rank_token_counts must be 1-D");
+        TORCH_CHECK(rank_token_counts.is_contiguous(), "rank_token_counts must be contiguous");
+        TORCH_CHECK(rank_token_counts.device() == device,
+                    "rank_token_counts must be on the router_logits device");
+        TORCH_CHECK(rows_per_rank > 0,
+                    "rows_per_rank must be positive when rank_token_counts is given, got ",
+                    rows_per_rank);
+        // Exact tiling: a short or long last block would make the rank index
+        // read past the counts, or silently mis-attribute rows to a rank.
+        TORCH_CHECK(rank_token_counts.size(0) * rows_per_rank == static_cast<int64_t>(N),
+                    "rank_token_counts.size(0)=", rank_token_counts.size(0),
+                    " x rows_per_rank=", rows_per_rank, " must equal N=", N);
+        pad.rank_counts_ptr = rank_token_counts.data_ptr<int64_t>();
+        pad.rows_per_rank = static_cast<int>(rows_per_rank);
+    } else {
+        TORCH_CHECK(rows_per_rank == 0,
+                    "rows_per_rank is only meaningful with rank_token_counts, got ",
+                    rows_per_rank);
+    }
+    return pad;
+}
+
+}  // anonymous namespace
 
 std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor router_logits,
@@ -294,52 +582,11 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
         topk_weights = torch::empty({N, k}, torch::dtype(torch::kFloat32).device(router_logits.device()));
     }
 
-    // A device-resident scalar keeps the live row count off the host, so one
-    // captured graph can be replayed at different valid-token counts.
-    const int32_t* valid_ptr = nullptr;
-    if (num_valid_tokens.defined() && num_valid_tokens.numel() > 0) {
-        TORCH_CHECK(num_valid_tokens.is_cuda(), "num_valid_tokens must be a CUDA tensor");
-        TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32,
-                    "num_valid_tokens must be int32");
-        TORCH_CHECK(num_valid_tokens.numel() == 1,
-                    "num_valid_tokens must contain one element");
-        TORCH_CHECK(num_valid_tokens.device() == router_logits.device(),
-                    "num_valid_tokens must be on the router_logits device");
-        valid_ptr = num_valid_tokens.data_ptr<int32_t>();
-    }
-
-    // EP all-gathered padding shape: R contiguous blocks of ``rows_per_rank``
-    // rows, block r live only up to ``rank_token_counts[r]``.  The live rows are
-    // not a prefix of N, so this cannot be folded into ``num_valid_tokens``;
-    // passing both is a caller bug rather than something to silently resolve.
-    const int64_t* rank_counts_ptr = nullptr;
-    int rows_per_rank_i = 0;
-    if (rank_token_counts.defined() && rank_token_counts.numel() > 0) {
-        TORCH_CHECK(valid_ptr == nullptr,
-                    "rank_token_counts and num_valid_tokens are mutually exclusive "
-                    "padding descriptions; pass exactly one");
-        TORCH_CHECK(rank_token_counts.is_cuda(), "rank_token_counts must be a CUDA tensor");
-        TORCH_CHECK(rank_token_counts.dtype() == torch::kInt64,
-                    "rank_token_counts must be int64");
-        TORCH_CHECK(rank_token_counts.dim() == 1, "rank_token_counts must be 1-D");
-        TORCH_CHECK(rank_token_counts.is_contiguous(), "rank_token_counts must be contiguous");
-        TORCH_CHECK(rank_token_counts.device() == router_logits.device(),
-                    "rank_token_counts must be on the router_logits device");
-        TORCH_CHECK(rows_per_rank > 0,
-                    "rows_per_rank must be positive when rank_token_counts is given, got ",
-                    rows_per_rank);
-        // Exact tiling: a short or long last block would make the rank index
-        // read past the counts, or silently mis-attribute rows to a rank.
-        TORCH_CHECK(rank_token_counts.size(0) * rows_per_rank == static_cast<int64_t>(N),
-                    "rank_token_counts.size(0)=", rank_token_counts.size(0),
-                    " x rows_per_rank=", rows_per_rank, " must equal N=", N);
-        rank_counts_ptr = rank_token_counts.data_ptr<int64_t>();
-        rows_per_rank_i = static_cast<int>(rows_per_rank);
-    } else {
-        TORCH_CHECK(rows_per_rank == 0,
-                    "rows_per_rank is only meaningful with rank_token_counts, got ",
-                    rows_per_rank);
-    }
+    const GstPaddingShape pad = resolve_gst_padding_shape(
+        N, router_logits.device(), num_valid_tokens, rank_token_counts, rows_per_rank);
+    const int32_t* valid_ptr = pad.valid_ptr;
+    const int64_t* rank_counts_ptr = pad.rank_counts_ptr;
+    const int rows_per_rank_i = pad.rows_per_rank;
 
     // Optional latent epilogue: ``router_logits`` is the leading-expert view of
     // a wider fused GEMM output, so the latent columns live in the same rows at
@@ -389,5 +636,79 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
             N, E, logits_stride, latent_off, latent_size, rows_per_rank_i, stream);
     }
 
+    return {topk_indices, topk_weights};
+}
+
+
+std::vector<torch::Tensor> gate_sigmoid_topk_warp_cuda(
+    torch::Tensor router_logits,
+    torch::Tensor e_score_correction,
+    int k,
+    float routed_scaling_factor,
+    torch::Tensor topk_indices,
+    torch::Tensor topk_weights,
+    torch::Tensor num_valid_tokens,
+    torch::Tensor rank_token_counts,
+    int64_t rows_per_rank
+) {
+    TORCH_CHECK(router_logits.is_cuda(), "router_logits must be CUDA tensor");
+    TORCH_CHECK(router_logits.dtype() == torch::kFloat32, "router_logits must be FP32");
+    TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2-D");
+    TORCH_CHECK(router_logits.stride(1) == 1, "router_logits rows must be contiguous");
+    TORCH_CHECK(e_score_correction.is_cuda() && e_score_correction.dtype() == torch::kFloat32,
+                "e_score_correction must be an FP32 CUDA tensor");
+    TORCH_CHECK(e_score_correction.device() == router_logits.device(),
+                "e_score_correction must be on the router_logits device");
+    TORCH_CHECK(e_score_correction.dim() == 1 && e_score_correction.is_contiguous(),
+                "e_score_correction must be a contiguous 1-D tensor");
+
+    const int N = router_logits.size(0);
+    const int E = router_logits.size(1);
+    const int logits_stride = static_cast<int>(router_logits.stride(0));
+    TORCH_CHECK(E <= MAX_EXPERTS_WARP_GST, "E=", E,
+                " exceeds the one-warp-per-row kernel's MAX_EXPERTS=", MAX_EXPERTS_WARP_GST,
+                "; use gate_sigmoid_topk");
+    TORCH_CHECK(E >= k, "E=", E, " must be at least k=", k);
+    TORCH_CHECK(e_score_correction.size(0) == E);
+
+    // The outputs are caller-owned (graph-static pool buffers), written
+    // row-major at token_id * k: validate rather than trust the layout.
+    TORCH_CHECK(topk_indices.is_cuda() && topk_indices.device() == router_logits.device(),
+                "topk_indices must be on the router_logits device");
+    TORCH_CHECK(topk_indices.dtype() == torch::kInt32 || topk_indices.dtype() == torch::kInt64,
+                "topk_indices must be int32 or int64, got ", topk_indices.dtype());
+    TORCH_CHECK(topk_indices.dim() == 2 && topk_indices.size(0) == N && topk_indices.size(1) == k
+                    && topk_indices.is_contiguous(),
+                "topk_indices must be a contiguous [", N, ", ", k, "] tensor, got ",
+                topk_indices.sizes());
+    TORCH_CHECK(topk_weights.is_cuda() && topk_weights.device() == router_logits.device(),
+                "topk_weights must be on the router_logits device");
+    TORCH_CHECK(topk_weights.dtype() == torch::kFloat32, "topk_weights must be FP32");
+    TORCH_CHECK(topk_weights.dim() == 2 && topk_weights.size(0) == N && topk_weights.size(1) == k
+                    && topk_weights.is_contiguous(),
+                "topk_weights must be a contiguous [", N, ", ", k, "] tensor, got ",
+                topk_weights.sizes());
+
+    const GstPaddingShape pad = resolve_gst_padding_shape(
+        N, router_logits.device(), num_valid_tokens, rank_token_counts, rows_per_rank);
+    if (N == 0) {
+        return {topk_indices, topk_weights};
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (topk_indices.dtype() == torch::kInt64) {
+        launch_gate_sigmoid_topk_warp<int64_t>(
+            k, router_logits.data_ptr<float>(), e_score_correction.data_ptr<float>(),
+            topk_indices.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
+            pad.valid_ptr, pad.rank_counts_ptr, routed_scaling_factor,
+            N, E, logits_stride, pad.rows_per_rank, stream);
+    } else {
+        launch_gate_sigmoid_topk_warp<int32_t>(
+            k, router_logits.data_ptr<float>(), e_score_correction.data_ptr<float>(),
+            topk_indices.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
+            pad.valid_ptr, pad.rank_counts_ptr, routed_scaling_factor,
+            N, E, logits_stride, pad.rows_per_rank, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {topk_indices, topk_weights};
 }

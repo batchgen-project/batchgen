@@ -7,11 +7,13 @@
 // 2. silu_mul_3d        — SiLU(gate) × up (vectorized BF16)
 // 3. fused_silu_quant_3d — SiLU(gate) × up + FP8 quantization (fuses S1 epilogue + S3 input)
 // 4. act_quant_ragged   — act_quant_3d arithmetic on compact ragged [max_rows, K] rows
+// 5. deepep_ll_scale_repack — DeepEP LL scale blocks -> grouped-GEMM scale matrix
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
 #include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -110,65 +112,110 @@ __global__ void act_quant_3d_kernel(
 
 // ============================================================================
 // Kernel 1b: act_quant_ragged — compact ragged FP8 blockwise quantization
-// Grid: (max_rows,)   Block: 128 threads (4 warps)
+// Grid: max(one resident wave, ceil(max_rows / 16)), capped at max_rows
+// Block: 128 threads (4 warps)
 // Expert e owns rows [cu_seqlens[e], cu_seqlens[e] + align64(seqlens[e])).
 // Valid rows use the exact act_quant_3d arithmetic. Pad rows inside that span
 // are quantized as zero input (y = 0, finite eps scale), so stale buffer rows
 // never reach GEMM tiles. Rows outside every span are left untouched.
 // Scale layout is the grouped GEMM x_scale layout [num_k_blocks, max_rows].
+//
+// Launch shape. The grid no longer has one block per row of the padded
+// capacity: it is one resident wave (sized from the device), or one block per
+// 16 rows of capacity when that is larger, and never depends on the live
+// counts, which are known only on device -- so a CUDA graph captured once
+// replays any seqlens. Blocks walk the concatenation of every expert's span
+// (clipped to [cu_seqlens[0], cu_seqlens[E]) and [0, max_rows)) round-robin,
+// so the rows visited are the span rows, not the capacity. In the
+// uniform-stride DeepEP layout cu_seqlens[E] == max_rows, so walking
+// [cu_seqlens[0], cu_seqlens[E]) row by row would still visit every padded row.
+//
+// Write set (unchanged): row r is written iff r in [0, max_rows) and
+// r in [cu_seqlens[0], cu_seqlens[E]) and, with o = the binary-search owner
+// of r, r - cu_seqlens[o] < align64(seqlens[o]). Every such r lies in owner
+// o's span, so it is visited while walking expert o; a row visited while
+// walking any other expert fails the owner check and is skipped. Each written
+// row is therefore produced exactly once, by the same per-row code.
 // ============================================================================
 #define RAGGED_ROW_ALIGN 64
+#define RAGGED_QUANT_THREADS 128
+#define RAGGED_ROWS_PER_BLOCK 16
 
-__global__ void act_quant_ragged_kernel(
-    const __nv_bfloat16* __restrict__ x,            // [max_rows, K]
-    uint8_t* __restrict__ y,                         // [max_rows, K] FP8
-    float* __restrict__ scale,                       // [num_k_blocks, max_rows]
-    const int32_t* __restrict__ seqlens,             // [E]
-    const int32_t* __restrict__ cu_seqlens,          // [E + 1]
-    int E, int max_rows, int K, int num_k_blocks
+// One row of act_quant_ragged: the act_quant_3d arithmetic on a valid row,
+// zero input on a pad row. Writes y[row, 0:K) and scale[0:num_k_blocks, row].
+// kVec (K % 4 == 0, x 8-byte and y 4-byte aligned): each lane's 4 columns are
+// moved with one 8-byte load and one 4-byte store instead of 4 + 4 scalar
+// accesses. The values, the FP32 op sequence and the bytes are unchanged; a
+// lane's quad is either fully inside [0, K) or fully outside it.
+template <bool kVec>
+__device__ __forceinline__ void act_quant_ragged_row(
+    const __nv_bfloat16* __restrict__ x,
+    uint8_t* __restrict__ y,
+    float* __restrict__ scale,
+    int64_t row, bool is_valid, int max_rows, int K, int num_k_blocks
 ) {
-    const int row = blockIdx.x;
-    if (row < cu_seqlens[0] || row >= cu_seqlens[E]) return;
-
-    // Rightmost expert whose span starts at or before this row; an empty
-    // expert shares its start with the next one, which then owns the row.
-    int lo = 0;
-    int hi = E - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) / 2;
-        if (cu_seqlens[mid] <= row) lo = mid;
-        else hi = mid - 1;
-    }
-    const int64_t rel = (int64_t)row - cu_seqlens[lo];
-    const int64_t valid_tokens = seqlens[lo];
-    const int64_t span = (valid_tokens + RAGGED_ROW_ALIGN - 1) /
-                         RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
-    if (rel >= span) return;
-    const bool is_valid = rel < valid_tokens;
-
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
-    const int num_warps = blockDim.x / 32;
+    constexpr int num_warps = RAGGED_QUANT_THREADS / 32;
 
     const __nv_bfloat16* x_row = x + (int64_t)row * K;
     uint8_t* y_row = y + (int64_t)row * K;
 
+    if (!is_valid) {
+        // A pad row quantizes all-zero input: every block max is 0, so the
+        // scale is the eps scale below (the same FP32 expression the general
+        // path evaluates) and every byte is FP8(+0 / s) = 0x00. Store those
+        // results directly; x is not read, exactly as before.
+        constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
+        const float s_pad = fmaxf(0.0f, QUANT_EPS) * FP8_MAX_VAL_INV;
+        for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
+            const int col0 = kb * BLOCK_SIZE_QUANT + lane_id * 4;
+            if constexpr (kVec) {
+                if (col0 < K) *reinterpret_cast<uint32_t*>(y_row + col0) = 0u;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    if (col0 + i < K) y_row[col0 + i] = 0;
+                }
+            }
+            if (lane_id == 0) {
+                scale[(int64_t)kb * max_rows + row] = s_pad;
+            }
+        }
+        return;
+    }
+
     for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
         int col_base = kb * BLOCK_SIZE_QUANT;
+        const int col0 = col_base + lane_id * 4;
 
         float vals[4];
         float local_max = 0.0f;
 
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int col = col_base + lane_id * 4 + i;
-            if (is_valid && col < K) {
-                vals[i] = __bfloat162float(x_row[col]);
+        if constexpr (kVec) {
+            if (col0 < K) {
+                const uint2 raw = *reinterpret_cast<const uint2*>(x_row + col0);
+                const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) vals[i] = __bfloat162float(v[i]);
             } else {
-                vals[i] = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) vals[i] = 0.0f;
             }
-            local_max = fmaxf(local_max, fabsf(vals[i]));
+            #pragma unroll
+            for (int i = 0; i < 4; i++) local_max = fmaxf(local_max, fabsf(vals[i]));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int col = col0 + i;
+                if (col < K) {
+                    vals[i] = __bfloat162float(x_row[col]);
+                } else {
+                    vals[i] = 0.0f;
+                }
+                local_max = fmaxf(local_max, fabsf(vals[i]));
+            }
         }
 
         #pragma unroll
@@ -181,13 +228,27 @@ __global__ void act_quant_ragged_kernel(
         constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
         float s = fmaxf(local_max, QUANT_EPS) * FP8_MAX_VAL_INV;
 
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int col = col_base + lane_id * 4 + i;
-            if (col < K) {
-                float scaled = vals[i] / s;
-                scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
-                y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+        if constexpr (kVec) {
+            if (col0 < K) {
+                uint32_t packed = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float scaled = vals[i] / s;
+                    scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                    packed |= (uint32_t)__nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3)
+                              << (8 * i);
+                }
+                *reinterpret_cast<uint32_t*>(y_row + col0) = packed;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int col = col0 + i;
+                if (col < K) {
+                    float scaled = vals[i] / s;
+                    scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                    y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+                }
             }
         }
 
@@ -195,6 +256,131 @@ __global__ void act_quant_ragged_kernel(
             scale[(int64_t)kb * max_rows + row] = s;
         }
     }
+}
+
+// 2048 resident threads per SM / 128 per block: ask for full residency
+// (caps registers at 32 per thread; the old one-block-per-row kernel used 25).
+template <bool kVec>
+__global__ void __launch_bounds__(RAGGED_QUANT_THREADS, 2048 / RAGGED_QUANT_THREADS)
+act_quant_ragged_kernel(
+    const __nv_bfloat16* __restrict__ x,            // [max_rows, K]
+    uint8_t* __restrict__ y,                         // [max_rows, K] FP8
+    float* __restrict__ scale,                       // [num_k_blocks, max_rows]
+    const int32_t* __restrict__ seqlens,             // [E]
+    const int32_t* __restrict__ cu_seqlens,          // [E + 1]
+    int E, int max_rows, int K, int num_k_blocks
+) {
+    // Rows the original one-block-per-row grid could reach: blockIdx.x in
+    // [0, max_rows), minus every row outside [cu_seqlens[0], cu_seqlens[E]).
+    const int64_t cu_first = cu_seqlens[0];
+    const int64_t cu_last = cu_seqlens[E];
+    const int64_t row_begin = cu_first > 0 ? cu_first : 0;
+    const int64_t row_end = cu_last < max_rows ? cu_last : (int64_t)max_rows;
+    if (row_begin >= row_end) return;
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    constexpr int kWarps = RAGGED_QUANT_THREADS / 32;
+    const int64_t grid = gridDim.x;
+
+    // One chunk of up to RAGGED_QUANT_THREADS experts at a time: thread t
+    // loads expert c0 + t's clipped span [r_begin, r_end) (relative to its
+    // cu_seqlens start), and a block-wide inclusive scan of the span lengths
+    // places that chunk's rows in the concatenation of all clipped spans.
+    // Block b takes concatenation positions b, b + grid, b + 2 * grid, ...
+    __shared__ int64_t s_incl[RAGGED_QUANT_THREADS];
+    __shared__ int64_t s_rbegin[RAGGED_QUANT_THREADS];
+    __shared__ int64_t s_start[RAGGED_QUANT_THREADS];
+    __shared__ int64_t s_warp_sum[kWarps];
+
+    int64_t base = 0;  // concatenation position of this chunk's first row
+    for (int c0 = 0; c0 < E; c0 += RAGGED_QUANT_THREADS) {
+        const int e = c0 + tid;
+        int64_t len = 0, r_begin = 0, start = 0;
+        if (e < E) {
+            start = cu_seqlens[e];
+            const int64_t valid_e = seqlens[e];
+            const int64_t span_e = (valid_e + RAGGED_ROW_ALIGN - 1) /
+                                   RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+            r_begin = row_begin > start ? row_begin - start : 0;
+            const int64_t r_end = span_e < row_end - start ? span_e : row_end - start;
+            len = r_end > r_begin ? r_end - r_begin : 0;
+        }
+        int64_t incl = len;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int64_t up = __shfl_up_sync(0xffffffff, incl, off);
+            if (lane >= off) incl += up;
+        }
+        if (lane == 31) s_warp_sum[warp] = incl;
+        __syncthreads();
+        for (int w = 0; w < warp; ++w) incl += s_warp_sum[w];
+        s_incl[tid] = incl;
+        s_rbegin[tid] = r_begin;
+        s_start[tid] = start;
+        __syncthreads();
+
+        const int n = E - c0 < RAGGED_QUANT_THREADS ? E - c0 : RAGGED_QUANT_THREADS;
+        const int64_t chunk_rows = s_incl[n - 1];
+        int64_t v = ((int64_t)blockIdx.x - base) % grid;
+        if (v < 0) v += grid;
+        for (; v < chunk_rows; v += grid) {
+            // Chunk-local expert j holding position v: first j with s_incl[j] > v.
+            int lo_j = 0, hi_j = n - 1;
+            while (lo_j < hi_j) {
+                const int mid = (lo_j + hi_j) / 2;
+                if (s_incl[mid] > v) hi_j = mid;
+                else lo_j = mid + 1;
+            }
+            const int64_t excl = lo_j ? s_incl[lo_j - 1] : 0;
+            const int64_t row = s_start[lo_j] + s_rbegin[lo_j] + (v - excl);
+            // Rightmost expert whose span starts at or before this row; an
+            // empty expert shares its start with the next one, which then owns
+            // the row. Identical search to the one-block-per-row kernel.
+            int lo = 0;
+            int hi = E - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (cu_seqlens[mid] <= row) lo = mid;
+                else hi = mid - 1;
+            }
+            if (lo != c0 + lo_j) continue;  // owned (and written) by expert lo
+            const int64_t rel = row - cu_seqlens[lo];
+            const int64_t valid_tokens = seqlens[lo];
+            const int64_t span = (valid_tokens + RAGGED_ROW_ALIGN - 1) /
+                                 RAGGED_ROW_ALIGN * RAGGED_ROW_ALIGN;
+            if (rel >= span) continue;
+            act_quant_ragged_row<kVec>(x, y, scale, row, rel < valid_tokens,
+                                       max_rows, K, num_k_blocks);
+        }
+        base += chunk_rows;
+        __syncthreads();  // s_* are rewritten by the next chunk
+    }
+}
+
+// act_quant_ragged grid: one full wave of resident blocks, or one block per
+// 16 rows of capacity when that is larger. Decode with E local experts fills
+// ~E x 64 span rows (2048 at E=32) of a capacity of at most 16 waves (32768
+// rows in the DeepEP layout), so it runs as a single wave with about one row
+// per block and no early-exit blocks. A large, densely filled buffer (grouped
+// prefill: 147200 rows, up to 131072 live) keeps enough blocks for the
+// hardware scheduler to balance the rows; one block per row would be 16x
+// more. The grid depends only on max_rows and the device, never on the live
+// counts, so a captured graph replays any seqlens correctly.
+template <bool kVec>
+static int act_quant_ragged_grid(const torch::Device& device, int64_t max_rows) {
+    static const int blocks_per_sm = [] {
+        int n = 0;
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, act_quant_ragged_kernel<kVec>, RAGGED_QUANT_THREADS, 0));
+        TORCH_CHECK(n > 0, "act_quant_ragged_kernel cannot be resident on this device");
+        return n;
+    }();
+    const int64_t sms = at::cuda::getDeviceProperties(device.index())->multiProcessorCount;
+    const int64_t wave = sms * blocks_per_sm;
+    const int64_t per_capacity = (max_rows + RAGGED_ROWS_PER_BLOCK - 1) / RAGGED_ROWS_PER_BLOCK;
+    return static_cast<int>(std::min<int64_t>(std::max<int64_t>(wave, per_capacity), max_rows));
 }
 
 // ============================================================================
@@ -412,15 +598,24 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_ragged(
 
     const c10::cuda::CUDAGuard device_guard(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 grid(static_cast<unsigned int>(max_rows));
-    act_quant_ragged_kernel<<<grid, 128, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-        reinterpret_cast<uint8_t*>(y.data_ptr()),
-        scale.data_ptr<float>(),
-        seqlens.data_ptr<int32_t>(),
-        cu_seqlens.data_ptr<int32_t>(),
-        static_cast<int>(E), static_cast<int>(max_rows),
-        static_cast<int>(K), static_cast<int>(num_k_blocks));
+    const bool vec = K % 4 == 0 &&
+                     reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0 &&
+                     reinterpret_cast<uintptr_t>(y.data_ptr()) % 4 == 0;
+    auto launch = [&](auto kernel, int grid) {
+        kernel<<<grid, RAGGED_QUANT_THREADS, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<uint8_t*>(y.data_ptr()),
+            scale.data_ptr<float>(),
+            seqlens.data_ptr<int32_t>(),
+            cu_seqlens.data_ptr<int32_t>(),
+            static_cast<int>(E), static_cast<int>(max_rows),
+            static_cast<int>(K), static_cast<int>(num_k_blocks));
+    };
+    if (vec) {
+        launch(act_quant_ragged_kernel<true>, act_quant_ragged_grid<true>(device, max_rows));
+    } else {
+        launch(act_quant_ragged_kernel<false>, act_quant_ragged_grid<false>(device, max_rows));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return std::make_tuple(y, scale);
@@ -480,6 +675,122 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
     return std::make_tuple(y, scale);
 }
 
+// ============================================================================
+// Kernel 5: deepep_ll_scale_repack — DeepEP low-latency FP8 activation scales
+// into the grouped GEMM's single transposed scale matrix, live span only.
+//
+// DeepEP LL (use_fp8=True) hands back the scales as a contiguous
+// [E, KB, S] fp32 block (S = per-expert row stride, KB = hidden/128; the
+// exchange exposes it as the [E, S, KB] view with strides (KB*S, 1, S)). The
+// grouped FP8 GEMM reads ONE [KB, E*S] matrix with expert e at column e*S.
+//
+// What the GEMM reads: its x-scale TMA descriptor is the static [KB, E*S]
+// matrix with a (1, TileM) box, addressed at column cu_seqlens[e] + itile_m *
+// TileM for itile_m < ceil(recv_count[e] / TileM) only (tiles[] from
+// update_expert_tma*). Per expert that is columns
+//   [e*S, e*S + ceil(recv_count[e] / span_align) * span_align)
+// for every k-block when span_align is the TileM the GEMM runs with. Exactly
+// that span is copied, bit for bit; the columns beyond it keep whatever the
+// buffer held, which no tile can address.
+//
+// Grid (E, kRepackChunksPerExpert), kRepackThreads threads; each expert's
+// [KB, span] block is flattened into float4 units and grid-strided, so the
+// launch is a fixed 256 CTAs regardless of load and the copy shrinks with
+// recv_count instead of moving the whole E*KB*S block every step.
+// ============================================================================
+constexpr int kRepackThreads = 128;
+constexpr int kRepackChunksPerExpert = 8;
+
+__global__ void __launch_bounds__(kRepackThreads)
+deepep_ll_scale_repack_kernel(
+    const float* __restrict__ src,          // [E, KB, S] contiguous
+    const int32_t* __restrict__ recv_count, // [E]
+    float* __restrict__ dst,                // [KB, E * S] contiguous
+    int E, int KB, int S, int span_align
+) {
+    const int e = blockIdx.x;
+    const int rc = recv_count[e];
+    if (rc < 0 || rc > S) {
+        // A count the receive layout cannot hold: the GEMM would trap on the
+        // same value (load_xscale_tile_base); fail here, loudly, first.
+        asm volatile("trap;");
+    }
+    const int span = (rc + span_align - 1) / span_align * span_align;
+    const int vec_per_row = span / 4;           // span_align % 4 == 0 (host)
+    const int total = KB * vec_per_row;
+    const float* src_e = src + (int64_t)e * KB * S;
+    float* dst_e = dst + (int64_t)e * S;
+    const int64_t dst_row_stride = (int64_t)E * S;
+    for (int i = blockIdx.y * kRepackThreads + threadIdx.x; i < total;
+         i += kRepackChunksPerExpert * kRepackThreads) {
+        const int kb = i / vec_per_row;
+        const int c = (i - kb * vec_per_row) * 4;
+        const float4 v =
+            *reinterpret_cast<const float4*>(src_e + (int64_t)kb * S + c);
+        *reinterpret_cast<float4*>(dst_e + (int64_t)kb * dst_row_stride + c) = v;
+    }
+}
+
+// recv_scales: the exchange's [E, S, KB] fp32 view (strides (KB*S, 1, S));
+// recv_count: [E] int32; out: [KB, E*S] fp32 contiguous; span_align: the
+// TileM the consuming grouped GEMM runs with. No allocations; recv_count is
+// never read on the host.
+torch::Tensor deepep_ll_scale_repack(
+    torch::Tensor recv_scales,
+    torch::Tensor recv_count,
+    torch::Tensor out,
+    int64_t span_align
+) {
+    constexpr int64_t kInt32Max = 2147483647;
+    TORCH_CHECK(recv_scales.defined() && recv_scales.is_cuda(),
+                "recv_scales must be a CUDA tensor");
+    const auto device = recv_scales.device();
+    check_ragged_cuda_tensor(recv_count, device, "recv_count");
+    check_ragged_cuda_tensor(out, device, "out");
+    TORCH_CHECK(recv_scales.dim() == 3 && recv_scales.scalar_type() == torch::kFloat32,
+                "recv_scales must be float32 [E, S, hidden/128]");
+    const int64_t E = recv_scales.size(0);
+    const int64_t S = recv_scales.size(1);
+    const int64_t KB = recv_scales.size(2);
+    TORCH_CHECK(E > 0 && S > 0 && KB > 0, "recv_scales must be non-empty");
+    TORCH_CHECK(recv_scales.stride(0) == KB * S && recv_scales.stride(1) == 1 &&
+                    recv_scales.stride(2) == S,
+                "recv_scales must be the (1, 2)-transposed view of a contiguous "
+                "[E, hidden/128, S] block, i.e. strides (", KB * S, ", 1, ", S,
+                "); got (", recv_scales.stride(0), ", ", recv_scales.stride(1), ", ",
+                recv_scales.stride(2), ")");
+    TORCH_CHECK(E * KB * S <= kInt32Max, "recv_scales too large for int32 indexing");
+    TORCH_CHECK(recv_count.dim() == 1 && recv_count.scalar_type() == torch::kInt32 &&
+                    recv_count.size(0) == E,
+                "recv_count must be int32 [E]");
+    TORCH_CHECK(out.dim() == 2 && out.scalar_type() == torch::kFloat32 &&
+                    out.size(0) == KB && out.size(1) == E * S,
+                "out must be float32 [hidden/128, E * S] = [", KB, ", ", E * S, "]");
+    TORCH_CHECK(span_align > 0 && span_align % 4 == 0 && S % span_align == 0,
+                "span_align (", span_align, ") must be a positive multiple of 4 "
+                "dividing the expert stride ", S);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(recv_scales.data_ptr()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
+                "recv_scales and out must be 16-byte aligned");
+    const auto src_lo = reinterpret_cast<uintptr_t>(recv_scales.data_ptr());
+    const auto dst_lo = reinterpret_cast<uintptr_t>(out.data_ptr());
+    const auto bytes = static_cast<uintptr_t>(E * KB * S * sizeof(float));
+    TORCH_CHECK(src_lo + bytes <= dst_lo || dst_lo + bytes <= src_lo,
+                "recv_scales and out must not overlap");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    deepep_ll_scale_repack_kernel<<<dim3(static_cast<unsigned>(E), kRepackChunksPerExpert),
+                                    kRepackThreads, 0, stream>>>(
+        recv_scales.data_ptr<float>(),
+        recv_count.data_ptr<int32_t>(),
+        out.data_ptr<float>(),
+        static_cast<int>(E), static_cast<int>(KB), static_cast<int>(S),
+        static_cast<int>(span_align));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("act_quant_3d", &act_quant_3d,
           "FP8 blockwise quantization on 3D [E, mtp, K] layout");
@@ -489,4 +800,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SiLU(gate) * up on 3D [E, mtp, N] layout");
     m.def("fused_silu_quant_3d", &fused_silu_quant_3d,
           "Fused SiLU(gate) * up + FP8 quantization on 3D layout");
+    m.def("deepep_ll_scale_repack", &deepep_ll_scale_repack,
+          "DeepEP LL FP8 activation scales -> grouped-GEMM [hidden/128, E*S] matrix, "
+          "copying only each expert's recv_count span rounded up to span_align",
+          pybind11::arg("recv_scales"), pybind11::arg("recv_count"), pybind11::arg("out"),
+          pybind11::arg("span_align"));
 }

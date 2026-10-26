@@ -534,6 +534,28 @@ torch::Tensor prepare_int_workspace(
   return value;
 }
 
+// The X/Y descriptor array of one non-pointer grouped GEMM: [2 * G, 128] bytes.
+void check_xy_tma_desc(const torch::Tensor &td, const torch::Device &device, int num_group,
+                       const char *name) {
+  check_cuda_tensor(td, device, name);
+  TORCH_CHECK(td.dim() == 2 && td.element_size() == 1 && td.size(0) == 2 * num_group &&
+                  td.size(1) == 128,
+              name, " must be a 1-byte [2 * num_group, 128] tensor");
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>(td.data_ptr()) % 64 == 0,
+              name, " data pointer must be 64-byte aligned");
+}
+
+// update_tma = false: the GEMM consumes descriptors and tile tables written
+// earlier on this stream (fp8_blockwise_prepare_s1_s3_tma), so all three must
+// be the caller's; a fresh allocation would hold no descriptors at all.
+void check_prepared_tma(bool update_tma, const std::optional<torch::Tensor> &tma_desc,
+                        const std::optional<torch::Tensor> &tiles,
+                        const std::optional<torch::Tensor> &cu_tiles, const char *op) {
+  if (update_tma) return;
+  TORCH_CHECK(tma_desc.has_value() && tiles.has_value() && cu_tiles.has_value(), op,
+              ": update_tma=false requires the prepared tma_desc, tiles and cu_tiles");
+}
+
 }  // namespace
 
 // ============================================================================
@@ -543,7 +565,8 @@ torch::Tensor fp8_blockwise_grouped_gemm(
     const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &seqlens,
     const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale, const torch::Tensor &w_scale,
     const int64_t num_seq_per_group_avg, std::optional<torch::Tensor> output,
-    std::optional<torch::Tensor> tma_desc) {
+    std::optional<torch::Tensor> tma_desc, std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace, bool update_tma) {
   const auto geom =
       check_grouped_gemm_inputs(x, weight, seqlens, cu_seqlens, x_scale, w_scale, output);
   const int m = geom.m;
@@ -553,14 +576,10 @@ torch::Tensor fp8_blockwise_grouped_gemm(
   const int num_block_k_pad4 = geom.num_block_k_pad4;
   const int num_group = geom.num_group;
 
+  check_prepared_tma(update_tma, tma_desc, tiles_workspace, cu_tiles_workspace,
+                     "fp8_blockwise_grouped_gemm");
   if (tma_desc.has_value()) {
-    const auto &td = tma_desc.value();
-    check_cuda_tensor(td, x.device(), "tma_desc");
-    TORCH_CHECK(td.dim() == 2 && td.element_size() == 1 && td.size(0) == 2 * num_group &&
-                    td.size(1) == 128,
-                "tma_desc must be a 1-byte [2 * num_group, 128] tensor");
-    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(td.data_ptr()) % 64 == 0,
-                "tma_desc data pointer must be 64-byte aligned");
+    check_xy_tma_desc(tma_desc.value(), x.device(), num_group, "tma_desc");
   }
 
   const c10::cuda::CUDAGuard device_guard(x.device());
@@ -581,8 +600,8 @@ torch::Tensor fp8_blockwise_grouped_gemm(
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
-  torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
+  torch::Tensor tiles = prepare_int_workspace(tiles_workspace, x, num_group, "tiles");
+  torch::Tensor cu_tiles = prepare_int_workspace(cu_tiles_workspace, x, num_group + 1, "cu_tiles");
 
   fp8_blockwise_grouped_gemm_async(
       y.mutable_data_ptr(), x.const_data_ptr(), weight.const_data_ptr(),
@@ -590,7 +609,7 @@ torch::Tensor fp8_blockwise_grouped_gemm(
       x_scale.const_data_ptr(), w_scale.const_data_ptr(),
       tmas.mutable_data_ptr(), tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(),
       num_group, m, n, k, m_pad, num_block_k_pad4,
-      num_seq_per_group_avg, true, stream);
+      num_seq_per_group_avg, update_tma, stream);
 
   return y;
 }
@@ -941,6 +960,86 @@ void fp8_blockwise_fused_s1_ptrs_async(
 }
 
 // ============================================================================
+// One-launch descriptor preparation for a fused S1 + grouped S3 pair that
+// shares seqlens / cu_seqlens / TileM. Writes the per-expert X/Y descriptors of
+// BOTH GEMMs plus one tiles / cu_tiles, which the two GEMMs then consume with
+// update_tma = false. The Config template arguments are the ones
+// fp8_blockwise_fused_s1_async and fp8_blockwise_grouped_gemm_async
+// instantiate, so the prototypes are the ones their own launches build.
+// ============================================================================
+template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage, int kWarpgroupM,
+          int kWarpgroupN, int kSwizzleX, int kSwizzleW, int kSwizzleY>
+void launch_prepare_s1_s3_tma(const void *x1_ptr, void *y1_ptr, const void *x3_ptr,
+                              void *y3_ptr, const void *seqlens_ptr,
+                              const void *cu_seqlens_ptr, void *tma_s1_ptr, void *tma_s3_ptr,
+                              void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+                              int n1, int k1, int n3, int k3, cudaStream_t stream) {
+  using namespace cute;  // NOLINT
+  using Tin = cute::float_e4m3_t;
+  using Tout = cute::bfloat16_t;
+  using TS = float;
+
+  using Config = Fp8BlockwiseGemmConfig<Tin, Tout, TS, kTileM, kTileN, kTileK, kTileS, kStage,
+                                         kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW,
+                                         kSwizzleY>;
+  Config config;
+
+  auto X1 = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x1_ptr)), make_shape(m, k1),
+                        make_stride(k1, Int<1>{}));
+  auto Y1 = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y1_ptr)), make_shape(n1, m),
+                        make_stride(Int<1>{}, n1));
+  auto X3 = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x3_ptr)), make_shape(m, k3),
+                        make_stride(k3, Int<1>{}));
+  auto Y3 = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y3_ptr)), make_shape(n3, m),
+                        make_stride(Int<1>{}, n3));
+  auto [tma_x1, tma_y1] = config.get_tma_xy(X1, Y1);
+  auto [tma_x3, tma_y3] = config.get_tma_xy(X3, Y3);
+
+  vec_t<cute::TmaDescriptor, 4> td_proto{
+      *tma_x1.get_tma_descriptor(),
+      *tma_y1.get_tma_descriptor(),
+      *tma_x3.get_tma_descriptor(),
+      *tma_y3.get_tma_descriptor(),
+  };
+  kernels::update_expert_tma_s1_s3<Tin, Tout, decltype(tma_x1), decltype(tma_y1),
+                                   decltype(tma_x3), decltype(tma_y3), kTileM,
+                                   kTmaGroupsPerThread, kTmaThreadsPerBlock>
+      <<<num_group + 1, kTmaThreadsPerBlock, 0, stream>>>(
+          td_proto, static_cast<cute::TmaDescriptor *>(tma_s1_ptr),
+          static_cast<cute::TmaDescriptor *>(tma_s3_ptr), (const Tin *)x1_ptr,
+          (const Tout *)y1_ptr, (const Tin *)x3_ptr, (const Tout *)y3_ptr,
+          (const int *)seqlens_ptr, (const int *)cu_seqlens_ptr, (int *)tiles_ptr,
+          (int *)cu_tiles_ptr, num_group, n1, k1, n3, k3);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fp8_blockwise_prepare_s1_s3_tma_async(const void *x1_ptr, void *y1_ptr, const void *x3_ptr,
+                                           void *y3_ptr, const void *seqlens_ptr,
+                                           const void *cu_seqlens_ptr, void *tma_s1_ptr,
+                                           void *tma_s3_ptr, void *tiles_ptr, void *cu_tiles_ptr,
+                                           int num_group, int m, int n1, int k1, int n3, int k3,
+                                           int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileN = 128, kTileK = 128, kTileS = 64;
+  constexpr int kWarpgroupM = 2, kWarpgroupN = 1;
+  constexpr int kSwizzleX = 128, kSwizzleW = 128, kSwizzleY = 64;
+#define LAUNCH_PREPARE_S1_S3(TM)                                                    \
+  launch_prepare_s1_s3_tma<TM, kTileN, kTileK, kTileS, 8, kWarpgroupM, kWarpgroupN, \
+                           kSwizzleX, kSwizzleW, kSwizzleY>(                        \
+      x1_ptr, y1_ptr, x3_ptr, y3_ptr, seqlens_ptr, cu_seqlens_ptr, tma_s1_ptr,      \
+      tma_s3_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n1, k1, n3, k3, stream)
+  // Same TileM selection as fp8_blockwise_fused_s1_async and
+  // fp8_blockwise_grouped_gemm_async (avg 33..48 already falls to 64 there).
+  if (num_seq_per_group_avg <= 16) {
+    LAUNCH_PREPARE_S1_S3(16);
+  } else if (num_seq_per_group_avg <= 32) {
+    LAUNCH_PREPARE_S1_S3(32);
+  } else {
+    LAUNCH_PREPARE_S1_S3(64);
+  }
+#undef LAUNCH_PREPARE_S1_S3
+}
+
+// ============================================================================
 // Fused S1 PyTorch entry point
 // ============================================================================
 torch::Tensor fp8_blockwise_fused_s1(
@@ -950,7 +1049,11 @@ torch::Tensor fp8_blockwise_fused_s1(
     const torch::Tensor &x_scale,
     const torch::Tensor &gate_w_scale, const torch::Tensor &up_w_scale,
     const int64_t num_seq_per_group_avg,
-    std::optional<torch::Tensor> output) {
+    std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> tma_desc,
+    std::optional<torch::Tensor> tiles_workspace,
+    std::optional<torch::Tensor> cu_tiles_workspace,
+    bool update_tma) {
   const auto geom = check_grouped_gemm_inputs(x, gate_weight, seqlens, cu_seqlens, x_scale,
                                               gate_w_scale, output);
   check_cuda_tensor(up_weight, x.device(), "up_weight");
@@ -969,6 +1072,12 @@ torch::Tensor fp8_blockwise_fused_s1(
   const int num_block_k_pad4 = geom.num_block_k_pad4;
   const int num_group = geom.num_group;
 
+  check_prepared_tma(update_tma, tma_desc, tiles_workspace, cu_tiles_workspace,
+                     "fp8_blockwise_fused_s1");
+  if (tma_desc.has_value()) {
+    check_xy_tma_desc(tma_desc.value(), x.device(), num_group, "tma_desc");
+  }
+
   const c10::cuda::CUDAGuard device_guard(x.device());
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
@@ -980,9 +1089,10 @@ torch::Tensor fp8_blockwise_fused_s1(
     y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
   }
 
-  torch::Tensor tmas = torch::empty({num_group * 2, 128}, options);
-  torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
+  torch::Tensor tmas =
+      tma_desc.has_value() ? tma_desc.value() : torch::empty({num_group * 2, 128}, options);
+  torch::Tensor tiles = prepare_int_workspace(tiles_workspace, x, num_group, "tiles");
+  torch::Tensor cu_tiles = prepare_int_workspace(cu_tiles_workspace, x, num_group + 1, "cu_tiles");
 
   fp8_blockwise_fused_s1_async(
       y.mutable_data_ptr(), x.const_data_ptr(),
@@ -992,9 +1102,91 @@ torch::Tensor fp8_blockwise_fused_s1(
       gate_w_scale.const_data_ptr(), up_w_scale.const_data_ptr(),
       tmas.mutable_data_ptr(), tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(),
       num_group, m, n, k, m_pad, num_block_k_pad4,
-      num_seq_per_group_avg, true, stream);
+      num_seq_per_group_avg, update_tma, stream);
 
   return y;
+}
+
+// ============================================================================
+// Shared descriptor preparation for a fused S1 + grouped S3 pair (one launch
+// instead of one update_expert_tma per GEMM). Requirements the pair must meet,
+// checked here on host metadata: one row space m for all four buffers, the
+// same seqlens / cu_seqlens, and the same num_seq_per_group_avg (=> TileM) as
+// the two GEMM calls that later consume the result with update_tma = false.
+// ============================================================================
+void fp8_blockwise_prepare_s1_s3_tma(
+    const torch::Tensor &s1_x, const torch::Tensor &s1_output,
+    const torch::Tensor &s3_x, const torch::Tensor &s3_output,
+    const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
+    const int64_t num_seq_per_group_avg,
+    const torch::Tensor &s1_tma_desc, const torch::Tensor &s3_tma_desc,
+    const torch::Tensor &tiles, const torch::Tensor &cu_tiles) {
+  TORCH_CHECK(s1_x.defined() && s1_x.is_cuda(), "s1_x must be a CUDA tensor");
+  const auto device = s1_x.device();
+  check_cuda_tensor(s1_x, device, "s1_x");
+  check_cuda_tensor(s1_output, device, "s1_output");
+  check_cuda_tensor(s3_x, device, "s3_x");
+  check_cuda_tensor(s3_output, device, "s3_output");
+  check_cuda_tensor(seqlens, device, "seqlens");
+  check_cuda_tensor(cu_seqlens, device, "cu_seqlens");
+
+  TORCH_CHECK(s1_x.dim() == 2 && s1_x.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "s1_x must be float8_e4m3fn [m, K1]");
+  TORCH_CHECK(s3_x.dim() == 2 && s3_x.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+              "s3_x must be float8_e4m3fn [m, K3]");
+  TORCH_CHECK(s1_output.dim() == 2 && s1_output.scalar_type() == torch::kBFloat16,
+              "s1_output must be BF16 [m, N1]");
+  TORCH_CHECK(s3_output.dim() == 2 && s3_output.scalar_type() == torch::kBFloat16,
+              "s3_output must be BF16 [m, N3]");
+  TORCH_CHECK(seqlens.dim() == 1 && seqlens.scalar_type() == torch::kInt32,
+              "seqlens must be int32 [G]");
+  const int64_t num_group = seqlens.size(0);
+  TORCH_CHECK(num_group > 0 && num_group <= kMaxTmaGroups,
+              "num_group must be in [1, ", kMaxTmaGroups, "], got ", num_group);
+  TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.scalar_type() == torch::kInt32 &&
+                  cu_seqlens.size(0) == num_group + 1,
+              "cu_seqlens must be int32 [G + 1]");
+
+  const int64_t m = s1_x.size(0);
+  const int64_t k1 = s1_x.size(1);
+  const int64_t n1 = s1_output.size(1);
+  const int64_t k3 = s3_x.size(1);
+  const int64_t n3 = s3_output.size(1);
+  TORCH_CHECK(m > 0 && s1_output.size(0) == m && s3_x.size(0) == m && s3_output.size(0) == m,
+              "s1_x, s1_output, s3_x and s3_output must share the row space m=", m);
+  for (int64_t d : {k1, n1, k3, n3}) {
+    TORCH_CHECK(d > 0 && d % kQuantBlock == 0,
+                "K1/N1/K3/N3 must be positive multiples of 128, got ", k1, "/", n1, "/", k3,
+                "/", n3);
+  }
+  TORCH_CHECK(m <= kInt32Max && n1 * k1 <= kInt32Max && n3 * k3 <= kInt32Max,
+              "prepare_s1_s3_tma shape products overflow int32");
+
+  check_xy_tma_desc(s1_tma_desc, device, static_cast<int>(num_group), "s1_tma_desc");
+  check_xy_tma_desc(s3_tma_desc, device, static_cast<int>(num_group), "s3_tma_desc");
+  const auto s1_lo = reinterpret_cast<std::uintptr_t>(s1_tma_desc.data_ptr());
+  const auto s3_lo = reinterpret_cast<std::uintptr_t>(s3_tma_desc.data_ptr());
+  const auto desc_bytes = static_cast<std::uintptr_t>(2 * num_group * 128);
+  TORCH_CHECK(s1_lo + desc_bytes <= s3_lo || s3_lo + desc_bytes <= s1_lo,
+              "s1_tma_desc and s3_tma_desc must not overlap");
+  check_cuda_tensor(tiles, device, "tiles");
+  check_cuda_tensor(cu_tiles, device, "cu_tiles");
+  TORCH_CHECK(tiles.dim() == 1 && tiles.scalar_type() == torch::kInt32 &&
+                  tiles.numel() >= num_group,
+              "tiles must be int32 [at least ", num_group, "]");
+  TORCH_CHECK(cu_tiles.dim() == 1 && cu_tiles.scalar_type() == torch::kInt32 &&
+                  cu_tiles.numel() >= num_group + 1,
+              "cu_tiles must be int32 [at least ", num_group + 1, "]");
+
+  const c10::cuda::CUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream(s1_x.get_device());
+  fp8_blockwise_prepare_s1_s3_tma_async(
+      s1_x.const_data_ptr(), s1_output.mutable_data_ptr(), s3_x.const_data_ptr(),
+      s3_output.mutable_data_ptr(), seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
+      s1_tma_desc.mutable_data_ptr(), s3_tma_desc.mutable_data_ptr(), tiles.mutable_data_ptr(),
+      cu_tiles.mutable_data_ptr(), static_cast<int>(num_group), static_cast<int>(m),
+      static_cast<int>(n1), static_cast<int>(k1), static_cast<int>(n3), static_cast<int>(k3),
+      static_cast<int>(num_seq_per_group_avg), stream);
 }
 
 torch::Tensor fp8_blockwise_fused_s1_ptrs(
@@ -1064,7 +1256,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FP8 blockwise grouped GEMM (CuTe persistent 3-WG, adaptive TileM)",
         py::arg("x"), py::arg("weight"), py::arg("seqlens"), py::arg("cu_seqlens"),
         py::arg("x_scale"), py::arg("w_scale"), py::arg("num_seq_per_group_avg"),
-        py::arg("output") = py::none(), py::arg("tma_desc") = py::none());
+        py::arg("output") = py::none(), py::arg("tma_desc") = py::none(),
+        py::arg("tiles") = py::none(), py::arg("cu_tiles") = py::none(),
+        py::arg("update_tma") = true);
   m.def("fp8_blockwise_grouped_gemm_ptrs",
         &batchgen::moe::fp8_blockwise_grouped_gemm_ptrs,
         "FP8 blockwise grouped GEMM over independent weight pointer arrays",
@@ -1080,7 +1274,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("gate_weight"), py::arg("up_weight"),
         py::arg("seqlens"), py::arg("cu_seqlens"),
         py::arg("x_scale"), py::arg("gate_w_scale"), py::arg("up_w_scale"),
-        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none());
+        py::arg("num_seq_per_group_avg"), py::arg("output") = py::none(),
+        py::arg("tma_desc") = py::none(), py::arg("tiles") = py::none(),
+        py::arg("cu_tiles") = py::none(), py::arg("update_tma") = true);
+  m.def("fp8_blockwise_prepare_s1_s3_tma",
+        &batchgen::moe::fp8_blockwise_prepare_s1_s3_tma,
+        "One launch writing the per-expert X/Y TMA descriptors of a fused S1 and a grouped "
+        "S3 GEMM plus their shared tiles / cu_tiles (consumed with update_tma=False)",
+        py::arg("s1_x"), py::arg("s1_output"), py::arg("s3_x"), py::arg("s3_output"),
+        py::arg("seqlens"), py::arg("cu_seqlens"), py::arg("num_seq_per_group_avg"),
+        py::arg("s1_tma_desc"), py::arg("s3_tma_desc"), py::arg("tiles"),
+        py::arg("cu_tiles"));
   m.def("fp8_blockwise_fused_s1_ptrs",
         &batchgen::moe::fp8_blockwise_fused_s1_ptrs,
         "FP8 fused S1 over independent gate/up weight pointer arrays",

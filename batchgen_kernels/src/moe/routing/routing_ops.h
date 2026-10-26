@@ -75,6 +75,24 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     int64_t rows_per_rank             // rows per rank block; 0 without the above
 );
 
+// Gate, one warp per token (E <= 256): byte-identical routing to
+// gate_sigmoid_topk_cuda from a 32-thread CTA (<= 64 registers per thread),
+// launched as a programmatic dependent launch (it waits for the preceding
+// kernel inside the grid, so the result equals a plain launch's).
+// Output: topk_indices [N, K] int32 OR int64 (caller-allocated, contiguous),
+//         topk_weights [N, K] FP32 (caller-allocated, contiguous)
+std::vector<torch::Tensor> gate_sigmoid_topk_warp_cuda(
+    torch::Tensor router_logits,
+    torch::Tensor e_score_correction,
+    int k,
+    float routed_scaling_factor,
+    torch::Tensor topk_indices,
+    torch::Tensor topk_weights,
+    torch::Tensor num_valid_tokens,   // optional, as gate_sigmoid_topk_cuda
+    torch::Tensor rank_token_counts,  // optional, as gate_sigmoid_topk_cuda
+    int64_t rows_per_rank             // 0 without rank_token_counts
+);
+
 // GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits.
 // Uses device-side rank_token_counts for graph-stable rank-major padding masks.
 torch::Tensor glm5_router_gemm_cuda(

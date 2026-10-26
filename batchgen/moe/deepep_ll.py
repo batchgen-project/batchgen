@@ -279,20 +279,57 @@ class DeepEPLowLatencyExchange:
         """Total rows of the expert-major receive space."""
         return self.num_local_experts * self.expert_stride
 
-    def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor
+    # ---- send / receive split -------------------------------------------
+    #
+    # Every LL call below takes ``split_phases``. False (the default) asks
+    # DeepEP for ONE kernel per exchange: it is launched on DeepEP's own comm
+    # stream (fenced against the caller's stream on both sides, since
+    # ``async_finish`` is False) and its CTAs send, then spin until every peer
+    # has delivered. True asks for ``return_recv_hook=True``: DeepEP launches
+    # the SEND phase on the caller's current stream and hands back a hook; the
+    # hook launches the RECEIVE phase on that same stream (csrc/deep_ep.cpp
+    # binds the stream current at the send into the hook). Both are
+    # cooperative launches, like the single kernel.
+    # The hook is issued here, immediately, so the call returns with the same
+    # contract either way -- the outputs are complete on the caller's stream
+    # once the call has been issued -- and only the kernel decomposition
+    # differs: two short kernels in stream order instead of one that holds the
+    # SMs it occupies across the whole round trip. Both phases run the same
+    # data movement and the same reduction order, so the outputs are the same
+    # bits. Both launches are ordinary stream work and are captured by a CUDA
+    # graph like the single kernel is; the buffer double-buffering index is
+    # advanced once per call on the host, at the send, exactly as in the
+    # single-kernel mode.
+
+    @staticmethod
+    def _issue_recv(hook, what: str) -> None:
+        if hook is None or not callable(hook):
+            raise RuntimeError(
+                f"DeepEP {what}(return_recv_hook=True) returned no callable "
+                f"receive hook (got {type(hook).__name__}); the installed "
+                "build does not implement the send/receive split")
+        hook()
+
+    def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, *,
+                 split_phases: bool = False
                  ) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
         """x [rows, hidden] bf16, topk_idx [rows, K] int64 (global expert ids,
         -1 = none) -> recv_x [E_local, num_ranks * max_tokens_per_rank, hidden]
         bf16 (expert-major, each expert's tokens packed from row 0),
-        recv_count [E_local] int32, and the handle the combine needs."""
-        recv_x, recv_count, handle, _event, _hook = self.buffer.low_latency_dispatch(
+        recv_count [E_local] int32, and the handle the combine needs.
+        ``split_phases``: see the send / receive split note above."""
+        split = bool(split_phases)
+        recv_x, recv_count, handle, _event, hook = self.buffer.low_latency_dispatch(
             x, topk_idx, self.max_tokens_per_rank, self.num_experts,
-            use_fp8=False, async_finish=False, return_recv_hook=False)
+            use_fp8=False, async_finish=False, return_recv_hook=split)
+        if split:
+            self._issue_recv(hook, "low_latency_dispatch")
         if isinstance(recv_x, (tuple, list)):
             recv_x = recv_x[0]
         return recv_x, recv_count, handle
 
-    def dispatch_fp8(self, x: torch.Tensor, topk_idx: torch.Tensor
+    def dispatch_fp8(self, x: torch.Tensor, topk_idx: torch.Tensor, *,
+                     split_phases: bool = False
                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         """FP8 dispatch: the per-token 128-block cast runs inside the exchange.
 
@@ -309,11 +346,16 @@ class DeepEPLowLatencyExchange:
 
         Rows at or beyond ``recv_count[e]`` hold stale bytes; every consumer
         must be driven by ``recv_count``.
+
+        ``split_phases``: see the send / receive split note above.
         """
-        recv, recv_count, handle, _event, _hook = self.buffer.low_latency_dispatch(
+        split = bool(split_phases)
+        recv, recv_count, handle, _event, hook = self.buffer.low_latency_dispatch(
             x, topk_idx, self.max_tokens_per_rank, self.num_experts,
             use_fp8=True, round_scale=False, use_ue8m0=False,
-            async_finish=False, return_recv_hook=False)
+            async_finish=False, return_recv_hook=split)
+        if split:
+            self._issue_recv(hook, "low_latency_dispatch")
         if not isinstance(recv, (tuple, list)) or len(recv) != 2:
             raise RuntimeError(
                 "DeepEP low_latency_dispatch(use_fp8=True) did not return the "
@@ -323,13 +365,18 @@ class DeepEPLowLatencyExchange:
 
     def combine(self, x: torch.Tensor, topk_idx: torch.Tensor,
                 topk_weights: torch.Tensor, handle: tuple,
-                out: torch.Tensor) -> torch.Tensor:
+                out: torch.Tensor, *, split_phases: bool = False
+                ) -> torch.Tensor:
         """x [E_local, num_ranks * max_tokens_per_rank, hidden] bf16 expert
         outputs (same layout as recv_x) -> out [rows, hidden] bf16 = the
-        fp32-accumulated top-k weighted sum on the token's own rank."""
-        combined, _event, _hook = self.buffer.low_latency_combine(
+        fp32-accumulated top-k weighted sum on the token's own rank.
+        ``split_phases``: see the send / receive split note above."""
+        split = bool(split_phases)
+        combined, _event, hook = self.buffer.low_latency_combine(
             x, topk_idx, topk_weights, handle,
-            async_finish=False, return_recv_hook=False, out=out)
+            async_finish=False, return_recv_hook=split, out=out)
+        if split:
+            self._issue_recv(hook, "low_latency_combine")
         return combined
 
 
