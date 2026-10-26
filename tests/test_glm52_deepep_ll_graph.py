@@ -394,6 +394,10 @@ def _build_segment(monkeypatch, *, rank=1, bucket=BUCKET, valid_rows=None,
     pool.deepep.expert_start = segment.expert_start
     segment.routed_scaling_factor = 1.0
     segment.deepep_ll = True
+    # This suite asserts the UNFUSED shared-expert chain (its own four
+    # launches, x quantize included). The norm-emitted activation version is
+    # pinned by tests/test_glm52_norm_quant_fuse.py and its GPU bitwise gate.
+    segment._fuse_shared_expert_norm_quant = False
     segment.comm = SimpleNamespace(disabled=False)
     segment.gate_bias_fp32 = torch.zeros(256, dtype=torch.float32)
     segment.gate_weight_bf16 = torch.zeros(256, H, dtype=torch.bfloat16)
@@ -889,10 +893,10 @@ def test_the_nccl_forward_keeps_the_shared_expert_in_line():
     nccl = inspect.getsource(Glm5MoEGraphSegment.forward)
     deepep = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
     assert "_shared_overlap" not in nccl
-    assert (
-        "bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))"
-        in nccl
-    )
+    # ``**shared_x`` is empty unless GLM5_NORM_QUANT_FUSE moved this layer's
+    # x quantize into the producing norm; the call stays in line either way.
+    assert "self.moe.shared_expert_forward(padded, **shared_x)" in nccl
+    assert "bufs.local_moe_output.add_(" in nccl
     assert "_shared_overlap.fork()" in deepep
     assert "_shared_overlap.join()" in deepep
 
@@ -916,7 +920,7 @@ def test_the_shared_expert_writes_straight_into_the_staging_buffer():
     pool buffer as ``out=`` and checks identity, and no ``copy_`` into it is
     left in the DeepEP forward."""
     deepep = inspect.getsource(Glm5MoEGraphSegment._forward_deepep)
-    assert "out=bufs.shared_out)" in deepep
+    assert "out=bufs.shared_out, **shared_x)" in deepep
     assert "shared_out is not bufs.shared_out" in deepep
     assert "bufs.shared_out.copy_(" not in deepep
 

@@ -101,6 +101,13 @@ def _top_level_index(fwd, node):
 # The switch, read once in __init__ and never re-evaluated per step.
 _SWITCH = "self._indexer_wk_deepgemm"
 _OLD_SWITCH = "not self._indexer_wk_deepgemm"
+# The hoisted position carries a second condition since GLM5_NORM_QUANT_FUSE:
+# with the fusion on there is no quantize launch here at all (the layer's fused
+# input_layernorm emitted those bytes), so the hoisted call belongs to
+# "DeepGEMM wk AND not fused". The unhoisted position is unchanged.
+_HOISTED_SWITCH = (
+    "self._indexer_wk_deepgemm and (not self._fuse_qkv_a_norm_quant)"
+)
 
 # The layer's blocked-FP8 cast of its hidden states. Source-identical in both
 # positions: the hoist moves WHERE it is issued, never what it computes.
@@ -173,7 +180,7 @@ def test_the_shared_quantize_is_hoisted_above_the_fork_for_the_deepgemm_backend(
     assert _top_level_index(fwd, unhoisted) > fork_at, "the unhoisted quantize is not below the fork"
     # Coherent gating: each position belongs to exactly one backend, so no
     # build issues the quantize twice and none issues it zero times.
-    assert _guarded_by(fwd, hoisted, _SWITCH)
+    assert _guarded_by(fwd, hoisted, _HOISTED_SWITCH)
     assert _guarded_by(fwd, unhoisted, _OLD_SWITCH)
     # Both write the same two names, which is what the wk GEMM and the qkv_a
     # GEMM then read.

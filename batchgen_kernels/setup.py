@@ -354,6 +354,20 @@ _sm80_extensions = [
                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
+    # Fused add+RMSNorm+FP8 quantize (hidden 6144) — NEW version beside
+    # _C_fused_ops' add_rmsnorm_bf16_6144_kernel, which stays compiled and
+    # selectable. Same nvcc flags as _C_fused_ops on purpose: the BF16 half is
+    # that kernel verbatim, and its bytes must not move (no --use_fast_math).
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_add_rmsnorm_fp8_quant",
+        sources=["src/attention/csrc/add_rmsnorm_fp8_quant.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
     # CuTe MXFP4 dequantization
     CUDAExtension(
         name="batchgen_kernels.moe._C_mxfp4_dequant_cute",

@@ -72,6 +72,9 @@ from batchgen_kernels.attention.dsa.indexer_wk_proj_deepgemm import (
     indexer_wk_proj_deepgemm_out,
 )
 from batchgen.models.glm.glm5.indexer_wk_backend import glm5_indexer_wk_is_deepgemm
+from batchgen.models.glm.glm5.norm_quant_fuse_policy import (
+    glm5_norm_quant_fuse_site_enabled,
+)
 from batchgen_kernels.attention.dsa.fused_indexer_score import (
     FP8WqbWeightsCUDA,
     cuda_wq_b_proj_out,
@@ -91,6 +94,7 @@ from batchgen_kernels.attention.dsa.selected_page_table import (
     transform_selected_positions_out,
 )
 from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
+from batchgen_kernels.triton.rmsnorm_fp8_quant_fused import fused_rmsnorm_fp8_quant
 
 
 @dataclass
@@ -506,6 +510,59 @@ def _merged_wq_b_scratch_placeholders(
         torch.ones(1, dtype=torch.bfloat16, device=device),
         torch.ones(1, dtype=torch.int32, device=device),
     )
+
+
+def _check_fused_hidden_fp8(
+    segment,
+    hidden_fp8: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    batch_size: int,
+    hidden_size: int,
+    num_valid_tokens: Optional[torch.Tensor],
+) -> None:
+    """Pin the FP8 pair the layer's fused input_layernorm handed down.
+
+    Host-side only (warmup/capture, never a replay). The qkv_a GEMM and the
+    indexer's dense wk GEMM consume these as the activation operand, so the
+    shape, dtype and -- for the TMA-aligned scale -- the exact MN-major stride
+    are part of the contract. A mismatch here would otherwise surface as a
+    DeepGEMM shape error deep inside a capture, or worse, as a silently
+    reinterpreted scale layout.
+    """
+
+    want_scale_blocks = hidden_size // 128
+    if hidden_fp8.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"Layer {segment.layer_idx}: the fused input_layernorm must hand "
+            f"down float8_e4m3fn activations, got {hidden_fp8.dtype}"
+        )
+    if tuple(hidden_fp8.shape) != (batch_size, hidden_size):
+        raise ValueError(
+            f"Layer {segment.layer_idx}: fused hidden_fp8 must be "
+            f"({batch_size}, {hidden_size}), got {tuple(hidden_fp8.shape)}"
+        )
+    if hidden_scale.dtype != torch.float32:
+        raise TypeError(
+            f"Layer {segment.layer_idx}: fused hidden_scale must be fp32, got "
+            f"{hidden_scale.dtype}"
+        )
+    if tuple(hidden_scale.shape) != (batch_size, want_scale_blocks):
+        raise ValueError(
+            f"Layer {segment.layer_idx}: fused hidden_scale must be "
+            f"({batch_size}, {want_scale_blocks}), got "
+            f"{tuple(hidden_scale.shape)}"
+        )
+    # The standalone quantize this replaces was called with
+    # ``scale_tma_aligned=num_valid_tokens is not None``, so the fused producer
+    # owes the same layout: MN-major, row stride 1, block stride align4(M).
+    if num_valid_tokens is not None:
+        aligned_m = ((batch_size + 3) // 4) * 4
+        if hidden_scale.stride() != (1, aligned_m):
+            raise ValueError(
+                f"Layer {segment.layer_idx}: fused hidden_scale must carry the "
+                f"TMA-aligned MN-major layout (stride (1, {aligned_m})), got "
+                f"{hidden_scale.stride()}"
+            )
 
 
 def _check_q_b_wq_b_layout(segment, buffers) -> None:
@@ -1221,6 +1278,42 @@ class Glm5FullDsaAttnSegment:
                 )
         else:
             self._indexer_wk_dg_weights = None
+
+        # Which of this segment's blocked-FP8 casts are emitted by the norm
+        # kernel that produced their input, decided ONCE here for the same
+        # reason as the two switches above: the capture records whichever
+        # kernels this forward issues. See norm_quant_fuse_policy.py.
+        #
+        # ``q_a``: fully local to this forward -- the q_a norm and its quantize
+        # are adjacent launches on the main stream, so the fused kernel sits
+        # exactly where the norm sat.
+        self._fuse_q_a_norm_quant = glm5_norm_quant_fuse_site_enabled("q_a")
+        # ``qkv_a``: the producing norm is the LAYER's input_layernorm, one
+        # level up, so the layer segment runs the fused kernel and hands the
+        # FP8 pair down (``hidden_fp8``/``hidden_scale`` in ``forward``).
+        #
+        # Only defined on the DeepGEMM wk backend. There, this quantize is
+        # already HOISTED above the indexer fork (the side stream reads its
+        # value), so emitting it from the norm keeps it on the main stream
+        # before the fork -- same stream, same ordering, one launch fewer. On
+        # the ``fused_cuda`` backend the quantize deliberately sits AFTER the
+        # fork to preserve that version's original stream ordering, and there
+        # is no norm-adjacent position for it; that backend keeps its
+        # standalone quantize and the layer segment is told not to fuse.
+        self._fuse_qkv_a_norm_quant = (
+            glm5_norm_quant_fuse_site_enabled("qkv_a") and self._indexer_wk_deepgemm
+        )
+
+    @property
+    def consumes_fused_hidden_fp8(self) -> bool:
+        """Whether ``forward`` requires ``hidden_fp8``/``hidden_scale``.
+
+        The layer segment reads this to decide whether its ``input_layernorm``
+        runs the fused add+RMSNorm+FP8 kernel. One source of truth: a layer that
+        fused while the segment did not would launch both, and the reverse would
+        hand the qkv_a GEMM nothing.
+        """
+        return self._fuse_qkv_a_norm_quant
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -2123,6 +2216,8 @@ class Glm5FullDsaAttnSegment:
         paged_mqa_prep_ready: bool = False,
         selected_positions_ready: bool = False,
         attn_output_mask_deferred: bool = False,
+        hidden_fp8: Optional[torch.Tensor] = None,
+        hidden_scale: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if selected_positions_ready:
             # This layer SELECTS the top-k, so the selected-page-table
@@ -2173,8 +2268,36 @@ class Glm5FullDsaAttnSegment:
         # it.
         token_indices = buffers.token_indices
 
-        hidden_fp8 = hidden_scale = None
-        if self._indexer_wk_deepgemm:
+        # The qkv_a activation's blocked-FP8 cast, in one of its two versions
+        # (selected once in __init__; see norm_quant_fuse_policy.py):
+        #   fused:  the layer's input_layernorm already wrote these bytes, from
+        #           the registers that held the normalized row -- so there is
+        #           NO quantize launch in this segment at all. The pair arrives
+        #           as arguments and is bit-for-bit what `act_quant` below
+        #           would have produced (see the kernel's byte-identity note).
+        #   standalone: the original `act_quant` call, byte for byte.
+        if self._fuse_qkv_a_norm_quant:
+            if hidden_fp8 is None or hidden_scale is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx}: GLM5_NORM_QUANT_FUSE selects the "
+                    "norm-emitted qkv_a activation, but the caller passed no "
+                    "hidden_fp8/hidden_scale; the layer segment must run the "
+                    "fused add+RMSNorm+FP8 input_layernorm (it reads "
+                    "consumes_fused_hidden_fp8 to decide)"
+                )
+            _check_fused_hidden_fp8(
+                self, hidden_fp8, hidden_scale, batch_size, attn.hidden_size,
+                num_valid_tokens,
+            )
+        else:
+            if hidden_fp8 is not None or hidden_scale is not None:
+                raise ValueError(
+                    f"Layer {self.layer_idx}: hidden_fp8/hidden_scale were "
+                    "passed in, but this segment quantizes the qkv_a "
+                    "activation itself; one of the two would be a dead launch"
+                )
+            hidden_fp8 = hidden_scale = None
+        if self._indexer_wk_deepgemm and not self._fuse_qkv_a_norm_quant:
             # HOISTED PRODUCER. This is the layer's ONE blocked-FP8 cast of
             # ``hidden_flat``; the qkv_a GEMM below consumes it on the main
             # stream exactly as before, and the indexer's wk GEMM now consumes
@@ -2333,17 +2456,34 @@ class Glm5FullDsaAttnSegment:
         # the absorb GEMVs, FA3) and every write to state shared across rows is
         # already gated on the same row validity -- see the invariant note on
         # `attn_output`'s mask below, which is the one mask that must stay.
-        q_a_normed = fused_rmsnorm(
-            buffers.q_a,
-            attn.q_a_layernorm.weight,
-            attn.q_a_layernorm.eps,
-            out=buffers.q_a_normed,
-        )
-        q_a_fp8, q_a_scale = act_quant(
-            q_a_normed,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
+        # The q_a norm and its blocked-FP8 cast, in one of their two versions
+        # (selected once in __init__; see norm_quant_fuse_policy.py). The fused
+        # kernel runs exactly where `fused_rmsnorm` ran -- same stream, same
+        # position, same `buffers.q_a_normed` output -- and the standalone
+        # `act_quant` launch disappears. Its FP8 bytes and scales are
+        # bit-for-bit the standalone pair's (byte-identity note in
+        # batchgen_kernels/triton/rmsnorm_fp8_quant_fused.py).
+        if self._fuse_q_a_norm_quant:
+            q_a_normed, q_a_fp8, q_a_scale = fused_rmsnorm_fp8_quant(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
+        else:
+            q_a_normed = fused_rmsnorm(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+            )
+            q_a_fp8, q_a_scale = act_quant(
+                q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
         # The q_b projection, in one of its two versions (selected once in
         # __init__), over the layer's ONE blocked quantize of ``q_a_normed``:
         #   merged:   one DeepGEMM over the load-time concatenated

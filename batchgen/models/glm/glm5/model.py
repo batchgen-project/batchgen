@@ -2711,13 +2711,25 @@ class Glm5MoE(nn.Module):
         return global_results.to(torch.bfloat16)
 
     def shared_expert_forward(
-        self, identity: torch.Tensor, out: Optional[torch.Tensor] = None
+        self,
+        identity: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``out``: write the down projection straight into a caller buffer
-        (persistent FP8 shared expert with the fused gate/up binding only)."""
-        if out is None:
-            return self.shared_experts(identity)
-        return self.shared_experts(identity, out=out)
+        (persistent FP8 shared expert with the fused gate/up binding only).
+
+        ``x_fp8``/``x_scale``: ``identity`` ALREADY blocked-FP8 quantized by the
+        norm kernel that produced it (GLM5_NORM_QUANT_FUSE), so the chain's own
+        x quantize is not launched. Both or neither."""
+        if x_fp8 is None and x_scale is None:
+            if out is None:
+                return self.shared_experts(identity)
+            return self.shared_experts(identity, out=out)
+        return self.shared_experts(
+            identity, out=out, x_fp8=x_fp8, x_scale=x_scale
+        )
 
     def _prefill_prepare_weights(self) -> None:
         """Acquire one full FP8 expert layer from the async core-engine ring."""

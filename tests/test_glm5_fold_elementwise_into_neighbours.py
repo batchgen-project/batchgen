@@ -296,6 +296,12 @@ class _RecordingNorm:
 
 
 class _FakeDsaSegment:
+    # This suite is about the residual-add folding, so both segments declare
+    # the UNFUSED norm contract: the layer runs `cuda_add_rmsnorm` and each
+    # consumer quantizes its own input. The norm-emitted-FP8 version is pinned
+    # by tests/test_glm52_norm_quant_fuse.py and its GPU bitwise gate.
+    consumes_fused_hidden_fp8 = False
+
     def __init__(self, log):
         self.log = log
         self.max_seqlen = 8
@@ -325,12 +331,17 @@ class _FakeDsaSegment:
 class _FakeMoeSegment:
     """Writes into ONE shared buffer, like the real per-bucket MoE pool."""
 
+    consumes_fused_padded_fp8 = False
+
     def __init__(self, log, buffer):
         self.log = log
         self.buffer = buffer
         self.generation = 0
 
-    def forward(self, *, padded, rank_token_counts):
+    def forward(self, *, padded, rank_token_counts,
+                padded_fp8=None, padded_scale=None):
+        assert padded_fp8 is None and padded_scale is None, (
+            "this segment declares the unfused contract")
         self.generation += 1
         self.log.append(("moe_write", self.generation))
         self.buffer.fill_(float(self.generation))

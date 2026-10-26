@@ -45,11 +45,16 @@ from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
+    _check_fused_hidden_fp8,
     _fa3_with_kvcache,
     transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
     fused_rmsnorm,
+    fused_rmsnorm_fp8_quant,
+)
+from batchgen.models.glm.glm5.norm_quant_fuse_policy import (
+    glm5_norm_quant_fuse_site_enabled,
 )
 
 # Max-bucket view split for the SKIP-layer buffer set (see the full segment's
@@ -196,6 +201,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         # Primary-only host-KV staging slice for this layer; see
         # Glm5FullDsaAttnSegment.set_host_kv_staging.
         self._host_kv_staging: Optional[Dict[str, Optional[torch.Tensor]]] = None
+        # Which of this spine's blocked-FP8 casts the producing norm emits.
+        # Decided once here, like the parent's: the capture records whichever
+        # kernels this forward issues. See norm_quant_fuse_policy.py.
+        self._fuse_q_a_norm_quant = glm5_norm_quant_fuse_site_enabled("q_a")
+        # A skip layer runs NO indexer fork, so unlike the full segment this
+        # quantize has no side stream reading it and no ordering constraint
+        # from the wk backend: the layer's fused input_layernorm can own it
+        # whenever the switch is on.
+        self._fuse_qkv_a_norm_quant = glm5_norm_quant_fuse_site_enabled("qkv_a")
 
     # -- capture-plumbing overrides ------------------------------------------
     # No super() here: the parent's specs/output methods deref aux_blocked_k /
@@ -513,6 +527,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         paged_mqa_prep_ready: bool = False,  # accepted, ignored: never scores
         selected_positions_ready: bool = False,
         attn_output_mask_deferred: bool = False,
+        hidden_fp8: Optional[torch.Tensor] = None,
+        hidden_scale: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
         batch_size = hidden_states.shape[0]
@@ -539,11 +555,36 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             self.compute_step_statics(buffers, position_ids=position_ids)
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
-        hidden_fp8, hidden_scale = act_quant(
-            hidden_flat,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
+        # The qkv_a activation's blocked-FP8 cast, in one of its two versions
+        # (selected once in __init__; see norm_quant_fuse_policy.py). Fused:
+        # the layer's input_layernorm already wrote these bytes from the
+        # registers that held the normalized row, so this segment launches no
+        # quantize at all.
+        if self._fuse_qkv_a_norm_quant:
+            if hidden_fp8 is None or hidden_scale is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx}: GLM5_NORM_QUANT_FUSE selects the "
+                    "norm-emitted qkv_a activation, but the caller passed no "
+                    "hidden_fp8/hidden_scale; the layer segment must run the "
+                    "fused add+RMSNorm+FP8 input_layernorm (it reads "
+                    "consumes_fused_hidden_fp8 to decide)"
+                )
+            _check_fused_hidden_fp8(
+                self, hidden_fp8, hidden_scale, batch_size, attn.hidden_size,
+                num_valid_tokens,
+            )
+        else:
+            if hidden_fp8 is not None or hidden_scale is not None:
+                raise ValueError(
+                    f"Layer {self.layer_idx}: hidden_fp8/hidden_scale were "
+                    "passed in, but this segment quantizes the qkv_a "
+                    "activation itself; one of the two would be a dead launch"
+                )
+            hidden_fp8, hidden_scale = act_quant(
+                hidden_flat,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
         fused_qkv_a_weight = getattr(self.wrapper, "_fp8_qkv_a_proj", None)
         fused_qkv_a_scale = getattr(self.wrapper, "_fp8_qkv_a_scale", None)
         if fused_qkv_a_weight is None or fused_qkv_a_scale is None:
@@ -560,17 +601,32 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         # the absorb GEMVs, FA3) and every write to state shared across rows is
         # already gated on the same row validity -- see the invariant note on
         # `attn_output`'s mask below, which is the one mask that must stay.
-        q_a_normed = fused_rmsnorm(
-            buffers.q_a,
-            attn.q_a_layernorm.weight,
-            attn.q_a_layernorm.eps,
-            out=buffers.q_a_normed,
-        )
-        q_a_fp8, q_a_scale = act_quant(
-            q_a_normed,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
+        # The q_a norm and its blocked-FP8 cast, in one of their two versions
+        # (selected once in __init__; see norm_quant_fuse_policy.py). The fused
+        # kernel runs exactly where `fused_rmsnorm` ran and the standalone
+        # `act_quant` launch disappears; its FP8 bytes and scales are
+        # bit-for-bit the standalone pair's.
+        if self._fuse_q_a_norm_quant:
+            q_a_normed, q_a_fp8, q_a_scale = fused_rmsnorm_fp8_quant(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
+        else:
+            q_a_normed = fused_rmsnorm(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+            )
+            q_a_fp8, q_a_scale = act_quant(
+                q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
         w8a8_deepgemm(
             q_a_fp8, q_a_scale, attn.q_b_proj.weight,
             self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],

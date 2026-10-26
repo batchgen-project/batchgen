@@ -488,7 +488,11 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         return self.core_engine.get_weights_pinned(self.module_key)
 
     def _forward_impl(
-        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """FP8 forward using cached weight tensors directly (no nn.Module delegation).
 
@@ -496,12 +500,19 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         ``_forward_fused_gate_up``; otherwise three ``w8a16_gemm`` calls. ``out``
         (the down projection's destination) is only accepted by the fused chain,
         which is the one that can write into a caller's buffer without a copy.
+        ``x_fp8``/``x_scale`` likewise: only the fused chain has a seam where a
+        pre-quantized activation can be substituted for its own x quantize.
         """
         if self.cached_gate_up is not None:
-            return self._forward_fused_gate_up(hidden_states, out)
+            return self._forward_fused_gate_up(hidden_states, out, x_fp8, x_scale)
         if out is not None:
             raise ValueError(
                 f"Layer {self.layer_idx}: out= requires the fused gate/up binding")
+        if x_fp8 is not None or x_scale is not None:
+            raise ValueError(
+                f"Layer {self.layer_idx}: x_fp8/x_scale require the fused "
+                "gate/up binding; the unfused chain quantizes inside each "
+                "w8a16_gemm and has no seam to hand them to")
         return self._forward_unfused(hidden_states)
 
     def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -521,7 +532,11 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         )
 
     def _forward_fused_gate_up(
-        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        out: Optional[torch.Tensor],
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Shared-expert chain in four launches, none of them a layout fix-up:
 
@@ -566,8 +581,45 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             return out if hidden_states.dim() == 2 else out.view(
                 *hidden_states.shape[:-1], n_out)
 
-        x_fp8, x_scale = per_token_blocked_quantize_bf16_to_fp8_1d(
-            x, scale_tma_aligned=True)
+        # The x quantize, in one of its two versions. When the norm that
+        # produced ``x`` already emitted the FP8 bytes and the per-128-block
+        # scales (GLM5_NORM_QUANT_FUSE), this launch disappears and the pair
+        # arrives as arguments -- bit-for-bit what this call would have
+        # produced, from a kernel that replicates its math statement for
+        # statement. Validated, never silently reinterpreted: a wrong scale
+        # layout is the one error DeepGEMM would consume without complaint.
+        if x_fp8 is None and x_scale is None:
+            x_fp8, x_scale = per_token_blocked_quantize_bf16_to_fp8_1d(
+                x, scale_tma_aligned=True)
+        elif x_fp8 is None or x_scale is None:
+            raise ValueError(
+                f"Layer {self.layer_idx}: x_fp8 and x_scale must be given "
+                "together, got "
+                f"{'x_scale' if x_fp8 is None else 'x_fp8'} alone")
+        else:
+            blocks = x.shape[1] // 128
+            aligned_rows = ((rows + 3) // 4) * 4
+            if x_fp8.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    f"Layer {self.layer_idx}: x_fp8 must be float8_e4m3fn, got "
+                    f"{x_fp8.dtype}")
+            if tuple(x_fp8.shape) != (rows, x.shape[1]):
+                raise ValueError(
+                    f"Layer {self.layer_idx}: x_fp8 must be "
+                    f"({rows}, {x.shape[1]}), got {tuple(x_fp8.shape)}")
+            if x_scale.dtype != torch.float32:
+                raise TypeError(
+                    f"Layer {self.layer_idx}: x_scale must be fp32, got "
+                    f"{x_scale.dtype}")
+            if tuple(x_scale.shape) != (rows, blocks):
+                raise ValueError(
+                    f"Layer {self.layer_idx}: x_scale must be "
+                    f"({rows}, {blocks}), got {tuple(x_scale.shape)}")
+            if x_scale.stride() != (1, aligned_rows):
+                raise ValueError(
+                    f"Layer {self.layer_idx}: x_scale must carry the "
+                    f"scale_tma_aligned MN-major layout (stride "
+                    f"(1, {aligned_rows})), got {x_scale.stride()}")
         gate_up = torch.empty(
             (rows, self.cached_gate_up.shape[0]), dtype=torch.bfloat16, device=x.device)
         deep_gemm.fp8_gemm_nt(
@@ -586,18 +638,26 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             *hidden_states.shape[:-1], n_out)
 
     def forward(
-        self, hidden_states: torch.Tensor, out: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self.persistent:
             if out is not None:
                 raise ValueError(
                     f"Layer {self.layer_idx}: out= requires a persistent expert")
+            if x_fp8 is not None or x_scale is not None:
+                raise ValueError(
+                    f"Layer {self.layer_idx}: x_fp8/x_scale require a "
+                    "persistent expert")
             weights = self.load_weights(self.module_key)
             self.cached_gate = weights["gate_proj.weight"]
             self.cached_up = weights["up_proj.weight"]
             self.cached_down = weights["down_proj.weight"]
 
-        result = self._forward_impl(hidden_states, out)
+        result = self._forward_impl(hidden_states, out, x_fp8, x_scale)
 
         if not self.persistent:
             torch.cuda.current_stream().synchronize()

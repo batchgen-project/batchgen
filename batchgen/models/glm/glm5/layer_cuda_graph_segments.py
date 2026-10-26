@@ -63,6 +63,24 @@ class Glm5DecoderLayerGraphSegment:
             self.aux_kv_dtype = getattr(
                 dsa_segment, "aux_host_kv_dtype", torch.bfloat16
             )
+        # Resolve the fused add+RMSNorm+FP8 extension HERE, at construction --
+        # before warmup and before capture. The first call would otherwise
+        # import (or, in dev mode, JIT-compile) it, and the earliest call site
+        # is inside the warmup iterations that precede a capture. Failing loud
+        # at construction also names a missing build at the right moment.
+        if (
+            self.dsa_segment.consumes_fused_hidden_fp8
+            or (
+                self.moe_segment is not None
+                and self.moe_segment.consumes_fused_padded_fp8
+            )
+        ):
+            from batchgen_kernels.attention.add_rmsnorm_fp8_quant import (
+                preload_add_rmsnorm_fp8_quant_kernel,
+            )
+
+            preload_add_rmsnorm_fp8_quant_kernel()
+
         self.capture_local_bsz: Optional[int] = None
         self.capture_rank_token_counts: Optional[torch.Tensor] = None
         self.set_capture_context(
@@ -298,6 +316,9 @@ class Glm5DecoderLayerGraphSegment:
         a silent fallback.
         """
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+        from batchgen_kernels.attention.add_rmsnorm_fp8_quant import (
+            cuda_add_rmsnorm_fp8_quant,
+        )
 
         if residual is not None and not defer_residual_add:
             raise ValueError(
@@ -309,10 +330,56 @@ class Glm5DecoderLayerGraphSegment:
 
         batch_size = int(hidden_states.shape[0])
 
+        # Does the DSA segment below want its qkv_a activation emitted BY this
+        # input norm instead of quantized by its own launch? The segment owns
+        # that decision (it was fixed before capture); this layer only has to
+        # run the matching norm version. See norm_quant_fuse_policy.py.
+        fuse_attn_input = bool(self.dsa_segment.consumes_fused_hidden_fp8)
+        attn_input_fp8 = attn_input_scale = None
+
         if residual is None:
             # First layer of the chain: its input IS the residual stream.
             residual = hidden_states
             attn_input = self.layer.input_layernorm(hidden_states)
+            if fuse_attn_input:
+                # There is no residual add in the chain's FIRST layer, so its
+                # input norm is the standalone `cuda_rmsnorm`
+                # (rmsnorm_bf16_6144_kernel), which has no fused FP8 version --
+                # fusing a kernel that is not the one the other 77 layers run
+                # would be a second variant for ONE launch per step. That one
+                # quantize stays standalone, which also keeps the DSA segment
+                # on a single contract: it always receives the FP8 pair.
+                from batchgen.attention.mla.fa3_backend import act_quant
+                attn_input_fp8, attn_input_scale = act_quant(
+                    attn_input.view(batch_size, self.hidden_size),
+                    num_valid_tokens=num_valid_tokens,
+                    scale_tma_aligned=num_valid_tokens is not None,
+                )
+        elif fuse_attn_input:
+            # The previous layer's deferred `residual + mlp_output`, the input
+            # norm, AND the qkv_a blocked-FP8 cast, in ONE launch: the FP8
+            # bytes come from the registers that held the normalized row, so
+            # the DSA segment's standalone quantize is not launched at all.
+            # `normed`/`residual` are bit-for-bit `cuda_add_rmsnorm`'s and the
+            # FP8 pair is bit-for-bit `act_quant`'s (byte-identity note in
+            # batchgen_kernels/src/attention/csrc/add_rmsnorm_fp8_quant.cu).
+            (
+                attn_input,
+                residual,
+                attn_input_fp8,
+                attn_input_scale,
+            ) = cuda_add_rmsnorm_fp8_quant(
+                residual,
+                hidden_states,
+                self.layer.input_layernorm.weight,
+                self.layer.input_layernorm.eps,
+                # The norm itself is NOT row-gated here, exactly as the
+                # unfused call below is not: every row is normalized, padding
+                # included. Only the FP8 half is gated, which is what the
+                # standalone `act_quant(..., num_valid_tokens=...)` did.
+                quant_num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
         else:
             # The previous layer's deferred `residual + mlp_output` happens
             # HERE, inside the input-norm launch. `hidden_states` is that
@@ -326,6 +393,8 @@ class Glm5DecoderLayerGraphSegment:
 
         dsa_out = self.dsa_segment.forward(
             hidden_states=attn_input,
+            hidden_fp8=attn_input_fp8,
+            hidden_scale=attn_input_scale,
             position_ids=position_ids,
             cache_seqlens=cache_seqlens,
             primary_slot_indices=primary_slot_indices,
@@ -342,13 +411,42 @@ class Glm5DecoderLayerGraphSegment:
             # add below, so the segment must not spend a launch on it.
             attn_output_mask_deferred=True,
         )
-        hidden_states, residual = cuda_add_rmsnorm(
-            residual,
-            dsa_out["attn_output"],
-            self.layer.post_attention_layernorm.weight,
-            self.layer.post_attention_layernorm.eps,
-            row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
+        # Same question for the MoE block's shared expert: does it want its x
+        # activation emitted BY this post-attention norm? A dense layer has no
+        # MoE segment and therefore no shared expert, so it never fuses.
+        fuse_moe_input = (
+            self.moe_segment is not None
+            and bool(self.moe_segment.consumes_fused_padded_fp8)
         )
+        moe_input_fp8 = moe_input_scale = None
+        if fuse_moe_input:
+            # The residual add, the post-attention norm AND the shared
+            # expert's x blocked-FP8 cast in ONE launch. The shared expert's
+            # own quantize passed `scale_tma_aligned=True` and NO
+            # num_valid_tokens (it quantizes every row of the bucket), so this
+            # call gates neither half -- the padding rows carry exactly the
+            # values they carried before.
+            (
+                hidden_states,
+                residual,
+                moe_input_fp8,
+                moe_input_scale,
+            ) = cuda_add_rmsnorm_fp8_quant(
+                residual,
+                dsa_out["attn_output"],
+                self.layer.post_attention_layernorm.weight,
+                self.layer.post_attention_layernorm.eps,
+                row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
+                scale_tma_aligned=True,
+            )
+        else:
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual,
+                dsa_out["attn_output"],
+                self.layer.post_attention_layernorm.weight,
+                self.layer.post_attention_layernorm.eps,
+                row_valid_mask=self.dsa_segment.attn_output_row_mask(batch_size),
+            )
 
         if self.moe_segment is None:
             mlp_output = self.layer.mlp(hidden_states)
@@ -357,6 +455,8 @@ class Glm5DecoderLayerGraphSegment:
             moe_output = self.moe_segment.forward(
                 padded=flat_hidden,
                 rank_token_counts=rank_token_counts,
+                padded_fp8=moe_input_fp8,
+                padded_scale=moe_input_scale,
             )["moe_output"]
             mlp_output = moe_output.view(batch_size, 1, self.hidden_size)
 
