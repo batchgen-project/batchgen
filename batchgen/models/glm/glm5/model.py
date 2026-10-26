@@ -1062,9 +1062,14 @@ class Glm5Expert(nn.Module):
         and shared experts. w8a16_gemm quantizes BF16 activations to FP8,
         then runs fp8_gemm_nt against FP8 weights with block-wise scales.
         """
-        from batchgen.attention.mla.fa3_backend import w8a16_gemm
-        up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x)
-        gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
+        from batchgen.attention.mla.fa3_backend import (
+            w8a16_gemm,
+            w8a16_gemm_act_quant,
+        )
+        # up and gate read the SAME x: quantize once, reuse the pair.
+        x_fp8 = w8a16_gemm_act_quant(x)
+        up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x, x_fp8=x_fp8)
+        gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x, x_fp8=x_fp8)
         intermediate = F.silu(gate) * up
         return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 
@@ -3163,9 +3168,15 @@ class Glm5MLP(nn.Module):
 
     def _forward_slice(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, 'gate_scale'):
-            from batchgen.attention.mla.fa3_backend import w8a16_gemm
-            gate = w8a16_gemm(self.gate_proj.weight.data, self.gate_scale, x)
-            up = w8a16_gemm(self.up_proj.weight.data, self.up_scale, x)
+            from batchgen.attention.mla.fa3_backend import (
+                w8a16_gemm,
+                w8a16_gemm_act_quant,
+            )
+            # gate and up read the SAME x: quantize it once and hand the pair
+            # to both GEMMs instead of letting each one re-quantize x.
+            x_fp8 = w8a16_gemm_act_quant(x)
+            gate = w8a16_gemm(self.gate_proj.weight.data, self.gate_scale, x, x_fp8=x_fp8)
+            up = w8a16_gemm(self.up_proj.weight.data, self.up_scale, x, x_fp8=x_fp8)
             return w8a16_gemm(self.down_proj.weight.data, self.down_scale, F.silu(gate) * up)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 

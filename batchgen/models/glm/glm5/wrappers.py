@@ -516,15 +516,24 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         return self._forward_unfused(hidden_states)
 
     def _forward_unfused(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Per-projection chain: gate, up and down each quantize their own
-        input and run their own GEMM (routed single-expert / non-persistent
-        experts, and the reference the fused chain is pinned against)."""
-        from batchgen.attention.mla.fa3_backend import w8a16_gemm
+        """Per-projection chain: gate, up and down each run their own GEMM
+        (routed single-expert / non-persistent experts, and the reference the
+        fused chain is pinned against). gate and up share one quantize of
+        hidden_states; down quantizes its own distinct input."""
+        from batchgen.attention.mla.fa3_backend import (
+            w8a16_gemm,
+            w8a16_gemm_act_quant,
+        )
+        # gate and up read the SAME hidden_states: quantize once, reuse the
+        # pair. down's input is a different tensor and keeps its own quantize.
+        x_fp8 = w8a16_gemm_act_quant(hidden_states)
         gate = w8a16_gemm(
-            self.cached_gate, self.weight_dequant_scale.get('gate_proj.weight_scale_inv'), hidden_states
+            self.cached_gate, self.weight_dequant_scale.get('gate_proj.weight_scale_inv'), hidden_states,
+            x_fp8=x_fp8,
         )
         up = w8a16_gemm(
-            self.cached_up, self.weight_dequant_scale.get('up_proj.weight_scale_inv'), hidden_states
+            self.cached_up, self.weight_dequant_scale.get('up_proj.weight_scale_inv'), hidden_states,
+            x_fp8=x_fp8,
         )
         intermediate = F.silu(gate) * up
         return w8a16_gemm(
