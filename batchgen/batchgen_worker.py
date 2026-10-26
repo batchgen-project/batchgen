@@ -12844,18 +12844,40 @@ class BatchGenWorker:
 		materialized_loader = self._materialized_segment_loader(wave)
 		materialized_tokens = 0
 		offload_recorder_handed_off = False
+		# Batch-level ``batchgen_debug.prefill_disable_gc``: hold off cyclic GC
+		# for the span of the chunk loop. Diagnostic for the weight-stream
+		# launch stalls: gc_collect_main tensor teardown takes the CUDA driver
+		# lock and queues behind it every cudaMemcpyAsync launch of the wave.
+		_wave_debug = self._active_batchgen_debug_for_sequences(
+			[self.global_batch.get_sequence(u) for u in wave.uuids]
+		) or {}
+		_gc_held = False
+		if self._debug_flag_enabled(_wave_debug.get("prefill_disable_gc")):
+			import gc as _gc
+			if _gc.isenabled():
+				_gc.disable()
+				_gc_held = True
 		try:
 			start = time.perf_counter()
+			# Per-wave split of the chunk loop, to localize growth that tracks
+			# the retained-prefix count rather than the wave's own work.
+			build_s = rows_s = mat_s = layers_s = tail_s = 0.0
+			AttnWrapperBase.pool_offload_s = 0.0
+			AttnWrapperBase.pool_retire_s = 0.0
 			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
 				self.feed_watchdog()
+				_t0 = time.perf_counter()
 				rows = wave.executor.build(chunk)
+				build_s += time.perf_counter() - _t0
 				if epilogue_trace is not None:
 					epilogue_trace.chunk_begin(
 						epilogue_trace.chunk + 1,
 						rows=len(rows.items),
 						tokens=int(rows.input_ids.numel()),
 					)
+				_t0 = time.perf_counter()
 				host_ids, host_starts = wave.row_host_targets(rows)
+				rows_s += time.perf_counter() - _t0
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = rows.cu_seqlens_q
 				AttnWrapperBase.prepack_max_seqlen = rows.max_seqlen_q
@@ -12868,9 +12890,12 @@ class BatchGenWorker:
 				# Before the forward, never during it: every layer's pool row
 				# holds the committed prefix by the time any row attends over
 				# it, and a failure here has not yet touched the forward.
+				_t0 = time.perf_counter()
 				materialized_tokens += self._load_materialized_segments(
 					wave, rows, materialized_loader
 				)
+				mat_s += time.perf_counter() - _t0
+				_t0 = time.perf_counter()
 				hidden_states = self.model.model.embed_tokens(rows.input_ids).unsqueeze(0)
 				block_residual = (
 					self.model.model._new_block_residual(hidden_states)
@@ -12896,6 +12921,8 @@ class BatchGenWorker:
 							output_attentions=False,
 							use_cache=False,
 						)[0]
+				layers_s += time.perf_counter() - _t0
+				_t0 = time.perf_counter()
 				if rows.tail_wave_indices:
 					if use_attn_res:
 						# Mix-then-norm over every row: the depth mix needs each
@@ -12964,6 +12991,7 @@ class BatchGenWorker:
 							# head all-gathers before returning).
 							logits=logits,
 						)
+				tail_s += time.perf_counter() - _t0
 				del hidden_states
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
@@ -13015,6 +13043,9 @@ class BatchGenWorker:
 			# retired, outside this method - and only it may clear the recorder.
 			offload_recorder_handed_off = True
 		finally:
+			if _gc_held:
+				import gc as _gc
+				_gc.enable()
 			if wave.pool.free_pages != wave.pool.num_pages:
 				logging.error("[PREFIX_POOL] Rank %s: pool released with pages still held", self.rank)
 			# A segment's recurrent state is keyed by its pseudo sequence id and
@@ -13066,7 +13097,33 @@ class BatchGenWorker:
 			"workspace_peak_bytes": workspace_peak,
 			"reserved_peak_bytes": reserved_peak,
 			"prefill_s": prefill_s,
+			"build_s": build_s,
+			"rows_s": rows_s,
+			"mat_s": mat_s,
+			"layers_s": layers_s,
+			"tail_s": tail_s,
+			"offload_s": AttnWrapperBase.pool_offload_s,
+			"retire_s": AttnWrapperBase.pool_retire_s,
 		}, separators=(",", ":")))
+		# Batch-level ``batchgen_debug.k3_prefill_profile`` on the POOLED path:
+		# the weight-stream counters are reset per wave by the pipeline install,
+		# but only the unpooled path emitted them; mirror that emission here.
+		_pool_debug = self._active_batchgen_debug_for_sequences(
+			[self.global_batch.get_sequence(u) for u in wave.uuids]
+		) or {}
+		if self._debug_flag_enabled(_pool_debug.get("k3_prefill_profile")):
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			from batchgen.moe.streamed_sp8_mxfp4 import StreamedSP8MXFP4MoELayer
+			logging.info("[METRICS] " + json.dumps({
+				"component": "k3_prefill_profile_pool",
+				"rank": self.rank,
+				"prefill_s": prefill_s,
+				"weight_stream": self.core_engine.get_weight_stream_profile(),
+				"expert_consumer": KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot(),
+				"streamed_sp8": StreamedSP8MXFP4MoELayer.prefill_profile_snapshot(),
+			}, separators=(",", ":"), default=str))
 		new_tokens = torch.stack([tokens_by_index[index] for index in order])
 		return self._write_prefill_tokens(batch, new_tokens)
 
