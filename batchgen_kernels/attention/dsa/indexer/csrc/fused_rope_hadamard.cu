@@ -105,6 +105,13 @@ inline __device__ void store_output_bf16_and_e4m3(
     }
 }
 
+// ``kApplyHadamard`` mirrors upstream's ``kHadamard`` template parameter on
+// ``sglang::fused_q_indexer_rope_hadamard_quant``: both instantiations are
+// built, and the caller picks the one its route needs. V3.2 drops the
+// incoherence rotation on BOTH q and k -- H is orthonormal, so the pair
+// cancels out of the indexer logit q @ k^T in exact arithmetic and only the
+// fp8 quantization error moves.
+template <bool kApplyHadamard>
 __global__ __launch_bounds__(16)
 void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
     constexpr int kNElts = 8;
@@ -144,17 +151,29 @@ void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
         }
     }
 
-    // 3. Hadamard butterfly: 3 thread-level + 4 warp-level stages
-    hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
-    hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
-    // kNWarps=1, kNChunks=1: no smem exchange, no transposed stage
+    // 3. Hadamard butterfly: 3 thread-level + 4 warp-level stages.
+    // ``params.scale`` is the 1/sqrt(128) normalization of H, so it belongs to
+    // the rotation: with kApplyHadamard=false this is a pure interleaved-RoPE
+    // pass and the store must not scale.
+    float store_scale = 1.0f;
+    if constexpr (kApplyHadamard) {
+        hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
+        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+        // kNWarps=1, kNChunks=1: no smem exchange, no transposed stage
+        store_scale = params.scale;
+    }
 
     // 4. Scale and store (bf16, plus the saturating e4m3 copy when requested)
-    store_output_bf16_and_e4m3<kNChunks, kNElts>(out, out_fp8, x_vals, 128, params.scale);
+    store_output_bf16_and_e4m3<kNChunks, kNElts>(out, out_fp8, x_vals, 128, store_scale);
 }
 
-void fused_rope_hadamard_launch(FusedRopeHadamardParams &params, cudaStream_t stream) {
+void fused_rope_hadamard_launch(FusedRopeHadamardParams &params,
+                                bool apply_hadamard, cudaStream_t stream) {
     dim3 grid(params.batch);
-    fused_rope_hadamard_kernel<<<grid, 16, 0, stream>>>(params);
+    if (apply_hadamard) {
+        fused_rope_hadamard_kernel<true><<<grid, 16, 0, stream>>>(params);
+    } else {
+        fused_rope_hadamard_kernel<false><<<grid, 16, 0, stream>>>(params);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

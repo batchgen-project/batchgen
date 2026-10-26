@@ -816,8 +816,9 @@ def apply_rope_interleaved(x, cos, sin):
     return torch.cat([x_rot, x_nope], dim=-1)
 
 
-def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
-    """Apply fused CUDA RoPE + Hadamard to Q [B, n_heads, head_dim].
+def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64,
+                    apply_hadamard=True):
+    """Apply fused CUDA RoPE + optional Hadamard to Q [B, n_heads, head_dim].
 
     Uses the existing CUDA kernel from attention/dsa/indexer.
     The kernel handles [batch, 128] with 1 block/row.
@@ -826,6 +827,9 @@ def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
 
     cos_table/sin_table: [max_pos, 64] — can be BF16 or FP32.
     The CUDA kernel expects float32 cos/sin, so we cast if needed.
+
+    ``apply_hadamard`` must agree with the index-K cache this q is scored
+    against: the rotation only cancels out of q @ k^T when both sides drop it.
     """
     B, n_heads, head_dim = q.shape
 
@@ -842,7 +846,8 @@ def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
         cos_f32,             # [max_pos, 64] float32
         sin_f32,             # [max_pos, 64] float32
         positions_expanded,  # [B*32] int64
-        128 ** -0.5,         # Hadamard scale
+        128 ** -0.5,         # Hadamard scale (unused when not rotating)
+        apply_hadamard,
     )
     return q_out
 
@@ -854,8 +859,9 @@ def rope_hadamard_q_out(
     positions_expanded: torch.Tensor,
     out: torch.Tensor,
     out_fp8: "torch.Tensor | None" = None,
+    apply_hadamard: bool = True,
 ) -> torch.Tensor:
-    """Out-buffer CUDA RoPE + Hadamard for graph capture.
+    """Out-buffer CUDA RoPE + optional Hadamard for graph capture.
 
     ``positions_expanded`` must already have shape ``[B * n_heads]`` to avoid
     allocating inside the captured segment.
@@ -866,6 +872,11 @@ def rope_hadamard_q_out(
     e4m3 range (+/-448, exact in bf16) and casts round-to-nearest-even, which
     is byte for byte what the ``clamp`` + ``copy_`` ATen pair produced. Passing
     it lets ``paged_mqa_score_and_topk_out`` skip both of those launches.
+
+    ``apply_hadamard=False`` is upstream V3.2's semantics and is what the
+    page-split FP8 route uses, because its index-K producers drop the rotation
+    too; the bf16 AoS route keeps it. Both are compiled instantiations of the
+    one kernel, so a captured graph picks its arm at capture time.
     """
     B, n_heads, head_dim = q.shape
     if head_dim != 128:
@@ -897,11 +908,13 @@ def rope_hadamard_q_out(
         out.reshape(B * n_heads, head_dim),
         128 ** -0.5,
         out_fp8,
+        apply_hadamard,
     )
 
 
-def rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim=64):
-    """PyTorch fallback for RoPE + Hadamard (reference/test only)."""
+def rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim=64,
+                            apply_hadamard=True):
+    """PyTorch fallback for RoPE + optional Hadamard (reference/test only)."""
     head_dim = q.shape[-1]
 
     # RoPE
@@ -910,8 +923,9 @@ def rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim=64):
     q = apply_rope_interleaved(q, q_cos, q_sin)
 
     # Hadamard
-    H = get_hadamard_matrix(head_dim, q.device, torch.bfloat16)
-    q = torch.matmul(q.to(torch.bfloat16), H)
+    if apply_hadamard:
+        H = get_hadamard_matrix(head_dim, q.device, torch.bfloat16)
+        q = torch.matmul(q.to(torch.bfloat16), H)
 
     return q
 

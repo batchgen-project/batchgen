@@ -296,6 +296,19 @@ _sm90a_extensions = [
                      "--threads", _nvcc_threads],
         },
     ),
+    # Same byte-exact quantization contract, with the indexer-K LayerNorm,
+    # RoPE and Hadamard folded in front of it: no --use_fast_math.
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_indexer_k_norm_rope_write_fp8",
+        sources=["src/attention/fused_indexer_k_norm_rope_write_fp8.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "-gencode", "arch=compute_90a,code=sm_90a",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads],
+        },
+    ),
     # Fused K3 KDA decode: short-conv update + recurrent delta rule + gated
     # RMSNorm.  The kernel is K3/SM90a-specific and is AOT-only at runtime.
     CUDAExtension(

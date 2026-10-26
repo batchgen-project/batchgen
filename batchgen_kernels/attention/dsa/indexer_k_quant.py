@@ -34,8 +34,16 @@ __all__ = [
     "page_split_cache_pages",
     "cache_is_page_split",
     "cache_data_dim",
+    "indexer_applies_hadamard",
+    "cache_applies_hadamard",
     "PageSplitWritePlan",
     "plan_page_split_write",
+    "NORM_ROPE_HEAD_DIM",
+    "NORM_ROPE_ROPE_DIM",
+    "NormRopeWritePlan",
+    "plan_norm_rope_write",
+    "indexer_k_norm_rope_reference",
+    "hadamard_matrix_128",
 ]
 
 SCALE_BYTES_PER_TOKEN = 4
@@ -45,6 +53,12 @@ AMAX_FLOOR = 1e-4
 # `src/attention/fused_indexer_k_write_fp8.cu`.
 WARP_SIZE = 32
 MAX_DATA_DIM = 256
+
+# The fused LayerNorm+RoPE+Hadamard+quantize+write kernel is specialized for
+# the GLM-5.2 indexer geometry: one warp owns one 128-dim token (4 elements per
+# lane) and the leading 64 dims carry interleaved RoPE (32 pairs).
+NORM_ROPE_HEAD_DIM = 128
+NORM_ROPE_ROPE_DIM = 64
 
 
 def quantize_indexer_k_fp8(
@@ -154,6 +168,46 @@ def cache_data_dim(blocked_kv: torch.Tensor) -> int:
     if int(blocked_kv.element_size()) == 1:
         return carrier - SCALE_BYTES_PER_TOKEN
     return carrier
+
+
+def indexer_applies_hadamard(*, page_split: bool) -> bool:
+    """Whether the DSA indexer rotates q and k before fp8 quantization.
+
+    THE predicate for the Hadamard incoherence rotation, stated once so every
+    producer of the fp8 index-K cache and every producer of the Q index vector
+    agree. ``H`` is orthonormal, so rotating BOTH operands leaves the indexer
+    logit ``q @ k.T`` unchanged in exact arithmetic -- the rotation only
+    redistributes fp8 quantization error across the 128 dims. Rotating one
+    side and not the other does NOT preserve the logit, which is why this is
+    one function and not a per-call-site flag.
+
+    Upstream DeepSeek-V3.2 drops the rotation wherever its fused indexer
+    writers are on (``_maybe_rotate`` in ``dsa_indexer.py``, ``kHadamard``
+    false on both the q and k kernels). BatchGen follows that on the
+    page-split FP8 route -- the route those fused writers serve, and the only
+    one that quantizes indexer records. The bf16 AoS indexer profiles
+    (GLM-5, GLM-5.1, GLM-5.3) store unquantized records, have no fused writer
+    and keep the rotation.
+
+    This is a MODEL-SEMANTICS switch, not a numerics tweak: a cache written
+    under one setting must never be read under the other.
+    """
+
+    return not bool(page_split)
+
+
+def cache_applies_hadamard(blocked_kv: torch.Tensor, data_dim: int) -> bool:
+    """``indexer_applies_hadamard`` resolved from the cache that was allocated.
+
+    Reads the page-split fact off the same cache ``cache_is_page_split``
+    dispatches the writer on, so the rotation cannot drift from the layout. A
+    mis-sized cache is named by ``cache_is_page_split`` rather than silently
+    picking a rotation.
+    """
+
+    return indexer_applies_hadamard(
+        page_split=cache_is_page_split(blocked_kv, data_dim)
+    )
 
 
 def page_split_cache_pages(blocked_kv: torch.Tensor) -> torch.Tensor:
@@ -281,3 +335,201 @@ def page_split_write_reference(
         scales.reshape(-1).float().view(torch.uint8).reshape(-1)
     )
     return buf_u8
+
+
+@dataclass(frozen=True)
+class NormRopeWritePlan:
+    """Resolved geometry of one fused norm+rope+quantize+write launch."""
+
+    num_tokens: int
+    num_pages: int
+    page_size: int
+    page_bytes: int
+    data_dim: int
+    rope_dim: int
+    rope_pairs: int
+    scale_region_offset: int
+    norm_param_dtype: torch.dtype
+    positions_dtype: torch.dtype
+
+
+def plan_norm_rope_write(
+    blocked_kv: torch.Tensor,
+    k_raw: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    page_size_tokens: int,
+) -> NormRopeWritePlan:
+    """Validate a fused norm+rope+quantize+write and return its geometry.
+
+    ``k_raw`` is the UNNORMALIZED ``wk`` output of this step, ``[N, 128]``
+    bf16: the fused kernel owns the LayerNorm, the interleaved RoPE, the
+    Hadamard rotation, the e4m3 quantization and the paged store that the
+    un-fused chain spent four launches on.
+
+    This is the kernel's whole precondition set expressed in torch, so every
+    disagreement is named here -- without a GPU -- instead of reaching a
+    launch that would write the wrong page.
+    """
+
+    base = plan_page_split_write(blocked_kv, k_raw, page_size_tokens)
+    if base.data_dim != NORM_ROPE_HEAD_DIM:
+        raise ValueError(
+            f"the fused norm+rope writer is specialized for a head dim of "
+            f"{NORM_ROPE_HEAD_DIM}, but the cache carries {base.data_dim}"
+        )
+    if k_raw.dim() != 2:
+        raise ValueError(
+            f"k_raw must be [N, {NORM_ROPE_HEAD_DIM}] (the wk output), got "
+            f"{tuple(k_raw.shape)}"
+        )
+    if not k_raw.is_contiguous():
+        raise ValueError(
+            "k_raw must be contiguous; a re-layout here would allocate inside "
+            "a captured graph"
+        )
+
+    if ln_weight.dtype is not ln_bias.dtype:
+        raise ValueError(
+            f"ln_weight and ln_bias must share a dtype, got {ln_weight.dtype} "
+            f"and {ln_bias.dtype}"
+        )
+    if ln_weight.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(
+            f"the LayerNorm parameters must be bfloat16 or float32, got "
+            f"{ln_weight.dtype}"
+        )
+    for name, param in (("ln_weight", ln_weight), ("ln_bias", ln_bias)):
+        if param.numel() != NORM_ROPE_HEAD_DIM:
+            raise ValueError(
+                f"{name} must hold {NORM_ROPE_HEAD_DIM} elements, got "
+                f"{param.numel()}"
+            )
+        if not param.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    rope_pairs = NORM_ROPE_ROPE_DIM // 2
+    for name, table in (("cos_cache", cos_cache), ("sin_cache", sin_cache)):
+        if table.dim() != 2:
+            raise ValueError(
+                f"{name} must be [max_seq, rope_dim], got {tuple(table.shape)}"
+            )
+        if table.dtype is not torch.float32:
+            raise ValueError(
+                f"{name} must be float32 for graph capture, got {table.dtype}"
+            )
+        if not table.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if int(table.shape[1]) < rope_pairs:
+            raise ValueError(
+                f"{name} must hold at least {rope_pairs} interleaved pairs per "
+                f"position, got {int(table.shape[1])}"
+            )
+    if cos_cache.shape != sin_cache.shape:
+        raise ValueError(
+            f"cos_cache {tuple(cos_cache.shape)} and sin_cache "
+            f"{tuple(sin_cache.shape)} must have the same shape"
+        )
+
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"positions must be int32 or int64, got {positions.dtype}"
+        )
+    if not positions.is_contiguous():
+        raise ValueError("positions must be contiguous")
+    if positions.numel() != base.num_tokens:
+        raise ValueError(
+            f"positions holds {positions.numel()} entries for "
+            f"{base.num_tokens} tokens"
+        )
+
+    return NormRopeWritePlan(
+        num_tokens=base.num_tokens,
+        num_pages=base.num_pages,
+        page_size=base.page_size,
+        page_bytes=base.page_bytes,
+        data_dim=base.data_dim,
+        rope_dim=NORM_ROPE_ROPE_DIM,
+        rope_pairs=rope_pairs,
+        scale_region_offset=base.scale_region_offset,
+        norm_param_dtype=ln_weight.dtype,
+        positions_dtype=positions.dtype,
+    )
+
+
+def hadamard_matrix_128(device: torch.device | None = None) -> torch.Tensor:
+    """Natural-order (Sylvester) 128-point Hadamard matrix, unnormalized.
+
+    ``H[e, f] = (-1) ** popcount(e & f)``. This is the transform both the
+    16-thread x 8-element kernel (``hadamard_mult_thread`` +
+    ``hadamard_mult_warp``) and the ported 32-lane x 4-element kernel realize;
+    they differ only in the order the 7 butterfly stages are summed.
+    """
+
+    n = NORM_ROPE_HEAD_DIM
+    idx = torch.arange(n, dtype=torch.int64, device=device)
+    bits = (idx[:, None] & idx[None, :]).to(torch.int64)
+    parity = torch.zeros_like(bits)
+    for shift in range(7):
+        parity = parity ^ ((bits >> shift) & 1)
+    return torch.where(
+        parity.bool(),
+        torch.full_like(parity, -1, dtype=torch.float32),
+        torch.ones_like(parity, dtype=torch.float32),
+    )
+
+
+def indexer_k_norm_rope_reference(
+    k_raw: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    ln_eps: float,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    apply_hadamard: bool,
+) -> torch.Tensor:
+    """bf16 indexer K the fused kernel quantizes, as an explicit torch chain.
+
+    Reproduces, stage for stage, what the fused kernel computes before its fp8
+    epilogue: fp32 LayerNorm of the ``wk`` output, a round to bf16 (the
+    un-fused chain materialized that tensor), interleaved RoPE on the leading
+    ``rope_dim`` dims, the normalized 128-point Hadamard rotation, and a final
+    round to bf16 -- the values whose amax becomes the per-token fp8 scale.
+
+    This is the oracle for both the CPU contract tests and the on-device
+    parity script; it is NOT bit-identical to the kernel, because the warp
+    butterfly and the warp mean/variance reductions sum in a different order.
+    """
+
+    if k_raw.dim() != 2 or int(k_raw.shape[1]) != NORM_ROPE_HEAD_DIM:
+        raise ValueError(
+            f"k_raw must be [N, {NORM_ROPE_HEAD_DIM}], got "
+            f"{tuple(k_raw.shape)}"
+        )
+    rope_dim = NORM_ROPE_ROPE_DIM
+    rope_pairs = rope_dim // 2
+
+    x = k_raw.float()
+    mean = x.mean(dim=-1, keepdim=True)
+    var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
+    y = (x - mean) * torch.rsqrt(var + float(ln_eps))
+    y = y * ln_weight.float() + ln_bias.float()
+    y = y.to(torch.bfloat16).float()
+
+    pos = positions.reshape(-1).to(torch.int64)
+    cos = cos_cache.index_select(0, pos)[:, :rope_pairs]
+    sin = sin_cache.index_select(0, pos)[:, :rope_pairs]
+    rope = y[:, :rope_dim].reshape(-1, rope_pairs, 2)
+    v0, v1 = rope[..., 0], rope[..., 1]
+    rotated = torch.stack((v0 * cos - v1 * sin, v1 * cos + v0 * sin), dim=-1)
+    y = torch.cat((rotated.reshape(-1, rope_dim), y[:, rope_dim:]), dim=-1)
+
+    if apply_hadamard:
+        h = hadamard_matrix_128(device=y.device)
+        y = (y @ h) * (NORM_ROPE_HEAD_DIM ** -0.5)
+
+    return y.to(torch.bfloat16)
