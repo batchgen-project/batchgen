@@ -290,6 +290,8 @@ void HtoD_Engine::reset_weight_stream_profile(bool enabled) {
     this->weight_profile_launch_seconds_.clear();
     this->weight_profile_sync_seconds_.clear();
     this->weight_profile_acquire_seconds_.clear();
+    this->weight_profile_slot_waits_.clear();
+    this->weight_profile_slot_wait_seconds_.clear();
 }
 
 py::dict HtoD_Engine::get_weight_stream_profile() {
@@ -306,6 +308,9 @@ py::dict HtoD_Engine::get_weight_stream_profile() {
         entry["launch_s"] = this->weight_profile_launch_seconds_[module_type];
         entry["sync_s"] = this->weight_profile_sync_seconds_[module_type];
         entry["acquire_s"] = this->weight_profile_acquire_seconds_[module_type];
+        entry["slot_waits"] = this->weight_profile_slot_waits_[module_type];
+        entry["slot_wait_s"] =
+            this->weight_profile_slot_wait_seconds_[module_type];
         by_type[module_type.c_str()] = entry;
     }
     result["by_type"] = by_type;
@@ -318,6 +323,9 @@ void HtoD_Engine::HtoD_Worker() {
         // Set when this pass copies or runs anything; an idle pass backs off
         // below instead of immediately re-taking the weight-buffer mutex.
         bool progressed = false;
+        // Non-empty when a module type had work queued but no free GPU slot.
+        std::string blocked_on_slot;
+        const auto pass_start = std::chrono::steady_clock::now();
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
             task();
@@ -457,6 +465,14 @@ void HtoD_Engine::HtoD_Worker() {
             }
             auto optional_buffer =
                 this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
+            if (!optional_buffer.has_value()) {
+                // There is a module to copy but every GPU slot of this type
+                // still holds one the consumer has not taken. The loop below
+                // just sleeps and retries, so without this counter a producer
+                // throttled by the ring is indistinguishable from one starved
+                // of data.
+                blocked_on_slot = module_type;
+            }
             if (optional_buffer.has_value()) {
                 progressed = true;
                 this->logger_->debug("Acquired buffer for module type: {}",
@@ -587,6 +603,18 @@ void HtoD_Engine::HtoD_Worker() {
         // get_weights. 50 us is negligible against a slot's copy time.
         if (!progressed) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        if (!progressed && !blocked_on_slot.empty()) {
+            // Charge the whole idle pass, back-off included: that is how long
+            // this producer was unable to act because the ring was full.
+            std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+            if (this->weight_profile_enabled_) {
+                this->weight_profile_slot_waits_[blocked_on_slot] += 1;
+                this->weight_profile_slot_wait_seconds_[blocked_on_slot] +=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - pass_start)
+                        .count();
+            }
         }
     }
 };

@@ -124,6 +124,10 @@ class HtoD_Engine {
     std::unordered_map<std::string, double> weight_profile_launch_seconds_;
     std::unordered_map<std::string, double> weight_profile_sync_seconds_;
     std::unordered_map<std::string, double> weight_profile_acquire_seconds_;
+    // Producer blocked because every GPU ring slot of that type was still
+    // occupied: pass count and the wall time of those passes.
+    std::unordered_map<std::string, uint64_t> weight_profile_slot_waits_;
+    std::unordered_map<std::string, double> weight_profile_slot_wait_seconds_;
 
     std::thread HtoD_worker_;
     void HtoD_Worker();
