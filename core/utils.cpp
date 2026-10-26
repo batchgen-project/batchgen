@@ -119,6 +119,12 @@ Basic_Config parse_basic_config(const py::object& engine_config) {
     basic_config.module_types = basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
     basic_config.rank = basic_config_obj.attr("rank").cast<int64_t>();
     basic_config.world_size = basic_config_obj.attr("world_size").cast<int64_t>();
+    // Optional so config objects built before the field existed keep the
+    // default; HtoD_Engine rejects any value other than the two modes.
+    if (py::hasattr(basic_config_obj, "weight_copy_mode")) {
+        basic_config.weight_copy_mode =
+            basic_config_obj.attr("weight_copy_mode").cast<std::string>();
+    }
 
     return basic_config;
 };

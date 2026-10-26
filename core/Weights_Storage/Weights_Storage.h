@@ -87,6 +87,14 @@ class Weights_Storage {
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);
 
+    // Metadata only: never acquires a remote lease. Throws for an unknown key.
+    module_copy_layout get_module_copy_layout(
+        const std::string& module_key) const;
+    bool is_remote_module(const std::string& module_key) const;
+    int64_t distributed_module_bytes() const {
+        return this->distributed_module_bytes_;
+    }
+
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
 

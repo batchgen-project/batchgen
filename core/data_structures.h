@@ -26,6 +26,7 @@
 #include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <unordered_map>
 
 struct MemoryChunk {
     void* ptr;
@@ -159,6 +160,26 @@ struct Basic_Config {
     std::vector<std::string> module_types;  // {"attn", "expert", "dense"}
     int64_t rank;
     int64_t world_size;
+    // HtoD weight stream: "memcpy" copies each tensor with its own
+    // cudaMemcpyAsync; "module_flat" copies a whole module with one when its
+    // host layout is contiguous (see HtoD_Engine::prepare_flat_layouts_).
+    std::string weight_copy_mode = "memcpy";
+};
+
+// Byte extent of one tensor inside a module, relative to the module base.
+struct module_tensor_extent {
+    int64_t offset = 0;
+    int64_t byte_size = 0;
+};
+
+// Host layout of one module as Weights_Storage holds it: per-tensor extents
+// relative to the lowest tensor address, and the span from that address to the
+// end of the highest tensor. remote marks a module served from the staging
+// ring rather than the local store.
+struct module_copy_layout {
+    std::unordered_map<std::string, module_tensor_extent> tensors;
+    int64_t span_bytes = 0;
+    bool remote = false;
 };
 
 struct Module_Batching_Config {

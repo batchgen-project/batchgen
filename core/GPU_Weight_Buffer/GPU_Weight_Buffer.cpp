@@ -174,6 +174,10 @@ void GPU_Weight_Buffer::Init() {
         this->buffers_[module_type].resize(num_buffer);
         this->buffer_status_[module_type].clear();
         this->buffer_status_[module_type].resize(num_buffer, 0);
+        if (this->flat_layouts_.count(module_type) != 0) {
+            this->build_flat_slots_(module_type);
+            continue;
+        }
         for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
             // Get per-tensor dtype using the helper function
             torch::Dtype tensor_dtype = get_tensor_dtype(
@@ -196,6 +200,162 @@ void GPU_Weight_Buffer::Init() {
     }
 };
 
+module_weight_tensor_map GPU_Weight_Buffer::make_flat_slot_(
+    const std::string& module_type, torch::Tensor& flat) {
+    const FlatLayout& layout = this->flat_layouts_.at(module_type);
+    // zeros, not empty: a per-tensor slot is zero-initialized today, and the
+    // per-module fallback copy must not expose uninitialized bytes either.
+    flat = torch::zeros(
+        {layout.span_bytes},
+        torch::TensorOptions()
+            .dtype(torch::kUInt8)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device)
+            .requires_grad(false));
+    module_weight_tensor_map slot;
+    for (const auto& [buffer_name, buffer_shape] :
+         this->engine_config_.gpu_buffer_config.module_shapes.at(
+             module_type)) {
+        const torch::Dtype tensor_dtype = get_tensor_dtype(
+            this->engine_config_.gpu_buffer_config,
+            this->engine_config_.basic_config, module_type, buffer_name);
+        const module_tensor_extent& extent = layout.tensors.at(buffer_name);
+        // Tensor::view(ScalarType) on the uint8 byte range needs its storage
+        // offset and length to be multiples of the element size;
+        // set_flat_layout checked both, so this cannot throw here.
+        slot[buffer_name] = flat.narrow(0, extent.offset, extent.byte_size)
+                                .view(tensor_dtype)
+                                .view(buffer_shape);
+    }
+    return slot;
+}
+
+void GPU_Weight_Buffer::build_flat_slots_(const std::string& module_type) {
+    auto& slots = this->buffers_[module_type];
+    auto& flats = this->flat_buffers_[module_type];
+    flats.assign(slots.size(), torch::Tensor());
+    for (size_t buffer_idx = 0; buffer_idx < slots.size(); ++buffer_idx) {
+        slots[buffer_idx] = this->make_flat_slot_(module_type, flats[buffer_idx]);
+    }
+}
+
+bool GPU_Weight_Buffer::set_flat_layout(
+    const std::string& module_type, int64_t span_bytes,
+    const std::unordered_map<std::string, module_tensor_extent>& layout) {
+    auto reject = [&](const std::string& reason) {
+        this->logger_->error("set_flat_layout({}) rejected: {}", module_type,
+                             reason);
+        return false;
+    };
+    const auto& gpu_config = this->engine_config_.gpu_buffer_config;
+    auto shapes_it = gpu_config.module_shapes.find(module_type);
+    if (shapes_it == gpu_config.module_shapes.end()) {
+        return reject("module_shapes declares no such module type");
+    }
+    if (span_bytes <= 0) {
+        return reject("span is " + std::to_string(span_bytes) + " B");
+    }
+    if (layout.size() != shapes_it->second.size()) {
+        return reject("host layout has " + std::to_string(layout.size()) +
+                      " tensors, module_shapes declares " +
+                      std::to_string(shapes_it->second.size()));
+    }
+    for (const auto& [buffer_name, buffer_shape] : shapes_it->second) {
+        auto extent = layout.find(buffer_name);
+        if (extent == layout.end()) {
+            return reject("module_shapes tensor " + buffer_name +
+                          " is not in the host layout");
+        }
+        const torch::Dtype tensor_dtype = get_tensor_dtype(
+            gpu_config, this->engine_config_.basic_config, module_type,
+            buffer_name);
+        const int64_t element_size =
+            static_cast<int64_t>(c10::elementSize(tensor_dtype));
+        int64_t numel = 1;
+        for (const int64_t dim : buffer_shape) {
+            numel *= dim;
+        }
+        const int64_t nbytes = numel * element_size;
+        if (extent->second.byte_size != nbytes) {
+            return reject("tensor " + buffer_name + " is " +
+                          std::to_string(extent->second.byte_size) +
+                          " B on the host, " + std::to_string(nbytes) +
+                          " B by module_shapes/dtype");
+        }
+        if (extent->second.offset < 0 ||
+            extent->second.offset % element_size != 0 ||
+            extent->second.offset + nbytes > span_bytes) {
+            return reject("tensor " + buffer_name + " at offset " +
+                          std::to_string(extent->second.offset) +
+                          " is misaligned for its dtype or outside the " +
+                          std::to_string(span_bytes) + " B span");
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto installed = this->flat_layouts_.find(module_type);
+    if (installed != this->flat_layouts_.end()) {
+        bool same = installed->second.span_bytes == span_bytes &&
+                    installed->second.tensors.size() == layout.size();
+        for (const auto& [name, extent] : layout) {
+            auto other = installed->second.tensors.find(name);
+            same = same && other != installed->second.tensors.end() &&
+                   other->second.offset == extent.offset &&
+                   other->second.byte_size == extent.byte_size;
+        }
+        return same ? true
+                    : reject("a different flat layout is already installed");
+    }
+    auto buffers_it = this->buffers_.find(module_type);
+    if (buffers_it == this->buffers_.end() || buffers_it->second.empty()) {
+        return reject("the type has no ring slots");
+    }
+    this->reclaimCompletedReleasesLocked();
+    for (const int64_t status : this->buffer_status_[module_type]) {
+        if (status != 0) {
+            return reject("a ring slot is still in use");
+        }
+    }
+    for (const auto& [module_name, location] : this->module_in_buffers_) {
+        if (location.first == module_type) {
+            return reject("module " + module_name + " is still resident");
+        }
+    }
+
+    // Free the per-tensor slots before allocating the flat ones, so the
+    // type's ring never needs twice its memory.
+    for (auto& slot : buffers_it->second) {
+        for (auto& [name, tensor] : slot) {
+            tensor = torch::Tensor();
+        }
+        slot.clear();
+    }
+    if (torch::cuda::is_available()) {
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+    int64_t tensor_bytes = 0;
+    for (const auto& [name, extent] : layout) {
+        tensor_bytes += extent.byte_size;
+    }
+    this->flat_layouts_[module_type] = FlatLayout{span_bytes, layout};
+    this->build_flat_slots_(module_type);
+    this->logger_->info(
+        "module_flat slots for {}: {} slots x {} B span ({} B of tensors)",
+        module_type, buffers_it->second.size(), span_bytes, tensor_bytes);
+    return true;
+}
+
+torch::Tensor GPU_Weight_Buffer::get_flat_slot(const std::string& module_type,
+                                               int64_t buffer_idx) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    auto flat_it = this->flat_buffers_.find(module_type);
+    if (flat_it == this->flat_buffers_.end() || buffer_idx < 0 ||
+        buffer_idx >= static_cast<int64_t>(flat_it->second.size())) {
+        return torch::Tensor();
+    }
+    return flat_it->second[buffer_idx];
+}
+
 void GPU_Weight_Buffer::resize_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
@@ -207,6 +367,14 @@ void GPU_Weight_Buffer::resize_buffer() {
         int64_t to_add_buffer = num_buffers["routed_expert"] -
                                 this->buffers_["routed_expert"].size();
         for (int64_t i = 0; i < to_add_buffer; i++) {
+            if (this->flat_layouts_.count("routed_expert") != 0) {
+                torch::Tensor flat;
+                this->buffers_["routed_expert"].push_back(
+                    this->make_flat_slot_("routed_expert", flat));
+                this->flat_buffers_["routed_expert"].push_back(flat);
+                this->buffer_status_["routed_expert"].push_back(0);
+                continue;
+            }
             module_weight_tensor_map new_buffer;
             for (auto& [buffer_name, buffer_shape] :
                  buffer_shapes["routed_expert"]) {
@@ -756,6 +924,11 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            // The flat blocks own the slot memory in module_flat mode.
+            auto flat_it = this->flat_buffers_.find("routed_expert");
+            if (flat_it != this->flat_buffers_.end()) {
+                flat_it->second.clear();
+            }
 
             // Optional: Force memory cleanup for routed_expert tensors only
             if (torch::cuda::is_available()) {
@@ -768,21 +941,25 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
 
         // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
-                this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
+        if (this->flat_layouts_.count("routed_expert") != 0) {
+            this->build_flat_slots_("routed_expert");
+        } else {
+            for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
+                // Get per-tensor dtype using the helper function
+                torch::Dtype tensor_dtype = get_tensor_dtype(
+                    this->engine_config_.gpu_buffer_config,
+                    this->engine_config_.basic_config,
+                    "routed_expert",
+                    buffer_name);
+                auto options = torch::TensorOptions()
+                    .dtype(tensor_dtype)
+                    .device(torch::kCUDA, this->engine_config_.basic_config.device)
+                    .requires_grad(false)
+                    .memory_format(torch::MemoryFormat::Contiguous);
+                for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+                    this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+                        torch::zeros(buffer_shape, options);
+                }
             }
         }
 
@@ -1009,6 +1186,11 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 module_map.clear();
             }
             this->buffers_["routed_expert"].clear();
+            // The flat blocks own the slot memory in module_flat mode.
+            auto flat_it = this->flat_buffers_.find("routed_expert");
+            if (flat_it != this->flat_buffers_.end()) {
+                flat_it->second.clear();
+            }
 
             // Optional: Force memory cleanup
             if (torch::cuda::is_available()) {
@@ -1021,21 +1203,25 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
 
         // Create new tensors
-        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
-            // Get per-tensor dtype using the helper function
-            torch::Dtype tensor_dtype = get_tensor_dtype(
-                this->engine_config_.gpu_buffer_config,
-                this->engine_config_.basic_config,
-                "routed_expert",
-                buffer_name);
-            auto options = torch::TensorOptions()
-                .dtype(tensor_dtype)
-                .device(torch::kCUDA, this->engine_config_.basic_config.device)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
+        if (this->flat_layouts_.count("routed_expert") != 0) {
+            this->build_flat_slots_("routed_expert");
+        } else {
+            for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
+                // Get per-tensor dtype using the helper function
+                torch::Dtype tensor_dtype = get_tensor_dtype(
+                    this->engine_config_.gpu_buffer_config,
+                    this->engine_config_.basic_config,
+                    "routed_expert",
+                    buffer_name);
+                auto options = torch::TensorOptions()
+                    .dtype(tensor_dtype)
+                    .device(torch::kCUDA, this->engine_config_.basic_config.device)
+                    .requires_grad(false)
+                    .memory_format(torch::MemoryFormat::Contiguous);
+                for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+                    this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+                        torch::zeros(buffer_shape, options);
+                }
             }
         }
 

@@ -47,6 +47,10 @@ class BasicConfig:
     world_size: Optional[int] = None
     gpu_arch: Optional[str] = None
     distributed_weight_sharded: bool = False
+    # HtoD weight stream: "memcpy" (one copy per tensor) or "module_flat"
+    # (one copy per module into a flat GPU slot). The core engine rejects
+    # anything else.
+    weight_copy_mode: str = "memcpy"
     enable_cuda_graphs: bool = False  # Default off (128K+ NCCL corruption when graph warmup runs MoE AllGather)
     cuda_graph_bucket_sizes: Optional[List[int]] = None
 
@@ -86,7 +90,8 @@ class BasicConfig:
             f"  rank: {self.rank}\n"
             f"  world_size: {self.world_size}\n"
             f"  gpu_arch: {self.gpu_arch}\n"
-            f"  distributed_weight_sharded: {self.distributed_weight_sharded}"
+            f"  distributed_weight_sharded: {self.distributed_weight_sharded}\n"
+            f"  weight_copy_mode: {self.weight_copy_mode}"
         )
 
 

@@ -30,6 +30,7 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../GPU_KV_Buffer/GPU_KV_Buffer.h"
@@ -125,7 +126,18 @@ class HtoD_Engine {
     std::unordered_map<std::string, double> weight_profile_sync_seconds_;
     std::unordered_map<std::string, double> weight_profile_acquire_seconds_;
 
+    // weight_copy_mode == "module_flat": canonical host layout per module type
+    // whose GPU slots are flat, and the types whose layout was refused. Both
+    // are written only by Start() before the worker thread exists.
+    std::unordered_map<std::string, module_copy_layout> flat_layouts_;
+    std::unordered_set<std::string> flat_layout_rejected_;
+
     std::thread HtoD_worker_;
     void HtoD_Worker();
     void blocking_copy_(void* dst, void* src, int64_t size);
+    void prepare_flat_layouts_();
+    bool copy_module_flat_(
+        const module_copy_layout& layout, const std::string& module_type,
+        const std::string& module_name, int64_t buffer_idx,
+        const std::unordered_map<std::string, tensor_buffer>& src);
 };

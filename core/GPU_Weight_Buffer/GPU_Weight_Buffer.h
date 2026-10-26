@@ -84,20 +84,45 @@ class GPU_Weight_Buffer {
         this->weight_copy_tasks_ = task;
     }
 
+    // module_flat: back every ring slot of module_type with ONE uint8 block of
+    // span_bytes and expose its tensors as views at the given byte extents.
+    // Rebuilds the type's slots, so every slot must be idle. Returns false
+    // (after logging why) when the layout disagrees with module_shapes or the
+    // slots are busy; the type then keeps its per-tensor slots.
+    bool set_flat_layout(
+        const std::string& module_type, int64_t span_bytes,
+        const std::unordered_map<std::string, module_tensor_extent>& layout);
+    // The flat block behind a slot, or an undefined tensor when the type has
+    // no flat layout.
+    torch::Tensor get_flat_slot(const std::string& module_type,
+                                int64_t buffer_idx);
+
    private:
     struct PendingRelease {
         cudaEvent_t event;
         std::vector<std::pair<std::string, int64_t>> slots;
     };
 
+    struct FlatLayout {
+        int64_t span_bytes = 0;
+        std::unordered_map<std::string, module_tensor_extent> tensors;
+    };
+
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
+    module_weight_tensor_map make_flat_slot_(const std::string& module_type,
+                                             torch::Tensor& flat);
+    void build_flat_slots_(const std::string& module_type);
 
     EngineConfig& engine_config_;
     ModelConfig& model_config_;
     std::shared_ptr<spdlog::logger> logger_;
 
     std::unordered_map<std::string, weight_buffers> buffers_;
+    // module_flat only. A type has an entry in both or in neither; the slot
+    // tensors in buffers_ are then views into flat_buffers_[type][idx].
+    std::unordered_map<std::string, FlatLayout> flat_layouts_;
+    std::unordered_map<std::string, std::vector<torch::Tensor>> flat_buffers_;
     /* Thread safe buffers management */
     mutable std::mutex mutex_;
     std::condition_variable cv_;

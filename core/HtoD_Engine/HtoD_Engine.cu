@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -51,6 +52,16 @@ HtoD_Engine::HtoD_Engine(const EngineConfig& engine_config,
         this->engine_config_.basic_config.log_level,
         "HtoD_Engine" +
             std::to_string(this->engine_config_.basic_config.device));
+    const std::string& weight_copy_mode =
+        this->engine_config_.basic_config.weight_copy_mode;
+    if (weight_copy_mode != "memcpy" && weight_copy_mode != "module_flat") {
+        throw std::invalid_argument(
+            "weight_copy_mode must be \"memcpy\" or \"module_flat\", got \"" +
+            weight_copy_mode + "\"");
+    }
+    if (weight_copy_mode != "memcpy") {
+        this->logger_->info("weight_copy_mode = {}", weight_copy_mode);
+    }
     CUDA_CHECK(
         cudaStreamCreateWithFlags(&this->HtoD_stream, cudaStreamNonBlocking));
 };
@@ -187,6 +198,10 @@ void HtoD_Engine::Init() {
 
 void HtoD_Engine::Start(){
     if (!this->HtoD_worker_.joinable()) {
+        if (this->engine_config_.basic_config.weight_copy_mode ==
+            "module_flat") {
+            this->prepare_flat_layouts_();
+        }
         this->terminate_flag_ = false;
         this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
     }
@@ -310,6 +325,207 @@ py::dict HtoD_Engine::get_weight_stream_profile() {
     }
     result["by_type"] = by_type;
     return result;
+}
+
+namespace {
+
+// Byte offsets of the tensor views inside a flat slot. The caching allocator
+// aligns the block itself to 512 B, so this is the view alignment on the GPU.
+constexpr int64_t kFlatTensorAlignment = 16;
+
+bool same_module_layout(const module_copy_layout& a,
+                        const module_copy_layout& b) {
+    if (a.span_bytes != b.span_bytes ||
+        a.tensors.size() != b.tensors.size()) {
+        return false;
+    }
+    for (const auto& [tensor_name, extent] : a.tensors) {
+        auto other = b.tensors.find(tensor_name);
+        if (other == b.tensors.end() ||
+            other->second.offset != extent.offset ||
+            other->second.byte_size != extent.byte_size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Empty when the layout can back one flat GPU block, otherwise the reason.
+std::string check_flat_layout(const module_copy_layout& layout) {
+    if (layout.tensors.empty()) {
+        return "the module has no tensors";
+    }
+    std::vector<std::pair<int64_t, int64_t>> extents;
+    extents.reserve(layout.tensors.size());
+    for (const auto& [tensor_name, extent] : layout.tensors) {
+        if (extent.offset < 0 || extent.byte_size < 0) {
+            return "tensor " + tensor_name + " has a negative extent";
+        }
+        if (extent.offset % kFlatTensorAlignment != 0) {
+            return "tensor " + tensor_name + " offset " +
+                   std::to_string(extent.offset) +
+                   " is not 16-byte aligned";
+        }
+        extents.emplace_back(extent.offset, extent.offset + extent.byte_size);
+    }
+    std::sort(extents.begin(), extents.end());
+    for (size_t i = 1; i < extents.size(); ++i) {
+        if (extents[i].first < extents[i - 1].second) {
+            return "tensors overlap at offset " +
+                   std::to_string(extents[i].first);
+        }
+    }
+    return "";
+}
+
+}  // namespace
+
+void HtoD_Engine::prepare_flat_layouts_() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    for (const auto& module_type :
+         this->engine_config_.basic_config.module_types) {
+        if (this->flat_layouts_.count(module_type) != 0 ||
+            this->flat_layout_rejected_.count(module_type) != 0) {
+            continue;
+        }
+        auto tasks = this->weight_copy_tasks_.find(module_type);
+        if (tasks == this->weight_copy_tasks_.end() || tasks->second.empty()) {
+            // Not streamed in this phase; decided at the first Start that
+            // streams it.
+            continue;
+        }
+        const std::vector<std::string>& modules = tasks->second;
+        const std::string& representative = modules.front();
+        const module_copy_layout layout =
+            this->weights_storage_.get_module_copy_layout(representative);
+        std::string reason = check_flat_layout(layout);
+        // Local-store and remote-staging modules derive their offsets
+        // differently; the first module of the other kind must agree.
+        bool streams_remote = layout.remote;
+        if (reason.empty()) {
+            for (const auto& module_name : modules) {
+                if (this->weights_storage_.is_remote_module(module_name) ==
+                    layout.remote) {
+                    continue;
+                }
+                streams_remote = true;
+                const module_copy_layout other =
+                    this->weights_storage_.get_module_copy_layout(module_name);
+                if (!same_module_layout(layout, other)) {
+                    reason = std::string(other.remote ? "remote" : "local") +
+                             " module " + module_name +
+                             " has a different layout";
+                }
+                break;
+            }
+        }
+        if (reason.empty() && streams_remote &&
+            layout.span_bytes !=
+                this->weights_storage_.distributed_module_bytes()) {
+            reason = "span " + std::to_string(layout.span_bytes) +
+                     " B differs from the distributed module contract " +
+                     std::to_string(
+                         this->weights_storage_.distributed_module_bytes()) +
+                     " B";
+        }
+        if (reason.empty() &&
+            !this->gpu_weight_buffer_.set_flat_layout(
+                module_type, layout.span_bytes, layout.tensors)) {
+            reason = "GPU_Weight_Buffer refused the layout";
+        }
+        if (!reason.empty()) {
+            this->logger_->error(
+                "weight_copy_mode=module_flat is OFF for module type {} "
+                "(representative {}): {}; it keeps per-tensor copies",
+                module_type, representative, reason);
+            this->flat_layout_rejected_.insert(module_type);
+            continue;
+        }
+        this->flat_layouts_[module_type] = layout;
+        this->logger_->info(
+            "weight_copy_mode=module_flat is ON for module type {}: {} "
+            "tensors per module in one {} B copy (representative {})",
+            module_type, layout.tensors.size(), layout.span_bytes,
+            representative);
+    }
+}
+
+bool HtoD_Engine::copy_module_flat_(
+    const module_copy_layout& layout, const std::string& module_type,
+    const std::string& module_name, int64_t buffer_idx,
+    const std::unordered_map<std::string, tensor_buffer>& src) {
+    // The canonical layout came from one module; every module is checked
+    // against it before its single copy. A mismatch copies this module per
+    // tensor into the same slot views instead.
+    if (src.size() != layout.tensors.size()) {
+        this->logger_->error(
+            "Module {}: host map has {} tensors, the {} flat layout has {}; "
+            "copying per tensor",
+            module_name, src.size(), module_type, layout.tensors.size());
+        return false;
+    }
+    const char* module_base = nullptr;
+    for (const auto& [tensor_name, host_tensor_storage] : src) {
+        const char* address =
+            static_cast<const char*>(host_tensor_storage.data_ptr);
+        if (module_base == nullptr || address < module_base) {
+            module_base = address;
+        }
+    }
+    for (const auto& [tensor_name, host_tensor_storage] : src) {
+        auto extent = layout.tensors.find(tensor_name);
+        if (extent == layout.tensors.end()) {
+            this->logger_->error(
+                "Module {}: host tensor {} is not in the {} flat layout; "
+                "copying per tensor",
+                module_name, tensor_name, module_type);
+            return false;
+        }
+        const char* address =
+            static_cast<const char*>(host_tensor_storage.data_ptr);
+        if (host_tensor_storage.byte_size != extent->second.byte_size ||
+            address != module_base + extent->second.offset) {
+            this->logger_->error(
+                "Module {}: tensor {} is at host offset {} ({} B), the {} "
+                "flat layout has offset {} ({} B); copying per tensor",
+                module_name, tensor_name,
+                static_cast<int64_t>(address - module_base),
+                host_tensor_storage.byte_size, module_type,
+                extent->second.offset, extent->second.byte_size);
+            return false;
+        }
+    }
+    torch::Tensor flat =
+        this->gpu_weight_buffer_.get_flat_slot(module_type, buffer_idx);
+    if (!flat.defined() ||
+        static_cast<int64_t>(flat.nbytes()) != layout.span_bytes) {
+        throw std::runtime_error(
+            "HtoD: module_flat slot " + std::to_string(buffer_idx) + " of " +
+            module_type + " is missing or not " +
+            std::to_string(layout.span_bytes) + " B");
+    }
+    auto copy_start = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaMemcpyAsync(flat.data_ptr(), module_base,
+                               layout.span_bytes, cudaMemcpyHostToDevice,
+                               this->HtoD_stream));
+    auto launch_end = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+    auto copy_end = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+        if (this->weight_profile_enabled_) {
+            this->weight_profile_tensors_[module_type] += src.size();
+            this->weight_profile_bytes_[module_type] +=
+                static_cast<uint64_t>(layout.span_bytes);
+            this->weight_profile_copy_seconds_[module_type] +=
+                std::chrono::duration<double>(copy_end - copy_start).count();
+            this->weight_profile_launch_seconds_[module_type] +=
+                std::chrono::duration<double>(launch_end - copy_start).count();
+            this->weight_profile_sync_seconds_[module_type] +=
+                std::chrono::duration<double>(copy_end - launch_end).count();
+        }
+    }
+    return true;
 }
 
 void HtoD_Engine::HtoD_Worker() {
@@ -487,7 +703,14 @@ void HtoD_Engine::HtoD_Worker() {
                 torch::Tensor tmp_src;
                 void* src_ptr;
                 int64_t src_byte_size;
+                auto flat_layout = this->flat_layouts_.find(module_type);
                 try {
+                    const bool copied_flat =
+                        flat_layout != this->flat_layouts_.end() &&
+                        this->copy_module_flat_(flat_layout->second,
+                                                module_type, module_name,
+                                                buffer_idx, src);
+                    if (!copied_flat) {
                     for (auto& [tensor_name, host_tensor_storage] : src) {
                         src_ptr = host_tensor_storage.data_ptr;
                         src_byte_size = host_tensor_storage.byte_size;
@@ -555,6 +778,7 @@ void HtoD_Engine::HtoD_Worker() {
                                         .count();
                             }
                         }
+                    }
                     }
                 } catch (...) {
                     this->weights_storage_.release_module(module_name);

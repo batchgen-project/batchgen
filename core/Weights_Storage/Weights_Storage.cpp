@@ -810,6 +810,54 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
     }
 };
 
+// Same lookup order as get_module_weights_storage: local first, then remote.
+bool Weights_Storage::is_remote_module(const std::string& module_key) const {
+    return this->module_weights_storage_.count(module_key) == 0 &&
+           this->remote_module_weights_.count(module_key) != 0;
+}
+
+module_copy_layout Weights_Storage::get_module_copy_layout(
+    const std::string& module_key) const {
+    module_copy_layout layout;
+    auto local = this->module_weights_storage_.find(module_key);
+    if (local == this->module_weights_storage_.end()) {
+        auto remote = this->remote_module_weights_.find(module_key);
+        if (remote == this->remote_module_weights_.end()) {
+            throw std::runtime_error(
+                "get_module_copy_layout: module key not found in storage: " +
+                module_key);
+        }
+        // module_offset is already relative to the module's lowest compact
+        // offset, which is exactly where a staging slot starts.
+        layout.remote = true;
+        for (const auto& [tensor_key, tensor] : remote->second) {
+            const int64_t offset = static_cast<int64_t>(tensor.module_offset);
+            layout.tensors[tensor_key] =
+                module_tensor_extent{offset, tensor.byte_size};
+            layout.span_bytes =
+                std::max(layout.span_bytes, offset + tensor.byte_size);
+        }
+        return layout;
+    }
+    const char* base = nullptr;
+    for (const auto& [tensor_key, tensor] : local->second) {
+        const char* address = static_cast<const char*>(tensor.data_ptr);
+        if (base == nullptr || address < base) {
+            base = address;
+        }
+    }
+    for (const auto& [tensor_key, tensor] : local->second) {
+        const int64_t offset =
+            static_cast<int64_t>(static_cast<const char*>(tensor.data_ptr) -
+                                 base);
+        layout.tensors[tensor_key] =
+            module_tensor_extent{offset, tensor.byte_size};
+        layout.span_bytes =
+            std::max(layout.span_bytes, offset + tensor.byte_size);
+    }
+    return layout;
+}
+
 py::dict Weights_Storage::get_tensor(std::string module_key) {
     /* Get the tensor from the weights storage and return as Python dict.
      *
