@@ -920,28 +920,60 @@ class GLM5ParallelStrategyManager:
         pairs = []
         for layer_idx in moe_layers:
             moe = self.model.model.layers[layer_idx].mlp
-            stacks = tuple(
-                carve((experts_per_rank, *first[name].shape), first[name].dtype)
-                for name in names
-            )
-            moe._w3d_prealloc = stacks
+            # A1: on the DeepEP decode configuration gate and up share ONE
+            # [E, 2I, H] carve so the masked m-grouped GEMM runs them in a
+            # single launch. The carve is the same total bytes as the two
+            # separate stacks. Glm5MoE._init_fp8_blockwise_weights decides the
+            # layout from enable_deepep and adopts a 2-tuple here, a 3-tuple
+            # otherwise; the two must agree, which the destination rows below
+            # and that method's alias check together enforce.
+            fused = bool(getattr(moe, "glm5_deepep_ll", False))
+            gate_shape = first[names[0]].shape
+            up_shape = first[names[1]].shape
+            if fused and (tuple(gate_shape) != tuple(up_shape)):
+                raise RuntimeError(
+                    f"layer {layer_idx}: the fused gate/up carve needs matching "
+                    f"gate {tuple(gate_shape)} and up {tuple(up_shape)} shapes"
+                )
+            if fused:
+                inter = int(gate_shape[0])
+                gate_up = carve(
+                    (experts_per_rank, 2 * inter, int(gate_shape[1])),
+                    first[names[0]].dtype,
+                )
+                down = carve(
+                    (experts_per_rank, *first[names[2]].shape),
+                    first[names[2]].dtype,
+                )
+                moe._w3d_prealloc = (gate_up, down)
+                # Destination row per (expert, projection), in ``names`` order.
+                def _rows(i, _gu=gate_up, _d=down, _n=inter):
+                    return (_gu[i, :_n, :], _gu[i, _n:, :], _d[i])
+            else:
+                stacks = tuple(
+                    carve((experts_per_rank, *first[name].shape), first[name].dtype)
+                    for name in names
+                )
+                moe._w3d_prealloc = stacks
+
+                def _rows(i, _s=stacks):
+                    return tuple(s[i] for s in _s)
             for i in range(experts_per_rank):
                 tensors = self.core_engine.get_tensor(
                     f"routed_expert_{layer_idx}_{start + i}"
                 )
-                for stack, name in zip(stacks, names):
+                rows = _rows(i)
+                for row, name in zip(rows, names):
                     src = tensors[name]
-                    if src.shape != stack.shape[1:] or src.dtype != stack.dtype:
+                    if src.shape != row.shape or src.dtype != row.dtype:
                         raise RuntimeError(
                             f"routed_expert_{layer_idx}_{start + i}.{name}: host "
                             f"{tuple(src.shape)}/{src.dtype} does not match stack row "
-                            f"{tuple(stack.shape[1:])}/{stack.dtype}"
+                            f"{tuple(row.shape)}/{row.dtype}"
                         )
-                    pairs.append((stack[i], src))
+                    pairs.append((row, src))
                 expert = moe.experts[start + i]
-                expert.fp8_gate, expert.fp8_up, expert.fp8_down = (
-                    stack[i] for stack in stacks
-                )
+                expert.fp8_gate, expert.fp8_up, expert.fp8_down = rows
         return pairs
 
     def _expert_stack_layer_bytes(self, first, names, experts_per_rank):

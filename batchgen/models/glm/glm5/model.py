@@ -1833,45 +1833,130 @@ class Glm5MoE(nn.Module):
         # per-expert allocation becomes refcount=0 and the CUDA allocator
         # reclaims it before the next expert's copy.
         start = self.routed_expert_start_idx
+        # A1: on the DeepEP decode configuration the routed gate/up stacks are
+        # ONE per-expert-fused [E, 2I, H] block, so the masked m-grouped GEMM
+        # runs gate+up in a single launch. The layout is decided here, once, at
+        # load time -- never per step -- and only for enable_deepep; with it off
+        # the stacks stay per-projection and every path is unchanged.
+        #
+        # The CuTe grouped kernels hardcode a stack's group stride as N * K
+        # (fp8_blockwise_gemm.cu:60/:67), so they CANNOT read a half of the
+        # fused block. fp8_gate_w3d / fp8_up_w3d are therefore left None under
+        # the fused layout: the one CuTe consumer that remains on this
+        # configuration (the ragged/prefill S1) is given the per-expert pointer
+        # form instead, and anything else that reaches for a contiguous stack
+        # fails loudly here rather than reading at the wrong stride.
+        self.fp8_gate_up_fused = bool(getattr(self, "glm5_deepep_ll", False))
+        if self.fp8_gate_up_fused and k_blocks_pad4 != k_blocks:
+            raise RuntimeError(
+                f"GLM-5 layer {self.layer_idx}: the fused gate/up layout feeds "
+                "the masked m-grouped GEMM, whose weight scales must have an "
+                f"exact K//{scale_block} trailing extent, but this geometry "
+                f"pads {k_blocks} to {k_blocks_pad4} for the CuTe kernels. "
+                "Fusing would hand the masked GEMM a padded scale stack it "
+                "cannot read."
+            )
         prealloc = getattr(self, "_w3d_prealloc", None)
         if prealloc is not None:
             # Persistent decode: the PSM already copied every local expert into
-            # fixed-address stacks and pointed each expert at its row.
-            self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d = prealloc
-            for i in range(E):
-                if (
-                    self.gate_list[i].data_ptr() != self.fp8_gate_w3d[i].data_ptr()
-                    or self.up_list[i].data_ptr() != self.fp8_up_w3d[i].data_ptr()
-                    or self.down_list[i].data_ptr() != self.fp8_down_w3d[i].data_ptr()
-                ):
+            # fixed-address stacks and pointed each expert at its row. It carves
+            # a 2-tuple (fused gate/up, down) under the fused layout and the
+            # 3-tuple (gate, up, down) otherwise, matching this layer's choice.
+            if self.fp8_gate_up_fused:
+                if len(prealloc) != 2:
                     raise RuntimeError(
-                        f"GLM-5 layer {self.layer_idx}: expert {start + i} does "
-                        "not alias its preallocated 3D stack row"
+                        f"GLM-5 layer {self.layer_idx}: the fused gate/up "
+                        "layout needs a (gate_up, down) preallocation; got "
+                        f"{len(prealloc)} stacks"
+                    )
+                self.fp8_gate_up_w3d, self.fp8_down_w3d = prealloc
+                self.fp8_gate_w3d = None
+                self.fp8_up_w3d = None
+                expect = [
+                    (self.fp8_gate_up_w3d[i, :N, :], self.gate_list[i])
+                    for i in range(E)
+                ] + [
+                    (self.fp8_gate_up_w3d[i, N:, :], self.up_list[i])
+                    for i in range(E)
+                ]
+            else:
+                if len(prealloc) != 3:
+                    raise RuntimeError(
+                        f"GLM-5 layer {self.layer_idx}: the per-projection "
+                        "layout needs a (gate, up, down) preallocation; got "
+                        f"{len(prealloc)} stacks"
+                    )
+                self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d = prealloc
+                self.fp8_gate_up_w3d = None
+                expect = [
+                    (self.fp8_gate_w3d[i], self.gate_list[i]) for i in range(E)
+                ] + [(self.fp8_up_w3d[i], self.up_list[i]) for i in range(E)]
+            expect += [(self.fp8_down_w3d[i], self.down_list[i]) for i in range(E)]
+            for row, resident in expect:
+                if resident.data_ptr() != row.data_ptr():
+                    raise RuntimeError(
+                        f"GLM-5 layer {self.layer_idx}: a local routed expert "
+                        "does not alias its preallocated 3D stack row "
+                        f"(fused={self.fp8_gate_up_fused})"
                     )
         else:
             gate_shape = self.gate_list[0].shape
-            self.fp8_gate_w3d = torch.empty(
-                (E, *gate_shape), dtype=self.gate_list[0].dtype, device=self.device)
-            for i in range(E):
-                self.fp8_gate_w3d[i].copy_(self.gate_list[i])
-                view = self.fp8_gate_w3d[i]
-                wrapper = self.experts[start + i]
-                wrapper.cached_gate = view
-                if hasattr(wrapper.module, 'fp8_gate'):
-                    wrapper.module.fp8_gate = view
-                self.gate_list[i] = view
+            if self.fp8_gate_up_fused:
+                # One [E, 2N, K] block: gate occupies rows [0, N) of each
+                # expert, up occupies [N, 2N). Each half is a row-major
+                # [N, K] view, so every expert's two halves are individually
+                # contiguous and their data_ptr()s are what the pointer-form
+                # CuTe kernels and the masked GEMM both consume. Peak is
+                # unchanged against the two separate stacks: the fused block is
+                # their combined size and the per-expert sources are released
+                # by the same one-at-a-time copy + rebind below.
+                self.fp8_gate_up_w3d = torch.empty(
+                    (E, 2 * N, K),
+                    dtype=self.gate_list[0].dtype,
+                    device=self.device,
+                )
+                self.fp8_gate_w3d = None
+                self.fp8_up_w3d = None
+                for i in range(E):
+                    view = self.fp8_gate_up_w3d[i, :N, :]
+                    view.copy_(self.gate_list[i])
+                    wrapper = self.experts[start + i]
+                    wrapper.cached_gate = view
+                    if hasattr(wrapper.module, 'fp8_gate'):
+                        wrapper.module.fp8_gate = view
+                    self.gate_list[i] = view
+                for i in range(E):
+                    view = self.fp8_gate_up_w3d[i, N:, :]
+                    view.copy_(self.up_list[i])
+                    wrapper = self.experts[start + i]
+                    wrapper.cached_up = view
+                    if hasattr(wrapper.module, 'fp8_up'):
+                        wrapper.module.fp8_up = view
+                    self.up_list[i] = view
+            else:
+                self.fp8_gate_up_w3d = None
+                self.fp8_gate_w3d = torch.empty(
+                    (E, *gate_shape), dtype=self.gate_list[0].dtype, device=self.device)
+                for i in range(E):
+                    self.fp8_gate_w3d[i].copy_(self.gate_list[i])
+                    view = self.fp8_gate_w3d[i]
+                    wrapper = self.experts[start + i]
+                    wrapper.cached_gate = view
+                    if hasattr(wrapper.module, 'fp8_gate'):
+                        wrapper.module.fp8_gate = view
+                    self.gate_list[i] = view
 
-            up_shape = self.up_list[0].shape
-            self.fp8_up_w3d = torch.empty(
-                (E, *up_shape), dtype=self.up_list[0].dtype, device=self.device)
-            for i in range(E):
-                self.fp8_up_w3d[i].copy_(self.up_list[i])
-                view = self.fp8_up_w3d[i]
-                wrapper = self.experts[start + i]
-                wrapper.cached_up = view
-                if hasattr(wrapper.module, 'fp8_up'):
-                    wrapper.module.fp8_up = view
-                self.up_list[i] = view
+                up_shape = self.up_list[0].shape
+                self.fp8_up_w3d = torch.empty(
+                    (E, *up_shape), dtype=self.up_list[0].dtype, device=self.device)
+                for i in range(E):
+                    self.fp8_up_w3d[i].copy_(self.up_list[i])
+                    view = self.fp8_up_w3d[i]
+                    wrapper = self.experts[start + i]
+                    wrapper.cached_up = view
+                    if hasattr(wrapper.module, 'fp8_up'):
+                        wrapper.module.fp8_up = view
+                    self.up_list[i] = view
 
             down_shape = self.down_list[0].shape
             self.fp8_down_w3d = torch.empty(
@@ -1894,17 +1979,33 @@ class Glm5MoE(nn.Module):
             [r.data_ptr() for r in self.down_list],
             dtype=torch.int64, device=self.device)
 
-        self.fp8_gate_ws3d = torch.zeros(
-            E, n_blocks, k_blocks_pad4,
-            dtype=torch.float32, device=self.device)
-        for i, s in enumerate(self.gate_scale_list):
-            self.fp8_gate_ws3d[i, :, :k_blocks] = s
+        if self.fp8_gate_up_fused:
+            # Scales fuse on the same axis as the weights: gate's n_blocks rows
+            # then up's. k_blocks_pad4 == k_blocks is guaranteed above, so this
+            # stack is also the exact [E, 2N // 128, K // 128] extent the masked
+            # GEMM requires of its B-scales.
+            self.fp8_gate_up_ws3d = torch.zeros(
+                E, 2 * n_blocks, k_blocks_pad4,
+                dtype=torch.float32, device=self.device)
+            for i, s in enumerate(self.gate_scale_list):
+                self.fp8_gate_up_ws3d[i, :n_blocks, :k_blocks] = s
+            for i, s in enumerate(self.up_scale_list):
+                self.fp8_gate_up_ws3d[i, n_blocks:, :k_blocks] = s
+            self.fp8_gate_ws3d = None
+            self.fp8_up_ws3d = None
+        else:
+            self.fp8_gate_up_ws3d = None
+            self.fp8_gate_ws3d = torch.zeros(
+                E, n_blocks, k_blocks_pad4,
+                dtype=torch.float32, device=self.device)
+            for i, s in enumerate(self.gate_scale_list):
+                self.fp8_gate_ws3d[i, :, :k_blocks] = s
 
-        self.fp8_up_ws3d = torch.zeros(
-            E, n_blocks, k_blocks_pad4,
-            dtype=torch.float32, device=self.device)
-        for i, s in enumerate(self.up_scale_list):
-            self.fp8_up_ws3d[i, :, :k_blocks] = s
+            self.fp8_up_ws3d = torch.zeros(
+                E, n_blocks, k_blocks_pad4,
+                dtype=torch.float32, device=self.device)
+            for i, s in enumerate(self.up_scale_list):
+                self.fp8_up_ws3d[i, :, :k_blocks] = s
 
         self.fp8_down_ws3d = torch.zeros(
             E, k_blocks, n_blocks_pad4,
@@ -1912,14 +2013,65 @@ class Glm5MoE(nn.Module):
         for i, s in enumerate(self.down_scale_list):
             self.fp8_down_ws3d[i, :, :n_blocks] = s
 
+        if self.fp8_gate_up_fused:
+            # The pointer form of the ragged/prefill S1 reads each expert's
+            # gate and up halves by address, which is what makes it immune to
+            # the CuTe kernels' hardcoded N * K group stride. Build the four
+            # arrays and their prototypes here, once, from the fused stacks --
+            # never per step, and never from self.gate_scale_list, whose
+            # tensors are the pre-stack sources and are NOT the bytes the
+            # masked GEMM reads.
+            gate_rows = [self.fp8_gate_up_w3d[i, :N, :] for i in range(E)]
+            up_rows = [self.fp8_gate_up_w3d[i, N:, :] for i in range(E)]
+            gate_ws_rows = [self.fp8_gate_up_ws3d[i, :n_blocks, :] for i in range(E)]
+            up_ws_rows = [self.fp8_gate_up_ws3d[i, n_blocks:, :] for i in range(E)]
+            self.fused_gate_w_proto = gate_rows[0]
+            self.fused_up_w_proto = up_rows[0]
+            self.fused_gate_ws_proto = gate_ws_rows[0]
+            self.fused_up_ws_proto = up_ws_rows[0]
+            self.fused_gate_w_ptrs = torch.tensor(
+                [r.data_ptr() for r in gate_rows],
+                dtype=torch.int64, device=self.device)
+            self.fused_up_w_ptrs = torch.tensor(
+                [r.data_ptr() for r in up_rows],
+                dtype=torch.int64, device=self.device)
+            self.fused_gate_ws_ptrs = torch.tensor(
+                [r.data_ptr() for r in gate_ws_rows],
+                dtype=torch.int64, device=self.device)
+            self.fused_up_ws_ptrs = torch.tensor(
+                [r.data_ptr() for r in up_ws_rows],
+                dtype=torch.int64, device=self.device)
+        else:
+            self.fused_gate_w_proto = None
+            self.fused_up_w_proto = None
+            self.fused_gate_ws_proto = None
+            self.fused_up_ws_proto = None
+            self.fused_gate_w_ptrs = None
+            self.fused_up_w_ptrs = None
+            self.fused_gate_ws_ptrs = None
+            self.fused_up_ws_ptrs = None
+
         self._fp8_blockwise_ready = True
 
         if not getattr(Glm5MoE, '_warned_weights_stacked', False):
+            # Layout-aware: under the fused layout the per-projection stacks are
+            # deliberately None, so this summary must read the stack that
+            # actually exists. Reporting the layout as well, because "which
+            # layout did this process load" is the first thing anyone debugging
+            # the DeepEP decode path needs from the log.
+            if self.fp8_gate_up_fused:
+                layout = "fused gate/up [E, 2I, H]"
+                gate_shape = list(self.fp8_gate_up_w3d.shape)
+                gate_scale_shape = list(self.fp8_gate_up_ws3d.shape)
+            else:
+                layout = "per-projection [E, I, H]"
+                gate_shape = list(self.fp8_gate_w3d.shape)
+                gate_scale_shape = list(self.fp8_gate_ws3d.shape)
             logging.info(
-                f"[Glm5MoE] FP8 blockwise 3D weights ready: "
-                f"gate={list(self.fp8_gate_w3d.shape)}, "
+                f"[Glm5MoE] FP8 blockwise 3D weights ready ({layout}): "
+                f"gate={gate_shape}, "
                 f"down={list(self.fp8_down_w3d.shape)}, "
-                f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
+                f"gate_scale={gate_scale_shape}"
             )
             Glm5MoE._warned_weights_stacked = True
 
@@ -2368,15 +2520,32 @@ class Glm5MoE(nn.Module):
         _glm5_act_quant_ragged(
             buf.dispatched_x, seqlens, cu_seqlens, buf.x_fp8, buf.x_scale)
 
-        # S1: gate + up + SiLU → BF16 intermediate
-        grouped_fp8_blockwise_fused_s1(
-            buf.x_fp8.view(torch.float8_e4m3fn), buf.x_scale,
-            self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-            self.fp8_up_w3d.view(torch.float8_e4m3fn),
-            self.fp8_gate_ws3d, self.fp8_up_ws3d,
-            seqlens, cu_seqlens, avg,
-            output=buf.intermediate,
-        )
+        # S1: gate + up + SiLU → BF16 intermediate.
+        # Under the fused [E, 2N, K] layout the contiguous kernel cannot be
+        # used: it derives each expert's weight address from a hardcoded N * K
+        # group stride and would read every expert past the first at half the
+        # correct offset. The pointer form takes the addresses explicitly.
+        if self.fp8_gate_up_fused:
+            grouped_fp8_blockwise_fused_s1_ptrs(
+                buf.x_fp8.view(torch.float8_e4m3fn), buf.x_scale,
+                self.fused_gate_w_proto.view(torch.float8_e4m3fn),
+                self.fused_gate_w_ptrs,
+                self.fused_up_w_proto.view(torch.float8_e4m3fn),
+                self.fused_up_w_ptrs,
+                self.fused_gate_ws_proto, self.fused_gate_ws_ptrs,
+                self.fused_up_ws_proto, self.fused_up_ws_ptrs,
+                seqlens, cu_seqlens, avg,
+                output=buf.intermediate,
+            )
+        else:
+            grouped_fp8_blockwise_fused_s1(
+                buf.x_fp8.view(torch.float8_e4m3fn), buf.x_scale,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+                output=buf.intermediate,
+            )
         _glm5_act_quant_ragged(
             buf.intermediate, seqlens, cu_seqlens, buf.inter_fp8, buf.inter_scale)
 
