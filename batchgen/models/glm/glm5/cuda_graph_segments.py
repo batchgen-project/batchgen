@@ -56,8 +56,11 @@ from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 from batchgen_kernels.attention.dsa.fp8_absorb import (
     FP8AbsorbWeights,
-    fp8_out_absorb_out,
-    fp8_q_absorb_out,
+)
+from batchgen_kernels.attention.dsa.bf16_absorb import (
+    BF16AbsorbWeights,
+    absorb_out_out,
+    absorb_q_out,
 )
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
     cuda_wk_proj_gemm_only_out,
@@ -483,7 +486,7 @@ class Glm5DsaAttnSegment:
         primary_page_table: torch.Tensor,
         aux_page_table: torch.Tensor,
         wq_b_weights: FP8WqbWeightsCUDA,
-        absorb_weights: FP8AbsorbWeights,
+        absorb_weights: BF16AbsorbWeights | FP8AbsorbWeights,
         cuda_module,
         cos_table: torch.Tensor,
         sin_table: torch.Tensor,
@@ -942,7 +945,7 @@ class Glm5DsaAttnSegment:
             return_indices=False,
             primary_slot_indices=primary_slot_indices,
         )
-        fp8_q_absorb_out(q_nope, self.absorb_weights, buffers.absorbed_q)
+        absorb_q_out(q_nope, self.absorb_weights, buffers.absorbed_q)
         pack_flashmla_query_out(buffers.absorbed_q, q_rope, buffers.query_states)
         attn_out = run_prepared_sparse_flash_mla_decode(
             buffers.prepared_flashmla,
@@ -950,7 +953,7 @@ class Glm5DsaAttnSegment:
             num_splits=flashmla_num_splits,
         )
         attn_heads = self._attn_head_outputs.get(batch_size, buffers.attn_heads)
-        fp8_out_absorb_out(attn_out, self.absorb_weights, attn_heads)
+        absorb_out_out(attn_out, self.absorb_weights, attn_heads)
 
         return {
             "attn_heads": attn_heads,
@@ -990,7 +993,7 @@ class Glm5FullDsaAttnSegment:
         primary_page_table: torch.Tensor,
         aux_page_table: torch.Tensor,
         wq_b_weights: FP8WqbWeightsCUDA,
-        absorb_weights: FP8AbsorbWeights,
+        absorb_weights: BF16AbsorbWeights | FP8AbsorbWeights,
         cuda_module,
         cos_table: torch.Tensor,
         sin_table: torch.Tensor,
@@ -2037,7 +2040,7 @@ class Glm5FullDsaAttnSegment:
                 paged_mqa_prep_ready=paged_mqa_prep_ready,
             )
 
-        fp8_q_absorb_out(
+        absorb_q_out(
             q_nope_strided,
             self.absorb_weights,
             buffers.absorbed_q,
@@ -2057,7 +2060,7 @@ class Glm5FullDsaAttnSegment:
                 num_valid_tokens=num_valid_tokens,
             )
             attn_out = self._run_selected_fa3(buffers)
-        fp8_out_absorb_out(
+        absorb_out_out(
             attn_out,
             self.absorb_weights,
             buffers.attn_heads,

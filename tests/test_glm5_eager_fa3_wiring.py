@@ -270,7 +270,7 @@ def test_eager_fa3_shape_matches_the_whole_model_graph_segment() -> None:
 def test_q_absorb_feeds_fa3_qv_directly() -> None:
     fn = _function(_selector(), "_absorb_q_nope")
     src = ast.unparse(fn)
-    assert "fp8_q_absorb" in src
+    assert "absorb_q" in src
     assert "_fp8_absorb_weights is None" in src
     assert "RuntimeError" in src
     # The builder absorbs once, under the q_absorb timer, and hands the result
@@ -412,7 +412,7 @@ def test_eager_consumer_keeps_absorb_and_debug_contract() -> None:
     fn = _eager_consumer()
     called = _called_names(fn)
     # out-absorb / o_proj stages unchanged.
-    assert "fp8_out_absorb" in called
+    assert "absorb_out" in called
     assert "w8a8_deepgemm" in called
     assert "act_quant" in called
     assert _calls_to(fn, "build_glm5_dsa_flashmla_inputs")

@@ -36,13 +36,16 @@ from typing import Dict, Optional
 
 import torch
 
+from batchgen_kernels.attention.dsa.bf16_absorb import (
+    BF16AbsorbWeights,
+    absorb_out_out,
+    absorb_q_out,
+)
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
     _fa3_with_kvcache,
-    fp8_q_absorb_out,
-    fp8_out_absorb_out,
     run_paged_kv_token_update_fused,
     transform_selected_positions_out,
     w8a8_deepgemm,
@@ -589,7 +592,15 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             num_valid_tokens=num_valid_tokens,
         )
 
-        fp8_q_absorb_out(
+        # num_valid_tokens is forwarded but the BF16 container IGNORES it:
+        # the Triton kernel's mask existed only so a Triton program never took
+        # a dynamic early return inside a captured graph, and a bmm has no such
+        # branch. Safe here because every consumer between this point and
+        # act_quant is row-local (see the invariant note above), act_quant
+        # never loads rows >= num_valid_tokens, and the one load-bearing mask
+        # on `attn_output` below is independent of the absorb. Full argument in
+        # BF16AbsorbWeights' docstring.
+        absorb_q_out(
             q_nope_strided, self.absorb_weights, buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
@@ -622,7 +633,10 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                     num_valid_tokens=num_valid_tokens,
                 )
             attn_out = self._run_selected_fa3(buffers)
-        fp8_out_absorb_out(
+        # Same as the q absorb above: forwarded, ignored by the BF16 path.
+        # `attn_heads`' invalid rows are never read -- act_quant below returns
+        # early for them without loading.
+        absorb_out_out(
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
         )
