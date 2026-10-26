@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - resolved by the node's FA3 install
 
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.dsa.fa3_split_policy import GLM5_SPARSE_FA3_NUM_SPLITS
+from batchgen.models.glm.glm5.qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
 )
@@ -179,6 +180,14 @@ class _Glm5FullDsaSegmentBuffers:
     # each bucket derives its own; ``None`` until the prologue runs, and it
     # stays ``None`` for a bucket whose segments never score.
     aux_schedule_meta: object = None
+    # Merged [q_b | wq_b] GEMM output, [batch, q_b_cols + wq_b_cols] bf16 and
+    # contiguous, allocated only for a buffer set built for the merged version
+    # (GLM5_QB_WQB_MERGE on, scoring graph). ``q_flat`` and ``q_flat_indexer``
+    # are then its two column slices -- row stride = the merged width -- and
+    # the private wq_b activation scratch (``q_x_fp8`` / ``q_x_scale`` /
+    # ``q_tma_desc``) is a 1-element placeholder nothing reads. ``None`` keeps
+    # the separate version's buffer set exactly as it was.
+    q_flat_merged: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -255,6 +264,10 @@ _GLM5_DSA_VIEW_FIELDS = frozenset({
     "absorbed_q",
     "attn_heads",
 })
+# Leading-dim views like the set above, but present only in one version's
+# buffer set (``None`` in the other), so a smaller bucket views the base's
+# tensor when there is one and keeps ``None`` otherwise.
+_GLM5_DSA_OPTIONAL_VIEW_FIELDS = frozenset({"q_flat_merged"})
 
 # Fail loudly at import time if the dataclass gains a field this split does
 # not name: an unclassified field would silently become a stale full-size
@@ -265,6 +278,7 @@ _split_delta = (
         _GLM5_DSA_VIEW_FIELDS
         | _GLM5_DSA_REBUILT_FIELDS
         | _GLM5_DSA_PER_STEP_FIELDS
+        | _GLM5_DSA_OPTIONAL_VIEW_FIELDS
     )
 )
 if _split_delta:
@@ -467,6 +481,46 @@ def _make_scorer_buffers(
         ),
         torch.empty(bucket_size, PAGED_MQA_NEXT_N, dtype=torch.int32, device=device),
     )
+
+
+def _merged_wq_b_scratch_placeholders(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(q_x_fp8, q_x_scale, q_tma_desc)`` for a merged-[q_b | wq_b] buffer set.
+
+    The separate version's private wq_b activation scratch (per-row quantize
+    output plus its TMA descriptor) has no reader once wq_b runs inside the
+    merged DeepGEMM, so these are 1-element placeholders -- the reuse
+    segment's convention -- not static buffers nothing writes. They are
+    ``_GLM5_DSA_REBUILT_FIELDS`` members, which are never row-sliced.
+    """
+
+    return (
+        torch.ones(1, dtype=torch.bfloat16, device=device),
+        torch.ones(1, dtype=torch.bfloat16, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+    )
+
+
+def _check_q_b_wq_b_layout(segment, buffers) -> None:
+    """Fail loud if a buffer set was built for the other q_b/wq_b version.
+
+    Every indexer layer of one capture shares ONE buffer set per bucket, so a
+    segment whose version disagrees with the set's layout (``q_flat_merged``
+    present iff merged) would GEMM into a buffer of the wrong width -- or, for
+    the plain q_b GEMM, into a strided column slice the masked DeepGEMM
+    rejects.
+    """
+
+    has_merged = buffers.q_flat_merged is not None
+    if has_merged != bool(segment._q_b_wq_b_merged):
+        raise RuntimeError(
+            f"Layer {segment.layer_idx}: this segment runs the "
+            f"{'merged' if segment._q_b_wq_b_merged else 'separate'} "
+            "[q_b | wq_b] version, but its shared buffer set was built for the "
+            f"{'merged' if has_merged else 'separate'} one; every indexer layer "
+            "sharing a buffer set must agree on GLM5_QB_WQB_MERGE and all_short"
+        )
 
 
 class Glm5DsaAttnSegment:
@@ -1060,6 +1114,12 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("aux_blocked_k page size does not match aux_page_size")
         if self.primary_blocked_k.shape[3] != self.attn.kv_lora_rank + self.attn.qk_rope_head_dim:
             raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
+        if getattr(self.attn, "indexer", None) is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: Glm5FullDsaAttnSegment is the "
+                "indexer-layer segment and needs attn.indexer; a layer without "
+                "one (GLM-5.2 skip_topk) takes Glm5ReuseTopkAttnSegment"
+            )
         # Accepts both aux formats and names a mis-sized cache: bf16 AoS keeps
         # `index_head_dim` elements per token, page-split FP8 keeps
         # `index_head_dim + 4` BYTES (the fp32 per-token scale included).
@@ -1093,6 +1153,48 @@ class Glm5FullDsaAttnSegment:
             if device.type == "cuda"
             else _InlineIndexerKPath()
         )
+        # Which version computes this layer's q_b and indexer wq_b projections,
+        # decided ONCE here -- before warmup and capture -- and then fixed for
+        # the life of this capture: the graph records whichever kernels this
+        # forward issues, so the choice cannot be a per-step decision. See
+        # qb_wqb_merge_policy.py.
+        #
+        # Per-layer choice: this class IS the indexer-layer segment (the
+        # worker builds it only for layers whose attention has an indexer;
+        # skip_topk layers get Glm5ReuseTopkAttnSegment, which never calls
+        # this __init__ and keeps the plain q_b GEMM), so the merge applies to
+        # exactly the layers that have a wq_b.
+        #
+        # ``_q_b_wq_b_merged`` is what ``forward`` and the buffer layout read.
+        # An ``all_short`` graph never runs wq_b at all, so it keeps the plain
+        # q_b GEMM (over the merged operand's q_b slice, which is the same
+        # bytes) rather than computing wq_b rows nothing reads.
+        self._q_b_wq_b_merge_selected = glm5_qb_wqb_merge_enabled()
+        self._q_b_wq_b_merged = self._q_b_wq_b_merge_selected and not self.all_short
+        self._q_b_wq_b_weight = None
+        self._q_b_wq_b_scale = None
+        if self._q_b_wq_b_merge_selected:
+            weight = getattr(self.wrapper, "_fp8_q_b_wq_b_proj", None)
+            scale = getattr(self.wrapper, "_fp8_q_b_wq_b_scale", None)
+            if weight is None or scale is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx}: GLM5_QB_WQB_MERGE selects the "
+                    "merged [q_b | wq_b] GEMM, but the wrapper has no "
+                    "_fp8_q_b_wq_b_proj/_fp8_q_b_wq_b_scale "
+                    "(initialize_fused_kernels did not run on a registered "
+                    "persistent wrapper, or ran with the switch off)"
+                )
+            indexer = self.attn.indexer
+            q_b_cols = self.attn.num_heads * self.attn.q_head_dim
+            wq_b_cols = indexer.index_n_heads * indexer.index_head_dim
+            if int(weight.shape[0]) != q_b_cols + wq_b_cols:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx}: merged [q_b | wq_b] operand has "
+                    f"{int(weight.shape[0])} rows, expected q_b {q_b_cols} + "
+                    f"wq_b {wq_b_cols} = {q_b_cols + wq_b_cols}"
+                )
+            self._q_b_wq_b_weight = weight
+            self._q_b_wq_b_scale = scale
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
@@ -1343,12 +1445,29 @@ class Glm5FullDsaAttnSegment:
             self.cuda_module,
             device=device,
         )
-        q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
-            bucket_size,
-            attn.q_lora_rank,
-            self.cuda_module,
-            device=device,
-        )
+        q_b_cols = attn.num_heads * attn.q_head_dim
+        if self._q_b_wq_b_merged:
+            # ONE output for the merged GEMM; both consumers read a column
+            # slice of it (row stride = the merged width), taken below where
+            # the separate version allocates its two buffers. The private wq_b
+            # activation scratch has no reader on this version, so it is a
+            # 1-element placeholder rather than a static buffer nothing
+            # writes.
+            q_flat_merged = torch.empty(
+                bucket_size,
+                q_b_cols + indexer.index_n_heads * index_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            q_x_fp8, q_x_scale, q_tma_desc = _merged_wq_b_scratch_placeholders(device)
+        else:
+            q_flat_merged = None
+            q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
+                bucket_size,
+                attn.q_lora_rank,
+                self.cuda_module,
+                device=device,
+            )
 
         selected_token_ids = torch.empty(
             bucket_size,
@@ -1403,11 +1522,15 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            q_flat=torch.empty(
-                bucket_size,
-                attn.num_heads * attn.q_head_dim,
-                dtype=torch.bfloat16,
-                device=device,
+            q_flat=(
+                torch.empty(
+                    bucket_size,
+                    attn.num_heads * attn.q_head_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                if q_flat_merged is None
+                else q_flat_merged[:, :q_b_cols]
             ),
             q_rope_4d=torch.empty(
                 bucket_size,
@@ -1427,11 +1550,15 @@ class Glm5FullDsaAttnSegment:
             q_x_fp8=q_x_fp8,
             q_x_scale=q_x_scale,
             q_tma_desc=q_tma_desc,
-            q_flat_indexer=torch.empty(
-                bucket_size,
-                indexer.index_n_heads * index_dim,
-                dtype=torch.bfloat16,
-                device=device,
+            q_flat_indexer=(
+                torch.empty(
+                    bucket_size,
+                    indexer.index_n_heads * index_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                if q_flat_merged is None
+                else q_flat_merged[:, q_b_cols:]
             ),
             q_index=torch.empty(
                 bucket_size,
@@ -1465,6 +1592,7 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
+            q_flat_merged=q_flat_merged,
         )
         self._setup_static_output_buffers(bucket_size)
 
@@ -1475,9 +1603,20 @@ class Glm5FullDsaAttnSegment:
         base_bucket = self._base_bucket()
         base = self._buffers[base_bucket]
         attn = self.attn
+        _check_q_b_wq_b_layout(self, base)
         view_kwargs = {
             name: getattr(base, name)[:bucket_size] for name in _GLM5_DSA_VIEW_FIELDS
         }
+        view_kwargs.update(
+            {
+                name: (
+                    None
+                    if getattr(base, name) is None
+                    else getattr(base, name)[:bucket_size]
+                )
+                for name in _GLM5_DSA_OPTIONAL_VIEW_FIELDS
+            }
+        )
         # FP8 activation scratch TMA descriptors bake pointer + global rows:
         # re-encode per bucket (the scratch itself is tiny).
         indexer_k_x_fp8, indexer_k_x_scale, indexer_k_tma_desc = make_fp8_activation_scratch(
@@ -1486,12 +1625,17 @@ class Glm5FullDsaAttnSegment:
             self.cuda_module,
             device=self.primary_blocked_k.device,
         )
-        q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
-            bucket_size,
-            attn.q_lora_rank,
-            self.cuda_module,
-            device=self.primary_blocked_k.device,
-        )
+        if base.q_flat_merged is not None:
+            # Merged version: the wq_b scratch is the base's placeholder, which
+            # nothing reads, so there is nothing to re-encode.
+            q_x_fp8, q_x_scale, q_tma_desc = base.q_x_fp8, base.q_x_scale, base.q_tma_desc
+        else:
+            q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
+                bucket_size,
+                attn.q_lora_rank,
+                self.cuda_module,
+                device=self.primary_blocked_k.device,
+            )
         return _Glm5FullDsaSegmentBuffers(
             indexer_k_x_fp8=indexer_k_x_fp8,
             indexer_k_x_scale=indexer_k_x_scale,
@@ -1974,6 +2118,8 @@ class Glm5FullDsaAttnSegment:
         if outputs is None:
             self._setup_static_output_buffers(batch_size)
             outputs = self._outputs[batch_size]
+        # Host-side only (runs during warmup/capture, never in a replay).
+        _check_q_b_wq_b_layout(self, buffers)
 
         # Layer-invariant, so the whole-model driver already ran them once for
         # this step and for this shared buffer set (see compute_row_validity
@@ -2118,17 +2264,37 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
             scale_tma_aligned=num_valid_tokens is not None,
         )
+        # The q_b projection, in one of its two versions (selected once in
+        # __init__), over the layer's ONE blocked quantize of ``q_a_normed``:
+        #   merged:   one DeepGEMM over the load-time concatenated
+        #             [q_b | wq_b] operand into ``q_flat_merged``, whose two
+        #             column slices are ``q_flat`` and ``q_flat_indexer``. Both
+        #             members start on a 128-row boundary, so each slice is
+        #             bitwise what that member's own DeepGEMM would write; the
+        #             indexer's private per-row quantize and its custom WGMMA
+        #             GEMM below are not issued at all.
+        #   separate: the original call, byte for byte, into ``q_flat``.
+        if self._q_b_wq_b_merged:
+            q_b_weight = self._q_b_wq_b_weight
+            q_b_scale = self._q_b_wq_b_scale
+            q_b_out = buffers.q_flat_merged
+        else:
+            q_b_weight = attn.q_b_proj.weight
+            q_b_scale = self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"]
+            q_b_out = buffers.q_flat
         w8a8_deepgemm(
             q_a_fp8,
             q_a_scale,
-            attn.q_b_proj.weight,
-            self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
-            out=buffers.q_flat,
+            q_b_weight,
+            q_b_scale,
+            out=q_b_out,
             num_valid_tokens=num_valid_tokens,
             expected_m=batch_size,
         )
         # The NoPE/RoPE split is FOLDED INTO THE CONSUMERS. `q_flat` is the
-        # q_b_proj output, [batch, num_heads * q_head_dim] and contiguous, so
+        # q_b_proj output, [batch, num_heads * q_head_dim] with a unit-stride
+        # last axis (contiguous on the separate version, a column slice of
+        # `q_flat_merged` on the merged one), so
         # each head's NoPE and RoPE slice is already addressable with a plain
         # (row, head) stride pair and a unit-stride innermost axis. Both
         # consumers now read it that way, so the two strided gathers that used
@@ -2144,7 +2310,15 @@ class Glm5FullDsaAttnSegment:
         #           in that buffer are unchanged, only the gather is gone.
         # `q_nope` is no longer a buffer at all: a static tensor nothing writes
         # is exactly how a removed copy creeps back in.
-        q_heads = buffers.q_flat.view(batch_size, attn.num_heads, attn.q_head_dim)
+        # `.unflatten` states the one legal operation on the merged version's
+        # `q_flat` -- a column slice of a wider buffer -- splitting ONLY the
+        # unit-stride last axis, which yields strides (row_stride,
+        # q_head_dim, 1) and the identical view on the contiguous separate
+        # version. (`.view(batch, H, D)` happens to produce the same tensor,
+        # since it leaves the batch axis alone; what a slice can NOT do is
+        # flatten batch and heads together -- that `reshape` copies.) Both
+        # consumers below already take the row stride from the tensor.
+        q_heads = buffers.q_flat.unflatten(-1, (attn.num_heads, attn.q_head_dim))
         q_nope_strided = q_heads[..., : attn.qk_nope_head_dim]
         q_rope_strided = q_heads[..., attn.qk_nope_head_dim :].unsqueeze(2)
 
@@ -2185,24 +2359,40 @@ class Glm5FullDsaAttnSegment:
             # ``positions_expanded`` is step-level and already written (see
             # compute_step_statics); the broadcast used to be re-launched here
             # by every indexer layer from the same ``position_ids``.
-            cuda_wq_b_proj_out(
-                q_a_normed,
-                self.wq_b_weights,
-                self.cuda_module,
-                buffers.q_x_fp8,
-                buffers.q_x_scale,
-                buffers.q_tma_desc,
-                buffers.q_flat_indexer,
-                num_valid_tokens=num_valid_tokens,
-            )
+            if self._q_b_wq_b_merged:
+                # wq_b already ran inside the merged q_b GEMM above. Its output
+                # is the trailing column slice of ``q_flat_merged``; the RoPE
+                # epilogue reads it in place with the merged row stride, so no
+                # gather (and no hidden ``reshape`` copy) is issued here.
+                q_index_src = buffers.q_flat_indexer.unflatten(
+                    -1, (indexer.index_n_heads, indexer.index_head_dim)
+                )
+                q_index_row_stride = q_index_src.stride(0)
+            else:
+                cuda_wq_b_proj_out(
+                    q_a_normed,
+                    self.wq_b_weights,
+                    self.cuda_module,
+                    buffers.q_x_fp8,
+                    buffers.q_x_scale,
+                    buffers.q_tma_desc,
+                    buffers.q_flat_indexer,
+                    num_valid_tokens=num_valid_tokens,
+                )
+                q_index_src = buffers.q_flat_indexer.view(
+                    batch_size, indexer.index_n_heads, indexer.index_head_dim
+                )
+                # None = the original contiguous entry point, unchanged.
+                q_index_row_stride = None
             rope_hadamard_q_out(
-                buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),
+                q_index_src,
                 self.cos_table,
                 self.sin_table,
                 buffers.positions_expanded.view(-1),
                 buffers.q_index,
                 out_fp8=buffers.q_index_fp8 if self.aux_is_page_split else None,
                 apply_hadamard=self.aux_applies_hadamard,
+                q_row_stride=q_index_row_stride,
             )
             # JOIN (scoring graphs). The scorer is the first main-stream
             # reader of the K path's writes: it scores the aux cache, whose

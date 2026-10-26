@@ -102,6 +102,10 @@ _GLM5_REUSE_PLACEHOLDER_FIELDS = frozenset({
     "aux_block_table",
     "aux_context_lens",
     "aux_deep_gemm_context_lens",
+    # The merged [q_b | wq_b] output exists only on indexer layers (a skip
+    # layer has no wq_b and keeps its plain q_b GEMM into its own contiguous
+    # ``q_flat``), so it stays at its ``None`` default here and passes through.
+    "q_flat_merged",
 })
 # Rebuilt per bucket: top_k_indices is borrowed from the producing full
 # segment's buffer set FOR THIS BUCKET, never sliced from our own base.

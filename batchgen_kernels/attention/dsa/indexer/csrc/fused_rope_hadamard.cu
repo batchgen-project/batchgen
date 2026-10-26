@@ -177,3 +177,85 @@ void fused_rope_hadamard_launch(FusedRopeHadamardParams &params,
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// ---------------------------------------------------------------------------
+// Strided-input version (kernel version management: the contiguous kernel and
+// launch above are unchanged and stay the entry point for every existing
+// caller).
+//
+// The merged [q_b | wq_b] decode GEMM writes the indexer q as the trailing
+// column slice of a wider [rows, q_b_cols + heads * 128] buffer, i.e. a
+// [rows, heads, 128] tensor with strides (x_row_stride, 128, 1). That layout
+// is not expressible as one flat [rows * heads, 128] row pitch, so the
+// contiguous kernel's caller would have to reshape -- which silently
+// allocates and copies. This version reads the source in place: flat row
+// ``r`` of the launch is head ``r % heads`` of source row ``r / heads``.
+// Everything after the load -- RoPE, the optional rotation, the bf16 store
+// and the saturating e4m3 epilogue -- is the same code as above, and the
+// outputs stay contiguous [rows * heads, 128].
+// ---------------------------------------------------------------------------
+template <bool kApplyHadamard>
+__global__ __launch_bounds__(16)
+void fused_rope_hadamard_strided_kernel(FusedRopeHadamardParams params,
+                                        int64_t x_row_stride,
+                                        int x_heads_per_row) {
+    constexpr int kNElts = 8;
+    constexpr int kNChunks = 1;
+    constexpr int kLogNElts = 3;   // log2(8)
+    constexpr int kWarpSize = 16;
+    constexpr int kLogWarpSize = 4; // log2(16)
+    using input_t = at::BFloat16;
+
+    const int batch_id = blockIdx.x;
+    const int64_t x_row = batch_id / x_heads_per_row;
+    const int64_t x_head = batch_id - x_row * x_heads_per_row;
+    input_t *x = reinterpret_cast<input_t *>(params.x_ptr)
+        + x_row * x_row_stride + x_head * 128;
+    input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * 128;
+    uint8_t *out_fp8 = params.out_fp8_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<uint8_t *>(params.out_fp8_ptr) + batch_id * 128;
+    const int tid = threadIdx.x;
+
+    float x_vals[kNChunks][kNElts];
+    load_input<kNChunks, kNElts, input_t>(x, x_vals, 128);
+
+    if (tid < 8) {
+        int64_t pos = params.pos_ptr[batch_id];
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            int cos_idx = tid * 4 + p;
+            float c = params.cos_ptr[pos * params.cos_stride + cos_idx];
+            float s = params.sin_ptr[pos * params.cos_stride + cos_idx];
+            float v0 = x_vals[0][2 * p];
+            float v1 = x_vals[0][2 * p + 1];
+            x_vals[0][2 * p]     = v0 * c - v1 * s;
+            x_vals[0][2 * p + 1] = v1 * c + v0 * s;
+        }
+    }
+
+    float store_scale = 1.0f;
+    if constexpr (kApplyHadamard) {
+        hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
+        hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+        store_scale = params.scale;
+    }
+
+    store_output_bf16_and_e4m3<kNChunks, kNElts>(out, out_fp8, x_vals, 128, store_scale);
+}
+
+void fused_rope_hadamard_strided_launch(FusedRopeHadamardParams &params,
+                                        int64_t x_row_stride,
+                                        int x_heads_per_row,
+                                        bool apply_hadamard,
+                                        cudaStream_t stream) {
+    dim3 grid(params.batch);
+    if (apply_hadamard) {
+        fused_rope_hadamard_strided_kernel<true><<<grid, 16, 0, stream>>>(
+            params, x_row_stride, x_heads_per_row);
+    } else {
+        fused_rope_hadamard_strided_kernel<false><<<grid, 16, 0, stream>>>(
+            params, x_row_stride, x_heads_per_row);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

@@ -41,7 +41,14 @@ from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
 from batchgen_kernels.attention.dsa.indexer import (
     fused_rope_hadamard as _cuda_fused_rope_hadamard,
     fused_rope_hadamard_out as _cuda_fused_rope_hadamard_out,
+    fused_rope_hadamard_strided_out as _cuda_fused_rope_hadamard_strided_out,
 )
+
+
+class RopeHadamardStridedInputError(ValueError):
+    """``rope_hadamard_q_out`` was handed a q layout its entry point cannot read
+    in place (a non-contiguous q on the contiguous entry point, or a strided q
+    that disagrees with its declared ``q_row_stride``)."""
 
 
 # ============================================================
@@ -860,11 +867,21 @@ def rope_hadamard_q_out(
     out: torch.Tensor,
     out_fp8: "torch.Tensor | None" = None,
     apply_hadamard: bool = True,
+    q_row_stride: "int | None" = None,
 ) -> torch.Tensor:
     """Out-buffer CUDA RoPE + optional Hadamard for graph capture.
 
     ``positions_expanded`` must already have shape ``[B * n_heads]`` to avoid
     allocating inside the captured segment.
+
+    ``q_row_stride`` selects the entry point. ``None`` (the default, every
+    pre-existing caller) is the original contiguous kernel and requires a
+    contiguous ``q``: a ``reshape`` of a strided q would silently allocate and
+    copy inside the captured graph, so that is refused by name instead. An
+    int declares ``q`` as ``[B, n_heads, head_dim]`` with strides
+    ``(q_row_stride, head_dim, 1)`` -- e.g. the wq_b column slice of the
+    merged ``[q_b | wq_b]`` GEMM output -- and the strided kernel reads it in
+    place; ``out`` / ``out_fp8`` stay contiguous either way.
 
     ``out_fp8``, when given, receives the saturating e4m3 copy of ``out`` from
     the same kernel epilogue. The scorer reads q as plain e4m3 with no scale
@@ -900,6 +917,34 @@ def rope_hadamard_q_out(
             )
         if not out_fp8.is_contiguous():
             raise ValueError("out_fp8 must be contiguous")
+    if q_row_stride is not None:
+        expected_strides = (int(q_row_stride), head_dim, 1)
+        if tuple(q.stride()) != expected_strides:
+            raise RopeHadamardStridedInputError(
+                f"q_row_stride={q_row_stride} declares q strides "
+                f"{expected_strides}, got {tuple(q.stride())}"
+            )
+        if not out.is_contiguous():
+            raise RopeHadamardStridedInputError(
+                "out must be contiguous for the strided RoPE+Hadamard entry point"
+            )
+        return _cuda_fused_rope_hadamard_strided_out(
+            q,
+            cos_table,
+            sin_table,
+            positions_expanded,
+            out,
+            int(q_row_stride),
+            128 ** -0.5,
+            out_fp8,
+            apply_hadamard,
+        )
+    if not q.is_contiguous():
+        raise RopeHadamardStridedInputError(
+            f"q with strides {tuple(q.stride())} is not contiguous; reshaping it "
+            "would copy it inside the captured graph. Pass q_row_stride to read "
+            "it in place"
+        )
     return _cuda_fused_rope_hadamard_out(
         q.reshape(B * n_heads, head_dim),
         cos_table,
@@ -948,6 +993,7 @@ def fused_score_pipeline(
     head_dim=128,
     rope_dim=64,
     topk=2048,
+    q_index_raw=None,       # optional [B, 32, 128] precomputed wq_b output
 ):
     """Full fused scoring pipeline — zero CPU-GPU sync in hot path.
 
@@ -955,12 +1001,24 @@ def fused_score_pipeline(
     Step 2-3: RoPE + Hadamard on Q [B, 32, 128]
     Step 4-8: Fused scoring kernel (Triton)
     Step 9: custom Triton top-k on aggregated [B, max_seqlen]
+
+    ``q_index_raw``, when given, is the wq_b projection already computed by
+    the caller -- the merged ``[q_b | wq_b]`` GEMM -- and Step 1 is skipped;
+    ``None`` keeps the original pipeline unchanged.
     """
     B = q_a.shape[0]
 
-    # Step 1: CUDA WGMMA wq_b projection
-    q_flat = cuda_wq_b_proj(q_a, wq_b_weights, module)  # [B, 4096]
-    q = q_flat.view(B, n_heads, head_dim)  # [B, 32, 128]
+    if q_index_raw is not None:
+        if tuple(q_index_raw.shape) != (B, n_heads, head_dim):
+            raise ValueError(
+                f"q_index_raw must be {(B, n_heads, head_dim)}, got "
+                f"{tuple(q_index_raw.shape)}"
+            )
+        q = q_index_raw
+    else:
+        # Step 1: CUDA WGMMA wq_b projection
+        q_flat = cuda_wq_b_proj(q_a, wq_b_weights, module)  # [B, 4096]
+        q = q_flat.view(B, n_heads, head_dim)  # [B, 32, 128]
 
     # Step 2-3: RoPE + Hadamard
     q = rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim)

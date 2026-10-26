@@ -45,10 +45,36 @@ from batchgen.models.wrappers import AttnWrapperBase
 # Phase C: _dsa_short_count moved from AttnWrapperBase to GLM5AttnWrapper
 # (audit §A finding #8).
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
+from batchgen.models.glm.glm5.qb_wqb_merge_policy import glm5_qb_wqb_merge_enabled
 from batchgen.timing import get_decode_timer
 from batchgen_kernels.attention.dsa.selected_page_table import (
     transform_selected_positions_out,
 )
+
+
+def _q_b_wq_b_merged_operand(wrapper):
+    """``(weight, scale)`` of the merged ``[q_b | wq_b]`` operand, or ``None``.
+
+    ``None`` -- the separate version -- for a layer without an indexer (it has
+    no wq_b; GLM-5.2 skip_topk layers) and whenever GLM5_QB_WQB_MERGE is off.
+    An indexer layer with the switch on MUST carry the operand
+    ``initialize_fused_kernels`` builds; a missing one fails loud rather than
+    silently running the other version's numerics.
+    """
+    if getattr(wrapper.module, "indexer", None) is None:
+        return None
+    if not glm5_qb_wqb_merge_enabled():
+        return None
+    weight = getattr(wrapper, "_fp8_q_b_wq_b_proj", None)
+    scale = getattr(wrapper, "_fp8_q_b_wq_b_scale", None)
+    if weight is None or scale is None:
+        raise RuntimeError(
+            f"[layer {wrapper.layer_idx}] GLM5_QB_WQB_MERGE selects the merged "
+            "[q_b | wq_b] GEMM, but the wrapper has no "
+            "_fp8_q_b_wq_b_proj/_fp8_q_b_wq_b_scale (initialize_fused_kernels "
+            "did not run on a registered persistent wrapper)"
+        )
+    return weight, scale
 
 
 def _slot_indices_override(
@@ -346,6 +372,13 @@ def build_glm5_dsa_flashmla_inputs(
     if bsz == 0:
         raise ValueError("empty GLM-5 DSA batches must be handled before FlashMLA prep")
 
+    # Eager mirror of the captured segment's q_b version (GLM5_QB_WQB_MERGE):
+    # an indexer layer with the switch on runs [q_b | wq_b] as ONE GEMM and
+    # hands the wq_b slice to the scorer, so graph-vs-eager compares the same
+    # GEMM decomposition and the same wq_b numerics.
+    q_b_wq_b = _q_b_wq_b_merged_operand(wrapper)
+    q_index_raw = None
+
     with (dt.timed("act_quant", li) if dt else nullcontext()):
         hidden_flat = hidden_states.squeeze(1)
         hidden_fp8, hidden_scale = act_quant(hidden_flat)
@@ -359,13 +392,25 @@ def build_glm5_dsa_flashmla_inputs(
         )
         q_a_normed = attn.q_a_layernorm(q_a)
         q_a_fp8, q_a_scale = act_quant(q_a_normed)
-        q = w8a8_deepgemm(
-            q_a_fp8,
-            q_a_scale,
-            attn.q_b_proj.weight,
-            weight_scale["q_b_proj.weight_scale_inv"],
-        )
-        q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
+        if q_b_wq_b is not None:
+            q_b_cols = attn.num_heads * attn.q_head_dim
+            q_merged = w8a8_deepgemm(q_a_fp8, q_a_scale, *q_b_wq_b)
+            # Column slices of the one output, split on the last axis only
+            # (the same `.unflatten` the captured segment uses).
+            q = q_merged[:, :q_b_cols].unflatten(
+                -1, (attn.num_heads, attn.q_head_dim)
+            ).unsqueeze(1).transpose(1, 2)
+            q_index_raw = q_merged[:, q_b_cols:].unflatten(
+                -1, (indexer.index_n_heads, indexer.index_head_dim)
+            )
+        else:
+            q = w8a8_deepgemm(
+                q_a_fp8,
+                q_a_scale,
+                attn.q_b_proj.weight,
+                weight_scale["q_b_proj.weight_scale_inv"],
+            )
+            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
         q_nope, q_pe = torch.split(
             q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1,
         )
@@ -541,6 +586,7 @@ def build_glm5_dsa_flashmla_inputs(
                 gpu_paged_kv_manager_aux,
                 aux_slot_indices,
                 need_dense_indices=bool(wrapper.module.next_skip_topk),
+                q_index_raw=q_index_raw,
             )
             index_topk = wrapper.module.indexer.index_topk
             if wrapper.module.next_skip_topk:
@@ -759,6 +805,7 @@ def _select_glm5_dsa_indices(
     aux_slot_indices: torch.Tensor,
     *,
     need_dense_indices: bool = True,
+    q_index_raw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, str, torch.Tensor]:
     """Select DSA top-k positions for this decode step.
 
@@ -767,6 +814,11 @@ def _select_glm5_dsa_indices(
     consumes: the eager all-short FA3 fast path attends over the real page
     table. The default stays ``True`` so legacy callers and unit tests keep
     the historical return contract.
+
+    ``q_index_raw`` ([batch, index_n_heads, index_head_dim]) is the indexer
+    wq_b projection when the caller computed it inside the merged
+    ``[q_b | wq_b]`` GEMM; the scorer then skips its own wq_b GEMM. ``None``
+    (the separate version) issues the scorer calls exactly as before.
     """
     indexer = wrapper.module.indexer
     index_topk = indexer.index_topk
@@ -814,6 +866,7 @@ def _select_glm5_dsa_indices(
             aux_page_size,
             positions=new_token_pos,
             max_seqlen=max_seqlen,
+            **({} if q_index_raw is None else {"q_index_raw": q_index_raw}),
         )
         return top_k_indices, "full-indexer", row_modes
 
@@ -848,6 +901,7 @@ def _select_glm5_dsa_indices(
         aux_page_size,
         positions=new_token_pos[long_mask],
         max_seqlen=long_max_seqlen,
+        **({} if q_index_raw is None else {"q_index_raw": q_index_raw[long_mask]}),
     )
     top_k_indices[long_mask] = long_top_k
     return top_k_indices, "mixed", row_modes
