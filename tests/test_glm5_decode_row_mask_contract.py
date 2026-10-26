@@ -21,7 +21,9 @@ The invariant this file pins is WHERE those rows have to be neutralized:
   * ``primary_k_tensor`` also leaves the segment (the whole-model graph stages
     it for host KV offload) and must be written by a SELECT, not a multiply:
     bf16 ``NaN * 0`` is ``NaN``, and after the upstream masks are gone a stale
-    row can be non-finite.
+    row can be non-finite. That select now lives in the epilogue of the kernel
+    that PRODUCES the value rather than in a launch of its own; the invariant
+    is identical, the launch is not.
   * The MoE segment's rank padding is the gate kernel's epilogue, not a
     gather + compare + two ``torch.where`` launches.
 
@@ -89,17 +91,48 @@ def test_attn_output_is_the_only_valid_row_mask(segment):
 
 @pytest.mark.parametrize("segment", ATTENTION_SEGMENTS)
 def test_primary_k_tensor_is_written_by_a_masked_select(segment):
+    """The select is now the PRODUCER's epilogue, not a second launch.
+
+    The invariant is unchanged -- an invalid row must receive the literal zero,
+    because bf16 ``NaN * 0`` is ``NaN`` -- but it is enforced one launch
+    earlier: the fused rmsnorm+RoPE kernel writes straight into
+    ``primary_k_tensor`` under a ``tl.where`` row gate. See
+    ``test_glm5_fold_elementwise_into_neighbours.py`` for the fold's own pins
+    and for the numeric gate on the kernel.
+    """
     tree = _tree(segment)
-    assert "outputs.primary_k_tensor" in _torch_where_out_targets(tree), (
-        f"{segment}: primary_k_tensor is staged for host KV offload, so an "
-        "invalid row's bytes leave the segment through it; it must be written "
-        "by torch.where(valid_mask, ..., zero) rather than copied."
+    producers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "_fused_rmsnorm_rope"
+    ]
+    assert producers, f"{segment}: expected a fused rmsnorm+RoPE producer call"
+    for call in producers:
+        kw = {k.arg: ast.unparse(k.value) for k in call.keywords if k.arg}
+        assert "primary_k_tensor" in kw.get("out", ""), (
+            f"{segment}: primary_k_tensor is staged for host KV offload, so an "
+            "invalid row's bytes leave the segment through it; the producing "
+            "kernel must write it directly, got out=" + repr(kw.get("out"))
+        )
+        assert kw.get("row_valid_mask") == "buffers.valid_mask", (
+            f"{segment}: that write must be gated by a SELECT on the boolean "
+            "row-validity mask, got row_valid_mask="
+            + repr(kw.get("row_valid_mask"))
+        )
+    assert not [
+        out for out in _torch_where_out_targets(tree) if "primary_k_tensor" in out
+    ], (
+        f"{segment}: a standalone torch.where into primary_k_tensor is the "
+        "launch this fold removes; the gate belongs in the producer"
     )
-    copied = [t for t, _ in _calls(tree, "copy_")]
-    assert "outputs.primary_k_tensor" not in copied, (
-        f"{segment}: a plain copy_ into primary_k_tensor would carry a stale "
-        "row through, and a follow-up multiply cannot clean it (bf16 NaN*0)."
-    )
+    for attr in ("copy_", "mul_"):
+        targets = [t for t, _ in _calls(tree, attr)]
+        assert "outputs.primary_k_tensor" not in targets, (
+            f"{segment}: a plain {attr} into primary_k_tensor would carry a "
+            "stale row through, and a follow-up multiply cannot clean it "
+            "(bf16 NaN*0)."
+        )
 
 
 @pytest.mark.parametrize("segment", ATTENTION_SEGMENTS)
