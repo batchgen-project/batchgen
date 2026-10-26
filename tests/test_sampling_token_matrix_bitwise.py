@@ -21,7 +21,10 @@ import torch
 import torch.nn.functional as F
 
 from batchgen.sampling import sample_tokens
-from batchgen.worker.sampling_residency import host_decisions_from_cast
+from batchgen.worker.sampling_residency import (
+    attach_row_index,
+    host_decisions_from_cast,
+)
 
 SEED = 20261017
 GOLDEN_TORCH_VERSION = "2.13.0"
@@ -215,7 +218,8 @@ def test_an_empty_batch_samples_no_tokens():
 
 
 def _host_decisions_for(kwargs):
-    """The four branch decisions `sample_tokens` would reduce on device.
+    """The branch decisions `sample_tokens` would otherwise reduce on device,
+    with the row-index tensors a mixed batch's split needs attached.
 
     The logits in this file are fp32, so `.to(logits.dtype)` is the identity
     and the fp32 row values are already the cast values. (Where the cast is
@@ -228,7 +232,7 @@ def _host_decisions_for(kwargs):
         temps.append(temp)
         top_ps.append(p)
         top_ks.append(k)
-    return host_decisions_from_cast(temps, top_ps, top_ks)
+    return attach_row_index(host_decisions_from_cast(temps, top_ps, top_ks), "cpu")
 
 
 def _reaches_the_branches(kwargs):

@@ -87,6 +87,14 @@ greedy, and can round a ``top_p`` just under 1.0 up to 1.0. The residency
 therefore keeps a cast host mirror alongside the fp32 one and evaluates the
 predicates on it, so predicate and tensor agree by construction.
 
+The greedy/sampling split is part of those decisions. Splitting with the
+device boolean mask (``logits[sampling_mask]``) is an implicit ``nonzero`` and
+blocks the host behind the graph replay on every step, so the decisions also
+carry the row partition: a uniform batch is not split at all, and for a mixed
+batch the residency stages the two ascending row lists through pinned memory
+into resident int64 device buffers once per rebuild, under the same copy event
+as the parameter tensors, and ``sample_tokens`` gathers/scatters with them.
+
 The pure resolution/decision helpers below are torch-free so the semantics can
 be tested without a device; ``DecodeSamplingResidency`` itself runs on CPU with
 ``device="cpu"`` (no pinning, no events), which is how the unit tests drive it.
@@ -94,7 +102,7 @@ be tested without a device; ``DecodeSamplingResidency`` itself runs on CPU with
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
@@ -119,6 +127,18 @@ class SamplingResidencyRowError(SamplingResidencyError):
 
 class SamplingResidencyStaleError(SamplingResidencyError):
     """A resident value no longer matches the value its sequence carries."""
+
+
+class SamplingRowIndexError(SamplingResidencyError):
+    """A mixed greedy/sampling batch lacks valid per-batch row index tensors.
+
+    The host-decided path in ``sample_tokens`` splits a mixed batch with
+    device index tensors built once per row-set change, never with a
+    per-step boolean mask (whose ``nonzero`` blocks the host until the device
+    catches up). A mixed batch that reaches it without those tensors -- or
+    with tensors that do not partition the batch -- has no correct sync-free
+    answer, so it is refused rather than silently falling back to the mask.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -200,6 +220,19 @@ class SamplingHostDecisions:
 
     Every field is derived from the **cast** parameter values, i.e. from the
     same numbers the device tensors hold after ``.to(logits.dtype)``.
+
+    ``greedy_rows`` / ``sampling_rows`` are the ascending row ids of the two
+    halves of the split, i.e. exactly the rows ``greedy_mask`` /
+    ``sampling_mask`` would select, in the order boolean indexing would
+    gather them. They partition ``range(n)``.
+
+    ``greedy_index`` / ``sampling_index`` are the same row ids as int64 device
+    tensors. They are only needed -- and only required -- when the batch is
+    **mixed** (``any_greedy and any_sampling``): a uniform batch needs no
+    split at all. They are built once per row-set change (by
+    ``DecodeSamplingResidency`` through pinned staging, or by
+    ``attach_row_index`` off the step path), never per step. They are excluded
+    from equality so two decisions compare by their host values only.
     """
 
     n: int
@@ -207,6 +240,15 @@ class SamplingHostDecisions:
     any_sampling: bool
     max_top_k: int
     needs_top_p: bool
+    greedy_rows: Tuple[int, ...] = ()
+    sampling_rows: Tuple[int, ...] = ()
+    greedy_index: Optional[torch.Tensor] = field(default=None, compare=False, repr=False)
+    sampling_index: Optional[torch.Tensor] = field(default=None, compare=False, repr=False)
+
+    @property
+    def mixed(self) -> bool:
+        """True iff the batch has both greedy and sampled rows."""
+        return self.any_greedy and self.any_sampling
 
 
 def host_decisions_from_cast(
@@ -214,24 +256,31 @@ def host_decisions_from_cast(
     cast_top_ps: Sequence[float],
     top_ks: Sequence[int],
 ) -> SamplingHostDecisions:
-    """Compute the four host-side branch decisions for one row set.
+    """Compute the host-side branch decisions for one row set.
 
     Mirrors, in order, ``sampling.py``'s ``greedy_mask.any()``,
     ``sampling_mask.any()``, ``s_top_ks.max().item()`` and
     ``(s_top_ps < 1.0).any()``. The last two are reductions over the *sampling*
     rows only, so they are computed over the same subset the device masks
-    select.
+    select. The greedy/sampling row lists are the rows those masks select.
+
+    Torch-free: the device index tensors a mixed batch needs are attached
+    separately (``attach_row_index`` or the residency's pinned path).
     """
     n = len(cast_temps)
     any_greedy = False
     any_sampling = False
     max_top_k = 0
     needs_top_p = False
+    greedy_rows: List[int] = []
+    sampling_rows: List[int] = []
     for i in range(n):
         if cast_temps[i] <= 0:
             any_greedy = True
+            greedy_rows.append(i)
             continue
         any_sampling = True
+        sampling_rows.append(i)
         k = top_ks[i]
         if k > max_top_k:
             max_top_k = k
@@ -243,6 +292,30 @@ def host_decisions_from_cast(
         any_sampling=any_sampling,
         max_top_k=int(max_top_k),
         needs_top_p=needs_top_p,
+        greedy_rows=tuple(greedy_rows),
+        sampling_rows=tuple(sampling_rows),
+    )
+
+
+def attach_row_index(
+    decisions: SamplingHostDecisions, device: Any
+) -> SamplingHostDecisions:
+    """Return ``decisions`` with device row-index tensors for a mixed batch.
+
+    A uniform batch needs no split, so it is returned unchanged. For a mixed
+    batch the tensors are built with ``torch.tensor(..., device=device)``,
+    which on CUDA is a pageable-source host->device copy that blocks the host
+    behind any queued work: this helper is for tests and for callers off the
+    decode step path. The decode step path gets its tensors from
+    ``DecodeSamplingResidency``, which stages them through pinned memory once
+    per row-set change.
+    """
+    if not decisions.mixed:
+        return decisions
+    return replace(
+        decisions,
+        greedy_index=torch.tensor(decisions.greedy_rows, dtype=torch.int64, device=device),
+        sampling_index=torch.tensor(decisions.sampling_rows, dtype=torch.int64, device=device),
     )
 
 
@@ -303,6 +376,13 @@ class DecodeSamplingResidency:
         self._d_temps: Optional[torch.Tensor] = None
         self._d_top_ps: Optional[torch.Tensor] = None
         self._d_top_ks: Optional[torch.Tensor] = None
+        # Row-index tensors for the greedy/sampling split of a mixed batch.
+        # Each half holds at most ``capacity`` rows, so each buffer is sized
+        # to capacity; only the leading ``len(rows)`` entries are meaningful.
+        self._h_greedy_idx: Optional[torch.Tensor] = None
+        self._h_sampling_idx: Optional[torch.Tensor] = None
+        self._d_greedy_idx: Optional[torch.Tensor] = None
+        self._d_sampling_idx: Optional[torch.Tensor] = None
         self._allocate(max(int(capacity), 1))
 
         self._key: Optional[Tuple[Any, ...]] = None
@@ -336,6 +416,10 @@ class DecodeSamplingResidency:
         self._d_temps = torch.empty(capacity, dtype=torch.float32, device=self._device)
         self._d_top_ps = torch.empty(capacity, dtype=torch.float32, device=self._device)
         self._d_top_ks = torch.empty(capacity, dtype=torch.int64, device=self._device)
+        self._h_greedy_idx = torch.empty(capacity, dtype=torch.int64, pin_memory=self._pin)
+        self._h_sampling_idx = torch.empty(capacity, dtype=torch.int64, pin_memory=self._pin)
+        self._d_greedy_idx = torch.empty(capacity, dtype=torch.int64, device=self._device)
+        self._d_sampling_idx = torch.empty(capacity, dtype=torch.int64, device=self._device)
 
     @property
     def capacity(self) -> int:
@@ -434,6 +518,23 @@ class DecodeSamplingResidency:
         self._h_top_ps[:n].copy_(torch.tensor(top_ps, dtype=torch.float32))
         self._h_top_ks[:n].copy_(torch.tensor(top_ks, dtype=torch.int64))
 
+        # Branch decisions come from the cast mirror, never from the fp32
+        # values: the device predicates they replace run on the cast tensor.
+        # Taken before the uploads because a mixed batch's row partition is
+        # part of what gets uploaded.
+        cast_temps = self._h_temps[:n].to(dtype).tolist()
+        cast_top_ps = self._h_top_ps[:n].to(dtype).tolist()
+        decisions = host_decisions_from_cast(cast_temps, cast_top_ps, top_ks)
+        n_greedy = len(decisions.greedy_rows)
+        n_sampling = len(decisions.sampling_rows)
+        if decisions.mixed:
+            self._h_greedy_idx[:n_greedy].copy_(
+                torch.tensor(decisions.greedy_rows, dtype=torch.int64)
+            )
+            self._h_sampling_idx[:n_sampling].copy_(
+                torch.tensor(decisions.sampling_rows, dtype=torch.int64)
+            )
+
         # Pinned source => a genuinely asynchronous copy, issued on the stream
         # that will later run the replay and the sampling. Stream order alone
         # makes the values visible to the first consumer; no event wait is
@@ -443,18 +544,26 @@ class DecodeSamplingResidency:
         self._d_temps[:n].copy_(self._h_temps[:n], non_blocking=True)
         self._d_top_ps[:n].copy_(self._h_top_ps[:n], non_blocking=True)
         self._d_top_ks[:n].copy_(self._h_top_ks[:n], non_blocking=True)
+        if decisions.mixed:
+            self._d_greedy_idx[:n_greedy].copy_(
+                self._h_greedy_idx[:n_greedy], non_blocking=True
+            )
+            self._d_sampling_idx[:n_sampling].copy_(
+                self._h_sampling_idx[:n_sampling], non_blocking=True
+            )
+            decisions = replace(
+                decisions,
+                greedy_index=self._d_greedy_idx[:n_greedy],
+                sampling_index=self._d_sampling_idx[:n_sampling],
+            )
+        # One event covers every copy above, so the pinned-rewrite wait at the
+        # top of the next rebuild also covers the index staging buffers.
         if self._event_factory is not None:
             event = self._copy_event
             if event is None:
                 event = self._event_factory()
                 self._copy_event = event
             event.record()
-
-        # Branch decisions come from the cast mirror, never from the fp32
-        # values: the device predicates they replace run on the cast tensor.
-        cast_temps = self._h_temps[:n].to(dtype).tolist()
-        cast_top_ps = self._h_top_ps[:n].to(dtype).tolist()
-        decisions = host_decisions_from_cast(cast_temps, cast_top_ps, top_ks)
 
         self._plan = SamplingPlan(
             n=n,

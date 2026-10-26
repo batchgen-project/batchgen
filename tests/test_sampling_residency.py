@@ -51,6 +51,7 @@ from batchgen.worker.sampling_residency import (  # noqa: E402
     SamplingResidencyRowError,
     SamplingResidencyShapeError,
     SamplingResidencyStaleError,
+    attach_row_index,
     batch_all_greedy,
     host_decisions_from_cast,
     resolve_sampling_values,
@@ -753,10 +754,13 @@ def test_sample_tokens_never_writes_to_the_tensors_it_is_handed(case):
     before = (temps.clone(), top_ps.clone(), top_ks.clone())
     logits = _logits(len(seqs))
     temps_f, top_ps_f, top_ks_f = resolve_sampling_values(seqs)
-    decisions = host_decisions_from_cast(
-        temps.to(logits.dtype).tolist(),
-        top_ps.to(logits.dtype).tolist(),
-        top_ks_f,
+    decisions = attach_row_index(
+        host_decisions_from_cast(
+            temps.to(logits.dtype).tolist(),
+            top_ps.to(logits.dtype).tolist(),
+            top_ks_f,
+        ),
+        logits.device,
     )
 
     for kwargs in ({}, {"host_decisions": decisions}):
@@ -878,15 +882,17 @@ def test_a_clean_batch_is_bitwise_identical_in_both_fallback_formulations():
     """With no bad row, the device-selected form must match the branched form.
 
     This is the common case, so it is the one that must not move: the filled
-    tensor equals `probs` element-for-element and multinomial consumes one
-    uniform per row regardless of values.
+    tensor equals `probs` element-for-element and the one-sample draw (an
+    `exponential_` over the whole tensor) consumes the same random numbers at
+    the same positions regardless of values.
     """
     logits = torch.randn(6, V, generator=torch.Generator().manual_seed(11))
     temps = torch.tensor([1.0, 0.0, 0.8, 1.2, 0.0, 1.0])
     top_ps = torch.tensor([1.0, 1.0, 0.9, 1.0, 1.0, 0.5])
     top_ks = torch.tensor([0, 0, 4, 0, 0, 3], dtype=torch.int64)
-    decisions = host_decisions_from_cast(
-        temps.tolist(), top_ps.tolist(), top_ks.tolist()
+    decisions = attach_row_index(
+        host_decisions_from_cast(temps.tolist(), top_ps.tolist(), top_ks.tolist()),
+        logits.device,
     )
 
     torch.manual_seed(SEED)
