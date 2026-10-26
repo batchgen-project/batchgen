@@ -47,6 +47,13 @@ def _quantize_indexer_k_pagesplit(
     k_fp8, scales = quantize_indexer_k_fp8(k_tensor)
     return k_fp8.contiguous(), scales.contiguous()
 
+# BF16 strided-batched absorb + container dispatch (slice 2c-2). Triton-free,
+# so this import is unguarded: decode depends on it.
+from batchgen_kernels.attention.dsa.bf16_absorb import (
+    BF16AbsorbWeights,
+    absorb_out,
+)
+
 # Try importing FP8 absorb kernels (WP5)
 try:
     from batchgen_kernels.attention.dsa.fp8_absorb import (
@@ -743,39 +750,49 @@ class GLM5AttnWrapper(AttnWrapperBase):
             attn.kv_b_proj.weight.data,
             weight_scale["kv_b_proj.weight_scale_inv"],
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
-        # BF16 absorb matrices, built as temporaries. When the FP8 WGMMA absorb
-        # path is available (the default), BOTH the eager (glm5_decode_selector)
-        # and CUDA-graph decode paths use the FP8 absorb weights for q_absorb and
-        # out_absorb — the BF16 matrices are never read. So we free them below to
-        # reclaim ~4.6 GB/GPU of HBM (78 layers) for the KV cache, keeping only the
-        # FP8 weights. The BF16 matrices are retained ONLY as a fallback when the
-        # FP8 absorb kernel is unavailable.
+        # Slice 2c-2: these BF16 matrices are now the ONES WE KEEP. They used
+        # to be quantizer input, freed immediately; the decode absorb is now a
+        # bf16 strided-batched bmm, which is both faster than the FP8 WGMMA
+        # kernel it replaces and numerically exact against a bf16 reference
+        # (the fp8 kernel is not), so it also removes an fp8 error source
+        # from the attention critical path.
+        #
+        # HBM accounting, per rank: bf16 q_absorb [H,192,512] 12.58 MB +
+        # out_absorb [H,256,512] 16.78 MB = 29.36 MB/layer kept, against the
+        # 14.68 MB/layer of FP8 copies no longer built -- a NET
+        # +14.68 MB/layer = +1.15 GB/GPU over 78 layers. (The comment this
+        # replaces claimed ~4.6 GB; that figure also counted the dequantised
+        # kv_b_proj intermediate, which is still a temporary.) The cost
+        # competes with the KV cache and is the slice's one open trade: it is
+        # settled by the paired cold M1 plus the HBM/KV-pool readings and must
+        # be reported with them.
         cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
-        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel. Every decode
-        # consumer (eager selector and CUDA-graph path) requires them — the
-        # BF16 BMM fallback was retired, so a failed init must surface here,
-        # not as a mid-decode raise after a silently kept dead fallback.
-        if not _HAS_FP8_ABSORB:
-            raise RuntimeError(
-                f"[layer {self.layer_idx}] GLM-5 decode requires the WP5 FP8 "
-                "absorb kernel; rebuild batchgen_kernels with fp8_absorb"
-            )
+        # The container decides the decode kernel: BF16AbsorbWeights -> bmm,
+        # FP8AbsorbWeights -> the Triton WGMMA path (kept in-tree, NOT
+        # deleted). Building bf16 means the Triton kernel is no longer reached
+        # from decode, so its build is no longer a hard requirement and the
+        # _HAS_FP8_ABSORB gate that used to gate this block is gone.
+        #
+        # The attribute keeps its historical `_fp8_absorb_weights` name ON
+        # PURPOSE: the core scaffolding reads it by that name
+        # (batchgen_worker.py checks it for None and forwards it to the graph
+        # segments), so renaming it would turn this model-class change into a
+        # core-class one. The name no longer implies the fp8 container.
         try:
-            self._fp8_absorb_weights = FP8AbsorbWeights(
-                cached_q_absorb,   # [H, 192, 512]
-                cached_out_absorb,  # [H, 256, 512]
+            self._fp8_absorb_weights = BF16AbsorbWeights(
+                cached_q_absorb,    # [H, 192, 512] kept as [H, K, N]
+                cached_out_absorb,  # [H, 256, 512] flipped to [H, 512, 256]
             )
         except Exception as e:
             raise RuntimeError(
-                f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
+                f"[layer {self.layer_idx}] BF16 absorb init failed: {e}"
             ) from e
         logging.debug(
-            f"[layer {self.layer_idx}] FP8 absorb weights initialized"
+            f"[layer {self.layer_idx}] BF16 absorb weights initialized "
+            f"({self._fp8_absorb_weights.nbytes() / 1e6:.2f} MB)"
         )
-        # The BF16 temporaries above are quantizer input only and die here,
-        # reclaiming their HBM for the KV cache.
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 
@@ -2089,7 +2106,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] GLM-5 DSA requires WP5 FP8 "
                     "out_absorb; PyTorch/BF16 fallback is disabled"
                 )
-            attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+            attn_heads = absorb_out(attn_out, self._fp8_absorb_weights)
             attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(

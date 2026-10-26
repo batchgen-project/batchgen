@@ -706,8 +706,11 @@ def _patch_full_dsa_dependencies(
     monkeypatch.setattr(segments, "fused_paged_score_and_topk_with_slots_out", fake_score_topk)
     monkeypatch.setattr(segments, "transform_selected_positions_out", fake_transform)
     monkeypatch.setattr(segments, "_fa3_with_kvcache", fake_fa3)
-    monkeypatch.setattr(segments, "fp8_q_absorb_out", fake_q_absorb)
-    monkeypatch.setattr(segments, "fp8_out_absorb_out", fake_out_absorb)
+    # Slice 2c-2: production calls the container dispatch, so the stubs
+    # must patch THOSE names. Patching the old fp8_* names would leave a
+    # dead stub and silently run the real Triton kernel on a GPU box.
+    monkeypatch.setattr(segments, "absorb_q_out", fake_q_absorb)
+    monkeypatch.setattr(segments, "absorb_out_out", fake_out_absorb)
     return calls
 
 

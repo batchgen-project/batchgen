@@ -205,7 +205,10 @@ def test_rope_kernel_reads_the_strided_half_and_writes_the_static_buffer(
 @pytest.mark.parametrize("segment,class_name", SEGMENTS)
 def test_absorb_gemv_reads_the_strided_nope_half(segment, class_name):
     fwd = _method(_tree(segment), class_name, "forward")
-    (call,) = _calls(fwd, "fp8_q_absorb_out")
+    # Slice 2c-2 renamed the entry point: production now calls the
+    # container-dispatching `absorb_*`. The invariant pinned here is
+    # unchanged; only the symbol moved.
+    (call,) = _calls(fwd, "absorb_q_out")
     first = ast.unparse(call.args[0])
     assert first == "q_nope_strided", (
         f"{segment}: the absorb GEMV takes the NoPE half in place -- it is "
@@ -219,7 +222,7 @@ def test_the_fold_adds_no_launch_of_its_own(segment, class_name):
     """One rope launch and one absorb launch per layer, as before."""
     fwd = _method(_tree(segment), class_name, "forward")
     assert len(_calls(fwd, "_fused_rmsnorm_rope")) == 1
-    assert len(_calls(fwd, "fp8_q_absorb_out")) == 1
+    assert len(_calls(fwd, "absorb_q_out")) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -347,7 +350,7 @@ def test_every_stubbed_kernel_accepts_the_production_call(segment, class_name):
     which runs on a CPU box where the CUDA tests themselves only skip.
     """
     stubs = _stub_bindings(_STUBBED_SEGMENT_TESTS)
-    assert "_fused_rmsnorm_rope" in stubs and "fp8_q_absorb_out" in stubs, (
+    assert "_fused_rmsnorm_rope" in stubs and "absorb_q_out" in stubs, (
         f"the two kernels this change re-contracts must both be stubbed, got "
         f"{sorted(stubs)}"
     )

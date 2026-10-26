@@ -39,11 +39,11 @@ _MAIN_PATH_CALLS = (
     "cuda_wq_b_proj_out",
     "rope_hadamard_q_out",
     "self._score_and_topk",
-    "fp8_q_absorb_out",
+    "absorb_q_out",
     "transform_selected_positions_out",
     "self._run_selected_fa3",
     "self._run_all_short_fa3",
-    "fp8_out_absorb_out",
+    "absorb_out_out",
 )
 
 
