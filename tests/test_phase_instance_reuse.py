@@ -330,12 +330,14 @@ def _invariant_worker(
     experts_resident=False,
     ring_released=True,
     attn_registered=True,
+    pool_created=None,
 ):
     """``kv`` is the pool's state at the switch: mapped, released or absent.
 
     "released" is a pool whose physical pages went back to the driver while its
     reserved addresses stayed — what decode -> prefill now leaves behind.
-    "absent" is a lifetime that has not sized a pool yet.
+    "absent" is a lifetime that has not sized a pool yet, unless
+    ``pool_created`` says this process did create one before.
     """
     cls = _isolated(
         [
@@ -372,6 +374,9 @@ def _invariant_worker(
             pool_is_mapped=mapped,
             uses_fixed_address_pool=True,
         )
+    worker._gpu_kv_pool_created = (
+        kv != "absent" if pool_created is None else pool_created
+    )
     worker._prefill_ring_released_for_switch = ring_released
     return worker
 
@@ -438,8 +443,14 @@ def test_reuse_prefill_to_decode_requires_mapped_experts_and_kv():
     # The activation must have remapped the pool before this point.
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
         _invariant_worker(
-            experts_resident=True, kv="absent"
+            experts_resident=True, kv="absent", pool_created=True
         )._assert_phase_switch_clean("prefill_to_decode", reused=True)
+
+    # A decode instance built before readiness is activated before the first
+    # pool sizing; _init_gpu_kv_with_actual_size() sizes it right after.
+    _invariant_worker(
+        experts_resident=True, kv="absent", pool_created=False
+    )._assert_phase_switch_clean("prefill_to_decode", reused=True)
 
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
         _invariant_worker(
@@ -643,7 +654,7 @@ def test_decode_activation_remaps_the_pool_before_anything_reads_it():
     ) < names.index("_prepare_decode_batch")
 
 
-def _remap_worker(*, pool="released", manager=True, fixed=True):
+def _remap_worker(*, pool="released", manager=True, fixed=True, created=None):
     cls = _isolated(
         [
             "_remap_reused_kv_pool",
@@ -675,6 +686,7 @@ def _remap_worker(*, pool="released", manager=True, fixed=True):
     worker.gpu_paged_kv_cache_manager = (
         _Pool(pool == "mapped") if manager else None
     )
+    worker._gpu_kv_pool_created = manager if created is None else created
     return worker, calls
 
 
@@ -703,12 +715,43 @@ def test_remap_refuses_a_pool_whose_addresses_can_move():
     assert calls == []
 
 
-def test_remap_fails_loud_without_a_pool_to_remap():
-    """A reused instance's own build sized the pool, so one must exist."""
-    worker, _ = _remap_worker(manager=False)
+def test_remap_fails_loud_when_a_created_pool_is_gone():
+    """Once this process created a pool, it must survive every switch."""
+    worker, _ = _remap_worker(manager=False, created=True)
 
     with pytest.raises(RuntimeError, match="no GPU KV manager"):
         worker._remap_reused_kv_pool()
+
+
+def test_remap_leaves_a_never_created_pool_to_the_sizing_step():
+    """A decode instance built before readiness precedes the first sizing.
+
+    Kimi-K3 builds its decode instance in the startup pass, so its first
+    activation finds no pool; _init_gpu_kv_with_actual_size(), which runs next
+    from the decode phase, sizes it.
+    """
+    worker, calls = _remap_worker(manager=False, created=False)
+
+    worker._remap_reused_kv_pool()
+
+    assert calls == []
+    assert worker.gpu_paged_kv_cache_manager is None
+
+
+def test_only_the_manager_binding_records_a_created_pool():
+    """The tolerance signal is set where a pool is bound and nowhere else."""
+    bind = ast.unparse(_method_ast("_bind_gpu_paged_kv_manager"))
+    assert "self._gpu_kv_pool_created = True" in bind
+    assert "self._gpu_kv_pool_created = False" in ast.unparse(
+        _method_ast("__init__")
+    )
+    writers = [
+        node.name
+        for node in _worker_class().body
+        if isinstance(node, ast.FunctionDef)
+        and "self._gpu_kv_pool_created =" in ast.unparse(node)
+    ]
+    assert sorted(writers) == ["__init__", "_bind_gpu_paged_kv_manager"]
 
 
 def test_sizing_remaps_a_reserved_pool_instead_of_building_a_second_one():
@@ -834,8 +877,9 @@ def test_the_building_switch_does_not_require_a_mapped_kv_region():
     # The building switch asserts only the ring release.
     worker._assert_phase_switch_clean("prefill_to_decode", reused=False)
 
-    # The activating switch still demands a mapped region.
+    # The activating switch still demands a mapped region once a pool exists.
     worker._prefill_ring_released_for_switch = True
+    worker._gpu_kv_pool_created = True
     with pytest.raises(RuntimeError, match="left the GPU KV region"):
         worker._assert_phase_switch_clean("prefill_to_decode", reused=True)
 
