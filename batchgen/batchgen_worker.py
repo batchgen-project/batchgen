@@ -21,6 +21,7 @@ from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.gemm.deepgemm_pdl_policy import apply_deepgemm_pdl
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
@@ -71,6 +72,25 @@ _DECODE_EVENT_POLL_INTERVAL_S = 1e-4
 # down and the event may never fire, so none of the step's outputs may be read.
 _DECODE_WAIT_COMPLETED = "completed"
 _DECODE_WAIT_ABANDONED = "abandoned"
+# Returned by _finish_deferred_decode_step when the cohort teardown flag was
+# seen after the step's host-KV drain (the deferred twin of the post-drain
+# flag check in the undeferred step).
+_DECODE_STEP_SHUTDOWN = "shutdown"
+
+# --- Deferred sampled-token readback (depth-1 decode pipeline) -------------
+# True: the decode loop enqueues step N+1 before it waits on step N's sampled
+# tokens, then does step N's token-consuming host work (trajectory append,
+# stop decisions) while step N+1 runs on the GPU. The next step's input ids
+# are already a device tensor and its per-row metadata advances by one per
+# live row regardless of the token value, so only the host bookkeeping is
+# deferred, and every consumer of host tokens (page boundary, input-id
+# rebuild, loop exit) drains the pending step first. Stop decisions lag by at
+# most the one step that is already computed for every finished row anyway
+# (finished rows stay in the batch until the next boundary and are skipped by
+# the completed-row mask), so emitted tokens are unchanged.
+# False: the undeferred step exactly as before (byte-identical behavior).
+# Read at call time, so it can be flipped on the module.
+DECODE_DEFERRED_TOKEN_READBACK = True
 # Total budget for the LOCAL quiesce on a decode teardown exit.  An abandoned
 # step leaves its host-KV appends and its async KV load parked behind device
 # work the dead collective will never let finish, so the quiesce bounds them
@@ -248,6 +268,12 @@ from batchgen.worker.step_timing import (
 	accumulate_decode_step_split,
 	format_decode_step_split,
 	new_decode_step_split,
+)
+from batchgen.worker.deferred_readback import (
+	DeferredTokenReadbackError,
+	PendingDecodeStep,
+	TokenReadbackRing,
+	deferred_decode_step_marks,
 )
 import dataclasses as _dataclasses
 
@@ -1054,6 +1080,12 @@ class BatchGenWorker:
 		self._decode_cache_seqlens_i32 = None
 		self._decode_position_ids_i64 = None
 		self._decode_cache_seqlens_cpu_staging = None
+		# Completion event of the last H2D copy out of the pinned staging
+		# above; only recorded under DECODE_DEFERRED_TOKEN_READBACK.
+		self._decode_metadata_staging_event = None
+		# True while a decode step's sampled tokens are launched but unread
+		# (deferred readback); host-token consumers fail loud on it.
+		self._decode_tokens_unread = False
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
 		# Kimi-K3 streamed-SP8 prefill pipeline identity. Host-RDMA preserves its
@@ -1070,6 +1102,11 @@ class BatchGenWorker:
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
+
+		# Process-global DeepGEMM PDL toggle; must precede every deep_gemm
+		# call (CUDA graph capture records the launch attribute).
+		if apply_deepgemm_pdl() and self.rank == 0:
+			logging.info("DeepGEMM PDL enabled for this worker process")
 
 		# 3. Path & Model Configurations
 		self.model_name = args.model_name
@@ -3255,6 +3292,193 @@ class BatchGenWorker:
 			if event.query():
 				return _DECODE_WAIT_COMPLETED
 			time.sleep(_DECODE_EVENT_POLL_INTERVAL_S)
+
+	def _apply_decode_row_token(self, seq, token_id: int, row: int, local_iteration: int) -> None:
+		"""Token-dependent per-row decode bookkeeping for one live row.
+
+		The caller has already advanced ``decoded_length`` /
+		``current_context_length`` for this step and appended ``token_id`` to
+		the trajectory book. This is the single implementation of the
+		per-step stop semantics (EOS, length limit, repetition breaker) for
+		both the undeferred and the deferred decode step.
+		"""
+		# DIAG: Log first 3 tokens for first 10 seqs in each decode group
+		if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and row < 10:
+			logging.info(
+				f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
+				f"decoded_len={seq.decoded_length} token={token_id}"
+			)
+		if self._should_stop_at_eos(token_id, seq):
+			seq.eos_reached = True
+
+		if seq.decoded_length >= seq.max_decode_length:
+			seq.eos_reached = True
+
+		# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
+		if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
+			if token_id == seq._rep_last_token:
+				seq._rep_count += 1
+				if seq._rep_count >= 32:
+					seq._rep_detected = True
+					seq.eos_reached = True
+					seq.log_event(SeqEvent.REPETITION, self.rank,
+						f"token={token_id}, count={seq._rep_count}")
+					lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+						seq._lifespan_log, "REPETITION")
+					logging.warning(
+						f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
+						f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+					)
+			else:
+				seq._rep_last_token = token_id
+				seq._rep_count = 1
+			# Variable-length N-gram pattern check (every 64 tokens)
+			if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
+				_dl = seq.decoded_length
+				_tokens = self._trajectory_decoded_tokens(seq)
+				if _check_repeating_pattern(_tokens, _dl):
+					seq._rep_detected = True
+					seq.eos_reached = True
+					logging.warning(
+						f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
+						f"gid={seq.global_idx} at decoded_len={_dl}"
+					)
+
+	def _require_decode_tokens_read(self, where: str) -> None:
+		"""Fail loud if a host-token consumer runs ahead of the deferred readback.
+
+		Under DECODE_DEFERRED_TOKEN_READBACK the last launched decode step's
+		tokens are not in the trajectory book yet. Anything that reads host
+		tokens or makes a decision from them (input-id rebuild, the page
+		boundary planner) must drain that step first; reaching here with one
+		pending is a loop-ordering bug, never something to paper over.
+		"""
+		if getattr(self, "_decode_tokens_unread", False):
+			raise DeferredTokenReadbackError(
+				f"Rank {getattr(self, 'rank', '?')}: {where} needs this rank's host "
+				"tokens, but the last decode step's sampled-token readback is still "
+				"deferred; the decode loop must drain the pending step first"
+			)
+
+	def _begin_deferred_decode_step(
+		self,
+		batch: List[int],
+		batch_sequences: List[SequenceEntry],
+		slot: int,
+		bs: int,
+		local_iteration: int,
+	) -> PendingDecodeStep:
+		"""Token-independent half of a launched step's bookkeeping.
+
+		Decides the live rows exactly where the undeferred step does (after the
+		previous step's tokens were consumed, before this step's) and advances
+		them by one, so the next step's setup reads the same context lengths
+		the undeferred loop would give it. The token value is not needed for
+		any of this.
+		"""
+		row_active = [not self._is_sequence_completed(seq) for seq in batch_sequences]
+		for seq, live in zip(batch_sequences, row_active):
+			if not live:
+				continue
+			seq.decoded_length += 1
+			seq.current_context_length = (
+				seq.original_prompt_length + seq.decoded_length
+			)
+		self._decode_tokens_unread = True
+		return PendingDecodeStep(
+			slot=slot,
+			bs=bs,
+			batch=list(batch),
+			batch_sequences=list(batch_sequences),
+			row_active=row_active,
+			local_iteration=local_iteration,
+		)
+
+	def _consume_deferred_decode_tokens(
+		self, step: PendingDecodeStep, token_ids: List[int]
+	) -> None:
+		"""Token-dependent half: trajectory append and stop decisions."""
+		if len(token_ids) < len(step.batch_sequences):
+			raise RuntimeError(
+				f"decode sampled {len(token_ids)} tokens for "
+				f"{len(step.batch_sequences)} rows"
+			)
+		# [COMPLETED_ROW_SKIP] with the mask decided at launch: completion
+		# must not be re-evaluated here, the advance already moved the rows.
+		self._append_trajectory_tokens(
+			[seq for seq, live in zip(step.batch_sequences, step.row_active) if live],
+			[tok for tok, live in zip(token_ids, step.row_active) if live],
+		)
+		for i, seq in enumerate(step.batch_sequences):
+			if not step.row_active[i]:
+				continue
+			self._apply_decode_row_token(seq, token_ids[i], i, step.local_iteration)
+
+	def _finish_deferred_decode_step(
+		self,
+		step: PendingDecodeStep,
+		ring: TokenReadbackRing,
+		*,
+		overlapped: bool,
+		marks: Optional[List[float]] = None,
+	) -> str:
+		"""Wait for a deferred step's tokens, drain its host-KV appends, consume.
+
+		The same three phases, in the same order and with the same teardown
+		exits, as the undeferred step's tail: pollable token wait (ABANDONED
+		leaves before anything else), per-step [KV_APPEND_DRAIN], post-drain
+		cohort flag test, bookkeeping.
+
+		``overlapped``: the NEXT step is already enqueued on the stream, so the
+		drain must not end in its device-wide sync -- that would wait for the
+		whole next forward. Each append task's ``wait()`` already ends in its
+		own copy-stream event sync (``SynchronizeWithEvent`` in the native
+		task), so the step's host writes are complete and its staging tensors
+		have no reader left; the device-wide sync only matters before GPU pages
+		are freed, which happens at the page boundary, where this is called
+		with ``overlapped=False``.
+
+		Returns ``_DECODE_WAIT_COMPLETED``, ``_DECODE_WAIT_ABANDONED`` or
+		``_DECODE_STEP_SHUTDOWN``; on the latter two the caller takes the
+		ordered teardown exit and none of the step's tokens are read.
+		``marks`` (optional) receives perf_counter readings after the wait,
+		after the drain and after the bookkeeping.
+		"""
+		status = self._wait_decode_tokens(ring.event(step.slot))
+		if marks is not None:
+			marks.append(time.perf_counter())
+		if status == _DECODE_WAIT_ABANDONED:
+			ring.abandon(step.slot)
+			return _DECODE_WAIT_ABANDONED
+		if self._pending_kv_append_tasks:
+			self._wait_pending_kv_append_tasks(
+				defer_errors=True, device_sync=not overlapped
+			)
+		if marks is not None:
+			marks.append(time.perf_counter())
+		if self._cohort_shutdown_requested():
+			ring.abandon(step.slot)
+			return _DECODE_STEP_SHUTDOWN
+		token_ids = ring.read(step.slot, step.bs)
+		self._consume_deferred_decode_tokens(step, token_ids)
+		self._decode_tokens_unread = False
+		if marks is not None:
+			marks.append(time.perf_counter())
+		return _DECODE_WAIT_COMPLETED
+
+	def _warn_sampling_bad_rows(self, residency) -> None:
+		"""Drain the device-side sampling fallback counter and warn on it.
+
+		Reads a device counter, so callers must be where the device has caught
+		up with the sampling that wrote it (see drain_bad_rows).
+		"""
+		_bad_rows = residency.drain_bad_rows()
+		if _bad_rows:
+			logging.warning(
+				f"[DECODE] invalid probabilities after filtering for "
+				f"{_bad_rows} row(s) since the last heartbeat; those rows "
+				"fell back to greedy"
+			)
 
 	def _poll_until(self, ready, deadline) -> bool:
 		"""Poll one NON-BLOCKING readiness probe until the shared deadline.
@@ -15436,6 +15660,9 @@ class BatchGenWorker:
 		Returns:
 			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered)
 		"""
+		# Completion, eviction and load decisions read every row's stop state;
+		# a deferred step's tokens must already be consumed on this rank.
+		self._require_decode_tokens_read("_page_boundary_fast")
 		timing = FastBoundaryTimingStats()
 		boundary_start = time.perf_counter()
 		
@@ -16696,9 +16923,26 @@ class BatchGenWorker:
 			position_view.add_(1)
 		else:
 			staging = self._decode_cache_seqlens_cpu_staging
+			_deferred = DECODE_DEFERRED_TOKEN_READBACK
+			if _deferred:
+				# With the readback deferred the host runs one step ahead of
+				# the stream, so the previous step's copy out of this pinned
+				# buffer may not have executed yet: rewriting it now would
+				# hand that step this step's lengths. The wait is on a copy
+				# queued before the previous forward, so it is already done
+				# or about to be; it never waits for a forward.
+				_staging_event = getattr(self, "_decode_metadata_staging_event", None)
+				if _staging_event is not None:
+					_staging_event.synchronize()
 			for i, value in enumerate(cache_seqlens_key):
 				staging[i] = value
 			cache_view.copy_(staging[:batch_size], non_blocking=True)
+			if _deferred:
+				if getattr(self, "_decode_metadata_staging_event", None) is None:
+					self._decode_metadata_staging_event = torch.cuda.Event()
+				self._decode_metadata_staging_event.record(
+					torch.cuda.current_stream(self.torch_device)
+				)
 			position_view[:, 0].copy_(cache_view.to(dtype=torch.int64))
 			position_view.sub_(1)
 
@@ -18373,6 +18617,21 @@ class BatchGenWorker:
 		# only mandatory steady-state GPU→CPU dependency: the sampled token IDs.
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 		_new_tokens_ready = torch.cuda.Event()
+		# Deferred readback (DECODE_DEFERRED_TOKEN_READBACK): two alternating
+		# pinned slots so the in-flight step's copy never targets the buffer
+		# the host is about to read, plus the one launched-but-unread step.
+		# Read once per round so the loop never mixes the two step shapes.
+		_deferred_readback = DECODE_DEFERRED_TOKEN_READBACK
+		_readback_ring = None
+		if _deferred_readback:
+			_readback_ring = TokenReadbackRing(
+				max(max_batch_size, 1),
+				lambda n: torch.empty(n, 1, dtype=torch.long, pin_memory=True),
+				torch.cuda.Event,
+			)
+		_pending_step = None
+		_bad_rows_drain_due = False
+		self._decode_tokens_unread = False
 
 		# Device-resident per-request sampling parameters. Rebuilding them each
 		# step meant three `torch.tensor(..., device=cuda)` calls, i.e. three
@@ -18458,18 +18717,36 @@ class BatchGenWorker:
 				# the step path never reads it back. Drain it here, where the
 				# sampled-token readback has already caught the device up, so an
 				# invalid-probability row still surfaces instead of going silent.
-				_bad_rows = _sampling_residency.drain_bad_rows()
-				if _bad_rows:
-					logging.warning(
-						f"[DECODE] invalid probabilities after filtering for "
-						f"{_bad_rows} row(s) since the last heartbeat; those rows "
-						"fell back to greedy"
-					)
+				# With a deferred step in flight the device has NOT caught up
+				# (that read would stall a whole forward), so the drain moves to
+				# the next pipeline drain at the page boundary.
+				if _pending_step is not None:
+					_bad_rows_drain_due = True
+				else:
+					self._warn_sampling_bad_rows(_sampling_residency)
 				_hb_last_time = time.perf_counter()
 				_hb_tokens = 0
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if force_host_boundary or local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				# [DEFERRED_READBACK_BOUNDARY_DRAIN] Every boundary decision
+				# (completion, eviction, loads, watermark, loop exit) reads stop
+				# state, so the deferred step is fully consumed first -- on
+				# every rank, at the same step, which keeps the boundary in DP
+				# lockstep. Nothing is enqueued behind it, so the drain may end
+				# in the usual device-wide sync.
+				if _pending_step is not None:
+					_finish = self._finish_deferred_decode_step(
+						_pending_step, _readback_ring, overlapped=False
+					)
+					_pending_step = None
+					if _finish != _DECODE_WAIT_COMPLETED:
+						self._cohort_shutdown_observed = True
+						self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+						return decode_uuids, batch
+					if _bad_rows_drain_due:
+						_bad_rows_drain_due = False
+						self._warn_sampling_bad_rows(_sampling_residency)
 				last_boundary = local_iteration
 				force_host_boundary = False
 
@@ -19367,6 +19644,52 @@ class BatchGenWorker:
 			# End marker, queued on the same stream ahead of the token copy below.
 			_fwd_ring.end(_fwd_slot, torch.cuda.current_stream(self.torch_device))
 
+			if _deferred_readback:
+				# [DEFERRED_READBACK] This step is enqueued; only now wait for
+				# the PREVIOUS step's tokens, so its host tail (KV drain,
+				# bookkeeping, next setup) runs while this forward runs.
+				bs = new_tokens.shape[0]
+				_rb_slot = _readback_ring.launch(
+					new_tokens, bs, torch.cuda.current_stream(self.torch_device)
+				)
+				_split_t2 = time.perf_counter()
+				_rb_marks = []
+				if _pending_step is not None:
+					_finish = self._finish_deferred_decode_step(
+						_pending_step, _readback_ring, overlapped=True, marks=_rb_marks
+					)
+					_pending_step = None
+					if _finish != _DECODE_WAIT_COMPLETED:
+						self._cohort_shutdown_observed = True
+						self._quiesce_decode_for_cohort_shutdown(pending_async_task)
+						return decode_uuids, batch
+				else:
+					_rb_marks = [_split_t2, _split_t2, _split_t2]
+				# One step's host-KV appends in flight at a time: the previous
+				# step's were drained just above.
+				self._flush_deferred_kv_to_host()
+				_split_kv = time.perf_counter()
+				_pending_step = self._begin_deferred_decode_step(
+					batch, batch_sequences, _rb_slot, bs, local_iteration
+				)
+				_split_end = time.perf_counter()
+				self._cumulative_forward_ms += (_split_end - forward_start) * 1000
+				accumulate_decode_step_split(
+					_step_split,
+					deferred_decode_step_marks(
+						forward_start, _split_t0, _split_t1, _split_t2,
+						_rb_marks[0], _rb_marks[1], _rb_marks[2],
+						_split_kv, _split_end,
+					),
+				)
+				_fwd_ring.harvest()
+				from batchgen.timing import get_decode_timer
+				_dt = get_decode_timer()
+				if _dt and _dt.enabled:
+					_dt.log_summary()
+					_dt.reset()
+				continue
+
 			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Record the
 			# exact token-readback boundary before launching host-KV copies on their
 			# independent D2H stream.
@@ -19500,48 +19823,7 @@ class BatchGenWorker:
 
 				# Already on the host from this step's single tolist()
 				token_id = new_token_ids[i]
-
-				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
-				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
-					logging.info(
-						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
-						f"decoded_len={seq.decoded_length} token={token_id}"
-					)
-				if self._should_stop_at_eos(token_id, seq):
-					seq.eos_reached = True
-
-				if seq.decoded_length >= seq.max_decode_length:
-					seq.eos_reached = True
-
-				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected and _repetition_check_enabled(seq):
-					if token_id == seq._rep_last_token:
-						seq._rep_count += 1
-						if seq._rep_count >= 32:
-							seq._rep_detected = True
-							seq.eos_reached = True
-							seq.log_event(SeqEvent.REPETITION, self.rank,
-								f"token={token_id}, count={seq._rep_count}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-								seq._lifespan_log, "REPETITION")
-							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
-								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
-							)
-					else:
-						seq._rep_last_token = token_id
-						seq._rep_count = 1
-					# Variable-length N-gram pattern check (every 64 tokens)
-					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
-						_dl = seq.decoded_length
-						_tokens = self._trajectory_decoded_tokens(seq)
-						if _check_repeating_pattern(_tokens, _dl):
-							seq._rep_detected = True
-							seq.eos_reached = True
-							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
-								f"gid={seq.global_idx} at decoded_len={_dl}"
-							)
+				self._apply_decode_row_token(seq, token_id, i, local_iteration)
 
 			_split_t5 = time.perf_counter()
 			self._cumulative_forward_ms += (_split_t5 - forward_start) * 1000
@@ -19563,6 +19845,14 @@ class BatchGenWorker:
 				_dt.reset()
 
 		# Cleanup
+		if _pending_step is not None:
+			# Every loop exit leaves through the page boundary, which drains
+			# the deferred step; a step still pending here means an exit path
+			# skipped that drain and its tokens would be lost.
+			raise DeferredTokenReadbackError(
+				f"Rank {self.rank}: decode loop exited with the sampled tokens of "
+				f"local step {_pending_step.local_iteration} still unread"
+			)
 		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		if pending_async_task is not None:
 			pending_async_task.wait()
@@ -19630,6 +19920,7 @@ class BatchGenWorker:
 		*,
 		sync_distributed_errors: bool = False,
 		defer_errors: bool = False,
+		device_sync: bool = True,
 	) -> int:
 		"""
 		Wait for all pending KV append tasks at page boundary.
@@ -19638,6 +19929,11 @@ class BatchGenWorker:
 		CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
 		Without this, KV data may not be fully written to host memory when
 		sequences are later resumed, causing KV corruption.
+
+		``device_sync=False`` is only for the deferred-readback decode step,
+		where the next forward is already enqueued and a device-wide sync
+		would wait for it; see _finish_deferred_decode_step for why each
+		task's own copy-stream sync suffices there.
 		"""
 		deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
 		if not hasattr(self, '_pending_kv_append_tasks'):
@@ -19677,7 +19973,7 @@ class BatchGenWorker:
 		# Even though each task internally syncs its stream via cudaEventSynchronize,
 		# we need a full device sync to ensure ALL pending operations complete
 		# before we allow GPU pages to be freed/reused.
-		if num_tasks > 0 and not wait_errors:
+		if device_sync and num_tasks > 0 and not wait_errors:
 			try:
 				torch.cuda.synchronize(self.torch_device)
 			except Exception as e:
@@ -20282,6 +20578,7 @@ class BatchGenWorker:
 
 	def _rebuild_input_tokens(self, batch: List[int]) -> torch.Tensor:
 		"""Build input tokens from each sequence's last decoded position."""
+		self._require_decode_tokens_read("_rebuild_input_tokens")
 		if not batch:
 			return torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		

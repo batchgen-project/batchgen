@@ -532,6 +532,10 @@ def _build_fake_wrapper(device):
         _fp8_q_b_wq_b_scale=torch.ones(1, device=device, dtype=torch.float32),
         _indexer_cuda_weights=object(),
         _indexer_cuda_module=object(),
+        # Both wk versions' weights are present, as on a real wrapper: the
+        # segment picks one at construction (GLM5_INDEXER_WK_BACKEND) and the
+        # other stays built and selectable.
+        _indexer_wk_deepgemm_weights=object(),
     )
 
 
@@ -650,6 +654,19 @@ def _patch_full_dsa_dependencies(
         out.copy_(hidden_flat[:, : out.shape[1]] + 0.5)
         return out
 
+    def fake_wk_proj_deepgemm(hidden_fp8, hidden_scale, weights, out):
+        """The DeepGEMM wk version's stub.
+
+        Same arithmetic as ``fake_wk_proj`` so the value assertions do not
+        depend on which backend GLM5_INDEXER_WK_BACKEND selects: it reads the
+        SHARED quantized activation (``fake_act_quant`` returns the bf16 input
+        unchanged) instead of the raw hidden and the custom kernel's private
+        scratch.
+        """
+        del hidden_scale, weights
+        out.copy_(hidden_fp8[:, : out.shape[1]] + 0.5)
+        return out
+
     def fake_head_gates(hidden_flat, weight, out, *, scale, num_valid_tokens=None):
         del weight, scale, num_valid_tokens
         calls["scoring"].append("head_gates_out")
@@ -751,6 +768,7 @@ def _patch_full_dsa_dependencies(
     monkeypatch.setattr(segments, "_fused_rmsnorm_rope", fake_rmsnorm_rope)
     monkeypatch.setattr(segments, "make_fp8_activation_scratch", fake_make_scratch)
     monkeypatch.setattr(segments, "cuda_wk_proj_gemm_only_out", fake_wk_proj)
+    monkeypatch.setattr(segments, "indexer_wk_proj_deepgemm_out", fake_wk_proj_deepgemm)
     monkeypatch.setattr(segments, "head_gates_out", fake_head_gates)
     monkeypatch.setattr(segments, "cuda_wq_b_proj_out", fake_wq_b_proj)
     monkeypatch.setattr(segments, "rope_hadamard_q_out", fake_rope_hadamard_q)
@@ -1283,10 +1301,15 @@ def _make_k_path_slow_and_observable(monkeypatch):
     scorer's output a function of what the K path wrote (this token's aux K
     and the head gates), so the result changes if the scorer reads early."""
     stub_wk = segments.cuda_wk_proj_gemm_only_out
+    stub_wk_dg = segments.indexer_wk_proj_deepgemm_out
 
     def slow_wk_proj(*args, **kwargs):
         torch.cuda._sleep(_K_PATH_SPIN_CYCLES)
         return stub_wk(*args, **kwargs)
+
+    def slow_wk_proj_deepgemm(*args, **kwargs):
+        torch.cuda._sleep(_K_PATH_SPIN_CYCLES)
+        return stub_wk_dg(*args, **kwargs)
 
     def observing_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):
         del q_index, aux_page_table, aux_slot_indices, cache_seqlens, agg_scores
@@ -1297,7 +1320,13 @@ def _make_k_path_slow_and_observable(monkeypatch):
         top_k_indices.copy_(code.expand_as(top_k_indices))
         return top_k_indices
 
+    # Both versions: the delay has to land on whichever one this build's
+    # GLM5_INDEXER_WK_BACKEND issues, or the race this test closes is not
+    # actually provoked and the assertion below goes vacuous.
     monkeypatch.setattr(segments, "cuda_wk_proj_gemm_only_out", slow_wk_proj)
+    monkeypatch.setattr(
+        segments, "indexer_wk_proj_deepgemm_out", slow_wk_proj_deepgemm
+    )
     monkeypatch.setattr(
         segments, "fused_paged_score_and_topk_with_slots_out", observing_score_topk
     )
