@@ -118,6 +118,12 @@ class HtoD_Engine {
     std::unordered_map<std::string, uint64_t> weight_profile_tensors_;
     std::unordered_map<std::string, uint64_t> weight_profile_bytes_;
     std::unordered_map<std::string, double> weight_profile_copy_seconds_;
+    // Split of copy_s plus the storage-acquire wait, per module type:
+    // launch = cudaMemcpyAsync return, sync = cudaStreamSynchronize,
+    // acquire = get_module_weights_storage (includes any remote-shard wait).
+    std::unordered_map<std::string, double> weight_profile_launch_seconds_;
+    std::unordered_map<std::string, double> weight_profile_sync_seconds_;
+    std::unordered_map<std::string, double> weight_profile_acquire_seconds_;
 
     std::thread HtoD_worker_;
     void HtoD_Worker();

@@ -287,6 +287,9 @@ void HtoD_Engine::reset_weight_stream_profile(bool enabled) {
     this->weight_profile_tensors_.clear();
     this->weight_profile_bytes_.clear();
     this->weight_profile_copy_seconds_.clear();
+    this->weight_profile_launch_seconds_.clear();
+    this->weight_profile_sync_seconds_.clear();
+    this->weight_profile_acquire_seconds_.clear();
 }
 
 py::dict HtoD_Engine::get_weight_stream_profile() {
@@ -300,6 +303,9 @@ py::dict HtoD_Engine::get_weight_stream_profile() {
         entry["tensors"] = this->weight_profile_tensors_[module_type];
         entry["bytes"] = this->weight_profile_bytes_[module_type];
         entry["copy_s"] = this->weight_profile_copy_seconds_[module_type];
+        entry["launch_s"] = this->weight_profile_launch_seconds_[module_type];
+        entry["sync_s"] = this->weight_profile_sync_seconds_[module_type];
+        entry["acquire_s"] = this->weight_profile_acquire_seconds_[module_type];
         by_type[module_type.c_str()] = entry;
     }
     result["by_type"] = by_type;
@@ -464,8 +470,20 @@ void HtoD_Engine::HtoD_Worker() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 auto dst = buffer.get();
+                auto acquire_start = std::chrono::steady_clock::now();
                 auto src = this->weights_storage_.get_module_weights_storage(
                     module_name);
+                auto acquire_end = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lock(
+                        this->weight_profile_mutex_);
+                    if (this->weight_profile_enabled_) {
+                        this->weight_profile_acquire_seconds_[module_type] +=
+                            std::chrono::duration<double>(acquire_end -
+                                                          acquire_start)
+                                .count();
+                    }
+                }
                 torch::Tensor tmp_src;
                 void* src_ptr;
                 int64_t src_byte_size;
@@ -507,9 +525,14 @@ void HtoD_Engine::HtoD_Worker() {
                                 "HtoD: host/GPU byte size mismatch for " +
                                 tensor_name);
                         }
+                        // Inlined blocking_copy_ (device already set for this
+                        // worker thread) so launch and sync are timed apart.
                         auto copy_start = std::chrono::steady_clock::now();
-                        this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                             src_byte_size);
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slot->second.data_ptr(), src_ptr, src_byte_size,
+                            cudaMemcpyHostToDevice, this->HtoD_stream));
+                        auto launch_end = std::chrono::steady_clock::now();
+                        CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
                         auto copy_end = std::chrono::steady_clock::now();
                         {
                             std::lock_guard<std::mutex> lock(
@@ -521,6 +544,14 @@ void HtoD_Engine::HtoD_Worker() {
                                 this->weight_profile_copy_seconds_[module_type] +=
                                     std::chrono::duration<double>(copy_end -
                                                                   copy_start)
+                                        .count();
+                                this->weight_profile_launch_seconds_[module_type] +=
+                                    std::chrono::duration<double>(launch_end -
+                                                                  copy_start)
+                                        .count();
+                                this->weight_profile_sync_seconds_[module_type] +=
+                                    std::chrono::duration<double>(copy_end -
+                                                                  launch_end)
                                         .count();
                             }
                         }
