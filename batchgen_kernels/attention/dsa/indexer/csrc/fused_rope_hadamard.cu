@@ -10,7 +10,6 @@
 
 #include <c10/util/BFloat16.h>
 #include <c10/cuda/CUDAException.h>
-#include <ATen/cuda/CUDAContext.h>
 
 #include "fast_hadamard_transform_common.h"
 
