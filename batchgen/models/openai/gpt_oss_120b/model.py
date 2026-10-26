@@ -941,6 +941,21 @@ class GptOssMoEDecode(nn.Module):
     ) -> torch.Tensor:
         """Grouped kernel for persistent experts."""
         if self.weight_format == "mxfp4":
+            # SM100 (Blackwell): no Hopper WGMMA/TMA grouped .cu — use the
+            # pure-Triton per-expert path over the stacked weight tensors.
+            import batchgen_kernels as _bk
+            if _bk.get_device_arch() == "sm100":
+                from batchgen.moe.fused_wgmma_grouped import (
+                    fused_mxfp4_grouped_moe_forward_triton,
+                )
+                return fused_mxfp4_grouped_moe_forward_triton(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.persistent_expert_indices,
+                    self.gate_weights, self.gate_scales,
+                    self.up_weights, self.up_scales,
+                    self.down_weights, self.down_scales,
+                    self.gate_biases, self.up_biases, self.down_biases,
+                )
             if not (_HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING):
                 raise RuntimeError(
                     "Grouped WGMMA MXFP4 kernel not available. "
