@@ -407,6 +407,27 @@ py::dict BatchGen::cancel_weight_pass(int64_t pass_id) {
     return result;
 }
 
+py::dict BatchGen::abort_weight_passes() {
+    HtoD_Engine::WeightPassAbort aborted;
+    {
+        // Synchronizes the device; other Python threads keep running.
+        py::gil_scoped_release release;
+        aborted = this->h2d_engine_.abort_weight_passes();
+    }
+    py::dict freed;
+    for (int state = 0; state < kWeightSlotStateCount; ++state) {
+        freed[weight_slot_state_name(static_cast<WeightSlotState>(state))] =
+            aborted.slots.freed[state];
+    }
+    py::dict result;
+    result["passes"] = aborted.slots.passes;
+    result["pending_skips"] = aborted.slots.pending_skips;
+    result["freed"] = freed;
+    result["daemon_leases"] = aborted.daemon_leases;
+    result["schedule_lost"] = aborted.schedule_lost;
+    return result;
+}
+
 void BatchGen::reset_prefill_buffer() {
     this->gpu_weight_buffer_.reset_prefill_buffer();
 };

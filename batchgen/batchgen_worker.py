@@ -474,9 +474,12 @@ class _WeightPasses:
 	it once that forward has consumed its modules. ``begin(carry=True)`` also
 	arms the pass of the forward that follows, so the producer can continue
 	into its first layers while this one finishes; the next ``begin()`` takes
-	that pass instead of arming one. Leaving the scope, normally or by an
-	exception, cancels and ends every pass still open, so no pass crosses a
-	phase boundary. Pass 0 means nothing is installed and costs no engine call.
+	that pass instead of arming one. Leaving the scope normally cancels and
+	ends a carried pass whose forward will not run. Leaving it by an
+	exception aborts every open pass instead: ending one waits for the
+	producer to drain it, which a sibling rank stuck in a collective can
+	stall until the engine's stall timeout. Either way no pass crosses a phase
+	boundary. Pass 0 means nothing is installed and costs no engine call.
 	"""
 
 	_COUNTED = ("copied", "skipped", "released_on_landing")
@@ -523,7 +526,7 @@ class _WeightPasses:
 			yield self
 		except BaseException as error:
 			try:
-				self.close()
+				self._abort()
 			except BaseException:
 				# The forward's failure stays the error raised; the cleanup
 				# failure becomes its context.
@@ -561,8 +564,8 @@ class _WeightPasses:
 		self._current = None
 
 	def close(self):
-		"""Cancel and end the pass of a forward that raised, then a carried
-		pass whose forward will not run."""
+		"""Cancel and end every pass still open: a carried pass whose forward
+		will not run."""
 		if self._current is not None:
 			self._abandon(self._current)
 			self._current = None
@@ -581,6 +584,34 @@ class _WeightPasses:
 		if pass_id != 0:
 			self._core_engine.cancel_weight_pass(pass_id)
 			self._record(self._core_engine.end_weight_pass(pass_id))
+
+	def _abort(self):
+		"""Drop the passes of a forward that raised without draining them.
+
+		Draining would make the producer retire every remaining module, and a
+		node-daemon module retires only once the daemon hands it over, which
+		needs the sibling ranks this one has stopped matching. The producer is
+		stopped instead (a stop is bounded), and the engine frees every slot
+		and drops every open pass. A producer failure raised by the stop is
+		chained, never lost. The producer restarts with the next phase
+		install; a distributed schedule cannot be resumed and refuses it.
+		"""
+		open_passes = [p for p in (self._current, self._carried) if p]
+		self._current = None
+		self._carried = None
+		if not open_passes:
+			return
+		try:
+			self._core_engine.stop_h2d_worker()
+		finally:
+			report = self._core_engine.abort_weight_passes()
+			logging.warning(
+				"[WEIGHT_PASS] rank %d %s passes %s aborted: %s",
+				self._rank,
+				self._phase,
+				open_passes,
+				report,
+			)
 
 	def _record(self, report):
 		self.totals["passes"] += 1

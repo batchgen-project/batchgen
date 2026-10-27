@@ -61,6 +61,7 @@ class GPU_Weight_Buffer {
         std::map<std::string, WeightSlotTable::Cursor> cursors;
         std::map<int64_t, std::map<std::string, WeightSlotTable::PassCounts>>
             pass_counts;
+        bool schedule_lost = false;
     };
 
     GPU_Weight_Buffer(EngineConfig& engine_config, ModelConfig& model_config);
@@ -90,6 +91,10 @@ class GPU_Weight_Buffer {
     // FILLING and every pending asynchronous release has completed.
     void wait_pass_drained(int64_t pass);
     WeightSlotTable::PassSummary end_pass(int64_t pass);
+    // After a forward died: synchronizes the device, then reclaims every
+    // pending release and drops every open pass and slot
+    // (WeightSlotTable::abort). The producer must be stopped.
+    WeightSlotTable::AbortCounts abort_passes(bool lose_schedule);
 
     /* Producer side of the slot lifecycle */
     WeightSlotTable::Production next_production(const std::string& module_type);

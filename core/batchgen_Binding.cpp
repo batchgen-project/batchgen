@@ -650,6 +650,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("pass_id"))
         .def("cancel_weight_pass", &BatchGen::cancel_weight_pass,
              py::arg("pass_id"))
+        // abort_weight_passes releases the interpreter lock itself while it
+        // synchronizes the device.
+        .def("abort_weight_passes", &BatchGen::abort_weight_passes)
         .def("reset_decoding_buffer", &BatchGen::reset_decoding_buffer)
         .def("stop_h2d_worker", &BatchGen::stop_h2d_worker)
         .def("copy_kv_to_worker",

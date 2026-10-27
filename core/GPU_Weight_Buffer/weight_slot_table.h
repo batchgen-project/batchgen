@@ -45,8 +45,14 @@
 // The name index covers FILLING (named), PRESENT and LEASED slots, keyed by
 // (module, pass): a module whose slot is PENDING_RELEASE may already be
 // copied again, and a carried copy is never confused with the current one.
+//
+// abort() drops every open pass after the forward that held them died. When
+// the producer follows an external cyclic schedule (the node daemon's), its
+// position is then lost for good, and every later begin_pass() and install()
+// refuses.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -156,6 +162,13 @@ class WeightSlotTable {
         int64_t carried = 0;
     };
 
+    struct AbortCounts {
+        int64_t passes = 0;
+        int64_t pending_skips = 0;
+        // Slots freed, indexed by the WeightSlotState they were in.
+        std::array<int64_t, kWeightSlotStateCount> freed{};
+    };
+
     /* Layout */
 
     // Declare `count` FREE slots for `module_type`, dropping all of its
@@ -192,6 +205,7 @@ class WeightSlotTable {
     // either would carry state of the previous queue into pass 1.
     void install(const std::unordered_map<std::string,
                                           std::vector<std::string>>& tasks) {
+        this->require_schedule_aligned("install weight copy tasks");
         this->require_no_open_pass("install weight copy tasks");
         std::unordered_map<std::string, Installed> installed;
         for (const auto& [module_type, module_names] : tasks) {
@@ -236,6 +250,7 @@ class WeightSlotTable {
 
     // Arm the next pass and return its id, or 0 when no module is installed.
     int64_t begin_pass() {
+        this->require_schedule_aligned("begin a weight pass");
         if (this->installed_.empty()) {
             return 0;
         }
@@ -371,6 +386,41 @@ class WeightSlotTable {
         }
         return summary;
     }
+
+    // Drop every open pass after the forward that held them died: free every
+    // slot whatever its state, drop the pending skips and the counts of the
+    // open passes, and park every cursor at the head of its list for the next
+    // pass id, as a normal phase end leaves them. The caller guarantees that
+    // no copy is in flight and no kernel still reads a slot. lose_schedule
+    // records that the producer's position no longer matches the node
+    // daemon's cyclic schedule: begin_pass() and install() refuse from then
+    // on.
+    AbortCounts abort(bool lose_schedule) {
+        AbortCounts counts;
+        counts.passes = static_cast<int64_t>(this->open_passes_.size());
+        counts.pending_skips = static_cast<int64_t>(this->pending_skips_.size());
+        for (auto& [module_type, slots] : this->slots_) {
+            for (Slot& slot : slots) {
+                if (slot.state != WeightSlotState::kFree) {
+                    ++counts.freed[static_cast<size_t>(slot.state)];
+                    slot = Slot{};
+                }
+            }
+        }
+        this->index_.clear();
+        this->pending_skips_.clear();
+        this->pass_counts_.clear();
+        this->open_passes_.clear();
+        for (auto& [module_type, cursor] : this->cursors_) {
+            cursor = Cursor{this->next_pass_, 0};
+        }
+        if (lose_schedule) {
+            this->schedule_lost_ = true;
+        }
+        return counts;
+    }
+
+    bool schedule_lost() const { return this->schedule_lost_; }
 
     // The pass the consumer executes, if any.
     std::optional<int64_t> current_pass() const {
@@ -947,6 +997,15 @@ class WeightSlotTable {
                (cursor.pass == pass && cursor.position > position);
     }
 
+    void require_schedule_aligned(const std::string& action) const {
+        if (this->schedule_lost_) {
+            throw std::runtime_error(
+                "Cannot " + action +
+                ": weight schedule lost alignment with the node daemon after "
+                "an aborted pass; restart the worker cohort");
+        }
+    }
+
     int64_t require_current_pass(const std::string& action) const {
         if (this->open_passes_.empty()) {
             throw std::runtime_error("Cannot " + action +
@@ -1024,4 +1083,6 @@ class WeightSlotTable {
     std::deque<int64_t> open_passes_;
     int64_t next_pass_ = 1;
     std::map<int64_t, std::map<std::string, PassCounts>> pass_counts_;
+    // Set by abort(lose_schedule=true); nothing clears it.
+    bool schedule_lost_ = false;
 };

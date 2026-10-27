@@ -403,6 +403,22 @@ WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(int64_t pass) {
     return this->slots_.end_pass(pass);
 }
 
+WeightSlotTable::AbortCounts GPU_Weight_Buffer::abort_passes(
+    bool lose_schedule) {
+    // The forward that leased a slot died with its kernels possibly still
+    // queued: none of its slots is reusable before they finish.
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    // Every release event has completed; the table frees the slots.
+    this->synchronizePendingReleasesLocked();
+    const WeightSlotTable::AbortCounts counts =
+        this->slots_.abort(lose_schedule);
+    // A waiter left in get_weights finds no open pass and throws.
+    this->bumpProgressLocked();
+    return counts;
+}
+
 WeightSlotTable::Production GPU_Weight_Buffer::next_production(
     const std::string& module_type) {
     std::lock_guard<std::mutex> lock(this->mutex_);
@@ -515,6 +531,8 @@ GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::skip_modules(
                 break;
         }
     }
+    // As cancel_pass: a waiter on a module just skipped re-checks and throws.
+    this->cv_.notify_all();
     return counts;
 }
 
@@ -533,6 +551,7 @@ GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
     snapshot.open_passes = this->slots_.open_passes();
     snapshot.cursors = this->slots_.cursors();
     snapshot.pass_counts = this->slots_.pass_counts();
+    snapshot.schedule_lost = this->slots_.schedule_lost();
     return snapshot;
 }
 

@@ -44,6 +44,12 @@
 namespace py = pybind11;
 class HtoD_Engine {
    public:
+    struct WeightPassAbort {
+        WeightSlotTable::AbortCounts slots;
+        int64_t daemon_leases = 0;  // released
+        bool schedule_lost = false;
+    };
+
     HtoD_Engine(const EngineConfig& engine_config,
                 const ModelConfig& model_config,
                 Weights_Storage& weights_storage, KV_Storage& kv_storage,
@@ -78,6 +84,14 @@ class HtoD_Engine {
     py::dict weight_stream_status();
     // Joins the producer, then rethrows its recorded failure, if any.
     void stop_h2d_worker();
+    // After a forward died inside its weight passes; the producer must be
+    // stopped. Releases every daemon lease still recorded, drops every open
+    // pass and slot (GPU_Weight_Buffer::abort_passes) and puts every queue
+    // back at the head of its list, where the cursors now are. With
+    // distributed storage the daemon schedule is lost: every later
+    // begin_weight_pass and set_weight_copy_queue throws. Otherwise the next
+    // set_weight_copy_queue, or start + begin, proceeds as after a phase end.
+    WeightPassAbort abort_weight_passes();
     // Un-parks the producer: a pass was armed or a task was queued.
     void wake_producer();
     // Throws when the node daemon still leases this worker a module of pass
