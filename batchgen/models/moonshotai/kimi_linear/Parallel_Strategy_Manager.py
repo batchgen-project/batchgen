@@ -628,18 +628,6 @@ class KimiLinearParallelStrategyManager:
             )
         return selected
 
-    def streamed_sp8_reseeds_h2d_on_reentry(self):
-        """Whether each streamed-SP8 prefill starts a fresh local H2D cycle.
-
-        Hierarchical GDR sources read their owned shard directly from the local
-        compact store; the other ranks have an empty host-copy task.  No rank
-        acquires a remote daemon generation, so carrying a partially filled GPU
-        ring across resident decode is unnecessary and can strand a full-batch
-        consumer behind stale leases.  Host-RDMA still depends on the daemon's
-        acquire/release generations and must preserve its cursor.
-        """
-        return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
-
     def streamed_sp8_requires_global_pass_alignment(self):
         """Whether every node must join each streamed prefill model pass."""
         return self.prefill_uses_streamed_sp8() and self._hierarchical_gdr
@@ -1046,18 +1034,18 @@ class KimiLinearParallelStrategyManager:
         Each module TYPE has its own ring, so what matters is that the list for
         a type is in the order the consumer will request it — the producer
         drains its list front to front and the consumer blocks on the head. An
-        out-of-order request finds no matching slot and dies on
-        ``get_weights``' 2 s ``std::runtime_error``
-        (GPU_Weight_Buffer.cpp:196-233); it does not hang and it does not
-        return the wrong module.
+        out-of-order request either throws at once (a module already consumed
+        in this pass) or ends in ``get_weights``' stall ``std::runtime_error``;
+        it does not hang and it does not return the wrong module.
 
         Consumer order, per forward pass:
           * one ``attn_{L}`` or ``kda_attn_{L}`` per layer, L ascending, at the
             top of the decoder layer;
           * one ``shared_expert_{L}`` per MoE layer, L ascending;
           * all ``routed_expert_{L}_{E}``, E ascending within L, L ascending —
-            ``moe_forward_serving`` drives EVERY expert including 0-token ones
-            precisely to keep this true.
+            ``moe_forward_serving`` runs the experts with tokens in this order
+            and declares the 0-token ones skipped first, so the producer never
+            waits on a slot that no consumer will request.
 
         With ``stream_all_modules`` off (the 48B default) the first three lists
         stay empty: those modules are resident and never touch the ring.
@@ -1197,8 +1185,8 @@ class KimiLinearParallelStrategyManager:
             # non-empty (_load_decode_model), and decode_moe_mode="resident_ep"
             # empties it below — so nothing would ever refill the attn /
             # kda_attn / shared_expert rings and every persistent=False
-            # wrapper would die on get_weights' 2 s throw. Fail here, loudly,
-            # instead of at that timeout 93 layers deep.
+            # wrapper would die on get_weights' stall throw. Fail here,
+            # loudly, instead of at that timeout 93 layers deep.
             raise NotImplementedError(
                 "stream_all_modules is a PREFILL-only path (M-PR-6). Decode "
                 "needs a decode-phase H2D streamer for attn/kda_attn/"

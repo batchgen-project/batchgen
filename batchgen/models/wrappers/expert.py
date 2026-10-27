@@ -22,10 +22,11 @@ Provides common functionality for expert module wrappers:
 - Module key generation for weight loading
 - Dequantization hooks (override in subclass)
 - Standard forward flow with weight load/apply/cleanup
+- Routing-informed release of idle streamed experts' weight slots
 """
 
 import logging
-from typing import ClassVar, Dict, Optional
+from typing import ClassVar, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -169,3 +170,59 @@ class ExpertWrapperBase(BaseModuleWrapper):
         )
 
         return result
+
+
+def skip_idle_streamed_experts(
+    experts,
+    expert_ids: Sequence[int],
+    token_counts: Sequence[int],
+) -> List[str]:
+    """Declare one layer's idle streamed experts to the weight copy engine.
+
+    A routed expert that received no tokens will not run again in this forward,
+    so its weight slot is released now: a PRESENT slot frees at once, an
+    in-flight copy frees when it lands and a copy not yet started is skipped
+    (``core_engine.skip_weight_modules``). Call once per layer, after routing
+    and before the first ``load_weights`` of that layer's experts, then run
+    only the experts with tokens. Running a 0-token expert after this call is
+    a caller bug.
+
+    Only non-persistent ``ExpertWrapperBase`` experts stream through the copy
+    engine; ``None``, placeholders and persistent experts are ignored.
+
+    Args:
+        experts: Expert container indexed by expert id.
+        expert_ids: Expert ids covered by the caller's loop, in loop order.
+        token_counts: Host-side token counts parallel to ``expert_ids``:
+            ``token_counts[i]`` is the count for ``expert_ids[i]``.
+
+    Returns:
+        The declared module keys, in ``expert_ids`` order.
+    """
+    expert_ids = list(expert_ids)
+    if len(token_counts) != len(expert_ids):
+        raise ValueError(
+            f"token_counts has {len(token_counts)} entries for "
+            f"{len(expert_ids)} expert ids"
+        )
+    core_engine = None
+    module_keys = []
+    for expert_id, count in zip(expert_ids, token_counts):
+        if count != 0:
+            continue
+        expert = experts[expert_id]
+        if not isinstance(expert, ExpertWrapperBase) or expert.persistent:
+            continue
+        module_keys.append(expert.module_key)
+        core_engine = expert.core_engine
+    if not module_keys:
+        return module_keys
+    # The skip changes host-side slot state once; a graph replay would not
+    # repeat it.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"Cannot skip streamed experts {module_keys} during CUDA graph "
+            "capture"
+        )
+    core_engine.skip_weight_modules(module_keys)
+    return module_keys

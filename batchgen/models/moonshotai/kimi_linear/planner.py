@@ -636,7 +636,7 @@ class KimiLinearPlanner(BasePlanner):
         # (base_planner.py:90-94), and GPU_Weight_Buffer::Init() iterates that
         # map (GPU_Weight_Buffer.cpp:95-125) — an absent key means zero slots,
         # acquireEmptyBuffer returns nullopt forever and the consumer dies on
-        # the 2 s throw. Declaring the whole map here fixes that model-side.
+        # the stall throw. Declaring the whole map here fixes that model-side.
         self.config.GPU_Buffer_Config.num_prefill_module_buffer = {
             "attn": 2,
             "kda_attn": 2,
