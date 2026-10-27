@@ -46,6 +46,8 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 from .configuration_gpt_oss import GptOssConfig
 
 # CUDA routing kernels (fused gate + dispatch + reduce)
@@ -659,22 +661,31 @@ class GptOssMoE(nn.Module):
             torch.cuda.synchronize()
             gemm_start = time.perf_counter()
 
+        # One host sync for every expert's count; idle streamed experts release
+        # their slots before any expert of this layer loads.
+        token_counts = torch.bincount(
+            topk_indices.reshape(-1), minlength=self.num_experts
+        ).tolist()
+        skip_idle_streamed_experts(self.experts, range(self.num_experts), token_counts)
+
         # Route tokens to experts
         for i, expert in enumerate(self.experts):
+            if token_counts[i] == 0:
+                continue
             # Find tokens routed to this expert
             expert_mask = (topk_indices == i).any(dim=-1)
-            if expert_mask.any():
-                # Get weights for this expert
-                expert_weights = torch.where(
-                    topk_indices == i,
-                    topk_weights,
-                    torch.zeros_like(topk_weights),
-                ).sum(dim=-1)
 
-                # Process tokens
-                expert_input = hidden_states_flat[expert_mask]
-                expert_output = expert(expert_input)
-                output[expert_mask] += expert_output * expert_weights[expert_mask].unsqueeze(-1)
+            # Get weights for this expert
+            expert_weights = torch.where(
+                topk_indices == i,
+                topk_weights,
+                torch.zeros_like(topk_weights),
+            ).sum(dim=-1)
+
+            # Process tokens
+            expert_input = hidden_states_flat[expert_mask]
+            expert_output = expert(expert_input)
+            output[expert_mask] += expert_output * expert_weights[expert_mask].unsqueeze(-1)
 
         if timing_enabled:
             torch.cuda.synchronize()

@@ -47,6 +47,8 @@ import triton.language as tl
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 from .config import MiniMaxM25Config
 
 # CUDA routing kernels
@@ -1403,11 +1405,18 @@ class MiniMaxM25MoE(nn.Module):
             (num_global_tokens, hidden_size), device=device, dtype=torch.float32,
         )
 
-        for local_e in range(self.experts_per_rank):
-            global_e = self.routed_expert_start_idx + local_e
-            mask = flat_expert_idx == global_e
-            if not mask.any():
+        # One host sync for every expert's count; idle streamed experts release
+        # their slots before any expert of this layer loads.
+        local_ids = range(self.routed_expert_start_idx,
+                          self.routed_expert_start_idx + self.experts_per_rank)
+        all_counts = torch.bincount(flat_expert_idx, minlength=len(self.experts)).tolist()
+        local_counts = [all_counts[global_e] for global_e in local_ids]
+        skip_idle_streamed_experts(self.experts, local_ids, local_counts)
+
+        for global_e, count in zip(local_ids, local_counts):
+            if count == 0:
                 continue
+            mask = flat_expert_idx == global_e
             expert_token_idx = token_indices[mask]
             expert_topk_pos = topk_positions[mask]
             tokens_for_expert = global_x[expert_token_idx]
@@ -1454,6 +1463,8 @@ class MiniMaxM25MoE(nn.Module):
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
         idxs = topk_idx.view(-1).argsort()
         sorted_tokens = hidden_flat[idxs // topk_idx.shape[1]]
+        skip_idle_streamed_experts(
+            self.experts, range(len(tokens_per_expert)), tokens_per_expert)
 
         # Sequential expert processing with pre-allocated output
         total_tokens = int(tokens_per_expert.sum())

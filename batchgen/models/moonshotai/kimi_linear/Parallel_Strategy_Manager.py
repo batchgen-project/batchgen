@@ -919,8 +919,9 @@ class KimiLinearParallelStrategyManager:
             top of the decoder layer;
           * one ``shared_expert_{L}`` per MoE layer, L ascending;
           * all ``routed_expert_{L}_{E}``, E ascending within L, L ascending —
-            ``moe_forward_serving`` drives EVERY expert including 0-token ones
-            precisely to keep this true.
+            ``moe_forward_serving`` runs the experts with tokens in this order
+            and declares the 0-token ones skipped first, so the producer never
+            waits on a slot that no consumer will request.
 
         With ``stream_all_modules`` off (the 48B default) the first three lists
         stay empty: those modules are resident and never touch the ring.

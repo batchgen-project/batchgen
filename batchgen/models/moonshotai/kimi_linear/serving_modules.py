@@ -37,6 +37,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 from .wrappers import KimiLinearExpertWrapper
 
 
@@ -1403,10 +1405,11 @@ def moe_forward_serving(self, hidden_states):
     decode_moe_mode="streamed" fallback): pure DP with streamed experts.
 
     Each rank independently processes its own tokens; the routed experts are
-    host-offloaded and streamed to GPU per layer by the copy engine. The MoE
-    drives EVERY expert wrapper in ascending index order (== weight-copy-task
-    order) so the producer never stalls: experts with no routed tokens still
-    run a load+free (via a 0-row forward). No cross-rank collectives.
+    host-offloaded and streamed to GPU per layer by the copy engine. After
+    routing, the experts with no routed tokens are declared idle
+    (``skip_idle_streamed_experts``) so their slots are released or never
+    copied; the experts with tokens then run in ascending index order
+    (== weight-copy-task order). No cross-rank collectives.
 
     LatentMoE (K3, ``config.routed_expert_hidden_size``): the routed experts
     do NOT live in the hidden space. Op order, from the eager reference
@@ -1594,8 +1597,8 @@ def moe_forward_serving(self, hidden_states):
     # Routing reads the PRE-down-proj hidden (`identity`), never the latent.
     if num_tokens == 0:
         # Empty DP rank: KimiMoEGate dies on scores.view(0, -1). Build empty
-        # routing instead so the drive loop below still load+frees every
-        # expert in lockstep with the non-empty ranks (first-smoke finding).
+        # routing instead so every streamed expert below is declared idle and
+        # its slot released (first-smoke finding).
         topk_idx = x.new_empty((0, self.gate.top_k), dtype=torch.long)
         topk_weight = x.new_empty((0, self.gate.top_k))
     else:
@@ -1615,17 +1618,21 @@ def moe_forward_serving(self, hidden_states):
     results = torch.zeros(num_tokens, expert_dim, device=device,
                           dtype=torch.float32)
 
+    # One host sync for every expert's count. Idle streamed experts release
+    # their slots before any expert of this layer loads; only experts with
+    # tokens run.
+    num_experts = len(self.experts)
+    token_counts = torch.bincount(flat_expert_idx, minlength=num_experts).tolist()
+    skip_idle_streamed_experts(self.experts, range(num_experts), token_counts)
+
     for expert_idx, expert in enumerate(self.experts):
-        if expert is None:
+        if expert is None or token_counts[expert_idx] == 0:
             continue
         mask = flat_expert_idx == expert_idx
         sel = mask.nonzero(as_tuple=False).squeeze(-1)
         expert_token_idx = token_indices[sel]
-        # Drive the wrapper even for 0 tokens (streamed load+free, no stall).
         tokens_for_expert = x.index_select(0, expert_token_idx)
         expert_output = expert(tokens_for_expert)
-        if sel.numel() == 0:
-            continue
         w = topk_weight.reshape(-1)[sel].unsqueeze(-1)
         results.index_add_(0, expert_token_idx,
                            expert_output.float() * w.float())

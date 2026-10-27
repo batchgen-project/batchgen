@@ -322,11 +322,11 @@ class K3MXFP4Expert(nn.Module):
                                            self.hidden_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # 0-token experts are DRIVEN, not skipped (moe_forward_serving keeps the
-        # copy engine in lockstep by forwarding every expert). Return early:
-        # the marlin grid is undefined at M=0 and the repack would be pure waste.
+        # The marlin grid is undefined at M=0. moe_forward_serving declares
+        # 0-token experts idle instead of running them, so an empty input is a
+        # caller bug.
         if hidden_states.shape[0] == 0:
-            return torch.empty_like(hidden_states)
+            raise ValueError("K3MXFP4Expert received 0 tokens")
 
         from batchgen.moe.marlin_grouped_moe import (
             single_expert_marlin_mxfp4_decode,
@@ -408,6 +408,12 @@ class KimiK3MXFP4ExpertWrapper(KimiLinearExpertWrapper):
         return weights_dict
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Refused before load_weights leases the slot: a 0-token expert must be
+        # declared with skip_idle_streamed_experts, not run.
+        if hidden_states.shape[0] == 0:
+            raise ValueError(
+                f"{self.module_key}: 0-token forward of a streamed expert"
+            )
         if not type(self)._prefill_profile_enabled:
             return super().forward(hidden_states)
         start = time.perf_counter()

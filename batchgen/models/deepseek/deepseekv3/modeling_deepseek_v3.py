@@ -55,6 +55,7 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek_v3 import DeepseekV3Config
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 import torch.distributed as dist
 import numpy as np
 import os
@@ -1169,6 +1170,12 @@ class DeepseekV3MoE_Prefill(nn.Module):
 			sorted_tokens = gathered_tokens[gatherd_idxs]
 			tokens_per_expert = tokens_per_expert_post_gather
 		tokens_per_expert = tokens_per_expert.cpu().numpy()
+		expert_offset = self.ep_rank * self.experts_per_rank
+		skip_idle_streamed_experts(
+			self.experts,
+			range(expert_offset, expert_offset + len(tokens_per_expert)),
+			tokens_per_expert,
+		)
 
 		# Pre-allocate output buffer to avoid torch.cat() memory overhead
 		total_tokens = int(tokens_per_expert.sum())
@@ -2022,14 +2029,26 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			dtype=torch.float32
 		)
 
+		# One host sync for the counts; idle streamed experts release their
+		# slots before any expert of this layer loads
+		expert_token_counts_cpu = expert_token_counts.tolist()
+		skip_idle_streamed_experts(
+			self.experts,
+			range(
+				self.routed_expert_start_idx,
+				self.routed_expert_start_idx + self.experts_per_rank,
+			),
+			expert_token_counts_cpu,
+		)
+
 		# Process each local expert
 		for local_e in range(self.experts_per_rank):
 			global_e = self.routed_expert_start_idx + local_e
+			if expert_token_counts_cpu[local_e] == 0:
+				continue
 
 			# Find tokens routed to this expert
 			mask = flat_expert_idx == global_e
-			if not mask.any():
-				continue
 
 			# Get token indices and topk positions for this expert
 			expert_token_idx = token_indices[mask]

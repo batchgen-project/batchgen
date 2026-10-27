@@ -347,7 +347,7 @@ def test_streamed_matches_fp32_dequant(cfg_name):
 
 
 # --------------------------------------------------------------------------- #
-#  3. down / norm / up run ONCE per token; every expert is driven in lockstep  #
+#  3. down / norm / up run ONCE per token; only experts with tokens run        #
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("cfg_name", sorted(CONFIGS))
 def test_latent_projections_run_once_per_token(cfg_name):
@@ -381,10 +381,10 @@ def test_latent_projections_run_once_per_token(cfg_name):
     assert seen["down"] == [(tokens, cfg.hidden_size)], seen["down"]
     assert seen["norm"] == [(tokens, latent)], seen["norm"]
     assert seen["up"] == [(tokens, latent)], seen["up"]
-    assert len(expert_calls) == len(block.experts)         # all driven, 0-token too
+    assert all(rows > 0 for rows in expert_calls), expert_calls   # no 0-token run
     assert sum(expert_calls) == tokens * top_k
     print("[mxfp4-moe] {} once-per-token OK: down/norm/up 1 call on {} rows; "
-          "experts driven {}/{}, assignments {}".format(
+          "experts run {}/{}, assignments {}".format(
               cfg_name, tokens, len(expert_calls), len(block.experts),
               sum(expert_calls)))
 

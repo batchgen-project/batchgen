@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 from .decode_utils import clamp_token_indices_to_seqlens
 # GLM-5 uses BatchGen's internal config (a plain BaseModelConfig dataclass), not
 # an HF transformers.PretrainedConfig — matching every other model (kimi, etc.).
@@ -2680,6 +2682,16 @@ class Glm5MoE(nn.Module):
         offsets_cpu = expert_offsets.tolist()
         actual_total = offsets_cpu[-1]
 
+        # Idle non-persistent experts release their slots before any of them
+        # loads, including when no local expert has tokens.
+        skip_idle_streamed_experts(
+            self.experts,
+            range(self.routed_expert_start_idx + n_persistent,
+                  self.routed_expert_start_idx + self.experts_per_rank),
+            [offsets_cpu[local_e + 1] - offsets_cpu[local_e]
+             for local_e in range(n_persistent, self.experts_per_rank)],
+        )
+
         if actual_total == 0:
             return torch.zeros(
                 num_tokens, hidden_size,
@@ -3033,6 +3045,7 @@ class Glm5MoE(nn.Module):
         _active = torch.zeros(self.total_experts, dtype=torch.bool, device=topk_indices.device)
         _active[topk_indices.reshape(-1)] = True
         _active_cpu = _active.tolist()
+        skip_idle_streamed_experts(self.experts, range(len(self.experts)), _active_cpu)
 
         if _moe_fp32:
             output = torch.zeros_like(hidden_flat, dtype=torch.float32)

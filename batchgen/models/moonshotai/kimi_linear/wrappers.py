@@ -41,10 +41,10 @@ class KimiLinearExpertWrapper(ExpertWrapperBase):
     Weights are BF16 (no dequant). When ``persistent=False`` the base class
     streams the expert's weights from the host copy-engine buffer on every
     forward (``load_weights`` -> ``apply_weights`` -> compute -> ``free_weights``);
-    the MoE layer MUST drive every streamed expert in weight-copy-task order
-    (layer-major ascending, including 0-token experts) so the copy engine does
-    not stall. ``_forward_impl`` just runs the wrapped KimiMLP (w1/w3 gate+up,
-    SiLU, w2 down).
+    the MoE layer declares its 0-token experts with
+    ``skip_idle_streamed_experts`` and runs the rest in weight-copy-task order
+    (layer-major ascending). ``_forward_impl`` just runs the wrapped KimiMLP
+    (w1/w3 gate+up, SiLU, w2 down).
     """
 
     def dequantize_weights(self, weights_dict):
@@ -369,10 +369,9 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
 
     def _forward_decode(self, hidden_states, **kwargs):
         # Empty DP rank (bsz==0): skip — 0-row conv1d_update /
-        # fused_recurrent grids are undefined. Streamed-expert lockstep is
-        # preserved: the MoE drive (moe_forward_serving) runs in the decoder
-        # layer's FFN after attention and still load+frees every expert via
-        # a 0-row forward.
+        # fused_recurrent grids are undefined. The decoder layer's FFN
+        # (moe_forward_serving) still runs and declares every streamed expert
+        # idle, which releases their slots.
         if hidden_states.shape[0] == 0:
             return hidden_states
         state = KimiLinearKDAWrapper.layer_pools[self.layer_idx]
