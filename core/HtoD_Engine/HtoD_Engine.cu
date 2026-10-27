@@ -483,6 +483,7 @@ py::dict HtoD_Engine::weight_stream_status() {
         passes[py::int_(pass)] = pass_entry;
     }
     result["passes"] = passes;
+    result["schedule_lost"] = snapshot.schedule_lost;
     return result;
 }
 
@@ -888,6 +889,62 @@ void HtoD_Engine::stop_h2d_worker() {
         throw std::runtime_error("HtoD producer failed: " + *failure);
     }
     this->producer_state_ = static_cast<int>(ProducerState::kParked);
+}
+
+HtoD_Engine::WeightPassAbort HtoD_Engine::abort_weight_passes() {
+    // The producer reads the queues and the cursors without the engine
+    // mutex, and a running one could acquire from the daemon meanwhile.
+    if (this->HtoD_worker_.joinable()) {
+        throw std::runtime_error(
+            "Cannot abort the weight passes while the HtoD producer is "
+            "running; stop it first");
+    }
+    WeightPassAbort result;
+    // The producer releases a lease before its copy lands, so one is left
+    // only where that release failed. Each is released; a failure is
+    // reported after the passes are dropped.
+    std::string release_failures;
+    for (const auto& module_name : this->weights_storage_.leased_modules()) {
+        try {
+            this->weights_storage_.release_module(module_name);
+            ++result.daemon_leases;
+        } catch (const std::exception& error) {
+            release_failures += (release_failures.empty() ? "" : "; ") +
+                                module_name + ": " + error.what();
+        }
+    }
+    // The daemon serves every rank of the node the same cyclic schedule.
+    // This rank stopped somewhere inside a pass its siblings may have
+    // finished or not started, so its position cannot be matched again.
+    result.schedule_lost = this->weights_storage_.is_distributed();
+    result.slots = this->gpu_weight_buffer_.abort_passes(result.schedule_lost);
+    {
+        // The table parked every cursor at the head of its list.
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->weights_copy_task_queue_.clear();
+        for (const auto& [module_type, module_names] :
+             this->weight_copy_tasks_) {
+            for (const auto& module_name : module_names) {
+                this->weights_copy_task_queue_[module_type].push(module_name);
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> status_lock(this->status_mutex_);
+        this->module_in_flight_.clear();
+        this->pass_in_flight_ = 0;
+    }
+    this->logger_->warn(
+        "Aborted {} weight passes and {} pending skips; released {} daemon "
+        "leases; schedule_lost={}",
+        result.slots.passes, result.slots.pending_skips, result.daemon_leases,
+        result.schedule_lost);
+    if (!release_failures.empty()) {
+        throw std::runtime_error(
+            "Aborted the weight passes, but releasing a daemon lease failed: " +
+            release_failures);
+    }
+    return result;
 }
 
 // Forward declaration of CUDA kernel

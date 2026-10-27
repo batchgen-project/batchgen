@@ -141,6 +141,14 @@ class BatchGen {
     // The caller still ends the pass. Returns {"pass", "freed_present",
     // "release_on_landing", "pending"}.
     py::dict cancel_weight_pass(int64_t pass_id);
+    // After a forward raised inside its passes, with the producer stopped
+    // (stop_h2d_worker): frees every slot whatever its state, drops every
+    // open pass and pending skip and releases any daemon lease left. With
+    // distributed storage the daemon schedule is lost and every later
+    // begin_weight_pass / set_weight_copy_queue throws. Returns {"passes",
+    // "pending_skips", "freed" (per slot state), "daemon_leases",
+    // "schedule_lost"}.
+    py::dict abort_weight_passes();
 
     void reset_decoding_buffer();
     void stop_h2d_worker();
