@@ -42,11 +42,31 @@
 
 #include "../data_structures.h"
 #include "../utils.h"
+#include "weight_slot_table.h"
 
 using module_weight_tensor_map = std::unordered_map<std::string, torch::Tensor>;
 using weight_buffers = std::vector<module_weight_tensor_map>;
 class GPU_Weight_Buffer {
    public:
+    // What the producer does with the module it reserved a slot for.
+    enum class CopyClaim {
+        kCopy,      // the slot is named; copy into it
+        kSkipped,   // a routing skip was pending; the slot is abandoned
+        kResident,  // already resident in another slot; the slot is abandoned
+    };
+
+    struct SkipCounts {
+        int64_t freed_present = 0;
+        int64_t release_on_landing = 0;
+        int64_t pending = 0;
+    };
+
+    struct SlotSnapshot {
+        // module type -> slot count per WeightSlotState
+        std::unordered_map<std::string, std::vector<int64_t>> counts;
+        std::vector<WeightSlotTable::HeldSlot> held;
+    };
+
     GPU_Weight_Buffer(EngineConfig& engine_config, ModelConfig& model_config);
     ~GPU_Weight_Buffer();
 
@@ -64,16 +84,33 @@ class GPU_Weight_Buffer {
 
     // std::shared_ptr<module_weight_tensor_map> get_weights(
     //     const std::string& module_name);
+    // Both lease the slot they return; the caller owns its release.
     module_weight_tensor_map get_weights(
             const std::string& module_name,
             std::string& phase);
-    // Return an existing lease without eviction; the caller owns its release.
+    // Waits without eviction.
     module_weight_tensor_map get_weights_pinned(
             const std::string& module_name);
 
-    void weights_copy_complete(const std::string& module_type,
+    /* Producer side of the slot lifecycle */
+    CopyClaim claim_for_copy(const std::string& module_type,
+                             int64_t buffer_idx,
+                             const std::string& module_name);
+    void abandon(const std::string& module_type, int64_t buffer_idx);
+    // Returns false when a skip released the slot as the copy landed.
+    bool weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
                                int64_t buffer_idx);
+    // Abandons buffer_idx if still FILLING (buffer_idx < 0: no slot), then
+    // records the failure so every waiter throws it.
+    void record_producer_failure(const std::string& module_type,
+                                 int64_t buffer_idx,
+                                 const std::string& message);
+    void clear_producer_failure();
+    std::optional<std::string> producer_failure() const;
+
+    SkipCounts skip_modules(const std::vector<std::string>& module_names);
+    SlotSnapshot slot_snapshot() const;
 
     void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
     void reset_prefill_buffer();
@@ -81,6 +118,8 @@ class GPU_Weight_Buffer {
     void reset_weight_stream_profile(bool enabled);
     pybind11::dict get_weight_stream_profile();
     void set_weight_copy_task(std::unordered_map<std::string, std::vector<std::string>> task){
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->slots_.install(task);
         this->weight_copy_tasks_ = task;
     }
 
@@ -92,6 +131,7 @@ class GPU_Weight_Buffer {
 
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
+    void throwIfProducerFailedLocked() const;
 
     EngineConfig& engine_config_;
     ModelConfig& model_config_;
@@ -102,10 +142,8 @@ class GPU_Weight_Buffer {
     mutable std::mutex mutex_;
     std::condition_variable cv_;
 
-    std::unordered_map<std::string, std::pair<std::string, int64_t>>
-        module_in_buffers_;  // module_name -> (module_type, buffer_idx)
-    std::unordered_map<std::string, std::vector<int64_t>>
-        buffer_status_;  // 0: empty, 1: in use, 2: pending compute completion
+    WeightSlotTable slots_;  // every slot's state and module, under mutex_
+    std::optional<std::string> producer_failure_;  // under mutex_
     std::deque<PendingRelease> pending_releases_;
     std::unordered_map<std::string, std::vector<std::string>>
         weight_copy_tasks_;

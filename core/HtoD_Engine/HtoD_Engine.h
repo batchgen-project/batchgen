@@ -22,6 +22,7 @@
 #include "pybind11/pybind11.h"
 #include "pybind11/stl.h"
 #include "spdlog/spdlog.h"
+#include <atomic>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -73,15 +74,37 @@ class HtoD_Engine {
             weight_copy_tasks);
     void reset_weight_stream_profile(bool enabled);
     py::dict get_weight_stream_profile();
+    py::dict weight_stream_status();
+    // Joins the producer, then rethrows its recorded failure, if any.
     void stop_h2d_worker();
     void batched_page_copy(const std::vector<void*>& gpu_ptrs,
                            const std::vector<void*>& host_ptrs,
                            int64_t page_byte_size);
-    
+
 
    private:
+    // idle: running, nothing in flight. acquiring: fetching a module's host
+    // storage (a remote module waits for the node daemon). copying: copying
+    // it into its slot. parked: the thread is not running. failed: a copy
+    // failed; nothing is copied until set_weight_copy_queue.
+    enum class ProducerState : int {
+        kIdle = 0,
+        kAcquiring = 1,
+        kCopying = 2,
+        kParked = 3,
+        kFailed = 4,
+    };
+    void set_producer_state_(ProducerState state,
+                             const std::string& module_name);
+    void count_module_(
+        std::unordered_map<std::string, uint64_t>& counter,
+        const std::string& module_type);
+    void fail_producer_(const std::string& module_type, int64_t buffer_idx,
+                        const std::string& module_name, bool leased,
+                        const std::string& message);
+
     /* Template */
-    bool terminate_flag_;
+    std::atomic<bool> terminate_flag_{false};
     const EngineConfig& engine_config_;
     const ModelConfig& model_config_;
     cudaStream_t HtoD_stream;
@@ -111,6 +134,21 @@ class HtoD_Engine {
         weight_copy_tasks_;
     std::unordered_map<std::string, threadsafe_queue<std::string>>
         weights_copy_task_queue_;  // module type -> queue of module names.
+    // Bumped under mutex_ by every queue install, clear or reset, so the
+    // producer can tell that the head it peeked no longer belongs to the
+    // queue it would pop or push back into.
+    uint64_t queue_generation_ = 0;
+    // Set by a failed copy, cleared only by set_weight_copy_queue.
+    std::atomic<bool> producer_failed_{false};
+
+    std::atomic<int> producer_state_{static_cast<int>(ProducerState::kParked)};
+    std::mutex status_mutex_;
+    std::string module_in_flight_;  // under status_mutex_
+    // Per module type since the last set_weight_copy_queue, under
+    // status_mutex_.
+    std::unordered_map<std::string, uint64_t> copied_modules_;
+    std::unordered_map<std::string, uint64_t> skipped_modules_;
+    std::unordered_map<std::string, uint64_t> released_on_landing_modules_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

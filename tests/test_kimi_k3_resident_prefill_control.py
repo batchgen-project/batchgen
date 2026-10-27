@@ -3630,18 +3630,29 @@ def test_streamed_sp8_reinterprets_offline_marlin_as_int32():
 def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     path = ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
     source = path.read_text()
+    table = (
+        ROOT / "core" / "GPU_Weight_Buffer" / "weight_slot_table.h"
+    ).read_text()
     release = source[
         source.index("void GPU_Weight_Buffer::releaseBuffer"):
-        source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights")
+        source.index("void GPU_Weight_Buffer::releaseBuffersAsync")
+    ]
+    table_release = table[
+        table.index("SlotRef release(const std::string& module_name)"):
+        table.index("std::vector<SlotRef> release_async(")
     ]
     get_weights = source[
         source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights"):
-        source.index("void GPU_Weight_Buffer::weights_copy_complete")
+        source.index("void GPU_Weight_Buffer::throwIfProducerFailedLocked")
     ]
 
-    assert "module_in_buffers_.find(module_name)" in release
-    assert "module_in_buffers_[module_name]" not in release
-    assert "Cannot release missing weight-buffer lease" in release
+    # Release goes through the slot table, which looks the name up without
+    # inserting it and refuses anything that is not LEASED.
+    assert "this->slots_.release(module_name)" in release
+    assert "this->index_.find(module_name)" in table_release
+    assert "this->index_[module_name]" not in table_release
+    assert "*state != WeightSlotState::kLeased" in table_release
+    assert "Cannot release missing weight-buffer lease" in table_release
     assert 'phase == "prefill_sp8"' in get_weights
     assert "std::chrono::seconds(300)" in get_weights
     assert "!hold_layer_batch" in get_weights
@@ -4651,7 +4662,7 @@ def test_hierarchical_gdr_get_module_is_fail_closed_outside_the_pinned_slot():
     source = _weights_storage_source()
     get_module = _cpp_section(
         source,
-        "Weights_Storage::get_module_weights_storage(std::string module_key)",
+        "Weights_Storage::get_module_weights_storage(\n    std::string module_key",
         "py::dict Weights_Storage::get_tensor",
     )
     get_tensor = source[source.index("py::dict Weights_Storage::get_tensor"):]

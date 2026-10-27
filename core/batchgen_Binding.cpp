@@ -645,6 +645,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &BatchGen::reset_weight_stream_profile)
         .def("get_weight_stream_profile",
              &BatchGen::get_weight_stream_profile)
+        .def("skip_weight_modules", &BatchGen::skip_weight_modules,
+             py::arg("module_names"))
+        .def("weight_stream_status", &BatchGen::weight_stream_status)
         .def("reset_decoding_buffer", &BatchGen::reset_decoding_buffer)
         .def("stop_h2d_worker", &BatchGen::stop_h2d_worker)
         .def("copy_kv_to_worker",

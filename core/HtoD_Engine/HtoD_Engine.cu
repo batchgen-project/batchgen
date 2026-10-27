@@ -25,6 +25,7 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../KV_Storage/KV_Storage.h"
@@ -188,15 +189,24 @@ void HtoD_Engine::Init() {
 void HtoD_Engine::Start(){
     if (!this->HtoD_worker_.joinable()) {
         this->terminate_flag_ = false;
+        this->set_producer_state_(this->producer_failed_
+                                      ? ProducerState::kFailed
+                                      : ProducerState::kIdle,
+                                  "");
         this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
     }
 }
 
 
+// Never throws: it runs from the destructor. stop_h2d_worker reports a
+// producer failure instead.
 void HtoD_Engine::Terminate() {
     this->terminate_flag_ = true;
     if (this->HtoD_worker_.joinable()) {
         this->HtoD_worker_.join();
+    }
+    if (!this->producer_failed_) {
+        this->producer_state_ = static_cast<int>(ProducerState::kParked);
     }
 };
 
@@ -254,6 +264,7 @@ void HtoD_Engine::clear_kv_copy_queue() {
 void HtoD_Engine::clear_weight_copy_queue() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     std::lock_guard<std::mutex> lock(this->mutex_);
+    ++this->queue_generation_;
     for (auto& [module_type, queue] : this->weights_copy_task_queue_) {
         while (!queue.empty()) {
             queue.clear();
@@ -264,6 +275,7 @@ void HtoD_Engine::clear_weight_copy_queue() {
 
 void HtoD_Engine::reset_weight_copy_queue() {
     std::lock_guard<std::mutex> lock(this->mutex_);
+    ++this->queue_generation_;
 
     // re-init the weights_copy_task_queue_ according to the weight_copy_tasks
     auto new_weights_copy_task_queue =
@@ -303,6 +315,122 @@ py::dict HtoD_Engine::get_weight_stream_profile() {
         by_type[module_type.c_str()] = entry;
     }
     result["by_type"] = by_type;
+    return result;
+}
+
+void HtoD_Engine::set_producer_state_(ProducerState state,
+                                      const std::string& module_name) {
+    std::lock_guard<std::mutex> lock(this->status_mutex_);
+    this->module_in_flight_ = module_name;
+    this->producer_state_ = static_cast<int>(state);
+}
+
+void HtoD_Engine::count_module_(
+    std::unordered_map<std::string, uint64_t>& counter,
+    const std::string& module_type) {
+    std::lock_guard<std::mutex> lock(this->status_mutex_);
+    counter[module_type] += 1;
+}
+
+// Called from the producer's catch: must not throw. The slot is abandoned and
+// the daemon lease released before waiters see the failure.
+void HtoD_Engine::fail_producer_(const std::string& module_type,
+                                 int64_t buffer_idx,
+                                 const std::string& module_name, bool leased,
+                                 const std::string& message) {
+    std::string failure = module_name.empty()
+                              ? message
+                              : module_name + ": " + message;
+    if (leased) {
+        try {
+            this->weights_storage_.release_module(module_name);
+        } catch (const std::exception& error) {
+            failure += "; releasing its daemon lease also failed: " +
+                       std::string(error.what());
+        }
+    }
+    this->logger_->error("HtoD producer failed: {}", failure);
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->producer_failed_ = true;
+        try {
+            this->gpu_weight_buffer_.record_producer_failure(
+                module_type, buffer_idx, failure);
+        } catch (const std::exception& error) {
+            this->logger_->error(
+                "HtoD producer could not record its failure: {}",
+                error.what());
+        }
+        this->set_producer_state_(ProducerState::kFailed, "");
+    }
+}
+
+py::dict HtoD_Engine::weight_stream_status() {
+    static const char* const kProducerStates[] = {
+        "idle", "acquiring", "copying", "parked", "failed"};
+    py::dict result;
+    result["producer_state"] = kProducerStates[this->producer_state_.load()];
+    {
+        std::lock_guard<std::mutex> lock(this->status_mutex_);
+        result["module_in_flight"] =
+            this->module_in_flight_.empty()
+                ? py::object(py::none())
+                : py::object(py::str(this->module_in_flight_));
+        std::unordered_set<std::string> module_types;
+        for (const auto* counter :
+             {&this->copied_modules_, &this->skipped_modules_,
+              &this->released_on_landing_modules_}) {
+            for (const auto& [module_type, count] : *counter) {
+                module_types.insert(module_type);
+            }
+        }
+        py::dict by_type;
+        for (const auto& module_type : module_types) {
+            auto count = [&module_type](
+                             const std::unordered_map<std::string, uint64_t>&
+                                 counter) -> uint64_t {
+                auto found = counter.find(module_type);
+                return found == counter.end() ? 0 : found->second;
+            };
+            py::dict entry;
+            entry["copied"] = count(this->copied_modules_);
+            entry["skipped"] = count(this->skipped_modules_);
+            entry["released_on_landing"] =
+                count(this->released_on_landing_modules_);
+            by_type[module_type.c_str()] = entry;
+        }
+        result["by_type"] = by_type;
+    }
+    const auto failure = this->gpu_weight_buffer_.producer_failure();
+    result["producer_failure"] = failure.has_value()
+                                     ? py::object(py::str(*failure))
+                                     : py::object(py::none());
+
+    const auto snapshot = this->gpu_weight_buffer_.slot_snapshot();
+    py::dict slot_counts;
+    for (const auto& [module_type, counts] : snapshot.counts) {
+        py::dict entry;
+        for (int state = 0; state < kWeightSlotStateCount; ++state) {
+            entry[weight_slot_state_name(
+                static_cast<WeightSlotState>(state))] = counts[state];
+        }
+        slot_counts[module_type.c_str()] = entry;
+    }
+    py::list held;
+    for (const auto& slot : snapshot.held) {
+        py::dict entry;
+        entry["module_type"] = slot.module_type;
+        entry["index"] = slot.index;
+        entry["module"] = slot.module_name.empty()
+                              ? py::object(py::none())
+                              : py::object(py::str(slot.module_name));
+        entry["state"] = weight_slot_state_name(slot.state);
+        held.append(entry);
+    }
+    py::dict buffer;
+    buffer["slot_counts"] = slot_counts;
+    buffer["held"] = held;
+    result["buffer"] = buffer;
     return result;
 }
 
@@ -444,9 +572,20 @@ void HtoD_Engine::HtoD_Worker() {
 
         for (auto& module_type :
              this->engine_config_.basic_config.module_types) {
+            // A failed producer copies nothing until set_weight_copy_queue;
+            // a stop request ends the pass between modules.
+            if (this->producer_failed_ || this->terminate_flag_) {
+                break;
+            }
             // Skip if queue is empty (no modules of this type need loading)
             // This prevents blocking when e.g. experts are persistent and not in queue
-            if (this->weights_copy_task_queue_[module_type].empty()) {
+            bool queue_empty = false;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                queue_empty =
+                    this->weights_copy_task_queue_[module_type].empty();
+            }
+            if (queue_empty) {
                 continue;
             }
             auto optional_buffer =
@@ -455,21 +594,100 @@ void HtoD_Engine::HtoD_Worker() {
                 progressed = true;
                 this->logger_->debug("Acquired buffer for module type: {}",
                                      module_type);
-                CUDA_CHECK(
-                    cudaSetDevice(this->engine_config_.basic_config.device));
                 auto [buffer, buffer_idx] = optional_buffer.value();
                 std::string module_name;
-                while (this->weights_copy_task_queue_[module_type].try_pop(
-                           module_name) == false) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-                auto dst = buffer.get();
-                auto src = this->weights_storage_.get_module_weights_storage(
-                    module_name);
-                torch::Tensor tmp_src;
-                void* src_ptr;
-                int64_t src_byte_size;
+                uint64_t generation = 0;
+                // release_module() is owed for module_name: a remote module
+                // holds a daemon lease from its fetch until then.
+                bool lease_held = false;
                 try {
+                    CUDA_CHECK(cudaSetDevice(
+                        this->engine_config_.basic_config.device));
+                    // Peek, do not pop: a cancelled acquire leaves the module
+                    // at the head, so the cyclic order is unchanged.
+                    {
+                        std::lock_guard<std::mutex> lock(this->mutex_);
+                        generation = this->queue_generation_;
+                        if (!this->weights_copy_task_queue_[module_type]
+                                 .try_front(module_name)) {
+                            module_name.clear();
+                        }
+                    }
+                    if (module_name.empty()) {
+                        // Emptied by a clear since the check above.
+                        this->gpu_weight_buffer_.abandon(module_type,
+                                                         buffer_idx);
+                        continue;
+                    }
+                    this->set_producer_state_(ProducerState::kAcquiring,
+                                              module_name);
+                    auto fetched =
+                        this->weights_storage_.get_module_weights_storage(
+                            module_name, &this->terminate_flag_);
+                    if (!fetched.has_value()) {
+                        // Stop requested before the daemon readied the
+                        // module: nothing is leased, and the module stays at
+                        // the head of its queue.
+                        this->gpu_weight_buffer_.abandon(module_type,
+                                                         buffer_idx);
+                        this->set_producer_state_(ProducerState::kParked, "");
+                        break;
+                    }
+                    lease_held = true;
+                    const auto src = std::move(*fetched);
+                    bool current = false;
+                    {
+                        std::lock_guard<std::mutex> lock(this->mutex_);
+                        current = this->queue_generation_ == generation;
+                        if (current) {
+                            // Only this thread pops: the head is still
+                            // module_name.
+                            this->weights_copy_task_queue_[module_type]
+                                .try_pop(module_name);
+                        }
+                    }
+                    if (!current) {
+                        // The queue was cleared or reinstalled during the
+                        // fetch; the module belongs to neither queue.
+                        lease_held = false;
+                        this->weights_storage_.release_module(module_name);
+                        this->gpu_weight_buffer_.abandon(module_type,
+                                                         buffer_idx);
+                        this->set_producer_state_(ProducerState::kIdle, "");
+                        continue;
+                    }
+                    const auto claim = this->gpu_weight_buffer_.claim_for_copy(
+                        module_type, buffer_idx, module_name);
+                    if (claim != GPU_Weight_Buffer::CopyClaim::kCopy) {
+                        // No copy, but the daemon lease is still released so
+                        // the node FIFO advances, and the module keeps its
+                        // place in the cycle.
+                        lease_held = false;
+                        this->weights_storage_.release_module(module_name);
+                        if (claim == GPU_Weight_Buffer::CopyClaim::kSkipped) {
+                            this->count_module_(this->skipped_modules_,
+                                                module_type);
+                        } else {
+                            // A resident module moves nothing; counting it
+                            // would spin a type whose whole task list is
+                            // resident on the buffer mutex.
+                            progressed = false;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(this->mutex_);
+                            if (this->queue_generation_ == generation) {
+                                this->weights_copy_task_queue_[module_type]
+                                    .push(module_name);
+                            }
+                        }
+                        this->set_producer_state_(ProducerState::kIdle, "");
+                        continue;
+                    }
+                    this->set_producer_state_(ProducerState::kCopying,
+                                              module_name);
+                    auto dst = buffer.get();
+                    void* src_ptr;
+                    int64_t src_byte_size;
                     for (auto& [tensor_name, host_tensor_storage] : src) {
                         src_ptr = host_tensor_storage.data_ptr;
                         src_byte_size = host_tensor_storage.byte_size;
@@ -525,29 +743,46 @@ void HtoD_Engine::HtoD_Worker() {
                             }
                         }
                     }
-                } catch (...) {
+                    lease_held = false;
                     this->weights_storage_.release_module(module_name);
-                    throw;
-                }
-                this->weights_storage_.release_module(module_name);
-                {
-                    std::lock_guard<std::mutex> lock(
-                        this->weight_profile_mutex_);
-                    if (this->weight_profile_enabled_) {
-                        this->weight_profile_modules_[module_type] += 1;
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            this->weight_profile_mutex_);
+                        if (this->weight_profile_enabled_) {
+                            this->weight_profile_modules_[module_type] += 1;
+                        }
                     }
-                }
-                this->logger_->debug("Copied module: {} to buffer: {}",
-                                    module_name, buffer_idx);
-                // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-                // CUDA_CHECK(cudaStreamSynchronize(0));
-                this->gpu_weight_buffer_.weights_copy_complete(
-                    module_type, module_name, buffer_idx);
-                /* PUSH THE TASK BACK */
-                {
-                    std::lock_guard<std::mutex> lock(this->mutex_);
-                    this->weights_copy_task_queue_[module_type].push(
-                        module_name);
+                    this->logger_->debug("Copied module: {} to buffer: {}",
+                                        module_name, buffer_idx);
+                    // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    // CUDA_CHECK(cudaStreamSynchronize(0));
+                    const bool present =
+                        this->gpu_weight_buffer_.weights_copy_complete(
+                            module_type, module_name, buffer_idx);
+                    this->count_module_(this->copied_modules_, module_type);
+                    if (!present) {
+                        this->count_module_(
+                            this->released_on_landing_modules_, module_type);
+                    }
+                    /* PUSH THE TASK BACK */
+                    {
+                        std::lock_guard<std::mutex> lock(this->mutex_);
+                        if (this->queue_generation_ == generation) {
+                            this->weights_copy_task_queue_[module_type].push(
+                                module_name);
+                        }
+                    }
+                    this->set_producer_state_(ProducerState::kIdle, "");
+                } catch (const std::exception& error) {
+                    // Never rethrow: an exception leaving this thread is
+                    // std::terminate. Waiters see the failure instead.
+                    this->fail_producer_(module_type, buffer_idx, module_name,
+                                         lease_held, error.what());
+                    break;
+                } catch (...) {
+                    this->fail_producer_(module_type, buffer_idx, module_name,
+                                         lease_held, "unknown exception");
+                    break;
                 }
             }
         }
@@ -565,6 +800,7 @@ void HtoD_Engine::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&
         weight_copy_tasks) {
     std::lock_guard<std::mutex> lock(this->mutex_);
+    ++this->queue_generation_;
     this->weight_copy_tasks_ = weight_copy_tasks;
     for (auto& item : weight_copy_tasks) {
         auto module_type = item.first;
@@ -574,6 +810,21 @@ void HtoD_Engine::set_weight_copy_queue(
             this->weights_copy_task_queue_[module_type].push(module_name);
         }
     }
+    // A new queue un-parks a failed producer.
+    this->gpu_weight_buffer_.clear_producer_failure();
+    this->producer_failed_ = false;
+    {
+        std::lock_guard<std::mutex> status_lock(this->status_mutex_);
+        this->copied_modules_.clear();
+        this->skipped_modules_.clear();
+        this->released_on_landing_modules_.clear();
+        if (this->producer_state_ == static_cast<int>(ProducerState::kFailed)) {
+            this->producer_state_ = static_cast<int>(
+                this->HtoD_worker_.joinable() ? ProducerState::kIdle
+                                              : ProducerState::kParked);
+            this->module_in_flight_.clear();
+        }
+    }
 }
 
 void HtoD_Engine::stop_h2d_worker() {
@@ -581,6 +832,11 @@ void HtoD_Engine::stop_h2d_worker() {
     if (this->HtoD_worker_.joinable()) {
         this->HtoD_worker_.join();
     }
+    const auto failure = this->gpu_weight_buffer_.producer_failure();
+    if (failure.has_value()) {
+        throw std::runtime_error("HtoD producer failed: " + *failure);
+    }
+    this->producer_state_ = static_cast<int>(ProducerState::kParked);
 }
 
 // Forward declaration of CUDA kernel
