@@ -824,9 +824,20 @@ main() {
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
                 remove_upstream_deepgemm
-                if ! pip install --find-links "$WHEEL_DIR" --no-index \
-                    flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
-                    "apache-tvm-ffi==${TVM_FFI_VERSION}"; then
+                # Install the five pre-built artifacts exactly, without letting
+                # resolution reach past the wheel directory: flash-attn-3 also
+                # declares einops, packaging and ninja, which the release does
+                # not ship, and a single offline resolve fails on the first one.
+                # The second call leaves the five (already satisfied) untouched
+                # and fills in their remaining requirements from the wheel
+                # directory when present, otherwise from the package index.
+                if ! pip install --no-index --no-deps \
+                        "$WHEEL_DIR"/flash_attn_3-*.whl "$WHEEL_DIR"/flash_mla-*.whl \
+                        "$WHEEL_DIR"/sgl_deep_gemm-*.whl "$WHEEL_DIR"/batchgen_kernels-*.whl \
+                        "$WHEEL_DIR"/apache_tvm_ffi-*.whl \
+                    || ! pip install --find-links "$WHEEL_DIR" \
+                        flash-attn-3 flash-mla sgl-deep-gemm batchgen-kernels \
+                        "apache-tvm-ffi==${TVM_FFI_VERSION}"; then
                     print_warning "pre-built wheel installation failed; validating each dependency and source-building only what is missing"
                 fi
                 # Validate the runtime interfaces rather than trusting wheel
