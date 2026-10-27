@@ -753,7 +753,8 @@ class GptOssMoEDecode(nn.Module):
         # Router
         self.router = nn.Linear(config.hidden_size, self.total_experts, bias=True)
 
-        # Expert wrappers for non-persistent experts (single-expert forward)
+        # Expert wrappers for non-persistent experts (single-expert forward);
+        # their weights come only from the weight ring.
         self.experts = nn.ModuleList([None] * self.total_experts)
 
         # ---- MXFP4 grouped kernel pointer arrays (persistent experts) ----
@@ -771,17 +772,6 @@ class GptOssMoEDecode(nn.Module):
         self.gate_scale_ref = None
         self.down_weight_ref = None
         self.down_scale_ref = None
-
-        # ---- MXFP4 per-expert weight lists (non-persistent experts) ----
-        self.gate_weights = None  # List[Tensor] indexed by global expert idx
-        self.gate_scales = None
-        self.up_weights = None
-        self.up_scales = None
-        self.down_weights = None
-        self.down_scales = None
-        self.gate_biases = None
-        self.up_biases = None
-        self.down_biases = None
 
         # ---- BF16 grouped kernel pointer arrays (placeholder) ----
         # TODO: Set up when grouped BF16 kernel is ported
@@ -988,38 +978,30 @@ class GptOssMoEDecode(nn.Module):
         topk_weights: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Process non-persistent experts one by one, accumulating into output."""
-        # Precompute which experts have tokens with a single CPU-GPU sync
-        # instead of one sync per expert from expert_mask.any()
-        active_experts_set = set(topk_indices.flatten().tolist())
+        """Process non-persistent experts one by one, accumulating into output.
+
+        A non-persistent expert's weights exist only in the weight ring: its
+        wrapper leases them in the current weight pass and frees them after
+        use. The copy engine streams every non-persistent expert each pass, so
+        the idle ones release their slots before any of them loads.
+        """
+        # One host sync for every expert's count.
+        token_counts = torch.bincount(
+            topk_indices.reshape(-1), minlength=self.total_experts
+        ).tolist()
+        skip_idle_streamed_experts(
+            self.experts,
+            self.non_persistent_expert_indices,
+            [token_counts[idx] for idx in self.non_persistent_expert_indices],
+        )
 
         for expert_idx in self.non_persistent_expert_indices:
-            if expert_idx not in active_experts_set:
+            if token_counts[expert_idx] == 0:
                 continue
             expert_mask = (topk_indices == expert_idx).any(dim=-1)
 
             expert_input = hidden_flat[expert_mask]
-
-            if self.weight_format == "mxfp4":
-                if _HAS_WGMMA_SINGLE:
-                    expert_output = fused_mxfp4_expert_forward(
-                        expert_input,
-                        self.gate_weights[expert_idx], self.gate_scales[expert_idx],
-                        self.up_weights[expert_idx], self.up_scales[expert_idx],
-                        self.down_weights[expert_idx], self.down_scales[expert_idx],
-                        gate_bias=self.gate_biases[expert_idx] if self.gate_biases is not None else None,
-                        up_bias=self.up_biases[expert_idx] if self.up_biases is not None else None,
-                        down_bias=self.down_biases[expert_idx] if self.down_biases is not None else None,
-                    )
-                else:
-                    expert = self.experts[expert_idx]
-                    expert_output = expert(expert_input)
-            elif self.weight_format == "bf16":
-                # BF16 single expert: use wrapper forward (torch.mm path)
-                expert = self.experts[expert_idx]
-                expert_output = expert(expert_input)
-            else:
-                raise ValueError(f"Unknown weight_format: {self.weight_format}")
+            expert_output = self.experts[expert_idx](expert_input)
 
             # Weighted accumulation
             expert_weight = torch.where(

@@ -434,9 +434,10 @@ class GptOssParallelStrategyManager:
         # EP mode only active when ranges are computed (decode phase)
         ep_enabled = self.world_size > 1 and self.routed_expert_gpu_start_idx is not None
         if ep_enabled:
-            # EP mode: only configure local experts
+            # EP mode: only configure this rank's experts. Its host-resident
+            # ones stream through the weight ring, so they need a wrapper too.
             expert_start = self.routed_expert_gpu_start_idx
-            expert_end = self.routed_expert_gpu_end_idx
+            expert_end = self.routed_expert_host_end_idx
         else:
             # Single GPU: configure all experts
             expert_start = 0
@@ -553,9 +554,17 @@ class GptOssParallelStrategyManager:
             decode_moe.non_persistent_expert_indices = non_persistent_indices
             decode_moe.weight_format = weight_format
 
-            # Transfer expert wrappers (for non-persistent single-expert forward)
+            # Transfer expert wrappers (for non-persistent single-expert forward).
+            # A non-persistent expert has no GPU copy: its wrapper leases it
+            # from the weight ring.
             for idx in non_persistent_indices:
-                decode_moe.experts[idx] = old_moe.experts[idx]
+                expert = old_moe.experts[idx]
+                if not isinstance(expert, GptOssExpertWrapper) or expert.persistent:
+                    raise RuntimeError(
+                        f"Rank {self.rank}: layer {layer_idx} expert {idx} is "
+                        "offloaded but has no streamed GptOssExpertWrapper"
+                    )
+                decode_moe.experts[idx] = expert
 
             # Set up grouped kernel pointer arrays for persistent experts
             if num_persistent > 0 and weight_format == "mxfp4" and _HAS_WGMMA_GROUPED:
@@ -611,32 +620,6 @@ class GptOssParallelStrategyManager:
                     decode_moe._persistent_gate_biases = gate_biases
                     decode_moe._persistent_up_biases = up_biases
                     decode_moe._persistent_down_biases = down_biases
-
-            # Store per-expert weight references for non-persistent single-expert path
-            if non_persistent_indices and weight_format == "mxfp4":
-                # Build sparse weight lists indexed by global expert idx
-                num_total = 128 if ep_enabled else self.model_config.num_local_experts
-                decode_moe.gate_weights = [None] * num_total
-                decode_moe.gate_scales = [None] * num_total
-                decode_moe.up_weights = [None] * num_total
-                decode_moe.up_scales = [None] * num_total
-                decode_moe.down_weights = [None] * num_total
-                decode_moe.down_scales = [None] * num_total
-                decode_moe.gate_biases = [None] * num_total
-                decode_moe.up_biases = [None] * num_total
-                decode_moe.down_biases = [None] * num_total
-
-                for idx in non_persistent_indices:
-                    wrapper = old_moe.experts[idx]
-                    decode_moe.gate_weights[idx] = wrapper.mxfp4_gate_packed
-                    decode_moe.gate_scales[idx] = wrapper.mxfp4_gate_scales
-                    decode_moe.up_weights[idx] = wrapper.mxfp4_up_packed
-                    decode_moe.up_scales[idx] = wrapper.mxfp4_up_scales
-                    decode_moe.down_weights[idx] = wrapper.mxfp4_down_packed
-                    decode_moe.down_scales[idx] = wrapper.mxfp4_down_scales
-                    decode_moe.gate_biases[idx] = getattr(wrapper, 'mxfp4_gate_bias', None)
-                    decode_moe.up_biases[idx] = getattr(wrapper, 'mxfp4_up_bias', None)
-                    decode_moe.down_biases[idx] = getattr(wrapper, 'mxfp4_down_bias', None)
 
             decode_moe.to(device)
 
