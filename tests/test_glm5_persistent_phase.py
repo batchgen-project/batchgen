@@ -212,24 +212,36 @@ def test_persistent_decode_instance_uses_runtime_rank_cap():
         return object(), {}
 
     manager.configure_decoding = configure_decoding
+    trace = []
     worker = SimpleNamespace(
         rank=1,
         parallel_manager=manager,
+        _weight_passes=SimpleNamespace(close=lambda: trace.append("close")),
         core_engine=SimpleNamespace(
-            stop_h2d_worker=lambda: None,
-            clear_kv_copy_queue=lambda: None,
-            clear_weight_copy_queue=lambda: None,
-            reset_decoding_buffer=lambda: None,
+            stop_h2d_worker=lambda: trace.append("stop"),
+            clear_kv_copy_queue=lambda: trace.append("clear_kv"),
+            reset_decoding_buffer=lambda: trace.append("reset_decoding"),
         ),
         init_nvshmem=lambda: None,
         _max_decode_rank_bsz=lambda: 128,
-        set_phase=lambda phase: None,
+        _install_decode_weight_copy_queue=lambda: trace.append("install"),
+        set_phase=lambda phase: trace.append(("set_phase", phase)),
     )
 
     activate(worker, "comm")
 
     assert configured == [(128, "comm")]
     assert worker._decode_padding_bsz == 128
+    # No weight pass is open across the switch, and the decode schedule
+    # (empty here) replaces the prefill lists before decode runs.
+    assert trace == [
+        "close",
+        "stop",
+        "clear_kv",
+        "reset_decoding",
+        "install",
+        ("set_phase", "decode"),
+    ]
 
 
 def test_persistent_startup_capture_follows_cuda_graph_enablement():

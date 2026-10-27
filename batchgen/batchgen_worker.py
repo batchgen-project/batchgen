@@ -464,6 +464,141 @@ class _DualAsyncLoadTask:
 			self._aux.wait()
 
 
+class _WeightPasses:
+	"""Runs every model forward that can consume streamed weights inside one
+	weight pass of the core engine.
+
+	A weight pass is one traversal of every installed weight-copy list, i.e.
+	one forward; ``get_weights`` fails outside one. Inside ``scope()``,
+	``begin()`` arms the pass of the forward about to run and ``end()`` closes
+	it once that forward has consumed its modules. ``begin(carry=True)`` also
+	arms the pass of the forward that follows, so the producer can continue
+	into its first layers while this one finishes; the next ``begin()`` takes
+	that pass instead of arming one. Leaving the scope, normally or by an
+	exception, cancels and ends every pass still open, so no pass crosses a
+	phase boundary. Pass 0 means nothing is installed and costs no engine call.
+	"""
+
+	_COUNTED = ("copied", "skipped", "released_on_landing")
+
+	def __init__(self, core_engine, rank):
+		self._core_engine = core_engine
+		self._rank = rank
+		self._phase = None
+		self._current = None
+		self._carried = None
+		# Summed end_weight_pass reports of the current (or last) scope.
+		self.totals = self._empty_totals()
+
+	@classmethod
+	def _empty_totals(cls):
+		totals = {name: {} for name in cls._COUNTED}
+		totals["passes"] = 0
+		totals["carried"] = 0
+		return totals
+
+	@classmethod
+	def _describe(cls, record):
+		def per_type(counts):
+			return ",".join(
+				f"{name}:{int(counts[name])}" for name in sorted(counts)
+			) or "-"
+
+		return " ".join(
+			[f"{name}={per_type(record[name])}" for name in cls._COUNTED]
+			+ [f"carried={int(record['carried'])}"]
+		)
+
+	@contextmanager
+	def scope(self, phase):
+		"""One forward loop; every pass it armed is closed on the way out."""
+		if self._phase is not None:
+			raise RuntimeError(
+				f"Rank {self._rank}: a {phase} weight-pass scope was opened "
+				f"inside the {self._phase} one"
+			)
+		self._phase = phase
+		self.totals = self._empty_totals()
+		try:
+			yield self
+		except BaseException as error:
+			try:
+				self.close()
+			except BaseException:
+				# The forward's failure stays the error raised; the cleanup
+				# failure becomes its context.
+				raise error
+			raise
+		else:
+			self.close()
+		finally:
+			self._phase = None
+
+	def begin(self, carry=False):
+		"""Open the pass of the forward about to run."""
+		if self._phase is None:
+			raise RuntimeError(
+				f"Rank {self._rank}: a weight pass was begun outside a scope"
+			)
+		if self._current is not None:
+			raise RuntimeError(
+				f"Rank {self._rank}: weight pass {self._current} was not ended "
+				"before the next forward began"
+			)
+		if self._carried is not None:
+			self._current, self._carried = self._carried, None
+		else:
+			self._current = self._core_engine.begin_weight_pass()
+		if carry and self._current != 0:
+			self._carried = self._core_engine.begin_weight_pass()
+
+	def end(self):
+		"""Close the pass of the forward that just ran."""
+		if self._current is None:
+			raise RuntimeError(f"Rank {self._rank}: no weight pass to end")
+		if self._current != 0:
+			self._record(self._core_engine.end_weight_pass(self._current))
+		self._current = None
+
+	def close(self):
+		"""Cancel and end the pass of a forward that raised, then a carried
+		pass whose forward will not run."""
+		if self._current is not None:
+			self._abandon(self._current)
+			self._current = None
+		if self._carried is not None:
+			self._abandon(self._carried)
+			self._carried = None
+		if self._phase == "decode" and self.totals["passes"]:
+			logging.info(
+				"[WEIGHT_PASS] rank %d decode passes=%d %s",
+				self._rank,
+				self.totals["passes"],
+				self._describe(self.totals),
+			)
+
+	def _abandon(self, pass_id):
+		if pass_id != 0:
+			self._core_engine.cancel_weight_pass(pass_id)
+			self._record(self._core_engine.end_weight_pass(pass_id))
+
+	def _record(self, report):
+		self.totals["passes"] += 1
+		for name in self._COUNTED:
+			counts = self.totals[name]
+			for module_type, count in report[name].items():
+				counts[module_type] = counts.get(module_type, 0) + int(count)
+		self.totals["carried"] += int(report["carried"])
+		# Every rank logs its own passes: node validation compares ranks.
+		if self._phase == "prefill":
+			logging.info(
+				"[WEIGHT_PASS] rank %d pass %d %s",
+				self._rank,
+				int(report["pass"]),
+				self._describe(report),
+			)
+
+
 @dataclass
 class _DualKVLoadPointers:
 	sequence_tensor: torch.Tensor
@@ -1088,9 +1223,9 @@ class BatchGenWorker:
 		self._decode_tokens_unread = False
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
-		# Kimi-K3 streamed-SP8 prefill pipeline identity. Host-RDMA preserves its
-		# remote-daemon cursor after the first install; hierarchical GDR uses the
-		# same fingerprint but reseeds its local queue/ring on each admission.
+		# Kimi-K3 streamed-SP8 prefill ring. Resident decode keeps its prefill
+		# layout, so only the first install allocates it; the fingerprint pins
+		# the schedule that install handed the distributed weight transport.
 		self._streamed_sp8_h2d_installed = False
 		self._streamed_sp8_weight_copy_fingerprint = None
 		# Kimi-K3 pre-readiness startup (prepare_kimi_k3_startup). The first
@@ -1342,6 +1477,9 @@ class BatchGenWorker:
 		self.loaded_model_config = None
 		self.engine_config = None
 		self.core_engine = None
+		# Weight passes of core_engine's model forwards, bound with it in
+		# _initialize_core_components().
+		self._weight_passes = None
 		self.tokenizer = None
 		self.initializer = None
 		self.parallel_manager = None
@@ -4574,6 +4712,7 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
+		self._weight_passes = _WeightPasses(self.core_engine, self.rank)
 		# Phase B: pull the cuda-graph adapter from the initializer (None if not implemented).
 		# Worker uses `_cuda_graph_adapter` only when `BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1`
 		# (dual-path migration gate). Legacy `_glm5_*` path is the default until Phase C.
@@ -9592,18 +9731,25 @@ class BatchGenWorker:
 							   "streamed-SP8 prefill weight schedules with no local rows")
 						)
 						transport_start = time.perf_counter()
-						for _ in range(transport_only_passes):
-							self.feed_watchdog()
-							with torch.inference_mode():
-								if resident_padding:
-									self._sync_prefill_moe_rank_counts(
-										0, reason="resident_padding_pass",
-									)
-									self.parallel_manager.run_resident_ep_collective_only_prefill()
-								else:
-									self.parallel_manager.run_streamed_sp8_transport_only_prefill(
-										1
-									)
+						# A hierarchical source rank still acquires every layer's
+						# shard, so each transport-only pass is a weight pass.
+						with self._weight_passes.scope("prefill"):
+							for transport_pass in range(transport_only_passes):
+								self.feed_watchdog()
+								self._weight_passes.begin(
+									carry=transport_pass + 1 < transport_only_passes
+								)
+								with torch.inference_mode():
+									if resident_padding:
+										self._sync_prefill_moe_rank_counts(
+											0, reason="resident_padding_pass",
+										)
+										self.parallel_manager.run_resident_ep_collective_only_prefill()
+									else:
+										self.parallel_manager.run_streamed_sp8_transport_only_prefill(
+											1
+										)
+								self._weight_passes.end()
 						prefill_time += time.perf_counter() - transport_start
 					self._nsys_prefill_profile_end(_prefill_profile_active)
 					self._mark_phase_end("prefill")
@@ -9881,7 +10027,10 @@ class BatchGenWorker:
 
 				# C. Execute Continuous Decode
 				decode_start = time.perf_counter()
-				with torch.inference_mode():
+				# One scope around the whole decode loop: every exit of it,
+				# including the early cohort-shutdown returns, closes the pass
+				# the last step carried.
+				with torch.inference_mode(), self._weight_passes.scope("decode"):
 					if local_decode_indices:
 						new_tokens = self._rebuild_input_tokens(local_decode_indices)
 					else:
@@ -10035,43 +10184,34 @@ class BatchGenWorker:
 
 		Requires ``self.weight_copy_task`` from the configure_prefill that just
 		ran. Shared by the pre-readiness Kimi-K3 startup and by every per-batch
-		prefill config, so first-install and transport-specific reentry rules live
-		in one place no matter which caller runs first.
+		prefill config, so the install rules live in one place no matter which
+		caller runs first.
+
+		Every install restarts the schedule at its head. That is where the last
+		weight pass of the previous phase parked the producer, and the node
+		daemon's schedule is cyclic, so no transport carries a cursor or a slot
+		across the phase boundary.
 		"""
-		# Host-RDMA drives one free-running remote-daemon schedule and erases each
-		# generation it releases, so that transport must preserve its queue cursor
-		# and prefetched GPU leases. Hierarchical GDR is different: source ranks
-		# read their local compact store directly and non-sources have an empty H2D
-		# task. Start that transport at the schedule boundary on every admission;
-		# preserving an arbitrary partially filled ring across resident decode can
-		# leave a full-batch consumer holding the published leases while it waits
-		# for a slot that can no longer be produced.
 		streamed_sp8 = (
 			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
 			and self.parallel_manager.prefill_uses_streamed_sp8()
 		)
+		# Resident decode leaves a streamed-SP8 ring in its prefill layout, so
+		# only the first streamed-SP8 install allocates it.
 		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
-		reseed_reentry = (
-			sp8_reentry
-			and hasattr(
-				self.parallel_manager,
-				"streamed_sp8_reseeds_h2d_on_reentry",
-			)
-			and self.parallel_manager.streamed_sp8_reseeds_h2d_on_reentry()
-		)
+		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
 		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
 		if sp8_reentry:
-			# configure_prefill rebuilt the task from scratch. Both a preserved
-			# cursor and a fresh schedule boundary require the same immutable task.
+			# configure_prefill rebuilt the task from scratch, but the
+			# distributed transport still serves the first install's schedule.
 			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
-					raise RuntimeError(
+				raise RuntimeError(
 					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
 					"changed after the H2D pipeline was installed; the "
-					"installed pipeline no longer matches the rebuilt task"
+					"distributed weight schedule no longer matches the rebuilt task"
 				)
-		if not sp8_reentry or reseed_reentry:
-			self.core_engine.clear_weight_copy_queue()
+		if not sp8_reentry:
 			self.core_engine.reset_prefill_buffer()
 		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
 		if streamed_sp8 or k3_prefill_profile:
@@ -10083,11 +10223,8 @@ class BatchGenWorker:
 				StreamedSP8MXFP4MoELayer,
 			)
 			StreamedSP8MXFP4MoELayer.reset_prefill_profile(k3_prefill_profile)
-		if not sp8_reentry or reseed_reentry:
-			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-			if any(self.weight_copy_task.values()):
-				self.core_engine.start_h2d_worker()
-		elif any(self.weight_copy_task.values()):
+		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		if any(self.weight_copy_task.values()):
 			self.core_engine.start_h2d_worker()
 		self._streamed_sp8_h2d_installed = streamed_sp8
 		self._streamed_sp8_weight_copy_fingerprint = (
@@ -10620,15 +10757,13 @@ class BatchGenWorker:
 		# This is the ordering _activate_persistent_decode_instance already
 		# uses.
 		#
-		# Resident decode does not stream routed experts. Keep the installed
-		# streamed-SP8 state through this transition: host-RDMA needs its daemon
-		# cursor, while hierarchical GDR resets its local queue/ring at the next
-		# prefill boundary. reset_decoding_buffer() must not resize those slots
-		# to the decode layout in either case.
+		# Resident decode does not stream routed experts, and the next
+		# streamed-SP8 prefill install reuses that ring in its prefill layout,
+		# so reset_decoding_buffer() must not resize it to the decode layout.
+		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
 		if not self._streamed_sp8_h2d_installed:
-			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
 		self._prefill_ring_released_for_switch = True
 
@@ -10694,13 +10829,15 @@ class BatchGenWorker:
 			self._log_decode_parameter_residency()
 
 	def _install_decode_weight_copy_queue(self) -> None:
-		"""Point the H2D copy engine at the decode weight-copy schedule.
+		"""Point the stopped H2D copy engine at the decode weight-copy schedule.
 
-		Only a rank that offloads part of its routed experts has one. Shared by
-		the first decode build and by every later activation of a reused
-		instance, whose task is the one its build produced.
+		Only a rank that offloads part of its routed experts has one. Every
+		other rank installs an empty schedule, which also uninstalls the prefill
+		lists, so its decode forwards arm no weight pass. Shared by the first
+		decode build, by every later activation of a reused instance, whose task
+		is the one its build produced, and by the persistent-phase activation.
 		"""
-		# Only start the H2D worker if there are experts to offload.
+		task = {}
 		if self.weight_copy_task.get("routed_expert"):
 			if self._streamed_sp8_h2d_installed:
 				raise RuntimeError(
@@ -10708,7 +10845,10 @@ class BatchGenWorker:
 					"installed streamed-SP8 prefill pipeline; use resident-EP "
 					"decode so the distributed weight schedule stays aligned"
 				)
-			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			task = self.weight_copy_task
+		self.core_engine.set_weight_copy_queue(task)
+		# Only start the H2D worker if there are experts to offload.
+		if any(task.values()):
 			self.core_engine.start_h2d_worker()
 
 	def _max_decode_rank_bsz(self) -> int:
@@ -11041,9 +11181,9 @@ class BatchGenWorker:
 		if pm.decode_instance is not None and pm.decode_experts_resident:
 			return  # decode -> decode interval
 		ring_start = time.perf_counter()
+		self._weight_passes.close()
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
-		self.core_engine.clear_weight_copy_queue()
 		# Decode keeps no routed-expert slots, so this frees the prefill ring
 		# before the decode experts are mapped back in.
 		self.core_engine.reset_decoding_buffer()
@@ -11067,6 +11207,7 @@ class BatchGenWorker:
 			raise RuntimeError(
 				"persistent decode instance must hold every local routed expert"
 			)
+		self._install_decode_weight_copy_queue()
 		self.set_phase("decode")
 		if self.rank == 0:
 			logging.info("[DECODE] Persistent decode instance active")
@@ -13080,8 +13221,13 @@ class BatchGenWorker:
 		offload_recorder_handed_off = False
 		try:
 			start = time.perf_counter()
-			for chunk in tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0)):
+			for chunk_index, chunk in enumerate(
+				tqdm(wave.plan.chunks, desc="Pool Prefill", disable=(self.rank != 0))
+			):
 				self.feed_watchdog()
+				self._weight_passes.begin(
+					carry=chunk_index + 1 < len(wave.plan.chunks)
+				)
 				rows = wave.executor.build(chunk)
 				if epilogue_trace is not None:
 					epilogue_trace.chunk_begin(
@@ -13202,6 +13348,7 @@ class BatchGenWorker:
 				# Dropped before the next chunk seeds its own buffer, so the two
 				# are never alive together (PREFILL_MEMORY_AUDIT.md fix 3).
 				block_residual = None
+				self._weight_passes.end()
 				executed += int(rows.input_ids.numel())
 				wave.executor.finish(chunk)
 				if epilogue_trace is not None:
@@ -14727,37 +14874,42 @@ class BatchGenWorker:
 
 		cur_batch_start = 0
 		output_tokens = []
-		
-		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
-			# Feed watchdog during long prefill operations
-			self.feed_watchdog()
 
-			with torch.inference_mode():
-				Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
-				Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
-					prefill_micro_batch_attention_masks[micro_batch_idx]
+		with self._weight_passes.scope("prefill"):
+			for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
+				# Feed watchdog during long prefill operations
+				self.feed_watchdog()
+				self._weight_passes.begin(
+					carry=micro_batch_idx + 1 < num_prefill_micro_batches
 				)
-				
-				cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
-				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
-				
-				# Pass local indices - the C++ layer handles rank offset internally
-				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
-				
-				cur_batch_start += cur_batch_size
-				assert len(cur_batch_local) == cur_batch_size
 
-				outputs = self.model(
-					prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
-					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
-					use_cache=False,
-				)
-				cur_batch_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in cur_batch_local
-				]
-				new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
-				output_tokens.append(new_tokens)
+				with torch.inference_mode():
+					Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
+					Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
+						prefill_micro_batch_attention_masks[micro_batch_idx]
+					)
+
+					cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
+					cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
+
+					# Pass local indices - the C++ layer handles rank offset internally
+					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+
+					cur_batch_start += cur_batch_size
+					assert len(cur_batch_local) == cur_batch_size
+
+					outputs = self.model(
+						prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device, dtype=torch.int64),
+						attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
+						use_cache=False,
+					)
+					cur_batch_sequences = [
+						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+						for local_idx in cur_batch_local
+					]
+					new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
+					self._weight_passes.end()
+					output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 
@@ -14802,7 +14954,8 @@ class BatchGenWorker:
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
 		if self._prefill_pool_wave is not None:
-			return self._prefill_prepacked_pool(batch)
+			with self._weight_passes.scope("prefill"):
+				return self._prefill_prepacked_pool(batch)
 
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
@@ -14996,7 +15149,7 @@ class BatchGenWorker:
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
 		_prefill_forward_t0 = time.perf_counter()
-		with torch.inference_mode():
+		with torch.inference_mode(), self._weight_passes.scope("prefill"):
 			for batch_idx, (seq_start, seq_end) in tqdm(
 				enumerate(micro_batches),
 				total=len(micro_batches),
@@ -15005,6 +15158,7 @@ class BatchGenWorker:
 			):
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
+				self._weight_passes.begin(carry=batch_idx + 1 < len(micro_batches))
 
 				# Get sequences for this micro-batch
 				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
@@ -15359,6 +15513,7 @@ class BatchGenWorker:
 						logits=logits,
 					)
 				output_tokens.append(batch_new_tokens)
+				self._weight_passes.end()
 
 				if prefix_materialization is not None:
 					AttnWrapperBase.retire_pending_prefill_offloads(
@@ -15401,11 +15556,6 @@ class BatchGenWorker:
 		)
 		_prefill_kv_ready_s = time.perf_counter() - _prefill_forward_t0
 		if _k3_profile_enabled:
-			# Freeze the cyclic producer before any Python import or JSON work.
-			# Otherwise it can refill newly released slots after the final
-			# expert and make one completed prefill look like a partial second
-			# pass.
-			self.core_engine.stop_h2d_worker()
 			_k3_profile_topk = []
 			for profile_logits in _k3_profile_logits:
 				top_values, top_indices = torch.topk(
@@ -15446,6 +15596,8 @@ class BatchGenWorker:
 					"total_bytes": total_hbm,
 				},
 				"weight_stream": self.core_engine.get_weight_stream_profile(),
+				# The exact module counts of the profiled forward's passes.
+				"weight_passes": self._weight_passes.totals,
 				"expert_consumer": (
 					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
 				),
@@ -19635,8 +19787,12 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
+					# Graph replays above stream nothing; an eager step is one
+					# weight pass and carries the next step's while decode runs.
+					self._weight_passes.begin(carry=True)
 					outputs = self._glm5_decode_model_forward(new_tokens)
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+					self._weight_passes.end()
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
@@ -20720,6 +20876,7 @@ class BatchGenWorker:
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = position_ids
+					self._weight_passes.begin(carry=True)
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
 						attention_mask=attention_mask.to(self.torch_device),
@@ -20730,6 +20887,7 @@ class BatchGenWorker:
 						for local_idx in batch
 					]
 					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
+					self._weight_passes.end()
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
@@ -20819,6 +20977,7 @@ class BatchGenWorker:
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = position_ids
+					self._weight_passes.begin(carry=True)
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
 						attention_mask=attention_mask.to(self.torch_device),
@@ -20829,6 +20988,7 @@ class BatchGenWorker:
 						for local_idx in batch
 					]
 					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
+					self._weight_passes.end()
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
