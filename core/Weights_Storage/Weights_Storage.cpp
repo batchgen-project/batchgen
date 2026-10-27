@@ -645,8 +645,21 @@ Weights_Storage::acquire_remote_module(
             "distributed weights daemon returned invalid slot");
     }
     active_lease lease{response.slot, response.generation};
-    this->active_leases_[module_key] = lease;
+    {
+        std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
+        this->active_leases_[module_key] = lease;
+    }
     return lease;
+}
+
+std::vector<std::string> Weights_Storage::leased_modules() const {
+    std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
+    std::vector<std::string> modules;
+    modules.reserve(this->active_leases_.size());
+    for (const auto& [module_key, lease] : this->active_leases_) {
+        modules.push_back(module_key);
+    }
+    return modules;
 }
 
 void Weights_Storage::release_module(
@@ -670,6 +683,7 @@ void Weights_Storage::release_module(
     Response response{};
     recv_exact(this->daemon_socket_, &response, sizeof(response));
     validate_response(response);
+    std::lock_guard<std::mutex> index_lock(this->lease_index_mutex_);
     this->active_leases_.erase(found);
 }
 

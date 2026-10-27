@@ -32,7 +32,7 @@ class _RecordingEngine:
         return {"freed_present": 0, "release_on_landing": 0,
                 "pending": len(module_names)}
 
-    def get_weights(self, module_key, phase):
+    def get_weights(self, module_key):
         self.events.append(("get", module_key))
         return {}
 

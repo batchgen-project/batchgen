@@ -224,7 +224,7 @@ def build_wrapped_expert(dev, weights_cpu):
             self.served = served
             self.freed = []
 
-        def get_weights(self, module_key, phase):
+        def get_weights(self, module_key):
             return self.served
 
         def free_weights_buffer(self, module_key):

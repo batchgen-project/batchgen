@@ -909,10 +909,9 @@ class KimiLinearParallelStrategyManager:
         Each module TYPE has its own ring, so what matters is that the list for
         a type is in the order the consumer will request it — the producer
         drains its list front to front and the consumer blocks on the head. An
-        out-of-order request finds no matching slot and dies on
-        ``get_weights``' 2 s ``std::runtime_error``
-        (GPU_Weight_Buffer.cpp:196-233); it does not hang and it does not
-        return the wrong module.
+        out-of-order request either throws at once (a module already consumed
+        in this pass) or ends in ``get_weights``' stall ``std::runtime_error``;
+        it does not hang and it does not return the wrong module.
 
         Consumer order, per forward pass:
           * one ``attn_{L}`` or ``kda_attn_{L}`` per layer, L ascending, at the
@@ -1044,8 +1043,8 @@ class KimiLinearParallelStrategyManager:
             # non-empty (_load_decode_model), and decode_moe_mode="resident_ep"
             # empties it below — so nothing would ever refill the attn /
             # kda_attn / shared_expert rings and every persistent=False
-            # wrapper would die on get_weights' 2 s throw. Fail here, loudly,
-            # instead of at that timeout 93 layers deep.
+            # wrapper would die on get_weights' stall throw. Fail here,
+            # loudly, instead of at that timeout 93 layers deep.
             raise NotImplementedError(
                 "stream_all_modules is a PREFILL-only path (M-PR-6). Decode "
                 "needs a decode-phase H2D streamer for attn/kda_attn/"
