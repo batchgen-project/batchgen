@@ -104,6 +104,10 @@ class Weights_Storage {
     // on a daemon request in flight.
     std::vector<std::string> leased_modules() const;
 
+    // Whether remote modules come from the node daemon, whose schedule every
+    // rank of the node consumes in the same cyclic order.
+    bool is_distributed() const { return this->distributed_; }
+
    private:
     int device_id_; // Stored device ID
     std::shared_ptr<spdlog::logger> logger;

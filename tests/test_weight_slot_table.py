@@ -4,8 +4,8 @@
 pybind, so a small driver is built against it with the system C++ compiler.
 The driver exercises every legal transition, every illegal one, routing skips
 on each state, and the weight passes: numbering, the producer cursor, lease
-and skip addressing the oldest open pass, the explicit carry, cancel, and the
-conditions end_pass asserts.
+and skip addressing the oldest open pass, the explicit carry, cancel, the
+conditions end_pass asserts, and the abort after a forward died.
 """
 
 import shutil
@@ -610,6 +610,107 @@ static void queries_and_layout() {
           "PENDING_RELEASE");
 }
 
+static int64_t freed(const WeightSlotTable::AbortCounts& counts, S state) {
+    return counts.freed[static_cast<size_t>(state)];
+}
+
+static void abort_frees_every_state() {
+    // Every non-FREE state at once, with a carried pass open.
+    WeightSlotTable table = make(5);
+    CHECK(table.begin_pass() == 1);
+    CHECK(table.begin_pass() == 2);
+    produce(table);  // e0: PRESENT
+    produce(table);  // e1
+    table.lease("e1");  // LEASED by the forward that died
+    const int64_t pending = produce(table);  // e2
+    table.lease("e2");
+    table.release_async({"e2"});  // PENDING_RELEASE
+    const auto filling = table.reserve(E);
+    table.claim(E, *filling, "e3");  // FILLING, named
+    table.reserve(E);                // FILLING, unnamed
+    CHECK(table.skip("e4") == WeightSkipOutcome::kPending);
+    CHECK(!table.reserve(E).has_value());
+
+    const auto counts = table.abort(false);
+    CHECK(counts.passes == 2);
+    CHECK(counts.pending_skips == 1);
+    CHECK(freed(counts, S::kFree) == 0);
+    CHECK(freed(counts, S::kFilling) == 2);
+    CHECK(freed(counts, S::kPresent) == 1);
+    CHECK(freed(counts, S::kLeased) == 1);
+    CHECK(freed(counts, S::kPendingRelease) == 1);
+    CHECK(table.held().empty());
+    CHECK(table.count(E, S::kFree) == 5);
+    CHECK(!table.current_pass().has_value());
+    CHECK(table.open_passes().empty());
+    CHECK(!table.skip_pending("e4", 1));
+    CHECK(table.pass_counts().empty());
+    CHECK(!table.schedule_lost());
+    // Nothing of the dropped passes can be leased, released or reclaimed.
+    EXPECT_THROW(table.lease("e0"), {"no weight pass is open"});
+    EXPECT_THROW(table.release("e1"),
+                 {"Cannot release missing weight-buffer lease for e1"});
+    EXPECT_THROW(table.reclaim(E, pending), {"FREE"});
+    EXPECT_THROW(table.end_pass(1), {"not the oldest open pass"});
+    EXPECT_THROW(table.cancel_pass(2), {"not open"});
+    // The cursor waits at the head of the next pass id, as after a phase end.
+    const auto next = table.next_production(E);
+    CHECK(next.kind == P::kParked && next.pass == 3 && next.position == 0 &&
+          next.module_name == "e0");
+    CHECK(table.producer_finished(2));
+
+    // Nothing open: nothing to drop.
+    const auto again = table.abort(false);
+    CHECK(again.passes == 0 && again.pending_skips == 0 &&
+          freed(again, S::kPresent) == 0);
+}
+
+static void a_local_abort_resumes_like_a_phase_end() {
+    WeightSlotTable table = make(2);
+    CHECK(table.begin_pass() == 1);
+    produce(table);
+    table.lease("e0");
+    produce(table);
+    table.abort(false);
+    // Without a reinstall the next pass reads the list from its head.
+    CHECK(table.begin_pass() == 2);
+    run_pass(table);
+    const auto summary = table.end_pass(2);
+    CHECK(summary.by_type.at(E).copied == 6);
+    CHECK(summary.carried == 0);
+    // A reinstall restarts numbering at 1 with the cursor at the head.
+    table.install({{E, EXPERTS}});
+    const auto next = table.next_production(E);
+    CHECK(next.kind == P::kParked && next.pass == 1 && next.position == 0);
+    CHECK(table.begin_pass() == 1);
+}
+
+static void a_distributed_abort_loses_the_schedule() {
+    WeightSlotTable table = make(2);
+    CHECK(table.begin_pass() == 1);
+    produce(table);
+    const auto counts = table.abort(true);
+    CHECK(counts.passes == 1 && freed(counts, S::kPresent) == 1);
+    CHECK(table.schedule_lost());
+    CHECK(table.held().empty());
+    EXPECT_THROW(table.begin_pass(),
+                 {"Cannot begin a weight pass",
+                  "weight schedule lost alignment with the node daemon after "
+                  "an aborted pass",
+                  "restart the worker cohort"});
+    EXPECT_THROW(table.install({{E, EXPERTS}}),
+                 {"Cannot install weight copy tasks", "lost alignment"});
+    EXPECT_THROW(table.install({}), {"lost alignment"});
+    CHECK(!table.current_pass().has_value());
+    // A later local abort does not clear it.
+    table.abort(false);
+    CHECK(table.schedule_lost());
+    EXPECT_THROW(table.begin_pass(), {"lost alignment"});
+    // The ring itself can still be reset or released between phases.
+    table.reset_type(E, 3);
+    CHECK(table.slot_count(E) == 3);
+}
+
 int main() {
     pass_numbering();
     producer_cursor_and_parking();
@@ -622,6 +723,9 @@ int main() {
     every_type_must_finish();
     install_refusals_and_renumbering();
     queries_and_layout();
+    abort_frees_every_state();
+    a_local_abort_resumes_like_a_phase_end();
+    a_distributed_abort_loses_the_schedule();
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);
         return 1;

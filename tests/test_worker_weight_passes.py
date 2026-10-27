@@ -3,7 +3,8 @@
 The core engine leases a weight only inside a pass (begin_weight_pass /
 end_weight_pass), so the worker arms one per forward, carries the next one
 while another forward follows, and closes every pass it armed before a loop
-exits or a phase installs its weight-copy lists.
+exits or a phase installs its weight-copy lists. A forward that raises stops
+the producer and aborts its passes instead of draining them.
 
 batchgen_worker imports the whole engine, so ``_WeightPasses`` is compiled in
 isolation against a fake core engine and the wiring is checked statically.
@@ -12,6 +13,7 @@ import ast
 import contextlib
 import copy
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -47,15 +49,41 @@ class _ForwardError(RuntimeError):
     pass
 
 
+class _StallError(RuntimeError):
+    pass
+
+
 class FakeEngine:
     """Records the pass calls and enforces the engine's pass contract."""
 
-    def __init__(self, installed=True, cancel_error=None):
+    def __init__(self, installed=True, cancel_error=None, end_error=None,
+                 stop_error=None, abort_error=None):
         self.installed = installed
         self.cancel_error = cancel_error
+        self.end_error = end_error
+        self.stop_error = stop_error
+        self.abort_error = abort_error
+        self.producer_running = True
         self.calls = []
         self.open = []
         self._next = 1
+
+    def stop_h2d_worker(self):
+        # The engine joins the producer, then raises a recorded failure.
+        self.producer_running = False
+        self.calls.append("stop")
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    def abort_weight_passes(self):
+        assert not self.producer_running, "abort requires a stopped producer"
+        aborted = list(self.open)
+        self.open = []
+        self.calls.append(("abort", aborted))
+        if self.abort_error is not None:
+            raise self.abort_error
+        return {"passes": len(aborted), "pending_skips": 0, "freed": {},
+                "daemon_leases": 0, "schedule_lost": False}
 
     def begin_weight_pass(self):
         if not self.installed:
@@ -71,6 +99,10 @@ class FakeEngine:
     def end_weight_pass(self, pass_id):
         assert pass_id != 0
         assert self.open and self.open[0] == pass_id, "only the oldest pass ends"
+        if self.end_error is not None:
+            # The drain timed out: the pass stays open.
+            self.calls.append(("end failed", pass_id))
+            raise self.end_error
         self.open.pop(0)
         self.calls.append(("end", pass_id))
         return {
@@ -164,7 +196,7 @@ def test_an_install_time_close_ends_a_pass_left_open():
     assert engine.open == []
 
 
-def test_a_forward_that_raises_cancels_and_ends_its_passes_and_reraises():
+def test_a_forward_that_raises_stops_the_producer_then_aborts_its_passes():
     engine = FakeEngine()
     passes = WeightPasses(engine, rank=0)
     failure = _ForwardError("forward failed")
@@ -175,21 +207,95 @@ def test_a_forward_that_raises_cancels_and_ends_its_passes_and_reraises():
             raise failure
 
     assert raised.value is failure
+    assert raised.value.__context__ is None
+    # No cancel and no end: ending would drain the producer.
+    assert engine.calls == [("begin", 1), ("begin", 2), "stop", ("abort", [1, 2])]
+    assert engine.open == []
+    assert passes._current is None and passes._carried is None
+    # The next install closes again; nothing is left to close.
+    passes.close()
+    assert engine.calls[-1] == ("abort", [1, 2])
+
+
+def test_an_end_that_cannot_drain_aborts_and_reraises_the_drain_error():
+    stall = _StallError("weight stream stalled")
+    engine = FakeEngine(end_error=stall)
+    passes = WeightPasses(engine, rank=0)
+
+    with pytest.raises(_StallError) as raised:
+        with passes.scope("decode"):
+            passes.begin(carry=True)
+            passes.end()
+
+    assert raised.value is stall
     assert engine.calls == [
-        ("begin", 1), ("begin", 2),
-        ("cancel", 1), ("end", 1), ("cancel", 2), ("end", 2),
+        ("begin", 1), ("begin", 2), ("end failed", 1), "stop", ("abort", [1, 2]),
     ]
-    assert engine.open == []
-    # The scope is reusable once it has unwound.
-    with passes.scope("prefill"):
-        passes.begin()
-        passes.end()
+    assert passes._current is None and passes._carried is None
+
+
+def test_a_raise_with_no_open_pass_makes_no_engine_call():
+    engine = FakeEngine()
+    passes = WeightPasses(engine, rank=0)
+
+    with pytest.raises(_ForwardError):
+        with passes.scope("prefill"):
+            passes.begin()
+            passes.end()
+            raise _ForwardError("after the last forward")
+
+    assert engine.calls == [("begin", 1), ("end", 1)]
+    assert engine.producer_running
+
+    nothing_installed = FakeEngine(installed=False)
+    passes = WeightPasses(nothing_installed, rank=0)
+    with pytest.raises(_ForwardError):
+        with passes.scope("decode"):
+            passes.begin(carry=True)
+            raise _ForwardError("forward failed")
+    assert nothing_installed.calls == [("begin", 0)]
+
+
+def test_a_producer_failure_from_the_stop_is_chained_and_the_abort_still_runs():
+    producer = _CleanupError("HtoD producer failed: copy failed")
+    engine = FakeEngine(stop_error=producer)
+    passes = WeightPasses(engine, rank=0)
+    failure = _ForwardError("forward failed")
+
+    with pytest.raises(_ForwardError) as raised:
+        with passes.scope("prefill"):
+            passes.begin()
+            raise failure
+
+    assert raised.value is failure
+    assert raised.value.__context__ is producer
+    assert engine.calls == [("begin", 1), "stop", ("abort", [1])]
     assert engine.open == []
 
 
-def test_a_cleanup_failure_is_chained_and_never_masks_the_forward_error():
-    cleanup = _CleanupError("cancel refused")
-    engine = FakeEngine(cancel_error=cleanup)
+def test_a_failed_abort_is_chained_and_forgets_the_passes():
+    cleanup = _CleanupError("abort refused")
+    engine = FakeEngine(abort_error=cleanup)
+    passes = WeightPasses(engine, rank=0)
+    failure = _ForwardError("forward failed")
+
+    with pytest.raises(_ForwardError) as raised:
+        with passes.scope("prefill"):
+            passes.begin(carry=True)
+            raise failure
+
+    assert raised.value is failure
+    assert raised.value.__context__ is cleanup
+    # Nothing is cancelled or ended later for a pass the engine dropped.
+    assert passes._current is None and passes._carried is None
+    passes.close()
+    assert engine.calls[-1] == ("abort", [1, 2])
+
+
+def test_stop_and_abort_failures_are_both_chained_behind_the_forward_error():
+    producer = _CleanupError("HtoD producer failed")
+    cleanup = _CleanupError("abort refused")
+    engine = FakeEngine(stop_error=producer, abort_error=cleanup)
     passes = WeightPasses(engine, rank=0)
     failure = _ForwardError("forward failed")
 
@@ -200,6 +306,21 @@ def test_a_cleanup_failure_is_chained_and_never_masks_the_forward_error():
 
     assert raised.value is failure
     assert raised.value.__context__ is cleanup
+    assert cleanup.__context__ is producer
+
+
+def test_a_cancel_failure_on_a_normal_exit_is_raised():
+    cleanup = _CleanupError("cancel refused")
+    engine = FakeEngine(cancel_error=cleanup)
+    passes = WeightPasses(engine, rank=0)
+
+    with pytest.raises(_CleanupError) as raised:
+        with passes.scope("decode"):
+            passes.begin(carry=True)
+            passes.end()
+
+    assert raised.value is cleanup
+    assert "stop" not in engine.calls
 
 
 def test_pass_zero_is_a_no_op(caplog):
@@ -345,10 +466,7 @@ def _assert_called_in_scope(caller, callee, phase):
 
 def test_every_prefill_forward_runs_inside_a_weight_pass():
     for name in ("prefill", "prefill_prepacked"):
-        calls = _forward_calls(
-            _method(name),
-            lambda func: func in {"self.model", "decoder_layer"},
-        )
+        calls = _forward_calls(_method(name), _is_model_forward)
         assert calls, name
         for call in calls:
             _assert_in_a_pass(_method(name), call, phase="prefill")
@@ -406,21 +524,54 @@ def test_every_decode_step_runs_inside_a_weight_pass():
     assert legacy_callers == {"decoding_continuous"}
 
 
+# Every way the worker drives the model: the model or its inner model (called
+# or ``.forward``), a decoder layer, an indexed ``layers[...]`` entry, or a
+# probing re-run of the model.
+MODEL_FORWARD = re.compile(
+    r"self\.model(\.model)?(\.forward)?"
+    r"|decoder_layer"
+    r"|.*\.layers\[.+\](\.forward)?"
+    r"|.*\brun_model_with_probes"
+)
+
+# Model forwards that run outside every weight pass, each with its reason.
+_GRAPH_COMPARE_RERUN = (
+    "GLM-5 whole-model graph compare: the eager re-run of a step that a "
+    "CUDA graph replayed. A graph cannot stream, so every weight it reads is "
+    "resident and the re-run leases nothing; a streamed weight would fail "
+    "loud in get_weights, which refuses a lease outside a pass."
+)
+UNSTREAMED_FORWARDS = {
+    ("decoding_continuous", "self.model.model"): _GRAPH_COMPARE_RERUN,
+    ("decoding_continuous", "self._whole_model_segment.run_model_with_probes"):
+        _GRAPH_COMPARE_RERUN,
+}
+
+
+def _is_model_forward(func):
+    return MODEL_FORWARD.fullmatch(func) is not None
+
+
 def test_no_other_model_forward_escapes_the_weight_passes():
-    """Every eager ``self.model(...)`` / decoder-layer drive is one of the
-    wrapped sites; ``_glm5_decode_model_forward`` is the forward itself."""
+    """Every eager model forward or decoder-layer drive is one of the wrapped
+    sites or a listed unstreamed one; ``_glm5_decode_model_forward`` is the
+    forward itself."""
     wrapped = {
         "prefill", "prefill_prepacked", "_prefill_prepacked_pool",
         "_decoding_legacy_modes", "_glm5_decode_model_forward",
     }
+    found = set()
     for function in WORKER_CLASS.body:
         if not isinstance(function, ast.FunctionDef):
             continue
-        calls = _forward_calls(
-            function, lambda func: func in {"self.model", "decoder_layer"}
-        )
-        if calls:
-            assert function.name in wrapped, function.name
+        for call in _forward_calls(function, _is_model_forward):
+            site = (function.name, ast.unparse(call.func))
+            if site in UNSTREAMED_FORWARDS:
+                found.add(site)
+                continue
+            assert function.name in wrapped, site
+    # The list holds no stale entry.
+    assert found == set(UNSTREAMED_FORWARDS)
     callers = {
         function.name
         for function in WORKER_CLASS.body
@@ -430,6 +581,42 @@ def test_no_other_model_forward_escapes_the_weight_passes():
         )
     }
     assert callers == {"decoding_continuous"}
+
+
+def test_the_unstreamed_forwards_only_rerun_a_graph_replay():
+    """Each listed site sits in the graph-replay branch of a decode step,
+    which arms no pass, inside the compare's forced-eager block."""
+    for (name, callee), reason in UNSTREAMED_FORWARDS.items():
+        function = _method(name)
+        parents = _parents(function)
+        calls = _forward_calls(function, lambda func: func == callee)
+        assert len(calls) == 1, (name, callee)
+        lineage = [calls[0], *_ancestors(calls[0], parents)]
+        assert any(
+            isinstance(node, ast.With)
+            and any(
+                ast.unparse(item.context_expr)
+                == "self._glm5_force_segmented_graph_eager()"
+                for item in node.items
+            )
+            for node in lineage
+        ), reason
+        graph_branch = next(
+            node for node in lineage
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "_use_graph"
+        )
+        assert any(statement in lineage for statement in graph_branch.body), reason
+        branch_calls = [
+            node for statement in graph_branch.body
+            for node in ast.walk(statement) if isinstance(node, ast.Call)
+        ]
+        assert any(
+            ast.unparse(node.func) == "self._cuda_graph_manager.replay"
+            for node in branch_calls
+        ), reason
+        assert not any(
+            _is_pass_call(node, "begin") for node in branch_calls
+        ), reason
 
 
 def test_worker_calls_no_removed_weight_buffer_binding():
@@ -483,7 +670,8 @@ def test_every_install_path_closes_the_weight_passes_before_stopping():
         assert closes and stops, name
         assert min(closes) < min(stops), name
 
-    # No other method stops the producer, so no install path is missed.
+    # No other worker method stops the producer, so no install path is
+    # missed. _WeightPasses._abort stops it only after a forward raised.
     stopping = {
         function.name
         for function in WORKER_CLASS.body
