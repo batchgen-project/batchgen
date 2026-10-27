@@ -673,7 +673,7 @@ def test_kimi_decode_graph_is_prewarmed_before_continuous_decode():
 
 
 # --------------------------------------------------------------------------- #
-#  (3) the H2D queue installation is shared and happens exactly once
+#  (3) the H2D queue installation is shared and allocates the ring once
 # --------------------------------------------------------------------------- #
 
 
@@ -709,15 +709,15 @@ def _bind_install(worker, trace, monkeypatch):
     ).__get__(worker)
 
 
-def _install_worker(
-    trace, *, streamed_sp8=True, reseed_reentry=False, task=None
-):
+def _install_worker(trace, *, streamed_sp8=True, task=None):
     return SimpleNamespace(
         rank=0,
         core_engine=_RecordingCoreEngine(trace),
         parallel_manager=SimpleNamespace(
             prefill_uses_streamed_sp8=lambda: streamed_sp8,
-            streamed_sp8_reseeds_h2d_on_reentry=lambda: reseed_reentry,
+        ),
+        _weight_passes=SimpleNamespace(
+            close=lambda: trace.append(("close_weight_passes",))
         ),
         weight_copy_task=task if task is not None else {"routed_expert": ["a", "b"]},
         _streamed_sp8_h2d_installed=False,
@@ -725,17 +725,18 @@ def _install_worker(
     )
 
 
-def test_host_rdma_streamed_sp8_queue_is_seeded_once_and_resumed(monkeypatch):
+def test_streamed_sp8_ring_is_allocated_once_and_the_queue_reinstalled(monkeypatch):
     trace = []
     worker = _install_worker(trace)
     install = _bind_install(worker, trace, monkeypatch)
 
     install(k3_prefill_profile=False)
 
-    # First install: seed the queue and start the copy engine.
+    # First install: close every weight pass, allocate the ring, install the
+    # queue and start the copy engine.
     assert trace == [
+        ("close_weight_passes",),
         ("stop_h2d_worker",),
-        ("clear_weight_copy_queue",),
         ("reset_prefill_buffer",),
         ("reset_weight_stream_profile", False),
         ("expert_profile", False),
@@ -748,34 +749,38 @@ def test_host_rdma_streamed_sp8_queue_is_seeded_once_and_resumed(monkeypatch):
     assert fingerprint == (("routed_expert", ("a", "b")),)
 
     # Re-entry (the first real prefill after startup, and every prefill after a
-    # decode phase): the daemon has already erased keys it released, so the
-    # cursor must NOT be rewound and the prefill buffer must NOT be reset.
+    # decode phase): the last weight pass parked the producer at the head of
+    # the schedule, so the queue is installed again from its head. Resident
+    # decode kept the ring in its prefill layout, so it is not reallocated.
     trace.clear()
     install(k3_prefill_profile=False)
     assert trace == [
+        ("close_weight_passes",),
         ("stop_h2d_worker",),
         ("reset_weight_stream_profile", False),
         ("expert_profile", False),
         ("sp8_profile", False),
+        ("set_weight_copy_queue", {"routed_expert": ["a", "b"]}),
         ("start_h2d_worker",),
     ]
     assert worker._streamed_sp8_weight_copy_fingerprint == fingerprint
 
 
-def test_hierarchical_gdr_reentry_reseeds_queue_and_ring(monkeypatch):
+def test_streamed_sp8_rank_without_host_copies_installs_but_never_starts(
+    monkeypatch,
+):
     trace = []
-    worker = _install_worker(trace, reseed_reentry=True)
+    worker = _install_worker(trace, task={"routed_expert": []})
     install = _bind_install(worker, trace, monkeypatch)
 
     install(k3_prefill_profile=False)
-    first = list(trace)
-    trace.clear()
     install(k3_prefill_profile=False)
 
-    # Hierarchical GDR has no remote-host acquire/release generations. A new
-    # admission therefore returns both the task queue and GPU leases to the
-    # layer-zero boundary instead of inheriting a partial ring from decode.
-    assert trace == first
+    # A hierarchical non-source rank has an empty task: it still installs it,
+    # so no stale list survives, but it never creates an H2D thread.
+    names = [entry[0] for entry in trace]
+    assert names.count("set_weight_copy_queue") == 2
+    assert "start_h2d_worker" not in names
 
 
 def test_streamed_sp8_reentry_rejects_a_changed_weight_schedule(monkeypatch):
@@ -785,13 +790,13 @@ def test_streamed_sp8_reentry_rejects_a_changed_weight_schedule(monkeypatch):
     install(k3_prefill_profile=False)
 
     # Same experts, different order: the copy engine drains each list front to
-    # front, so the preserved cursor would stream the wrong expert.
+    # front, so the distributed schedule would serve the wrong expert.
     worker.weight_copy_task = {"routed_expert": ["b", "a"]}
     with pytest.raises(RuntimeError, match="weight-copy schedule changed"):
         install(k3_prefill_profile=False)
 
 
-def test_non_streamed_prefill_keeps_reseeding_the_queue(monkeypatch):
+def test_non_streamed_prefill_reallocates_the_ring_on_every_install(monkeypatch):
     trace = []
     worker = _install_worker(trace, streamed_sp8=False)
     install = _bind_install(worker, trace, monkeypatch)
@@ -799,11 +804,12 @@ def test_non_streamed_prefill_keeps_reseeding_the_queue(monkeypatch):
     install(k3_prefill_profile=False)
     install(k3_prefill_profile=False)
 
-    # No preserved cursor outside streamed-SP8: both passes reseed, and the
-    # fingerprint stays cleared so a later install cannot claim re-entry.
+    # Outside streamed-SP8 decode may have resized the ring: both installs
+    # reallocate it, and the fingerprint stays cleared so a later install
+    # cannot claim re-entry.
     assert [entry[0] for entry in trace] == [
+        "close_weight_passes",
         "stop_h2d_worker",
-        "clear_weight_copy_queue",
         "reset_prefill_buffer",
         "reset_weight_stream_profile",
         "set_weight_copy_queue",

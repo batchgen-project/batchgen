@@ -519,6 +519,7 @@ DELETED_CORE = (
 )
 DELETED_PYTHON = (
     "clear_expert_buffer",
+    "clear_weight_copy_queue",
     "get_weights_pinned",
     "load_weights_pinned",
     "reset_weight_copy_queue",
@@ -549,9 +550,6 @@ def test_deleted_symbols_are_gone_from_python_callers():
         text = path.read_text()
         for symbol in DELETED_PYTHON:
             assert symbol not in text, (path, symbol)
-        # The worker's remaining call sites are rewired by the worker slice.
-        if path.name != "batchgen_worker.py":
-            assert "clear_weight_copy_queue" not in text, path
 
 
 def test_dead_python_modules_are_deleted():
