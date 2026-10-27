@@ -73,7 +73,8 @@ class _Expert:
             "down_proj.weight": torch.ones(1, 1),
         }
 
-    def load_weights_pinned(self):
+    def load_weights(self, module_key):
+        assert module_key == self.module_key
         self.log.append(("load", self.module_key))
         if self.fail:
             raise RuntimeError("load failed")

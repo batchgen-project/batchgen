@@ -29,6 +29,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 
 _FP4_E2M1_TABLE_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -567,9 +569,15 @@ class DeepSeekV4FlashMoE(nn.Module):
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 
         routed = torch.zeros_like(flat_states, dtype=torch.float32)
-        counts = torch.bincount(topk_indices.reshape(-1), minlength=self.total_experts)
-        for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-            if counts[expert_idx].item() == 0:
+        counts = torch.bincount(
+            topk_indices.reshape(-1), minlength=self.total_experts
+        ).tolist()
+        local_ids = range(self.routed_expert_start_idx, self.routed_expert_end_idx)
+        skip_idle_streamed_experts(
+            self.experts, local_ids, [counts[expert_idx] for expert_idx in local_ids]
+        )
+        for expert_idx in local_ids:
+            if counts[expert_idx] == 0:
                 continue
             token_idx, topk_pos = torch.where(topk_indices == expert_idx)
             expert_out = self.experts[expert_idx](

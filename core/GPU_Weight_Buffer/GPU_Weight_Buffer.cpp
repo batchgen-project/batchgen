@@ -115,6 +115,56 @@ void GPU_Weight_Buffer::synchronizePendingReleasesLocked() {
     this->pending_releases_.clear();
 }
 
+void GPU_Weight_Buffer::drainPendingReleasesLocked() {
+    while (!this->pending_releases_.empty()) {
+        PendingRelease& pending = this->pending_releases_.front();
+        CUDA_CHECK(cudaEventSynchronize(pending.event));
+        for (const auto& [module_type, buffer_idx] : pending.slots) {
+            this->slots_.reclaim(module_type, buffer_idx);
+        }
+        CUDA_CHECK(cudaEventDestroy(pending.event));
+        this->pending_releases_.pop_front();
+    }
+}
+
+void GPU_Weight_Buffer::bumpProgressLocked() {
+    ++this->progress_epoch_;
+    this->cv_.notify_all();
+}
+
+void GPU_Weight_Buffer::waitWithoutStallLocked(
+    std::unique_lock<std::mutex>& lock, const std::string& waiting_for,
+    const std::function<bool()>& ready) {
+    uint64_t seen = this->progress_epoch_;
+    auto last_progress = std::chrono::steady_clock::now();
+    while (true) {
+        this->throwIfProducerFailedLocked();
+        if (ready()) {
+            return;
+        }
+        const auto deadline = last_progress + kStallTimeout;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            const std::string message =
+                "Weight stream stalled waiting for " + waiting_for +
+                ": no slot landed, no skip was retired and the producer did "
+                "not change state for " +
+                std::to_string(kStallTimeout.count()) + " s (" +
+                this->slots_.describe_passes() +
+                "). Held: " + this->slots_.describe_held();
+            this->logger_->error("{}", message);
+            throw std::runtime_error(message);
+        }
+        this->cv_.wait_until(lock, deadline, [this, seen, &ready] {
+            return this->progress_epoch_ != seen ||
+                   this->producer_failure_.has_value() || ready();
+        });
+        if (this->progress_epoch_ != seen) {
+            seen = this->progress_epoch_;
+            last_progress = std::chrono::steady_clock::now();
+        }
+    }
+}
+
 void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
     for (auto it = this->pending_releases_.begin();
          it != this->pending_releases_.end();) {
@@ -125,15 +175,7 @@ void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
         }
         CUDA_CHECK(status);
         for (const auto& [module_type, buffer_idx] : it->slots) {
-            auto status_it = this->buffer_status_.find(module_type);
-            if (status_it == this->buffer_status_.end() || buffer_idx < 0 ||
-                buffer_idx >= static_cast<int64_t>(status_it->second.size()) ||
-                status_it->second[buffer_idx] != 2) {
-                throw std::runtime_error(
-                    "Invalid pending weight-buffer release: type=" +
-                    module_type + " idx=" + std::to_string(buffer_idx));
-            }
-            status_it->second[buffer_idx] = 0;
+            this->slots_.reclaim(module_type, buffer_idx);
         }
         CUDA_CHECK(cudaEventDestroy(it->event));
         it = this->pending_releases_.erase(it);
@@ -172,8 +214,10 @@ void GPU_Weight_Buffer::Init() {
     for (auto& [module_type, num_buffer] : num_buffers) {
         this->buffers_[module_type].clear();
         this->buffers_[module_type].resize(num_buffer);
-        this->buffer_status_[module_type].clear();
-        this->buffer_status_[module_type].resize(num_buffer, 0);
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->slots_.reset_type(module_type, num_buffer);
+        }
         for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
             // Get per-tensor dtype using the helper function
             torch::Dtype tensor_dtype = get_tensor_dtype(
@@ -226,8 +270,10 @@ void GPU_Weight_Buffer::resize_buffer() {
                 new_buffer[buffer_name] = torch::zeros(buffer_shape, options);
             }
             this->buffers_["routed_expert"].push_back(new_buffer);
-            this->buffer_status_["routed_expert"].push_back(0);
         }
+        this->slots_.grow_type(
+            "routed_expert",
+            static_cast<int64_t>(this->buffers_["routed_expert"].size()));
     }
 }
 
@@ -236,40 +282,21 @@ std::optional<
 GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     this->reclaimCompletedReleasesLocked();
-    for (int64_t buffer_idx = 0;
-         buffer_idx < this->buffer_status_[module_type].size(); buffer_idx++) {
-        if (this->buffer_status_[module_type][buffer_idx] == 0) {
-            this->buffer_status_[module_type][buffer_idx] = 1;
-            this->logger_->debug("Acquired empty buffer: type={}, idx={}",
-                                module_type, buffer_idx);
-            return std::make_pair(
-                std::ref(this->buffers_[module_type][buffer_idx]), buffer_idx);
-        }
+    const std::optional<int64_t> buffer_idx = this->slots_.reserve(module_type);
+    if (!buffer_idx.has_value()) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    this->logger_->debug("Acquired empty buffer: type={}, idx={}",
+                         module_type, *buffer_idx);
+    return std::make_pair(std::ref(this->buffers_[module_type][*buffer_idx]),
+                          *buffer_idx);
 };
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    auto module_it = this->module_in_buffers_.find(module_name);
-    if (module_it == this->module_in_buffers_.end()) {
-        std::ostringstream oss;
-        oss << "Cannot release missing weight-buffer lease for "
-            << module_name << ". Current modules: ";
-        size_t count = 0;
-        for (const auto& [key, value] : this->module_in_buffers_) {
-            oss << key;
-            if (++count < this->module_in_buffers_.size()) {
-                oss << ", ";
-            }
-        }
-        throw std::runtime_error(oss.str());
-    }
-    auto [module_type, buffer_idx] = module_it->second;
-    this->module_in_buffers_.erase(module_it);
-    this->buffer_status_[module_type][buffer_idx] = 0;
+    const auto slot = this->slots_.release(module_name);
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
-                         module_name, module_type, buffer_idx);
+                         module_name, slot.module_type, slot.index);
 };
 
 void GPU_Weight_Buffer::releaseBuffersAsync(
@@ -280,33 +307,6 @@ void GPU_Weight_Buffer::releaseBuffersAsync(
     }
 
     std::lock_guard<std::mutex> lock(this->mutex_);
-    std::unordered_set<std::string> unique_names;
-    std::vector<std::pair<std::string, int64_t>> slots;
-    slots.reserve(module_names.size());
-    for (const auto& module_name : module_names) {
-        if (!unique_names.insert(module_name).second) {
-            throw std::runtime_error(
-                "Duplicate module in asynchronous weight release: " +
-                module_name);
-        }
-        auto module_it = this->module_in_buffers_.find(module_name);
-        if (module_it == this->module_in_buffers_.end()) {
-            throw std::runtime_error(
-                "Cannot asynchronously release missing weight-buffer lease: " +
-                module_name);
-        }
-        const auto [module_type, buffer_idx] = module_it->second;
-        auto status_it = this->buffer_status_.find(module_type);
-        if (status_it == this->buffer_status_.end() || buffer_idx < 0 ||
-            buffer_idx >= static_cast<int64_t>(status_it->second.size()) ||
-            status_it->second[buffer_idx] != 1) {
-            throw std::runtime_error(
-                "Invalid asynchronous weight-buffer ownership for module: " +
-                module_name);
-        }
-        slots.emplace_back(module_type, buffer_idx);
-    }
-
     cudaEvent_t completion_event = nullptr;
     CUDA_CHECK(cudaEventCreateWithFlags(
         &completion_event, cudaEventDisableTiming));
@@ -317,10 +317,18 @@ void GPU_Weight_Buffer::releaseBuffersAsync(
         CUDA_CHECK(record_status);
     }
 
-    for (size_t i = 0; i < module_names.size(); ++i) {
-        this->module_in_buffers_.erase(module_names[i]);
-        const auto& [module_type, buffer_idx] = slots[i];
-        this->buffer_status_[module_type][buffer_idx] = 2;
+    // All or nothing: every name must be LEASED, none duplicated.
+    std::vector<WeightSlotTable::SlotRef> refs;
+    try {
+        refs = this->slots_.release_async(module_names);
+    } catch (...) {
+        cudaEventDestroy(completion_event);
+        throw;
+    }
+    std::vector<std::pair<std::string, int64_t>> slots;
+    slots.reserve(refs.size());
+    for (const auto& ref : refs) {
+        slots.emplace_back(ref.module_type, ref.index);
     }
     this->pending_releases_.push_back(
         PendingRelease{completion_event, std::move(slots)});
@@ -330,241 +338,221 @@ void GPU_Weight_Buffer::releaseBuffersAsync(
 }
 
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
-    const std::string& module_name,
-    std::string& phase) 
-{
-    this->logger_->debug("Get weights: {}", module_name);
-    
-    // Start timer for timeout tracking
-    auto start_time = std::chrono::steady_clock::now();
-    const bool hold_layer_batch = phase == "prefill_sp8";
-    const auto timeout_duration = hold_layer_batch
-                                      ? std::chrono::seconds(300)
-                                      : std::chrono::seconds(2);
-    
-    try {
-        while (true) {
-            {
-                std::unique_lock<std::mutex> lock(this->mutex_);
-                if (this->cv_.wait_for(
-                        lock, std::chrono::milliseconds(1),
-                        [this, module_name] {
-                            return this->module_in_buffers_.find(module_name) !=
-                                   this->module_in_buffers_.end();
-                        })) {
-                    auto [module_type, buffer_idx] =
-                        this->module_in_buffers_[module_name];
-                    auto wait_end = std::chrono::steady_clock::now();
-                    {
-                        std::lock_guard<std::mutex> profile_lock(
-                            this->weight_profile_mutex_);
-                        if (this->weight_profile_enabled_) {
-                            this->weight_profile_requests_[module_type] += 1;
-                            this->weight_profile_wait_seconds_[module_type] +=
-                                std::chrono::duration<double>(wait_end -
-                                                              start_time)
-                                    .count();
-                        }
-                    }
-                    return this->buffers_[module_type][buffer_idx];
-                }
-                this->logger_->debug("Waiting for module: {}", module_name);
-            }
-            
-            // Check for timeout
-            auto current_time = std::chrono::steady_clock::now();
-            auto elapsed = current_time - start_time;
-            if (elapsed >= timeout_duration) {
-                // Log timeout error with buffer contents
-                std::ostringstream oss;
-                oss << "Map keys: ";
-                
-                size_t count = 0;
-                for (const auto& [key, value] : this->module_in_buffers_) {
-                    oss << key;
-                    if (++count < this->module_in_buffers_.size()) {
-                        oss << ", ";
-                    }
-                }
-                
-                this->logger_->error("Timeout reached while waiting for module: {}. Buffer contents: {}", 
-                                    module_name, oss.str());
-                throw std::runtime_error("Timeout reached while waiting for module: " + module_name);
-            }
-            
-            // Check if module_name starts with "routed_expert" and has enough
-            // length
-            if (!hold_layer_batch &&
-                module_name.substr(0, 13) == "routed_expert") {
-                // Find the last two underscores
-                size_t last_underscore = module_name.rfind('_');
-                size_t second_last_underscore =
-                    module_name.rfind('_', last_underscore - 1);
-
-                if (last_underscore != std::string::npos &&
-                    second_last_underscore != std::string::npos) {
-                    // Extract indices using the underscore positions
-                    std::string layer_str = module_name.substr(
-                        second_last_underscore + 1,
-                        last_underscore - second_last_underscore - 1);
-                    std::string expert_str =
-                        module_name.substr(last_underscore + 1);
-
-                    int64_t layer_idx = std::stoi(layer_str);
-                    int64_t expert_idx = std::stoi(expert_str);
-                    this->logger_->debug(
-                        "Clearing expert buffer: layer_idx: {}, expert_idx: {}",
-                        layer_idx, expert_idx);
-                    this->clear_expert_buffer(layer_idx, expert_idx, phase);
-                } else {
-                    this->logger_->error(
-                        "Invalid format in module name: '{}', expected "
-                        "format: routed_expert_X_Y",
-                        module_name);
-                }
-            }
-        }
-    } catch (const c10::Error& e) {
-        this->logger_->debug(
-            "GPU_Weight_Buffer get_weights(): CUDA/PyTorch error: {}",
-            e.what());
-        throw std::runtime_error(e.what());
-    }
-    // Catch CUDA runtime errors
-    catch (const cudaError_t& err) {
-        this->logger_->debug(
-            "GPU_Weight_Buffer get_weights(): CUDA runtime error: {}",
-            cudaGetErrorString(err));
-        throw std::runtime_error(cudaGetErrorString(err));
-    }
-    // Catch standard C++ exceptions
-    catch (const std::exception& e) {
-        this->logger_->debug("GPU_Weight_Buffer get_weights() Error: {}",
-                             e.what());
-        throw std::runtime_error("GPU_Weight_Buffer get_weights()");
-    }
-    // Catch any other unexpected errors
-    catch (...) {
-        this->logger_->debug("GPU_Weight_Buffer get_weights()");
-        throw std::runtime_error("GPU_Weight_Buffer get_weights()");
-    }
-};
-
-module_weight_tensor_map GPU_Weight_Buffer::get_weights_pinned(
     const std::string& module_name) {
-    /* Wait for an already-owned buffer without evicting or releasing it. */
-    this->logger_->debug("Get pinned weights: {}", module_name);
+    this->logger_->debug("Get weights: {}", module_name);
+    const auto start_time = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(this->mutex_);
-    if (!this->cv_.wait_for(lock, std::chrono::seconds(120),
-                            [this, &module_name] {
-                                return this->module_in_buffers_.find(
-                                           module_name) !=
-                                       this->module_in_buffers_.end();
-                            })) {
-        std::ostringstream oss;
-        size_t count = 0;
-        for (const auto& [key, value] : this->module_in_buffers_) {
-            oss << key;
-            if (++count < this->module_in_buffers_.size()) {
-                oss << ", ";
-            }
+    // check_lease throws at once for a module that can never be leased in
+    // this pass, so the wait only covers FILLING and not yet produced.
+    this->waitWithoutStallLocked(lock, module_name, [this, &module_name] {
+        return this->slots_.check_lease(module_name) ==
+               WeightLeaseCheck::kReady;
+    });
+    const auto slot = this->slots_.lease(module_name);
+    const auto wait_end = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> profile_lock(this->weight_profile_mutex_);
+        if (this->weight_profile_enabled_) {
+            this->weight_profile_requests_[slot.module_type] += 1;
+            this->weight_profile_wait_seconds_[slot.module_type] +=
+                std::chrono::duration<double>(wait_end - start_time).count();
         }
-        this->logger_->error(
-            "Timeout reached while waiting for pinned module: {}. Buffer "
-            "contents: {}",
-            module_name, oss.str());
-        throw std::runtime_error(
-            "Timeout reached while waiting for pinned module: " + module_name +
-            ". Current modules: " + oss.str());
     }
-    const auto& [module_type, buffer_idx] =
-        this->module_in_buffers_.at(module_name);
-    return this->buffers_.at(module_type).at(buffer_idx);
-};
+    return this->buffers_.at(slot.module_type).at(slot.index);
+}
 
-void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
+int64_t GPU_Weight_Buffer::begin_pass() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->slots_.begin_pass();
+}
+
+GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::cancel_pass(int64_t pass) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const SkipCounts counts = this->slots_.cancel_pass(pass);
+    this->cv_.notify_all();
+    return counts;
+}
+
+void GPU_Weight_Buffer::wait_pass_drained(int64_t pass) {
+    if (pass == 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    const auto current = this->slots_.current_pass();
+    if (!current.has_value() || *current != pass) {
+        throw std::runtime_error(
+            "Cannot end weight pass " + std::to_string(pass) +
+            ": it is not the oldest open pass (" +
+            this->slots_.describe_passes() + ")");
+    }
+    // The producer retires the pass's pending skips on its way past its end.
+    this->waitWithoutStallLocked(
+        lock, "the end of weight pass " + std::to_string(pass),
+        [this, pass] {
+            return this->slots_.producer_finished(pass) &&
+                   this->slots_.count_in_pass(pass,
+                                              WeightSlotState::kFilling) == 0;
+        });
+    // A forward boundary: waiting for the consumer's release events is fine.
+    this->drainPendingReleasesLocked();
+}
+
+WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(int64_t pass) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->throwIfProducerFailedLocked();
+    return this->slots_.end_pass(pass);
+}
+
+WeightSlotTable::AbortCounts GPU_Weight_Buffer::abort_passes(
+    bool lose_schedule) {
+    // The forward that leased a slot died with its kernels possibly still
+    // queued: none of its slots is reusable before they finish.
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    // Every release event has completed; the table frees the slots.
+    this->synchronizePendingReleasesLocked();
+    const WeightSlotTable::AbortCounts counts =
+        this->slots_.abort(lose_schedule);
+    // A waiter left in get_weights finds no open pass and throws.
+    this->bumpProgressLocked();
+    return counts;
+}
+
+WeightSlotTable::Production GPU_Weight_Buffer::next_production(
+    const std::string& module_type) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->slots_.next_production(module_type);
+}
+
+void GPU_Weight_Buffer::retire_skip(const std::string& module_type,
+                                    const std::string& module_name) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.retire_skip(module_type, module_name);
+    this->bumpProgressLocked();
+}
+
+void GPU_Weight_Buffer::note_producer_progress() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->bumpProgressLocked();
+}
+
+void GPU_Weight_Buffer::throwIfProducerFailedLocked() const {
+    if (this->producer_failure_.has_value()) {
+        throw std::runtime_error("HtoD producer failed: " +
+                                 *this->producer_failure_);
+    }
+}
+
+WeightProduction GPU_Weight_Buffer::claim_for_copy(
+    const std::string& module_type, int64_t buffer_idx,
+    const std::string& module_name) {
+    // One critical section with skip_modules() and cancel_pass(): a skip
+    // lands either before this check (pending) or after the slot is named
+    // (release-on-landing).
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const WeightProduction claim =
+        this->slots_.claim(module_type, buffer_idx, module_name);
+    this->bumpProgressLocked();
+    return claim;
+}
+
+void GPU_Weight_Buffer::abandon(const std::string& module_type,
+                                int64_t buffer_idx) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->slots_.abandon(module_type, buffer_idx);
+}
+
+bool GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
                                               const std::string& module_name,
                                               int64_t buffer_idx) {
-    {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        this->module_in_buffers_[module_name] =
-            std::make_pair(module_type, buffer_idx);
-        this->logger_->debug("Module: {} is in buffer: {}", module_name,
-                             buffer_idx);
-        this->cv_.notify_all();
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    if (this->slots_.name_at(module_type, buffer_idx) != module_name) {
+        throw std::runtime_error(
+            "Copy of " + module_name + " landed in " + module_type + "[" +
+            std::to_string(buffer_idx) + "], which holds " +
+            this->slots_.name_at(module_type, buffer_idx) +
+            ". Held: " + this->slots_.describe_held());
     }
-    
+    const bool present = this->slots_.landed(module_type, buffer_idx);
+    this->logger_->debug("Module: {} is in buffer: {} (present={})",
+                         module_name, buffer_idx, present);
+    this->bumpProgressLocked();
+    return present;
 };
 
+void GPU_Weight_Buffer::record_producer_failure(const std::string& module_type,
+                                                int64_t buffer_idx,
+                                                const std::string& message) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->producer_failure_ = message;
+    if (buffer_idx >= 0 && buffer_idx < this->slots_.slot_count(module_type) &&
+        this->slots_.state_at(module_type, buffer_idx) ==
+            WeightSlotState::kFilling) {
+        this->slots_.abandon(module_type, buffer_idx);
+    }
+    this->cv_.notify_all();
+}
 
-void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
-    // Log the keys of the module_in_buffers_ in the same log msg
-    std::ostringstream oss;
-    oss << "Map keys: ";
-    
-    size_t count = 0;
-    for (const auto& [key, value] : this->module_in_buffers_) {
-        oss << key;
-        if (++count < this->module_in_buffers_.size()) {
-            oss << ", ";
+void GPU_Weight_Buffer::clear_producer_failure() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->producer_failure_.reset();
+}
+
+std::optional<std::string> GPU_Weight_Buffer::producer_failure() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->producer_failure_;
+}
+
+GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::skip_modules(
+    const std::vector<std::string>& module_names) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->throwIfProducerFailedLocked();
+    // Validate every name before changing any slot.
+    std::unordered_set<std::string> unique_names;
+    for (const auto& module_name : module_names) {
+        if (!unique_names.insert(module_name).second) {
+            throw std::runtime_error("Duplicate module in weight skip: " +
+                                     module_name);
+        }
+        this->slots_.check_skip(module_name);
+    }
+    SkipCounts counts;
+    for (const auto& module_name : module_names) {
+        switch (this->slots_.skip(module_name)) {
+            case WeightSkipOutcome::kFreedPresent:
+                ++counts.freed_present;
+                break;
+            case WeightSkipOutcome::kReleaseOnLanding:
+                ++counts.release_on_landing;
+                break;
+            case WeightSkipOutcome::kPending:
+                ++counts.pending;
+                break;
         }
     }
-    this->logger_->debug("clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: {}", layer_idx, expert_idx, oss.str());
+    // As cancel_pass: a waiter on a module just skipped re-checks and throws.
+    this->cv_.notify_all();
+    return counts;
+}
 
-    // Get the number of expert buffers based on phase
-    int64_t num_expert_buffer;
-    if (phase == "prefill") {
-        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer["routed_expert"];
-    } else if (phase == "decode") {
-        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer["routed_expert"];
-    } else {
-        throw std::runtime_error("Invalid phase: " + std::string(phase));
-    }
-    
-    // Create the current expert name once
-    std::string current_expert_name = "routed_expert_" + std::to_string(layer_idx) + "_" + std::to_string(expert_idx);
-    
-    // Find index of current expert in weight_copy_tasks_ in one pass
-    const auto& expert_tasks = this->weight_copy_tasks_["routed_expert"];
-    auto task_it = std::find(expert_tasks.begin(), expert_tasks.end(), current_expert_name);
-    if (task_it == expert_tasks.end()) {
-        return; // Expert name not found, nothing to clear
-    }
-    
-    // Build the set of allowed expert names efficiently
-    std::unordered_set<std::string> allowed_expert_names;
-    allowed_expert_names.reserve(num_expert_buffer); // Preallocate for performance
-    allowed_expert_names.insert(current_expert_name);
-    
-    size_t task_size = expert_tasks.size();
-    size_t idx = std::distance(expert_tasks.begin(), task_it);
-    
-    // Add the next (num_expert_buffer - 1) expert names
-    for (int64_t i = 1; i < num_expert_buffer; i++) {
-        idx = (idx + 1) % task_size; // Wrap around more efficiently
-        allowed_expert_names.insert(expert_tasks[idx]);
-    }
-    
-    // Remove buffers in one pass, avoiding temporary storage vector
-    {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        for (auto it = this->module_in_buffers_.begin(); it != this->module_in_buffers_.end();) {
-            const auto& key = it->first;
-            // Check if this is a routed expert buffer not in our allowed list
-            if (key.compare(0, 13, "routed_expert") == 0 && 
-                allowed_expert_names.find(key) == allowed_expert_names.end()) {
-                this->logger_->debug(
-                    "Clearing expert buffer: layer_idx: {}, expert_idx: {}, {} cleared",
-                    layer_idx, expert_idx, key);
-                auto module_type = it->second.first;  // Access through iterator
-                auto buffer_idx = it->second.second;  // Access through iterator
-                it = this->module_in_buffers_.erase(it); // Erase and get next iterator
-                this->buffer_status_[module_type][buffer_idx] = 0; // Release buffer
-            } else {
-                ++it; // Move to next element
-            }
+GPU_Weight_Buffer::SlotSnapshot GPU_Weight_Buffer::slot_snapshot() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    SlotSnapshot snapshot;
+    for (const auto& module_type : this->slots_.module_types()) {
+        auto& counts = snapshot.counts[module_type];
+        counts.resize(kWeightSlotStateCount, 0);
+        for (int state = 0; state < kWeightSlotStateCount; ++state) {
+            counts[state] = this->slots_.count(
+                module_type, static_cast<WeightSlotState>(state));
         }
     }
+    snapshot.held = this->slots_.held();
+    snapshot.open_passes = this->slots_.open_passes();
+    snapshot.cursors = this->slots_.cursors();
+    snapshot.pass_counts = this->slots_.pass_counts();
+    snapshot.schedule_lost = this->slots_.schedule_lost();
+    return snapshot;
 }
 
 
@@ -743,6 +731,8 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
 
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
+        // Between forwards only: a closed pass holds no slot and no skip.
+        this->slots_.require_no_open_pass("reset the prefill weight ring");
         this->synchronizePendingReleasesLocked();
 
         // IMPORTANT: Only clear routed_expert buffers, not all buffers!
@@ -786,24 +776,15 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
             }
         }
 
-        // Clear module_in_buffers
-        this->module_in_buffers_.clear();
-
-        // Set all buffer status to 0 (for ALL module types, not just routed_expert)
+        // Every slot FREE (for ALL module types, not just routed_expert)
         for (auto& [module_type, num_buffer] : num_buffers) {
-            this->buffer_status_[module_type].clear();
-            this->buffer_status_[module_type].resize(num_buffer, 0);
+            this->slots_.reset_type(module_type, num_buffer);
         }
 
-        // Log the buffer status and size of each buffer (keep original debug level)
+        // Log the buffer size of each type (keep original debug level)
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->logger_->debug("Module type: {}, Number of buffer: {}",
                                  module_type, num_buffer);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer; buffer_idx++) {
-                this->logger_->debug("Buffer_idx: {}, Buffer status: {}",
-                                   buffer_idx,
-                                   this->buffer_status_[module_type][buffer_idx]);
-            }
         }
     }
 }
@@ -997,6 +978,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
 
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
+        // Between forwards only: a closed pass holds no slot and no skip.
+        this->slots_.require_no_open_pass("reset the decoding weight ring");
         this->synchronizePendingReleasesLocked();
 
         // IMPORTANT: Only clear routed_expert buffers!
@@ -1039,24 +1022,15 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
             }
         }
 
-        // Clear module_in_buffers
-        this->module_in_buffers_.clear();
-
-        // Set all buffer status to 0
+        // Every slot FREE
         for (auto& [module_type, num_buffer] : num_buffers) {
-            this->buffer_status_[module_type].clear();
-            this->buffer_status_[module_type].resize(num_buffer, 0);
+            this->slots_.reset_type(module_type, num_buffer);
         }
 
-        // Log the buffer status and size of each buffer
+        // Log the buffer size of each type
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->logger_->debug("Module type: {}, Number of buffer: {}",
                                  module_type, num_buffer);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer; buffer_idx++) {
-                this->logger_->debug("Buffer_idx: {}, Buffer status: {}",
-                                   buffer_idx,
-                                   this->buffer_status_[module_type][buffer_idx]);
-            }
         }
 
         this->logger_->debug("Decoding buffer reset complete.");

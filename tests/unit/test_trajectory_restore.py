@@ -61,8 +61,13 @@ def _import_kda_state_pool():
     language_stub = types.ModuleType("triton.language")
     language_stub.constexpr = object
     triton_stub.language = language_stub
+    extra_stub = types.ModuleType("triton.language.extra")
+    extra_stub.libdevice = types.ModuleType("triton.language.extra.libdevice")
+    language_stub.extra = extra_stub
     sys.modules["triton"] = triton_stub
     sys.modules["triton.language"] = language_stub
+    sys.modules["triton.language.extra"] = extra_stub
+    sys.modules["triton.language.extra.libdevice"] = extra_stub.libdevice
     from batchgen.kv_cache.kda_state_gpu_manager import (
         KDAStateGPUConfig,
         KDAStateGPUManager,

@@ -74,6 +74,8 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import is_torch_fx_available
 
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
+
 from .configuration_deepseek_v2 import DeepseekV2Config
 
 logger = logging.get_logger(__name__)
@@ -715,6 +717,12 @@ class DeepseekV2MoE(nn.Module):
             sorted_tokens = gathered_tokens[gatherd_idxs]
             tokens_per_expert = tokens_per_expert_post_gather
         tokens_per_expert = tokens_per_expert.cpu().numpy()
+        expert_offset = self.ep_rank * self.experts_per_rank
+        skip_idle_streamed_experts(
+            self.experts,
+            range(expert_offset, expert_offset + len(tokens_per_expert)),
+            tokens_per_expert,
+        )
 
         outputs = []
         start_idx = 0

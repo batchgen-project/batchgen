@@ -56,6 +56,7 @@ from batchgen.moe.dispatch_scatter_3d import (
     dispatch_scatter_3d,
     reduce_weighted_scatter,
 )
+from batchgen.models.wrappers.expert import skip_idle_streamed_experts
 
 
 @dataclass
@@ -1097,28 +1098,32 @@ class KimiK25MoE(nn.Module):
         # 5b) Offloaded (non-persistent) experts. The fused path above covers only the
         # persistent experts: the dispatch uses num_persistent_local_experts, so tokens routed
         # to offloaded experts get topk_pos=-1 and are skipped by reduce_weighted_scatter. Add
-        # their contribution via the per-expert streamed path. CONTRACT (see
-        # batchgen_design/weight_loading/gpu_weight_buffer_copy_contract.md): the copy engine
-        # streams EVERY offloaded expert into a slot in task order (layer-major, ascending)
-        # regardless of tokens, so we MUST drive the wrapper for EVERY offloaded expert in that
-        # order — including 0-token ones (load+free, no compute) — or the producer stalls.
-        # wrapper.forward_decode_offloaded handles load -> (Marlin E=1 GEMM or 0-token free) ->
-        # free. Must land in global_results BEFORE the all-reduce below. nonpersistent_expert_ids
-        # is empty when offloading is off -> zero overhead.
+        # their contribution via the per-expert streamed path. The copy engine streams the
+        # offloaded experts in task order (layer-major, ascending): one bincount gives every
+        # offloaded expert's count, the 0-token ones are declared idle (their slots are
+        # released, or their copies skipped) and only experts with tokens run, in that order,
+        # through wrapper.forward_decode_offloaded (load -> Marlin E=1 GEMM -> free). Must land
+        # in global_results BEFORE the all-reduce below. nonpersistent_expert_ids is empty when
+        # offloading is off -> zero overhead.
         nonpersistent = getattr(self, 'nonpersistent_expert_ids', None)
         if nonpersistent:
             flat_idx = topk_idx.reshape(-1)
             tok_idx = torch.arange(total_real, device=device).repeat_interleave(topk)
             tk_pos = torch.arange(topk, device=device).repeat(total_real)
-            for global_e in nonpersistent:          # ascending == task order; NO skips
+            # Padding tokens carry topk_idx == -1: the +1 shift counts them in bin 0.
+            all_counts = torch.bincount(flat_idx + 1, minlength=self.num_experts + 1).tolist()
+            counts = [all_counts[global_e + 1] for global_e in nonpersistent]
+            skip_idle_streamed_experts(self.experts, nonpersistent, counts)
+            for global_e, count in zip(nonpersistent, counts):   # ascending == task order
+                if count == 0:
+                    continue
                 mask = flat_idx == global_e
-                et = tok_idx[mask]                  # may be empty (0-token)
+                et = tok_idx[mask]
                 out_e = self.experts[global_e].forward_decode_offloaded(
                     all_tokens[et], self.moe_intermediate_size, self.hidden_size)
-                if et.numel() > 0:
-                    w = topk_weight[et, tk_pos[mask]]
-                    global_results.index_add_(
-                        0, et, (out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
+                w = topk_weight[et, tk_pos[mask]]
+                global_results.index_add_(
+                    0, et, (out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
 
         if timer is not None:
             ev[6].record()  # after reduce, before allreduce
@@ -1165,12 +1170,16 @@ class KimiK25MoE(nn.Module):
 
         results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
 
+        # One host sync for every expert's count; idle streamed experts release
+        # their slots before any expert of this layer loads.
+        num_experts = len(self.experts)
+        token_counts = torch.bincount(flat_expert_idx, minlength=num_experts).tolist()
+        skip_idle_streamed_experts(self.experts, range(num_experts), token_counts)
+
         for expert_idx, expert in enumerate(self.experts):
-            if expert is None:
+            if expert is None or token_counts[expert_idx] == 0:
                 continue
             mask = flat_expert_idx == expert_idx
-            if not mask.any():
-                continue
             expert_token_idx = token_indices[mask]
             expert_topk_pos = topk_positions[mask]
             tokens_for_expert = hidden_states[expert_token_idx]

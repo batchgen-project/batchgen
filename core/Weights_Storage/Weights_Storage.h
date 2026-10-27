@@ -21,8 +21,10 @@
 #pragma once
 
 #include "spdlog/spdlog.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
@@ -84,13 +86,27 @@ class Weights_Storage {
     void InitDistributed(const std::string& config_path,
                          uint64_t cohort_epoch);
                   
-    std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
-        std::string module_key);
+    // A remote module is acquired from the node daemon, which answers in
+    // bounded slices; stop_requested (may be null) is polled between them.
+    // std::nullopt means stop was requested before the module was ready, and
+    // nothing is leased.
+    std::optional<std::unordered_map<std::string, tensor_buffer>>
+    get_module_weights_storage(
+        std::string module_key,
+        const std::atomic<bool>* stop_requested = nullptr);
 
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
 
     void release_module(const std::string& module_key);
+
+    // Modules the node daemon currently leases to this worker. Never waits
+    // on a daemon request in flight.
+    std::vector<std::string> leased_modules() const;
+
+    // Whether remote modules come from the node daemon, whose schedule every
+    // rank of the node consumes in the same cyclic order.
+    bool is_distributed() const { return this->distributed_; }
 
    private:
     int device_id_; // Stored device ID
@@ -149,7 +165,11 @@ class Weights_Storage {
                        std::unordered_map<std::string,
                                           distributed_tensor_meta>>
         remote_module_weights_;
+    // Written under daemon_mutex_ and lease_index_mutex_; read under either.
     std::unordered_map<std::string, active_lease> active_leases_;
+    mutable std::mutex lease_index_mutex_;
 
-    active_lease acquire_remote_module(const std::string& module_key);
+    std::optional<active_lease> acquire_remote_module(
+        const std::string& module_key,
+        const std::atomic<bool>* stop_requested);
 };

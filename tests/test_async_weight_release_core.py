@@ -24,16 +24,36 @@ def test_async_release_keeps_slots_pending_until_consumer_event_completes():
     ]
 
     record = release.index("cudaEventRecord(completion_event, consumer_stream)")
-    pending = release.index("this->buffer_status_[module_type][buffer_idx] = 2")
+    # LEASED -> PENDING_RELEASE in the slot table, all or nothing; a refused
+    # release destroys the event it no longer needs.
+    pending = release.index("this->slots_.release_async(module_names)")
+    refused = release.index("cudaEventDestroy(completion_event);\n        throw;")
     enqueue = release.index("this->pending_releases_.push_back(")
-    assert record < pending < enqueue
+    assert record < pending < refused < enqueue
 
     query = reclaim.index("cudaEventQuery(it->event)")
     not_ready = reclaim.index("status == cudaErrorNotReady")
-    reusable = reclaim.index("status_it->second[buffer_idx] = 0")
+    # PENDING_RELEASE -> FREE only once the consumer's event completed.
+    reusable = reclaim.index("this->slots_.reclaim(module_type, buffer_idx)")
     destroy = reclaim.index("cudaEventDestroy(it->event)")
     assert query < not_ready < reusable < destroy
     assert "this->reclaimCompletedReleasesLocked();" in acquire
+    assert "this->slots_.reserve(module_type)" in acquire
+
+
+def test_slot_table_release_async_is_all_or_nothing():
+    table = _source("core/GPU_Weight_Buffer/weight_slot_table.h")
+    release_async = table[
+        table.index("std::vector<SlotRef> release_async(") :
+        table.index("void reclaim(const std::string& module_type")
+    ]
+    validate = release_async.index("Duplicate module in asynchronous weight release")
+    leased = release_async.index("*state != WeightSlotState::kLeased")
+    mutate = release_async.index("WeightSlotState::kPendingRelease")
+    assert validate < leased < mutate
+    # The (name, pass) key leaves the index, so the module may be copied
+    # again while its old slot waits for the consumer's event.
+    assert "this->index_.erase(Key{module_names[i], *pass})" in release_async
 
 
 def test_async_release_binding_records_the_current_cuda_stream():
@@ -67,4 +87,31 @@ def test_reset_waits_for_pending_consumers_before_replacing_storage():
     )
     assert decoding.index("synchronizePendingReleasesLocked") < decoding.index(
         'this->buffers_["routed_expert"].clear()'
+    )
+    # A reset runs between forwards only: with no pass open no routing skip
+    # exists, and after the drain every slot is FREE.
+    for reset in (prefill, decoding):
+        refuse = reset.index("this->slots_.require_no_open_pass(")
+        drain = reset.index("synchronizePendingReleasesLocked")
+        assert refuse < drain
+        assert drain < reset.index("this->slots_.reset_type(module_type, num_buffer)")
+        assert "clear_pending_skips" not in reset
+
+
+def test_pass_end_drains_and_reclaims_every_pending_release():
+    source = _source("core/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp")
+    drain = source[
+        source.index("void GPU_Weight_Buffer::drainPendingReleasesLocked()") :
+        source.index("void GPU_Weight_Buffer::bumpProgressLocked()")
+    ]
+    # Unlike the reset drain, the slots return to FREE in the table.
+    assert drain.index("cudaEventSynchronize(pending.event)") < drain.index(
+        "this->slots_.reclaim(module_type, buffer_idx)"
+    )
+    wait = source[
+        source.index("void GPU_Weight_Buffer::wait_pass_drained(int64_t pass)") :
+        source.index("WeightSlotTable::PassSummary GPU_Weight_Buffer::end_pass(")
+    ]
+    assert wait.index("this->waitWithoutStallLocked(") < wait.index(
+        "this->drainPendingReleasesLocked();"
     )
