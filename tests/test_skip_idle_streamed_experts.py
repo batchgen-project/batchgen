@@ -82,6 +82,22 @@ def _ran(*module_keys):
     return events
 
 
+def _assert_leased_and_freed_once(events, active, idle):
+    """Every expert with tokens is leased once and freed once, after the one
+    declaration of the idle ones; an idle expert is never leased."""
+    skips = [event for event in events if event[0] == "skip"]
+    assert skips == ([("skip", list(idle))] if idle else [])
+    if idle:
+        assert events[0] == skips[0]
+    for key in active:
+        assert events.count(("get", key)) == 1, key
+        assert events.count(("free", key)) == 1, key
+        assert events.index(("get", key)) < events.index(("free", key)), key
+    for key in idle:
+        assert ("get", key) not in events, key
+        assert ("free", key) not in events, key
+
+
 # --------------------------------------------------------------------------- #
 #  The helper                                                                  #
 # --------------------------------------------------------------------------- #
@@ -213,6 +229,10 @@ def test_kimi_linear_serving_declares_idle_experts_and_runs_only_the_rest():
         [("skip", ["routed_expert_9_2"])]
         + _ran("routed_expert_9_0", "routed_expert_9_4")
     )
+    _assert_leased_and_freed_once(
+        engine.events, ["routed_expert_9_0", "routed_expert_9_4"],
+        ["routed_expert_9_2"],
+    )
     expected = torch.zeros_like(hidden_states)
     for token in range(topk_idx.shape[0]):
         for slot in range(topk_idx.shape[1]):
@@ -293,6 +313,10 @@ def test_glm5_prefill_declares_idle_experts_before_loading(monkeypatch):
         [("skip", ["routed_expert_7_1"])]
         + _ran("routed_expert_7_0", "routed_expert_7_2")
     )
+    _assert_leased_and_freed_once(
+        engine.events, ["routed_expert_7_0", "routed_expert_7_2"],
+        ["routed_expert_7_1"],
+    )
     expected = hidden_states * 0.5
     for token in range(2):
         for slot in range(2):
@@ -355,6 +379,10 @@ def test_glm5_mixed_declares_idle_offloaded_experts_before_loading(
         [("skip", ["routed_expert_11_4"])]
         + _ran("routed_expert_11_3", "routed_expert_11_5")
     )
+    _assert_leased_and_freed_once(
+        engine.events, ["routed_expert_11_3", "routed_expert_11_5"],
+        ["routed_expert_11_4"],
+    )
     expected = torch.cat([input_x[:2] * 3.0, input_x[2:] * 5.0])
     torch.testing.assert_close(reduced["res"].float(), expected)
 
@@ -370,6 +398,118 @@ def test_glm5_mixed_declares_every_offloaded_expert_when_none_has_tokens(
     assert engine.events == [("skip", ["routed_expert_11_3",
                                        "routed_expert_11_4",
                                        "routed_expert_11_5"])]
+
+
+# --------------------------------------------------------------------------- #
+#  GPT-OSS EP-offload decode                                                   #
+# --------------------------------------------------------------------------- #
+def _gpt_oss_decode_moe(engine, scales):
+    """Experts 0-2 persistent (grouped kernel, not run here), 3-5 offloaded."""
+    from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEDecode
+
+    moe = object.__new__(GptOssMoEDecode)
+    torch.nn.Module.__init__(moe)
+    moe.total_experts = 6
+    moe.non_persistent_expert_indices = [3, 4, 5]
+    moe.experts = torch.nn.ModuleList(
+        [None] * 3
+        + [_StreamedExpert(13, e, engine, scales[e]) for e in range(3, 6)]
+    )
+    return moe
+
+
+def test_gpt_oss_decode_streams_offloaded_experts_through_their_wrappers():
+    scales = [0.0, 0.0, 0.0, 3.0, 4.0, 5.0]
+    hidden_flat = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+    topk_indices = torch.tensor([[3, 0], [5, 1], [0, 3], [2, 1]])
+    topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.5, 0.5],
+                                 [0.3, 0.7]])
+    output = torch.zeros_like(hidden_flat)
+    engine = _RecordingEngine()
+    moe = _gpt_oss_decode_moe(engine, scales)
+
+    moe._single_expert_forward(hidden_flat, topk_indices, topk_weights, output)
+
+    assert engine.events == (
+        [("skip", ["routed_expert_13_4"])]
+        + _ran("routed_expert_13_3", "routed_expert_13_5")
+    )
+    _assert_leased_and_freed_once(
+        engine.events, ["routed_expert_13_3", "routed_expert_13_5"],
+        ["routed_expert_13_4"],
+    )
+    expected = torch.zeros_like(hidden_flat)
+    for token in range(topk_indices.shape[0]):
+        for slot in range(topk_indices.shape[1]):
+            expert = int(topk_indices[token, slot])
+            if expert in moe.non_persistent_expert_indices:
+                expected[token] += (hidden_flat[token] * scales[expert]
+                                    * topk_weights[token, slot])
+    torch.testing.assert_close(output, expected)
+
+
+def test_gpt_oss_decode_declares_every_offloaded_expert_when_none_has_tokens():
+    engine = _RecordingEngine()
+    moe = _gpt_oss_decode_moe(engine, [1.0] * 6)
+    hidden_flat = torch.ones(2, 2)
+    output = torch.zeros_like(hidden_flat)
+
+    moe._single_expert_forward(
+        hidden_flat, torch.tensor([[0, 1], [2, 0]]), torch.full((2, 2), 0.5),
+        output,
+    )
+
+    keys = ["routed_expert_13_3", "routed_expert_13_4", "routed_expert_13_5"]
+    assert engine.events == [("skip", keys)]
+    _assert_leased_and_freed_once(engine.events, [], keys)
+    assert torch.count_nonzero(output) == 0
+
+
+def test_gpt_oss_ep_offload_wraps_every_host_expert_as_streamed():
+    """A host-resident expert has no GPU tensors: it must be a non-persistent
+    wrapper, and the decode MoE refuses anything else for it."""
+    from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import (
+        GptOssParallelStrategyManager,
+    )
+    from batchgen.models.openai.gpt_oss_120b.wrappers import GptOssExpertWrapper
+
+    resident = {
+        f"mxfp4_{proj}_{kind}": torch.zeros(1)
+        for proj in ("gate", "up", "down") for kind in ("packed", "scales")
+    }
+    experts = [types.SimpleNamespace() for _ in range(4)]
+    experts[2] = types.SimpleNamespace(**resident)
+    psm = object.__new__(GptOssParallelStrategyManager)
+    psm.world_size = 2
+    psm.rank = 1
+    psm.routed_expert_gpu_start_idx = 2
+    psm.routed_expert_gpu_end_idx = 3
+    psm.routed_expert_host_end_idx = 4
+    psm.core_engine = _RecordingEngine()
+    psm.engine_config = None
+    psm.model_config = types.SimpleNamespace(num_hidden_layers=1)
+    psm.weight_copy_task = {"routed_expert": ["routed_expert_0_3"]}
+    psm.model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[
+        types.SimpleNamespace(mlp=types.SimpleNamespace(experts=experts)),
+    ]))
+
+    psm._config_expert_module()
+
+    assert isinstance(experts[2], GptOssExpertWrapper) and experts[2].persistent
+    assert isinstance(experts[3], GptOssExpertWrapper)
+    assert not experts[3].persistent
+    assert experts[3].module_key == "routed_expert_0_3"
+    # Another rank's experts stay unconfigured.
+    assert not isinstance(experts[0], GptOssExpertWrapper)
+
+
+def test_gpt_oss_decode_moe_has_no_direct_tensors_for_offloaded_experts():
+    function = _function("openai/gpt_oss_120b/model.py", "GptOssMoEDecode",
+                         "_single_expert_forward")
+    read = {node.attr for node in ast.walk(function)
+            if isinstance(node, ast.Attribute)}
+    assert not read & {"gate_weights", "gate_scales", "up_weights",
+                       "up_scales", "down_weights", "down_scales"}
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +532,8 @@ MIGRATED_LOOPS = [
      "moe_infer"),
     ("deepseek/deepseekv4_flash/model.py", "DeepSeekV4FlashMoE", "forward"),
     ("openai/gpt_oss_120b/model.py", "GptOssMoE", "forward"),
+    ("openai/gpt_oss_120b/model.py", "GptOssMoEDecode",
+     "_single_expert_forward"),
 ]
 
 
