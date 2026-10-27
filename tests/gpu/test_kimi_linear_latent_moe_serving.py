@@ -216,18 +216,18 @@ def test_latent_projections_run_once_per_token():
     assert seen["down"] == [(tokens, cfg.hidden_size)], seen["down"]
     assert seen["norm"] == [(tokens, latent)], seen["norm"]
     assert seen["up"] == [(tokens, latent)], seen["up"]
-    # Streamed-expert lockstep: EVERY expert is driven, 0-token ones included.
-    assert len(expert_calls) == len(serving.experts)
+    # Only experts with routed tokens run; 0-token experts are declared idle.
+    assert all(rows > 0 for rows in expert_calls), expert_calls
     assert sum(expert_calls) == tokens * top_k
     print("[latent-moe] once-per-token OK: down/norm/up 1 call each on "
-          "{} rows; experts driven {}/{} , assignments {}".format(
+          "{} rows; experts run {}/{} , assignments {}".format(
               tokens, len(expert_calls), len(serving.experts), sum(expert_calls)))
 
 
 # --------------------------------------------------------------------------- #
-#  4. Empty DP rank (0 tokens) still drives every expert and returns (…,0,H)   #
+#  4. Empty DP rank (0 tokens) runs no expert and returns (…,0,H)              #
 # --------------------------------------------------------------------------- #
-def test_empty_rank_drives_every_expert():
+def test_empty_rank_runs_no_expert():
     _eager, serving, cfg = _build_pair("syn25", torch.bfloat16)
     x = torch.empty(1, 0, cfg.hidden_size, dtype=torch.bfloat16, device=DEV)
     expert_calls = []
@@ -237,8 +237,7 @@ def test_empty_rank_drives_every_expert():
     with torch.no_grad():
         out = serving(x)
     assert out.shape == (1, 0, cfg.hidden_size)
-    assert len(expert_calls) == len(serving.experts)
-    assert sum(expert_calls) == 0
+    assert expert_calls == []
 
 
 # --------------------------------------------------------------------------- #

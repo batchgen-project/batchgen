@@ -366,15 +366,18 @@ def check_numerics(dev, num_tokens=64):
     report("weight buffer released exactly once per forward",
            engine.freed == ["routed_expert_4_0"], f"freed={engine.freed}")
 
-    # 0-token expert: the lockstep drive must still load+free, and must not
-    # launch an M=0 grid.
+    # 0-token expert: the MoE layer declares it idle instead of running it, so
+    # a 0-token forward is refused before the slot is leased and never
+    # launches an M=0 grid.
     engine.freed.clear()
-    empty_out = wrapper(torch.empty(0, K3_LATENT, device=dev,
-                                    dtype=torch.bfloat16))
-    report("0-token expert returns [0, latent] and still frees its slot",
-           tuple(empty_out.shape) == (0, K3_LATENT)
-           and engine.freed == ["routed_expert_4_0"],
-           f"shape={tuple(empty_out.shape)} freed={engine.freed}")
+    try:
+        wrapper(torch.empty(0, K3_LATENT, device=dev, dtype=torch.bfloat16))
+        refused = False
+    except ValueError:
+        refused = True
+    report("0-token expert forward is refused without touching its slot",
+           refused and engine.freed == [],
+           f"refused={refused} freed={engine.freed}")
 
 
 def check_negatives(dev):
