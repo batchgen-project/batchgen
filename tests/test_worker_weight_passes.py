@@ -14,6 +14,7 @@ import contextlib
 import copy
 import logging
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,11 @@ def _load_weight_passes():
         node for node in TREE.body
         if isinstance(node, ast.ClassDef) and node.name == "_WeightPasses"
     )
-    namespace = {"contextmanager": contextlib.contextmanager, "logging": logging}
+    namespace = {
+        "contextmanager": contextlib.contextmanager,
+        "logging": logging,
+        "time": time,
+    }
     exec(compile(ast.fix_missing_locations(ast.Module(
         body=[copy.deepcopy(klass)], type_ignores=[])), str(WORKER), "exec"),
         namespace)
@@ -714,3 +719,54 @@ def test_the_weight_passes_are_bound_to_the_core_engine():
     source = ast.unparse(_method("_initialize_core_components"))
     assert "self._weight_passes = _WeightPasses(self.core_engine, self.rank)" in source
     assert "self._weight_passes = None" in ast.unparse(_method("__init__"))
+
+
+def test_end_delay_sleeps_before_closing_a_prefill_pass_only(monkeypatch):
+    engine = FakeEngine()
+    passes = WeightPasses(engine, rank=0)
+    passes.end_delay_s = 2.5
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append((s, list(engine.open))))
+
+    with passes.scope("prefill"):
+        passes.begin()
+        passes.end()
+    # The delay runs while the pass is still open, i.e. before end_weight_pass.
+    assert sleeps == [(2.5, [1])]
+
+    with passes.scope("decode"):
+        passes.begin()
+        passes.end()
+    assert len(sleeps) == 1
+
+
+def test_weight_pass_end_delay_parses_only_this_rank():
+    method = next(
+        node for node in WORKER_CLASS.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_weight_pass_end_delay"
+    )
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(
+        body=[copy.deepcopy(method)], type_ignores=[])), str(WORKER), "exec"),
+        namespace)
+    parse = namespace["_weight_pass_end_delay"]
+
+    class _Worker:
+        rank = 5
+
+    assert parse(_Worker(), None) == 0.0
+    assert parse(_Worker(), {"rank": 5, "seconds": 3}) == 3.0
+    assert parse(_Worker(), {"rank": 4, "seconds": 3}) == 0.0
+    for bad in ({"rank": 5}, {"rank": "5", "seconds": 1}, {"rank": 5, "seconds": 0},
+                {"rank": 5, "seconds": 61}, 7):
+        with pytest.raises(ValueError):
+            parse(_Worker(), bad)
+
+
+def test_prefill_config_installs_the_end_delay_before_the_forward():
+    method = next(
+        node for node in WORKER_CLASS.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_config_prefill_for_batch"
+    )
+    source = ast.unparse(method)
+    assert "self._weight_passes.end_delay_s = self._weight_pass_end_delay(" in source
