@@ -19,10 +19,13 @@
 // clang-format on
 
 #pragma once
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
+#include <map>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -48,23 +51,16 @@ using module_weight_tensor_map = std::unordered_map<std::string, torch::Tensor>;
 using weight_buffers = std::vector<module_weight_tensor_map>;
 class GPU_Weight_Buffer {
    public:
-    // What the producer does with the module it reserved a slot for.
-    enum class CopyClaim {
-        kCopy,      // the slot is named; copy into it
-        kSkipped,   // a routing skip was pending; the slot is abandoned
-        kResident,  // already resident in another slot; the slot is abandoned
-    };
-
-    struct SkipCounts {
-        int64_t freed_present = 0;
-        int64_t release_on_landing = 0;
-        int64_t pending = 0;
-    };
+    using SkipCounts = WeightSkipCounts;
 
     struct SlotSnapshot {
         // module type -> slot count per WeightSlotState
         std::unordered_map<std::string, std::vector<int64_t>> counts;
         std::vector<WeightSlotTable::HeldSlot> held;
+        std::vector<int64_t> open_passes;
+        std::map<std::string, WeightSlotTable::Cursor> cursors;
+        std::map<int64_t, std::map<std::string, WeightSlotTable::PassCounts>>
+            pass_counts;
     };
 
     GPU_Weight_Buffer(EngineConfig& engine_config, ModelConfig& model_config);
@@ -82,20 +78,28 @@ class GPU_Weight_Buffer {
     void releaseBuffersAsync(const std::vector<std::string>& module_names,
                              cudaStream_t consumer_stream);
 
-    // std::shared_ptr<module_weight_tensor_map> get_weights(
-    //     const std::string& module_name);
-    // Both lease the slot they return; the caller owns its release.
-    module_weight_tensor_map get_weights(
-            const std::string& module_name,
-            std::string& phase);
-    // Waits without eviction.
-    module_weight_tensor_map get_weights_pinned(
-            const std::string& module_name);
+    // Waits until module_name is PRESENT in the current pass and leases it;
+    // the caller owns its release. Throws at once when it can never be
+    // leased in this pass, and after kStallTimeout without producer progress.
+    module_weight_tensor_map get_weights(const std::string& module_name);
+
+    /* Passes */
+    int64_t begin_pass();
+    SkipCounts cancel_pass(int64_t pass);
+    // Waits until the producer is past the end of pass, none of its slots is
+    // FILLING and every pending asynchronous release has completed.
+    void wait_pass_drained(int64_t pass);
+    WeightSlotTable::PassSummary end_pass(int64_t pass);
 
     /* Producer side of the slot lifecycle */
-    CopyClaim claim_for_copy(const std::string& module_type,
-                             int64_t buffer_idx,
-                             const std::string& module_name);
+    WeightSlotTable::Production next_production(const std::string& module_type);
+    // kCopy: copy into buffer_idx. kSkip: buffer_idx (if any) is abandoned;
+    // release the daemon lease, then retire_skip().
+    WeightProduction claim_for_copy(const std::string& module_type,
+                                    int64_t buffer_idx,
+                                    const std::string& module_name);
+    void retire_skip(const std::string& module_type,
+                     const std::string& module_name);
     void abandon(const std::string& module_type, int64_t buffer_idx);
     // Returns false when a skip released the slot as the copy landed.
     bool weights_copy_complete(const std::string& module_type,
@@ -108,20 +112,25 @@ class GPU_Weight_Buffer {
                                  const std::string& message);
     void clear_producer_failure();
     std::optional<std::string> producer_failure() const;
+    // A producer state change resets the stall clock of every waiter.
+    void note_producer_progress();
 
     SkipCounts skip_modules(const std::vector<std::string>& module_names);
     SlotSnapshot slot_snapshot() const;
 
-    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
     void reset_prefill_buffer();
     void reset_decoding_buffer();
     void reset_weight_stream_profile(bool enabled);
     pybind11::dict get_weight_stream_profile();
-    void set_weight_copy_task(std::unordered_map<std::string, std::vector<std::string>> task){
+    // Refused while a pass is open or a slot is held.
+    void set_weight_copy_task(
+        const std::unordered_map<std::string, std::vector<std::string>>&
+            task) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->slots_.install(task);
-        this->weight_copy_tasks_ = task;
     }
+
+    static constexpr std::chrono::seconds kStallTimeout{300};
 
    private:
     struct PendingRelease {
@@ -131,7 +140,16 @@ class GPU_Weight_Buffer {
 
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
+    // Waits for every pending release and returns its slots to FREE.
+    void drainPendingReleasesLocked();
     void throwIfProducerFailedLocked() const;
+    // Counts a landing, a claim, a retired skip or a producer state change.
+    void bumpProgressLocked();
+    // Waits on cv_ until ready() holds. Throws the producer failure, or a
+    // stall once no progress was counted for kStallTimeout.
+    void waitWithoutStallLocked(std::unique_lock<std::mutex>& lock,
+                                const std::string& waiting_for,
+                                const std::function<bool()>& ready);
 
     EngineConfig& engine_config_;
     ModelConfig& model_config_;
@@ -144,9 +162,8 @@ class GPU_Weight_Buffer {
 
     WeightSlotTable slots_;  // every slot's state and module, under mutex_
     std::optional<std::string> producer_failure_;  // under mutex_
+    uint64_t progress_epoch_ = 0;                  // under mutex_
     std::deque<PendingRelease> pending_releases_;
-    std::unordered_map<std::string, std::vector<std::string>>
-        weight_copy_tasks_;
 
     std::mutex weight_profile_mutex_;
     bool weight_profile_enabled_{false};

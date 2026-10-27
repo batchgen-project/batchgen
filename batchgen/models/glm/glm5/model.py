@@ -2787,7 +2787,7 @@ class Glm5MoE(nn.Module):
                         "GLM-5 grouped prefill requires every routed expert to "
                         "be nonpersistent FP8"
                     )
-                weights = expert.load_weights_pinned()
+                weights = expert.load_weights(expert.module_key)
                 keys.append(expert.module_key)
                 gate = weights["gate_proj.weight"]
                 up = weights["up_proj.weight"]
@@ -2821,7 +2821,7 @@ class Glm5MoE(nn.Module):
                 raise RuntimeError(
                     "GLM-5 grouped prefill requires a nonpersistent FP8 shared expert"
                 )
-            shared_weights = shared.load_weights_pinned()
+            shared_weights = shared.load_weights(shared.module_key)
             shared_key = shared.module_key
             shared.cached_gate = shared_weights["gate_proj.weight"]
             shared.cached_up = shared_weights["up_proj.weight"]

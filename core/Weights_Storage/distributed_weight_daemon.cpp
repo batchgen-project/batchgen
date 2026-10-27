@@ -1486,7 +1486,7 @@ struct DistributedWeightDaemon::Impl {
             // Round-robin complete superchunks across worker shards. Every
             // worker's first requested module is then within the initial ring
             // fill; a layer-major expert sweep would strand high TP ranks
-            // behind get_weights()' 2-second timeout.
+            // behind get_weights()' stall timeout.
             for (int layer = 1; layer <= kLayers; ++layer) {
                 for (int chunk_offset = 0;
                      chunk_offset < experts_per_worker;

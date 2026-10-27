@@ -1396,7 +1396,7 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
     assert tuple(call.args[0].value for call in calls) == stages
 
 
-def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
+def test_streamed_sp8_weight_batch_leases_by_module_name_only():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(
         path, "StreamedSP8LayerBuffer", "_acquire_local_shard"
@@ -1408,8 +1408,18 @@ def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
         and isinstance(node.value, str)
         and node.value.startswith("prefill")
     ]
-    assert "prefill_sp8" in phases
-    assert "prefill" not in phases
+    # The ring evicts nothing, so no phase selects a non-evicting wait.
+    assert phases == []
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_weights"
+    ]
+    assert calls
+    for call in calls:
+        assert len(call.args) == 1 and not call.keywords
 
 
 def test_streamed_sp8_reusable_buffers_are_not_inference_tensors():
@@ -3091,8 +3101,8 @@ def _sp8_ingress_buffer(
         record=lambda stream: trace.append(("local_free",))
     )
     buffer.core_engine = SimpleNamespace(
-        get_weights=lambda name, phase: trace.append(
-            ("get_weights", name, phase)
+        get_weights=lambda name: trace.append(
+            ("get_weights", name)
         ) or {tensor: tensor for tensor in SIX_TENSORS},
         free_weights_buffer=lambda name: trace.append(("free_weights", name)),
     )
@@ -3167,13 +3177,13 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     assert ops.count("synchronize") == 2
     assert ops.count("free_weights") == 4
     assert trace[:10] == [
-        ("get_weights", "routed_expert_7_336", "prefill_sp8"),
-        ("get_weights", "routed_expert_7_337", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_336"),
+        ("get_weights", "routed_expert_7_337"),
         ("synchronize",),
         ("free_weights", "routed_expert_7_336"),
         ("free_weights", "routed_expert_7_337"),
-        ("get_weights", "routed_expert_7_338", "prefill_sp8"),
-        ("get_weights", "routed_expert_7_339", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_338"),
+        ("get_weights", "routed_expert_7_339"),
         ("synchronize",),
         ("free_weights", "routed_expert_7_338"),
         ("free_weights", "routed_expert_7_339"),
@@ -3310,7 +3320,7 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
         trace, cross_group="cross3", cross_root=11, cross_source=True
     )
 
-    def fail_source(name, phase):
+    def fail_source(name):
         raise RuntimeError("source load failed")
 
     buffer.core_engine.get_weights = fail_source
@@ -3643,19 +3653,23 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     ]
     get_weights = source[
         source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights"):
-        source.index("void GPU_Weight_Buffer::throwIfProducerFailedLocked")
+        source.index("int64_t GPU_Weight_Buffer::begin_pass()")
     ]
 
-    # Release goes through the slot table, which looks the name up without
-    # inserting it and refuses anything that is not LEASED.
+    # Release goes through the slot table, which looks the (name, pass) key
+    # up without inserting it and refuses anything that is not LEASED.
     assert "this->slots_.release(module_name)" in release
-    assert "this->index_.find(module_name)" in table_release
-    assert "this->index_[module_name]" not in table_release
+    assert "this->index_.find(Key{module_name, *pass})" in table_release
+    assert "this->index_[" not in table_release
     assert "*state != WeightSlotState::kLeased" in table_release
     assert "Cannot release missing weight-buffer lease" in table_release
-    assert 'phase == "prefill_sp8"' in get_weights
-    assert "std::chrono::seconds(300)" in get_weights
-    assert "!hold_layer_batch" in get_weights
+    # One wait for every caller: the 300 s stall rule, no phase split.
+    assert "phase" not in get_weights
+    assert "this->waitWithoutStallLocked(lock, module_name," in get_weights
+    header = (
+        ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.h"
+    ).read_text()
+    assert "static constexpr std::chrono::seconds kStallTimeout{300};" in header
 
 
 def test_worker_reads_batch_level_mode_before_configure_prefill():

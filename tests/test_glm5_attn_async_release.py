@@ -17,8 +17,8 @@ class _Core:
         self.module = module
         self.log = log
 
-    def get_weights(self, module_key, phase):
-        self.log.append(("load", module_key, phase))
+    def get_weights(self, module_key):
+        self.log.append(("load", module_key))
         return {"streamed": torch.full((1,), 3.0)}
 
     def free_weights_buffer(self, module_key):
@@ -71,7 +71,7 @@ def test_nonpersistent_prefill_releases_without_host_stream_sync(monkeypatch):
 
     assert result == "prefill-result"
     assert log == [
-        ("load", "attn_4", "prefill"),
+        ("load", "attn_4"),
         ("prefill", 2.0, "ok"),
         ("free_async", "attn_4", 0, 7.0),
     ]

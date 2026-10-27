@@ -81,9 +81,8 @@ class BatchGen {
     // 	int64_t byte_size
     // );
 
+    // Leases module_name in the current weight pass; see begin_weight_pass.
     std::unordered_map<std::string, torch::Tensor> get_weights(
-        std::string module_key, std::string& phase);
-    std::unordered_map<std::string, torch::Tensor> get_weights_pinned(
         const std::string& module_name);
     void free_weights_buffer(const std::string& module_name);
     void free_weights_buffer_async(const std::string& module_name);
@@ -97,8 +96,6 @@ class BatchGen {
                        torch::Tensor& position_ids,
                        std::vector<std::vector<int64_t>> cur_batching_plan);
 
-    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
-
     void set_phase(std::string phase);
 
     void register_signal_handler();
@@ -106,8 +103,6 @@ class BatchGen {
     void clear_kv_storage();
     void clear_kv_buffer();
     void clear_kv_copy_queue();
-    void clear_weight_copy_queue();
-    void reset_weight_copy_queue();
     void reset_prefill_buffer();
     void create_fake_kv_storage();
     // std::unordered_map<std::string, torch::Tensor> get_tensor(
@@ -125,11 +120,27 @@ class BatchGen {
             weight_copy_tasks);
     void reset_weight_stream_profile(bool enabled);
     py::dict get_weight_stream_profile();
-    // Routing-informed skip: frees, releases on landing, or skips the next
-    // copy of each module. Returns {"freed_present", "release_on_landing",
-    // "pending"} counts.
+    // Routing-informed skip in the current pass: frees, releases on landing,
+    // or skips the copy of each module. Returns {"freed_present",
+    // "release_on_landing", "pending"} counts.
     py::dict skip_weight_modules(const std::vector<std::string>& module_names);
     py::dict weight_stream_status();
+
+    /* Weight passes: one traversal of every installed list, i.e. one
+     * forward. */
+    // Arms the next pass and returns its id (0: nothing installed). Arming a
+    // second pass while one is open is the explicit carry; a third throws.
+    int64_t begin_weight_pass();
+    // Waits until the producer is past the end of pass_id (the oldest open
+    // pass) and its copies and releases completed, asserts that it holds no
+    // slot, skip or daemon lease, and closes it. Returns {"pass", "copied",
+    // "skipped", "released_on_landing"} (per type) and "carried" (slots
+    // already produced for the next pass).
+    py::dict end_weight_pass(int64_t pass_id);
+    // Declares every module of an open pass that is not leased as skipped.
+    // The caller still ends the pass. Returns {"pass", "freed_present",
+    // "release_on_landing", "pending"}.
+    py::dict cancel_weight_pass(int64_t pass_id);
 
     void reset_decoding_buffer();
     void stop_h2d_worker();

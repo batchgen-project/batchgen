@@ -48,7 +48,7 @@ from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
 )
 
 
-# Match the C++ ``prefill_sp8`` ring-lease bound. Timing out the Python launch
+# Match the C++ ``get_weights`` stall bound. Timing out the Python launch
 # handoff earlier would strand peers in a payload broadcast while a cold source
 # was still legitimately waiting for its host shard.
 PREFETCH_HANDOFF_TIMEOUT_S = 300.0
@@ -222,9 +222,7 @@ class StreamedSP8LayerBuffer:
                 )
             ]
             # Hold every slot in this bounded batch until its D2D copy
-            # completes.  The ordinary prefill phase may evict earlier expert
-            # mappings while a later module is still being acquired.
-            phase = "prefill_sp8"
+            # completes.
             try:
                 for begin in range(0, len(names), self.acquire_batch_size):
                     acquired = []
@@ -235,7 +233,7 @@ class StreamedSP8LayerBuffer:
                                 batch, start=begin
                             ):
                                 weights = self.core_engine.get_weights(
-                                    module_name, phase
+                                    module_name
                                 )
                                 acquired.append(module_name)
                                 validate_routed_expert_slot(
