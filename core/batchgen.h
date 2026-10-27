@@ -125,6 +125,11 @@ class BatchGen {
             weight_copy_tasks);
     void reset_weight_stream_profile(bool enabled);
     py::dict get_weight_stream_profile();
+    // Routing-informed skip: frees, releases on landing, or skips the next
+    // copy of each module. Returns {"freed_present", "release_on_landing",
+    // "pending"} counts.
+    py::dict skip_weight_modules(const std::vector<std::string>& module_names);
+    py::dict weight_stream_status();
 
     void reset_decoding_buffer();
     void stop_h2d_worker();

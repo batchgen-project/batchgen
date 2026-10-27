@@ -357,6 +357,20 @@ py::dict BatchGen::get_weight_stream_profile() {
     return result;
 }
 
+py::dict BatchGen::skip_weight_modules(
+    const std::vector<std::string>& module_names) {
+    const auto counts = this->gpu_weight_buffer_.skip_modules(module_names);
+    py::dict result;
+    result["freed_present"] = counts.freed_present;
+    result["release_on_landing"] = counts.release_on_landing;
+    result["pending"] = counts.pending;
+    return result;
+}
+
+py::dict BatchGen::weight_stream_status() {
+    return this->h2d_engine_.weight_stream_status();
+}
+
 void BatchGen::reset_prefill_buffer() {
     this->gpu_weight_buffer_.reset_prefill_buffer();
 };
@@ -403,8 +417,10 @@ void BatchGen::save_compressed_kv(){
 void BatchGen::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&
         weight_copy_tasks) {
-    this->h2d_engine_.set_weight_copy_queue(weight_copy_tasks);
+    // Install the buffer's task set first: the queue install below un-parks
+    // a failed producer, which must find the new tasks already in place.
     this->gpu_weight_buffer_.set_weight_copy_task(weight_copy_tasks);
+    this->h2d_engine_.set_weight_copy_queue(weight_copy_tasks);
 }
 
 void BatchGen::reset_decoding_buffer() {

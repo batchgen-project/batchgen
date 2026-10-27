@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -44,6 +45,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using batchgen::distributed_weights::kStatusRetry;
 using batchgen::distributed_weights::Operation;
 using batchgen::distributed_weights::Request;
 using batchgen::distributed_weights::Response;
@@ -55,6 +57,13 @@ constexpr int kExperts = 896;
 constexpr int kDefaultWorkers = 8;
 // The summary keeps the most recent cohort swaps only.
 constexpr size_t kSwapLogEntries = 32;
+// One acquire request waits at most one slice, so a worker can stop between
+// slices. The timeout spans all slices of one pending acquire.
+constexpr auto kAcquireSlice = std::chrono::milliseconds(250);
+constexpr auto kAcquireTimeout = std::chrono::seconds(300);
+// A pending acquire not polled for this long belongs to a worker that stopped
+// asking (its producer was cancelled); the next request starts a fresh wait.
+constexpr auto kAcquireAbandoned = std::chrono::seconds(5);
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -311,6 +320,15 @@ struct Slot {
     std::uint32_t released_mask = 0;
 };
 
+// The acquire a worker connection is retrying, kept across its slices so the
+// timeout and its diagnostics see the whole wait. Empty key: none.
+struct PendingAcquire {
+    std::string module_key;
+    Clock::time_point begin;
+    Clock::time_point last_poll;
+    std::uint64_t completions_at_start = 0;
+};
+
 struct Chunk {
     int slot_start = 0;
     int count = 0;
@@ -512,6 +530,7 @@ struct DistributedWeightDaemon::Impl {
     // Lock order, outermost first. No path holds two of these at once except
     // where listed, and none is held across a thread join or WriteSummary:
     //   summary_mutex -> cohort_mutex (snapshot), then
+    //   summary_mutex -> ring_mutex (snapshot), then
     //   summary_mutex -> stats_mutex -> failure_mutex
     //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop)
     //   ready_mutex -> failure_mutex (WaitReady)
@@ -542,6 +561,9 @@ struct DistributedWeightDaemon::Impl {
     // (no completion while slots are fetching) from a cohort that never
     // consumed what the ring holds. Under ring_mutex.
     std::uint64_t ring_completions = 0;
+    // Per worker id; a cohort admits one connection per worker. Under
+    // ring_mutex.
+    std::array<PendingAcquire, kDefaultWorkers> pending_acquires;
     // Ring reset handshake. Once prefetch_owns_ring is set, only the prefetch
     // thread resets slots, at a point where it has no fetch in flight. All
     // under ring_mutex.
@@ -1238,7 +1260,9 @@ struct DistributedWeightDaemon::Impl {
                     set_error(&response, error.what());
                 }
                 send_exact(fd, &response, sizeof(response));
-                if (response.status != 0) {
+                // kStatusRetry is an acquire slice that found its module not
+                // ready yet; the worker re-sends it.
+                if (response.status != 0 && response.status != kStatusRetry) {
                     fail(response.error);
                 }
             }
@@ -1293,11 +1317,17 @@ struct DistributedWeightDaemon::Impl {
             fail("worker acquired a module outside its SP shard: " +
                  module_key);
         }
-        const Clock::time_point begin = Clock::now();
+        const Clock::time_point now = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex);
-        const std::uint64_t completions_at_start = ring_completions;
+        PendingAcquire& pending = pending_acquires.at(worker_id);
+        if (pending.module_key != module_key ||
+            now - pending.last_poll > kAcquireAbandoned) {
+            pending.module_key = module_key;
+            pending.begin = now;
+            pending.completions_at_start = ring_completions;
+        }
         const bool available = ring_cv.wait_for(
-            lock, std::chrono::seconds(300), [&]() {
+            lock, kAcquireSlice, [&]() {
             if (failed.load() || stop.load() || cohort_closed.load()) {
                 return true;
             }
@@ -1306,13 +1336,37 @@ struct DistributedWeightDaemon::Impl {
                    slots[found->second].state ==
                        SlotState::kReady;
         });
+        pending.last_poll = Clock::now();
+        if (!available && pending.last_poll - pending.begin < kAcquireTimeout) {
+            response->status = kStatusRetry;
+            return;
+        }
+        const Clock::time_point begin = pending.begin;
+        const std::uint64_t completions_at_start =
+            pending.completions_at_start;
+        pending = PendingAcquire{};
         if (!available) {
             int fetching = 0;
             int ready = 0;
+            const Slot* oldest_unacquired = nullptr;
             for (const Slot& slot : slots) {
                 fetching += slot.state == SlotState::kFetching;
                 ready += slot.state == SlotState::kReady;
+                if (slot.state == SlotState::kReady &&
+                    slot.acquired_mask == 0 &&
+                    (oldest_unacquired == nullptr ||
+                     slot.generation < oldest_unacquired->generation)) {
+                    oldest_unacquired = &slot;
+                }
             }
+            const std::string oldest =
+                oldest_unacquired == nullptr
+                    ? ""
+                    : "; oldest unacquired ready module " +
+                          oldest_unacquired->module_key + " (worker " +
+                          std::to_string(
+                              OwningWorker(oldest_unacquired->module_key)) +
+                          ")";
             const bool progressed = ring_completions != completions_at_start;
             lock.unlock();
             if (fetching > 0 && !progressed) {
@@ -1321,13 +1375,14 @@ struct DistributedWeightDaemon::Impl {
                 const std::string message =
                     "remote fetch stalled: no fetch completed in 300 s "
                     "with " + std::to_string(fetching) +
-                    " slots fetching (waiting for " + module_key + ")";
+                    " slots fetching (waiting for " + module_key + ")" +
+                    oldest;
                 RecordFailure(message);
                 fail(message);
             }
             fail("timed out waiting for remote module " + module_key +
                  ": the ring holds " + std::to_string(ready) +
-                 " ready modules this cohort did not consume");
+                 " ready modules this cohort did not consume" + oldest);
         }
         if (failed.load()) {
             fail(FailureMessage());
@@ -1409,6 +1464,17 @@ struct DistributedWeightDaemon::Impl {
         const int worker = expert / experts_per_worker;
         (void)layer;
         return static_cast<std::uint32_t>(1) << worker;
+    }
+
+    // The lowest worker expected to acquire module_key.
+    int OwningWorker(const std::string& module_key) const {
+        const std::uint32_t expected = ExpectedWorkers(module_key);
+        for (int worker = 0; worker < workers; ++worker) {
+            if ((expected >> worker) & 1U) {
+                return worker;
+            }
+        }
+        return -1;
     }
 
     std::vector<std::string> BuildSchedule() const {
@@ -1528,6 +1594,7 @@ struct DistributedWeightDaemon::Impl {
             slot = Slot{};
         }
         module_to_slot.clear();
+        pending_acquires.fill(PendingAcquire{});
         return report;
     }
 
@@ -1745,6 +1812,30 @@ struct DistributedWeightDaemon::Impl {
             cohort["completed_swaps"] = completed_swaps;
             swaps = swap_log;
         }
+        // Keyed by worker id: ready slots no worker has acquired yet, by the
+        // worker expected to acquire them, and each worker's pending acquire.
+        std::map<std::string, std::uint64_t> ready_unacquired;
+        nlohmann::json pending_by_worker = nlohmann::json::object();
+        {
+            std::lock_guard<std::mutex> lock(ring_mutex);
+            const Clock::time_point now = Clock::now();
+            for (const Slot& slot : slots) {
+                if (slot.state == SlotState::kReady &&
+                    slot.acquired_mask == 0) {
+                    ++ready_unacquired[std::to_string(
+                        OwningWorker(slot.module_key))];
+                }
+            }
+            for (int worker = 0; worker < kDefaultWorkers; ++worker) {
+                const PendingAcquire& pending = pending_acquires[worker];
+                if (!pending.module_key.empty()) {
+                    pending_by_worker[std::to_string(worker)] = {
+                        {"module_key", pending.module_key},
+                        {"age_s", elapsed_seconds(pending.begin, now)},
+                    };
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(stats_mutex);
             summary["schema"] = "k3-distributed-weights/1";
@@ -1773,6 +1864,8 @@ struct DistributedWeightDaemon::Impl {
             summary["wait_seconds"] = wait_seconds;
             summary["worker_wait_count"] = worker_wait_count;
             summary["worker_wait_seconds"] = worker_wait_seconds;
+            summary["ready_unacquired_by_worker"] = ready_unacquired;
+            summary["pending_acquire_by_worker"] = pending_by_worker;
             summary["staging_hwm_modules"] = staging_hwm;
             summary["ready_latency_ms"] = {
                 {"p50", percentile(ready_latency_ms, 50)},

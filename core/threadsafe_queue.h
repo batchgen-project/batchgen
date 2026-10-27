@@ -71,6 +71,14 @@ class threadsafe_queue {
         return true;
     };
 
+    // Copy the head without removing it.
+    bool try_front(T& value) const {
+        std::lock_guard<std::mutex> lk(mut);
+        if (data_queue.empty()) return false;
+        value = data_queue.front();
+        return true;
+    };
+
     std::shared_ptr<T> try_pop() {
         std::lock_guard<std::mutex> lk(mut);
         if (data_queue.empty()) return std::shared_ptr<T>();

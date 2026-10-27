@@ -21,8 +21,10 @@
 #pragma once
 
 #include "spdlog/spdlog.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
@@ -84,8 +86,14 @@ class Weights_Storage {
     void InitDistributed(const std::string& config_path,
                          uint64_t cohort_epoch);
                   
-    std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
-        std::string module_key);
+    // A remote module is acquired from the node daemon, which answers in
+    // bounded slices; stop_requested (may be null) is polled between them.
+    // std::nullopt means stop was requested before the module was ready, and
+    // nothing is leased.
+    std::optional<std::unordered_map<std::string, tensor_buffer>>
+    get_module_weights_storage(
+        std::string module_key,
+        const std::atomic<bool>* stop_requested = nullptr);
 
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
@@ -151,5 +159,7 @@ class Weights_Storage {
         remote_module_weights_;
     std::unordered_map<std::string, active_lease> active_leases_;
 
-    active_lease acquire_remote_module(const std::string& module_key);
+    std::optional<active_lease> acquire_remote_module(
+        const std::string& module_key,
+        const std::atomic<bool>* stop_requested);
 };
