@@ -490,6 +490,10 @@ class _WeightPasses:
 		self._phase = None
 		self._current = None
 		self._carried = None
+		# Batch-level debug skew (batchgen_debug.weight_pass_end_delay): this
+		# rank sleeps before closing each prefill pass, so its siblings run
+		# ahead exactly where a per-rank stop used to strand the node daemon.
+		self.end_delay_s = 0.0
 		# Summed end_weight_pass reports of the current (or last) scope.
 		self.totals = self._empty_totals()
 
@@ -560,6 +564,8 @@ class _WeightPasses:
 		if self._current is None:
 			raise RuntimeError(f"Rank {self._rank}: no weight pass to end")
 		if self._current != 0:
+			if self._phase == "prefill" and self.end_delay_s > 0:
+				time.sleep(self.end_delay_s)
 			self._record(self._core_engine.end_weight_pass(self._current))
 		self._current = None
 
@@ -10360,6 +10366,9 @@ class BatchGenWorker:
 		k3_prefill_profile = self._debug_flag_enabled(
 			prefill_debug.get("k3_prefill_profile")
 		)
+		self._weight_passes.end_delay_s = self._weight_pass_end_delay(
+			prefill_debug.get("weight_pass_end_delay")
+		)
 		AttnWrapperBase.batchgen_debug = prefill_debug or None
 		_default_k3_prefill_mode = "streamed"
 		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
@@ -17403,6 +17412,28 @@ class BatchGenWorker:
 		if isinstance(value, str):
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
+
+	def _weight_pass_end_delay(self, value) -> float:
+		"""Seconds this rank sleeps before closing each prefill weight pass.
+
+		``value`` is the batch-level ``weight_pass_end_delay`` debug entry,
+		``{"rank": <global rank>, "seconds": <float>}``; any other rank, or no
+		entry, gets 0.
+		"""
+		if value is None:
+			return 0.0
+		if (
+			not isinstance(value, dict)
+			or not isinstance(value.get("rank"), int)
+			or not isinstance(value.get("seconds"), (int, float))
+			or not 0 < value["seconds"] <= 60
+		):
+			raise ValueError(
+				"batchgen_debug.weight_pass_end_delay must be "
+				'{"rank": <int>, "seconds": <0 < s <= 60>}, '
+				f"got {value!r}"
+			)
+		return float(value["seconds"]) if value["rank"] == self.rank else 0.0
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_GRAPH_PATH_LOG", "0") == "1":
