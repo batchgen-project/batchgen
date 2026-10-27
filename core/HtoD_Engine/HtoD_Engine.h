@@ -44,6 +44,12 @@
 namespace py = pybind11;
 class HtoD_Engine {
    public:
+    struct WeightPassAbort {
+        WeightSlotTable::AbortCounts slots;
+        int64_t daemon_leases = 0;  // released
+        bool schedule_lost = false;
+    };
+
     HtoD_Engine(const EngineConfig& engine_config,
                 const ModelConfig& model_config,
                 Weights_Storage& weights_storage, KV_Storage& kv_storage,
@@ -63,12 +69,13 @@ class HtoD_Engine {
                             int64_t micro_batch_idx, int64_t layer_idx,
                             int64_t byte_size);
     void clear_kv_copy_queue();
-    void clear_weight_copy_queue();
-    void reset_weight_copy_queue();
     void set_global_routed_experts_data_ptr(
         const py::dict& experts_IPC_handles,
         const py::dict& expert_location_map);
     void cuda_enable_peer_access(int rank, int world_size);
+    // Installs the tasks in the weight buffer and the producer queues and
+    // restarts pass numbering. Throws while the producer runs, a pass is open
+    // or a slot is held.
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&
             weight_copy_tasks);
@@ -77,6 +84,22 @@ class HtoD_Engine {
     py::dict weight_stream_status();
     // Joins the producer, then rethrows its recorded failure, if any.
     void stop_h2d_worker();
+    // After a forward died inside its weight passes; the producer must be
+    // stopped. Releases every daemon lease still recorded, drops every open
+    // pass and slot (GPU_Weight_Buffer::abort_passes) and puts every queue
+    // back at the head of its list, where the cursors now are. With
+    // distributed storage the daemon schedule is lost: every later
+    // begin_weight_pass and set_weight_copy_queue throws. Otherwise the next
+    // set_weight_copy_queue, or start + begin, proceeds as after a phase end.
+    WeightPassAbort abort_weight_passes();
+    // Un-parks the producer: a pass was armed or a task was queued.
+    void wake_producer();
+    // Throws when the node daemon still leases this worker a module of pass
+    // or an earlier one. A lease of the module in flight for a later
+    // (carried) pass is allowed.
+    void require_no_daemon_lease_for_pass(int64_t pass);
+    // Producer state, module and pass in flight, for error messages.
+    std::string describe_producer();
     void batched_page_copy(const std::vector<void*>& gpu_ptrs,
                            const std::vector<void*>& host_ptrs,
                            int64_t page_byte_size);
@@ -95,7 +118,9 @@ class HtoD_Engine {
         kFailed = 4,
     };
     void set_producer_state_(ProducerState state,
-                             const std::string& module_name);
+                             const std::string& module_name,
+                             int64_t pass = 0);
+    std::string describe_producer_locked_() const;  // under status_mutex_
     void count_module_(
         std::unordered_map<std::string, uint64_t>& counter,
         const std::string& module_type);
@@ -132,18 +157,24 @@ class HtoD_Engine {
 
     std::unordered_map<std::string, std::vector<std::string>>
         weight_copy_tasks_;
+    // module type -> queue of module names, in schedule order. Replaced only
+    // while the producer is stopped; the producer pops its head and pushes it
+    // back to the tail once per claim, so every pass reads the same order.
     std::unordered_map<std::string, threadsafe_queue<std::string>>
-        weights_copy_task_queue_;  // module type -> queue of module names.
-    // Bumped under mutex_ by every queue install, clear or reset, so the
-    // producer can tell that the head it peeked no longer belongs to the
-    // queue it would pop or push back into.
-    uint64_t queue_generation_ = 0;
+        weights_copy_task_queue_;
     // Set by a failed copy, cleared only by set_weight_copy_queue.
     std::atomic<bool> producer_failed_{false};
+
+    // A producer with no type to produce blocks on producer_wake_cv_ until
+    // producer_wake_ moves (wake_producer) or it is told to stop.
+    std::mutex producer_wake_mutex_;
+    std::condition_variable producer_wake_cv_;
+    uint64_t producer_wake_ = 0;  // under producer_wake_mutex_
 
     std::atomic<int> producer_state_{static_cast<int>(ProducerState::kParked)};
     std::mutex status_mutex_;
     std::string module_in_flight_;  // under status_mutex_
+    int64_t pass_in_flight_ = 0;    // under status_mutex_
     // Per module type since the last set_weight_copy_queue, under
     // status_mutex_.
     std::unordered_map<std::string, uint64_t> copied_modules_;

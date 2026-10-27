@@ -385,7 +385,7 @@ def build_k3_state_dict_name_map(cfg) -> Tuple[Dict[str, Dict[str, str]],
 
     ``weight_copy_task`` lists module keys in layer-major ascending order — the
     order the forwards MUST consume them in, or the single-threaded producer
-    stalls and ``get_weights`` throws after 2 s.  The queue the worker actually
+    stalls and ``get_weights`` throws its stall error.  The queue the worker actually
     installs comes from the PSM's ``configure_prefill()``; this is the reference
     ordering that must reproduce.
     """

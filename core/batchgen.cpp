@@ -272,20 +272,14 @@ void BatchGen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
 // };
 
 std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights(
-    std::string module_key,
-    std::string& phase) 
-{
-    /* Get the weights from the weights storage. */
-    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    // CUDA_CHECK(cudaStreamSynchronize(0));
-    return this->gpu_weight_buffer_.get_weights(module_key, phase);  // blocking.
-};
-
-std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights_pinned(
     const std::string& module_name) {
-    /* Get already-owned weights without evicting or releasing buffers. */
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    return this->gpu_weight_buffer_.get_weights_pinned(module_name);  // blocking.
+    try {
+        return this->gpu_weight_buffer_.get_weights(module_name);  // blocking.
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string(error.what()) + " Producer: " +
+                                 this->h2d_engine_.describe_producer());
+    }
 };
 
 void BatchGen::free_weights_buffer(const std::string& module_name) {
@@ -322,10 +316,6 @@ void BatchGen::submit_to_KV_queue(std::vector<int64_t> micro_batch,
                                          layer_idx, byte_size);
 };
 
-void BatchGen::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
-    this->gpu_weight_buffer_.clear_expert_buffer(layer_idx, expert_idx, phase);
-};
-
 void BatchGen::prefill_complete_sync() {
     this->d2h_engine_.wait_until_queue_B_empty();
 };
@@ -334,14 +324,6 @@ void BatchGen::clear_kv_storage() { this->kv_storage_.clear_kv_storage(); };
 
 void BatchGen::clear_kv_copy_queue() {
     this->h2d_engine_.clear_kv_copy_queue();
-};
-
-void BatchGen::clear_weight_copy_queue() {
-    this->h2d_engine_.clear_weight_copy_queue();
-};
-
-void BatchGen::reset_weight_copy_queue() {
-    this->h2d_engine_.reset_weight_copy_queue();
 };
 
 void BatchGen::reset_weight_stream_profile(bool enabled) {
@@ -369,6 +351,81 @@ py::dict BatchGen::skip_weight_modules(
 
 py::dict BatchGen::weight_stream_status() {
     return this->h2d_engine_.weight_stream_status();
+}
+
+int64_t BatchGen::begin_weight_pass() {
+    const int64_t pass = this->gpu_weight_buffer_.begin_pass();
+    if (pass != 0) {
+        this->h2d_engine_.wake_producer();
+    }
+    return pass;
+}
+
+py::dict BatchGen::end_weight_pass(int64_t pass_id) {
+    WeightSlotTable::PassSummary summary;
+    {
+        // The wait can take as long as the producer needs to finish the
+        // pass; other Python threads must keep running meanwhile.
+        py::gil_scoped_release release;
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+        try {
+            this->gpu_weight_buffer_.wait_pass_drained(pass_id);
+            if (pass_id != 0) {
+                this->h2d_engine_.require_no_daemon_lease_for_pass(pass_id);
+            }
+            summary = this->gpu_weight_buffer_.end_pass(pass_id);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string(error.what()) +
+                                     " Producer: " +
+                                     this->h2d_engine_.describe_producer());
+        }
+    }
+    py::dict copied;
+    py::dict skipped;
+    py::dict released_on_landing;
+    for (const auto& [module_type, counts] : summary.by_type) {
+        copied[module_type.c_str()] = counts.copied;
+        skipped[module_type.c_str()] = counts.skipped;
+        released_on_landing[module_type.c_str()] = counts.released_on_landing;
+    }
+    py::dict result;
+    result["pass"] = pass_id;
+    result["copied"] = copied;
+    result["skipped"] = skipped;
+    result["released_on_landing"] = released_on_landing;
+    result["carried"] = summary.carried;
+    return result;
+}
+
+py::dict BatchGen::cancel_weight_pass(int64_t pass_id) {
+    const auto counts = this->gpu_weight_buffer_.cancel_pass(pass_id);
+    py::dict result;
+    result["pass"] = pass_id;
+    result["freed_present"] = counts.freed_present;
+    result["release_on_landing"] = counts.release_on_landing;
+    result["pending"] = counts.pending;
+    return result;
+}
+
+py::dict BatchGen::abort_weight_passes() {
+    HtoD_Engine::WeightPassAbort aborted;
+    {
+        // Synchronizes the device; other Python threads keep running.
+        py::gil_scoped_release release;
+        aborted = this->h2d_engine_.abort_weight_passes();
+    }
+    py::dict freed;
+    for (int state = 0; state < kWeightSlotStateCount; ++state) {
+        freed[weight_slot_state_name(static_cast<WeightSlotState>(state))] =
+            aborted.slots.freed[state];
+    }
+    py::dict result;
+    result["passes"] = aborted.slots.passes;
+    result["pending_skips"] = aborted.slots.pending_skips;
+    result["freed"] = freed;
+    result["daemon_leases"] = aborted.daemon_leases;
+    result["schedule_lost"] = aborted.schedule_lost;
+    return result;
 }
 
 void BatchGen::reset_prefill_buffer() {
@@ -417,9 +474,7 @@ void BatchGen::save_compressed_kv(){
 void BatchGen::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&
         weight_copy_tasks) {
-    // Install the buffer's task set first: the queue install below un-parks
-    // a failed producer, which must find the new tasks already in place.
-    this->gpu_weight_buffer_.set_weight_copy_task(weight_copy_tasks);
+    // Installs the buffer's task set and the producer queues together.
     this->h2d_engine_.set_weight_copy_queue(weight_copy_tasks);
 }
 

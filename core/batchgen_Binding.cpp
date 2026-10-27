@@ -611,9 +611,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // from a Python prefetch thread.  Release the interpreter lock while
         // get_weights waits for the daemon/ring so the main thread can run
         // attention and MoE compute concurrently.
-        .def("get_weights", &BatchGen::get_weights,
-             py::call_guard<py::gil_scoped_release>())
-        .def("get_weights_pinned", &BatchGen::get_weights_pinned,
+        .def("get_weights", &BatchGen::get_weights, py::arg("module_name"),
              py::call_guard<py::gil_scoped_release>())
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
         .def("free_weights_buffer_async",
@@ -622,15 +620,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &BatchGen::free_weights_buffers_async)
         .def("attn", &BatchGen::attn)
         .def("submit_to_KV_queue", &BatchGen::submit_to_KV_queue)
-        .def("clear_expert_buffer", &BatchGen::clear_expert_buffer)
         // .def("get_skeleton_state_dict", &BatchGen::get_skeleton_state_dict)
         .def("prefill_complete_sync", &BatchGen::prefill_complete_sync)
         .def("set_phase", &BatchGen::set_phase)
         .def("clear_kv_storage", &BatchGen::clear_kv_storage)
         .def("clear_kv_copy_queue", &BatchGen::clear_kv_copy_queue)
-        .def("reset_weight_copy_queue", &BatchGen::reset_weight_copy_queue)
         .def("clear_kv_buffer", &BatchGen::clear_kv_buffer)
-        .def("clear_weight_copy_queue", &BatchGen::clear_weight_copy_queue)
         .def("reset_prefill_buffer", &BatchGen::reset_prefill_buffer)
         .def("create_fake_kv_storage", &BatchGen::create_fake_kv_storage)
         // .def("get_tensor", &BatchGen::get_tensor,py::return_value_policy::take_ownership)
@@ -648,6 +643,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("skip_weight_modules", &BatchGen::skip_weight_modules,
              py::arg("module_names"))
         .def("weight_stream_status", &BatchGen::weight_stream_status)
+        .def("begin_weight_pass", &BatchGen::begin_weight_pass)
+        // end_weight_pass releases the interpreter lock itself while it
+        // waits, and takes it back to build its result.
+        .def("end_weight_pass", &BatchGen::end_weight_pass,
+             py::arg("pass_id"))
+        .def("cancel_weight_pass", &BatchGen::cancel_weight_pass,
+             py::arg("pass_id"))
+        // abort_weight_passes releases the interpreter lock itself while it
+        // synchronizes the device.
+        .def("abort_weight_passes", &BatchGen::abort_weight_passes)
         .def("reset_decoding_buffer", &BatchGen::reset_decoding_buffer)
         .def("stop_h2d_worker", &BatchGen::stop_h2d_worker)
         .def("copy_kv_to_worker",

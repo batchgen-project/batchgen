@@ -108,9 +108,9 @@ def test_decode_configure_releases_the_ring_before_building_the_model():
     names = _call_order(
         method,
         {
+            "close",
             "stop_h2d_worker",
             "clear_kv_copy_queue",
-            "clear_weight_copy_queue",
             "reset_decoding_buffer",
             "configure_decoding",
             "_assert_phase_switch_clean",
@@ -120,12 +120,14 @@ def test_decode_configure_releases_the_ring_before_building_the_model():
 
     configure = names.index("configure_decoding")
     for released in (
+        "close",
         "stop_h2d_worker",
         "clear_kv_copy_queue",
-        "clear_weight_copy_queue",
         "reset_decoding_buffer",
     ):
         assert names.index(released) < configure, released
+    # No weight pass may be open while the producer stops.
+    assert names.index("close") < names.index("stop_h2d_worker")
     # The method has two exits (activate a reused instance, or build one), so
     # only the release-before-build ordering is asserted here; the activation
     # path is covered in tests/test_phase_instance_reuse.py. Both exits install
@@ -137,13 +139,13 @@ def test_decode_configure_releases_the_ring_before_building_the_model():
 def test_ring_release_still_preserves_an_installed_streamed_sp8_pipeline():
     """Reordering must not widen what the reset touches.
 
-    Host-RDMA keeps its daemon cursor and its prefill-shaped slots, so the
+    The next streamed-SP8 prefill reuses its prefill-shaped slots, so the
     decode-layout reset stays behind the streamed-SP8 guard. (The K3 contract
     test ``test_resident_decode_preserves_streamed_sp8_weight_pipeline`` pins
     the same property; this one states it from the phase-switch side.)
     """
     method = _worker_method_ast("_load_decode_model")
-    guarded = {"clear_weight_copy_queue", "reset_decoding_buffer"}
+    guarded = {"reset_decoding_buffer"}
     seen = set()
 
     for node in ast.walk(method):

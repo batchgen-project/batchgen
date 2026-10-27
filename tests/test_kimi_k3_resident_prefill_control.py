@@ -1396,7 +1396,7 @@ def test_streamed_sp8_finite_trace_is_batch_gated_and_non_synchronizing():
     assert tuple(call.args[0].value for call in calls) == stages
 
 
-def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
+def test_streamed_sp8_weight_batch_leases_by_module_name_only():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(
         path, "StreamedSP8LayerBuffer", "_acquire_local_shard"
@@ -1408,8 +1408,18 @@ def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
         and isinstance(node.value, str)
         and node.value.startswith("prefill")
     ]
-    assert "prefill_sp8" in phases
-    assert "prefill" not in phases
+    # The ring evicts nothing, so no phase selects a non-evicting wait.
+    assert phases == []
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_weights"
+    ]
+    assert calls
+    for call in calls:
+        assert len(call.args) == 1 and not call.keywords
 
 
 def test_streamed_sp8_reusable_buffers_are_not_inference_tensors():
@@ -3091,8 +3101,8 @@ def _sp8_ingress_buffer(
         record=lambda stream: trace.append(("local_free",))
     )
     buffer.core_engine = SimpleNamespace(
-        get_weights=lambda name, phase: trace.append(
-            ("get_weights", name, phase)
+        get_weights=lambda name: trace.append(
+            ("get_weights", name)
         ) or {tensor: tensor for tensor in SIX_TENSORS},
         free_weights_buffer=lambda name: trace.append(("free_weights", name)),
     )
@@ -3167,13 +3177,13 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
     assert ops.count("synchronize") == 2
     assert ops.count("free_weights") == 4
     assert trace[:10] == [
-        ("get_weights", "routed_expert_7_336", "prefill_sp8"),
-        ("get_weights", "routed_expert_7_337", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_336"),
+        ("get_weights", "routed_expert_7_337"),
         ("synchronize",),
         ("free_weights", "routed_expert_7_336"),
         ("free_weights", "routed_expert_7_337"),
-        ("get_weights", "routed_expert_7_338", "prefill_sp8"),
-        ("get_weights", "routed_expert_7_339", "prefill_sp8"),
+        ("get_weights", "routed_expert_7_338"),
+        ("get_weights", "routed_expert_7_339"),
         ("synchronize",),
         ("free_weights", "routed_expert_7_338"),
         ("free_weights", "routed_expert_7_339"),
@@ -3310,7 +3320,7 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
         trace, cross_group="cross3", cross_root=11, cross_source=True
     )
 
-    def fail_source(name, phase):
+    def fail_source(name):
         raise RuntimeError("source load failed")
 
     buffer.core_engine.get_weights = fail_source
@@ -3643,19 +3653,23 @@ def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     ]
     get_weights = source[
         source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights"):
-        source.index("void GPU_Weight_Buffer::throwIfProducerFailedLocked")
+        source.index("int64_t GPU_Weight_Buffer::begin_pass()")
     ]
 
-    # Release goes through the slot table, which looks the name up without
-    # inserting it and refuses anything that is not LEASED.
+    # Release goes through the slot table, which looks the (name, pass) key
+    # up without inserting it and refuses anything that is not LEASED.
     assert "this->slots_.release(module_name)" in release
-    assert "this->index_.find(module_name)" in table_release
-    assert "this->index_[module_name]" not in table_release
+    assert "this->index_.find(Key{module_name, *pass})" in table_release
+    assert "this->index_[" not in table_release
     assert "*state != WeightSlotState::kLeased" in table_release
     assert "Cannot release missing weight-buffer lease" in table_release
-    assert 'phase == "prefill_sp8"' in get_weights
-    assert "std::chrono::seconds(300)" in get_weights
-    assert "!hold_layer_batch" in get_weights
+    # One wait for every caller: the 300 s stall rule, no phase split.
+    assert "phase" not in get_weights
+    assert "this->waitWithoutStallLocked(lock, module_name," in get_weights
+    header = (
+        ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.h"
+    ).read_text()
+    assert "static constexpr std::chrono::seconds kStallTimeout{300};" in header
 
 
 def test_worker_reads_batch_level_mode_before_configure_prefill():
@@ -4108,33 +4122,6 @@ def test_worker_initializes_streamed_sp8_install_state():
     assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
 
 
-def test_only_hierarchical_gdr_reseeds_streamed_sp8_reentry():
-    path = (
-        ROOT
-        / "batchgen"
-        / "models"
-        / "moonshotai"
-        / "kimi_linear"
-        / "Parallel_Strategy_Manager.py"
-    )
-    method = _isolated_method(
-        path,
-        "KimiLinearParallelStrategyManager",
-        "streamed_sp8_reseeds_h2d_on_reentry",
-    )
-    manager = SimpleNamespace(
-        _hierarchical_gdr=True,
-        prefill_uses_streamed_sp8=lambda: True,
-    )
-
-    assert method(manager) is True
-    manager._hierarchical_gdr = False
-    assert method(manager) is False
-    manager._hierarchical_gdr = True
-    manager.prefill_uses_streamed_sp8 = lambda: False
-    assert method(manager) is False
-
-
 def test_only_hierarchical_gdr_aligns_and_drives_empty_prefill_passes():
     path = (
         ROOT
@@ -4361,7 +4348,7 @@ def test_streamed_prefill_releases_phase_inactive_resident_decode_shards():
     assert trace.count("empty_cache") == 1
 
 
-def test_streamed_sp8_installer_selects_transport_specific_reentry():
+def test_streamed_sp8_installer_has_one_install_path():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(
         worker_path,
@@ -4370,48 +4357,27 @@ def test_streamed_sp8_installer_selects_transport_specific_reentry():
     )
     guards = _call_guards(function)
 
-    # Every installer invocation stops the copy engine and resets the profile.
-    # Host-RDMA sources resume the cursor; hierarchical GDR sources reseed it.
-    # Hierarchical non-sources stay empty and never create an H2D thread.
+    # Every installer invocation closes the weight passes, stops the copy
+    # engine, resets the profile and installs the queue from its head: the
+    # last pass parked the producer there for every transport.
     for name in (
+        "close",
         "stop_h2d_worker",
         "reset_weight_stream_profile",
-    ):
-        assert () in guards[name], name
-    start_guards = guards["start_h2d_worker"]
-    assert len(start_guards) == 2
-    assert all(
-        "any(self.weight_copy_task.values())" in stack
-        for stack in start_guards
-    )
-    assert any(
-        any("reseed_reentry" in test for test in stack)
-        for stack in start_guards
-    )
-    assert any(
-        any(test.startswith("else:") for test in stack)
-        for stack in start_guards
-    )
-
-    # Host-RDMA preserves its daemon cursor. Hierarchical GDR has no remote
-    # generations, so it is allowed to reseed the queue and GPU ring.
-    for name in (
-        "clear_weight_copy_queue",
-        "reset_prefill_buffer",
         "set_weight_copy_queue",
     ):
-        assert guards[name], name
-        assert all(
-            any("sp8_reentry" in test for test in stack)
-            for stack in guards[name]
-        ), name
-        assert any(
-            any("reseed_reentry" in test for test in stack)
-            for stack in guards[name]
-        ), name
+        assert guards[name] == [()], name
+    # Hierarchical non-sources stay empty and never create an H2D thread.
+    assert guards["start_h2d_worker"] == [
+        ("any(self.weight_copy_task.values())",)
+    ]
+    # Only the ring layout depends on re-entry: resident decode keeps a
+    # streamed-SP8 ring in its prefill layout.
+    assert guards["reset_prefill_buffer"] == [("not sp8_reentry",)]
+    assert "reseed" not in ast.unparse(function)
 
     # A re-entry that finds a different schedule must fail loudly rather than
-    # stream a task that no longer matches the installed pipeline.
+    # stream a task that no longer matches the distributed schedule.
     mismatch = next(
         node
         for node in ast.walk(function)
@@ -4426,28 +4392,29 @@ def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
     function = _function(worker_path, "BatchGenWorker", "_load_decode_model")
     guards = _call_guards(function)
 
+    assert () in guards["close"]
     assert () in guards["stop_h2d_worker"]
     assert () in guards["clear_kv_copy_queue"]
-    # Decode cannot replace the prefill queue or resize its routed-expert ring.
-    for name in ("clear_weight_copy_queue", "reset_decoding_buffer"):
-        assert guards[name], name
-        assert all(
-            any("_streamed_sp8_h2d_installed" in test for test in stack)
-            for stack in guards[name]
-        ), name
+    # Decode cannot resize the streamed-SP8 routed-expert ring.
+    assert guards["reset_decoding_buffer"], "reset_decoding_buffer"
+    assert all(
+        any("_streamed_sp8_h2d_installed" in test for test in stack)
+        for stack in guards["reset_decoding_buffer"]
+    )
 
-    # A streamed decode task would reseed the same queue with a different
-    # phase schedule.  Distributed streamed-SP8 therefore requires the
-    # resident-EP decode path and fails before set_weight_copy_queue.
-    # The install moved into _install_decode_weight_copy_queue, which both the
-    # first decode build and every later activation of a reused instance call;
-    # its internal structure is unchanged.
+    # A streamed decode task would replace the streamed-SP8 schedule with a
+    # different phase schedule. Distributed streamed-SP8 therefore requires
+    # the resident-EP decode path and fails before set_weight_copy_queue; every
+    # other rank installs an empty decode schedule, which uninstalls the
+    # prefill lists. The install lives in _install_decode_weight_copy_queue,
+    # which the first decode build, every later activation of a reused
+    # instance and the persistent-phase activation call.
     function = _function(
         worker_path, "BatchGenWorker", "_install_decode_weight_copy_queue"
     )
     routed_task = next(
         node
-        for node in ast.walk(function)
+        for node in function.body
         if isinstance(node, ast.If)
         and "weight_copy_task.get('routed_expert')" in ast.unparse(node.test)
     )
@@ -4458,14 +4425,16 @@ def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
         and "_streamed_sp8_h2d_installed" in ast.unparse(node.test)
     )
     assert any(isinstance(node, ast.Raise) for node in installed_guard.body)
-    assert routed_task.body.index(installed_guard) < next(
-        index
-        for index, node in enumerate(routed_task.body)
+    install = next(
+        node
+        for node in function.body
         if isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Attribute)
         and node.value.func.attr == "set_weight_copy_queue"
     )
+    assert ast.unparse(install.value.args[0]) == "task"
+    assert function.body.index(routed_task) < function.body.index(install)
 
 
 def test_weight_copy_task_fingerprint_pins_type_and_order():

@@ -100,6 +100,14 @@ class Weights_Storage {
 
     void release_module(const std::string& module_key);
 
+    // Modules the node daemon currently leases to this worker. Never waits
+    // on a daemon request in flight.
+    std::vector<std::string> leased_modules() const;
+
+    // Whether remote modules come from the node daemon, whose schedule every
+    // rank of the node consumes in the same cyclic order.
+    bool is_distributed() const { return this->distributed_; }
+
    private:
     int device_id_; // Stored device ID
     std::shared_ptr<spdlog::logger> logger;
@@ -157,7 +165,9 @@ class Weights_Storage {
                        std::unordered_map<std::string,
                                           distributed_tensor_meta>>
         remote_module_weights_;
+    // Written under daemon_mutex_ and lease_index_mutex_; read under either.
     std::unordered_map<std::string, active_lease> active_leases_;
+    mutable std::mutex lease_index_mutex_;
 
     std::optional<active_lease> acquire_remote_module(
         const std::string& module_key,

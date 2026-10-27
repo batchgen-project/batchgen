@@ -137,7 +137,7 @@ class BaseModuleWrapper(nn.Module):
         cls._cached_world_size = None
 
     def load_weights(self, module_key: str) -> Dict[str, torch.Tensor]:
-        """Load weights from core engine.
+        """Lease the module's weights in the current weight pass.
 
         Args:
             module_key: Key identifying the module weights to load
@@ -145,7 +145,7 @@ class BaseModuleWrapper(nn.Module):
         Returns:
             Dict mapping parameter names to weight tensors
         """
-        return self.core_engine.get_weights(module_key, self.phase)
+        return self.core_engine.get_weights(module_key)
 
     def _sync_device_before_release(self) -> None:
         """Drain the current compute stream before releasing weight storage."""
