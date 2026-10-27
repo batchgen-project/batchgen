@@ -611,6 +611,23 @@ class KimiLinearPlanner(BasePlanner):
         ):
             self.config.Basic_Config.decode_graph_mode = "graph"
 
+        # Routed-expert prefill ring depth. Without this K3 inherits
+        # base_planner's generic default of 8 slots, which lets the HtoD
+        # producer run at most 8 modules ahead of the consumer -- about 3.5 ms
+        # of lookahead at the measured consume rate, far too little to cover
+        # the fetch of the next module, so the ring sits empty and the GPU
+        # waits (run k3h20-mflat-20261026: consumer waited 30.2 s of a 34.2 s
+        # wave). One TP8 shard of a layer is the natural depth: the consumer
+        # asks for the whole shard before the node-local all-gather, so a
+        # layer-deep ring lets the producer stay a full layer ahead.
+        # _configure_streamed_rings() already uses this depth, but only runs
+        # under stream_all_modules.
+        self.config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"] = (
+            self.NUM_EXPERTS // self.attention_group_size
+            if self.attention_group_size > 0
+            else 8
+        )
+
     def _configure_streamed_rings(self):
         """Ring depths for the four streamed module types.
 
