@@ -64,29 +64,6 @@ else
   echo "/dev/shm already ${CURRENT_SHM_GB}G, no remount needed."
 fi
 
-# start parameter server
-HF_ENDPOINT=https://hf-mirror.com \
-python -m batchgen.parameter_server \
-        --model deepseek-ai/DeepSeek-R1 \
-        --cache-dir "$CACHE_DIR" &
-PARAM_SERVER_PID=$!
-
-# ensure the parameter server is killed on script exit
-trap "kill $PARAM_SERVER_PID 2>/dev/null" EXIT
-
-# wait for the parameter server to be ready
-function wait_for_port() {
-    local host="localhost"
-    local port=10900
-    while ! (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1; do
-        echo "Waiting for port $port to become available..."
-        sleep 10
-    done
-    echo "Port $port is available."
-}
-
-wait_for_port
-
 # run test
 HF_ENDPOINT=https://hf-mirror.com \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
