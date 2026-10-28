@@ -200,7 +200,6 @@ from batchgen.batch_order import (
 from batchgen.memfd import create_memfd
 from batchgen.query_book import (
 	QueryBook,
-	QueryBookEntry as query,
 	bind_local_sequence_to_query_book,
 	make_query_book_entry,
 	release_local_query_slot,
@@ -299,16 +298,12 @@ from batchgen.continuous_batching import (
 	AdaptiveChunkSizer,
 	BoundaryDecisions,
 	FastBoundaryTimingStats,
-	plan_host_kv_growth_evictions,
-	EvictionStrategy,
-	LoadingStrategy,
-	select_sequences_for_loading,
 	validate_boundary_payload_alignment,
 )
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
 # Migration data structures for KV cache migration between nodes
-from batchgen.migration import MigrationOp, HostKVStats
+from batchgen.migration import MigrationOp
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
