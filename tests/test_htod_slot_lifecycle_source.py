@@ -9,8 +9,10 @@ with one event after its copies; the producer alone observes the events and
 lands the copies oldest first, and it never waits for the node daemon or for
 a free slot while a copy is un-landed: with copies in flight it only tries a
 remote module, one request the daemon answers at once, and leaves a module
-that is not ready at the head of its queue. The daemon summary copies its
-state and formats it outside the locks the request path takes.
+that is not ready at the head of its queue. The daemon posts each schedule
+chunk into any free chunk-slot, a chunk an acquire waits for first, and its
+summary copies its state and formats it outside the locks the request path
+takes.
 """
 
 import re
@@ -635,6 +637,13 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     stalled = acquire.index("remote fetch stalled")
     stats = acquire.index("++stats.acquire_count;")
     assert pending < evaluate < polled < retry < stalled < stats
+    # A module that is not ready demands its chunk before any wait.
+    not_ready = acquire.index("if (!ready()) {")
+    demand = acquire.index(
+        "DemandChunkLocked(worker_id, ChunkOf(layer, expert, worker_id));"
+    )
+    assert pending < not_ready < demand < evaluate
+    assert acquire.count("DemandChunkLocked(") == 2  # the call and the helper
     assert "std::chrono::seconds(300)" not in acquire
     # The 300 s diagnostics span every slice of one pending acquire.
     assert "pending_acquires.at(worker_id)" in acquire
@@ -647,6 +656,102 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
     assert 'summary["ready_unacquired_by_worker"]' in summary
     assert 'summary["pending_acquire_by_worker"]' in summary
+
+
+def test_daemon_posts_demanded_chunks_first_into_free_chunk_slots():
+    daemon = DAEMON.read_text()
+    # The positional ring is gone: no tail, no in-order slot check.
+    assert "SlotsFree" not in daemon
+    assert "int tail = 0;" not in daemon
+    assert "constexpr int kOwnerChunksPerRail = 3;" in daemon
+    loop = _section(daemon, "void PrefetchLoop() {", "CohortSnapshot SnapshotCohort()")
+    capacity = loop.index("2 * (outstanding + depth / superchunk)")
+    # The window refills in schedule order and wraps with the schedule.
+    refill = loop.index("while (posting_window.size() < window_capacity) {")
+    wrap = loop.index("if (next == schedule.size()) {", refill)
+    take = loop.index("schedule_chunks[next / superchunk];", wrap)
+    order = loop.index('fail("posting window refill left schedule order");', take)
+    deferred = loop.index("for (ChunkKey& wanted : deferred_demand) {", order)
+    append = loop.index("posting_window.push_back(pending);", deferred)
+    advance = loop.index("next += superchunk;", append)
+    assert capacity < refill < wrap < take < order < deferred < append < advance
+    # No free chunk-slot: counted, nothing posted.
+    empty = loop.index("if (free_chunk_slots.empty()) {", advance)
+    assert loop.index("++stats.freelist_empty_polls;", empty) < loop.index("break;", empty)
+    # The first demanded entry, else the oldest one under its owner's cap.
+    demanded = loop.index("return pending.demanded;", empty)
+    capped = loop.index("kOwnerChunksPerRail *", demanded)
+    none = loop.index("break;  // every owner at its cap, nothing demanded", capped)
+    erase = loop.index("posting_window.erase(selected);", none)
+    # Any free chunk-slot, checked free before it is filled.
+    pop = loop.index("free_chunk_slots.pop_back();", erase)
+    live = loop.index('fail("posted into a live chunk-slot");', pop)
+    twice = loop.index('fail("chunk posted twice: "', live)
+    fetched = loop.index("module_to_slot.count(module_key) != 0", twice)
+    fill = loop.index("slot.state = SlotState::kFetching;", fetched)
+    pinned = loop.index("chunk_slot_live[chunk_slot] = superchunk;", fill)
+    expedited = loop.index("stats.expedited_posts += pick.demanded;", pinned)
+    post = loop.index("chunk.request = ucp_get_nbx(", expedited)
+    assert empty < demanded < capped < none < erase < pop < live < twice
+    assert twice < fetched < fill < pinned < expedited < post
+    # One get per chunk, into its chunk-slot; outstanding caps the flight.
+    assert loop.count("ucp_get_nbx(") == 1
+    assert "static_cast<std::uint64_t>(chunk.slot_start) *" in loop
+    assert "while (static_cast<int>(chunks.size()) < outstanding) {" in loop
+    assert loop.count("++owner_in_flight[owner];") == 1
+    assert loop.count("--owner_in_flight[iterator->owner];") == 2
+
+    # The last release of a chunk-slot's modules frees it; nothing else does
+    # but a reset, which frees all of them.
+    release = _section(
+        daemon,
+        "void Release(const std::string& module_key, int worker_id,",
+        "std::uint32_t ExpectedWorkers(",
+    )
+    last = release.index("if (slot.released_mask == ExpectedWorkers(module_key)) {")
+    count = release.index("if (--chunk_slot_live[chunk_slot] == 0) {", last)
+    push = release.index("free_chunk_slots.push_back(chunk_slot);", count)
+    assert last < count < push
+    assert daemon.count("free_chunk_slots.push_back(") == 2
+    free_all = _section(
+        daemon, "void FreeAllChunkSlotsLocked() {", "void MarkReady(const Chunk& chunk,"
+    )
+    for token in (
+        "free_chunk_slots.clear();",
+        "chunk_slot_live.assign(count, 0);",
+        "posting_window.clear();",
+        "deferred_demand.fill(ChunkKey{});",
+    ):
+        assert token in free_all, token
+    reset = _section(
+        daemon, "RingResetReport ResetSlotsLocked() {", "std::uint64_t DrainForReset("
+    )
+    assert reset.index("module_to_slot.clear();") < reset.index("FreeAllChunkSlotsLocked();")
+    # The prefetch thread resets only after draining, and reports the
+    # window base as the ring tail.
+    drain = loop.index("DrainForReset(&chunks);")
+    base = loop.index("posting_window.front().schedule_index", drain)
+    reset_call = loop.index("ResetSlotsLocked();", base)
+    tail = loop.index("report.ring_tail = static_cast<int>(window_base);", reset_call)
+    assert drain < base < reset_call < tail
+
+    # The demand mark: a posted chunk needs nothing, a window entry is
+    # marked once, one past the window is left for the refill.
+    demand = _section(
+        daemon,
+        "void DemandChunkLocked(int worker_id, const ChunkKey& key) {",
+        "void Release(const std::string& module_key, int worker_id,",
+    )
+    posted = demand.index("chunk_slot_key[chunk_slot] == key")
+    window = demand.index("for (PendingChunk& pending : posting_window) {")
+    hit = demand.index("++stats.demand_hits;", window)
+    defer = demand.index("deferred = key;", hit)
+    miss = demand.index("++stats.demand_misses;", defer)
+    assert posted < window < hit < defer < miss
+
+    summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
+    for key in ("demand_hits", "demand_misses", "expedited_posts", "freelist_empty_polls"):
+        assert f'summary["{key}"] = counters.{key};' in summary, key
 
 
 def test_daemon_summary_formats_snapshots_outside_the_request_locks():

@@ -66,6 +66,10 @@ constexpr auto kAcquireTimeout = std::chrono::seconds(300);
 // A pending acquire not polled for this long belongs to a worker that stopped
 // asking (its producer was cancelled); the next request starts a fresh wait.
 constexpr auto kAcquireAbandoned = std::chrono::seconds(5);
+// A speculative chunk is not posted while its owner has this many chunks in
+// flight per rail: per-rail queueing stays near three chunks, so a demanded
+// chunk lands soon, and every owner's rails still run concurrently.
+constexpr int kOwnerChunksPerRail = 3;
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -326,6 +330,26 @@ struct Chunk {
     Clock::time_point posted;
 };
 
+// One superchunk of the schedule: its layer and first expert name all of its
+// modules. layer -1: none.
+struct ChunkKey {
+    int layer = -1;
+    int first_expert = -1;
+
+    bool operator==(const ChunkKey& other) const {
+        return layer == other.layer && first_expert == other.first_expert;
+    }
+};
+
+// A schedule chunk not posted yet. demanded: a worker's acquire waits for it,
+// so it is posted ahead of the speculative chunks before it.
+struct PendingChunk {
+    size_t schedule_index = 0;
+    int owner = -1;
+    ChunkKey key;
+    bool demanded = false;
+};
+
 // A worker cohort is one generation of the server's worker pool. The daemon
 // admits hellos for exactly one cohort epoch at a time. Draining is the window
 // between BeginCohortSwap and FinishCohortSwap: the cohort is being torn down,
@@ -358,7 +382,7 @@ struct RingResetReport {
     std::uint64_t discarded_ready = 0;  // fetched, never acquired
     std::uint64_t drained_fetches = 0;  // modules in flight at the reset
     std::uint64_t schedule_cursor = 0;  // prefetch position rewound to 0
-    int ring_tail = 0;                  // ring position rewound to 0
+    int ring_tail = 0;                  // posting-window base rewound to 0
     bool prefetch_handshake = false;    // reset done by the prefetch thread
 };
 
@@ -376,6 +400,14 @@ struct Stats {
     std::array<std::uint64_t, kDefaultWorkers> worker_wait_count{};
     std::array<double, kDefaultWorkers> worker_wait_seconds{};
     int staging_hwm = 0;
+    // Demand-aware posting. hits: window chunks newly marked demanded;
+    // misses: a demanded chunk was neither posted nor in the window yet;
+    // expedited: chunks demanded when posted; freelist_empty_polls: posting
+    // stopped with outstanding room because no chunk-slot was free.
+    std::uint64_t demand_hits = 0;
+    std::uint64_t demand_misses = 0;
+    std::uint64_t expedited_posts = 0;
+    std::uint64_t freelist_empty_polls = 0;
     // Post-to-ready latency of each fetched module, in milliseconds.
     LatencyHistogram ready_latency;
 };
@@ -484,6 +516,7 @@ struct DistributedWeightDaemon::Impl {
         all_workers_mask =
             (static_cast<std::uint32_t>(1) << workers) - 1;
         slots.resize(depth);
+        FreeAllChunkSlotsLocked();
         owner_rails.resize(num_nodes);
         owner_rail_cursor.assign(num_nodes, 0);
         for (std::vector<RemoteEndpoint>& rail_remotes : remotes) {
@@ -559,7 +592,8 @@ struct DistributedWeightDaemon::Impl {
     //   summary_mutex -> at most one of cohort_mutex, ring_mutex,
     //                    stats_mutex, failure_mutex at a time (WriteSummary
     //                    takes one snapshot after another)
-    //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop); every
+    //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop,
+    //                 DemandChunkLocked via Acquire); every
     //                 stats_mutex hold is a few scalar updates or one copy
     //                 of stats
     //   ready_mutex -> failure_mutex (WaitReady)
@@ -584,6 +618,20 @@ struct DistributedWeightDaemon::Impl {
     std::condition_variable ring_cv;
     std::vector<Slot> slots;
     std::unordered_map<std::string, int> module_to_slot;
+    // Staging is depth / superchunk chunk-slots: chunk-slot i is staging slots
+    // [i * superchunk, (i + 1) * superchunk). A chunk is posted into any free
+    // chunk-slot, which frees once its last module is released, so modules a
+    // slow worker holds pin only their own chunk-slots. Under ring_mutex.
+    std::vector<int> free_chunk_slots;     // LIFO
+    std::vector<int> chunk_slot_live;      // modules not released yet
+    std::vector<ChunkKey> chunk_slot_key;  // the chunk a live chunk-slot holds
+    // The next unposted schedule chunks in schedule order. The prefetch thread
+    // refills it and posts from it; an acquire that is not ready marks its
+    // chunk demanded there. Under ring_mutex.
+    std::deque<PendingChunk> posting_window;
+    // Per worker: the chunk its waiting acquire needs that had not entered
+    // the window yet; the refill marks it demanded. Under ring_mutex.
+    std::array<ChunkKey, kDefaultWorkers> deferred_demand;
     std::uint64_t next_generation = 1;
     // Completed fetches, so an acquire timeout can tell a stalled transport
     // (no completion while slots are fetching) from a cohort that never
@@ -1347,6 +1395,9 @@ struct DistributedWeightDaemon::Impl {
             pending.module_key = module_key;
             pending.begin = now;
             pending.completions_at_start = ring_completions;
+            // A fresh wait abandons any demand deferred for the previous
+            // module, so a stale key cannot expedite a chunk nobody wants.
+            deferred_demand.at(worker_id) = ChunkKey{};
         }
         const auto ready = [&]() {
             if (failed.load() || stop.load() || cohort_closed.load()) {
@@ -1357,6 +1408,10 @@ struct DistributedWeightDaemon::Impl {
                    slots[found->second].state ==
                        SlotState::kReady;
         };
+        if (!ready()) {
+            // Before any wait: the chunk this worker needs is posted next.
+            DemandChunkLocked(worker_id, ChunkOf(layer, expert, worker_id));
+        }
         // A no-wait acquire evaluates the same predicate with no slice; the
         // rest, the 300 s diagnostics included, is the same for both.
         const bool available =
@@ -1370,6 +1425,7 @@ struct DistributedWeightDaemon::Impl {
         const std::uint64_t completions_at_start =
             pending.completions_at_start;
         pending = PendingAcquire{};
+        deferred_demand.at(worker_id) = ChunkKey{};
         if (!available) {
             int fetching = 0;
             int ready = 0;
@@ -1448,7 +1504,46 @@ struct DistributedWeightDaemon::Impl {
             stats.worker_wait_count.at(worker_id) += 1;
             stats.worker_wait_seconds.at(worker_id) += wait_s;
         }
-        (void)layer;
+    }
+
+    // The schedule chunk of a worker's module: the worker's superchunks start
+    // at the first expert of its shard.
+    ChunkKey ChunkOf(int layer, int expert, int worker_id) const {
+        const int worker_first_expert = worker_id * (kExperts / workers);
+        return ChunkKey{
+            layer, expert - (expert - worker_first_expert) % superchunk};
+    }
+
+    // An acquire found its module not ready: mark its chunk demanded so the
+    // prefetch thread posts it next. A chunk already posted needs nothing,
+    // and is checked first so a later cycle's entry is never marked; one the
+    // window has not reached yet is marked by the refill. Caller holds
+    // ring_mutex.
+    void DemandChunkLocked(int worker_id, const ChunkKey& key) {
+        for (size_t chunk_slot = 0; chunk_slot < chunk_slot_live.size();
+             ++chunk_slot) {
+            if (chunk_slot_live[chunk_slot] != 0 &&
+                chunk_slot_key[chunk_slot] == key) {
+                return;
+            }
+        }
+        for (PendingChunk& pending : posting_window) {
+            if (pending.key == key) {
+                if (!pending.demanded) {
+                    pending.demanded = true;
+                    std::lock_guard<std::mutex> stats_lock(stats_mutex);
+                    ++stats.demand_hits;
+                }
+                return;
+            }
+        }
+        ChunkKey& deferred = deferred_demand.at(worker_id);
+        if (deferred == key) {
+            return;
+        }
+        deferred = key;
+        std::lock_guard<std::mutex> stats_lock(stats_mutex);
+        ++stats.demand_misses;
     }
 
     void Release(const std::string& module_key, int worker_id,
@@ -1470,8 +1565,18 @@ struct DistributedWeightDaemon::Impl {
         response->slot = found->second;
         response->generation = generation;
         if (slot.released_mask == ExpectedWorkers(module_key)) {
+            const int chunk_slot = found->second / superchunk;
+            if (chunk_slot_live[chunk_slot] <= 0) {
+                fail("released a module of a free chunk-slot: " + module_key);
+            }
             module_to_slot.erase(found);
             slot = Slot{};
+            if (--chunk_slot_live[chunk_slot] == 0) {
+                // Its last module is released: the chunk-slot takes a new
+                // chunk, whatever any other chunk-slot still holds.
+                chunk_slot_key[chunk_slot] = ChunkKey{};
+                free_chunk_slots.push_back(chunk_slot);
+            }
             ring_cv.notify_all();
         }
         lock.unlock();
@@ -1555,13 +1660,18 @@ struct DistributedWeightDaemon::Impl {
                    module_bytes;
     }
 
-    bool SlotsFree(int start, int count) {
-        for (int index = 0; index < count; ++index) {
-            if (slots[start + index].state != SlotState::kFree) {
-                return false;
-            }
+    // Every chunk-slot free and no chunk pending or demanded, as at daemon
+    // start. Caller holds ring_mutex, or is the constructor.
+    void FreeAllChunkSlotsLocked() {
+        const int count = depth / superchunk;
+        free_chunk_slots.clear();
+        for (int chunk_slot = count - 1; chunk_slot >= 0; --chunk_slot) {
+            free_chunk_slots.push_back(chunk_slot);
         }
-        return true;
+        chunk_slot_live.assign(count, 0);
+        chunk_slot_key.assign(count, ChunkKey{});
+        posting_window.clear();
+        deferred_demand.fill(ChunkKey{});
     }
 
     void MarkReady(const Chunk& chunk,
@@ -1618,6 +1728,7 @@ struct DistributedWeightDaemon::Impl {
             slot = Slot{};
         }
         module_to_slot.clear();
+        FreeAllChunkSlotsLocked();
         pending_acquires.fill(PendingAcquire{});
         return report;
     }
@@ -1654,11 +1765,59 @@ struct DistributedWeightDaemon::Impl {
         return drained;
     }
 
+    // The schedule's chunks in order, each checked once to be superchunk-
+    // contiguous and of one owner.
+    std::vector<PendingChunk> ScheduleChunks(
+        const std::vector<std::string>& schedule) const {
+        if (schedule.size() % superchunk != 0) {
+            fail("truncated final superchunk");
+        }
+        std::vector<PendingChunk> chunks;
+        chunks.reserve(schedule.size() / superchunk);
+        for (size_t first = 0; first < schedule.size(); first += superchunk) {
+            const auto [layer, first_expert] =
+                parse_module_key(schedule[first]);
+            const int owner = first_expert / experts_per_owner;
+            for (int index = 0; index < superchunk; ++index) {
+                const auto [next_layer, next_expert] =
+                    parse_module_key(schedule[first + index]);
+                if (next_layer != layer ||
+                    next_expert != first_expert + index ||
+                    next_expert / experts_per_owner != owner) {
+                    fail("remote schedule is not superchunk-contiguous");
+                }
+            }
+            PendingChunk chunk;
+            chunk.schedule_index = first;
+            chunk.owner = owner;
+            chunk.key = ChunkKey{layer, first_expert};
+            chunks.push_back(chunk);
+        }
+        return chunks;
+    }
+
+    // Posts chunks from a bounded window over the cyclic schedule. Each chunk
+    // enters the window once per cycle, in schedule order, so every module is
+    // fetched once per pass; within the window a demanded chunk goes first,
+    // else the oldest whose owner is under its in-flight cap.
     void PrefetchLoop() {
         const std::vector<std::string> schedule = BuildSchedule();
-        size_t next = 0;
-        int tail = 0;
+        const std::vector<PendingChunk> schedule_chunks =
+            ScheduleChunks(schedule);
+        const size_t window_capacity =
+            static_cast<size_t>(2 * (outstanding + depth / superchunk));
+        if (window_capacity >= schedule_chunks.size()) {
+            // Exactly-once per pass rests on the window never holding two
+            // passes' copies of one chunk: the refill cursor must not lap a
+            // pass within one window. Enforce the geometry instead of
+            // assuming it.
+            fail("posting window (" + std::to_string(window_capacity) +
+                 " chunks) must be smaller than one schedule pass (" +
+                 std::to_string(schedule_chunks.size()) + " chunks)");
+        }
+        size_t next = 0;  // schedule index of the next window refill
         std::deque<Chunk> chunks;
+        std::vector<int> owner_in_flight(num_nodes, 0);
 
         while (!stop.load()) {
             // A cohort swap rewinds the ring to its start-of-day state: the
@@ -1678,17 +1837,22 @@ struct DistributedWeightDaemon::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(ring_mutex);
+                    // The window base: the oldest chunk not posted yet.
+                    const size_t window_base =
+                        posting_window.empty()
+                            ? next
+                            : posting_window.front().schedule_index;
                     RingResetReport report = ResetSlotsLocked();
                     report.drained_fetches = drained;
                     report.schedule_cursor = next;
-                    report.ring_tail = tail;
+                    report.ring_tail = static_cast<int>(window_base);
                     report.prefetch_handshake = true;
                     last_ring_reset = report;
                     ring_reset_completed = reset_request;
                 }
                 ring_cv.notify_all();
                 next = 0;
-                tail = 0;
+                std::fill(owner_in_flight.begin(), owner_in_flight.end(), 0);
                 std::fill(owner_rail_cursor.begin(),
                           owner_rail_cursor.end(), 0);
                 continue;
@@ -1698,6 +1862,7 @@ struct DistributedWeightDaemon::Impl {
                  iterator != chunks.end();) {
                 if (iterator->request == nullptr) {
                     MarkReady(*iterator, Clock::now());
+                    --owner_in_flight[iterator->owner];
                     iterator = chunks.erase(iterator);
                     continue;
                 }
@@ -1715,58 +1880,103 @@ struct DistributedWeightDaemon::Impl {
                 ucp_request_free(iterator->request);
                 iterator->request = nullptr;
                 MarkReady(*iterator, Clock::now());
+                --owner_in_flight[iterator->owner];
                 iterator = chunks.erase(iterator);
             }
 
             bool posted = false;
             while (static_cast<int>(chunks.size()) < outstanding) {
-                if (next == schedule.size()) {
-                    next = 0;
-                }
-                if (tail + superchunk > depth) {
-                    tail = 0;
-                }
+                PendingChunk pick;
+                Chunk chunk;
                 {
                     std::lock_guard<std::mutex> lock(ring_mutex);
-                    if (!SlotsFree(tail, superchunk)) {
+                    // Refill strictly in schedule order, wrapping at the
+                    // end of the schedule as one pass ends.
+                    while (posting_window.size() < window_capacity) {
+                        if (next == schedule.size()) {
+                            next = 0;
+                        }
+                        PendingChunk pending =
+                            schedule_chunks[next / superchunk];
+                        if (pending.schedule_index != next) {
+                            fail("posting window refill left schedule order");
+                        }
+                        for (ChunkKey& wanted : deferred_demand) {
+                            if (wanted == pending.key) {
+                                wanted = ChunkKey{};
+                                pending.demanded = true;
+                            }
+                        }
+                        if (pending.demanded) {
+                            std::lock_guard<std::mutex> stats_lock(
+                                stats_mutex);
+                            ++stats.demand_hits;
+                        }
+                        posting_window.push_back(pending);
+                        next += superchunk;
+                    }
+                    if (free_chunk_slots.empty()) {
+                        std::lock_guard<std::mutex> stats_lock(stats_mutex);
+                        ++stats.freelist_empty_polls;
                         break;
                     }
-                }
-                const auto [layer, first_expert] =
-                    parse_module_key(schedule[next]);
-                const int owner =
-                    first_expert / experts_per_owner;
-                if (next + superchunk > schedule.size()) {
-                    fail("truncated final superchunk");
-                }
-                for (int index = 0; index < superchunk; ++index) {
-                    const auto [next_layer, next_expert] =
-                        parse_module_key(schedule[next + index]);
-                    if (next_layer != layer ||
-                        next_expert != first_expert + index ||
-                        next_expert / experts_per_owner != owner) {
-                        fail("remote schedule is not superchunk-contiguous");
+                    auto selected = std::find_if(
+                        posting_window.begin(), posting_window.end(),
+                        [](const PendingChunk& pending) {
+                            return pending.demanded;
+                        });
+                    if (selected == posting_window.end()) {
+                        selected = std::find_if(
+                            posting_window.begin(), posting_window.end(),
+                            [&](const PendingChunk& pending) {
+                                return owner_in_flight[pending.owner] <
+                                       kOwnerChunksPerRail *
+                                           static_cast<int>(
+                                               owner_rails[pending.owner]
+                                                   .size());
+                            });
                     }
-                }
-                Chunk chunk;
-                chunk.slot_start = tail;
-                chunk.count = superchunk;
-                chunk.owner = owner;
-                const std::vector<int>& available =
-                    owner_rails[owner];
-                chunk.rail =
-                    available[owner_rail_cursor[owner]++ %
-                              available.size()];
-                chunk.posted = Clock::now();
+                    if (selected == posting_window.end()) {
+                        break;  // every owner at its cap, nothing demanded
+                    }
+                    pick = *selected;
+                    posting_window.erase(selected);
 
-                {
-                    std::lock_guard<std::mutex> lock(ring_mutex);
+                    const int chunk_slot = free_chunk_slots.back();
+                    free_chunk_slots.pop_back();
+                    chunk.slot_start = chunk_slot * superchunk;
+                    if (chunk_slot_live[chunk_slot] != 0) {
+                        fail("posted into a live chunk-slot");
+                    }
+                    for (size_t live = 0; live < chunk_slot_key.size();
+                         ++live) {
+                        if (chunk_slot_live[live] != 0 &&
+                            chunk_slot_key[live] == pick.key) {
+                            fail("chunk posted twice: " +
+                                 schedule[pick.schedule_index]);
+                        }
+                    }
                     for (int index = 0; index < superchunk; ++index) {
-                        Slot& slot = slots[tail + index];
+                        const std::string& module_key =
+                            schedule[pick.schedule_index + index];
+                        if (slots[chunk.slot_start + index].state !=
+                            SlotState::kFree) {
+                            fail("posted into an occupied staging slot");
+                        }
+                        if (module_to_slot.count(module_key) != 0) {
+                            fail("remote module fetched twice: " +
+                                 module_key);
+                        }
+                    }
+                    for (int index = 0; index < superchunk; ++index) {
+                        Slot& slot = slots[chunk.slot_start + index];
                         slot.state = SlotState::kFetching;
-                        slot.module_key = schedule[next + index];
+                        slot.module_key =
+                            schedule[pick.schedule_index + index];
                         slot.generation = next_generation++;
                     }
+                    chunk_slot_live[chunk_slot] = superchunk;
+                    chunk_slot_key[chunk_slot] = pick.key;
                     int occupied = 0;
                     for (const Slot& slot : slots) {
                         occupied += slot.state != SlotState::kFree;
@@ -1776,17 +1986,28 @@ struct DistributedWeightDaemon::Impl {
                             stats_mutex);
                         stats.staging_hwm =
                             std::max(stats.staging_hwm, occupied);
+                        stats.expedited_posts += pick.demanded;
                     }
                 }
+                const int owner = pick.owner;
+                chunk.count = superchunk;
+                chunk.owner = owner;
+                const std::vector<int>& available =
+                    owner_rails[owner];
+                chunk.rail =
+                    available[owner_rail_cursor[owner]++ %
+                              available.size()];
+                chunk.posted = Clock::now();
 
                 RemoteEndpoint& remote =
                     remotes[chunk.rail][owner];
                 const std::uint64_t remote_address =
                     remote.source_address +
-                    RemoteOffset(schedule[next]);
+                    RemoteOffset(schedule[pick.schedule_index]);
                 void* destination =
                     static_cast<char*>(staging) +
-                    static_cast<std::uint64_t>(tail) * module_bytes;
+                    static_cast<std::uint64_t>(chunk.slot_start) *
+                        module_bytes;
                 ucp_request_param_t params{};
                 params.op_attr_mask = UCP_OP_ATTR_FIELD_MEMH;
                 params.memh = rails[chunk.rail].staging_memh;
@@ -1799,8 +2020,7 @@ struct DistributedWeightDaemon::Impl {
                               "ucp_get_nbx post");
                 }
                 chunks.push_back(chunk);
-                next += superchunk;
-                tail = (tail + superchunk) % depth;
+                ++owner_in_flight[owner];
                 posted = true;
             }
             if (!posted && chunks.empty()) {
@@ -1915,6 +2135,10 @@ struct DistributedWeightDaemon::Impl {
         summary["ready_unacquired_by_worker"] = ready_unacquired;
         summary["pending_acquire_by_worker"] = pending_by_worker;
         summary["staging_hwm_modules"] = counters.staging_hwm;
+        summary["demand_hits"] = counters.demand_hits;
+        summary["demand_misses"] = counters.demand_misses;
+        summary["expedited_posts"] = counters.expedited_posts;
+        summary["freelist_empty_polls"] = counters.freelist_empty_polls;
         const LatencyHistogram& latency = counters.ready_latency;
         summary["ready_latency_ms"] = {
             {"p50", latency.percentile(50)},

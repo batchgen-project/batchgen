@@ -6,10 +6,12 @@ modules the node pulls (a local worker reads the node's own store) from a
 staging ring of D slots, ordered per layer in superchunks of S across those
 workers exactly as ``BuildSchedule`` in
 ``core/Weights_Storage/distributed_weight_daemon.cpp`` orders them. Like
-``PrefetchLoop`` it fills its D / S ring positions strictly in order and
-never skips an occupied one, and a slot frees only when its worker releases
-it: entry i of the cyclic schedule is fetched only once every entry <= i - D
-was released.
+``PrefetchLoop`` it posts chunks from a bounded window over the cyclic
+schedule into any free one of its D / S chunk-slots, a chunk-slot freeing
+once its worker released all of its modules. A chunk an acquire waits for
+is demanded and posted first; otherwise the oldest chunk whose owner is
+under its in-flight cap goes. Each chunk enters the window once per cycle,
+in schedule order, so every module is fetched exactly once per pass.
 
 The pass-armed model mirrors ``core/GPU_Weight_Buffer/weight_slot_table.h``:
 the producer of a worker produces a position only while its pass is armed,
@@ -99,56 +101,197 @@ class Deadlock(Exception):
 
 
 class Daemon:
-    """The staging ring over the cyclic schedule; a slot frees only on release.
+    """The staging chunk-slots over the cyclic schedule.
 
-    Chunk c (S consecutive entries) is posted into ring position
-    c mod (D / S), strictly after chunk c - 1, and only once every slot of
-    that position is free. A fetch completes at once here.
+    Global chunk g is entries [g * S, (g + 1) * S) of the cyclic schedule.
+    A window holds the next unposted chunks in schedule order, at most
+    2 * (outstanding + D / S) and never more than one pass of them. While
+    fewer than ``outstanding`` chunks are in flight and a chunk-slot is free,
+    the first demanded chunk of the window is posted, else the oldest one
+    whose owner has fewer than 3 x its rails chunks in flight. A chunk-slot
+    frees once every module of its chunk was released. An acquire that finds
+    its module not ready demands its chunk; one past the window is demanded
+    as the refill reaches it. A fetch takes ``fetch_polls`` calls of
+    ``fetch``; 0 completes it at once. Two workers' shards share an owner,
+    as with four nodes.
     """
 
-    def __init__(self, slots=D, superchunk=S, workers=N, local=()):
+    def __init__(self, slots=D, superchunk=S, workers=N, local=(), *,
+                 outstanding=None, fetch_polls=0, rails=None):
         self.schedule = daemon_schedule(workers, superchunk, local)
         assert slots % superchunk == 0 and 0 < slots <= len(self.schedule)
         self.slots = slots
         self.superchunk = superchunk
         self.positions = slots // superchunk
-        self.next_entry = 0
-        self.pool = {}  # posted, unreleased entry index -> "ready" | "leased"
+        self.chunks_per_pass = len(self.schedule) // superchunk
+        self.outstanding = (
+            self.positions if outstanding is None else outstanding
+        )
+        self.capacity = min(
+            2 * (self.outstanding + self.positions), self.chunks_per_pass
+        )
+        self.fetch_polls = fetch_polls
+        self.rails = rails or {}  # owner -> rails; 1 if absent
+        self.free = list(range(self.positions - 1, -1, -1))  # LIFO
+        self.live = [0] * self.positions  # unreleased modules per chunk-slot
+        self.chunk_slot = {}  # live global chunk -> its chunk-slot
+        self.window = deque()  # [global chunk, demanded], schedule order
+        self.next_chunk = 0  # the next global chunk the refill takes
+        self.deferred = {}  # worker -> module its acquire waits for
+        self.in_flight = {}  # global chunk -> {"polls", "demanded"}
+        self.pool = {}  # entry index -> "fetching" | "ready" | "leased"
+        self.posts = []  # {"chunk", "front", "demanded"} in post order
+        self.peak_speculative = Counter()  # owner -> undemanded in flight
+        self.stats = Counter()
 
     def entry(self, index):
         """(pass, worker, module) of a global FIFO index."""
         worker, name = self.schedule[index % len(self.schedule)]
         return index // len(self.schedule) + 1, worker, name
 
+    def chunk_entries(self, chunk):
+        return range(chunk * self.superchunk, (chunk + 1) * self.superchunk)
+
+    def chunk_worker(self, chunk):
+        return self.entry(chunk * self.superchunk)[1]
+
+    def owner(self, chunk):
+        return self.chunk_worker(chunk) // 2
+
+    def cap(self, owner):
+        return 3 * self.rails.get(owner, 1)
+
+    def _holds(self, chunk, worker, name):
+        return any(
+            self.entry(index)[1:] == (worker, name)
+            for index in self.chunk_entries(chunk)
+        )
+
+    def _owner_in_flight(self, owner, demanded=None):
+        return sum(
+            1 for chunk, flight in self.in_flight.items()
+            if self.owner(chunk) == owner
+            and (demanded is None or flight["demanded"] == demanded)
+        )
+
+    def _refill(self):
+        while len(self.window) < self.capacity:
+            chunk = self.next_chunk
+            # Strict schedule order: each chunk enters once per cycle.
+            assert not self.window or self.window[-1][0] < chunk
+            self.next_chunk += 1
+            demanded = False
+            for worker, name in list(self.deferred.items()):
+                if self._holds(chunk, worker, name):
+                    del self.deferred[worker]
+                    demanded = True
+            if demanded:
+                self.stats["demand_hits"] += 1
+            self.window.append([chunk, demanded])
+
+    def _select(self):
+        for position, (_, demanded) in enumerate(self.window):
+            if demanded:
+                return position
+        for position, (chunk, _) in enumerate(self.window):
+            owner = self.owner(chunk)
+            if self._owner_in_flight(owner) < self.cap(owner):
+                return position
+            self.stats["capped_skips"] += 1
+        return None
+
+    def _post(self, position):
+        front = self.window[0][0]
+        chunk, demanded = self.window[position]
+        del self.window[position]
+        slot = self.free.pop()
+        assert self.live[slot] == 0
+        for index in self.chunk_entries(chunk):
+            # No module is fetched twice within a cycle.
+            assert not any(
+                self.entry(held)[1:] == self.entry(index)[1:]
+                for held in self.pool
+            ), (chunk, self.describe())
+        state = "fetching" if self.fetch_polls else "ready"
+        for index in self.chunk_entries(chunk):
+            self.pool[index] = state
+        if self.fetch_polls:
+            self.in_flight[chunk] = {
+                "polls": self.fetch_polls, "demanded": demanded,
+            }
+            owner = self.owner(chunk)
+            self.peak_speculative[owner] = max(
+                self.peak_speculative[owner],
+                self._owner_in_flight(owner, demanded=False),
+            )
+        self.live[slot] = self.superchunk
+        self.chunk_slot[chunk] = slot
+        self.stats["expedited_posts"] += demanded
+        self.posts.append(
+            {"chunk": chunk, "front": front, "demanded": demanded}
+        )
+
     def fetch(self):
-        fetched = False
-        while True:
-            # The chunk that last held the tail position.
-            previous = self.next_entry - self.slots
-            if previous >= 0 and any(
-                previous + index in self.pool
-                for index in range(self.superchunk)
-            ):
-                break  # SlotsFree(tail, superchunk) fails: no skipping ahead
-            last = self.next_entry + self.superchunk - 1
-            assert all(index > last - self.slots for index in self.pool)
-            for index in range(self.next_entry, last + 1):
-                self.pool[index] = "ready"
-            self.next_entry = last + 1
-            fetched = True
-        return fetched
+        """Advance the fetches in flight, then post as ``PrefetchLoop`` does."""
+        progressed = False
+        for chunk in list(self.in_flight):
+            progressed = True
+            self.in_flight[chunk]["polls"] -= 1
+            if self.in_flight[chunk]["polls"] == 0:
+                del self.in_flight[chunk]
+                for index in self.chunk_entries(chunk):
+                    self.pool[index] = "ready"
+        while len(self.in_flight) < self.outstanding:
+            self._refill()
+            if not self.free:
+                self.stats["freelist_empty_polls"] += 1
+                break
+            position = self._select()
+            if position is None:
+                break  # every owner at its cap, nothing demanded
+            self._post(position)
+            progressed = True
+        return progressed
+
+    def _demand(self, worker, name):
+        """``DemandChunkLocked``: posted chunks first, then the window."""
+        if any(self._holds(chunk, worker, name) for chunk in self.chunk_slot):
+            return  # posted: in flight or ready
+        for pending in self.window:
+            if self._holds(pending[0], worker, name):
+                if not pending[1]:
+                    pending[1] = True
+                    self.stats["demand_hits"] += 1
+                return
+        if self.deferred.get(worker) != name:
+            self.deferred[worker] = name
+            self.stats["demand_misses"] += 1
 
     def acquire(self, worker, name):
-        """Lease the oldest ready entry of (worker, name), if any."""
+        """Lease the oldest unleased entry of (worker, name) once ready.
+
+        Not ready: its chunk is demanded, before any wait, as ``Acquire``
+        does.
+        """
         for index in sorted(self.pool):
             _, owner, module = self.entry(index)
-            if owner == worker and module == name and self.pool[index] == "ready":
-                self.pool[index] = "leased"
-                return index
+            if owner == worker and module == name and self.pool[index] != "leased":
+                if self.pool[index] == "ready":
+                    self.pool[index] = "leased"
+                    self.deferred.pop(worker, None)
+                    return index
+                break  # posted, still in flight
+        self._demand(worker, name)
         return None
 
     def release(self, index):
         assert self.pool.pop(index) == "leased"
+        chunk = index // self.superchunk
+        slot = self.chunk_slot[chunk]
+        self.live[slot] -= 1
+        if self.live[slot] == 0:
+            del self.chunk_slot[chunk]
+            self.free.append(slot)
 
     def describe(self):
         return sorted(
@@ -793,14 +936,14 @@ def test_pass_armed_streaming_survives_the_same_skew(seed):
         assert all(summary["copied"] == L * E for summary in worker.summaries)
 
 
-# (workers, local workers, superchunk, ring positions): D = positions x S.
+# (workers, local workers, superchunk, chunk-slots): D = chunk-slots x S.
 PIPELINE_CONFIGS = [
-    (8, 2, 2, 4),  # six remote workers over four positions
+    (8, 2, 2, 4),  # six remote workers over four chunk-slots
     (8, 0, 2, 8),
     (6, 0, 1, 3),
     (4, 1, 2, 2),
-    (4, 2, 1, 6),  # more positions than remote workers
-    (3, 0, 2, 1),  # one position: every chunk waits for the one before
+    (4, 2, 1, 6),  # more chunk-slots than remote workers
+    (3, 0, 2, 1),  # one chunk-slot: every chunk waits for the one before
 ]
 PIPELINE_SEEDS = range(6)
 NO_RANDOM_EVENTS = {
@@ -920,11 +1063,12 @@ def test_blocking_acquire_while_holding_a_lease_deadlocks(seed):
     )
     with pytest.raises(Deadlock):
         run(workers, daemon, order_rng)
-    # The ring posted chunks 0-3 first, those of ranks 2-5. Each leased both
-    # modules of its chunk, then, both still in flight, waited in the
-    # acquire of its next chunk. The ring posts that chunk only once its own
-    # current chunk was released, which it cannot send from inside the
-    # acquire. Ranks 6 and 7 wait for their first chunk behind them.
+    # The daemon posted chunks 0-3 first, those of ranks 2-5, into its four
+    # chunk-slots. Each rank leased both modules of its chunk, then, both
+    # still in flight, waited in the acquire of its next chunk. That chunk is
+    # demanded, but a chunk-slot frees only once its chunk is released, which
+    # no rank can send from inside the acquire. Ranks 6 and 7 wait for their
+    # demanded first chunk with no chunk-slot free either.
     holding = {
         worker.rank for worker in workers
         if worker.fetching is not None
@@ -938,6 +1082,8 @@ def test_blocking_acquire_while_holding_a_lease_deadlocks(seed):
         assert workers[rank].fetching is not None
         assert not workers[rank].in_flight
     assert workers[0].done and workers[1].done
+    assert not daemon.free
+    assert {daemon.chunk_worker(chunk) for chunk in daemon.chunk_slot} == holding
 
 
 def test_lease_safe_producer_finishes_the_deadlock_configuration():
@@ -973,7 +1119,8 @@ def test_try_acquire_producer_finishes_the_deadlock_configuration(seed):
 def test_try_acquire_trials_pipeline_remote_ranks_and_retry_per_landing():
     totals = Counter()
     for config in PIPELINE_CONFIGS:
-        workers, _ = run_pipelined_trial(config, 0, try_acquire=True)
+        workers, daemon = run_pipelined_trial(config, 0, try_acquire=True)
+        totals["expedited"] += daemon.stats["expedited_posts"]
         for worker in workers:
             if worker.local:
                 continue
@@ -990,3 +1137,151 @@ def test_try_acquire_trials_pipeline_remote_ranks_and_retry_per_landing():
     # With nothing in flight the fetch still waits for the daemon.
     assert totals["blocked"] > 0
     assert totals["cancelled"] > 0
+    # A rank waiting for a chunk gets it posted ahead of the window's order.
+    assert totals["expedited"] > 0
+
+
+class StreamingConsumer:
+    """A worker that acquires its modules in order straight from the daemon.
+
+    It holds at most ``leases`` leases and releases the oldest once it was
+    held ``hold_rounds`` steps; None never releases. Each step asks for the
+    next module before releasing, as a producer with copies in flight does.
+    """
+
+    def __init__(self, daemon, rank, *, hold_rounds, leases=1, passes=1,
+                 modules=None):
+        self.daemon = daemon
+        self.rank = rank
+        self.hold_rounds = hold_rounds
+        self.leases = leases
+        names = module_names() if modules is None else modules
+        self.per_pass = len(names)
+        self.order = names * passes
+        self.position = 0
+        self.held = deque()  # [entry, steps left], oldest first
+
+    @property
+    def done(self):
+        return self.position == len(self.order) and not self.held
+
+    def step(self):
+        acted = False
+        if self.position < len(self.order) and len(self.held) < self.leases:
+            entry = self.daemon.acquire(self.rank, self.order[self.position])
+            if entry is not None:
+                # Every module once per pass, in the daemon's pass.
+                assert self.daemon.entry(entry)[0] == (
+                    self.position // self.per_pass + 1
+                )
+                self.held.append([entry, self.hold_rounds])
+                self.position += 1
+                acted = True
+        if self.held and self.held[0][1] is not None:
+            if self.held[0][1] == 0:
+                self.daemon.release(self.held.popleft()[0])
+                return "acted"
+            self.held[0][1] -= 1
+            return "acted" if acted else "sleep"
+        return "acted" if acted else "blocked"
+
+
+def drive(daemon, consumers):
+    """Rounds in which each consumer steps once, in rank order."""
+    for rounds in range(MAX_ROUNDS):
+        if all(consumer.done for consumer in consumers):
+            return rounds
+        progressed = daemon.fetch()
+        sleeping = False
+        for consumer in consumers:
+            outcome = consumer.step()
+            progressed |= outcome == "acted"
+            sleeping |= outcome == "sleep"
+            progressed |= daemon.fetch()
+        if not progressed and not sleeping:
+            raise Deadlock(f"round {rounds}: daemon={daemon.describe()}")
+    raise AssertionError(f"no completion within {MAX_ROUNDS} rounds")
+
+
+def _assert_fetched_once_per_cycle(daemon, passes):
+    posted = Counter(post["chunk"] for post in daemon.posts)
+    assert all(count == 1 for count in posted.values())
+    assert set(range(passes * daemon.chunks_per_pass)) <= set(posted)
+
+
+def test_waiting_fast_worker_is_posted_ahead_of_older_speculative_chunks():
+    # Worker 0 holds each module 6 steps; worker 1 asks for its next module
+    # while still holding one. Two chunk-slots: chunks 0 and 1 are posted
+    # first. Worker 1 finds chunk 3 not ready and demands it; when worker 1
+    # releases chunk 1, chunk 3 is posted ahead of worker 0's older chunk 2.
+    passes = 2
+    daemon = Daemon(slots=4, superchunk=2, workers=2)
+    slow = StreamingConsumer(daemon, 0, hold_rounds=6, passes=passes)
+    fast = StreamingConsumer(
+        daemon, 1, hold_rounds=1, leases=2, passes=passes
+    )
+    drive(daemon, [slow, fast])
+
+    expedited = [post for post in daemon.posts if post["demanded"]]
+    first = expedited[0]
+    assert (first["chunk"], first["front"]) == (3, 2)
+    assert daemon.chunk_worker(first["chunk"]) == 1
+    assert daemon.chunk_worker(first["front"]) == 0
+    # Worker 1 keeps jumping worker 0's speculative chunks.
+    assert sum(
+        post["chunk"] > post["front"] and daemon.chunk_worker(post["chunk"]) == 1
+        for post in expedited
+    ) > 1
+    assert daemon.stats["demand_hits"] > 0
+    _assert_fetched_once_per_cycle(daemon, passes)
+
+
+def test_a_never_released_chunk_pins_only_its_own_chunk_slot():
+    # Worker 0 leases its first chunk and never releases it, nor asks for
+    # more. A positional ring would stop workers 1 and 2 after their first
+    # chunk, once the tail wrapped onto that chunk. The free list keeps
+    # serving them until worker 0's chunks, the held one and the speculative
+    # ones it never acquires, take every chunk-slot.
+    daemon = Daemon(slots=6, superchunk=2, workers=3)
+    stuck = StreamingConsumer(
+        daemon, 0, hold_rounds=None, leases=2,
+        modules=module_names()[:2],
+    )
+    others = [
+        StreamingConsumer(daemon, rank, hold_rounds=0, passes=2)
+        for rank in (1, 2)
+    ]
+    with pytest.raises(Deadlock):
+        drive(daemon, [stuck, *others])
+    assert stuck.position == 2 and len(stuck.held) == 2
+    assert not daemon.free
+    assert len(daemon.chunk_slot) == daemon.positions
+    assert {daemon.chunk_worker(chunk) for chunk in daemon.chunk_slot} == {0}
+    for consumer in others:
+        assert not consumer.done
+        # Served far past what the staging ring holds at once.
+        assert consumer.position > daemon.slots
+
+
+def test_speculative_chunks_in_flight_stay_under_the_owner_cap():
+    # Owners 0 (workers 0, 1) and 1 (workers 2, 3) have 1 and 2 rails, so
+    # at most 3 and 6 undemanded chunks in flight; a demanded chunk is never
+    # held back by the cap.
+    rails = {0: 1, 1: 2}
+    daemon = Daemon(
+        slots=24, superchunk=2, workers=4, outstanding=12, fetch_polls=6,
+        rails=rails,
+    )
+    consumers = [
+        StreamingConsumer(
+            daemon, rank, hold_rounds=3 if rank == 0 else 1, leases=2,
+        )
+        for rank in range(4)
+    ]
+    drive(daemon, consumers)
+    for owner in rails:
+        assert daemon.peak_speculative[owner] <= daemon.cap(owner)
+    # The cap bound: owner 0 reached it and a candidate was passed over.
+    assert daemon.peak_speculative[0] == daemon.cap(0)
+    assert daemon.stats["capped_skips"] > 0
+    _assert_fetched_once_per_cycle(daemon, 1)
