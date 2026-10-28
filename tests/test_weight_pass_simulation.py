@@ -1,11 +1,15 @@
 """Deterministic simulation of weight streaming on one node, CPU-only.
 
-Eight workers share one node daemon. Each worker streams L layers x E routed
-experts through a GPU ring of R slots; the daemon serves every worker's
-modules from one strict FIFO of D slots, interleaved per layer in
-superchunks of S across the workers exactly as ``BuildSchedule`` in
-``core/Weights_Storage/distributed_weight_daemon.cpp`` orders them, and a
-daemon slot frees only when its worker releases it.
+Workers share one node daemon. Each worker streams L layers x E routed
+experts through a GPU ring of R slots. The daemon serves the workers whose
+modules the node pulls (a local worker reads the node's own store) from a
+staging ring of D slots, ordered per layer in superchunks of S across those
+workers exactly as ``BuildSchedule`` in
+``core/Weights_Storage/distributed_weight_daemon.cpp`` orders them. Like
+``PrefetchLoop`` it fills its D / S ring positions strictly in order and
+never skips an occupied one, and a slot frees only when its worker releases
+it: entry i of the cyclic schedule is fetched only once every entry <= i - D
+was released.
 
 The pass-armed model mirrors ``core/GPU_Weight_Buffer/weight_slot_table.h``:
 the producer of a worker produces a position only while its pass is armed,
@@ -14,6 +18,15 @@ arms the next pass early (the explicit carry) at random, cancels a carried
 pass or a pass whose forward raised, and one worker per trial delays its
 begin and end by up to a full pass. Every trial must finish, and every pass
 end must see the conditions ``end_weight_pass`` asserts.
+
+The pipelined model is that producer as ``HtoD_Worker`` in
+``core/HtoD_Engine/HtoD_Engine.cu`` runs it: up to A copies in flight on one
+stream, landed oldest first, each daemon lease released before its slot
+turns PRESENT. Its daemon socket carries one request at a time: an acquire
+that is not ready waits in bounded slices and is resent, and the worker
+sends no release until it returns. Fetching a remote module only with
+nothing in flight finishes every trial in schedule order; a blocking
+acquire issued while a lease is held deadlocks the node.
 
 The free-running model is the engine before passes: a cyclic producer that
 reads ahead across forwards, stopped at each worker's own boundary and
@@ -25,7 +38,7 @@ No core import: this models the contract, the compiled table is tested in
 """
 
 import random
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 
 import pytest
 
@@ -37,6 +50,8 @@ S = 2  # daemon superchunk
 R = 4  # GPU ring slots per worker
 D = 16  # daemon ring slots, fewer than one worker's modules per pass
 P = 5  # passes per trial
+A = 4  # copies in flight per producer: HtoD_Engine kMaxCopiesInFlight
+ACQUIRE_SLICE = 3  # rounds a daemon acquire waits before it answers retry
 
 FULL_PASS_ROUNDS = 4 * L * E
 MAX_ROUNDS = 100_000
@@ -56,13 +71,19 @@ def module_names():
     ]
 
 
-def daemon_schedule():
-    """One pass of the daemon FIFO: per layer, superchunks across workers."""
+def daemon_schedule(workers=N, superchunk=S, local=()):
+    """One pass of the daemon FIFO: per layer, superchunks across workers.
+
+    A local worker's modules are read from the node's own store and never
+    enter the daemon.
+    """
     schedule = []
     for layer in range(L):
-        for offset in range(0, E, S):
-            for worker in range(N):
-                for index in range(S):
+        for offset in range(0, E, superchunk):
+            for worker in range(workers):
+                if worker in local:
+                    continue
+                for index in range(superchunk):
                     schedule.append(
                         (worker, f"routed_expert_{layer}_{offset + index}")
                     )
@@ -74,13 +95,21 @@ class Deadlock(Exception):
 
 
 class Daemon:
-    """Strict FIFO over the cyclic schedule; a slot frees only on release."""
+    """The staging ring over the cyclic schedule; a slot frees only on release.
 
-    def __init__(self, slots=D):
-        self.schedule = daemon_schedule()
+    Chunk c (S consecutive entries) is posted into ring position
+    c mod (D / S), strictly after chunk c - 1, and only once every slot of
+    that position is free. A fetch completes at once here.
+    """
+
+    def __init__(self, slots=D, superchunk=S, workers=N, local=()):
+        self.schedule = daemon_schedule(workers, superchunk, local)
+        assert slots % superchunk == 0 and 0 < slots <= len(self.schedule)
         self.slots = slots
+        self.superchunk = superchunk
+        self.positions = slots // superchunk
         self.next_entry = 0
-        self.pool = {}  # entry index -> "ready" | "leased"
+        self.pool = {}  # posted, unreleased entry index -> "ready" | "leased"
 
     def entry(self, index):
         """(pass, worker, module) of a global FIFO index."""
@@ -89,9 +118,19 @@ class Daemon:
 
     def fetch(self):
         fetched = False
-        while len(self.pool) < self.slots:
-            self.pool[self.next_entry] = "ready"
-            self.next_entry += 1
+        while True:
+            # The chunk that last held the tail position.
+            previous = self.next_entry - self.slots
+            if previous >= 0 and any(
+                previous + index in self.pool
+                for index in range(self.superchunk)
+            ):
+                break  # SlotsFree(tail, superchunk) fails: no skipping ahead
+            last = self.next_entry + self.superchunk - 1
+            assert all(index > last - self.slots for index in self.pool)
+            for index in range(self.next_entry, last + 1):
+                self.pool[index] = "ready"
+            self.next_entry = last + 1
             fetched = True
         return fetched
 
@@ -111,6 +150,51 @@ class Daemon:
         return sorted(
             (self.entry(index), state) for index, state in self.pool.items()
         )
+
+
+class Connection:
+    """One worker's daemon socket: one request at a time, as ``HandleWorker``
+    serves it.
+
+    An acquire of a module that is not ready holds the socket for a bounded
+    slice and answers retry; ``Weights_Storage`` resends at once under its
+    daemon mutex. Until the acquire returns, the worker sends nothing else,
+    so no lease it holds can be released.
+    """
+
+    def __init__(self, daemon, rank, slice_rounds=ACQUIRE_SLICE):
+        self.daemon = daemon
+        self.rank = rank
+        self.slice_rounds = slice_rounds
+        self.waiting = None  # module of the outstanding acquire
+        self.waited = 0  # rounds into the current slice
+        self.blocked = 0  # acquires that had to wait
+        self.retries = 0
+
+    def acquire(self, name):
+        """The leased entry once ready; None while the acquire still waits."""
+        assert self.waiting in (None, name)
+        entry = self.daemon.acquire(self.rank, name)
+        if entry is not None:
+            self.waiting = None
+            self.waited = 0
+            return entry
+        if self.waiting is None:
+            self.waiting = name
+            self.blocked += 1
+        self.waited += 1
+        if self.waited == self.slice_rounds:
+            # The slice expired: retry is answered and the request resent.
+            self.waited = 0
+            self.retries += 1
+        return None
+
+    def release(self, entry):
+        assert self.waiting is None, (
+            f"worker {self.rank} sent a release behind its acquire of "
+            f"{self.waiting}"
+        )
+        self.daemon.release(entry)
 
 
 def _sleep(rounds):
@@ -134,7 +218,7 @@ class PassArmedWorker(_Worker):
 
     def __init__(self, rank, daemon, rng, delay, *, idle_rate=IDLE_RATE,
                  carry_rate=CARRY_RATE, cancel_rate=CANCEL_RATE,
-                 raise_rate=RAISE_RATE):
+                 raise_rate=RAISE_RATE, hold_rounds=0):
         self.rank = rank
         self.daemon = daemon
         self.rng = rng
@@ -143,6 +227,7 @@ class PassArmedWorker(_Worker):
         self.carry_rate = carry_rate
         self.cancel_rate = cancel_rate
         self.raise_rate = raise_rate
+        self.hold_rounds = hold_rounds  # rounds the consumer holds a lease
         self.names = module_names()
         self.position = {name: i for i, name in enumerate(self.names)}
         # None, or {"name", "pass", "state", "rol"} (rol: release on landing)
@@ -356,6 +441,7 @@ class PassArmedWorker(_Worker):
                         yield "blocked"
                     self.lease(name)
                     yield "acted"
+                    yield from _sleep(self.hold_rounds)
                     self.release(name)
                     yield "acted"
             if raise_at is not None:
@@ -377,6 +463,120 @@ class PassArmedWorker(_Worker):
                 pass_id += 2
             else:
                 pass_id += 1
+
+
+class PipelinedWorker(PassArmedWorker):
+    """The pass-armed worker with up to A copies in flight.
+
+    One copy stream: copies complete in submit order, the oldest unfinished
+    one advancing a round per round, copy_rounds rounds each, whether or not
+    the producer thread is free. Each produce lands the completed copies,
+    oldest first, releasing each daemon lease before its slot turns PRESENT,
+    then submits while fewer than max_in_flight are in flight. A local
+    module is read at once. A remote module takes a blocking acquire, during
+    which the producer lands and releases nothing; lease_safe issues one only
+    with nothing in flight, so the acquire never waits holding a lease.
+    """
+
+    def __init__(self, rank, daemon, rng, delay, *, local, copy_rounds,
+                 lease_safe=True, max_in_flight=A, **kwargs):
+        super().__init__(rank, daemon, rng, delay, **kwargs)
+        self.local = local
+        self.copy_rounds = copy_rounds
+        self.lease_safe = lease_safe
+        self.max_in_flight = max_in_flight
+        self.connection = Connection(daemon, rank)
+        self.in_flight = deque()  # {"slot", "entry", "rounds"}, oldest first
+        self.fetching = None  # (pass, name, reserved slot) being acquired
+        self.fetched = defaultdict(list)  # pass -> modules in fetch order
+        self.peak_in_flight = 0
+
+    def _run_copy_stream(self):
+        for copy in self.in_flight:
+            if copy["rounds"]:
+                copy["rounds"] -= 1
+                return True
+        return False
+
+    def _land(self):
+        landed = False
+        while self.in_flight and self.in_flight[0]["rounds"] == 0:
+            copy = self.in_flight.popleft()
+            if copy["entry"] is not None:
+                # Released before the landing: once no slot of a pass is
+                # FILLING, no lease of it is held either.
+                self.connection.release(copy["entry"])
+            slot = self.slots[copy["slot"]]
+            self.copied[slot["pass"]] += 1
+            if slot["rol"]:
+                self.slots[copy["slot"]] = None
+            else:
+                slot["state"] = "PRESENT"
+            landed = True
+        return landed
+
+    def _claim(self, entry):
+        pass_id, name, slot = self.fetching
+        self.fetching = None
+        if entry is not None:
+            # The producer and the daemon FIFO stay on the same pass.
+            assert self.daemon.entry(entry)[0] == pass_id
+        self.acquired[pass_id] += 1
+        self.fetched[pass_id].append(name)
+        if (pass_id, name) in self.pending:
+            # A skip, possibly declared while the acquire waited: the lease
+            # is released at once and a reserved slot is abandoned.
+            if entry is not None:
+                self.connection.release(entry)
+            self.pending.discard((pass_id, name))
+            self.skipped[pass_id] += 1
+        else:
+            self.slots[slot] = {
+                "name": name, "pass": pass_id, "state": "FILLING", "rol": False,
+            }
+            self.in_flight.append(
+                {"slot": slot, "entry": entry, "rounds": self.copy_rounds}
+            )
+            self.peak_in_flight = max(self.peak_in_flight, len(self.in_flight))
+        self.cursor[1] += 1
+        if self.cursor[1] == len(self.names):
+            self.cursor = [pass_id + 1, 0]
+
+    def produce(self):
+        acted = self._run_copy_stream()
+        if self.fetching is not None:
+            # Still inside the blocking acquire.
+            entry = self.connection.acquire(self.fetching[1])
+            if entry is None:
+                return "acted" if acted else "blocked"
+            self._claim(entry)
+            acted = True
+        if self._land():
+            acted = True
+        while len(self.in_flight) < self.max_in_flight:
+            pass_id, position = self.cursor
+            if pass_id not in self.open:
+                break  # parked until the pass is armed
+            if not self.local and self.in_flight and self.lease_safe:
+                break  # a remote fetch waits for an empty pipeline
+            name = self.names[position]
+            slot = None
+            if (pass_id, name) not in self.pending:
+                slot = next(
+                    (i for i, held in enumerate(self.slots) if held is None),
+                    None,
+                )
+                if slot is None:
+                    break
+            self.fetching = (pass_id, name, slot)
+            acted = True
+            entry = None
+            if not self.local:
+                entry = self.connection.acquire(name)
+                if entry is None:
+                    break  # the producer thread now waits in the acquire
+            self._claim(entry)
+        return "acted" if acted else "blocked"
 
 
 class FreeRunningWorker(_Worker):
@@ -552,3 +752,140 @@ def test_pass_armed_streaming_survives_the_same_skew(seed):
         )
         assert all(summary["carried"] == 0 for summary in worker.summaries)
         assert all(summary["copied"] == L * E for summary in worker.summaries)
+
+
+# (workers, local workers, superchunk, ring positions): D = positions x S.
+PIPELINE_CONFIGS = [
+    (8, 2, 2, 4),  # six remote workers over four positions
+    (8, 0, 2, 8),
+    (6, 0, 1, 3),
+    (4, 1, 2, 2),
+    (4, 2, 1, 6),  # more positions than remote workers
+    (3, 0, 2, 1),  # one position: every chunk waits for the one before
+]
+PIPELINE_SEEDS = range(6)
+NO_RANDOM_EVENTS = {
+    "idle_rate": 0.0, "carry_rate": 0.0, "cancel_rate": 0.0, "raise_rate": 0.0,
+}
+# Ranks 0 and 1 local; ranks 2-7 own chunks 0-5 of every superchunk round,
+# so each remote rank's next chunk is six chunks after its current one.
+DEADLOCK_CONFIG = (8, 2, 2, 4)
+
+
+def build_pipelined_trial(config, seed, *, lease_safe=True, skew=True,
+                          **rates):
+    workers_count, local_count, superchunk, positions = config
+    local = range(local_count)
+    daemon = Daemon(positions * superchunk, superchunk, workers_count, local)
+    order_rng = random.Random(seed)
+    skewed_rank = order_rng.randrange(workers_count) if skew else None
+    workers = []
+    for rank in range(workers_count):
+        speed_rng = random.Random(seed * 104729 + rank)
+        workers.append(PipelinedWorker(
+            rank,
+            daemon,
+            random.Random(seed * 1009 + rank),
+            _skew(random.Random(seed * 7919 + rank), rank == skewed_rank),
+            local=rank in local,
+            copy_rounds=speed_rng.randint(1, 4),
+            hold_rounds=speed_rng.randint(0, 2),
+            lease_safe=lease_safe,
+            **rates,
+        ))
+    return workers, daemon, order_rng
+
+
+def run_pipelined_trial(config, seed, **kwargs):
+    workers, daemon, order_rng = build_pipelined_trial(config, seed, **kwargs)
+    run(workers, daemon, order_rng)
+    return workers, daemon
+
+
+@pytest.mark.parametrize("seed", PIPELINE_SEEDS)
+@pytest.mark.parametrize("config", PIPELINE_CONFIGS)
+def test_pipelined_producer_finishes_in_schedule_order(config, seed):
+    # Every end-of-pass condition is asserted inside the model as it runs.
+    workers, daemon = run_pipelined_trial(config, seed)
+    for worker in workers:
+        order = [
+            name for owner, name in daemon.schedule if owner == worker.rank
+        ]
+        assert order == (module_names() if not worker.local else [])
+        assert sorted(worker.fetched) == list(range(1, P + 1))
+        for pass_id in range(1, P + 1):
+            assert worker.fetched[pass_id] == module_names()
+        assert [summary["pass"] for summary in worker.summaries] == list(
+            range(1, P + 1)
+        )
+        for summary in worker.summaries:
+            assert summary["copied"] + summary["skipped"] == L * E
+            assert summary["carried"] <= R
+        assert worker.pending == set()
+        assert not worker.open
+        assert not worker.in_flight and worker.fetching is None
+        assert all(slot is None for slot in worker.slots)
+        if not worker.local:
+            # A remote module is only fetched into an empty pipeline.
+            assert worker.peak_in_flight <= 1
+    assert "leased" not in daemon.pool.values()
+
+
+def test_pipelined_trials_exercise_pipelining_waits_and_carry():
+    totals = Counter()
+    for config in PIPELINE_CONFIGS:
+        workers, _ = run_pipelined_trial(config, 0)
+        for worker in workers:
+            if worker.local:
+                totals["local_peak"] = max(
+                    totals["local_peak"], worker.peak_in_flight
+                )
+            totals["blocked"] += worker.connection.blocked
+            totals["retries"] += worker.connection.retries
+            totals["carried"] += sum(s["carried"] for s in worker.summaries)
+            totals["skipped"] += sum(s["skipped"] for s in worker.summaries)
+            totals["cancelled"] += len(worker.cancelled)
+    assert totals["local_peak"] > 1
+    assert totals["blocked"] > 0
+    assert totals["retries"] > 0
+    assert totals["carried"] > 0
+    assert totals["skipped"] > 0
+    assert totals["cancelled"] > 0
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_blocking_acquire_while_holding_a_lease_deadlocks(seed):
+    workers, daemon, order_rng = build_pipelined_trial(
+        DEADLOCK_CONFIG, seed, lease_safe=False, skew=False,
+        **NO_RANDOM_EVENTS,
+    )
+    with pytest.raises(Deadlock):
+        run(workers, daemon, order_rng)
+    # The ring posted chunks 0-3 first, those of ranks 2-5. Each leased both
+    # modules of its chunk, then, both still in flight, waited in the
+    # acquire of its next chunk. The ring posts that chunk only once its own
+    # current chunk was released, which it cannot send from inside the
+    # acquire. Ranks 6 and 7 wait for their first chunk behind them.
+    holding = {
+        worker.rank for worker in workers
+        if worker.fetching is not None
+        and any(copy["entry"] is not None for copy in worker.in_flight)
+    }
+    assert holding == {2, 3, 4, 5}
+    for rank in holding:
+        # The copies completed: only their landing, and its release, is owed.
+        assert all(copy["rounds"] == 0 for copy in workers[rank].in_flight)
+    for rank in (6, 7):
+        assert workers[rank].fetching is not None
+        assert not workers[rank].in_flight
+    assert workers[0].done and workers[1].done
+
+
+def test_lease_safe_producer_finishes_the_deadlock_configuration():
+    workers, _ = run_pipelined_trial(
+        DEADLOCK_CONFIG, 0, skew=False, **NO_RANDOM_EVENTS
+    )
+    assert all(worker.done for worker in workers)
+    assert all(
+        worker.peak_in_flight > 1 for worker in workers if worker.local
+    )
