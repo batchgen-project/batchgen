@@ -12,6 +12,12 @@ records each session's lifecycle state and validates every turn against it:
 turn is accepted only for a session that was opened explicitly (no implicit
 open). Holding KV across turns is not done here; the registry only keeps state.
 
+A turn in flight has its own terminal point: when the scheduler routes its
+worker completion (``complete_turn``) the turn is finished even though its
+HTTP response has not been sent yet. An abort in that window gets 409
+``already_completed`` and leaves the session as it is: the turn's answer is
+returned, and the session goes idle when the handler ends the turn.
+
 The registry is confined to the server's event loop: the HTTP handlers are its
 only callers, so it takes no lock.
 """
@@ -57,6 +63,8 @@ class SessionRecord:
     state: SessionState = SessionState.OPEN
     turns: int = 0
     in_flight_turn_id: Optional[str] = None
+    # The in-flight turn's completion was routed; only its response remains.
+    in_flight_turn_completed: bool = False
     end_reason: Optional[str] = None
     opened_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -156,9 +164,21 @@ class SessionRegistry:
                 "it accepts no more turns",
             )
         record.in_flight_turn_id = turn_id
+        record.in_flight_turn_completed = False
         record.turns += 1
         record._set(SessionState.TURN_IN_FLIGHT)
         return record
+
+    def complete_turn(self, session_id: str, turn_id: str) -> None:
+        """The turn's worker completion was routed: it can no longer be aborted.
+
+        Called synchronously by the scheduler before it resolves the turn's
+        future, so no abort can run between the two.
+        """
+        record = self._sessions.get(session_id)
+        if record is None or record.in_flight_turn_id != turn_id:
+            return
+        record.in_flight_turn_completed = True
 
     def end_turn(self, session_id: str, turn_id: str) -> None:
         """A turn finished (answered or failed): its session becomes idle.
@@ -169,6 +189,7 @@ class SessionRegistry:
         if record is None or record.in_flight_turn_id != turn_id:
             return
         record.in_flight_turn_id = None
+        record.in_flight_turn_completed = False
         if record.state == SessionState.TURN_IN_FLIGHT:
             record._set(SessionState.IDLE)
 
@@ -206,12 +227,24 @@ class SessionRegistry:
     def abort(
         self, session_id: str, reason: Optional[str]
     ) -> Tuple[SessionRecord, Optional[str]]:
-        """Abort a session; return it and the id of the turn it had in flight."""
+        """Abort a session; return it and the id of the turn it had in flight.
+
+        Raises 409 ``already_completed`` (and changes nothing) when the turn in
+        flight has had its completion routed: that turn returns its answer.
+        """
         record = self._require(session_id)
         if record.state in _TERMINAL:
             raise TurnError(
                 409, f"session_{record.state.value}",
                 f"session {session_id!r} is already {record.state.value}",
+            )
+        if record.in_flight_turn_completed:
+            raise TurnError(
+                409, "already_completed",
+                f"turn {record.in_flight_turn_id!r} of session {session_id!r} "
+                "already completed and its response is being returned; the "
+                "session was not aborted (abort it again once the turn has "
+                "returned to end it)",
             )
         in_flight = record.in_flight_turn_id
         record.in_flight_turn_id = None

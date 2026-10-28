@@ -129,3 +129,28 @@ def test_end_of_trajectory_is_all_or_nothing_while_a_turn_is_in_flight():
     assert _error(reg.close, "main", "end_of_trajectory") == (409, "turn_in_flight")
     assert reg.get("main").state is SessionState.OPEN
     assert reg.get("sub").state is SessionState.TURN_IN_FLIGHT
+
+
+def test_abort_after_the_completion_is_routed_is_already_completed():
+    reg = SessionRegistry()
+    reg.open("t1", "s1")
+    reg.begin_turn("t1", "s1", None, "turn-a")
+    reg.complete_turn("s1", "turn-a")
+    assert _error(reg.abort, "s1", "late") == (409, "already_completed")
+    record = reg.get("s1")
+    assert record.state is SessionState.TURN_IN_FLIGHT and record.end_reason is None
+    reg.end_turn("s1", "turn-a")
+    assert record.state is SessionState.IDLE
+    # The next turn is abortable again until its own completion is routed.
+    reg.begin_turn("t1", "s1", None, "turn-b")
+    assert reg.abort("s1", "tool_crash")[1] == "turn-b"
+    assert record.state is SessionState.ABORTED
+
+
+def test_complete_turn_ignores_a_turn_that_is_not_in_flight():
+    reg = SessionRegistry()
+    reg.open("t1", "s1")
+    reg.begin_turn("t1", "s1", None, "turn-a")
+    reg.complete_turn("s1", "turn-stale")
+    reg.complete_turn("ghost", "turn-a")
+    assert reg.abort("s1", None)[1] == "turn-a"

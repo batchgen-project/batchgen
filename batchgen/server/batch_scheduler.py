@@ -168,13 +168,17 @@ def turn_timing_summary(timing: Dict[str, Optional[float]]) -> Dict[str, Any]:
 class _TurnWaiter:
     """One submitted turn waiting for its completion (scheduler-loop only)."""
 
-    __slots__ = ("turn_id", "model", "session", "future", "timing")
+    __slots__ = ("turn_id", "model", "session", "future", "timing", "on_routed")
 
-    def __init__(self, turn_id, model, session, future, received_at) -> None:
+    def __init__(self, turn_id, model, session, future, received_at,
+                 on_routed=None) -> None:
         self.turn_id = turn_id
         self.model = model
         self.session = session
         self.future = future
+        # Called on the loop when the completion is routed, before the future
+        # resolves (the session registry marks the turn finished).
+        self.on_routed = on_routed
         self.timing: Dict[str, Optional[float]] = {"http_received_at": received_at}
 
 
@@ -864,12 +868,19 @@ class BatchScheduler:
 
     # ============ Per-turn path (POST /v1/turns) ============
 
-    def submit_turn(self, turn_id: str, body: Any, received_at: float) -> _TurnWaiter:
+    def submit_turn(
+        self,
+        turn_id: str,
+        body: Any,
+        received_at: float,
+        on_routed: Optional[Any] = None,
+    ) -> _TurnWaiter:
         """Render one turn as the batch path does and submit it to the IntakePool.
 
         ``body`` is a validated TurnRequest. The turn becomes a one-entry intake
         batch keyed by ``turn_id``; the returned waiter's future resolves with
-        the worker's completion item. Raises TurnError for a request that
+        the worker's completion item, and ``on_routed()`` (if given) runs
+        synchronously just before it does. Raises TurnError for a request that
         cannot run (400), a full intake pool (429), or a worker pool that is
         not serving or has failed and not yet restarted (503). Runs on the
         scheduler loop: the gate check and the waiter registration below have
@@ -939,6 +950,7 @@ class BatchScheduler:
             session,
             asyncio.get_running_loop().create_future(),
             received_at,
+            on_routed,
         )
         # Registered before the submit: the drain discards an intake entry that
         # belongs to neither a live batch nor a live turn.
@@ -994,6 +1006,10 @@ class BatchScheduler:
         waiter.timing["worker_admitted_at"] = result.get("admitted_at")
         waiter.timing["worker_completed_at"] = result.get("completed_at")
         waiter.timing["completion_routed_at"] = routed_at
+        if waiter.on_routed is not None:
+            # Same loop step as the resolution below: no abort can observe the
+            # turn as routed-but-still-abortable.
+            waiter.on_routed()
         if not waiter.future.done():
             waiter.future.set_result(result)
 

@@ -701,3 +701,45 @@ def test_e2e_session_ids_with_a_slash_reach_close_and_abort(tmp_path):
     assert out["abort"].json()["state"] == "aborted"
     assert out["abort_unknown"].status_code == 404
     assert out["abort_unknown"].json()["detail"]["code"] == "session_not_found"
+
+
+def _route_endpoint(app, path):
+    (route,) = [r for r in app.routes if getattr(r, "path", None) == path]
+    return route.endpoint
+
+
+def test_e2e_abort_between_completion_routing_and_response_is_already_completed(tmp_path):
+    # The listener routes the completion and resolves the future; the turn's
+    # handler has not resumed yet. An abort arriving in exactly that window
+    # must not mark the session aborted while the turn returns 200.
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        abort = _route_endpoint(app, "/v1/sessions/{session_id:path}/abort")
+        seen = {}
+        original = scheduler._resolve_turn
+
+        def resolve_then_abort(turn_id, result):
+            original(turn_id, result)
+            # The abort handler has no await: drive it to completion right
+            # here, on the loop, before the turn handler can run again.
+            coro = abort(request=SimpleNamespace(app=app), session_id="s1",
+                         body=io_struct.AbortSessionRequest(reason="late"))
+            try:
+                coro.send(None)
+            except StopIteration as stop:
+                seen["abort"] = ("ok", stop.value)
+            except Exception as exc:  # HTTPException from the handler
+                seen["abort"] = ("error", exc.status_code, exc.detail)
+            seen["state_after_abort"] = app.state.session_registry.get("s1").state.value
+
+        scheduler._resolve_turn = resolve_then_abort
+        turn = await client.post("/v1/turns", json=_turn_body("s1"))
+        seen["state_after_turn"] = app.state.session_registry.get("s1").state.value
+        return turn, seen
+
+    turn, seen = asyncio.run(_serve(tmp_path, scenario))
+    assert turn.status_code == 200, turn.text
+    assert seen["abort"][0] == "error", seen["abort"]
+    assert seen["abort"][1] == 409 and seen["abort"][2]["code"] == "already_completed"
+    assert seen["state_after_abort"] == "turn_in_flight"
+    assert seen["state_after_turn"] == "idle"

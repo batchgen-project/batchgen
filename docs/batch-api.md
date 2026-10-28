@@ -304,6 +304,12 @@ queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`); a
 turn already running on a worker runs to completion there and its result is
 discarded (`cancelled_turn: "detached"`) — the same limit as batch cancel.
 
+A turn is finished once the server routes its worker completion, even before
+its HTTP response is written. An abort that arrives in that window gets
+`409 already_completed` and changes nothing: the turn returns its answer and
+the session goes `idle`. Abort again after the turn has returned to end the
+session.
+
 ### POST /v1/turns
 
 An OpenAI chat-completions body (`model`, `messages`, `tools`, `max_tokens` or

@@ -90,6 +90,8 @@ def register_turn_routes(app: FastAPI) -> None:
             record, turn_id = registry.abort(session_id, reason)
         except TurnError as exc:
             raise _http_error(exc) from exc
+        # registry.abort refused (409 already_completed) a turn whose
+        # completion is routed, so a turn cancelled here has not completed.
         cancelled = None
         if turn_id is not None:
             cancelled = request.app.state.scheduler.cancel_turn(
@@ -159,7 +161,12 @@ def register_turn_routes(app: FastAPI) -> None:
         except TurnError as exc:
             raise _http_error(exc) from exc
         try:
-            waiter = scheduler.submit_turn(turn_id, body, received_at)
+            waiter = scheduler.submit_turn(
+                turn_id, body, received_at,
+                on_routed=lambda: registry.complete_turn(
+                    session.session_id, turn_id
+                ),
+            )
             try:
                 result = await waiter.future
             except asyncio.CancelledError:
