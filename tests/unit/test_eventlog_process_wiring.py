@@ -402,9 +402,6 @@ def test_exit_process_unconfigured_exits_with_code():
 _RUNTIME_MODULES = (
     "batchgen/launch_http_server.py",
     "batchgen/server_worker_main_loop.py",
-    "batchgen/parameter_server.py",
-    "batchgen/entrypoint.py",
-    "batchgen/batchgen_.py",
     "batchgen/server/http_server.py",
 )
 

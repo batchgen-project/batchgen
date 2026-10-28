@@ -905,7 +905,7 @@ main() {
     echo "========================================"
     echo ""
     echo "You can now use BatchGen. Example:"
-    echo "  python -m batchgen.parameter_server --model deepseek-ai/DeepSeek-R1"
+    echo "  python -m batchgen.launch_http_server --model deepseek-ai/DeepSeek-R1"
 }
 
 main "$@"
