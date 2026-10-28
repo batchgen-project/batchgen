@@ -290,6 +290,8 @@ for a bad parent.
 {"reason": "end_of_session"}
 ```
 
+The id is the rest of the path and may contain `/`
+(`POST /v1/sessions/traj-17/main/close`); the same holds for `/abort`.
 `reason` is `end_of_session` (this session) or `end_of_trajectory` (every live
 session of the same `traj_id`). All-or-nothing: `409 turn_in_flight` if any of
 them has a turn running. **Response:** `{"object": "session.close", "reason": …, "closed": [sessions]}`.

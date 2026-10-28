@@ -8,6 +8,7 @@ the body); the session lifecycle is signalled out of band:
     POST /v1/sessions                       open (traj_id, session_id, parent)
     POST /v1/sessions/{session_id}/close    reason end_of_session | end_of_trajectory
     POST /v1/sessions/{session_id}/abort    cancels the in-flight turn, if any
+                                            (session_id may contain "/")
     POST /v1/turns                          one chat-completions turn
 
 A turn is rendered exactly as a /v1/batches chat request, submitted to the
@@ -58,7 +59,10 @@ def register_turn_routes(app: FastAPI) -> None:
             raise _http_error(exc) from exc
         return record.to_dict()
 
-    @app.post("/v1/sessions/{session_id}/close")
+    # ``:path`` so a session id may contain "/" (the documented
+    # "<traj>/<name>" form); a plain parameter stops at the first slash and
+    # the request 404s before reaching the handler.
+    @app.post("/v1/sessions/{session_id:path}/close")
     async def close_session(session_id: str, body: CloseSessionRequest):
         try:
             closed = registry.close(session_id, body.reason)
@@ -70,7 +74,7 @@ def register_turn_routes(app: FastAPI) -> None:
             "closed": [record.to_dict() for record in closed],
         }
 
-    @app.post("/v1/sessions/{session_id}/abort")
+    @app.post("/v1/sessions/{session_id:path}/abort")
     async def abort_session(
         request: Request,
         session_id: str,

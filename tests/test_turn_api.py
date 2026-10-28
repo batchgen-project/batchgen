@@ -577,3 +577,34 @@ def test_e2e_turns_coexist_with_a_running_batch(tmp_path):
     # Turns write no output file of their own and none into the batch's.
     assert sorted(p.name for p in (tmp_path / "incr").iterdir()) == ["batch_1.jsonl"]
     assert not turn_ids & {r["custom_id"] for r in rows}
+
+
+def test_e2e_session_ids_with_a_slash_reach_close_and_abort(tmp_path):
+    # The documented id form is "<traj>/<name>" (e.g. "traj-17/main"). The
+    # close and abort routes must accept it, not 404 on the extra path segment.
+    async def scenario(client, scheduler, worker, app):
+        out = {}
+        for sid, parent in (("traj-17/main", None), ("traj-17/sub/1", "traj-17/main"),
+                            ("traj-18/main", None)):
+            r = await client.post("/v1/sessions", json={
+                "traj_id": sid.split("/")[0], "session_id": sid, "parent_session_id": parent})
+            assert r.status_code == 200, r.text
+        out["turn"] = await client.post("/v1/turns", json=_turn_body(
+            "traj-17/sub/1", "hi", traj_id="traj-17", parent="traj-17/main"))
+        out["close"] = await client.post("/v1/sessions/traj-17/sub/1/close",
+                                         json={"reason": "end_of_trajectory"})
+        out["abort"] = await client.post("/v1/sessions/traj-18/main/abort",
+                                         json={"reason": "tool_crash"})
+        out["abort_unknown"] = await client.post("/v1/sessions/traj-19/main/abort")
+        return out
+
+    out = asyncio.run(_serve(tmp_path, scenario))
+    assert out["turn"].status_code == 200, out["turn"].text
+    assert out["close"].status_code == 200, out["close"].text
+    assert sorted(s["session_id"] for s in out["close"].json()["closed"]) == [
+        "traj-17/main", "traj-17/sub/1"]
+    assert out["abort"].status_code == 200, out["abort"].text
+    assert out["abort"].json()["session_id"] == "traj-18/main"
+    assert out["abort"].json()["state"] == "aborted"
+    assert out["abort_unknown"].status_code == 404
+    assert out["abort_unknown"].json()["detail"]["code"] == "session_not_found"
