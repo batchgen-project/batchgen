@@ -227,8 +227,8 @@ class StreamedSP8LayerBuffer:
                 for begin in range(0, len(names), self.acquire_batch_size):
                     acquired = []
                     batch = names[begin:begin + self.acquire_batch_size]
-                    try:
-                        with torch.cuda.stream(copy_stream):
+                    with torch.cuda.stream(copy_stream):
+                        try:
                             for local_offset, module_name in enumerate(
                                 batch, start=begin
                             ):
@@ -243,18 +243,25 @@ class StreamedSP8LayerBuffer:
                                     self.local[tensor_name][local_offset].copy_(
                                         weights[tensor_name]
                                     )
-                    finally:
-                        # Both transports release each bounded batch as soon as
-                        # its copies have landed in ``self.local``, so the ring
-                        # only ever has to hold ``acquire_batch_size`` slots and
-                        # the next batch can reuse the ones just freed.
-                        copy_stream.synchronize()
-                        for module_name in acquired:
-                            self.core_engine.free_weights_buffer(module_name)
+                        finally:
+                            # Both transports release each bounded batch, also
+                            # on error, with one event recorded on
+                            # ``copy_stream`` after its copies: the producer
+                            # reclaims those slots once the event completes and
+                            # this thread leases the next batch at once. Every
+                            # later reader of ``self.local`` -- the payload
+                            # broadcasts and the assembly copy -- is enqueued on
+                            # this same stream, so no host wait is needed.
+                            if acquired:
+                                self.core_engine.free_weights_buffers_async(
+                                    acquired
+                                )
             except BaseException as exc:
                 if self.cross_group is None:
                     raise
                 source_error = exc
+            # Host time at which the last lease was taken and its copies were
+            # enqueued; the copies themselves may still be in flight.
             if enabled and source_error is None:
                 profile_host.acquisition_end_s = time.perf_counter()
 
