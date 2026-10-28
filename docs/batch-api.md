@@ -365,12 +365,28 @@ the worker's admit-to-complete time. Each turn also logs one `[TURN] … done`
 line on the server and `[SESSION] admit` / `[SESSION] complete` lines on the
 worker rank that owns the sequence.
 
+**Limits** (checked before the session is touched; `detail` is
+`{"code", "message"}`):
+
+| Limit | Value | Error |
+|-------|-------|-------|
+| Request body | 32 MiB (declared `Content-Length` and bytes received) | `413 request_body_too_large` |
+| `max_tokens`, `max_completion_tokens` | the model context length (`max_context_length` of `GET /v1/models`) | `400 max_tokens_exceeds_context` |
+| `messages` | 8192 entries | `400 too_many_messages` |
+| `tools` | 1024 entries | `400 too_many_tools` |
+| `batchgen_debug` | 64 KiB as JSON | `413 batchgen_debug_too_large` |
+
+The batch path has no request-size limit of its own; prompt plus output
+beyond the context is still rejected per request by the worker
+(`400 context_length_exceeded`).
+
 **Errors:** `503` when the worker pool is not serving and `429` under intake
 pressure (same gates and `Retry-After` as `POST /v1/batches`); `404` / `409` /
-`400` from the session checks; `422` for a malformed body; `400` with the
-worker's code for a request the worker rejects (`context_length_exceeded`,
-`host_kv_capacity_exceeded`); `409 turn_aborted`; `503 worker_fatal` when the
-worker pool fails while the turn is pending.
+`400` from the session checks; `422` for a malformed body; `400`/`413` for the
+limits above; `400` with the worker's code for a request the worker rejects
+(`context_length_exceeded`, `host_kv_capacity_exceeded`); `409 turn_aborted`;
+`503 worker_fatal` when the worker pool fails while the turn is pending, and
+for every new turn after that until the pool has restarted.
 
 ---
 

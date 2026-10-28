@@ -36,6 +36,79 @@ from batchgen.server.io_struct import (
 )
 
 
+# Request-size limits of POST /v1/turns (documented in docs/batch-api.md).
+# The batch path has no request-size limit to share; the model's context
+# length (``app.state.model_object.max_context_length``, what GET /v1/models
+# reports) bounds max_tokens. Module-level so a deployment test can lower them.
+MAX_TURN_BODY_BYTES = 32 * 1024 * 1024
+MAX_TURN_MESSAGES = 8192
+MAX_TURN_TOOLS = 1024
+MAX_TURN_DEBUG_BYTES = 64 * 1024
+
+
+async def _read_body_capped(request: Request, limit: int) -> bytes:
+    """The request body, or 413 request_body_too_large past ``limit`` bytes.
+
+    Checks a declared Content-Length first and then counts what actually
+    arrives, so a missing or false header cannot get a larger body read.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_bytes = int(declared)
+        except ValueError:
+            raise TurnError(
+                400, "invalid_content_length",
+                f"Content-Length {declared!r} is not an integer",
+            ) from None
+        if declared_bytes > limit:
+            raise TurnError(
+                413, "request_body_too_large",
+                f"request body is {declared_bytes} bytes; the limit is {limit}",
+            )
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise TurnError(
+                413, "request_body_too_large",
+                f"request body exceeds the {limit}-byte limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _check_turn_limits(body: TurnRequest, max_context_length: int) -> None:
+    """Reject a parsed turn whose budget or fields exceed the server limits."""
+    for field in ("max_tokens", "max_completion_tokens"):
+        value = getattr(body, field)
+        if value is not None and value > max_context_length:
+            raise TurnError(
+                400, "max_tokens_exceeds_context",
+                f"{field}={value} exceeds the model context length "
+                f"{max_context_length}",
+            )
+    if len(body.messages) > MAX_TURN_MESSAGES:
+        raise TurnError(
+            400, "too_many_messages",
+            f"{len(body.messages)} messages; the limit is {MAX_TURN_MESSAGES}",
+        )
+    if body.tools is not None and len(body.tools) > MAX_TURN_TOOLS:
+        raise TurnError(
+            400, "too_many_tools",
+            f"{len(body.tools)} tools; the limit is {MAX_TURN_TOOLS}",
+        )
+    if body.batchgen_debug is not None:
+        debug_bytes = len(json.dumps(body.batchgen_debug).encode())
+        if debug_bytes > MAX_TURN_DEBUG_BYTES:
+            raise TurnError(
+                413, "batchgen_debug_too_large",
+                f"batchgen_debug is {debug_bytes} bytes as JSON; the limit is "
+                f"{MAX_TURN_DEBUG_BYTES}",
+            )
+
+
 def _http_error(exc: TurnError) -> HTTPException:
     # A 503 (pool not serving, or failed and not yet restarted) is retryable,
     # as the batch path's 503 is.
@@ -133,7 +206,11 @@ def register_turn_routes(app: FastAPI) -> None:
             )
 
         try:
-            payload = await request.json()
+            raw = await _read_body_capped(request, MAX_TURN_BODY_BYTES)
+        except TurnError as exc:
+            raise _http_error(exc) from exc
+        try:
+            payload = json.loads(raw)
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"request body is not JSON: {exc}"
@@ -148,6 +225,12 @@ def register_turn_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=422, detail=json.loads(exc.json())
             ) from exc
+        try:
+            _check_turn_limits(
+                body, request.app.state.model_object.max_context_length
+            )
+        except TurnError as exc:
+            raise _http_error(exc) from exc
 
         session = body.session
         turn_id = f"turn_{uuid.uuid4().hex[:24]}"

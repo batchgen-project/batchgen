@@ -69,6 +69,7 @@ _M = _load_server_modules()
 io_struct, bs, turn_api = _M["io_struct"], _M["batch_scheduler"], _M["turn_api"]
 TurnError = _M["agent_sessions"].TurnError
 MODEL = "gpt-oss-120b"
+CONTEXT = 4096  # the served model's context length in these tests
 
 
 class _Tokenizer:
@@ -223,6 +224,7 @@ async def _serve(tmp_path, scenario, capacity=8):
     app = FastAPI()
     app.state.scheduler = scheduler
     app.state.worker = worker
+    app.state.model_object = SimpleNamespace(max_context_length=CONTEXT)
     turn_api.register_turn_routes(app)
     try:
         # A real worker publishes its capacity long before the first request.
@@ -743,3 +745,62 @@ def test_e2e_abort_between_completion_routing_and_response_is_already_completed(
     assert seen["abort"][1] == 409 and seen["abort"][2]["code"] == "already_completed"
     assert seen["state_after_abort"] == "turn_in_flight"
     assert seen["state_after_turn"] == "idle"
+
+
+def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
+    monkeypatch.setattr(turn_api, "MAX_TURN_BODY_BYTES", 4096)
+    monkeypatch.setattr(turn_api, "MAX_TURN_MESSAGES", 4)
+    monkeypatch.setattr(turn_api, "MAX_TURN_TOOLS", 2)
+    monkeypatch.setattr(turn_api, "MAX_TURN_DEBUG_BYTES", 64)
+    tool = {"type": "function", "function": {"name": "ls", "parameters": {"type": "object"}}}
+
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        out = {}
+        out["max_tokens"] = await client.post(
+            "/v1/turns", json=_turn_body("s1", max_tokens=CONTEXT + 1))
+        out["max_completion_tokens"] = await client.post(
+            "/v1/turns", json=_turn_body("s1", max_completion_tokens=10**12))
+        out["body"] = await client.post(
+            "/v1/turns", json=_turn_body("s1", "x" * 5000))
+        undeclared = json.dumps(_turn_body("s1", "y" * 5000)).encode()
+
+        async def chunks():
+            for i in range(0, len(undeclared), 1000):
+                yield undeclared[i:i + 1000]
+
+        out["body_undeclared"] = await client.post(
+            "/v1/turns", content=chunks(), headers={"content-type": "application/json"})
+        many = _turn_body("s1")
+        many["messages"] = [{"role": "user", "content": "m"}] * 5
+        out["messages"] = await client.post("/v1/turns", json=many)
+        out["tools"] = await client.post("/v1/turns", json=_turn_body("s1", tools=[tool] * 3))
+        out["debug"] = await client.post(
+            "/v1/turns", json=_turn_body("s1", batchgen_debug={"note": "z" * 100}))
+        out["state"] = app.state.session_registry.get("s1").state.value
+        out["turns"] = app.state.session_registry.get("s1").turns
+        out["at_limit"] = await client.post("/v1/turns", json=_turn_body(
+            "s1", max_tokens=CONTEXT, tools=[tool] * 2, batchgen_debug={"k": 1}))
+        return out, list(worker.admitted)
+
+    out, admitted = asyncio.run(_serve(tmp_path, scenario))
+    expected = {
+        "max_tokens": (400, "max_tokens_exceeds_context"),
+        "max_completion_tokens": (400, "max_tokens_exceeds_context"),
+        "body": (413, "request_body_too_large"),
+        "body_undeclared": (413, "request_body_too_large"),
+        "messages": (400, "too_many_messages"),
+        "tools": (400, "too_many_tools"),
+        "debug": (413, "batchgen_debug_too_large"),
+    }
+    got = {}
+    for name in expected:
+        response = out[name]
+        detail = response.json().get("detail")
+        got[name] = (response.status_code,
+                     detail.get("code") if isinstance(detail, dict) else detail)
+    assert got == expected
+    # Rejected before the session was touched; nothing reached a worker.
+    assert (out["state"], out["turns"]) == ("open", 0)
+    assert out["at_limit"].status_code == 200, out["at_limit"].text
+    assert len(admitted) == 1
