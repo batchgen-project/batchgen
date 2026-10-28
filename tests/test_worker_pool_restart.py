@@ -230,6 +230,7 @@ def _manager(monkeypatch):
         lambda timeout_s=None, peer_check=None: None
     )
     manager.distributed_weight_daemon = None
+    manager._weight_daemon_watcher = None
     return manager
 
 
@@ -3942,6 +3943,26 @@ class _FakeWeightDaemon:
     def stop(self):
         self.order.append("daemon_stop")
 
+    def status(self):
+        return {
+            "started": True,
+            "failed": False,
+            "failure": "",
+            "cohort": {"epoch": self.epoch, "state": "draining" if self.draining else "admitting"},
+        }
+
+    def metrics(self):
+        return {
+            "fetched_modules": 7,
+            "ready_latency_ms": {
+                "bucket_counts": [3, 1, 0], "count": 4, "sum_ms": 9.0, "max_ms": 5.0,
+            },
+        }
+
+    @staticmethod
+    def ready_latency_bucket_edges_ms():
+        return [1.0, 10.0, float("inf")]
+
 
 def _swap_manager(monkeypatch, order, **daemon_kwargs):
     manager = _manager(monkeypatch)
@@ -4198,3 +4219,36 @@ def test_cohort_epoch_is_zero_without_a_daemon(monkeypatch):
     assert manager._distributed_weight_cohort() == 0
     manager.distributed_weight_daemon = _FakeWeightDaemon([])
     assert manager._distributed_weight_cohort() == 1
+
+
+def test_workers_status_carries_the_weight_daemon_block(monkeypatch):
+    manager = _manager(monkeypatch)
+    assert "weight_daemon" not in manager.status()
+    manager.distributed_weight_daemon = _FakeWeightDaemon([])
+    block = manager.status()["weight_daemon"]
+    assert block["failed"] is False
+    assert block["cohort"]["epoch"] == 1
+
+
+def test_weight_daemon_metrics_carry_the_bucket_edges(monkeypatch):
+    manager = _manager(monkeypatch)
+    assert manager.weight_daemon_metrics() is None
+    manager.distributed_weight_daemon = _FakeWeightDaemon([])
+    metrics = manager.weight_daemon_metrics()
+    assert metrics["fetched_modules"] == 7
+    latency = metrics["ready_latency_ms"]
+    assert latency["bucket_edges_ms"] == [1.0, 10.0, float("inf")]
+    assert len(latency["bucket_edges_ms"]) == len(latency["bucket_counts"])
+
+
+def test_swap_finished_line_logs_epoch_and_elapsed_only():
+    tree = _worker_manager_tree()
+    finish = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_finish_distributed_weight_swap"
+    )
+    source = ast.unparse(finish)
+    # The report is logged once, by the cohort.admitting event.
+    assert "json.dumps" not in source
+    assert "cohort=%s elapsed_ms=%.1f" in source

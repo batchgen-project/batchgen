@@ -207,6 +207,9 @@ class WorkerManager:
         self.host_kv_manager = None
         self.host_kv_aux_manager = None
         self.distributed_weight_daemon = None
+        # Logs the daemon's events; stopped after the daemon, before the
+        # daemon object is dropped.
+        self._weight_daemon_watcher = None
         self.distributed_weight_config = None
         # The server-owned staged copy of the distributed weight store, and
         # the config the daemon and every worker receive: the effective
@@ -386,7 +389,26 @@ class WorkerManager:
             and self.args.node_rank == 0
         ):
             status["peers"] = coordinator.peer_acks()
+        daemon = self.distributed_weight_daemon
+        if daemon is not None:
+            status["weight_daemon"] = daemon.status()
         return status
+
+    def weight_daemon_metrics(self) -> Optional[Dict[str, Any]]:
+        """The daemon's counters and ready-latency histogram, or None.
+
+        ``ready_latency_ms.bucket_edges_ms`` holds each bucket's inclusive
+        upper edge; the last is +inf, the overflow bucket. Counts are
+        per bucket, not cumulative.
+        """
+        daemon = self.distributed_weight_daemon
+        if daemon is None:
+            return None
+        metrics = daemon.metrics()
+        metrics["ready_latency_ms"]["bucket_edges_ms"] = list(
+            daemon.ready_latency_bucket_edges_ms()
+        )
+        return metrics
 
     def _acquire_runtime_admission(self) -> None:
         if self._runtime_locks is not None:
@@ -607,6 +629,13 @@ class WorkerManager:
 
             if self.distributed_weight_daemon is not None:
                 self.distributed_weight_daemon.stop()
+                # The watcher polls inside the daemon without the GIL, so it
+                # is joined before the daemon is dropped; its final drain
+                # logs the daemon's stopped event.
+                watcher = getattr(self, "_weight_daemon_watcher", None)
+                if watcher is not None:
+                    watcher.stop()
+                    self._weight_daemon_watcher = None
                 self.distributed_weight_daemon = None
         finally:
             try:
@@ -1886,9 +1915,12 @@ class WorkerManager:
                 self._DISTRIBUTED_WEIGHT_SWAP_TIMEOUT_S
             )
         )
+        # The full report is logged once, as weight_daemon.cohort.admitting.
         logging.getLogger("uvicorn.error").info(
-            "[restart] distributed weight cohort swap finished: %s",
-            json.dumps(report, sort_keys=True),
+            "[restart] distributed weight cohort swap finished: cohort=%s "
+            "elapsed_ms=%.1f",
+            report.get("to_cohort"),
+            float(report.get("elapsed_ms", 0.0)),
         )
         return report
 
@@ -1943,6 +1975,7 @@ class WorkerManager:
         from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
             load_distributed_weight_config,
         )
+        from batchgen.server import weight_daemon_events
 
         config_path = self._distributed_weight_config_path
         config = load_distributed_weight_config(config_path)
@@ -1962,6 +1995,12 @@ class WorkerManager:
             str(config_path)
         )
         self.distributed_weight_daemon.start()
+        # Started after the daemon: its first poll finds the config event.
+        watcher = weight_daemon_events.WeightDaemonWatcher(
+            self.distributed_weight_daemon, weight_daemon_events.logger
+        )
+        watcher.start()
+        self._weight_daemon_watcher = watcher
         logger.info(
             "Distributed weight daemon started for node %d: store=%s",
             self.args.node_rank,

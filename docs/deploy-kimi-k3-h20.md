@@ -58,6 +58,10 @@ copies; `--store-residency resident` keeps that copy for the next start. See the
 "Staged copy and its lifetime" note in the [H200 guide](deploy-kimi-k3-h200.md). Do not copy
 the store into `/dev/shm` by hand.
 
+The node's weight daemon reports through the server log as `weight_daemon.*` events (a
+failure as `ERROR`, a stalled acquire as `WARNING`), and its state appears under
+`weight_daemon` in `/v1/workers/status`. It no longer writes a summary file next to the store.
+
 On **all four** nodes, before launch, lower the kernel memory watermark (fleet images that
 ship `vm.watermark_scale_factor=1000` reserve a large high-watermark that starves the
 weight load):

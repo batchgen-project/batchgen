@@ -774,6 +774,15 @@ def test_start_stages_after_compaction_and_before_the_daemon():
     assert "str(self._distributed_weight_config_path)" in keywords["distributed_weight_config"]
 
 
+def test_daemon_start_starts_the_event_watcher_after_the_daemon():
+    from tests.test_worker_pool_restart import _worker_manager_tree
+
+    calls = _calls(_method(_worker_manager_tree(), "_start_distributed_weight_daemon"))
+    assert calls.index("self.distributed_weight_daemon.start") < calls.index(
+        "weight_daemon_events.WeightDaemonWatcher"
+    ) < calls.index("watcher.start")
+
+
 class _FakeStaged:
     def __init__(self, order):
         self.order = order
@@ -781,6 +790,20 @@ class _FakeStaged:
 
     def release(self):
         self.order.append("store_release")
+
+
+class _FakeWatcher:
+    """Records its stop, and whether the daemon was still held at that point:
+    the real watcher polls inside the daemon, which must outlive it."""
+
+    def __init__(self, order, manager):
+        self.order = order
+        self.manager = manager
+        self.daemon_held_at_stop = None
+
+    def stop(self):
+        self.order.append("watcher_stop")
+        self.daemon_held_at_stop = self.manager.distributed_weight_daemon is not None
 
 
 def _stopping_manager(monkeypatch, tmp_path, order):
@@ -801,14 +824,21 @@ def _stopping_manager(monkeypatch, tmp_path, order):
     manager.prefix_cache_runtime_config = None
     manager._close_skeleton_memfd = lambda: None
     manager._staged_weight_store = _FakeStaged(order)
+    manager._weight_daemon_watcher = _FakeWatcher(order, manager)
     return manager
 
 
 def test_stop_releases_the_store_after_the_daemon_and_workers(monkeypatch, tmp_path):
     order = []
     manager = _stopping_manager(monkeypatch, tmp_path, order)
+    watcher = manager._weight_daemon_watcher
     manager.stop()
-    assert order == ["prepare_stop", "teardown", "daemon_stop", "store_release"]
+    assert order == [
+        "prepare_stop", "teardown", "daemon_stop", "watcher_stop", "store_release",
+    ]
+    assert watcher.daemon_held_at_stop is True
+    assert manager._weight_daemon_watcher is None
+    assert manager.distributed_weight_daemon is None
     assert manager._staged_weight_store is None
 
 
@@ -851,8 +881,10 @@ def test_stop_keeps_the_store_while_the_daemon_failed_to_stop(monkeypatch, tmp_p
     manager.distributed_weight_daemon.stop = daemon_stop_fails
     with pytest.raises(RuntimeError, match="daemon stop failed"):
         manager.stop()
+    # The watcher keeps reporting on the daemon that is still held.
     assert order == ["prepare_stop", "teardown", "daemon_stop"]
     assert manager._staged_weight_store is not None
+    assert manager._weight_daemon_watcher is not None
 
 
 def test_worker_restart_never_touches_the_store(monkeypatch, tmp_path):

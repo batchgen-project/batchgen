@@ -269,6 +269,12 @@ commands in §4 reach the replicated parameter server only because they pass `--
   server refuses before copying and names the shortfall
   (`sudo mount -o remount,size=<bytes> /dev/shm`).
 
+  **Daemon events and status.** The node's weight daemon reports through the server log as
+  `weight_daemon.*` events: a failure logs as `ERROR` (`weight_daemon.failed`) and an acquire that
+  keeps waiting logs as `WARNING` (`weight_daemon.acquire.stalled`). Its current state — failure,
+  cohort epoch, pending acquires — appears under `weight_daemon` in `/v1/workers/status`. The
+  daemon no longer writes a summary file next to the store.
+
   > **`--fast-init` requires a huge-page tmpfs.** The daemon and the workers advise the staged
   > mapping with `MADV_HUGEPAGE`, but a tmpfs backs files with transparent huge pages only when it
   > is mounted with `huge=within_size` or `huge=always`. Without that the store stays on 4 KB pages
