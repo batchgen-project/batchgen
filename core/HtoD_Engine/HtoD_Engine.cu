@@ -202,8 +202,10 @@ void HtoD_Engine::Start(){
 // producer failure instead.
 void HtoD_Engine::Terminate() {
     this->terminate_flag_ = true;
-    this->wake_producer();
+    // Only a running producer needs the wake. From ~HtoD_Engine the weight
+    // buffer it would notify may already be destroyed.
     if (this->HtoD_worker_.joinable()) {
+        this->wake_producer();
         this->HtoD_worker_.join();
     }
     if (!this->producer_failed_) {
@@ -249,6 +251,8 @@ void HtoD_Engine::wake_producer() {
         ++this->producer_wake_;
     }
     this->producer_wake_cv_.notify_all();
+    // A producer waiting for a free weight slot wakes as well.
+    this->gpu_weight_buffer_.wake_producer();
 }
 
 void HtoD_Engine::blocking_copy_(void* dst, void* src, int64_t size) {
@@ -496,6 +500,9 @@ void HtoD_Engine::HtoD_Worker() {
             std::lock_guard<std::mutex> lock(this->producer_wake_mutex_);
             wake_seen = this->producer_wake_;
         }
+        // Read as early as wake_seen: a slot freed or a wake after this read
+        // ends the full-ring wait below at once.
+        const uint64_t slot_epoch_seen = this->gpu_weight_buffer_.slot_epoch();
         // Set when this iteration copies or runs anything; an idle iteration
         // backs off below instead of immediately re-taking the weight-buffer
         // mutex.
@@ -503,6 +510,8 @@ void HtoD_Engine::HtoD_Worker() {
         // Stays true while every weight type is uninstalled or parked: only
         // begin_weight_pass can give the producer weight work.
         bool weights_parked = true;
+        // The first type whose ring had no FREE slot this iteration.
+        std::string full_ring_type;
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
             task();
@@ -660,6 +669,9 @@ void HtoD_Engine::HtoD_Worker() {
                 auto optional_buffer =
                     this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
                 if (!optional_buffer.has_value()) {
+                    if (full_ring_type.empty()) {
+                        full_ring_type = module_type;
+                    }
                     continue;
                 }
                 buffer = optional_buffer->first;
@@ -827,12 +839,34 @@ void HtoD_Engine::HtoD_Worker() {
                 });
                 continue;
             }
-            // A full ring frees only when the consumer's release events
-            // complete, which nothing signals. Without a sleep the iteration
-            // re-locks the weight-buffer mutex in a tight loop and starves
-            // the consumer's get_weights. 50 us is negligible against a
-            // slot's copy time.
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (!this->kv_copy_task_queue_.empty()) {
+                // The KV buffer is full, and GPU_KV_Buffer signals no freed
+                // slot. Without a sleep the iteration re-locks the buffer
+                // mutexes in a tight loop and starves the consumer. 50 us is
+                // negligible against a slot's copy time.
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            if (full_ring_type.empty()) {
+                // No ring was found full: the iteration ended on a stop or a
+                // producer failure, which the next iteration parks on.
+                continue;
+            }
+            // Every unparked weight type found its ring full. The weight
+            // buffer reclaims, waits on the oldest pending release or on its
+            // slot notification, and returns on any slot change, wake or
+            // stop since slot_epoch_seen. It counts no consumer progress.
+            try {
+                this->gpu_weight_buffer_.wait_for_free_slot(
+                    full_ring_type, slot_epoch_seen, this->terminate_flag_);
+            } catch (const std::exception& error) {
+                // Never rethrow: waiters see the failure instead.
+                this->fail_producer_(full_ring_type, -1, "", false,
+                                     error.what());
+            } catch (...) {
+                this->fail_producer_(full_ring_type, -1, "", false,
+                                     "unknown exception");
+            }
         }
     }
 };

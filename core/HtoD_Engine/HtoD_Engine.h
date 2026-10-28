@@ -92,7 +92,8 @@ class HtoD_Engine {
     // begin_weight_pass and set_weight_copy_queue throws. Otherwise the next
     // set_weight_copy_queue, or start + begin, proceeds as after a phase end.
     WeightPassAbort abort_weight_passes();
-    // Un-parks the producer: a pass was armed or a task was queued.
+    // Un-parks the producer: a pass was armed, a task was queued or a stop
+    // was requested. Also ends its wait for a free weight slot.
     void wake_producer();
     // Throws when the node daemon still leases this worker a module of pass
     // or an earlier one. A lease of the module in flight for a later

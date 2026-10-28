@@ -19,6 +19,7 @@
 // clang-format on
 
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -106,6 +107,19 @@ class GPU_Weight_Buffer {
     void retire_skip(const std::string& module_type,
                      const std::string& module_name);
     void abandon(const std::string& module_type, int64_t buffer_idx);
+    // Moves at every transition that can create a FREE or PENDING_RELEASE
+    // slot, and on wake_producer(). Not consumer progress: it never resets
+    // the stall clock of get_weights.
+    uint64_t slot_epoch() const;
+    // Producer, after an iteration found a ring full: reclaims completed
+    // releases and returns once a slot of module_type is FREE, the slot
+    // epoch moved past seen, or stop is set. Waits on the oldest pending
+    // release's event outside the mutex, or else on slot_cv_.
+    void wait_for_free_slot(const std::string& module_type, uint64_t seen,
+                            const std::atomic<bool>& stop);
+    // Ends a wait_for_free_slot: a pass was armed, a task was queued or the
+    // producer is stopping.
+    void wake_producer();
     // Returns false when a skip released the slot as the copy landed.
     bool weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
@@ -138,11 +152,30 @@ class GPU_Weight_Buffer {
     static constexpr std::chrono::seconds kStallTimeout{300};
 
    private:
+    // Owns a consumer release event. Shared, so the producer can wait on it
+    // outside mutex_ while a drain, reset or abort drops its release.
+    class CudaEventHandle {
+       public:
+        CudaEventHandle() {
+            CUDA_CHECK(cudaEventCreateWithFlags(&this->event_,
+                                                cudaEventDisableTiming));
+        }
+        ~CudaEventHandle() { cudaEventDestroy(this->event_); }
+        CudaEventHandle(const CudaEventHandle&) = delete;
+        CudaEventHandle& operator=(const CudaEventHandle&) = delete;
+        cudaEvent_t get() const { return this->event_; }
+
+       private:
+        cudaEvent_t event_ = nullptr;
+    };
+
     struct PendingRelease {
-        cudaEvent_t event;
+        std::shared_ptr<CudaEventHandle> event;
         std::vector<std::pair<std::string, int64_t>> slots;
     };
 
+    // Moves slot_epoch_ and wakes a producer in wait_for_free_slot.
+    void notifySlotsLocked();
     void reclaimCompletedReleasesLocked();
     void synchronizePendingReleasesLocked();
     // Waits for every pending release and returns its slots to FREE.
@@ -168,6 +201,9 @@ class GPU_Weight_Buffer {
     WeightSlotTable slots_;  // every slot's state and module, under mutex_
     std::optional<std::string> producer_failure_;  // under mutex_
     uint64_t progress_epoch_ = 0;                  // under mutex_
+    // Only the producer waits on slot_cv_; consumers wait on cv_.
+    std::condition_variable slot_cv_;
+    uint64_t slot_epoch_ = 0;  // under mutex_
     std::deque<PendingRelease> pending_releases_;
 
     std::mutex weight_profile_mutex_;

@@ -98,19 +98,14 @@ GPU_Weight_Buffer::~GPU_Weight_Buffer() {
     cudaSetDevice(this->engine_config_.basic_config.device);
     std::lock_guard<std::mutex> lock(this->mutex_);
     for (auto& pending : this->pending_releases_) {
-        if (pending.event != nullptr) {
-            cudaEventSynchronize(pending.event);
-            cudaEventDestroy(pending.event);
-        }
+        cudaEventSynchronize(pending.event->get());
     }
+    this->pending_releases_.clear();
 }
 
 void GPU_Weight_Buffer::synchronizePendingReleasesLocked() {
     for (auto& pending : this->pending_releases_) {
-        if (pending.event != nullptr) {
-            CUDA_CHECK(cudaEventSynchronize(pending.event));
-            CUDA_CHECK(cudaEventDestroy(pending.event));
-        }
+        CUDA_CHECK(cudaEventSynchronize(pending.event->get()));
     }
     this->pending_releases_.clear();
 }
@@ -118,18 +113,23 @@ void GPU_Weight_Buffer::synchronizePendingReleasesLocked() {
 void GPU_Weight_Buffer::drainPendingReleasesLocked() {
     while (!this->pending_releases_.empty()) {
         PendingRelease& pending = this->pending_releases_.front();
-        CUDA_CHECK(cudaEventSynchronize(pending.event));
+        CUDA_CHECK(cudaEventSynchronize(pending.event->get()));
         for (const auto& [module_type, buffer_idx] : pending.slots) {
             this->slots_.reclaim(module_type, buffer_idx);
         }
-        CUDA_CHECK(cudaEventDestroy(pending.event));
         this->pending_releases_.pop_front();
+        this->notifySlotsLocked();
     }
 }
 
 void GPU_Weight_Buffer::bumpProgressLocked() {
     ++this->progress_epoch_;
     this->cv_.notify_all();
+}
+
+void GPU_Weight_Buffer::notifySlotsLocked() {
+    ++this->slot_epoch_;
+    this->slot_cv_.notify_all();
 }
 
 void GPU_Weight_Buffer::waitWithoutStallLocked(
@@ -168,7 +168,7 @@ void GPU_Weight_Buffer::waitWithoutStallLocked(
 void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
     for (auto it = this->pending_releases_.begin();
          it != this->pending_releases_.end();) {
-        const cudaError_t status = cudaEventQuery(it->event);
+        const cudaError_t status = cudaEventQuery(it->event->get());
         if (status == cudaErrorNotReady) {
             ++it;
             continue;
@@ -177,8 +177,8 @@ void GPU_Weight_Buffer::reclaimCompletedReleasesLocked() {
         for (const auto& [module_type, buffer_idx] : it->slots) {
             this->slots_.reclaim(module_type, buffer_idx);
         }
-        CUDA_CHECK(cudaEventDestroy(it->event));
         it = this->pending_releases_.erase(it);
+        this->notifySlotsLocked();
     }
 }
 
@@ -217,6 +217,7 @@ void GPU_Weight_Buffer::Init() {
         {
             std::lock_guard<std::mutex> lock(this->mutex_);
             this->slots_.reset_type(module_type, num_buffer);
+            this->notifySlotsLocked();
         }
         for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
             // Get per-tensor dtype using the helper function
@@ -274,6 +275,7 @@ void GPU_Weight_Buffer::resize_buffer() {
         this->slots_.grow_type(
             "routed_expert",
             static_cast<int64_t>(this->buffers_["routed_expert"].size()));
+        this->notifySlotsLocked();
     }
 }
 
@@ -295,6 +297,7 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const auto slot = this->slots_.release(module_name);
+    this->notifySlotsLocked();
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
                          module_name, slot.module_type, slot.index);
 };
@@ -307,31 +310,22 @@ void GPU_Weight_Buffer::releaseBuffersAsync(
     }
 
     std::lock_guard<std::mutex> lock(this->mutex_);
-    cudaEvent_t completion_event = nullptr;
-    CUDA_CHECK(cudaEventCreateWithFlags(
-        &completion_event, cudaEventDisableTiming));
-    const cudaError_t record_status =
-        cudaEventRecord(completion_event, consumer_stream);
-    if (record_status != cudaSuccess) {
-        cudaEventDestroy(completion_event);
-        CUDA_CHECK(record_status);
-    }
+    // The handle destroys the event on every path that does not queue it.
+    auto completion_event = std::make_shared<CudaEventHandle>();
+    CUDA_CHECK(cudaEventRecord(completion_event->get(), consumer_stream));
 
     // All or nothing: every name must be LEASED, none duplicated.
-    std::vector<WeightSlotTable::SlotRef> refs;
-    try {
-        refs = this->slots_.release_async(module_names);
-    } catch (...) {
-        cudaEventDestroy(completion_event);
-        throw;
-    }
+    const std::vector<WeightSlotTable::SlotRef> refs =
+        this->slots_.release_async(module_names);
     std::vector<std::pair<std::string, int64_t>> slots;
     slots.reserve(refs.size());
     for (const auto& ref : refs) {
         slots.emplace_back(ref.module_type, ref.index);
     }
     this->pending_releases_.push_back(
-        PendingRelease{completion_event, std::move(slots)});
+        PendingRelease{std::move(completion_event), std::move(slots)});
+    // A producer with a full ring waits on this release's event.
+    this->notifySlotsLocked();
     this->logger_->debug(
         "Queued asynchronous release for {} weight buffers",
         module_names.size());
@@ -370,6 +364,7 @@ GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::cancel_pass(int64_t pass) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const SkipCounts counts = this->slots_.cancel_pass(pass);
     this->cv_.notify_all();
+    this->notifySlotsLocked();
     return counts;
 }
 
@@ -416,6 +411,7 @@ WeightSlotTable::AbortCounts GPU_Weight_Buffer::abort_passes(
         this->slots_.abort(lose_schedule);
     // A waiter left in get_weights finds no open pass and throws.
     this->bumpProgressLocked();
+    this->notifySlotsLocked();
     return counts;
 }
 
@@ -461,6 +457,49 @@ void GPU_Weight_Buffer::abandon(const std::string& module_type,
                                 int64_t buffer_idx) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     this->slots_.abandon(module_type, buffer_idx);
+    this->notifySlotsLocked();
+}
+
+uint64_t GPU_Weight_Buffer::slot_epoch() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->slot_epoch_;
+}
+
+void GPU_Weight_Buffer::wait_for_free_slot(const std::string& module_type,
+                                           uint64_t seen,
+                                           const std::atomic<bool>& stop) {
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    while (true) {
+        // Moves the slot epoch for every release it returns to FREE.
+        this->reclaimCompletedReleasesLocked();
+        if (stop || this->slot_epoch_ != seen ||
+            this->slots_.count(module_type, WeightSlotState::kFree) > 0) {
+            return;
+        }
+        if (!this->pending_releases_.empty()) {
+            // The oldest release was recorded first. Its event completes
+            // with work its consumer already enqueued, the same bound as the
+            // pass-end drain. The handle outlives a drain, reset or abort
+            // that drops the release while the mutex is not held.
+            const std::shared_ptr<CudaEventHandle> oldest =
+                this->pending_releases_.front().event;
+            lock.unlock();
+            const cudaError_t status = cudaEventSynchronize(oldest->get());
+            lock.lock();
+            CUDA_CHECK(status);
+            continue;
+        }
+        // Only a consumer release, skip, cancel, abort, reset or a producer
+        // wake can free a slot now; each moves the epoch under mutex_.
+        this->slot_cv_.wait(lock, [this, seen, &stop] {
+            return stop || this->slot_epoch_ != seen;
+        });
+    }
+}
+
+void GPU_Weight_Buffer::wake_producer() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->notifySlotsLocked();
 }
 
 bool GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
@@ -478,6 +517,10 @@ bool GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
     this->logger_->debug("Module: {} is in buffer: {} (present={})",
                          module_name, buffer_idx, present);
     this->bumpProgressLocked();
+    if (!present) {
+        // Released on landing: the slot is FREE again.
+        this->notifySlotsLocked();
+    }
     return present;
 };
 
@@ -490,6 +533,7 @@ void GPU_Weight_Buffer::record_producer_failure(const std::string& module_type,
         this->slots_.state_at(module_type, buffer_idx) ==
             WeightSlotState::kFilling) {
         this->slots_.abandon(module_type, buffer_idx);
+        this->notifySlotsLocked();
     }
     this->cv_.notify_all();
 }
@@ -533,6 +577,9 @@ GPU_Weight_Buffer::SkipCounts GPU_Weight_Buffer::skip_modules(
     }
     // As cancel_pass: a waiter on a module just skipped re-checks and throws.
     this->cv_.notify_all();
+    if (counts.freed_present > 0) {
+        this->notifySlotsLocked();
+    }
     return counts;
 }
 
@@ -780,6 +827,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->slots_.reset_type(module_type, num_buffer);
         }
+        this->notifySlotsLocked();
 
         // Log the buffer size of each type (keep original debug level)
         for (auto& [module_type, num_buffer] : num_buffers) {
@@ -1026,6 +1074,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->slots_.reset_type(module_type, num_buffer);
         }
+        this->notifySlotsLocked();
 
         // Log the buffer size of each type
         for (auto& [module_type, num_buffer] : num_buffers) {
