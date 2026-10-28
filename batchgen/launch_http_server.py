@@ -12,16 +12,18 @@ This launches the FastAPI server with:
 import logging
 import sys
 
+from batchgen.eventlog.process import (
+    configure_process,
+    ensure_run_bound,
+    new_run_identity,
+)
 from batchgen.server.server_args import prepare_server_args
 from batchgen.runtime_preflight import RuntimePreflightError, run_runtime_preflight
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - [BatchGenServer] - %(levelname)s - %(message)s",
-    )
-
+    # Nothing is configured yet: a parse failure reaches stderr through
+    # logging.lastResort, and the event log starts once the args are known.
     try:
         server_args = prepare_server_args()
     except ValueError as exc:
@@ -31,6 +33,32 @@ def main():
         logging.error(f"Failed to parse arguments: {exc}")
         sys.exit(1)
 
+    # Node 0 names the run directory; every other node buffers its records
+    # until it learns that name from node 0 over the restart control store.
+    node_rank = server_args.node_rank
+    run = (
+        new_run_identity(server_args.runtime_identity.run_id)
+        if node_rank == 0
+        else None
+    )
+    configure_process(
+        "server",
+        node=node_rank,
+        run=run,
+        log_dir=server_args.log_dir,
+        level=server_args.log_level,
+        fallback_run_id=server_args.runtime_identity.run_id,
+    )
+
+    try:
+        _serve(server_args)
+    finally:
+        # A node other than 0 that fails before node 0 names the run still
+        # writes its buffered records, under a run of its own.
+        ensure_run_bound()
+
+
+def _serve(server_args) -> None:
     logging.info(f"Starting BatchGen HTTP server for model: {server_args.model}")
     logging.info(f"Listen address: {server_args.listen_ip}:{server_args.listen_port}")
     logging.info(f"Watchdog timeout: {server_args.watchdog_timeout}s")

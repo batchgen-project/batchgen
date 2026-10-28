@@ -1,6 +1,7 @@
 """Server-argument validation for the K3 distributed host-weight topologies."""
 
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -234,3 +235,25 @@ def test_shared_capability_rejects_overlapping_ports(tmp_path):
         validate_shared_runtime_capability(
             _shared_args(tmp_path, listen_port=21001, world_size=2)
         )
+
+
+def test_log_options_resolved_absolute_with_info_default(tmp_path, monkeypatch):
+    """The log root is fixed against the launch directory at parse time, so
+    every process of the server -- workers included -- names the same one."""
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    argv = [
+        "--model", "openai/gpt-oss-120b",
+        "--host-kv-cache-size", "1",
+        "--storage-path", str(tmp_path / "storage"),
+    ]
+
+    defaults = server_args_module.prepare_server_args(argv)
+    assert defaults.log_dir == os.path.join(cwd, "batchgen_logs")
+    assert defaults.log_level == "INFO"
+
+    explicit = server_args_module.prepare_server_args(
+        argv + ["--log-dir", "logs/run", "--log-level", "warning"]
+    )
+    assert explicit.log_dir == os.path.join(cwd, "logs", "run")
+    assert explicit.log_level == "WARNING"

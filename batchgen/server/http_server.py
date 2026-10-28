@@ -46,6 +46,7 @@ from batchgen.deprecation import (
     LEGACY_INFERENCE_MESSAGE,
 )
 from batchgen.server.health import ServerHealthState
+from batchgen.eventlog.process import exit_process
 from batchgen.server.restart_coordinator import PeerRestartError
 from batchgen.server.server_args import (
     ServerArgs,
@@ -728,7 +729,7 @@ def launch_server(server_args: ServerArgs) -> None:
                     "Server failed to start within %ss. Exiting with code 1.",
                     server_args.startup_timeout,
                 )
-                os._exit(1)
+                exit_process(1, "startup timeout", logger=logger)
 
         t = threading.Thread(target=_startup_watchdog, daemon=True)
         t.start()
@@ -756,7 +757,10 @@ def launch_server(server_args: ServerArgs) -> None:
             app,
             host=server_args.listen_ip,
             port=server_args.listen_port,
-            log_level="info",
+            # No logging config of uvicorn's own: its loggers propagate to the
+            # root event-log handler and inherit the root level.
+            log_config=None,
+            log_level=None,
             access_log=False,  # Use custom QuietAccessLogMiddleware instead
             timeout_keep_alive=1000,
             # Without a bound uvicorn waits for every open request before the

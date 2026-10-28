@@ -24,6 +24,7 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.memfd import create_memfd
+from batchgen.eventlog import process as eventlog_process
 from batchgen.server.process_utils import (
     cleanup_shm_files,
     get_hugepage_size,
@@ -424,6 +425,49 @@ class WorkerManager:
                 logger.exception("Runtime rollback failed after startup error")
             raise
 
+    def _exchange_run_identity(self) -> None:
+        """Give every node node 0's run directory name before any worker exists.
+
+        Node 0 named the run when it configured logging; the other nodes have
+        buffered their records since and bind to that name here. A node that
+        never learns it still writes its buffered records, under a directory of
+        its own, and then fails startup: it cannot serve without node 0.
+        """
+        coordinator = self._restart_coordinator
+        if not coordinator.enabled:
+            return
+        if self.args.node_rank == 0:
+            run = eventlog_process.current_run()
+            if run is None:
+                raise RuntimeError("node 0 configured logging without a run identity")
+            coordinator.publish_run_identity(run.to_json())
+            return
+        try:
+            run = eventlog_process.RunIdentity.from_json(
+                coordinator.wait_run_identity()
+            )
+        except Exception as exc:
+            fallback = eventlog_process.RunIdentity(
+                self.args.runtime_identity.run_id, time.time()
+            )
+            try:
+                eventlog_process.bind_run(fallback)
+            except Exception:
+                # Never hide why startup fails behind a logging problem.
+                logger.exception("Binding the fallback log run failed")
+            logger.critical(
+                "Node %d did not receive the run identity from node 0; logs of "
+                "this node are under run %s instead: %s",
+                self.args.node_rank,
+                fallback.run_id,
+                exc,
+            )
+            raise
+        eventlog_process.bind_run(run)
+        logger.info(
+            "Node %d joined run %s for logging", self.args.node_rank, run.run_id
+        )
+
     def _start_impl(self) -> None:
         import time as _time
 
@@ -440,6 +484,7 @@ class WorkerManager:
         # 0's store as soon as its own process starts, and every node spends
         # minutes loading weights before it would otherwise be reachable.
         self._restart_coordinator.start()
+        self._exchange_run_identity()
 
         if self.args.fast_init:
             _validate_shmem_enabled()
@@ -1489,6 +1534,14 @@ class WorkerManager:
         # Auto-detect GPU architecture if not specified
         gpu_arch = self.args.gpu_arch or detect_gpu_arch()
 
+        # Workers write under this node's run directory, which is bound by now
+        # on every node (node 0 at configure time, the others at startup).
+        run = eventlog_process.current_run()
+        if run is None:
+            raise RuntimeError(
+                "workers cannot be spawned before this node's log run is bound"
+            )
+
         args = BatchGenWorkerArgs(
             model_name=self.args.model,
             hf_cache_dir=self.args.hf_cache_dir,
@@ -1572,6 +1625,11 @@ class WorkerManager:
             runtime_dir=str(self.args.runtime_identity.runtime_dir),
             pynccl_port_base=self.args.pynccl_port_base,
             pynccl_port_span=self.args.pynccl_port_span,
+            log_dir=self.args.log_dir,
+            log_level=self.args.log_level,
+            run_id=run.run_id,
+            run_started_at=run.run_started_at,
+            log_cohort=self._generation,
         )
         from batchgen.server_worker_main_loop import server_worker_main
         # Each worker arms PR_SET_PDEATHSIG, which the kernel delivers when the

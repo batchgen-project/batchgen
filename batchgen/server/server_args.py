@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from batchgen.eventlog.process import (
+    DEFAULT_LOG_LEVEL,
+    add_logging_args,
+    resolve_log_dir,
+)
 from batchgen.models.glm.glm5.cuda_graph_policy import (
     GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
@@ -265,6 +270,10 @@ class ServerArgs:
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
+    # Structured event log root (absolute once parsed) and minimum level;
+    # every process of this server, workers included, writes under it.
+    log_dir: Optional[str] = None
+    log_level: str = DEFAULT_LOG_LEVEL
     runtime_identity: RuntimeIdentity = field(init=False)
 
     def __post_init__(self):
@@ -719,6 +728,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable incremental saving of completed sequences to disk",
     )
+    add_logging_args(parser)
     return parser
 
 
@@ -1013,6 +1023,10 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         max_pool_size=parsed.max_pool_size,
         input_ids_pool_size_gb=parsed.input_ids_pool_size_gb,
         max_intake_capacity=parsed.max_intake_capacity,
+        # Resolved against the launch directory, so a spawned worker or a
+        # later chdir names the same directory.
+        log_dir=resolve_log_dir(parsed.log_dir),
+        log_level=parsed.log_level,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
