@@ -7,8 +7,10 @@ and every slot and daemon lease belongs to exactly one weight pass that the
 consumer arms and closes. Up to kMaxCopiesInFlight modules are in flight, each
 with one event after its copies; the producer alone observes the events and
 lands the copies oldest first, and it never waits for the node daemon or for
-a free slot while a copy is un-landed. The daemon summary copies its state and
-formats it outside the locks the request path takes.
+a free slot while a copy is un-landed: with copies in flight it only tries a
+remote module, one request the daemon answers at once, and leaves a module
+that is not ready at the head of its queue. The daemon summary copies its
+state and formats it outside the locks the request path takes.
 """
 
 import re
@@ -63,9 +65,10 @@ def test_storage_fetch_is_inside_the_producer_try():
     fetch = weights.index("get_module_weights_storage(")
     catch = weights.index("} catch (const std::exception& error) {")
     assert try_open < fetch < catch
-    # The fetch takes the stop flag, so a remote acquire can be cancelled.
+    # The fetch takes the stop flag, so a remote acquire can be cancelled,
+    # and whether it may wait for the node daemon.
     assert "get_module_weights_storage(\n" in weights
-    assert "module_name, &this->terminate_flag_)" in weights
+    assert "module_name, &this->terminate_flag_, may_wait)" in weights
 
 
 def test_producer_catch_records_the_failure_and_never_rethrows():
@@ -240,7 +243,9 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
     weights = _weight_section()
     peek = weights.index(".try_front(module_name)")
     fetch = weights.index("get_module_weights_storage(")
-    cancelled = weights.index("if (!fetched.has_value()) {")
+    cancelled = weights.index(
+        "if (fetched.status == module_fetch::Status::kCancelled) {"
+    )
     cancel_end = weights.index("break;", cancelled)
     cancel_path = weights[cancelled:cancel_end]
     claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
@@ -265,6 +270,32 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
     assert "data_queue.pop()" not in front
 
 
+def test_a_try_fetch_that_is_not_ready_leaves_the_module_at_the_head():
+    weights = _weight_section()
+    fetch = weights.index("get_module_weights_storage(")
+    cancelled = weights.index(
+        "if (fetched.status == module_fetch::Status::kCancelled) {"
+    )
+    not_ready = weights.index(
+        "if (fetched.status == module_fetch::Status::kNotReady) {"
+    )
+    path = weights[not_ready:weights.index("continue;", not_ready)]
+    leased = weights.index("this->in_flight_.back().leased = true;")
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
+    pop = weights.index(".try_pop(module_name)")
+    assert fetch < cancelled < not_ready < leased < claim < pop
+    # The cancelled fetch's contract: the reserved slot is abandoned and the
+    # entry dropped; queue head and cursor stay. Then the next type, not a
+    # park: the oldest copy lands first, so the try is retried per landing.
+    assert "this->gpu_weight_buffer_.abandon(module_type," in path
+    assert "this->end_in_flight_(false);" in path
+    for token in (
+        ".push(", ".try_pop(", "claim_for_copy", "progressed = true",
+        "set_producer_state_", "release_module", "break;",
+    ):
+        assert token not in path, token
+
+
 def test_a_module_is_in_flight_from_before_its_fetch():
     weights = _weight_section()
     peek = weights.index(".try_front(module_name)")
@@ -275,29 +306,40 @@ def test_a_module_is_in_flight_from_before_its_fetch():
     claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
     # Named before the fetch, so any daemon lease is of a module in flight.
     assert peek < begin < acquiring < fetch < leased < claim
-    cancelled = weights.index("if (!fetched.has_value()) {")
+    cancelled = weights.index(
+        "if (fetched.status == module_fetch::Status::kCancelled) {"
+    )
     cancel_path = weights[cancelled:weights.index("break;", cancelled)]
     assert "this->end_in_flight_(false);" in cancel_path
 
 
-def test_a_fetch_that_can_wait_for_the_daemon_starts_with_nothing_in_flight():
+def test_a_fetch_may_wait_for_the_daemon_only_with_nothing_in_flight():
     weights = _weight_section()
     full = weights.index("this->in_flight_.size() >= kMaxCopiesInFlight")
     unparked = weights.index("weights_parked = false;")
-    # Only a module fetched from the node daemon waits behind the in-flight
-    # queue; a module of the node's registered store holds no lease.
-    gate = weights.index(
-        "if (!this->in_flight_.empty() &&\n"
-        "                this->weights_storage_.is_remote_module(next.module_name)) {"
-    )
-    deferred = weights.index("continue;", gate)
+    # Read before the module is named in flight: blocked in a daemon acquire
+    # the producer could release no lease and land no copy, so a fetch may
+    # wait only while nothing, hence no lease, is in flight. With copies in
+    # flight a remote module is only tried.
+    gate = weights.index("const bool may_wait = this->in_flight_.empty();")
     reserve = weights.index("acquireEmptyBuffer(module_type)")
+    begin = weights.index("this->begin_in_flight_(module_type, module_name, buffer_idx,")
     fetch = weights.index("get_module_weights_storage(")
-    # Checked before a slot is reserved, for copies and skips alike: blocked
-    # in a daemon acquire the producer could release no lease and land no
-    # copy.
-    assert full < unparked < gate < deferred < reserve < fetch
-    assert "progressed = true;" not in weights[gate:deferred]
+    assert full < unparked < gate < reserve < begin < fetch
+    # The one fetch, and its wait argument is that gate.
+    assert weights.count("get_module_weights_storage(") == 1
+    assert "module_name, &this->terminate_flag_, may_wait)" in weights
+    assert "is_remote_module" not in weights
+    # Only a fetch that may wait shows as acquiring: a try that finds its
+    # module not ready changes no state and counts no consumer progress.
+    acquiring = weights.index("this->set_producer_state_(ProducerState::kAcquiring);")
+    assert begin < weights.rindex("if (may_wait) {", 0, acquiring) < acquiring < fetch
+    assert weights.count("ProducerState::kAcquiring") == 1
+    # Progress is counted only once the fetch returned the module.
+    not_ready = weights.index("if (fetched.status == module_fetch::Status::kNotReady) {")
+    progressed = weights.index("progressed = true;", fetch)
+    assert fetch < not_ready < progressed
+    assert "progressed = true;" not in weights[unparked:fetch]
     header = ENGINE_HEADER.read_text()
     assert "static constexpr size_t kMaxCopiesInFlight = 4;" in header
     assert "static constexpr size_t kCopyEvents = kMaxCopiesInFlight + 1;" in header
@@ -548,11 +590,19 @@ def test_end_pass_waits_then_checks_daemon_leases_then_closes():
 
 def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     protocol = PROTOCOL.read_text()
-    assert "constexpr std::uint32_t kProtocolVersion = 3;" in protocol
-    assert "// Version 3:" in protocol
+    assert "constexpr std::uint32_t kProtocolVersion = 4;" in protocol
+    assert "// Version 4:" in protocol
     assert "constexpr std::int32_t kStatusRetry = 1;" in protocol
+    assert "constexpr std::uint32_t kAcquireNoWait = 1;" in protocol
+    request = _section(protocol, "struct Request {", "};")
+    assert "std::uint32_t flags = 0;" in request
+    assert "reserved" not in request
 
     daemon = DAEMON.read_text()
+    # Workers and daemon are one build: any other version fails the hello.
+    hello = _section(daemon, "std::string AdmitWorker(", "void WaitReadyForWorker(")
+    assert "batchgen::distributed_weights::kProtocolVersion ||" in hello
+    assert '"invalid distributed weights worker hello (protocol "' in hello
     handler = _section(
         daemon, "void HandleWorker(ClientConnection* connection)",
         "void CloseUnadmitted(",
@@ -561,6 +611,9 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     failure = handler.index("fail(response.error);", send)
     guard = handler[send:failure]
     assert "response.status != 0 && response.status != kStatusRetry" in guard
+    # The flag reaches Acquire; an unknown flag bit is an invalid request.
+    assert "(operation.flags & ~kAcquireNoWait) != 0" in handler
+    assert "(operation.flags & kAcquireNoWait) != 0," in handler
 
     acquire = _section(
         daemon,
@@ -569,9 +622,20 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     )
     assert "constexpr auto kAcquireSlice = std::chrono::milliseconds(250);" in daemon
     assert "constexpr auto kAcquireTimeout = std::chrono::seconds(300);" in daemon
-    assert "ring_cv.wait_for(\n            lock, kAcquireSlice," in acquire
+    # A no-wait acquire evaluates the slice's predicate once, with no wait;
+    # everything before and after is shared.
+    evaluate = acquire.index(
+        "no_wait ? ready() : ring_cv.wait_for(lock, kAcquireSlice, ready);"
+    )
+    assert acquire.count("ring_cv.wait_for(") == 1
+    assert acquire.count("no_wait") == 2  # the parameter and that branch
+    pending = acquire.index("pending_acquires.at(worker_id)")
+    polled = acquire.index("pending.last_poll = Clock::now();")
+    retry = acquire.index("response->status = kStatusRetry;")
+    stalled = acquire.index("remote fetch stalled")
+    stats = acquire.index("++stats.acquire_count;")
+    assert pending < evaluate < polled < retry < stalled < stats
     assert "std::chrono::seconds(300)" not in acquire
-    assert "response->status = kStatusRetry;" in acquire
     # The 300 s diagnostics span every slice of one pending acquire.
     assert "pending_acquires.at(worker_id)" in acquire
     assert "pending.completions_at_start" in acquire
@@ -641,18 +705,54 @@ def test_worker_acquire_loops_on_retry_and_can_be_cancelled():
         "Weights_Storage::acquire_remote_module(",
         "void Weights_Storage::release_module(",
     )
+    lock = acquire.index("std::lock_guard<std::mutex> lock(this->daemon_mutex_);")
+    flags = acquire.index(
+        "request.flags =\n        wait ? 0 : batchgen::distributed_weights::kAcquireNoWait;"
+    )
     loop = acquire.index("while (true) {")
     retry = acquire.index("is_retry_response(response)", loop)
+    # Without wait, one round trip: a retry is answered as not ready.
+    no_wait = acquire.index("if (!wait) {", retry)
+    not_ready = acquire.index("return std::nullopt;", no_wait)
     stop = acquire.index("stop_requested->load()", retry)
     cancelled = acquire.index("return std::nullopt;", stop)
     validate = acquire.index("validate_response(response);", cancelled)
     lease = acquire.index("this->active_leases_[module_key] = lease;")
-    assert loop < retry < stop < cancelled < validate < lease
+    assert lock < flags < loop < retry < no_wait < not_ready < stop < cancelled
+    assert cancelled < validate < lease
     retry_impl = _section(
         storage, "bool is_retry_response(const Response& response)", "}  // namespace"
     )
     assert "kStatusRetry" in retry_impl
     assert "kProtocolVersion" in retry_impl
+
+    # Ready with tensors, not ready (without wait) or cancelled (with wait).
+    get_module = _section(
+        storage,
+        "module_fetch Weights_Storage::get_module_weights_storage(",
+        "py::dict Weights_Storage::get_tensor(",
+    )
+    assert "module_fetch{module_fetch::Status::kReady, local->second}" in get_module
+    assert "this->acquire_remote_module(module_key, stop_requested, wait)" in get_module
+    assert re.search(
+        r"wait \? module_fetch::Status::kCancelled\s*: module_fetch::Status::kNotReady",
+        get_module,
+    )
+    header = STORAGE_HEADER.read_text()
+    fetch = _section(header, "struct module_fetch {", "\n};")
+    for status in ("kReady,", "kNotReady,", "kCancelled,"):
+        assert status in fetch, status
+    assert "std::unordered_map<std::string, tensor_buffer> tensors;" in fetch
+    assert re.search(
+        r"module_fetch get_module_weights_storage\(\s*std::string module_key,\s*"
+        r"const std::atomic<bool>\* stop_requested = nullptr, bool wait = true\);",
+        header,
+    )
+    assert re.search(
+        r"acquire_remote_module\(\s*const std::string& module_key,\s*"
+        r"const std::atomic<bool>\* stop_requested, bool wait\);",
+        header,
+    )
 
 
 def test_bindings_expose_passes_skip_and_status():
@@ -781,13 +881,3 @@ def test_deleted_symbols_are_gone_from_python_callers():
 def test_dead_python_modules_are_deleted():
     for relative in DEAD_MODULES:
         assert not (PACKAGE / relative).exists(), relative
-
-
-def test_remote_module_lookup_is_an_init_built_read_only_map():
-    header = (ROOT / "core" / "Weights_Storage" / "Weights_Storage.h").read_text()
-    lookup = header[header.index("bool is_remote_module(") :]
-    lookup = lookup[: lookup.index("}") + 1]
-    # Read without a lock by the producer thread: it may only consult the map
-    # filled at init, never a structure the daemon path mutates.
-    assert "remote_module_weights_.find(module_key)" in lookup
-    assert "lock" not in lookup

@@ -26,7 +26,11 @@ turns PRESENT. Its daemon socket carries one request at a time: an acquire
 that is not ready waits in bounded slices and is resent, and the worker
 sends no release until it returns. Fetching a remote module only with
 nothing in flight finishes every trial in schedule order; a blocking
-acquire issued while a lease is held deadlocks the node.
+acquire issued while a lease is held deadlocks the node. The try-acquire
+producer finishes every trial in schedule order too: it also fetches a
+remote module with copies in flight, but only with a no-wait request the
+daemon answers at once (``kAcquireNoWait``), and tries one that was not
+ready again only after the next landing.
 
 The free-running model is the engine before passes: a cyclic producer that
 reads ahead across forwards, stopped at each worker's own boundary and
@@ -188,6 +192,15 @@ class Connection:
             self.waited = 0
             self.retries += 1
         return None
+
+    def try_acquire(self, name):
+        """One ``kAcquireNoWait`` request: the leased entry, or None at once.
+
+        The daemon answers without a slice, so the socket is free again and
+        the worker may release a lease right after.
+        """
+        assert self.waiting is None
+        return self.daemon.acquire(self.rank, name)
 
     def release(self, entry):
         assert self.waiting is None, (
@@ -476,20 +489,28 @@ class PipelinedWorker(PassArmedWorker):
     module is read at once. A remote module takes a blocking acquire, during
     which the producer lands and releases nothing; lease_safe issues one only
     with nothing in flight, so the acquire never waits holding a lease.
+    try_acquire (with lease_safe) also fetches a remote module while copies
+    are in flight, but only with a no-wait request: a module not ready yet
+    stays at the cursor, and is tried again only after the next landing.
     """
 
     def __init__(self, rank, daemon, rng, delay, *, local, copy_rounds,
-                 lease_safe=True, max_in_flight=A, **kwargs):
+                 lease_safe=True, try_acquire=False, max_in_flight=A,
+                 **kwargs):
         super().__init__(rank, daemon, rng, delay, **kwargs)
+        assert lease_safe or not try_acquire
         self.local = local
         self.copy_rounds = copy_rounds
         self.lease_safe = lease_safe
+        self.try_acquire = try_acquire
         self.max_in_flight = max_in_flight
         self.connection = Connection(daemon, rank)
         self.in_flight = deque()  # {"slot", "entry", "rounds"}, oldest first
         self.fetching = None  # (pass, name, reserved slot) being acquired
         self.fetched = defaultdict(list)  # pass -> modules in fetch order
         self.peak_in_flight = 0
+        self.tried = False  # a try was not ready; none again until a landing
+        self.tries = Counter()  # "ready" / "not_ready" no-wait requests
 
     def _run_copy_stream(self):
         for copy in self.in_flight:
@@ -513,6 +534,7 @@ class PipelinedWorker(PassArmedWorker):
             else:
                 slot["state"] = "PRESENT"
             landed = True
+            self.tried = False
         return landed
 
     def _claim(self, entry):
@@ -557,8 +579,11 @@ class PipelinedWorker(PassArmedWorker):
             pass_id, position = self.cursor
             if pass_id not in self.open:
                 break  # parked until the pass is armed
-            if not self.local and self.in_flight and self.lease_safe:
-                break  # a remote fetch waits for an empty pipeline
+            try_only = (
+                not self.local and bool(self.in_flight) and self.lease_safe
+            )
+            if try_only and (not self.try_acquire or self.tried):
+                break  # wait for an empty pipeline, or for the next landing
             name = self.names[position]
             slot = None
             if (pass_id, name) not in self.pending:
@@ -568,13 +593,27 @@ class PipelinedWorker(PassArmedWorker):
                 )
                 if slot is None:
                     break
-            self.fetching = (pass_id, name, slot)
-            acted = True
             entry = None
-            if not self.local:
-                entry = self.connection.acquire(name)
+            if try_only:
+                entry = self.connection.try_acquire(name)
                 if entry is None:
-                    break  # the producer thread now waits in the acquire
+                    # Not ready: the slot goes back, the cursor stays, and
+                    # nothing counts as progress.
+                    self.tries["not_ready"] += 1
+                    self.tried = True
+                    break
+                self.tries["ready"] += 1
+                self.fetching = (pass_id, name, slot)
+            else:
+                # Never a blocking acquire while a lease is held.
+                assert not (self.lease_safe and not self.local and self.in_flight)
+                self.fetching = (pass_id, name, slot)
+                if not self.local:
+                    entry = self.connection.acquire(name)
+                    if entry is None:
+                        acted = True
+                        break  # the producer thread now waits in the acquire
+            acted = True
             self._claim(entry)
         return "acted" if acted else "blocked"
 
@@ -772,8 +811,8 @@ NO_RANDOM_EVENTS = {
 DEADLOCK_CONFIG = (8, 2, 2, 4)
 
 
-def build_pipelined_trial(config, seed, *, lease_safe=True, skew=True,
-                          **rates):
+def build_pipelined_trial(config, seed, *, lease_safe=True, try_acquire=False,
+                          skew=True, **rates):
     workers_count, local_count, superchunk, positions = config
     local = range(local_count)
     daemon = Daemon(positions * superchunk, superchunk, workers_count, local)
@@ -791,6 +830,7 @@ def build_pipelined_trial(config, seed, *, lease_safe=True, skew=True,
             copy_rounds=speed_rng.randint(1, 4),
             hold_rounds=speed_rng.randint(0, 2),
             lease_safe=lease_safe,
+            try_acquire=try_acquire,
             **rates,
         ))
     return workers, daemon, order_rng
@@ -802,11 +842,7 @@ def run_pipelined_trial(config, seed, **kwargs):
     return workers, daemon
 
 
-@pytest.mark.parametrize("seed", PIPELINE_SEEDS)
-@pytest.mark.parametrize("config", PIPELINE_CONFIGS)
-def test_pipelined_producer_finishes_in_schedule_order(config, seed):
-    # Every end-of-pass condition is asserted inside the model as it runs.
-    workers, daemon = run_pipelined_trial(config, seed)
+def _assert_schedule_order(workers, daemon):
     for worker in workers:
         order = [
             name for owner, name in daemon.schedule if owner == worker.rank
@@ -825,10 +861,33 @@ def test_pipelined_producer_finishes_in_schedule_order(config, seed):
         assert not worker.open
         assert not worker.in_flight and worker.fetching is None
         assert all(slot is None for slot in worker.slots)
+    assert "leased" not in daemon.pool.values()
+
+
+@pytest.mark.parametrize("seed", PIPELINE_SEEDS)
+@pytest.mark.parametrize("config", PIPELINE_CONFIGS)
+def test_pipelined_producer_finishes_in_schedule_order(config, seed):
+    # Every end-of-pass condition is asserted inside the model as it runs.
+    workers, daemon = run_pipelined_trial(config, seed)
+    _assert_schedule_order(workers, daemon)
+    for worker in workers:
         if not worker.local:
             # A remote module is only fetched into an empty pipeline.
             assert worker.peak_in_flight <= 1
-    assert "leased" not in daemon.pool.values()
+            assert not worker.tries
+
+
+@pytest.mark.parametrize("seed", PIPELINE_SEEDS)
+@pytest.mark.parametrize("config", PIPELINE_CONFIGS)
+def test_try_acquire_producer_finishes_in_schedule_order(config, seed):
+    # The model asserts that no blocking acquire is issued with a copy, and
+    # so possibly a lease, in flight.
+    workers, daemon = run_pipelined_trial(config, seed, try_acquire=True)
+    _assert_schedule_order(workers, daemon)
+    for worker in workers:
+        assert worker.peak_in_flight <= A
+        if worker.local:
+            assert not worker.tries
 
 
 def test_pipelined_trials_exercise_pipelining_waits_and_carry():
@@ -889,3 +948,45 @@ def test_lease_safe_producer_finishes_the_deadlock_configuration():
     assert all(
         worker.peak_in_flight > 1 for worker in workers if worker.local
     )
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_try_acquire_producer_finishes_the_deadlock_configuration(seed):
+    # The configuration where a blocking acquire behind a lease deadlocks:
+    # the remote ranks now keep copies in flight too, and still finish.
+    workers, daemon, order_rng = build_pipelined_trial(
+        DEADLOCK_CONFIG, seed, try_acquire=True, skew=False,
+        **NO_RANDOM_EVENTS,
+    )
+    run(workers, daemon, order_rng)
+    _assert_schedule_order(workers, daemon)
+    for worker in workers:
+        assert worker.done
+        assert worker.peak_in_flight > 1
+        if not worker.local:
+            # Each chunk's second module is ready with its first in flight;
+            # the next chunk is not, until other ranks released theirs.
+            assert worker.tries["ready"] > 0
+            assert worker.tries["not_ready"] > 0
+
+
+def test_try_acquire_trials_pipeline_remote_ranks_and_retry_per_landing():
+    totals = Counter()
+    for config in PIPELINE_CONFIGS:
+        workers, _ = run_pipelined_trial(config, 0, try_acquire=True)
+        for worker in workers:
+            if worker.local:
+                continue
+            totals["remote_peak"] = max(
+                totals["remote_peak"], worker.peak_in_flight
+            )
+            totals["ready"] += worker.tries["ready"]
+            totals["not_ready"] += worker.tries["not_ready"]
+            totals["blocked"] += worker.connection.blocked
+            totals["cancelled"] += len(worker.cancelled)
+    assert totals["remote_peak"] > 1
+    assert totals["ready"] > 0
+    assert totals["not_ready"] > 0
+    # With nothing in flight the fetch still waits for the daemon.
+    assert totals["blocked"] > 0
+    assert totals["cancelled"] > 0

@@ -10,14 +10,19 @@ constexpr std::uint64_t kProtocolMagic = 0x4b33523457454947ULL;
 // the daemon admits only the epoch it currently serves.
 // Version 3: a kAcquire waits one bounded slice and answers kStatusRetry when
 // its module is not ready yet; the worker re-sends it.
-constexpr std::uint32_t kProtocolVersion = 3;
+// Version 4: Request::flags. A kAcquire with kAcquireNoWait waits no slice:
+// it answers kStatusRetry at once when its module is not ready.
+constexpr std::uint32_t kProtocolVersion = 4;
 constexpr std::size_t kModuleKeyBytes = 64;
 constexpr std::size_t kErrorBytes = 192;
 
 // Response::status: 0 success, negative an error that ends the connection,
-// kStatusRetry an acquire whose module was not ready within one slice
-// (nothing was acquired).
+// kStatusRetry an acquire whose module was not ready within one slice, or at
+// once for kAcquireNoWait (nothing was acquired).
 constexpr std::int32_t kStatusRetry = 1;
+
+// Request::flags bits.
+constexpr std::uint32_t kAcquireNoWait = 1;
 
 enum class Operation : std::uint32_t {
     kHello = 1,
@@ -30,7 +35,7 @@ struct Request {
     std::uint32_t version = kProtocolVersion;
     std::uint32_t operation = 0;
     std::uint32_t worker_id = 0;
-    std::uint32_t reserved = 0;
+    std::uint32_t flags = 0;
     std::uint64_t generation = 0;
     char module_key[kModuleKeyBytes] = {};
 };

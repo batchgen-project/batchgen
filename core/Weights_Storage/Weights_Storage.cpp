@@ -608,7 +608,7 @@ void Weights_Storage::InitDistributed(const std::string& config_path,
 std::optional<Weights_Storage::active_lease>
 Weights_Storage::acquire_remote_module(
     const std::string& module_key,
-    const std::atomic<bool>* stop_requested) {
+    const std::atomic<bool>* stop_requested, bool wait) {
     std::lock_guard<std::mutex> lock(this->daemon_mutex_);
     if (this->active_leases_.count(module_key) != 0) {
         throw std::runtime_error(
@@ -619,6 +619,8 @@ Weights_Storage::acquire_remote_module(
     request.operation =
         static_cast<uint32_t>(Operation::kAcquire);
     request.worker_id = static_cast<uint32_t>(this->device_id_);
+    request.flags =
+        wait ? 0 : batchgen::distributed_weights::kAcquireNoWait;
     std::strncpy(request.module_key, module_key.c_str(),
                  sizeof(request.module_key) - 1);
     Response response{};
@@ -626,10 +628,15 @@ Weights_Storage::acquire_remote_module(
         send_exact(this->daemon_socket_, &request, sizeof(request));
         response = Response{};
         recv_exact(this->daemon_socket_, &response, sizeof(response));
-        // The daemon waits one bounded slice per request; a retry means the
-        // module is not ready yet and nothing was acquired.
+        // The daemon waits one bounded slice per request, or none without
+        // wait; a retry means the module is not ready yet and nothing was
+        // acquired.
         if (!is_retry_response(response)) {
             break;
+        }
+        // Without wait, one round trip.
+        if (!wait) {
+            return std::nullopt;
         }
         if (stop_requested != nullptr && stop_requested->load()) {
             return std::nullopt;
@@ -793,9 +800,9 @@ void Weights_Storage::Init(
 //     }
 // }
 
-std::optional<std::unordered_map<std::string, tensor_buffer>>
-Weights_Storage::get_module_weights_storage(
-    std::string module_key, const std::atomic<bool>* stop_requested) {
+module_fetch Weights_Storage::get_module_weights_storage(
+    std::string module_key, const std::atomic<bool>* stop_requested,
+    bool wait) {
     /* To Facilitate Module Copy */
     // A hierarchical_gdr worker only pinned its own 112-expert slot, so any
     // other routed-expert copy would DMA from unregistered host memory. Fail
@@ -816,7 +823,7 @@ Weights_Storage::get_module_weights_storage(
     }
     auto local = this->module_weights_storage_.find(module_key);
     if (local != this->module_weights_storage_.end()) {
-        return local->second;
+        return module_fetch{module_fetch::Status::kReady, local->second};
     }
     auto remote = this->remote_module_weights_.find(module_key);
     if (remote != this->remote_module_weights_.end()) {
@@ -826,17 +833,19 @@ Weights_Storage::get_module_weights_storage(
                 module_key);
         }
         const std::optional<active_lease> lease =
-            this->acquire_remote_module(module_key, stop_requested);
+            this->acquire_remote_module(module_key, stop_requested, wait);
         if (!lease.has_value()) {
-            return std::nullopt;
+            return module_fetch{wait ? module_fetch::Status::kCancelled
+                                     : module_fetch::Status::kNotReady,
+                                {}};
         }
-        std::unordered_map<std::string, tensor_buffer> result;
+        module_fetch result{module_fetch::Status::kReady, {}};
         char* base =
             static_cast<char*>(this->staging_ptr_) +
             static_cast<int64_t>(lease->slot) *
                 this->distributed_module_bytes_;
         for (const auto& [tensor_key, tensor] : remote->second) {
-            result[tensor_key] = tensor_buffer(
+            result.tensors[tensor_key] = tensor_buffer(
                 base + tensor.module_offset,
                 tensor.tensor_shape, tensor.byte_size, tensor.dtype);
         }

@@ -826,17 +826,16 @@ void HtoD_Engine::HtoD_Worker() {
                 continue;
             }
             weights_parked = false;
-            // A fetch that can wait for the node daemon starts only with no
-            // module in flight. Blocked in that acquire, the producer can
-            // neither release a lease (the daemon socket carries one request
-            // at a time) nor land a copy its consumer may be waiting for,
-            // while the daemon readies the module only once other ranks
-            // consumed theirs. A module of this node's registered store holds
-            // no lease and is read at once, so it pipelines freely.
-            if (!this->in_flight_.empty() &&
-                this->weights_storage_.is_remote_module(next.module_name)) {
-                continue;
-            }
+            // A fetch may wait for the node daemon only with no module in
+            // flight, hence no lease held. Blocked in that acquire, the
+            // producer can neither release a lease (the daemon socket carries
+            // one request at a time) nor land a copy its consumer may be
+            // waiting for, while the daemon readies the module only once
+            // other ranks consumed theirs. With copies in flight a remote
+            // module is only tried: one request the daemon answers at once. A
+            // module of this node's registered store holds no lease and is
+            // read at once, so it pipelines freely.
+            const bool may_wait = this->in_flight_.empty();
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
             std::optional<std::reference_wrapper<module_weight_tensor_map>>
@@ -854,7 +853,6 @@ void HtoD_Engine::HtoD_Worker() {
                 buffer = optional_buffer->first;
                 buffer_idx = optional_buffer->second;
             }
-            progressed = true;
             std::string module_name;
             try {
                 CUDA_CHECK(
@@ -873,11 +871,15 @@ void HtoD_Engine::HtoD_Worker() {
                 // lease is released: any lease is of a module in flight.
                 this->begin_in_flight_(module_type, module_name, buffer_idx,
                                        next.pass);
-                this->set_producer_state_(ProducerState::kAcquiring);
+                if (may_wait) {
+                    // Only a fetch that may wait shows as acquiring: a try
+                    // that finds its module not ready counts no progress.
+                    this->set_producer_state_(ProducerState::kAcquiring);
+                }
                 auto fetched =
                     this->weights_storage_.get_module_weights_storage(
-                        module_name, &this->terminate_flag_);
-                if (!fetched.has_value()) {
+                        module_name, &this->terminate_flag_, may_wait);
+                if (fetched.status == module_fetch::Status::kCancelled) {
                     // Stop requested before the daemon readied the module:
                     // nothing is leased, and the module stays at the head of
                     // its queue and at its cursor.
@@ -889,10 +891,24 @@ void HtoD_Engine::HtoD_Worker() {
                     this->set_producer_state_(ProducerState::kParked);
                     break;
                 }
+                if (fetched.status == module_fetch::Status::kNotReady) {
+                    // Tried with copies in flight and not ready yet: nothing
+                    // is leased, the module stays at the head of its queue
+                    // and at its cursor, and nothing progressed for this
+                    // type. It is tried again once a copy lands, and fetched
+                    // with a wait once none is in flight.
+                    if (buffer_idx >= 0) {
+                        this->gpu_weight_buffer_.abandon(module_type,
+                                                         buffer_idx);
+                    }
+                    this->end_in_flight_(false);
+                    continue;
+                }
+                progressed = true;
                 // release_module() is owed for module_name: a remote module
                 // holds a daemon lease from its fetch until then.
                 this->in_flight_.back().leased = true;
-                const auto src = std::move(*fetched);
+                const auto src = std::move(fetched.tensors);
                 const auto claim = this->gpu_weight_buffer_.claim_for_copy(
                     module_type, buffer_idx, module_name);
                 // Only this thread pops: the head is still module_name. It
@@ -1034,9 +1050,10 @@ void HtoD_Engine::HtoD_Worker() {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
                 continue;
             }
-            if (full_ring_type.empty()) {
-                // No ring was found full: the iteration ended on a stop or a
-                // producer failure, which the next iteration parks on.
+            if (full_ring_type.empty() || this->producer_failed_) {
+                // No ring was found full, or a later type failed before its
+                // fetch returned: the iteration ended on a stop or a producer
+                // failure, which the next iteration parks on.
                 continue;
             }
             // Every unparked weight type found its ring full. The weight

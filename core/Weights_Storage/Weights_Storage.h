@@ -59,6 +59,18 @@ struct tensor_buffer {
           dtype(dtype) {};
 };
 
+// The outcome of Weights_Storage::get_module_weights_storage. tensors is
+// filled only when kReady; kNotReady and kCancelled lease nothing.
+struct module_fetch {
+    enum class Status {
+        kReady,
+        kNotReady,   // without wait: the node daemon has not readied it yet
+        kCancelled,  // with wait: stop was requested before it was ready
+    };
+    Status status = Status::kCancelled;
+    std::unordered_map<std::string, tensor_buffer> tensors;
+};
+
 struct distributed_tensor_meta {
     std::vector<int64_t> tensor_shape;
     int64_t byte_size;
@@ -86,14 +98,14 @@ class Weights_Storage {
     void InitDistributed(const std::string& config_path,
                          uint64_t cohort_epoch);
                   
-    // A remote module is acquired from the node daemon, which answers in
-    // bounded slices; stop_requested (may be null) is polled between them.
-    // std::nullopt means stop was requested before the module was ready, and
-    // nothing is leased.
-    std::optional<std::unordered_map<std::string, tensor_buffer>>
-    get_module_weights_storage(
+    // A remote module is acquired from the node daemon. With wait, the daemon
+    // answers in bounded slices and stop_requested (may be null) is polled
+    // between them: kCancelled once stop was requested first. Without wait,
+    // one request that the daemon answers at once: kNotReady when the module
+    // is not ready yet. A local module is always kReady.
+    module_fetch get_module_weights_storage(
         std::string module_key,
-        const std::atomic<bool>* stop_requested = nullptr);
+        const std::atomic<bool>* stop_requested = nullptr, bool wait = true);
 
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
@@ -107,14 +119,6 @@ class Weights_Storage {
     // Whether remote modules come from the node daemon, whose schedule every
     // rank of the node consumes in the same cyclic order.
     bool is_distributed() const { return this->distributed_; }
-
-    // Whether module_key is fetched from the node daemon (a lease until its
-    // release) rather than read from this node's registered store. The map is
-    // built at init and never changes after, so any thread may ask.
-    bool is_remote_module(const std::string& module_key) const {
-        return this->remote_module_weights_.find(module_key) !=
-               this->remote_module_weights_.end();
-    }
 
    private:
     int device_id_; // Stored device ID
@@ -177,7 +181,9 @@ class Weights_Storage {
     std::unordered_map<std::string, active_lease> active_leases_;
     mutable std::mutex lease_index_mutex_;
 
+    // std::nullopt leases nothing: with wait, stop was requested before the
+    // module was ready; without, the daemon's one answer was not ready.
     std::optional<active_lease> acquire_remote_module(
         const std::string& module_key,
-        const std::atomic<bool>* stop_requested);
+        const std::atomic<bool>* stop_requested, bool wait);
 };

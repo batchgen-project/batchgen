@@ -45,6 +45,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using batchgen::distributed_weights::kAcquireNoWait;
 using batchgen::distributed_weights::kStatusRetry;
 using batchgen::distributed_weights::Operation;
 using batchgen::distributed_weights::Request;
@@ -58,7 +59,8 @@ constexpr int kDefaultWorkers = 8;
 // The summary keeps the most recent cohort swaps only.
 constexpr size_t kSwapLogEntries = 32;
 // One acquire request waits at most one slice, so a worker can stop between
-// slices. The timeout spans all slices of one pending acquire.
+// slices; a kAcquireNoWait request waits none. The timeout spans all requests
+// of one pending acquire, waiting or not.
 constexpr auto kAcquireSlice = std::chrono::milliseconds(250);
 constexpr auto kAcquireTimeout = std::chrono::seconds(300);
 // A pending acquire not polled for this long belongs to a worker that stopped
@@ -1253,7 +1255,8 @@ struct DistributedWeightDaemon::Impl {
                             batchgen::distributed_weights::kProtocolMagic ||
                         operation.version !=
                             batchgen::distributed_weights::kProtocolVersion ||
-                        operation.worker_id != request.worker_id) {
+                        operation.worker_id != request.worker_id ||
+                        (operation.flags & ~kAcquireNoWait) != 0) {
                         fail("invalid distributed weight request");
                     }
                     const std::string module_key(
@@ -1263,7 +1266,9 @@ struct DistributedWeightDaemon::Impl {
                     if (operation.operation ==
                         static_cast<std::uint32_t>(
                             Operation::kAcquire)) {
-                        Acquire(module_key, worker_id, &response);
+                        Acquire(module_key, worker_id,
+                                (operation.flags & kAcquireNoWait) != 0,
+                                &response);
                     } else if (operation.operation ==
                                static_cast<std::uint32_t>(
                                    Operation::kRelease)) {
@@ -1313,7 +1318,8 @@ struct DistributedWeightDaemon::Impl {
         }
     }
 
-    void Acquire(const std::string& module_key, int worker_id,
+    // no_wait: answer kStatusRetry at once instead of waiting one slice.
+    void Acquire(const std::string& module_key, int worker_id, bool no_wait,
                  Response* response) {
         if (hierarchical_gdr) {
             fail("hierarchical_gdr forbids remote host acquire: " +
@@ -1342,8 +1348,7 @@ struct DistributedWeightDaemon::Impl {
             pending.begin = now;
             pending.completions_at_start = ring_completions;
         }
-        const bool available = ring_cv.wait_for(
-            lock, kAcquireSlice, [&]() {
+        const auto ready = [&]() {
             if (failed.load() || stop.load() || cohort_closed.load()) {
                 return true;
             }
@@ -1351,7 +1356,11 @@ struct DistributedWeightDaemon::Impl {
             return found != module_to_slot.end() &&
                    slots[found->second].state ==
                        SlotState::kReady;
-        });
+        };
+        // A no-wait acquire evaluates the same predicate with no slice; the
+        // rest, the 300 s diagnostics included, is the same for both.
+        const bool available =
+            no_wait ? ready() : ring_cv.wait_for(lock, kAcquireSlice, ready);
         pending.last_poll = Clock::now();
         if (!available && pending.last_poll - pending.begin < kAcquireTimeout) {
             response->status = kStatusRetry;

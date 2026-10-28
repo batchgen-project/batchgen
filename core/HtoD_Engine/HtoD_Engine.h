@@ -110,8 +110,8 @@ class HtoD_Engine {
 
    private:
     // idle: running, nothing in flight. acquiring: fetching a module's host
-    // storage (a remote module waits for the node daemon). copying: copies
-    // are in flight. parked: the thread is not running. failed: a copy
+    // storage with nothing in flight (a remote module waits for the node
+    // daemon). copying: copies are in flight; a remote module is only tried. parked: the thread is not running. failed: a copy
     // failed; nothing is copied until set_weight_copy_queue.
     enum class ProducerState : int {
         kIdle = 0,
