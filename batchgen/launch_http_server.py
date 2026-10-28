@@ -12,6 +12,12 @@ This launches the FastAPI server with:
 import logging
 import sys
 
+from batchgen.kernel_compat import check_kernels_version
+
+# Before the imports below: server_args already loads batchgen_kernels
+# extensions, and a stale kernels package must fail on its version check.
+check_kernels_version()
+
 from batchgen.eventlog.process import (
     configure_process,
     new_run_identity,

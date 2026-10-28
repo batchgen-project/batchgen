@@ -14,6 +14,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from batchgen.kernel_compat import check_kernels_version
+
+# Spawned workers import this module to unpickle their target, so this runs
+# before batchgen_worker below loads any batchgen_kernels extension.
+check_kernels_version()
+
 from batchgen.batchgen_worker import (
 	KIMI_K3_MODEL_ID,
 	BatchGenWorker,

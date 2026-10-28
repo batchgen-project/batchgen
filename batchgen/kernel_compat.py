@@ -1,8 +1,8 @@
 """Runtime compatibility check for batchgen_kernels.
 
 batchgen_kernels is not on PyPI, so pip cannot enforce version constraints.
-This module checks the installed version at import time and raises a clear
-error if the kernel package is too old.
+Process entry points call check_kernels_version() before any kernel import;
+it raises a clear error if the kernel package is too old.
 """
 
 import logging
@@ -15,7 +15,7 @@ MIN_KERNELS_VERSION = (0, 5, 0)
 
 
 def check_kernels_version():
-    """Check batchgen_kernels version compatibility. Called at import batchgen."""
+    """Check batchgen_kernels version compatibility; process entry points call it."""
     try:
         import batchgen_kernels
     except ImportError as exc:

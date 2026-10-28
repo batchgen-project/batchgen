@@ -44,7 +44,7 @@ except ImportError:
 from safetensors.torch import load_file
 from tqdm import trange
 
-from batchgen.config import EngineConfig, ModelConfig
+from batchgen.config.config import EngineConfig, ModelConfig
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
 Attn_Wrapper = AttnWrapperBase

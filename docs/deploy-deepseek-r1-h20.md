@@ -89,7 +89,7 @@ Options:
 ### Using Python API
 
 ```python
-from batchgen import ckpt_converter
+from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 converter = ckpt_converter()
 
