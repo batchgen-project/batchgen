@@ -29,9 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
-#include <iomanip>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -57,8 +55,6 @@ constexpr int kRails = 8;
 constexpr int kLayers = 92;
 constexpr int kExperts = 896;
 constexpr int kDefaultWorkers = 8;
-// The summary keeps the most recent cohort swaps only.
-constexpr size_t kSwapLogEntries = 32;
 // One acquire request waits at most one slice, so a worker can stop between
 // slices; a kAcquireNoWait request waits none. The timeout spans all requests
 // of one pending acquire, waiting or not.
@@ -371,8 +367,8 @@ struct RingResetReport {
     bool prefetch_handshake = false;    // reset done by the prefetch thread
 };
 
-// The counters the summary reports. Every update is a few scalar writes, and
-// the summary copies the whole struct, so stats_mutex is never held for long.
+// The counters Metrics() reports. Every update is a few scalar writes, and
+// Metrics() copies the whole struct, so stats_mutex is never held for long.
 struct Stats {
     std::uint64_t fetched_modules = 0;
     std::uint64_t fetched_bytes = 0;
@@ -389,7 +385,7 @@ struct Stats {
     LatencyHistogram ready_latency;
 };
 
-// What the summary reads of the cohort. Copied under cohort_mutex.
+// What Status() reads of the cohort. Copied under cohort_mutex.
 struct CohortSnapshot {
     std::uint64_t epoch = 0;
     CohortState state = CohortState::kAdmitting;
@@ -400,10 +396,9 @@ struct CohortSnapshot {
     std::uint64_t rejected_hellos = 0;
     std::string last_rejected_hello;
     std::uint64_t completed_swaps = 0;
-    nlohmann::json swap_log;
 };
 
-// What the summary reads of the ring. Copied under ring_mutex.
+// What Status() reads of the ring. Copied under ring_mutex.
 struct RingSnapshot {
     std::vector<Slot> slots;
     std::array<PendingAcquire, kDefaultWorkers> pending_acquires;
@@ -427,8 +422,6 @@ struct DistributedWeightDaemon::Impl {
         store_path = config.at("store_path").get<std::string>();
         socket_path =
             config.at("daemon_socket").get<std::string>();
-        summary_path =
-            config.at("summary_path").get<std::string>();
         store_bytes = config.at("store_bytes").get<std::uint64_t>();
         module_bytes =
             config.at("module_bytes").get<std::uint64_t>();
@@ -509,7 +502,6 @@ struct DistributedWeightDaemon::Impl {
     std::vector<std::string> node_ips;
     std::string store_path;
     std::string socket_path;
-    std::string summary_path;
     std::uint64_t store_bytes = 0;
     std::uint64_t module_bytes = 0;
     std::uint64_t replicated_bytes = 0;
@@ -558,17 +550,12 @@ struct DistributedWeightDaemon::Impl {
     std::thread bootstrap_thread;
     std::thread unix_accept_thread;
     std::thread prefetch_thread;
-    std::thread summary_thread;
     std::array<std::thread, kRails> progress_threads;
     std::vector<std::unique_ptr<ClientConnection>> clients;
     std::mutex client_mutex;
 
     // Lock order, outermost first. No path holds two of these at once except
-    // where listed, and none is held across a thread join, WriteSummary or
-    // an event push:
-    //   summary_mutex -> at most one of cohort_mutex, ring_mutex,
-    //                    stats_mutex, failure_mutex at a time (WriteSummary
-    //                    takes one snapshot after another)
+    // where listed, and none is held across a thread join or an event push:
     //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop); every
     //                 stats_mutex hold is a few scalar updates or one copy
     //                 of stats
@@ -576,8 +563,9 @@ struct DistributedWeightDaemon::Impl {
     //   client_mutex, cohort_mutex: leaves
     // The event queue's mutex is a leaf below all of them: every event is
     // pushed with none of the daemon's mutexes held, and a PollEvents()
-    // waiter holds only the queue's. Status() and Metrics() take
-    // one snapshot after another, like WriteSummary, without summary_mutex.
+    // waiter holds only the queue's. Status() and Metrics() take one
+    // snapshot after another, each under its own mutex only, and hold none
+    // while they build the result.
     // cohort_closed mirrors (cohort_state == kDraining || cohort_faulted) so
     // the ring and ready predicates can read it without taking cohort_mutex;
     // every writer stores it and then calls WakeWaiters().
@@ -591,7 +579,6 @@ struct DistributedWeightDaemon::Impl {
     std::uint64_t rejected_hellos = 0;
     std::string last_rejected_hello;
     std::uint64_t completed_swaps = 0;
-    nlohmann::json swap_log = nlohmann::json::array();
     std::atomic<bool> cohort_closed{false};
 
     std::mutex ring_mutex;
@@ -615,7 +602,6 @@ struct DistributedWeightDaemon::Impl {
     RingResetReport last_ring_reset;
 
     std::mutex stats_mutex;
-    std::mutex summary_mutex;
     Stats stats;  // under stats_mutex
 
     DaemonEventQueue events;
@@ -689,7 +675,6 @@ struct DistributedWeightDaemon::Impl {
         if (latched) {
             events.push(MakeEvent(DaemonEventKind::kFailed, 0, -1, message));
         }
-        WriteSummary();
     }
 
     std::string TransportFatalMessage() {
@@ -735,7 +720,6 @@ struct DistributedWeightDaemon::Impl {
             events.push(MakeEvent(DaemonEventKind::kCohortFaulted, epoch,
                                   worker_id, fault));
         }
-        WriteSummary();
     }
 
     void RecordRejectedHello(const std::string& message) {
@@ -960,16 +944,6 @@ struct DistributedWeightDaemon::Impl {
                         RecordFailure(error.what());
                     }
                 }
-            });
-            summary_thread = std::thread([this]() {
-                while (!stop.load()) {
-                    WriteSummary();
-                    for (int i = 0; i < 10 && !stop.load(); ++i) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(100));
-                    }
-                }
-                WriteSummary();
             });
         } catch (...) {
             started.store(false);
@@ -1934,11 +1908,10 @@ struct DistributedWeightDaemon::Impl {
                     std::chrono::microseconds(20));
             }
         }
-        WriteSummary();
     }
 
-    // The summary's snapshots. Each takes one mutex and only copies, so a
-    // request path never waits behind JSON formatting or file I/O.
+    // The snapshots Status() and Metrics() read. Each takes one mutex and
+    // only copies, so a request path never waits behind building a result.
     CohortSnapshot SnapshotCohort() {
         std::lock_guard<std::mutex> lock(cohort_mutex);
         CohortSnapshot snapshot;
@@ -1951,7 +1924,6 @@ struct DistributedWeightDaemon::Impl {
         snapshot.rejected_hellos = rejected_hellos;
         snapshot.last_rejected_hello = last_rejected_hello;
         snapshot.completed_swaps = completed_swaps;
-        snapshot.swap_log = swap_log;
         return snapshot;
     }
 
@@ -1963,95 +1935,6 @@ struct DistributedWeightDaemon::Impl {
     Stats SnapshotStats() {
         std::lock_guard<std::mutex> lock(stats_mutex);
         return stats;
-    }
-
-    void WriteSummary() {
-        if (summary_path.empty()) {
-            return;
-        }
-        std::lock_guard<std::mutex> summary_lock(summary_mutex);
-        const CohortSnapshot cohort_snapshot = SnapshotCohort();
-        const RingSnapshot ring = SnapshotRing();
-        const Stats counters = SnapshotStats();
-        const bool transport_failed = failed.load();
-        const std::string failure = FailureMessage();
-
-        nlohmann::json cohort;
-        cohort["epoch"] = cohort_snapshot.epoch;
-        cohort["state"] = cohort_state_name(cohort_snapshot.state);
-        cohort["admitted_workers_mask"] = cohort_snapshot.admitted_mask;
-        cohort["faulted"] = cohort_snapshot.faulted;
-        cohort["fault"] = cohort_snapshot.fault;
-        cohort["fault_class"] =
-            cohort_snapshot.faulted ? "cohort_recoverable" : "none";
-        cohort["expected_disconnects"] = cohort_snapshot.expected_disconnects;
-        cohort["rejected_hellos"] = cohort_snapshot.rejected_hellos;
-        cohort["last_rejected_hello"] = cohort_snapshot.last_rejected_hello;
-        cohort["completed_swaps"] = cohort_snapshot.completed_swaps;
-        // Keyed by worker id: ready slots no worker has acquired yet, by the
-        // worker expected to acquire them, and each worker's pending acquire.
-        std::map<std::string, std::uint64_t> ready_unacquired;
-        nlohmann::json pending_by_worker = nlohmann::json::object();
-        for (const Slot& slot : ring.slots) {
-            if (slot.state == SlotState::kReady && slot.acquired_mask == 0) {
-                ++ready_unacquired[std::to_string(
-                    OwningWorker(slot.module_key))];
-            }
-        }
-        for (int worker = 0; worker < kDefaultWorkers; ++worker) {
-            const PendingAcquire& pending = ring.pending_acquires[worker];
-            if (!pending.module_key.empty()) {
-                pending_by_worker[std::to_string(worker)] = {
-                    {"module_key", pending.module_key},
-                    {"age_s", elapsed_seconds(pending.begin, ring.taken)},
-                };
-            }
-        }
-
-        nlohmann::json summary;
-        summary["schema"] = "k3-distributed-weights/1";
-        summary["node_rank"] = node_rank;
-        summary["network_ready"] = network_ready.load();
-        summary["failed"] = transport_failed;
-        summary["failure"] = failure;
-        summary["failure_class"] =
-            transport_failed ? "transport_fatal" : "none";
-        summary["cohort"] = cohort;
-        summary["cohort_swaps"] = cohort_snapshot.swap_log;
-        summary["depth"] = depth;
-        summary["superchunk"] = superchunk;
-        summary["outstanding"] = outstanding;
-        summary["worker_sharded"] = worker_sharded;
-        summary["transport"] = transport;
-        summary["store_bytes"] = store_bytes;
-        summary["staging_bytes"] = staging_bytes;
-        summary["fetched_modules"] = counters.fetched_modules;
-        summary["fetched_bytes"] = counters.fetched_bytes;
-        summary["acquire_count"] = counters.acquire_count;
-        summary["release_count"] = counters.release_count;
-        summary["cache_hits"] = counters.cache_hits;
-        summary["duplicate_fetches"] = counters.duplicate_fetches;
-        summary["wait_count"] = counters.wait_count;
-        summary["wait_seconds"] = counters.wait_seconds;
-        summary["worker_wait_count"] = counters.worker_wait_count;
-        summary["worker_wait_seconds"] = counters.worker_wait_seconds;
-        summary["ready_unacquired_by_worker"] = ready_unacquired;
-        summary["pending_acquire_by_worker"] = pending_by_worker;
-        summary["staging_hwm_modules"] = counters.staging_hwm;
-        const LatencyHistogram& latency = counters.ready_latency;
-        summary["ready_latency_ms"] = {
-            {"p50", latency.percentile(50)},
-            {"p95", latency.percentile(95)},
-            {"p99", latency.percentile(99)},
-            {"count", latency.count()},
-            {"max", latency.max()},
-        };
-        const std::string temporary = summary_path + ".tmp";
-        {
-            std::ofstream output(temporary);
-            output << std::setw(2) << summary << '\n';
-        }
-        rename(temporary.c_str(), summary_path.c_str());
     }
 
     std::uint64_t CohortEpoch() {
@@ -2144,7 +2027,6 @@ struct DistributedWeightDaemon::Impl {
         // Pending acquires and hello waits of this cohort return now.
         WakeWaiters();
         events.push(MakeEvent(DaemonEventKind::kCohortDraining, epoch));
-        WriteSummary();
         return epoch;
     }
 
@@ -2268,16 +2150,11 @@ struct DistributedWeightDaemon::Impl {
             cohort_epoch = retiring + 1;
             cohort_state = CohortState::kAdmitting;
             ++completed_swaps;
-            swap_log.push_back(report);
-            if (swap_log.size() > kSwapLogEntries) {
-                swap_log.erase(swap_log.begin());
-            }
             cohort_closed.store(false);
         }
         std::string dumped = report.dump();
         events.push(MakeEvent(DaemonEventKind::kCohortAdmitting, retiring + 1,
                               -1, "", dumped));
-        WriteSummary();
         return dumped;
     }
 
@@ -2345,9 +2222,6 @@ struct DistributedWeightDaemon::Impl {
                 }
             }
         }
-        if (summary_thread.joinable()) {
-            summary_thread.join();
-        }
 
         for (int rail = 0; rail < kRails; ++rail) {
             for (int owner = 0; owner < num_nodes; ++owner) {
@@ -2374,7 +2248,6 @@ struct DistributedWeightDaemon::Impl {
             }
             DestroyRail(&rails[rail]);
         }
-        WriteSummary();
         unlink(socket_path.c_str());
         if (staging != nullptr) {
             munmap(staging, staging_bytes);

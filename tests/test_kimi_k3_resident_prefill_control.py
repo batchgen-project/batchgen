@@ -3563,7 +3563,12 @@ def test_hierarchical_gdr_core_transport_fails_closed_without_host_network():
     assert "network_ready.store(true)" in daemon
     assert "BootstrapNetwork();" in daemon
     assert "hierarchical_gdr forbids remote host acquire" in daemon
-    assert 'summary["transport"] = transport' in daemon
+    # The config event reports the transport the daemon runs.
+    detail = daemon[daemon.index("std::string ConfigDetail() const") :]
+    detail = detail[: detail.index("return config.dump();")]
+    assert 'config["transport"] = transport;' in detail
+    assert "DaemonEventKind::kConfig" in daemon
+    assert '"", ConfigDetail()));' in daemon
 
 
 def test_distributed_store_core_derives_and_checks_the_runtime_topology():

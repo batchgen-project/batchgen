@@ -9,9 +9,9 @@ with one event after its copies; the producer alone observes the events and
 lands the copies oldest first, and it never waits for the node daemon or for
 a free slot while a copy is un-landed: with copies in flight it only tries a
 remote module, one request the daemon answers at once, and leaves a module
-that is not ready at the head of its queue. The daemon summary copies its
-state and formats it outside the locks the request path takes; its status
-and metrics are built from the same snapshots, and every daemon event is
+that is not ready at the head of its queue. The daemon writes no summary
+file: its status and metrics copy snapshots of its state and build the
+result outside the locks the request path takes, and every daemon event is
 pushed with none of the daemon's mutexes held.
 """
 
@@ -678,36 +678,43 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     assert "oldest unacquired ready module" in acquire
     assert "OwningWorker(oldest_unacquired->module_key)" in acquire
 
-    summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
-    assert 'summary["ready_unacquired_by_worker"]' in summary
-    assert 'summary["pending_acquire_by_worker"]' in summary
+    # A waiting acquire is reported while it waits: on the retry path, before
+    # the timeout, a stall event carries what the ring holds per worker, and
+    # Status() reports each worker's pending acquire and unacquired modules.
+    assert retry < acquire.index("events.push(std::move(stalled));") < stalled
+    assert "stalled.ready_unacquired" in acquire
+    assert "stalled.oldest_unacquired_worker" in acquire
+    status = _section(daemon, "DaemonStatus Status() {", "DaemonMetrics Metrics() {")
+    assert "++status.ready_unacquired_by_worker[worker];" in status
+    assert "status.pending_acquires.push_back(" in status
 
 
-def test_daemon_summary_formats_snapshots_outside_the_request_locks():
+def test_daemon_status_and_metrics_copy_snapshots_outside_the_request_locks():
     daemon = DAEMON.read_text()
-    # Ready latency is a fixed-size histogram: no per-module sample vector
-    # and no sort for the summary.
+    # Ready latency is a fixed-size histogram: no per-module sample vector,
+    # no sort and no quantile in the daemon; the consumer reads the buckets.
     assert "std::vector<double> ready_latency_ms" not in daemon
     assert "std::sort" not in daemon
-    assert "double percentile(" not in daemon
     assert '#include "latency_histogram.h"' in daemon
     assert "Stats stats;  // under stats_mutex" in daemon
 
-    # The summary holds only its own mutex and takes one snapshot at a time.
-    summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
-    assert summary.count("std::lock_guard") == 1
-    assert "std::lock_guard<std::mutex> summary_lock(summary_mutex);" in summary
-    assert "unique_lock" not in summary
-    for mutex in ("stats_mutex", "ring_mutex", "cohort_mutex"):
-        assert mutex not in summary, mutex
-    snapshots = [
-        summary.index(call)
-        for call in ("SnapshotCohort()", "SnapshotRing()", "SnapshotStats()")
-    ]
-    assert summary.index("summary_lock(summary_mutex)") < min(snapshots)
-    assert 'summary["transport"] = transport' in summary
-    for key in ('{"p50", ', '{"p95", ', '{"p99", ', '{"count", ', '{"max", '):
-        assert key in summary, key
+    # The daemon writes no periodic summary: its state is read through
+    # Status(), Metrics() and the event queue.
+    for token in ("WriteSummary", "summary_path", "summary_thread",
+                  "summary_mutex", "swap_log", "kSwapLogEntries", "ofstream",
+                  "rename(", "percentile(", "#include <iomanip>",
+                  "#include <map>"):
+        assert token not in daemon, token
+    cohort_snapshot = _section(daemon, "struct CohortSnapshot {", "};")
+    assert "json" not in cohort_snapshot
+    assert "std::uint64_t completed_swaps = 0;" in cohort_snapshot
+    finish = _section(daemon, "std::string FinishCohortSwap(double timeout_seconds)",
+                      "void PrepareStop()")
+    assert "++completed_swaps;" in finish
+    # The config no longer names a summary file; a config that still carries
+    # the key loads because the daemon never reads it.
+    config = _section(daemon, "explicit Impl(const std::string& path)", "~Impl()")
+    assert "summary" not in config
 
     # Each snapshot only copies under its one mutex.
     cohort = _section(daemon, "CohortSnapshot SnapshotCohort()", "RingSnapshot SnapshotRing()")
@@ -718,10 +725,10 @@ def test_daemon_summary_formats_snapshots_outside_the_request_locks():
     assert "std::lock_guard<std::mutex> lock(ring_mutex);" in ring
     for token in ("std::to_string", "OwningWorker", "json"):
         assert token not in ring, token
-    stats = _section(daemon, "Stats SnapshotStats()", "void WriteSummary()")
+    stats = _section(daemon, "Stats SnapshotStats()", "std::uint64_t CohortEpoch()")
     assert stats.count("std::lock_guard") == 1
     assert "std::lock_guard<std::mutex> lock(stats_mutex);" in stats
-    for token in ("nlohmann", "summary[", "percentile(", "ofstream", "FailureMessage"):
+    for token in ("nlohmann", "percentile(", "FailureMessage"):
         assert token not in stats, token
 
     # A fetched chunk records its latency once, weighted by its modules.
@@ -826,8 +833,7 @@ def test_daemon_status_and_metrics_only_copy_snapshots():
     metrics = _section(daemon, "DaemonMetrics Metrics() {", "std::uint64_t BeginCohortSwap()")
     for section in (status, metrics):
         for token in ("lock_guard", "unique_lock", "ring_mutex", "cohort_mutex",
-                      "stats_mutex", "summary_mutex", "WriteSummary", "json",
-                      "percentile("):
+                      "stats_mutex", "json", "percentile("):
             assert token not in section, token
     assert "const CohortSnapshot cohort = SnapshotCohort();" in status
     assert "const RingSnapshot ring = SnapshotRing();" in status
