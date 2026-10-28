@@ -124,11 +124,12 @@ class GPU_Weight_Buffer {
     bool weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
                                int64_t buffer_idx);
-    // Abandons buffer_idx if still FILLING (buffer_idx < 0: no slot), then
-    // records the failure so every waiter throws it.
-    void record_producer_failure(const std::string& module_type,
-                                 int64_t buffer_idx,
-                                 const std::string& message);
+    // Abandons every (module type, slot) of filling that is still FILLING
+    // (slot < 0: none), then records the failure so every waiter throws it.
+    // The producer's copies into them must have completed.
+    void record_producer_failure(
+        const std::vector<std::pair<std::string, int64_t>>& filling,
+        const std::string& message);
     void clear_producer_failure();
     std::optional<std::string> producer_failure() const;
     // A producer state change resets the stall clock of every waiter.

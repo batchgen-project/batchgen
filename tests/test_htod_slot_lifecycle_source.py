@@ -4,7 +4,10 @@ The producer thread must never let an exception escape (that is
 std::terminate), a cancelled remote acquire must keep the schedule order, a
 node daemon acquire that is merely not ready yet must not fault the cohort,
 and every slot and daemon lease belongs to exactly one weight pass that the
-consumer arms and closes.
+consumer arms and closes. Up to kMaxCopiesInFlight modules are in flight, each
+with one event after its copies; the producer alone observes the events and
+lands the copies oldest first, and it never waits for the node daemon or for
+a free slot while a copy is un-landed.
 """
 
 import re
@@ -45,6 +48,14 @@ def _weight_section():
     return body[body.index("for (auto& module_type :"):]
 
 
+def _land_copies():
+    return _section(
+        ENGINE.read_text(),
+        "size_t HtoD_Engine::land_copies_(bool wait)",
+        "py::dict HtoD_Engine::weight_stream_status()",
+    )
+
+
 def test_storage_fetch_is_inside_the_producer_try():
     weights = _weight_section()
     try_open = weights.index("try {")
@@ -69,13 +80,25 @@ def test_producer_catch_records_the_failure_and_never_rethrows():
     fail = _section(
         engine,
         "void HtoD_Engine::fail_producer_(",
-        "py::dict HtoD_Engine::weight_stream_status()",
+        "size_t HtoD_Engine::land_copies_(bool wait)",
     )
-    release = fail.index("this->weights_storage_.release_module(module_name)")
-    record = fail.index("this->gpu_weight_buffer_.record_producer_failure(")
-    assert release < record
+    # No copy may still write into a slot about to be abandoned: the copy
+    # stream is synchronized first, without CUDA_CHECK, which would throw.
+    sync = fail.index("cudaStreamSynchronize(this->HtoD_stream)")
+    walk = fail.index("for (InFlightCopy& copy : this->in_flight_) {")
+    slots = fail.index("filling.emplace_back(copy.module_type, copy.buffer_idx);")
+    release = fail.index("this->weights_storage_.release_module(copy.module_name)")
+    record = fail.index(
+        "this->gpu_weight_buffer_.record_producer_failure(filling, failure);"
+    )
+    dropped = fail.index("this->end_in_flight_(true);", record)
+    failed = fail.index("ProducerState::kFailed", dropped)
+    assert sync < walk < slots < release < record < dropped < failed
+    assert "CUDA_CHECK" not in fail
+    assert "throw" not in fail
+    # The slot reserved for a module not in flight yet is abandoned too.
+    assert "filling.emplace_back(module_type, buffer_idx);" in fail[:walk]
     assert "this->producer_failed_ = true;" in fail
-    assert "ProducerState::kFailed" in fail
 
 
 def test_failure_is_visible_to_waiters_and_cleared_by_a_queue_install():
@@ -86,9 +109,18 @@ def test_failure_is_visible_to_waiters_and_cleared_by_a_queue_install():
         "void GPU_Weight_Buffer::clear_producer_failure()",
     )
     assert "this->producer_failure_ = message;" in record
-    assert "WeightSlotState::kFilling" in record
-    assert "this->slots_.abandon(module_type, buffer_idx)" in record
+    # Every slot in flight is abandoned, each only while still FILLING.
+    loop = record.index("for (const auto& [module_type, buffer_idx] : filling) {")
+    filling = record.index("WeightSlotState::kFilling", loop)
+    abandon = record.index("this->slots_.abandon(module_type, buffer_idx)", filling)
+    assert loop < filling < abandon
     assert "this->cv_.notify_all();" in record
+    assert re.search(
+        r"void record_producer_failure\(\s*"
+        r"const std::vector<std::pair<std::string, int64_t>>& filling,\s*"
+        r"const std::string& message\);",
+        BUFFER_HEADER.read_text(),
+    )
 
     failed = _section(
         buffer,
@@ -232,6 +264,126 @@ def test_cancelled_acquire_leaves_the_module_at_the_head():
     assert "data_queue.pop()" not in front
 
 
+def test_a_module_is_in_flight_from_before_its_fetch():
+    weights = _weight_section()
+    peek = weights.index(".try_front(module_name)")
+    begin = weights.index("this->begin_in_flight_(module_type, module_name, buffer_idx,")
+    acquiring = weights.index("this->set_producer_state_(ProducerState::kAcquiring);")
+    fetch = weights.index("get_module_weights_storage(")
+    leased = weights.index("this->in_flight_.back().leased = true;")
+    claim = weights.index("this->gpu_weight_buffer_.claim_for_copy(")
+    # Named before the fetch, so any daemon lease is of a module in flight.
+    assert peek < begin < acquiring < fetch < leased < claim
+    cancelled = weights.index("if (!fetched.has_value()) {")
+    cancel_path = weights[cancelled:weights.index("break;", cancelled)]
+    assert "this->end_in_flight_(false);" in cancel_path
+
+
+def test_a_fetch_that_can_wait_for_the_daemon_starts_with_nothing_in_flight():
+    weights = _weight_section()
+    full = weights.index("this->in_flight_.size() >= kMaxCopiesInFlight")
+    unparked = weights.index("weights_parked = false;")
+    # Only a module fetched from the node daemon waits behind the in-flight
+    # queue; a module of the node's registered store holds no lease.
+    gate = weights.index(
+        "if (!this->in_flight_.empty() &&\n"
+        "                this->weights_storage_.is_remote_module(next.module_name)) {"
+    )
+    deferred = weights.index("continue;", gate)
+    reserve = weights.index("acquireEmptyBuffer(module_type)")
+    fetch = weights.index("get_module_weights_storage(")
+    # Checked before a slot is reserved, for copies and skips alike: blocked
+    # in a daemon acquire the producer could release no lease and land no
+    # copy.
+    assert full < unparked < gate < deferred < reserve < fetch
+    assert "progressed = true;" not in weights[gate:deferred]
+    header = ENGINE_HEADER.read_text()
+    assert "static constexpr size_t kMaxCopiesInFlight = 4;" in header
+    assert "static constexpr size_t kCopyEvents = kMaxCopiesInFlight + 1;" in header
+
+
+def test_a_module_is_copied_asynchronously_with_one_event():
+    weights = _weight_section()
+    copying = weights[weights.index("this->set_producer_state_(ProducerState::kCopying"):]
+    copying = copying[:copying.index("} catch (const std::exception& error) {")]
+    memcpy = copying.index("CUDA_CHECK(cudaMemcpyAsync(slot->second.data_ptr(),")
+    loop_end = copying.index("}\n", copying.index("submitted_bytes +=", memcpy))
+    record = re.search(
+        r"CUDA_CHECK\(cudaEventRecord\(this->in_flight_\.back\(\)\.event,\s*"
+        r"this->HtoD_stream\)\);",
+        copying,
+    )
+    assert record is not None
+    assert memcpy < loop_end < record.start()
+    assert copying.count("cudaEventRecord(") == 1
+    # The weight path never synchronizes the copy stream; on-demand and KV
+    # copies keep blocking_copy_ and their own stream syncs.
+    assert "blocking_copy_" not in weights
+    assert "cudaStreamSynchronize" not in weights
+    engine = ENGINE.read_text()
+    blocking = _section(
+        engine, "void HtoD_Engine::blocking_copy_(", "void HtoD_Engine::clear_kv_copy_queue()"
+    )
+    assert "CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));" in blocking
+
+    take = _section(
+        engine,
+        "cudaEvent_t HtoD_Engine::take_copy_event_()",
+        "void HtoD_Engine::require_no_daemon_lease_for_pass(int64_t pass)",
+    )
+    assert "while (this->copy_events_.size() < kCopyEvents) {" in take
+    assert "cudaEventCreateWithFlags(&event, cudaEventDisableTiming)" in take
+    destructor = _section(engine, "HtoD_Engine::~HtoD_Engine() {", "torch::Tensor HtoD_Engine::")
+    terminate = destructor.index("this->Terminate();")
+    destroy = destructor.index("cudaEventDestroy(event);")
+    assert terminate < destroy
+    assert "for (cudaEvent_t event : this->copy_events_) {" in destructor
+    assert engine.count("cudaEventDestroy(") == 1
+
+
+def test_copies_land_oldest_first_and_only_on_the_producer():
+    land = _land_copies()
+    loop = land.index("while (!this->in_flight_.empty()) {")
+    oldest = land.index("InFlightCopy& copy = this->in_flight_.front();", loop)
+    wait = land.index("CUDA_CHECK(cudaEventSynchronize(copy.event));", oldest)
+    query = land.index("cudaEventQuery(copy.event)", wait)
+    not_ready = land.index("if (status == cudaErrorNotReady) {", query)
+    stop = land.index("break;", not_ready)
+    assert loop < oldest < wait < query < not_ready < stop
+    # Only the first copy of a waiting call is waited for.
+    assert "if (wait && landed == 0) {" in land
+    # weights_copy_complete is the only FILLING -> PRESENT writer, and only
+    # land_copies_ calls it.
+    engine = ENGINE.read_text()
+    assert engine.count("this->gpu_weight_buffer_.weights_copy_complete(") == 1
+    assert "cudaLaunchHostFunc" not in engine
+    assert "cudaStreamAddCallback" not in engine
+
+
+def test_land_before_any_wait_and_land_everything_on_stop():
+    body = _worker_body()
+    loop = body.index("while (!terminate_flag_) {")
+    land = body.index("this->land_copies_(false)", loop)
+    on_demand = body.index("on_demand_task_queue_.try_pop", loop)
+    modules = body.index("for (auto& module_type :", loop)
+    idle = body.index("if (!progressed) {", modules)
+    in_flight = body.index("if (!this->in_flight_.empty()) {", idle)
+    land_oldest = body.index("this->land_copies_(true);", in_flight)
+    park = body.index("this->producer_wake_cv_.wait(lock,", land_oldest)
+    slot_wait = body.index("this->gpu_weight_buffer_.wait_for_free_slot(", park)
+    assert land < on_demand < modules < idle < in_flight < land_oldest < park < slot_wait
+
+    # After the loop: nothing is submitted, every copy in flight lands, and a
+    # failure on the way is recorded, never thrown.
+    drain = body[body.rindex("while (!this->in_flight_.empty()) {"):]
+    assert body.rindex("while (!this->in_flight_.empty()) {") > slot_wait
+    assert "this->land_copies_(true);" in drain
+    assert drain.count('this->fail_producer_("", -1, "",') == 2
+    assert "throw;" not in drain
+    assert "get_module_weights_storage" not in drain
+    assert "cudaMemcpyAsync" not in drain
+
+
 def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     weights = _weight_section()
     fetch = weights.index("get_module_weights_storage(")
@@ -243,8 +395,10 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
     # moves past it only after the lease is released.
     release = skipped.index("this->weights_storage_.release_module(module_name);")
     retire = skipped.index("this->gpu_weight_buffer_.retire_skip(module_type,")
-    assert release < retire
-    assert "blocking_copy_" not in skipped
+    # Its in-flight entry, the newest, is dropped only after both.
+    dropped = skipped.index("this->end_in_flight_(false);")
+    assert release < retire < dropped
+    assert "cudaMemcpyAsync" not in skipped
     assert ".push(module_name)" in skipped
     assert "this->skipped_modules_" in skipped
     # A pending skip reserves no ring slot.
@@ -269,14 +423,24 @@ def test_skip_check_follows_the_fetch_and_releases_the_daemon_lease():
 
 
 def test_lease_is_released_before_the_copy_lands():
+    land = _land_copies()
+    observed = land.index("cudaEventQuery(copy.event)")
+    release = land.index("this->weights_storage_.release_module(copy.module_name);")
+    complete = land.index("this->gpu_weight_buffer_.weights_copy_complete(")
+    dropped = land.index("this->end_in_flight_(true);")
+    # The lease is released only once the event shows the copy out of its
+    # staging slot. No FILLING slot of a pass implies no daemon lease of it,
+    # and the entry is dropped only after the landing, so a failure in it
+    # still abandons the slot.
+    assert observed < release < complete < dropped
+    assert "const bool present =" in land[complete - 80:complete]
+    assert "this->released_on_landing_modules_" in land[complete:]
+    # The copy path itself never lands or releases a copied module.
     weights = _weight_section()
-    copying = weights.index("ProducerState::kCopying")
-    release = weights.index("this->weights_storage_.release_module(module_name);", copying)
-    complete = weights.index("this->gpu_weight_buffer_.weights_copy_complete(", copying)
-    # No FILLING slot of a pass implies no daemon lease of it.
-    assert release < complete
-    assert "const bool present =" in weights[complete - 80:complete]
-    assert "this->released_on_landing_modules_" in weights[complete:]
+    copying = weights[weights.index("this->set_producer_state_(ProducerState::kCopying"):]
+    copying = copying[:copying.index("} catch (const std::exception& error) {")]
+    assert "weights_copy_complete" not in copying
+    assert "release_module" not in copying
     buffer = BUFFER.read_text()
     landed = _section(
         buffer,
@@ -343,8 +507,19 @@ def test_end_pass_waits_then_checks_daemon_leases_then_closes():
     )
     lock = check.index("std::lock_guard<std::mutex> lock(this->status_mutex_);")
     leased = check.index("this->weights_storage_.leased_modules()")
-    assert lock < leased
-    assert "this->pass_in_flight_ > pass" in check
+    walk = check.index("this->in_flight_.begin(), this->in_flight_.end(),", leased)
+    assert lock < leased < walk
+    # A lease is allowed only for a module in flight for a later pass.
+    assert "copy.module_name == module_name && copy.pass > pass" in check
+    # Every in-flight entry is pushed and popped under status_mutex_.
+    for begin, end in (
+        ("void HtoD_Engine::begin_in_flight_(", "void HtoD_Engine::end_in_flight_("),
+        ("void HtoD_Engine::end_in_flight_(", "cudaEvent_t HtoD_Engine::take_copy_event_()"),
+    ):
+        section = _section(engine, begin, end)
+        assert "std::lock_guard<std::mutex> lock(this->status_mutex_);" in section, begin
+    assert "module_in_flight_" not in engine
+    assert "pass_in_flight_" not in engine
 
     storage = STORAGE.read_text()
     accessor = _section(
@@ -465,6 +640,7 @@ def test_bindings_expose_passes_skip_and_status():
         "producer_state",
         "module_in_flight",
         "pass_in_flight",
+        "in_flight",
         "copied",
         "skipped",
         "released_on_landing",
@@ -555,3 +731,13 @@ def test_deleted_symbols_are_gone_from_python_callers():
 def test_dead_python_modules_are_deleted():
     for relative in DEAD_MODULES:
         assert not (PACKAGE / relative).exists(), relative
+
+
+def test_remote_module_lookup_is_an_init_built_read_only_map():
+    header = (ROOT / "core" / "Weights_Storage" / "Weights_Storage.h").read_text()
+    lookup = header[header.index("bool is_remote_module(") :]
+    lookup = lookup[: lookup.index("}") + 1]
+    # Read without a lock by the producer thread: it may only consult the map
+    # filled at init, never a structure the daemon path mutates.
+    assert "remote_module_weights_.find(module_key)" in lookup
+    assert "lock" not in lookup

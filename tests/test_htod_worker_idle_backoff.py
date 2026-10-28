@@ -1,12 +1,13 @@
 """CPU-only source regression for the HtoD_Worker idle backoff.
 
 The worker loop used to spin a CPU core at 100% while idle. An iteration that
-made no progress parks on a condition variable when no weight type has an
-armed pass to produce, sleeps 50 us only while a KV copy waits for a full KV
-buffer (GPU_KV_Buffer signals nothing), and otherwise waits in the weight
-buffer for a free slot: on the oldest pending release's event, or on the slot
-notification every slot-freeing transition and every producer wake sends. A
-progressed iteration never waits.
+made no progress first waits for its oldest weight copy in flight and lands
+it; with none in flight it parks on a condition variable when no weight type
+has an armed pass to produce, sleeps 50 us only while a KV copy waits for a
+full KV buffer (GPU_KV_Buffer signals nothing), and otherwise waits in the
+weight buffer for a free slot: on the oldest pending release's event, or on
+the slot notification every slot-freeing transition and every producer wake
+sends. A progressed iteration never waits.
 """
 
 import re
@@ -59,6 +60,16 @@ def test_progress_flag_and_wake_count_are_read_each_iteration():
     assert full < body.index("for (auto& module_type :", loop)
 
 
+def test_landing_a_copy_marks_progress_before_any_other_work():
+    body = _worker_body()
+    loop = body.index("while (!terminate_flag_)")
+    reset = body.index("bool progressed = false;", loop)
+    land = body.index("if (this->land_copies_(false) > 0) {", reset)
+    progressed = body.index("progressed = true;", land)
+    assert progressed < body.index("on_demand_task_queue_.try_pop", loop)
+    assert land < body.index("for (auto& module_type :", loop)
+
+
 def test_on_demand_task_marks_progress():
     body = _worker_body()
     pop = body.index("while (on_demand_task_queue_.try_pop(task))")
@@ -93,8 +104,25 @@ def test_a_parked_type_is_skipped_without_progress():
     assert full.index("full_ring_type = module_type;") < full.index("continue;")
 
 
-def test_progress_is_only_set_on_the_three_paths():
-    assert _worker_body().count("progressed = true;") == 3
+def test_progress_is_only_set_on_the_four_paths():
+    # A landing, an on-demand task, a KV copy and a weight module started.
+    assert _worker_body().count("progressed = true;") == 4
+
+
+def test_an_idle_producer_lands_its_oldest_copy_before_any_other_wait():
+    tail = _idle_tail()
+    in_flight = tail.index("if (!this->in_flight_.empty()) {")
+    land = tail.index("this->land_copies_(true);", in_flight)
+    leave = tail.index("continue;", land)
+    park = tail.index("if (weights_parked && this->kv_copy_task_queue_.empty()) {")
+    sleep = IDLE_SLEEP.search(tail)
+    slot_wait = tail.index("this->gpu_weight_buffer_.wait_for_free_slot(")
+    # A copy un-landed while the producer parks or waits for a slot could be
+    # the one the consumer waits for while it holds every other slot.
+    assert in_flight < land < leave < park < sleep.start() < slot_wait
+    handlers = tail[land:leave]
+    assert handlers.count('this->fail_producer_("", -1, "",') == 2
+    assert "throw;" not in handlers
 
 
 def test_parked_producer_blocks_on_the_wake_cv_instead_of_sleeping():

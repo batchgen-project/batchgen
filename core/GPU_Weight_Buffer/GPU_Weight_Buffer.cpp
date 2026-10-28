@@ -524,15 +524,23 @@ bool GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
     return present;
 };
 
-void GPU_Weight_Buffer::record_producer_failure(const std::string& module_type,
-                                                int64_t buffer_idx,
-                                                const std::string& message) {
+void GPU_Weight_Buffer::record_producer_failure(
+    const std::vector<std::pair<std::string, int64_t>>& filling,
+    const std::string& message) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     this->producer_failure_ = message;
-    if (buffer_idx >= 0 && buffer_idx < this->slots_.slot_count(module_type) &&
-        this->slots_.state_at(module_type, buffer_idx) ==
-            WeightSlotState::kFilling) {
-        this->slots_.abandon(module_type, buffer_idx);
+    bool abandoned = false;
+    // A slot listed twice is FREE the second time and left alone.
+    for (const auto& [module_type, buffer_idx] : filling) {
+        if (buffer_idx >= 0 &&
+            buffer_idx < this->slots_.slot_count(module_type) &&
+            this->slots_.state_at(module_type, buffer_idx) ==
+                WeightSlotState::kFilling) {
+            this->slots_.abandon(module_type, buffer_idx);
+            abandoned = true;
+        }
+    }
+    if (abandoned) {
         this->notifySlotsLocked();
     }
     this->cv_.notify_all();

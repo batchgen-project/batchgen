@@ -108,6 +108,14 @@ class Weights_Storage {
     // rank of the node consumes in the same cyclic order.
     bool is_distributed() const { return this->distributed_; }
 
+    // Whether module_key is fetched from the node daemon (a lease until its
+    // release) rather than read from this node's registered store. The map is
+    // built at init and never changes after, so any thread may ask.
+    bool is_remote_module(const std::string& module_key) const {
+        return this->remote_module_weights_.find(module_key) !=
+               this->remote_module_weights_.end();
+    }
+
    private:
     int device_id_; // Stored device ID
     std::shared_ptr<spdlog::logger> logger;

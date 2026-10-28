@@ -5,7 +5,8 @@ pybind, so a small driver is built against it with the system C++ compiler.
 The driver exercises every legal transition, every illegal one, routing skips
 on each state, and the weight passes: numbering, the producer cursor, lease
 and skip addressing the oldest open pass, the explicit carry, cancel, the
-conditions end_pass asserts, and the abort after a forward died.
+conditions end_pass asserts, and the abort after a forward died, with one copy
+or several in flight.
 """
 
 import shutil
@@ -22,7 +23,9 @@ DRIVER = r"""
 #include "weight_slot_table.h"
 
 #include <cstdio>
+#include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 using S = WeightSlotState;
@@ -665,6 +668,134 @@ static void abort_frees_every_state() {
           freed(again, S::kPresent) == 0);
 }
 
+// Producer with several copies in flight: reserve + claim the module at the
+// cursor, recording (module, slot) until it lands.
+using InFlight = std::deque<std::pair<std::string, int64_t>>;
+
+static void submit(WeightSlotTable& table, InFlight& in_flight) {
+    const auto next = table.next_production(E);
+    CHECK(next.kind == P::kCopy);
+    const auto index = table.reserve(E);
+    CHECK(index.has_value());
+    if (!index.has_value()) {
+        return;
+    }
+    CHECK(table.claim(E, *index, next.module_name) == P::kCopy);
+    in_flight.emplace_back(next.module_name, *index);
+}
+
+static void several_copies_in_flight() {
+    // Every slot is reserved and claimed before the first copy lands; they
+    // land in submit order.
+    WeightSlotTable table = make(4);
+    CHECK(table.begin_pass() == 1);
+    InFlight in_flight;
+    for (int i = 0; i < 4; ++i) {
+        submit(table, in_flight);
+    }
+    CHECK(!table.reserve(E).has_value());
+    CHECK(table.count(E, S::kFilling) == 4);
+    CHECK(table.count_in_pass(1, S::kFilling) == 4);
+    // The cursor moved past every claimed module; the consumer waits for
+    // each of them.
+    CHECK(table.next_production(E).module_name == "e4");
+    for (const char* name : {"e0", "e1", "e2", "e3"}) {
+        CHECK(table.check_lease(name) == WeightLeaseCheck::kWait);
+    }
+
+    // The oldest lands first; the later ones stay FILLING.
+    CHECK(table.landed(E, in_flight.front().second));
+    in_flight.pop_front();
+    CHECK(table.state_of("e0", 1) == S::kPresent);
+    CHECK(table.state_of("e1", 1) == S::kFilling);
+    CHECK(table.check_lease("e1") == WeightLeaseCheck::kWait);
+    consume(table, "e0");
+    submit(table, in_flight);  // e4, into e0's slot
+    CHECK(table.landed(E, in_flight.front().second));
+    in_flight.pop_front();
+    consume(table, "e1");
+    submit(table, in_flight);  // e5
+    CHECK(in_flight.size() == 4);
+
+    // The producer finished the pass, but end_pass refuses while any of its
+    // slots is FILLING, and changes nothing.
+    CHECK(table.producer_finished(1));
+    EXPECT_THROW(table.end_pass(1),
+                 {"Cannot end weight pass 1", "e2 is FILLING", "e3 is FILLING",
+                  "e4 is FILLING", "e5 is FILLING"});
+    CHECK(table.current_pass() == 1);
+    CHECK(table.count_in_pass(1, S::kFilling) == 4);
+    while (!in_flight.empty()) {
+        const std::string name = in_flight.front().first;
+        CHECK(table.landed(E, in_flight.front().second));
+        in_flight.pop_front();
+        if (!in_flight.empty()) {
+            EXPECT_THROW(table.end_pass(1), {"is FILLING"});
+        }
+        consume(table, name);
+    }
+    const auto summary = table.end_pass(1);
+    CHECK(summary.by_type.at(E).copied == 6);
+    CHECK(summary.by_type.at(E).released_on_landing == 0);
+    CHECK(table.held().empty());
+}
+
+static void cancel_with_several_copies_in_flight() {
+    WeightSlotTable table = make(4);
+    table.begin_pass();
+    InFlight in_flight;
+    for (int i = 0; i < 4; ++i) {
+        submit(table, in_flight);
+    }
+    // Every FILLING slot of the pass is released on landing; the modules not
+    // produced yet become pending skips.
+    const auto counts = table.cancel_pass(1);
+    CHECK(counts.release_on_landing == 4);
+    CHECK(counts.freed_present == 0);
+    CHECK(counts.pending == 2);  // e4, e5
+    for (const char* name : {"e0", "e1", "e2", "e3"}) {
+        EXPECT_THROW(table.check_lease(name), {"skipped in pass 1"});
+    }
+    EXPECT_THROW(table.end_pass(1),
+                 {"e0 is FILLING", "e3 is FILLING", "2 skips are still pending"});
+    // Each landing, in order, frees its slot.
+    while (!in_flight.empty()) {
+        const int64_t index = in_flight.front().second;
+        CHECK(!table.landed(E, index));
+        CHECK(table.state_at(E, index) == S::kFree);
+        in_flight.pop_front();
+    }
+    CHECK(table.count(E, S::kFree) == 4);
+    retire(table);
+    retire(table);
+    const auto summary = table.end_pass(1);
+    CHECK(summary.by_type.at(E).copied == 4);
+    CHECK(summary.by_type.at(E).released_on_landing == 4);
+    CHECK(summary.by_type.at(E).skipped == 2);
+    CHECK(table.held().empty());
+}
+
+static void abort_with_several_copies_in_flight() {
+    WeightSlotTable table = make(4);
+    table.begin_pass();
+    InFlight in_flight;
+    for (int i = 0; i < 4; ++i) {
+        submit(table, in_flight);
+    }
+    const auto counts = table.abort(false);
+    CHECK(counts.passes == 1);
+    CHECK(freed(counts, S::kFilling) == 4);
+    CHECK(freed(counts, S::kPresent) == 0);
+    CHECK(table.held().empty());
+    CHECK(table.count(E, S::kFree) == 4);
+    // None of the dropped copies can land.
+    for (const auto& copy : in_flight) {
+        const int64_t index = copy.second;
+        EXPECT_THROW(table.landed(E, index), {"FREE"});
+        CHECK(!table.state_of(copy.first, 1).has_value());
+    }
+}
+
 static void a_local_abort_resumes_like_a_phase_end() {
     WeightSlotTable table = make(2);
     CHECK(table.begin_pass() == 1);
@@ -724,6 +855,9 @@ int main() {
     install_refusals_and_renumbering();
     queries_and_layout();
     abort_frees_every_state();
+    several_copies_in_flight();
+    cancel_with_several_copies_in_flight();
+    abort_with_several_copies_in_flight();
     a_local_abort_resumes_like_a_phase_end();
     a_distributed_abort_loses_the_schedule();
     if (failures != 0) {

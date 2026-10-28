@@ -24,6 +24,7 @@
 #include "spdlog/spdlog.h"
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <memory>
 #include <string>
@@ -96,10 +97,11 @@ class HtoD_Engine {
     // was requested. Also ends its wait for a free weight slot.
     void wake_producer();
     // Throws when the node daemon still leases this worker a module of pass
-    // or an earlier one. A lease of the module in flight for a later
-    // (carried) pass is allowed.
+    // or an earlier one. A lease of a module in flight for a later (carried)
+    // pass is allowed.
     void require_no_daemon_lease_for_pass(int64_t pass);
-    // Producer state, module and pass in flight, for error messages.
+    // Producer state and its oldest module and pass in flight, for error
+    // messages.
     std::string describe_producer();
     void batched_page_copy(const std::vector<void*>& gpu_ptrs,
                            const std::vector<void*>& host_ptrs,
@@ -108,8 +110,8 @@ class HtoD_Engine {
 
    private:
     // idle: running, nothing in flight. acquiring: fetching a module's host
-    // storage (a remote module waits for the node daemon). copying: copying
-    // it into its slot. parked: the thread is not running. failed: a copy
+    // storage (a remote module waits for the node daemon). copying: copies
+    // are in flight. parked: the thread is not running. failed: a copy
     // failed; nothing is copied until set_weight_copy_queue.
     enum class ProducerState : int {
         kIdle = 0,
@@ -118,15 +120,48 @@ class HtoD_Engine {
         kParked = 3,
         kFailed = 4,
     };
-    void set_producer_state_(ProducerState state,
-                             const std::string& module_name,
-                             int64_t pass = 0);
+
+    // A module from the moment the producer names it, before its fetch,
+    // until its copy landed or it was retired as a skip, after its daemon
+    // lease was released. Its copies are queued on HtoD_stream; event is
+    // recorded after the last of them. The producer only queries or waits on
+    // an event while copies are in flight, which needs an armed pass: a CUDA
+    // graph is captured with none armed, while the producer is parked.
+    struct InFlightCopy {
+        std::string module_type;
+        std::string module_name;
+        int64_t buffer_idx = -1;  // -1: a skip, which holds no slot
+        int64_t pass = 0;
+        bool leased = false;  // release_module() is still owed
+        cudaEvent_t event = nullptr;
+    };
+    // Enough to keep the copy engine busy behind the producer's per-module
+    // host work; more only holds more slots and leases.
+    static constexpr size_t kMaxCopiesInFlight = 4;
+    static constexpr size_t kCopyEvents = kMaxCopiesInFlight + 1;
+
+    void set_producer_state_(ProducerState state);
+    // copying while a copy is in flight, else idle.
+    void set_copying_or_idle_();
     std::string describe_producer_locked_() const;  // under status_mutex_
     void count_module_(
         std::unordered_map<std::string, uint64_t>& counter,
         const std::string& module_type);
+    // Producer thread only. Pushes or pops in_flight_ under status_mutex_
+    // and takes or returns the entry's event.
+    void begin_in_flight_(const std::string& module_type,
+                          const std::string& module_name, int64_t buffer_idx,
+                          int64_t pass);
+    void end_in_flight_(bool oldest);
+    cudaEvent_t take_copy_event_();
+    // Lands the copies whose event completed, oldest first, and stops at
+    // the first that has not. wait: first waits for the oldest, so at least
+    // one lands. Returns how many landed.
+    size_t land_copies_(bool wait);
+    // (module_type, buffer_idx): a slot reserved for module_name that may
+    // not be in flight yet (-1: none).
     void fail_producer_(const std::string& module_type, int64_t buffer_idx,
-                        const std::string& module_name, bool leased,
+                        const std::string& module_name,
                         const std::string& message);
 
     /* Template */
@@ -174,8 +209,14 @@ class HtoD_Engine {
 
     std::atomic<int> producer_state_{static_cast<int>(ProducerState::kParked)};
     std::mutex status_mutex_;
-    std::string module_in_flight_;  // under status_mutex_
-    int64_t pass_in_flight_ = 0;    // under status_mutex_
+    // Oldest first. Written by the producer under status_mutex_, read by it
+    // without; empty whenever the producer is not running (a stop lands
+    // every copy, a failure abandons them).
+    std::deque<InFlightCopy> in_flight_;
+    // Created lazily on the engine device, destroyed in ~HtoD_Engine.
+    // Producer thread only.
+    std::vector<cudaEvent_t> copy_events_;
+    std::vector<cudaEvent_t> free_copy_events_;
     // Per module type since the last set_weight_copy_queue, under
     // status_mutex_.
     std::unordered_map<std::string, uint64_t> copied_modules_;

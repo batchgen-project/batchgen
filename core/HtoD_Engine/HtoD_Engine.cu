@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -191,8 +192,7 @@ void HtoD_Engine::Start(){
         this->terminate_flag_ = false;
         this->set_producer_state_(this->producer_failed_
                                       ? ProducerState::kFailed
-                                      : ProducerState::kIdle,
-                                  "");
+                                      : ProducerState::kIdle);
         this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
     }
 }
@@ -213,7 +213,14 @@ void HtoD_Engine::Terminate() {
     }
 };
 
-HtoD_Engine::~HtoD_Engine() { this->Terminate(); };
+HtoD_Engine::~HtoD_Engine() {
+    this->Terminate();
+    // The joined producer landed or abandoned every copy.
+    cudaSetDevice(this->engine_config_.basic_config.device);
+    for (cudaEvent_t event : this->copy_events_) {
+        cudaEventDestroy(event);
+    }
+};
 
 torch::Tensor HtoD_Engine::tensor_on_demand_copy(torch::Tensor src_tensor) {
     auto dst_tensor = torch::empty_like(src_tensor, torch::kCUDA).contiguous();
@@ -302,17 +309,19 @@ py::dict HtoD_Engine::get_weight_stream_profile() {
     return result;
 }
 
-void HtoD_Engine::set_producer_state_(ProducerState state,
-                                      const std::string& module_name,
-                                      int64_t pass) {
+void HtoD_Engine::set_producer_state_(ProducerState state) {
     {
         std::lock_guard<std::mutex> lock(this->status_mutex_);
-        this->module_in_flight_ = module_name;
-        this->pass_in_flight_ = module_name.empty() ? 0 : pass;
         this->producer_state_ = static_cast<int>(state);
     }
     // After status_mutex_: the buffer mutex never nests inside it.
     this->gpu_weight_buffer_.note_producer_progress();
+}
+
+void HtoD_Engine::set_copying_or_idle_() {
+    this->set_producer_state_(this->in_flight_.empty()
+                                  ? ProducerState::kIdle
+                                  : ProducerState::kCopying);
 }
 
 namespace {
@@ -323,9 +332,14 @@ const char* const kProducerStates[] = {"idle", "acquiring", "copying",
 std::string HtoD_Engine::describe_producer_locked_() const {
     std::string description =
         std::string("state=") + kProducerStates[this->producer_state_.load()];
-    if (!this->module_in_flight_.empty()) {
-        description += " module=" + this->module_in_flight_ +
-                       " pass=" + std::to_string(this->pass_in_flight_);
+    if (!this->in_flight_.empty()) {
+        const InFlightCopy& oldest = this->in_flight_.front();
+        description += " module=" + oldest.module_name +
+                       " pass=" + std::to_string(oldest.pass);
+        if (this->in_flight_.size() > 1) {
+            description +=
+                " in_flight=" + std::to_string(this->in_flight_.size());
+        }
     }
     return description;
 }
@@ -335,14 +349,64 @@ std::string HtoD_Engine::describe_producer() {
     return this->describe_producer_locked_();
 }
 
+void HtoD_Engine::begin_in_flight_(const std::string& module_type,
+                                   const std::string& module_name,
+                                   int64_t buffer_idx, int64_t pass) {
+    const cudaEvent_t event = this->take_copy_event_();
+    std::lock_guard<std::mutex> lock(this->status_mutex_);
+    this->in_flight_.push_back(
+        InFlightCopy{module_type, module_name, buffer_idx, pass, false, event});
+}
+
+void HtoD_Engine::end_in_flight_(bool oldest) {
+    cudaEvent_t event = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(this->status_mutex_);
+        if (oldest) {
+            event = this->in_flight_.front().event;
+            this->in_flight_.pop_front();
+        } else {
+            event = this->in_flight_.back().event;
+            this->in_flight_.pop_back();
+        }
+    }
+    // Reserved for kCopyEvents: never reallocates.
+    this->free_copy_events_.push_back(event);
+}
+
+cudaEvent_t HtoD_Engine::take_copy_event_() {
+    // On the producer's device, which it set as it started.
+    this->copy_events_.reserve(kCopyEvents);
+    this->free_copy_events_.reserve(kCopyEvents);
+    while (this->copy_events_.size() < kCopyEvents) {
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        this->copy_events_.push_back(event);
+        this->free_copy_events_.push_back(event);
+    }
+    if (this->free_copy_events_.empty()) {
+        throw std::runtime_error(
+            "HtoD: no free copy event with " +
+            std::to_string(this->in_flight_.size()) + " modules in flight");
+    }
+    const cudaEvent_t event = this->free_copy_events_.back();
+    this->free_copy_events_.pop_back();
+    return event;
+}
+
 void HtoD_Engine::require_no_daemon_lease_for_pass(int64_t pass) {
-    // While status_mutex_ is held the producer cannot change its module in
-    // flight, and it acquires a lease only after naming the module and
-    // releases it before clearing the name: any lease is of that module.
+    // While status_mutex_ is held the producer cannot change its modules in
+    // flight, and it acquires a lease only after naming its module in flight
+    // and releases it before dropping the name: any lease is of a module in
+    // flight.
     std::lock_guard<std::mutex> lock(this->status_mutex_);
     for (const auto& module_name : this->weights_storage_.leased_modules()) {
-        if (module_name == this->module_in_flight_ &&
-            this->pass_in_flight_ > pass) {
+        const bool carried = std::any_of(
+            this->in_flight_.begin(), this->in_flight_.end(),
+            [&module_name, pass](const InFlightCopy& copy) {
+                return copy.module_name == module_name && copy.pass > pass;
+            });
+        if (carried) {
             continue;
         }
         throw std::runtime_error(
@@ -360,21 +424,39 @@ void HtoD_Engine::count_module_(
     counter[module_type] += 1;
 }
 
-// Called from the producer's catch: must not throw. The slot is abandoned and
-// the daemon lease released before waiters see the failure.
+// Called from the producer's catch: must not throw. The copy stream is
+// synchronized first, so no copy still writes into a slot about to be
+// abandoned. Every daemon lease in flight is released and every slot in
+// flight abandoned before waiters see the failure.
 void HtoD_Engine::fail_producer_(const std::string& module_type,
                                  int64_t buffer_idx,
-                                 const std::string& module_name, bool leased,
+                                 const std::string& module_name,
                                  const std::string& message) {
     std::string failure = module_name.empty()
                               ? message
                               : module_name + ": " + message;
-    if (leased) {
+    const cudaError_t synchronized = cudaStreamSynchronize(this->HtoD_stream);
+    if (synchronized != cudaSuccess) {
+        failure += "; synchronizing the copy stream also failed: " +
+                   std::string(cudaGetErrorString(synchronized));
+    }
+    std::vector<std::pair<std::string, int64_t>> filling;
+    if (buffer_idx >= 0) {
+        filling.emplace_back(module_type, buffer_idx);
+    }
+    for (InFlightCopy& copy : this->in_flight_) {
+        if (copy.buffer_idx >= 0) {
+            filling.emplace_back(copy.module_type, copy.buffer_idx);
+        }
+        if (!copy.leased) {
+            continue;
+        }
+        copy.leased = false;
         try {
-            this->weights_storage_.release_module(module_name);
+            this->weights_storage_.release_module(copy.module_name);
         } catch (const std::exception& error) {
-            failure += "; releasing its daemon lease also failed: " +
-                       std::string(error.what());
+            failure += "; releasing the daemon lease of " + copy.module_name +
+                       " also failed: " + std::string(error.what());
         }
     }
     this->logger_->error("HtoD producer failed: {}", failure);
@@ -382,15 +464,73 @@ void HtoD_Engine::fail_producer_(const std::string& module_type,
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->producer_failed_ = true;
         try {
-            this->gpu_weight_buffer_.record_producer_failure(
-                module_type, buffer_idx, failure);
+            this->gpu_weight_buffer_.record_producer_failure(filling, failure);
         } catch (const std::exception& error) {
             this->logger_->error(
                 "HtoD producer could not record its failure: {}",
                 error.what());
         }
-        this->set_producer_state_(ProducerState::kFailed, "");
+        while (!this->in_flight_.empty()) {
+            this->end_in_flight_(true);
+        }
+        this->set_producer_state_(ProducerState::kFailed);
     }
+}
+
+size_t HtoD_Engine::land_copies_(bool wait) {
+    size_t landed = 0;
+    while (!this->in_flight_.empty()) {
+        InFlightCopy& copy = this->in_flight_.front();
+        if (wait && landed == 0) {
+            // Bounded by the copies queued up to and including this module.
+            const auto wait_start = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaEventSynchronize(copy.event));
+            const auto wait_end = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+            if (this->weight_profile_enabled_) {
+                this->weight_profile_copy_seconds_[copy.module_type] +=
+                    std::chrono::duration<double>(wait_end - wait_start)
+                        .count();
+            }
+        } else {
+            // One stream: a copy not done yet means none after it is.
+            const cudaError_t status = cudaEventQuery(copy.event);
+            if (status == cudaErrorNotReady) {
+                break;
+            }
+            CUDA_CHECK(status);
+        }
+        // Released before the landing: once no slot of a pass is FILLING,
+        // the producer holds no lease of it either.
+        if (copy.leased) {
+            copy.leased = false;
+            this->weights_storage_.release_module(copy.module_name);
+        }
+        {
+            std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+            if (this->weight_profile_enabled_) {
+                this->weight_profile_modules_[copy.module_type] += 1;
+            }
+        }
+        this->logger_->debug("Copied module: {} to buffer: {}",
+                             copy.module_name, copy.buffer_idx);
+        // The only FILLING -> PRESENT writer; it wakes the consumer.
+        const bool present = this->gpu_weight_buffer_.weights_copy_complete(
+            copy.module_type, copy.module_name, copy.buffer_idx);
+        this->count_module_(this->copied_modules_, copy.module_type);
+        if (!present) {
+            this->count_module_(this->released_on_landing_modules_,
+                                copy.module_type);
+        }
+        // Dropped only after the landing: until then a failure abandons the
+        // slot.
+        this->end_in_flight_(true);
+        ++landed;
+    }
+    if (landed > 0) {
+        this->set_copying_or_idle_();
+    }
+    return landed;
 }
 
 py::dict HtoD_Engine::weight_stream_status() {
@@ -398,11 +538,23 @@ py::dict HtoD_Engine::weight_stream_status() {
     result["producer_state"] = kProducerStates[this->producer_state_.load()];
     {
         std::lock_guard<std::mutex> lock(this->status_mutex_);
+        // The oldest module in flight, then every one, oldest first.
         result["module_in_flight"] =
-            this->module_in_flight_.empty()
+            this->in_flight_.empty()
                 ? py::object(py::none())
-                : py::object(py::str(this->module_in_flight_));
-        result["pass_in_flight"] = this->pass_in_flight_;
+                : py::object(py::str(this->in_flight_.front().module_name));
+        result["pass_in_flight"] =
+            this->in_flight_.empty() ? 0 : this->in_flight_.front().pass;
+        py::list in_flight;
+        for (const InFlightCopy& copy : this->in_flight_) {
+            py::dict entry;
+            entry["module_type"] = copy.module_type;
+            entry["module"] = copy.module_name;
+            entry["pass"] = copy.pass;
+            entry["index"] = copy.buffer_idx;
+            in_flight.append(entry);
+        }
+        result["in_flight"] = in_flight;
         std::unordered_set<std::string> module_types;
         for (const auto* counter :
              {&this->copied_modules_, &this->skipped_modules_,
@@ -503,15 +655,27 @@ void HtoD_Engine::HtoD_Worker() {
         // Read as early as wake_seen: a slot freed or a wake after this read
         // ends the full-ring wait below at once.
         const uint64_t slot_epoch_seen = this->gpu_weight_buffer_.slot_epoch();
-        // Set when this iteration copies or runs anything; an idle iteration
-        // backs off below instead of immediately re-taking the weight-buffer
-        // mutex.
+        // Set when this iteration lands, copies or runs anything; an idle
+        // iteration waits below instead of immediately re-taking the
+        // weight-buffer mutex.
         bool progressed = false;
         // Stays true while every weight type is uninstalled or parked: only
         // begin_weight_pass can give the producer weight work.
         bool weights_parked = true;
         // The first type whose ring had no FREE slot this iteration.
         std::string full_ring_type;
+        // Land every copy that completed, oldest first, before anything
+        // else: the consumer may be waiting for one of them.
+        try {
+            if (this->land_copies_(false) > 0) {
+                progressed = true;
+            }
+        } catch (const std::exception& error) {
+            // Never rethrow: waiters see the failure instead.
+            this->fail_producer_("", -1, "", error.what());
+        } catch (...) {
+            this->fail_producer_("", -1, "", "unknown exception");
+        }
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
             task();
@@ -645,8 +809,10 @@ void HtoD_Engine::HtoD_Worker() {
         for (auto& module_type :
              this->engine_config_.basic_config.module_types) {
             // A failed producer copies nothing until set_weight_copy_queue;
-            // a stop request ends the iteration between modules.
-            if (this->producer_failed_ || this->terminate_flag_) {
+            // a stop request ends the iteration between modules; no module
+            // starts while kMaxCopiesInFlight are in flight.
+            if (this->producer_failed_ || this->terminate_flag_ ||
+                this->in_flight_.size() >= kMaxCopiesInFlight) {
                 break;
             }
             // The type's cursor (pass, position) lives in the weight buffer,
@@ -660,6 +826,17 @@ void HtoD_Engine::HtoD_Worker() {
                 continue;
             }
             weights_parked = false;
+            // A fetch that can wait for the node daemon starts only with no
+            // module in flight. Blocked in that acquire, the producer can
+            // neither release a lease (the daemon socket carries one request
+            // at a time) nor land a copy its consumer may be waiting for,
+            // while the daemon readies the module only once other ranks
+            // consumed theirs. A module of this node's registered store holds
+            // no lease and is read at once, so it pipelines freely.
+            if (!this->in_flight_.empty() &&
+                this->weights_storage_.is_remote_module(next.module_name)) {
+                continue;
+            }
             // A pending skip needs no slot: the module is only acquired and
             // released, so the node daemon's FIFO stays aligned across ranks.
             std::optional<std::reference_wrapper<module_weight_tensor_map>>
@@ -679,9 +856,6 @@ void HtoD_Engine::HtoD_Worker() {
             }
             progressed = true;
             std::string module_name;
-            // release_module() is owed for module_name: a remote module
-            // holds a daemon lease from its fetch until then.
-            bool lease_held = false;
             try {
                 CUDA_CHECK(
                     cudaSetDevice(this->engine_config_.basic_config.device));
@@ -695,8 +869,11 @@ void HtoD_Engine::HtoD_Worker() {
                         module_type + " is not its cursor module " +
                         next.module_name);
                 }
-                this->set_producer_state_(ProducerState::kAcquiring,
-                                          module_name, next.pass);
+                // Named before the fetch and dropped only after its daemon
+                // lease is released: any lease is of a module in flight.
+                this->begin_in_flight_(module_type, module_name, buffer_idx,
+                                       next.pass);
+                this->set_producer_state_(ProducerState::kAcquiring);
                 auto fetched =
                     this->weights_storage_.get_module_weights_storage(
                         module_name, &this->terminate_flag_);
@@ -708,10 +885,13 @@ void HtoD_Engine::HtoD_Worker() {
                         this->gpu_weight_buffer_.abandon(module_type,
                                                          buffer_idx);
                     }
-                    this->set_producer_state_(ProducerState::kParked, "");
+                    this->end_in_flight_(false);
+                    this->set_producer_state_(ProducerState::kParked);
                     break;
                 }
-                lease_held = true;
+                // release_module() is owed for module_name: a remote module
+                // holds a daemon lease from its fetch until then.
+                this->in_flight_.back().leased = true;
                 const auto src = std::move(*fetched);
                 const auto claim = this->gpu_weight_buffer_.claim_for_copy(
                     module_type, buffer_idx, module_name);
@@ -725,19 +905,22 @@ void HtoD_Engine::HtoD_Worker() {
                     // node FIFO advances. The cursor moves past the module
                     // only after that, so its pass cannot end while the lease
                     // is held.
-                    lease_held = false;
+                    this->in_flight_.back().leased = false;
                     this->weights_storage_.release_module(module_name);
                     this->gpu_weight_buffer_.retire_skip(module_type,
                                                          module_name);
                     this->count_module_(this->skipped_modules_, module_type);
-                    this->set_producer_state_(ProducerState::kIdle, "");
+                    this->end_in_flight_(false);
+                    this->set_copying_or_idle_();
                     continue;
                 }
-                this->set_producer_state_(ProducerState::kCopying, module_name,
-                                          next.pass);
+                this->set_producer_state_(ProducerState::kCopying);
                 auto dst = buffer->get();
                 void* src_ptr;
                 int64_t src_byte_size;
+                uint64_t submitted_tensors = 0;
+                uint64_t submitted_bytes = 0;
+                const auto submit_start = std::chrono::steady_clock::now();
                 for (auto& [tensor_name, host_tensor_storage] : src) {
                     src_ptr = host_tensor_storage.data_ptr;
                     src_byte_size = host_tensor_storage.byte_size;
@@ -761,8 +944,8 @@ void HtoD_Engine::HtoD_Worker() {
                     }
                     int64_t dst_byte_size = slot->second.nbytes();
                     if (src_byte_size != dst_byte_size) {
-                        // blocking_copy_ writes src_byte_size bytes with no
-                        // bound check: a short slot is overrun into its
+                        // The copy writes src_byte_size bytes with no bound
+                        // check: a short slot is overrun into its
                         // neighbour, a long one keeps a stale tail. Both are
                         // silent and both produce wrong weights.
                         this->logger_->error(
@@ -775,59 +958,63 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
-                    auto copy_start = std::chrono::steady_clock::now();
-                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
-                                         src_byte_size);
-                    auto copy_end = std::chrono::steady_clock::now();
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            this->weight_profile_mutex_);
-                        if (this->weight_profile_enabled_) {
-                            this->weight_profile_tensors_[module_type] += 1;
-                            this->weight_profile_bytes_[module_type] +=
-                                static_cast<uint64_t>(src_byte_size);
-                            this->weight_profile_copy_seconds_[module_type] +=
-                                std::chrono::duration<double>(copy_end -
-                                                              copy_start)
-                                    .count();
-                        }
-                    }
+                    CUDA_CHECK(cudaMemcpyAsync(slot->second.data_ptr(),
+                                               src_ptr, src_byte_size,
+                                               cudaMemcpyHostToDevice,
+                                               this->HtoD_stream));
+                    submitted_tensors += 1;
+                    submitted_bytes += static_cast<uint64_t>(src_byte_size);
                 }
-                // Released before the landing: once no slot of the pass is
-                // FILLING, the producer holds no lease of it either.
-                lease_held = false;
-                this->weights_storage_.release_module(module_name);
+                // One event after the module's last copy. The stream runs
+                // its copies in order, so modules complete in submit order;
+                // land_copies_ observes the event, releases the lease and
+                // lands the slot.
+                CUDA_CHECK(cudaEventRecord(this->in_flight_.back().event,
+                                           this->HtoD_stream));
+                const auto submit_end = std::chrono::steady_clock::now();
                 {
                     std::lock_guard<std::mutex> lock(
                         this->weight_profile_mutex_);
                     if (this->weight_profile_enabled_) {
-                        this->weight_profile_modules_[module_type] += 1;
+                        this->weight_profile_tensors_[module_type] +=
+                            submitted_tensors;
+                        this->weight_profile_bytes_[module_type] +=
+                            submitted_bytes;
+                        this->weight_profile_copy_seconds_[module_type] +=
+                            std::chrono::duration<double>(submit_end -
+                                                          submit_start)
+                                .count();
                     }
                 }
-                this->logger_->debug("Copied module: {} to buffer: {}",
+                this->logger_->debug("Submitted module: {} to buffer: {}",
                                      module_name, buffer_idx);
-                const bool present =
-                    this->gpu_weight_buffer_.weights_copy_complete(
-                        module_type, module_name, buffer_idx);
-                this->count_module_(this->copied_modules_, module_type);
-                if (!present) {
-                    this->count_module_(this->released_on_landing_modules_,
-                                        module_type);
-                }
-                this->set_producer_state_(ProducerState::kIdle, "");
             } catch (const std::exception& error) {
                 // Never rethrow: an exception leaving this thread is
                 // std::terminate. Waiters see the failure instead.
                 this->fail_producer_(module_type, buffer_idx, module_name,
-                                     lease_held, error.what());
+                                     error.what());
                 break;
             } catch (...) {
                 this->fail_producer_(module_type, buffer_idx, module_name,
-                                     lease_held, "unknown exception");
+                                     "unknown exception");
                 break;
             }
         }
         if (!progressed) {
+            if (!this->in_flight_.empty()) {
+                // Nothing else to do: wait for the oldest copy and land it.
+                // Never park or wait for a slot with a copy un-landed: the
+                // consumer may be waiting for it while it holds every other
+                // slot. Bounded by the copies already queued.
+                try {
+                    this->land_copies_(true);
+                } catch (const std::exception& error) {
+                    this->fail_producer_("", -1, "", error.what());
+                } catch (...) {
+                    this->fail_producer_("", -1, "", "unknown exception");
+                }
+                continue;
+            }
             if (weights_parked && this->kv_copy_task_queue_.empty()) {
                 // No type has an armed position to produce and no KV copy is
                 // queued: block until a pass is armed, a task is queued or
@@ -861,12 +1048,23 @@ void HtoD_Engine::HtoD_Worker() {
                     full_ring_type, slot_epoch_seen, this->terminate_flag_);
             } catch (const std::exception& error) {
                 // Never rethrow: waiters see the failure instead.
-                this->fail_producer_(full_ring_type, -1, "", false,
-                                     error.what());
+                this->fail_producer_(full_ring_type, -1, "", error.what());
             } catch (...) {
-                this->fail_producer_(full_ring_type, -1, "", false,
+                this->fail_producer_(full_ring_type, -1, "",
                                      "unknown exception");
             }
+        }
+    }
+    // Stopping: nothing more is submitted, and every copy in flight lands
+    // before the thread exits, bounded by the copies already queued. A
+    // failure abandons the rest.
+    while (!this->in_flight_.empty()) {
+        try {
+            this->land_copies_(true);
+        } catch (const std::exception& error) {
+            this->fail_producer_("", -1, "", error.what());
+        } catch (...) {
+            this->fail_producer_("", -1, "", "unknown exception");
         }
     }
 };
@@ -907,7 +1105,6 @@ void HtoD_Engine::set_weight_copy_queue(
             this->producer_state_ = static_cast<int>(
                 this->HtoD_worker_.joinable() ? ProducerState::kIdle
                                               : ProducerState::kParked);
-            this->module_in_flight_.clear();
         }
     }
 }
@@ -963,11 +1160,8 @@ HtoD_Engine::WeightPassAbort HtoD_Engine::abort_weight_passes() {
             }
         }
     }
-    {
-        std::lock_guard<std::mutex> status_lock(this->status_mutex_);
-        this->module_in_flight_.clear();
-        this->pass_in_flight_ = 0;
-    }
+    // The stopped producer left nothing in flight: its stop landed every
+    // copy and a failure abandoned them.
     this->logger_->warn(
         "Aborted {} weight passes and {} pending skips; released {} daemon "
         "leases; schedule_lost={}",
