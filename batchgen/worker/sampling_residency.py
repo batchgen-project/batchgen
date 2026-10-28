@@ -102,43 +102,19 @@ be tested without a device; ``DecodeSamplingResidency`` itself runs on CPU with
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
-
-class SamplingResidencyError(RuntimeError):
-    """Base class for resident-sampling-tensor failures."""
-
-
-class SamplingResidencyShapeError(SamplingResidencyError):
-    """The decode batch, its sequences and the logits disagree on row count."""
-
-
-class SamplingResidencyRowError(SamplingResidencyError):
-    """A decode row did not resolve to a sequence.
-
-    ``batch`` and ``_local_to_uuid_map`` disagree. Before residency this
-    resolved to an empty parameter dict and therefore to temperature 0, which
-    silently forced that row to greedy decoding.
-    """
-
-
-class SamplingResidencyStaleError(SamplingResidencyError):
-    """A resident value no longer matches the value its sequence carries."""
-
-
-class SamplingRowIndexError(SamplingResidencyError):
-    """A mixed greedy/sampling batch lacks valid per-batch row index tensors.
-
-    The host-decided path in ``sample_tokens`` splits a mixed batch with
-    device index tensors built once per row-set change, never with a
-    per-step boolean mask (whose ``nonzero`` blocks the host until the device
-    catches up). A mixed batch that reaches it without those tensors -- or
-    with tensors that do not partition the batch -- has no correct sync-free
-    answer, so it is refused rather than silently falling back to the mask.
-    """
+from batchgen.sampling import (
+    SamplingHostDecisions,
+    SamplingResidencyError,
+    SamplingResidencyRowError,
+    SamplingResidencyShapeError,
+    SamplingResidencyStaleError,
+    SamplingRowIndexError,
+)
 
 
 # --------------------------------------------------------------------------
@@ -212,43 +188,6 @@ def batch_all_greedy(temps: Sequence[float]) -> bool:
         if t > 0:
             return False
     return True
-
-
-@dataclass(frozen=True)
-class SamplingHostDecisions:
-    """Branch decisions ``sample_tokens`` would otherwise read back from device.
-
-    Every field is derived from the **cast** parameter values, i.e. from the
-    same numbers the device tensors hold after ``.to(logits.dtype)``.
-
-    ``greedy_rows`` / ``sampling_rows`` are the ascending row ids of the two
-    halves of the split, i.e. exactly the rows ``greedy_mask`` /
-    ``sampling_mask`` would select, in the order boolean indexing would
-    gather them. They partition ``range(n)``.
-
-    ``greedy_index`` / ``sampling_index`` are the same row ids as int64 device
-    tensors. They are only needed -- and only required -- when the batch is
-    **mixed** (``any_greedy and any_sampling``): a uniform batch needs no
-    split at all. They are built once per row-set change (by
-    ``DecodeSamplingResidency`` through pinned staging, or by
-    ``attach_row_index`` off the step path), never per step. They are excluded
-    from equality so two decisions compare by their host values only.
-    """
-
-    n: int
-    any_greedy: bool
-    any_sampling: bool
-    max_top_k: int
-    needs_top_p: bool
-    greedy_rows: Tuple[int, ...] = ()
-    sampling_rows: Tuple[int, ...] = ()
-    greedy_index: Optional[torch.Tensor] = field(default=None, compare=False, repr=False)
-    sampling_index: Optional[torch.Tensor] = field(default=None, compare=False, repr=False)
-
-    @property
-    def mixed(self) -> bool:
-        """True iff the batch has both greedy and sampled rows."""
-        return self.any_greedy and self.any_sampling
 
 
 def host_decisions_from_cast(
