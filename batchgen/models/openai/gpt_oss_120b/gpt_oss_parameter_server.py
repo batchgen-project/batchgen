@@ -56,6 +56,7 @@ from tqdm import tqdm, trange
 
 from .model import GptOss
 from .configuration_gpt_oss import GptOssConfig
+from .converted_ckpt_plan import check_converted_ckpt_format, plan_converted_ckpt_load
 from batchgen.config.model_registry import load_config
 
 try:
@@ -112,6 +113,10 @@ class GptOss_Parameter_Server:
 
     def Init(self):
         """Initialize parameter server and load weights."""
+        # Fail before converting into, or reading from, a directory that holds
+        # files outside the GPT-OSS server set (e.g. convert_checkpoint shards).
+        check_converted_ckpt_format(self.converted_ckpt_dir, self.num_layers)
+
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
@@ -139,6 +144,10 @@ class GptOss_Parameter_Server:
 
         # Convert checkpoint files to BatchGen format
         self._convert_checkpoint()
+
+        # Every file must fit the buffer before the C++ loader reads any of them.
+        load_plan = plan_converted_ckpt_load(self.converted_ckpt_dir, byte_size, self.num_layers)
+        logging.info(f"Weight load plan: {len(load_plan)} files fit the {byte_size}-byte buffer")
 
         self.parameter_server.Init(
             self.shm_name,
