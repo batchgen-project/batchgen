@@ -29,6 +29,7 @@ STORAGE_HEADER = ROOT / "core/Weights_Storage/Weights_Storage.h"
 DAEMON = ROOT / "core/Weights_Storage/distributed_weight_daemon.cpp"
 DAEMON_HEADER = ROOT / "core/Weights_Storage/distributed_weight_daemon.h"
 PROTOCOL = ROOT / "core/Weights_Storage/distributed_weights_protocol.h"
+PENDING_ACQUIRE = ROOT / "core/Weights_Storage/pending_acquire.h"
 QUEUE = ROOT / "core/threadsafe_queue.h"
 BATCHGEN = ROOT / "core/batchgen.cpp"
 BATCHGEN_HEADER = ROOT / "core/batchgen.h"
@@ -654,8 +655,10 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
         "void Acquire(const std::string& module_key, int worker_id,",
         "void Release(const std::string& module_key, int worker_id,",
     )
-    assert "constexpr auto kAcquireSlice = std::chrono::milliseconds(250);" in daemon
-    assert "constexpr auto kAcquireTimeout = std::chrono::seconds(300);" in daemon
+    schedule = PENDING_ACQUIRE.read_text()
+    assert '#include "pending_acquire.h"' in daemon
+    assert "constexpr auto kAcquireSlice = std::chrono::milliseconds(250);" in schedule
+    assert "constexpr auto kAcquireTimeout = std::chrono::seconds(300);" in schedule
     # A no-wait acquire evaluates the slice's predicate once, with no wait;
     # everything before and after is shared.
     evaluate = acquire.index(
@@ -664,7 +667,7 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     assert acquire.count("ring_cv.wait_for(") == 1
     assert acquire.count("no_wait") == 2  # the parameter and that branch
     pending = acquire.index("pending_acquires.at(worker_id)")
-    polled = acquire.index("pending.last_poll = Clock::now();")
+    polled = acquire.index("pending.after_poll(available, Clock::now());")
     retry = acquire.index("response->status = kStatusRetry;")
     stalled = acquire.index("remote fetch stalled")
     stats = acquire.index("++stats.acquire_count;")
@@ -892,36 +895,39 @@ def test_daemon_status_and_metrics_only_copy_snapshots():
 
 
 def test_daemon_stall_warning_is_derived_from_the_timeout():
-    daemon = DAEMON.read_text()
-    assert "constexpr auto kStallWarnAfter = kAcquireTimeout / 10;" in daemon
-    assert "static_assert(kStallWarnAfter > kAcquireAbandoned," in daemon
-    assert daemon.index("constexpr auto kAcquireTimeout") < daemon.index(
+    # The schedule itself is compiled and driven by
+    # tests/test_pending_acquire_schedule.py; this checks its wiring.
+    schedule = PENDING_ACQUIRE.read_text()
+    assert "constexpr auto kStallWarnAfter = kAcquireTimeout / 10;" in schedule
+    assert "static_assert(kStallWarnAfter > kAcquireAbandoned," in schedule
+    assert schedule.index("constexpr auto kAcquireTimeout") < schedule.index(
         "constexpr auto kStallWarnAfter"
     )
-    assert "std::chrono::seconds(30)" not in daemon
-    pending = _section(daemon, "struct PendingAcquire {", "};")
-    assert "Clock::time_point next_warn;" in pending
+    assert "std::chrono::seconds(30)" not in schedule
+    pending = _section(schedule, "struct PendingAcquire {", "\n};")
+    assert "AcquireClock::time_point next_warn;" in pending
 
+    daemon = DAEMON.read_text()
+    assert "std::chrono::seconds(30)" not in daemon
+    assert "next_warn" not in daemon
     acquire = _section(
         daemon,
         "void Acquire(const std::string& module_key, int worker_id,",
         "void Release(const std::string& module_key, int worker_id,",
     )
-    # A fresh pending acquire schedules its first warning.
-    fresh = acquire.index("pending.begin = now;")
-    scheduled = acquire.index("pending.next_warn = now + kStallWarnAfter;")
-    assert fresh < scheduled < acquire.index("const auto ready = [&]() {")
-    # The warning is on the shared retry path, after the slice or the try,
-    # so both count toward the same pending acquire.
+    # Every request, waiting or not, continues or starts the pending wait
+    # before it evaluates, and reports what it found after.
+    request = acquire.index("pending.on_request(module_key, now, ring_completions);")
     evaluate = acquire.index("ring_cv.wait_for(lock, kAcquireSlice, ready);")
+    step = acquire.index("pending.after_poll(available, Clock::now());")
     retry = acquire.index("response->status = kStatusRetry;")
-    due = acquire.index("if (pending.last_poll < pending.next_warn) {")
-    advance = acquire.index("pending.next_warn += kStallWarnAfter;")
-    unlock = acquire.index("lock.unlock();", advance)
+    due = acquire.index("if (step == AcquireStep::kRetry) {")
+    unlock = acquire.index("lock.unlock();", due)
     push = acquire.index("events.push(std::move(stalled));")
     timeout = acquire.index("remote fetch stalled")
-    assert evaluate < retry < due < advance < unlock < push < timeout
-    warning = acquire[advance:push]
+    assert request < evaluate < step < retry < due < unlock < push < timeout
+    assert "if (step != AcquireStep::kFinish) {" in acquire[step:retry]
+    warning = acquire[due:push]
     for field in ("module_key", "age_s", "progressed", "fetching", "ready",
                   "ready_unacquired", "oldest_unacquired",
                   "oldest_unacquired_worker", "cohort", "message"):

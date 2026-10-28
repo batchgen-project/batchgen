@@ -3,6 +3,7 @@
 #include "daemon_event_queue.h"
 #include "distributed_weights_protocol.h"
 #include "latency_histogram.h"
+#include "pending_acquire.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -55,21 +56,6 @@ constexpr int kRails = 8;
 constexpr int kLayers = 92;
 constexpr int kExperts = 896;
 constexpr int kDefaultWorkers = 8;
-// One acquire request waits at most one slice, so a worker can stop between
-// slices; a kAcquireNoWait request waits none. The timeout spans all requests
-// of one pending acquire, waiting or not.
-constexpr auto kAcquireSlice = std::chrono::milliseconds(250);
-constexpr auto kAcquireTimeout = std::chrono::seconds(300);
-// A pending acquire not polled for this long belongs to a worker that stopped
-// asking (its producer was cancelled); the next request starts a fresh wait.
-constexpr auto kAcquireAbandoned = std::chrono::seconds(5);
-// A pending acquire still waiting this long, and each multiple of it, pushes
-// one acquire_stalled event, so at most nine warnings precede the timeout. It
-// is six times kAcquireAbandoned: a wait that long is a live worker's.
-constexpr auto kStallWarnAfter = kAcquireTimeout / 10;
-static_assert(kStallWarnAfter > kAcquireAbandoned,
-              "a stall warning is about a worker still asking");
-
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
 }
@@ -309,17 +295,6 @@ struct Slot {
     std::uint64_t generation = 0;
     std::uint32_t acquired_mask = 0;
     std::uint32_t released_mask = 0;
-};
-
-// The acquire a worker connection is retrying, kept across its slices so the
-// timeout and its diagnostics see the whole wait. Empty key: none.
-struct PendingAcquire {
-    std::string module_key;
-    Clock::time_point begin;
-    Clock::time_point last_poll;
-    // The next acquire_stalled warning is due at or after this.
-    Clock::time_point next_warn;
-    std::uint64_t completions_at_start = 0;
 };
 
 struct Chunk {
@@ -1399,13 +1374,7 @@ struct DistributedWeightDaemon::Impl {
         const Clock::time_point now = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex);
         PendingAcquire& pending = pending_acquires.at(worker_id);
-        if (pending.module_key != module_key ||
-            now - pending.last_poll > kAcquireAbandoned) {
-            pending.module_key = module_key;
-            pending.begin = now;
-            pending.next_warn = now + kStallWarnAfter;
-            pending.completions_at_start = ring_completions;
-        }
+        pending.on_request(module_key, now, ring_completions);
         const auto ready = [&]() {
             if (failed.load() || stop.load() || cohort_closed.load()) {
                 return true;
@@ -1419,15 +1388,14 @@ struct DistributedWeightDaemon::Impl {
         // rest, the 300 s diagnostics included, is the same for both.
         const bool available =
             no_wait ? ready() : ring_cv.wait_for(lock, kAcquireSlice, ready);
-        pending.last_poll = Clock::now();
-        if (!available && pending.last_poll - pending.begin < kAcquireTimeout) {
+        const AcquireStep step = pending.after_poll(available, Clock::now());
+        if (step != AcquireStep::kFinish) {
             response->status = kStatusRetry;
-            // A try and a waiting slice count alike: once per kStallWarnAfter
-            // of the same pending acquire, warn with what the ring holds.
-            if (pending.last_poll < pending.next_warn) {
+            if (step == AcquireStep::kRetry) {
                 return;
             }
-            pending.next_warn += kStallWarnAfter;
+            // Once per kStallWarnAfter of the same pending acquire, warn with
+            // what the ring holds.
             DaemonEvent stalled =
                 MakeEvent(DaemonEventKind::kAcquireStalled, 0, worker_id);
             stalled.module_key = module_key;
