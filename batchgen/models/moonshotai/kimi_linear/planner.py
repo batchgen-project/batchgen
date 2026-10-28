@@ -113,14 +113,22 @@ _K3_H200_KDA_STATE_SLOTS_SHARDED = 160
 _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
 # Streamed-SP8 prefill leases its routed experts from the prefill ring in
 # batches of K3_PREFILL_EXPERT_BATCH and releases each batch with one
-# stream-ordered event. The ring holds that consumer batch plus one batch the
-# HtoD producer fills ahead while the consumer copies; with ring == batch the
-# producer has no free slot until the consumer releases, so the two alternate
-# instead of overlapping. The ring must also exceed batch + the producer's
-# copies in flight (HtoD_Engine kMaxCopiesInFlight), or the producer cannot
-# keep its copy pipeline full while the consumer holds a whole batch.
+# stream-ordered event.
+#
+# The ring must hold MORE THAN ONE LAYER of this rank's experts (112 on the
+# 8-worker shard), or the next layer's HtoD cannot hide behind this layer's
+# compute: with a ring smaller than a layer, the producer tops out after
+# ring-many modules while the consumer computes, and the remaining experts of
+# layer k+1 transfer serially inside layer k+1 itself. Measured on the 4-node
+# H20 group, that serialization is the largest single component of the
+# prefill layer time (ring of 16 hides only 16/112 of a layer). One layer is
+# 112 x 16.73 MiB = 1.83 GiB of HBM; the ring below holds one full layer plus
+# two consumer batches of the next (2.14 GiB), so the producer streams layer
+# k+1 while layer k computes and still has slack past the consumer's held
+# batch and the copy pipeline (HtoD_Engine kMaxCopiesInFlight).
 K3_PREFILL_EXPERT_BATCH = 8
-K3_PREFILL_EXPERT_RING = K3_PREFILL_EXPERT_BATCH + K3_PREFILL_EXPERT_BATCH
+_K3_EXPERTS_PER_RANK = 112
+K3_PREFILL_EXPERT_RING = _K3_EXPERTS_PER_RANK + 2 * K3_PREFILL_EXPERT_BATCH
 
 
 def k3_shard_latent_projections(

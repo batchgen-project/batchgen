@@ -245,11 +245,13 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
 def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
     config = _plan_k3(memory_bytes)
 
-    # Streamed-SP8 leases a consumer batch of 8 experts; the ring holds that
-    # batch plus one more the HtoD producer fills ahead, instead of inheriting
-    # base_planner's generic depth (== the batch, so the two alternated).
+    # Streamed-SP8 leases consumer batches of 8 experts. The ring must hold
+    # MORE THAN ONE LAYER of this rank's experts (112 on the 8-worker shard):
+    # a smaller ring caps the HtoD producer's lookahead below a layer, so
+    # layer k+1's transfers serialize inside layer k+1 instead of hiding
+    # behind layer k's compute.
     assert K3_PREFILL_EXPERT_BATCH == 8
-    assert K3_PREFILL_EXPERT_RING == 16
+    assert K3_PREFILL_EXPERT_RING == 112 + 2 * K3_PREFILL_EXPERT_BATCH
     assert (
         config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"]
         == K3_PREFILL_EXPERT_RING
@@ -258,9 +260,10 @@ def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
         config.Module_Batching_Config.k3_prefill_expert_batch
         == K3_PREFILL_EXPERT_BATCH
     )
-    # The PSM enforces ring > batch. The plan also clears the batch plus the
-    # producer's copies in flight (HtoD_Engine kMaxCopiesInFlight = 4), which
-    # no code enforces.
+    # One full layer of lookahead past the consumer's held batch, and the
+    # producer's copies in flight (HtoD_Engine kMaxCopiesInFlight = 4) still
+    # clear the ring; the PSM enforces only ring > batch.
+    assert K3_PREFILL_EXPERT_RING >= 112 + K3_PREFILL_EXPERT_BATCH
     assert K3_PREFILL_EXPERT_RING > K3_PREFILL_EXPERT_BATCH + 4
 
 
