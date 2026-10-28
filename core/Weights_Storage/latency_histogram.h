@@ -18,6 +18,11 @@
 // above 2^kMaxOctave. record() is O(1) and the size never grows, so a copy
 // costs the same however long the daemon has run.
 //
+// counts() exposes the buckets by index and upper_edge(index) the edge that
+// closes each one, so a consumer can export the histogram as it is; the
+// overflow bucket has no finite upper edge, and upper_edge() reports
+// 2^kMaxOctave for it, the clamp edge below.
+//
 // percentile() is nearest-rank over the buckets and returns the upper edge of
 // the bucket holding the rank. For the exact nearest-rank quantile q of the
 // recorded values, with ratio = 2^(1 / kSubBuckets):
@@ -75,13 +80,11 @@ public:
     std::uint64_t count() const { return count_; }
     double sum() const { return sum_; }
     double max() const { return max_; }
-
-private:
-    // 2^(k / kSubBuckets); exact when k is a multiple of kSubBuckets.
-    static double edge(int k) {
-        return std::exp2(static_cast<double>(k) / kSubBuckets);
+    const std::array<std::uint64_t, kBuckets>& counts() const {
+        return counts_;
     }
 
+    // The edge that closes bucket index, index in [0, kBuckets).
     static double upper_edge(int index) {
         if (index == 0) {
             return low_edge();
@@ -90,6 +93,12 @@ private:
             return high_edge();
         }
         return edge(index + kMinOctave * kSubBuckets);
+    }
+
+private:
+    // 2^(k / kSubBuckets); exact when k is a multiple of kSubBuckets.
+    static double edge(int k) {
+        return std::exp2(static_cast<double>(k) / kSubBuckets);
     }
 
     static int bucket_of(double ms) {

@@ -1,5 +1,6 @@
 #include "distributed_weight_daemon.h"
 
+#include "daemon_event_queue.h"
 #include "distributed_weights_protocol.h"
 #include "latency_histogram.h"
 
@@ -66,6 +67,12 @@ constexpr auto kAcquireTimeout = std::chrono::seconds(300);
 // A pending acquire not polled for this long belongs to a worker that stopped
 // asking (its producer was cancelled); the next request starts a fresh wait.
 constexpr auto kAcquireAbandoned = std::chrono::seconds(5);
+// A pending acquire still waiting this long, and each multiple of it, pushes
+// one acquire_stalled event, so at most nine warnings precede the timeout. It
+// is six times kAcquireAbandoned: a wait that long is a live worker's.
+constexpr auto kStallWarnAfter = kAcquireTimeout / 10;
+static_assert(kStallWarnAfter > kAcquireAbandoned,
+              "a stall warning is about a worker still asking");
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -314,6 +321,8 @@ struct PendingAcquire {
     std::string module_key;
     Clock::time_point begin;
     Clock::time_point last_poll;
+    // The next acquire_stalled warning is due at or after this.
+    Clock::time_point next_warn;
     std::uint64_t completions_at_start = 0;
 };
 
@@ -555,7 +564,8 @@ struct DistributedWeightDaemon::Impl {
     std::mutex client_mutex;
 
     // Lock order, outermost first. No path holds two of these at once except
-    // where listed, and none is held across a thread join or WriteSummary:
+    // where listed, and none is held across a thread join, WriteSummary or
+    // an event push:
     //   summary_mutex -> at most one of cohort_mutex, ring_mutex,
     //                    stats_mutex, failure_mutex at a time (WriteSummary
     //                    takes one snapshot after another)
@@ -564,6 +574,10 @@ struct DistributedWeightDaemon::Impl {
     //                 of stats
     //   ready_mutex -> failure_mutex (WaitReady)
     //   client_mutex, cohort_mutex: leaves
+    // The event queue's mutex is a leaf below all of them: every event is
+    // pushed with none of the daemon's mutexes held, and a PollEvents()
+    // waiter holds only the queue's. Status() and Metrics() take
+    // one snapshot after another, like WriteSummary, without summary_mutex.
     // cohort_closed mirrors (cohort_state == kDraining || cohort_faulted) so
     // the ring and ready predicates can read it without taking cohort_mutex;
     // every writer stores it and then calls WakeWaiters().
@@ -604,6 +618,48 @@ struct DistributedWeightDaemon::Impl {
     std::mutex summary_mutex;
     Stats stats;  // under stats_mutex
 
+    DaemonEventQueue events;
+
+    static DaemonEvent MakeEvent(DaemonEventKind kind,
+                                 std::uint64_t cohort = 0, int worker = -1,
+                                 std::string message = "",
+                                 std::string detail = "") {
+        DaemonEvent event;
+        event.kind = kind;
+        event.cohort = cohort;
+        event.worker = worker;
+        event.message = std::move(message);
+        event.detail = std::move(detail);
+        return event;
+    }
+
+    // What the config event reports: the topology, the ring and the acquire
+    // thresholds, so a log of the events describes itself.
+    std::string ConfigDetail() const {
+        nlohmann::json config;
+        config["node_rank"] = node_rank;
+        config["num_nodes"] = num_nodes;
+        config["transport"] = transport;
+        config["workers"] = workers;
+        config["worker_sharded"] = worker_sharded;
+        config["depth"] = depth;
+        config["superchunk"] = superchunk;
+        config["outstanding"] = outstanding;
+        config["store_bytes"] = store_bytes;
+        config["module_bytes"] = module_bytes;
+        config["staging_bytes"] = staging_bytes;
+        config["acquire_slice_ms"] =
+            std::chrono::duration<double, std::milli>(kAcquireSlice).count();
+        config["acquire_timeout_s"] =
+            std::chrono::duration<double>(kAcquireTimeout).count();
+        config["acquire_abandoned_s"] =
+            std::chrono::duration<double>(kAcquireAbandoned).count();
+        config["stall_warn_after_s"] =
+            std::chrono::duration<double>(kStallWarnAfter).count();
+        config["event_capacity"] = DaemonEventQueue::kCapacity;
+        return config.dump();
+    }
+
     // Wake every condition waiter after a flag its predicate reads changed.
     // Taking each mutex once orders that store before the waiter's next
     // predicate check, so a waiter between its check and its sleep cannot
@@ -619,14 +675,20 @@ struct DistributedWeightDaemon::Impl {
     // fetches, ring bookkeeping) is broken. This latch is permanent; no
     // cohort swap clears it. Worker-side failures go to RecordWorkerLoss.
     void RecordFailure(const std::string& message) {
+        bool latched = false;
         {
             std::lock_guard<std::mutex> lock(failure_mutex);
             if (!failed.exchange(true)) {
                 failure_message = message;
+                latched = true;
             }
         }
         stop.store(true);
         WakeWaiters();
+        // One event, for the failure the latch keeps.
+        if (latched) {
+            events.push(MakeEvent(DaemonEventKind::kFailed, 0, -1, message));
+        }
         WriteSummary();
     }
 
@@ -646,6 +708,9 @@ struct DistributedWeightDaemon::Impl {
         if (stop.load() || failed.load()) {
             return;
         }
+        // Set only by the loss that faults the cohort; the losses that
+        // follow it are its consequence.
+        std::string fault;
         {
             std::lock_guard<std::mutex> lock(cohort_mutex);
             if (epoch != cohort_epoch) {
@@ -661,17 +726,26 @@ struct DistributedWeightDaemon::Impl {
                 cohort_faulted = true;
                 cohort_fault = "worker " + std::to_string(worker_id) +
                                " control connection failed: " + message;
+                fault = cohort_fault;
             }
             cohort_closed.store(true);
         }
         WakeWaiters();
+        if (!fault.empty()) {
+            events.push(MakeEvent(DaemonEventKind::kCohortFaulted, epoch,
+                                  worker_id, fault));
+        }
         WriteSummary();
     }
 
     void RecordRejectedHello(const std::string& message) {
-        std::lock_guard<std::mutex> lock(cohort_mutex);
-        ++rejected_hellos;
-        last_rejected_hello = message;
+        {
+            std::lock_guard<std::mutex> lock(cohort_mutex);
+            ++rejected_hellos;
+            last_rejected_hello = message;
+        }
+        events.push(
+            MakeEvent(DaemonEventKind::kHelloRejected, 0, -1, message));
     }
 
     std::string CohortClosedMessage() {
@@ -853,6 +927,10 @@ struct DistributedWeightDaemon::Impl {
             return;
         }
         try {
+            // Pushed before any thread starts, so it is the first event of
+            // the run and precedes network_ready.
+            events.push(MakeEvent(DaemonEventKind::kConfig, CohortEpoch(), -1,
+                                  "", ConfigDetail()));
             AllocateMappings();
             SetupUnixListener();
             if (hierarchical_gdr) {
@@ -862,6 +940,7 @@ struct DistributedWeightDaemon::Impl {
                 // host-RDMA prefetch, or remote host registration is needed.
                 network_ready.store(true);
                 ready_cv.notify_all();
+                events.push(MakeEvent(DaemonEventKind::kNetworkReady));
             } else {
                 bootstrap_thread = std::thread([this]() {
                     try {
@@ -1087,6 +1166,7 @@ struct DistributedWeightDaemon::Impl {
         }
         network_ready.store(true);
         ready_cv.notify_all();
+        events.push(MakeEvent(DaemonEventKind::kNetworkReady));
         prefetch_thread = std::thread([this]() {
             try {
                 PrefetchLoop();
@@ -1239,6 +1319,9 @@ struct DistributedWeightDaemon::Impl {
             admitted = true;
             epoch = connection->epoch;
             worker_id = connection->worker_id;
+            // AdmitWorker has released cohort_mutex.
+            events.push(
+                MakeEvent(DaemonEventKind::kWorkerAdmitted, epoch, worker_id));
             WaitReadyForWorker(600.0);
             Response hello;
             hello.staging_bytes = staging_bytes;
@@ -1346,6 +1429,7 @@ struct DistributedWeightDaemon::Impl {
             now - pending.last_poll > kAcquireAbandoned) {
             pending.module_key = module_key;
             pending.begin = now;
+            pending.next_warn = now + kStallWarnAfter;
             pending.completions_at_start = ring_completions;
         }
         const auto ready = [&]() {
@@ -1364,6 +1448,45 @@ struct DistributedWeightDaemon::Impl {
         pending.last_poll = Clock::now();
         if (!available && pending.last_poll - pending.begin < kAcquireTimeout) {
             response->status = kStatusRetry;
+            // A try and a waiting slice count alike: once per kStallWarnAfter
+            // of the same pending acquire, warn with what the ring holds.
+            if (pending.last_poll < pending.next_warn) {
+                return;
+            }
+            pending.next_warn += kStallWarnAfter;
+            DaemonEvent stalled =
+                MakeEvent(DaemonEventKind::kAcquireStalled, 0, worker_id);
+            stalled.module_key = module_key;
+            stalled.age_s = elapsed_seconds(pending.begin, pending.last_poll);
+            stalled.progressed =
+                ring_completions != pending.completions_at_start;
+            const Slot* oldest_unacquired = nullptr;
+            for (const Slot& slot : slots) {
+                stalled.fetching += slot.state == SlotState::kFetching;
+                stalled.ready += slot.state == SlotState::kReady;
+                if (slot.state == SlotState::kReady &&
+                    slot.acquired_mask == 0) {
+                    ++stalled.ready_unacquired;
+                    if (oldest_unacquired == nullptr ||
+                        slot.generation < oldest_unacquired->generation) {
+                        oldest_unacquired = &slot;
+                    }
+                }
+            }
+            if (oldest_unacquired != nullptr) {
+                stalled.oldest_unacquired = oldest_unacquired->module_key;
+            }
+            lock.unlock();
+            if (!stalled.oldest_unacquired.empty()) {
+                stalled.oldest_unacquired_worker =
+                    OwningWorker(stalled.oldest_unacquired);
+            }
+            stalled.cohort = CohortEpoch();
+            stalled.message =
+                "worker " + std::to_string(worker_id) + " acquire of " +
+                module_key + " still waiting after " +
+                std::to_string(static_cast<long long>(stalled.age_s)) + " s";
+            events.push(std::move(stalled));
             return;
         }
         const Clock::time_point begin = pending.begin;
@@ -1936,6 +2059,74 @@ struct DistributedWeightDaemon::Impl {
         return cohort_epoch;
     }
 
+    // Built from the snapshots alone, so a status read never holds a mutex
+    // the request path takes for longer than one copy.
+    DaemonStatus Status() {
+        const CohortSnapshot cohort = SnapshotCohort();
+        const RingSnapshot ring = SnapshotRing();
+        DaemonStatus status;
+        status.started = started.load();
+        status.network_ready = network_ready.load();
+        status.failed = failed.load();
+        status.failure = FailureMessage();
+        status.stopping = stop.load();
+        status.cohort_epoch = cohort.epoch;
+        status.cohort_state = cohort_state_name(cohort.state);
+        status.admitted_workers_mask = cohort.admitted_mask;
+        status.cohort_faulted = cohort.faulted;
+        status.cohort_fault = cohort.fault;
+        status.expected_disconnects = cohort.expected_disconnects;
+        status.rejected_hellos = cohort.rejected_hellos;
+        status.last_rejected_hello = cohort.last_rejected_hello;
+        status.completed_swaps = cohort.completed_swaps;
+        status.ready_unacquired_by_worker.assign(kDefaultWorkers, 0);
+        for (const Slot& slot : ring.slots) {
+            if (slot.state == SlotState::kReady && slot.acquired_mask == 0) {
+                const int worker = OwningWorker(slot.module_key);
+                if (worker >= 0 && worker < kDefaultWorkers) {
+                    ++status.ready_unacquired_by_worker[worker];
+                }
+            }
+        }
+        for (int worker = 0; worker < kDefaultWorkers; ++worker) {
+            const PendingAcquire& pending = ring.pending_acquires[worker];
+            if (!pending.module_key.empty()) {
+                status.pending_acquires.push_back(DaemonPendingAcquire{
+                    worker, pending.module_key,
+                    elapsed_seconds(pending.begin, ring.taken)});
+            }
+        }
+        status.last_event_seq = events.last_seq();
+        return status;
+    }
+
+    DaemonMetrics Metrics() {
+        const Stats counters = SnapshotStats();
+        DaemonMetrics metrics;
+        metrics.fetched_modules = counters.fetched_modules;
+        metrics.fetched_bytes = counters.fetched_bytes;
+        metrics.acquire_count = counters.acquire_count;
+        metrics.release_count = counters.release_count;
+        metrics.cache_hits = counters.cache_hits;
+        metrics.duplicate_fetches = counters.duplicate_fetches;
+        metrics.wait_count = counters.wait_count;
+        metrics.wait_seconds = counters.wait_seconds;
+        metrics.worker_wait_count.assign(counters.worker_wait_count.begin(),
+                                         counters.worker_wait_count.end());
+        metrics.worker_wait_seconds.assign(
+            counters.worker_wait_seconds.begin(),
+            counters.worker_wait_seconds.end());
+        metrics.staging_hwm_modules = counters.staging_hwm;
+        const LatencyHistogram& latency = counters.ready_latency;
+        metrics.ready_latency_bucket_counts.assign(latency.counts().begin(),
+                                                   latency.counts().end());
+        metrics.ready_latency_count = latency.count();
+        metrics.ready_latency_sum_ms = latency.sum();
+        metrics.ready_latency_max_ms = latency.max();
+        metrics.events_dropped = events.dropped();
+        return metrics;
+    }
+
     std::uint64_t BeginCohortSwap() {
         if (!started.load()) {
             fail("distributed weights daemon is not started");
@@ -1952,6 +2143,7 @@ struct DistributedWeightDaemon::Impl {
         }
         // Pending acquires and hello waits of this cohort return now.
         WakeWaiters();
+        events.push(MakeEvent(DaemonEventKind::kCohortDraining, epoch));
         WriteSummary();
         return epoch;
     }
@@ -2082,8 +2274,11 @@ struct DistributedWeightDaemon::Impl {
             }
             cohort_closed.store(false);
         }
+        std::string dumped = report.dump();
+        events.push(MakeEvent(DaemonEventKind::kCohortAdmitting, retiring + 1,
+                              -1, "", dumped));
         WriteSummary();
-        return report.dump();
+        return dumped;
     }
 
     void PrepareStop() {
@@ -2197,7 +2392,15 @@ struct DistributedWeightDaemon::Impl {
             close(store_fd);
             store_fd = -1;
         }
+        // The last event of the run: every daemon thread is joined.
+        events.push(MakeEvent(DaemonEventKind::kStopped, CohortEpoch()));
         started.store(false);
+    }
+
+    std::vector<DaemonEvent> PollEvents(std::uint64_t after_seq,
+                                        double timeout_seconds,
+                                        std::uint64_t* dropped) {
+        return events.wait(after_seq, timeout_seconds, dropped);
     }
 };
 
@@ -2229,3 +2432,23 @@ std::string DistributedWeightDaemon::FinishCohortSwap(
 void DistributedWeightDaemon::PrepareStop() { impl_->PrepareStop(); }
 
 void DistributedWeightDaemon::Stop() { impl_->Stop(); }
+
+DaemonStatus DistributedWeightDaemon::Status() { return impl_->Status(); }
+
+DaemonMetrics DistributedWeightDaemon::Metrics() { return impl_->Metrics(); }
+
+std::vector<DaemonEvent> DistributedWeightDaemon::PollEvents(
+    std::uint64_t after_seq, double timeout_seconds,
+    std::uint64_t* dropped) {
+    return impl_->PollEvents(after_seq, timeout_seconds, dropped);
+}
+
+std::vector<double> DistributedWeightDaemon::ReadyLatencyBucketEdgesMs() {
+    std::vector<double> edges;
+    edges.reserve(LatencyHistogram::kBuckets);
+    for (int index = 0; index < LatencyHistogram::kBuckets - 1; ++index) {
+        edges.push_back(LatencyHistogram::upper_edge(index));
+    }
+    edges.push_back(std::numeric_limits<double>::infinity());
+    return edges;
+}

@@ -10,7 +10,9 @@ lands the copies oldest first, and it never waits for the node daemon or for
 a free slot while a copy is un-landed: with copies in flight it only tries a
 remote module, one request the daemon answers at once, and leaves a module
 that is not ready at the head of its queue. The daemon summary copies its
-state and formats it outside the locks the request path takes.
+state and formats it outside the locks the request path takes; its status
+and metrics are built from the same snapshots, and every daemon event is
+pushed with none of the daemon's mutexes held.
 """
 
 import re
@@ -25,6 +27,7 @@ BUFFER_HEADER = ROOT / "core/GPU_Weight_Buffer/GPU_Weight_Buffer.h"
 STORAGE = ROOT / "core/Weights_Storage/Weights_Storage.cpp"
 STORAGE_HEADER = ROOT / "core/Weights_Storage/Weights_Storage.h"
 DAEMON = ROOT / "core/Weights_Storage/distributed_weight_daemon.cpp"
+DAEMON_HEADER = ROOT / "core/Weights_Storage/distributed_weight_daemon.h"
 PROTOCOL = ROOT / "core/Weights_Storage/distributed_weights_protocol.h"
 QUEUE = ROOT / "core/threadsafe_queue.h"
 BATCHGEN = ROOT / "core/batchgen.cpp"
@@ -36,6 +39,37 @@ PACKAGE = ROOT / "batchgen"
 def _section(source, begin, end):
     start = source.index(begin)
     return source[start:source.index(end, start)]
+
+
+def _locks_held_at(section, position):
+    """The mutex locks declared in section before position and still held there.
+
+    A lock is released once the block that declared it closes, or, for a
+    unique_lock, once it is unlocked between its declaration and position.
+    """
+    held = []
+    for match in re.finditer(
+        r"std::(lock_guard|unique_lock)<std::mutex> (\w+)\(", section[:position]
+    ):
+        depth = 0
+        released = False
+        for char in section[match.end():position]:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth < 0:
+                    released = True
+                    break
+        if (
+            not released
+            and match.group(1) == "unique_lock"
+            and f"{match.group(2)}.unlock();" in section[match.end():position]
+        ):
+            released = True
+        if not released:
+            held.append(match.group(0))
+    return held
 
 
 def _worker_body():
@@ -696,6 +730,200 @@ def test_daemon_summary_formats_snapshots_outside_the_request_locks():
     )
     assert "stats.ready_latency.record(" in mark_ready
     assert "push_back" not in mark_ready
+
+
+# Each daemon function that pushes an event, its bounds, and the kinds it
+# pushes, in order.
+DAEMON_PUSH_SITES = (
+    ("void Start() {", "void BootstrapNetwork()",
+     ("kConfig", "kNetworkReady")),
+    ("void BootstrapNetwork()", "void WaitReady(double timeout_seconds)",
+     ("kNetworkReady",)),
+    ("void RecordFailure(", "std::string TransportFatalMessage()",
+     ("kFailed",)),
+    ("void RecordWorkerLoss(", "void RecordRejectedHello(",
+     ("kCohortFaulted",)),
+    ("void RecordRejectedHello(", "std::string CohortClosedMessage()",
+     ("kHelloRejected",)),
+    ("void HandleWorker(ClientConnection* connection)", "void CloseUnadmitted(",
+     ("kWorkerAdmitted",)),
+    ("void Acquire(const std::string& module_key, int worker_id,",
+     "void Release(const std::string& module_key, int worker_id,",
+     ("kAcquireStalled",)),
+    ("std::uint64_t BeginCohortSwap()", "RingResetReport ResetRing(",
+     ("kCohortDraining",)),
+    ("std::string FinishCohortSwap(double timeout_seconds)", "void PrepareStop()",
+     ("kCohortAdmitting",)),
+    ("    void Stop() {", "std::vector<DaemonEvent> PollEvents(",
+     ("kStopped",)),
+)
+
+
+def test_daemon_events_are_pushed_after_the_locks_are_released():
+    daemon = DAEMON.read_text()
+    assert '#include "daemon_event_queue.h"' in daemon
+    assert "DaemonEventQueue events;" in daemon
+    total = 0
+    for begin, end, kinds in DAEMON_PUSH_SITES:
+        section = _section(daemon, begin, end)
+        pushes = [match.start() for match in re.finditer(r"events\.push\(", section)]
+        assert len(pushes) == len(kinds), begin
+        total += len(pushes)
+        named = re.findall(r"DaemonEventKind::(k\w+)", section)
+        assert tuple(named) == kinds, begin
+        for push in pushes:
+            assert _locks_held_at(section, push) == [], begin
+    # No push outside the functions checked above.
+    assert daemon.count("events.push(") == total
+
+    # The lock-order comment states the queue mutex is a leaf.
+    order = _section(daemon, "// Lock order, outermost first.", "std::mutex cohort_mutex;")
+    assert "event push" in order
+    assert "The event queue's mutex is a leaf below all of them" in order
+
+    # Pushed where WakeWaiters (which needs no mutex held) already ran.
+    for begin, end, _ in DAEMON_PUSH_SITES:
+        if begin in ("void RecordFailure(", "void RecordWorkerLoss(",
+                     "std::uint64_t BeginCohortSwap()"):
+            section = _section(daemon, begin, end)
+            assert section.index("WakeWaiters();") < section.index("events.push("), begin
+
+    # The config event precedes every thread; the hierarchical network_ready
+    # follows its store.
+    start = _section(daemon, "void Start() {", "void BootstrapNetwork()")
+    config = start.index("DaemonEventKind::kConfig")
+    assert config < start.index("AllocateMappings();")
+    assert config < start.index("std::thread(")
+    assert "ConfigDetail()" in start
+    detail = _section(daemon, "std::string ConfigDetail() const", "void WakeWaiters()")
+    for key in ("transport", "acquire_timeout_s", "acquire_slice_ms",
+                "stall_warn_after_s"):
+        assert f'config["{key}"]' in detail, key
+
+    # A failure event only for the failure the latch keeps; a fault event only
+    # for the loss that faulted the cohort.
+    failure = _section(daemon, "void RecordFailure(", "std::string TransportFatalMessage()")
+    assert failure.index("latched = true;") < failure.index("if (latched) {")
+    loss = _section(daemon, "void RecordWorkerLoss(", "void RecordRejectedHello(")
+    assert loss.index("fault = cohort_fault;") < loss.index("if (!fault.empty()) {")
+
+    # The swap report is pushed and returned as the same text.
+    finish = _section(daemon, "std::string FinishCohortSwap(double timeout_seconds)",
+                      "void PrepareStop()")
+    assert "std::string dumped = report.dump();" in finish
+    assert "return dumped;" in finish
+    assert finish.count("report.dump()") == 1
+
+    # The stopped event follows every join and precedes started = false.
+    stop = _section(daemon, "    void Stop() {", "std::vector<DaemonEvent> PollEvents(")
+    stopped = stop.index("DaemonEventKind::kStopped")
+    assert stop.rindex(".join();") < stopped < stop.index("started.store(false);")
+
+
+def test_daemon_status_and_metrics_only_copy_snapshots():
+    daemon = DAEMON.read_text()
+    status = _section(daemon, "DaemonStatus Status() {", "DaemonMetrics Metrics() {")
+    metrics = _section(daemon, "DaemonMetrics Metrics() {", "std::uint64_t BeginCohortSwap()")
+    for section in (status, metrics):
+        for token in ("lock_guard", "unique_lock", "ring_mutex", "cohort_mutex",
+                      "stats_mutex", "summary_mutex", "WriteSummary", "json",
+                      "percentile("):
+            assert token not in section, token
+    assert "const CohortSnapshot cohort = SnapshotCohort();" in status
+    assert "const RingSnapshot ring = SnapshotRing();" in status
+    assert "SnapshotStats()" not in status
+    assert "const Stats counters = SnapshotStats();" in metrics
+    assert "SnapshotCohort()" not in metrics
+    assert "SnapshotRing()" not in metrics
+    assert "latency.counts()" in metrics
+    assert "events.dropped()" in metrics
+    poll = _section(daemon, "std::vector<DaemonEvent> PollEvents(", "};\n")
+    assert "return events.wait(after_seq, timeout_seconds, dropped);" in poll
+    assert "mutex" not in poll
+
+    # The overflow bucket's edge is +infinity; the rest are the histogram's.
+    edges = _section(
+        daemon,
+        "std::vector<double> DistributedWeightDaemon::ReadyLatencyBucketEdgesMs()",
+        "return edges;",
+    )
+    assert "LatencyHistogram::upper_edge(index)" in edges
+    assert "index < LatencyHistogram::kBuckets - 1" in edges
+    assert "std::numeric_limits<double>::infinity()" in edges
+
+    header = DAEMON_HEADER.read_text()
+    assert '#include "daemon_event_queue.h"' in header
+    assert "nlohmann" not in header
+    for declaration in (
+        "DaemonStatus Status();",
+        "DaemonMetrics Metrics();",
+        "std::vector<DaemonEvent> PollEvents(std::uint64_t after_seq,",
+        "static std::vector<double> ReadyLatencyBucketEdgesMs();",
+    ):
+        assert declaration in header, declaration
+
+    binding = BINDING.read_text()
+    daemon_class = _section(
+        binding,
+        'py::class_<DistributedWeightDaemon>(m, "DistributedWeightDaemon")',
+        "py::enum_<kv::HostKVPageFormat>",
+    )
+    assert "return DaemonStatusDict(self.Status());" in daemon_class
+    assert "return DaemonMetricsDict(self.Metrics());" in daemon_class
+    poll = _section(daemon_class, '.def("poll_events",', '.def_static(')
+    release = poll.index("py::gil_scoped_release release;")
+    wait = poll.index("self.PollEvents(after_seq, timeout_seconds, &dropped);")
+    # The GIL is back before any Python object is built.
+    scope_end = poll.index("}", wait)
+    build = poll.index("py::list result;")
+    assert release < wait < scope_end < build
+    assert "return py::make_tuple(result, dropped);" in poll
+    assert 'py::arg("after_seq"), py::arg("timeout_seconds")' in poll
+    assert (
+        '.def_static("ready_latency_bucket_edges_ms",\n'
+        "                    &DistributedWeightDaemon::ReadyLatencyBucketEdgesMs);"
+    ) in daemon_class
+
+
+def test_daemon_stall_warning_is_derived_from_the_timeout():
+    daemon = DAEMON.read_text()
+    assert "constexpr auto kStallWarnAfter = kAcquireTimeout / 10;" in daemon
+    assert "static_assert(kStallWarnAfter > kAcquireAbandoned," in daemon
+    assert daemon.index("constexpr auto kAcquireTimeout") < daemon.index(
+        "constexpr auto kStallWarnAfter"
+    )
+    assert "std::chrono::seconds(30)" not in daemon
+    pending = _section(daemon, "struct PendingAcquire {", "};")
+    assert "Clock::time_point next_warn;" in pending
+
+    acquire = _section(
+        daemon,
+        "void Acquire(const std::string& module_key, int worker_id,",
+        "void Release(const std::string& module_key, int worker_id,",
+    )
+    # A fresh pending acquire schedules its first warning.
+    fresh = acquire.index("pending.begin = now;")
+    scheduled = acquire.index("pending.next_warn = now + kStallWarnAfter;")
+    assert fresh < scheduled < acquire.index("const auto ready = [&]() {")
+    # The warning is on the shared retry path, after the slice or the try,
+    # so both count toward the same pending acquire.
+    evaluate = acquire.index("ring_cv.wait_for(lock, kAcquireSlice, ready);")
+    retry = acquire.index("response->status = kStatusRetry;")
+    due = acquire.index("if (pending.last_poll < pending.next_warn) {")
+    advance = acquire.index("pending.next_warn += kStallWarnAfter;")
+    unlock = acquire.index("lock.unlock();", advance)
+    push = acquire.index("events.push(std::move(stalled));")
+    timeout = acquire.index("remote fetch stalled")
+    assert evaluate < retry < due < advance < unlock < push < timeout
+    warning = acquire[advance:push]
+    for field in ("module_key", "age_s", "progressed", "fetching", "ready",
+                  "ready_unacquired", "oldest_unacquired",
+                  "oldest_unacquired_worker", "cohort", "message"):
+        assert re.search(rf"stalled\.{field}\b", warning), field
+    # It still answers retry: the warning never fails the acquire.
+    assert "fail(" not in warning
+    assert "RecordFailure" not in warning
+    assert acquire[push:].index("return;") < acquire[push:].index("}")
 
 
 def test_worker_acquire_loops_on_retry_and_can_be_cancelled():

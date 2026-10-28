@@ -4,7 +4,8 @@
 and JSON, so a small driver is built against it with the system C++ compiler.
 The driver checks the fixed size, the empty histogram, the stated percentile
 bound on single samples, every bucket edge, known and random populations and
-a long recording run, weighted records, and the out-of-range clamps.
+a long recording run, weighted records, the out-of-range clamps, and the
+exported bucket counts and upper edges.
 """
 
 import shutil
@@ -226,6 +227,40 @@ static void out_of_range() {
     CHECK(histogram.percentile(100) == H::high_edge());
 }
 
+static void counts_and_upper_edges() {
+    H histogram;
+    CHECK(histogram.counts().size() == static_cast<size_t>(H::kBuckets));
+    CHECK(H::upper_edge(0) == H::low_edge());
+    CHECK(H::upper_edge(H::kBuckets - 1) == H::high_edge());
+    // Every edge is strictly above the one before, and the last in-range
+    // edge is the top of the range.
+    for (int index = 1; index < H::kBuckets - 1; ++index) {
+        CHECK(H::upper_edge(index) > H::upper_edge(index - 1));
+    }
+    CHECK(H::upper_edge(H::kBuckets - 2) == H::high_edge());
+    // A value on an edge lands in the bucket that edge closes.
+    for (int index = 0; index < H::kBuckets - 1; ++index) {
+        histogram.record(H::upper_edge(index));
+    }
+    histogram.record(H::high_edge() * 2.0, 3);
+    std::uint64_t total = 0;
+    for (int index = 0; index < H::kBuckets; ++index) {
+        total += histogram.counts()[index];
+    }
+    CHECK(total == histogram.count());
+    // The underflow bucket and every in-range bucket hold their own edge;
+    // the overflow bucket holds the weighted record only.
+    for (int index = 0; index < H::kBuckets - 1; ++index) {
+        if (histogram.counts()[index] != 1) {
+            std::fprintf(stderr, "bucket %d holds %llu\n", index,
+                         static_cast<unsigned long long>(
+                             histogram.counts()[index]));
+            ++failures;
+        }
+    }
+    CHECK(histogram.counts()[H::kBuckets - 1] == 3);
+}
+
 static void long_run() {
     std::mt19937_64 random(2026);
     std::uniform_real_distribution<double> exponent(
@@ -260,6 +295,7 @@ int main() {
     weighted_equals_repeated();
     known_populations();
     out_of_range();
+    counts_and_upper_edges();
     long_run();
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

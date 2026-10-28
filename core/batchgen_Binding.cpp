@@ -597,6 +597,96 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
              [](const Manager& self) { return self.DebugString(); });
 }
 
+// One daemon event as a dict holding only the fields it sets; an
+// acquire_stalled event always carries its ring fields, zero included.
+py::dict DaemonEventDict(const DaemonEvent& event) {
+    py::dict result;
+    result["seq"] = event.seq;
+    result["wall_time_s"] = event.wall_time_s;
+    result["kind"] = daemon_event_kind_name(event.kind);
+    if (event.cohort != 0) {
+        result["cohort"] = event.cohort;
+    }
+    if (event.worker >= 0) {
+        result["worker"] = event.worker;
+    }
+    if (!event.message.empty()) {
+        result["message"] = event.message;
+    }
+    if (!event.detail.empty()) {
+        result["detail"] = event.detail;
+    }
+    if (event.kind == DaemonEventKind::kAcquireStalled) {
+        result["module_key"] = event.module_key;
+        result["fetching"] = event.fetching;
+        result["ready"] = event.ready;
+        result["ready_unacquired"] = event.ready_unacquired;
+        result["age_s"] = event.age_s;
+        result["progressed"] = event.progressed;
+        if (!event.oldest_unacquired.empty()) {
+            result["oldest_unacquired"] = event.oldest_unacquired;
+            result["oldest_unacquired_worker"] =
+                event.oldest_unacquired_worker;
+        }
+    }
+    return result;
+}
+
+py::dict DaemonStatusDict(const DaemonStatus& status) {
+    py::dict result;
+    result["started"] = status.started;
+    result["network_ready"] = status.network_ready;
+    result["failed"] = status.failed;
+    result["failure"] = status.failure;
+    result["stopping"] = status.stopping;
+    py::dict cohort;
+    cohort["epoch"] = status.cohort_epoch;
+    cohort["state"] = status.cohort_state;
+    cohort["admitted_workers_mask"] = status.admitted_workers_mask;
+    cohort["faulted"] = status.cohort_faulted;
+    cohort["fault"] = status.cohort_fault;
+    cohort["expected_disconnects"] = status.expected_disconnects;
+    cohort["rejected_hellos"] = status.rejected_hellos;
+    cohort["last_rejected_hello"] = status.last_rejected_hello;
+    cohort["completed_swaps"] = status.completed_swaps;
+    result["cohort"] = cohort;
+    py::list pending;
+    for (const DaemonPendingAcquire& acquire : status.pending_acquires) {
+        py::dict entry;
+        entry["worker"] = acquire.worker;
+        entry["module_key"] = acquire.module_key;
+        entry["age_s"] = acquire.age_s;
+        pending.append(entry);
+    }
+    result["pending_acquires"] = pending;
+    result["ready_unacquired_by_worker"] = status.ready_unacquired_by_worker;
+    result["last_event_seq"] = status.last_event_seq;
+    return result;
+}
+
+py::dict DaemonMetricsDict(const DaemonMetrics& metrics) {
+    py::dict result;
+    result["fetched_modules"] = metrics.fetched_modules;
+    result["fetched_bytes"] = metrics.fetched_bytes;
+    result["acquire_count"] = metrics.acquire_count;
+    result["release_count"] = metrics.release_count;
+    result["cache_hits"] = metrics.cache_hits;
+    result["duplicate_fetches"] = metrics.duplicate_fetches;
+    result["wait_count"] = metrics.wait_count;
+    result["wait_seconds"] = metrics.wait_seconds;
+    result["worker_wait_count"] = metrics.worker_wait_count;
+    result["worker_wait_seconds"] = metrics.worker_wait_seconds;
+    result["staging_hwm_modules"] = metrics.staging_hwm_modules;
+    py::dict latency;
+    latency["bucket_counts"] = metrics.ready_latency_bucket_counts;
+    latency["count"] = metrics.ready_latency_count;
+    latency["sum_ms"] = metrics.ready_latency_sum_ms;
+    latency["max_ms"] = metrics.ready_latency_max_ms;
+    result["ready_latency_ms"] = latency;
+    result["events_dropped"] = metrics.events_dropped;
+    return result;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -718,7 +808,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("timeout_seconds"),
              py::call_guard<py::gil_scoped_release>())
         .def("prepare_stop", &DistributedWeightDaemon::PrepareStop)
-        .def("stop", &DistributedWeightDaemon::Stop);
+        .def("stop", &DistributedWeightDaemon::Stop)
+        .def("status",
+             [](DistributedWeightDaemon& self) {
+                 return DaemonStatusDict(self.Status());
+             })
+        .def("metrics",
+             [](DistributedWeightDaemon& self) {
+                 return DaemonMetricsDict(self.Metrics());
+             })
+        // Blocks in C++ without the GIL until an event after after_seq
+        // exists or the timeout passes; returns (events, dropped).
+        .def("poll_events",
+             [](DistributedWeightDaemon& self, std::uint64_t after_seq,
+                double timeout_seconds) {
+                 std::vector<DaemonEvent> events;
+                 std::uint64_t dropped = 0;
+                 {
+                     py::gil_scoped_release release;
+                     events =
+                         self.PollEvents(after_seq, timeout_seconds, &dropped);
+                 }
+                 py::list result;
+                 for (const DaemonEvent& event : events) {
+                     result.append(DaemonEventDict(event));
+                 }
+                 return py::make_tuple(result, dropped);
+             },
+             py::arg("after_seq"), py::arg("timeout_seconds"))
+        .def_static("ready_latency_bucket_edges_ms",
+                    &DistributedWeightDaemon::ReadyLatencyBucketEdgesMs);
     
     py::enum_<kv::HostKVPageFormat>(m, "HostKVPageFormat")
         .value("CONTIGUOUS_AOS", kv::HostKVPageFormat::kContiguousAoS,
