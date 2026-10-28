@@ -3194,9 +3194,12 @@ class BatchGenWorker:
 		if not completed_uuids:
 			return {}
 
-		# Each rank provides tokens for its locally-owned completed sequences,
-		# plus the prompt tokens their last prefill took from the prefix cache:
-		# that state lives on the owner, and rank 0 reports the completion.
+		# Each rank provides tokens for its locally-owned completed sequences.
+		# The prompt tokens their last prefill took from the prefix cache come
+		# only from the rank that owns the sequence's host KV
+		# (_owns_host_kv): under G>1 every rank of the serve group holds the
+		# sequence, but only the leader drives its prefix state, so a
+		# follower's count is not authoritative. Others send None.
 		my_tokens = {}
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
@@ -3208,23 +3211,45 @@ class BatchGenWorker:
 						text = self._decode_tokens_to_string(decoded_tokens)
 					except Exception:
 						text = ""
-					state = self._prefix_sequence_states.get(seq.global_idx)
-					cached = 0 if state is None else int(state.compute_cached_tokens)
+					cached = None
+					if self._owns_host_kv(seq):
+						state = self._prefix_sequence_states.get(seq.global_idx)
+						cached = 0 if state is None else int(state.compute_cached_tokens)
 					my_tokens[uuid] = (text, cached)
 
 		# All ranks participate in gather
 		all_tokens = [None] * self.world_size
 		dist.all_gather_object(all_tokens, my_tokens)
 
-		# Merge: each uuid is owned by exactly one rank
+		# Merge. Under G>1 a uuid arrives from every rank of its serve group;
+		# exactly one of them (the host-KV owner) carries its cached count.
+		# Every rank merges the same gathered data, so a violation raises on
+		# all ranks alike rather than desynchronising them.
 		merged = {}
-		for rank_tokens in all_tokens:
+		owner_cached = {}
+		for src_rank, rank_tokens in enumerate(all_tokens):
 			if rank_tokens:
 				for uuid, (text, cached) in rank_tokens.items():
 					merged[uuid] = text
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is not None:
-						seq.prefix_cached_tokens = cached
+					if cached is None:
+						continue
+					if uuid in owner_cached and owner_cached[uuid][1] != cached:
+						raise RuntimeError(
+							f"cached_tokens for {uuid} disagree between host-KV "
+							f"owners: rank {owner_cached[uuid][0]} reports "
+							f"{owner_cached[uuid][1]}, rank {src_rank} reports {cached}"
+						)
+					owner_cached[uuid] = (src_rank, cached)
+		missing = sorted(set(merged) - set(owner_cached))
+		if missing:
+			raise RuntimeError(
+				f"no host-KV owner reported cached_tokens for completed "
+				f"sequence(s) {missing[:8]} ({len(missing)} total)"
+			)
+		for uuid, (_, cached) in owner_cached.items():
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.prefix_cached_tokens = cached
 		return merged
 
 	# ============ End Request Pool Methods ============

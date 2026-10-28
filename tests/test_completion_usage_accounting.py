@@ -78,7 +78,11 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
             assert skip_special_tokens is True
             return "answer"
 
+    seq.assigned_rank = 0
     worker = object.__new__(BatchGenWorker)
+    # Single rank, G=1: it owns the sequence's host KV and so reports its
+    # cached-token count (none here: no prefix state).
+    worker.rank = 0
     worker._uuid_to_local_map = {seq.uuid: 0}
     worker.global_batch = SimpleNamespace(get_sequence=lambda uuid: seq)
     worker.query_book = {0: SimpleNamespace()}

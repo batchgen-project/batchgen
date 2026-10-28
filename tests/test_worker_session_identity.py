@@ -16,6 +16,8 @@ import queue
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from batchgen.query_book import release_local_query_slot
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from tests.worker_method_source import load_worker_methods
@@ -30,7 +32,8 @@ def _all_gather_object(output, local):
 
 
 _METHODS = load_worker_methods(
-    ["_admit_sequences_from_message", "_report_completion", "_gather_completed_tokens"],
+    ["_admit_sequences_from_message", "_report_completion", "_gather_completed_tokens",
+     "_owns_host_kv", "_decode_attn_tp_size"],
     {
         "SequenceEntry": SequenceEntry,
         "logging": logging,
@@ -51,10 +54,13 @@ class _Worker:
     _admit_sequences_from_message = _METHODS["_admit_sequences_from_message"]
     _report_completion = _METHODS["_report_completion"]
     _gather_completed_tokens = _METHODS["_gather_completed_tokens"]
+    _owns_host_kv = _METHODS["_owns_host_kv"]
+    _decode_attn_tp_size = _METHODS["_decode_attn_tp_size"]
 
-    def __init__(self, rank, owner_rank=0):
+    def __init__(self, rank, owner_rank=0, attn_tp_size=1):
         self.rank = rank
         self.owner_rank = owner_rank
+        self.parallel_manager = SimpleNamespace(attn_tp_size=attn_tp_size)
         self.global_batch = SequenceBatch()
         self._group_uuids = set()
         self._uuid_to_local_map = {}
@@ -196,3 +202,96 @@ def test_batch_completion_without_prefix_cache_reports_zero_cached():
     worker._report_completion("r@batch_1", gathered_text="answer")
     item = worker._response_queue.get_nowait()
     assert (item["cached_tokens"], item["computed_tokens"]) == (0, 12)
+
+
+def _bind_locally(worker, uuid, cached=None):
+    """Hold ``uuid`` in this rank's local maps; ``cached`` is its prefix state."""
+    seq = worker.global_batch.get_sequence(uuid)
+    worker._uuid_to_local_map[uuid] = 0
+    worker.query_book[0] = object()
+    if cached is not None:
+        worker._prefix_sequence_states[seq.global_idx] = SimpleNamespace(
+            compute_cached_tokens=cached)
+    return seq
+
+
+def _g2_group():
+    """World 2, G=2: both ranks serve group 0; rank 0 is its host-KV leader.
+
+    The follower holds the sequence too, but its prefix state was never
+    populated (the leader drives prefix lookups), so it would report 0.
+    """
+    workers = []
+    for rank in (0, 1):
+        worker = _Worker(rank=rank, owner_rank=0, attn_tp_size=2)
+        worker._admit_sequences_from_message({"entries": [_TURN_ENTRY]})
+        seq = _bind_locally(worker, "turn_abc", cached=24 if rank == 0 else None)
+        seq.decode_dp_group = 0
+        workers.append(worker)
+    return workers
+
+
+def _gather_on_all_ranks(workers, uuids):
+    """Run the collective on every rank: each sees all ranks' payloads in order."""
+    payloads = {}
+
+    def capture(rank):
+        def gather(output, local):
+            payloads[rank] = local
+        return gather
+
+    original = _METHODS["_gather_completed_tokens"].__globals__["dist"]
+    try:
+        for worker in workers:
+            _METHODS["_gather_completed_tokens"].__globals__["dist"] = SimpleNamespace(
+                all_gather_object=capture(worker.rank))
+            worker._gather_completed_tokens(uuids)
+        results = []
+        for worker in workers:
+            def replay(output, local):
+                for rank in range(len(output)):
+                    output[rank] = payloads[rank]
+            _METHODS["_gather_completed_tokens"].__globals__["dist"] = SimpleNamespace(
+                all_gather_object=replay)
+            results.append(worker._gather_completed_tokens(uuids))
+        return results
+    finally:
+        _METHODS["_gather_completed_tokens"].__globals__["dist"] = original
+
+
+def test_g2_follower_does_not_overwrite_the_leaders_cached_tokens():
+    workers = _g2_group()
+    texts = _gather_on_all_ranks(workers, ["turn_abc"])
+    assert texts == [{"turn_abc": "answer"}] * 2
+    assert [w.global_batch.get_sequence("turn_abc").prefix_cached_tokens
+            for w in workers] == [24, 24]
+
+
+def test_g2_only_the_host_kv_leader_contributes_a_cached_count():
+    leader, follower = _g2_group()
+    seen = {}
+    original = _METHODS["_gather_completed_tokens"].__globals__["dist"]
+
+    def record(output, local):
+        seen["local"] = local
+        output[0] = output[1] = {}
+
+    _METHODS["_gather_completed_tokens"].__globals__["dist"] = SimpleNamespace(
+        all_gather_object=record)
+    try:
+        follower._gather_completed_tokens(["turn_abc"])
+    finally:
+        _METHODS["_gather_completed_tokens"].__globals__["dist"] = original
+    assert seen["local"] == {"turn_abc": ("answer", None)}
+
+
+def test_disagreeing_owner_counts_for_one_uuid_raise():
+    worker = _Worker(rank=0, owner_rank=0)
+    worker._admit_sequences_from_message({"entries": [_TURN_ENTRY]})
+    _bind_locally(worker, "turn_abc", cached=24)
+    _PEER["payload"] = {"turn_abc": ("answer", 30)}
+    try:
+        with pytest.raises(RuntimeError, match="disagree between host-KV owners"):
+            worker._gather_completed_tokens(["turn_abc"])
+    finally:
+        _PEER["payload"] = {}
