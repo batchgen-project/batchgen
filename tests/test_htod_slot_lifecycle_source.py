@@ -7,7 +7,8 @@ and every slot and daemon lease belongs to exactly one weight pass that the
 consumer arms and closes. Up to kMaxCopiesInFlight modules are in flight, each
 with one event after its copies; the producer alone observes the events and
 lands the copies oldest first, and it never waits for the node daemon or for
-a free slot while a copy is un-landed.
+a free slot while a copy is un-landed. The daemon summary copies its state and
+formats it outside the locks the request path takes.
 """
 
 import re
@@ -582,6 +583,55 @@ def test_daemon_acquire_is_bounded_and_retry_is_not_a_failure():
     summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
     assert 'summary["ready_unacquired_by_worker"]' in summary
     assert 'summary["pending_acquire_by_worker"]' in summary
+
+
+def test_daemon_summary_formats_snapshots_outside_the_request_locks():
+    daemon = DAEMON.read_text()
+    # Ready latency is a fixed-size histogram: no per-module sample vector
+    # and no sort for the summary.
+    assert "std::vector<double> ready_latency_ms" not in daemon
+    assert "std::sort" not in daemon
+    assert "double percentile(" not in daemon
+    assert '#include "latency_histogram.h"' in daemon
+    assert "Stats stats;  // under stats_mutex" in daemon
+
+    # The summary holds only its own mutex and takes one snapshot at a time.
+    summary = _section(daemon, "void WriteSummary()", "std::uint64_t CohortEpoch()")
+    assert summary.count("std::lock_guard") == 1
+    assert "std::lock_guard<std::mutex> summary_lock(summary_mutex);" in summary
+    assert "unique_lock" not in summary
+    for mutex in ("stats_mutex", "ring_mutex", "cohort_mutex"):
+        assert mutex not in summary, mutex
+    snapshots = [
+        summary.index(call)
+        for call in ("SnapshotCohort()", "SnapshotRing()", "SnapshotStats()")
+    ]
+    assert summary.index("summary_lock(summary_mutex)") < min(snapshots)
+    assert 'summary["transport"] = transport' in summary
+    for key in ('{"p50", ', '{"p95", ', '{"p99", ', '{"count", ', '{"max", '):
+        assert key in summary, key
+
+    # Each snapshot only copies under its one mutex.
+    cohort = _section(daemon, "CohortSnapshot SnapshotCohort()", "RingSnapshot SnapshotRing()")
+    assert cohort.count("std::lock_guard") == 1
+    assert "std::lock_guard<std::mutex> lock(cohort_mutex);" in cohort
+    ring = _section(daemon, "RingSnapshot SnapshotRing()", "Stats SnapshotStats()")
+    assert ring.count("std::lock_guard") == 1
+    assert "std::lock_guard<std::mutex> lock(ring_mutex);" in ring
+    for token in ("std::to_string", "OwningWorker", "json"):
+        assert token not in ring, token
+    stats = _section(daemon, "Stats SnapshotStats()", "void WriteSummary()")
+    assert stats.count("std::lock_guard") == 1
+    assert "std::lock_guard<std::mutex> lock(stats_mutex);" in stats
+    for token in ("nlohmann", "summary[", "percentile(", "ofstream", "FailureMessage"):
+        assert token not in stats, token
+
+    # A fetched chunk records its latency once, weighted by its modules.
+    mark_ready = _section(
+        daemon, "void MarkReady(const Chunk& chunk,", "RingResetReport ResetSlotsLocked()"
+    )
+    assert "stats.ready_latency.record(" in mark_ready
+    assert "push_back" not in mark_ready
 
 
 def test_worker_acquire_loops_on_retry_and_can_be_cancelled():

@@ -1,6 +1,7 @@
 #include "distributed_weight_daemon.h"
 
 #include "distributed_weights_protocol.h"
+#include "latency_histogram.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -21,7 +22,6 @@
 #include <bitset>
 #include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -254,20 +254,6 @@ double elapsed_seconds(Clock::time_point begin,
     return std::chrono::duration<double>(end - begin).count();
 }
 
-double percentile(std::vector<double> values, double percent) {
-    if (values.empty()) {
-        return 0.0;
-    }
-    std::sort(values.begin(), values.end());
-    const double index =
-        (values.size() - 1) * percent / 100.0;
-    const size_t lower = static_cast<size_t>(std::floor(index));
-    const size_t upper = std::min(lower + 1, values.size() - 1);
-    const double weight = index - lower;
-    return values[lower] * (1.0 - weight) +
-           values[upper] * weight;
-}
-
 std::pair<int, int> parse_module_key(const std::string& key) {
     int layer = -1;
     int expert = -1;
@@ -372,6 +358,45 @@ struct RingResetReport {
     std::uint64_t schedule_cursor = 0;  // prefetch position rewound to 0
     int ring_tail = 0;                  // ring position rewound to 0
     bool prefetch_handshake = false;    // reset done by the prefetch thread
+};
+
+// The counters the summary reports. Every update is a few scalar writes, and
+// the summary copies the whole struct, so stats_mutex is never held for long.
+struct Stats {
+    std::uint64_t fetched_modules = 0;
+    std::uint64_t fetched_bytes = 0;
+    std::uint64_t acquire_count = 0;
+    std::uint64_t release_count = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t duplicate_fetches = 0;
+    std::uint64_t wait_count = 0;
+    double wait_seconds = 0.0;
+    std::array<std::uint64_t, kDefaultWorkers> worker_wait_count{};
+    std::array<double, kDefaultWorkers> worker_wait_seconds{};
+    int staging_hwm = 0;
+    // Post-to-ready latency of each fetched module, in milliseconds.
+    LatencyHistogram ready_latency;
+};
+
+// What the summary reads of the cohort. Copied under cohort_mutex.
+struct CohortSnapshot {
+    std::uint64_t epoch = 0;
+    CohortState state = CohortState::kAdmitting;
+    std::uint32_t admitted_mask = 0;
+    bool faulted = false;
+    std::string fault;
+    std::uint64_t expected_disconnects = 0;
+    std::uint64_t rejected_hellos = 0;
+    std::string last_rejected_hello;
+    std::uint64_t completed_swaps = 0;
+    nlohmann::json swap_log;
+};
+
+// What the summary reads of the ring. Copied under ring_mutex.
+struct RingSnapshot {
+    std::vector<Slot> slots;
+    std::array<PendingAcquire, kDefaultWorkers> pending_acquires;
+    Clock::time_point taken;
 };
 
 }  // namespace
@@ -529,10 +554,12 @@ struct DistributedWeightDaemon::Impl {
 
     // Lock order, outermost first. No path holds two of these at once except
     // where listed, and none is held across a thread join or WriteSummary:
-    //   summary_mutex -> cohort_mutex (snapshot), then
-    //   summary_mutex -> ring_mutex (snapshot), then
-    //   summary_mutex -> stats_mutex -> failure_mutex
-    //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop)
+    //   summary_mutex -> at most one of cohort_mutex, ring_mutex,
+    //                    stats_mutex, failure_mutex at a time (WriteSummary
+    //                    takes one snapshot after another)
+    //   ring_mutex -> stats_mutex (MarkReady, PrefetchLoop); every
+    //                 stats_mutex hold is a few scalar updates or one copy
+    //                 of stats
     //   ready_mutex -> failure_mutex (WaitReady)
     //   client_mutex, cohort_mutex: leaves
     // cohort_closed mirrors (cohort_state == kDraining || cohort_faulted) so
@@ -556,7 +583,6 @@ struct DistributedWeightDaemon::Impl {
     std::vector<Slot> slots;
     std::unordered_map<std::string, int> module_to_slot;
     std::uint64_t next_generation = 1;
-    int staging_hwm = 0;
     // Completed fetches, so an acquire timeout can tell a stalled transport
     // (no completion while slots are fetching) from a cohort that never
     // consumed what the ring holds. Under ring_mutex.
@@ -574,17 +600,7 @@ struct DistributedWeightDaemon::Impl {
 
     std::mutex stats_mutex;
     std::mutex summary_mutex;
-    std::uint64_t fetched_modules = 0;
-    std::uint64_t fetched_bytes = 0;
-    std::uint64_t acquire_count = 0;
-    std::uint64_t release_count = 0;
-    std::uint64_t cache_hits = 0;
-    std::uint64_t duplicate_fetches = 0;
-    std::uint64_t wait_count = 0;
-    double wait_seconds = 0.0;
-    std::array<std::uint64_t, kDefaultWorkers> worker_wait_count{};
-    std::array<double, kDefaultWorkers> worker_wait_seconds{};
-    std::vector<double> ready_latency_ms;
+    Stats stats;  // under stats_mutex
 
     // Wake every condition waiter after a flag its predicate reads changed.
     // Taking each mutex once orders that store before the waiter's next
@@ -1413,15 +1429,15 @@ struct DistributedWeightDaemon::Impl {
         lock.unlock();
 
         std::lock_guard<std::mutex> stats_lock(stats_mutex);
-        ++acquire_count;
+        ++stats.acquire_count;
         if (cache_hit) {
-            ++cache_hits;
+            ++stats.cache_hits;
         }
         if (waited) {
-            ++wait_count;
-            wait_seconds += wait_s;
-            worker_wait_count.at(worker_id) += 1;
-            worker_wait_seconds.at(worker_id) += wait_s;
+            ++stats.wait_count;
+            stats.wait_seconds += wait_s;
+            stats.worker_wait_count.at(worker_id) += 1;
+            stats.worker_wait_seconds.at(worker_id) += wait_s;
         }
         (void)layer;
     }
@@ -1451,7 +1467,7 @@ struct DistributedWeightDaemon::Impl {
         }
         lock.unlock();
         std::lock_guard<std::mutex> stats_lock(stats_mutex);
-        ++release_count;
+        ++stats.release_count;
     }
 
     std::uint32_t ExpectedWorkers(
@@ -1557,7 +1573,7 @@ struct DistributedWeightDaemon::Impl {
                     {
                         std::lock_guard<std::mutex> stats_lock(
                             stats_mutex);
-                        ++duplicate_fetches;
+                        ++stats.duplicate_fetches;
                     }
                     fail("duplicate remote module fetch: " +
                          slot.module_key);
@@ -1567,12 +1583,11 @@ struct DistributedWeightDaemon::Impl {
             ring_cv.notify_all();
         }
         std::lock_guard<std::mutex> stats_lock(stats_mutex);
-        fetched_modules += chunk.count;
-        fetched_bytes +=
+        stats.fetched_modules += chunk.count;
+        stats.fetched_bytes +=
             static_cast<std::uint64_t>(chunk.count) * module_bytes;
-        for (int index = 0; index < chunk.count; ++index) {
-            ready_latency_ms.push_back(latency_ms);
-        }
+        stats.ready_latency.record(
+            latency_ms, static_cast<std::uint64_t>(chunk.count));
     }
 
     // Free every slot and forget every module, as at daemon start. Counts what
@@ -1750,7 +1765,8 @@ struct DistributedWeightDaemon::Impl {
                     {
                         std::lock_guard<std::mutex> stats_lock(
                             stats_mutex);
-                        staging_hwm = std::max(staging_hwm, occupied);
+                        stats.staging_hwm =
+                            std::max(stats.staging_hwm, occupied);
                     }
                 }
 
@@ -1789,90 +1805,115 @@ struct DistributedWeightDaemon::Impl {
         WriteSummary();
     }
 
+    // The summary's snapshots. Each takes one mutex and only copies, so a
+    // request path never waits behind JSON formatting or file I/O.
+    CohortSnapshot SnapshotCohort() {
+        std::lock_guard<std::mutex> lock(cohort_mutex);
+        CohortSnapshot snapshot;
+        snapshot.epoch = cohort_epoch;
+        snapshot.state = cohort_state;
+        snapshot.admitted_mask = cohort_admitted_mask;
+        snapshot.faulted = cohort_faulted;
+        snapshot.fault = cohort_fault;
+        snapshot.expected_disconnects = cohort_expected_disconnects;
+        snapshot.rejected_hellos = rejected_hellos;
+        snapshot.last_rejected_hello = last_rejected_hello;
+        snapshot.completed_swaps = completed_swaps;
+        snapshot.swap_log = swap_log;
+        return snapshot;
+    }
+
+    RingSnapshot SnapshotRing() {
+        std::lock_guard<std::mutex> lock(ring_mutex);
+        return RingSnapshot{slots, pending_acquires, Clock::now()};
+    }
+
+    Stats SnapshotStats() {
+        std::lock_guard<std::mutex> lock(stats_mutex);
+        return stats;
+    }
+
     void WriteSummary() {
         if (summary_path.empty()) {
             return;
         }
         std::lock_guard<std::mutex> summary_lock(summary_mutex);
-        nlohmann::json summary;
+        const CohortSnapshot cohort_snapshot = SnapshotCohort();
+        const RingSnapshot ring = SnapshotRing();
+        const Stats counters = SnapshotStats();
+        const bool transport_failed = failed.load();
+        const std::string failure = FailureMessage();
+
         nlohmann::json cohort;
-        nlohmann::json swaps;
-        {
-            std::lock_guard<std::mutex> lock(cohort_mutex);
-            cohort["epoch"] = cohort_epoch;
-            cohort["state"] = cohort_state_name(cohort_state);
-            cohort["admitted_workers_mask"] = cohort_admitted_mask;
-            cohort["faulted"] = cohort_faulted;
-            cohort["fault"] = cohort_fault;
-            cohort["fault_class"] =
-                cohort_faulted ? "cohort_recoverable" : "none";
-            cohort["expected_disconnects"] = cohort_expected_disconnects;
-            cohort["rejected_hellos"] = rejected_hellos;
-            cohort["last_rejected_hello"] = last_rejected_hello;
-            cohort["completed_swaps"] = completed_swaps;
-            swaps = swap_log;
-        }
+        cohort["epoch"] = cohort_snapshot.epoch;
+        cohort["state"] = cohort_state_name(cohort_snapshot.state);
+        cohort["admitted_workers_mask"] = cohort_snapshot.admitted_mask;
+        cohort["faulted"] = cohort_snapshot.faulted;
+        cohort["fault"] = cohort_snapshot.fault;
+        cohort["fault_class"] =
+            cohort_snapshot.faulted ? "cohort_recoverable" : "none";
+        cohort["expected_disconnects"] = cohort_snapshot.expected_disconnects;
+        cohort["rejected_hellos"] = cohort_snapshot.rejected_hellos;
+        cohort["last_rejected_hello"] = cohort_snapshot.last_rejected_hello;
+        cohort["completed_swaps"] = cohort_snapshot.completed_swaps;
         // Keyed by worker id: ready slots no worker has acquired yet, by the
         // worker expected to acquire them, and each worker's pending acquire.
         std::map<std::string, std::uint64_t> ready_unacquired;
         nlohmann::json pending_by_worker = nlohmann::json::object();
-        {
-            std::lock_guard<std::mutex> lock(ring_mutex);
-            const Clock::time_point now = Clock::now();
-            for (const Slot& slot : slots) {
-                if (slot.state == SlotState::kReady &&
-                    slot.acquired_mask == 0) {
-                    ++ready_unacquired[std::to_string(
-                        OwningWorker(slot.module_key))];
-                }
-            }
-            for (int worker = 0; worker < kDefaultWorkers; ++worker) {
-                const PendingAcquire& pending = pending_acquires[worker];
-                if (!pending.module_key.empty()) {
-                    pending_by_worker[std::to_string(worker)] = {
-                        {"module_key", pending.module_key},
-                        {"age_s", elapsed_seconds(pending.begin, now)},
-                    };
-                }
+        for (const Slot& slot : ring.slots) {
+            if (slot.state == SlotState::kReady && slot.acquired_mask == 0) {
+                ++ready_unacquired[std::to_string(
+                    OwningWorker(slot.module_key))];
             }
         }
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            summary["schema"] = "k3-distributed-weights/1";
-            summary["node_rank"] = node_rank;
-            summary["network_ready"] = network_ready.load();
-            summary["failed"] = failed.load();
-            summary["failure"] = FailureMessage();
-            summary["failure_class"] =
-                failed.load() ? "transport_fatal" : "none";
-            summary["cohort"] = cohort;
-            summary["cohort_swaps"] = swaps;
-            summary["depth"] = depth;
-            summary["superchunk"] = superchunk;
-            summary["outstanding"] = outstanding;
-            summary["worker_sharded"] = worker_sharded;
-            summary["transport"] = transport;
-            summary["store_bytes"] = store_bytes;
-            summary["staging_bytes"] = staging_bytes;
-            summary["fetched_modules"] = fetched_modules;
-            summary["fetched_bytes"] = fetched_bytes;
-            summary["acquire_count"] = acquire_count;
-            summary["release_count"] = release_count;
-            summary["cache_hits"] = cache_hits;
-            summary["duplicate_fetches"] = duplicate_fetches;
-            summary["wait_count"] = wait_count;
-            summary["wait_seconds"] = wait_seconds;
-            summary["worker_wait_count"] = worker_wait_count;
-            summary["worker_wait_seconds"] = worker_wait_seconds;
-            summary["ready_unacquired_by_worker"] = ready_unacquired;
-            summary["pending_acquire_by_worker"] = pending_by_worker;
-            summary["staging_hwm_modules"] = staging_hwm;
-            summary["ready_latency_ms"] = {
-                {"p50", percentile(ready_latency_ms, 50)},
-                {"p95", percentile(ready_latency_ms, 95)},
-                {"p99", percentile(ready_latency_ms, 99)},
-            };
+        for (int worker = 0; worker < kDefaultWorkers; ++worker) {
+            const PendingAcquire& pending = ring.pending_acquires[worker];
+            if (!pending.module_key.empty()) {
+                pending_by_worker[std::to_string(worker)] = {
+                    {"module_key", pending.module_key},
+                    {"age_s", elapsed_seconds(pending.begin, ring.taken)},
+                };
+            }
         }
+
+        nlohmann::json summary;
+        summary["schema"] = "k3-distributed-weights/1";
+        summary["node_rank"] = node_rank;
+        summary["network_ready"] = network_ready.load();
+        summary["failed"] = transport_failed;
+        summary["failure"] = failure;
+        summary["failure_class"] =
+            transport_failed ? "transport_fatal" : "none";
+        summary["cohort"] = cohort;
+        summary["cohort_swaps"] = cohort_snapshot.swap_log;
+        summary["depth"] = depth;
+        summary["superchunk"] = superchunk;
+        summary["outstanding"] = outstanding;
+        summary["worker_sharded"] = worker_sharded;
+        summary["transport"] = transport;
+        summary["store_bytes"] = store_bytes;
+        summary["staging_bytes"] = staging_bytes;
+        summary["fetched_modules"] = counters.fetched_modules;
+        summary["fetched_bytes"] = counters.fetched_bytes;
+        summary["acquire_count"] = counters.acquire_count;
+        summary["release_count"] = counters.release_count;
+        summary["cache_hits"] = counters.cache_hits;
+        summary["duplicate_fetches"] = counters.duplicate_fetches;
+        summary["wait_count"] = counters.wait_count;
+        summary["wait_seconds"] = counters.wait_seconds;
+        summary["worker_wait_count"] = counters.worker_wait_count;
+        summary["worker_wait_seconds"] = counters.worker_wait_seconds;
+        summary["ready_unacquired_by_worker"] = ready_unacquired;
+        summary["pending_acquire_by_worker"] = pending_by_worker;
+        summary["staging_hwm_modules"] = counters.staging_hwm;
+        const LatencyHistogram& latency = counters.ready_latency;
+        summary["ready_latency_ms"] = {
+            {"p50", latency.percentile(50)},
+            {"p95", latency.percentile(95)},
+            {"p99", latency.percentile(99)},
+            {"count", latency.count()},
+            {"max", latency.max()},
+        };
         const std::string temporary = summary_path + ".tmp";
         {
             std::ofstream output(temporary);
