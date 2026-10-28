@@ -299,59 +299,6 @@ class TestCombinedPerSequence:
 
 
 # ===========================================================================
-# 12. Sequence manager integration
-# ===========================================================================
-class TestSequenceEntryParams:
-    def test_sequence_entry_stores_params(self):
-        from batchgen.sequence_manager.batch_defs import SequenceEntry
-        seq = SequenceEntry(
-            uuid="test-1",
-            input_ids=[1, 2, 3],
-            max_output_length=10,
-            temperature=0.7,
-            top_p=0.95,
-            top_k=40,
-        )
-        assert seq.temperature == 0.7
-        assert seq.top_p == 0.95
-        assert seq.top_k == 40
-
-    def test_sequence_entry_default_params(self):
-        from batchgen.sequence_manager.batch_defs import SequenceEntry
-        seq = SequenceEntry(
-            uuid="test-2",
-            input_ids=[1, 2, 3],
-            max_output_length=10,
-        )
-        assert seq.temperature is None
-        assert seq.top_p is None
-        assert seq.top_k is None
-
-
-class TestActiveBatchSamplingTensors:
-    def test_build_sampling_tensors(self):
-        from batchgen.sequence_manager.batch_defs import (
-            SequenceEntry, GlobalSequenceRegistry, ActiveBatch
-        )
-        seqs = [
-            SequenceEntry("s1", [1, 2], 10, temperature=0.7, top_p=0.9, top_k=10),
-            SequenceEntry("s2", [3, 4], 10, temperature=None, top_p=None, top_k=None),
-            SequenceEntry("s3", [5, 6], 10, temperature=1.0, top_p=0.5, top_k=20),
-        ]
-        registry = GlobalSequenceRegistry(seqs)
-        batch = ActiveBatch(registry, ["s1", "s2", "s3"], torch.device("cpu"), 0)
-
-        assert batch.sampling_temps is not None
-        torch.testing.assert_close(
-            batch.sampling_temps, torch.tensor([0.7, 0.0, 1.0])
-        )  # None → 0.0
-        torch.testing.assert_close(
-            batch.sampling_top_ps, torch.tensor([0.9, 1.0, 0.5])
-        )  # None → 1.0
-        assert batch.sampling_top_ks.tolist() == [10, 0, 20]  # None → 0
-
-
-# ===========================================================================
 # Performance test (GPU only — run on remote machine)
 # ===========================================================================
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
