@@ -126,8 +126,9 @@ def routed_expert_tensor_names() -> List[str]:
     Order is for human reading only (packed next to its scale).  It has no
     runtime effect: the H2D producer iterates
     ``Weights_Storage::get_module_weights_storage``, which returns a
-    ``std::unordered_map`` (``Weights_Storage.h:70``), so the copy order inside
-    a module is hash order.
+    ``module_fetch`` whose ``tensors`` field is a ``std::unordered_map``
+    (``Weights_Storage.h:71``), so the copy order inside a module is hash
+    order.
     """
     names: List[str] = []
     for projection in ROUTED_EXPERT_PROJECTIONS:

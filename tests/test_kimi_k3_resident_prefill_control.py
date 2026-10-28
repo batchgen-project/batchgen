@@ -338,7 +338,6 @@ def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
         "store_path": str(store),
         "metadata_path": str(metadata),
         "daemon_socket": str(tmp_path / "daemon.sock"),
-        "summary_path": str(tmp_path / "summary.json"),
         "store_bytes": store.stat().st_size,
         "replicated_bytes": 0,
         "module_bytes": 1,

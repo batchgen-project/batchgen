@@ -180,7 +180,6 @@ def _schema_config(tmp_path, **extra):
         "store_path": "/stores/store.bin",
         "metadata_path": "/stores/metadata.tsv",
         "daemon_socket": "/stores/daemon.sock",
-        "summary_path": "/stores/summary.json",
         "store_bytes": 1,
         "replicated_bytes": 1,
         "module_bytes": 1,

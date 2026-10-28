@@ -64,6 +64,10 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
     Only :func:`load_distributed_weight_config` may hand a config to the
     engine; this half exists so the manifest verifier and the rebuild-command
     formatter can read a config whose store is known to be unusable.
+
+    Keys outside the schema are left in place and ignored. A config written
+    before the daemon stopped writing a summary file still carries
+    ``summary_path``; it loads unchanged, and nothing reads the key.
     """
     config_path = Path(path)
     config = json.loads(config_path.read_text())
@@ -74,7 +78,6 @@ def read_distributed_weight_config(path: str | Path) -> dict[str, Any]:
         "store_path",
         "metadata_path",
         "daemon_socket",
-        "summary_path",
         "store_bytes",
         "replicated_bytes",
         "module_bytes",

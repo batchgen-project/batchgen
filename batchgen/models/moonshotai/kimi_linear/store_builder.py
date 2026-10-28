@@ -87,8 +87,8 @@ config whose manifest is missing or disagrees with the store, so an
 interrupted build is never mapped. ``--dry-run`` writes nothing and refuses an
 output directory that holds a store without a matching manifest.
 
-``summary.json`` is NOT written here: the daemon writes it at runtime
-(``distributed_weight_daemon.cpp:1337-1378``) and only ever reads its path.
+The node config names no summary file: the daemon reports its state through
+the server log and status, not through a file beside the store.
 """
 
 from __future__ import annotations
@@ -934,7 +934,6 @@ def node_config(
     manifest_path: Path,
     node_ips: Sequence[str],
     daemon_socket: Path,
-    summary_path: Path,
     base_port: int,
     transport: str,
     rail_devices: Sequence[str],
@@ -957,7 +956,6 @@ def node_config(
         "metadata_path": str(metadata_path),
         "manifest_path": str(manifest_path),
         "daemon_socket": str(daemon_socket),
-        "summary_path": str(summary_path),
         "store_bytes": plan.store_bytes,
         "replicated_bytes": plan.replicated_bytes,
         "module_bytes": plan.module_bytes,
@@ -1345,7 +1343,6 @@ def _builder_argv(
     ]
     for key, flag in (
         ("daemon_socket", "--daemon-socket"),
-        ("summary_path", "--summary-path"),
         ("base_port", "--base-port"),
         ("transport", "--transport"),
         ("store_residency", "--store-residency"),
@@ -1972,7 +1969,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node-rank", type=int, required=True)
     parser.add_argument("--node-ips", type=_parse_csv, required=True)
     parser.add_argument("--daemon-socket", type=Path, default=None)
-    parser.add_argument("--summary-path", type=Path, default=None)
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT)
     parser.add_argument(
         "--transport", choices=WEIGHT_TRANSPORTS, default=WEIGHT_TRANSPORTS[0]
@@ -2090,11 +2086,6 @@ def build(
             Path(os.path.abspath(args.daemon_socket))
             if args.daemon_socket
             else output_dir / "daemon.sock"
-        ),
-        summary_path=(
-            Path(os.path.abspath(args.summary_path))
-            if args.summary_path
-            else output_dir / "summary.json"
         ),
         base_port=args.base_port,
         transport=args.transport,

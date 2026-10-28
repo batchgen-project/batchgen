@@ -703,12 +703,13 @@ def test_node_config_validates_through_the_real_loader(env):
     assert config["metadata_path"] == str(output / "metadata.tsv")
     assert config["manifest_path"] == str(output / sb.MANIFEST_FILE_NAME)
     assert config["daemon_socket"] == str(output / "daemon.sock")
-    assert config["summary_path"] == str(output / "summary.json")
+    # The daemon writes no summary file, so the config names none.
+    assert "summary_path" not in config
     # H200 HCA numbering, NOT the loader's H20 default.
     assert config["rail_devices"] == list(sb.H200_RAIL_DEVICES)
     assert config["rail_devices"] != list(DEFAULT_RAIL_DEVICES)
-    # Nothing but the published set is left: no staging directory, and no
-    # summary.json (the daemon's runtime output).
+    # Nothing but the published set is left: no staging directory and no
+    # summary.json.
     assert sorted(path.name for path in output.iterdir()) == sorted(
         [sb.LOCK_FILE_NAME, sb.MANIFEST_FILE_NAME, "metadata.tsv", "node0.json", "store.bin"]
     )
@@ -717,14 +718,12 @@ def test_node_config_validates_through_the_real_loader(env):
 def test_node_config_honours_the_optional_overrides(env):
     output = env.tmp / "node1"
     socket = env.tmp / "custom.sock"
-    summary = env.tmp / "custom-summary.json"
     rails = ",".join(f"mlx5_{index}:1" for index in range(8))
     env.build(
         output,
         1,
         extra=[
             "--daemon-socket", str(socket),
-            "--summary-path", str(summary),
             "--base-port", "27100",
             "--transport", "hierarchical_gdr",
             "--rail-devices", rails,
@@ -734,7 +733,7 @@ def test_node_config_honours_the_optional_overrides(env):
     config = load_distributed_weight_config(output / "node1.json")
     assert config["node_rank"] == 1
     assert config["daemon_socket"] == str(socket)
-    assert config["summary_path"] == str(summary)
+    assert "summary_path" not in config
     assert config["base_port"] == 27100
     assert config["transport"] == "hierarchical_gdr"
     assert config["rail_devices"] == rails.split(",")
@@ -742,6 +741,7 @@ def test_node_config_honours_the_optional_overrides(env):
     manifest = json.loads((output / sb.MANIFEST_FILE_NAME).read_text())
     for token in ("--transport hierarchical_gdr", "--base-port 27100", f"--rail-devices {rails}"):
         assert token in manifest["build_command"]
+    assert "--summary-path" not in manifest["build_command"]
 
 
 def test_the_two_node_stores_differ_only_in_the_expert_region(env):

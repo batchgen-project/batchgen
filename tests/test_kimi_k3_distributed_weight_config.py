@@ -86,7 +86,6 @@ def _write_store_config(tmp_path, **overrides):
         "store_path": str(store),
         "metadata_path": str(metadata),
         "daemon_socket": str(tmp_path / "daemon.sock"),
-        "summary_path": str(tmp_path / "summary.json"),
         "store_bytes": store.stat().st_size,
         "replicated_bytes": 0,
         "module_bytes": 1,
@@ -115,6 +114,46 @@ def test_weight_transport_defaults_to_host_rdma_and_accepts_hierarchical(
         _write_store_config(tmp_path / "gdr", transport="hierarchical_gdr")
     )
     assert selected["transport"] == "hierarchical_gdr"
+
+
+def test_legacy_summary_path_key_loads_and_is_not_echoed_on_rebuild(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        load_distributed_weight_config,
+        read_distributed_weight_config,
+    )
+    from batchgen.models.moonshotai.kimi_linear.store_builder import (
+        K3StoreManifestError,
+        rebuild_command,
+    )
+
+    # Backward compatibility: a config written while the daemon still wrote a
+    # summary file carries summary_path. Nothing reads it any more, so it
+    # loads unchanged and the rebuild command no longer names the removed flag.
+    path = _write_store_config(
+        tmp_path, summary_path=str(tmp_path / "summary.json")
+    )
+    legacy = read_distributed_weight_config(path)
+    assert legacy["num_nodes"] == 4
+    assert legacy["summary_path"] == str(tmp_path / "summary.json")
+
+    command = rebuild_command(path, legacy)
+    assert "--daemon-socket" in command
+    assert "--summary-path" not in command
+    assert "summary.json" not in command
+
+    with pytest.raises(K3StoreManifestError) as excinfo:
+        load_distributed_weight_config(path)
+    assert "--summary-path" not in str(excinfo.value)
+
+
+def test_store_config_without_summary_path_is_accepted(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        read_distributed_weight_config,
+    )
+
+    path = _write_store_config(tmp_path)
+    assert "summary_path" not in json.loads(path.read_text())
+    assert "summary_path" not in read_distributed_weight_config(path)
 
 
 def test_store_config_normalizes_two_and_four_node_topologies(tmp_path):
