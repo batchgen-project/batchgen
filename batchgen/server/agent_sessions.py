@@ -8,9 +8,15 @@ records each session's lifecycle state and validates every turn against it:
     open | idle --close--> closed
     open | idle | turn_in_flight --abort--> aborted
 
-``closed`` and ``aborted`` are terminal. A session id is never reused, and a
-turn is accepted only for a session that was opened explicitly (no implicit
-open). Holding KV across turns is not done here; the registry only keeps state.
+``closed`` and ``aborted`` are terminal. A turn is accepted only for a
+session that was opened explicitly (no implicit open).
+
+A terminal session is kept as a tombstone so its id cannot be reused, for
+``terminal_ttl_s`` seconds (default 3600) after it ended or until
+``max_terminal`` (default 65536) later sessions have ended, whichever comes
+first. Past that window the id is forgotten: a turn for it gets
+``404 session_not_found`` and it can be opened again. This bounds the
+registry's memory under a long run of short sessions. Holding KV across turns is not done here; the registry only keeps state.
 
 A turn in flight has its own terminal point: when the scheduler routes its
 worker completion (``complete_turn``) the turn is finished even though its
@@ -25,9 +31,10 @@ only callers, so it takes no lock.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class TurnError(Exception):
@@ -86,14 +93,60 @@ class SessionRecord:
         self.updated_at = time.time()
 
 
-class SessionRegistry:
-    """Lifecycle state of every session this server has seen."""
+DEFAULT_TERMINAL_TTL_S = 3600.0
+DEFAULT_MAX_TERMINAL = 65536
 
-    def __init__(self) -> None:
+
+class SessionRegistry:
+    """Lifecycle state of every live session and of recently ended ones."""
+
+    def __init__(
+        self,
+        *,
+        terminal_ttl_s: float = DEFAULT_TERMINAL_TTL_S,
+        max_terminal: int = DEFAULT_MAX_TERMINAL,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not terminal_ttl_s > 0:
+            raise ValueError(f"terminal_ttl_s must be > 0, got {terminal_ttl_s}")
+        if max_terminal < 1:
+            raise ValueError(f"max_terminal must be >= 1, got {max_terminal}")
+        self._terminal_ttl_s = float(terminal_ttl_s)
+        self._max_terminal = int(max_terminal)
+        self._clock = clock
+        # Live sessions: open, turn_in_flight, idle.
         self._sessions: Dict[str, SessionRecord] = {}
+        # Tombstones of closed/aborted sessions, oldest first:
+        # session_id -> (ended at, by ``clock``; record).
+        self._terminal: "OrderedDict[str, Tuple[float, SessionRecord]]" = OrderedDict()
 
     def get(self, session_id: str) -> Optional[SessionRecord]:
-        return self._sessions.get(session_id)
+        self._prune()
+        return self._lookup(session_id)
+
+    def _lookup(self, session_id: str) -> Optional[SessionRecord]:
+        record = self._sessions.get(session_id)
+        if record is None:
+            tombstone = self._terminal.get(session_id)
+            record = None if tombstone is None else tombstone[1]
+        return record
+
+    def _retire(self, record: SessionRecord) -> None:
+        """Move a session that just became terminal to the tombstones."""
+        del self._sessions[record.session_id]
+        self._terminal[record.session_id] = (self._clock(), record)
+        self._prune()
+
+    def _prune(self) -> None:
+        """Drop tombstones past the TTL, then the oldest beyond the cap."""
+        cutoff = self._clock() - self._terminal_ttl_s
+        while self._terminal:
+            ended_at, _ = next(iter(self._terminal.values()))
+            if ended_at > cutoff:
+                break
+            self._terminal.popitem(last=False)
+        while len(self._terminal) > self._max_terminal:
+            self._terminal.popitem(last=False)
 
     def open(
         self,
@@ -101,15 +154,17 @@ class SessionRegistry:
         session_id: str,
         parent_session_id: Optional[str] = None,
     ) -> SessionRecord:
-        existing = self._sessions.get(session_id)
+        self._prune()
+        existing = self._lookup(session_id)
         if existing is not None:
             raise TurnError(
                 409, "session_exists",
                 f"session {session_id!r} already exists "
-                f"(state={existing.state.value}); session ids are not reused",
+                f"(state={existing.state.value}); session ids are not reused "
+                "while the server still holds them",
             )
         if parent_session_id is not None:
-            parent = self._sessions.get(parent_session_id)
+            parent = self._lookup(parent_session_id)
             if parent is None:
                 raise TurnError(
                     404, "parent_session_not_found",
@@ -137,6 +192,7 @@ class SessionRegistry:
         turn_id: str,
     ) -> SessionRecord:
         """Validate a turn's identity and mark its session turn_in_flight."""
+        self._prune()
         record = self._require(session_id)
         if record.traj_id != traj_id:
             raise TurnError(
@@ -175,7 +231,7 @@ class SessionRegistry:
         Called synchronously by the scheduler before it resolves the turn's
         future, so no abort can run between the two.
         """
-        record = self._sessions.get(session_id)
+        record = self._lookup(session_id)
         if record is None or record.in_flight_turn_id != turn_id:
             return
         record.in_flight_turn_completed = True
@@ -185,7 +241,7 @@ class SessionRegistry:
 
         A session that was aborted while the turn ran stays aborted.
         """
-        record = self._sessions.get(session_id)
+        record = self._lookup(session_id)
         if record is None or record.in_flight_turn_id != turn_id:
             return
         record.in_flight_turn_id = None
@@ -199,6 +255,7 @@ class SessionRegistry:
         All-or-nothing: if any session to close has a turn in flight, nothing
         is closed. Returns the sessions closed by this call.
         """
+        self._prune()
         record = self._require(session_id)
         if record.state in _TERMINAL:
             raise TurnError(
@@ -207,8 +264,7 @@ class SessionRegistry:
             )
         if reason == "end_of_trajectory":
             targets = [
-                r for r in self._sessions.values()
-                if r.traj_id == record.traj_id and r.state not in _TERMINAL
+                r for r in self._sessions.values() if r.traj_id == record.traj_id
             ]
         else:
             targets = [record]
@@ -222,6 +278,7 @@ class SessionRegistry:
         for target in targets:
             target.end_reason = reason
             target._set(SessionState.CLOSED)
+            self._retire(target)
         return targets
 
     def abort(
@@ -232,6 +289,7 @@ class SessionRegistry:
         Raises 409 ``already_completed`` (and changes nothing) when the turn in
         flight has had its completion routed: that turn returns its answer.
         """
+        self._prune()
         record = self._require(session_id)
         if record.state in _TERMINAL:
             raise TurnError(
@@ -250,10 +308,11 @@ class SessionRegistry:
         record.in_flight_turn_id = None
         record.end_reason = reason or "aborted"
         record._set(SessionState.ABORTED)
+        self._retire(record)
         return record, in_flight
 
     def _require(self, session_id: str) -> SessionRecord:
-        record = self._sessions.get(session_id)
+        record = self._lookup(session_id)
         if record is None:
             raise TurnError(
                 404, "session_not_found",

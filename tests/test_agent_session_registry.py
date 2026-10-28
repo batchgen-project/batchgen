@@ -2,7 +2,8 @@
 
 open --turn--> turn_in_flight --done--> idle --turn--> ...; open/idle --close-->
 closed; open/idle/turn_in_flight --abort--> aborted. closed and aborted are
-terminal, ids are never reused, and there is no implicit open.
+terminal, ids are not reused while the registry holds their tombstone,
+and there is no implicit open.
 
 agent_sessions.py is stdlib-only, but importing it as batchgen.server.* would
 run the server package __init__ (the GPU stack), so it is loaded by path.
@@ -154,3 +155,73 @@ def test_complete_turn_ignores_a_turn_that_is_not_in_flight():
     reg.complete_turn("s1", "turn-stale")
     reg.complete_turn("ghost", "turn-a")
     assert reg.abort("s1", None)[1] == "turn-a"
+
+
+def test_terminal_sessions_are_bounded_by_default():
+    # A long run of short sessions must not grow the registry without bound:
+    # with the defaults, at most 65,536 ended sessions are retained.
+    reg = SessionRegistry()
+    for i in range(65536 + 100):
+        reg.open("t", f"s{i}")
+        reg.close(f"s{i}", "end_of_session")
+    retained = len(reg._sessions) + len(getattr(reg, "_terminal", {}))
+    assert retained <= 65536
+    assert reg.get("s0") is None and reg.get(f"s{65536 + 99}") is not None
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_tombstone_blocks_reuse_until_ttl_then_the_id_is_forgotten():
+    clock = _Clock()
+    reg = SessionRegistry(terminal_ttl_s=60.0, max_terminal=100, clock=clock)
+    reg.open("t1", "s1")
+    reg.close("s1", "end_of_session")
+    reg.open("t1", "s2")
+    reg.abort("s2", "tool_crash")
+    clock.now += 59.0
+    assert _error(reg.open, "t1", "s1") == (409, "session_exists")
+    assert _error(reg.begin_turn, "t1", "s2", None, "x") == (409, "session_aborted")
+    assert reg.get("s1").state is SessionState.CLOSED
+    clock.now += 1.0
+    assert reg.get("s1") is None and reg.get("s2") is None
+    assert _error(reg.begin_turn, "t1", "s1", None, "x") == (404, "session_not_found")
+    assert reg.open("t1", "s1").state is SessionState.OPEN
+
+
+def test_tombstone_cap_evicts_the_oldest_and_never_live_sessions():
+    clock = _Clock()
+    reg = SessionRegistry(terminal_ttl_s=3600.0, max_terminal=2, clock=clock)
+    reg.open("t1", "live")
+    for sid in ("a", "b", "c"):
+        reg.open("t1", sid)
+        reg.close(sid, "end_of_session")
+        clock.now += 1.0
+    assert reg.get("a") is None
+    assert [reg.get(s).state for s in ("b", "c")] == [SessionState.CLOSED] * 2
+    assert reg.get("live").state is SessionState.OPEN
+    # end_of_trajectory retires every live session of the trajectory at once.
+    closed = reg.close("live", "end_of_trajectory")
+    assert [r.session_id for r in closed] == ["live"]
+    assert reg.get("live").state is SessionState.CLOSED and reg.get("b") is None
+
+
+def test_an_aborted_in_flight_session_still_ends_its_turn_after_retirement():
+    reg = SessionRegistry(max_terminal=1)
+    reg.open("t1", "s1")
+    reg.begin_turn("t1", "s1", None, "turn-a")
+    record, turn_id = reg.abort("s1", None)
+    reg.end_turn("s1", turn_id)
+    assert record.state is SessionState.ABORTED
+
+
+def test_registry_limits_are_validated():
+    with pytest.raises(ValueError):
+        SessionRegistry(terminal_ttl_s=0)
+    with pytest.raises(ValueError):
+        SessionRegistry(max_terminal=0)

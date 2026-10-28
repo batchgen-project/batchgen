@@ -265,7 +265,7 @@ with running batches. Like the batch routes, these are served by node 0 only.
 | Term | Meaning |
 |------|---------|
 | `traj_id` | One agent task (item); shared by its sub-agents |
-| `session_id` | One model context inside a trajectory; never reused |
+| `session_id` | One model context inside a trajectory; not reused (see below) |
 | `parent_session_id` | The session that spawned this one (optional; same trajectory) |
 
 Session states: `open` → (turn) `turn_in_flight` → (answered or failed) `idle`
@@ -274,14 +274,21 @@ Session states: `open` → (turn) `turn_in_flight` → (answered or failed) `idl
 explicitly: a turn for an unknown session gets `404 session_not_found`, and
 there is no implicit open. A session has at most one turn in flight.
 
+A `closed` or `aborted` session is kept as a tombstone that blocks reuse of
+its id until `terminal_ttl_s` (default 3600) seconds after it ended, or until
+`max_terminal` (default 65536) later sessions have ended, whichever comes
+first. After that the server forgets it: a turn for that id
+gets `404 session_not_found` and the id can be opened again. Clients should
+still use ids that are unique per run (e.g. `<traj_id>/<name>`).
+
 ### POST /v1/sessions
 
 ```json
 {"traj_id": "traj-17", "session_id": "traj-17/main", "parent_session_id": null}
 ```
 
-**Response:** the session (`state: "open"`). `409 session_exists` if the id was
-used before; `404 parent_session_not_found` / `400 parent_session_other_trajectory`
+**Response:** the session (`state: "open"`). `409 session_exists` if the id is
+live or still held as a tombstone; `404 parent_session_not_found` / `400 parent_session_other_trajectory`
 for a bad parent.
 
 ### POST /v1/sessions/{session_id}/close
