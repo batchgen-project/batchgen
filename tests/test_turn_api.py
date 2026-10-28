@@ -197,6 +197,11 @@ def _scheduler(tmp_path, worker):
     return scheduler
 
 
+def _ns_worker(**extra):
+    """A serving worker pool with only the channels a scheduler unit needs."""
+    return SimpleNamespace(state="serving", response_queue=queue.Queue(), **extra)
+
+
 def _turn_body(session_id, content="hi", traj_id="traj-1", parent=None, **extra):
     body = {
         "model": MODEL,
@@ -282,7 +287,7 @@ def test_timing_summary_legs_and_overhead():
 
 def test_admit_message_carries_identity_and_batches_carry_none(tmp_path):
     async def run():
-        worker = SimpleNamespace(request_queue=queue.Queue(), response_queue=queue.Queue())
+        worker = _ns_worker(request_queue=queue.Queue())
         scheduler = _scheduler(tmp_path, worker)
         scheduler._scheduling_pool.set_capacity(8)
         scheduler._loop = asyncio.get_running_loop()
@@ -324,7 +329,7 @@ def test_admit_message_carries_identity_and_batches_carry_none(tmp_path):
 
 def test_listener_resolves_the_turn_future_without_a_tracker_or_file(tmp_path):
     async def run():
-        worker = SimpleNamespace(request_queue=queue.Queue(), response_queue=queue.Queue())
+        worker = _ns_worker(request_queue=queue.Queue())
         scheduler = _scheduler(tmp_path, worker)
         scheduler._loop = asyncio.get_running_loop()
         scheduler._completion_inbox = asyncio.Queue()
@@ -360,7 +365,7 @@ def test_listener_resolves_the_turn_future_without_a_tracker_or_file(tmp_path):
 
 def test_cancel_dequeues_a_turn_that_never_reached_a_worker(tmp_path):
     async def run():
-        scheduler = _scheduler(tmp_path, SimpleNamespace(response_queue=queue.Queue()))
+        scheduler = _scheduler(tmp_path, _ns_worker())
         waiter = scheduler.submit_turn(
             "turn_q", io_struct.TurnRequest(**_turn_body("s1")), time.time())
         assert scheduler.cancel_turn("turn_q", "test") == "dequeued"
@@ -377,7 +382,7 @@ def test_cancel_dequeues_a_turn_that_never_reached_a_worker(tmp_path):
 
 def test_pool_fatal_fails_pending_turns_from_another_thread(tmp_path):
     async def run():
-        scheduler = _scheduler(tmp_path, SimpleNamespace(response_queue=queue.Queue()))
+        scheduler = _scheduler(tmp_path, _ns_worker())
         scheduler._loop = asyncio.get_running_loop()
         waiter = scheduler.submit_turn(
             "turn_f", io_struct.TurnRequest(**_turn_body("s1")), time.time())
@@ -394,9 +399,97 @@ def test_pool_fatal_fails_pending_turns_from_another_thread(tmp_path):
     assert scheduler._intake_pool.size() == 0 and scheduler._turn_waiters == {}
 
 
+def test_fatal_fails_a_turn_submitted_after_the_restart_thread_called_it(tmp_path):
+    # The restart thread calls fail_in_flight while the loop is busy; a turn
+    # that the loop submits before the fail callback runs must be failed by
+    # that callback, not left in _turn_waiters with no completion to come.
+    async def run():
+        scheduler = _scheduler(tmp_path, _ns_worker())
+        scheduler._loop = asyncio.get_running_loop()
+        restart = threading.Thread(target=scheduler.fail_in_flight, args=("rank 3 died",))
+        restart.start()
+        restart.join()  # blocks the loop: its callback cannot have run yet
+        late = scheduler.submit_turn(
+            "turn_late", io_struct.TurnRequest(**_turn_body("s1")), time.time())
+        try:
+            await asyncio.wait_for(asyncio.shield(late.future), timeout=1.0)
+        except TurnError as exc:
+            return scheduler, exc
+        except asyncio.TimeoutError:
+            return scheduler, None
+
+    scheduler, error = asyncio.run(run())
+    assert error is not None, "turn submitted after the fatal snapshot was never failed"
+    assert (error.status_code, error.code) == (503, "worker_fatal")
+    assert scheduler._turn_waiters == {} and scheduler._intake_pool.size() == 0
+
+
+def test_turns_are_refused_until_the_restart_resumes(tmp_path):
+    async def run():
+        worker = _ns_worker()
+        scheduler = _scheduler(tmp_path, worker)
+        scheduler._loop = asyncio.get_running_loop()
+        out = {}
+
+        def submit(name):
+            try:
+                scheduler.submit_turn(
+                    f"turn_{name}", io_struct.TurnRequest(**_turn_body("s1")), time.time())
+                return "accepted"
+            except TurnError as exc:
+                return (exc.status_code, exc.code)
+
+        await asyncio.get_running_loop().run_in_executor(
+            None, scheduler.fail_in_flight, "rank 3 died")
+        await asyncio.sleep(0)
+        out["after_fatal"] = submit("a")
+        worker.state = "restarting"
+        out["restarting"] = submit("b")
+        # Restart thread: resume() then the manager flips the state to serving.
+        await asyncio.get_running_loop().run_in_executor(None, scheduler.resume)
+        await asyncio.sleep(0)
+        out["resumed_not_serving"] = submit("c")
+        worker.state = "serving"
+        out["serving"] = submit("d")
+        return scheduler, out
+
+    scheduler, out = asyncio.run(run())
+    assert out == {
+        "after_fatal": (503, "worker_fatal"),
+        "restarting": (503, "worker_not_serving"),
+        "resumed_not_serving": (503, "worker_not_serving"),
+        "serving": "accepted",
+    }
+    assert list(scheduler._turn_waiters) == ["turn_d"]
+
+
+def test_fatal_never_resolves_a_turn_future_off_the_loop(tmp_path):
+    # With the scheduler loop stopped (not closed), the fail is queued on it,
+    # not run on the calling thread against the loop's futures.
+    scheduler = _scheduler(tmp_path, _ns_worker())
+    loop = asyncio.new_event_loop()
+    try:
+        scheduler._loop = loop
+
+        async def submit():
+            return scheduler.submit_turn(
+                "turn_s", io_struct.TurnRequest(**_turn_body("s1")), time.time())
+
+        waiter = loop.run_until_complete(submit())
+        scheduler.fail_in_flight("rank 3 died")
+        done_off_loop = waiter.future.done()
+        loop.run_until_complete(asyncio.sleep(0))
+        error = waiter.future.exception()
+    finally:
+        loop.close()
+    assert not done_off_loop
+    assert (error.status_code, error.code) == (503, "worker_fatal")
+    assert scheduler._turn_waiters == {}
+
+
 def test_submit_rejections(tmp_path):
     async def run():
-        scheduler = _scheduler(tmp_path, SimpleNamespace(response_queue=queue.Queue()))
+        scheduler = _scheduler(tmp_path, _ns_worker())
         cases = {
             "n": _turn_body("s1", n=2),
             "max": {k: v for k, v in _turn_body("s1").items() if k != "max_tokens"},

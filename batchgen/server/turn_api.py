@@ -37,7 +37,12 @@ from batchgen.server.io_struct import (
 
 
 def _http_error(exc: TurnError) -> HTTPException:
-    return HTTPException(status_code=exc.status_code, detail=exc.detail())
+    # A 503 (pool not serving, or failed and not yet restarted) is retryable,
+    # as the batch path's 503 is.
+    headers = {"Retry-After": "30"} if exc.status_code == 503 else None
+    return HTTPException(
+        status_code=exc.status_code, detail=exc.detail(), headers=headers
+    )
 
 
 def register_turn_routes(app: FastAPI) -> None:

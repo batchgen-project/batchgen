@@ -235,6 +235,13 @@ class BatchScheduler:
         # A turn submission wakes an idle drain at once instead of at its next
         # 0.1 s poll.
         self._intake_wakeup = asyncio.Event()
+        # Why turn submission is refused (None while it is accepted). Set by a
+        # worker fatal or restart, cleared when the restart resumes the
+        # scheduler. Loop-confined, like _turn_waiters: written only by
+        # _close_turn_gate / _open_turn_gate and read only by submit_turn, all
+        # on the scheduler loop, so a submit is ordered either before a fatal
+        # (and failed by it) or after it (and refused).
+        self._turn_gate_closed: Optional[str] = None
 
     async def start(self) -> None:
         if self._task:
@@ -301,6 +308,9 @@ class BatchScheduler:
     def resume(self) -> None:
         self._quiesced.clear()
         self._quiesce_ack.clear()
+        # The restart that called this has replaced the failed generation;
+        # turns are accepted again (queued behind any earlier fatal callback).
+        self._call_on_loop(self._open_turn_gate, "reopen turn submission")
 
     def fail_in_flight(self, error_msg: str) -> int:
         return self._fail_all_active_batches(error_msg)
@@ -860,9 +870,24 @@ class BatchScheduler:
         ``body`` is a validated TurnRequest. The turn becomes a one-entry intake
         batch keyed by ``turn_id``; the returned waiter's future resolves with
         the worker's completion item. Raises TurnError for a request that
-        cannot run (400) or a full intake pool (429). Runs on the scheduler
-        loop.
+        cannot run (400), a full intake pool (429), or a worker pool that is
+        not serving or has failed and not yet restarted (503). Runs on the
+        scheduler loop: the gate check and the waiter registration below have
+        no await between them, so a fatal's loop callback either sees this
+        waiter or has already closed the gate.
         """
+        pool_state = self.worker.state
+        if pool_state != "serving":
+            raise TurnError(
+                503, "worker_not_serving",
+                f"worker pool is not serving (state={pool_state}); retry later",
+            )
+        if self._turn_gate_closed is not None:
+            raise TurnError(
+                503, "worker_fatal",
+                f"worker_fatal: {self._turn_gate_closed}; turns are refused "
+                "until the worker pool restarts",
+            )
         if body.n not in (None, 1):
             raise TurnError(
                 400, "unsupported_n",
@@ -973,42 +998,74 @@ class BatchScheduler:
             waiter.future.set_result(result)
 
     def _fail_pending_turns(self, error_msg: str) -> None:
-        """Fail every pending turn after a fatal worker error.
+        """Fail every pending turn after a fatal worker error; refuse new ones.
 
         Callable from any thread (a restart's fail_in_flight runs off the
-        loop): queued entries are purged at once, futures are failed on the
-        loop.
+        loop), but every read, removal and resolution of _turn_waiters happens
+        in one callback on the scheduler loop. That callback closes the turn
+        gate and fails all waiters that exist when it runs, so a turn
+        submitted after this call but before the callback is failed too, and
+        one submitted after the callback is refused until resume().
         """
-        turn_ids = list(self._turn_waiters)
-        for turn_id in turn_ids:
-            self._intake_pool.remove_batch_entries(turn_id)
+        self._call_on_loop(
+            lambda: self._close_turn_gate(error_msg), "fail pending turns"
+        )
 
-        def fail_on_loop() -> None:
-            for turn_id in turn_ids:
-                waiter = self._turn_waiters.pop(turn_id, None)
-                if waiter is None:
-                    continue
-                self._intake_pool.remove_batch_info(turn_id)
-                if not waiter.future.done():
-                    waiter.future.set_exception(TurnError(
-                        503, "worker_fatal", f"worker_fatal: {error_msg}",
-                    ))
-            # A detached turn's worker generation is gone with its completion.
-            self._detached_turns.clear()
-
-        if turn_ids:
+    def _close_turn_gate(self, error_msg: str) -> None:
+        """Refuse new turns and fail all pending ones. Runs on the loop."""
+        self._turn_gate_closed = error_msg
+        waiters = list(self._turn_waiters.values())
+        self._turn_waiters.clear()
+        for waiter in waiters:
+            self._intake_pool.remove_batch_entries(waiter.turn_id)
+            self._intake_pool.remove_batch_info(waiter.turn_id)
+            if not waiter.future.done():
+                waiter.future.set_exception(TurnError(
+                    503, "worker_fatal", f"worker_fatal: {error_msg}",
+                ))
+        # A detached turn's worker generation is gone with its completion.
+        self._detached_turns.clear()
+        if waiters:
             logger.error(
-                "[TURN] Failing %d pending turn(s): %s", len(turn_ids), error_msg
+                "[TURN] Failed %d pending turn(s): %s", len(waiters), error_msg
             )
+
+    def _open_turn_gate(self) -> None:
+        """Accept turns again after a restart resumed. Runs on the loop."""
+        if self._turn_gate_closed is not None:
+            logger.info(
+                "[TURN] Turn submission reopened (closed by: %s)",
+                self._turn_gate_closed,
+            )
+        self._turn_gate_closed = None
+
+    def _call_on_loop(self, fn, what: str) -> None:
+        """Run ``fn`` on the scheduler loop: now if already on it, else queued.
+
+        Never runs ``fn`` on another thread. A stopped (not closed) loop keeps
+        the callback queued; a closed loop has no turn left to serve, so the
+        call is dropped with a log line.
+        """
         loop = self._loop
         try:
-            on_loop = loop is not None and asyncio.get_running_loop() is loop
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            on_loop = False
-        if on_loop or loop is None or not loop.is_running():
-            fail_on_loop()
-        else:
-            loop.call_soon_threadsafe(fail_on_loop)
+            running = None
+        if running is not None and (loop is None or running is loop):
+            fn()
+            return
+        if loop is None or loop.is_closed():
+            logger.warning(
+                "[TURN] Cannot %s: the scheduler loop is %s",
+                what, "not started" if loop is None else "closed",
+            )
+            return
+        try:
+            loop.call_soon_threadsafe(fn)
+        except RuntimeError:
+            logger.warning(
+                "[TURN] Cannot %s: the scheduler loop closed", what
+            )
 
     def build_turn_response(self, waiter: _TurnWaiter, result: dict) -> dict:
         """The chat.completion body for a resolved turn, with BatchGen metadata.
