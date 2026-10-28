@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
-from batchgen.config import EngineConfig, ModelConfig
+from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
 
 try:

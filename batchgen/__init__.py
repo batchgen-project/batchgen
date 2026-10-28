@@ -15,10 +15,3 @@
 #  see the license for the specific language governing permissions and          #
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
-
-from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
-from batchgen.kernel_compat import check_kernels_version as _check_kv
-
-_check_kv()
-
-__all__ = ["ckpt_converter"]

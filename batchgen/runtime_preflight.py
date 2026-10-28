@@ -22,6 +22,8 @@ from typing import Iterable
 
 import torch
 
+from batchgen.kernel_compat import check_kernels_version
+
 logger = logging.getLogger(__name__)
 
 
@@ -467,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", required=True)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    check_kernels_version()
     try:
         model_type = run_runtime_preflight(args)
     except RuntimePreflightError as exc:
