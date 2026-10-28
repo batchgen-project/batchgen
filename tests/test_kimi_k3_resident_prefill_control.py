@@ -627,7 +627,7 @@ def test_hierarchical_gdr_requires_supported_implicit_launch_order(monkeypatch):
     check()
 
 
-def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
+def test_streamed_sp8_acquire_batch_is_the_planned_consumer_batch():
     path = (
         ROOT
         / "batchgen"
@@ -643,9 +643,59 @@ def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
     )
     source = ast.unparse(function)
 
+    # The ingress leases the planner's consumer batch, not the whole ring:
+    # with batch == ring the producer can fill nothing while it is held.
     assert "num_prefill_module_buffer['routed_expert']" in source
-    assert "acquire_batch_size=expert_ring_depth" in source
-    assert "acquire_batch_size=16" not in source
+    assert "'k3_prefill_expert_batch'" in source
+    assert "acquire_batch_size=expert_batch" in source
+    assert "acquire_batch_size=expert_ring_depth" not in source
+
+
+def _streamed_sp8_init_with_plan(ring, **batching):
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    method = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_init_streamed_sp8_prefill",
+    )
+    manager = SimpleNamespace(
+        _streamed_sp8_buffer=None,
+        engine_config=SimpleNamespace(
+            GPU_Buffer_Config=SimpleNamespace(
+                num_prefill_module_buffer={"routed_expert": ring}
+            ),
+            Module_Batching_Config=SimpleNamespace(**batching),
+        ),
+    )
+    return lambda: method(manager)
+
+
+@pytest.mark.parametrize(
+    ("ring", "batch"),
+    [(8, 8), (4, 8), (0, 8)],
+)
+def test_streamed_sp8_refuses_a_ring_no_deeper_than_its_batch(ring, batch):
+    init = _streamed_sp8_init_with_plan(ring, k3_prefill_expert_batch=batch)
+
+    # Validated before the buffer is built, so the producer never runs a pass
+    # in which it has no slot to fill ahead of the consumer.
+    with pytest.raises(RuntimeError, match="deeper than its consumer batch"):
+        init()
+
+
+@pytest.mark.parametrize("batching", [{}, {"k3_prefill_expert_batch": 0}])
+def test_streamed_sp8_refuses_a_missing_or_empty_consumer_batch(batching):
+    init = _streamed_sp8_init_with_plan(16, **batching)
+
+    with pytest.raises(RuntimeError, match="positive routed-expert consumer"):
+        init()
 
 
 def test_streamed_sp8_layer_uses_planned_collective_stripe_threshold():
@@ -1031,7 +1081,7 @@ def test_streamed_sp8_attention_modules_unwraps_and_skips_missing_attention():
     assert list(method()) == [inner]
 
 
-def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
+def test_distributed_k3_initializer_leaves_the_prefill_ring_to_the_planner():
     path = (
         ROOT
         / "batchgen"
@@ -1044,10 +1094,10 @@ def test_distributed_k3_inherits_the_base_planner_prefill_ring_depth():
         _function(path, "KimiLinearInitializer", "__init__")
     )
 
-    # The routed-expert ring is bounded by the base planner's depth-8 slot
-    # budget. Sizing it to a whole 112-expert TP8 shard here would reserve ~12
-    # GiB of ring per rank for an ingress that now releases each bounded batch
-    # as soon as its copies land.
+    # The K3 planner owns the routed-expert ring depth (one consumer batch
+    # plus one producer batch). Sizing it to a whole 112-expert TP8 shard here
+    # would reserve a full shard of ring per rank for an ingress that releases
+    # each bounded batch behind its copies.
     assert "num_prefill_module_buffer" not in source
 
 
@@ -2517,10 +2567,9 @@ def test_streamed_sp8_profile_does_not_synchronize_each_layer():
             and isinstance(node.func, ast.Attribute)
         }
         assert "elapsed_time" not in attrs, name
-        # ``_acquire_local_shard`` keeps its per-batch ring-lease synchronize,
-        # which predates E0 and is not a timing-event read.
-        if name != "_acquire_local_shard":
-            assert "synchronize" not in attrs, name
+        # ``_acquire_local_shard`` releases each ring batch with a
+        # stream-ordered event, so it parks the host on no copy either.
+        assert "synchronize" not in attrs, name
     assert "elapsed_time" in snapshot_calls
     assert "synchronize" not in snapshot_calls
 
@@ -2985,7 +3034,11 @@ class _FakeShardTensor:
         self._trace = trace
 
     def __getitem__(self, index):
-        return SimpleNamespace(copy_=lambda source: None)
+        return SimpleNamespace(
+            copy_=lambda source: self._trace.append(
+                ("local_copy", self.name, index)
+            )
+        )
 
     def copy_(self, source):
         self._trace.append(("assemble", self.name, source.name))
@@ -3024,13 +3077,19 @@ class _FakeIngressEvent:
 
 
 class _FakeStreamContext:
+    # The streams entered so far, innermost last: what
+    # ``torch.cuda.current_stream`` would return inside the context.
+    current = []
+
     def __init__(self, stream):
         self._stream = stream
 
     def __enter__(self):
+        _FakeStreamContext.current.append(self._stream)
         return self._stream
 
     def __exit__(self, *exc_info):
+        _FakeStreamContext.current.pop()
         return False
 
 
@@ -3105,6 +3164,14 @@ def _sp8_ingress_buffer(
             ("get_weights", name)
         ) or {tensor: tensor for tensor in SIX_TENSORS},
         free_weights_buffer=lambda name: trace.append(("free_weights", name)),
+        # The real binding records its release event on the CURRENT stream.
+        free_weights_buffers_async=lambda names: trace.append((
+            "free_async",
+            tuple(names),
+            _FakeStreamContext.current[-1]
+            if _FakeStreamContext.current
+            else None,
+        )),
     )
     for name in (
         "_acquire_local_shard",
@@ -3171,28 +3238,44 @@ def test_hierarchical_gdr_broadcasts_six_tensors_before_the_local_assembly():
         trace, "cross_launch_handoff"
     )[0]
 
-    # Each bounded batch is synchronized and released on its own, and the first
-    # batch's slots are freed BEFORE the second batch acquires -- that is what
-    # lets a depth-2 ring carry a four-expert shard.
-    assert ops.count("synchronize") == 2
-    assert ops.count("free_weights") == 4
-    assert trace[:10] == [
+    # Each bounded batch is handed back with ONE event-fenced async release,
+    # and the first batch's slots are released BEFORE the second batch
+    # acquires -- that is what lets a depth-2 ring carry a four-expert shard.
+    # No host synchronize parks the thread between batches, and nothing is
+    # released synchronously.
+    assert "synchronize" not in ops
+    assert "free_weights" not in ops
+    assert [
+        entry[:2]
+        for entry in trace
+        if entry[0] in ("get_weights", "free_async")
+    ] == [
         ("get_weights", "routed_expert_7_336"),
         ("get_weights", "routed_expert_7_337"),
-        ("synchronize",),
-        ("free_weights", "routed_expert_7_336"),
-        ("free_weights", "routed_expert_7_337"),
+        ("free_async", ("routed_expert_7_336", "routed_expert_7_337")),
         ("get_weights", "routed_expert_7_338"),
         ("get_weights", "routed_expert_7_339"),
-        ("synchronize",),
-        ("free_weights", "routed_expert_7_338"),
-        ("free_weights", "routed_expert_7_339"),
+        ("free_async", ("routed_expert_7_338", "routed_expert_7_339")),
     ]
+    # The release event is recorded on the ingress stream, after every copy
+    # out of the batch's slots and before any copy of the next batch.
+    releases = [
+        index for index, entry in enumerate(trace) if entry[0] == "free_async"
+    ]
+    assert all(trace[index][2] is stream for index in releases)
+    copies = [
+        index for index, entry in enumerate(trace) if entry[0] == "local_copy"
+    ]
+    assert len(copies) == 4 * len(SIX_TENSORS)
+    first_batch = copies[:2 * len(SIX_TENSORS)]
+    second_batch = copies[2 * len(SIX_TENSORS):]
+    assert first_batch[-1] < releases[0] < second_batch[0]
+    assert second_batch[-1] < releases[1]
     # Every lease is released before the cross-node phase begins, so no slot is
     # held across the gate, the status broadcast or the payload broadcasts.
-    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
-    # Releases are not deferred behind an H2D completion event any more: the
-    # per-batch stream synchronize is the whole ordering.
+    assert releases[-1] < _op_span(trace, "cross_gate")[0]
+    # The payload broadcasts and the assembly read ``self.local`` on the same
+    # stream the copies were enqueued on, so neither needs a host wait.
     assert "h2d_record" not in ops
     assert "h2d_synchronize" not in ops
 
@@ -3334,6 +3417,8 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
     broadcasts = [entry for entry in trace if entry[0] == "broadcast"]
     assert broadcasts == [("broadcast", "source_status", 11, "cross3")]
     assert "assemble" not in [entry[0] for entry in trace]
+    # Nothing was leased, so there is nothing to release.
+    assert "free_async" not in [entry[0] for entry in trace]
     # Even the failure announcement is a cross-node collective, so it stays
     # behind the gate; announcing it early would reorder this rank's
     # communicator launches against its peers'.
@@ -3345,6 +3430,60 @@ def test_hierarchical_gdr_source_failure_announces_status_before_raising():
     # acquisition sample timing the failure, no ordering handoff.
     assert profile._prefill_profile_broadcast_spans == []
     assert profile._prefill_profile_host_records == []
+
+
+@pytest.mark.parametrize(
+    ("cross_group", "cross_root", "cross_source"),
+    [(None, None, False), ("cross3", 11, True)],
+)
+def test_streamed_sp8_failed_ingress_releases_every_lease_exactly_once(
+    cross_group, cross_root, cross_source
+):
+    trace = []
+    stream = _FakeIngressStream(trace)
+    buffer, profile = _sp8_ingress_buffer(
+        trace,
+        cross_group=cross_group,
+        cross_root=cross_root,
+        cross_source=cross_source,
+        experts_per_rank=4,
+        acquire_batch_size=2,
+    )
+    get_weights = buffer.core_engine.get_weights
+
+    def fail_mid_batch(name):
+        if name == "routed_expert_7_339":
+            raise RuntimeError("source load failed")
+        return get_weights(name)
+
+    buffer.core_engine.get_weights = fail_mid_batch
+    with pytest.raises(RuntimeError, match="source load failed"):
+        buffer._acquire_local_shard(
+            7,
+            stream=stream,
+            cross_launch_gate=lambda: trace.append(("cross_gate",)) or True,
+        )
+
+    # The full first batch and the one lease the failing batch took are each
+    # released once, on the ingress stream, and the failure never retries the
+    # release with the expert that was never leased.
+    releases = [entry for entry in trace if entry[0] == "free_async"]
+    assert [entry[1] for entry in releases] == [
+        ("routed_expert_7_336", "routed_expert_7_337"),
+        ("routed_expert_7_338",),
+    ]
+    assert all(entry[2] is stream for entry in releases)
+    ops = [entry[0] for entry in trace]
+    assert "free_weights" not in ops
+    assert "synchronize" not in ops
+    assert _FakeStreamContext.current == []
+    if cross_group is not None:
+        # The source still announces its failure to the peers before raising.
+        assert [entry for entry in trace if entry[0] == "broadcast"] == [
+            ("broadcast", "source_status", 11, "cross3")
+        ]
+        assert trace.index(releases[-1]) < _op_span(trace, "cross_gate")[0]
+        assert profile._prefill_profile_cross_status_failures == 1
 
 
 def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
@@ -3371,8 +3510,11 @@ def test_hierarchical_gdr_cancelled_gate_issues_no_cross_collective():
     assert "assemble" not in ops
     # The leases were already released by their own bounded batch, so a
     # cancelled gate returns early without stranding a single ring slot.
-    assert ops.count("free_weights") == 2
-    assert _op_span(trace, "free_weights")[1] < _op_span(trace, "cross_gate")[0]
+    assert [entry[:2] for entry in trace if entry[0] == "free_async"] == [
+        ("free_async", ("routed_expert_7_336", "routed_expert_7_337")),
+    ]
+    assert "free_weights" not in ops
+    assert _op_span(trace, "free_async")[1] < _op_span(trace, "cross_gate")[0]
     assert "h2d_record" not in ops
     assert "h2d_synchronize" not in ops
     assert profile._prefill_profile_cross_broadcast_calls == 0

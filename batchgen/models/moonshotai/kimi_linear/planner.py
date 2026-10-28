@@ -111,6 +111,16 @@ _K3_H200_KDA_STATE_SLOTS_SHARDED = 160
 # funds 256 persistent slots per node: every D512 request in flight from
 # wave 1 (no mid-run waves, long requests admitted at t=0). Slot cost ~36 MB.
 _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
+# Streamed-SP8 prefill leases its routed experts from the prefill ring in
+# batches of K3_PREFILL_EXPERT_BATCH and releases each batch with one
+# stream-ordered event. The ring holds that consumer batch plus one batch the
+# HtoD producer fills ahead while the consumer copies; with ring == batch the
+# producer has no free slot until the consumer releases, so the two alternate
+# instead of overlapping. The ring must also exceed batch + the producer's
+# copies in flight (HtoD_Engine kMaxCopiesInFlight), or the producer cannot
+# keep its copy pipeline full while the consumer holds a whole batch.
+K3_PREFILL_EXPERT_BATCH = 8
+K3_PREFILL_EXPERT_RING = K3_PREFILL_EXPERT_BATCH + K3_PREFILL_EXPERT_BATCH
 
 
 def k3_shard_latent_projections(
@@ -611,6 +621,22 @@ class KimiLinearPlanner(BasePlanner):
         ):
             self.config.Basic_Config.decode_graph_mode = "graph"
 
+        # Routed-expert prefill ring and the streamed-SP8 consumer batch that
+        # leases from it (see K3_PREFILL_EXPERT_BATCH). Set explicitly instead
+        # of inheriting base_planner's generic depth. No planner formula
+        # counts this map: GPU_Weight_Buffer allocates the slots (engine Init,
+        # reset_prefill_buffer), so only budgets measured from mem_get_info
+        # while the ring is mapped see them, and the prefill->decode switch
+        # releases the ring before decode sizes its KV pool. A
+        # stream_all_modules plan replaces the whole map in
+        # _configure_streamed_rings below; streamed-SP8 never runs there.
+        self.config.GPU_Buffer_Config.num_prefill_module_buffer[
+            "routed_expert"
+        ] = K3_PREFILL_EXPERT_RING
+        self.config.Module_Batching_Config.k3_prefill_expert_batch = (
+            K3_PREFILL_EXPERT_BATCH
+        )
+
     def _configure_streamed_rings(self):
         """Ring depths for the four streamed module types.
 
@@ -628,9 +654,10 @@ class KimiLinearPlanner(BasePlanner):
         # requests exactly one attn OR one kda_attn and one shared_expert, so a
         # third slot buys prefetch cushion at 0.83 GiB per slot on the KDA ring
         # — the worst HBM-per-benefit trade of the four. Depth 112 on the routed
-        # experts is one TP8 shard of a K3 layer (896/8): streamed-SP8 acquires
-        # the whole shard before the node-local weight all-gather. The legacy
-        # streamed path also tolerates the deeper producer lead.
+        # experts is one TP8 shard of a K3 layer (896/8) for the legacy
+        # streamed path, which tolerates the deeper producer lead. Streamed-SP8
+        # needs attention_group_size=8 with stream_all_modules off, so it
+        # never sees this map; its ring is K3_PREFILL_EXPERT_RING.
         #
         # kda_attn has no entry in base_planner's default map
         # (base_planner.py:90-94), and GPU_Weight_Buffer::Init() iterates that

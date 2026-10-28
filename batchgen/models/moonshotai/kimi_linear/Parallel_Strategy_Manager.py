@@ -1425,21 +1425,37 @@ class KimiLinearParallelStrategyManager:
         """Attach one reusable layer-wise all-expert buffer to every K3 MoE."""
         if self._streamed_sp8_buffer is not None:
             return
+        # The ingress leases ``expert_batch`` slots, copies them out and
+        # releases them with one stream-ordered event while it leases the
+        # next batch. The ring must hold more than that batch, or the HtoD
+        # producer has no slot to fill ahead and the two alternate.
+        expert_ring_depth = int(
+            self.engine_config.GPU_Buffer_Config
+            .num_prefill_module_buffer["routed_expert"]
+        )
+        expert_batch = int(getattr(
+            self.engine_config.Module_Batching_Config,
+            "k3_prefill_expert_batch",
+            0,
+        ))
+        if expert_batch <= 0:
+            raise RuntimeError(
+                "streamed-SP8 prefill requires a positive routed-expert "
+                f"consumer batch; the plan set {expert_batch}"
+            )
+        if expert_ring_depth <= expert_batch:
+            raise RuntimeError(
+                "streamed-SP8 prefill requires a routed-expert prefill ring "
+                f"deeper than its consumer batch; got ring={expert_ring_depth}, "
+                f"batch={expert_batch}, which leaves the producer no slot to "
+                "fill ahead"
+            )
         cfg = self.loaded_model_config
         from batchgen.moe.streamed_sp8_mxfp4 import (
             StreamedSP8LayerBuffer,
             StreamedSP8MXFP4MoELayer,
         )
 
-        expert_ring_depth = int(
-            self.engine_config.GPU_Buffer_Config
-            .num_prefill_module_buffer["routed_expert"]
-        )
-        if expert_ring_depth <= 0:
-            raise RuntimeError(
-                "streamed-SP8 prefill requires a positive routed-expert "
-                "prefill ring depth"
-            )
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
@@ -1449,7 +1465,7 @@ class KimiLinearParallelStrategyManager:
             num_experts=cfg.n_routed_experts,
             intermediate_size=cfg.moe_intermediate_size,
             latent_size=cfg.routed_expert_hidden_size,
-            acquire_batch_size=expert_ring_depth,
+            acquire_batch_size=expert_batch,
             layer_indices=[
                 layer_idx
                 for layer_idx, layer in enumerate(self.model.model.layers)

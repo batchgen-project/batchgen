@@ -17,6 +17,8 @@ _config_spec.loader.exec_module(_config_module)
 EngineConfig = _config_module.EngineConfig
 
 from batchgen.models.moonshotai.kimi_linear.planner import (
+    K3_PREFILL_EXPERT_BATCH,
+    K3_PREFILL_EXPERT_RING,
     KimiLinearPlanner,
     k3_kda_state_slots,
     k3_prefill_collective_stripe_threshold_rows,
@@ -237,6 +239,56 @@ def test_h200_plan_exposes_256_users_plus_separate_graph_scratch():
         config.Module_Batching_Config.k3_resident_prefill_token_cap == 16_384
     )
     assert config.Module_Batching_Config.k3_resident_prefill_chunk_rows == 2048
+
+
+@pytest.mark.parametrize("memory_bytes", [96 * GIB, 140 * GIB, None])
+def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
+    config = _plan_k3(memory_bytes)
+
+    # Streamed-SP8 leases a consumer batch of 8 experts; the ring holds that
+    # batch plus one more the HtoD producer fills ahead, instead of inheriting
+    # base_planner's generic depth (== the batch, so the two alternated).
+    assert K3_PREFILL_EXPERT_BATCH == 8
+    assert K3_PREFILL_EXPERT_RING == 16
+    assert (
+        config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"]
+        == K3_PREFILL_EXPERT_RING
+    )
+    assert (
+        config.Module_Batching_Config.k3_prefill_expert_batch
+        == K3_PREFILL_EXPERT_BATCH
+    )
+    # The PSM enforces ring > batch. The plan also clears the batch plus the
+    # producer's copies in flight (HtoD_Engine kMaxCopiesInFlight = 4), which
+    # no code enforces.
+    assert K3_PREFILL_EXPERT_RING > K3_PREFILL_EXPERT_BATCH + 4
+
+
+def test_k3_streamed_all_modules_plan_keeps_its_own_ring_map():
+    config = EngineConfig()
+    config.Basic_Config.kv_dtype = "bfloat16"
+    config.Basic_Config.set_max_prompt_length(8192)
+    config.Basic_Config.max_decoding_length = 128
+    config.Basic_Config.world_size = 16
+    config = KimiLinearPlanner(
+        is_k3=True,
+        stream_all_modules=True,
+        attention_group_size=1,
+        gpu_total_memory_bytes=96 * GIB,
+    ).generate_config(config)
+
+    # The legacy streamed path (never streamed-SP8) keeps one TP8 shard per
+    # routed-expert ring; the consumer batch is still planned for K3.
+    assert config.GPU_Buffer_Config.num_prefill_module_buffer == {
+        "attn": 2,
+        "kda_attn": 2,
+        "shared_expert": 2,
+        "routed_expert": 112,
+    }
+    assert (
+        config.Module_Batching_Config.k3_prefill_expert_batch
+        == K3_PREFILL_EXPERT_BATCH
+    )
 
 
 def test_resident_prefill_cap_is_h200_tp8_only():
