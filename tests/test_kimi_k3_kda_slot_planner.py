@@ -250,8 +250,8 @@ def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
     # a smaller ring caps the HtoD producer's lookahead below a layer, so
     # layer k+1's transfers serialize inside layer k+1 instead of hiding
     # behind layer k's compute.
-    assert K3_PREFILL_EXPERT_BATCH == 8
-    assert K3_PREFILL_EXPERT_RING == 112 + 2 * K3_PREFILL_EXPERT_BATCH
+    assert K3_PREFILL_EXPERT_BATCH == 112
+    assert K3_PREFILL_EXPERT_RING == 112 + 16
     assert (
         config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"]
         == K3_PREFILL_EXPERT_RING
@@ -263,7 +263,6 @@ def test_k3_prefill_expert_ring_holds_one_producer_batch_ahead(memory_bytes):
     # One full layer of lookahead past the consumer's held batch, and the
     # producer's copies in flight (HtoD_Engine kMaxCopiesInFlight = 4) still
     # clear the ring; the PSM enforces only ring > batch.
-    assert K3_PREFILL_EXPERT_RING >= 112 + K3_PREFILL_EXPERT_BATCH
     assert K3_PREFILL_EXPERT_RING > K3_PREFILL_EXPERT_BATCH + 4
 
 

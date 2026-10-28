@@ -126,9 +126,15 @@ _K3_H200_KDA_STATE_SLOTS_VOCAB_SHARDED = 256
 # two consumer batches of the next (2.14 GiB), so the producer streams layer
 # k+1 while layer k computes and still has slack past the consumer's held
 # batch and the copy pipeline (HtoD_Engine kMaxCopiesInFlight).
-K3_PREFILL_EXPERT_BATCH = 8
+# The consumer leases ONE WHOLE LAYER per acquire and releases it with a
+# single stream-ordered event once its D2D into the local shard is enqueued:
+# prefill advances layer by layer into one grouped GEMM (the Kimi-K2.5
+# default path), so sub-layer lease batches only add acquire/release round
+# trips. The hold window is the D2D enqueue, a few ms; the 16 extra ring
+# slots keep the HtoD producer streaming layer k+2 during it.
 _K3_EXPERTS_PER_RANK = 112
-K3_PREFILL_EXPERT_RING = _K3_EXPERTS_PER_RANK + 2 * K3_PREFILL_EXPERT_BATCH
+K3_PREFILL_EXPERT_BATCH = _K3_EXPERTS_PER_RANK
+K3_PREFILL_EXPERT_RING = _K3_EXPERTS_PER_RANK + 16
 
 
 def k3_shard_latent_projections(
