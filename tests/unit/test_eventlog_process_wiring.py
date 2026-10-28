@@ -337,6 +337,58 @@ def test_exit_process_records_the_active_exception(tmp_path):
     assert "boom" not in recs[-1]["msg"]
 
 
+def test_recording_exit_records_a_failed_startup_under_the_fallback(tmp_path):
+    done = _run_exit_script(
+        f"ls.configure_process('server', node=1, run=None, "
+        f"log_dir={str(tmp_path)!r}, level='INFO', "
+        f"fallback_run_id={FALLBACK_ID!r})\n"
+        "logging.getLogger('batchgen.test').info('waiting for node 0')\n"
+        "with ls.recording_exit():\n"
+        "    sys.exit(3)\n"
+    )
+
+    assert done.returncode == 3, done.stderr
+    (run_dir,) = _run_dirs(tmp_path)
+    recs = tu.read_jsonl(tmp_path / run_dir / "node1" / "server.jsonl")
+    assert recs[0]["msg"] == "waiting for node 0"
+    last = recs[-1]
+    assert last["event"] == "process.exit"
+    assert last["level"] == "CRITICAL"
+    assert last["data"] == {"code": 3, "reason": "exit with an error"}
+    assert last["run_id"] == FALLBACK_ID
+
+
+def test_recording_exit_records_an_unhandled_exception(tmp_path):
+    done = _run_exit_script(
+        f"ls.configure_process('server', node=0, run=t.RUN, "
+        f"log_dir={str(tmp_path)!r}, level='INFO')\n"
+        "with ls.recording_exit():\n"
+        "    raise ValueError('boom')\n"
+    )
+
+    assert done.returncode == 1
+    last = tu.read_jsonl(tmp_path / tu.RUN_DIR / "node0" / "server.jsonl")[-1]
+    assert last["event"] == "process.exit"
+    assert last["data"] == {"code": 1, "reason": "unhandled exception"}
+    assert "ValueError: boom" in last["exc"]
+
+
+def test_recording_exit_clean_exit_writes_no_exit_record(tmp_path):
+    done = _run_exit_script(
+        f"ls.configure_process('server', node=1, run=None, "
+        f"log_dir={str(tmp_path)!r}, level='INFO', "
+        f"fallback_run_id={FALLBACK_ID!r})\n"
+        "logging.getLogger('batchgen.test').info('served')\n"
+        "with ls.recording_exit():\n"
+        "    sys.exit(0)\n"
+    )
+
+    assert done.returncode == 0, done.stderr
+    (run_dir,) = _run_dirs(tmp_path)
+    recs = tu.read_jsonl(tmp_path / run_dir / "node1" / "server.jsonl")
+    assert [rec["msg"] for rec in recs] == ["served"]
+
+
 def test_exit_process_unconfigured_exits_with_code():
     done = _run_exit_script("ls.exit_process(5, 'early exit')\n")
 

@@ -14,8 +14,8 @@ import sys
 
 from batchgen.eventlog.process import (
     configure_process,
-    ensure_run_bound,
     new_run_identity,
+    recording_exit,
 )
 from batchgen.server.server_args import prepare_server_args
 from batchgen.runtime_preflight import RuntimePreflightError, run_runtime_preflight
@@ -50,12 +50,11 @@ def main():
         fallback_run_id=server_args.runtime_identity.run_id,
     )
 
-    try:
+    # A failed startup (uvicorn exits 3) leaves a process.exit record, and a
+    # node other than 0 that ends before node 0 names the run still writes its
+    # buffered records, under a run of its own.
+    with recording_exit():
         _serve(server_args)
-    finally:
-        # A node other than 0 that fails before node 0 names the run still
-        # writes its buffered records, under a run of its own.
-        ensure_run_bound()
 
 
 def _serve(server_args) -> None:

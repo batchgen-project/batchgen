@@ -17,13 +17,14 @@ so it loads without the server stack and without torch.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple
+from typing import Iterator, NoReturn, Optional, Tuple
 
 from batchgen import eventlog
 from batchgen.eventlog import schema
@@ -239,3 +240,25 @@ def exit_process(
         stacklevel=3,
     )
     os._exit(code)
+
+
+@contextlib.contextmanager
+def recording_exit() -> Iterator[None]:
+    """Run a process body; leave a ``process.exit`` record when it fails.
+
+    A nonzero ``SystemExit`` or an unhandled exception is recorded at CRITICAL
+    before it propagates. Either way, a process that never bound a run binds
+    its fallback run, so its buffered records reach disk.
+    """
+    try:
+        yield
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            code = exc.code if isinstance(exc.code, int) else 1
+            record_exit(code, "exit with an error", stacklevel=3)
+        raise
+    except Exception:
+        record_exit(1, "unhandled exception", exc_info=True, stacklevel=3)
+        raise
+    finally:
+        ensure_run_bound()
