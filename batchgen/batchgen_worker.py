@@ -207,6 +207,10 @@ from batchgen.query_book import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.cuda_graph_flag_policy import (
+	cli_enables_whole_model_graph,
+	require_cuda_graph_flag_supported,
+)
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
 	glm5_dsa_cuda_graph_requested_for_model,
@@ -4786,7 +4790,13 @@ class BatchGenWorker:
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
 
-		# Set CUDA graph config from command-line args
+		# Set CUDA graph config from command-line args. --enable-cuda-graph on a
+		# model with no flag-driven graph path raises (validate_server_args
+		# rejects it first, before any worker starts).
+		require_cuda_graph_flag_supported(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
 		if self.args.disable_cuda_graphs:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
@@ -4800,13 +4810,13 @@ class BatchGenWorker:
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
-		elif (
-			is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
-			and getattr(self.args, "enable_cuda_graph", False)
+		elif cli_enables_whole_model_graph(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 		):
-			# K2.5 whole-model decode graph (cuda-graph adapter). The config flag
-			# defaults off; --enable-cuda-graph flips it on (mirrors GLM-5's
-			# force-enable) so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
+			# K2.5 (cuda-graph adapter) and GPT-OSS-120B whole-model decode
+			# graphs. The config flag defaults off; --enable-cuda-graph flips it
+			# on so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
