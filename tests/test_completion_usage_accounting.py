@@ -88,6 +88,7 @@ def test_gather_completed_tokens_applies_stop_token_trimming(monkeypatch):
     worker.pad_token_id = 154820
     worker.detokenization_include_special_tokens = False
     worker.tokenizer = Tokenizer()
+    worker._prefix_sequence_states = {}
 
     def gather(output, local):
         output[0] = local

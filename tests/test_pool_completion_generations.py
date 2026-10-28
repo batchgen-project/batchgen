@@ -178,6 +178,9 @@ def _scheduler(tmp_path: Path):
         size=lambda: 0, remove_batch_entries=lambda batch_id: 0,
     )
     scheduler._stale_intake_batches = set()
+    scheduler._turn_waiters = {}
+    scheduler._detached_turns = set()
+    scheduler._intake_wakeup = asyncio.Event()
     scheduler.server_args = SimpleNamespace(
         incremental_output_dir=str(tmp_path),
     )

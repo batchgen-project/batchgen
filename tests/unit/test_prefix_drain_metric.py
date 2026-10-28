@@ -12,6 +12,7 @@ admission methods are compiled in isolation against a fake worker.
 import ast
 import copy
 import logging
+import time
 from pathlib import Path
 
 from batchgen.query_book import release_local_query_slot
@@ -33,6 +34,7 @@ _NAMESPACE = {
     "logging": logging,
     "release_local_query_slot": release_local_query_slot,
     "_release_tokenizer_arenas": lambda **_: None,
+    "time": time,
 }
 exec(compile(ast.fix_missing_locations(ast.Module(
     body=[

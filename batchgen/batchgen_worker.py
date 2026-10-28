@@ -2044,6 +2044,7 @@ class BatchGenWorker:
 		start_idx = existing_max_idx + 1
 
 		# Step 1: Create SequenceEntry objects
+		admitted_at = time.time()
 		new_uuids = []
 		for i, entry in enumerate(entries):
 			global_idx = start_idx + i
@@ -2064,6 +2065,10 @@ class BatchGenWorker:
 			# Per-request ignore_eos: _should_stop_at_eos(token, seq) never marks
 			# this sequence done on an EOS or stop token.
 			seq.ignore_eos = bool(entry.get("ignore_eos", False))
+			seq.traj_id = entry.get("traj_id")
+			seq.session_id = entry.get("session_id")
+			seq.parent_session_id = entry.get("parent_session_id")
+			seq.admitted_at = admitted_at
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
 		self._group_uuids.update(new_uuids)
@@ -2100,6 +2105,16 @@ class BatchGenWorker:
 		# decode groups were assigned during tokenization, before arena views were
 		# materialized.
 		self._build_local_query_book_for_admitted(new_uuids)
+
+		for uuid in new_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None and seq.session_id is not None and seq.assigned_rank == self.rank:
+				logging.info(
+					"[SESSION] admit request=%s traj=%s session=%s parent=%s "
+					"prompt_tokens=%d rank=%d",
+					seq.uuid, seq.traj_id, seq.session_id, seq.parent_session_id,
+					seq.prompt_length, self.rank,
+				)
 
 		if self.rank == 0:
 			logging.info(
@@ -3128,6 +3143,20 @@ class BatchGenWorker:
 
 		self._maybe_emit_prefix_drain_metric()
 
+		# Cached/computed refer to the sequence's last prefill: computed is the
+		# prompt tokens that prefill ran, cached the ones it took from cache.
+		cached_tokens = int(seq.prefix_cached_tokens)
+		computed_tokens = max(int(seq.prompt_length) - cached_tokens, 0)
+		if seq.session_id is not None and seq.assigned_rank == self.rank:
+			logging.info(
+				"[SESSION] complete request=%s traj=%s session=%s parent=%s "
+				"prompt_tokens=%d cached_tokens=%d computed_tokens=%d "
+				"decoded_tokens=%d rank=%d",
+				seq.uuid, seq.traj_id, seq.session_id, seq.parent_session_id,
+				seq.original_prompt_length, cached_tokens, computed_tokens,
+				seq.decoded_length, self.rank,
+			)
+
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
 			return
@@ -3146,6 +3175,10 @@ class BatchGenWorker:
 			"prompt_length": seq.original_prompt_length,
 			"decoded_length": seq.decoded_length,
 			"finish_reason": self._get_finish_reason(seq),
+			"cached_tokens": cached_tokens,
+			"computed_tokens": computed_tokens,
+			"admitted_at": seq.admitted_at,
+			"completed_at": time.time(),
 		})
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
@@ -3161,7 +3194,9 @@ class BatchGenWorker:
 		if not completed_uuids:
 			return {}
 
-		# Each rank provides tokens for its locally-owned completed sequences
+		# Each rank provides tokens for its locally-owned completed sequences,
+		# plus the prompt tokens their last prefill took from the prefix cache:
+		# that state lives on the owner, and rank 0 reports the completion.
 		my_tokens = {}
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
@@ -3173,7 +3208,9 @@ class BatchGenWorker:
 						text = self._decode_tokens_to_string(decoded_tokens)
 					except Exception:
 						text = ""
-					my_tokens[uuid] = text
+					state = self._prefix_sequence_states.get(seq.global_idx)
+					cached = 0 if state is None else int(state.compute_cached_tokens)
+					my_tokens[uuid] = (text, cached)
 
 		# All ranks participate in gather
 		all_tokens = [None] * self.world_size
@@ -3183,7 +3220,11 @@ class BatchGenWorker:
 		merged = {}
 		for rank_tokens in all_tokens:
 			if rank_tokens:
-				merged.update(rank_tokens)
+				for uuid, (text, cached) in rank_tokens.items():
+					merged[uuid] = text
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is not None:
+						seq.prefix_cached_tokens = cached
 		return merged
 
 	# ============ End Request Pool Methods ============

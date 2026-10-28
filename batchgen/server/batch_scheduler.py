@@ -10,7 +10,9 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from batchgen.server.agent_sessions import TurnError
 from batchgen.server.io_struct import (
+    BatchEndpoint,
     BatchRequestItem,
     BatchStatus,
     ChatCompletionRequest,
@@ -127,6 +129,55 @@ def parse_batch_file(
     return True, None, requests
 
 
+# Worker per-request error codes that describe the request itself; any other
+# worker error on a turn is a server-side failure.
+_TURN_REQUEST_ERROR_CODES = ("context_length_exceeded", "host_kv_capacity_exceeded")
+
+
+def turn_timing_summary(timing: Dict[str, Optional[float]]) -> Dict[str, Any]:
+    """Wall-clock stamps of one turn plus the per-leg durations in ms.
+
+    Legs: HTTP receipt -> IntakePool submit -> admit message sent -> worker
+    admit, worker admit -> worker completion (service), and worker completion
+    -> completion routed -> HTTP response. ``overhead_ms`` is everything but
+    the worker's service time. A leg whose stamp is missing is None.
+    """
+    def ms(start: str, end: str) -> Optional[float]:
+        a, b = timing.get(start), timing.get(end)
+        if a is None or b is None:
+            return None
+        return round((b - a) * 1000.0, 3)
+
+    summary: Dict[str, Any] = dict(timing)
+    summary["receipt_to_submit_ms"] = ms("http_received_at", "intake_submitted_at")
+    summary["submit_to_admit_sent_ms"] = ms("intake_submitted_at", "admit_sent_at")
+    summary["admit_sent_to_worker_admit_ms"] = ms("admit_sent_at", "worker_admitted_at")
+    summary["submit_to_worker_admit_ms"] = ms("intake_submitted_at", "worker_admitted_at")
+    summary["worker_admit_to_complete_ms"] = ms("worker_admitted_at", "worker_completed_at")
+    summary["worker_complete_to_routed_ms"] = ms("worker_completed_at", "completion_routed_at")
+    summary["routed_to_response_ms"] = ms("completion_routed_at", "http_responded_at")
+    summary["worker_complete_to_response_ms"] = ms("worker_completed_at", "http_responded_at")
+    before = ms("http_received_at", "worker_admitted_at")
+    after = summary["worker_complete_to_response_ms"]
+    summary["overhead_ms"] = (
+        None if before is None or after is None else round(before + after, 3)
+    )
+    return summary
+
+
+class _TurnWaiter:
+    """One submitted turn waiting for its completion (scheduler-loop only)."""
+
+    __slots__ = ("turn_id", "model", "session", "future", "timing")
+
+    def __init__(self, turn_id, model, session, future, received_at) -> None:
+        self.turn_id = turn_id
+        self.model = model
+        self.session = session
+        self.future = future
+        self.timing: Dict[str, Optional[float]] = {"http_received_at": received_at}
+
+
 class BatchScheduler:
     """Async scheduler that executes batches sequentially."""
 
@@ -174,6 +225,16 @@ class BatchScheduler:
         self._quiesced = threading.Event()
         self._quiesce_ack = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Per-turn path (POST /v1/turns). Each turn is a one-entry intake batch
+        # keyed by its turn id; the completion listener resolves its waiter's
+        # future directly, with no batch tracker and no output file.
+        self._turn_waiters: Dict[str, _TurnWaiter] = {}
+        # Aborted turns already sent to a worker. The worker still finishes
+        # them (there is no worker-side cancel); their completion is dropped.
+        self._detached_turns: set = set()
+        # A turn submission wakes an idle drain at once instead of at its next
+        # 0.1 s poll.
+        self._intake_wakeup = asyncio.Event()
 
     async def start(self) -> None:
         if self._task:
@@ -791,6 +852,212 @@ class BatchScheduler:
         self._tokenizer_model = model
         return tokenizer
 
+    # ============ Per-turn path (POST /v1/turns) ============
+
+    def submit_turn(self, turn_id: str, body: Any, received_at: float) -> _TurnWaiter:
+        """Render one turn as the batch path does and submit it to the IntakePool.
+
+        ``body`` is a validated TurnRequest. The turn becomes a one-entry intake
+        batch keyed by ``turn_id``; the returned waiter's future resolves with
+        the worker's completion item. Raises TurnError for a request that
+        cannot run (400) or a full intake pool (429). Runs on the scheduler
+        loop.
+        """
+        if body.n not in (None, 1):
+            raise TurnError(
+                400, "unsupported_n",
+                f"a turn returns exactly one choice; n={body.n} is not supported",
+            )
+        mismatch = tokenizer_family_mismatch(body.model, self.server_args.model)
+        if mismatch is not None:
+            raise TurnError(400, "model_mismatch", mismatch)
+        item = BatchRequestItem.model_construct(
+            custom_id=turn_id,
+            method="POST",
+            url=BatchEndpoint.CHAT_COMPLETIONS,
+            body=body,
+        )
+        try:
+            prompts, max_tokens, sampling_params = (
+                self._convert_requests_to_worker_inputs([item])
+            )
+        except Exception as exc:
+            raise TurnError(
+                400, "invalid_request",
+                f"prompt construction failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        if max_tokens[0] is None:
+            raise TurnError(
+                400, "max_tokens_required",
+                "a turn needs max_completion_tokens or max_tokens",
+            )
+        session = body.session
+        entry = IntakeEntry(
+            request_id=turn_id,
+            batch_id=turn_id,
+            raw_request={
+                "text": prompts[0],
+                "max_tokens": max_tokens[0],
+                "priority": 0,
+                "sampling_params": sampling_params[0],
+                "ignore_eos": bool(body.ignore_eos),
+                "batchgen_debug": body.batchgen_debug or {},
+                "traj_id": session.traj_id,
+                "session_id": session.session_id,
+                "parent_session_id": session.parent_session_id,
+            },
+            priority=Priority.NORMAL,
+        )
+        waiter = _TurnWaiter(
+            turn_id,
+            body.model,
+            session,
+            asyncio.get_running_loop().create_future(),
+            received_at,
+        )
+        # Registered before the submit: the drain discards an intake entry that
+        # belongs to neither a live batch nor a live turn.
+        self._turn_waiters[turn_id] = waiter
+        if not self._intake_pool.submit_batch(turn_id, [entry], Priority.NORMAL):
+            del self._turn_waiters[turn_id]
+            raise TurnError(
+                429, "capacity_exceeded",
+                f"Server at capacity ({self._intake_pool.size()}/"
+                f"{self._intake_pool.max_capacity} requests in queue). Retry later.",
+            )
+        waiter.timing["intake_submitted_at"] = time.time()
+        self._pool_max_output_len = max(
+            getattr(self, "_pool_max_output_len", 0), max_tokens[0]
+        )
+        self._intake_wakeup.set()
+        return waiter
+
+    def cancel_turn(self, turn_id: str, reason: str) -> Optional[str]:
+        """Cancel a submitted turn; its waiter fails with 409 turn_aborted.
+
+        Returns "dequeued" when the turn was still in the IntakePool (it never
+        reaches a worker), "detached" when it was already admitted, or None
+        for a turn that is not pending. A detached turn runs to completion on
+        the worker -- the worker has no per-request cancel, the same as
+        /v1/batches/{id}/cancel -- and its completion is discarded. Runs on the
+        scheduler loop.
+        """
+        waiter = self._turn_waiters.pop(turn_id, None)
+        if waiter is None:
+            return None
+        removed = self._intake_pool.remove_batch_entries(turn_id)
+        self._intake_pool.remove_batch_info(turn_id)
+        outcome = "dequeued" if removed else "detached"
+        if not removed:
+            self._detached_turns.add(turn_id)
+        if not waiter.future.done():
+            waiter.future.set_exception(TurnError(
+                409, "turn_aborted", f"turn {turn_id} was aborted: {reason}",
+            ))
+        logger.info("[TURN] %s cancelled (%s): %s", turn_id, outcome, reason)
+        return outcome
+
+    def _resolve_turn(self, turn_id: str, result: dict) -> None:
+        """Hand a turn's completion item to its waiter. Runs on the loop."""
+        routed_at = time.time()
+        self._intake_pool.remove_batch_info(turn_id)
+        if turn_id in self._detached_turns:
+            self._detached_turns.discard(turn_id)
+            logger.info("[TURN] %s: discarding the completion of an aborted turn", turn_id)
+            return
+        waiter = self._turn_waiters.pop(turn_id)
+        waiter.timing["worker_admitted_at"] = result.get("admitted_at")
+        waiter.timing["worker_completed_at"] = result.get("completed_at")
+        waiter.timing["completion_routed_at"] = routed_at
+        if not waiter.future.done():
+            waiter.future.set_result(result)
+
+    def _fail_pending_turns(self, error_msg: str) -> None:
+        """Fail every pending turn after a fatal worker error.
+
+        Callable from any thread (a restart's fail_in_flight runs off the
+        loop): queued entries are purged at once, futures are failed on the
+        loop.
+        """
+        turn_ids = list(self._turn_waiters)
+        for turn_id in turn_ids:
+            self._intake_pool.remove_batch_entries(turn_id)
+
+        def fail_on_loop() -> None:
+            for turn_id in turn_ids:
+                waiter = self._turn_waiters.pop(turn_id, None)
+                if waiter is None:
+                    continue
+                self._intake_pool.remove_batch_info(turn_id)
+                if not waiter.future.done():
+                    waiter.future.set_exception(TurnError(
+                        503, "worker_fatal", f"worker_fatal: {error_msg}",
+                    ))
+            # A detached turn's worker generation is gone with its completion.
+            self._detached_turns.clear()
+
+        if turn_ids:
+            logger.error(
+                "[TURN] Failing %d pending turn(s): %s", len(turn_ids), error_msg
+            )
+        loop = self._loop
+        try:
+            on_loop = loop is not None and asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop or loop is None or not loop.is_running():
+            fail_on_loop()
+        else:
+            loop.call_soon_threadsafe(fail_on_loop)
+
+    def build_turn_response(self, waiter: _TurnWaiter, result: dict) -> dict:
+        """The chat.completion body for a resolved turn, with BatchGen metadata.
+
+        A worker per-request error raises TurnError: 400 when it describes the
+        request (e.g. context_length_exceeded), 500 otherwise.
+        """
+        error = result.get("error")
+        if error:
+            code = error.get("code", "worker_error")
+            status = 400 if code in _TURN_REQUEST_ERROR_CODES else 500
+            logger.warning(
+                "[TURN] %s failed on the worker: session=%s code=%s message=%s",
+                waiter.turn_id, waiter.session.session_id, code,
+                error.get("message", ""),
+            )
+            raise TurnError(status, code, error.get("message", ""))
+        body = self._chat_completion_body(waiter.model, result, int(time.time()))
+        cached = result.get("cached_tokens")
+        body["usage"]["prompt_tokens_details"] = {"cached_tokens": cached}
+        waiter.timing["http_responded_at"] = time.time()
+        timing = turn_timing_summary(waiter.timing)
+        session = waiter.session
+        body["batchgen"] = {
+            "turn_id": waiter.turn_id,
+            "session": {
+                "traj_id": session.traj_id,
+                "session_id": session.session_id,
+                "parent_session_id": session.parent_session_id,
+            },
+            "cached_tokens": cached,
+            "computed_tokens": result.get("computed_tokens"),
+            "timing": timing,
+        }
+        logger.info(
+            "[TURN] %s done traj=%s session=%s parent=%s prompt=%s cached=%s "
+            "computed=%s decoded=%s finish=%s receipt_to_submit_ms=%s "
+            "submit_to_worker_admit_ms=%s worker_ms=%s "
+            "worker_complete_to_response_ms=%s overhead_ms=%s",
+            waiter.turn_id, session.traj_id, session.session_id,
+            session.parent_session_id, result.get("prompt_length"), cached,
+            result.get("computed_tokens"), result.get("decoded_length"),
+            result.get("finish_reason"), timing["receipt_to_submit_ms"],
+            timing["submit_to_worker_admit_ms"],
+            timing["worker_admit_to_complete_ms"],
+            timing["worker_complete_to_response_ms"], timing["overhead_ms"],
+        )
+        return body
+
     # ============ Pool Mode ============
 
     async def _process_batch_pool_mode(
@@ -959,7 +1226,11 @@ class BatchScheduler:
                 await asyncio.sleep(0.05)
                 continue
             if self._intake_pool.is_empty():
-                await asyncio.sleep(0.1)
+                self._intake_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._intake_wakeup.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
                 continue
 
             # First drain: send init message to worker
@@ -1013,6 +1284,10 @@ class BatchScheduler:
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
                     "ignore_eos": entry.raw_request.get("ignore_eos", False),
                     "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
+                    # Agent-session identity; None for batch requests.
+                    "traj_id": entry.raw_request.get("traj_id"),
+                    "session_id": entry.raw_request.get("session_id"),
+                    "parent_session_id": entry.raw_request.get("parent_session_id"),
                 })
 
             admission_msg = {
@@ -1029,6 +1304,12 @@ class BatchScheduler:
                 await asyncio.sleep(0)
                 continue
             self.worker.request_queue.put(admission_msg)
+            if self._turn_waiters:
+                sent_at = time.time()
+                for entry in drained:
+                    waiter = self._turn_waiters.get(entry.batch_id)
+                    if waiter is not None:
+                        waiter.timing["admit_sent_at"] = sent_at
             logger.warning(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
                 f"(intake remaining: {self._intake_pool.size()}, "
@@ -1051,6 +1332,9 @@ class BatchScheduler:
         live: List[IntakeEntry] = []
         dropped: Dict[str, int] = {}
         for entry in drained:
+            if entry.batch_id in self._turn_waiters:
+                live.append(entry)
+                continue
             tracker = self._scheduling_pool.get_batch_tracker(entry.batch_id)
             if (
                 tracker is None
@@ -1090,6 +1374,7 @@ class BatchScheduler:
                     f"({purged} queued requests discarded)"
                 )
                 failed += 1
+        self._fail_pending_turns(error_msg)
         clear_slots = getattr(self._scheduling_pool, "clear_active_slots", None)
         if clear_slots is not None:
             clear_slots()
@@ -1169,6 +1454,14 @@ class BatchScheduler:
                                 f"free={self._scheduling_pool.num_free_slots()}, "
                                 f"intake={self._intake_pool.size()}"
                             )
+                        if (
+                            request_id in self._turn_waiters
+                            or request_id in self._detached_turns
+                        ):
+                            # A turn: resolve its HTTP waiter; no batch tracker
+                            # and no output file.
+                            self._resolve_turn(request_id, result)
+                            continue
                         # Write output JSONL line
                         if batch_id and request_id:
                             self._write_pool_completion(batch_id, request_id, result)
@@ -1313,36 +1606,7 @@ class BatchScheduler:
 
         # Build response body based on endpoint type
         if url == "/v1/chat/completions":
-            content, reasoning_content, tool_calls = self._parse_output(
-                model, decoded_text
-            )
-            message = {
-                "role": "assistant",
-                "content": content,
-            }
-            if reasoning_content is not None:
-                message["reasoning_content"] = reasoning_content
-            if tool_calls:
-                message["tool_calls"] = [
-                    call.dict(exclude_none=True) for call in tool_calls
-                ]
-            body = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion",
-                "created": created_at,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": message,
-                    "logprobs": None,
-                    "finish_reason": finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": prompt_length,
-                    "completion_tokens": decoded_length,
-                    "total_tokens": prompt_length + decoded_length,
-                },
-            }
+            body = self._chat_completion_body(model, result, created_at)
         else:
             body = {
                 "id": f"cmpl-{uuid.uuid4().hex}",
@@ -1372,6 +1636,44 @@ class BatchScheduler:
             },
             "error": None,
         })
+
+    def _chat_completion_body(
+        self, model: str, result: dict, created_at: int
+    ) -> dict:
+        """The chat.completion body for one worker completion item."""
+        decoded_text = result.get("text", "")
+        prompt_length = result.get("prompt_length", 0)
+        decoded_length = result.get("decoded_length", 0)
+        content, reasoning_content, tool_calls = self._parse_output(
+            model, decoded_text
+        )
+        message = {
+            "role": "assistant",
+            "content": content,
+        }
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
+        if tool_calls:
+            message["tool_calls"] = [
+                call.dict(exclude_none=True) for call in tool_calls
+            ]
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": created_at,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "logprobs": None,
+                "finish_reason": result.get("finish_reason", "stop"),
+            }],
+            "usage": {
+                "prompt_tokens": prompt_length,
+                "completion_tokens": decoded_length,
+                "total_tokens": prompt_length + decoded_length,
+            },
+        }
 
     def _append_pool_result_item(
         self, batch_id: str, request_id: str, result_item: dict

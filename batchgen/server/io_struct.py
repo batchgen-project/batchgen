@@ -87,6 +87,38 @@ class ChatCompletionRequest(BaseModel):
         return value
 
 
+class SessionIdentity(BaseModel):
+    """Who a model turn belongs to: its trajectory and its model context.
+
+    ``traj_id`` names one agent task (shared by its sub-agents); ``session_id``
+    names one model context inside it; ``parent_session_id`` names the session
+    that spawned this one, if any.
+    """
+
+    traj_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    parent_session_id: Optional[str] = Field(default=None, min_length=1)
+
+
+class TurnRequest(ChatCompletionRequest):
+    """Body of POST /v1/turns: one chat-completions turn of an agent session."""
+
+    session: SessionIdentity
+    batchgen_debug: Optional[Dict[str, Any]] = None
+
+
+class CloseSessionRequest(BaseModel):
+    """Body of POST /v1/sessions/{session_id}/close."""
+
+    reason: Literal["end_of_session", "end_of_trajectory"]
+
+
+class AbortSessionRequest(BaseModel):
+    """Body of POST /v1/sessions/{session_id}/abort (optional)."""
+
+    reason: Optional[str] = None
+
+
 class CompletionRequest(BaseModel):
     """Body structure for /v1/completions batch requests."""
 
