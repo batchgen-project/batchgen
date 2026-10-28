@@ -1078,6 +1078,17 @@ class BatchGenWorkerArgs:
 	runtime_dir: str = "/tmp"
 	pynccl_port_base: int = 20003
 	pynccl_port_span: int = 100
+	# Structured event log of this rank: the server's log root and level, and
+	# the run directory every process of the run writes under (see
+	# batchgen.eventlog.process). None log_dir means the eventlog default.
+	log_dir: Optional[str] = None
+	log_level: str = "INFO"
+	run_id: Optional[str] = None
+	run_started_at: Optional[float] = None
+	# Restart generation of this worker cohort (0 at the first launch), stamped
+	# as ``cohort`` on every record so successive cohorts stay distinguishable
+	# in the appended per-rank files.
+	log_cohort: int = 0
 
 
 def _reset_glm5_dsa_step_state(wrapper_cls, cache_seqlens, index_topk) -> None:
@@ -3759,6 +3770,7 @@ class BatchGenWorker:
 		module; by the time any rank can reach here that module is loaded, since
 		it is what arms the probe this path depends on.
 		"""
+		from batchgen.eventlog.process import record_exit
 		from batchgen.server_worker_main_loop import (
 			_EXIT_PATH_SELF_EXIT,
 			_WORKER_SELF_EXIT_CODE,
@@ -3773,6 +3785,7 @@ class BatchGenWorker:
 			_COHORT_QUIESCE_DEADLINE_REASON,
 		)
 		_flush_worker_logs()
+		record_exit(_WORKER_SELF_EXIT_CODE, _COHORT_QUIESCE_DEADLINE_REASON)
 		os._exit(_WORKER_SELF_EXIT_CODE)
 
 	def _quiesce_decode_for_cohort_shutdown(self, pending_async_task=None) -> None:
@@ -9099,14 +9112,15 @@ class BatchGenWorker:
 			dist.barrier()
 
 		if BATCHGEN_NSYS_DECODE_PROFILE_EXIT:
+			# Local: only this diagnostic exit needs it.
+			from batchgen.eventlog.process import exit_process
+
 			logging.info(
 				"[NSYS_DECODE_PROFILE] rank=%s exiting after %s profiled decode forwards",
 				self.rank,
 				forward_idx,
 			)
-			sys.stdout.flush()
-			sys.stderr.flush()
-			os._exit(0)
+			exit_process(0, "nsys profile exit")
 
 	def _ensure_pynccl_communicator(self) -> None:
 		"""Create the PyNccl communicator unless every rank already holds one.

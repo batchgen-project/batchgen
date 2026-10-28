@@ -1391,3 +1391,44 @@ def test_a_shutdown_does_not_wait_out_an_open_restart_request():
         and ast.unparse(node.targets[0]) == ast.unparse(keywords["timeout_graceful_shutdown"])
     )
     assert 0 < constant <= 30
+
+
+# ---------------------------------------------- the run identity for logging
+
+
+def test_run_identity_publish_then_wait():
+    """Node 0 names the run directory; a peer reads it from the store, also
+    when it started waiting before node 0 published."""
+    store, (node0, node1) = _cluster(run_identity_wait_s=5.0)
+    payload = json.dumps({"run_id": "a" * 32, "run_started_at": 1.5})
+
+    thread, outcome = _in_thread(node1.wait_run_identity)
+    time.sleep(0.05)
+    node0.publish_run_identity(payload)
+    thread.join(5)
+
+    assert outcome == [(True, payload)]
+    assert store.snapshot()["run/identity"] == payload
+    # Already published: answered from the store at once.
+    assert node1.wait_run_identity() == payload
+
+
+def test_wait_run_identity_times_out_without_node0():
+    _store, (_node0, node1) = _cluster(run_identity_wait_s=0.05)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="did not publish the run identity"):
+        node1.wait_run_identity()
+
+    assert time.monotonic() - started < 2.0
+
+
+def test_publish_run_identity_noop_single_node():
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a single-node server must not open a control store")
+
+    node = RestartCoordinator(1, 0, "127.0.0.1", 12356, store_factory=refuse)
+    node.start()
+
+    node.publish_run_identity(json.dumps({"run_id": "a" * 32}))
+    node.close()

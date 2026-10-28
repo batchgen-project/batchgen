@@ -52,8 +52,14 @@ _CONTROL_ERROR_BACKOFF_S = 2.0
 # /v1/workers/status.  A whole traceback helps nobody there and would make the
 # value unbounded.
 _REASON_MAX_CHARS = 400
+# Node 0 publishes the run identity right after it opens the store, so a peer
+# that connected has it almost at once; the wait only covers a peer that
+# connected before node 0 finished its own start-up up to that point.
+_RUN_IDENTITY_WAIT_S = 60.0
 
 _EPOCH_KEY = "epoch"
+# One key holding the whole payload, so a reader never sees half of it.
+_RUN_IDENTITY_KEY = "run/identity"
 _ACK_OK = "ok"
 _ACK_FAILED_PREFIX = "failed:"
 
@@ -159,6 +165,7 @@ class RestartCoordinator:
         connect_timeout_s: float = _STORE_CONNECT_TIMEOUT_S,
         request_wait_s: float = _REQUEST_PUBLISH_WAIT_S,
         error_backoff_s: float = _CONTROL_ERROR_BACKOFF_S,
+        run_identity_wait_s: float = _RUN_IDENTITY_WAIT_S,
     ) -> None:
         self._nnodes = int(nnodes)
         self._node_rank = int(node_rank)
@@ -169,6 +176,7 @@ class RestartCoordinator:
         self._connect_timeout_s = float(connect_timeout_s)
         self._request_wait_s = float(request_wait_s)
         self._error_backoff_s = float(error_backoff_s)
+        self._run_identity_wait_s = float(run_identity_wait_s)
         self._store: Optional[Any] = None
         self._epoch = 0
         # Phases this node published an ``ok`` ack for.  An ack is a promise
@@ -245,6 +253,35 @@ class RestartCoordinator:
         if self._store is None:
             raise RuntimeError("the restart control store is not open")
         return self._store
+
+    # ---------------------- Run identity ----------------------
+    def publish_run_identity(self, payload: str) -> None:
+        """Node 0: publish the run identity every node names its logs by.
+
+        The payload is opaque here; a single-node server has no peer to tell.
+        """
+        if not self.enabled:
+            return
+        self._require_store().set(_RUN_IDENTITY_KEY, payload)
+
+    def wait_run_identity(self) -> str:
+        """Node k > 0: the payload node 0 published, waiting for it briefly.
+
+        Raises ``RuntimeError`` when node 0 has not published it in time.
+        """
+        store = self._require_store()
+        if not store.check([_RUN_IDENTITY_KEY]):
+            try:
+                store.wait(
+                    [_RUN_IDENTITY_KEY],
+                    timedelta(seconds=self._run_identity_wait_s),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "node 0 did not publish the run identity within "
+                    f"{self._run_identity_wait_s:.0f}s: {exc}"
+                ) from exc
+        return _text(store.get(_RUN_IDENTITY_KEY))
 
     # ---------------------- Node 0: requesting ----------------------
     def begin_restart(self, timeout_s: float) -> RestartRequest:

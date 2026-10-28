@@ -251,6 +251,23 @@ def cleanup_shm_files(
     return removed
 
 
+def _exit_process(code: int, reason: str) -> None:
+    """Write the event log's ``process.exit`` record, then ``os._exit``.
+
+    Callers run in signal handlers and before the worker configured logging,
+    so nothing is imported here: a BatchGen worker has loaded
+    ``batchgen.eventlog.process`` by then (its entry module imports it). This
+    module loaded on its own, by path, logs the plain way instead. The exit
+    itself is always this module's ``os._exit``.
+    """
+    events = sys.modules.get("batchgen.eventlog.process")
+    if events is not None:
+        events.record_exit(code, reason, logger=logger)
+    else:
+        logger.critical("process.exit code=%s reason=%s", code, reason)
+    os._exit(code)
+
+
 def install_worker_signal_handlers(
     shutdown_callback: Optional[Callable[[], None]] = None,
 ) -> None:
@@ -271,7 +288,7 @@ def install_worker_signal_handlers(
             except Exception as e:
                 logger.warning(f"Shutdown callback failed: {e}")
         # Use os._exit to force exit even if blocked in NCCL
-        os._exit(128 + signum)
+        _exit_process(128 + signum, f"worker received {sig_name}")
 
     # Install handlers for common termination signals
     signal.signal(signal.SIGINT, signal_handler)
@@ -316,8 +333,8 @@ def die_with_parent() -> None:
     # then never deliver the death signal, leaving this process an orphan.
     parent = multiprocessing.parent_process()
     if parent is not None and os.getppid() != parent.pid:
-        logger.error(
-            "Parent process %s exited before the parent-death signal was armed; exiting",
-            parent.pid,
+        _exit_process(
+            1,
+            f"parent process {parent.pid} exited before the parent-death "
+            "signal was armed",
         )
-        os._exit(1)

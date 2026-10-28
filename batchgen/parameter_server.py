@@ -20,18 +20,18 @@ import subprocess
 import signal
 import multiprocessing
 from multiprocessing import shared_memory
+import secrets
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import torch
 import torch.distributed as dist
+from batchgen.eventlog.process import (
+	add_logging_args,
+	configure_process,
+	new_run_identity,
+)
 from batchgen.utils import config_torch_module_initializer
 config_torch_module_initializer()
-# Configure logging
-
-logging.basicConfig(
-	level=logging.INFO,
-	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 
 class ParameterServer:
 	def __init__(self, host='localhost', port=10900, model_name=None,
@@ -913,11 +913,21 @@ def parse_args():
 		default=False,
 		help="Enable hugetlbfs for shared memory (requires root privileges)"
 	)
+	add_logging_args(parser)
 	return parser.parse_args()
 
 
 if __name__ == "__main__":
 	args = parse_args()
+	# A standalone parameter server belongs to no server run, so it names a
+	# run of its own.
+	configure_process(
+		"paramserver",
+		node=0,
+		run=new_run_identity(secrets.token_hex(16)),
+		log_dir=args.log_dir,
+		level=args.log_level,
+	)
 	if args.enable_hugetlbfs:
 		os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
 	logging.info(f"Starting Parameter Server on {args.host}:{args.port}")

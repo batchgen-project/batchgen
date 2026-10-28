@@ -2702,7 +2702,11 @@ def test_the_self_exit_status_collides_with_nothing_the_manager_reads():
         for node in ast.walk(ast.parse(source)):
             if (
                 isinstance(node, ast.Call)
-                and ast.unparse(node.func) == "os._exit"
+                and ast.unparse(node.func) in (
+                    "os._exit",
+                    "exit_process",
+                    "eventlog_process.exit_process",
+                )
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
             ):
@@ -3758,13 +3762,18 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
     supervisor's module, so the manager's reaping argument (it branches on no
     exitcode value) and the marker vocabulary stay as grounded in attempt 3."""
     fn = _worker_method("_self_exit_on_quiesce_deadline")
-    imports = [node for node in ast.walk(fn) if isinstance(node, ast.ImportFrom)]
-    assert len(imports) == 1
-    assert imports[0].module == "batchgen.server_worker_main_loop"
-    assert {alias.name for alias in imports[0].names} == {
-        "_EXIT_PATH_SELF_EXIT",
-        "_WORKER_SELF_EXIT_CODE",
-        "_flush_worker_logs",
+    imports = {
+        node.module: {alias.name for alias in node.names}
+        for node in ast.walk(fn) if isinstance(node, ast.ImportFrom)
+    }
+    assert imports == {
+        "batchgen.server_worker_main_loop": {
+            "_EXIT_PATH_SELF_EXIT",
+            "_WORKER_SELF_EXIT_CODE",
+            "_flush_worker_logs",
+        },
+        # Writes and flushes the CRITICAL process.exit record.
+        "batchgen.eventlog.process": {"record_exit"},
     }
     (exit_call,) = [
         node for node in ast.walk(fn)
@@ -3776,7 +3785,9 @@ def test_the_quiesce_self_exit_reuses_the_supervisor_s_status_and_path():
         ast.unparse(node.value.func) for node in fn.body
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
-    assert order == ["logging.error", "_flush_worker_logs", "os._exit"]
+    assert order == [
+        "logging.error", "_flush_worker_logs", "record_exit", "os._exit",
+    ]
 
 
 def test_the_quiesce_probe_runner_cannot_raise_into_the_teardown():

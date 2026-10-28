@@ -19,7 +19,9 @@ from batchgen.batchgen_worker import (
 	BatchGenWorker,
 	BatchGenWorkerArgs,
 )
+from batchgen import eventlog
 from batchgen.deprecation import LegacyInferenceDeprecated
+from batchgen.eventlog import process as eventlog_process
 from batchgen.server.process_utils import (
 	die_with_parent,
 	install_worker_signal_handlers,
@@ -246,11 +248,12 @@ def _start_worker_fatal_monitor(
 						ready_event,
 						fatal_ack_event,
 					)
-					os._exit(1)
+					eventlog_process.exit_process(1, "remote worker fatal relayed")
 				time.sleep(0.1)
 		except Exception:
-			logging.exception("Worker fatal TCPStore monitor failed")
-			os._exit(1)
+			eventlog_process.exit_process(
+				1, "worker fatal TCPStore monitor failed", exc_info=True
+			)
 
 	threading.Thread(
 		target=_monitor,
@@ -331,7 +334,15 @@ def _flush_worker_logs() -> None:
 	self-exit marker -- the one line that attributes the exit -- the most likely
 	record to disappear.  Every flush is individually guarded: this runs on the
 	way out of a failing teardown and must not raise there.
+
+	The event log's root handler only queues records, so its ``flush()`` is a
+	no-op; ``eventlog.flush`` waits until the listener thread has written
+	everything queued so far.
 	"""
+	try:
+		eventlog.flush()
+	except Exception:
+		pass
 	for handler in list(logging.getLogger().handlers):
 		try:
 			handler.flush()
@@ -380,7 +391,11 @@ def _start_shutdown_abort_watchdog(
 		return None
 	enumerate_groups = live_process_groups or _live_process_groups
 	abort_group = abort_one_group or _abort_one_process_group
-	self_exit = exit_process or os._exit
+	def _record_and_exit(code: int) -> None:
+		eventlog_process.record_exit(code, _EXIT_PATH_SELF_EXIT)
+		os._exit(code)
+
+	self_exit = exit_process or _record_and_exit
 
 	def _abort_entry(group: Any, label: str) -> None:
 		started = time.monotonic()
@@ -600,10 +615,14 @@ def server_worker_main(
 		)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
-		logging.error(f"[FATAL] Unhandled exception in worker "
-					  f"rank_idx={rank_idx}, global_rank={global_rank}: {e}")
+		logging.critical(
+			"[FATAL] Unhandled exception in worker rank_idx=%s, global_rank=%s: %s",
+			rank_idx,
+			global_rank,
+			e,
+			exc_info=True,
+		)
 		traceback_text = traceback.format_exc()
-		print(traceback_text, file=sys.stderr, flush=True)
 		message = _format_worker_fatal(
 			rank_idx,
 			global_rank,
@@ -620,21 +639,7 @@ def server_worker_main(
 		)
 		# Do not enter distributed teardown after a rank fatal: peers may already
 		# be stuck in a collective. The two launchers own process-tree cleanup.
-		os._exit(1)
-
-
-def _setup_worker_logging(rank_idx: int, global_rank: int = -1):
-	"""
-	Configure logging for worker processes.
-	Spawned processes don't inherit logging config from the parent process.
-	"""
-	# Use global_rank if available, otherwise fall back to rank_idx
-	rank_label = global_rank if global_rank >= 0 else rank_idx
-	logging.basicConfig(
-		level=logging.INFO,
-		format=f'%(asctime)s - [BatchGenWorker-{rank_label}] - %(levelname)s - %(message)s',
-		force=True,  # Override any existing configuration
-	)
+		eventlog_process.exit_process(1, "unhandled worker exception")
 
 
 def _server_worker_main_impl(
@@ -658,6 +663,19 @@ def _server_worker_main_impl(
 	# collective, so the worker would survive as an orphan holding GPUs and SHM.
 	die_with_parent()
 
+	# Then logging: a spawned worker inherits no logging configuration, and
+	# every input of its identity is already in args.
+	eventlog_process.configure_process(
+		"rank",
+		node=args.nnode_rank,
+		rank=args.local_world_size * args.nnode_rank + rank_idx,
+		local_rank=rank_idx,
+		cohort=args.log_cohort,
+		run=eventlog_process.RunIdentity(args.run_id, args.run_started_at),
+		log_dir=args.log_dir,
+		level=args.log_level,
+	)
+
 	# Step 0.0: Join this run's liveness lock.  A spawned worker inherits no
 	# descriptor, so it opens the server-created file itself and never closes it;
 	# while any process of the run holds it LOCK_SH, a later run of this instance
@@ -665,9 +683,6 @@ def _server_worker_main_impl(
 	global _run_lock_file
 	# args.runtime_dir IS the run directory holding the liveness lock file.
 	_run_lock_file = hold_run_lock(args.runtime_dir)
-
-	# Step 0: Configure logging for this worker process first
-	_setup_worker_logging(rank_idx)
 
 	# Step 0.1: Install signal handlers so workers respond to Ctrl+C
 	# This is critical for multi-node setups where node 1 workers might be
@@ -701,9 +716,6 @@ def _server_worker_main_impl(
 	args.local_rank = rank_idx
 	args.global_rank = args.local_world_size * args.nnode_rank + rank_idx
 	args.device = args.local_rank
-
-	# Reconfigure logging with actual global rank for clearer log output
-	_setup_worker_logging(rank_idx, args.global_rank)
 
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
