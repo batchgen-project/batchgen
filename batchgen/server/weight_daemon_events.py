@@ -152,9 +152,17 @@ class WeightDaemonWatcher:
         stopped = False
         for event in events:
             self._last_seq = max(self._last_seq, int(event["seq"]))
-            name, level, data = event_fields(event)
-            self._emit(name, level, data)
             stopped = stopped or event.get("kind") == "stopped"
+            try:
+                name, level, data = event_fields(event)
+                self._emit(name, level, data)
+            except Exception:
+                # One event that cannot be rendered or logged must not end
+                # the watcher: report it and keep draining the rest.
+                self._logger.exception(
+                    "Could not log weight daemon event seq=%s",
+                    event.get("seq"),
+                )
         return stopped
 
     def _emit(self, name: str, level: int, data: Dict[str, Any]) -> None:

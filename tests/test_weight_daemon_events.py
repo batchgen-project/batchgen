@@ -326,3 +326,37 @@ def test_stop_never_raises_when_the_final_drain_fails(captured):
 
     wde.WeightDaemonWatcher(Broken(), event_logger).stop()
     assert records[-1].getMessage() == "Final drain of weight daemon events failed"
+
+
+def test_an_event_that_cannot_be_logged_does_not_end_the_watcher(caplog):
+    logger = logging.getLogger("test.weight_daemon_events.bad_event")
+
+    class _BadOnce:
+        calls = 0
+
+        def log(self, level, *args, **kwargs):
+            _BadOnce.calls += 1
+            if _BadOnce.calls == 1:
+                raise RuntimeError("handler failed")
+            logger.log(level, *args, **kwargs)
+
+        def exception(self, *args, **kwargs):
+            logger.exception(*args, **kwargs)
+
+    events = [
+        {"seq": 1, "kind": "network_ready", "wall_time_s": 0.0},
+        {"seq": 2, "kind": "stopped", "wall_time_s": 0.0},
+    ]
+
+    class _Daemon:
+        def poll_events(self, after_seq, timeout_s):
+            return [e for e in events if e["seq"] > after_seq], 0
+
+    watcher = wde.WeightDaemonWatcher(_Daemon(), _BadOnce())
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        assert watcher._drain(0.0) is True
+    assert watcher._last_seq == 2
+    names = [getattr(r, "bg_event", None) for r in caplog.records]
+    assert "weight_daemon.stopped" in names
+    assert any("Could not log weight daemon event seq=1" in r.getMessage()
+               for r in caplog.records)
