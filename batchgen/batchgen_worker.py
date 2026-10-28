@@ -15195,6 +15195,12 @@ class BatchGenWorker:
 			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
+		# Batch-level ``batchgen_debug.glm5_lmhead_fp32``: read once here,
+		# like ``k3_prefill_profile`` above, so the per-micro-batch lm_head
+		# epilogue below costs one local bool test.
+		_lmhead_fp32 = self._debug_flag_enabled(
+			prefill_debug.get("glm5_lmhead_fp32")
+		)
 		# Batch-level ``prefix_pool_epilogue_trace`` on the UNPOOLED path: the
 		# same keys as the pooled wave, so one armed batch traces whichever
 		# prefill runs (the first batch on a fresh server, or reuse OFF).
@@ -15539,14 +15545,15 @@ class BatchGenWorker:
 					)
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
+				# Opt into FP32-cast via batchgen_debug.glm5_lmhead_fp32 for
+				# debugging (batch-level only; no env guard).
 				if getattr(self.model.lm_head, "tp_size", 1) > 1:
 					# vocab-parallel head (K3 TP8): the module all_gathers the
 					# full logits; the raw shard weight must not be used here.
 					# .forward skips the decode-only pre-hook (``[:, -1, :]``
 					# expects [bsz, seq, H]; this input is the gathered [n, H]).
 					logits = self.model.lm_head.forward(last_token_hidden).float()
-				elif os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+				elif _lmhead_fp32:
 					logits = torch.nn.functional.linear(
 						last_token_hidden.float(),
 						self.model.lm_head.weight.float(),
