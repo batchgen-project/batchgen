@@ -191,9 +191,10 @@ class _Storage:
         self.metadata[file_id] = meta
 
 
-def _scheduler(tmp_path, worker):
+def _scheduler(tmp_path, worker, session_hold=False):
     args = SimpleNamespace(
         model=MODEL,
+        enable_session_kv_hold=session_hold,
         max_intake_capacity=64,
         incremental_output_dir=str(tmp_path / "incr"),
         no_incremental_save=False,
@@ -205,6 +206,10 @@ def _scheduler(tmp_path, worker):
     # The fake worker needs no init message (WorkerManager sends it for a
     # real generation before worker_generation_ready()).
     scheduler._pool_initialized = True
+    mark_live = getattr(scheduler, "_mark_generation_live", None)
+    if mark_live is not None and hasattr(worker, "request_queue"):
+        # ... and this generation is live: session_control may reach it.
+        mark_live()
     return scheduler
 
 
@@ -226,10 +231,10 @@ def _turn_body(session_id, content="hi", traj_id="traj-1", parent=None, **extra)
     return body
 
 
-async def _serve(tmp_path, scenario, capacity=8):
+async def _serve(tmp_path, scenario, capacity=8, session_hold=False):
     worker = _FakeWorker(capacity=capacity)
     worker.start()
-    scheduler = _scheduler(tmp_path, worker)
+    scheduler = _scheduler(tmp_path, worker, session_hold=session_hold)
     await scheduler.start()
     app = FastAPI()
     app.state.scheduler = scheduler
@@ -373,6 +378,92 @@ def test_listener_resolves_the_turn_future_without_a_tracker_or_file(tmp_path):
     assert waiter.timing["completion_routed_at"] >= waiter.timing["worker_completed_at"]
     assert scheduler._turn_waiters == {}
     assert not (tmp_path / "incr").exists() or not list((tmp_path / "incr").iterdir())
+
+
+def _drain_queue(q):
+    items = []
+    while True:
+        try:
+            items.append(q.get_nowait())
+        except queue.Empty:
+            return items
+
+
+def test_session_control_never_precedes_a_restarted_generations_init(tmp_path):
+    """A close or abort during a worker restart must not reach the new
+    generation's queue ahead of its "init" (the worker dies on it)."""
+    old_queue = queue.Queue()
+    worker = _ns_worker(request_queue=old_queue)
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    scheduler.release_sessions(["s0"], "closed")
+    assert [m["type"] for m in _drain_queue(old_queue)] == ["session_control"]
+
+    # WorkerManager.restart_workers: quiesce, teardown, fresh channels, spawn.
+    scheduler.quiesce()
+    scheduler.release_sessions(["s1"], "closed")      # close mid-restart
+    new_queue = queue.Queue()
+    worker.request_queue = new_queue
+    scheduler.release_sessions(["s2"], "aborted")     # abort mid-restart
+    assert _drain_queue(old_queue) == []
+    assert _drain_queue(new_queue) == []
+    # The manager sends the generation's init, then calls the ready hook.
+    new_queue.put({"type": "init"})
+    scheduler.worker_generation_ready()
+    scheduler.release_sessions(["s3"], "closed")
+    sent = _drain_queue(new_queue)
+    assert [m["type"] for m in sent] == ["init", "session_control"]
+    assert sent[1]["release"] == [{"session_id": "s3", "reason": "closed"}]
+
+
+def test_session_control_is_dropped_after_a_fatal_until_the_next_generation(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=True)
+    # WorkerManager._handle_worker_failure: quiesce, teardown, reconcile.
+    scheduler.fail_in_flight("rank 3 died")
+    worker.request_queue = queue.Queue()
+    scheduler.release_sessions(["s1"], "closed")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_session_control_waits_for_the_first_generations_init(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    args = SimpleNamespace(model=MODEL, max_intake_capacity=64,
+                           enable_session_kv_hold=True)
+    scheduler = bs.BatchScheduler(_Storage(tmp_path), worker, args)
+    scheduler.release_sessions(["s1"], "closed")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_nothing_is_sent_to_the_worker_without_session_hold(tmp_path):
+    worker = _ns_worker(request_queue=queue.Queue())
+    scheduler = _scheduler(tmp_path, worker, session_hold=False)
+    scheduler.release_sessions(["s1"], "closed")
+    scheduler._send_session_control(cancel=["turn_x"], reason="abort")
+    assert _drain_queue(worker.request_queue) == []
+
+
+def test_worker_main_loop_skips_session_control_before_init():
+    """Every rank gets the broadcast message and skips it with ``continue``,
+    before the init branch and the unexpected-message raise."""
+    import ast
+
+    source = (SERVER.parent / "server_worker_main_loop.py").read_text()
+    impl = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_server_worker_main_impl"
+    )
+    loop = next(
+        node for node in ast.walk(impl)
+        if isinstance(node, ast.While) and any(
+            "Pool mode init received" in ast.unparse(stmt) for stmt in node.body)
+    )
+    texts = [ast.unparse(stmt) for stmt in loop.body]
+    guard = next(i for i, text in enumerate(texts)
+                 if "'session_control'" in text and text.startswith("if "))
+    init = next(i for i, text in enumerate(texts) if "Pool mode init received" in text)
+    assert guard < init
+    assert isinstance(loop.body[guard].body[-1], ast.Continue)
 
 
 def test_cancel_dequeues_a_turn_that_never_reached_a_worker(tmp_path):
@@ -644,7 +735,7 @@ def test_e2e_abort_cancels_the_in_flight_turn(tmp_path):
         return await scenario(client, scheduler, worker, app)
 
     aborted, answer, detached, after = asyncio.run(
-        _serve(tmp_path, scenario_with_worker)
+        _serve(tmp_path, scenario_with_worker, session_hold=True)
     )
     assert aborted.status_code == 200, aborted.text
     payload = aborted.json()
@@ -679,7 +770,8 @@ def test_e2e_close_releases_the_held_kv_of_every_closed_session(tmp_path):
         await _until(lambda: len(worker.control_messages) == 2)
         return single, whole, list(worker.control_messages)
 
-    single, whole, control = asyncio.run(_serve(tmp_path, scenario))
+    single, whole, control = asyncio.run(
+        _serve(tmp_path, scenario, session_hold=True))
     assert single.status_code == 200 and whole.status_code == 200
     assert control[0]["release"] == [{"session_id": "sub", "reason": "closed"}]
     assert sorted(item["session_id"] for item in control[1]["release"]) == ["m2", "s2"]
@@ -696,7 +788,7 @@ def test_e2e_turn_reports_its_session_hold_and_pool_status_metrics(tmp_path):
         await _until(lambda: scheduler._session_hold_info is not None)
         return answer, scheduler._session_hold_info
 
-    answer, metrics = asyncio.run(_serve(tmp_path, scenario))
+    answer, metrics = asyncio.run(_serve(tmp_path, scenario, session_hold=True))
     assert answer.status_code == 200, answer.text
     meta = answer.json()["batchgen"]
     assert meta["session_resume"] == {"lcp_tokens": 70, "cached_tokens": 7,

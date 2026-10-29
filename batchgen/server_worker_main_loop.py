@@ -960,6 +960,22 @@ def _server_worker_main_impl(
 				logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
 				break
 
+			# --- STEP 3.5: session_control before "init" ---
+			# Cancel / release for agent sessions (--enable-session-kv-hold).
+			# Before "init" this generation has admitted nothing, so it holds no
+			# session KV and runs no turn: there is nothing to cancel or free.
+			# The server sends control only to a generation it saw ready, but a
+			# message that still lands here must not kill the fresh generation.
+			# Every rank received the same broadcast, so every rank skips it.
+			if isinstance(task_data, dict) and task_data.get("type") == "session_control":
+				if global_rank == 0:
+					logging.warning(
+						"Rank %s: ignoring session_control before init "
+						"(nothing admitted yet): cancel=%s release=%s",
+						global_rank, task_data.get("cancel"), task_data.get("release"),
+					)
+				continue
+
 			# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
 			if isinstance(task_data, dict) and task_data.get("type") == "init":
 				logging.info(f"Rank {global_rank}: Pool mode init received")

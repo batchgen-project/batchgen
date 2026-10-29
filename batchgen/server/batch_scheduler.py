@@ -211,6 +211,18 @@ class BatchScheduler:
         # (--enable-session-kv-hold); None until the first hold event.
         self._session_hold_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
+        # --enable-session-kv-hold: the request queue of the worker generation
+        # that has received its "init" and is serving, or None while no
+        # generation is live (before the first init, and from a quiesce or a
+        # fatal until the next generation is ready). session_control messages
+        # go only there: one put on a generation's queue ahead of its "init"
+        # kills that generation. Guarded by _control_lock because the restart
+        # thread clears it while the loop sends.
+        self._session_kv_hold = bool(
+            getattr(server_args, "enable_session_kv_hold", False)
+        )
+        self._control_lock = threading.Lock()
+        self._control_queue: Optional[Any] = None
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
         # Completion delivery is generation-scoped: one daemon pump thread per
@@ -307,6 +319,10 @@ class BatchScheduler:
 
     def quiesce(self) -> None:
         """Stop dispatching new work while retaining the upstream queues."""
+        # The generation is about to be torn down (restart) or is already dead
+        # (fatal): no session_control may reach it or its successor's queue
+        # until that successor is ready.
+        self._mark_generation_down()
         self._quiesced.set()
         if self._loop is not None and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
@@ -320,12 +336,24 @@ class BatchScheduler:
         self._call_on_loop(self._open_turn_gate, "reopen turn submission")
 
     def fail_in_flight(self, error_msg: str) -> int:
+        self._mark_generation_down()
         return self._fail_all_active_batches(error_msg)
+
+    def _mark_generation_live(self) -> None:
+        """The current worker generation got its "init": control may flow."""
+        with self._control_lock:
+            self._control_queue = self.worker.request_queue
+
+    def _mark_generation_down(self) -> None:
+        """No generation is serving: session_control is dropped until ready."""
+        with self._control_lock:
+            self._control_queue = None
 
     def worker_generation_ready(self) -> None:
         # WorkerManager sends the generation's init message before this hook;
         # the drain task must not send a duplicate init after resume.
         self._pool_initialized = True
+        self._mark_generation_live()
         # The new cohort writes to a new response queue, and the previous
         # generation's pump owns a queue that was abandoned with its cohort.
         # Completion delivery therefore has to be rebuilt here or no batch of
@@ -1022,24 +1050,39 @@ class BatchScheduler:
         release: Optional[List[Dict[str, str]]] = None,
         reason: Optional[str] = None,
     ) -> None:
-        """Put one session_control message on the worker's admission queue.
+        """Put one session_control message on the live generation's queue.
 
-        Before the first drain sent ``init`` the worker has admitted nothing,
-        so it holds nothing and runs nothing: there is nothing to tell it.
+        Nothing is sent without --enable-session-kv-hold. With it, the message
+        goes only to a generation that has received its ``init`` and is
+        serving; with none live it is dropped, which loses nothing: before the
+        first init the worker has admitted nothing, and a generation being
+        restarted or failed has its in-flight turns failed and its held Host
+        pages swept by the reconcile. A message put on a fresh generation's
+        queue ahead of its ``init`` would kill it.
         """
-        if not self._pool_initialized:
+        if not self._session_kv_hold:
             return
-        self.worker.request_queue.put({
-            "type": "session_control",
-            "cancel": list(cancel or ()),
-            "release": list(release or ()),
-            "reason": reason,
-        })
+        cancel_ids = list(cancel or ())
+        released = [item["session_id"] for item in release or ()]
+        with self._control_lock:
+            control_queue = self._control_queue
+            if control_queue is not None:
+                control_queue.put({
+                    "type": "session_control",
+                    "cancel": cancel_ids,
+                    "release": list(release or ()),
+                    "reason": reason,
+                })
+        if control_queue is None:
+            logger.warning(
+                "[TURN] session_control dropped (no live worker generation; "
+                "a restart reconciles it): cancel=%s release=%s reason=%s",
+                cancel_ids, released, reason,
+            )
+            return
         logger.info(
             "[TURN] session_control sent: cancel=%s release=%s reason=%s",
-            list(cancel or ()),
-            [item["session_id"] for item in release or ()],
-            reason,
+            cancel_ids, released, reason,
         )
 
     def _resolve_turn(self, turn_id: str, result: dict) -> None:
@@ -1363,6 +1406,7 @@ class BatchScheduler:
                 init_msg = {"type": "init", **self.pool_init_params()}
                 self.worker.request_queue.put(init_msg)
                 self._pool_initialized = True
+                self._mark_generation_live()
                 logger.info("[POOL] Init message sent to worker")
                 # Brief wait for worker to initialize before sending sequences
                 await asyncio.sleep(1.0)
