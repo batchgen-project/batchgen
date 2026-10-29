@@ -395,17 +395,46 @@ its KV in Host memory until the session's next turn, `close` or `abort`:
   on the rank that holds its session's KV.
 - **Release.** `close` (either reason) and `abort` free the held KV.
 - **Never a victim.** Held KV is not a running sequence, so preemption and
-  Host-KV eviction never select it. When Host KV runs short, running and
-  queued work waits or is evicted as before; held KV is never dropped to make
-  room. Queued turns that wait only because held sessions occupy Host KV are
-  counted and logged (`[SESSION_HOLD] admission waits on held KV`).
+  Host-KV eviction never select it, and held KV is never dropped to make room.
+  Queued turns that wait only because held sessions occupy Host KV are counted
+  and logged (`[SESSION_HOLD] admission waits on held KV`).
+- **Footprint admission.** Every prefill candidate is admitted only if its
+  projected KV footprint fits: a new turn, batch request or evicted sequence
+  needs its whole budget (`prompt + max_tokens`, in 64-token pages), a resumed
+  turn that budget minus the pages its session holds. Free capacity is the
+  Host pool minus the budgets of all sequences that own KV, minus held KV,
+  minus a margin (`--session-kv-admission-margin-percent`, default the larger
+  of 10 and `--host-kv-eviction-watermark`; a smaller value is refused, since
+  the decode boundary evicts running work below the watermark), and per rank
+  the GPU KV pool minus those budgets (held KV has no GPU pages). Admitted work
+  can therefore always grow to its budget without Host-KV eviction. Resumed
+  turns go before new work; while one cannot fit, new work waits
+  (`resumed_turn_waiting`). A resumed turn that cannot fit with nothing running
+  is a genuine overcommit: logged as `[KV_ADMISSION] OVERCOMMIT`, counted, new
+  work stays refused, and no held KV is dropped (it waits for a close or
+  abort). A request whose budget exceeds the whole pool after the margin fails
+  with `kv_footprint_exceeds_capacity`. Decode breaks for a prefill wave only
+  when that wave would admit something. A large `max_tokens` lowers how much
+  runs at once; the footprint error metric shows how far budgets exceed use.
+- **Scheduling slots.** A held turn keeps its trajectory reservation on the
+  worker, so the server keeps its scheduling slot too
+  (`scheduling_pool_held` in `GET /v1/pool/status`) until the session's next
+  turn completes, or `close` / `abort`.
 
 Metrics (`GET /v1/pool/status` → `session_hold`, and `[SESSION_HOLD] metrics`
 log lines): `held_sessions`, `held_kv_tokens`, `held_kv_pages`, `holds`,
 `resumes`, `reload_tokens`, `reload_ms`, `lcp_histogram`, `drops` (held KV not
 reused, by reason: `lcp_below_page`, `superseded`, `evicted_after_resume`,
 `cancelled`), `releases` (`closed`, `aborted`),
-`admission_waits_on_held_kv`, `evictions_while_held`.
+`admission_waits_on_held_kv`, `evictions_while_held`. Footprint admission
+(`kv_admission`, and `[KV_ADMISSION] metrics` log lines): `margin_percent`,
+`admitted` and `deferred` (per candidate and wave, by reason: `host_footprint`,
+`gpu_footprint`, `resumed_turn_waiting`, `overcommit`), `rejected_never_fits`,
+`overcommit_active`, `overcommit_episodes`, `overcommit_waits`,
+`footprint_error` (projected budget vs final context pages at completion:
+sums, mean, min, max, ratio), `host_total_pages`, `peak_host_used_pages`,
+`peak_held_pages`, `peak_held_plus_running_projected_pages` and both peaks
+over capacity, `gpu_total_pages`, `peak_gpu_projected_pages`.
 
 Supported for GPT-OSS on one node with pure DP attention; the server refuses
 the flag together with `--enable-prefix-cache` or on another model.

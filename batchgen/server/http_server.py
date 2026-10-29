@@ -316,9 +316,12 @@ def create_app(
             "intake_pool_capacity": ipool.max_capacity,
             "scheduling_pool_active": spool.num_active_slots(),
             "scheduling_pool_free": spool.num_free_slots(),
+            # Slots of finished turns whose session KV the worker holds.
+            "scheduling_pool_held": spool.num_held_slots(),
             "scheduling_pool_capacity": spool.capacity,
             "trajectory_pool": scheduler._trajectory_pool_info,
             "session_hold": scheduler._session_hold_info,
+            "kv_admission": scheduler._kv_admission_info,
             "active_batches": active_batches,
             "pool_mode": scheduler._pool_mode,
         }

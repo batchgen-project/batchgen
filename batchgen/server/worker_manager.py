@@ -42,6 +42,7 @@ from batchgen.server.restart_coordinator import RestartCoordinator
 from batchgen.server.server_args import (
     ServerArgs,
     parse_host_port,
+    resolve_session_kv_admission_margin,
     validate_shared_runtime_capability,
 )
 from batchgen.utils import config_torch_module_initializer
@@ -77,6 +78,14 @@ _WORKER_KILL_REAP_TIMEOUT_S = 900.0
 # it again.  The marker is therefore emitted here, by the only process that
 # knows a signal replaced an ordered exit.
 _WORKER_EXIT_PATH_SIGNAL = "signal-fallback"
+
+
+def _session_kv_admission_kwargs(args: ServerArgs) -> Dict[str, Any]:
+    """Worker args of footprint admission; empty when session hold is off."""
+    margin = resolve_session_kv_admission_margin(args)
+    if margin is None:
+        return {}
+    return {"session_kv_admission_margin_percent": margin}
 
 
 def _resolve_local_world_size(
@@ -1565,6 +1574,7 @@ class WorkerManager:
             enable_prefix_cache=self.args.enable_prefix_cache,
             prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
             enable_session_kv_hold=self.args.enable_session_kv_hold,
+            **_session_kv_admission_kwargs(self.args),
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,

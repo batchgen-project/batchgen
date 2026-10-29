@@ -210,6 +210,8 @@ class BatchScheduler:
         # Latest agent-session KV hold metrics published by the worker
         # (--enable-session-kv-hold); None until the first hold event.
         self._session_hold_info: Optional[Dict[str, Any]] = None
+        # Latest footprint admission metrics (session-hold server only).
+        self._kv_admission_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -1014,6 +1016,11 @@ class BatchScheduler:
                 ],
                 reason=reason,
             )
+            # The release is queued ahead of every later admission, and the
+            # worker applies queue messages in order, so the held slots are
+            # free for whatever the drain sends next.
+            for session_id in session_ids:
+                self._scheduling_pool.release_held_slot(session_id)
 
     def _send_session_control(
         self,
@@ -1564,10 +1571,7 @@ class BatchScheduler:
                         request_id = result.get("request_id")
                         batch_id = result.get("batch_id")
                         if request_id:
-                            try:
-                                self._scheduling_pool.free_slot(request_id)
-                            except KeyError:
-                                pass
+                            self._account_completion_slot(request_id, result)
                         # DIAG: Periodic slot status after completions
                         if not hasattr(self, '_completion_count'):
                             self._completion_count = 0
@@ -1621,6 +1625,11 @@ class BatchScheduler:
                         continue
                     elif msg_type == "session_hold_metrics":
                         self._session_hold_info = {
+                            key: value for key, value in result.items()
+                            if key != "type"
+                        }
+                    elif msg_type == "kv_admission_metrics":
+                        self._kv_admission_info = {
                             key: value for key, value in result.items()
                             if key != "type"
                         }
@@ -1679,6 +1688,30 @@ class BatchScheduler:
                 )
 
         logger.info("[POOL] Completion listener stopped")
+
+    def _account_completion_slot(self, request_id: str, result: dict) -> None:
+        """Free a completed request's scheduling slot, or keep it for its session.
+
+        With --enable-session-kv-hold the worker keeps a held turn's trajectory
+        reservation bound until the session's next turn commits (or close /
+        abort), so the server keeps the slot too: both sides then agree on
+        free capacity. A turn that resumed from a hold consumed the previous
+        held slot when its wave committed, which its completion reports.
+        """
+        session_id = result.get("session_id")
+        hold = result.get("session_hold") or {}
+        if session_id and hold.get("held"):
+            try:
+                self._scheduling_pool.hold_slot(request_id, session_id)
+            except KeyError:
+                pass
+            return
+        try:
+            self._scheduling_pool.free_slot(request_id)
+        except KeyError:
+            pass
+        if session_id and result.get("session_resume") is not None:
+            self._scheduling_pool.release_held_slot(session_id)
 
     def _write_pool_completion(
         self, batch_id: str, request_id: str, result: dict

@@ -126,6 +126,34 @@ def validate_session_kv_hold_args(args: "ServerArgs") -> None:
         )
 
 
+def resolve_session_kv_admission_margin(args: "ServerArgs") -> Optional[float]:
+    """The Host safety margin (percent) of footprint admission, validated.
+
+    Footprint admission runs only with --enable-session-kv-hold; an explicit
+    margin without it is refused rather than ignored. The default is the
+    larger of 10 % and --host-kv-eviction-watermark: the decode boundary
+    evicts running sequences whenever free Host pages fall below the
+    watermark, so admission must keep projected free pages above it.
+    """
+    from batchgen.worker.kv_admission import (
+        DEFAULT_ADMISSION_MARGIN_PERCENT,
+        validate_margin_percent,
+    )
+
+    margin = getattr(args, "session_kv_admission_margin_percent", None)
+    if not getattr(args, "enable_session_kv_hold", False):
+        if margin is not None:
+            raise ValueError(
+                "--session-kv-admission-margin-percent applies only with "
+                "--enable-session-kv-hold"
+            )
+        return None
+    watermark = float(args.host_kv_eviction_watermark)
+    if margin is None:
+        margin = max(DEFAULT_ADMISSION_MARGIN_PERCENT, watermark)
+    return validate_margin_percent(margin, eviction_watermark_percent=watermark)
+
+
 def _validate_distributed_weight_source(args: "ServerArgs") -> None:
     """Preflight of a ``--distributed-weight-config`` launch.
 
@@ -240,6 +268,9 @@ class ServerArgs:
     # /v1/turns: a finished turn of an open session keeps its Host KV for the
     # session's next turn (GPT-OSS, one node, prefix cache off).
     enable_session_kv_hold: bool = False
+    # Footprint admission Host safety margin (percent of the Host pool) on a
+    # session-hold server; None = max(10, --host-kv-eviction-watermark).
+    session_kv_admission_margin_percent: Optional[float] = None
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -483,6 +514,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "turn, close or abort; the next turn prefills only the suffix past "
             "its longest common prefix with the held tokens (GPT-OSS, one "
             "node, not with --enable-prefix-cache)"
+        ),
+    )
+    parser.add_argument(
+        "--session-kv-admission-margin-percent",
+        type=float,
+        default=None,
+        help=(
+            "With --enable-session-kv-hold: Host KV share (percent) footprint "
+            "admission keeps free beyond running and held KV. Default: the "
+            "larger of 10 and --host-kv-eviction-watermark; a value below the "
+            "watermark (or below 5) is refused"
         ),
     )
     parser.add_argument(
@@ -854,6 +896,7 @@ def validate_server_args(args: ServerArgs) -> None:
     )
     if args.enable_session_kv_hold:
         validate_session_kv_hold_args(args)
+    resolve_session_kv_admission_margin(args)
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         _validate_distributed_weight_source(args)
@@ -1025,6 +1068,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
         enable_session_kv_hold=parsed.enable_session_kv_hold,
+        session_kv_admission_margin_percent=parsed.session_kv_admission_margin_percent,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,
