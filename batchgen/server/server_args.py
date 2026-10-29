@@ -102,6 +102,29 @@ def _launch_converted_ckpt_dir(args: "ServerArgs") -> Optional[Path]:
     return None
 
 
+def validate_session_kv_hold_args(args: "ServerArgs") -> None:
+    """Refuse --enable-session-kv-hold where the worker cannot serve it.
+
+    The hold reuses held Host pages through the GPT-OSS prefix-hit prefill,
+    keeps them in one node's Host region, and cannot share pages with the
+    prefix cache yet (the worker re-checks the rest at startup).
+    """
+    from batchgen.config.model_registry import _detect_model_type_from_identifier
+
+    reasons = []
+    if args.enable_prefix_cache:
+        reasons.append("--enable-prefix-cache is also set")
+    model_type = _detect_model_type_from_identifier(str(args.model).strip())
+    if model_type != "gpt_oss":
+        reasons.append(f"model type {model_type!r} is not GPT-OSS")
+    if int(args.nnodes) != 1:
+        reasons.append(f"--nnodes={args.nnodes}; held KV lives in one node's Host region")
+    if reasons:
+        raise ValueError(
+            "--enable-session-kv-hold is unsupported here: " + "; ".join(reasons)
+        )
+
+
 def _validate_distributed_weight_source(args: "ServerArgs") -> None:
     """Preflight of a ``--distributed-weight-config`` launch.
 
@@ -213,6 +236,9 @@ class ServerArgs:
     glm5_disable_decode_host_kv_staging: bool = False
     enable_prefix_cache: bool = False
     prefix_cache_debug_stats: bool = False
+    # /v1/turns: a finished turn of an open session keeps its Host KV for the
+    # session's next turn (GPT-OSS, one node, prefix cache off).
+    enable_session_kv_hold: bool = False
     gpu_arch: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
@@ -446,6 +472,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable page-level Host prefix-cache reuse for qualified models",
+    )
+    parser.add_argument(
+        "--enable-session-kv-hold",
+        action="store_true",
+        default=False,
+        help=(
+            "Hold a finished /v1/turns turn's Host KV until its session's next "
+            "turn, close or abort; the next turn prefills only the suffix past "
+            "its longest common prefix with the held tokens (GPT-OSS, one "
+            "node, not with --enable-prefix-cache)"
+        ),
     )
     parser.add_argument(
         "--prefix-cache-debug-stats",
@@ -814,6 +851,8 @@ def validate_server_args(args: ServerArgs) -> None:
     require_cuda_graph_flag_supported(
         args.model, enable_cuda_graph=args.enable_cuda_graph
     )
+    if args.enable_session_kv_hold:
+        validate_session_kv_hold_args(args)
     validate_shared_runtime_capability(args)
     if args.distributed_weight_config is not None:
         _validate_distributed_weight_source(args)
@@ -984,6 +1023,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         glm5_disable_decode_host_kv_staging=parsed.glm5_disable_decode_host_kv_staging,
         enable_prefix_cache=parsed.enable_prefix_cache,
         prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
+        enable_session_kv_hold=parsed.enable_session_kv_hold,
         gpu_arch=parsed.gpu_arch,
         nnodes=parsed.nnodes,
         node_rank=parsed.node_rank,

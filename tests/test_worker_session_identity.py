@@ -149,7 +149,7 @@ def test_gather_brings_the_owners_cached_tokens_to_rank_zero():
     """Rank 0 does not own the sequence; the owner (rank 1) reports 24 cached."""
     worker = _Worker(rank=0, owner_rank=1)
     worker._admit_sequences_from_message({"entries": [_TURN_ENTRY]})
-    _PEER["payload"] = {"turn_abc": ("from owner", 24)}
+    _PEER["payload"] = {"turn_abc": ("from owner", 24, None)}
     try:
         texts = worker._gather_completed_tokens(["turn_abc"])
     finally:
@@ -282,14 +282,14 @@ def test_g2_only_the_host_kv_leader_contributes_a_cached_count():
         follower._gather_completed_tokens(["turn_abc"])
     finally:
         _METHODS["_gather_completed_tokens"].__globals__["dist"] = original
-    assert seen["local"] == {"turn_abc": ("answer", None)}
+    assert seen["local"] == {"turn_abc": ("answer", None, None)}
 
 
 def test_disagreeing_owner_counts_for_one_uuid_raise():
     worker = _Worker(rank=0, owner_rank=0)
     worker._admit_sequences_from_message({"entries": [_TURN_ENTRY]})
     _bind_locally(worker, "turn_abc", cached=24)
-    _PEER["payload"] = {"turn_abc": ("answer", 30)}
+    _PEER["payload"] = {"turn_abc": ("answer", 30, None)}
     try:
         with pytest.raises(RuntimeError, match="disagree between host-KV owners"):
             worker._gather_completed_tokens(["turn_abc"])

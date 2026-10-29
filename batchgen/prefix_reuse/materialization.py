@@ -183,11 +183,21 @@ def materialize_gpt_oss_prefixes(
             sequence_count=count,
         )
 
+    from batchgen.prefix_reuse.prefill import SessionHeldPrefixPages
+
     host_rows: list[list[int]] = []
     attachment_handles: list[int] = []
     for result, page_count in zip(lookup_results, page_counts):
         pages: list[int] = []
-        if page_count:
+        if page_count and isinstance(result, SessionHeldPrefixPages):
+            # Held session pages: resident pages owned by the hold this turn
+            # consumed; no coordinator attachment to begin or end.
+            pages = [int(page) for page in result.page_ids]
+            if len(pages) < page_count:
+                raise RuntimeError(
+                    "held session has too few Host pages for materialization"
+                )
+        elif page_count:
             spans = list(result.materialization_spans)
             if len(spans) != 1 or int(spans[0].group_id) != 0:
                 raise RuntimeError(

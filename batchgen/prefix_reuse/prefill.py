@@ -18,6 +18,23 @@ class PrefixCachePrefillLookup:
 
 
 @dataclass(frozen=True)
+class SessionHeldPrefixPages:
+    """Held agent-session Host pages a resumed turn attaches as its prefix.
+
+    Stands in for a coordinator lookup result: the pages are resident pages
+    the session hold owns (``batchgen.worker.session_hold``), not
+    prefix-cache nodes, so there is no attachment handle and no coordinator
+    call. The turn consumed the hold, so it may write into the last page when
+    that page is partial (``cached_tokens`` is not page-aligned).
+    """
+
+    session_id: str
+    page_ids: tuple[int, ...]
+    cached_tokens: int
+    attachment_handle: int = 0
+
+
+@dataclass(frozen=True)
 class PrefixCacheSequenceState:
     lookup_result: object
     attached_tokens: int
@@ -28,6 +45,10 @@ class PrefixCacheSequenceState:
     planned_shared_page_ids: Mapping[int, tuple[int, ...]] = field(
         default_factory=dict
     )
+
+    @property
+    def is_session_hold(self) -> bool:
+        return isinstance(self.lookup_result, SessionHeldPrefixPages)
 
     @property
     def attachment_handle(self) -> int:
@@ -42,6 +63,8 @@ class PrefixCacheSequenceState:
     def shared_page_ids_for_group(self, group_id: int) -> tuple[int, ...]:
         if self.attached_tokens == 0:
             return ()
+        if isinstance(self.lookup_result, SessionHeldPrefixPages):
+            return self.lookup_result.page_ids if int(group_id) == 0 else ()
         if self.lookup_result is None:
             return tuple(self.planned_shared_page_ids.get(int(group_id), ()))
         spans = [

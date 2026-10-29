@@ -94,6 +94,7 @@ class _FakeWorker:
         self.response_queue = queue.Queue()
         self.admitted = []
         self.admit_messages = []
+        self.control_messages = []
         self.release = threading.Event()
         self.fatals = []
         self._capacity = capacity
@@ -128,6 +129,9 @@ class _FakeWorker:
                 for entry, admitted_at in held:
                     self._answer(entry, admitted_at)
                 held = []
+            if isinstance(msg, dict) and msg.get("type") == "session_control":
+                self.control_messages.append(msg)
+                continue
             if not isinstance(msg, dict) or msg.get("type") != "admit":
                 continue
             self.admit_messages.append(msg)
@@ -153,6 +157,12 @@ class _FakeWorker:
             "admitted_at": admitted_at,
             "completed_at": time.time(),
         }
+        if "KVKEPT" in entry["text"]:
+            # --enable-session-kv-hold: the worker reports what the turn
+            # reused from its session's hold and what it holds now.
+            item["session_resume"] = {"lcp_tokens": 70, "cached_tokens": 7,
+                                      "dropped": None}
+            item["session_hold"] = {"held": True, "kv_tokens": 12, "pages": 1}
         if "TOO_LONG" in entry["text"]:
             item = {
                 "type": "completion",
@@ -627,15 +637,72 @@ def test_e2e_abort_cancels_the_in_flight_turn(tmp_path):
         after = await client.post("/v1/turns", json=_turn_body("s1"))
         return aborted, answer, detached, after
 
-    aborted, answer, detached, after = asyncio.run(_serve(tmp_path, scenario))
+    holder = {}
+
+    async def scenario_with_worker(client, scheduler, worker, app):
+        holder["worker"] = worker
+        return await scenario(client, scheduler, worker, app)
+
+    aborted, answer, detached, after = asyncio.run(
+        _serve(tmp_path, scenario_with_worker)
+    )
     assert aborted.status_code == 200, aborted.text
     payload = aborted.json()
     assert payload["state"] == "aborted" and payload["end_reason"] == "tool_crash"
-    assert payload["cancelled_turn"] == "detached"
+    # The worker is told to cancel the admitted turn and to free the
+    # session's held KV, in that order, through its admission queue.
+    assert payload["cancelled_turn"] == "cancelled"
     assert detached == {payload["cancelled_turn_id"]}
+    control = holder["worker"].control_messages
+    assert [m["cancel"] for m in control] == [[payload["cancelled_turn_id"]], []]
+    assert [m["release"] for m in control] == [
+        [], [{"session_id": "s1", "reason": "aborted"}]]
     assert answer.status_code == 409
     assert answer.json()["detail"]["code"] == "turn_aborted"
     assert after.status_code == 409 and after.json()["detail"]["code"] == "session_aborted"
+
+
+def test_e2e_close_releases_the_held_kv_of_every_closed_session(tmp_path):
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "main"})
+        await client.post("/v1/sessions", json={
+            "traj_id": "traj-1", "session_id": "sub", "parent_session_id": "main"})
+        await client.post("/v1/turns", json=_turn_body("main"))
+        single = await client.post("/v1/sessions/sub/close",
+                                   json={"reason": "end_of_session"})
+        await client.post("/v1/sessions", json={"traj_id": "traj-2", "session_id": "m2"})
+        await client.post("/v1/sessions", json={
+            "traj_id": "traj-2", "session_id": "s2", "parent_session_id": "m2"})
+        await client.post("/v1/turns", json=_turn_body("m2", traj_id="traj-2"))
+        whole = await client.post("/v1/sessions/s2/close",
+                                  json={"reason": "end_of_trajectory"})
+        await _until(lambda: len(worker.control_messages) == 2)
+        return single, whole, list(worker.control_messages)
+
+    single, whole, control = asyncio.run(_serve(tmp_path, scenario))
+    assert single.status_code == 200 and whole.status_code == 200
+    assert control[0]["release"] == [{"session_id": "sub", "reason": "closed"}]
+    assert sorted(item["session_id"] for item in control[1]["release"]) == ["m2", "s2"]
+    assert all(m["cancel"] == [] for m in control)
+
+
+def test_e2e_turn_reports_its_session_hold_and_pool_status_metrics(tmp_path):
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        answer = await client.post("/v1/turns", json=_turn_body("s1", "KVKEPT"))
+        worker.response_queue.put({
+            "type": "session_hold_metrics", "held_sessions": 1,
+            "held_kv_tokens": 12, "held_kv_pages": 1})
+        await _until(lambda: scheduler._session_hold_info is not None)
+        return answer, scheduler._session_hold_info
+
+    answer, metrics = asyncio.run(_serve(tmp_path, scenario))
+    assert answer.status_code == 200, answer.text
+    meta = answer.json()["batchgen"]
+    assert meta["session_resume"] == {"lcp_tokens": 70, "cached_tokens": 7,
+                                      "dropped": None}
+    assert meta["session_hold"] == {"held": True, "kv_tokens": 12, "pages": 1}
+    assert metrics == {"held_sessions": 1, "held_kv_tokens": 12, "held_kv_pages": 1}
 
 
 def test_e2e_turns_coexist_with_a_running_batch(tmp_path):

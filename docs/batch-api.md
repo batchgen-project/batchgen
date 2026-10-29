@@ -308,8 +308,10 @@ them has a turn running. **Response:** `{"object": "session.close", "reason": �
 Optional body `{"reason": "tool_crash"}`. Marks the session `aborted` and
 cancels its in-flight turn, whose caller gets `409 turn_aborted`. A turn still
 queued is removed before it reaches a worker (`cancelled_turn: "dequeued"`); a
-turn already running on a worker runs to completion there and its result is
-discarded (`cancelled_turn: "detached"`) — the same limit as batch cancel.
+turn already on a worker is cancelled there (`cancelled_turn: "cancelled"`): at
+the worker's next admission poll it is dropped if it has not started, or it
+stops at its next completion check (within one decode interval) and its result
+is discarded. Abort also frees any KV the session holds (see session KV hold).
 
 A turn is finished once the server routes its worker completion, even before
 its HTTP response is written. An abort that arrives in that window gets
@@ -366,11 +368,47 @@ rendered exactly as for a `/v1/batches` chat request. `n` must be 1.
 ```
 
 `cached_tokens` / `computed_tokens` are the prompt tokens the sequence's last
-prefill took from the prefix cache / computed. Timestamps are wall-clock seconds
+prefill took from cache (the prefix cache, or the session's held KV) /
+computed. With session KV hold on, `batchgen` also carries `session_resume`
+(`{"lcp_tokens", "cached_tokens", "dropped"}` when the turn met a held
+session, else `null`) and `session_hold` (`{"held": true, "kv_tokens",
+"pages"}` when the turn's KV is now held, else `null`). Timestamps are wall-clock seconds
 (server and worker rank 0 share node 0's clock); `overhead_ms` is everything but
 the worker's admit-to-complete time. Each turn also logs one `[TURN] … done`
 line on the server and `[SESSION] admit` / `[SESSION] complete` lines on the
 worker rank that owns the sequence.
+
+#### Session KV hold (`--enable-session-kv-hold`)
+
+With this server flag, a turn that finishes while its session is open keeps
+its KV in Host memory until the session's next turn, `close` or `abort`:
+
+- **Hold.** The Host pages covering the turn's KV (prompt plus decoded tokens,
+  except the last sampled token, which has no KV yet) stay resident; its GPU
+  pages and unused Host pages are freed as usual.
+- **Resume.** The next turn sends the full prompt (re-rendered history). Its
+  longest common token prefix with the held tokens, capped at the held KV and
+  at one token short of the new prompt, is reused: those Host pages (the last
+  one may be partial) seed the turn, and only the rest of the prompt is
+  prefilled. `cached_tokens` is that reused length. Below one Host page (64
+  tokens) the hold is dropped and the turn is prefilled in full. The turn runs
+  on the rank that holds its session's KV.
+- **Release.** `close` (either reason) and `abort` free the held KV.
+- **Never a victim.** Held KV is not a running sequence, so preemption and
+  Host-KV eviction never select it. When Host KV runs short, running and
+  queued work waits or is evicted as before; held KV is never dropped to make
+  room. Queued turns that wait only because held sessions occupy Host KV are
+  counted and logged (`[SESSION_HOLD] admission waits on held KV`).
+
+Metrics (`GET /v1/pool/status` → `session_hold`, and `[SESSION_HOLD] metrics`
+log lines): `held_sessions`, `held_kv_tokens`, `held_kv_pages`, `holds`,
+`resumes`, `reload_tokens`, `reload_ms`, `lcp_histogram`, `drops` (held KV not
+reused, by reason: `lcp_below_page`, `superseded`, `evicted_after_resume`,
+`cancelled`), `releases` (`closed`, `aborted`),
+`admission_waits_on_held_kv`, `evictions_while_held`.
+
+Supported for GPT-OSS on one node with pure DP attention; the server refuses
+the flag together with `--enable-prefix-cache` or on another model.
 
 **Limits** (checked before the session is touched; `detail` is
 `{"code", "message"}`):

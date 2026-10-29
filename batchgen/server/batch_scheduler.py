@@ -207,6 +207,9 @@ class BatchScheduler:
         self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
         self._scheduling_pool = SchedulingPool(capacity=0)
         self._trajectory_pool_info: Optional[Dict[str, Any]] = None
+        # Latest agent-session KV hold metrics published by the worker
+        # (--enable-session-kv-hold); None until the first hold event.
+        self._session_hold_info: Optional[Dict[str, Any]] = None
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
@@ -233,8 +236,8 @@ class BatchScheduler:
         # keyed by its turn id; the completion listener resolves its waiter's
         # future directly, with no batch tracker and no output file.
         self._turn_waiters: Dict[str, _TurnWaiter] = {}
-        # Aborted turns already sent to a worker. The worker still finishes
-        # them (there is no worker-side cancel); their completion is dropped.
+        # Aborted turns already sent to a worker. The worker is told to cancel
+        # them and still reports one completion each, which is dropped.
         self._detached_turns: set = set()
         # A turn submission wakes an idle drain at once instead of at its next
         # 0.1 s poll.
@@ -973,26 +976,71 @@ class BatchScheduler:
         """Cancel a submitted turn; its waiter fails with 409 turn_aborted.
 
         Returns "dequeued" when the turn was still in the IntakePool (it never
-        reaches a worker), "detached" when it was already admitted, or None
-        for a turn that is not pending. A detached turn runs to completion on
-        the worker -- the worker has no per-request cancel, the same as
-        /v1/batches/{id}/cancel -- and its completion is discarded. Runs on the
-        scheduler loop.
+        reaches a worker), "cancelled" when it was already admitted, or None
+        for a turn that is not pending. An admitted turn is cancelled on the
+        worker (a session_control message, handled at the worker's next
+        admission poll): it is dropped if it has not started, or finishes at
+        the next completion check and is never held; its one completion is
+        discarded here. Runs on the scheduler loop.
         """
         waiter = self._turn_waiters.pop(turn_id, None)
         if waiter is None:
             return None
         removed = self._intake_pool.remove_batch_entries(turn_id)
         self._intake_pool.remove_batch_info(turn_id)
-        outcome = "dequeued" if removed else "detached"
+        outcome = "dequeued" if removed else "cancelled"
         if not removed:
             self._detached_turns.add(turn_id)
+            self._send_session_control(cancel=[turn_id], reason=reason)
         if not waiter.future.done():
             waiter.future.set_exception(TurnError(
                 409, "turn_aborted", f"turn {turn_id} was aborted: {reason}",
             ))
         logger.info("[TURN] %s cancelled (%s): %s", turn_id, outcome, reason)
         return outcome
+
+    def release_sessions(self, session_ids: List[str], reason: str) -> None:
+        """Free the KV the worker holds for these sessions (close / abort).
+
+        A no-op on the worker for a session it holds nothing for. Runs on the
+        scheduler loop, so the message is ordered after every admission the
+        drain already sent.
+        """
+        if session_ids:
+            self._send_session_control(
+                release=[
+                    {"session_id": session_id, "reason": reason}
+                    for session_id in session_ids
+                ],
+                reason=reason,
+            )
+
+    def _send_session_control(
+        self,
+        *,
+        cancel: Optional[List[str]] = None,
+        release: Optional[List[Dict[str, str]]] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Put one session_control message on the worker's admission queue.
+
+        Before the first drain sent ``init`` the worker has admitted nothing,
+        so it holds nothing and runs nothing: there is nothing to tell it.
+        """
+        if not self._pool_initialized:
+            return
+        self.worker.request_queue.put({
+            "type": "session_control",
+            "cancel": list(cancel or ()),
+            "release": list(release or ()),
+            "reason": reason,
+        })
+        logger.info(
+            "[TURN] session_control sent: cancel=%s release=%s reason=%s",
+            list(cancel or ()),
+            [item["session_id"] for item in release or ()],
+            reason,
+        )
 
     def _resolve_turn(self, turn_id: str, result: dict) -> None:
         """Hand a turn's completion item to its waiter. Runs on the loop."""
@@ -1114,6 +1162,10 @@ class BatchScheduler:
             },
             "cached_tokens": cached,
             "computed_tokens": result.get("computed_tokens"),
+            # --enable-session-kv-hold: the hold this turn resumed from (LCP,
+            # reused tokens) and the KV it now holds for the next turn.
+            "session_resume": result.get("session_resume"),
+            "session_hold": result.get("session_hold"),
             "timing": timing,
         }
         logger.info(
@@ -1567,6 +1619,11 @@ class BatchScheduler:
                         else:
                             logger.info("[POOL] Worker shutdown signal received")
                         continue
+                    elif msg_type == "session_hold_metrics":
+                        self._session_hold_info = {
+                            key: value for key, value in result.items()
+                            if key != "type"
+                        }
                     elif msg_type == "trajectory_pool_capacity":
                         # ``total_capacity`` is immutable token-pool capacity and
                         # sizes SchedulingPool.  ``free_reservations`` changes on
