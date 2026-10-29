@@ -167,6 +167,7 @@ class _FakeWorker:
             item["session_resume"] = {"lcp_tokens": 70, "cached_tokens": 7,
                                       "dropped": None}
             item["session_hold"] = {"held": True, "kv_tokens": 12, "pages": 1}
+            item["session_id"] = entry.get("session_id")
         if "TOO_LONG" in entry["text"]:
             item = {
                 "type": "completion",
@@ -1316,3 +1317,89 @@ def test_e2e_turn_size_and_budget_limits(tmp_path, monkeypatch):
     assert (out["state"], out["turns"]) == ("open", 0)
     assert out["at_limit"].status_code == 200, out["at_limit"].text
     assert len(admitted) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  --enable-session-kv-hold: held sessions keep their scheduling slot
+# --------------------------------------------------------------------------- #
+
+
+def test_a_held_turn_keeps_its_slot_until_the_next_turn_or_release():
+    pool = _M["scheduling_pool"].SchedulingPool(capacity=3)
+    pool.allocate_slot("t1")
+    assert pool.hold_slot("t1", "s1") is None
+    assert pool.num_active_slots() == 0 and pool.num_held_slots() == 1
+    assert pool.num_free_slots() == 2
+    # The next turn needs its own slot while the hold still exists (the worker
+    # binds it at admission and frees the held one only when its wave commits).
+    pool.allocate_slot("t2")
+    assert pool.num_free_slots() == 1
+    # t2 is held again: the previous held slot is returned.
+    assert pool.hold_slot("t2", "s1") is not None
+    assert pool.num_held_slots() == 1 and pool.num_free_slots() == 2
+    assert pool.release_held_slot("s1") is not None
+    assert pool.release_held_slot("s1") is None
+    assert pool.num_free_slots() == 3
+    with pytest.raises(RuntimeError, match="held"):
+        pool.allocate_slot("t3")
+        pool.hold_slot("t3", "s2")
+        pool.set_capacity(5)
+
+
+def test_fatal_clear_returns_held_slots_too():
+    pool = _M["scheduling_pool"].SchedulingPool(capacity=2)
+    pool.allocate_slot("t1")
+    pool.hold_slot("t1", "s1")
+    pool.allocate_slot("t2")
+    assert pool.clear_active_slots() == 2
+    assert pool.num_free_slots() == 2 and pool.num_held_slots() == 0
+
+
+def _scheduler_with_pool(pool):
+    scheduler = bs.BatchScheduler.__new__(bs.BatchScheduler)
+    scheduler._scheduling_pool = pool
+    return scheduler
+
+
+def test_completion_routes_slots_by_hold_and_resume():
+    pool = _M["scheduling_pool"].SchedulingPool(capacity=4)
+    scheduler = _scheduler_with_pool(pool)
+    pool.allocate_slot("t1")
+    scheduler._account_completion_slot(
+        "t1", {"session_id": "s1", "session_hold": {"held": True}},
+    )
+    assert pool.num_held_slots() == 1 and pool.num_free_slots() == 3
+    # A resumed turn that is not held again (cancelled) frees both slots.
+    pool.allocate_slot("t2")
+    scheduler._account_completion_slot(
+        "t2", {"session_id": "s1", "session_hold": None,
+               "session_resume": {"lcp_tokens": 10}},
+    )
+    assert pool.num_held_slots() == 0 and pool.num_free_slots() == 4
+    # A batch request (no session) just frees its slot.
+    pool.allocate_slot("b1")
+    scheduler._account_completion_slot("b1", {"session_id": None})
+    assert pool.num_free_slots() == 4
+
+def test_e2e_held_turn_keeps_its_slot_until_close_and_status_reports_admission(tmp_path):
+    async def scenario(client, scheduler, worker, app):
+        await client.post("/v1/sessions", json={"traj_id": "traj-1", "session_id": "s1"})
+        answer = await client.post("/v1/turns", json=_turn_body("s1", "KVKEPT"))
+        held = scheduler._scheduling_pool.num_held_slots()
+        worker.response_queue.put({
+            "type": "kv_admission_metrics", "deferred": {"host_footprint": 2},
+            "overcommit_active": False})
+        await _until(lambda: scheduler._kv_admission_info is not None)
+        free = scheduler._scheduling_pool.num_free_slots()
+        await client.post("/v1/sessions/s1/close", json={"reason": "end_of_session"})
+        return (answer, held, free, scheduler._kv_admission_info,
+                scheduler._scheduling_pool.num_held_slots(),
+                scheduler._scheduling_pool.num_free_slots())
+
+    answer, held, free, info, after, free_after = asyncio.run(
+        _serve(tmp_path, scenario, capacity=4))
+    assert answer.status_code == 200, answer.text
+    # The worker still binds the held turn's reservation: the server agrees.
+    assert held == 1 and free == 3
+    assert after == 0 and free_after == 4
+    assert info == {"deferred": {"host_footprint": 2}, "overcommit_active": False}

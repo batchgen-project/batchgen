@@ -165,6 +165,7 @@ def _malloc_trim() -> None:
 		pass
 
 from batchgen.worker import session_hold as session_hold_lib
+from batchgen.worker import kv_admission as kv_admission_lib
 
 # Sentinel: the admission queue was empty when polled (None is the shutdown
 # message, so it cannot mean "nothing").
@@ -1019,6 +1020,11 @@ class BatchGenWorkerArgs:
 	# A hold idle this long (no turn of its session in the worker) is released;
 	# 0 = never. Default: session_hold.DEFAULT_IDLE_TTL_S.
 	session_hold_idle_ttl_s: float = session_hold_lib.DEFAULT_IDLE_TTL_S
+	# Footprint admission on a session-hold server (batchgen.worker.kv_admission):
+	# Host safety margin, percent of the node's Host pool.
+	session_kv_admission_margin_percent: float = (
+		kv_admission_lib.DEFAULT_ADMISSION_MARGIN_PERCENT
+	)
 
 	# Watchdog configuration
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
@@ -1417,6 +1423,23 @@ class BatchGenWorker:
 		# each resumed turn's decision (until its completion is reported).
 		self._session_resume_wave = {}
 		self._session_resume_plans = {}
+		# Footprint admission (I-A) on a hold server; None when hold is off.
+		# See batchgen.worker.kv_admission. Every rank keeps the same stats.
+		self._kv_admission = None
+		self._kv_admission_margin_percent = float(getattr(
+			args, "session_kv_admission_margin_percent",
+			kv_admission_lib.DEFAULT_ADMISSION_MARGIN_PERCENT,
+		))
+		# Gathered pool totals of the last admission: (Host pages per node,
+		# GPU KV pages per rank or -1 while unknown). Constant per deployment.
+		self._kv_admission_totals = None
+		self._kv_admission_plan = None
+		self._kv_admission_last_log = None
+		self._kv_admission_last_publish = 0.0
+		# This rank's GPU KV pool size, recorded once a decode pool exists.
+		self._kv_gpu_total_pages = -1
+		# (uuid, held request id) -> held pages a resumed turn keeps (its LCP).
+		self._kv_resume_keep_cache = {}
 		self._prefill_pool_wave = None
 		# Prefill-phase pool page budget: measured after configure_prefill,
 		# None until the first prefill of this deployment.
@@ -3205,6 +3228,8 @@ class BatchGenWorker:
 		# decision is identical on every rank (broadcast inputs only).
 		held = False
 		session_hold = session_resume = None
+		if getattr(self, "_kv_admission", None) is not None:
+			self._note_kv_footprint_completion(seq)
 		if getattr(self, "_session_hold", None) is not None:
 			held = self._session_hold_eligible(seq)
 			self._cancelled_request_ids.discard(uuid)
@@ -3291,8 +3316,12 @@ class BatchGenWorker:
 					}
 				),
 				"session_hold": session_hold,
+				# Lets the server keep a held session's scheduling slot.
+				"session_id": seq.session_id,
 			}),
 		})
+		if getattr(self, "_kv_admission", None) is not None:
+			self._publish_kv_admission_metrics("completion", force=True)
 
 	# ============ Agent session KV hold (batchgen.worker.session_hold) ============
 
@@ -3341,12 +3370,25 @@ class BatchGenWorker:
 			page_tokens=page_tokens, idle_ttl_s=idle_ttl_s,
 		)
 		self._session_hold_page_bytes = int(_host_page_bytes_all_layers(host_kv_config))
+		# Held KV joins every admission decision (invariant I-A).
+		margin = kv_admission_lib.validate_margin_percent(
+			self._kv_admission_margin_percent,
+			eviction_watermark_percent=self.host_kv_eviction_watermark,
+		)
+		self._kv_admission = kv_admission_lib.KVAdmissionStats(
+			margin_percent=margin, page_tokens=page_tokens,
+		)
 		if self.rank == 0:
 			logging.info(
 				"[SESSION_HOLD] enabled: page_tokens=%s host_page_bytes=%s "
 				"idle_ttl_s=%s",
 				page_tokens, self._session_hold_page_bytes,
 				idle_ttl_s if idle_ttl_s > 0 else "off",
+			)
+			logging.info(
+				"[KV_ADMISSION] footprint admission enabled: host margin %.1f%% "
+				"(eviction watermark %s%%), GPU margin 0",
+				margin, self.host_kv_eviction_watermark,
 			)
 
 	def _session_hold_eligible(self, seq) -> bool:
@@ -3745,18 +3787,7 @@ class BatchGenWorker:
 					f"turn {uuid} of held session {seq.session_id} is on rank "
 					f"{seq.assigned_rank}, its KV on rank {record.rank}"
 				)
-			held_tokens = torch.empty(record.kv_tokens, dtype=torch.int32)
-			self._trajectory_book.copy_span_to(
-				record.trajectory_slot, held_tokens, start=0, length=record.kv_tokens
-			)
-			prompt = self._trajectory_tokens(seq, length=seq.prompt_length)
-			plan = session_hold_lib.plan_resume(
-				session_id=seq.session_id,
-				lcp_tokens=session_hold_lib.longest_common_prefix(held_tokens, prompt),
-				kv_tokens=record.kv_tokens,
-				prompt_tokens=int(seq.prompt_length),
-				page_tokens=record.page_tokens,
-			)
+			plan = self._session_resume_plan(seq, record)
 			self._session_resume_wave[uuid] = plan
 			if plan.resumes and self._owns_host_kv(seq):
 				pages = tuple(record.page_ids[: plan.keep_pages])
@@ -3769,6 +3800,26 @@ class BatchGenWorker:
 					attached_tokens=plan.keep_pages * record.page_tokens,
 					compute_cached_tokens=plan.cached_tokens,
 				)
+
+	def _session_resume_plan(self, seq, record):
+		"""Every rank: how a queued turn reuses its session's hold (from the LCP).
+
+		Reads the node-shared trajectory book only, so every rank decides the
+		same. Used at the prefill wave and by footprint admission, which must
+		discount exactly the held pages the wave will attach.
+		"""
+		held_tokens = torch.empty(record.kv_tokens, dtype=torch.int32)
+		self._trajectory_book.copy_span_to(
+			record.trajectory_slot, held_tokens, start=0, length=record.kv_tokens
+		)
+		prompt = self._trajectory_tokens(seq, length=seq.prompt_length)
+		return session_hold_lib.plan_resume(
+			session_id=seq.session_id,
+			lcp_tokens=session_hold_lib.longest_common_prefix(held_tokens, prompt),
+			kv_tokens=record.kv_tokens,
+			prompt_tokens=int(seq.prompt_length),
+			page_tokens=record.page_tokens,
+		)
 
 	def _commit_session_resumes(self) -> None:
 		"""Every rank, after the wave's Host reservation committed: consume holds.
@@ -3875,6 +3926,30 @@ class BatchGenWorker:
 		):
 			return False
 		book.admission_waits += 1
+		plan = self._kv_admission_plan
+		stats = self._kv_admission
+		if stats is not None and plan is not None and plan.overcommit:
+			started = stats.note_overcommit(True)
+			if self.rank == 0 and (started or stats.overcommit_waits % 50 == 0):
+				needs = [
+					(uuid[:8], plan.deferred.get(uuid))
+					for uuid in plan.blocked_resumed[:4]
+				]
+				logging.error(
+					"[KV_ADMISSION] OVERCOMMIT (episode %d, wait #%d): nothing is "
+					"running, %d held session(s) hold %d Host pages (%d tokens), "
+					"Host free after margin %s, and %d resumed turn(s) %s cannot "
+					"fit; new sessions are refused (%d deferred), no held KV is "
+					"dropped; waiting for a close or abort",
+					stats.overcommit_episodes, stats.overcommit_waits,
+					len(book.sessions), book.held_pages, book.held_kv_tokens,
+					list(plan.host_free_after), len(plan.blocked_resumed), needs,
+					sum(
+						1 for reason in plan.deferred.values()
+						if reason == kv_admission_lib.DEFER_RESUMED_FIRST
+					),
+				)
+				self._publish_kv_admission_metrics("overcommit", force=True)
 		if self.rank == 0 and (
 			book.admission_waits == 1 or book.admission_waits % 50 == 0
 		):
@@ -3900,6 +3975,330 @@ class BatchGenWorker:
 		if self._response_queue is None:
 			return
 		self._response_queue.put({"type": "session_hold_metrics", **snapshot})
+
+	# ============ Footprint admission, I-A (batchgen.worker.kv_admission) ============
+
+	_KV_STATUSES = (
+		SequenceStatus.IN_PREFILL,
+		SequenceStatus.PREFILLED,
+		SequenceStatus.IN_DECODE,
+		SequenceStatus.ON_HOLD,
+	)
+
+	def _kv_budget_pages(self, seq) -> int:
+		return kv_admission_lib.ceil_div(int(seq.kv_token_budget), SequenceEntry.PAGE_SIZE)
+
+	def _kv_running_footprint(self) -> Tuple[List[int], List[int]]:
+		"""Every rank: projected pages of sequences that own KV, per node / rank.
+
+		The projection is the whole KV budget (prompt + max decode), not the
+		current allocation, so admitted work can always grow to it. Read from
+		the replicated global batch, so it is rank-uniform.
+		"""
+		host = [0] * self._get_num_nodes()
+		gpu = [0] * int(self.world_size)
+		for seq in self.global_batch:
+			if seq.status not in self._KV_STATUSES:
+				continue
+			if seq.assigned_rank is None:
+				raise RuntimeError(
+					f"sequence {seq.uuid} owns KV but has no assigned rank"
+				)
+			pages = self._kv_budget_pages(seq)
+			host[int(seq.assigned_rank) // self.local_world_size] += pages
+			gpu[int(seq.assigned_rank)] += pages
+		return host, gpu
+
+	def _kv_held_by_node(self) -> List[int]:
+		held = [0] * self._get_num_nodes()
+		for record in self._session_hold.sessions.values():
+			held[int(record.rank) // self.local_world_size] += record.pages
+		return held
+
+	def _kv_footprint_state(self, host_running, gpu_running):
+		host_totals, gpu_totals = self._kv_admission_totals
+		margin = self._kv_admission.margin_percent
+		return kv_admission_lib.FootprintState(
+			host_total_by_node=tuple(host_totals),
+			host_running_by_node=tuple(host_running),
+			host_held_by_node=tuple(self._kv_held_by_node()),
+			host_margin_by_node=tuple(
+				kv_admission_lib.margin_pages(total, margin) for total in host_totals
+			),
+			gpu_total_by_rank=tuple(gpu_totals),
+			gpu_running_by_rank=tuple(gpu_running),
+		)
+
+	def _kv_footprint_candidates(self, uuids: List[str], *, with_keep: bool):
+		"""Every rank: projected footprints, kinds and (optionally) kept held pages.
+
+		A queued turn whose session holds KV is a resumed turn: it is charged
+		its budget minus the pages its session holds. ``with_keep`` also
+		computes the held pages the wave will attach (its LCP), which the
+		physical Host reservation discounts.
+		"""
+		candidates, kinds, keep = [], {}, {}
+		book = self._session_hold
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.assigned_rank is None:
+				raise RuntimeError(
+					f"admission candidate {uuid} is unknown or has no assigned rank"
+				)
+			budget = self._kv_budget_pages(seq)
+			record = (
+				book.get(seq.session_id)
+				if seq.status == SequenceStatus.QUEUEING else None
+			)
+			if seq.status == SequenceStatus.EVICTED:
+				kind, host, held = kv_admission_lib.KIND_EVICTED, budget, 0
+			elif record is not None:
+				kind, held = kv_admission_lib.KIND_RESUMED, record.pages
+				# Net change at commit: the turn's budget joins "running", its
+				# whole hold leaves "held" (LCP pages reused, the rest freed).
+				host = max(0, budget - held)
+				if with_keep:
+					key = (uuid, record.request_id)
+					if key not in self._kv_resume_keep_cache:
+						plan = self._session_resume_plan(seq, record)
+						self._kv_resume_keep_cache[key] = (
+							plan.keep_pages if plan.resumes else 0
+						)
+					keep[uuid] = self._kv_resume_keep_cache[key]
+			else:
+				kind, host, held = kv_admission_lib.KIND_NEW, budget, 0
+			kinds[uuid] = kind
+			candidates.append(kv_admission_lib.FootprintCandidate(
+				uuid=uuid,
+				kind=kind,
+				node_id=int(seq.assigned_rank) // self.local_world_size,
+				rank=int(seq.assigned_rank),
+				global_idx=int(seq.global_idx),
+				host_pages=host,
+				gpu_pages=budget,
+				budget_pages=budget,
+				held_pages=held,
+				total_decoded_before_eviction=int(
+					getattr(seq, "total_decoded_before_eviction", 0)
+				),
+			))
+		return candidates, kinds, keep
+
+	def _kv_gpu_total_pages_report(self) -> int:
+		"""This rank's GPU KV pool pages, or -1 before the first decode pool.
+
+		The pool is sized once and keeps its page count for the deployment, so
+		the value recorded from a live pool stays valid across phase switches.
+		"""
+		manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+		# Between decode phases the pool may be unmapped; read it only while
+		# it is live, and keep the recorded size otherwise.
+		if (
+			manager is not None
+			and getattr(manager, "is_initialized", True)
+			and getattr(manager, "pool_is_mapped", True)
+		):
+			try:
+				pages = int(manager.get_stats().num_total_pages)
+			except Exception:
+				logging.exception(
+					"Rank %s: GPU KV stats unavailable for footprint admission",
+					self.rank,
+				)
+			else:
+				if pages > 0:
+					self._kv_gpu_total_pages = pages
+		return int(self._kv_gpu_total_pages)
+
+	def _apply_footprint_admission(
+		self, selection, per_node_host_free, per_node_host_total, per_rank_gpu_total,
+	):
+		"""Every rank: restrict a wave's candidates to those whose footprint fits.
+
+		Returns ``(selection, changed)``. ``changed`` is True when requests
+		that can never fit were failed by name (the candidate set changed under
+		the snapshot, so the caller rebuilds it next iteration). Otherwise the
+		selection keeps only the admitted candidates, in footprint priority
+		order (resumed turns before new work), with each resumed turn's
+		physical reservation discounted by the held pages it attaches.
+		"""
+		if any(int(total) < 0 for total in per_node_host_total):
+			raise RuntimeError(
+				f"footprint admission needs every node's Host pool size, got "
+				f"{list(per_node_host_total)}"
+			)
+		self._kv_admission_totals = (
+			tuple(int(total) for total in per_node_host_total),
+			tuple(int(total) for total in per_rank_gpu_total),
+		)
+		stats = self._kv_admission
+		host_running, gpu_running = self._kv_running_footprint()
+		state = self._kv_footprint_state(host_running, gpu_running)
+		uuids = [candidate.uuid for candidate in selection.candidates]
+		candidates, kinds, keep = self._kv_footprint_candidates(uuids, with_keep=True)
+		plan = kv_admission_lib.plan_footprint_admission(
+			candidates, state, live=self._prefill_admission_live,
+		)
+		self._kv_admission_plan = plan
+		stats.note_plan(plan, kinds)
+		self._note_kv_footprint_sample(
+			host_total=sum(state.host_total_by_node),
+			host_used=sum(
+				int(total) - int(free)
+				for total, free in zip(per_node_host_total, per_node_host_free)
+			),
+			held=sum(state.host_held_by_node),
+			running_projected=sum(host_running),
+			gpu_running=gpu_running,
+		)
+		# Keep cached LCP decisions only for holds still awaiting their turn.
+		live_keys = set()
+		for uuid in uuids:
+			record = self._session_hold.get(
+				self.global_batch.get_sequence(uuid).session_id
+			)
+			if record is not None:
+				live_keys.add((uuid, record.request_id))
+		self._kv_resume_keep_cache = {
+			key: value for key, value in self._kv_resume_keep_cache.items()
+			if key in live_keys
+		}
+		if self.rank == 0:
+			signature = (plan.admitted, tuple(sorted(plan.deferred.items())), plan.overcommit)
+			if plan.deferred and signature != self._kv_admission_last_log:
+				logging.info(
+					"[KV_ADMISSION] wave: admitted=%d (%s) deferred=%s "
+					"host_free_after=%s host_total=%s held=%s running_projected=%s "
+					"gpu_free=%s live=%s",
+					len(plan.admitted),
+					",".join(sorted({kinds[u] for u in plan.admitted})) or "-",
+					plan.deferred_by_reason(), list(plan.host_free_after),
+					list(state.host_total_by_node), list(state.host_held_by_node),
+					list(host_running), state.gpu_free(), self._prefill_admission_live,
+				)
+			self._kv_admission_last_log = signature
+		if plan.never_fits:
+			for uuid, reason in sorted(plan.never_fits.items()):
+				seq = self.global_batch.get_sequence(uuid)
+				if self.rank == 0:
+					logging.error(
+						"[KV_ADMISSION] reject %s (idx %s): %s",
+						uuid, seq.global_idx, reason,
+					)
+				self._drop_unstarted_request(
+					seq, kv_admission_lib.REJECT_NEVER_FITS, reason,
+				)
+			self._publish_kv_admission_metrics("reject", force=True)
+			return selection, True
+		if not plan.overcommit and stats.overcommit_active:
+			stats.note_overcommit(False)
+			if self.rank == 0:
+				logging.warning(
+					"[KV_ADMISSION] overcommit cleared after %d waits: admitted=%d",
+					stats.overcommit_waits, len(plan.admitted),
+				)
+			self._publish_kv_admission_metrics("overcommit_cleared", force=True)
+		position = {uuid: index for index, uuid in enumerate(plan.order)}
+		admitted = set(plan.admitted)
+		kept = tuple(sorted(
+			(
+				replace(
+					candidate,
+					prefill_order=position[candidate.uuid],
+					cached_prefix_pages=int(keep.get(candidate.uuid, 0)),
+				)
+				for candidate in selection.candidates
+				if candidate.uuid in admitted
+			),
+			key=lambda candidate: position[candidate.uuid],
+		))
+		self._publish_kv_admission_metrics("admission")
+		return replace(selection, candidates=kept), False
+
+	def _kv_admission_would_admit(self) -> bool:
+		"""Every rank: would the next prefill wave admit (or reject) anything?
+
+		Decode breaks for prefill only then: a break whose wave admits nothing
+		costs two phase switches and moves every decoding row ON_HOLD for
+		nothing. Pure over replicated state and the last gathered totals, so
+		every rank answers the same and the watermark collective that follows
+		is entered by all ranks or by none.
+		"""
+		if (
+			getattr(self, "_kv_admission", None) is None
+			or self._kv_admission_totals is None
+		):
+			return True
+		uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
+		if self.enable_host_kv_eviction:
+			uuids = uuids + self.global_batch.get_sequences_by_status(
+				SequenceStatus.EVICTED
+			)
+		if not uuids:
+			return False
+		host_running, gpu_running = self._kv_running_footprint()
+		candidates, _, _ = self._kv_footprint_candidates(uuids, with_keep=False)
+		plan = kv_admission_lib.plan_footprint_admission(
+			candidates, self._kv_footprint_state(host_running, gpu_running), live=True,
+		)
+		return bool(plan.admitted) or bool(plan.never_fits)
+
+	def _note_kv_footprint_sample(
+		self, *, host_total, host_used, held, running_projected, gpu_running,
+	) -> None:
+		gpu_totals = (
+			self._kv_admission_totals[1] if self._kv_admission_totals else ()
+		)
+		known = [int(total) for total in gpu_totals if int(total) >= 0]
+		self._kv_admission.note_sample(
+			host_total=host_total,
+			host_used=host_used,
+			held=held,
+			running_projected=running_projected,
+			gpu_total=min(known) if known else None,
+			gpu_projected_max=max(gpu_running) if gpu_running else 0,
+		)
+
+	def _note_kv_footprint_boundary(self, per_node_host_stats) -> None:
+		"""Every rank: sample peak Host use at a decode boundary (gathered stats)."""
+		if self._kv_admission is None or not per_node_host_stats:
+			return
+		host_running, gpu_running = self._kv_running_footprint()
+		self._note_kv_footprint_sample(
+			host_total=sum(int(s["num_total_pages"]) for s in per_node_host_stats),
+			host_used=sum(
+				int(s["num_total_pages"]) - int(s["num_free_pages"])
+				for s in per_node_host_stats
+			),
+			held=sum(self._kv_held_by_node()),
+			running_projected=sum(host_running),
+			gpu_running=gpu_running,
+		)
+
+	def _note_kv_footprint_completion(self, seq) -> None:
+		"""Every rank: projected (budget) vs actual (final context) footprint."""
+		if self._kv_admission is None:
+			return
+		self._kv_admission.note_completion(
+			projected_pages=self._kv_budget_pages(seq),
+			actual_pages=kv_admission_lib.ceil_div(
+				int(seq.current_context_length), SequenceEntry.PAGE_SIZE
+			),
+		)
+
+	def _publish_kv_admission_metrics(self, event: str, *, force: bool = False) -> None:
+		"""Rank 0: send the (rank-uniform) admission metrics for /v1/pool/status."""
+		stats = self._kv_admission
+		if stats is None or self.rank != 0:
+			return
+		now = time.monotonic()
+		if not force and now - self._kv_admission_last_publish < 1.0:
+			return
+		self._kv_admission_last_publish = now
+		kv_admission_lib.log_metrics(stats, self.rank, event)
+		if self._response_queue is None:
+			return
+		self._response_queue.put({"type": "kv_admission_metrics", **stats.snapshot()})
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
 		"""Gather decoded tokens from owning ranks for completed sequences.
@@ -6458,6 +6857,11 @@ class BatchGenWorker:
 		"""
 		if not self.enable_decode_preemption:
 			return False
+		# Session-hold server: break decode only for a wave that would admit
+		# something under footprint admission. Rank-uniform (replicated state),
+		# so every rank skips the gather below together.
+		if not self._kv_admission_would_admit():
+			return False
 
 		# Only local_rank 0 reports (one per node)
 		if self.local_rank == 0:
@@ -8335,13 +8739,17 @@ class BatchGenWorker:
 		#       only), so the guard tells an in-flight wait from a stall
 		#   [10] reclaimable retained prefix pages of the node (node leader
 		#       with the prefix cache only): joins the host admission budget
+		#   [11] footprint admission only (session-hold server, the same on
+		#       every rank): GPU KV pool pages of this rank, -1 before the
+		#       first decode pool exists
+		kv_admission_on = getattr(self, "_kv_admission", None) is not None
 		free_tensor = torch.tensor(
 			[
 				report_node, report_host_free, limit_scope, local_sequence_free,
 				report_host_total, int(local_live), candidate_digest,
 				prefix_pressure[0], prefix_pressure[1], prefix_pressure[2],
 				report_releasable,
-			],
+			] + ([self._kv_gpu_total_pages_report()] if kv_admission_on else []),
 			dtype=torch.int64,
 			device=self.torch_device,
 		)
@@ -8463,6 +8871,19 @@ class BatchGenWorker:
 			per_node_sequence_free=per_node_sequence_free,
 			per_node_host_reclaimable=per_node_host_reclaimable,
 		)
+		# Session-hold server: admit only what fits its projected KV footprint
+		# (held KV included), resumed turns first (batchgen.worker.kv_admission).
+		if kv_admission_on:
+			selection, changed = self._apply_footprint_admission(
+				selection,
+				per_node_host_free,
+				per_node_host_total,
+				[int(item[11].item()) for item in gathered],
+			)
+			if changed:
+				self._prefill_admission_state = None
+				self._prefill_admission_selection = None
+				return []
 		# One reservation per candidate, reused by the rejection below, the
 		# reclaim target and the guard state. Independent of free pages, so it
 		# survives the post-reclaim `replace(selection, ...)`.
@@ -17202,6 +17623,8 @@ class BatchGenWorker:
 		if worker_view is None:
 			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		per_node_host_stats = self._gather_host_kv_stats_by_node(worker_view)
+		if getattr(self, "_kv_admission", None) is not None:
+			self._note_kv_footprint_boundary(per_node_host_stats)
 
 		if self.rank == 0:
 			try:
